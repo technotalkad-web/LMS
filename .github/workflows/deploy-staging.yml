@@ -1,0 +1,48 @@
+# Auto-deploys to STAGING (my-lms.mentora.workers.dev) on every push
+# to main. Assumes PR checks passed before the merge.
+#
+# Secrets needed (Repository Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN            Token with "Edit Cloudflare Workers" perm
+#   CLOUDFLARE_ACCOUNT_ID           From Cloudflare dashboard right sidebar
+#   STAGING_NEXT_PUBLIC_SUPABASE_URL
+#   STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY
+#   STAGING_NEXT_PUBLIC_SITE_URL    https://my-lms.mentora.workers.dev
+#
+# Note: runtime secrets (SUPABASE_SERVICE_ROLE_KEY, IMPERSONATION_SECRET,
+# CRON_SECRET) are already on the deployed Worker — wrangler deploy
+# preserves them. We only inject NEXT_PUBLIC_* here because Next.js
+# bakes them into the bundle at build time.
+name: Deploy to staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      NEXT_PUBLIC_SITE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SITE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Build (OpenNext for Cloudflare)
+        run: npm run cf:build
+      - name: Deploy to Cloudflare (staging)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy

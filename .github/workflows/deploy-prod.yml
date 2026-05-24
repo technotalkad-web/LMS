@@ -1,0 +1,47 @@
+# Deploys to PROD (my-lms-prod.mentora.workers.dev) when:
+#   (a) a Git tag matching v*.*.* is pushed, OR
+#   (b) someone manually triggers via Actions UI (workflow_dispatch).
+#
+# Tag-based prod deploy makes shipping a deliberate act:
+#   git tag v1.2.0 && git push --tags
+#
+# Secrets needed:
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (same as staging)
+#   PROD_NEXT_PUBLIC_SUPABASE_URL    https://alkfrcglmseksweqhwzq.supabase.co
+#   PROD_NEXT_PUBLIC_SUPABASE_ANON_KEY
+#   PROD_NEXT_PUBLIC_SITE_URL        https://my-lms-prod.mentora.workers.dev
+name: Deploy to production
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.PROD_NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.PROD_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      NEXT_PUBLIC_SITE_URL: ${{ secrets.PROD_NEXT_PUBLIC_SITE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Build (OpenNext for Cloudflare)
+        run: npm run cf:build
+      - name: Deploy to Cloudflare (production)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --env production

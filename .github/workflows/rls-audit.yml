@@ -1,0 +1,87 @@
+name: RLS Cross-Tenant Audit
+
+# Weekly safety net: re-runs tests/rls-audit/audit.sql against staging
+# every Monday morning. If any table's status returns FAIL (RLS missing,
+# policies missing, or a runtime cross-tenant leak) the script raises
+# an exception, psql exits non-zero, and the job goes red.
+#
+# A red run here is launch-critical: it means a migration shipped that
+# broke multi-tenant isolation. Halt deploys until it's green again.
+#
+# Required repo secret:
+#   SUPABASE_STAGING_DB_URL  — full Postgres connection string for the
+#                              staging Supabase project
+#                              (Project Settings → Database → Connection
+#                              string → URI). NEVER set this to a prod URL.
+
+on:
+  schedule:
+    # Mondays at 07:00 UTC. Early enough that any failure is on
+    # someone's screen before the workweek's deploys start.
+    - cron: '0 7 * * 1'
+  workflow_dispatch: {}      # also runnable on-demand from the Actions tab
+  pull_request:
+    paths:
+      - 'supabase/migrations/**'
+      - 'tests/rls-audit/**'
+      - '.github/workflows/rls-audit.yml'
+
+jobs:
+  audit:
+    name: psql audit.sql against staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Refuse to run if staging URL is missing
+        env:
+          STAGING_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+        run: |
+          if [ -z "$STAGING_URL" ]; then
+            echo "::error::SUPABASE_STAGING_DB_URL secret is not set. Configure it in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+          # Belt-and-braces: never let this hit prod even if someone
+          # misconfigures the secret. audit.sql also has its own guard.
+          if echo "$STAGING_URL" | grep -iqE '(prod|production)'; then
+            echo "::error::Staging URL looks like production. Refusing to continue."
+            exit 1
+          fi
+
+      - name: Run RLS audit
+        env:
+          PGPASSWORD_PROMPT: never
+          STAGING_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
+        run: |
+          set -o pipefail
+          mkdir -p ./_audit-out
+          # -v ON_ERROR_STOP=1 makes psql exit on the first SQL error.
+          # The script itself RAISES EXCEPTION on any FAIL row, so this
+          # is how the job propagates that to a non-zero exit code.
+          psql "$STAGING_URL" \
+            -v ON_ERROR_STOP=1 \
+            -f tests/rls-audit/audit.sql \
+            2>&1 | tee ./_audit-out/audit.log
+
+      - name: Upload audit log
+        # Always upload, even on failure — the log shows which table
+        # failed and why, which is what the on-call engineer needs.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rls-audit-log
+          path: ./_audit-out/audit.log
+          retention-days: 30
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          echo "::error title=RLS Audit FAILED::Cross-tenant isolation regressed on staging. Download the rls-audit-log artifact for the per-table report and HALT prod deploys until it's green again."

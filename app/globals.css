@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/* ---- light theme (default) ---- */
+:root {
+  --canvas: #faf8f4;
+  --ink: #1a1816;
+  --muted: #6b6661;
+  --line: #e8e3dc;
+  --paper: #ffffff;
+  --accent: #3a5a40;
+}
+
+/* ---- dark theme — toggled by [data-theme="dark"] on <html> ---- */
+:root[data-theme="dark"] {
+  --canvas: #14110e;
+  --ink: #f3eee6;
+  --muted: #8a8581;
+  --line: #2a2520;
+  --paper: #1b1814;
+  --accent: #7ea884;
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-paper: var(--paper);
+  --color-accent: var(--accent);
+
+  --font-sans: var(--font-inter), "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  /* `--font-serif` is kept for backwards-compat where code explicitly
+     opts into a serif look. New code should use the `.serif` utility
+     class below, which inherits the active brand font. */
+  --font-serif: var(--font-merriweather), Georgia, "Times New Roman", serif;
+}
+
+html, body {
+  background: var(--canvas);
+  color: var(--ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Headline / display utility. Inherits the active brand font so
+   the org-level override flows through to every heading without
+   pinning a specific typeface. Tight tracking gives it editorial
+   weight even when used with sans typefaces like Inter or Poppins. */
+.serif {
+  font-family: inherit;
+  letter-spacing: -0.022em;
+  font-weight: 600;
+}
+
+/* Theme transition smoothing */
+:root, body {
+  transition: background-color 150ms ease, color 150ms ease;
+}

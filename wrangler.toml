@@ -1,0 +1,116 @@
+# =============================================================================
+# Cloudflare Workers config for the LMS
+# =============================================================================
+#
+# Built by OpenNext from the Next.js app. The Worker entry, assets, and
+# routes wire-up are produced by `opennextjs-cloudflare build`; this file
+# tells wrangler where to find them and what runtime flags to apply.
+#
+# Two surfaces this file controls beyond the build artifact:
+#   1. compatibility_flags = ["nodejs_compat"] — required for
+#      crypto.createHmac (impersonation cookie) and @aws-sdk/* (R2).
+#   2. [triggers.crons] — scheduled triggers for the 4 cron routes.
+#      Cloudflare's built-in cron is free and gives us reliable wakeup
+#      without provisioning anything external.
+#
+# Secrets (SUPABASE_SERVICE_ROLE_KEY, IMPERSONATION_SECRET, CRON_SECRET,
+# R2 keys) are set with `wrangler secret put <NAME>` — never in this file.
+# Public/non-secret env vars (NEXT_PUBLIC_*, NEXT_PUBLIC_SITE_URL,
+# STORAGE_DRIVER, etc.) go in the [vars] block below.
+# =============================================================================
+
+name = "my-lms"
+main = ".open-next/worker.js"
+
+# `compatibility_date` should be set to today or recent past at first deploy,
+# then ratcheted forward only when you've tested a newer date locally.
+# 2025-03-01 is a known-good baseline for OpenNext + Next.js 16.
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Static assets emitted by Next/OpenNext.
+[assets]
+directory = ".open-next/assets"
+binding = "ASSETS"
+
+# Observability — surface Worker logs in the Cloudflare dashboard.
+[observability]
+enabled = true
+
+# ---- Scheduled triggers (cron) ---------------------------------------------
+# Each entry is a cron expression in UTC. Cloudflare invokes the Worker's
+# scheduled handler (which OpenNext synthesizes from your /api/cron/*
+# route handlers) at these times.
+#
+# Schedules match what pre-launch-checklist.docx § 7 expects.
+[triggers]
+crons = [
+  
+]
+
+# ---- Non-secret env vars ---------------------------------------------------
+# IMPORTANT: NEXT_PUBLIC_* values are public anyway; service-role keys
+# and HMAC secrets must NEVER go here — use `wrangler secret put` instead.
+#
+# Fill these in with your real prod values before first deploy.
+[vars]
+NEXT_PUBLIC_SUPABASE_URL = "https://zeaclbapadosqqttexxh.supabase.co"
+NEXT_PUBLIC_SUPABASE_ANON_KEY = "sb_publishable_2ynjJ05_qfegVFb495AR5g_mTezusls"
+NEXT_PUBLIC_SITE_URL = "https://my-lms.mentora.workers.dev"
+STORAGE_DRIVER = "supabase"
+SUPABASE_STORAGE_BUCKET = "course-content"
+NODE_ENV = "production"
+
+# ---- Custom domain ---------------------------------------------------------
+# Uncomment + edit after the Worker is deployed once and you've added the
+# domain in Cloudflare DNS. The pattern matches the host you'll serve on.
+# [[routes]]
+# pattern = "your-prod-domain.example"
+# custom_domain = true
+
+# ---- R2 binding (only if STORAGE_DRIVER=r2) --------------------------------
+# Uncomment + create the bucket via `wrangler r2 bucket create lms-uploads`
+# if you switch from Supabase Storage to R2.
+# [[r2_buckets]]
+# binding = "R2_UPLOADS"
+# bucket_name = "lms-uploads"
+
+# =============================================================================
+# Production environment
+# =============================================================================
+# Deployed with:  npx wrangler deploy --env production
+# Runs as a separate Worker named "my-lms-prod" at:
+#   https://my-lms-prod.mentora.workers.dev
+#
+# IMPORTANT: with [env.*], vars / triggers / r2_buckets / kv_namespaces do
+# NOT inherit from the top-level config — they must be redeclared here for
+# the production env. Inheritable: name/main/compatibility_date/flags.
+#
+# Secrets (SUPABASE_SERVICE_ROLE_KEY, IMPERSONATION_SECRET, CRON_SECRET)
+# are set with `wrangler secret put <NAME> --env production` — never here.
+# =============================================================================
+[env.production]
+name = "my-lms-prod"
+
+[env.production.assets]
+directory = ".open-next/assets"
+binding = "ASSETS"
+
+[env.production.observability]
+enabled = true
+
+[env.production.triggers]
+crons = [
+  "0 2 * * *",   # /api/cron/billing       — daily 02:00 UTC
+  "0 3 * * *",   # /api/cron/reaper        — daily 03:00 UTC
+  "0 6 * * *",   # /api/cron/reminders     — daily 06:00 UTC
+  "0 7 * * 1",   # /api/cron/rls-audit     — Mondays 07:00 UTC
+]
+
+[env.production.vars]
+NEXT_PUBLIC_SUPABASE_URL = "https://alkfrcglmseksweqhwzq.supabase.co"
+NEXT_PUBLIC_SUPABASE_ANON_KEY = "sb_publishable_qDQKIyEyoj8zTg6jZ0jCkA_O24oAtQh"
+NEXT_PUBLIC_SITE_URL = "https://my-lms-prod.mentora.workers.dev"
+STORAGE_DRIVER = "supabase"
+SUPABASE_STORAGE_BUCKET = "course-content"
+NODE_ENV = "production"
