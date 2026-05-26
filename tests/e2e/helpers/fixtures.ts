@@ -56,9 +56,9 @@ export async function newAuthedContext(
   return ctx;
 }
 
-interface SeededAdmin extends SeededUser {}
-interface SeededLearner extends SeededUser {}
-interface SeededPlatformOwner extends SeededUser {}
+type SeededAdmin = SeededUser;
+type SeededLearner = SeededUser;
+type SeededPlatformOwner = SeededUser;
 
 type Fixtures = {
   seededOrg: SeededOrg;

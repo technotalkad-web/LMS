@@ -91,7 +91,7 @@ values ('<your auth.users.id>', 'bootstrap');`}
 
       <div className="mt-6 border border-amber-200 bg-amber-50 text-amber-900 rounded-xl p-4 text-sm">
         <strong>Phase 10b queued:</strong> add-owner form, MFA enforcement,
-        IP allowlist. For now, manage via SQL — that's intentional friction
+        IP allowlist. For now, manage via SQL — that&apos;s intentional friction
         for an extremely high-privilege role.
       </div>
     </div>

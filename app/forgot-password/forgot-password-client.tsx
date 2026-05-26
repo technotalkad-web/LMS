@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
@@ -236,9 +237,9 @@ export function ForgotPasswordClient() {
           </button>
 
           <p className="text-center text-sm text-muted pt-2">
-            <a href="/login" className="hover:text-ink inline-flex items-center gap-1">
+            <Link href="/login" className="hover:text-ink inline-flex items-center gap-1">
               <ArrowLeft className="w-3 h-3" /> Back to sign in
-            </a>
+            </Link>
           </p>
         </form>
       )}

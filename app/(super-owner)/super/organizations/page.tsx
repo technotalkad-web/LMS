@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   Activity,
@@ -115,12 +116,12 @@ export default async function OrganizationsPage() {
             Manage tenant workspaces, subscriptions, and platform access.
           </p>
         </div>
-        <a
+        <Link
           href="/super/organizations/new"
           className="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-lg font-semibold text-sm transition shadow-sm flex items-center gap-2"
         >
           <Plus className="w-4 h-4" /> Create new organization
-        </a>
+        </Link>
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
