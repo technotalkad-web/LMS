@@ -25,6 +25,7 @@ const eslintConfig = [
       "supabase/functions/**",
       "**/*.tmp",
       "**/*.clean",
+      "**/*.new",
     ],
   },
   {
