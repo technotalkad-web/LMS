@@ -31,6 +31,13 @@ jobs:
       NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
       NEXT_PUBLIC_SITE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SITE_URL }}
+      NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.STAGING_NEXT_PUBLIC_SENTRY_DSN }}
+      NEXT_PUBLIC_SENTRY_ENV: staging
+      # Source-map upload to Sentry. Set in repo Secrets once; SDK
+      # gracefully skips upload if the token is missing.
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ vars.SENTRY_ORG || 'mentora-wc' }}
+      SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT || 'lms-staging' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
