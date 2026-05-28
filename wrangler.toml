@@ -57,6 +57,8 @@ crons = [
 NEXT_PUBLIC_SUPABASE_URL = "https://zeaclbapadosqqttexxh.supabase.co"
 NEXT_PUBLIC_SUPABASE_ANON_KEY = "sb_publishable_2ynjJ05_qfegVFb495AR5g_mTezusls"
 NEXT_PUBLIC_SITE_URL = "https://my-lms.mentora.workers.dev"
+NEXT_PUBLIC_SENTRY_DSN = "https://8f6c96bf3bfdfe59bce26a500b9a5396@o4511468212846592.ingest.de.sentry.io/4511468217892944"
+NEXT_PUBLIC_SENTRY_ENV = "staging"
 STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
@@ -111,6 +113,11 @@ crons = [
 NEXT_PUBLIC_SUPABASE_URL = "https://alkfrcglmseksweqhwzq.supabase.co"
 NEXT_PUBLIC_SUPABASE_ANON_KEY = "sb_publishable_qDQKIyEyoj8zTg6jZ0jCkA_O24oAtQh"
 NEXT_PUBLIC_SITE_URL = "https://my-lms-prod.mentora.workers.dev"
+# TODO: create separate Sentry project "lms-prod" and swap this DSN.
+# Until then we share the staging project; events are tagged "production"
+# via NEXT_PUBLIC_SENTRY_ENV so you can filter in the Sentry UI.
+NEXT_PUBLIC_SENTRY_DSN = "https://8f6c96bf3bfdfe59bce26a500b9a5396@o4511468212846592.ingest.de.sentry.io/4511468217892944"
+NEXT_PUBLIC_SENTRY_ENV = "production"
 STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
