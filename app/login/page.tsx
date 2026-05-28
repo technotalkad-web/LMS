@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import {
   ArrowRight,
@@ -245,12 +246,12 @@ export default function LoginPage() {
                     >
                       Password
                     </label>
-                    <a
+                    <Link
                       href="/forgot-password"
                       className="text-xs text-muted hover:text-ink underline-offset-4 hover:underline"
                     >
                       Forgot password?
-                    </a>
+                    </Link>
                   </div>
                   <div className="relative">
                     <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted pointer-events-none" />

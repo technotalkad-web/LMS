@@ -64,7 +64,6 @@ test("platform owner can start + exit an impersonation session", async ({
     .isVisible({ timeout: 5_000 })
     .catch(() => false);
   if (!bannerVisible) {
-    // eslint-disable-next-line no-console
     console.warn(
       `[impersonation] Banner not visible at ${platformOwnerPage.url()}; ` +
         `RSC may have rendered before cookie propagation. ` +

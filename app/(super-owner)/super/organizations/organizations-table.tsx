@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   Search,
@@ -223,9 +224,9 @@ export function OrganizationsTable({
                     <button type="button" onClick={() => impersonate(t)} disabled={busy === t.id || t.status !== "active"} className="p-1.5 text-slate-400 hover:text-indigo-600 transition disabled:opacity-40" title="Log in as org admin">
                       <ExternalLink className="w-4 h-4" />
                     </button>
-                    <a href="/super/plans" className="p-1.5 text-slate-400 hover:text-slate-900 transition" title="Edit plan definitions (prices, quotas, features)">
+                    <Link href="/super/plans" className="p-1.5 text-slate-400 hover:text-slate-900 transition" title="Edit plan definitions (prices, quotas, features)">
                       <Edit3 className="w-4 h-4" />
-                    </a>
+                    </Link>
                     {t.status === "scheduled_deletion" ? (
                       <button type="button" onClick={() => restore(t)} disabled={busy === t.id} className="p-1.5 text-emerald-500 hover:text-emerald-700 transition disabled:opacity-40" title="Cancel scheduled deletion">
                         <RotateCcw className="w-4 h-4" />

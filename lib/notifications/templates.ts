@@ -1,5 +1,5 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import type { NotificationEvent, TemplateRow } from "./types";
+import type { NotificationEvent } from "./types";
 
 /**
  * Default seed text for each event. Used when an org hasn't customized

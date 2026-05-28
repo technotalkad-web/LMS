@@ -389,7 +389,7 @@ function BrandingPauseForm({
       <section className="border border-line rounded-lg bg-paper p-5">
         <h2 className="serif text-2xl mb-3">Pause specific events</h2>
         <p className="text-xs text-muted mb-3">
-          Useful when you don't want to disable everything — just specific
+          Useful when you don&apos;t want to disable everything — just specific
           trigger types (e.g., silence reminders during a holiday).
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">

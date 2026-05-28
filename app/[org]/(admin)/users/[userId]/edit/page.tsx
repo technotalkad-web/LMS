@@ -121,7 +121,7 @@ export default async function EditUserPage({
             Editing <span className="text-ink font-medium">{email}</span>.{" "}
           </>
         )}
-        Email + password are managed separately and can't be changed here.
+        Email + password are managed separately and can&apos;t be changed here.
       </p>
 
       <EditUserForm

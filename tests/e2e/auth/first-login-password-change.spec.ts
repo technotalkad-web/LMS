@@ -40,9 +40,14 @@ test("forced first-login password change redirects, then unblocks the user", asy
   await expect(newPw).toBeVisible({ timeout: 10_000 });
 
   const newPassword = `Forced!${Date.now()}Aa1`;
-  await newPw.fill(newPassword);
-  await confirmPw.fill(newPassword);
-  await page.getByRole("button", { name: /save new password/i }).click();
+  await newPw.clear();
+   await newPw.pressSequentially(newPassword, { delay: 20 });
+   await confirmPw.clear();
+   await confirmPw.pressSequentially(newPassword, { delay: 20 });
+  // Wait for React to flush state and the button to enable
+const saveBtn = page.getByRole("button", { name: /save new password/i });
+await expect(saveBtn).toBeEnabled({ timeout: 5_000 });
+await saveBtn.click();
 
   // Unblocked: lands inside the app.
   await expect(page).toHaveURL(
