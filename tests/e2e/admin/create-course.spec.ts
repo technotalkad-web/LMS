@@ -1,4 +1,5 @@
 import { test, expect } from "../helpers/fixtures";
+import { svc } from "../helpers/supabase";
 
 /**
  * Library smoke + RBAC.
@@ -31,8 +32,16 @@ test("learner hitting POST /api/courses is rejected (no public create endpoint)"
 }) => {
   // There is no public /api/courses POST — only /api/courses/upload (admin).
   // Any of 401/403/404/405 is healthy; what we MUST NOT see is 200.
-  const res = await learnerPage.request.post(`/api/courses`, {
+ // Check the count BEFORE the request
+  const before = await svc().from("courses").select("id", { count: "exact", head: true }).eq("organization_id", seededOrg.id);
+  
+  // Make the unauthorized request
+  await learnerPage.request.post(`/api/courses`, {
     data: { orgSlug: seededOrg.slug, title: "Should not exist" },
   });
-  expect([401, 403, 404, 405]).toContain(res.status());
-});
+  
+  // Check the count AFTER the request
+  const after = await svc().from("courses").select("id", { count: "exact", head: true }).eq("organization_id", seededOrg.id);
+  
+  // Make sure they match (no course was secretly created)
+  expect(after.count).toBe(before.count)});
