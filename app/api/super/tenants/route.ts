@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog } from "@/lib/auth/require-platform-owner";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/super/tenants
@@ -152,7 +153,7 @@ export async function POST(request: Request) {
     organization_id: org.id,
     slug: org.slug,
     invite_url: inviteToken
-      ? `${process.env.NEXT_PUBLIC_SITE_URL ?? ""}/invitations/${inviteToken}`
+      ? `${await originFromRequest()}/invitations/${inviteToken}`
       : null,
   });
 }

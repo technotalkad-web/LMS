@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 import { notifyBackground } from "@/lib/notifications/send";
+import { originFromRequest } from "@/lib/http/origin";
 
 function generateTempPassword(): string {
   const alphabet =
@@ -163,8 +164,8 @@ export async function POST(
     return NextResponse.json({ error: memErr.message }, { status: 400 });
   }
 
+  const origin = await originFromRequest();
   if (isBrandNew && tempPassword) {
-    const origin = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
     const loginUrl = origin
       ? `${origin}/${org.slug}/login`
       : `/${org.slug}/login`;
@@ -197,7 +198,7 @@ export async function POST(
     user_id: user.id,
     invited: isBrandNew,
     temp_password: tempPassword,
-    login_url: `${process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? ""}/${org.slug}/login`,
+    login_url: `${origin}/${org.slug}/login`,
   });
 }
 
