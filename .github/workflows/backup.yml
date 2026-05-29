@@ -1,0 +1,166 @@
+# Nightly Supabase Postgres backup.
+#
+# Runs daily at 02:00 UTC (07:30 IST). Dumps the production database
+# with pg_dump, gzips it, optionally GPG-encrypts (if BACKUP_GPG_PUBKEY
+# is set), uploads to Cloudflare R2 for durable storage, and publishes
+# a GitHub artifact for quick same-day access.
+#
+# On failure: GitHub will email the repo admins automatically. Worth
+# pairing with a UptimeRobot keyword check on the latest-backup R2 URL
+# if you want external alerting.
+#
+# Required GitHub Secrets:
+#   PROD_DATABASE_URL          Direct Supabase connection string
+#                              (Project Settings → Database → URI,
+#                              "Direct connection", NOT the pooler).
+#                              Example: postgres://postgres:[pass]@db.<ref>.supabase.co:5432/postgres
+#   B2_BUCKET                  Backblaze B2 bucket name, e.g. "lms-backups"
+#   B2_REGION                  Bucket region — visible on the B2 bucket page.
+#                              Examples: "us-west-002", "eu-central-003"
+#   B2_KEY_ID                  Application Key ID (B2 dashboard →
+#                              App Keys → Add a New Application Key,
+#                              scoped to the bucket above with
+#                              "Read and Write" capabilities)
+#   B2_APPLICATION_KEY         Application Key (shown ONCE on creation —
+#                              save it before you navigate away)
+#
+# Why Backblaze B2 instead of S3/R2:
+#   - Truly free 10GB tier + 1GB/day egress, no credit card required
+#   - S3-compatible API (same `aws s3 cp` invocation works)
+#   - In production since 2015, widely used for backups
+#
+# Optional:
+#   BACKUP_GPG_PUBKEY          Armored public key (paste the full block
+#                              including "-----BEGIN PGP PUBLIC KEY BLOCK-----").
+#                              If unset, backups are uploaded plaintext.
+#                              Generate with: gpg --gen-key, export with
+#                              `gpg --armor --export your@email.com`.
+#                              Store the matching PRIVATE key somewhere safe
+#                              (1Password, hardware key, secure offline storage)
+#                              — without it, the backups are permanently
+#                              unreadable.
+name: Nightly Supabase backup
+
+on:
+  schedule:
+    # 02:00 UTC daily = 07:30 IST
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: nightly-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Install Postgres client + tooling
+        run: |
+          # Ubuntu 24.04 ships pg_dump 16 by default; pin to 17 for
+          # forward compat with newer Supabase Postgres versions.
+          sudo apt-get update
+          sudo apt-get install -y wget ca-certificates gnupg
+          # Postgres APT repo for pg_dump 17
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
+            sudo gpg --dearmor -o /etc/apt/keyrings/postgres.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/postgres.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+            sudo tee /etc/apt/sources.list.d/postgres.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17 awscli
+          pg_dump --version
+
+      - name: Dump database
+        env:
+          PGCONNECT_TIMEOUT: "30"
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          OUT="lms-prod-${STAMP}.sql"
+          echo "Dumping to ${OUT}..."
+          # --no-owner / --no-privileges keeps the dump portable across
+          # Supabase projects (different role names). --clean + --if-exists
+          # lets restore against an existing DB without manual DROPs.
+          pg_dump \
+            --no-owner \
+            --no-privileges \
+            --clean \
+            --if-exists \
+            --format=plain \
+            --file="${OUT}" \
+            "${DATABASE_URL}"
+          ls -lh "${OUT}"
+          # Compress
+          gzip -9 "${OUT}"
+          ls -lh "${OUT}.gz"
+          # Record metadata for next step
+          echo "BACKUP_FILE=${OUT}.gz" >> $GITHUB_ENV
+          echo "BACKUP_STAMP=${STAMP}" >> $GITHUB_ENV
+
+      - name: Optional GPG encryption
+        env:
+          GPG_PUBKEY: ${{ secrets.BACKUP_GPG_PUBKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PUBKEY}" ]; then
+            echo "BACKUP_GPG_PUBKEY not set — uploading plaintext."
+            exit 0
+          fi
+          echo "Encrypting with provided GPG public key..."
+          echo "${GPG_PUBKEY}" | gpg --import
+          RECIPIENT=$(echo "${GPG_PUBKEY}" | gpg --show-keys --with-colons | awk -F: '/^uid/ { print $10; exit }')
+          gpg --trust-model always --encrypt --armor \
+            --recipient "${RECIPIENT}" \
+            --output "${BACKUP_FILE}.asc" \
+            "${BACKUP_FILE}"
+          rm "${BACKUP_FILE}"
+          echo "BACKUP_FILE=${BACKUP_FILE}.asc" >> $GITHUB_ENV
+          ls -lh "${BACKUP_FILE}.asc"
+
+      - name: Upload to Backblaze B2
+        env:
+          # B2 is S3-compatible, so the standard AWS SDK env vars work.
+          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.B2_REGION }}
+          B2_REGION: ${{ secrets.B2_REGION }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://s3.${B2_REGION}.backblazeb2.com"
+          KEY="daily/${BACKUP_FILE}"
+          echo "Uploading ${BACKUP_FILE} to b2://${B2_BUCKET}/${KEY}..."
+          aws s3 cp "${BACKUP_FILE}" "s3://${B2_BUCKET}/${KEY}" \
+            --endpoint-url "${ENDPOINT}"
+          # Also keep a "latest.sql.gz[.asc]" pointer for easy fetch:
+          # we copy the same file to a stable key so restore tooling
+          # always has a fixed URL regardless of date.
+          LATEST_KEY="latest/$(basename "${BACKUP_FILE}" | sed -E 's/lms-prod-[^.]+\./lms-prod./')"
+          echo "Also writing pointer to b2://${B2_BUCKET}/${LATEST_KEY}..."
+          aws s3 cp "${BACKUP_FILE}" "s3://${B2_BUCKET}/${LATEST_KEY}" \
+            --endpoint-url "${ENDPOINT}"
+          echo "B2 upload complete."
+
+      - name: Publish as GitHub artifact (7-day hot copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lms-prod-backup-${{ env.BACKUP_STAMP }}
+          path: ${{ env.BACKUP_FILE }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "## Backup complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** \`${BACKUP_FILE}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size:** $(ls -lh "${BACKUP_FILE}" | awk '{print $5}')" >> $GITHUB_STEP_SUMMARY
+          echo "- **B2:** \`b2://${B2_BUCKET:-(unset)}/daily/${BACKUP_FILE}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **B2 latest pointer:** \`b2://${B2_BUCKET:-(unset)}/latest/...\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub artifact:** retained 7 days" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Restore instructions: docs/ops/backup-restore.md" >> $GITHUB_STEP_SUMMARY
