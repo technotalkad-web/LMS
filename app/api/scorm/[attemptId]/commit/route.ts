@@ -9,6 +9,7 @@ import {
 } from "@/lib/scorm/types";
 import { notifyBackground } from "@/lib/notifications/send";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/scorm/{attemptId}/commit
@@ -170,7 +171,7 @@ export async function POST(
           .select("name, slug")
           .eq("id", orgId)
           .maybeSingle();
-        const portalBase = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
+        const portalBase = await originFromRequest();
         await notifyBackground({
           organizationId: orgId,
           event: "asset_completion",

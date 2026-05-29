@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { headers } from "next/headers";
+import { originFromRequest } from "@/lib/http/origin";
 import { randomBytes } from "crypto";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
@@ -243,23 +243,11 @@ export default async function LaunchPage({
     );
   }
 
-  // xAPI endpoint URL MUST point at the live host so the SCORM/cmi5 player
-  // (running inside the iframe) can POST progress back to /api/xapi. We
-  // derive it from the incoming request headers rather than from
-  // NEXT_PUBLIC_SITE_URL because Next.js inlines NEXT_PUBLIC_* values at
-  // build time — if the env var is undefined when `npm run cf:build` runs,
-  // the fallback `http://localhost:3000` gets frozen into the deployed
-  // Worker bundle and every xAPI write silently fails on staging/prod.
-  // Headers are always live, work for any domain (including custom ones
-  // post-launch), and need no rebuild when the deploy target changes.
-  // Caught via wrangler tail on 2026-05-23 — see ticket #145.
-  const h = await headers();
-  const reqProto = h.get("x-forwarded-proto") ?? "https";
-  const reqHost = h.get("host") ?? h.get("x-forwarded-host");
-  const host = reqHost
-    ? `${reqProto}://${reqHost}`
-    : (process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ??
-       "https://localhost:3000");
+  // xAPI endpoint URL must point at the live host so the SCORM/cmi5
+  // player (in the iframe) can POST progress back. The helper handles
+  // the build-time-inlining bug (#145, #146) — keep the empty-string
+  // fallback so this never regresses to localhost.
+  const host = (await originFromRequest()) || "https://localhost:3000";
 
   const launchParams = new URLSearchParams({
     endpoint: `${host}/api/xapi/`,

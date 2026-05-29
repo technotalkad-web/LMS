@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/users/bulk
@@ -320,8 +321,7 @@ export async function POST(request: Request) {
 
     // Fire welcome email for new accounts (skip when we just updated metadata).
     if (!priorMem) {
-      const origin =
-        process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
+      const origin = await originFromRequest();
       await notifyBackground({
         organizationId: org.id,
         event: "account_creation",

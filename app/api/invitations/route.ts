@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { checkQuota } from "@/lib/billing/enforce-quota";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/invitations
@@ -109,7 +110,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const base = process.env.NEXT_PUBLIC_SITE_URL ?? "";
+  const base = await originFromRequest();
   const acceptUrl = `${base}/invitations/${(inv as { token: string }).token}`;
   return NextResponse.json({
     id: (inv as { id: string }).id,

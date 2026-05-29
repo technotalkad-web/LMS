@@ -4,6 +4,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { uploadCoursePackage } from "@/lib/courses/upload";
 import { notifyBackground } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  * Course package upload endpoint.
@@ -150,8 +151,7 @@ export async function POST(request: NextRequest) {
           if (u.email && learnerIds.has(u.id)) emailById.set(u.id, u.email);
         }
 
-        const portalBase =
-          process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
+        const portalBase = await originFromRequest();
         const directLink = portalBase
           ? `${portalBase}/${org.slug}/courses/${courseId}/launch`
           : `/${org.slug}/courses/${courseId}/launch`;

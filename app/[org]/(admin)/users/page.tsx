@@ -5,6 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersClient } from "./learners-client";
+import { originFromRequest } from "@/lib/http/origin";
 
 type Member = {
   user_id: string;
@@ -138,9 +139,7 @@ export default async function LearnersPage({
     expires_at: r.expires_at,
   }));
 
-  const origin =
-    process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ??
-    "http://localhost:3000";
+  const origin = (await originFromRequest()) || "http://localhost:3000";
 
   return (
     <LearnersClient
