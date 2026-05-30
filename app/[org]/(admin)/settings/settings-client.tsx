@@ -19,6 +19,7 @@ type Settings = {
   reply_to: string;
   has_password: boolean;
   logo_url: string;
+  favicon_url: string;
   brand_color: string;
   footer_text: string;
   email_paused: boolean;
@@ -51,6 +52,7 @@ const EVENT_LABELS: Record<NotificationEvent, string> = {
 export type WorkspaceBranding = {
   name: string;
   logo_url: string;
+  favicon_url: string;
   brand_color: string;
   brand_font: string;
   custom_domain: string;
@@ -324,6 +326,7 @@ function BrandingPauseForm({
   onSaved: () => void;
 }) {
   const [form, setForm] = useState({
+    favicon_url: initial.favicon_url,
     logo_url: initial.logo_url,
     brand_color: initial.brand_color,
     footer_text: initial.footer_text,
@@ -913,6 +916,7 @@ function WorkspaceForm({
         orgSlug,
         name: form.name,
         logo_url: form.logo_url,
+        favicon_url: form.favicon_url,
         brand_color: form.brand_color,
         brand_font: form.brand_font,
         custom_domain: form.custom_domain,
@@ -977,6 +981,21 @@ function WorkspaceForm({
             Replaces the default book icon in the top nav, sidebar, login
             page, and email shell. Square or wide logos both work; PNG with a
             transparent background recommended.
+          </p>
+        </Field>
+
+        <Field label="Browser tab icon (favicon)">
+          <ThumbnailPicker
+            orgSlug={orgSlug}
+            kind="logo"
+            value={form.favicon_url || null}
+            onChange={(url) => setForm({ ...form, favicon_url: url ?? "" })}
+          />
+          <p className="text-xs text-muted mt-2">
+            Square icon shown in the browser tab and bookmarks. If left
+            empty, the brand logo above is used (which may look stretched
+            for wide logos). Recommended: 64×64 or 128×128 PNG with a
+            transparent background.
           </p>
         </Field>
       </section>

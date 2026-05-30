@@ -108,7 +108,7 @@ export function renderEmailShell(args: EmailLayoutArgs): string {
     ? `<div style="font-size:12px;color:#6b6661;line-height:1.5">${escapeHtmlAllowingBreaks(branding.footerText)}</div>`
     : `<div style="font-size:12px;color:#6b6661">Sent by ${orgName}</div>`;
 
-  return `<!doctype html>
+  return stripTrailingWhitespace(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -147,7 +147,7 @@ export function renderEmailShell(args: EmailLayoutArgs): string {
     </tr>
   </table>
 </body>
-</html>`;
+</html>`);
 }
 
 function sanitizeHex(s: string | null | undefined): string | null {
@@ -180,4 +180,22 @@ function escapeAttr(s: string): string {
 function escapeHtmlAllowingBreaks(s: string): string {
   // Escapes HTML but turns \n into <br> so multi-line footers render.
   return escapeHtml(s).replace(/\n/g, "<br>");
+}
+
+/**
+ * Strip trailing spaces/tabs on every line of the rendered HTML.
+ *
+ * Quoted-printable encoding (used by most SMTP transports when bodies
+ * exceed 998 chars per line) turns trailing whitespace into literal
+ * `=20` on the wire. Modern email clients decode this back to spaces,
+ * but some corporate / older clients render the raw `=20` to the user
+ * — see ticket #165. Stripping at render time fixes the common case
+ * for zero perf cost; if the renderer added trailing whitespace to a
+ * pre formatted block it would matter, but it doesn't.
+ */
+function stripTrailingWhitespace(html: string): string {
+  return html
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""))
+    .join("\n");
 }
