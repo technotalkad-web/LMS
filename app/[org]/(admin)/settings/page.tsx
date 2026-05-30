@@ -38,13 +38,14 @@ export default async function SettingsPage({
   const { data: orgRow } = await supabase
     .from("organizations")
     .select(
-      "name, logo_url, brand_color, brand_font, custom_domain, login_hero_image_url, login_hero_title, login_hero_subtitle"
+      "name, logo_url, favicon_url, brand_color, brand_font, custom_domain, login_hero_image_url, login_hero_title, login_hero_subtitle"
     )
     .eq("id", org.id)
     .maybeSingle();
   const workspace = {
     name: (orgRow?.name as string | undefined) ?? org.name,
     logo_url: (orgRow?.logo_url as string | null | undefined) ?? "",
+    favicon_url: (orgRow?.favicon_url as string | null | undefined) ?? "",
     brand_color:
       (orgRow?.brand_color as string | null | undefined) ?? "#4f46e5",
     brand_font:
@@ -112,6 +113,7 @@ export default async function SettingsPage({
     reply_to: (smtpRow?.reply_to as string | null) ?? "",
     has_password: !!(smtpRow as { smtp_user?: string } | null)?.smtp_user,
     logo_url: (smtpRow?.logo_url as string | null) ?? "",
+    favicon_url: "",
     brand_color: (smtpRow?.brand_color as string | null) ?? "#3a5a40",
     footer_text: (smtpRow?.footer_text as string | null) ?? "",
     email_paused: !!smtpRow?.email_paused,
@@ -140,3 +142,4 @@ export default async function SettingsPage({
     </div>
   );
 }
+     

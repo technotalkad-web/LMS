@@ -431,11 +431,36 @@ export default async function LearnersPage({
         </Link>
         <div className="flex items-baseline justify-between mt-2 mb-1 gap-4 flex-wrap">
           <h1 className="serif text-4xl">Enrolled learners</h1>
-          <div className="text-sm text-muted tabular-nums">
-            {totalRows.toLocaleString()} total
-            {totalRows !== enriched.length && (
-              <> · {enriched.length.toLocaleString()} matching filters cleared</>
-            )}
+          <div className="flex items-center gap-4">
+            <a
+              href={`/api/courses/${c.id}/learners/export?orgSlug=${encodeURIComponent(orgSlug)}`}
+              className="text-sm text-ink border border-line rounded-md px-3 py-1.5 hover:bg-paper transition-colors inline-flex items-center gap-1.5"
+              download
+              title="Download all enrolled learners as CSV (includes filtered-out rows)"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="w-3.5 h-3.5"
+                aria-hidden="true"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Download CSV
+            </a>
+            <div className="text-sm text-muted tabular-nums">
+              {totalRows.toLocaleString()} total
+              {totalRows !== enriched.length && (
+                <> · {enriched.length.toLocaleString()} matching filters cleared</>
+              )}
+            </div>
           </div>
         </div>
       </div>

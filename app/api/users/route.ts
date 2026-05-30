@@ -298,7 +298,13 @@ export async function POST(request: Request) {
         learner_email: email,
         username,
         login_id: email,
-        password: didInvite ? "(set via the invite link)" : password,
+        // 3-way: invited via magic link / existing user with their own
+        // password / brand-new account where we generated the password.
+        password: didInvite
+          ? "(set via the invite link)"
+          : found
+          ? "(use your existing password)"
+          : password,
         portal_url: origin
           ? `${origin}/${org.slug}/dashboard`
           : `/${org.slug}/dashboard`,

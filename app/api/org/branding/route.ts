@@ -23,6 +23,7 @@ export async function POST(request: Request) {
     brand_color?: string | null;
     brand_font?: string | null;
     custom_domain?: string | null;
+    favicon_url?: string | null;
     login_hero_image_url?: string | null;
     login_hero_title?: string | null;
     login_hero_subtitle?: string | null;
@@ -58,6 +59,9 @@ export async function POST(request: Request) {
   }
   if (body.logo_url !== undefined) {
     update.logo_url = body.logo_url ? body.logo_url.trim() : null;
+  }
+  if (body.favicon_url !== undefined) {
+    update.favicon_url = body.favicon_url ? body.favicon_url.trim() : null;
   }
   if (body.brand_color !== undefined) {
     const c = body.brand_color?.trim() ?? "";
