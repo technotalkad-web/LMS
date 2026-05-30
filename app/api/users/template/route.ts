@@ -5,6 +5,10 @@ import { NextResponse } from "next/server";
  *
  * Returns a starter CSV for bulk user upload. Includes the header row plus
  * one example row so admins can see the expected format.
+ *
+ * The optional last column (team_name, #162) auto-creates a team in the
+ * org if no team with that name exists, then adds the user to it.
+ * Leave blank for users who shouldn\'t go into a team.
  */
 export async function GET() {
   const header = [
@@ -28,6 +32,7 @@ export async function GET() {
     "node_id",
     "city",
     "state",
+    "team_name",
   ].join(",");
 
   const example = [
@@ -51,6 +56,7 @@ export async function GET() {
     "ENG-PLATFORM",
     "Austin",
     "TX",
+    "Marketing",
   ].join(",");
 
   const body = `${header}\n${example}\n`;
