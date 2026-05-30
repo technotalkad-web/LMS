@@ -16,8 +16,11 @@ import type { AssignableMember } from "./assign-section";
  * Scaling notes:
  *   Filters client-side over the full member list passed as prop. Fine
  *   for ~5000 members (sub-millisecond per keystroke, ~1MB payload).
- *   Past that, switch to a debounced /api/users/search endpoint — see
- *   ticket #149.
+ *   Past that, switch to debounced calls to /api/users/search (shipped
+ *   in #149). The endpoint exposes the same ranking semantics — exact
+ *   match → starts-with → contains — so a swap is mechanical: replace
+ *   the client-side filter with a 250ms-debounced fetch and feed the
+ *   results into the same render path below.
  *
  * Ranking:
  *   1. exact match in any searchable field      (rank 0)
