@@ -5,7 +5,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 
 /**
- *   GET /api/learning-paths/{pathId}/learners/export?orgSlug=...
+ *   GET /api/learning-paths/{id}/learners/export?orgSlug=...
  *
  * Mirrors /api/courses/{courseId}/learners/export (shipped in #155) for
  * the path-learners surface. Returns CSV of every enrolled learner with
@@ -31,9 +31,9 @@ function csvEscape(value: unknown): string {
 
 export async function GET(
   request: Request,
-  { params }: { params: Promise<{ pathId: string }> }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const { pathId } = await params;
+  const { id: pathId } = await params;
   const url = new URL(request.url);
   const orgSlug = url.searchParams.get("orgSlug");
   if (!orgSlug) {
