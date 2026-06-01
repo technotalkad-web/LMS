@@ -371,12 +371,21 @@ export default async function AdminCourseDetailPage({
       <section>
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="serif text-2xl">Enrolled learners</h2>
-          <Link
-            href={`/${orgSlug}/library/${c.id}/learners`}
-            className="text-xs px-3 py-1.5 border border-line rounded hover:border-ink transition-colors"
-          >
-            View all learners →
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              href={`/${orgSlug}/library/${c.id}/reports`}
+              className="text-xs px-3 py-1.5 border border-line rounded hover:border-ink transition-colors"
+              title="Full performance report for this course"
+            >
+              View reports →
+            </Link>
+            <Link
+              href={`/${orgSlug}/library/${c.id}/learners`}
+              className="text-xs px-3 py-1.5 border border-line rounded hover:border-ink transition-colors"
+            >
+              View all learners →
+            </Link>
+          </div>
         </div>
         {enrSummary.total === 0 ? (
           <div className="border border-line rounded-2xl bg-paper p-8 text-muted text-sm text-center">
