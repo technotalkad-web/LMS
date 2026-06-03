@@ -12,6 +12,11 @@ import {
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { languageDisplay } from "@/lib/i18n/languages";
+import {
+  ChangeLanguageMenu,
+  type ChangeLanguageOption,
+} from "./change-language-menu";
 
 type Version = {
   id: string;
@@ -83,6 +88,40 @@ export default async function CourseDetailPage({
   const list = (versions ?? []) as Version[];
   const current = list.find((v) => v.id === c.current_version_id) ?? list[0];
   const versionIds = list.map((v) => v.id);
+
+  // Multi-language packages for this course (#158 Phase 3). The
+  // ChangeLanguageMenu silently renders nothing if there are <2 active
+  // packages, so this fetch is cheap noise on monolingual courses.
+  const { data: pkgRows } = await supabase
+    .from("course_packages")
+    .select("id, language, display_name, is_active")
+    .eq("course_id", c.id)
+    .eq("is_active", true);
+  const languageOptions: ChangeLanguageOption[] = (
+    (pkgRows ?? []) as Array<{
+      id: string;
+      language: string | null;
+      display_name: string | null;
+    }>
+  ).map((p) => ({
+    id: p.id,
+    language: p.language,
+    display_label:
+      p.display_name ??
+      languageDisplay(p.language, "native") ??
+      p.language ??
+      "Default",
+  }));
+  let savedLanguage: string | null = null;
+  if (languageOptions.length >= 2) {
+    const { data: prefRow } = await supabase
+      .from("course_language_preferences")
+      .select("language")
+      .eq("user_id", user.id)
+      .eq("course_id", c.id)
+      .maybeSingle();
+    savedLanguage = (prefRow?.language as string | undefined) ?? null;
+  }
 
   const attemptsResp = versionIds.length
     ? await supabase
@@ -196,7 +235,7 @@ export default async function CourseDetailPage({
           )}
 
           {/* Launch CTA */}
-          <div className="pt-4 border-t border-line">
+          <div className="pt-4 border-t border-line flex flex-wrap items-center gap-3">
             {current ? (
               <Link
                 href={`/${orgSlug}/courses/${c.id}/launch`}
@@ -214,10 +253,17 @@ export default async function CourseDetailPage({
                 This course doesn&apos;t have a version yet.
               </div>
             )}
+            {/* Phase 3: Change language — auto-hides if <2 active packages */}
+            <ChangeLanguageMenu
+              orgSlug={orgSlug}
+              courseId={c.id}
+              options={languageOptions}
+              currentLanguage={savedLanguage}
+            />
             {isAdmin && (
               <Link
                 href={`/${orgSlug}/library/${c.id}`}
-                className="ml-3 inline-flex items-center gap-1 text-xs text-muted hover:text-ink"
+                className="inline-flex items-center gap-1 text-xs text-muted hover:text-ink"
               >
                 Manage in admin Library <ChevronRight className="w-3 h-3" />
               </Link>

@@ -6,6 +6,8 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { ScormRuntime } from "./scorm-runtime";
 import { Cmi5Runtime } from "./cmi5-runtime";
+import { LaunchLanguagePicker } from "./launch-language-picker";
+import { isSupportedLanguage, languageDisplay } from "@/lib/i18n/languages";
 import type { CmiData } from "@/lib/scorm/types";
 
 type Course = {
@@ -23,12 +25,23 @@ type Version = {
   manifest_data: { raw?: { courseId?: string; auId?: string } };
 };
 
+type PackageRow = {
+  id: string;
+  language: string | null;
+  display_name: string | null;
+  current_version_id: string | null;
+  is_active: boolean;
+};
+
 export default async function LaunchPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
+  searchParams: Promise<{ lang?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
+  const { lang: langParam } = await searchParams;
   const { user, org } = await requireOrgAccess(orgSlug);
 
   const supabase = await createClient();
@@ -39,7 +52,7 @@ export default async function LaunchPage({
     .eq("organization_id", org.id)
     .maybeSingle();
 
-  if (!course || !(course as Course).current_version_id) {
+  if (!course) {
     redirect(`/${orgSlug}/courses/${courseId}`);
   }
   if ((course as Course).is_active === false) {
@@ -47,10 +60,81 @@ export default async function LaunchPage({
   }
   const c = course as Course;
 
+  // ---------------------------------------------------------------
+  // Multi-language resolution (Phase 2 + Phase 3 of #158)
+  //
+  // Priority order:
+  //   1. ?lang=xx query param (if it matches an active package on the course)
+  //   2. user's saved preference in course_language_preferences
+  //   3. if only ONE active package exists, auto-use it
+  //   4. otherwise render the picker (early return)
+  //   5. legacy fallback to course.current_version_id when no packages
+  // ---------------------------------------------------------------
+  const { data: pkgRows } = await supabase
+    .from("course_packages")
+    .select("id, language, display_name, current_version_id, is_active")
+    .eq("course_id", courseId)
+    .eq("is_active", true);
+  const activePackages = (pkgRows ?? []) as PackageRow[];
+
+  let resolvedVersionId: string | null = null;
+
+  if (activePackages.length === 0) {
+    // Legacy path: no packages yet — fall back to course.current_version_id
+    resolvedVersionId = c.current_version_id;
+  } else if (activePackages.length === 1) {
+    resolvedVersionId = activePackages[0].current_version_id;
+  } else {
+    // Pick from explicit ?lang= if it matches an active package.
+    let chosen: PackageRow | null = null;
+    if (langParam && isSupportedLanguage(langParam)) {
+      chosen =
+        activePackages.find((p) => p.language === langParam) ?? null;
+    }
+    if (!chosen) {
+      // Look up saved preference.
+      const { data: prefRow } = await supabase
+        .from("course_language_preferences")
+        .select("language")
+        .eq("user_id", user.id)
+        .eq("course_id", courseId)
+        .maybeSingle();
+      const savedLang = (prefRow?.language as string | undefined) ?? null;
+      if (savedLang) {
+        chosen =
+          activePackages.find((p) => p.language === savedLang) ?? null;
+      }
+    }
+    if (!chosen) {
+      // Render picker — learner has no signal we can use.
+      return (
+        <LaunchLanguagePicker
+          orgSlug={orgSlug}
+          courseId={courseId}
+          courseTitle={c.title}
+          packages={activePackages.map((p) => ({
+            id: p.id,
+            language: p.language,
+            display_label:
+              p.display_name ??
+              languageDisplay(p.language, "native") ??
+              p.language ??
+              "Default",
+          }))}
+        />
+      );
+    }
+    resolvedVersionId = chosen.current_version_id;
+  }
+
+  if (!resolvedVersionId) {
+    redirect(`/${orgSlug}/courses/${courseId}`);
+  }
+
   const { data: version } = await supabase
     .from("course_versions")
     .select("id, manifest_type, launch_url, manifest_data")
-    .eq("id", c.current_version_id!)
+    .eq("id", resolvedVersionId)
     .maybeSingle();
   if (!version) redirect(`/${orgSlug}/courses/${courseId}`);
   const v = version as Version;
