@@ -5,6 +5,7 @@
 | **Status** | Draft — awaiting decision |
 | **Author** | Arpit Lalani |
 | **Created** | 2026-05-31 |
+| **Revised** | 2026-05-31 — incorporated product team's concrete metric requirements (§4 rewrite, §5 + §8 updates) |
 | **Ticket** | #156 |
 | **Related** | #143 (enrolled-courses page), #152 (course-learners), #153 (path-learners), #155 (CSV export) |
 
@@ -254,87 +255,101 @@ Switch to Option B as primary if:
 
 ---
 
-## 4. Report inventory — the must-have six
+## 4. Report inventory
 
-Pinning the scope of v1. These are the reports tenant admins will use
-on Day 1, drafted from talking to similar B2B-LMS buyers + Ambak's
-training-content product knowledge.
+Concrete v1 requirements from the product team (2026-05-31 update).
+Every metric below applies to **both individual courses AND learning
+paths** — the path-level view aggregates the same metric across
+contained courses.
 
-For each report: question it answers, intended audience, SQL-shaped
-or xAPI-shaped, refresh cadence.
+### 4.1 Enrollment & status (per course / per path)
 
-### R1. Course completion funnel
+| Metric | Definition | Data source | Refresh |
+|---|---|---|---|
+| Total Enrolled | Distinct learners with at least one assignment to the course/path (direct + team + org-wide) | `course_assignments` + `learning_path_assignments` joined with `team_members` + `organization_members` | Real-time |
+| Completed | Distinct learners with latest attempt `completion_status = completed` OR `success_status = passed` | `course_attempts` | Real-time |
+| In Progress | Distinct learners with at least one attempt but not yet completed | `course_attempts` | Real-time |
+| Not Started | Total Enrolled minus (Completed + In Progress) | derived | Real-time |
 
-> "What % of learners assigned this course have started / completed /
-> passed it?"
+### 4.2 Performance metrics (per course / per path)
 
-- **Audience:** course owner (admin), team lead
-- **Shape:** SQL-shaped. Group by `course_assignments` + max
-  `course_attempts.completion_status` per learner.
-- **Refresh:** real-time (cheap query, every page load)
-- **Surface:** new tab on `/library/[courseId]` that drilldown-links
-  to #152 learners view
+| Metric | Definition | Data source | Refresh |
+|---|---|---|---|
+| Completion Rate | Completed ÷ Total Enrolled, expressed as % | derived from §4.1 | Real-time |
+| Total Passed | Distinct learners with `success_status = passed` | `course_attempts` | Real-time |
+| Total Failed | Distinct learners with `success_status = failed` (no later passing attempt) | `course_attempts` | Real-time |
+| Average Score | Mean of best score per learner, across all completed attempts | `course_attempts.score` | Nightly (materialized) |
+| Average Time Spent | Mean of `completed_at − started_at` per learner, OR `result.duration` from cmi5 xAPI statements when present | `course_attempts` + `xapi_statements` | Nightly (materialized) |
+| Overall Rating | Mean of learner-submitted ratings (1–5 stars) for this course/path | **NEW** — needs a `course_ratings` table (see §4.4) | Real-time |
 
-### R2. Quiz / interaction-level breakdown
+### 4.3 Granular assessment data (per assessment / activity within a course)
 
-> "Of all learners who attempted Q3 in this course, what % got it
-> right? What were the most common wrong answers?"
+| Metric | Definition | Data source | Refresh |
+|---|---|---|---|
+| Average correct responses | Per question/interaction in the course, % of attempts that answered correctly | xAPI `verb: answered` with `result.success = true`, OR SCORM `cmi.interactions.N.result = correct` | Nightly (mat. view per course) |
+| Average incorrect responses | Same shape, `result.success = false` | xAPI / SCORM as above | Nightly |
+| Most common wrong answer | Per question, top-N most frequent `result.response` values among incorrect answers | xAPI / SCORM as above | Nightly |
+| Drop-off point | Earliest interaction at which a meaningful % of learners stop answering further questions in the same attempt | xAPI / SCORM as above | Nightly |
 
-- **Audience:** course author (instructional designer)
-- **Shape:** SQL-shaped over `attempt_snapshots.cmi_interactions` JSON
-  + per-interaction unpacking. Requires a materialized view per course
-  for performance at 1k+ attempts.
-- **Refresh:** nightly (recompute the materialized view via cron)
-- **Surface:** new "Interaction analytics" tab on `/library/[courseId]`
+Granular metrics are most reliable with **cmi5** content (your authoring
+tool's export format) — every interaction emits a structured xAPI
+statement to `/api/xapi/statements`, which already lands in
+`xapi_statements`. SCORM 1.2 content puts the same data in
+`cmi.interactions.N.*` rows inside `course_attempts.cmi_data` (JSON);
+derivable from either format with a per-format unpacking step.
 
-### R3. Team-vs-team cohort comparison
+### 4.4 New data needed — Overall Rating
 
-> "How is Marketing's completion rate trending vs Engineering on this
-> compliance module?"
+The "Overall Rating" metric (§4.2) is **not capturable today**. cmi5
+doesn't emit a "learner rated this course X stars" verb in the standard
+profile, and SCORM has no equivalent. The standard pattern is:
 
-- **Audience:** L&D director
-- **Shape:** SQL-shaped. Group by `team_members.team_id` × week
-  buckets × completion status.
-- **Refresh:** nightly
-- **Surface:** new `/reports/cohorts` page with team picker
+1. After a learner completes a course (or finishes a path), prompt:
+   *"Rate this course (1–5 stars). Optional comment."*
+2. Store in a new `course_ratings` table:
+   ```sql
+   create table public.course_ratings (
+     id                uuid primary key default gen_random_uuid(),
+     user_id           uuid not null references auth.users(id) on delete cascade,
+     course_id         uuid not null references public.courses(id) on delete cascade,
+     -- For path-context ratings, also tag which path completion
+     -- prompted it (so "Marketing Onboarding path" can have its own
+     -- composite rating distinct from "Sales Onboarding path"
+     -- containing the same course).
+     path_id           uuid references public.learning_paths(id) on delete set null,
+     rating            smallint not null check (rating between 1 and 5),
+     comment           text,
+     created_at        timestamptz not null default now(),
+     unique (user_id, course_id, path_id)
+   );
+   ```
+3. RLS: learners read+write their own; tenant admins read all in their org.
+4. The post-completion prompt UI is a small client component on the
+   course-launch result page. Skippable (no force).
 
-### R4. Per-learner journey timeline
+This becomes ticket #181 (listed in §8) and is the only schema addition
+needed for the v1 metric set.
 
-> "What has Jane Doe done across all her assigned content in the last 30
-> days?"
+### 4.5 Implications for the SQL-vs-LRS decision
 
-- **Audience:** team lead, HR for performance reviews
-- **Shape:** Mixed. The high-volume events come from xAPI statements
-  (cmi5 / xAPI content); SCORM events come from `course_attempts` +
-  `attempt_snapshots`. Union them at query time.
-- **Refresh:** real-time
-- **Surface:** new "Activity timeline" tab on
-  `/users/[userId]` profile page
+All seven enrollment/performance metrics in §4.1 + §4.2 are
+**SQL-shaped aggregates** — `COUNT(*)`, `AVG(*)`, `WHERE status = X`
+group-bys. They are not statement-streams. The granular per-assessment
+metrics (§4.3) require **parsing xAPI statements / SCORM interactions**,
+but the parsing happens once at materialized-view-refresh time, then
+admins query plain SQL views.
 
-### R5. Learning path drop-off analysis
-
-> "In this 5-step path, which step do learners most commonly get stuck on?"
-
-- **Audience:** path owner
-- **Shape:** SQL-shaped. For each path, count learners who started
-  step N but not step N+1.
-- **Refresh:** nightly
-- **Surface:** new "Drop-off" widget on `/learning-paths/[id]` admin view
-
-### R6. Time-to-completion distribution
-
-> "How long does it typically take a learner to finish this course end-
-> to-end? What's the 90th percentile?"
-
-- **Audience:** course author, capacity planning
-- **Shape:** SQL-shaped. `min(started_at)` to `max(completed_at)` per
-  user per course version, percentile-binned.
-- **Refresh:** nightly
-- **Surface:** new card on the existing `/library/[courseId]` page
+This further strengthens the Option A recommendation. The Yet Analytics
+SQL LRS's statement-query API is **less expressive** for these aggregate
+questions than SQL — you end up fetching statement batches and reducing
+client-side, when a single SQL aggregate gives the answer directly.
 
 ### Reports deferred to v2 (Phase 2.5)
 
-- Verb-frequency analytics across all xAPI content (Option B territory)
+- Time-to-completion distribution (90th percentile, etc.)
+- Per-learner journey timeline (useful for performance reviews)
+- Team-vs-team cohort comparison charts (derivable from §4.1+§4.2
+  filtered by team, but the chart UX is a separate scope)
 - Activity heatmap (when do learners log in)
 - Per-question difficulty calibration (item response theory)
 - Predictive at-risk learner flagging (Phase 3 — needs the data history
@@ -342,22 +357,25 @@ or xAPI-shaped, refresh cadence.
 - Custom report builder (after v1 reports clarify what tenants actually
   customize)
 
-**All six v1 reports are SQL-shaped.** That's the strongest argument
-for Option A.
-
----
+**Every v1 metric in §4.1 + §4.2 + §4.3 is SQL-shaped or
+SQL-after-parsing.** That's the strongest argument for Option A.
 
 ## 5. Implementation plan (if accepted)
 
 ### Phase 2a — Foundation (week 1)
 
-- Create `supabase/migrations/0030_reports_views.sql`:
-  - `mv_course_completion_funnel` (R1)
-  - `mv_team_completion_weekly` (R3)
-  - `mv_path_dropoff` (R5)
-  - `mv_course_time_distribution` (R6)
+- Create `supabase/migrations/0031_reports_foundation.sql`:
+  - `course_ratings` table per §4.4 (the only new schema beyond views)
+  - `mv_course_enrollment_status` — Total Enrolled, Completed, In
+    Progress, Not Started per course (§4.1)
+  - `mv_course_performance` — Completion Rate, Total Passed, Total
+    Failed, Average Score, Average Time Spent (§4.2)
+  - `mv_path_enrollment_status` — same shape for paths
+  - `mv_path_performance` — same shape for paths
+  - `mv_course_interaction_breakdown` — Average correct/incorrect per
+    interaction, parsed from xAPI statements (§4.3)
 - Add Cloudflare cron `/api/cron/refresh-report-views` to refresh
-  materialized views nightly
+  the materialized views nightly
 - Wire into the existing cron-trigger pattern in `wrangler.toml`
 
 ### Phase 2b — Report APIs + UI (weeks 2–3)
@@ -432,17 +450,30 @@ decide whether to revise.
 
 If this RFC is accepted as written, break the work into:
 
-- **#175** — Migration: report materialized views (R1, R3, R5, R6)
+- **#175** — Migration 0031: `course_ratings` table + 5 materialized
+  views for the §4.1 + §4.2 + §4.3 metric set
 - **#176** — Cron: nightly refresh of report views
-- **#177** — R1 + R2: course-level reports tabs
-- **#178** — R3: cohort comparison page
-- **#179** — R4: learner journey timeline tab
-- **#180** — R5: path drop-off widget
-- **#181** — R6: time-to-completion distribution card
-- **#182** — Weekly metrics digest email
-- **#183** — PDF export (investigation + implementation)
+- **#177** — Reports tab on `/library/[courseId]` surfacing §4.1
+  (Enrollment & Status) + §4.2 (Performance)
+- **#178** — Reports tab on `/learning-paths/[id]` with the same
+  §4.1 + §4.2 metrics, aggregated across contained courses
+- **#179** — Granular per-assessment view (§4.3) on the same course
+  reports tab — table of every interaction with correct/incorrect %
+- **#180** — Most-common-wrong-answer drilldown UI (§4.3) — clickable
+  row showing the top-5 wrong responses per question
+- **#181** — Post-completion rating prompt + `course_ratings` write
+  endpoint (§4.4)
+- **#182** — CSV export on every reports surface (reuses the #155
+  pattern already shipped for learner views)
+- **#183** — Weekly metrics digest email (Friday morning, tenant-admin
+  recipients) reusing the existing `notifyBackground` pipeline
+- **#184** — PDF export (investigation + implementation)
+- **#185** — Time-to-completion distribution (deferred from v1 per §4.5)
+- **#186** — Per-learner journey timeline (deferred from v1)
 
-Total ticket count: 9. Estimated 3–4 weeks of one engineer's focused time.
+Total ticket count: 12. Estimated 4–5 weeks of one engineer's focused
+time. Note: ticket count grew vs the draft (was 9) because §4 specified
+more granular metrics than the original sketch.
 
 ---
 
