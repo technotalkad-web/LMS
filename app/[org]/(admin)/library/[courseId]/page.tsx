@@ -12,6 +12,7 @@ import {
 } from "./assign-section";
 import { ReminderSection, type ReminderSettings } from "./reminder-section";
 import { DetailsForm, type CourseDetails } from "./details-form";
+import { LanguagesSection, type LanguagePackage } from "./languages-section";
 
 type Version = {
   id: string;
@@ -69,6 +70,16 @@ export default async function AdminCourseDetailPage({
     .order("version_number", { ascending: false });
   const list = (versions ?? []) as Version[];
   const current = list.find((v) => v.id === c.current_version_id) ?? list[0];
+
+  // Language packages (#158 Phase 1c). Sorted by language code so the
+  // "Unlabeled (legacy)" NULL row floats to the top — it's the one
+  // admins most commonly want to promote.
+  const { data: pkgRows } = await supabase
+    .from("course_packages")
+    .select("id, language, display_name, is_active, current_version_id")
+    .eq("course_id", c.id)
+    .order("language", { ascending: true, nullsFirst: true });
+  const languagePackages = (pkgRows ?? []) as LanguagePackage[];
 
   // Assignments
   const { data: assignmentRows } = await supabase
@@ -404,6 +415,13 @@ export default async function AdminCourseDetailPage({
           </div>
         )}
       </section>
+
+      {/* Languages (#158 Phase 1c) */}
+      <LanguagesSection
+        orgSlug={orgSlug}
+        courseId={c.id}
+        packages={languagePackages}
+      />
 
       {/* Versions */}
       <section>
