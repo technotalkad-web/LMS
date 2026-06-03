@@ -16,15 +16,25 @@ export interface UploadResult {
  * Server-side helper. Parses a course zip's manifest, extracts every file
  * to storage under a per-version prefix, and writes course + course_version
  * rows. Caller handles authentication / authorization.
+ *
+ * Multi-language note (#158): course_versions.package_id is NOT NULL since
+ * migration 0030. Callers that have already created the target course_packages
+ * row pass `packageId` directly. Callers that don't (legacy single-language
+ * upload path, brand-new course creation) get the NULL-language default
+ * package auto-resolved / auto-created so the insert always has a valid
+ * package_id. Version numbers sequence per-package, not per-course, so that
+ * uploading v3 of the English variant doesn't make Hindi skip from v1 to v4.
  */
 export async function uploadCoursePackage(opts: {
   zipBytes: Buffer | Uint8Array;
   organizationId: string;
   uploaderId: string;
   courseId?: string;
+  packageId?: string;
   supabase: SupabaseClient;
 }): Promise<UploadResult> {
   const { zipBytes, organizationId, uploaderId, supabase } = opts;
+  let packageId = opts.packageId;
 
   // 1) Parse the manifest.
   const { manifest, zip } = await parseManifestFromZip(zipBytes);
@@ -74,11 +84,46 @@ export async function uploadCoursePackage(opts: {
     courseId = created.id;
   }
 
-  // 3) Next version number.
+  // 3a) Resolve the target package. If the caller passed one, use it
+  //     directly (the multi-language POST /packages route does this).
+  //     Otherwise look up the NULL-language default package on the course;
+  //     if there isn't one (brand-new course), create it now. Migration
+  //     0030 enforces course_versions.package_id NOT NULL, so we MUST have
+  //     a package_id before the version insert.
+  if (!packageId) {
+    const { data: defaultPkg } = await supabase
+      .from("course_packages")
+      .select("id")
+      .eq("course_id", courseId)
+      .is("language", null)
+      .maybeSingle();
+    if (defaultPkg) {
+      packageId = (defaultPkg as { id: string }).id;
+    } else {
+      const { data: newDefault, error: pkgErr } = await supabase
+        .from("course_packages")
+        .insert({
+          course_id: courseId,
+          language: null,
+          is_active: true,
+        })
+        .select("id")
+        .single();
+      if (pkgErr || !newDefault) {
+        throw new Error(
+          `Failed to create default package: ${pkgErr?.message ?? "unknown"}`
+        );
+      }
+      packageId = (newDefault as { id: string }).id;
+    }
+  }
+
+  // 3b) Next version number — sequenced PER PACKAGE per the RFC so each
+  //     language variant has its own clean v1, v2, ... timeline.
   const { data: prevVersions } = await supabase
     .from("course_versions")
     .select("version_number")
-    .eq("course_id", courseId)
+    .eq("package_id", packageId)
     .order("version_number", { ascending: false })
     .limit(1);
   const versionNumber = (prevVersions?.[0]?.version_number ?? 0) + 1;
@@ -106,6 +151,7 @@ export async function uploadCoursePackage(opts: {
     .from("course_versions")
     .insert({
       course_id: courseId,
+      package_id: packageId,
       version_number: versionNumber,
       manifest_type: manifest.type,
       launch_url: manifest.launchUrl,
@@ -124,7 +170,13 @@ export async function uploadCoursePackage(opts: {
     throw new Error(`Failed to create course_version: ${versionError?.message}`);
   }
 
-  // 6) Point the course at this version.
+  // 6) Point the package at this version (so the launcher picks it up as
+  //    the current variant) and the course at it too (for back-compat with
+  //    paths that still read course.current_version_id directly).
+  await supabase
+    .from("course_packages")
+    .update({ current_version_id: version.id })
+    .eq("id", packageId);
   await supabase
     .from("courses")
     .update({

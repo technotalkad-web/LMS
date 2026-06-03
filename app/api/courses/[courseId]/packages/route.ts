@@ -20,17 +20,11 @@ import { isSupportedLanguage } from "@/lib/i18n/languages";
  *      course (admins should upload a NEW VERSION of that package via
  *      /api/courses/upload?courseId=... + ?packageId=... instead)
  *   4. Creates a course_packages row, then runs the standard
- *      uploadCoursePackage helper to extract + persist the zip
- *   5. Links the resulting course_version to the new package
- *   6. Sets the new version as the package's current_version_id
+ *      uploadCoursePackage helper to extract + persist the zip with
+ *      package_id set on the new course_version row
+ *   5. (uploadCoursePackage also sets course_packages.current_version_id)
  *
  * Returns: { package_id, version_id, version_number }
- *
- * Companion endpoints (deferred per RFC phasing):
- *   GET   /api/courses/{courseId}/languages         (Phase 1, shipping with this commit)
- *   PUT   /api/courses/{courseId}/language-preference (Phase 3 — needed by launch picker)
- *   PATCH /api/courses/{courseId}/packages/{packageId} (Phase 1c — admin UI)
- *   DELETE /api/courses/{courseId}/packages/{packageId} (Phase 1c — admin UI)
  */
 export async function POST(
   request: NextRequest,
@@ -145,11 +139,9 @@ export async function POST(
   const newPackageId = (newPkg as { id: string }).id;
 
   // ---- Run the standard zip-upload helper ----
-  // Note: uploadCoursePackage creates a NEW course OR appends to an
-  // existing one. We pass courseId so it appends. The version it
-  // creates needs its package_id retargeted at our new package
-  // (uploadCoursePackage doesn't know about packages yet; that's a
-  // follow-up refactor for the unified upload path).
+  // We pass courseId so it appends, and packageId so the new version
+  // belongs to our just-created language variant. The helper handles
+  // per-package version sequencing and sets course_packages.current_version_id.
   let uploadResult;
   try {
     const ab = await (file as File).arrayBuffer();
@@ -158,6 +150,7 @@ export async function POST(
       organizationId: org.id,
       uploaderId: caller.id,
       courseId,
+      packageId: newPackageId,
       supabase: svc,
     });
   } catch (e) {
@@ -168,16 +161,6 @@ export async function POST(
       { status: 500 }
     );
   }
-
-  // Retarget the new version at our new package + set as current.
-  await svc
-    .from("course_versions")
-    .update({ package_id: newPackageId })
-    .eq("id", uploadResult.versionId);
-  await svc
-    .from("course_packages")
-    .update({ current_version_id: uploadResult.versionId })
-    .eq("id", newPackageId);
 
   return NextResponse.json({
     package_id: newPackageId,
