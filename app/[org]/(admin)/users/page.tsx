@@ -5,6 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersClient } from "./learners-client";
+import { originFromRequest } from "@/lib/http/origin";
 
 type Member = {
   user_id: string;
@@ -96,11 +97,31 @@ export default async function LearnersPage({
     { auth: { persistSession: false } }
   );
   const memberIds = (memberRows ?? []).map((m) => m.user_id);
+  const memberIdSet = new Set(memberIds);
   const emailByUser = new Map<string, string>();
+  // Paginate through auth.users until we run out (or hit safety cap).
+  // Previous code stopped at 200 — silently dropped emails for orgs >200.
+  // Per #154 and #168 the right primitive is loop-with-cap; for the
+  // /users LIST PAGE specifically, true server-side pagination on the
+  // membership row requires re-architecting LearnersClient to not
+  // depend on the full member list (it currently filters / paginates
+  // client-side over ALL members passed as prop). That refactor is
+  // deferred — pagination on top of an everything-in-prop client
+  // component is just expensive client filtering with extra steps.
   if (memberIds.length > 0) {
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 200 });
-    for (const u of data?.users ?? []) {
-      if (u.email && memberIds.includes(u.id)) emailByUser.set(u.id, u.email);
+    let pageNum = 1;
+    while (true) {
+      const { data } = await svc.auth.admin.listUsers({
+        page: pageNum,
+        perPage: 1000,
+      });
+      const users = data?.users ?? [];
+      for (const u of users) {
+        if (u.email && memberIdSet.has(u.id)) emailByUser.set(u.id, u.email);
+      }
+      if (users.length < 1000) break;
+      pageNum += 1;
+      if (pageNum > 50) break; // 50k-member safety cap
     }
   }
 
@@ -138,9 +159,7 @@ export default async function LearnersPage({
     expires_at: r.expires_at,
   }));
 
-  const origin =
-    process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ??
-    "http://localhost:3000";
+  const origin = (await originFromRequest()) || "http://localhost:3000";
 
   return (
     <LearnersClient

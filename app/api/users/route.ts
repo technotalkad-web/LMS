@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { headers } from "next/headers";
+import { originFromRequest } from "@/lib/http/origin";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -285,15 +285,8 @@ export async function POST(request: Request) {
 
   // Fire welcome / account-creation email (background, non-blocking).
   if (!priorMem) {
-    // Derive origin from the incoming request headers (same fix as #145
-    // and the broadcast endpoint). NEXT_PUBLIC_SITE_URL is inlined at
-    // build time and was producing http://localhost:3000 in the welcome
-    // email's sign-in link. Headers are always live and work on staging,
-    // prod, and any future custom domain with no rebuild.
-    const h = await headers();
-    const reqProto = h.get("x-forwarded-proto") ?? "https";
-    const reqHost = h.get("host") ?? h.get("x-forwarded-host") ?? "";
-    const origin = reqHost ? `${reqProto}://${reqHost}` : "";
+    // Use the request-origin helper (see #146 for the full sweep).
+    const origin = await originFromRequest();
     await notifyBackground({
       organizationId: org.id,
       event: "account_creation",
@@ -305,7 +298,13 @@ export async function POST(request: Request) {
         learner_email: email,
         username,
         login_id: email,
-        password: didInvite ? "(set via the invite link)" : password,
+        // 3-way: invited via magic link / existing user with their own
+        // password / brand-new account where we generated the password.
+        password: didInvite
+          ? "(set via the invite link)"
+          : found
+          ? "(use your existing password)"
+          : password,
         portal_url: origin
           ? `${origin}/${org.slug}/dashboard`
           : `/${org.slug}/dashboard`,

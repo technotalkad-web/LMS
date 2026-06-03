@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/assignments
@@ -185,7 +186,7 @@ export async function POST(request: Request) {
           if (u.email && recipientUserIds.has(u.id)) emailById.set(u.id, u.email);
         }
 
-        const portalBase = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
+        const portalBase = await originFromRequest();
         const directLink = portalBase
           ? `${portalBase}/${body.orgSlug}/courses/${course.id}/launch`
           : `/${body.orgSlug}/courses/${course.id}/launch`;

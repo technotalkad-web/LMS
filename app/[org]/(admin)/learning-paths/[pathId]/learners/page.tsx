@@ -4,44 +4,39 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { LearnersFilters } from "./learners-filters";
+import { LearnersFilters } from "../../../library/[courseId]/learners/learners-filters";
 
 // =============================================================================
-// Dedicated enrolled-learners page for an admin viewing one course.
+// Dedicated enrolled-learners page for an admin viewing one learning path.
 //
-// Why it exists:
-//   The course detail page used to render the full enrolled-learners table
-//   inline. At 1000+ learners the page became unusably long and pushed
-//   important course settings (assignments, reminders) far below the fold.
-//   This page splits the table off so the detail page stays a clean
-//   "settings" surface and learners get their own dedicated, scalable view.
+// Mirrors the structure of /library/[courseId]/learners (#152) — same URL-
+// driven filter / sort / pagination, same StatusPill, same CSV export
+// button. Adapted for paths:
+//   - "completion" = learner has completed every course in the path
+//   - "in_progress" = at least one course done OR in progress
+//   - "not_started" = no course attempts on any step
+//   - "passed" / "failed" map to whether the FINAL step's attempt
+//     surfaced a pass/fail (mostly relevant for paths whose last
+//     course is an assessment)
 //
-// Scale design:
-//   Filters / search / sort / pagination are all driven by URL search
-//   params (q, status, via, sort, page). The server renders the right
-//   slice on every request, so:
-//     - links to a specific filtered view are shareable / bookmarkable
-//     - browser back/forward Just Works
-//     - the page can render without client JS for the basic flow
+// Score / attempts aren't meaningful at path level — those columns
+// are dropped from the table. "Last activity" rolls up to the latest
+// attempt across any step.
 //
-//   For 10k users today: we still fetch the full enrolled set in memory
-//   on each request (because computing "via" requires joining assignments
-//   + team_members + org members), then filter + paginate in memory. At
-//   ~10k users that's ~1MB of payload and sub-100ms compute — acceptable
-//   for an admin page hit infrequently. For 100k+ users we'd want a
-//   materialized view (course_id, user_id, last_status, last_score) kept
-//   in sync by triggers — flagged as a follow-up post-launch task.
+// Companion CSV export: /api/learning-paths/[pathId]/learners/export
+// (parallels /api/courses/[courseId]/learners/export from #155).
+//
+// History: #153.
 // =============================================================================
 
 export const dynamic = "force-dynamic";
 
 const PAGE_SIZE = 50;
 
-type Course = {
+type Path = {
   id: string;
-  title: string;
+  name: string;
   organization_id: string;
-  current_version_id: string | null;
 };
 
 type Status =
@@ -53,7 +48,7 @@ type Status =
 
 type ViaKind = "user" | "team" | "org";
 
-interface EnrichedLearner {
+interface EnrichedPathLearner {
   user_id: string;
   email: string;
   first_name: string | null;
@@ -61,16 +56,16 @@ interface EnrichedLearner {
   employee_id: string | null;
   via: ViaKind[];
   status: Status;
-  bestScore: number | null;
-  attempts: number;
+  coursesDone: number;
+  coursesTotal: number;
   lastTouched: string | null;
 }
 
-export default async function LearnersPage({
+export default async function PathLearnersPage({
   params,
   searchParams,
 }: {
-  params: Promise<{ org: string; courseId: string }>;
+  params: Promise<{ org: string; pathId: string }>;
   searchParams: Promise<{
     q?: string;
     status?: string;
@@ -79,7 +74,7 @@ export default async function LearnersPage({
     page?: string;
   }>;
 }) {
-  const { org: orgSlug, courseId } = await params;
+  const { org: orgSlug, pathId } = await params;
   const sp = await searchParams;
 
   const { org, role } = await requireOrgAccess(orgSlug);
@@ -87,7 +82,6 @@ export default async function LearnersPage({
     redirect(`/${orgSlug}/dashboard?denied=1`);
   }
 
-  // ---- normalize search params (defensive, defaults applied) ----
   const q = (sp.q ?? "").trim();
   const statusParam = (sp.status ?? "all") as "all" | Status;
   const viaParam = (sp.via ?? "any") as "any" | ViaKind;
@@ -95,42 +89,46 @@ export default async function LearnersPage({
     | "last_desc"
     | "last_asc"
     | "email_asc"
-    | "best_desc"
-    | "attempts_desc";
+    | "progress_desc";
   const page = Math.max(1, parseInt(sp.page ?? "1", 10) || 1);
 
-  // ---- fetch course (verifies tenant scope) ----
   const supabase = await createClient();
-  const { data: course } = await supabase
-    .from("courses")
-    .select("id, title, organization_id, current_version_id")
-    .eq("id", courseId)
+
+  // ---- fetch path (verifies tenant scope) ----
+  const { data: pathRow } = await supabase
+    .from("learning_paths")
+    .select("id, name, organization_id")
+    .eq("id", pathId)
     .eq("organization_id", org.id)
     .maybeSingle();
-  if (!course) redirect(`/${orgSlug}/library`);
-  const c = course as Course;
+  if (!pathRow) redirect(`/${orgSlug}/learning-paths`);
+  const p = pathRow as Path;
 
-  // ---- fetch all versions for this course (for attempts join) ----
-  const { data: versionRows } = await supabase
-    .from("course_versions")
-    .select("id")
-    .eq("course_id", c.id);
-  const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map(
-    (v) => v.id
-  );
+  // ---- fetch the path's steps (courses) ----
+  const { data: stepRows } = await supabase
+    .from("learning_path_courses")
+    .select("course_id, step_number")
+    .eq("path_id", p.id)
+    .order("step_number", { ascending: true });
+  const steps = (stepRows ?? []) as Array<{
+    course_id: string;
+    step_number: number;
+  }>;
+  const stepCourseIds = steps.map((s) => s.course_id);
+  const coursesTotal = steps.length;
 
-  // ---- fetch assignments + work out who's enrolled and how ----
+  // ---- fetch assignments to this path ----
   const { data: assignmentRows } = await supabase
-    .from("course_assignments")
+    .from("learning_path_assignments")
     .select("assignee_type, user_id, team_id")
-    .eq("course_id", c.id);
+    .eq("path_id", p.id);
   const assignments = (assignmentRows ?? []) as Array<{
     assignee_type: ViaKind;
     user_id: string | null;
     team_id: string | null;
   }>;
 
-  // Org members (always need this for org-wide assignments + employee_id lookup)
+  // ---- org members + teams (same expansion pattern as course-learners) ----
   const { data: memberRows } = await supabase
     .from("organization_members")
     .select("user_id, employee_id")
@@ -142,7 +140,6 @@ export default async function LearnersPage({
   const employeeIdByUser = new Map<string, string | null>();
   for (const m of orgMembers) employeeIdByUser.set(m.user_id, m.employee_id);
 
-  // Team members for any assigned teams.
   const assignedTeamIds = assignments
     .filter((a) => a.assignee_type === "team" && a.team_id)
     .map((a) => a.team_id as string);
@@ -162,13 +159,12 @@ export default async function LearnersPage({
     }
   }
 
-  // Build viaByUser → who's enrolled, via what mechanism(s).
   const viaByUser = new Map<string, Set<ViaKind>>();
-  function addVia(uid: string, v: ViaKind) {
+  const addVia = (uid: string, v: ViaKind) => {
     const s = viaByUser.get(uid) ?? new Set<ViaKind>();
     s.add(v);
     viaByUser.set(uid, s);
-  }
+  };
   for (const a of assignments) {
     if (a.assignee_type === "user" && a.user_id) addVia(a.user_id, "user");
     else if (a.assignee_type === "team" && a.team_id) {
@@ -179,7 +175,7 @@ export default async function LearnersPage({
   }
   const enrolledUserIds = Array.from(viaByUser.keys());
 
-  // ---- resolve names + emails (service role for cross-table reads) ----
+  // ---- resolve emails + profiles ----
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -192,50 +188,55 @@ export default async function LearnersPage({
     { first_name: string | null; last_name: string | null }
   >();
   if (enrolledUserIds.length > 0) {
-    // Auth users (for emails). listUsers pages at 1000 — call multiple
-    // times for orgs over that size.
     let pageNum = 1;
-    let fetched = 0;
     while (true) {
       const { data: authPage } = await svc.auth.admin.listUsers({
         page: pageNum,
         perPage: 1000,
       });
       const users = authPage?.users ?? [];
-      for (const u of users) {
-        if (u.email) emailByUser.set(u.id, u.email);
-      }
-      fetched += users.length;
+      for (const u of users) if (u.email) emailByUser.set(u.id, u.email);
       if (users.length < 1000) break;
       pageNum += 1;
-      // Safety cap: don't loop forever if listUsers misbehaves.
       if (pageNum > 50) break;
     }
-    void fetched;
-
     const { data: profileRows } = await svc
       .from("profiles")
       .select("id, first_name, last_name")
       .in("id", enrolledUserIds);
-    for (const p of (profileRows ?? []) as Array<{
+    for (const pr of (profileRows ?? []) as Array<{
       id: string;
       first_name: string | null;
       last_name: string | null;
     }>) {
-      profileByUser.set(p.id, {
-        first_name: p.first_name,
-        last_name: p.last_name,
+      profileByUser.set(pr.id, {
+        first_name: pr.first_name,
+        last_name: pr.last_name,
       });
     }
   }
 
-  // ---- fetch attempts ----
+  // ---- fetch attempts across all step courses (via course_versions) ----
+  const { data: versionRows } =
+    stepCourseIds.length > 0
+      ? await supabase
+          .from("course_versions")
+          .select("id, course_id")
+          .in("course_id", stepCourseIds)
+      : { data: [] };
+  const versions = (versionRows ?? []) as Array<{
+    id: string;
+    course_id: string;
+  }>;
+  const courseByVersion = new Map(versions.map((v) => [v.id, v.course_id]));
+  const versionIds = versions.map((v) => v.id);
+
   const { data: attemptRows } =
     enrolledUserIds.length && versionIds.length
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
+            "user_id, course_version_id, completion_status, success_status, started_at, completed_at"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
@@ -245,38 +246,58 @@ export default async function LearnersPage({
     course_version_id: string;
     completion_status: string;
     success_status: string;
-    score: number | null;
     started_at: string;
     completed_at: string | null;
   };
   const attempts = (attemptRows ?? []) as AttemptRow[];
 
+  const lastStepCourseId = steps[steps.length - 1]?.course_id ?? null;
+
   // ---- enrich one row per enrolled user ----
-  const enriched: EnrichedLearner[] = enrolledUserIds.map((uid) => {
+  const enriched: EnrichedPathLearner[] = enrolledUserIds.map((uid) => {
     const myAttempts = attempts.filter((a) => a.user_id === uid);
-    const latest = myAttempts
-      .slice()
-      .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
-    let status: Status = "not_started";
-    if (latest) {
-      if (latest.success_status === "passed") status = "passed";
-      else if (latest.success_status === "failed") status = "failed";
-      else if (latest.completion_status === "completed") status = "completed";
-      else status = "in_progress";
+    // Which step courses has the user completed?
+    const doneCourseIds = new Set<string>();
+    for (const a of myAttempts) {
+      const cid = courseByVersion.get(a.course_version_id);
+      if (!cid) continue;
+      if (
+        a.completion_status === "completed" ||
+        a.success_status === "passed"
+      ) {
+        doneCourseIds.add(cid);
+      }
     }
-    const bestScore = myAttempts
-      .map((a) => a.score)
-      .filter((s): s is number => typeof s === "number")
-      .reduce<number | null>(
-        (best, s) => (best === null || s > best ? s : best),
-        null
+    const coursesDone = stepCourseIds.filter((cid) =>
+      doneCourseIds.has(cid)
+    ).length;
+
+    let status: Status;
+    if (coursesDone === 0 && myAttempts.length === 0) {
+      status = "not_started";
+    } else if (coursesDone < coursesTotal) {
+      status = "in_progress";
+    } else {
+      // All done — surface pass/fail of the FINAL step if available,
+      // otherwise plain "completed".
+      const finalAttempts = myAttempts.filter(
+        (a) => courseByVersion.get(a.course_version_id) === lastStepCourseId
       );
+      const latestFinal = finalAttempts
+        .slice()
+        .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
+      if (latestFinal?.success_status === "passed") status = "passed";
+      else if (latestFinal?.success_status === "failed") status = "failed";
+      else status = "completed";
+    }
+
     const lastTouched =
       myAttempts
         .map((a) => a.completed_at ?? a.started_at)
         .filter((x): x is string => !!x)
         .sort()
         .pop() ?? null;
+
     const profile = profileByUser.get(uid);
     return {
       user_id: uid,
@@ -286,17 +307,13 @@ export default async function LearnersPage({
       employee_id: employeeIdByUser.get(uid) ?? null,
       via: Array.from(viaByUser.get(uid) ?? []),
       status,
-      bestScore,
-      attempts: myAttempts.length,
+      coursesDone,
+      coursesTotal,
       lastTouched,
     };
   });
 
   // ---- apply filters ----
-  // q applies first (matches across name/email/employee_id), then via,
-  // then status. We compute the status-chip counts AFTER q+via but
-  // BEFORE status so chips show the live counts the user would see if
-  // they clicked into each status.
   const qLower = q.toLowerCase();
   const afterQ = qLower
     ? enriched.filter((r) => {
@@ -336,11 +353,8 @@ export default async function LearnersPage({
     case "email_asc":
       sorted.sort((a, b) => a.email.localeCompare(b.email));
       break;
-    case "best_desc":
-      sorted.sort((a, b) => (b.bestScore ?? -1) - (a.bestScore ?? -1));
-      break;
-    case "attempts_desc":
-      sorted.sort((a, b) => b.attempts - a.attempts);
+    case "progress_desc":
+      sorted.sort((a, b) => b.coursesDone - a.coursesDone);
       break;
     case "last_asc":
       sorted.sort((a, b) =>
@@ -362,7 +376,6 @@ export default async function LearnersPage({
   const startIdx = (safePage - 1) * PAGE_SIZE;
   const slice = sorted.slice(startIdx, startIdx + PAGE_SIZE);
 
-  // ---- helpers to build URLs that preserve other params ----
   function hrefWith(updates: Record<string, string | number | null>) {
     const next = new URLSearchParams();
     const all: Record<string, string | number | null | undefined> = {
@@ -387,8 +400,8 @@ export default async function LearnersPage({
     }
     const qs = next.toString();
     return qs
-      ? `/${orgSlug}/library/${c.id}/learners?${qs}`
-      : `/${orgSlug}/library/${c.id}/learners`;
+      ? `/${orgSlug}/learning-paths/${p.id}/learners?${qs}`
+      : `/${orgSlug}/learning-paths/${p.id}/learners`;
   }
 
   function SortHeader({
@@ -424,16 +437,16 @@ export default async function LearnersPage({
     <div className="max-w-6xl space-y-6">
       <div>
         <Link
-          href={`/${orgSlug}/library/${c.id}`}
+          href={`/${orgSlug}/learning-paths`}
           className="text-muted text-sm hover:text-ink transition-colors"
         >
-          ← {c.title}
+          ← {p.name}
         </Link>
         <div className="flex items-baseline justify-between mt-2 mb-1 gap-4 flex-wrap">
           <h1 className="serif text-4xl">Enrolled learners</h1>
           <div className="flex items-center gap-4">
             <a
-              href={`/api/courses/${c.id}/learners/export?orgSlug=${encodeURIComponent(orgSlug)}`}
+              href={`/api/learning-paths/${p.id}/learners/export?orgSlug=${encodeURIComponent(orgSlug)}`}
               className="text-sm text-ink border border-line rounded-md px-3 py-1.5 hover:bg-paper transition-colors inline-flex items-center gap-1.5"
               download
               title="Download all enrolled learners as CSV (includes filtered-out rows)"
@@ -465,20 +478,19 @@ export default async function LearnersPage({
         </div>
       </div>
 
-      {/* Filter UI (URL-driven client component). */}
+      {/* Reuse the same URL-driven filter component as course-learners. */}
       <LearnersFilters counts={statusCounts} />
 
-      {/* Table */}
       {slice.length === 0 ? (
         <div className="border border-line rounded-2xl bg-paper p-12 text-muted text-sm text-center">
           {enriched.length === 0 ? (
             <>
-              No learners are enrolled in this course yet. Add some in the{" "}
+              No learners are enrolled in this path yet. Assign it from the{" "}
               <Link
-                href={`/${orgSlug}/library/${c.id}`}
+                href={`/${orgSlug}/learning-paths`}
                 className="text-ink underline-offset-4 hover:underline"
               >
-                Assignments section
+                Paths page
               </Link>
               .
             </>
@@ -503,10 +515,9 @@ export default async function LearnersPage({
                 <SortHeader label="Learner" sortKey="email_asc" />
                 <th className="text-left px-4 py-2 font-medium">Source</th>
                 <th className="text-left px-4 py-2 font-medium">Status</th>
-                <SortHeader label="Best" sortKey="best_desc" align="right" />
                 <SortHeader
-                  label="Attempts"
-                  sortKey="attempts_desc"
+                  label="Progress"
+                  sortKey="progress_desc"
                   align="right"
                 />
                 <SortHeader
@@ -550,13 +561,8 @@ export default async function LearnersPage({
                     <td className="px-4 py-3">
                       <StatusPill status={r.status} />
                     </td>
-                    <td className="px-4 py-3 text-right text-xs tabular-nums">
-                      {r.bestScore !== null
-                        ? `${(r.bestScore * 100).toFixed(0)}%`
-                        : "—"}
-                    </td>
-                    <td className="px-4 py-3 text-right text-xs tabular-nums">
-                      {r.attempts}
+                    <td className="px-4 py-3 text-right text-xs tabular-nums whitespace-nowrap">
+                      {r.coursesDone}/{r.coursesTotal} courses
                     </td>
                     <td className="px-4 py-3 text-right text-xs text-muted whitespace-nowrap">
                       {r.lastTouched
@@ -571,7 +577,6 @@ export default async function LearnersPage({
         </div>
       )}
 
-      {/* Pagination */}
       {totalRows > PAGE_SIZE && (
         <nav className="flex items-center justify-between text-sm text-muted">
           <div>

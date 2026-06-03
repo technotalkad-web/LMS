@@ -35,6 +35,12 @@ export async function GET(request: Request) {
     return NextResponse.redirect(`${origin}/login?error=verify&msg=${encodeURIComponent(error.message)}`);
   }
 
-  console.error("[auth/callback] no code or token_hash present:", request.url);
-  return NextResponse.redirect(`${origin}/login?error=missing_code`);
+  // No query params from Supabase usually means the auth payload
+  // (success tokens or error info) is in the URL fragment, which we
+  // can't read server-side. Hand off to /auth/finish, a client
+  // component that reads window.location.hash and either completes
+  // setSession() or renders a friendly error UI. The fragment is
+  // preserved across this 302 by the browser.
+  console.warn("[auth/callback] no code or token_hash — handing off to /auth/finish for fragment parsing:", request.url);
+  return NextResponse.redirect(`${origin}/auth/finish`);
 }

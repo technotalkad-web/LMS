@@ -200,6 +200,10 @@ export async function POST(request: Request) {
   }
 
   const now = Date.now();
+  // LEGITIMATE NEXT_PUBLIC_SITE_URL use: cron triggers have no inbound
+  // request, so there are no headers to read. The build-time value is
+  // the only option here. See lib/http/origin.ts for the full rationale
+  // and ticket #146 for the rest of the codebase sweep.
   const portalBase =
     process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
 

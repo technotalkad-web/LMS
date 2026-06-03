@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/users/bulk
@@ -11,7 +12,9 @@ import { notifyBackground } from "@/lib/notifications/send";
  * is flexible:
  *   first_name, last_name, unique_id, gender, status, dob, doj, email,
  *   username, password, phone, grade, designation, role, line_manager_id,
- *   indirect_manager_id, lms_role, node_id, city, state
+ *   indirect_manager_id, lms_role, node_id, city, state,
+ *   team_name (optional — auto-creates the team in this org if missing,
+ *              or adds to an existing team if name matches case-insensitively)
  *
  * For every row:
  *   - If email already exists in auth.users -> existing user_id reused.
@@ -28,6 +31,10 @@ type ResultRow = {
   email: string;
   status: "created" | "updated" | "invited" | "skipped" | "error";
   message?: string;
+  // #162: if the row had a team_name and we successfully added them
+  // to that team, the team name is surfaced here so admins see
+  // "added to Marketing" in the result UI.
+  team_added?: string;
 };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -106,6 +113,67 @@ export async function POST(request: Request) {
   for (const u of listed?.users ?? []) {
     if (u.email) userIdByEmail.set(u.email.toLowerCase(), u.id);
   }
+
+  // ---- #162: Pre-fetch / batch-create teams referenced in the CSV ----
+  // Collect unique team names (case-insensitive). One DB read for existing
+  // teams + at most one INSERT for any missing ones, keeping the per-row
+  // loop on a fixed team_id lookup.
+  const teamIdByLowerName = new Map<string, string>();
+  const teamsCreated: string[] = [];
+  const requestedTeamNames = new Set<string>();
+  for (const r of rows) {
+    const n = r.team_name?.trim();
+    if (n) requestedTeamNames.add(n);
+  }
+  if (requestedTeamNames.size > 0) {
+    const { data: existingTeams } = await supabase
+      .from("teams")
+      .select("id, name")
+      .eq("organization_id", org.id);
+    for (const t of (existingTeams ?? []) as Array<{
+      id: string;
+      name: string;
+    }>) {
+      teamIdByLowerName.set(t.name.trim().toLowerCase(), t.id);
+    }
+    // Determine which team names aren't already present.
+    const seenLower = new Set<string>();
+    const toCreate: Array<{ organization_id: string; name: string }> = [];
+    for (const name of requestedTeamNames) {
+      const k = name.toLowerCase();
+      if (seenLower.has(k)) continue;
+      seenLower.add(k);
+      if (!teamIdByLowerName.has(k)) {
+        toCreate.push({ organization_id: org.id, name });
+      }
+    }
+    if (toCreate.length > 0) {
+      const { data: created, error: teamErr } = await svc
+        .from("teams")
+        .insert(toCreate)
+        .select("id, name");
+      if (teamErr) {
+        return NextResponse.json(
+          {
+            error: `Failed to create one or more teams: ${teamErr.message}`,
+          },
+          { status: 500 }
+        );
+      }
+      for (const t of (created ?? []) as Array<{
+        id: string;
+        name: string;
+      }>) {
+        teamIdByLowerName.set(t.name.trim().toLowerCase(), t.id);
+        teamsCreated.push(t.name);
+      }
+    }
+  }
+  // Track pending team memberships to upsert in a single batch after
+  // the per-row loop. (Each upsert is cheap but batching keeps the
+  // loop tight and limits round-trips at scale.)
+  const pendingTeamMemberships: Array<{ team_id: string; user_id: string }> =
+    [];
 
   const results: ResultRow[] = [];
 
@@ -318,10 +386,23 @@ export async function POST(request: Request) {
     else if (createdThisRow === "created") outcome = "created";
     else outcome = priorMem ? "updated" : "created";
 
+    // ---- #162: queue team membership if team_name was provided ----
+    let teamAdded: string | undefined;
+    const teamNameRaw = r.team_name?.trim();
+    if (teamNameRaw) {
+      const teamId = teamIdByLowerName.get(teamNameRaw.toLowerCase());
+      if (teamId) {
+        pendingTeamMemberships.push({
+          team_id: teamId,
+          user_id: authUserId,
+        });
+        teamAdded = teamNameRaw;
+      }
+    }
+
     // Fire welcome email for new accounts (skip when we just updated metadata).
     if (!priorMem) {
-      const origin =
-        process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
+      const origin = await originFromRequest();
       await notifyBackground({
         organizationId: org.id,
         event: "account_creation",
@@ -342,7 +423,40 @@ export async function POST(request: Request) {
       });
     }
 
-    results.push({ row: rowNum, email, status: outcome });
+    results.push({
+      row: rowNum,
+      email,
+      status: outcome,
+      ...(teamAdded ? { team_added: teamAdded } : {}),
+    });
+  }
+
+  // ---- #162: flush queued team memberships in one batch ----
+  let teamMembershipsAdded = 0;
+  if (pendingTeamMemberships.length > 0) {
+    // ignoreDuplicates so re-uploading a CSV that already added users
+    // to a team is a no-op, not an error. The composite PK on
+    // team_members (team_id, user_id) handles dedup.
+    const { error: tmErr, count } = await svc
+      .from("team_members")
+      .upsert(pendingTeamMemberships, {
+        onConflict: "team_id,user_id",
+        ignoreDuplicates: true,
+        count: "exact",
+      });
+    if (tmErr) {
+      // Don't fail the whole upload — the user-creation half succeeded,
+      // and admins can re-run for the team part. Flag in result rows
+      // so they know.
+      for (const r of results) {
+        if (r.team_added) {
+          r.message = `${r.message ? r.message + " · " : ""}team add failed: ${tmErr.message}`;
+          delete r.team_added;
+        }
+      }
+    } else {
+      teamMembershipsAdded = count ?? pendingTeamMemberships.length;
+    }
   }
 
   const summary = {
@@ -352,6 +466,9 @@ export async function POST(request: Request) {
     updated: results.filter((r) => r.status === "updated").length,
     skipped: results.filter((r) => r.status === "skipped").length,
     errored: results.filter((r) => r.status === "error").length,
+    teams_created: teamsCreated.length,
+    teams_created_names: teamsCreated,
+    team_memberships_added: teamMembershipsAdded,
   };
   return NextResponse.json({ summary, results });
 }
@@ -377,6 +494,11 @@ const KNOWN_COLS = [
   "node_id",
   "city",
   "state",
+  // #162: optional team assignment. If the named team exists in this
+  // org, the user is added to it; otherwise the team is created
+  // (idempotent — same team_name across multiple rows reuses the row
+  // we just created).
+  "team_name",
 ] as const;
 
 function parseCsv(csv: string): Row[] {

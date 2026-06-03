@@ -36,9 +36,9 @@ export const dynamic = "force-dynamic";
  * logo configured (so a freshly-provisioned tenant without branding
  * uploads still gets a usable tab).
  *
- * NOTE: tenants whose main logo isn't square will see a slightly
- * stretched favicon — ticket #151 tracks adding a dedicated favicon_url
- * field with a square uploader.
+ * As of #151: tenants can upload a dedicated square favicon_url in
+ * Settings → Branding. If set, it overrides logo_url for the browser
+ * tab. Falls back to logo_url, then to the static platform default.
  */
 export async function generateMetadata({
   params,
@@ -55,7 +55,7 @@ export async function generateMetadata({
 
   const { data: org } = await svc
     .from("organizations")
-    .select("name, logo_url")
+    .select("name, logo_url, favicon_url")
     .eq("slug", orgSlug)
     .maybeSingle();
 
@@ -67,6 +67,9 @@ export async function generateMetadata({
 
   const name = (org.name as string | null) ?? "Mentora";
   const logoUrl = (org.logo_url as string | null) ?? null;
+  const faviconUrl = (org.favicon_url as string | null) ?? null;
+  // Prefer the dedicated favicon (square) over the logo (often wide).
+  const tabIcon = faviconUrl ?? logoUrl;
 
   const meta: Metadata = {
     title: {
@@ -75,14 +78,15 @@ export async function generateMetadata({
     },
   };
 
-  if (logoUrl) {
+  if (tabIcon) {
     // Set icon, shortcut (legacy IE/Edge), and apple-touch (mobile home
-    // screen). All three point at the same logo — browsers pick the
-    // most appropriate per context.
+    // screen). All three point at the same source — browsers pick the
+    // most appropriate per context. Prefers favicon_url over logo_url
+    // (#151) so non-square logos don't look stretched in the tab.
     meta.icons = {
-      icon: [{ url: logoUrl }],
-      shortcut: [{ url: logoUrl }],
-      apple: [{ url: logoUrl }],
+      icon: [{ url: tabIcon }],
+      shortcut: [{ url: tabIcon }],
+      apple: [{ url: tabIcon }],
     };
   }
 
