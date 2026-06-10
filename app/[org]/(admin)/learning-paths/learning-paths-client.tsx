@@ -12,6 +12,7 @@ import type {
   TeamOption,
 } from "./page";
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
+import { VisibilityRadio } from "../library/[courseId]/details-form";
 import {
   AdminPageHeader,
   KpiStrip,
@@ -90,6 +91,7 @@ export function LearningPathsClient({
         duration_minutes: string;
         is_active: boolean;
         thumbnail_url: string | null;
+        visibility: "private" | "org_public";
       }
     >
   >({});
@@ -117,6 +119,7 @@ export function LearningPathsClient({
           p.duration_minutes !== null ? String(p.duration_minutes) : "",
         is_active: p.is_active,
         thumbnail_url: p.thumbnail_url,
+        visibility: p.visibility ?? "private",
       },
     }));
     setEditing((s) => ({ ...s, [p.id]: true }));
@@ -137,6 +140,7 @@ export function LearningPathsClient({
         duration_minutes: f.duration_minutes === "" ? null : f.duration_minutes,
         is_active: f.is_active,
         thumbnail_url: f.thumbnail_url,
+        visibility: f.visibility,
       }),
     });
     if (!res.ok) {
@@ -668,6 +672,16 @@ export function LearningPathsClient({
                             }
                           />
                         </div>
+                        <VisibilityRadio
+                          value={editForm[p.id].visibility}
+                          onChange={(v) =>
+                            setEditForm((s) => ({
+                              ...s,
+                              [p.id]: { ...s[p.id], visibility: v },
+                            }))
+                          }
+                          assetKind="learning path"
+                        />
                       </div>
                     )}
 
