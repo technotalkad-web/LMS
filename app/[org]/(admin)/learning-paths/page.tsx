@@ -16,6 +16,7 @@ export type PathRow = {
   duration_minutes: number | null;
   is_active: boolean;
   thumbnail_url: string | null;
+  visibility: "private" | "org_public";
 };
 
 export type PathEnrollee = {
@@ -65,7 +66,7 @@ export default async function LearningPathsPage({
   const { data: pathRows } = await supabase
     .from("learning_paths")
     .select(
-      "id, name, description, slug, created_at, duration_minutes, is_active, thumbnail_url"
+      "id, name, description, slug, created_at, duration_minutes, is_active, thumbnail_url, visibility"
     )
     .eq("organization_id", org.id)
     .order("created_at", { ascending: false });
