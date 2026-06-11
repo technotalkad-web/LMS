@@ -342,6 +342,7 @@ export default async function LearningPathDetailPage({
                   orgSlug={orgSlug}
                   inProgress={inProgressCourseIds.has(s.course_id)}
                   score={scoreByCourse.get(s.course_id) ?? null}
+                  pathId={pathId}
                 />
               ))}
             </div>
@@ -374,12 +375,14 @@ function StepCard({
   orgSlug,
   inProgress,
   score,
+  pathId,
 }: {
   step: StepView;
   isLast: boolean;
   orgSlug: string;
   inProgress: boolean;
   score: number | null;
+  pathId: string;
 }) {
   void isLast;
   const isCompleted = step.state === "completed";
@@ -485,7 +488,7 @@ function StepCard({
             </Link>
           ) : (
             <Link
-              href={`/${orgSlug}/courses/${step.course_id}/launch`}
+              href={`/${orgSlug}/courses/${step.course_id}/launch?lp=${pathId}`}
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-lg text-sm font-semibold transition-colors shadow-sm"
             >
               <PlayCircle className="w-4 h-4" />
