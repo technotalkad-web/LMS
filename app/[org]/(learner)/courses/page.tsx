@@ -34,6 +34,7 @@ type Course = {
   current_version_id: string | null;
   updated_at: string;
   thumbnail_url: string | null;
+  visibility?: "private" | "org_public";
 };
 
 type Version = {
@@ -160,8 +161,23 @@ export default async function CoursesIndexPage({
   }
   const pathCourseIds = Array.from(pathNameByCourseId.keys());
 
+  // ---- Org-public courses (#visibility) ----
+  // Every member of the org sees these regardless of assignment. We pull
+  // them separately and union with the assigned/path-based set. Cards
+  // sourced only via org_public are tagged source='org' so the existing
+  // UI affordances ("Org-wide") describe them correctly.
+  const { data: orgPublicCourseRows } = await supabase
+    .from("courses")
+    .select("id")
+    .eq("organization_id", org.id)
+    .eq("is_active", true)
+    .eq("visibility", "org_public");
+  const orgPublicCourseIds = ((orgPublicCourseRows ?? []) as Array<{
+    id: string;
+  }>).map((r) => r.id);
+
   const allCourseIds = Array.from(
-    new Set([...directCourseIds, ...pathCourseIds])
+    new Set([...directCourseIds, ...pathCourseIds, ...orgPublicCourseIds])
   );
 
   // ---- Empty state ----
@@ -173,7 +189,7 @@ export default async function CoursesIndexPage({
   const { data: courseRows } = await supabase
     .from("courses")
     .select(
-      "id, title, description, current_version_id, updated_at, thumbnail_url"
+      "id, title, description, current_version_id, updated_at, thumbnail_url, visibility"
     )
     .eq("is_active", true)
     .in("id", allCourseIds);
@@ -268,6 +284,27 @@ export default async function CoursesIndexPage({
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
       pathName,
+      thumbnail_url: course.thumbnail_url,
+    });
+    seen.add(cid);
+  }
+  // Org-public courses not already pulled in via assignment or path.
+  // These show up to every member of the org. Tag source='org' so the
+  // existing pill UI labels them as org-wide.
+  for (const cid of orgPublicCourseIds) {
+    if (seen.has(cid)) continue;
+    const course = courseById.get(cid);
+    if (!course) continue;
+    cards.push({
+      course_id: course.id,
+      title: course.title,
+      description: course.description,
+      source: "org",
+      status: attemptStatusForCourse(cid),
+      isRevised: false,
+      dueAt: null,
+      bestScore: bestScoreForCourse(cid),
+      pathName: null,
       thumbnail_url: course.thumbnail_url,
     });
     seen.add(cid);
