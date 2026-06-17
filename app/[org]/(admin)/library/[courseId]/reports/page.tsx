@@ -111,6 +111,48 @@ export default async function CourseReportsPage({
     refreshed_at: new Date(0).toISOString(),
   };
 
+  // ---- §4.3 — Per-question breakdown ----
+  // Two matviews: one with correct/incorrect counts per question, one
+  // with the top wrong responses per question (added in migration 0035).
+  // Both are course-scoped so the row counts stay tiny per page render.
+  const { data: interactionRows } = await supabase
+    .from("mv_course_interaction_breakdown")
+    .select(
+      "interaction_id, interaction_label, total_responses, distinct_learners, correct_count, incorrect_count, correct_rate"
+    )
+    .eq("course_id", c.id)
+    .order("interaction_id", { ascending: true });
+
+  const { data: topWrongRows } = await supabase
+    .from("mv_course_interaction_top_wrong")
+    .select("interaction_id, rank, response, freq")
+    .eq("course_id", c.id)
+    .order("interaction_id", { ascending: true })
+    .order("rank", { ascending: true });
+
+  type InteractionRow = {
+    interaction_id: string;
+    interaction_label: string | null;
+    total_responses: number;
+    distinct_learners: number;
+    correct_count: number;
+    incorrect_count: number;
+    correct_rate: number; // 0..1
+  };
+  type WrongRow = {
+    interaction_id: string;
+    rank: number;
+    response: string;
+    freq: number;
+  };
+  const interactions = (interactionRows ?? []) as InteractionRow[];
+  const topWrongByInteraction = new Map<string, WrongRow[]>();
+  for (const w of (topWrongRows ?? []) as WrongRow[]) {
+    const list = topWrongByInteraction.get(w.interaction_id) ?? [];
+    list.push(w);
+    topWrongByInteraction.set(w.interaction_id, list);
+  }
+
   // Use the most recent refresh stamp across the two views (they refresh
   // together in the cron but reading both makes the staleness display
   // robust to manual partial refreshes during debug).
@@ -233,12 +275,107 @@ export default async function CourseReportsPage({
         </div>
       </section>
 
-      {/* Placeholder for §4.3 — coming in #179 */}
-      <section className="border border-dashed border-line rounded-2xl bg-paper p-6 text-sm text-muted">
-        <strong className="text-ink">Coming soon:</strong> per-question
-        breakdown (§4.3) showing the % of attempts that answered each quiz
-        question correctly, and the most common wrong answers. Tracked as
-        #179.
+      {/* §4.3 Per-question breakdown */}
+      <section>
+        <h2 className="serif text-xl mb-3">Per-question breakdown</h2>
+        {interactions.length === 0 ? (
+          <div className="border border-dashed border-line rounded-2xl bg-paper p-6 text-sm text-muted">
+            <strong className="text-ink">No question data yet.</strong>{" "}
+            This section populates after learners submit quiz answers in a
+            cmi5 module. SCORM 1.2 packages don&apos;t emit xAPI statements
+            so their per-question detail isn&apos;t aggregated here.
+          </div>
+        ) : (
+          <div className="border border-line rounded-2xl bg-paper overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
+                <tr>
+                  <th className="text-left px-4 py-2 font-medium">Question</th>
+                  <th className="text-right px-4 py-2 font-medium">Responses</th>
+                  <th className="text-right px-4 py-2 font-medium">Correct</th>
+                  <th className="text-left px-4 py-2 font-medium">
+                    Most common wrong answer
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {interactions.map((q) => {
+                  const wrongs = topWrongByInteraction.get(q.interaction_id) ?? [];
+                  const top = wrongs[0] ?? null;
+                  const restCount = wrongs.slice(1).length;
+                  const correctPct = (q.correct_rate * 100).toFixed(0);
+                  const tone =
+                    q.correct_rate >= 0.7
+                      ? "text-emerald-700"
+                      : q.correct_rate >= 0.4
+                        ? "text-amber-700"
+                        : "text-red-700";
+                  return (
+                    <tr key={q.interaction_id} className="hover:bg-canvas/40">
+                      <td className="px-4 py-3 align-top">
+                        <div className="font-medium">
+                          {q.interaction_label ?? q.interaction_id}
+                        </div>
+                        {q.interaction_label && (
+                          <div className="text-[11px] text-muted mt-0.5">
+                            <code>{q.interaction_id}</code>
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right tabular-nums align-top">
+                        {q.total_responses.toLocaleString()}
+                        <div className="text-[11px] text-muted">
+                          {q.distinct_learners.toLocaleString()}{" "}
+                          {q.distinct_learners === 1 ? "learner" : "learners"}
+                        </div>
+                      </td>
+                      <td
+                        className={`px-4 py-3 text-right tabular-nums font-semibold align-top ${tone}`}
+                      >
+                        {correctPct}%
+                        <div className="text-[11px] text-muted font-normal">
+                          {q.correct_count.toLocaleString()} /{" "}
+                          {q.total_responses.toLocaleString()}
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 align-top">
+                        {top ? (
+                          <>
+                            <div className="text-sm">
+                              <span className="text-ink">{top.response}</span>
+                              <span className="text-muted ml-2">
+                                · {top.freq.toLocaleString()}{" "}
+                                {top.freq === 1 ? "pick" : "picks"}
+                              </span>
+                            </div>
+                            {restCount > 0 && (
+                              <div className="text-[11px] text-muted mt-0.5">
+                                + {restCount} other{" "}
+                                {restCount === 1 ? "wrong answer" : "wrong answers"}
+                              </div>
+                            )}
+                          </>
+                        ) : q.incorrect_count > 0 ? (
+                          <span className="text-xs text-muted italic">
+                            No response text captured
+                          </span>
+                        ) : (
+                          <span className="text-xs text-muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="text-xs text-muted mt-2">
+          Up to 3 wrong-answer variants are tracked per question. Free-text
+          and select-all-that-apply questions often spread across several
+          near-equal distractors — worth a click into the data when the top
+          pick looks small.
+        </p>
       </section>
     </div>
   );
@@ -253,43 +390,44 @@ type StatTone = "default" | "emerald" | "amber" | "red" | "muted";
 function BigStat({
   label,
   value,
-  tone = "default",
   sub,
+  tone = "default",
 }: {
   label: string;
   value: string;
-  tone?: StatTone;
   sub?: string;
+  tone?: StatTone;
 }) {
-  const toneClass: Record<StatTone, string> = {
-    default: "text-ink",
-    emerald: "text-emerald-700",
-    amber: "text-amber-700",
-    red: "text-red-700",
-    muted: "text-muted",
-  };
+  const toneClass =
+    tone === "emerald"
+      ? "text-emerald-700"
+      : tone === "amber"
+        ? "text-amber-700"
+        : tone === "red"
+          ? "text-red-700"
+          : tone === "muted"
+            ? "text-muted"
+            : "text-ink";
   return (
-    <div className="border border-line rounded-2xl bg-paper p-5">
-      <div className="text-xs uppercase tracking-wide text-muted mb-1">
+    <div className="border border-line rounded-xl bg-paper p-4">
+      <div className="text-[10px] text-muted uppercase tracking-wide">
         {label}
       </div>
-      <div className={`text-3xl tabular-nums font-semibold ${toneClass[tone]}`}>
-        {value}
-      </div>
-      {sub && <div className="text-xs text-muted mt-1">{sub}</div>}
+      <div className={`serif text-3xl mt-1 ${toneClass}`}>{value}</div>
+      {sub && <div className="text-[11px] text-muted mt-0.5">{sub}</div>}
     </div>
   );
 }
 
 function humanizeAgo(iso: string): string {
   const t = new Date(iso).getTime();
-  if (!t || t === 0) return "never";
-  const seconds = Math.floor((Date.now() - t) / 1000);
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
+  if (!Number.isFinite(t) || t === 0) return "never";
+  const diffMs = Date.now() - t;
+  if (diffMs < 60_000) return "just now";
+  const m = Math.floor(diffMs / 60_000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
 }
