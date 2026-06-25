@@ -223,12 +223,19 @@ export default async function CoursesIndexPage({
       return v?.course_id === courseId;
     });
     if (courseAttempts.length === 0) return "not_started";
-    const latest = courseAttempts.sort((a, b) =>
-      b.started_at > a.started_at ? 1 : -1
-    )[0];
-    if (latest.success_status === "passed") return "passed";
-    if (latest.success_status === "failed") return "failed";
-    if (latest.completion_status === "completed") return "completed";
+    // Sticky completion: once a learner has ever passed or completed a course
+    // it stays in the Completed bucket forever. Relaunching opens a fresh
+    // in-progress attempt, which must NOT drag the card back to "in progress".
+    // Derive from the best terminal outcome across ALL attempts (mirrors the
+    // `completedCourseIds` logic). Priority: passed > completed > failed.
+    if (courseAttempts.some((a) => a.success_status === "passed")) return "passed";
+    if (
+      courseAttempts.some(
+        (a) => a.completion_status === "completed" && a.success_status !== "failed"
+      )
+    )
+      return "completed";
+    if (courseAttempts.some((a) => a.success_status === "failed")) return "failed";
     return "in_progress";
   }
   function bestScoreForCourse(courseId: string): number | null {
