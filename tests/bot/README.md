@@ -17,6 +17,7 @@ it finds into one report.
 | --- | --- | --- |
 | **1 — Autonomous crawl** | `specs/00-crawl.spec.ts` | Logs in as each role (anonymous, learner, data analyst, admin, platform owner) and BFS-walks every in-app link. On each page it captures: uncaught JS exceptions, console & React-hydration errors, failed network calls (4xx/5xx), framework error pages, accessibility issues, and navigation performance. Also asserts **RBAC boundaries** (a learner must be bounced from `/users`, `/settings`, `/super/*`, etc.). |
 | **2 — Scripted journeys** | `specs/10-journeys.spec.ts` | Flows a crawler can't: bad-credential login, forgot-password, learner dashboard/profile, admin Users/Library/Settings + empty-form validation, platform-owner console. |
+| **2 — Write workflows** | `specs/20-admin-writes.spec.ts` | Real create/assign flows driven through the API as the seeded admin/learner, each **verified to persist** via the service-role client: create team + add member, create learning path, create announcement, learner files a ticket, assign a course org-wide. Plus an RBAC pass: a learner must be rejected from admin-only writes. Everything created is deleted in `afterAll`. Driven via API (not UI forms) so a styling change can't turn a backend regression into a false pass. |
 | **3 — API contract** | `specs/50-api-contract.spec.ts` | Unauthenticated reads must not leak data; cron endpoints must reject secret-less calls; a learner must not be able to drive an admin write. |
 
 Every defect becomes a **Finding** with severity, category, role, URL(s),
