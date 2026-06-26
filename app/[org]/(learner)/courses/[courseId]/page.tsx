@@ -136,15 +136,17 @@ export default async function CourseDetailPage({
   const attempts = (attemptsResp.data ?? []) as Attempt[];
   const versionById = new Map(list.map((v) => [v.id, v]));
 
-  const latestAttempt = attempts[0] ?? null;
-  const isComplete =
-    !!latestAttempt &&
-    (latestAttempt.completion_status === "completed" ||
-      latestAttempt.success_status === "passed");
+  // Sticky completion: a course that was ever completed/passed stays
+  // "complete" even after the learner relaunches it (which opens a fresh
+  // in-progress attempt). Only show "Resume" when there's an open attempt and
+  // the course has never been finished. Otherwise "Relaunch" / "Launch".
+  const isComplete = attempts.some(
+    (a) =>
+      a.completion_status === "completed" || a.success_status === "passed"
+  );
   const isInProgress =
-    !!latestAttempt &&
     !isComplete &&
-    latestAttempt.completion_status === "in_progress";
+    attempts.some((a) => a.completion_status === "in_progress");
 
   const manifestDescription = current?.manifest_data?.description ?? "";
   const description = c.description || manifestDescription;
