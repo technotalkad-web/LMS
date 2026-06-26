@@ -183,6 +183,7 @@ export function UserFilters({
           Team
         </span>
         <select
+          aria-label="Filter by team"
           value={current.teamId}
           onChange={(e) => updateParam("team", e.target.value || null)}
           className="px-3 py-1 border border-line rounded-lg bg-canvas text-xs outline-none focus:border-ink"

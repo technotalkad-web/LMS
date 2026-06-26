@@ -156,14 +156,14 @@ export function OrganizationsTable({
           />
         </div>
         <div className="flex gap-2">
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)} className="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white outline-none">
+          <select aria-label="Filter by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)} className="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white outline-none">
             <option value="all">All statuses</option>
             <option value="active">Active</option>
             <option value="past_due">Past Due</option>
             <option value="suspended">Suspended</option>
             <option value="scheduled_deletion">Scheduled deletion</option>
           </select>
-          <select value={planFilter} onChange={(e) => setPlanFilter(e.target.value as PlanFilter)} className="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white outline-none">
+          <select aria-label="Filter by plan" value={planFilter} onChange={(e) => setPlanFilter(e.target.value as PlanFilter)} className="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white outline-none">
             <option value="all">All plans</option>
             <option value="basic">Basic</option>
             <option value="pro">Pro</option>
@@ -199,6 +199,7 @@ export function OrganizationsTable({
                 </td>
                 <td className="px-6 py-4">
                   <select
+                    aria-label={`Change plan for ${t.name}`}
                     value={t.plan_id ?? ""}
                     onChange={(e) => setPlan(t, e.target.value)}
                     disabled={busy === t.id || t.status === "scheduled_deletion"}

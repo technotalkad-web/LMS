@@ -229,7 +229,7 @@ function PlanCard({
             <button onClick={onEdit} disabled={disabled} className="text-indigo-600 font-semibold hover:underline">
               Edit
             </button>
-            <button onClick={onDelete} disabled={disabled || counts.total > 0} className="text-red-600 hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed">
+            <button aria-label="Delete plan" title="Delete plan" onClick={onDelete} disabled={disabled || counts.total > 0} className="text-red-600 hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed">
               <Trash2 className="w-3.5 h-3.5" />
             </button>
           </div>
