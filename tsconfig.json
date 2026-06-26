@@ -39,7 +39,9 @@
   "exclude": [
     "node_modules",
     "tests/e2e",
+    "tests/bot",
     "playwright.config.ts",
+    "playwright.bot.config.ts",
     "supabase/functions"
   ]
 }
