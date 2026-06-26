@@ -89,6 +89,25 @@ export async function PATCH(
     );
   }
 
+  // ---- Tenant guard: the target user MUST belong to this org. ----
+  // Without this, an admin of org A could overwrite the global `profiles`
+  // row (name/username/DOB/phone/gender) of ANY user in ANY org by passing
+  // their UUID — the profile upsert below runs on the service-role client
+  // (bypassing RLS) and is keyed only on the user id. The membership update
+  // is already org-scoped, but the profile write is not.
+  const { data: targetMem } = await supabase
+    .from("organization_members")
+    .select("user_id")
+    .eq("organization_id", org.id)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!targetMem) {
+    return NextResponse.json(
+      { error: "User is not a member of this organization" },
+      { status: 404 }
+    );
+  }
+
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
