@@ -19,6 +19,7 @@ type PathRow = {
   description: string | null;
   organization_id: string;
   thumbnail_url: string | null;
+  visibility: "private" | "org_public" | null;
 };
 
 type StepRow = {
@@ -60,7 +61,7 @@ export default async function LearningPathDetailPage({
   // 1) Path metadata (must be active).
   const { data: pathRow } = await supabase
     .from("learning_paths")
-    .select("id, name, description, organization_id, is_active, thumbnail_url")
+    .select("id, name, description, organization_id, is_active, thumbnail_url, visibility")
     .eq("id", pathId)
     .eq("organization_id", org.id)
     .maybeSingle();
@@ -97,7 +98,12 @@ export default async function LearningPathDetailPage({
         a.team_id &&
         myTeamIds.includes(a.team_id))
   );
-  if (!isAssigned) redirect(`/${orgSlug}/dashboard?denied=1`);
+  // org_public paths are visible to every member of the org regardless of an
+  // explicit assignment — the dashboard already surfaces them as tiles, so the
+  // detail page must accept them too (otherwise the tile dead-ends in a
+  // "denied" bounce). Mirrors the visibility union in dashboard/page.tsx.
+  const isOrgPublic = path.visibility === "org_public";
+  if (!isAssigned && !isOrgPublic) redirect(`/${orgSlug}/dashboard?denied=1`);
 
   // Earliest due_at across the user's matching assignments.
   const myDueDates = assignments

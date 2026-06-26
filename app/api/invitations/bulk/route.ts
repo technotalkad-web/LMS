@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { checkQuota } from "@/lib/billing/enforce-quota";
 
 /**
  *   POST /api/invitations/bulk
@@ -37,6 +38,30 @@ export async function POST(request: Request) {
     .eq("slug", orgSlug)
     .maybeSingle();
   if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
+
+  // ---- Admin gate (parity with the single POST /api/invitations) ----
+  // The `invitations` admin-only RLS policy already blocks non-admin inserts,
+  // but check explicitly so a non-admin gets a clean 403 instead of a 200
+  // with every row errored — and so the gate doesn't silently depend on RLS.
+  const { data: callerMem } = await supabase
+    .from("organization_members")
+    .select("role")
+    .eq("organization_id", org.id)
+    .eq("user_id", user.id)
+    .maybeSingle();
+  const cr = callerMem?.role as string | undefined;
+  if (!(cr === "super_owner" || cr === "owner" || cr === "admin")) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // ---- Quota + suspension gate (parity with the single-invite path) ----
+  const quota = await checkQuota(org.id as string, "users", 1);
+  if (!quota.ok) {
+    return NextResponse.json(
+      { error: quota.message, reason: quota.reason },
+      { status: 402 }
+    );
+  }
 
   const allowedDomains = ((org.allowed_email_domains ?? []) as string[]).map(
     (d) => d.toLowerCase().trim()
