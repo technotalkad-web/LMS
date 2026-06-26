@@ -50,3 +50,7 @@ next-env.d.ts
 /test-results/
 /playwright/.cache/
 /blob-report/
+
+# testing bot (tests/bot) generated output
+/bot-report/
+/bot-playwright-report/

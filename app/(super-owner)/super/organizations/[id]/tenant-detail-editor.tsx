@@ -195,6 +195,7 @@ export function TenantDetailEditor({
                     value={a.role}
                     onChange={(e) => changeRole(a, e.target.value)}
                     disabled={busy}
+                    aria-label={`Change role for ${a.email}`}
                     className="border border-slate-300 rounded-md px-2 py-1 text-xs bg-white"
                   >
                     {Object.entries(ROLE_LABEL).map(([k, v]) => (
@@ -237,6 +238,7 @@ export function TenantDetailEditor({
               onChange={(e) =>
                 setNewRole(e.target.value as "super_owner" | "admin" | "data_analyst")
               }
+              aria-label="Role for new admin"
               className="border border-slate-300 rounded-md px-3 py-2 text-sm bg-white"
             >
               <option value="admin">Admin</option>
