@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
+import { checkQuota } from "@/lib/billing/enforce-quota";
 
 /**
  *   POST /api/users/bulk
@@ -112,6 +113,26 @@ export async function POST(request: Request) {
   const userIdByEmail = new Map<string, string>();
   for (const u of listed?.users ?? []) {
     if (u.email) userIdByEmail.set(u.email.toLowerCase(), u.id);
+  }
+
+  // ---- Quota + suspension gate (parity with POST /api/users) ----
+  // The single-user create path calls checkQuota; this loop previously did
+  // not, letting an admin bypass the plan's seat cap and add users to a
+  // suspended/cancelled tenant. Count distinct NEW emails (rows that will
+  // consume a seat) and gate the whole upload on them.
+  const prospectiveNewEmails = new Set<string>();
+  for (const r of rows) {
+    const e = (r.email ?? "").trim().toLowerCase();
+    if (e && !userIdByEmail.has(e)) prospectiveNewEmails.add(e);
+  }
+  if (prospectiveNewEmails.size > 0) {
+    const quota = await checkQuota(org.id as string, "users", prospectiveNewEmails.size);
+    if (!quota.ok) {
+      return NextResponse.json(
+        { error: quota.message, reason: quota.reason },
+        { status: 402 }
+      );
+    }
   }
 
   // ---- #162: Pre-fetch / batch-create teams referenced in the CSV ----
