@@ -81,6 +81,13 @@ export async function PATCH(
       .update({
         billing_status: "active",
         suspended_at: null,
+        // B4: clear the stale past_due marker AND advance the billing period,
+        // otherwise the daily billing cron immediately re-flips the tenant to
+        // past_due (current_period_end in the past) and re-suspends it.
+        past_due_at: null,
+        current_period_end: new Date(
+          Date.now() + 30 * 24 * 60 * 60 * 1000
+        ).toISOString(),
         updated_at: new Date().toISOString(),
       })
       .eq("organization_id", tenantId);
@@ -125,6 +132,10 @@ export async function PATCH(
           billing_status: "active",
           suspended_at: null,
           past_due_at: null,
+          // B4: advance the period so the billing cron doesn't re-flip to past_due.
+          current_period_end: new Date(
+            Date.now() + 30 * 24 * 60 * 60 * 1000
+          ).toISOString(),
           updated_at: new Date().toISOString(),
         },
         { onConflict: "organization_id" }

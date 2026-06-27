@@ -83,6 +83,18 @@ export async function POST(request: NextRequest) {
       );
     }
   }
+  // Storage quota on real bytes (B5): every upload — new course OR new version —
+  // adds the package's footprint, so check it for all uploads.
+  const deltaMb = Math.ceil(zipBytes.length / (1024 * 1024));
+  if (deltaMb > 0) {
+    const storageQuota = await checkQuota(org.id as string, "storage_mb", deltaMb);
+    if (!storageQuota.ok) {
+      return NextResponse.json(
+        { error: storageQuota.message, reason: storageQuota.reason },
+        { status: 402 }
+      );
+    }
+  }
   const thumbnailUrlRaw = form.get("thumbnail_url");
   const thumbnailUrl =
     typeof thumbnailUrlRaw === "string" && thumbnailUrlRaw.trim()
