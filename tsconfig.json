@@ -42,6 +42,7 @@
     "tests/bot",
     "playwright.config.ts",
     "playwright.bot.config.ts",
+    "playwright.lifecycle.config.ts",
     "supabase/functions"
   ]
 }
