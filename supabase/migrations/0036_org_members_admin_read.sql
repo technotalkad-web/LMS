@@ -14,16 +14,20 @@
 --   this policy — no recursion), but no policy was ever added to use them.
 --
 -- This policy is PERMISSIVE, so it ORs with the existing "own memberships"
--- policy: a learner still sees their own row; an admin/analyst sees every
+-- policy: a learner still sees their own row; an admin/super_owner sees every
 -- member of orgs they administer. is_org_admin(organization_id) scopes the
--- read to the caller's own org, preserving tenant isolation.
+-- read to the caller's own org, preserving tenant isolation. (is_org_admin
+-- already covers super_owner + admin + legacy owner.)
+--
+-- NOTE: we intentionally use ONLY is_org_admin here. is_org_data_analyst()
+-- (defined in 0010) is not present on all deployed databases, and the admin
+-- Users page is gated to admins/super_owners (canManage) anyway, so the
+-- analyst branch is unnecessary for this fix and would fail where the helper
+-- was never applied.
 
 drop policy if exists "admins read org memberships" on public.organization_members;
 create policy "admins read org memberships"
   on public.organization_members for select
-  using (
-    public.is_org_admin(organization_id)
-    or public.is_org_data_analyst(organization_id)
-  );
+  using (public.is_org_admin(organization_id));
 
 notify pgrst, 'reload schema';
