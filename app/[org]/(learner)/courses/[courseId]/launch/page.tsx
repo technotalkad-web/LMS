@@ -38,10 +38,10 @@ export default async function LaunchPage({
   searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
-  searchParams: Promise<{ lang?: string }>;
+  searchParams: Promise<{ lang?: string; lp?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
-  const { lang: langParam } = await searchParams;
+  const { lang: langParam, lp: lpParam } = await searchParams;
   const { user, org } = await requireOrgAccess(orgSlug);
 
   const supabase = await createClient();
@@ -140,7 +140,10 @@ export default async function LaunchPage({
   const v = version as Version;
 
   // PREREQ LOCK: if this course is in a learning path the user is assigned
-  // to, every earlier step in that path must be completed first.
+  // to, every earlier step in that path must be completed first — UNLESS
+  // the path's sequence_mode is 'random', in which case the prereq lock
+  // is intentionally skipped per admin choice. The check itself is gated
+  // by the per-path sequence_mode lookup further down (#188).
   const { data: pathStepRows } = await supabase
     .from("learning_path_courses")
     .select("path_id, step_number")
@@ -186,11 +189,25 @@ export default async function LaunchPage({
         .map((a) => a.path_id)
     );
     if (assignedPathIds.size > 0) {
-      const relevant = stepInPaths.filter((s) => assignedPathIds.has(s.path_id));
+      // Filter out 'random' sequence-mode paths from the prereq lock —
+      // those paths intentionally let learners take steps in any order.
+      const { data: pathModeRows } = await supabase
+        .from("learning_paths")
+        .select("id, sequence_mode")
+        .in("id", Array.from(assignedPathIds));
+      const strictPathIds = new Set(
+        ((pathModeRows ?? []) as Array<{
+          id: string;
+          sequence_mode: string | null;
+        }>)
+          .filter((p) => (p.sequence_mode ?? "strict") === "strict")
+          .map((p) => p.id)
+      );
+      const relevant = stepInPaths.filter((s) => strictPathIds.has(s.path_id));
       const { data: allStepRows } = await supabase
         .from("learning_path_courses")
         .select("path_id, course_id, step_number")
-        .in("path_id", Array.from(assignedPathIds));
+        .in("path_id", Array.from(strictPathIds));
       const allSteps = (allStepRows ?? []) as Array<{
         path_id: string;
         course_id: string;
@@ -263,6 +280,16 @@ export default async function LaunchPage({
     attemptId = existing.id;
     cmi = (existing.cmi_data ?? {}) as CmiData;
   } else {
+    // ?lp=<pathId> threads through from the path detail page so reports
+    // can slice attempts by which learning path they were launched from.
+    // We trust the param only if it points at a path the user is actually
+    // assigned to (or that's org_public) and that contains this course as
+    // a step — otherwise NULL so reports stay honest.
+    let pathContextId: string | null = null;
+    if (lpParam) {
+      const stepMatch = stepInPaths.some((s) => s.path_id === lpParam);
+      if (stepMatch) pathContextId = lpParam;
+    }
     const { data: created } = await supabase
       .from("course_attempts")
       .insert({
@@ -271,6 +298,7 @@ export default async function LaunchPage({
         organization_id: org.id,
         status: "in_progress",
         cmi_data: {},
+        learning_path_id: pathContextId,
       })
       .select("id")
       .single();

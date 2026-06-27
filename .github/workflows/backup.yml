@@ -63,15 +63,24 @@ jobs:
           # Ubuntu 24.04 ships pg_dump 16 by default; pin to 17 for
           # forward compat with newer Supabase Postgres versions.
           sudo apt-get update
-          sudo apt-get install -y wget ca-certificates gnupg
+          sudo apt-get install -y wget ca-certificates gnupg unzip
           # Postgres APT repo for pg_dump 17
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
             sudo gpg --dearmor -o /etc/apt/keyrings/postgres.gpg
           echo "deb [signed-by=/etc/apt/keyrings/postgres.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
             sudo tee /etc/apt/sources.list.d/postgres.list
           sudo apt-get update
-          sudo apt-get install -y postgresql-client-17 awscli
+          sudo apt-get install -y postgresql-client-17
           pg_dump --version
+          # AWS CLI v2 via official installer.
+          # Ubuntu 24.04 (noble) removed the `awscli` apt package because
+          # the v1 series was deprecated. AWS now ships only v2 via this
+          # zip installer — see https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2-linux.html.
+          # We install to a temp prefix so subsequent steps find it on PATH.
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          sudo /tmp/aws/install --update
+          aws --version
 
       - name: Dump database
         env:

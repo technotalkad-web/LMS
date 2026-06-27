@@ -10,6 +10,7 @@ export type CourseDetails = {
   duration_minutes: number | null;
   is_active: boolean;
   thumbnail_url: string | null;
+  visibility: "private" | "org_public";
 };
 
 export function DetailsForm({
@@ -46,6 +47,7 @@ export function DetailsForm({
         duration_minutes: form.duration_minutes,
         is_active: form.is_active,
         thumbnail_url: form.thumbnail_url,
+        visibility: form.visibility,
       }),
     });
     setBusy(false);
@@ -116,6 +118,12 @@ export function DetailsForm({
           onChange={(url) => set("thumbnail_url", url)}
         />
       </Field>
+
+      <VisibilityRadio
+        value={form.visibility}
+        onChange={(v) => set("visibility", v)}
+        assetKind="course"
+      />
 
       {error && (
         <div className="border border-red-200 bg-red-50 text-red-900 rounded-lg p-3 text-sm">
@@ -204,5 +212,81 @@ function Field({
       </span>
       {children}
     </label>
+  );
+}
+
+/**
+ * Visibility radio used by both the course Details form and the
+ * learning-path Details form. Exported so the path form can reuse it.
+ *
+ * - private    → only specifically-assigned learners see this asset
+ * - org_public → every member of the org sees it on their dashboard
+ *                and can launch it directly. No assignment row required.
+ */
+export function VisibilityRadio({
+  value,
+  onChange,
+  assetKind,
+}: {
+  value: "private" | "org_public";
+  onChange: (next: "private" | "org_public") => void;
+  assetKind: "course" | "learning path";
+}) {
+  return (
+    <div className="block">
+      <span className="block text-xs font-medium text-muted mb-1.5">
+        Who can see this {assetKind}?
+      </span>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <VisibilityOption
+          selected={value === "private"}
+          onClick={() => onChange("private")}
+          title="Assigned only"
+          description={`Only learners with an explicit assignment see this ${assetKind} on their dashboard.`}
+        />
+        <VisibilityOption
+          selected={value === "org_public"}
+          onClick={() => onChange("org_public")}
+          title="Everyone in this org"
+          description={`Every member of the workspace sees this ${assetKind} on their dashboard and can launch it directly.`}
+        />
+      </div>
+    </div>
+  );
+}
+
+function VisibilityOption({
+  selected,
+  onClick,
+  title,
+  description,
+}: {
+  selected: boolean;
+  onClick: () => void;
+  title: string;
+  description: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`text-left border rounded-xl p-3 transition-colors ${
+        selected
+          ? "border-ink bg-canvas"
+          : "border-line bg-paper hover:border-ink"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={`inline-block w-3 h-3 rounded-full border-2 ${
+            selected ? "border-ink bg-ink" : "border-line bg-paper"
+          }`}
+        />
+        <span className="text-sm font-medium">{title}</span>
+      </div>
+      <div className="text-xs text-muted mt-1.5 leading-relaxed">
+        {description}
+      </div>
+    </button>
   );
 }

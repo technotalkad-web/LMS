@@ -34,6 +34,7 @@ type Course = {
   duration_minutes: number | null;
   is_active: boolean;
   thumbnail_url: string | null;
+  visibility: "private" | "org_public";
 };
 
 type TeamRow = { id: string; name: string; slug: string };
@@ -53,7 +54,7 @@ export default async function AdminCourseDetailPage({
   const { data: course } = await supabase
     .from("courses")
     .select(
-      "id, slug, title, description, status, current_version_id, organization_id, duration_minutes, is_active, thumbnail_url"
+      "id, slug, title, description, status, current_version_id, organization_id, duration_minutes, is_active, thumbnail_url, visibility"
     )
     .eq("id", courseId)
     .eq("organization_id", org.id)
@@ -283,6 +284,7 @@ export default async function AdminCourseDetailPage({
     duration_minutes: c.duration_minutes,
     is_active: c.is_active,
     thumbnail_url: c.thumbnail_url,
+    visibility: c.visibility ?? "private",
   };
 
   return (

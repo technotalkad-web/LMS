@@ -6,8 +6,15 @@ import { createClient } from "@/lib/supabase/server";
  *   DELETE /api/learning-paths/[id]
  *
  * Admin-only via RLS. PATCH accepts any subset of: name, description,
- * duration_minutes, is_active.
+ * duration_minutes, is_active, thumbnail_url, visibility, sequence_mode.
  */
+
+const VISIBILITY_VALUES = ["private", "org_public"] as const;
+type Visibility = (typeof VISIBILITY_VALUES)[number];
+
+const SEQUENCE_MODE_VALUES = ["strict", "random"] as const;
+type SequenceMode = (typeof SEQUENCE_MODE_VALUES)[number];
+
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -19,6 +26,8 @@ export async function PATCH(
     duration_minutes?: number | string | null;
     is_active?: boolean;
     thumbnail_url?: string | null;
+    visibility?: string;
+    sequence_mode?: string;
   };
   const update: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
@@ -55,6 +64,28 @@ export async function PATCH(
   }
   if (body.thumbnail_url !== undefined) {
     update.thumbnail_url = body.thumbnail_url || null;
+  }
+  if (body.visibility !== undefined) {
+    if (!VISIBILITY_VALUES.includes(body.visibility as Visibility)) {
+      return NextResponse.json(
+        {
+          error: `visibility must be one of: ${VISIBILITY_VALUES.join(", ")}`,
+        },
+        { status: 400 }
+      );
+    }
+    update.visibility = body.visibility;
+  }
+  if (body.sequence_mode !== undefined) {
+    if (!SEQUENCE_MODE_VALUES.includes(body.sequence_mode as SequenceMode)) {
+      return NextResponse.json(
+        {
+          error: `sequence_mode must be one of: ${SEQUENCE_MODE_VALUES.join(", ")}`,
+        },
+        { status: 400 }
+      );
+    }
+    update.sequence_mode = body.sequence_mode;
   }
 
   if (Object.keys(update).length === 1) {

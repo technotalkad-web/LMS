@@ -34,6 +34,7 @@ type Course = {
   current_version_id: string | null;
   updated_at: string;
   thumbnail_url: string | null;
+  visibility?: "private" | "org_public";
 };
 
 type Version = {
@@ -160,8 +161,23 @@ export default async function CoursesIndexPage({
   }
   const pathCourseIds = Array.from(pathNameByCourseId.keys());
 
+  // ---- Org-public courses (#visibility) ----
+  // Every member of the org sees these regardless of assignment. We pull
+  // them separately and union with the assigned/path-based set. Cards
+  // sourced only via org_public are tagged source='org' so the existing
+  // UI affordances ("Org-wide") describe them correctly.
+  const { data: orgPublicCourseRows } = await supabase
+    .from("courses")
+    .select("id")
+    .eq("organization_id", org.id)
+    .eq("is_active", true)
+    .eq("visibility", "org_public");
+  const orgPublicCourseIds = ((orgPublicCourseRows ?? []) as Array<{
+    id: string;
+  }>).map((r) => r.id);
+
   const allCourseIds = Array.from(
-    new Set([...directCourseIds, ...pathCourseIds])
+    new Set([...directCourseIds, ...pathCourseIds, ...orgPublicCourseIds])
   );
 
   // ---- Empty state ----
@@ -173,7 +189,7 @@ export default async function CoursesIndexPage({
   const { data: courseRows } = await supabase
     .from("courses")
     .select(
-      "id, title, description, current_version_id, updated_at, thumbnail_url"
+      "id, title, description, current_version_id, updated_at, thumbnail_url, visibility"
     )
     .eq("is_active", true)
     .in("id", allCourseIds);
@@ -207,12 +223,19 @@ export default async function CoursesIndexPage({
       return v?.course_id === courseId;
     });
     if (courseAttempts.length === 0) return "not_started";
-    const latest = courseAttempts.sort((a, b) =>
-      b.started_at > a.started_at ? 1 : -1
-    )[0];
-    if (latest.success_status === "passed") return "passed";
-    if (latest.success_status === "failed") return "failed";
-    if (latest.completion_status === "completed") return "completed";
+    // Sticky completion: once a learner has ever passed or completed a course
+    // it stays in the Completed bucket forever. Relaunching opens a fresh
+    // in-progress attempt, which must NOT drag the card back to "in progress".
+    // Derive from the best terminal outcome across ALL attempts (mirrors the
+    // `completedCourseIds` logic). Priority: passed > completed > failed.
+    if (courseAttempts.some((a) => a.success_status === "passed")) return "passed";
+    if (
+      courseAttempts.some(
+        (a) => a.completion_status === "completed" && a.success_status !== "failed"
+      )
+    )
+      return "completed";
+    if (courseAttempts.some((a) => a.success_status === "failed")) return "failed";
     return "in_progress";
   }
   function bestScoreForCourse(courseId: string): number | null {
@@ -268,6 +291,27 @@ export default async function CoursesIndexPage({
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
       pathName,
+      thumbnail_url: course.thumbnail_url,
+    });
+    seen.add(cid);
+  }
+  // Org-public courses not already pulled in via assignment or path.
+  // These show up to every member of the org. Tag source='org' so the
+  // existing pill UI labels them as org-wide.
+  for (const cid of orgPublicCourseIds) {
+    if (seen.has(cid)) continue;
+    const course = courseById.get(cid);
+    if (!course) continue;
+    cards.push({
+      course_id: course.id,
+      title: course.title,
+      description: course.description,
+      source: "org",
+      status: attemptStatusForCourse(cid),
+      isRevised: false,
+      dueAt: null,
+      bestScore: bestScoreForCourse(cid),
+      pathName: null,
       thumbnail_url: course.thumbnail_url,
     });
     seen.add(cid);

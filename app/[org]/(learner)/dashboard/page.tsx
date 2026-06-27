@@ -168,6 +168,36 @@ export default async function DashboardPage({
       pathDueAt.set(a.path_id, a.due_at);
     }
   }
+
+  // 2.5) Org-public visibility (#visibility). Every org member sees
+  // org_public courses + paths on their dashboard regardless of any
+  // explicit assignment. We fold the path ids into pathSrcRank with
+  // the 'org' tier so they're picked up by the existing step / title
+  // pull-through logic. The course ids are stored separately and
+  // unioned into allCourseIds below.
+  const { data: orgPublicCourseRows } = await supabase
+    .from("courses")
+    .select("id")
+    .eq("organization_id", org.id)
+    .eq("is_active", true)
+    .eq("visibility", "org_public");
+  const orgPublicCourseIds = ((orgPublicCourseRows ?? []) as Array<{
+    id: string;
+  }>).map((r) => r.id);
+
+  const { data: orgPublicPathRows } = await supabase
+    .from("learning_paths")
+    .select("id")
+    .eq("organization_id", org.id)
+    .eq("is_active", true)
+    .eq("visibility", "org_public");
+  for (const r of (orgPublicPathRows ?? []) as Array<{ id: string }>) {
+    if (!pathSrcRank.has(r.id)) {
+      pathSrcRank.set(r.id, prec.org);
+      pathDueAt.set(r.id, null);
+    }
+  }
+
   const myPathIds = Array.from(pathSrcRank.keys());
 
   // 3) Path metadata + steps + course titles (active only).
@@ -211,9 +241,10 @@ export default async function DashboardPage({
     new Set(allPathSteps.map((s) => s.course_id))
   );
 
-  // 4) Combined course universe.
+  // 4) Combined course universe. orgPublicCourseIds is fetched above (3.5)
+  //    and folded in so every member of the org sees those courses too.
   const allCourseIds = Array.from(
-    new Set([...directCourseIds, ...pathCourseIds])
+    new Set([...directCourseIds, ...pathCourseIds, ...orgPublicCourseIds])
   );
   if (allCourseIds.length === 0) {
     return (
@@ -360,12 +391,19 @@ export default async function DashboardPage({
       return v?.course_id === courseId;
     });
     if (courseAttempts.length === 0) return "not_started";
-    const latest = courseAttempts.sort((a, b) =>
-      b.started_at > a.started_at ? 1 : -1
-    )[0];
-    if (latest.success_status === "passed") return "passed";
-    if (latest.success_status === "failed") return "failed";
-    if (latest.completion_status === "completed") return "completed";
+    // Sticky completion: once a learner has ever passed or completed a course
+    // it stays in the Completed bucket forever. Relaunching opens a fresh
+    // in-progress attempt, which must NOT drag the card back to "in progress".
+    // Derive from the best terminal outcome across ALL attempts (mirrors the
+    // `completedCourseIds` logic). Priority: passed > completed > failed.
+    if (courseAttempts.some((a) => a.success_status === "passed")) return "passed";
+    if (
+      courseAttempts.some(
+        (a) => a.completion_status === "completed" && a.success_status !== "failed"
+      )
+    )
+      return "completed";
+    if (courseAttempts.some((a) => a.success_status === "failed")) return "failed";
     return "in_progress";
   }
 

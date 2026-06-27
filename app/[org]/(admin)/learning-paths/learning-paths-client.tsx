@@ -12,6 +12,7 @@ import type {
   TeamOption,
 } from "./page";
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
+import { VisibilityRadio } from "../library/[courseId]/details-form";
 import {
   AdminPageHeader,
   KpiStrip,
@@ -90,6 +91,8 @@ export function LearningPathsClient({
         duration_minutes: string;
         is_active: boolean;
         thumbnail_url: string | null;
+        visibility: "private" | "org_public";
+        sequence_mode: "strict" | "random";
       }
     >
   >({});
@@ -117,6 +120,8 @@ export function LearningPathsClient({
           p.duration_minutes !== null ? String(p.duration_minutes) : "",
         is_active: p.is_active,
         thumbnail_url: p.thumbnail_url,
+        visibility: p.visibility ?? "private",
+        sequence_mode: p.sequence_mode ?? "strict",
       },
     }));
     setEditing((s) => ({ ...s, [p.id]: true }));
@@ -137,6 +142,8 @@ export function LearningPathsClient({
         duration_minutes: f.duration_minutes === "" ? null : f.duration_minutes,
         is_active: f.is_active,
         thumbnail_url: f.thumbnail_url,
+        visibility: f.visibility,
+        sequence_mode: f.sequence_mode,
       }),
     });
     if (!res.ok) {
@@ -668,6 +675,25 @@ export function LearningPathsClient({
                             }
                           />
                         </div>
+                        <VisibilityRadio
+                          value={editForm[p.id].visibility}
+                          onChange={(v) =>
+                            setEditForm((s) => ({
+                              ...s,
+                              [p.id]: { ...s[p.id], visibility: v },
+                            }))
+                          }
+                          assetKind="learning path"
+                        />
+                        <SequenceModeRadio
+                          value={editForm[p.id].sequence_mode}
+                          onChange={(v) =>
+                            setEditForm((s) => ({
+                              ...s,
+                              [p.id]: { ...s[p.id], sequence_mode: v },
+                            }))
+                          }
+                        />
                       </div>
                     )}
 
@@ -915,6 +941,19 @@ export function LearningPathsClient({
                       />
                     </div>
 
+                    {/* Path reports link */}
+                    <div className="flex items-center justify-between border-t border-line pt-3">
+                      <span className="text-[11px] uppercase tracking-wider font-semibold text-muted">
+                        Reports
+                      </span>
+                      <a
+                        href={`/${orgSlug}/learning-paths/${p.id}/reports`}
+                        className="text-xs px-3 py-1.5 border border-line rounded-lg hover:border-ink transition-colors"
+                      >
+                        View path reports →
+                      </a>
+                    </div>
+
                     {/* Enrolled learners */}
                     <div>
                       <button
@@ -1021,5 +1060,78 @@ function PathEnrolledTable({ enrollees }: { enrollees: PathEnrollee[] }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+/**
+ * Sequence mode radio for the path inline editor. Strict (default)
+ * enforces step ordering at launch; Random allows learners to complete
+ * steps in any order. The launch page reads learning_paths.sequence_mode
+ * to decide whether to apply the prereq lock when a learner clicks into
+ * a course that lives inside a path they're assigned to.
+ */
+function SequenceModeRadio({
+  value,
+  onChange,
+}: {
+  value: "strict" | "random";
+  onChange: (next: "strict" | "random") => void;
+}) {
+  return (
+    <div className="block">
+      <span className="block text-xs font-medium text-muted mb-1.5">
+        How should learners complete the steps?
+      </span>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <SequenceOption
+          selected={value === "strict"}
+          onClick={() => onChange("strict")}
+          title="In order (strict)"
+          description="Each step unlocks only after the previous one is completed. Best for foundational programs where order matters."
+        />
+        <SequenceOption
+          selected={value === "random"}
+          onClick={() => onChange("random")}
+          title="Any order (random)"
+          description="Learners can take steps in any order they choose. Best for refresher kits or mix-and-match certifications."
+        />
+      </div>
+    </div>
+  );
+}
+
+function SequenceOption({
+  selected,
+  onClick,
+  title,
+  description,
+}: {
+  selected: boolean;
+  onClick: () => void;
+  title: string;
+  description: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`text-left border rounded-xl p-3 transition-colors ${
+        selected
+          ? "border-ink bg-canvas"
+          : "border-line bg-paper hover:border-ink"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={`inline-block w-3 h-3 rounded-full border-2 ${
+            selected ? "border-ink bg-ink" : "border-line bg-paper"
+          }`}
+        />
+        <span className="text-sm font-medium">{title}</span>
+      </div>
+      <div className="text-xs text-muted mt-1.5 leading-relaxed">
+        {description}
+      </div>
+    </button>
   );
 }
