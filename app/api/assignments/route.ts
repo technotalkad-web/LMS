@@ -83,6 +83,31 @@ export async function POST(request: Request) {
   };
   const rows: Row[] = [];
 
+  // Tenant guard: keep only assignees that actually belong to this org. The
+  // rows are inserted and the assignees are then emailed via the service-role
+  // notifier, so unvalidated user_ids/team_ids would leak assignments + PII to
+  // another tenant's users.
+  const reqUserIds = (body.userIds ?? []).filter(Boolean);
+  const reqTeamIds = (body.teamIds ?? []).filter(Boolean);
+  let validUserIds: string[] = [];
+  let validTeamIds: string[] = [];
+  if (reqUserIds.length) {
+    const { data: m } = await supabase
+      .from("organization_members")
+      .select("user_id")
+      .eq("organization_id", org.id)
+      .in("user_id", reqUserIds);
+    validUserIds = ((m ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
+  }
+  if (reqTeamIds.length) {
+    const { data: t } = await supabase
+      .from("teams")
+      .select("id")
+      .eq("organization_id", org.id)
+      .in("id", reqTeamIds);
+    validTeamIds = ((t ?? []) as Array<{ id: string }>).map((r) => r.id);
+  }
+
   if (body.assignToOrg) {
     rows.push({
       course_id: course.id,
@@ -94,8 +119,7 @@ export async function POST(request: Request) {
       assigned_by: user.id,
     });
   }
-  for (const uid of body.userIds ?? []) {
-    if (!uid) continue;
+  for (const uid of validUserIds) {
     rows.push({
       course_id: course.id,
       organization_id: org.id,
@@ -106,8 +130,7 @@ export async function POST(request: Request) {
       assigned_by: user.id,
     });
   }
-  for (const tid of body.teamIds ?? []) {
-    if (!tid) continue;
+  for (const tid of validTeamIds) {
     rows.push({
       course_id: course.id,
       organization_id: org.id,

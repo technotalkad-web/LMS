@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
+import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { languageDisplay } from "@/lib/i18n/languages";
 import {
@@ -77,6 +78,18 @@ export default async function CourseDetailPage({
     redirect(`/${orgSlug}/dashboard`);
   }
   const c = course as Course;
+
+  // Entitlement: only assigned (direct/org/team) or org_public courses are
+  // viewable by learners — closes the private/unassigned-course IDOR. Admins
+  // preview freely.
+  const canAccess = await learnerCanAccessCourse({
+    supabase,
+    orgId: org.id,
+    userId: user.id,
+    courseId: c.id,
+    isAdmin,
+  });
+  if (!canAccess) redirect(`/${orgSlug}/dashboard?denied=1`);
 
   const { data: versions } = await supabase
     .from("course_versions")

@@ -150,8 +150,28 @@ export async function POST(request: Request) {
       .eq("organization_id", org.id);
     for (const m of om ?? []) recipientIds.add(m.user_id as string);
   }
+  // Tenant guard: restrict recipients to members of THIS org regardless of how
+  // the audience was specified. user_ids/team_id/course_id/path_id come from the
+  // request and are resolved via the service-role client (bypasses RLS), so
+  // without this an admin could email/notify another tenant's users.
+  if (recipientIds.size > 0) {
+    const { data: orgMembers } = await svc
+      .from("organization_members")
+      .select("user_id")
+      .eq("organization_id", org.id)
+      .in("user_id", Array.from(recipientIds));
+    const allowed = new Set(
+      ((orgMembers ?? []) as Array<{ user_id: string }>).map((m) => m.user_id)
+    );
+    for (const id of Array.from(recipientIds)) {
+      if (!allowed.has(id)) recipientIds.delete(id);
+    }
+  }
   if (recipientIds.size === 0) {
-    return NextResponse.json({ error: "No recipients" }, { status: 400 });
+    return NextResponse.json(
+      { error: "No recipients in this organization" },
+      { status: 400 }
+    );
   }
 
   // ---- Resolve action buttons (course/path/profile/custom) → URLs -----

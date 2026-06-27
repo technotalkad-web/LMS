@@ -97,7 +97,7 @@ export async function PATCH(
   // is already org-scoped, but the profile write is not.
   const { data: targetMem } = await supabase
     .from("organization_members")
-    .select("user_id")
+    .select("user_id, role")
     .eq("organization_id", org.id)
     .eq("user_id", userId)
     .maybeSingle();
@@ -105,6 +105,18 @@ export async function PATCH(
     return NextResponse.json(
       { error: "User is not a member of this organization" },
       { status: 404 }
+    );
+  }
+
+  // Privilege-escalation guard: only a super_owner may modify another
+  // super_owner/owner (role, status, or profile). Without this an admin could
+  // PATCH a super_owner's membership to lms_role:"user" — via the service-role
+  // client below, which bypasses RLS — and dethrone the org's actual owner.
+  const targetRole = (targetMem as { role?: string }).role;
+  if ((targetRole === "super_owner" || targetRole === "owner") && !isSuperOwner) {
+    return NextResponse.json(
+      { error: "Only super owners can modify another super owner" },
+      { status: 403 }
     );
   }
 

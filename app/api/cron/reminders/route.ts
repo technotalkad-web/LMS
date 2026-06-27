@@ -124,11 +124,23 @@ export async function POST(request: Request) {
     orgUserIds.set(oid, s);
   }
 
-  // Completed pairs
-  const { data: completedAttempts } = await svc
+  // Completed pairs. `!inner` makes the embedded-column filter actually
+  // restrict parent rows to the courses we care about (without it the filter
+  // is a no-op and scans all attempts). Capture the error and ABORT on failure
+  // — proceeding with an empty completed-set would re-nudge learners who have
+  // already finished (the skip-guard below relies on this set being complete).
+  const { data: completedAttempts, error: completedErr } = await svc
     .from("course_attempts")
-    .select("user_id, course_versions(course_id), completion_status, success_status")
+    .select(
+      "user_id, course_versions!inner(course_id), completion_status, success_status"
+    )
     .in("course_versions.course_id", courseIds);
+  if (completedErr) {
+    return NextResponse.json(
+      { error: `reminders: completed-attempts query failed: ${completedErr.message}` },
+      { status: 500 }
+    );
+  }
   const completedPairs = new Set<string>(); // `user|course`
   for (const a of completedAttempts ?? []) {
     const row = a as {
