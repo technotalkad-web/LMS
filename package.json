@@ -51,6 +51,7 @@
     "dotenv": "^16.4.5",
     "eslint": "^9",
     "eslint-config-next": "~15.5.18",
+    "imapflow": "^1.4.3",
     "tailwindcss": "^4",
     "typescript": "^5",
     "wrangler": "^4.86.0"
