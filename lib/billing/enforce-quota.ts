@@ -1,20 +1,18 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 
 /**
- * Quota enforcement. The super-owner-defined subscription_plans table
- * holds caps on users / storage / courses per tenant; this module
- * checks them BEFORE the corresponding create operation runs.
+ * Quota enforcement (pre-flight). The hard, atomic guarantee lives in DB
+ * triggers (migration 0038, enforce_row_quota) which lock the org row and
+ * re-count inside the insert's own transaction — eliminating the check-then-
+ * create TOCTOU race. This function is the friendly pre-check so the UI can
+ * show a clear "limit reached / upgrade" message before attempting the write.
  *
- * Call patterns:
- *   const q = await checkQuota(orgId, "users");
- *   if (!q.ok) return NextResponse.json({ error: q.message }, { status: 402 });
+ * Cap resolution is centralized in SQL (`effective_cap`): per-tenant override →
+ * plan → BASIC default, with a manual grace period treated as unlimited. We
+ * call that same function here so the pre-check and the trigger never diverge.
  *
- * 402 (Payment Required) is the semantic status — billing tier is the
- * reason we said no. Frontend can detect this and show a "Upgrade plan"
- * CTA.
- *
- * Suspended/cancelled tenants are blocked from ALL creates regardless
- * of cap.
+ * Suspended/cancelled tenants are blocked from ALL creates regardless of cap.
+ * On any lookup error we fail CLOSED.
  */
 
 export type QuotaKind = "users" | "courses" | "storage_mb";
@@ -38,80 +36,67 @@ export async function checkQuota(
 ): Promise<QuotaCheck> {
   const s = svc();
 
-  // 1) Subscription + plan cap.
-  const { data: subRaw } = await s
+  // 1) Billing status gate. Suspended/cancelled → no creates. Fail closed.
+  const { data: subRow, error: subErr } = await s
     .from("tenant_subscriptions")
-    .select("billing_status, plan_id, subscription_plans(max_users,max_courses,max_storage_gb)")
+    .select("billing_status")
     .eq("organization_id", organizationId)
     .maybeSingle();
-
-  // Defensive default: no sub row means we treat the tenant as Basic
-  // (rather than letting them through with no limits). Admins running
-  // a fresh dev DB will hit this branch.
-  const sub = subRaw as
-    | {
-        billing_status: string;
-        plan_id: string | null;
-        subscription_plans: {
-          max_users: number | null;
-          max_courses: number | null;
-          max_storage_gb: number | null;
-        } | null;
-      }
-    | null;
-
-  if (sub && (sub.billing_status === "suspended" || sub.billing_status === "cancelled")) {
+  if (subErr) {
+    return {
+      ok: false,
+      reason: "quota_check_failed",
+      message: "Couldn't verify your subscription right now. Please try again.",
+    };
+  }
+  const status = (subRow as { billing_status?: string } | null)?.billing_status;
+  if (status === "suspended" || status === "cancelled") {
     return {
       ok: false,
       reason: "tenant_suspended",
-      message: `This workspace is ${sub.billing_status}. Contact the billing admin to restore service.`,
+      message: `This workspace is ${status}. Contact the billing admin to restore service.`,
     };
   }
 
-  const plan = sub?.subscription_plans ?? null;
-  const cap =
-    kind === "users"
-      ? plan?.max_users ?? null
-      : kind === "courses"
-        ? plan?.max_courses ?? null
-        : (plan?.max_storage_gb ?? null) === null
-          ? null
-          : (plan!.max_storage_gb as number) * 1024;
-
-  if (cap === null) {
-    // Unlimited (Enterprise) or unknown plan — allow.
-    return { ok: true, remaining: null, cap: null };
+  // 2) Effective cap via the same SQL the DB trigger uses
+  //    (override → plan → basic; manual grace period = unlimited).
+  const { data: capRaw, error: capErr } = await s.rpc("effective_cap", {
+    org_id: organizationId,
+    kind,
+  });
+  if (capErr) {
+    return {
+      ok: false,
+      reason: "quota_check_failed",
+      message: "Couldn't verify your plan limits right now. Please try again.",
+    };
   }
+  if (capRaw === null || capRaw === undefined) {
+    return { ok: true, remaining: null, cap: null }; // unlimited
+  }
+  const cap = Number(capRaw);
 
-  // 2) Current usage from the tenant_usage view.
-  const { data: usageRaw } = await s
-    .from("tenant_usage")
-    .select("user_count, course_count, storage_mb_est")
-    .eq("organization_id", organizationId)
-    .maybeSingle();
-  const usage = usageRaw as
-    | {
-        user_count: number;
-        course_count: number;
-        storage_mb_est: number;
-      }
-    | null;
-
-  const current =
-    kind === "users"
-      ? usage?.user_count ?? 0
-      : kind === "courses"
-        ? usage?.course_count ?? 0
-        : usage?.storage_mb_est ?? 0;
+  // 3) Current usage (real byte accounting for storage).
+  const { data: usageRaw, error: usageErr } = await s.rpc("current_quota_usage", {
+    org_id: organizationId,
+    kind,
+  });
+  if (usageErr) {
+    return {
+      ok: false,
+      reason: "quota_check_failed",
+      message: "Couldn't verify current usage right now. Please try again.",
+    };
+  }
+  const current = Number(usageRaw ?? 0);
 
   if (current + delta > cap) {
     return {
       ok: false,
       reason: "quota_exceeded",
-      message: `Plan limit reached: ${current}/${cap} ${labelFor(kind)}. Upgrade your plan to add more.`,
+      message: `Plan limit reached: ${current}/${cap} ${labelFor(kind)}. Upgrade your plan or contact support to raise the limit.`,
     };
   }
-
   return { ok: true, remaining: cap - current - delta, cap };
 }
 

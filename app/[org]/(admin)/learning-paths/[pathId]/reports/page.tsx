@@ -199,33 +199,55 @@ export default async function PathReportsPage({
       : { data: [] };
   const attempts = (attemptRows ?? []) as Attempt[];
 
-  // Index attempts: latest per (user_id, course_id) wins for status.
+  // Index attempts STICKILY per (user_id, course_id): a step is "done" if ANY
+  // attempt completed/passed. Previously the LATEST attempt won, so re-launching
+  // a passed step (which creates a fresh in-progress attempt) regressed the
+  // learner from passed → in_progress. Mirrors the dashboard's sticky rule. (#L4)
   const versionToCourse = new Map<string, string>();
   for (const s of steps) {
     for (const vid of s.version_ids) versionToCourse.set(vid, s.course_id);
   }
-  type LatestAttempt = {
-    completion_status: string;
-    success_status: string;
-    score: number | null;
-    started_at: string;
-    completed_at: string | null;
+  type CourseAgg = {
+    touched: boolean;
+    done: boolean; // any attempt completed or passed
+    passed: boolean; // any attempt passed
+    failed: boolean; // any attempt failed
+    bestScore: number | null;
+    firstStarted: string | null;
+    lastCompleted: string | null;
+    lastActivity: string | null;
   };
-  const latestByUserCourse = new Map<string, LatestAttempt>(); // key: `${uid}::${courseId}`
+  const aggByUserCourse = new Map<string, CourseAgg>(); // key: `${uid}::${courseId}`
   for (const a of attempts) {
     const cid = versionToCourse.get(a.course_version_id);
     if (!cid) continue;
     const key = `${a.user_id}::${cid}`;
-    const prev = latestByUserCourse.get(key);
-    if (!prev || a.started_at > prev.started_at) {
-      latestByUserCourse.set(key, {
-        completion_status: a.completion_status,
-        success_status: a.success_status,
-        score: a.score,
-        started_at: a.started_at,
-        completed_at: a.completed_at,
-      });
+    const cur: CourseAgg = aggByUserCourse.get(key) ?? {
+      touched: false,
+      done: false,
+      passed: false,
+      failed: false,
+      bestScore: null,
+      firstStarted: null,
+      lastCompleted: null,
+      lastActivity: null,
+    };
+    cur.touched = true;
+    if (a.completion_status === "completed" || a.success_status === "passed") cur.done = true;
+    if (a.success_status === "passed") cur.passed = true;
+    if (a.success_status === "failed") cur.failed = true;
+    if (typeof a.score === "number" && (cur.bestScore === null || a.score > cur.bestScore)) {
+      cur.bestScore = a.score;
     }
+    if (a.started_at && (!cur.firstStarted || a.started_at < cur.firstStarted)) {
+      cur.firstStarted = a.started_at;
+    }
+    if (a.completed_at && (!cur.lastCompleted || a.completed_at > cur.lastCompleted)) {
+      cur.lastCompleted = a.completed_at;
+    }
+    const act = a.completed_at ?? a.started_at ?? null;
+    if (act && (!cur.lastActivity || act > cur.lastActivity)) cur.lastActivity = act;
+    aggByUserCourse.set(key, cur);
   }
 
   // ---- Per-step metrics ----
@@ -237,22 +259,17 @@ export default async function PathReportsPage({
     const scores: number[] = [];
     const minutes: number[] = [];
     for (const uid of assignedUserIds) {
-      const latest = latestByUserCourse.get(`${uid}::${s.course_id}`);
-      if (!latest) continue;
+      const agg = aggByUserCourse.get(`${uid}::${s.course_id}`);
+      if (!agg || !agg.touched) continue;
       started += 1;
-      if (latest.success_status === "passed") passed += 1;
-      else if (latest.success_status === "failed") failed += 1;
-      if (
-        latest.completion_status === "completed" ||
-        latest.success_status === "passed"
-      ) {
-        completed += 1;
-      }
-      if (typeof latest.score === "number") scores.push(latest.score);
-      if (latest.started_at && latest.completed_at) {
+      if (agg.passed) passed += 1;
+      else if (agg.failed) failed += 1;
+      if (agg.done) completed += 1;
+      if (typeof agg.bestScore === "number") scores.push(agg.bestScore);
+      if (agg.firstStarted && agg.lastCompleted) {
         const ms =
-          new Date(latest.completed_at).getTime() -
-          new Date(latest.started_at).getTime();
+          new Date(agg.lastCompleted).getTime() -
+          new Date(agg.firstStarted).getTime();
         if (ms > 0) minutes.push(ms / 60000);
       }
     }
@@ -277,6 +294,14 @@ export default async function PathReportsPage({
 
   // ---- Per-learner status ----
   const stepCount = steps.length;
+  // The final step is the one with the highest step_number — NOT the step whose
+  // number equals stepCount, which breaks when step numbers are non-contiguous
+  // (e.g. 1,2,4 after edits). (#L3)
+  const finalStep = steps.reduce(
+    (max, s) => (s.step_number > max.step_number ? s : max),
+    steps[0]
+  );
+  const finalStepCourseId = finalStep?.course_id ?? null;
   const perLearner: LearnerStatus[] = [];
   for (const uid of assignedUserIds) {
     let stepsDone = 0;
@@ -284,19 +309,16 @@ export default async function PathReportsPage({
     let lastActivity: string | null = null;
     let finalSuccessful: boolean | null = null;
     for (const s of steps) {
-      const latest = latestByUserCourse.get(`${uid}::${s.course_id}`);
-      if (!latest) continue;
+      const agg = aggByUserCourse.get(`${uid}::${s.course_id}`);
+      if (!agg || !agg.touched) continue;
       anyTouched = true;
-      if (!lastActivity || latest.started_at > lastActivity) {
-        lastActivity = latest.started_at;
+      if (agg.lastActivity && (!lastActivity || agg.lastActivity > lastActivity)) {
+        lastActivity = agg.lastActivity;
       }
-      const done =
-        latest.completion_status === "completed" ||
-        latest.success_status === "passed";
-      if (done) stepsDone += 1;
-      if (s.step_number === stepCount) {
-        if (latest.success_status === "passed") finalSuccessful = true;
-        else if (latest.success_status === "failed") finalSuccessful = false;
+      if (agg.done) stepsDone += 1;
+      if (s.course_id === finalStepCourseId) {
+        if (agg.passed) finalSuccessful = true;
+        else if (agg.failed) finalSuccessful = false;
       }
     }
     let status: LearnerStatus["status"];

@@ -162,6 +162,9 @@ export async function uploadCoursePackage(opts: {
         masteryScore: manifest.masteryScore ?? null,
         raw: manifest.raw,
       },
+      // B5: real per-upload footprint (the uploaded package's byte size) so
+      // storage quota is enforced on actual bytes, not a flat per-row estimate.
+      size_bytes: (zipBytes as Uint8Array).byteLength,
       uploaded_by: uploaderId,
     })
     .select("id, version_number")

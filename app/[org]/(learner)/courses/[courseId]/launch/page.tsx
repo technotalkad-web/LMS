@@ -202,19 +202,34 @@ export default async function LaunchPage({
         )
         .map((a) => a.path_id)
     );
-    if (assignedPathIds.size > 0) {
-      // Filter out 'random' sequence-mode paths from the prereq lock —
-      // those paths intentionally let learners take steps in any order.
-      const { data: pathModeRows } = await supabase
-        .from("learning_paths")
-        .select("id, sequence_mode")
-        .in("id", Array.from(assignedPathIds));
+    // Enforce prereqs for paths the learner is ASSIGNED to OR that are
+    // org_public — org_public paths grant access without an assignment, so
+    // gating only on assignment silently let learners skip strict sequencing on
+    // any public path. (#L1)
+    const { data: pathMetaRows } = await supabase
+      .from("learning_paths")
+      .select("id, sequence_mode, visibility")
+      .in("id", pathIds);
+    const pathMeta = (pathMetaRows ?? []) as Array<{
+      id: string;
+      sequence_mode: string | null;
+      visibility: string | null;
+    }>;
+    const enforcedPathIds = new Set(
+      pathMeta
+        .filter((p) => assignedPathIds.has(p.id) || p.visibility === "org_public")
+        .map((p) => p.id)
+    );
+    if (enforcedPathIds.size > 0) {
+      // 'random' sequence-mode paths intentionally let learners take steps in
+      // any order — only 'strict' paths are prereq-locked.
       const strictPathIds = new Set(
-        ((pathModeRows ?? []) as Array<{
-          id: string;
-          sequence_mode: string | null;
-        }>)
-          .filter((p) => (p.sequence_mode ?? "strict") === "strict")
+        pathMeta
+          .filter(
+            (p) =>
+              enforcedPathIds.has(p.id) &&
+              (p.sequence_mode ?? "strict") === "strict"
+          )
           .map((p) => p.id)
       );
       const relevant = stepInPaths.filter((s) => strictPathIds.has(s.path_id));

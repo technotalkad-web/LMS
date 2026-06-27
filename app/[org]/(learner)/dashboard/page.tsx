@@ -51,6 +51,7 @@ type Attempt = {
   score: number | null;
   started_at: string;
   completed_at: string | null;
+  learning_path_id: string | null;
 };
 
 type PathStepView = {
@@ -287,23 +288,30 @@ export default async function DashboardPage({
     ? await supabase
         .from("course_attempts")
         .select(
-          "id, course_version_id, completion_status, success_status, score, started_at, completed_at"
+          "id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
         )
         .eq("user_id", user.id)
         .in("course_version_id", versionIds)
     : { data: [] as Attempt[] };
   const attempts = (attemptRows ?? []) as Attempt[];
 
-  // 8) Completed course set.
+  // 8) Completed course set (GLOBAL — any completion; used for standalone
+  // course tiles + deadlines).
   const completedCourseIds = new Set<string>();
+  // Path step progress counts ONLY path-context attempts (learning_path_id),
+  // per product decision L2 — a standalone completion doesn't advance a path.
+  const pathDoneByPath = new Map<string, Set<string>>();
   for (const a of attempts) {
     const v = versionById.get(a.course_version_id);
     if (!v) continue;
-    if (
-      a.completion_status === "completed" ||
-      a.success_status === "passed"
-    ) {
-      completedCourseIds.add(v.course_id);
+    const done =
+      a.completion_status === "completed" || a.success_status === "passed";
+    if (!done) continue;
+    completedCourseIds.add(v.course_id);
+    if (a.learning_path_id) {
+      const set = pathDoneByPath.get(a.learning_path_id) ?? new Set<string>();
+      set.add(v.course_id);
+      pathDoneByPath.set(a.learning_path_id, set);
     }
   }
 
@@ -341,10 +349,11 @@ export default async function DashboardPage({
   const paths: PathSummary[] = pathsList
     .map((p) => {
       const steps = allPathSteps.filter((s) => s.path_id === p.id);
+      const pathDone = pathDoneByPath.get(p.id) ?? new Set<string>();
       let currentSet = false;
       const stepViews: PathStepView[] = steps.map((s) => {
         let state: PathStepView["state"];
-        if (completedCourseIds.has(s.course_id)) {
+        if (pathDone.has(s.course_id)) {
           state = "completed";
         } else if (!currentSet) {
           state = "current";
@@ -769,7 +778,7 @@ function LearningPathsSection({
                     <PathBadge state={s.state} step={s.step_number} />
                     {s.state === "current" ? (
                       <Link
-                        href={`/${orgSlug}/courses/${s.course_id}/launch`}
+                        href={`/${orgSlug}/courses/${s.course_id}/launch?lp=${p.id}`}
                         className="font-medium hover:underline flex-1 truncate"
                       >
                         {s.title}

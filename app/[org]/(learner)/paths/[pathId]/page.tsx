@@ -176,7 +176,10 @@ export default async function LearningPathDetailPage({
     );
   }
 
-  // 5) User attempts for those courses → completion set.
+  // 5) User attempts for those courses → completion set. Path progress counts
+  // ONLY attempts launched from within this path (learning_path_id === pathId);
+  // a standalone completion of the same module does not advance the path.
+  // (Product decision L2.) Path step links carry ?lp= so launches are tagged.
   const versionIds = versions.map((v) => v.id);
   const { data: attemptRows } = versionIds.length
     ? await supabase
@@ -185,6 +188,7 @@ export default async function LearningPathDetailPage({
           "course_version_id, completion_status, success_status, score, started_at, completed_at"
         )
         .eq("user_id", user.id)
+        .eq("learning_path_id", pathId)
         .in("course_version_id", versionIds)
     : { data: [] };
   type Attempt = {

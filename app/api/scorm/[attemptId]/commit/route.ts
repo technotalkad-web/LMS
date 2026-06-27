@@ -293,30 +293,40 @@ export async function POST(
           ? await svc
               .from("course_attempts")
               .select(
-                "course_version_id, completion_status, success_status"
+                "course_version_id, completion_status, success_status, learning_path_id"
               )
               .eq("user_id", user.id)
               .in("course_version_id", verIds)
           : { data: [] };
-        const doneCourses = new Set<string>();
+        // Path completion counts ONLY attempts launched from WITHIN the path
+        // (learning_path_id === that path). A standalone completion of the same
+        // module does not retroactively advance a path. (Product decision L2.)
+        // Done-courses are keyed per path.
+        const doneByPath = new Map<string, Set<string>>();
         for (const a of (aRows ?? []) as Array<{
           course_version_id: string;
           completion_status: string;
           success_status: string;
+          learning_path_id: string | null;
         }>) {
+          if (!a.learning_path_id) continue;
           if (
             a.completion_status === "completed" ||
             a.success_status === "passed"
           ) {
             const cid = verToCourse.get(a.course_version_id);
-            if (cid) doneCourses.add(cid);
+            if (!cid) continue;
+            const set = doneByPath.get(a.learning_path_id) ?? new Set<string>();
+            set.add(cid);
+            doneByPath.set(a.learning_path_id, set);
           }
         }
 
-        // Resolve names for any path the user has now finished.
+        // Resolve names for any path the user has now finished within-path.
         const finishedPathIds = Array.from(assignedPathIds).filter((pid) => {
           const steps = stepsByPath.get(pid) ?? [];
-          return steps.length > 0 && steps.every((cid) => doneCourses.has(cid));
+          const done = doneByPath.get(pid) ?? new Set<string>();
+          return steps.length > 0 && steps.every((cid) => done.has(cid));
         });
         if (finishedPathIds.length === 0) return;
 

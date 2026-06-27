@@ -179,18 +179,24 @@ export async function POST(request: Request) {
           .maybeSingle();
         const courseTitle = (courseRow as { title?: string } | null)?.title ?? "a course";
 
-        // Resolve recipient user_ids per inserted row.
+        // Resolve recipient user_ids — only for rows we ACTUALLY inserted, so a
+        // re-assignment that hit a 23505 duplicate (already assigned) doesn't
+        // re-email that learner.
         const recipientUserIds = new Set<string>();
-        for (const row of rows) {
-          if (row.assignee_type === "user" && row.user_id) {
-            recipientUserIds.add(row.user_id);
-          } else if (row.assignee_type === "team" && row.team_id) {
+        for (const ins of inserted as Array<{
+          assignee_type: string;
+          user_id: string | null;
+          team_id: string | null;
+        }>) {
+          if (ins.assignee_type === "user" && ins.user_id) {
+            recipientUserIds.add(ins.user_id);
+          } else if (ins.assignee_type === "team" && ins.team_id) {
             const { data: tm } = await svc
               .from("team_members")
               .select("user_id")
-              .eq("team_id", row.team_id);
+              .eq("team_id", ins.team_id);
             for (const m of tm ?? []) recipientUserIds.add(m.user_id as string);
-          } else if (row.assignee_type === "org") {
+          } else if (ins.assignee_type === "org") {
             const { data: om } = await svc
               .from("organization_members")
               .select("user_id")
