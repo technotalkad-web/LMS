@@ -54,4 +54,25 @@ test.describe.serial("UI Batch 3 — toast + confirm dialog", () => {
 
     await ctx.close();
   });
+
+  test("shared form primitives (Input/Button) work — support ticket submit", async ({
+    browser,
+    baseURL,
+  }) => {
+    const org = await createOrg({ name: "QA UI Form Org" });
+    const learner = await createAuthUser({
+      profile: { first_name: "UI", last_name: "Learner", must_change_password: false },
+    });
+    await addMember({ organizationId: org.id, userId: learner.id, role: "member" });
+
+    const ctx = await authedContext(browser, baseURL!, learner.email, learner.password);
+    const page = await ctx.newPage();
+    await page.goto(`/${org.slug}/support`);
+
+    await page.getByPlaceholder("Briefly describe the issue").fill("QA primitive smoke ticket");
+    await page.getByRole("button", { name: /submit ticket/i }).click();
+
+    await expect(page.getByText(/ticket submitted/i)).toBeVisible({ timeout: 10_000 });
+    await ctx.close();
+  });
 });
