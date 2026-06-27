@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -46,6 +49,8 @@ export function OrganizationsTable({
   plans: PlanOption[];
 }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [planFilter, setPlanFilter] = useState<PlanFilter>("all");
@@ -65,7 +70,7 @@ export function OrganizationsTable({
     if (plan_id === t.plan_id) return;
     const next = plans.find((p) => p.id === plan_id);
     if (!next) return;
-    if (!confirm(`Change ${t.name} from "${t.plan_name}" to "${next.name}" ($${Math.round(next.monthly_price_cents / 100)}/mo)?`)) return;
+    if (!await confirm(`Change ${t.name} from "${t.plan_name}" to "${next.name}" ($${Math.round(next.monthly_price_cents / 100)}/mo)?`)) return;
     setBusy(t.id);
     const res = await fetch(`/api/super/tenants/${t.id}`, {
       method: "PATCH",
@@ -75,14 +80,14 @@ export function OrganizationsTable({
     setBusy(null);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
   }
 
   async function suspend(t: TenantRow) {
-    if (!confirm(`Suspend ${t.name}? Learner access will be cut off immediately.`)) return;
+    if (!await confirm(`Suspend ${t.name}? Learner access will be cut off immediately.`)) return;
     setBusy(t.id);
     const res = await fetch(`/api/super/tenants/${t.id}`, {
       method: "PATCH",
@@ -90,7 +95,7 @@ export function OrganizationsTable({
       body: JSON.stringify({ action: "suspend" }),
     });
     setBusy(null);
-    if (!res.ok) { const j = await res.json().catch(() => ({})); alert(j.error ?? "Failed"); return; }
+    if (!res.ok) { const j = await res.json().catch(() => ({})); toast.error(j.error ?? "Failed"); return; }
     router.refresh();
   }
 
@@ -102,16 +107,16 @@ export function OrganizationsTable({
       body: JSON.stringify({ action: "activate" }),
     });
     setBusy(null);
-    if (!res.ok) { const j = await res.json().catch(() => ({})); alert(j.error ?? "Failed"); return; }
+    if (!res.ok) { const j = await res.json().catch(() => ({})); toast.error(j.error ?? "Failed"); return; }
     router.refresh();
   }
 
   async function softDelete(t: TenantRow) {
-    if (!confirm(`Schedule ${t.name} for deletion in 30 days?`)) return;
+    if (!await confirm(`Schedule ${t.name} for deletion in 30 days?`)) return;
     setBusy(t.id);
     const res = await fetch(`/api/super/tenants/${t.id}`, { method: "DELETE" });
     setBusy(null);
-    if (!res.ok) { const j = await res.json().catch(() => ({})); alert(j.error ?? "Failed"); return; }
+    if (!res.ok) { const j = await res.json().catch(() => ({})); toast.error(j.error ?? "Failed"); return; }
     router.refresh();
   }
 
@@ -123,7 +128,7 @@ export function OrganizationsTable({
       body: JSON.stringify({ action: "restore" }),
     });
     setBusy(null);
-    if (!res.ok) { const j = await res.json().catch(() => ({})); alert(j.error ?? "Failed"); return; }
+    if (!res.ok) { const j = await res.json().catch(() => ({})); toast.error(j.error ?? "Failed"); return; }
     router.refresh();
   }
 
@@ -138,7 +143,7 @@ export function OrganizationsTable({
     });
     setBusy(null);
     const j = (await res.json().catch(() => ({}))) as { redirect?: string; error?: string };
-    if (!res.ok) { alert(j.error ?? "Failed to start impersonation"); return; }
+    if (!res.ok) { toast.error(j.error ?? "Failed to start impersonation"); return; }
     router.push(j.redirect ?? `/${t.slug}/dashboard`);
   }
 

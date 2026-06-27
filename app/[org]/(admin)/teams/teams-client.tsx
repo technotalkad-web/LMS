@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import {
@@ -40,6 +43,8 @@ export function TeamsClient({
   orgMembers: OrgMember[];
 }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -73,11 +78,11 @@ export function TeamsClient({
   }
 
   async function deleteTeam(id: string, name: string) {
-    if (!confirm(`Delete team "${name}"? Members will be unassigned.`)) return;
+    if (!await confirm(`Delete team "${name}"? Members will be unassigned.`)) return;
     const res = await fetch(`/api/teams/${id}`, { method: "DELETE" });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     if (activeTeamId === id) setActiveTeamId(null);
@@ -99,7 +104,7 @@ export function TeamsClient({
     setAddingTo(null);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
@@ -112,7 +117,7 @@ export function TeamsClient({
     );
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();

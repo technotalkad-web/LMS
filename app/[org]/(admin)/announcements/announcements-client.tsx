@@ -1,5 +1,7 @@
 "use client";
 
+
+import { useConfirm } from "@/components/ui/confirm";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import {
@@ -43,6 +45,7 @@ export function AnnouncementsClient({
   announcements: Announcement[];
 }) {
   const router = useRouter();
+  const confirm = useConfirm();
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -91,7 +94,7 @@ export function AnnouncementsClient({
   }
 
   async function remove(id: string) {
-    if (!confirm("Delete this announcement?")) return;
+    if (!await confirm("Delete this announcement?")) return;
     await fetch(`/api/announcements/${id}`, { method: "DELETE" });
     router.refresh();
   }

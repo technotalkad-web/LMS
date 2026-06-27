@@ -1,5 +1,7 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
 import { Lock } from "lucide-react";
 
 /**
@@ -20,11 +22,12 @@ import { Lock } from "lucide-react";
  * and delete this file.
  */
 export function ChangePasswordButton() {
+  const toast = useToast();
   return (
     <button
       type="button"
       onClick={() => {
-        alert(
+        toast.info(
           "To change your password, sign out and use the 'Forgot password?' link on the login page, or ask an admin to reset it for you."
         );
       }}

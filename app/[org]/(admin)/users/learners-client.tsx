@@ -2,6 +2,8 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMemo, useState } from "react";
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { roleLabel } from "@/lib/auth/permissions";
 import {
@@ -72,6 +74,8 @@ export function LearnersClient({
   shareBase: string;
 }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [tab, setTab] = useState<Tab>("members");
 
   // Invite single
@@ -166,32 +170,32 @@ export function LearnersClient({
     );
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
   }
 
   async function removeMember(userId: string) {
-    if (!confirm("Remove this member from the org?")) return;
+    if (!(await confirm({ message: "Remove this member from the org?", destructive: true }))) return;
     const res = await fetch(
       `/api/organization-members/${userId}?orgSlug=${orgSlug}`,
       { method: "DELETE" }
     );
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
   }
 
   async function revokeInvite(id: string) {
-    if (!confirm("Revoke this invitation?")) return;
+    if (!(await confirm({ message: "Revoke this invitation?", destructive: true }))) return;
     const res = await fetch(`/api/invitations/${id}`, { method: "DELETE" });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
@@ -201,7 +205,7 @@ export function LearnersClient({
     const url = `${shareBase}/${token}`;
     try {
       await navigator.clipboard.writeText(url);
-      alert("Copied invitation link to clipboard");
+      toast.success("Copied invitation link to clipboard");
     } catch {
       window.prompt("Copy this invitation link:", url);
     }

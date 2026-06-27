@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import type {
@@ -64,6 +67,8 @@ export function LearningPathsClient({
 }) {
   void orgSlug;
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
 
   // Create form
   const [showCreate, setShowCreate] = useState(false);
@@ -148,7 +153,7 @@ export function LearningPathsClient({
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Save failed");
+      toast.error(j.error ?? "Save failed");
       return;
     }
     setEditing((s) => ({ ...s, [pid]: false }));
@@ -162,7 +167,7 @@ export function LearningPathsClient({
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
@@ -197,12 +202,12 @@ export function LearningPathsClient({
   }
 
   async function deletePath(id: string, name: string) {
-    if (!confirm(`Delete path "${name}"? Course assignments to this path will be removed.`))
+    if (!await confirm(`Delete path "${name}"? Course assignments to this path will be removed.`))
       return;
     const res = await fetch(`/api/learning-paths/${id}`, { method: "DELETE" });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
@@ -219,7 +224,7 @@ export function LearningPathsClient({
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setPickedCourse((s) => ({ ...s, [pathId]: "" }));
@@ -227,14 +232,14 @@ export function LearningPathsClient({
   }
 
   async function removeCourseFromPath(pathId: string, courseId: string) {
-    if (!confirm("Remove this course from the path?")) return;
+    if (!await confirm("Remove this course from the path?")) return;
     const res = await fetch(
       `/api/learning-paths/${pathId}/courses?courseId=${courseId}`,
       { method: "DELETE" }
     );
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
@@ -248,7 +253,7 @@ export function LearningPathsClient({
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
@@ -291,7 +296,7 @@ export function LearningPathsClient({
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     if (opts.user) setPickedUser((s) => ({ ...s, [pathId]: "" }));
@@ -300,13 +305,13 @@ export function LearningPathsClient({
   }
 
   async function unassign(id: string) {
-    if (!confirm("Remove this path assignment?")) return;
+    if (!await confirm("Remove this path assignment?")) return;
     const res = await fetch(`/api/learning-path-assignments/${id}`, {
       method: "DELETE",
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();
