@@ -102,13 +102,13 @@ binding = "ASSETS"
 enabled = true
 
 [env.production.triggers]
-crons = [
-  "0 2 * * *",    # /api/cron/billing                — daily 02:00 UTC
-  "0 3 * * *",    # /api/cron/reaper                 — daily 03:00 UTC
-  "30 3 * * *",   # /api/cron/refresh-report-views   — daily 03:30 UTC (#176)
-  "0 6 * * *",    # /api/cron/reminders              — daily 06:00 UTC
-  "0 7 * * 1",    # /api/cron/rls-audit              — Mondays 07:00 UTC
-]
+# IMPORTANT: OpenNext (@opennextjs/cloudflare) builds a Worker that exports only
+# `fetch` — it does NOT synthesize a `scheduled` handler. Cloudflare cron
+# triggers here would fire events the Worker can't receive, so the /api/cron/*
+# jobs never run. The schedules now live in .github/workflows/cron.yml, which
+# POSTs each endpoint with CRON_SECRET. Keep this empty to avoid unhandled
+# scheduled invocations.
+crons = []
 
 [env.production.vars]
 NEXT_PUBLIC_SUPABASE_URL = "https://alkfrcglmseksweqhwzq.supabase.co"
