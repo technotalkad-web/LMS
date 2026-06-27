@@ -54,3 +54,5 @@ next-env.d.ts
 # testing bot (tests/bot) generated output
 /bot-report/
 /bot-playwright-report/
+/lifecycle-report/
+/lifecycle-playwright-report/
