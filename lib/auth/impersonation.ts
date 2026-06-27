@@ -23,13 +23,25 @@ const COOKIE_NAME = "lms_impersonation";
 const COOKIE_MAX_AGE_SECS = 60 * 60; // 60 min, matches DB default
 
 function getSecret(): string {
-  const s = process.env.IMPERSONATION_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!s) {
+  const s = process.env.IMPERSONATION_SECRET;
+  if (s) return s;
+  // In production, refuse to fall back to the service-role key: reusing the
+  // master DB key to sign impersonation cookies collapses two trust boundaries
+  // (a service-role leak would then also let an attacker forge impersonation
+  // cookies, and the signing key can't be rotated independently).
+  // ⚠️ Deploy note: IMPERSONATION_SECRET must be set as a Worker secret in prod.
+  if (process.env.NODE_ENV === "production") {
     throw new Error(
-      "Missing IMPERSONATION_SECRET (falls back to SUPABASE_SERVICE_ROLE_KEY) in env."
+      "IMPERSONATION_SECRET must be set in production (no service-role fallback)."
     );
   }
-  return s;
+  const fallback = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!fallback) {
+    throw new Error(
+      "Missing IMPERSONATION_SECRET (and no SUPABASE_SERVICE_ROLE_KEY for dev fallback)."
+    );
+  }
+  return fallback;
 }
 
 function sign(payload: string): string {

@@ -130,9 +130,10 @@ export async function POST(
               learner_email: email,
               path_name: p.name ?? "your learning path",
               path_id: pathId,
-              // course_name is empty here; the asset_update template should
-              // gracefully handle either case.
-              course_name: "",
+              // The asset_update template renders {Course_Name}; for a path
+              // update we populate it with the path's name so the email reads
+              // naturally instead of leaking a literal {Course_Name} token.
+              course_name: p.name ?? "your learning path",
               org_name: orgInfo?.name ?? "your org",
               direct_link: directLink,
             },

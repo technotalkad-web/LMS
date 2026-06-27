@@ -68,7 +68,7 @@ You haven't finished **{Course_Name}** yet. It only takes a few minutes — pick
 
 A course you're enrolled in on **{Org_Name}** has been updated.
 
-- **What changed:** {Course_Name}{Path_Name}
+- **What changed:** {Course_Name}
 - **What this means:** previously completed work stays completed; only newly added content needs to be done.
 
 Hop in to see what's new:

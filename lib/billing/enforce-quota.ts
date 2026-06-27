@@ -39,11 +39,22 @@ export async function checkQuota(
   const s = svc();
 
   // 1) Subscription + plan cap.
-  const { data: subRaw } = await s
+  const { data: subRaw, error: subErr } = await s
     .from("tenant_subscriptions")
     .select("billing_status, plan_id, subscription_plans(max_users,max_courses,max_storage_gb)")
     .eq("organization_id", organizationId)
     .maybeSingle();
+  // Fail CLOSED on a lookup error: previously the error was ignored and a null
+  // result fell through to "unlimited", which would also bypass the
+  // suspended/cancelled block. Better to refuse the create than to silently
+  // exceed plan limits or let a suspended tenant write.
+  if (subErr) {
+    return {
+      ok: false,
+      reason: "quota_check_failed",
+      message: "Couldn't verify your plan limits right now. Please try again.",
+    };
+  }
 
   // Defensive default: no sub row means we treat the tenant as Basic
   // (rather than letting them through with no limits). Admins running
@@ -84,11 +95,20 @@ export async function checkQuota(
   }
 
   // 2) Current usage from the tenant_usage view.
-  const { data: usageRaw } = await s
+  const { data: usageRaw, error: usageErr } = await s
     .from("tenant_usage")
     .select("user_count, course_count, storage_mb_est")
     .eq("organization_id", organizationId)
     .maybeSingle();
+  // Fail CLOSED: an ignored error here defaulted usage to 0 and let the create
+  // through regardless of the real count.
+  if (usageErr) {
+    return {
+      ok: false,
+      reason: "quota_check_failed",
+      message: "Couldn't verify current usage right now. Please try again.",
+    };
+  }
   const usage = usageRaw as
     | {
         user_count: number;

@@ -91,12 +91,20 @@ export async function POST(request: Request) {
         // Pick an org to attribute the email to — the user's first org
         // membership, or any org if none. We need an organization_id
         // for notifyBackground() to resolve SMTP + branding.
-        const { data: mem } = await svc
+        const { data: mem, error: memErr } = await svc
           .from("organization_members")
           .select("organization_id, organizations(name)")
           .eq("user_id", user.id)
           .limit(1)
           .maybeSingle();
+        if (memErr) {
+          // Don't mask a transient query failure as "user has no org" — that
+          // silently drops the reset email. Surface it for alerting.
+          console.error(
+            `[forgot-password] org lookup failed for ${user.id} (${email}):`,
+            memErr.message
+          );
+        }
         type MemOrg = { name: string };
         const memRow = mem as
           | {
