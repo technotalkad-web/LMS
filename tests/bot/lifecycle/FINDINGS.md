@@ -55,6 +55,16 @@ These are **not bugs** — they're unbuilt/partial features. Tests skip them by 
 
 ---
 
+## 🟠 Config finding — invite / magic-link redirects point at localhost (MED)
+
+- **Symptom:** invite & magic-link emails verify against `…/auth/v1/verify?…&redirect_to=http://localhost:3000`. On the deployed app, a real invited user who clicks the link is redirected to **localhost:3000** (dead page) instead of the LMS.
+- **Cause:** the Supabase project's Auth **Site URL** (and redirect allow-list) is set to `http://localhost:3000`, not the deployed app URL.
+- **Impact:** passwordless onboarding (magic-link/invite) is effectively broken in any deployed environment until fixed. (Password onboarding is unaffected — it goes through org SMTP and a normal login.)
+- **Fix (config, no code):** Supabase → **Authentication → URL Configuration** → set **Site URL** to the deployed app URL and add it (plus `…/auth/callback`) to **Redirect URLs**. Do this on **both** the staging and prod Supabase projects.
+- Email send + delivery + link validity are already verified; only the redirect target is misconfigured.
+
+---
+
 ## 🟡 Minor / informational
 
 - **`is_org_data_analyst()` drift:** defined in migration 0010 but absent on staging. Harmless — it is **not referenced** by any policy or app code (dead code). Worth reconciling for cleanliness.

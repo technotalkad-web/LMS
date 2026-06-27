@@ -57,13 +57,23 @@ export interface ReceivedEmail {
   links: string[];
 }
 
+function decodeEntities(url: string): string {
+  // Hrefs in HTML encode query separators as &amp; (and friends). Left as-is,
+  // "&amp;type=invite" parses as a param named "amp;type", dropping `type` —
+  // which made Supabase's /auth/v1/verify reject the link.
+  return url
+    .replace(/&amp;/gi, "&")
+    .replace(/&#38;/g, "&")
+    .replace(/&#x26;/gi, "&");
+}
+
 function extractLinks(html: string, text: string): string[] {
   const links = new Set<string>();
   const hrefRe = /href\s*=\s*["']([^"']+)["']/gi;
   let m: RegExpExecArray | null;
-  while ((m = hrefRe.exec(html))) links.add(m[1]);
+  while ((m = hrefRe.exec(html))) links.add(decodeEntities(m[1]));
   const urlRe = /https?:\/\/[^\s"'<>)]+/gi;
-  while ((m = urlRe.exec(text))) links.add(m[0]);
+  while ((m = urlRe.exec(text))) links.add(decodeEntities(m[0]));
   return [...links];
 }
 
