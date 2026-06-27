@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { ArrowLeft, Building2 } from "lucide-react";
 import { TenantDetailEditor } from "./tenant-detail-editor";
+import { OverridesEditor } from "./overrides-editor";
 
 export const dynamic = "force-dynamic";
 
@@ -38,20 +39,49 @@ export default async function TenantDetailPage({
     scheduled_deletion_at: string | null;
   };
 
-  // Subscription + plan
+  // Subscription + plan + manual overrides
   const { data: subRaw } = await svc
     .from("tenant_subscriptions")
-    .select("billing_status, mrr_cents, plan:subscription_plans(slug, name)")
+    .select(
+      "billing_status, mrr_cents, custom_user_limit_override, custom_storage_limit_override, manual_grace_period_until, owner_notes, plan:subscription_plans(slug, name)"
+    )
     .eq("organization_id", id)
     .maybeSingle();
   const sub = subRaw as
     | {
         billing_status: string;
         mrr_cents: number;
+        custom_user_limit_override: number | null;
+        custom_storage_limit_override: number | null;
+        manual_grace_period_until: string | null;
+        owner_notes: string | null;
         plan: { slug: string; name: string } | { slug: string; name: string }[] | null;
       }
     | null;
   const planObj = Array.isArray(sub?.plan) ? sub?.plan?.[0] : sub?.plan;
+
+  // Current usage + effective caps (caps resolve via the 0038 SQL fn; null when
+  // unlimited or before the migration is applied).
+  const { data: usageRow } = await svc
+    .from("tenant_usage")
+    .select("user_count, course_count, storage_mb_est")
+    .eq("organization_id", id)
+    .maybeSingle();
+  const usage = {
+    users: Number((usageRow as { user_count?: number } | null)?.user_count ?? 0),
+    courses: Number((usageRow as { course_count?: number } | null)?.course_count ?? 0),
+    storageMb: Number((usageRow as { storage_mb_est?: number } | null)?.storage_mb_est ?? 0),
+  };
+  async function effCap(kind: string): Promise<number | null> {
+    const { data, error } = await svc.rpc("effective_cap", { org_id: id, kind });
+    if (error || data === null || data === undefined) return null;
+    return Number(data);
+  }
+  const caps = {
+    users: await effCap("users"),
+    courses: await effCap("courses"),
+    storageMb: await effCap("storage_mb"),
+  };
 
   // Admins
   const { data: members } = await svc
@@ -119,6 +149,18 @@ export default async function TenantDetailPage({
           custom_domain: o.custom_domain,
         }}
         initialAdmins={admins}
+      />
+
+      <OverridesEditor
+        tenantId={o.id}
+        initial={{
+          custom_user_limit_override: sub?.custom_user_limit_override ?? null,
+          custom_storage_limit_override: sub?.custom_storage_limit_override ?? null,
+          manual_grace_period_until: sub?.manual_grace_period_until ?? null,
+          owner_notes: sub?.owner_notes ?? null,
+        }}
+        usage={usage}
+        caps={caps}
       />
 
       <div className="mt-6 text-xs text-slate-400">

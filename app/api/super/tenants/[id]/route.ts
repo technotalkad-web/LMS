@@ -55,12 +55,23 @@ export async function PATCH(
   const { id: tenantId } = await params;
 
   const body = (await request.json().catch(() => ({}))) as {
-    action?: "suspend" | "activate" | "restore" | "set_plan" | "update_org";
+    action?:
+      | "suspend"
+      | "activate"
+      | "restore"
+      | "set_plan"
+      | "update_org"
+      | "set_overrides";
     plan_id?: string;
     // update_org payload
     name?: string;
     allowed_email_domains?: string[];
     custom_domain?: string | null;
+    // set_overrides payload (feature #5)
+    custom_user_limit_override?: number | null;
+    custom_storage_limit_override?: number | null;
+    manual_grace_period_until?: string | null;
+    owner_notes?: string | null;
   };
 
   const svc = createServiceClient(
@@ -95,6 +106,34 @@ export async function PATCH(
     await auditLog({
       actorUserId: guard.userId,
       action: "tenant.restore",
+      targetType: "organization",
+      targetId: tenantId,
+    });
+    return NextResponse.json({ ok: true });
+  }
+
+  if (body.action === "set_overrides") {
+    // Platform-owner manual caps / grace period / notes for custom-tenant
+    // support + dispute settlement (feature #5). null clears an override.
+    const patch: Record<string, unknown> = {
+      organization_id: tenantId,
+      updated_at: new Date().toISOString(),
+    };
+    if (body.custom_user_limit_override !== undefined)
+      patch.custom_user_limit_override = body.custom_user_limit_override;
+    if (body.custom_storage_limit_override !== undefined)
+      patch.custom_storage_limit_override = body.custom_storage_limit_override;
+    if (body.manual_grace_period_until !== undefined)
+      patch.manual_grace_period_until = body.manual_grace_period_until;
+    if (body.owner_notes !== undefined) patch.owner_notes = body.owner_notes;
+
+    const { error } = await svc
+      .from("tenant_subscriptions")
+      .upsert(patch, { onConflict: "organization_id" });
+    if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+    await auditLog({
+      actorUserId: guard.userId,
+      action: "tenant.set_overrides",
       targetType: "organization",
       targetId: tenantId,
     });
