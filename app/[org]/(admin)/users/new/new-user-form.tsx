@@ -79,6 +79,11 @@ export function NewUserForm({
     setForm((f) => ({ ...f, [key]: value }));
   }
 
+  // Inline email-format validation (only flags once something is typed).
+  const emailInvalid =
+    form.email.trim().length > 0 &&
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim());
+
   // Username mirrors email until the user types into it directly.
   function onEmail(v: string) {
     setForm((f) => ({
@@ -152,7 +157,14 @@ export function NewUserForm({
               onChange={(e) => onEmail(e.target.value)}
               className="input"
               placeholder="user@company.com"
+              aria-invalid={emailInvalid}
+              aria-describedby={emailInvalid ? "email-error" : undefined}
             />
+            {emailInvalid && (
+              <p id="email-error" className="mt-1 text-xs text-red-600">
+                Enter a valid email address.
+              </p>
+            )}
           </Field>
           <Field label="Username" required>
             <input
@@ -380,7 +392,7 @@ export function NewUserForm({
         </button>
         <button
           type="submit"
-          disabled={busy}
+          disabled={busy || emailInvalid}
           className="px-5 py-2 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50"
         >
           {busy ? "Creating…" : "Create user"}
@@ -399,6 +411,9 @@ export function NewUserForm({
         }
         :global(.input:focus) {
           border-color: var(--color-ink);
+        }
+        :global(.input[aria-invalid="true"]) {
+          border-color: #f87171;
         }
       `}</style>
     </form>
