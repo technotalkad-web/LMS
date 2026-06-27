@@ -52,6 +52,7 @@ export default async function AuditLogPage() {
             No audit events yet.
           </div>
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="bg-canvas text-muted border-b border-line">
               <tr>
@@ -101,6 +102,7 @@ export default async function AuditLogPage() {
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>

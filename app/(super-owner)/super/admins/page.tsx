@@ -51,6 +51,7 @@ values ('<your auth.users.id>', 'bootstrap');`}
             </pre>
           </div>
         ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="bg-canvas text-muted border-b border-line">
               <tr>
@@ -86,6 +87,7 @@ values ('<your auth.users.id>', 'bootstrap');`}
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 
