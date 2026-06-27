@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Plus, Trash2, Megaphone } from "lucide-react";
@@ -25,6 +28,8 @@ const TONE_BADGE: Record<BroadcastRow["tone"], string> = {
 
 export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState<Omit<BroadcastRow, "id" | "posted_at">>({
@@ -39,7 +44,7 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
 
   async function submit() {
     if (!draft.title.trim() || !draft.body_md.trim()) {
-      alert("Title and body are required.");
+      toast.error("Title and body are required.");
       return;
     }
     setBusy(true);
@@ -51,7 +56,7 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setCreating(false);
@@ -79,7 +84,7 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
   }
 
   async function remove(b: BroadcastRow) {
-    if (!confirm(`Permanently delete "${b.title}"?`)) return;
+    if (!await confirm(`Permanently delete "${b.title}"?`)) return;
     setBusy(true);
     await fetch(`/api/super/broadcasts?id=${b.id}`, { method: "DELETE" });
     setBusy(false);

@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { MemberCombobox } from "./member-combobox";
@@ -49,6 +52,8 @@ export function AssignSection({
   teams: AssignableTeam[];
 }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedUser, setSelectedUser] = useState("");
@@ -82,11 +87,11 @@ export function AssignSection({
   }
 
   async function unassign(id: string) {
-    if (!confirm("Remove this assignment?")) return;
+    if (!await confirm("Remove this assignment?")) return;
     const res = await fetch(`/api/assignments/${id}`, { method: "DELETE" });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     router.refresh();

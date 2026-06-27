@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
 import { ThemePill } from "./_components/theme-pill";
+import { NavItem } from "./_components/nav-item";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
 
@@ -119,16 +120,5 @@ export default async function AdminLayout({
         <main className="flex-1 px-5 md:px-10 py-6 md:py-8 overflow-x-auto">{children}</main>
       </div>
     </div>
-  );
-}
-
-function NavItem({ href, label }: { href: string; label: string }) {
-  return (
-    <Link
-      href={href}
-      className="shrink-0 md:block px-3 py-2 rounded-md hover:bg-canvas text-ink transition-colors whitespace-nowrap"
-    >
-      {label}
-    </Link>
   );
 }

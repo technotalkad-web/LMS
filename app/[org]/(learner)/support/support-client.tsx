@@ -3,6 +3,8 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Send, Inbox, CheckCircle2, Clock, AlertTriangle } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input, Textarea, Select } from "@/components/ui/input";
 
 export type LearnerTicket = {
   id: string;
@@ -79,38 +81,33 @@ export function SupportClient({
         className="bg-paper border border-line rounded-2xl shadow-sm p-6 sm:p-8 space-y-5"
       >
         <Field label="Issue category">
-          <select
-            value={category}
-            onChange={(e) => setCategory(e.target.value)}
-            className="field-input"
-          >
+          <Select value={category} onChange={(e) => setCategory(e.target.value)}>
             <option value="">Select a category…</option>
             {CATEGORIES.map((c) => (
               <option key={c} value={c}>
                 {c}
               </option>
             ))}
-          </select>
+          </Select>
         </Field>
 
         <Field label="Subject" required>
-          <input
+          <Input
             type="text"
             required
             value={subject}
             onChange={(e) => setSubject(e.target.value)}
             placeholder="Briefly describe the issue"
-            className="field-input"
           />
         </Field>
 
         <Field label="Description">
-          <textarea
+          <Textarea
             value={bodyText}
             onChange={(e) => setBodyText(e.target.value)}
             placeholder="Please provide as much detail as possible…"
             rows={5}
-            className="field-input resize-none"
+            className="resize-none"
           />
         </Field>
 
@@ -121,9 +118,10 @@ export function SupportClient({
                 key={p}
                 type="button"
                 onClick={() => setPriority(p)}
+                aria-pressed={priority === p}
                 className={`flex-1 py-2 rounded-lg border text-sm font-medium transition ${
                   priority === p
-                    ? "border-indigo-600 bg-indigo-50 text-indigo-700"
+                    ? "border-accent bg-accent/10 text-accent"
                     : "border-line text-muted hover:border-ink hover:text-ink"
                 }`}
               >
@@ -146,31 +144,10 @@ export function SupportClient({
           </div>
         )}
 
-        <button
-          type="submit"
-          disabled={busy || !subject.trim()}
-          className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg transition shadow-sm disabled:opacity-50"
-        >
+        <Button type="submit" disabled={busy || !subject.trim()} className="w-full">
           <Send className="w-4 h-4" />
           {busy ? "Submitting…" : "Submit ticket"}
-        </button>
-
-        <style jsx>{`
-          :global(.field-input) {
-            width: 100%;
-            padding: 0.625rem 0.75rem;
-            border: 1px solid var(--color-line);
-            border-radius: 0.5rem;
-            background: var(--color-canvas);
-            outline: none;
-            font-size: 0.875rem;
-            transition: border-color 150ms, box-shadow 150ms;
-          }
-          :global(.field-input:focus) {
-            border-color: rgb(79 70 229);
-            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.15);
-          }
-        `}</style>
+        </Button>
       </form>
 
       {tickets.length > 0 && (

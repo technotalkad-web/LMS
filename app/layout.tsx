@@ -9,6 +9,7 @@ import {
 } from "next/font/google";
 import { cookies } from "next/headers";
 import "./globals.css";
+import { UiProviders } from "@/components/ui/providers";
 
 // ----- Global default + approved org-level brand fonts -----
 // Inter is the platform's absolute default. The four others below are
@@ -92,7 +93,7 @@ export default async function RootLayout({
         suppressHydrationWarning
         style={{ fontFamily: "var(--font-sans)" }}
       >
-        {children}
+        <UiProviders>{children}</UiProviders>
       </body>
     </html>
   );

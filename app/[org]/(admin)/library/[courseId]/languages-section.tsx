@@ -1,5 +1,7 @@
 "use client";
 
+
+import { useConfirm } from "@/components/ui/confirm";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { SUPPORTED_LANGUAGES, languageDisplay } from "@/lib/i18n/languages";
@@ -86,7 +88,7 @@ export function LanguagesSection({
 
   async function deletePackage(pkg: LanguagePackage) {
     if (
-      !confirm(
+      !await confirm(
         `Delete the "${languageDisplay(pkg.language, "english")}" package? This is irreversible. If learners have attempted it, the delete will be refused — deactivate instead.`
       )
     ) {

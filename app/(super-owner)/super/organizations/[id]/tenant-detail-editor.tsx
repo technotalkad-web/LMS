@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Plus, Trash2, Save, Mail, ShieldAlert } from "lucide-react";
@@ -26,6 +29,8 @@ export function TenantDetailEditor({
   initialAdmins: Admin[];
 }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [name, setName] = useState(initial.name);
   const [domains, setDomains] = useState(initial.allowed_email_domains.join(", "));
   const [customDomain, setCustomDomain] = useState(initial.custom_domain ?? "");
@@ -54,7 +59,7 @@ export function TenantDetailEditor({
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setSavedMsg("Saved.");
@@ -73,7 +78,7 @@ export function TenantDetailEditor({
     setBusy(false);
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     const wasInvited = j.invited;
@@ -84,7 +89,7 @@ export function TenantDetailEditor({
     setAdmins(listJson.admins ?? []);
     router.refresh();
     if (wasInvited) {
-      alert(
+      toast.success(
         "User didn't exist — a magic-link invitation has been emailed. They'll set their password on first sign-in."
       );
     }
@@ -101,7 +106,7 @@ export function TenantDetailEditor({
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setAdmins(admins.map((a) => (a.user_id === admin.user_id ? { ...a, role } : a)));
@@ -109,7 +114,7 @@ export function TenantDetailEditor({
   }
 
   async function removeAdmin(admin: Admin) {
-    if (!confirm(`Remove ${admin.email} from this organization?`)) return;
+    if (!await confirm(`Remove ${admin.email} from this organization?`)) return;
     setBusy(true);
     const res = await fetch(
       `/api/super/tenants/${tenantId}/admins?user_id=${admin.user_id}`,
@@ -118,7 +123,7 @@ export function TenantDetailEditor({
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setAdmins(admins.filter((a) => a.user_id !== admin.user_id));

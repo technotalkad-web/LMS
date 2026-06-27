@@ -1,5 +1,7 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Copy, CheckCircle2 } from "lucide-react";
@@ -8,6 +10,7 @@ type Plan = { slug: string; name: string; monthly_price_cents: number };
 
 export function NewTenantForm({ plans }: { plans: Plan[] }) {
   const router = useRouter();
+  const toast = useToast();
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [slugTouched, setSlugTouched] = useState(false);
@@ -49,7 +52,7 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
     setBusy(false);
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
-      alert(j.error ?? "Failed to create tenant");
+      toast.error(j.error ?? "Failed to create tenant");
       return;
     }
     setResult({ slug: j.slug, invite_url: j.invite_url });

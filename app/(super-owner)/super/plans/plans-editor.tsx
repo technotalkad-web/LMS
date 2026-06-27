@@ -1,5 +1,8 @@
 "use client";
 
+
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Plus, Trash2, Save, X } from "lucide-react";
@@ -36,6 +39,8 @@ export function PlansEditor({
   counts: Counts;
 }) {
   const router = useRouter();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [plans, setPlans] = useState<PlanRow[]>(initialPlans);
   const [editing, setEditing] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -51,7 +56,7 @@ export function PlansEditor({
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setEditing(null);
@@ -59,13 +64,13 @@ export function PlansEditor({
   }
 
   async function remove(plan: PlanRow) {
-    if (!confirm(`Delete plan "${plan.name}"? This cannot be undone.`)) return;
+    if (!await confirm(`Delete plan "${plan.name}"? This cannot be undone.`)) return;
     setBusy(true);
     const res = await fetch(`/api/super/plans?id=${plan.id}`, { method: "DELETE" });
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setPlans(plans.filter((p) => p.id !== plan.id));
@@ -82,7 +87,7 @@ export function PlansEditor({
     setBusy(false);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      alert(j.error ?? "Failed");
+      toast.error(j.error ?? "Failed");
       return;
     }
     setCreating(false);
