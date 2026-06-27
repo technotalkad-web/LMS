@@ -144,7 +144,11 @@ export async function POST(
         const { data: row } = await svc
           .from("course_attempts")
           .select(
-            "organization_id, course_version_id, course_versions(course_id, courses(title)), score"
+            // Disambiguate the embed: course_versions <-> courses has TWO FKs
+            // (course_versions.course_id and courses.current_version_id), so an
+            // unqualified courses(...) embed errors out ("more than one
+            // relationship found") and silently skipped the completion email.
+            "organization_id, course_version_id, course_versions(course_id, courses!course_versions_course_id_fkey(title)), score"
           )
           .eq("id", attemptId)
           .maybeSingle();

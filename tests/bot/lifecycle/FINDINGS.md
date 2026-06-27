@@ -34,6 +34,15 @@ Behaviors covered: complete · partial+bookmark · launched-only · never-starte
 
 ---
 
+## 🔴 Bug found & FIXED — course/path completion emails never sent (HIGH)
+
+- **Symptom:** `asset_completion` ("Nice work! You completed …") emails are **never sent** — `notification_log` has **zero** `asset_completion` rows ever, despite many completed attempts. `path_completion` is broken the same way.
+- **Root cause:** the commit route loaded the course via an **ambiguous PostgREST embed** — `course_versions(course_id, courses(title))`. `course_versions` ↔ `courses` has *two* FKs (`course_versions.course_id` and `courses.current_version_id`), so the embed errors with *"more than one relationship found"* and returns `null`. The route ignored the query error and hit `if (!orgId) return;`, silently skipping the email (and the path-completion block after it). `notifyBackground` swallows throws, so nothing was logged.
+- **Proof:** running the exact query returns `data: null` + that error; adding the FK hint `courses!course_versions_course_id_fkey(title)` returns the row.
+- **Fix:** disambiguate the embed in [commit/route.ts:147](../../../app/[org]/(learner)/courses/[courseId]/launch/../../../../api/scorm/[attemptId]/commit/route.ts). Code-only change → ships to staging/prod on the next deploy. Verified post-deploy by the Phase 4 suite.
+
+---
+
 ## ⚠️ Capability gaps (features the plan asked for that aren't built)
 
 These are **not bugs** — they're unbuilt/partial features. Tests skip them by design (per your "skip 2004, continue with available" decision).
