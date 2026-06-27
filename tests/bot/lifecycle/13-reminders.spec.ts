@@ -65,9 +65,9 @@ test.describe.serial("Phase 4 — reminder emails (cron)", () => {
       method: "POST",
       headers: { "x-cron-secret": cronSecret! },
     });
-    expect(res.ok, `cron → ${res.status}: ${await res.text()}`).toBeTruthy();
-    const summary = await res.json();
-    console.log(`[reminders] cron summary: ${JSON.stringify(summary)}`);
+    const bodyText = await res.text(); // read once — body is single-use
+    expect(res.ok, `cron → ${res.status}: ${bodyText}`).toBeTruthy();
+    console.log(`[reminders] cron summary: ${bodyText}`);
 
     // Verify the reminder email landed.
     const mail = await waitForEmail({
