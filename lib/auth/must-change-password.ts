@@ -13,10 +13,21 @@ export async function mustChangePassword(userId: string): Promise<boolean> {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
-  const { data } = await svc
+  const { data, error } = await svc
     .from("profiles")
     .select("must_change_password")
     .eq("id", userId)
     .maybeSingle();
+  if (error) {
+    // Security gate: fail CLOSED. Previously the error was ignored and this
+    // returned false, silently skipping a mandatory password change. The
+    // /change-password page is self-service, so a not-actually-required user
+    // just sets a new password — no lockout. Surface the error for alerting.
+    console.error(
+      `[mustChangePassword] lookup failed for ${userId}, failing closed:`,
+      error.message
+    );
+    return true;
+  }
   return Boolean((data as { must_change_password?: boolean } | null)?.must_change_password);
 }

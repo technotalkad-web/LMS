@@ -19,11 +19,19 @@ export async function processStatement(opts: {
   if (!verbId) return null;
 
   // Read current attempt state so we can apply non-downgrade rules.
-  const { data: row } = await supabase
+  const { data: row, error: readErr } = await supabase
     .from("course_attempts")
     .select("completion_status, success_status, status, completed_at, score")
     .eq("id", attemptId)
     .maybeSingle();
+  // Distinguish a real query error from "no such attempt". On error we must NOT
+  // silently swallow it — that previously dropped cmi5/xAPI completions on a
+  // transient read failure. Throw so the route surfaces/logs it (the AU retries).
+  if (readErr) {
+    throw new Error(
+      `processStatement: failed to load attempt ${attemptId}: ${readErr.message}`
+    );
+  }
   if (!row) return null;
 
   const update: Record<string, unknown> = {};
@@ -79,6 +87,14 @@ export async function processStatement(opts: {
 
   if (Object.keys(update).length === 0) return null;
 
-  await supabase.from("course_attempts").update(update).eq("id", attemptId);
+  const { error: updErr } = await supabase
+    .from("course_attempts")
+    .update(update)
+    .eq("id", attemptId);
+  if (updErr) {
+    throw new Error(
+      `processStatement: failed to update attempt ${attemptId}: ${updErr.message}`
+    );
+  }
   return update;
 }

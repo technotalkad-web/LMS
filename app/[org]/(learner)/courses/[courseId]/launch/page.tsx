@@ -2,6 +2,8 @@ import { redirect } from "next/navigation";
 import { originFromRequest } from "@/lib/http/origin";
 import { randomBytes } from "crypto";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { canManage } from "@/lib/auth/permissions";
+import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { ScormRuntime } from "./scorm-runtime";
@@ -42,7 +44,7 @@ export default async function LaunchPage({
 }) {
   const { org: orgSlug, courseId } = await params;
   const { lang: langParam, lp: lpParam } = await searchParams;
-  const { user, org } = await requireOrgAccess(orgSlug);
+  const { user, org, role } = await requireOrgAccess(orgSlug);
 
   const supabase = await createClient();
   const { data: course } = await supabase
@@ -59,6 +61,18 @@ export default async function LaunchPage({
     redirect(`/${orgSlug}/dashboard`);
   }
   const c = course as Course;
+
+  // Entitlement gate (closes the private/unassigned-course IDOR): a learner may
+  // only launch an assigned (direct/org/team) or org_public course. Admins
+  // preview freely. Mirrors the dashboard so launchable == visible.
+  const canAccess = await learnerCanAccessCourse({
+    supabase,
+    orgId: org.id,
+    userId: user.id,
+    courseId: c.id,
+    isAdmin: canManage(role),
+  });
+  if (!canAccess) redirect(`/${orgSlug}/dashboard?denied=1`);
 
   // ---------------------------------------------------------------
   // Multi-language resolution (Phase 2 + Phase 3 of #158)

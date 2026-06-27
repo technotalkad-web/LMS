@@ -27,6 +27,31 @@ export async function POST(
   }
 
   const supabase = await createClient();
+
+  // Tenant guard: the course must belong to the SAME org as the path. RLS lets
+  // a path's admin write learning_path_courses but doesn't check the course's
+  // org, so without this an admin could inject another tenant's course as a
+  // step. (Reading courses is RLS-scoped to org members, so a foreign course
+  // resolves to null and is rejected.)
+  const { data: path } = await supabase
+    .from("learning_paths")
+    .select("organization_id")
+    .eq("id", pathId)
+    .maybeSingle();
+  if (!path) return NextResponse.json({ error: "Path not found" }, { status: 404 });
+  const { data: course } = await supabase
+    .from("courses")
+    .select("id")
+    .eq("id", courseId)
+    .eq("organization_id", (path as { organization_id: string }).organization_id)
+    .maybeSingle();
+  if (!course) {
+    return NextResponse.json(
+      { error: "Course not found in this organization" },
+      { status: 404 }
+    );
+  }
+
   // Find the next step number.
   const { data: existing } = await supabase
     .from("learning_path_courses")

@@ -21,13 +21,40 @@ export async function POST(
   }
 
   const supabase = await createClient();
-  // Insert one row per user, ignoring conflicts (idempotent).
-  const rows = userIds.map((uid) => ({ team_id: teamId, user_id: uid }));
+
+  // Resolve the team's org and keep ONLY userIds that are members of it. RLS on
+  // team_members gates on the team's org (admin) but not on each user_id (the
+  // only FK is to auth.users), so without this an admin could inject foreign-org
+  // user UUIDs into their team and push courses onto them via team assignments.
+  const { data: team } = await supabase
+    .from("teams")
+    .select("organization_id")
+    .eq("id", teamId)
+    .maybeSingle();
+  if (!team) return NextResponse.json({ error: "Team not found" }, { status: 404 });
+  const orgId = (team as { organization_id: string }).organization_id;
+
+  const { data: members } = await supabase
+    .from("organization_members")
+    .select("user_id")
+    .eq("organization_id", orgId)
+    .in("user_id", userIds);
+  const validIds = new Set((members ?? []).map((m) => m.user_id as string));
+  const rows = userIds
+    .filter((uid) => validIds.has(uid))
+    .map((uid) => ({ team_id: teamId, user_id: uid }));
+  if (rows.length === 0) {
+    return NextResponse.json(
+      { error: "None of the provided users belong to this organization" },
+      { status: 400 }
+    );
+  }
+
   const { error } = await supabase
     .from("team_members")
     .upsert(rows, { onConflict: "team_id,user_id" });
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.json({ ok: true, added: userIds.length });
+  return NextResponse.json({ ok: true, added: rows.length });
 }
 
 export async function DELETE(

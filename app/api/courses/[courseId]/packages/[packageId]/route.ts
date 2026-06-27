@@ -177,6 +177,21 @@ export async function DELETE(
     { auth: { persistSession: false } }
   );
 
+  // Tenant guard: the course must belong to the caller's org. The caller is only
+  // authorized as admin of `orgSlug`; everything below runs on the service-role
+  // client (bypasses RLS). Without this, an admin of org A could delete a
+  // package from org B's course by passing org B's courseId/packageId. (The PATCH
+  // handler already does this join; DELETE was missing it.)
+  const { data: courseOwner } = await svc
+    .from("courses")
+    .select("id")
+    .eq("id", courseId)
+    .eq("organization_id", org.id)
+    .maybeSingle();
+  if (!courseOwner) {
+    return NextResponse.json({ error: "Course not found" }, { status: 404 });
+  }
+
   // Refuse if any course_attempts exist for versions in this package.
   const { data: versions } = await svc
     .from("course_versions")

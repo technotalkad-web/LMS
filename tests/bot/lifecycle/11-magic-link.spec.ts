@@ -86,7 +86,16 @@ test.describe.serial("Phase 1 — magic-link onboarding (3 users)", () => {
     for (const u of state.users) {
       const ctx = await browser.newContext({ baseURL });
       const page = await ctx.newPage();
-      await page.goto(u.inviteLink!);
+      // The Supabase project's default redirect (Site URL) points at
+      // localhost; rewrite redirect_to to the app under test so the post-verify
+      // hop lands on the deployed app. NOTE: Supabase only honors this if the
+      // URL is in the Auth redirect allow-list — otherwise it falls back to the
+      // (localhost) Site URL. See FINDINGS.md.
+      const target = u.inviteLink!.replace(
+        /redirect_to=[^&]+/i,
+        `redirect_to=${encodeURIComponent(baseURL!)}`
+      );
+      await page.goto(target);
       // Supabase verifies the token then redirects into the app. A new invite
       // typically lands on change-password / select-org / dashboard — anywhere
       // that isn't the login wall means the session was established.
