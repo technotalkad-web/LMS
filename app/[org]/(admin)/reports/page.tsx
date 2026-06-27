@@ -126,27 +126,55 @@ export default async function ReportsPage({
     : { data: [] };
   const versions = (versionRows ?? []) as Version[];
 
-  const { data: attemptRows } = await supabase
-    .from("course_attempts")
-    .select(
-      "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
-    )
-    .eq("organization_id", org.id);
-  const attempts = (attemptRows ?? []) as Attempt[];
+  // Paginate the unbounded reads. Supabase caps a single response at 1000 rows,
+  // which silently truncated every KPI once an org crossed ~1000 attempts /
+  // members / assignments — wrong numbers with no error. (C1) Aggregation stays
+  // in JS; for very large tenants the next optimization is the per-course
+  // matviews (mv_course_*, refreshed by the now-working cron).
+  const fetchAll = async <T,>(
+    make: (from: number, to: number) => PromiseLike<{ data: T[] | null }>
+  ): Promise<T[]> => {
+    const PAGE = 1000;
+    let from = 0;
+    const all: T[] = [];
+    for (;;) {
+      const { data } = await make(from, from + PAGE - 1);
+      const rows = data ?? [];
+      all.push(...rows);
+      if (rows.length < PAGE) break;
+      from += PAGE;
+      if (from >= 500_000) break; // safety ceiling
+    }
+    return all;
+  };
 
-  const { data: memberRows } = await supabase
-    .from("organization_members")
-    .select("user_id, role")
-    .eq("organization_id", org.id);
-  const members = (memberRows ?? []) as Member[];
+  const attempts = await fetchAll<Attempt>((f, t) =>
+    supabase
+      .from("course_attempts")
+      .select(
+        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
+      )
+      .eq("organization_id", org.id)
+      .range(f, t)
+  );
 
-  const { data: assignmentRows } = courseIds.length
-    ? await supabase
-        .from("course_assignments")
-        .select("course_id, assignee_type, user_id, team_id, due_at")
-        .eq("organization_id", org.id)
-    : { data: [] };
-  const assignments = (assignmentRows ?? []) as Assignment[];
+  const members = await fetchAll<Member>((f, t) =>
+    supabase
+      .from("organization_members")
+      .select("user_id, role")
+      .eq("organization_id", org.id)
+      .range(f, t)
+  );
+
+  const assignments = courseIds.length
+    ? await fetchAll<Assignment>((f, t) =>
+        supabase
+          .from("course_assignments")
+          .select("course_id, assignee_type, user_id, team_id, due_at")
+          .eq("organization_id", org.id)
+          .range(f, t)
+      )
+    : [];
 
   const { data: teamRows } = await supabase
     .from("teams")

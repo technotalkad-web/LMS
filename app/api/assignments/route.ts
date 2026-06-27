@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
 
@@ -205,15 +206,8 @@ export async function POST(request: Request) {
           }
         }
 
-        // Resolve emails for those user_ids.
-        const { data: listed } = await svc.auth.admin.listUsers({
-          page: 1,
-          perPage: 1500,
-        });
-        const emailById = new Map<string, string>();
-        for (const u of listed?.users ?? []) {
-          if (u.email && recipientUserIds.has(u.id)) emailById.set(u.id, u.email);
-        }
+        // Resolve emails (indexed via profiles; no listUsers pagination cap).
+        const emailById = await resolveEmails(svc, recipientUserIds);
 
         const portalBase = await originFromRequest();
         const directLink = portalBase
