@@ -19,12 +19,12 @@ export default async function NewTenantPage() {
   return (
     <div className="max-w-2xl">
       <header className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-slate-900 flex items-center gap-3">
-          <Building2 className="w-7 h-7 text-indigo-600" /> Create organization
+        <h1 className="text-3xl font-bold tracking-tight text-ink flex items-center gap-3">
+          <Building2 className="w-7 h-7 text-accent" /> Create organization
         </h1>
-        <p className="text-slate-500 mt-1">
+        <p className="text-muted mt-1">
           Provision a new tenant workspace. The slug becomes the URL prefix
-          (e.g. <code className="bg-slate-100 px-1 rounded">/{`{slug}`}/dashboard</code>) and cannot be changed later.
+          (e.g. <code className="bg-canvas px-1 rounded">/{`{slug}`}/dashboard</code>) and cannot be changed later.
         </p>
       </header>
       <NewTenantForm

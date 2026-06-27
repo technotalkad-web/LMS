@@ -20,7 +20,7 @@ export type BroadcastRow = {
 };
 
 const TONE_BADGE: Record<BroadcastRow["tone"], string> = {
-  info: "bg-indigo-50 text-indigo-700",
+  info: "bg-accent/10 text-accent",
   warning: "bg-amber-50 text-amber-700",
   critical: "bg-red-50 text-red-700",
   success: "bg-emerald-50 text-emerald-700",
@@ -96,32 +96,32 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
       <div className="flex justify-end mb-4">
         <button
           onClick={() => setCreating((v) => !v)}
-          className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2"
+          className="bg-ink text-canvas hover:opacity-90 px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2"
         >
           <Plus className="w-4 h-4" /> New broadcast
         </button>
       </div>
 
       {creating && (
-        <div className="bg-white border-2 border-indigo-200 rounded-xl p-5 shadow-sm mb-6">
-          <h3 className="font-bold text-slate-900 mb-4 flex items-center gap-2">
+        <div className="bg-paper border-2 border-line rounded-xl p-5 shadow-sm mb-6">
+          <h3 className="font-bold text-ink mb-4 flex items-center gap-2">
             <Megaphone className="w-4 h-4" /> Compose
           </h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
             <label>
-              <span className="text-xs text-slate-500">Title</span>
+              <span className="text-xs text-muted">Title</span>
               <input
                 value={draft.title}
                 onChange={(e) => setDraft({ ...draft, title: e.target.value })}
-                className="w-full mt-0.5 border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                className="w-full mt-0.5 border border-line rounded-md px-2 py-1.5 text-sm"
               />
             </label>
             <label>
-              <span className="text-xs text-slate-500">Tone</span>
+              <span className="text-xs text-muted">Tone</span>
               <select
                 value={draft.tone}
                 onChange={(e) => setDraft({ ...draft, tone: e.target.value as BroadcastRow["tone"] })}
-                className="w-full mt-0.5 border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                className="w-full mt-0.5 border border-line rounded-md px-2 py-1.5 text-sm"
               >
                 <option value="info">Info</option>
                 <option value="warning">Warning</option>
@@ -130,20 +130,20 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
               </select>
             </label>
             <label className="md:col-span-2">
-              <span className="text-xs text-slate-500">Body (Markdown supported)</span>
+              <span className="text-xs text-muted">Body (Markdown supported)</span>
               <textarea
                 rows={3}
                 value={draft.body_md}
                 onChange={(e) => setDraft({ ...draft, body_md: e.target.value })}
-                className="w-full mt-0.5 border border-slate-300 rounded-md px-2 py-1.5 text-sm font-mono"
+                className="w-full mt-0.5 border border-line rounded-md px-2 py-1.5 text-sm font-mono"
               />
             </label>
             <label>
-              <span className="text-xs text-slate-500">Audience</span>
+              <span className="text-xs text-muted">Audience</span>
               <select
                 value={draft.audience}
                 onChange={(e) => setDraft({ ...draft, audience: e.target.value as BroadcastRow["audience"] })}
-                className="w-full mt-0.5 border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                className="w-full mt-0.5 border border-line rounded-md px-2 py-1.5 text-sm"
               >
                 <option value="all">All users</option>
                 <option value="admins_only">Admins only</option>
@@ -151,17 +151,17 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
               </select>
             </label>
             <label>
-              <span className="text-xs text-slate-500">Expires (optional)</span>
+              <span className="text-xs text-muted">Expires (optional)</span>
               <input
                 type="datetime-local"
                 value={draft.expires_at ?? ""}
                 onChange={(e) =>
                   setDraft({ ...draft, expires_at: e.target.value || null })
                 }
-                className="w-full mt-0.5 border border-slate-300 rounded-md px-2 py-1.5 text-sm"
+                className="w-full mt-0.5 border border-line rounded-md px-2 py-1.5 text-sm"
               />
             </label>
-            <label className="flex items-center gap-2 text-xs text-slate-700">
+            <label className="flex items-center gap-2 text-xs text-ink">
               <input
                 type="checkbox"
                 checked={draft.dismissable}
@@ -170,7 +170,7 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
               />
               Allow users to dismiss
             </label>
-            <label className="flex items-center gap-2 text-xs text-slate-700">
+            <label className="flex items-center gap-2 text-xs text-ink">
               <input
                 type="checkbox"
                 checked={draft.is_active}
@@ -184,14 +184,14 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
             <button
               onClick={() => setCreating(false)}
               disabled={busy}
-              className="text-slate-500 px-3 py-1.5 text-sm hover:bg-slate-100 rounded-md"
+              className="text-muted px-3 py-1.5 text-sm hover:bg-canvas rounded-md"
             >
               Cancel
             </button>
             <button
               onClick={submit}
               disabled={busy}
-              className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-1.5 rounded-md text-sm font-semibold disabled:opacity-60"
+              className="bg-ink text-canvas hover:opacity-90 px-4 py-1.5 rounded-md text-sm font-semibold disabled:opacity-60"
             >
               Publish
             </button>
@@ -199,12 +199,12 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
         </div>
       )}
 
-      <div className="bg-white border border-slate-200 rounded-xl shadow-sm">
+      <div className="bg-paper border border-line rounded-xl shadow-sm">
         {initial.length === 0 ? (
-          <div className="p-12 text-center text-slate-500 text-sm">No broadcasts yet.</div>
+          <div className="p-12 text-center text-muted text-sm">No broadcasts yet.</div>
         ) : (
           <table className="w-full text-left text-sm">
-            <thead className="bg-slate-50 text-slate-500 border-b border-slate-200">
+            <thead className="bg-canvas text-muted border-b border-line">
               <tr>
                 <th className="px-4 py-3 font-semibold uppercase text-xs">Title</th>
                 <th className="px-4 py-3 font-semibold uppercase text-xs">Tone</th>
@@ -214,27 +214,27 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
                 <th className="px-4 py-3 font-semibold uppercase text-xs text-right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody className="divide-y divide-line">
               {initial.map((b) => (
-                <tr key={b.id} className="hover:bg-slate-50">
+                <tr key={b.id} className="hover:bg-canvas">
                   <td className="px-4 py-3">
-                    <p className="font-semibold text-slate-900">{b.title}</p>
-                    <p className="text-slate-500 text-xs mt-0.5 line-clamp-1">{b.body_md}</p>
+                    <p className="font-semibold text-ink">{b.title}</p>
+                    <p className="text-muted text-xs mt-0.5 line-clamp-1">{b.body_md}</p>
                   </td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded-md text-xs font-bold ${TONE_BADGE[b.tone]}`}>
                       {b.tone}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-slate-700 text-xs">
+                  <td className="px-4 py-3 text-ink text-xs">
                     {b.audience.replace(/_/g, " ")}
                   </td>
                   <td className="px-4 py-3 text-xs">
-                    <span className={b.is_active ? "text-emerald-700 font-semibold" : "text-slate-400"}>
+                    <span className={b.is_active ? "text-emerald-700 font-semibold" : "text-muted"}>
                       {b.is_active ? "Live" : "Paused"}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-xs text-slate-500">
+                  <td className="px-4 py-3 text-xs text-muted">
                     {new Date(b.posted_at).toLocaleString()}
                     {b.expires_at && (
                       <p className="text-[10px] mt-0.5">expires {new Date(b.expires_at).toLocaleDateString()}</p>
@@ -245,14 +245,14 @@ export function BroadcastsManager({ initial }: { initial: BroadcastRow[] }) {
                       <button
                         onClick={() => toggle(b)}
                         disabled={busy}
-                        className="text-xs px-2 py-1 rounded-md hover:bg-slate-100 text-slate-700"
+                        className="text-xs px-2 py-1 rounded-md hover:bg-canvas text-ink"
                       >
                         {b.is_active ? "Pause" : "Activate"}
                       </button>
                       <button
                         onClick={() => remove(b)}
                         disabled={busy}
-                        className="p-1.5 text-slate-400 hover:text-red-600 transition"
+                        className="p-1.5 text-muted hover:text-red-600 transition"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>

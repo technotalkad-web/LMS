@@ -47,10 +47,10 @@ export default async function PlansPage() {
   return (
     <div>
       <header className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-slate-900 flex items-center gap-3">
-          <Database className="w-7 h-7 text-indigo-600" /> Plans &amp; Billing
+        <h1 className="text-3xl font-bold tracking-tight text-ink flex items-center gap-3">
+          <Database className="w-7 h-7 text-accent" /> Plans &amp; Billing
         </h1>
-        <p className="text-slate-500 mt-1">
+        <p className="text-muted mt-1">
           Manage subscription tiers, pricing, quotas, and feature flags. Changes propagate to every tenant on save.
         </p>
       </header>

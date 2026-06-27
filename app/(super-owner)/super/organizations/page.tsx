@@ -111,14 +111,14 @@ export default async function OrganizationsPage() {
     <div>
       <header className="flex justify-between items-end mb-8">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-slate-900">Organizations</h1>
-          <p className="text-slate-500 mt-1">
+          <h1 className="text-3xl font-bold tracking-tight text-ink">Organizations</h1>
+          <p className="text-muted mt-1">
             Manage tenant workspaces, subscriptions, and platform access.
           </p>
         </div>
         <Link
           href="/super/organizations/new"
-          className="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-lg font-semibold text-sm transition shadow-sm flex items-center gap-2"
+          className="bg-ink hover:opacity-90 text-white px-5 py-2.5 rounded-lg font-semibold text-sm transition shadow-sm flex items-center gap-2"
         >
           <Plus className="w-4 h-4" /> Create new organization
         </Link>
@@ -141,15 +141,15 @@ export default async function OrganizationsPage() {
           title="Total platform users"
           value={totalUsers.toLocaleString()}
           trend="across all tenants"
-          icon={<UsersIcon className="text-indigo-500 w-5 h-5" />}
+          icon={<UsersIcon className="text-accent w-5 h-5" />}
         />
-        <div className="bg-white p-6 rounded-xl border border-red-200 shadow-sm flex flex-col">
+        <div className="bg-paper p-6 rounded-xl border border-red-200 shadow-sm flex flex-col">
           <div className="flex justify-between items-start mb-2">
             <span className="text-red-600 font-bold text-sm">Action required</span>
             <AlertTriangle className="text-red-500 w-5 h-5" />
           </div>
-          <p className="text-3xl font-black text-slate-900">{actionRequired} accounts</p>
-          <p className="text-sm text-slate-500 mt-1">past due, suspended, or scheduled for deletion</p>
+          <p className="text-3xl font-black text-ink">{actionRequired} accounts</p>
+          <p className="text-sm text-muted mt-1">past due, suspended, or scheduled for deletion</p>
         </div>
       </div>
 
@@ -170,13 +170,13 @@ function KpiCard({
   icon: React.ReactNode;
 }) {
   return (
-    <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col">
+    <div className="bg-paper p-6 rounded-xl border border-line shadow-sm flex flex-col">
       <div className="flex justify-between items-start mb-2">
-        <span className="text-slate-500 font-medium text-sm">{title}</span>
-        <div className="p-2 bg-slate-50 rounded-lg border border-slate-100">{icon}</div>
+        <span className="text-muted font-medium text-sm">{title}</span>
+        <div className="p-2 bg-canvas rounded-lg border border-line">{icon}</div>
       </div>
-      <p className="text-3xl font-black text-slate-900">{value}</p>
-      <p className="text-sm text-slate-500 mt-1">{trend}</p>
+      <p className="text-3xl font-black text-ink">{value}</p>
+      <p className="text-sm text-muted mt-1">{trend}</p>
     </div>
   );
 }
