@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendNotification } from "@/lib/notifications/send";
+import { resolveEmails } from "@/lib/users/emails";
+import { mapWithConcurrency } from "@/lib/util/concurrency";
 
 /**
  *   POST /api/cron/reminders
@@ -200,16 +202,9 @@ export async function POST(request: Request) {
       for (const uid of orgUserIds.get(a.organization_id) ?? []) allUserIds.add(uid);
     }
   }
-  const emailById = new Map<string, string>();
-  if (allUserIds.size > 0) {
-    const { data: listed } = await svc.auth.admin.listUsers({
-      page: 1,
-      perPage: 1000,
-    });
-    for (const u of listed?.users ?? []) {
-      if (u.email && allUserIds.has(u.id)) emailById.set(u.id, u.email);
-    }
-  }
+  // Resolve emails via profiles (indexed, no pagination cap) — listUsers paged
+  // only the first 1000 platform users, silently dropping everyone beyond it.
+  const emailById = await resolveEmails(svc, allUserIds);
 
   const now = Date.now();
   // LEGITIMATE NEXT_PUBLIC_SITE_URL use: cron triggers have no inbound
@@ -230,6 +225,20 @@ export async function POST(request: Request) {
     nudge_count: number;
     stopped: boolean;
   }> = [];
+
+  // Phase 1: apply all skip rules and build the list of eligible send-jobs.
+  // (No sends here.) Phase 2 fans the sends out with bounded concurrency so a
+  // run with thousands of learners doesn't go serially (Worker timeout) nor
+  // all-at-once (SMTP overload).
+  type Job = {
+    uid: string;
+    email: string;
+    course: (typeof enabledCourses)[number];
+    firstAssignedIso: string;
+    nudgeCount: number;
+    directLink: string;
+  };
+  const jobs: Job[] = [];
 
   for (const course of enabledCourses) {
     const cadenceMs = course.cadence_days * 24 * 60 * 60 * 1000;
@@ -288,40 +297,49 @@ export async function POST(request: Request) {
         continue;
       }
 
-      const directLink = portalBase
-        ? `${portalBase}/${course.org_slug}/courses/${course.course_id}/launch`
-        : `/${course.org_slug}/courses/${course.course_id}/launch`;
-
-      const result = await sendNotification({
-        organizationId: course.organization_id,
-        event: "asset_reminder",
-        to: { user_id: uid, email },
-        context: {
-          learner_name: email,
-          learner_email: email,
-          course_name: course.title,
-          course_id: course.course_id,
-          org_name: course.org_name,
-          direct_link: directLink,
-        },
-      });
-
-      if (result.status === "sent") sent++;
-      else skipped++;
-
-      stateUpserts.push({
-        user_id: uid,
-        course_id: course.course_id,
-        organization_id: course.organization_id,
-        first_assigned_at: st
+      jobs.push({
+        uid,
+        email,
+        course,
+        firstAssignedIso: st
           ? st.first_assigned_at
           : new Date(firstAssigned).toISOString(),
-        last_nudge_at: new Date(now).toISOString(),
-        nudge_count: (st?.nudge_count ?? 0) + 1,
-        stopped: false,
+        nudgeCount: st?.nudge_count ?? 0,
+        directLink: portalBase
+          ? `${portalBase}/${course.org_slug}/courses/${course.course_id}/launch`
+          : `/${course.org_slug}/courses/${course.course_id}/launch`,
       });
     }
   }
+
+  // Phase 2: bounded-concurrency send. (sent/skipped++ and .push are synchronous
+  // between awaits, so they're safe under JS's single-threaded model.)
+  await mapWithConcurrency(jobs, 8, async (job) => {
+    const result = await sendNotification({
+      organizationId: job.course.organization_id,
+      event: "asset_reminder",
+      to: { user_id: job.uid, email: job.email },
+      context: {
+        learner_name: job.email,
+        learner_email: job.email,
+        course_name: job.course.title,
+        course_id: job.course.course_id,
+        org_name: job.course.org_name,
+        direct_link: job.directLink,
+      },
+    });
+    if (result.status === "sent") sent++;
+    else skipped++;
+    stateUpserts.push({
+      user_id: job.uid,
+      course_id: job.course.course_id,
+      organization_id: job.course.organization_id,
+      first_assigned_at: job.firstAssignedIso,
+      last_nudge_at: new Date(now).toISOString(),
+      nudge_count: job.nudgeCount + 1,
+      stopped: false,
+    });
+  });
 
   if (stateUpserts.length > 0) {
     await svc

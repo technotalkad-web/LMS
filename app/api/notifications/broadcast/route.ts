@@ -3,6 +3,8 @@ import { headers } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendNotification } from "@/lib/notifications/send";
+import { resolveEmails } from "@/lib/users/emails";
+import { mapWithConcurrency } from "@/lib/util/concurrency";
 
 // Action-button types the admin can attach to a broadcast. Course/Path
 // types reference an org-scoped entity and are resolved to a deep link
@@ -255,24 +257,23 @@ export async function POST(request: Request) {
     if (url) resolvedButtons.push({ label, url });
   }
 
-  // ---- Resolve emails for the recipients --------------------------------
-  const { data: listed } = await svc.auth.admin.listUsers({
-    page: 1,
-    perPage: 1500,
-  });
-  const emailById = new Map<string, string>();
-  for (const u of listed?.users ?? []) {
-    if (u.email && recipientIds.has(u.id)) emailById.set(u.id, u.email);
-  }
+  // ---- Resolve emails (indexed via profiles; no listUsers pagination cap
+  //      that silently dropped recipients past the first 1500) -------------
+  const emailById = await resolveEmails(svc, recipientIds);
 
-  // ---- Send sequentially (don't overwhelm SMTP) -------------------------
+  // ---- Send with bounded concurrency (batch — fast without overwhelming
+  //      SMTP; serial would time out for large orgs) ----------------------
+  // Hoist the (already-validated at line ~45) subject/body into consts — TS
+  // drops object-property narrowing inside the async callback below.
+  const subject = body.subject!;
+  const bodyMd = body.body_md!;
   let sent = 0;
   let failed = 0;
-  for (const uid of recipientIds) {
+  await mapWithConcurrency([...recipientIds], 8, async (uid) => {
     const email = emailById.get(uid);
     if (!email) {
       failed++;
-      continue;
+      return;
     }
     const result = await sendNotification({
       organizationId: org.id,
@@ -284,14 +285,14 @@ export async function POST(request: Request) {
         org_name: org.name,
       },
       override: {
-        subject: body.subject,
-        body_md: body.body_md,
+        subject,
+        body_md: bodyMd,
         buttons: resolvedButtons.length > 0 ? resolvedButtons : undefined,
       },
     });
     if (result.status === "sent") sent++;
     else failed++;
-  }
+  });
 
   return NextResponse.json({
     sent,

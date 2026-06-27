@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { resolveEmails } from "@/lib/users/emails";
 import { uploadCoursePackage } from "@/lib/courses/upload";
 import { notifyBackground } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
@@ -154,14 +155,7 @@ export async function POST(request: NextRequest) {
         });
         if (learnerIds.size === 0) return;
 
-        const { data: listed } = await svc.auth.admin.listUsers({
-          page: 1,
-          perPage: 1500,
-        });
-        const emailById = new Map<string, string>();
-        for (const u of listed?.users ?? []) {
-          if (u.email && learnerIds.has(u.id)) emailById.set(u.id, u.email);
-        }
+        const emailById = await resolveEmails(svc, learnerIds);
 
         const portalBase = await originFromRequest();
         const directLink = portalBase

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 
 /**
@@ -75,14 +76,7 @@ export async function DELETE(
         }
         if (recipientIds.size === 0) return;
 
-        const { data: listed } = await svc.auth.admin.listUsers({
-          page: 1,
-          perPage: 1500,
-        });
-        const emailById = new Map<string, string>();
-        for (const u of listed?.users ?? []) {
-          if (u.email && recipientIds.has(u.id)) emailById.set(u.id, u.email);
-        }
+        const emailById = await resolveEmails(svc, recipientIds);
 
         const course = Array.isArray(r.courses) ? r.courses[0] : r.courses;
         const orgInfo = Array.isArray(r.organizations)
