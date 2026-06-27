@@ -148,27 +148,27 @@ export function OrganizationsTable({
   }
 
   return (
-    <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
-      <div className="p-4 border-b border-slate-200 flex flex-wrap justify-between gap-3 items-center bg-slate-50">
+    <div className="bg-paper border border-line rounded-xl shadow-sm overflow-hidden">
+      <div className="p-4 border-b border-line flex flex-wrap justify-between gap-3 items-center bg-canvas">
         <div className="relative w-72">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted" />
           <input
             type="text"
             placeholder="Search organizations..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-600 focus:border-transparent outline-none"
+            className="w-full pl-9 pr-4 py-2 border border-line rounded-lg text-sm focus:ring-2 focus:ring-ink focus:border-transparent outline-none"
           />
         </div>
         <div className="flex gap-2">
-          <select aria-label="Filter by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)} className="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white outline-none">
+          <select aria-label="Filter by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)} className="border border-line rounded-lg px-3 py-2 text-sm bg-paper outline-none">
             <option value="all">All statuses</option>
             <option value="active">Active</option>
             <option value="past_due">Past Due</option>
             <option value="suspended">Suspended</option>
             <option value="scheduled_deletion">Scheduled deletion</option>
           </select>
-          <select aria-label="Filter by plan" value={planFilter} onChange={(e) => setPlanFilter(e.target.value as PlanFilter)} className="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white outline-none">
+          <select aria-label="Filter by plan" value={planFilter} onChange={(e) => setPlanFilter(e.target.value as PlanFilter)} className="border border-line rounded-lg px-3 py-2 text-sm bg-paper outline-none">
             <option value="all">All plans</option>
             <option value="basic">Basic</option>
             <option value="pro">Pro</option>
@@ -178,10 +178,10 @@ export function OrganizationsTable({
       </div>
 
       {filtered.length === 0 ? (
-        <div className="p-12 text-center text-slate-500 text-sm">No tenants match the current filters.</div>
+        <div className="p-12 text-center text-muted text-sm">No tenants match the current filters.</div>
       ) : (
         <table className="w-full text-left text-sm">
-          <thead className="bg-slate-50 text-slate-500 border-b border-slate-200">
+          <thead className="bg-canvas text-muted border-b border-line">
             <tr>
               <th className="px-6 py-3 font-semibold uppercase tracking-wider text-xs">Organization</th>
               <th className="px-6 py-3 font-semibold uppercase tracking-wider text-xs">Plan &amp; MRR</th>
@@ -190,17 +190,17 @@ export function OrganizationsTable({
               <th className="px-6 py-3 font-semibold uppercase tracking-wider text-xs text-right">Actions</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-100">
+          <tbody className="divide-y divide-line">
             {filtered.map((t) => (
-              <tr key={t.id} className="hover:bg-slate-50 transition">
+              <tr key={t.id} className="hover:bg-canvas transition">
                 <td className="px-6 py-4">
                   <a
                     href={`/super/organizations/${t.id}`}
-                    className="font-bold text-slate-900 hover:text-indigo-600 transition"
+                    className="font-bold text-ink hover:text-accent transition"
                   >
                     {t.name}
                   </a>
-                  <p className="text-slate-500 text-xs font-mono mt-0.5">{t.slug}</p>
+                  <p className="text-muted text-xs font-mono mt-0.5">{t.slug}</p>
                 </td>
                 <td className="px-6 py-4">
                   <select
@@ -208,7 +208,7 @@ export function OrganizationsTable({
                     value={t.plan_id ?? ""}
                     onChange={(e) => setPlan(t, e.target.value)}
                     disabled={busy === t.id || t.status === "scheduled_deletion"}
-                    className="border border-slate-300 rounded-md px-2 py-1 text-xs font-bold bg-slate-50 hover:border-slate-400 outline-none disabled:opacity-60"
+                    className="border border-line rounded-md px-2 py-1 text-xs font-bold bg-canvas hover:border-ink outline-none disabled:opacity-60"
                     title="Change plan"
                   >
                     {!t.plan_id && <option value="">No plan</option>}
@@ -216,21 +216,21 @@ export function OrganizationsTable({
                       <option key={p.id} value={p.id}>{p.name}</option>
                     ))}
                   </select>
-                  <p className="text-slate-500 text-xs mt-1">${Math.round(t.mrr_cents / 100).toLocaleString()} / mo</p>
+                  <p className="text-muted text-xs mt-1">${Math.round(t.mrr_cents / 100).toLocaleString()} / mo</p>
                 </td>
                 <td className="px-6 py-4">
-                  <p className="text-slate-900 font-medium">{t.users.toLocaleString()} users</p>
-                  <p className="text-slate-500 text-xs mt-0.5">{t.storage_gb > 0 ? `${t.storage_gb} GB` : "—"}</p>
+                  <p className="text-ink font-medium">{t.users.toLocaleString()} users</p>
+                  <p className="text-muted text-xs mt-0.5">{t.storage_gb > 0 ? `${t.storage_gb} GB` : "—"}</p>
                 </td>
                 <td className="px-6 py-4">
                   <StatusBadge status={t.status} scheduledAt={t.scheduled_deletion_at} />
                 </td>
                 <td className="px-6 py-4 text-right">
                   <div className="flex justify-end gap-1">
-                    <button type="button" onClick={() => impersonate(t)} disabled={busy === t.id || t.status !== "active"} className="p-1.5 text-slate-400 hover:text-indigo-600 transition disabled:opacity-40" title="Log in as org admin">
+                    <button type="button" onClick={() => impersonate(t)} disabled={busy === t.id || t.status !== "active"} className="p-1.5 text-muted hover:text-accent transition disabled:opacity-40" title="Log in as org admin">
                       <ExternalLink className="w-4 h-4" />
                     </button>
-                    <Link href="/super/plans" className="p-1.5 text-slate-400 hover:text-slate-900 transition" title="Edit plan definitions (prices, quotas, features)">
+                    <Link href="/super/plans" className="p-1.5 text-muted hover:text-ink transition" title="Edit plan definitions (prices, quotas, features)">
                       <Edit3 className="w-4 h-4" />
                     </Link>
                     {t.status === "scheduled_deletion" ? (
@@ -238,7 +238,7 @@ export function OrganizationsTable({
                         <RotateCcw className="w-4 h-4" />
                       </button>
                     ) : t.status === "active" ? (
-                      <button type="button" onClick={() => suspend(t)} disabled={busy === t.id} className="p-1.5 text-slate-400 hover:text-amber-600 transition disabled:opacity-40" title="Suspend service">
+                      <button type="button" onClick={() => suspend(t)} disabled={busy === t.id} className="p-1.5 text-muted hover:text-amber-600 transition disabled:opacity-40" title="Suspend service">
                         <Power className="w-4 h-4" />
                       </button>
                     ) : (
@@ -246,7 +246,7 @@ export function OrganizationsTable({
                         <Power className="w-4 h-4" />
                       </button>
                     )}
-                    <button type="button" onClick={() => softDelete(t)} disabled={busy === t.id || t.status === "scheduled_deletion"} className="p-1.5 text-slate-400 hover:text-red-600 transition disabled:opacity-40" title="Schedule deletion (30-day grace)">
+                    <button type="button" onClick={() => softDelete(t)} disabled={busy === t.id || t.status === "scheduled_deletion"} className="p-1.5 text-muted hover:text-red-600 transition disabled:opacity-40" title="Schedule deletion (30-day grace)">
                       <Trash2 className="w-4 h-4" />
                     </button>
                   </div>

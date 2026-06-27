@@ -133,14 +133,14 @@ export function TenantDetailEditor({
   return (
     <div className="space-y-6">
       {/* Org details card */}
-      <section className="bg-white border border-slate-200 rounded-xl shadow-sm p-6">
-        <h2 className="font-bold text-slate-900 mb-4">Organization details</h2>
+      <section className="bg-paper border border-line rounded-xl shadow-sm p-6">
+        <h2 className="font-bold text-ink mb-4">Organization details</h2>
         <div className="space-y-4">
           <Field label="Workspace name">
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+              className="w-full border border-line rounded-md px-3 py-2 text-sm"
             />
           </Field>
           <Field
@@ -151,7 +151,7 @@ export function TenantDetailEditor({
               value={domains}
               onChange={(e) => setDomains(e.target.value)}
               placeholder="acme.com, acme.co.uk"
-              className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+              className="w-full border border-line rounded-md px-3 py-2 text-sm"
             />
           </Field>
           <Field
@@ -162,7 +162,7 @@ export function TenantDetailEditor({
               value={customDomain}
               onChange={(e) => setCustomDomain(e.target.value)}
               placeholder="learn.acme.com"
-              className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+              className="w-full border border-line rounded-md px-3 py-2 text-sm"
             />
           </Field>
         </div>
@@ -171,7 +171,7 @@ export function TenantDetailEditor({
           <button
             onClick={saveOrg}
             disabled={busy || !name.trim()}
-            className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1 disabled:opacity-60"
+            className="bg-ink text-canvas hover:opacity-90 px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1 disabled:opacity-60"
           >
             <Save className="w-4 h-4" /> Save changes
           </button>
@@ -179,21 +179,21 @@ export function TenantDetailEditor({
       </section>
 
       {/* Admins card */}
-      <section className="bg-white border border-slate-200 rounded-xl shadow-sm p-6">
-        <h2 className="font-bold text-slate-900 mb-4 flex items-center gap-2">
-          <ShieldAlert className="w-4 h-4 text-indigo-600" />
+      <section className="bg-paper border border-line rounded-xl shadow-sm p-6">
+        <h2 className="font-bold text-ink mb-4 flex items-center gap-2">
+          <ShieldAlert className="w-4 h-4 text-accent" />
           Admins & data analysts
         </h2>
 
         {admins.length === 0 ? (
-          <p className="text-sm text-slate-500 mb-4">No admins yet. Add one below.</p>
+          <p className="text-sm text-muted mb-4">No admins yet. Add one below.</p>
         ) : (
-          <ul className="divide-y divide-slate-100 mb-4">
+          <ul className="divide-y divide-line mb-4">
             {admins.map((a) => (
               <li key={a.user_id} className="flex items-center justify-between gap-3 py-2.5">
                 <div className="min-w-0">
-                  <p className="text-sm font-semibold text-slate-900 truncate">{a.email}</p>
-                  <p className="text-xs text-slate-400 font-mono truncate">{a.user_id}</p>
+                  <p className="text-sm font-semibold text-ink truncate">{a.email}</p>
+                  <p className="text-xs text-muted font-mono truncate">{a.user_id}</p>
                 </div>
                 <div className="flex items-center gap-2">
                   <select
@@ -201,7 +201,7 @@ export function TenantDetailEditor({
                     onChange={(e) => changeRole(a, e.target.value)}
                     disabled={busy}
                     aria-label={`Change role for ${a.email}`}
-                    className="border border-slate-300 rounded-md px-2 py-1 text-xs bg-white"
+                    className="border border-line rounded-md px-2 py-1 text-xs bg-paper"
                   >
                     {Object.entries(ROLE_LABEL).map(([k, v]) => (
                       <option key={k} value={k}>
@@ -212,7 +212,7 @@ export function TenantDetailEditor({
                   <button
                     onClick={() => removeAdmin(a)}
                     disabled={busy}
-                    className="p-1.5 text-slate-400 hover:text-red-600 transition"
+                    className="p-1.5 text-muted hover:text-red-600 transition"
                     title="Remove from organization"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -223,19 +223,19 @@ export function TenantDetailEditor({
           </ul>
         )}
 
-        <div className="border-t border-slate-100 pt-4">
-          <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+        <div className="border-t border-line pt-4">
+          <p className="text-xs font-semibold text-muted uppercase tracking-wider mb-2">
             Add admin
           </p>
           <div className="flex gap-2 flex-wrap">
             <div className="flex-1 min-w-[200px] relative">
-              <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+              <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted" />
               <input
                 type="email"
                 placeholder="user@acme.com"
                 value={newEmail}
                 onChange={(e) => setNewEmail(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-md text-sm"
+                className="w-full pl-9 pr-3 py-2 border border-line rounded-md text-sm"
               />
             </div>
             <select
@@ -244,7 +244,7 @@ export function TenantDetailEditor({
                 setNewRole(e.target.value as "super_owner" | "admin" | "data_analyst")
               }
               aria-label="Role for new admin"
-              className="border border-slate-300 rounded-md px-3 py-2 text-sm bg-white"
+              className="border border-line rounded-md px-3 py-2 text-sm bg-paper"
             >
               <option value="admin">Admin</option>
               <option value="super_owner">Super owner</option>
@@ -253,12 +253,12 @@ export function TenantDetailEditor({
             <button
               onClick={addAdmin}
               disabled={busy || !newEmail.trim()}
-              className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1 disabled:opacity-60"
+              className="bg-ink text-canvas hover:opacity-90 px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1 disabled:opacity-60"
             >
               <Plus className="w-4 h-4" /> Add
             </button>
           </div>
-          <p className="text-xs text-slate-400 mt-2">
+          <p className="text-xs text-muted mt-2">
             If the email doesn&apos;t already have an account, a magic-link invitation is emailed.
           </p>
         </div>
@@ -278,8 +278,8 @@ function Field({
 }) {
   return (
     <label className="block">
-      <span className="text-sm font-semibold text-slate-700">{label}</span>
-      {hint && <span className="block text-xs text-slate-500 mt-0.5 mb-1.5">{hint}</span>}
+      <span className="text-sm font-semibold text-ink">{label}</span>
+      {hint && <span className="block text-xs text-muted mt-0.5 mb-1.5">{hint}</span>}
       {!hint && <span className="block mb-1.5" />}
       {children}
     </label>

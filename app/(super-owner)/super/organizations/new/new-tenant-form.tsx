@@ -60,28 +60,28 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
 
   if (result) {
     return (
-      <div className="bg-white border border-emerald-200 rounded-xl shadow-sm p-6">
+      <div className="bg-paper border border-emerald-200 rounded-xl shadow-sm p-6">
         <div className="flex items-start gap-3">
           <CheckCircle2 className="w-6 h-6 text-emerald-600 mt-0.5" />
           <div>
-            <h2 className="font-bold text-lg text-slate-900">Tenant created</h2>
-            <p className="text-sm text-slate-600 mt-1">
+            <h2 className="font-bold text-lg text-ink">Tenant created</h2>
+            <p className="text-sm text-muted mt-1">
               The workspace is live at{" "}
-              <a href={`/${result.slug}/login`} className="text-indigo-600 underline font-mono">
+              <a href={`/${result.slug}/login`} className="text-accent underline font-mono">
                 /{result.slug}/login
               </a>
               .
             </p>
             {result.invite_url && (
               <div className="mt-4">
-                <p className="text-xs uppercase font-bold tracking-wider text-slate-500 mb-1">
+                <p className="text-xs uppercase font-bold tracking-wider text-muted mb-1">
                   Invitation link for initial admin
                 </p>
                 <div className="flex gap-2">
                   <input
                     readOnly
                     value={result.invite_url}
-                    className="flex-1 border border-slate-300 rounded-md px-2 py-1.5 text-xs font-mono bg-slate-50"
+                    className="flex-1 border border-line rounded-md px-2 py-1.5 text-xs font-mono bg-canvas"
                   />
                   <button
                     onClick={() => navigator.clipboard.writeText(result.invite_url!)}
@@ -95,13 +95,13 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
             <div className="mt-5 flex gap-2">
               <button
                 onClick={() => router.push("/super/organizations")}
-                className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-semibold text-sm"
+                className="bg-ink text-canvas hover:opacity-90 px-4 py-2 rounded-lg font-semibold text-sm"
               >
                 Back to organizations
               </button>
               <button
                 onClick={() => setResult(null)}
-                className="text-slate-500 px-4 py-2 rounded-lg text-sm hover:bg-slate-100"
+                className="text-muted px-4 py-2 rounded-lg text-sm hover:bg-canvas"
               >
                 Create another
               </button>
@@ -113,20 +113,20 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
   }
 
   return (
-    <form onSubmit={submit} className="bg-white border border-slate-200 rounded-xl shadow-sm p-6 space-y-4">
+    <form onSubmit={submit} className="bg-paper border border-line rounded-xl shadow-sm p-6 space-y-4">
       <Field label="Workspace name">
         <input
           value={name}
           onChange={(e) => onNameChange(e.target.value)}
           required
           maxLength={120}
-          className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+          className="w-full border border-line rounded-md px-3 py-2 text-sm"
           placeholder="Acme Corp"
         />
       </Field>
       <Field label="URL slug" hint="3-42 chars, lowercase letters/digits/hyphens. Becomes the URL prefix.">
         <div className="flex gap-1 items-center">
-          <span className="text-slate-400 text-sm">/</span>
+          <span className="text-muted text-sm">/</span>
           <input
             value={slug}
             onChange={(e) => {
@@ -136,7 +136,7 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
             required
             minLength={3}
             maxLength={42}
-            className="flex-1 border border-slate-300 rounded-md px-3 py-2 text-sm font-mono"
+            className="flex-1 border border-line rounded-md px-3 py-2 text-sm font-mono"
             placeholder="acme"
           />
         </div>
@@ -145,7 +145,7 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
         <select
           value={planSlug}
           onChange={(e) => setPlanSlug(e.target.value)}
-          className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm bg-white"
+          className="w-full border border-line rounded-md px-3 py-2 text-sm bg-paper"
         >
           {plans.map((p) => (
             <option key={p.slug} value={p.slug}>
@@ -159,7 +159,7 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
           type="email"
           value={adminEmail}
           onChange={(e) => setAdminEmail(e.target.value)}
-          className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+          className="w-full border border-line rounded-md px-3 py-2 text-sm"
           placeholder="admin@acme.com"
         />
       </Field>
@@ -167,7 +167,7 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
         <input
           value={domains}
           onChange={(e) => setDomains(e.target.value)}
-          className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+          className="w-full border border-line rounded-md px-3 py-2 text-sm"
           placeholder="acme.com, acme.co.uk"
         />
       </Field>
@@ -175,14 +175,14 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
         <button
           type="button"
           onClick={() => router.push("/super/organizations")}
-          className="text-slate-500 px-4 py-2 rounded-lg text-sm hover:bg-slate-100"
+          className="text-muted px-4 py-2 rounded-lg text-sm hover:bg-canvas"
         >
           Cancel
         </button>
         <button
           type="submit"
           disabled={busy || !name || !slug}
-          className="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2 rounded-lg font-semibold text-sm disabled:opacity-60"
+          className="bg-ink text-canvas hover:opacity-90 px-5 py-2 rounded-lg font-semibold text-sm disabled:opacity-60"
         >
           {busy ? "Creating…" : "Create tenant"}
         </button>
@@ -194,8 +194,8 @@ export function NewTenantForm({ plans }: { plans: Plan[] }) {
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="text-sm font-semibold text-slate-700">{label}</span>
-      {hint && <span className="block text-xs text-slate-500 mt-0.5 mb-1.5">{hint}</span>}
+      <span className="text-sm font-semibold text-ink">{label}</span>
+      {hint && <span className="block text-xs text-muted mt-0.5 mb-1.5">{hint}</span>}
       {!hint && <span className="block mb-1.5" />}
       {children}
     </label>

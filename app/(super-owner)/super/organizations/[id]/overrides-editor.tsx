@@ -82,11 +82,11 @@ export function OverridesEditor({
   const capLabel = (c: number | null) => (c === null ? "unlimited" : c.toString());
 
   return (
-    <section className="bg-white border border-slate-200 rounded-lg p-5 mt-6">
-      <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2 mb-1">
-        <SlidersHorizontal className="w-4 h-4 text-indigo-600" /> Plan overrides
+    <section className="bg-paper border border-line rounded-lg p-5 mt-6">
+      <h2 className="text-sm font-bold text-ink flex items-center gap-2 mb-1">
+        <SlidersHorizontal className="w-4 h-4 text-accent" /> Plan overrides
       </h2>
-      <p className="text-xs text-slate-500 mb-4">
+      <p className="text-xs text-muted mb-4">
         Manual caps for custom-tenant support. Leave blank to use the plan limit.
         A grace period (date) lifts all caps until that day.
       </p>
@@ -102,7 +102,7 @@ export function OverridesEditor({
             value={userLimit}
             onChange={(e) => setUserLimit(e.target.value)}
             placeholder="plan default"
-            className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+            className="w-full border border-line rounded-md px-3 py-2 text-sm"
             aria-label="User limit override"
           />
         </Field>
@@ -117,7 +117,7 @@ export function OverridesEditor({
             value={storageLimit}
             onChange={(e) => setStorageLimit(e.target.value)}
             placeholder="plan default"
-            className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+            className="w-full border border-line rounded-md px-3 py-2 text-sm"
             aria-label="Storage limit override in MB"
           />
         </Field>
@@ -127,7 +127,7 @@ export function OverridesEditor({
             type="date"
             value={grace}
             onChange={(e) => setGrace(e.target.value)}
-            className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+            className="w-full border border-line rounded-md px-3 py-2 text-sm"
             aria-label="Manual grace period until"
           />
         </Field>
@@ -138,7 +138,7 @@ export function OverridesEditor({
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             placeholder="e.g. raised to 250 users for Q3 pilot"
-            className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm"
+            className="w-full border border-line rounded-md px-3 py-2 text-sm"
             aria-label="Owner notes"
           />
         </Field>
@@ -148,11 +148,11 @@ export function OverridesEditor({
         <button
           onClick={save}
           disabled={busy}
-          className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1 disabled:opacity-60"
+          className="bg-ink text-canvas hover:opacity-90 px-4 py-2 rounded-md text-sm font-semibold flex items-center gap-1 disabled:opacity-60"
         >
           <Save className="w-4 h-4" /> {busy ? "Saving…" : "Save overrides"}
         </button>
-        {msg && <span className="text-xs text-slate-500">{msg}</span>}
+        {msg && <span className="text-xs text-muted">{msg}</span>}
       </div>
     </section>
   );
@@ -169,9 +169,9 @@ function Field({
 }) {
   return (
     <div>
-      <label className="block text-xs font-semibold text-slate-600 mb-1">{label}</label>
+      <label className="block text-xs font-semibold text-muted mb-1">{label}</label>
       {children}
-      <p className="text-[11px] text-slate-400 mt-1">{hint}</p>
+      <p className="text-[11px] text-muted mt-1">{hint}</p>
     </div>
   );
 }

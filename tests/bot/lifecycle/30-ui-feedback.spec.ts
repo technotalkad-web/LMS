@@ -5,7 +5,14 @@
  *   - confirming completes the delete
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import {
+  addMember,
+  createAuthUser,
+  createOrg,
+  markPlatformOwner,
+  rand,
+  svc,
+} from "../../e2e/helpers/supabase";
 import { authedContext } from "../lib/session";
 
 test.describe.serial("UI Batch 3 — toast + confirm dialog", () => {
@@ -73,6 +80,29 @@ test.describe.serial("UI Batch 3 — toast + confirm dialog", () => {
     await page.getByRole("button", { name: /submit ticket/i }).click();
 
     await expect(page.getByText(/ticket submitted/i)).toBeVisible({ timeout: 10_000 });
+    await ctx.close();
+  });
+
+  test("super-owner console renders after token restyle (no broken slate/indigo)", async ({
+    browser,
+    baseURL,
+  }) => {
+    const org = await createOrg({ name: "QA SuperView Org" });
+    const po = await createAuthUser({
+      profile: { first_name: "Plat", last_name: "Owner", must_change_password: false },
+    });
+    await markPlatformOwner(po.id); // mfa_required:false → skips the MFA gate
+
+    const ctx = await authedContext(browser, baseURL!, po.email, po.password);
+    const page = await ctx.newPage();
+
+    await page.goto(`/super/organizations`);
+    await expect(page.getByText("QA SuperView Org")).toBeVisible({ timeout: 20_000 });
+
+    // Tenant detail renders the restyled editors (tokens, not slate/indigo).
+    await page.goto(`/super/organizations/${org.id}`);
+    await expect(page.getByText("Organization details")).toBeVisible();
+    await expect(page.getByText("Plan overrides")).toBeVisible();
     await ctx.close();
   });
 });

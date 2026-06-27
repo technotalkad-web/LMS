@@ -31,10 +31,10 @@ export default async function BroadcastsPage() {
   return (
     <div>
       <header className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-slate-900 flex items-center gap-3">
-          <Megaphone className="w-7 h-7 text-indigo-600" /> Global broadcasts
+        <h1 className="text-3xl font-bold tracking-tight text-ink flex items-center gap-3">
+          <Megaphone className="w-7 h-7 text-accent" /> Global broadcasts
         </h1>
-        <p className="text-slate-500 mt-1">
+        <p className="text-muted mt-1">
           Platform-wide announcements rendered as a top-bar banner inside every tenant. Pick an audience and a tone, set an expiry, and ship.
         </p>
       </header>
