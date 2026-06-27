@@ -88,17 +88,24 @@ export async function POST(
       ? currentCompletion
       : derivedCompletion;
 
+  // Non-downgrade: a `passed` attempt is terminal — never let a later commit
+  // (a stray unload beacon, a re-run SCO emitting `failed`, or an `unknown`
+  // derivation) pull it back to failed/unknown. `failed` is held only against
+  // an `unknown` derivation — an actual later `passed` may still upgrade it.
   const success_status =
-    (currentSuccess === "passed" || currentSuccess === "failed") &&
-    derivedSuccess === "unknown"
-      ? currentSuccess
-      : derivedSuccess;
+    currentSuccess === "passed"
+      ? "passed"
+      : currentSuccess === "failed" && derivedSuccess === "unknown"
+        ? "failed"
+        : derivedSuccess;
 
   const terminal: Array<string | undefined> = ["passed", "failed", "completed"];
   const status =
-    terminal.includes(currentStatus) && derivedStatus === "in_progress"
-      ? (currentStatus as typeof derivedStatus)
-      : derivedStatus;
+    currentStatus === "passed" && derivedStatus !== "passed"
+      ? "passed"
+      : terminal.includes(currentStatus) && derivedStatus === "in_progress"
+        ? (currentStatus as typeof derivedStatus)
+        : derivedStatus;
 
   const score = deriveScore(cmi);
 
