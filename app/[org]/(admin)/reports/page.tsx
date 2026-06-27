@@ -203,10 +203,17 @@ export default async function ReportsPage({
     const courseVersions = versionsByCourse.get(c.id) ?? [];
     const versionIds = new Set(courseVersions.map((v) => v.id));
     const myAttempts = attempts.filter((a) => versionIds.has(a.course_version_id));
-    const completed = myAttempts.filter((a) => a.completion_status === "completed").length;
+    // "Completed" = completion_status completed OR success_status passed —
+    // passing a graded module is a successful completion. Unified across all
+    // reporting surfaces (product decision R1); matches the report matviews.
+    const completed = myAttempts.filter(
+      (a) => a.completion_status === "completed" || a.success_status === "passed"
+    ).length;
     const passed = myAttempts.filter((a) => a.success_status === "passed").length;
     const failed = myAttempts.filter((a) => a.success_status === "failed").length;
-    const inProgress = myAttempts.filter((a) => a.completion_status === "in_progress").length;
+    const inProgress = myAttempts.filter(
+      (a) => a.completion_status !== "completed" && a.success_status !== "passed"
+    ).length;
     const scored = myAttempts.filter((a) => typeof a.score === "number");
     const avgScore =
       scored.length === 0
@@ -291,7 +298,7 @@ export default async function ReportsPage({
     const memberSet = teamUserIds.get(t.id) ?? new Set<string>();
     const teamAttempts = attempts.filter((a) => memberSet.has(a.user_id));
     const completed = teamAttempts.filter(
-      (a) => a.completion_status === "completed"
+      (a) => a.completion_status === "completed" || a.success_status === "passed"
     ).length;
     const passed = teamAttempts.filter(
       (a) => a.success_status === "passed"
@@ -317,7 +324,9 @@ export default async function ReportsPage({
     attempts: attempts.length,
     learnersWithActivity: new Set(attempts.map((a) => a.user_id)).size,
     totalUsers: members.length,
-    completed: attempts.filter((a) => a.completion_status === "completed").length,
+    completed: attempts.filter(
+      (a) => a.completion_status === "completed" || a.success_status === "passed"
+    ).length,
     passed: attempts.filter((a) => a.success_status === "passed").length,
   };
   const completionRate =
