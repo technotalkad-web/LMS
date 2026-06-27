@@ -61,3 +61,39 @@ body {
 :root, body {
   transition: background-color 150ms ease, color 150ms ease;
 }
+
+/* ---- Accessibility & polish (app-wide, non-breaking) ---- */
+
+/* Consistent, branded keyboard focus indicator. Only shows for keyboard
+   navigation (:focus-visible), so it never bothers mouse/touch users. Fixes the
+   inconsistent/absent focus styling across buttons, links, and custom controls
+   (WCAG 2.4.7 Focus Visible). */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Branded text selection. */
+::selection {
+  background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* Respect users who prefer reduced motion — disable transitions/animations. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Smooth in-page scrolling for anchor/scroll-into-view navigation. */
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}

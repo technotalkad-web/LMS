@@ -3,6 +3,7 @@ import { BookOpen } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
 import { ProfileDropdown } from "./_components/profile-dropdown";
+import { LearnerTopNav } from "./_components/learner-nav";
 import { MobileBottomNav } from "./_components/mobile-nav";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
@@ -85,11 +86,7 @@ export default async function LearnerLayout({
               <span className="font-semibold text-lg tracking-tight">{org.name}</span>
             </Link>
 
-            <nav className="hidden md:flex items-center gap-1 text-sm">
-              <Link href={`/${org.slug}/dashboard`} className="px-3 py-2 rounded-lg text-muted hover:text-ink hover:bg-canvas transition-colors">Dashboard</Link>
-              <Link href={`/${org.slug}/courses`} className="px-3 py-2 rounded-lg text-muted hover:text-ink hover:bg-canvas transition-colors">Courses</Link>
-              <Link href={`/${org.slug}/support`} className="px-3 py-2 rounded-lg text-muted hover:text-ink hover:bg-canvas transition-colors">Help &amp; Support</Link>
-            </nav>
+            <LearnerTopNav orgSlug={org.slug} />
           </div>
 
           <ProfileDropdown
