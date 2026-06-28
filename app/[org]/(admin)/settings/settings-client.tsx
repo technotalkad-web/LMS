@@ -56,9 +56,19 @@ export type WorkspaceBranding = {
   brand_color: string;
   brand_font: string;
   custom_domain: string;
+  custom_domain_verified: boolean;
+  custom_domain_status: string;
   login_hero_image_url: string;
   login_hero_title: string;
   login_hero_subtitle: string;
+};
+
+export type SsoConfig = {
+  enabled: boolean;
+  enforced: boolean;
+  providerId: string | null;
+  domains: string[];
+  serviceProvider: { acsUrl: string; entityId: string; metadataUrl: string };
 };
 
 export function SettingsClient({
@@ -67,12 +77,14 @@ export function SettingsClient({
   templates,
   orgName,
   workspace,
+  sso,
 }: {
   orgSlug: string;
   settings: Settings;
   templates: Tpl[];
   orgName: string;
   workspace: WorkspaceBranding;
+  sso: SsoConfig;
 }) {
   const router = useRouter();
   const [tab, setTab] = useState<
@@ -96,11 +108,14 @@ export function SettingsClient({
       />
 
       {tab === "workspace" && (
-        <WorkspaceForm
-          orgSlug={orgSlug}
-          initial={workspace}
-          onSaved={() => router.refresh()}
-        />
+        <div className="space-y-6">
+          <WorkspaceForm
+            orgSlug={orgSlug}
+            initial={workspace}
+            onSaved={() => router.refresh()}
+          />
+          <SsoSection orgSlug={orgSlug} initial={sso} onSaved={() => router.refresh()} />
+        </div>
       )}
       {tab === "smtp" && (
         <SmtpForm orgSlug={orgSlug} initial={settings} onSaved={() => router.refresh()} />
@@ -839,6 +854,189 @@ function Field({
 }
 
 
+/* ---------- Enterprise SAML SSO ---------- */
+
+function SsoSection({
+  orgSlug,
+  initial,
+  onSaved,
+}: {
+  orgSlug: string;
+  initial: SsoConfig;
+  onSaved: () => void;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [enforced, setEnforced] = useState(initial.enforced);
+  const [domains, setDomains] = useState((initial.domains ?? []).join(", "));
+  const [metadataUrl, setMetadataUrl] = useState("");
+  const [metadataXml, setMetadataXml] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const sp = initial.serviceProvider;
+
+  async function configure() {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    const res = await fetch("/api/org/sso", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        orgSlug,
+        action: "configure",
+        domains: domains.split(",").map((d) => d.trim()).filter(Boolean),
+        metadataUrl: metadataUrl.trim() || undefined,
+        metadataXml: metadataXml.trim() || undefined,
+        enforced,
+      }),
+    });
+    setBusy(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setError(j.error ?? "Could not configure SSO");
+      return;
+    }
+    setEnabled(true);
+    setSaved(true);
+    onSaved();
+  }
+
+  async function disable() {
+    setBusy(true);
+    setError(null);
+    const res = await fetch("/api/org/sso", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug, action: "disable" }),
+    });
+    setBusy(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setError(j.error ?? "Could not disable SSO");
+      return;
+    }
+    setEnabled(false);
+    setEnforced(false);
+    onSaved();
+  }
+
+  return (
+    <section className="border border-line rounded-2xl bg-paper p-6 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="serif text-2xl">Single sign-on (SAML)</h2>
+          <p className="text-xs text-muted mt-0.5">
+            Let your team sign in through your identity provider (Okta, Azure AD,
+            Google Workspace). Users must still be provisioned here first.
+          </p>
+        </div>
+        <span
+          className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium border ${
+            enabled
+              ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+              : "bg-canvas text-muted border-line"
+          }`}
+        >
+          {enabled ? "Enabled" : "Off"}
+        </span>
+      </div>
+
+      {/* Step 1: SP details to put in the IdP */}
+      <div className="border border-line rounded-lg bg-canvas/40 p-4 text-xs leading-relaxed">
+        <div className="font-semibold text-ink mb-2">
+          1. In your IdP, create a SAML app with these Service Provider values
+        </div>
+        {[
+          ["ACS URL (Reply / Single Sign-On URL)", sp.acsUrl],
+          ["Entity ID / Audience", sp.entityId],
+        ].map(([label, value]) => (
+          <div key={label} className="mb-2">
+            <div className="text-muted">{label}</div>
+            <code className="block break-all rounded border border-line bg-paper p-2 mt-1 text-[11px]">
+              {value}
+            </code>
+          </div>
+        ))}
+      </div>
+
+      {/* Step 2: IdP metadata + domains */}
+      <div className="text-xs font-semibold text-ink">
+        2. Paste your IdP metadata and the email domains it covers
+      </div>
+      <Field label="IdP metadata URL">
+        <input
+          type="text"
+          value={metadataUrl}
+          onChange={(e) => setMetadataUrl(e.target.value)}
+          placeholder="https://idp.example.com/app/.../sso/saml/metadata"
+          className="ws-input"
+        />
+      </Field>
+      <Field label="…or paste metadata XML">
+        <textarea
+          value={metadataXml}
+          onChange={(e) => setMetadataXml(e.target.value)}
+          rows={3}
+          placeholder="<EntityDescriptor ...>…</EntityDescriptor>"
+          className="ws-input font-mono text-[11px]"
+        />
+      </Field>
+      <Field label="Email domains (comma-separated)">
+        <input
+          type="text"
+          value={domains}
+          onChange={(e) => setDomains(e.target.value)}
+          placeholder="acme.com, acme.co.uk"
+          className="ws-input"
+        />
+      </Field>
+
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={enforced}
+          onChange={(e) => setEnforced(e.target.checked)}
+        />
+        Require SSO (hide password & magic-link login for this workspace)
+      </label>
+
+      {error && (
+        <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
+      {saved && (
+        <div className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-xl px-4 py-3 text-sm">
+          SSO configured. Learners on the listed domains can now sign in via your
+          IdP at your tenant login page.
+        </div>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={configure}
+          disabled={busy}
+          className="px-5 py-2 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? "Saving…" : enabled ? "Update SSO" : "Enable SSO"}
+        </button>
+        {enabled && (
+          <button
+            type="button"
+            onClick={disable}
+            disabled={busy}
+            className="px-4 py-2 border border-line rounded-lg text-sm hover:border-ink disabled:opacity-50"
+          >
+            Disable SSO
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
+
 /* ---------- Workspace branding (company name + logo + brand color + font + domain) ---------- */
 
 /**
@@ -898,6 +1096,50 @@ function WorkspaceForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+
+  // Custom-domain provisioning state (returned by the branding save +
+  // domain-status endpoints).
+  type DomainInfo = {
+    cnameTarget: string | null;
+    validationRecords: Array<{ type: string; name: string; value: string }>;
+    status: string;
+  };
+  const [domainInfo, setDomainInfo] = useState<DomainInfo | null>(null);
+  const [domainWarning, setDomainWarning] = useState<string | null>(null);
+  const [verified, setVerified] = useState(initial.custom_domain_verified);
+  const [statusLabel, setStatusLabel] = useState(initial.custom_domain_status);
+  const [checking, setChecking] = useState(false);
+
+  async function checkDomainStatus() {
+    setChecking(true);
+    setError(null);
+    const res = await fetch("/api/org/branding/domain-status", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug }),
+    });
+    setChecking(false);
+    const j = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      status?: string;
+      verified?: boolean;
+      cnameTarget?: string | null;
+      validationRecords?: DomainInfo["validationRecords"];
+    };
+    if (!res.ok) {
+      setError(j.error ?? "Status check failed");
+      return;
+    }
+    setVerified(!!j.verified);
+    setStatusLabel(j.status ?? "");
+    if (j.cnameTarget || j.validationRecords) {
+      setDomainInfo({
+        cnameTarget: j.cnameTarget ?? null,
+        validationRecords: j.validationRecords ?? [],
+        status: j.status ?? "",
+      });
+    }
+  }
   // Gate render to client-only so form-fill browser extensions (LastPass,
   // 1Password, Chrome autofill) can't inject `fdprocessedid` between SSR
   // and hydrate. Skeleton is shown for ~1 frame, no UX impact.
@@ -926,12 +1168,22 @@ function WorkspaceForm({
       }),
     });
     setBusy(false);
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    const j = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      domain?: DomainInfo;
+      warning?: string;
+    };
     if (!res.ok) {
       setError(j.error ?? "Save failed");
       return;
     }
     setSaved(true);
+    setDomainWarning(j.warning ?? null);
+    if (j.domain) {
+      setDomainInfo(j.domain);
+      setStatusLabel(j.domain.status);
+      setVerified(false);
+    }
     onSaved();
   }
 
@@ -1162,37 +1414,85 @@ function WorkspaceForm({
           />
         </Field>
 
+        {/* Status badge */}
+        {form.custom_domain && (
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-muted">Status:</span>
+            {verified ? (
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 font-medium">
+                Active — learners can use this domain
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 font-medium">
+                {statusLabel === "unconfigured"
+                  ? "Not available on this platform yet"
+                  : statusLabel
+                    ? `Pending (${statusLabel})`
+                    : "Pending verification"}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={checkDomainStatus}
+              disabled={checking}
+              className="ml-auto text-accent hover:underline disabled:opacity-50"
+            >
+              {checking ? "Checking…" : "Check status"}
+            </button>
+          </div>
+        )}
+
+        {domainWarning && (
+          <div className="border border-amber-200 bg-amber-50 text-amber-800 rounded-lg px-3 py-2 text-xs">
+            {domainWarning}
+          </div>
+        )}
+
         <div className="border border-line rounded-lg bg-canvas/40 p-4 text-xs leading-relaxed">
           <div className="font-semibold text-ink mb-2">
-            Setup steps (one-time, takes ~10 minutes)
+            Setup steps (one-time, ~10 minutes + DNS propagation)
           </div>
           <ol className="list-decimal pl-5 space-y-1 text-muted">
-            <li>
-              Save the domain above. The system will start expecting traffic
-              on that hostname.
-            </li>
+            <li>Enter your domain above and save.</li>
             <li>
               In your DNS provider, add a <strong>CNAME</strong> record from{" "}
-              <code>{form.custom_domain || "learn.your-company.com"}</code> to
-              your platform host (e.g. <code>cname.vercel-dns.com</code> for
-              Vercel, your load balancer for self-hosted).
+              <code>{form.custom_domain || "learn.your-company.com"}</code>{" "}
+              pointing to{" "}
+              <code>
+                {domainInfo?.cnameTarget ?? "the target shown after you save"}
+              </code>
+              .
             </li>
+            {domainInfo && domainInfo.validationRecords.length > 0 && (
+              <li>
+                Add the certificate-validation record(s) below so we can issue
+                HTTPS for your domain:
+                <div className="mt-2 space-y-2">
+                  {domainInfo.validationRecords.map((r, i) => (
+                    <div
+                      key={i}
+                      className="rounded border border-line bg-paper p-2 font-mono text-[11px] break-all"
+                    >
+                      <div>
+                        <span className="text-muted">type:</span> {r.type}
+                      </div>
+                      <div>
+                        <span className="text-muted">name:</span> {r.name}
+                      </div>
+                      <div>
+                        <span className="text-muted">value:</span> {r.value}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </li>
+            )}
             <li>
-              Add the domain to your hosting&apos;s &ldquo;Domains&rdquo;
-              dashboard so SSL is provisioned automatically.
-            </li>
-            <li>
-              Once DNS propagates (5–60 min), learners can sign in at your
-              custom URL — the app routes them to this workspace
-              automatically.
+              Wait for DNS to propagate (5–60 min), then click{" "}
+              <strong>Check status</strong>. Once it shows <em>Active</em>,
+              learners can sign in at your domain.
             </li>
           </ol>
-          <div className="mt-3 text-amber-700">
-            Custom domain routing depends on your deployment. Vercel, Render,
-            and most managed hosts handle it via their domains dashboard. For
-            self-hosted, point your reverse proxy at the app and pass the
-            host header through.
-          </div>
         </div>
       </section>
 

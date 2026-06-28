@@ -21,9 +21,25 @@ export type BrandedLoginProps = {
   heroImageUrl: string | null;
   heroTitle: string;
   heroSubtitle: string;
+  ssoEnabled?: boolean;
+  ssoEnforced?: boolean;
+  ssoProviderId?: string | null;
 };
 
 type Mode = "password" | "magic";
+
+/**
+ * Where to land after a successful password sign-in. Honors a host-relative
+ * `next` (set by the middleware auth gate — e.g. a clean /dashboard on a
+ * white-label domain), falling back to the tenant dashboard. Guards against
+ * open redirects (must start with a single "/").
+ */
+function safeNext(orgSlug: string): string {
+  if (typeof window === "undefined") return `/${orgSlug}/dashboard`;
+  const n = new URLSearchParams(window.location.search).get("next");
+  if (n && n.startsWith("/") && !n.startsWith("//")) return n;
+  return `/${orgSlug}/dashboard`;
+}
 
 export function BrandedLogin({
   orgSlug,
@@ -33,6 +49,9 @@ export function BrandedLogin({
   heroImageUrl,
   heroTitle,
   heroSubtitle,
+  ssoEnabled = false,
+  ssoEnforced = false,
+  ssoProviderId = null,
 }: BrandedLoginProps) {
   const [mode, setMode] = useState<Mode>("password");
   const [email, setEmail] = useState("");
@@ -41,6 +60,25 @@ export function BrandedLogin({
     "idle" | "working" | "sent" | "error"
   >("idle");
   const [error, setError] = useState<string | null>(null);
+
+  async function startSso() {
+    if (!ssoProviderId) return;
+    setStatus("working");
+    setError(null);
+    const supabase = createClient();
+    const { data, error } = await supabase.auth.signInWithSSO({
+      providerId: ssoProviderId,
+      options: {
+        redirectTo: `${window.location.origin}/auth/callback?next=/${orgSlug}/dashboard`,
+      },
+    });
+    if (error) {
+      setError(error.message);
+      setStatus("error");
+      return;
+    }
+    if (data?.url) window.location.assign(data.url);
+  }
 
   function switchMode(next: Mode) {
     setMode(next);
@@ -75,7 +113,7 @@ export function BrandedLogin({
         setError(error.message);
         setStatus("error");
       } else {
-        window.location.href = `/${orgSlug}/dashboard`;
+        window.location.href = safeNext(orgSlug);
       }
     }
   }
@@ -170,6 +208,38 @@ export function BrandedLogin({
             </p>
           </div>
 
+          {ssoEnabled && (
+            <div className="mb-7">
+              <button
+                type="button"
+                onClick={startSso}
+                disabled={status === "working"}
+                className="w-full px-4 py-3 rounded-xl text-sm font-semibold border border-line bg-paper hover:border-ink disabled:opacity-50 transition flex items-center justify-center gap-2"
+              >
+                <ShieldCheck className="w-4 h-4" />
+                {status === "working" ? "Redirecting…" : "Sign in with SSO"}
+              </button>
+              {ssoEnforced ? (
+                <p className="text-center text-xs text-muted mt-3">
+                  Your organization uses single sign-on.
+                </p>
+              ) : (
+                <div className="flex items-center gap-3 my-5 text-xs text-muted">
+                  <span className="h-px flex-1 bg-line" />
+                  or
+                  <span className="h-px flex-1 bg-line" />
+                </div>
+              )}
+              {ssoEnforced && error && (
+                <div className="mt-3 border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-3 text-sm">
+                  {error}
+                </div>
+              )}
+            </div>
+          )}
+
+          {!ssoEnforced && (
+          <>
           <div
             role="tablist"
             className="flex p-1 bg-paper border border-line rounded-xl mb-7"
@@ -292,6 +362,8 @@ export function BrandedLogin({
                 </div>
               )}
             </form>
+          )}
+          </>
           )}
 
           <p className="text-center text-xs text-muted mt-10">

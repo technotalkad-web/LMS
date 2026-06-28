@@ -1,6 +1,12 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { isAllowlistEnabled, isIpAllowed, extractClientIp } from "@/lib/security/ip-allowlist";
+import {
+  customDomainsEnabled,
+  isCustomDomainHost,
+  resolveOrgSlugByDomain,
+  tenantRewritePath,
+} from "@/lib/domains/resolve";
 
 // Per-tenant branded login pages live at /<org-slug>/login. They must be
 // reachable without a session — they're the entry point. We match this
@@ -11,14 +17,44 @@ const ORG_LOGIN_RE = /^\/[^/]+\/login$/;
 export async function updateSession(request: NextRequest) {
   let response = NextResponse.next({ request });
 
+  const rawPath = request.nextUrl.pathname;
+
+  // ---- Custom-domain (white-label) host -> tenant resolution ----
+  // When a learner visits a tenant's own verified hostname, we internally
+  // rewrite /<path> -> /<slug>/<path> so the path-based app works unchanged.
+  // Entirely inert unless CUSTOM_DOMAINS_ENABLED=1 and the host resolves to a
+  // verified tenant; on the platform host this whole block is a no-op and the
+  // legacy behavior below is byte-for-byte identical.
+  let customSlug: string | null = null;
+  if (customDomainsEnabled()) {
+    const host = request.headers.get("host") ?? "";
+    if (isCustomDomainHost(host)) {
+      customSlug = await resolveOrgSlugByDomain(host);
+    }
+  }
+
+  // Don't surface the platform super-owner console on a tenant's white-label
+  // domain.
+  if (customSlug && rawPath.startsWith("/super")) {
+    return new NextResponse("Not Found", { status: 404 });
+  }
+
+  // Compute the effective (slug-scoped) path the auth gate reasons about.
+  let effectivePath = rawPath;
+  let needsRewrite = false;
+  if (customSlug) {
+    const rewritten = tenantRewritePath(rawPath, customSlug);
+    if (rewritten) {
+      effectivePath = rewritten;
+      needsRewrite = true;
+    }
+  }
+
   // ---- Phase 10c: IP allowlist for /super/* ----
   // If PLATFORM_OWNER_IP_ALLOWLIST is set in env, only requests from a
   // listed CIDR / IP can hit /super/*. We do this BEFORE the auth check
   // so the platform owner's IP is gated even before authenticating.
-  if (
-    request.nextUrl.pathname.startsWith("/super") &&
-    isAllowlistEnabled()
-  ) {
+  if (rawPath.startsWith("/super") && isAllowlistEnabled()) {
     // Note: this also matches /super-mfa because /super is a prefix.
     const ip = extractClientIp(request.headers);
     if (!isIpAllowed(ip)) {
@@ -52,7 +88,7 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const path = request.nextUrl.pathname;
+  const path = effectivePath;
   const isPublic =
     path === "/" ||
     path.startsWith("/login") ||
@@ -95,17 +131,35 @@ export async function updateSession(request: NextRequest) {
     const firstSegment = path.split("/")[1] ?? "";
     const isTenantPath =
       firstSegment.length > 0 && !RESERVED_TOP_PATHS.has(firstSegment);
-    if (isTenantPath) {
-      url.pathname = `/${firstSegment}/login`;
-    } else {
+
+    if (customSlug) {
+      // On a white-label domain keep the browser URL clean (no /<slug>): the
+      // host already implies the tenant, so redirect to /login and remember a
+      // slug-less `next`.
       url.pathname = "/login";
-    }
-    // Preserve where they were headed so post-login the app can return
-    // them to that exact page instead of dumping them on the dashboard.
-    if (path !== "/" && !path.startsWith("/login")) {
-      url.searchParams.set("next", path);
+      const cleanNext = effectivePath.replace(new RegExp(`^/${customSlug}`), "") || "/";
+      if (cleanNext !== "/" && !cleanNext.startsWith("/login")) {
+        url.searchParams.set("next", cleanNext);
+      }
+    } else {
+      url.pathname = isTenantPath ? `/${firstSegment}/login` : "/login";
+      // Preserve where they were headed so post-login the app can return
+      // them to that exact page instead of dumping them on the dashboard.
+      if (path !== "/" && !path.startsWith("/login")) {
+        url.searchParams.set("next", path);
+      }
     }
     return NextResponse.redirect(url);
+  }
+
+  // Apply the internal rewrite for verified custom domains, carrying over any
+  // auth cookies Supabase refreshed onto `response`.
+  if (needsRewrite) {
+    const rwUrl = request.nextUrl.clone();
+    rwUrl.pathname = effectivePath;
+    const rewrite = NextResponse.rewrite(rwUrl);
+    response.cookies.getAll().forEach((c) => rewrite.cookies.set(c));
+    return rewrite;
   }
 
   return response;

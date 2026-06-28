@@ -4,8 +4,22 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
 import { ThemePill } from "./_components/theme-pill";
 import { NavItem } from "./_components/nav-item";
+import { Breadcrumbs } from "./_components/breadcrumbs";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
+
+/**
+ * Section eyebrow inside the admin sidebar. Hidden on mobile so the nav stays a
+ * single flat horizontal scroll row there; on desktop it groups links into
+ * People / Content / Engagement / Insights / Configure for faster scanning.
+ */
+function NavGroup({ label }: { label: string }) {
+  return (
+    <div className="hidden md:block px-3 pt-4 pb-1 text-[10px] uppercase tracking-wider text-muted first:pt-0">
+      {label}
+    </div>
+  );
+}
 
 function fontStackFor(name: string | null | undefined): string {
   switch (name) {
@@ -95,16 +109,24 @@ export default async function AdminLayout({
             <span className="serif text-2xl leading-none">{org.name}</span>
           </Link>
 
-          <div className="px-3 mb-2 text-[10px] uppercase tracking-wider text-muted">Admin</div>
           <nav className="flex-1 md:space-y-1 text-sm flex md:block gap-1 overflow-x-auto md:overflow-visible">
+            {manage && <NavGroup label="People" />}
             {manage && <NavItem href={`/${org.slug}/users`} label="Users" />}
-            {manage && <NavItem href={`/${org.slug}/announcements`} label="Announcements" />}
-            {manage && <NavItem href={`/${org.slug}/tickets`} label="Tickets" />}
+            {manage && <NavItem href={`/${org.slug}/teams`} label="Teams" />}
+
+            {manage && <NavGroup label="Content" />}
             {manage && <NavItem href={`/${org.slug}/library`} label="Library" />}
             {manage && <NavItem href={`/${org.slug}/learning-paths`} label="Learning paths" />}
-            {manage && <NavItem href={`/${org.slug}/teams`} label="Teams" />}
-            {reports && <NavItem href={`/${org.slug}/reports`} label="Reports" />}
+
+            {manage && <NavGroup label="Engagement" />}
+            {manage && <NavItem href={`/${org.slug}/announcements`} label="Announcements" />}
+            {manage && <NavItem href={`/${org.slug}/tickets`} label="Tickets" />}
             {manage && <NavItem href={`/${org.slug}/notifications`} label="Broadcast" />}
+
+            {reports && <NavGroup label="Insights" />}
+            {reports && <NavItem href={`/${org.slug}/reports`} label="Reports" />}
+
+            {manage && <NavGroup label="Configure" />}
             {manage && <NavItem href={`/${org.slug}/settings`} label="Settings" />}
           </nav>
 
@@ -117,7 +139,10 @@ export default async function AdminLayout({
           </div>
         </aside>
 
-        <main className="flex-1 px-5 md:px-10 py-6 md:py-8 overflow-x-auto">{children}</main>
+        <main className="flex-1 px-5 md:px-10 py-6 md:py-8 overflow-x-auto">
+          <Breadcrumbs />
+          {children}
+        </main>
       </div>
     </div>
   );

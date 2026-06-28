@@ -180,6 +180,7 @@ export function OrganizationsTable({
       {filtered.length === 0 ? (
         <div className="p-12 text-center text-muted text-sm">No tenants match the current filters.</div>
       ) : (
+        <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
           <thead className="bg-canvas text-muted border-b border-line">
             <tr>
@@ -255,6 +256,7 @@ export function OrganizationsTable({
             ))}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );

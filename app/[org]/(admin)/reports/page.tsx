@@ -539,8 +539,9 @@ export default async function ReportsPage({
           </Card>
         ) : (
           <Card className="overflow-hidden">
+            <div className="max-h-[70vh] overflow-auto">
             <table className="w-full text-sm">
-              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
+              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted sticky top-0 z-10">
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">Learner</th>
                   <th className="text-left px-4 py-2 font-medium">Course</th>
@@ -570,6 +571,7 @@ export default async function ReportsPage({
                 ))}
               </tbody>
             </table>
+            </div>
             {atRisk.length > 50 && (
               <div className="px-4 py-2 text-xs text-muted text-center bg-canvas border-t border-line">
                 Showing 50 of {atRisk.length}. Use CSV download for the full list.
@@ -608,8 +610,9 @@ export default async function ReportsPage({
           </Card>
         ) : (
           <Card className="overflow-x-auto">
+            <div className="max-h-[70vh] overflow-auto">
             <table className="w-full text-sm">
-              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
+              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted sticky top-0 z-10">
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">Course</th>
                   <th className="text-left px-4 py-2 font-medium">Std</th>
@@ -655,6 +658,7 @@ export default async function ReportsPage({
                 ))}
               </tbody>
             </table>
+            </div>
           </Card>
         )}
       </section>
@@ -686,8 +690,9 @@ export default async function ReportsPage({
           </Card>
         ) : (
           <Card className="overflow-x-auto">
+            <div className="max-h-[70vh] overflow-auto">
             <table className="w-full text-sm">
-              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
+              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted sticky top-0 z-10">
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">Team</th>
                   <th className="text-right px-4 py-2 font-medium">Members</th>
@@ -718,6 +723,7 @@ export default async function ReportsPage({
                 ))}
               </tbody>
             </table>
+            </div>
           </Card>
         )}
       </section>
@@ -734,8 +740,9 @@ export default async function ReportsPage({
           </Card>
         ) : (
           <Card className="overflow-x-auto">
+            <div className="max-h-[70vh] overflow-auto">
             <table className="w-full text-sm">
-              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
+              <thead className="bg-canvas text-xs uppercase tracking-wide text-muted sticky top-0 z-10">
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">When</th>
                   <th className="text-left px-4 py-2 font-medium">Learner</th>
@@ -805,6 +812,7 @@ export default async function ReportsPage({
                 })}
               </tbody>
             </table>
+            </div>
           </Card>
         )}
       </section>
