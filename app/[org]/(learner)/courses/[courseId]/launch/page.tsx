@@ -92,12 +92,14 @@ export default async function LaunchPage({
   const activePackages = (pkgRows ?? []) as PackageRow[];
 
   let resolvedVersionId: string | null = null;
+  let chosenPackageId: string | null = null;
 
   if (activePackages.length === 0) {
     // Legacy path: no packages yet — fall back to course.current_version_id
     resolvedVersionId = c.current_version_id;
   } else if (activePackages.length === 1) {
     resolvedVersionId = activePackages[0].current_version_id;
+    chosenPackageId = activePackages[0].id;
   } else {
     // Pick from explicit ?lang= if it matches an active package.
     let chosen: PackageRow | null = null;
@@ -139,10 +141,41 @@ export default async function LaunchPage({
       );
     }
     resolvedVersionId = chosen.current_version_id;
+    chosenPackageId = chosen.id;
   }
 
   if (!resolvedVersionId) {
     redirect(`/${orgSlug}/courses/${courseId}`);
+  }
+
+  // GRANDFATHER ROUTING (silent module versioning):
+  // If the learner already has an in-progress attempt on ANY version of the
+  // chosen package — including a now-retired version that a newer one replaced —
+  // resume THAT version so their bookmark/suspend_data stays intact. New
+  // learners (no in-progress attempt) get the current version. "Force restart"
+  // replaces abandon old in-progress attempts at replace time, so none match
+  // here and the learner starts fresh on the new version. No learner-facing
+  // choice or notice either way.
+  if (chosenPackageId) {
+    const { data: pkgVers } = await supabase
+      .from("course_versions")
+      .select("id")
+      .eq("package_id", chosenPackageId);
+    const pkgVerIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id);
+    if (pkgVerIds.length > 0) {
+      const { data: ip } = await supabase
+        .from("course_attempts")
+        .select("course_version_id")
+        .eq("user_id", user.id)
+        .in("course_version_id", pkgVerIds)
+        .eq("status", "in_progress")
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (ip?.course_version_id) {
+        resolvedVersionId = ip.course_version_id as string;
+      }
+    }
   }
 
   const { data: version } = await supabase

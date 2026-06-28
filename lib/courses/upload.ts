@@ -129,7 +129,12 @@ export async function uploadCoursePackage(opts: {
   const versionNumber = (prevVersions?.[0]?.version_number ?? 0) + 1;
 
   // 4) Upload every file in the zip to storage.
-  const storagePrefix = `courses/${courseId}/v${versionNumber}/`;
+  // Package-scoped prefix: each language package has its own folder, so two
+  // languages that both happen to be at the same version_number (e.g. both v1)
+  // never share a storage path and can't clobber each other. (Older versions
+  // keep whatever storage_prefix was stored on their row, so this is fully
+  // backward-compatible — the launcher always reads the per-version prefix.)
+  const storagePrefix = `courses/${courseId}/${packageId}/v${versionNumber}/`;
   const storage = await getStorage();
 
   const uploads: Array<Promise<void>> = [];
