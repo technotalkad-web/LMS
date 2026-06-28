@@ -5,52 +5,41 @@ import {
   AdminPageHeader,
   KpiStrip,
   KpiCard,
-  Card,
-  EmptyState,
-  StatusPill,
 } from "@/components/admin";
 import {
   BookOpen,
   CheckCircle2,
   CircleSlash,
   Users as UsersIcon,
-  Clock,
-  Pencil,
+  FolderTree,
   Upload,
 } from "lucide-react";
-
-type CourseRow = {
-  id: string;
-  slug: string;
-  title: string;
-  description: string | null;
-  status: "draft" | "published" | "archived";
-  updated_at: string;
-  current_version_id: string | null;
-  thumbnail_url: string | null;
-  duration_minutes: number | null;
-  is_active: boolean;
-};
-
-function formatDuration(mins: number | null): string | null {
-  if (mins === null || mins <= 0) return null;
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
-}
+import { LibraryBrowser, type FolderLite, type CourseLite } from "./library-browser";
 
 export default async function CoursesPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string }>;
+  searchParams: Promise<{ folder?: string }>;
 }) {
   const { org: slug } = await params;
+  const { folder: folderParam } = await searchParams;
   const { org, role } = await requireOrgAccess(slug);
-  const canUpload = role === "super_owner" || role === "admin";
+  const canManage = role === "super_owner" || role === "admin";
 
   const supabase = await createClient();
+
+  // Folders are added by migration 0041 — read best-effort so the Library still
+  // renders if the code is deployed before the migration is applied.
+  let folders: FolderLite[] = [];
+  const { data: folderRows } = await supabase
+    .from("folders")
+    .select("id, name, parent_id")
+    .eq("organization_id", org.id)
+    .order("name", { ascending: true });
+  if (folderRows) folders = folderRows as FolderLite[];
+
   const { data: courses } = await supabase
     .from("courses")
     .select(
@@ -59,8 +48,26 @@ export default async function CoursesPage({
     .eq("organization_id", org.id)
     .order("updated_at", { ascending: false });
 
+  type CourseRow = Omit<CourseLite, "folder_id" | "enrolled"> & {
+    slug: string;
+    status: string;
+    updated_at: string;
+  };
   const list = (courses ?? []) as CourseRow[];
   const courseIds = list.map((c) => c.id);
+
+  // folder_id is added by migration 0041 — read best-effort so the Library still
+  // lists courses if the code is deployed before the migration is applied.
+  const folderByCourse = new Map<string, string | null>();
+  const { data: folderMap } = await supabase
+    .from("courses")
+    .select("id, folder_id")
+    .eq("organization_id", org.id);
+  if (folderMap) {
+    for (const r of folderMap as Array<{ id: string; folder_id: string | null }>) {
+      folderByCourse.set(r.id, r.folder_id ?? null);
+    }
+  }
 
   type AssignmentLite = {
     course_id: string;
@@ -112,6 +119,18 @@ export default async function CoursesPage({
     enrolledByCourse.set(a.course_id, set);
   }
 
+  const courseList: CourseLite[] = list.map((c) => ({
+    id: c.id,
+    title: c.title,
+    description: c.description,
+    current_version_id: c.current_version_id,
+    thumbnail_url: c.thumbnail_url,
+    duration_minutes: c.duration_minutes,
+    is_active: c.is_active,
+    folder_id: folderByCourse.get(c.id) ?? null,
+    enrolled: enrolledByCourse.get(c.id)?.size ?? 0,
+  }));
+
   const totalCourses = list.length;
   const activeCount = list.filter((c) => c.is_active).length;
   const inactiveCount = totalCourses - activeCount;
@@ -120,13 +139,17 @@ export default async function CoursesPage({
     0
   );
 
+  // Validate the requested folder belongs to this org; otherwise treat as root.
+  const currentFolderId =
+    folderParam && folders.some((f) => f.id === folderParam) ? folderParam : null;
+
   return (
     <div className="max-w-7xl">
       <AdminPageHeader
         title="Library"
-        description="Your course catalog."
+        description="Organise your course catalog into folders."
         action={
-          canUpload ? (
+          canManage ? (
             <Link
               href={`/${org.slug}/library/upload`}
               className="inline-flex items-center gap-2 px-4 py-2 bg-ink text-canvas rounded-xl text-sm font-medium hover:opacity-90 transition-opacity"
@@ -157,6 +180,12 @@ export default async function CoursesPage({
           accent="text-slate-500"
         />
         <KpiCard
+          label="Folders"
+          value={folders.length}
+          icon={<FolderTree className="w-4 h-4" />}
+          accent="text-indigo-600"
+        />
+        <KpiCard
           label="Enrollments"
           value={totalEnrollments}
           icon={<UsersIcon className="w-4 h-4" />}
@@ -164,93 +193,13 @@ export default async function CoursesPage({
         />
       </KpiStrip>
 
-      {list.length === 0 ? (
-        <Card>
-          <EmptyState
-            icon={<BookOpen className="w-5 h-5" />}
-            title="No courses yet"
-            description="Upload a SCORM 1.2 or cmi5 .zip package to get started."
-            action={
-              canUpload ? (
-                <Link
-                  href={`/${org.slug}/library/upload`}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-ink text-canvas rounded-xl text-sm font-medium hover:opacity-90 transition-opacity"
-                >
-                  <Upload className="w-4 h-4" />
-                  Upload your first course
-                </Link>
-              ) : undefined
-            }
-          />
-        </Card>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {list.map((c) => {
-            const enrolled = enrolledByCourse.get(c.id)?.size ?? 0;
-            const duration = formatDuration(c.duration_minutes);
-            return (
-              <Link
-                key={c.id}
-                href={`/${org.slug}/library/${c.id}`}
-                className="group bg-paper border border-line rounded-xl overflow-hidden transition-all hover:border-ink/30 hover:shadow-sm flex flex-col"
-              >
-                {c.thumbnail_url ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={c.thumbnail_url}
-                    alt=""
-                    className="aspect-video w-full object-cover rounded-t-xl"
-                  />
-                ) : (
-                  <div className="aspect-video w-full bg-canvas rounded-t-xl flex items-center justify-center text-muted">
-                    <BookOpen className="w-8 h-8 opacity-40" />
-                  </div>
-                )}
-                <div className="p-4 flex-1 flex flex-col gap-2">
-                  <div className="flex items-start justify-between gap-2">
-                    <h3 className="serif text-lg leading-snug text-ink line-clamp-2">
-                      {c.title}
-                    </h3>
-                    <span
-                      className="shrink-0 text-muted opacity-0 group-hover:opacity-100 transition-opacity"
-                      aria-hidden
-                    >
-                      <Pencil className="w-3.5 h-3.5" />
-                    </span>
-                  </div>
-                  {c.description ? (
-                    <p className="text-sm text-muted line-clamp-2">
-                      {c.description}
-                    </p>
-                  ) : (
-                    <p className="text-sm text-muted italic">No description</p>
-                  )}
-                  <div className="mt-auto pt-3 flex items-center justify-between gap-2 flex-wrap">
-                    <StatusPill tone={c.is_active ? "active" : "neutral"}>
-                      {c.is_active ? "Active" : "Inactive"}
-                    </StatusPill>
-                    <div className="flex items-center gap-3 text-xs text-muted">
-                      {duration && (
-                        <span className="inline-flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {duration}
-                        </span>
-                      )}
-                      <span className="inline-flex items-center gap-1">
-                        <UsersIcon className="w-3 h-3" />
-                        {enrolled}
-                      </span>
-                      {!c.current_version_id && (
-                        <span className="text-amber-700">no version</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </Link>
-            );
-          })}
-        </div>
-      )}
+      <LibraryBrowser
+        orgSlug={org.slug}
+        canManage={canManage}
+        currentFolderId={currentFolderId}
+        folders={folders}
+        courses={courseList}
+      />
     </div>
   );
 }
