@@ -23,8 +23,27 @@ type FragmentState =
   | { kind: "error"; code: string; description: string }
   | { kind: "noop" };
 
+/**
+ * Tenant magic links carry next=/{org}/dashboard. Derive the org slug so the
+ * "request a new link" CTA returns the learner to their branded /{org}/login
+ * rather than the global /login.
+ */
+function orgFromNext(next: string | null): string | null {
+  if (!next) return null;
+  const m = /^\/([a-z0-9-]+)\//.exec(next);
+  return m ? m[1] : null;
+}
+
 export function AuthCallbackFragment() {
   const [state, setState] = useState<FragmentState>({ kind: "idle" });
+  const [loginHref, setLoginHref] = useState("/login");
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const next = new URLSearchParams(window.location.search).get("next");
+    const org = orgFromNext(next);
+    if (org) setLoginHref(`/${org}/login`);
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -97,7 +116,7 @@ export function AuthCallbackFragment() {
     // /login so they can try again. (If the page reached here with
     // ?error=..., the server-rendered LoginRedirect below handles it.)
     if (typeof window !== "undefined") {
-      window.location.replace("/login");
+      window.location.replace(loginHref);
     }
     return null;
   }
@@ -129,7 +148,7 @@ export function AuthCallbackFragment() {
         <p className="text-muted text-sm text-center mb-6">{friendly.body}</p>
         <div className="space-y-3">
           <Link
-            href="/login"
+            href={loginHref}
             className="block w-full text-center bg-ink text-canvas font-semibold rounded-lg py-2.5 hover:opacity-90 transition"
           >
             Request a new sign-in link
