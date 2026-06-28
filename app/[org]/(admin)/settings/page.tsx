@@ -38,7 +38,7 @@ export default async function SettingsPage({
   const { data: orgRow } = await supabase
     .from("organizations")
     .select(
-      "name, logo_url, favicon_url, brand_color, brand_font, custom_domain, login_hero_image_url, login_hero_title, login_hero_subtitle"
+      "name, logo_url, favicon_url, brand_color, brand_font, custom_domain, custom_domain_verified, custom_domain_status, login_hero_image_url, login_hero_title, login_hero_subtitle"
     )
     .eq("id", org.id)
     .maybeSingle();
@@ -52,6 +52,10 @@ export default async function SettingsPage({
       (orgRow?.brand_font as string | null | undefined) ?? "sans",
     custom_domain:
       (orgRow?.custom_domain as string | null | undefined) ?? "",
+    custom_domain_verified:
+      (orgRow?.custom_domain_verified as boolean | null | undefined) ?? false,
+    custom_domain_status:
+      (orgRow?.custom_domain_status as string | null | undefined) ?? "",
     login_hero_image_url:
       (orgRow?.login_hero_image_url as string | null | undefined) ?? "",
     login_hero_title:

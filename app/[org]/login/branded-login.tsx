@@ -25,6 +25,19 @@ export type BrandedLoginProps = {
 
 type Mode = "password" | "magic";
 
+/**
+ * Where to land after a successful password sign-in. Honors a host-relative
+ * `next` (set by the middleware auth gate — e.g. a clean /dashboard on a
+ * white-label domain), falling back to the tenant dashboard. Guards against
+ * open redirects (must start with a single "/").
+ */
+function safeNext(orgSlug: string): string {
+  if (typeof window === "undefined") return `/${orgSlug}/dashboard`;
+  const n = new URLSearchParams(window.location.search).get("next");
+  if (n && n.startsWith("/") && !n.startsWith("//")) return n;
+  return `/${orgSlug}/dashboard`;
+}
+
 export function BrandedLogin({
   orgSlug,
   orgName,
@@ -75,7 +88,7 @@ export function BrandedLogin({
         setError(error.message);
         setStatus("error");
       } else {
-        window.location.href = `/${orgSlug}/dashboard`;
+        window.location.href = safeNext(orgSlug);
       }
     }
   }

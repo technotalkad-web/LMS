@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import {
+  cloudflareSaasConfigured,
+  createCustomHostname,
+  deleteCustomHostname,
+  saasCnameTarget,
+  type CustomHostnameStatus,
+} from "@/lib/cloudflare/custom-hostnames";
 
 /**
  *   POST /api/org/branding
@@ -41,7 +48,7 @@ export async function POST(request: Request) {
   }
   const { data: org } = await supabase
     .from("organizations")
-    .select("id")
+    .select("id, custom_domain, cf_hostname_id")
     .eq("slug", body.orgSlug)
     .maybeSingle();
   if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
@@ -85,6 +92,17 @@ export async function POST(request: Request) {
     }
     update.brand_font = f || null;
   }
+  // Carries provisioning info back to the client (CNAME target + cert
+  // validation records) when a domain is (re)registered.
+  let domainProvisioning:
+    | {
+        cnameTarget: string | null;
+        validationRecords: CustomHostnameStatus["validationRecords"];
+        status: string;
+      }
+    | null = null;
+  let domainWarning: string | null = null;
+
   if (body.custom_domain !== undefined) {
     const d = body.custom_domain?.trim().toLowerCase() ?? "";
     if (d && !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) {
@@ -93,7 +111,52 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-    update.custom_domain = d || null;
+
+    const prev = (org.custom_domain as string | null) ?? null;
+    const prevHostnameId = (org.cf_hostname_id as string | null) ?? null;
+    const changed = (d || null) !== prev;
+
+    if (changed) {
+      // Any domain change invalidates prior verification, and we tear down the
+      // old Cloudflare hostname so it stops routing.
+      update.custom_domain = d || null;
+      update.custom_domain_verified = false;
+      update.cf_hostname_id = null;
+      update.custom_domain_status = null;
+
+      if (prevHostnameId && cloudflareSaasConfigured()) {
+        try {
+          await deleteCustomHostname(prevHostnameId);
+        } catch {
+          /* best-effort cleanup; don't block the save */
+        }
+      }
+
+      if (d) {
+        if (!cloudflareSaasConfigured()) {
+          // Store the intent but mark it unconfigured so the UI can explain the
+          // platform isn't provisioning custom domains yet.
+          update.custom_domain_status = "unconfigured";
+          domainWarning =
+            "Domain saved, but custom-domain provisioning isn't enabled on this platform yet.";
+        } else {
+          try {
+            const hn = await createCustomHostname(d);
+            update.cf_hostname_id = hn.id;
+            update.custom_domain_status = hn.status;
+            domainProvisioning = {
+              cnameTarget: saasCnameTarget(),
+              validationRecords: hn.validationRecords,
+              status: hn.status,
+            };
+          } catch (e) {
+            update.custom_domain_status = "error";
+            domainWarning =
+              e instanceof Error ? e.message : "Failed to register the domain with Cloudflare.";
+          }
+        }
+      }
+    }
   }
   if (body.login_hero_image_url !== undefined) {
     update.login_hero_image_url = body.login_hero_image_url
@@ -120,5 +183,9 @@ export async function POST(request: Request) {
     .update(update)
     .eq("id", org.id);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({
+    ok: true,
+    ...(domainProvisioning ? { domain: domainProvisioning } : {}),
+    ...(domainWarning ? { warning: domainWarning } : {}),
+  });
 }
