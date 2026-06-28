@@ -102,8 +102,7 @@ export async function PUT(
       .select("id", { count: "exact", head: true })
       .eq("user_id", user.id)
       .in("course_version_id", otherLangVerIds)
-      .neq("completion_status", "completed")
-      .or("success_status.neq.passed,success_status.is.null");
+      .eq("status", "in_progress");
     inProgressCount = count ?? 0;
   }
 
@@ -139,8 +138,7 @@ export async function PUT(
       .update({ status: "abandoned" })
       .eq("user_id", user.id)
       .in("course_version_id", otherLangVerIds)
-      .neq("completion_status", "completed")
-      .or("success_status.neq.passed,success_status.is.null");
+      .eq("status", "in_progress");
     if (abErr) {
       return NextResponse.json(
         { error: `Saved preference but failed to reset progress: ${abErr.message}` },
