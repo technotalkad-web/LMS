@@ -156,6 +156,7 @@ export function ProfileDropdown({
             method="post"
             className="border-t border-line"
           >
+            <input type="hidden" name="org" value={orgSlug} />
             <button
               type="submit"
               className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-red-600 hover:bg-red-50"
