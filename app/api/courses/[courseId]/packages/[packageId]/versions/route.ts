@@ -9,6 +9,7 @@ import { uploadCoursePackage } from "@/lib/courses/upload";
  *   multipart/form-data:
  *     file:     the new SCORM/cmi5 zip to become this package's current version
  *     orgSlug:  tenant org slug (for auth)
+ *     mode:     'grandfather' (default) | 'force_restart'
  *
  * Replaces / updates the content of an EXISTING language package by uploading a
  * new version under it. The helper sequences the version number per package
@@ -16,9 +17,17 @@ import { uploadCoursePackage } from "@/lib/courses/upload";
  * untouched), and repoints course_packages.current_version_id at the new
  * version. Prior versions and all attempts/reporting are preserved.
  *
+ * Versioning mode (silent, no learner-facing notice — enterprise behavior):
+ *   - 'grandfather' (default): in-progress attempts keep routing to their
+ *     retired version (bookmarks intact); only NEW attempts get the new version.
+ *     This is the launcher's natural behavior — no action needed here.
+ *   - 'force_restart': mark this package's old in-progress attempts 'abandoned'
+ *     so the launcher starts each learner fresh on the new version (0% on next
+ *     launch).
+ *
  * Admin-only; tenant-guarded (course + package must belong to the caller's org).
  *
- * Returns: { version_id, version_number }
+ * Returns: { version_id, version_number, mode, restarted? }
  */
 export async function POST(
   request: NextRequest,
@@ -28,6 +37,9 @@ export async function POST(
   const form = await request.formData();
   const file = form.get("file");
   const orgSlug = (form.get("orgSlug") as string | null)?.trim();
+  const mode = (form.get("mode") as string | null)?.trim() === "force_restart"
+    ? "force_restart"
+    : "grandfather";
 
   if (!file || !(file instanceof File)) {
     return NextResponse.json({ error: "file required" }, { status: 400 });
@@ -88,9 +100,10 @@ export async function POST(
   }
 
   // ---- Upload a new version under this package ----
+  let result;
   try {
     const ab = await (file as File).arrayBuffer();
-    const result = await uploadCoursePackage({
+    result = await uploadCoursePackage({
       zipBytes: new Uint8Array(ab),
       organizationId: org.id,
       uploaderId: caller.id,
@@ -98,15 +111,47 @@ export async function POST(
       packageId,
       supabase: svc,
     });
-    return NextResponse.json({
-      ok: true,
-      version_id: result.versionId,
-      version_number: result.versionNumber,
-    });
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Upload failed" },
       { status: 500 }
     );
   }
+
+  // ---- Force-restart: silently abandon old in-progress attempts ----
+  // After this, the launcher finds no resumable attempt on the package's old
+  // versions, so each learner starts fresh on the new version. Grandfather mode
+  // skips this — the launcher keeps routing them to their retired version.
+  let restarted = 0;
+  if (mode === "force_restart") {
+    const { data: pkgVers } = await svc
+      .from("course_versions")
+      .select("id")
+      .eq("package_id", packageId);
+    const oldVerIds = ((pkgVers ?? []) as Array<{ id: string }>)
+      .map((r) => r.id)
+      .filter((id) => id !== result.versionId);
+    if (oldVerIds.length > 0) {
+      const { count, error: abErr } = await svc
+        .from("course_attempts")
+        .update({ status: "abandoned" }, { count: "exact" })
+        .in("course_version_id", oldVerIds)
+        .eq("status", "in_progress");
+      if (abErr) {
+        return NextResponse.json(
+          { error: `New version uploaded, but restart failed: ${abErr.message}` },
+          { status: 500 }
+        );
+      }
+      restarted = count ?? 0;
+    }
+  }
+
+  return NextResponse.json({
+    ok: true,
+    version_id: result.versionId,
+    version_number: result.versionNumber,
+    mode,
+    restarted,
+  });
 }

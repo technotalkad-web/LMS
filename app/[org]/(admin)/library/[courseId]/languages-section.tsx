@@ -282,6 +282,7 @@ function ReplacePackageDialog({
   onReplaced: () => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
+  const [mode, setMode] = useState<"grandfather" | "force_restart">("grandfather");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const label =
@@ -296,6 +297,7 @@ function ReplacePackageDialog({
     const fd = new FormData();
     fd.append("orgSlug", orgSlug);
     fd.append("file", file);
+    fd.append("mode", mode);
     const res = await fetch(
       `/api/courses/${courseId}/packages/${pkg.id}/versions`,
       { method: "POST", body: fd }
@@ -334,6 +336,47 @@ function ReplacePackageDialog({
           className="block w-full text-sm"
           disabled={busy}
         />
+
+        <fieldset className="space-y-2">
+          <legend className="text-xs font-medium text-ink mb-1">
+            In-progress learners
+          </legend>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="radio"
+              name="version-mode"
+              className="mt-0.5"
+              checked={mode === "grandfather"}
+              onChange={() => setMode("grandfather")}
+              disabled={busy}
+            />
+            <span className="text-xs">
+              <span className="font-medium text-ink">Grandfather in-progress learners</span>{" "}
+              <span className="text-muted">(default)</span>
+              <span className="block text-muted">
+                Active attempts keep their bookmark on the current version; only
+                new attempts get the new version.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="radio"
+              name="version-mode"
+              className="mt-0.5"
+              checked={mode === "force_restart"}
+              onChange={() => setMode("force_restart")}
+              disabled={busy}
+            />
+            <span className="text-xs">
+              <span className="font-medium text-ink">Force restart on new version</span>
+              <span className="block text-muted">
+                Active attempts are silently reset; every learner starts the new
+                version from 0% on their next launch.
+              </span>
+            </span>
+          </label>
+        </fieldset>
 
         {error && (
           <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">
