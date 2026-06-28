@@ -35,6 +35,7 @@ export function LanguagesSection({
   const router = useRouter();
   const [packages, setPackages] = useState(initialPackages);
   const [showAdd, setShowAdd] = useState(false);
+  const [replaceFor, setReplaceFor] = useState<LanguagePackage | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -198,7 +199,15 @@ export function LanguagesSection({
                     </span>
                   </label>
                 </td>
-                <td className="px-4 py-3 text-right">
+                <td className="px-4 py-3 text-right whitespace-nowrap">
+                  <button
+                    type="button"
+                    onClick={() => setReplaceFor(p)}
+                    disabled={busyId === p.id}
+                    className="text-xs text-ink hover:underline disabled:opacity-40 mr-3"
+                  >
+                    Replace content
+                  </button>
                   <button
                     type="button"
                     onClick={() => deletePackage(p)}
@@ -215,9 +224,10 @@ export function LanguagesSection({
       </div>
 
       <p className="text-xs text-muted mt-2">
-        Need to upload a NEW VERSION of an existing language? Use the standard{" "}
-        <span className="text-ink">Versions</span> section below — versions
-        sequence per package.
+        To update a language&apos;s module, click{" "}
+        <span className="text-ink">Replace content</span> on its row and upload a
+        new SCORM/cmi5 zip. It becomes that language&apos;s current version;
+        earlier versions, attempts and reporting are preserved.
       </p>
 
       {showAdd && (
@@ -241,7 +251,116 @@ export function LanguagesSection({
           upload page first.)
         </p>
       )}
+
+      {replaceFor && (
+        <ReplacePackageDialog
+          orgSlug={orgSlug}
+          courseId={courseId}
+          pkg={replaceFor}
+          onClose={() => setReplaceFor(null)}
+          onReplaced={() => {
+            setReplaceFor(null);
+            router.refresh();
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function ReplacePackageDialog({
+  orgSlug,
+  courseId,
+  pkg,
+  onClose,
+  onReplaced,
+}: {
+  orgSlug: string;
+  courseId: string;
+  pkg: LanguagePackage;
+  onClose: () => void;
+  onReplaced: () => void;
+}) {
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const label =
+    pkg.language === null
+      ? "Unlabeled (legacy)"
+      : `${languageDisplay(pkg.language, "english")} (${pkg.language})`;
+
+  async function submit() {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    const fd = new FormData();
+    fd.append("orgSlug", orgSlug);
+    fd.append("file", file);
+    const res = await fetch(
+      `/api/courses/${courseId}/packages/${pkg.id}/versions`,
+      { method: "POST", body: fd }
+    );
+    setBusy(false);
+    if (!res.ok) {
+      const j = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(j.error ?? "Upload failed");
+      return;
+    }
+    onReplaced();
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div>
+          <h3 className="serif text-2xl">Replace module content</h3>
+          <p className="text-xs text-muted mt-1">
+            Upload a new SCORM/cmi5 zip for the{" "}
+            <span className="text-ink">{label}</span> package. It becomes the
+            current version; earlier versions and learner records are kept.
+          </p>
+        </div>
+
+        <input
+          type="file"
+          accept=".zip"
+          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          className="block w-full text-sm"
+          disabled={busy}
+        />
+
+        {error && (
+          <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">
+            {error}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="px-4 py-2 border border-line rounded-lg text-sm hover:border-ink disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={!file || busy}
+            className="px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >
+            {busy ? "Uploading…" : "Upload new version"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
