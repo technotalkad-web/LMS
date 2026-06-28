@@ -63,11 +63,23 @@ STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
 
-# ---- Custom domain ---------------------------------------------------------
+# ---- White-label custom domains (tenant own-domain routing) -----------------
+# The code is host-agnostic; this feature stays fully inert until enabled.
+# When you move to proper infra, see docs/INFRA_MIGRATION.md. Then set:
+#   PRIMARY_APP_HOST        = "app.your-platform.com"  # never treated as a tenant domain
+#   CUSTOM_DOMAINS_ENABLED  = "1"                       # flip on once CF for SaaS is ready
+#   CF_SAAS_CNAME_TARGET    = "saas.your-platform.com"  # fallback-origin host tenants CNAME to
+# CF_API_TOKEN and CF_ZONE_ID are SECRETS — set via `wrangler secret put`, not here.
+# PRIMARY_APP_HOST = "app.your-platform.com"
+# CUSTOM_DOMAINS_ENABLED = "1"
+# CF_SAAS_CNAME_TARGET = "saas.your-platform.com"
+
+# ---- Platform domain (the app's own host) ----------------------------------
 # Uncomment + edit after the Worker is deployed once and you've added the
 # domain in Cloudflare DNS. The pattern matches the host you'll serve on.
+# Also update NEXT_PUBLIC_SITE_URL above to match, then rebuild + redeploy.
 # [[routes]]
-# pattern = "your-prod-domain.example"
+# pattern = "app.your-platform.com"
 # custom_domain = true
 
 # ---- R2 binding (only if STORAGE_DRIVER=r2) --------------------------------
@@ -122,3 +134,10 @@ NEXT_PUBLIC_SENTRY_ENV = "production"
 STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
+# White-label custom domains (see docs/INFRA_MIGRATION.md). Inert until set.
+# PRIMARY_APP_HOST = "app.your-platform.com"
+# CUSTOM_DOMAINS_ENABLED = "1"
+# CF_SAAS_CNAME_TARGET = "saas.your-platform.com"
+# [[env.production.routes]]  (declare the platform domain here for prod)
+# pattern = "app.your-platform.com"
+# custom_domain = true
