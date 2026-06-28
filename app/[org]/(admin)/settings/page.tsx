@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { DEFAULT_TEMPLATES, DEFAULT_CTAS } from "@/lib/notifications/templates";
 import type { NotificationEvent } from "@/lib/notifications/types";
 import { SettingsClient } from "./settings-client";
+import { serviceProviderDetails } from "@/lib/supabase/sso-admin";
 
 export const dynamic = "force-dynamic";
 
@@ -38,10 +39,22 @@ export default async function SettingsPage({
   const { data: orgRow } = await supabase
     .from("organizations")
     .select(
-      "name, logo_url, favicon_url, brand_color, brand_font, custom_domain, custom_domain_verified, custom_domain_status, login_hero_image_url, login_hero_title, login_hero_subtitle"
+      "name, logo_url, favicon_url, brand_color, brand_font, custom_domain, login_hero_image_url, login_hero_title, login_hero_subtitle"
     )
     .eq("id", org.id)
     .maybeSingle();
+
+  // Columns added by migrations 0039 (custom-domain verification) and 0040 (SSO)
+  // are read best-effort so this page works even if the code is deployed before
+  // the migration is applied (degrades to defaults rather than nulling branding).
+  const { data: extraRow } = await supabase
+    .from("organizations")
+    .select(
+      "custom_domain_verified, custom_domain_status, sso_enabled, sso_enforced, sso_provider_id, sso_domains"
+    )
+    .eq("id", org.id)
+    .maybeSingle();
+
   const workspace = {
     name: (orgRow?.name as string | undefined) ?? org.name,
     logo_url: (orgRow?.logo_url as string | null | undefined) ?? "",
@@ -53,9 +66,9 @@ export default async function SettingsPage({
     custom_domain:
       (orgRow?.custom_domain as string | null | undefined) ?? "",
     custom_domain_verified:
-      (orgRow?.custom_domain_verified as boolean | null | undefined) ?? false,
+      (extraRow?.custom_domain_verified as boolean | null | undefined) ?? false,
     custom_domain_status:
-      (orgRow?.custom_domain_status as string | null | undefined) ?? "",
+      (extraRow?.custom_domain_status as string | null | undefined) ?? "",
     login_hero_image_url:
       (orgRow?.login_hero_image_url as string | null | undefined) ?? "",
     login_hero_title:
@@ -142,6 +155,13 @@ export default async function SettingsPage({
         templates={templates}
         orgName={org.name}
         workspace={workspace}
+        sso={{
+          enabled: (extraRow?.sso_enabled as boolean | null | undefined) ?? false,
+          enforced: (extraRow?.sso_enforced as boolean | null | undefined) ?? false,
+          providerId: (extraRow?.sso_provider_id as string | null | undefined) ?? null,
+          domains: (extraRow?.sso_domains as string[] | null | undefined) ?? [],
+          serviceProvider: serviceProviderDetails(),
+        }}
       />
     </div>
   );

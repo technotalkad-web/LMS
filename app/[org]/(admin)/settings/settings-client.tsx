@@ -63,18 +63,28 @@ export type WorkspaceBranding = {
   login_hero_subtitle: string;
 };
 
+export type SsoConfig = {
+  enabled: boolean;
+  enforced: boolean;
+  providerId: string | null;
+  domains: string[];
+  serviceProvider: { acsUrl: string; entityId: string; metadataUrl: string };
+};
+
 export function SettingsClient({
   orgSlug,
   settings,
   templates,
   orgName,
   workspace,
+  sso,
 }: {
   orgSlug: string;
   settings: Settings;
   templates: Tpl[];
   orgName: string;
   workspace: WorkspaceBranding;
+  sso: SsoConfig;
 }) {
   const router = useRouter();
   const [tab, setTab] = useState<
@@ -98,11 +108,14 @@ export function SettingsClient({
       />
 
       {tab === "workspace" && (
-        <WorkspaceForm
-          orgSlug={orgSlug}
-          initial={workspace}
-          onSaved={() => router.refresh()}
-        />
+        <div className="space-y-6">
+          <WorkspaceForm
+            orgSlug={orgSlug}
+            initial={workspace}
+            onSaved={() => router.refresh()}
+          />
+          <SsoSection orgSlug={orgSlug} initial={sso} onSaved={() => router.refresh()} />
+        </div>
       )}
       {tab === "smtp" && (
         <SmtpForm orgSlug={orgSlug} initial={settings} onSaved={() => router.refresh()} />
@@ -840,6 +853,189 @@ function Field({
   );
 }
 
+
+/* ---------- Enterprise SAML SSO ---------- */
+
+function SsoSection({
+  orgSlug,
+  initial,
+  onSaved,
+}: {
+  orgSlug: string;
+  initial: SsoConfig;
+  onSaved: () => void;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [enforced, setEnforced] = useState(initial.enforced);
+  const [domains, setDomains] = useState((initial.domains ?? []).join(", "));
+  const [metadataUrl, setMetadataUrl] = useState("");
+  const [metadataXml, setMetadataXml] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const sp = initial.serviceProvider;
+
+  async function configure() {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    const res = await fetch("/api/org/sso", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        orgSlug,
+        action: "configure",
+        domains: domains.split(",").map((d) => d.trim()).filter(Boolean),
+        metadataUrl: metadataUrl.trim() || undefined,
+        metadataXml: metadataXml.trim() || undefined,
+        enforced,
+      }),
+    });
+    setBusy(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setError(j.error ?? "Could not configure SSO");
+      return;
+    }
+    setEnabled(true);
+    setSaved(true);
+    onSaved();
+  }
+
+  async function disable() {
+    setBusy(true);
+    setError(null);
+    const res = await fetch("/api/org/sso", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug, action: "disable" }),
+    });
+    setBusy(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setError(j.error ?? "Could not disable SSO");
+      return;
+    }
+    setEnabled(false);
+    setEnforced(false);
+    onSaved();
+  }
+
+  return (
+    <section className="border border-line rounded-2xl bg-paper p-6 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="serif text-2xl">Single sign-on (SAML)</h2>
+          <p className="text-xs text-muted mt-0.5">
+            Let your team sign in through your identity provider (Okta, Azure AD,
+            Google Workspace). Users must still be provisioned here first.
+          </p>
+        </div>
+        <span
+          className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium border ${
+            enabled
+              ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+              : "bg-canvas text-muted border-line"
+          }`}
+        >
+          {enabled ? "Enabled" : "Off"}
+        </span>
+      </div>
+
+      {/* Step 1: SP details to put in the IdP */}
+      <div className="border border-line rounded-lg bg-canvas/40 p-4 text-xs leading-relaxed">
+        <div className="font-semibold text-ink mb-2">
+          1. In your IdP, create a SAML app with these Service Provider values
+        </div>
+        {[
+          ["ACS URL (Reply / Single Sign-On URL)", sp.acsUrl],
+          ["Entity ID / Audience", sp.entityId],
+        ].map(([label, value]) => (
+          <div key={label} className="mb-2">
+            <div className="text-muted">{label}</div>
+            <code className="block break-all rounded border border-line bg-paper p-2 mt-1 text-[11px]">
+              {value}
+            </code>
+          </div>
+        ))}
+      </div>
+
+      {/* Step 2: IdP metadata + domains */}
+      <div className="text-xs font-semibold text-ink">
+        2. Paste your IdP metadata and the email domains it covers
+      </div>
+      <Field label="IdP metadata URL">
+        <input
+          type="text"
+          value={metadataUrl}
+          onChange={(e) => setMetadataUrl(e.target.value)}
+          placeholder="https://idp.example.com/app/.../sso/saml/metadata"
+          className="ws-input"
+        />
+      </Field>
+      <Field label="…or paste metadata XML">
+        <textarea
+          value={metadataXml}
+          onChange={(e) => setMetadataXml(e.target.value)}
+          rows={3}
+          placeholder="<EntityDescriptor ...>…</EntityDescriptor>"
+          className="ws-input font-mono text-[11px]"
+        />
+      </Field>
+      <Field label="Email domains (comma-separated)">
+        <input
+          type="text"
+          value={domains}
+          onChange={(e) => setDomains(e.target.value)}
+          placeholder="acme.com, acme.co.uk"
+          className="ws-input"
+        />
+      </Field>
+
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={enforced}
+          onChange={(e) => setEnforced(e.target.checked)}
+        />
+        Require SSO (hide password & magic-link login for this workspace)
+      </label>
+
+      {error && (
+        <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
+      {saved && (
+        <div className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-xl px-4 py-3 text-sm">
+          SSO configured. Learners on the listed domains can now sign in via your
+          IdP at your tenant login page.
+        </div>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={configure}
+          disabled={busy}
+          className="px-5 py-2 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? "Saving…" : enabled ? "Update SSO" : "Enable SSO"}
+        </button>
+        {enabled && (
+          <button
+            type="button"
+            onClick={disable}
+            disabled={busy}
+            className="px-4 py-2 border border-line rounded-lg text-sm hover:border-ink disabled:opacity-50"
+          >
+            Disable SSO
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
 
 /* ---------- Workspace branding (company name + logo + brand color + font + domain) ---------- */
 

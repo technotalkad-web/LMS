@@ -35,6 +35,25 @@ export default async function OrgLoginPage({
     notFound();
   }
 
+  // SSO columns are added by migration 0040. Read them best-effort so the login
+  // page never 404s if the code is deployed before the migration is applied.
+  let ssoProviderId: string | null = null;
+  let ssoEnabledRaw = false;
+  let ssoEnforcedRaw = false;
+  const { data: ssoRow } = await svc
+    .from("organizations")
+    .select("sso_enabled, sso_enforced, sso_provider_id")
+    .eq("slug", orgSlug)
+    .maybeSingle();
+  if (ssoRow) {
+    ssoProviderId = (ssoRow.sso_provider_id as string | null) ?? null;
+    ssoEnabledRaw = Boolean(ssoRow.sso_enabled);
+    ssoEnforcedRaw = Boolean(ssoRow.sso_enforced);
+  }
+
+  // Only surface SSO if it's enabled AND a provider is actually registered.
+  const ssoEnabled = ssoEnabledRaw && Boolean(ssoProviderId);
+
   return (
     <BrandedLogin
       orgSlug={orgSlug}
@@ -46,6 +65,9 @@ export default async function OrgLoginPage({
       heroSubtitle={
         (org.login_hero_subtitle as string | null) || DEFAULT_SUBTITLE
       }
+      ssoEnabled={ssoEnabled}
+      ssoEnforced={ssoEnabled && ssoEnforcedRaw}
+      ssoProviderId={ssoProviderId}
     />
   );
 }
