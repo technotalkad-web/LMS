@@ -6,7 +6,7 @@ import { createClient } from "@/lib/supabase/server";
  *   DELETE /api/courses/[courseId]
  *
  * Admin-only via RLS. PATCH accepts any subset of: title, description,
- * duration_minutes, is_active, thumbnail_url, visibility.
+ * duration_minutes, is_active, thumbnail_url, visibility, folder_id.
  */
 
 const VISIBILITY_VALUES = ["private", "org_public"] as const;
@@ -24,11 +24,41 @@ export async function PATCH(
     is_active?: boolean;
     thumbnail_url?: string | null;
     visibility?: string;
+    folder_id?: string | null;
   };
+
+  const supabase = await createClient();
 
   const update: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   };
+
+  // Move into a folder. Validate the folder belongs to the same org as the
+  // course (no cross-org filing); null = move to root / Uncategorised.
+  if (body.folder_id !== undefined) {
+    if (body.folder_id === null) {
+      update.folder_id = null;
+    } else {
+      const { data: course } = await supabase
+        .from("courses")
+        .select("id, organization_id")
+        .eq("id", courseId)
+        .maybeSingle();
+      if (!course) {
+        return NextResponse.json({ error: "Course not found" }, { status: 404 });
+      }
+      const { data: folder } = await supabase
+        .from("folders")
+        .select("id")
+        .eq("id", body.folder_id)
+        .eq("organization_id", course.organization_id as string)
+        .maybeSingle();
+      if (!folder) {
+        return NextResponse.json({ error: "Folder not found" }, { status: 404 });
+      }
+      update.folder_id = folder.id as string;
+    }
+  }
 
   if (typeof body.title === "string") {
     const t = body.title.trim();
@@ -82,7 +112,6 @@ export async function PATCH(
     return NextResponse.json({ ok: true, noop: true });
   }
 
-  const supabase = await createClient();
   const { error } = await supabase
     .from("courses")
     .update(update)
