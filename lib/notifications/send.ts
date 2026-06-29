@@ -2,6 +2,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadTemplate, mdToHtml, DEFAULT_CTAS } from "./templates";
 import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
+import { dispatchResend, resendConfigured } from "@/lib/email/resend";
 import type {
   NotificationEvent,
   NotificationContext,
@@ -201,11 +202,14 @@ export async function sendNotification(args: SendArgs): Promise<SendResult> {
   } else {
     tpl = await loadTemplate(organizationId, event);
   }
-  const subject = substitute(tpl.subject, context);
-  const body_md = substitute(tpl.body_md, context);
+  // Ensure {Org_Name} always resolves even if the caller didn't pass it; an
+  // explicit context.org_name still wins.
+  const ctx = { org_name: orgName, ...context };
+  const subject = substitute(tpl.subject, ctx);
+  const body_md = substitute(tpl.body_md, ctx);
   const bodyHtml = mdToHtml(body_md);
   const ctaLabel =
-    (tpl.cta_label && substitute(tpl.cta_label, context)) ||
+    (tpl.cta_label && substitute(tpl.cta_label, ctx)) ||
     DEFAULT_CTAS[event] ||
     null;
   const ctaUrl = context.direct_link || context.portal_url || null;
@@ -229,35 +233,59 @@ export async function sendNotification(args: SendArgs): Promise<SendResult> {
   });
 
   // ---- Send -----------------------------------------------------------
+  // Tenant SMTP first (white-label). On missing config OR send failure, fall
+  // back to the global Resend sender so a user is never locked out. Errors from
+  // both transports are accumulated for the audit log.
   let status: SendResult["status"] = "queued";
   let errorMessage: string | undefined;
+  const tenantReady = Boolean(cfg && smtpConfigComplete(cfg) && cfg.from_email);
+  let sent = false;
 
-  if (!cfg || !smtpConfigComplete(cfg) || !cfg.from_email) {
-    status = "failed";
-    errorMessage =
-      "SMTP is not configured. Set it under Settings → Notifications.";
-  } else {
+  if (tenantReady) {
     const result = await dispatchSmtp({
-      host: cfg.smtp_host!,
-      port: cfg.smtp_port!,
-      secure: cfg.smtp_secure,
-      user: cfg.smtp_user ?? undefined,
-      pass: cfg.smtp_password ?? undefined,
-      from: cfg.from_name
-        ? `"${cfg.from_name}" <${cfg.from_email}>`
-        : cfg.from_email,
+      host: cfg!.smtp_host!,
+      port: cfg!.smtp_port!,
+      secure: cfg!.smtp_secure,
+      user: cfg!.smtp_user ?? undefined,
+      pass: cfg!.smtp_password ?? undefined,
+      from: cfg!.from_name
+        ? `"${cfg!.from_name}" <${cfg!.from_email}>`
+        : cfg!.from_email!,
       to: to.email,
-      replyTo: cfg.reply_to ?? undefined,
+      replyTo: cfg!.reply_to ?? undefined,
       subject,
       text: body_md,
       html,
     });
     if (result.ok) {
-      status = "sent";
+      sent = true;
     } else {
-      status = "failed";
-      errorMessage = result.error ?? "Unknown SMTP error";
+      errorMessage = `tenant SMTP failed: ${result.error ?? "unknown"}`;
     }
+  } else {
+    errorMessage = "tenant SMTP not configured";
+  }
+
+  if (!sent && resendConfigured()) {
+    const fb = await dispatchResend({
+      to: to.email,
+      subject,
+      text: body_md,
+      html,
+      replyTo: cfg?.reply_to ?? undefined,
+    });
+    if (fb.ok) {
+      sent = true;
+      errorMessage = undefined; // delivered via fallback
+    } else {
+      errorMessage = `${errorMessage}; resend fallback failed: ${fb.error ?? "unknown"}`;
+    }
+  }
+
+  status = sent ? "sent" : "failed";
+  if (!sent && !resendConfigured() && !tenantReady) {
+    errorMessage =
+      "No email transport: configure Settings → Notifications SMTP, or set the platform Resend fallback.";
   }
 
   await logAttempt({

@@ -115,6 +115,26 @@ The code expires in {OTP_Minutes} minutes. If you didn't request this, you can i
 
 — The {Org_Name} team`,
   },
+  magic_link: {
+    subject: "Your sign-in link for {Org_Name}",
+    body_md: `Hi there,
+
+Click the button below to sign in to **{Org_Name}**. This link is valid for a short time and can only be used once.
+
+If you didn't request this, you can safely ignore this email — no action will be taken on your account.
+
+— The {Org_Name} team`,
+  },
+  account_invite: {
+    subject: "You're invited to {Org_Name}",
+    body_md: `Hi {Learner_Name},
+
+You've been invited to the **{Org_Name}** learning portal. Click the button below to activate your account and sign in.
+
+This link is valid for a short time and can only be used once.
+
+— The {Org_Name} team`,
+  },
 };
 
 /**
@@ -155,6 +175,8 @@ export const DEFAULT_CTAS: Partial<Record<NotificationEvent, string>> = {
   asset_update: "See what's new",
   path_assignment: "Open path",
   path_completion: "See your progress",
+  magic_link: "Sign in",
+  account_invite: "Activate account",
 };
 
 /**

@@ -63,6 +63,14 @@ STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
 
+# ---- Auth email fallback (global Resend sender) -----------------------------
+# Auth emails (invite / magic-link) are minted via generateLink and sent via the
+# TENANT's SMTP. If a tenant has no SMTP (or it fails), the app falls back to
+# this global Resend sender so users are never locked out. Inert until both are
+# set. RESEND_API_KEY is a SECRET (wrangler secret put RESEND_API_KEY); RESEND_FROM
+# is a plain var. Use a verified domain with SPF/DKIM/DMARC.
+# RESEND_FROM = "Ambak University <no-reply@ambak.com>"
+
 # ---- White-label custom domains (tenant own-domain routing) -----------------
 # The code is host-agnostic; this feature stays fully inert until enabled.
 # When you move to proper infra, see docs/INFRA_MIGRATION.md. Then set:
@@ -134,6 +142,8 @@ NEXT_PUBLIC_SENTRY_ENV = "production"
 STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
+# Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
+# RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 # White-label custom domains (see docs/INFRA_MIGRATION.md). Inert until set.
 # PRIMARY_APP_HOST = "app.your-platform.com"
 # CUSTOM_DOMAINS_ENABLED = "1"

@@ -285,11 +285,14 @@ export async function POST(request: Request) {
     // ---- Find or create auth user ----
     let authUserId = userIdByEmail.get(email) ?? null;
     let createdThisRow: "created" | "invited" | null = null;
+    let inviteTokenHash: string | null = null;
     if (!authUserId) {
       try {
         if (wantsInvite) {
+          // Mint the invite link WITHOUT Supabase auto-sending; we email the
+          // branded activation link via the tenant pipeline below.
           const { data: inv, error: invErr } =
-            await svc.auth.admin.inviteUserByEmail(email);
+            await svc.auth.admin.generateLink({ type: "invite", email });
           if (invErr || !inv?.user) {
             results.push({
               row: rowNum,
@@ -300,6 +303,8 @@ export async function POST(request: Request) {
             continue;
           }
           authUserId = inv.user.id;
+          inviteTokenHash =
+            (inv.properties as { hashed_token?: string }).hashed_token ?? null;
           createdThisRow = "invited";
         } else {
           const { data: created, error: createErr } =
@@ -424,24 +429,43 @@ export async function POST(request: Request) {
     // Fire welcome email for new accounts (skip when we just updated metadata).
     if (!priorMem) {
       const origin = await originFromRequest();
-      await notifyBackground({
-        organizationId: org.id,
-        event: "account_creation",
-        to: { user_id: authUserId, email },
-        context: {
-          learner_name:
-            r.first_name!.trim() +
-            (r.last_name ? " " + r.last_name.trim() : ""),
-          learner_email: email,
-          username,
-          login_id: email,
-          password: wantsInvite ? "(set via the invite link)" : password,
-          org_name: (org as { name: string }).name,
-          portal_url: origin
-            ? `${origin}/${orgSlug}/dashboard`
-            : "your learning portal",
-        },
-      });
+      const learnerName =
+        r.first_name!.trim() + (r.last_name ? " " + r.last_name.trim() : "");
+      if (inviteTokenHash) {
+        const base = (origin || "").replace(/\/$/, "");
+        const link =
+          `${base}/auth/callback?token_hash=${encodeURIComponent(inviteTokenHash)}` +
+          `&type=invite&next=${encodeURIComponent(`/${orgSlug}/dashboard`)}`;
+        await notifyBackground({
+          organizationId: org.id,
+          event: "account_invite",
+          to: { user_id: authUserId, email },
+          context: {
+            learner_name: learnerName,
+            learner_email: email,
+            direct_link: link,
+            portal_url: link,
+            org_name: (org as { name: string }).name,
+          },
+        });
+      } else {
+        await notifyBackground({
+          organizationId: org.id,
+          event: "account_creation",
+          to: { user_id: authUserId, email },
+          context: {
+            learner_name: learnerName,
+            learner_email: email,
+            username,
+            login_id: email,
+            password,
+            org_name: (org as { name: string }).name,
+            portal_url: origin
+              ? `${origin}/${orgSlug}/dashboard`
+              : "your learning portal",
+          },
+        });
+      }
     }
 
     results.push({

@@ -40,21 +40,23 @@ export default function LoginPage() {
     setStatus("working");
     setError(null);
 
-    const supabase = createClient();
     if (mode === "magic") {
-      const { error } = await supabase.auth.signInWithOtp({
-        email,
-        options: {
-          emailRedirectTo: `${window.location.origin}/auth/callback`,
-        },
+      // Backend mints + sends the link (no Supabase auto-send). Platform login
+      // has no tenant context, so it goes via the global Resend sender.
+      const res = await fetch("/api/auth/magic-link", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email }),
       });
-      if (error) {
-        setError(error.message);
+      if (!res.ok) {
+        const j = (await res.json().catch(() => ({}))) as { error?: string };
+        setError(j.error ?? "Could not send the sign-in link");
         setStatus("error");
       } else {
         setStatus("sent");
       }
     } else {
+      const supabase = createClient();
       const { error } = await supabase.auth.signInWithPassword({
         email,
         password,
