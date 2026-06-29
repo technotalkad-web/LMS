@@ -73,6 +73,18 @@ export type SsoConfig = {
   serviceProvider: { acsUrl: string; entityId: string; metadataUrl: string };
 };
 
+export type LrsConfigView = {
+  enabled: boolean;
+  endpoint: string;
+  auth_key: string;
+  has_secret: boolean;
+  auth_secret: string;
+  xapi_version: string;
+  last_test_at: string | null;
+  last_test_status: string | null;
+  last_test_error: string | null;
+};
+
 export function SettingsClient({
   orgSlug,
   settings,
@@ -80,6 +92,7 @@ export function SettingsClient({
   orgName,
   workspace,
   sso,
+  lrs,
 }: {
   orgSlug: string;
   settings: Settings;
@@ -87,6 +100,7 @@ export function SettingsClient({
   orgName: string;
   workspace: WorkspaceBranding;
   sso: SsoConfig;
+  lrs: LrsConfigView;
 }) {
   const router = useRouter();
   const [tab, setTab] = useState<
@@ -117,6 +131,7 @@ export function SettingsClient({
             onSaved={() => router.refresh()}
           />
           <SsoSection orgSlug={orgSlug} initial={sso} onSaved={() => router.refresh()} />
+          <LrsSection orgSlug={orgSlug} initial={lrs} onSaved={() => router.refresh()} />
         </div>
       )}
       {tab === "smtp" && (
@@ -857,6 +872,182 @@ function Field({
 
 
 /* ---------- Enterprise SAML SSO ---------- */
+
+/* ---------- External LRS Integration (all orgs, standard) ---------- */
+
+function LrsSection({
+  orgSlug,
+  initial,
+  onSaved,
+}: {
+  orgSlug: string;
+  initial: LrsConfigView;
+  onSaved: () => void;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [endpoint, setEndpoint] = useState(initial.endpoint);
+  const [authKey, setAuthKey] = useState(initial.auth_key);
+  // Pre-filled with the mask when a secret exists; only sent if the admin edits it.
+  const [authSecret, setAuthSecret] = useState(initial.auth_secret);
+  const [version, setVersion] = useState(initial.xapi_version);
+  const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [test, setTest] = useState<
+    { status: string; versions?: string[]; error?: string } | null
+  >(initial.last_test_status ? { status: initial.last_test_status, error: initial.last_test_error ?? undefined } : null);
+
+  async function save() {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    const res = await fetch("/api/org/lrs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        orgSlug,
+        enabled,
+        endpoint,
+        auth_key: authKey,
+        auth_secret: authSecret,
+        xapi_version: version,
+      }),
+    });
+    setBusy(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setError(j.error ?? "Save failed");
+      return;
+    }
+    setSaved(true);
+    onSaved();
+  }
+
+  async function runTest() {
+    setTesting(true);
+    setError(null);
+    const res = await fetch("/api/org/lrs/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        orgSlug,
+        endpoint,
+        auth_key: authKey,
+        auth_secret: authSecret,
+        xapi_version: version,
+      }),
+    });
+    setTesting(false);
+    const j = (await res.json().catch(() => ({}))) as {
+      status?: string;
+      versions?: string[];
+      error?: string;
+    };
+    if (!res.ok) {
+      setTest({ status: "error", error: j.error });
+      return;
+    }
+    setTest({ status: j.status ?? "error", versions: j.versions, error: j.error });
+  }
+
+  const testOk = test?.status === "ok";
+
+  return (
+    <section className="border border-line rounded-2xl bg-paper p-6 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="serif text-2xl">External LRS Integration</h2>
+          <p className="text-xs text-muted mt-0.5">
+            Send a real-time copy of your learners&apos; xAPI activity to your own
+            Learning Record Store. Your reports here keep working — this is an
+            additional mirror.
+          </p>
+        </div>
+        <label className="flex items-center gap-2 text-sm shrink-0">
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          Enabled
+        </label>
+      </div>
+
+      <Field label="LRS endpoint (xAPI base URL)">
+        <input
+          type="url"
+          value={endpoint}
+          onChange={(e) => setEndpoint(e.target.value)}
+          placeholder="https://your-lrs.example.com/xapi/"
+          className="ws-input"
+        />
+      </Field>
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Auth key (Basic username)">
+          <input type="text" value={authKey} onChange={(e) => setAuthKey(e.target.value)} className="ws-input" />
+        </Field>
+        <Field label="Auth secret (Basic password)">
+          <input
+            type="password"
+            value={authSecret}
+            onChange={(e) => setAuthSecret(e.target.value)}
+            placeholder={initial.has_secret ? "•••••• (unchanged)" : ""}
+            className="ws-input"
+          />
+        </Field>
+      </div>
+      <Field label="xAPI version">
+        <input type="text" value={version} onChange={(e) => setVersion(e.target.value)} className="ws-input" />
+      </Field>
+
+      {test && (
+        <div
+          className={`rounded-lg px-3 py-2 text-xs ${
+            testOk
+              ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+              : "bg-red-50 text-red-700 border border-red-200"
+          }`}
+        >
+          {testOk
+            ? `Connection OK${test.versions?.length ? ` — LRS supports xAPI ${test.versions.join(", ")}` : ""}`
+            : `Test ${test.status}: ${test.error ?? "failed"}`}
+        </div>
+      )}
+
+      {error && (
+        <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
+      {saved && (
+        <div className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-xl px-4 py-3 text-sm">
+          Saved.
+        </div>
+      )}
+
+      <p className="text-xs text-muted">
+        Enabling this sends a copy of your learners&apos; xAPI activity to the LRS
+        you configure.
+      </p>
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={save}
+          disabled={busy}
+          className="px-5 py-2 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? "Saving…" : "Save"}
+        </button>
+        <button
+          type="button"
+          onClick={runTest}
+          disabled={testing || !endpoint}
+          className="px-4 py-2 border border-line rounded-lg text-sm hover:border-ink disabled:opacity-50"
+        >
+          {testing ? "Testing…" : "Test connection"}
+        </button>
+      </div>
+    </section>
+  );
+}
 
 function SsoSection({
   orgSlug,
