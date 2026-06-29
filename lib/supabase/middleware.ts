@@ -104,7 +104,9 @@ export async function updateSession(request: NextRequest) {
     path.startsWith("/api/cron") ||
     // Password recovery flow runs while signed-out.
     path.startsWith("/forgot-password") ||
-    path.startsWith("/api/auth/forgot-password");
+    path.startsWith("/api/auth/forgot-password") ||
+    // Magic-link request endpoint is a pre-auth login action.
+    path.startsWith("/api/auth/magic-link");
 
   if (!user && !isPublic) {
     const url = request.nextUrl.clone();

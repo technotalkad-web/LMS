@@ -169,6 +169,10 @@ export async function POST(request: Request) {
   // ---- Find or create the auth.user ----
   let authUserId: string | null = null;
   let didInvite = false;
+  // For invited (no-password) users we mint the activation link here via
+  // generateLink (which creates the user but does NOT send anything), then
+  // email it ourselves through the tenant's branded pipeline below.
+  let inviteTokenHash: string | null = null;
 
   // Look up by email first.
   const { data: existing } = await svc.auth.admin.listUsers({
@@ -182,8 +186,11 @@ export async function POST(request: Request) {
   if (found) {
     authUserId = found.id;
   } else if (wantsInvite) {
-    // Generate the auth row + email a magic link.
-    const { data: inv, error: invErr } = await svc.auth.admin.inviteUserByEmail(email);
+    // Create the auth row + mint an invite link WITHOUT Supabase auto-sending.
+    const { data: inv, error: invErr } = await svc.auth.admin.generateLink({
+      type: "invite",
+      email,
+    });
     if (invErr || !inv?.user) {
       return NextResponse.json(
         { error: invErr?.message ?? "Could not invite user" },
@@ -191,6 +198,8 @@ export async function POST(request: Request) {
       );
     }
     authUserId = inv.user.id;
+    inviteTokenHash =
+      (inv.properties as { hashed_token?: string }).hashed_token ?? null;
     didInvite = true;
   } else {
     const { data: created, error: createErr } = await svc.auth.admin.createUser({
@@ -287,33 +296,49 @@ export async function POST(request: Request) {
   if (!priorMem) {
     // Use the request-origin helper (see #146 for the full sweep).
     const origin = await originFromRequest();
-    await notifyBackground({
-      organizationId: org.id,
-      event: "account_creation",
-      to: { user_id: authUserId, email },
-      context: {
-        learner_name:
-          body.first_name?.trim() +
-          (body.last_name ? " " + body.last_name.trim() : ""),
-        learner_email: email,
-        username,
-        login_id: email,
-        // 3-way: invited via magic link / existing user with their own
-        // password / brand-new account where we generated the password.
-        password: didInvite
-          ? "(set via the invite link)"
-          : found
-          ? "(use your existing password)"
-          : password,
-        portal_url: origin
-          ? `${origin}/${org.slug}/dashboard`
-          : `/${org.slug}/dashboard`,
-        // {Org_Name} placeholder needs `org_name` in context — was
-        // missing, so the welcome email rendered "Welcome to {Org_Name}"
-        // and "— The {Org_Name} team" with the literal placeholder.
-        org_name: org.name,
-      },
-    });
+    const learnerName =
+      body.first_name?.trim() +
+      (body.last_name ? " " + body.last_name.trim() : "");
+
+    if (didInvite && inviteTokenHash) {
+      // White-label invite: branded activation link (token_hash → /auth/callback)
+      // sent via the tenant's SMTP, Resend fallback. No Supabase auto-send.
+      const base = (origin || "").replace(/\/$/, "");
+      const link =
+        `${base}/auth/callback?token_hash=${encodeURIComponent(inviteTokenHash)}` +
+        `&type=invite&next=${encodeURIComponent(`/${org.slug}/dashboard`)}`;
+      await notifyBackground({
+        organizationId: org.id,
+        event: "account_invite",
+        to: { user_id: authUserId, email },
+        context: {
+          learner_name: learnerName,
+          learner_email: email,
+          direct_link: link,
+          portal_url: link,
+          org_name: org.name,
+        },
+      });
+    } else {
+      await notifyBackground({
+        organizationId: org.id,
+        event: "account_creation",
+        to: { user_id: authUserId, email },
+        context: {
+          learner_name: learnerName,
+          learner_email: email,
+          username,
+          login_id: email,
+          // existing user with their own password / brand-new account where we
+          // generated the password.
+          password: found ? "(use your existing password)" : password,
+          portal_url: origin
+            ? `${origin}/${org.slug}/dashboard`
+            : `/${org.slug}/dashboard`,
+          org_name: org.name,
+        },
+      });
+    }
   }
 
   return NextResponse.json({

@@ -9,7 +9,9 @@ export type NotificationEvent =
   | "path_assignment"
   | "path_unassignment"
   | "path_completion"
-  | "password_reset";
+  | "password_reset"
+  | "magic_link"
+  | "account_invite";
 
 export type NotificationContext = {
   learner_name?: string;

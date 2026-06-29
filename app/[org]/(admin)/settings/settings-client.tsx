@@ -47,6 +47,8 @@ const EVENT_LABELS: Record<NotificationEvent, string> = {
   path_completion: "Path completion",
   custom_broadcast: "Custom broadcast",
   password_reset: "Password reset code",
+  magic_link: "Magic-link sign-in",
+  account_invite: "Account invite",
 };
 
 export type WorkspaceBranding = {
