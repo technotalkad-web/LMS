@@ -145,12 +145,14 @@ export async function PATCH(
 
   if (Object.keys(profileFields).length > 0) {
     // NOTE: profiles PK is `id`, not `user_id` (Supabase starter schema).
+    // Editing an existing user → plain UPDATE of only the provided columns.
+    // (Was an upsert, but the INSERT side of ON CONFLICT proposes a row with no
+    // `email`, tripping profiles.email NOT NULL before the conflict resolves —
+    // so changing a role nulled nothing but errored "null value in column email".)
     const { error: pErr } = await svc
       .from("profiles")
-      .upsert(
-        { id: userId, ...profileFields },
-        { onConflict: "id" }
-      );
+      .update(profileFields)
+      .eq("id", userId);
     if (pErr) {
       return NextResponse.json(
         { error: `Profile update failed: ${pErr.message}` },
