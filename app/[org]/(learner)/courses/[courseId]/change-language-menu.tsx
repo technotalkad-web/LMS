@@ -34,11 +34,11 @@ export function ChangeLanguageMenu({
   const [open, setOpen] = useState(false);
   const [picking, setPicking] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The learner has an existing language; switching always prompts a
+  // confirmation first (per spec) — picking a new language opens this.
   const [confirmFor, setConfirmFor] = useState<{
     language: string;
     label: string;
-    in_progress_attempts: number;
-    message: string;
   } | null>(null);
 
   if (options.length < 2) return null;
@@ -46,49 +46,38 @@ export function ChangeLanguageMenu({
   const currentOption =
     options.find((o) => o.language === currentLanguage) ?? null;
 
-  async function pick(language: string, restart = false) {
+  // Switching away from the current language always resets progress, so it
+  // requires explicit confirmation before any change is made.
+  function requestSwitch(language: string) {
+    setError(null);
+    setOpen(false);
+    setConfirmFor({
+      language,
+      label: options.find((o) => o.language === language)?.display_label ?? language,
+    });
+  }
+
+  async function confirmSwitch(language: string) {
+    setConfirmFor(null);
     setError(null);
     setPicking(language);
-    const res = await fetch(
-      `/api/courses/${courseId}/language-preference`,
-      {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          orgSlug,
-          language,
-          restart_if_in_progress: restart,
-        }),
-      }
-    );
-    if (res.status === 409 && !restart) {
-      const j = (await res.json().catch(() => ({}))) as {
-        requires_confirm?: boolean;
-        in_progress_attempts?: number;
-        message?: string;
-      };
-      if (j.requires_confirm) {
-        setConfirmFor({
-          language,
-          label:
-            options.find((o) => o.language === language)?.display_label ??
-            language,
-          in_progress_attempts: j.in_progress_attempts ?? 0,
-          message:
-            j.message ??
-            "Switching languages will reset your progress. Continue?",
-        });
-        setPicking(null);
-        return;
-      }
-    }
+    const res = await fetch(`/api/courses/${courseId}/language-preference`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        orgSlug,
+        language,
+        // Confirmed by the learner — reset any in-progress attempt and start
+        // fresh in the new language.
+        restart_if_in_progress: true,
+      }),
+    });
     if (!res.ok) {
       const j = (await res.json().catch(() => ({}))) as { error?: string };
       setError(j.error ?? `HTTP ${res.status}`);
       setPicking(null);
       return;
     }
-    setOpen(false);
     setPicking(null);
     router.refresh();
   }
@@ -113,7 +102,7 @@ export function ChangeLanguageMenu({
               <button
                 key={o.id}
                 type="button"
-                onClick={() => o.language && pick(o.language)}
+                onClick={() => o.language && requestSwitch(o.language)}
                 disabled={picking !== null || isCurrent}
                 className="w-full text-left flex items-center justify-between gap-3 px-3 py-2 text-sm hover:bg-canvas/60 disabled:opacity-50"
               >
@@ -146,14 +135,10 @@ export function ChangeLanguageMenu({
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
         >
           <div className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4">
-            <h3 className="serif text-2xl">Switch to {confirmFor.label}?</h3>
+            <h3 className="serif text-2xl">Change Course Language?</h3>
             <p className="text-sm text-ink leading-relaxed">
-              {confirmFor.message}
-            </p>
-            <p className="text-sm text-muted">
-              You have {confirmFor.in_progress_attempts} in-progress attempt
-              {confirmFor.in_progress_attempts === 1 ? "" : "s"} in another
-              language. Continuing will mark them as abandoned.
+              Changing the language will reset your current progress and start the
+              course from the beginning in the new language.
             </p>
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -165,13 +150,10 @@ export function ChangeLanguageMenu({
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  pick(confirmFor.language, true);
-                  setConfirmFor(null);
-                }}
-                className="px-4 py-2 bg-red-700 text-white rounded-lg text-sm font-semibold"
+                onClick={() => confirmSwitch(confirmFor.language)}
+                className="px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-semibold hover:opacity-90"
               >
-                Switch and reset progress
+                OK, Switch Language
               </button>
             </div>
           </div>

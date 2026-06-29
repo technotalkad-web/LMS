@@ -85,23 +85,13 @@ export async function PUT(
     { auth: { persistSession: false } }
   );
 
-  // Look for in-progress attempts on this course in a DIFFERENT language.
-  const { data: cvs } = await svc
-    .from("course_versions")
-    .select("id, package_id, course_packages!inner(language)")
-    .eq("package_id", body.language); // placeholder; real query below
-  void cvs;
-  // Need to: find all versions of THIS course where the version\'s package
-  // is NOT the chosen language, then count in-progress attempts by this user.
-  const { data: otherVersions } = await svc
+  // Find all versions of THIS course whose package is NOT the chosen language,
+  // then count this user's in-progress attempts on them.
+  const { data: thisCourseVersions } = await svc
     .from("course_versions")
     .select("id, package_id")
-    .neq("package_id", targetPkg.id);
-  // Restrict to versions of THIS course via a second filter:
-  const { data: thisCourseVersions } = await svc
-    .from("course_versions").select("id, package_id").eq("course_id", courseId);
-  const thisCourseVerIds = ((thisCourseVersions ?? []) as Array<{ id: string; package_id: string }>);
-  const otherLangVerIds = thisCourseVerIds
+    .eq("course_id", courseId);
+  const otherLangVerIds = ((thisCourseVersions ?? []) as Array<{ id: string; package_id: string }>)
     .filter((v) => v.package_id !== targetPkg.id)
     .map((v) => v.id);
 
@@ -112,11 +102,9 @@ export async function PUT(
       .select("id", { count: "exact", head: true })
       .eq("user_id", user.id)
       .in("course_version_id", otherLangVerIds)
-      .neq("completion_status", "completed")
-      .or("success_status.neq.passed,success_status.is.null");
+      .eq("status", "in_progress");
     inProgressCount = count ?? 0;
   }
-  void otherVersions;
 
   if (inProgressCount > 0 && !body.restart_if_in_progress) {
     return NextResponse.json(
@@ -142,15 +130,21 @@ export async function PUT(
   );
   if (upErr) return NextResponse.json({ error: upErr.message }, { status: 400 });
 
-  // If the caller confirmed restart, mark old-language attempts as abandoned.
+  // If the caller confirmed restart, mark old-language attempts as abandoned so
+  // the next launch starts fresh in the new language.
   if (body.restart_if_in_progress && otherLangVerIds.length > 0) {
-    await svc
+    const { error: abErr } = await svc
       .from("course_attempts")
       .update({ status: "abandoned" })
       .eq("user_id", user.id)
       .in("course_version_id", otherLangVerIds)
-      .neq("completion_status", "completed")
-      .or("success_status.neq.passed,success_status.is.null");
+      .eq("status", "in_progress");
+    if (abErr) {
+      return NextResponse.json(
+        { error: `Saved preference but failed to reset progress: ${abErr.message}` },
+        { status: 500 }
+      );
+    }
   }
 
   return NextResponse.json({ ok: true, abandoned: inProgressCount });
