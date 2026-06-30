@@ -103,6 +103,10 @@ test("LRS forwarding engine: drain, retry, connection test, secret masking", asy
       statement_id: stmtId,
       payload: { id: stmtId, verb: { id: "http://adlnet.gov/expapi/verbs/completed" } },
       status: "pending",
+      // Backdate so the row is unambiguously due regardless of any clock skew
+      // between this machine and the DB (the DB default now() can land ahead of
+      // the drainer's local now(), making a fresh row look "not yet due").
+      next_attempt_at: new Date(Date.now() - 60_000).toISOString(),
     });
     await drain(baseURL!);
     expect((await outboxStatus(stmtId))?.status, "happy row should be sent").toBe("sent");
@@ -116,6 +120,7 @@ test("LRS forwarding engine: drain, retry, connection test, secret masking", asy
       statement_id: retryId,
       payload: { id: retryId, verb: { id: "http://adlnet.gov/expapi/verbs/attempted" } },
       status: "pending",
+      next_attempt_at: new Date(Date.now() - 60_000).toISOString(),
     });
     await drain(baseURL!);
     const afterFail = await outboxStatus(retryId);
