@@ -24,6 +24,7 @@ on:
     - cron: "30 3 * * *"   # /api/cron/refresh-report-views   — daily 03:30 UTC
     - cron: "0 6 * * *"    # /api/cron/reminders              — daily 06:00 UTC
     - cron: "0 7 * * 1"    # /api/cron/rls-audit              — Mondays 07:00 UTC
+    - cron: "*/5 * * * *"  # /api/cron/lrs-forward            — every 5 min (outbox retry net)
   workflow_dispatch:
     inputs:
       endpoint:
@@ -50,6 +51,7 @@ jobs:
               "30 3 * * *") P=/api/cron/refresh-report-views ;;
               "0 6 * * *")  P=/api/cron/reminders ;;
               "0 7 * * 1")  P=/api/cron/rls-audit ;;
+              "*/5 * * * *") P=/api/cron/lrs-forward ;;
               *) echo "Unknown schedule '${SCHEDULE}'"; exit 1 ;;
             esac
           else

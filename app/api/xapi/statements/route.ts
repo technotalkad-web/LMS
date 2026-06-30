@@ -6,6 +6,7 @@ import {
   unauthorizedResponse,
 } from "@/lib/xapi/auth";
 import { processStatement } from "@/lib/xapi/process-statement";
+import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
 import type { XapiStatement } from "@/lib/xapi/types";
 
 /**
@@ -62,6 +63,10 @@ export async function POST(request: Request) {
 
     ids.push(statement.id);
   }
+
+  // Fan-out: mirror these statements to the org's external LRS if configured.
+  // Fail-isolated + non-blocking — never affects this response or our own copy.
+  await mirrorToExternalLrs(session.attemptId, statements);
 
   return NextResponse.json(ids, { status: 200 });
 }

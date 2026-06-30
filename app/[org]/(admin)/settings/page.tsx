@@ -6,6 +6,7 @@ import { DEFAULT_TEMPLATES, DEFAULT_CTAS } from "@/lib/notifications/templates";
 import type { NotificationEvent } from "@/lib/notifications/types";
 import { SettingsClient } from "./settings-client";
 import { serviceProviderDetails } from "@/lib/supabase/sso-admin";
+import { maskedConfig } from "@/lib/lrs/config";
 
 export const dynamic = "force-dynamic";
 
@@ -162,6 +163,7 @@ export default async function SettingsPage({
           domains: (extraRow?.sso_domains as string[] | null | undefined) ?? [],
           serviceProvider: serviceProviderDetails(),
         }}
+        lrs={await maskedConfig(org.id)}
       />
     </div>
   );
