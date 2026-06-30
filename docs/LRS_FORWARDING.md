@@ -136,11 +136,18 @@ Unique `(organization_id, statement_id)` to avoid duplicate enqueues on retry.
 
 ### 5.3 RLS & secret handling
 
-- `tenant_lrs_config`: org **admins** may `select`/`update` their row
-  (`is_org_admin(organization_id)`) — **but the API layer never returns
-  `auth_secret`** to the client (masked to `••••••` on read; write-only). All
-  secret use happens server-side with the service role.
-- `lrs_forward_outbox`: **service-role only** — no client RLS policies.
+- Both tables have **RLS enabled**. Each gets an **admin-scoped SELECT policy**
+  `using (is_org_admin(organization_id))` (migration `0045`) so an admin can
+  read **only their own org's** row(s) — never another org's. **Writes have no
+  client policy**, so only the service role (our API) can mutate them.
+  - Why a policy at all (vs. policy-less deny-all): the cross-tenant RLS audit
+    (`tests/rls-audit/audit.sql`) hard-FAILs any `organization_id` table with
+    zero policies, because it can't *certify* isolation on a policy-less table.
+    The admin-scoped policy clears the FAIL **and** passes the audit's runtime
+    leak probe (org A's admin sees 0 of org B's rows).
+- **`auth_secret` is never returned to the browser** — the config API masks it
+  (`••••••`); the only direct-read exposure is an org's own admin reading their
+  own credential.
 - Secret at rest: **plaintext + RLS**, consistent with the existing
   `notification_settings.smtp_password`. *(Optional hardening: `pgcrypto`
   encryption — noted as a future step, not v1.)*
