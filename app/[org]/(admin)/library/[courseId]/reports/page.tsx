@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
@@ -68,6 +69,8 @@ export default async function CourseReportsPage({
   const supabase = await createClient();
 
   // ---- Verify course is in this org ----
+  // This RLS-scoped query is the security gate: it confirms the course belongs
+  // to the caller's org before we touch any matview by course_id.
   const { data: course } = await supabase
     .from("courses")
     .select("id, title, organization_id")
@@ -77,8 +80,18 @@ export default async function CourseReportsPage({
   if (!course) redirect(`/${orgSlug}/library`);
   const c = course as Course;
 
+  // Report matviews carry no RLS, so they are revoked from anon/authenticated
+  // (migration 0049) and read with the service role. Safe here because access is
+  // already gated above (requireOrgAccess + canManage + course-in-org) and every
+  // matview read below is pinned to this org-verified course_id.
+  const svc = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
+
   // ---- Read the two matviews ----
-  const { data: enrRow } = await supabase
+  const { data: enrRow } = await svc
     .from("mv_course_enrollment_status")
     .select("*")
     .eq("course_id", c.id)
@@ -92,7 +105,7 @@ export default async function CourseReportsPage({
     refreshed_at: new Date(0).toISOString(),
   };
 
-  const { data: perfRow } = await supabase
+  const { data: perfRow } = await svc
     .from("mv_course_performance")
     .select("*")
     .eq("course_id", c.id)
@@ -115,7 +128,7 @@ export default async function CourseReportsPage({
   // Two matviews: one with correct/incorrect counts per question, one
   // with the top wrong responses per question (added in migration 0035).
   // Both are course-scoped so the row counts stay tiny per page render.
-  const { data: interactionRows } = await supabase
+  const { data: interactionRows } = await svc
     .from("mv_course_interaction_breakdown")
     .select(
       "interaction_id, interaction_label, total_responses, distinct_learners, correct_count, incorrect_count, correct_rate"
@@ -123,7 +136,7 @@ export default async function CourseReportsPage({
     .eq("course_id", c.id)
     .order("interaction_id", { ascending: true });
 
-  const { data: topWrongRows } = await supabase
+  const { data: topWrongRows } = await svc
     .from("mv_course_interaction_top_wrong")
     .select("interaction_id, rank, response, freq")
     .eq("course_id", c.id)
