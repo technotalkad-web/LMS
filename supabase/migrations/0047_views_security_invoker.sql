@@ -17,9 +17,14 @@
 -- so setting security_invoker = on changes NO current behavior (service role and
 -- the definer refresh still see every row) while closing the RLS-bypass hole for
 -- any future authed reader. Requires Postgres 15+ (Supabase default).
+--
+-- `if exists` because these are applied by hand across DBs in different states
+-- (e.g. prod may not have the 0031 report views) — missing view = no-op, not an
+-- abort. The 0031 report views are also re-created WITH the flag in 0048's
+-- companion note; here we only flip whatever is present.
 
-alter view public.v_course_enrollments_expanded set (security_invoker = on);
-alter view public.v_path_enrollments_expanded   set (security_invoker = on);
-alter view public.v_course_attempt_summary      set (security_invoker = on);
-alter view public.tenant_usage                  set (security_invoker = on);
-alter view public.platform_tables_without_rls   set (security_invoker = on);
+alter view if exists public.v_course_enrollments_expanded set (security_invoker = on);
+alter view if exists public.v_path_enrollments_expanded   set (security_invoker = on);
+alter view if exists public.v_course_attempt_summary      set (security_invoker = on);
+alter view if exists public.tenant_usage                  set (security_invoker = on);
+alter view if exists public.platform_tables_without_rls   set (security_invoker = on);

@@ -1,81 +1,96 @@
 -- 0049: Supabase Security Advisor hardening (WARN-level lints).
 --
 -- After 0046-0048 cleared the ERROR-level findings, these WARN items remain.
--- This migration fixes the ones that are safe and/or real; see the notes for
--- the two classes we deliberately DO NOT touch.
+-- Every statement is guarded (to_regclass / to_regprocedure) because these are
+-- applied by hand across DBs in different states (e.g. prod may be missing the
+-- 0031 report matviews / quota functions) — a missing object must no-op, not
+-- abort the whole script.
 --
--- ─────────────────────────────────────────────────────────────────────────────
--- A) materialized_view_in_api  — REAL cross-tenant leak.
---    The mv_* report matviews carry no RLS, yet SELECT was granted to anon /
---    authenticated, so any signed-in user could read EVERY tenant's aggregates
---    directly via /rest/v1/mv_* (bypassing the app's per-org WHERE filter).
---    Revoke client access. The course reports page now reads them with the
---    service role (app/[org]/(admin)/library/[courseId]/reports/page.tsx), so we
---    grant service_role explicitly to guarantee it keeps working after the
---    revoke. The mv_path_* views are unused by the app.
---    ORDER OF OPS: deploy the page change BEFORE applying this, or the reports
---    page (still on the authed client) loses matview access in the gap.
-
-revoke select on public.mv_course_enrollment_status      from anon, authenticated;
-revoke select on public.mv_path_enrollment_status        from anon, authenticated;
-revoke select on public.mv_course_performance            from anon, authenticated;
-revoke select on public.mv_path_performance              from anon, authenticated;
-revoke select on public.mv_course_interaction_breakdown  from anon, authenticated;
-revoke select on public.mv_course_interaction_top_wrong  from anon, authenticated;
-
-grant select on public.mv_course_enrollment_status     to service_role;
-grant select on public.mv_course_performance           to service_role;
-grant select on public.mv_course_interaction_breakdown to service_role;
-grant select on public.mv_course_interaction_top_wrong to service_role;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- B) anon/authenticated_security_definer_function_executable
---    SECURITY DEFINER functions exposed as RPC to the API roles. Lock down the
---    ones that are triggers or service-role-only. Trigger functions still fire
---    after the revoke (Postgres triggers do NOT check EXECUTE); service-role
---    callers get an explicit grant because revoking from PUBLIC would otherwise
---    strip it from service_role too (all roles inherit PUBLIC).
+-- WHAT THIS FIXES
+--  A) materialized_view_in_api (REAL cross-tenant leak): the mv_* report matviews
+--     carry no RLS but granted SELECT to anon/authenticated, so any signed-in
+--     user could read EVERY tenant's aggregates via /rest/v1/mv_*. The course
+--     reports page now reads them with the service role, so we revoke the API
+--     roles and grant service_role explicitly.
+--  B) anon/authenticated_security_definer_function_executable: revoke EXECUTE on
+--     trigger + service-role-only definer functions. Triggers still fire (they
+--     don't check EXECUTE); service-role callers get an explicit grant because
+--     revoking from PUBLIC would otherwise strip service_role too.
+--  C) function_search_path_mutable: pin set_updated_at's search_path.
+--  D) public_bucket_allows_listing: drop the broad listing policy on the public
+--     public-assets bucket (public URLs still serve objects; only enumeration
+--     is removed).
 --
---    DELIBERATELY LEFT EXECUTABLE: public.is_org_member(uuid),
---    public.is_org_admin(uuid), public.is_platform_owner() — these are invoked
---    INSIDE RLS policies (47 + 15 + platform policy references), so the authed
---    role MUST keep EXECUTE or every policy evaluation fails. Their advisor WARN
---    is expected (same posture as Supabase's own auth.uid()/auth.role()).
+-- DELIBERATELY LEFT ALONE: is_org_member(uuid) / is_org_admin(uuid) /
+-- is_platform_owner() stay EXECUTE-able — they run inside RLS policies, so the
+-- authed role must keep EXECUTE or every policy check fails (same posture as
+-- Supabase's own auth.uid()).
+--
+-- NOT fixable in SQL: auth_leaked_password_protection — enable in
+-- Dashboard → Authentication → Password → "Leaked password protection".
 
--- trigger-only (no RPC caller; triggers fire regardless of EXECUTE):
-revoke execute on function public.handle_new_user()           from public, anon, authenticated;
-revoke execute on function public.create_default_lrs_config() from public, anon, authenticated;
-revoke execute on function public.enforce_row_quota()         from public, anon, authenticated;
+do $$
+begin
+  -- ── A) matviews: not exposed over the Data API ──────────────────────────
+  if to_regclass('public.mv_course_enrollment_status') is not null then
+    revoke select on public.mv_course_enrollment_status from anon, authenticated;
+    grant  select on public.mv_course_enrollment_status to service_role;
+  end if;
+  if to_regclass('public.mv_path_enrollment_status') is not null then
+    revoke select on public.mv_path_enrollment_status from anon, authenticated;
+  end if;
+  if to_regclass('public.mv_course_performance') is not null then
+    revoke select on public.mv_course_performance from anon, authenticated;
+    grant  select on public.mv_course_performance to service_role;
+  end if;
+  if to_regclass('public.mv_path_performance') is not null then
+    revoke select on public.mv_path_performance from anon, authenticated;
+  end if;
+  if to_regclass('public.mv_course_interaction_breakdown') is not null then
+    revoke select on public.mv_course_interaction_breakdown from anon, authenticated;
+    grant  select on public.mv_course_interaction_breakdown to service_role;
+  end if;
+  if to_regclass('public.mv_course_interaction_top_wrong') is not null then
+    revoke select on public.mv_course_interaction_top_wrong from anon, authenticated;
+    grant  select on public.mv_course_interaction_top_wrong to service_role;
+  end if;
 
--- service-role-only helpers (revoke from API roles, keep for service_role):
-revoke execute on function public.effective_cap(uuid, text)       from public, anon, authenticated;
-revoke execute on function public.current_quota_usage(uuid, text) from public, anon, authenticated;
-revoke execute on function public.platform_reapable_orgs()        from public, anon, authenticated;
-revoke execute on function public.refresh_report_views()          from public, anon, authenticated;
+  -- ── B) definer functions not meant for the public API ───────────────────
+  -- trigger-only (no RPC caller; triggers fire regardless of EXECUTE):
+  if to_regprocedure('public.handle_new_user()') is not null then
+    revoke execute on function public.handle_new_user() from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.create_default_lrs_config()') is not null then
+    revoke execute on function public.create_default_lrs_config() from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.enforce_row_quota()') is not null then
+    revoke execute on function public.enforce_row_quota() from public, anon, authenticated;
+  end if;
 
-grant execute on function public.effective_cap(uuid, text)       to service_role;
-grant execute on function public.current_quota_usage(uuid, text) to service_role;
-grant execute on function public.platform_reapable_orgs()        to service_role;
-grant execute on function public.refresh_report_views()          to service_role;
+  -- service-role-only helpers (revoke API roles, keep service_role):
+  if to_regprocedure('public.effective_cap(uuid, text)') is not null then
+    revoke execute on function public.effective_cap(uuid, text) from public, anon, authenticated;
+    grant  execute on function public.effective_cap(uuid, text) to service_role;
+  end if;
+  if to_regprocedure('public.current_quota_usage(uuid, text)') is not null then
+    revoke execute on function public.current_quota_usage(uuid, text) from public, anon, authenticated;
+    grant  execute on function public.current_quota_usage(uuid, text) to service_role;
+  end if;
+  if to_regprocedure('public.platform_reapable_orgs()') is not null then
+    revoke execute on function public.platform_reapable_orgs() from public, anon, authenticated;
+    grant  execute on function public.platform_reapable_orgs() to service_role;
+  end if;
+  if to_regprocedure('public.refresh_report_views()') is not null then
+    revoke execute on function public.refresh_report_views() from public, anon, authenticated;
+    grant  execute on function public.refresh_report_views() to service_role;
+  end if;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- C) function_search_path_mutable — pin set_updated_at's search_path.
---    (This trigger fn predates the migrations — created via the dashboard — so
---    we ALTER it in place. pg_catalog,public is used rather than '' so it stays
---    safe even if the body references an unqualified public object.)
+  -- ── C) pin set_updated_at search_path ───────────────────────────────────
+  -- pg_catalog,public (not '') so it stays safe if the body references public.
+  if to_regprocedure('public.set_updated_at()') is not null then
+    alter function public.set_updated_at() set search_path = pg_catalog, public;
+  end if;
+end $$;
 
-alter function public.set_updated_at() set search_path = pg_catalog, public;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- D) public_bucket_allows_listing — public-assets.
---    public-assets is a PUBLIC bucket: its objects are served via their public
---    URL with no policy check, so this broad SELECT policy on storage.objects
---    only enables directory LISTING of every file. The app never lists it
---    (writes are service-role; reads are by known public URL), so drop it.
-
+-- ── D) public-assets listing policy (storage.objects always exists) ───────
 drop policy if exists "public read public-assets" on storage.objects;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- NOT fixable in SQL:
---   auth_leaked_password_protection — enable in Dashboard → Authentication →
---   Sign In / Providers → Password → "Leaked password protection" (HaveIBeenPwned).
