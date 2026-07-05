@@ -17,7 +17,7 @@ export default async function SuperOwnerLayout({
   const { user } = await requirePlatformOwner();
 
   return (
-    <div className="min-h-screen flex font-sans text-slate-900 bg-slate-100">
+    <div data-theme="light" className="min-h-screen flex font-sans text-slate-900 bg-slate-100">
       <aside className="w-64 bg-slate-900 text-slate-300 flex flex-col fixed h-full z-10">
         <div className="h-16 flex items-center px-6 bg-slate-950 border-b border-slate-800">
           <ShieldAlert className="w-6 h-6 text-emerald-500 mr-2" />

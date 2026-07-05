@@ -1,7 +1,10 @@
 @import "tailwindcss";
 
 /* ---- light theme (default) ---- */
-:root {
+/* `[data-theme="light"]` lets a subtree pin light tokens even when <html> is in
+   dark mode (e.g. the super-owner admin panel, which is a light-only design). */
+:root,
+[data-theme="light"] {
   --canvas: #faf8f4;
   --ink: #1a1816;
   --muted: #6b6661;
