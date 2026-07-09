@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { recordHeartbeat } from "@/lib/ops/heartbeat";
 
 /**
  *   POST /api/cron/refresh-report-views
@@ -59,6 +60,7 @@ export async function POST(request: NextRequest) {
     return unauthorized();
   }
   const result = await run();
+  await recordHeartbeat("refresh-report-views", result, result.ok);
   return NextResponse.json(result, {
     status: result.ok ? 200 : 500,
   });

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadLrsConfig } from "@/lib/lrs/config";
 import { forwardStatements } from "@/lib/lrs/forward";
+import { recordHeartbeat } from "@/lib/ops/heartbeat";
 
 /**
  *   POST /api/cron/lrs-forward      header: x-cron-secret: <CRON_SECRET>
@@ -54,7 +55,10 @@ export async function POST(request: Request) {
     payload: unknown;
     attempts: number;
   }>;
-  if (rows.length === 0) return NextResponse.json({ ok: true, processed: 0 });
+  if (rows.length === 0) {
+    await recordHeartbeat("lrs-forward", { processed: 0 });
+    return NextResponse.json({ ok: true, processed: 0 });
+  }
 
   // Group by org so we forward each LRS one batch.
   const byOrg = new Map<string, typeof rows>();
@@ -114,5 +118,6 @@ export async function POST(request: Request) {
     }
   }
 
+  await recordHeartbeat("lrs-forward", { processed: rows.length, sent, failed, dead });
   return NextResponse.json({ ok: true, processed: rows.length, sent, failed, dead });
 }

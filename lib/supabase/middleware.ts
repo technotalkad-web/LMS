@@ -106,7 +106,10 @@ export async function updateSession(request: NextRequest) {
     path.startsWith("/forgot-password") ||
     path.startsWith("/api/auth/forgot-password") ||
     // Magic-link request endpoint is a pre-auth login action.
-    path.startsWith("/api/auth/magic-link");
+    path.startsWith("/api/auth/magic-link") ||
+    // Ops health probe: public liveness summary; detail gated by CRON_SECRET
+    // header inside the route (watchdog + uptime robots run unauthenticated).
+    path.startsWith("/api/ops/health");
 
   if (!user && !isPublic) {
     const url = request.nextUrl.clone();
