@@ -1,20 +1,21 @@
 name: Ops AI review (daily)
 
-# Layer 2 of the ops model (ops/RUNBOOK.md §1): a headless Claude Code session
-# runs the daily ops review INSIDE GitHub Actions — no claude.ai GitHub
-# connection needed. It reads the watchdog's daily digest + open incidents +
-# recent workflow runs, triages them against the RUNBOOK playbooks, and posts
-# one "🤖 Daily AI review" comment on the rolling ops-digest issue.
+# Layer 2 of the ops model (ops/RUNBOOK.md §1): a headless Gemini CLI session
+# runs the daily ops review inside GitHub Actions. It reads the watchdog's
+# daily digest + open incidents + recent workflow runs, triages them against
+# the RUNBOOK playbooks, and posts one "🤖 Daily AI review" comment on the
+# rolling ops-digest issue.
 #
-# Auth: add ONE repo secret (Settings → Secrets and variables → Actions):
-#   CLAUDE_CODE_OAUTH_TOKEN — from `claude setup-token` (Claude Pro/Max
-#                             subscription; no per-token billing), OR
-#   ANTHROPIC_API_KEY       — from console.anthropic.com (API billing).
-# The action uses whichever is set.
+# Auth: ONE repo secret (Settings → Secrets and variables → Actions):
+#   GEMINI_API_KEY — from https://aistudio.google.com/apikey (free tier: no
+#   card needed, but Google may use free-tier prompts/responses to improve
+#   its products, and rate limits apply — hence gemini-2.5-flash below.
+#   Enabling billing on the key's project lifts both.)
 #
-# Safety: issues-only by construction — the job token has contents: read (can't
-# push), and the tool allowlist below only permits read tools + gh/curl/jq.
-# Runs at 02:15 UTC (07:45 IST), 45 min after ops-watch.yml posts the digest.
+# Safety is structural, engine-independent: the job token has contents: read
+# (cannot push) and the settings allowlist only exposes read tools + gh/curl/
+# jq/date shell commands. Runs at 02:15 UTC (07:45 IST), 45 min after
+# ops-watch.yml posts the digest.
 
 on:
   schedule:
@@ -39,15 +40,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: anthropics/claude-code-action@v1
+      - uses: google-github-actions/run-gemini-cli@v0
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: >-
-            --model claude-sonnet-5
-            --max-turns 50
-            --allowedTools "Read,Grep,Glob,Bash(gh issue:*),Bash(gh run:*),Bash(gh workflow:*),Bash(gh api:*),Bash(gh label:*),Bash(curl:*),Bash(jq:*),Bash(date:*)"
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: gemini-2.5-flash
+          settings: |
+            {
+              "coreTools": [
+                "list_directory",
+                "read_file",
+                "read_many_files",
+                "glob",
+                "search_file_content",
+                "run_shell_command(gh issue)",
+                "run_shell_command(gh run)",
+                "run_shell_command(gh workflow)",
+                "run_shell_command(gh api)",
+                "run_shell_command(gh label)",
+                "run_shell_command(curl)",
+                "run_shell_command(jq)",
+                "run_shell_command(date)"
+              ]
+            }
           prompt: |
             You are the AI Senior LMS Ops Engineer for this repository (multi-
             tenant LMS: Next.js on Cloudflare Workers + Supabase; GitHub Actions
