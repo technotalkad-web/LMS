@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog } from "@/lib/auth/require-platform-owner";
+import { recordHeartbeat } from "@/lib/ops/heartbeat";
 
 /**
  *   POST /api/cron/rls-audit
@@ -73,6 +74,7 @@ export async function POST(request: Request) {
     return unauthorized();
   }
   const result = await run();
+  await recordHeartbeat("rls-audit", { offenders: result.offenders.length }, true);
   return NextResponse.json(result);
 }
 

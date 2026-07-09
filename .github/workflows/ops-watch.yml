@@ -1,0 +1,127 @@
+name: Ops watchdog (prod)
+
+# The deterministic, always-on layer of the LMS ops agent (see ops/RUNBOOK.md).
+#
+#   */10  probe   — GET /api/ops/health on PROD. On degraded/down/unreachable it
+#                   opens (or updates) a GitHub issue labelled `ops-incident` and
+#                   fails the run. On recovery it comments + auto-closes the
+#                   issue. GitHub notifications deliver the page (email/mobile).
+#   01:30 digest  — daily UTC (07:00 IST): posts the full health JSON as a
+#                   comment on the rolling `ops-digest` issue, so there is a
+#                   browsable daily history and a hook for the AI review.
+#
+# Reuses the same repo secrets as cron.yml: PROD_BASE_URL + PROD_CRON_SECRET.
+# NOTE: GitHub scheduled workflows run from the default branch only — this
+# activates once merged to main. Schedule can jitter by a few minutes under
+# GH load; cadence thresholds in /api/ops/health already allow for it.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # probe
+    - cron: "30 1 * * *"   # daily digest
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: ops-watch
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/10 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe /api/ops/health
+        id: probe
+        env:
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_SECRET: ${{ secrets.PROD_CRON_SECRET }}
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -m 25 -o /tmp/health.json -w "%{http_code}" \
+            -H "x-cron-secret: ${CRON_SECRET}" "${BASE}/api/ops/health" || echo "000")
+          status=$(jq -r '.status // "unreachable"' /tmp/health.json 2>/dev/null || echo "unreachable")
+          if [ "$code" != "200" ] && [ "$code" != "503" ]; then status="unreachable"; fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Prod health: \`$status\` (HTTP $code)"
+            echo '```json'
+            jq . /tmp/health.json 2>/dev/null || cat /tmp/health.json 2>/dev/null || echo "{}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Alert on failure / auto-close on recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.probe.outputs.status }}
+          CODE: ${{ steps.probe.outputs.code }}
+        run: |
+          set -euo pipefail
+          gh label create ops-incident --repo "$GITHUB_REPOSITORY" \
+            --color B60205 --description "Auto-filed by the ops watchdog" 2>/dev/null || true
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ops-incident \
+            --state open --json number --jq '.[0].number // empty')
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          now="$(date -u +%FT%TZ)"
+
+          if [ "$STATUS" = "ok" ] || [ "$STATUS" = "warn" ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+                --body "✅ **Recovered** at $now — prod health is \`$STATUS\`. ($run_url) Auto-closing."
+              gh issue close "$existing" --repo "$GITHUB_REPOSITORY"
+            fi
+            if [ "$STATUS" = "warn" ]; then
+              echo "::warning::Prod health WARN — advisory thresholds breached (see summary)"
+            fi
+            exit 0
+          fi
+
+          body="**Watchdog probe failed** at $now — prod health is \`$STATUS\` (HTTP $CODE).
+
+          - Run (health JSON in the step summary): $run_url
+          - Playbooks: \`ops/RUNBOOK.md\`
+          - Health endpoint: \`GET /api/ops/health\` with \`x-cron-secret\`"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "🔴 Ops incident: prod health $STATUS" \
+              --label ops-incident --body "$body"
+          fi
+          echo "::error::Prod health is $STATUS (HTTP $CODE)"
+          exit 1
+
+  digest:
+    if: github.event.schedule == '30 1 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post daily digest comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ secrets.PROD_BASE_URL }}
+          CRON_SECRET: ${{ secrets.PROD_CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          gh label create ops-digest --repo "$GITHUB_REPOSITORY" \
+            --color 0E8A16 --description "Rolling daily ops digest" 2>/dev/null || true
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ops-digest \
+            --state open --json number --jq '.[0].number // empty')
+          if [ -z "$issue" ]; then
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "📊 Ops digest (rolling)" --label ops-digest \
+              --body "Daily prod health snapshots are posted below by ops-watch.yml. Keep this issue open.")
+            issue="${url##*/}"
+          fi
+          curl -sS -m 25 -H "x-cron-secret: ${CRON_SECRET}" \
+            "${BASE}/api/ops/health" -o /tmp/health.json || echo '{"status":"unreachable"}' > /tmp/health.json
+          status=$(jq -r '.status // "unreachable"' /tmp/health.json)
+          {
+            echo "### $(date -u +%F) — prod health: \`$status\`"
+            echo '```json'
+            jq . /tmp/health.json
+            echo '```'
+          } > /tmp/digest.md
+          gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file /tmp/digest.md

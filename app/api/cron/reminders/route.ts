@@ -3,6 +3,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendNotification } from "@/lib/notifications/send";
 import { resolveEmails } from "@/lib/users/emails";
 import { mapWithConcurrency } from "@/lib/util/concurrency";
+import { recordHeartbeat } from "@/lib/ops/heartbeat";
 
 /**
  *   POST /api/cron/reminders
@@ -347,6 +348,11 @@ export async function POST(request: Request) {
       .upsert(stateUpserts, { onConflict: "user_id,course_id" });
   }
 
+  await recordHeartbeat("reminders", {
+    scanned: enabledCourses.length,
+    sent,
+    skipped,
+  });
   return NextResponse.json({
     scanned: enabledCourses.length,
     sent,
