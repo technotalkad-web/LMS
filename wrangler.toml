@@ -142,6 +142,10 @@ NEXT_PUBLIC_SENTRY_ENV = "production"
 STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
+# Arms cron-staleness paging in /api/ops/health. Prod-only: cron.yml drives
+# crons on prod alone — never set this on staging, where heartbeats are stale
+# by design and the env would read permanently degraded.
+OPS_EXPECT_CRONS = "1"
 # Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
 # RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 # White-label custom domains (see docs/INFRA_MIGRATION.md). Inert until set.

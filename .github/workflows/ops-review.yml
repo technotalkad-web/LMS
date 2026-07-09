@@ -1,0 +1,110 @@
+name: Ops AI review (daily)
+
+# Layer 2 of the ops model (ops/RUNBOOK.md §1): a headless Gemini CLI session
+# runs the daily ops review inside GitHub Actions. It reads the watchdog's
+# daily digest + open incidents + recent workflow runs, triages them against
+# the RUNBOOK playbooks, and posts one "🤖 Daily AI review" comment on the
+# rolling ops-digest issue.
+#
+# Auth: ONE repo secret (Settings → Secrets and variables → Actions):
+#   GEMINI_API_KEY — from https://aistudio.google.com/apikey (free tier: no
+#   card needed, but Google may use free-tier prompts/responses to improve
+#   its products, and rate limits apply — hence gemini-2.5-flash below.
+#   Enabling billing on the key's project lifts both.)
+#
+# Safety is structural, engine-independent: the job token has contents: read
+# (cannot push) and the settings allowlist only exposes read tools + gh/curl/
+# jq/date shell commands. Runs at 02:15 UTC (07:45 IST), 45 min after
+# ops-watch.yml posts the digest.
+
+on:
+  schedule:
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+concurrency:
+  group: ops-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: gemini-2.5-flash
+          settings: |
+            {
+              "coreTools": [
+                "list_directory",
+                "read_file",
+                "read_many_files",
+                "glob",
+                "search_file_content",
+                "run_shell_command(gh issue)",
+                "run_shell_command(gh run)",
+                "run_shell_command(gh workflow)",
+                "run_shell_command(gh api)",
+                "run_shell_command(gh label)",
+                "run_shell_command(curl)",
+                "run_shell_command(jq)",
+                "run_shell_command(date)"
+              ]
+            }
+          prompt: |
+            You are the AI Senior LMS Ops Engineer for this repository (multi-
+            tenant LMS: Next.js on Cloudflare Workers + Supabase; GitHub Actions
+            drives the crons and a 10-minute prod health watchdog). Run the
+            DAILY OPS REVIEW.
+
+            Authority and boundaries: read ops/RUNBOOK.md first and obey §7
+            (safe-actions) strictly. In this workflow you are ISSUES-ONLY: you
+            may read the repo and query gh, and open/comment on GitHub issues —
+            you must NEVER modify code, migrations, workflows, secrets, or any
+            database. Do not attempt git writes (the token cannot push).
+
+            Procedure:
+            1. Gather signals via gh:
+               a. The open issue labelled `ops-digest` — read the newest 2-3
+                  comments (daily prod health JSON posted by "Ops watchdog
+                  (prod)" at 01:30 UTC; this run at 02:15 UTC should find
+                  today's snapshot).
+               b. Open issues labelled `ops-incident`, plus recently closed
+                  ones (recurrence patterns).
+               c. Latest runs of: "Scheduled crons (prod)", "Ops watchdog
+                  (prod)", the staging and production deploy workflows — note
+                  red runs and their error annotations.
+               d. Staging liveness: curl -s
+                  https://my-lms.mentora.workers.dev/api/ops/health
+                  (public response is {status,ts} only; you have no secrets —
+                  do not try to obtain detail).
+            2. Triage every non-ok / red / stale signal against the RUNBOOK §6
+               playbooks (cron 404 = deploy sequencing; SMTP 535 = dead app
+               password; RLS audit fail = policy-less table; LRS dead letters;
+               schema drift; rollback). For each finding: severity P1-P4,
+               evidence (quote the JSON/log line), root-cause hypothesis,
+               recommended next action, autonomous vs needs-approval.
+            3. Report: post ONE comment on the `ops-digest` issue titled
+               "🤖 Daily AI review <YYYY-MM-DD>" with: overall status
+               one-liner; new/ongoing incidents; trends vs previous digests
+               (db latency, email failed_24h, LRS backlog, cron staleness);
+               top 3 recommended actions; an "Approval needed" list (possibly
+               empty). Keep it under ~40 lines. If the digest issue does not
+               exist yet, create it (title "📊 Ops digest (rolling)", label
+               `ops-digest`).
+            4. If you found a P1/P2 with NO open `ops-incident` issue, open one
+               (label `ops-incident`) with the evidence and the playbook
+               reference.
+            5. If a signal source is unreachable (labels missing, no runs yet),
+               say so plainly in the report instead of guessing.
