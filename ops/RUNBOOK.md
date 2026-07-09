@@ -11,7 +11,7 @@ routine) and any human on-call should follow this document.
 | Layer | What | Cadence | Cost of failure |
 |---|---|---|---|
 | **L1 Deterministic watchdog** | `.github/workflows/ops-watch.yml` probes `GET /api/ops/health` on prod; files/updates a GitHub issue (`ops-incident`) on degraded/down; auto-closes on recovery; posts a daily digest comment (`ops-digest` issue). | every 10 min, 24/7 | none — it's dumb and reliable |
-| **L2 AI review** | `/ops-review` (skill) or the scheduled routine: reads health + heartbeats + digests + recent workflow runs, triages against this runbook, opens issues/PRs, drafts fixes. | daily + on-demand | bounded by §7 safe-actions |
+| **L2 AI review** | `.github/workflows/ops-review.yml` — headless Claude Code in Actions (daily 02:15 UTC, issues-only) — plus `/ops-review` (skill) for on-demand sessions: reads health + heartbeats + digests + recent workflow runs, triages against this runbook, opens issues; drafts fixes only in interactive sessions. | daily + on-demand | bounded by §7 safe-actions |
 | **L3 Human (you)** | Approves anything in §7's "requires approval" list; receives pages via GitHub notifications on `ops-incident` issues. | on page / daily digest | — |
 
 **Design stance:** this stack is **serverless** (Cloudflare Workers + Supabase).
