@@ -11,8 +11,27 @@ routine) and any human on-call should follow this document.
 | Layer | What | Cadence | Cost of failure |
 |---|---|---|---|
 | **L1 Deterministic watchdog** | `.github/workflows/ops-watch.yml` probes `GET /api/ops/health` on prod; files/updates a GitHub issue (`ops-incident`) on degraded/down; auto-closes on recovery; posts a daily digest comment (`ops-digest` issue). | every 10 min, 24/7 | none — it's dumb and reliable |
-| **L2 AI review** | `.github/workflows/ops-review.yml` — headless Gemini CLI in Actions (daily 02:15 UTC, issues-only, free-tier API key) — plus `/ops-review` (Claude skill) for on-demand interactive sessions: reads health + heartbeats + digests + recent workflow runs, triages against this runbook, opens issues; fixes are drafted only in interactive sessions. | daily + on-demand | bounded by §7 safe-actions |
+| **L2 AI review** | `.github/workflows/ops-review.yml` — headless Claude Code in Actions (daily 02:15 UTC, issues-only, subscription token — no metered billing possible) — plus `/ops-review` (skill) for on-demand interactive sessions: reads health + heartbeats + digests + recent workflow runs, triages against this runbook, opens issues; fixes are drafted only in interactive sessions. | daily + on-demand | bounded by §7 safe-actions |
 | **L3 Human (you)** | Approves anything in §7's "requires approval" list; receives pages via GitHub notifications on `ops-incident` issues. | on page / daily digest | — |
+
+### Switching the AI engine (L2)
+
+The daily review is engine-pluggable; all engines share one prompt file
+(`ops/ops-review-prompt.md` — edit once, applies to all). To switch:
+
+- **Permanently:** GitHub → Settings → Secrets and variables → Actions →
+  **Variables** tab → set `OPS_REVIEW_ENGINE`. No code change, no PR.
+- **For one run:** Actions → "Ops AI review (daily)" → Run workflow → type the
+  engine name.
+
+| Engine | Variable value | Required secret | Cost reality |
+|---|---|---|---|
+| Claude (default) | `claude` (or unset) | `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) | Draws on the Pro/Max plan allowance; no payment method attached → metered charges impossible; exhausted allowance = run fails, never bills |
+| Gemini | `gemini` | `GEMINI_API_KEY` (AI Studio) | Free tier = 20 req/day — live-tested **insufficient** for one agentic review; usable only with billing enabled on the key's GCP project |
+| OpenAI | `openai` | `OPENAI_API_KEY` | Commented template in ops-review.yml — verify the codex CLI invocation, uncomment, and extend the unknown-engine guard before first use |
+
+Safety does not depend on the engine: the job token is `contents: read`
+(cannot push) and each engine gets a read-only + gh/curl/jq tool allowlist.
 
 **Design stance:** this stack is **serverless** (Cloudflare Workers + Supabase).
 There are no servers to restart, no disks to fill, no OS to patch — CPU/memory/
