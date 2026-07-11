@@ -37,6 +37,10 @@ jobs:
     timeout-minutes: 25
     env:
       GH_TOKEN: ${{ github.token }}
+      # Gemini CLI refuses untrusted folders in headless mode (exit 1:
+      # "not running in a trusted directory") — CI checkouts must be
+      # explicitly trusted per its headless-environments doc.
+      GEMINI_CLI_TRUST_WORKSPACE: "true"
     steps:
       - uses: actions/checkout@v4
 
