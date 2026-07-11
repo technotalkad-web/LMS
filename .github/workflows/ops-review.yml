@@ -1,27 +1,42 @@
 name: Ops AI review (daily)
 
-# Layer 2 of the ops model (ops/RUNBOOK.md §1): a headless Claude Code session
-# runs the daily ops review INSIDE GitHub Actions — no claude.ai GitHub
-# connection needed. It reads the watchdog's daily digest + open incidents +
-# recent workflow runs, triages them against the RUNBOOK playbooks, and posts
-# one "🤖 Daily AI review" comment on the rolling ops-digest issue.
+# Layer 2 of the ops model (ops/RUNBOOK.md §1): a headless AI agent runs the
+# daily ops review inside GitHub Actions, reads the watchdog digest + open
+# incidents + recent workflow runs, and posts one "🤖 Daily AI review" comment
+# on the rolling ops-digest issue.
 #
-# Auth: ONE repo secret — CLAUDE_CODE_OAUTH_TOKEN, from `claude setup-token`.
-# It draws on the owner's Claude Pro/Max subscription allowance: no payment
-# method is attached, so this workflow CANNOT incur metered charges. If the
-# plan allowance is exhausted at run time the job fails for the day — it never
-# bills. Deliberately no ANTHROPIC_API_KEY input: a paid key in the repo's
-# secrets could otherwise be picked up by accident. (History: Gemini free tier
-# was tried first — 20 req/day quota can't fit one agentic review.)
+# ── ENGINE-SWITCHABLE ────────────────────────────────────────────────────────
+# The AI engine is pluggable (see ops/RUNBOOK.md "Switching the AI engine"):
+#   * default:            claude  (subscription token — no metered billing)
+#   * switch permanently: set repo VARIABLE OPS_REVIEW_ENGINE to claude|gemini
+#                         (Settings → Secrets and variables → Actions → Variables)
+#   * switch for one run: Actions → Run workflow → type the engine name
+# All engines share the SAME instructions: ops/ops-review-prompt.md.
 #
-# Safety: issues-only by construction — the job token has contents: read (can't
-# push), and the tool allowlist below only permits read tools + gh/curl/jq.
+# Per-engine secrets:
+#   claude → CLAUDE_CODE_OAUTH_TOKEN  (`claude setup-token`; draws on the
+#            Claude Pro/Max plan allowance, no payment method attached, so
+#            metered charges are impossible; on exhausted allowance the run
+#            fails for the day — it never bills)
+#   gemini → GEMINI_API_KEY           (AI Studio; free tier is 20 req/day —
+#            live-tested INSUFFICIENT for one agentic review; only useful with
+#            billing enabled on the key's Google Cloud project)
+#   openai → OPENAI_API_KEY           (template below, commented — verify the
+#            codex CLI invocation before first use)
+#
+# Safety is engine-independent: the job token has contents: read (cannot
+# push) and each engine's tool allowlist permits only read tools + gh/curl/jq.
 # Runs at 02:15 UTC (07:45 IST), 45 min after ops-watch.yml posts the digest.
 
 on:
   schedule:
     - cron: "15 2 * * *"
   workflow_dispatch:
+    inputs:
+      engine:
+        description: "AI engine for this run: claude | gemini (empty = repo variable OPS_REVIEW_ENGINE, else claude)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -38,10 +53,25 @@ jobs:
     timeout-minutes: 25
     env:
       GH_TOKEN: ${{ github.token }}
+      # Resolution order: manual-run input > repo variable > claude.
+      ENGINE: ${{ github.event.inputs.engine || vars.OPS_REVIEW_ENGINE || 'claude' }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: anthropics/claude-code-action@v1
+      - name: Announce engine + load the shared prompt
+        id: prompt
+        run: |
+          echo "### 🤖 Ops review engine: \`${ENGINE}\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "text<<OPS_PROMPT_EOF"
+            cat ops/ops-review-prompt.md
+            echo "OPS_PROMPT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── ENGINE: claude (default) ──────────────────────────────────────────
+      - name: Review with Claude
+        if: env.ENGINE == 'claude'
+        uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -49,49 +79,53 @@ jobs:
             --model claude-sonnet-5
             --max-turns 50
             --allowedTools "Read,Grep,Glob,Bash(gh issue:*),Bash(gh run:*),Bash(gh workflow:*),Bash(gh api:*),Bash(gh label:*),Bash(curl:*),Bash(jq:*),Bash(date:*)"
-          prompt: |
-            You are the AI Senior LMS Ops Engineer for this repository (multi-
-            tenant LMS: Next.js on Cloudflare Workers + Supabase; GitHub Actions
-            drives the crons and a 10-minute prod health watchdog). Run the
-            DAILY OPS REVIEW.
+          prompt: ${{ steps.prompt.outputs.text }}
 
-            Authority and boundaries: read ops/RUNBOOK.md first and obey §7
-            (safe-actions) strictly. In this workflow you are ISSUES-ONLY: you
-            may read the repo and query gh, and open/comment on GitHub issues —
-            you must NEVER modify code, migrations, workflows, secrets, or any
-            database. Do not attempt git writes (the token cannot push).
+      # ── ENGINE: gemini ────────────────────────────────────────────────────
+      # Works only with a billing-enabled key (free tier = 20 req/day, tested
+      # insufficient). Trust var required for headless runs (CLI 0.50+).
+      - name: Review with Gemini
+        if: env.ENGINE == 'gemini'
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: "true"
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: gemini-3.5-flash
+          settings: |
+            {
+              "coreTools": [
+                "list_directory",
+                "read_file",
+                "read_many_files",
+                "glob",
+                "search_file_content",
+                "run_shell_command(gh issue)",
+                "run_shell_command(gh run)",
+                "run_shell_command(gh workflow)",
+                "run_shell_command(gh api)",
+                "run_shell_command(gh label)",
+                "run_shell_command(curl)",
+                "run_shell_command(jq)",
+                "run_shell_command(date)"
+              ]
+            }
+          prompt: ${{ steps.prompt.outputs.text }}
 
-            Procedure:
-            1. Gather signals via gh:
-               a. The open issue labelled `ops-digest` — read the newest 2-3
-                  comments (daily prod health JSON posted by "Ops watchdog
-                  (prod)" at 01:30 UTC; this run at 02:15 UTC should find
-                  today's snapshot).
-               b. Open issues labelled `ops-incident`, plus recently closed
-                  ones (recurrence patterns).
-               c. Latest runs of: "Scheduled crons (prod)", "Ops watchdog
-                  (prod)", the staging and production deploy workflows — note
-                  red runs and their error annotations.
-               d. Staging liveness: curl -s
-                  https://my-lms.mentora.workers.dev/api/ops/health
-                  (public response is {status,ts} only; you have no secrets —
-                  do not try to obtain detail).
-            2. Triage every non-ok / red / stale signal against the RUNBOOK §6
-               playbooks (cron 404 = deploy sequencing; SMTP 535 = dead app
-               password; RLS audit fail = policy-less table; LRS dead letters;
-               schema drift; rollback). For each finding: severity P1-P4,
-               evidence (quote the JSON/log line), root-cause hypothesis,
-               recommended next action, autonomous vs needs-approval.
-            3. Report: post ONE comment on the `ops-digest` issue titled
-               "🤖 Daily AI review <YYYY-MM-DD>" with: overall status
-               one-liner; new/ongoing incidents; trends vs previous digests
-               (db latency, email failed_24h, LRS backlog, cron staleness);
-               top 3 recommended actions; an "Approval needed" list (possibly
-               empty). Keep it under ~40 lines. If the digest issue does not
-               exist yet, create it (title "📊 Ops digest (rolling)", label
-               `ops-digest`).
-            4. If you found a P1/P2 with NO open `ops-incident` issue, open one
-               (label `ops-incident`) with the evidence and the playbook
-               reference.
-            5. If a signal source is unreachable (labels missing, no runs yet),
-               say so plainly in the report instead of guessing.
+      # ── ENGINE: openai (TEMPLATE — verify before first use) ───────────────
+      # To enable: uncomment, add repo secret OPENAI_API_KEY, verify the codex
+      # CLI's current non-interactive flags (https://github.com/openai/codex),
+      # then set OPS_REVIEW_ENGINE=openai and extend the guard step below.
+      # - name: Review with OpenAI Codex
+      #   if: env.ENGINE == 'openai'
+      #   env:
+      #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      #   run: |
+      #     npm install -g @openai/codex
+      #     codex exec --full-auto "$(cat ops/ops-review-prompt.md)"
+
+      - name: Fail on unknown engine
+        if: env.ENGINE != 'claude' && env.ENGINE != 'gemini'
+        run: |
+          echo "::error::Unknown OPS_REVIEW_ENGINE '${ENGINE}' — supported: claude, gemini (openai is a commented template in this file)."
+          exit 1
