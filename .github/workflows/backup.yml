@@ -10,10 +10,13 @@
 # if you want external alerting.
 #
 # Required GitHub Secrets:
-#   PROD_DATABASE_URL          Direct Supabase connection string
-#                              (Project Settings → Database → URI,
-#                              "Direct connection", NOT the pooler).
-#                              Example: postgres://postgres:[pass]@db.<ref>.supabase.co:5432/postgres
+#   PROD_DATABASE_URL          Supabase connection string, URL-encoded password.
+#                              Use the SESSION POOLER URI (Project Settings →
+#                              Database → Connect → Session pooler, port 5432):
+#                              GitHub runners are IPv4-only and direct connection
+#                              is IPv6-only on newer projects, so direct fails;
+#                              the transaction pooler (6543) can't run pg_dump.
+#                              Example: postgresql://postgres.<ref>:[pass]@aws-1-<region>.pooler.supabase.com:5432/postgres
 #   B2_BUCKET                  Backblaze B2 bucket name, e.g. "lms-backups"
 #   B2_REGION                  Bucket region — visible on the B2 bucket page.
 #                              Examples: "us-west-002", "eu-central-003"
@@ -71,7 +74,13 @@ jobs:
             sudo tee /etc/apt/sources.list.d/postgres.list
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
-          pg_dump --version
+          # The runner image ships pg_dump 16 at /usr/bin, which wins on PATH
+          # and refuses to dump a newer server ("server version mismatch":
+          # prod is Postgres 17.x). Put the v17 client dir first — for THIS
+          # step (export) and all later steps (GITHUB_PATH).
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/lib/postgresql/17/bin:$PATH"
+          pg_dump --version   # must print 17.x
           # AWS CLI v2 via official installer.
           # Ubuntu 24.04 (noble) removed the `awscli` apt package because
           # the v1 series was deprecated. AWS now ships only v2 via this
