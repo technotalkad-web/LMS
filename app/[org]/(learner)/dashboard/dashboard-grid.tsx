@@ -186,9 +186,10 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
         overdue ? "border-red-200 ring-1 ring-red-100" : "border-line"
       } hover:shadow-md transition-shadow`}
     >
-      {/* Top banner */}
+      {/* Top banner — portrait 3:4 so uploaded posters/thumbnails show without
+          cropping (admins are told to upload 3:4 · 900×1200; see ThumbnailPicker). */}
       <div
-        className={`relative h-32 border-b border-line overflow-hidden ${
+        className={`relative aspect-[3/4] border-b border-line overflow-hidden ${
           card.thumbnail_url
             ? "bg-canvas"
             : card.pathName

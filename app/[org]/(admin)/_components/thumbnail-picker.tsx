@@ -19,6 +19,14 @@ export function ThumbnailPicker({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Course thumbnails render in a portrait 3:4 frame in the learner view, so
+  // show the picker (preview + dropzone) at that same ratio and tell admins the
+  // exact target size. Logos keep the original landscape box.
+  const isThumb = kind === "thumbnail";
+  const frame = isThumb
+    ? "w-full max-w-[190px] aspect-[3/4]"
+    : "w-full max-w-xs h-32";
+
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -51,7 +59,7 @@ export function ThumbnailPicker({
           <img
             src={value}
             alt="Thumbnail"
-            className="w-full max-w-xs h-32 object-cover rounded-lg border border-line bg-canvas"
+            className={`${frame} object-cover rounded-lg border border-line bg-canvas`}
           />
           <button
             type="button"
@@ -65,9 +73,12 @@ export function ThumbnailPicker({
         </div>
       ) : (
         <label className="block">
-          <div className="w-full max-w-xs h-32 border-2 border-dashed border-line rounded-lg bg-canvas hover:border-ink transition-colors flex flex-col items-center justify-center gap-1 cursor-pointer text-muted text-xs">
+          <div className={`${frame} border-2 border-dashed border-line rounded-lg bg-canvas hover:border-ink transition-colors flex flex-col items-center justify-center gap-1 cursor-pointer text-muted text-xs text-center px-3`}>
             <ImageIcon className="w-6 h-6" />
             <span className="font-medium">Click to upload</span>
+            {isThumb && (
+              <span className="font-medium text-ink">Portrait 3:4 · 900 × 1200 px</span>
+            )}
             <span>JPEG, PNG, or WebP · max 4 MB</span>
           </div>
           <input
@@ -90,6 +101,14 @@ export function ThumbnailPicker({
             className="hidden"
           />
         </label>
+      )}
+
+      {isThumb && (
+        <p className="mt-2 text-xs text-muted max-w-xs">
+          Use a <strong className="text-ink">portrait poster, 3:4 ratio</strong> — recommended{" "}
+          <strong className="text-ink">900 × 1200 px</strong> (e.g. 1200 × 1600). Learners see it in a
+          tall card frame; other ratios are centre-cropped to fit.
+        </p>
       )}
 
       {busy && (
