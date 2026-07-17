@@ -186,10 +186,10 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
         overdue ? "border-red-200 ring-1 ring-red-100" : "border-line"
       } hover:shadow-md transition-shadow`}
     >
-      {/* Top banner — portrait 3:4 so uploaded posters/thumbnails show without
-          cropping (admins are told to upload 3:4 · 900×1200; see ThumbnailPicker). */}
+      {/* Top banner — landscape 16:9 so uploaded banner thumbnails show without
+          cropping (admins are told to upload 16:9 · 1280×720; see ThumbnailPicker). */}
       <div
-        className={`relative aspect-[3/4] border-b border-line overflow-hidden ${
+        className={`relative aspect-video border-b border-line overflow-hidden ${
           card.thumbnail_url
             ? "bg-canvas"
             : card.pathName
