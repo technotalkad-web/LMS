@@ -19,12 +19,12 @@ export function ThumbnailPicker({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Course thumbnails render in a portrait 3:4 frame in the learner view, so
+  // Course thumbnails render in a landscape 16:9 banner in the learner view, so
   // show the picker (preview + dropzone) at that same ratio and tell admins the
-  // exact target size. Logos keep the original landscape box.
+  // exact target size. Logos keep the original box.
   const isThumb = kind === "thumbnail";
   const frame = isThumb
-    ? "w-full max-w-[190px] aspect-[3/4]"
+    ? "w-full max-w-xs aspect-video"
     : "w-full max-w-xs h-32";
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -77,7 +77,7 @@ export function ThumbnailPicker({
             <ImageIcon className="w-6 h-6" />
             <span className="font-medium">Click to upload</span>
             {isThumb && (
-              <span className="font-medium text-ink">Portrait 3:4 · 900 × 1200 px</span>
+              <span className="font-medium text-ink">Landscape 16:9 · 1280 × 720 px</span>
             )}
             <span>JPEG, PNG, or WebP · max 4 MB</span>
           </div>
@@ -105,9 +105,9 @@ export function ThumbnailPicker({
 
       {isThumb && (
         <p className="mt-2 text-xs text-muted max-w-xs">
-          Use a <strong className="text-ink">portrait poster, 3:4 ratio</strong> — recommended{" "}
-          <strong className="text-ink">900 × 1200 px</strong> (e.g. 1200 × 1600). Learners see it in a
-          tall card frame; other ratios are centre-cropped to fit.
+          Use a <strong className="text-ink">landscape banner, 16:9 ratio</strong> — recommended{" "}
+          <strong className="text-ink">1280 × 720 px</strong> (e.g. 1600 × 900). Learners see it across
+          the top of the card; other ratios are centre-cropped to fit.
         </p>
       )}
 
