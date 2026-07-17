@@ -80,6 +80,10 @@ export async function POST(request: Request) {
     };
   });
   if (enabledCourses.length === 0) {
+    // A successful run with nothing to do must still heartbeat, or the health
+    // probe reads reminders as never-seen/stale → false "degraded" (which is
+    // exactly what happened on pre-launch prod: no reminder-enabled courses).
+    await recordHeartbeat("reminders", { scanned: 0, sent: 0, skipped: 0 });
     return NextResponse.json({ scanned: 0, sent: 0, skipped: 0 });
   }
 
