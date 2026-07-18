@@ -1,11 +1,17 @@
-# PR checks — runs on every push to any branch and every PR.
+# PR checks — pull_request covers PR branches; push covers main (post-merge).
 # Three parallel jobs: typecheck, lint, e2e.
 # Failure on any blocks PR merge (when branch protection is enabled).
+#
+# push was previously ["**"], which made every PR-branch commit run the
+# workflow TWICE (push + pull_request). Besides duplicate required checks,
+# the two e2e suites hit the staging worker's auth concurrently from one CI
+# IP — bursty enough to trip rate limits and randomly fail logins in one of
+# the twins. One run per commit fixes both.
 name: PR checks
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
     branches: ["**"]
 
