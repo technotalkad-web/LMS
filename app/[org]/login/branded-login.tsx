@@ -61,6 +61,31 @@ export function BrandedLogin({
   >("idle");
   const [error, setError] = useState<string | null>(null);
 
+  async function startGoogle() {
+    setStatus("working");
+    setError(null);
+    const supabase = createClient();
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        // Same deep-link contract as SSO/magic-link: land on ?next (e.g. a
+        // QR-scanned course), falling back to the tenant dashboard.
+        redirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(safeNext(orgSlug))}`,
+        // Always show Google's account chooser — learners often have a
+        // personal account signed in alongside the company one, and the
+        // company account is the only one that maps to an LMS user.
+        queryParams: { prompt: "select_account" },
+        skipBrowserRedirect: true,
+      },
+    });
+    if (error) {
+      setError(error.message);
+      setStatus("error");
+      return;
+    }
+    if (data?.url) window.location.assign(data.url);
+  }
+
   async function startSso() {
     if (!ssoProviderId) return;
     setStatus("working");
@@ -248,6 +273,30 @@ export function BrandedLogin({
 
           {!ssoEnforced && (
           <>
+          {/* Google sign-in — for pre-provisioned users whose company email is
+              a Google account. prompt=select_account always shows the account
+              chooser (company vs personal); unknown accounts can't sign up. */}
+          <div className="mb-7">
+            <button
+              type="button"
+              onClick={startGoogle}
+              disabled={status === "working"}
+              className="w-full px-4 py-3 rounded-xl text-sm font-semibold border border-line bg-paper hover:border-ink disabled:opacity-50 transition flex items-center justify-center gap-2"
+            >
+              <svg className="w-4 h-4" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.2-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z" />
+                <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z" />
+                <path fill="#FBBC05" d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z" />
+                <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09C6.22 6.86 8.87 4.75 12 4.75z" />
+              </svg>
+              {status === "working" ? "Redirecting…" : "Continue with Google"}
+            </button>
+            <div className="flex items-center gap-3 mt-5 text-xs text-muted">
+              <span className="h-px flex-1 bg-line" />
+              or
+              <span className="h-px flex-1 bg-line" />
+            </div>
+          </div>
           <div
             role="tablist"
             className="flex p-1 bg-paper border border-line rounded-xl mb-7"
