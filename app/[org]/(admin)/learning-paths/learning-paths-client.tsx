@@ -15,6 +15,7 @@ import type {
   TeamOption,
 } from "./page";
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
+import { QrCodeModal } from "../_components/qr-code-modal";
 import { VisibilityRadio } from "../library/[courseId]/details-form";
 import {
   AdminPageHeader,
@@ -34,6 +35,7 @@ import {
   Layers,
   Pencil,
   Trash2,
+  QrCode,
   X,
 } from "lucide-react";
 
@@ -104,6 +106,7 @@ export function LearningPathsClient({
 
   // Search
   const [query, setQuery] = useState("");
+  const [qrTarget, setQrTarget] = useState<{ title: string; path: string } | null>(null);
 
   const filteredPaths = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -417,6 +420,15 @@ export function LearningPathsClient({
         </Card>
       )}
 
+      {qrTarget && (
+        <QrCodeModal
+          title={qrTarget.title}
+          path={qrTarget.path}
+          kind="learning path"
+          onClose={() => setQrTarget(null)}
+        />
+      )}
+
       {/* Search */}
       {paths.length > 0 && (
         <div className="relative mb-5 max-w-sm">
@@ -541,6 +553,16 @@ export function LearningPathsClient({
                       className="flex-1 px-3 py-1.5 text-xs font-medium border border-line rounded-xl hover:border-ink transition-colors"
                     >
                       {isExpanded ? "Collapse" : "Manage"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setQrTarget({ title: p.name, path: `/${orgSlug}/paths/${p.id}` })
+                      }
+                      title="Share via QR code"
+                      className="px-2 py-1.5 border border-line rounded-xl hover:border-ink transition-colors"
+                    >
+                      <QrCode className="w-3.5 h-3.5" />
                     </button>
                     <button
                       type="button"

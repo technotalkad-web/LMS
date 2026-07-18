@@ -89,7 +89,7 @@ export default async function CourseDetailPage({
     courseId: c.id,
     isAdmin,
   });
-  if (!canAccess) redirect(`/${orgSlug}/dashboard?denied=1`);
+  if (!canAccess) redirect(`/${orgSlug}/dashboard?denied=course`);
 
   const { data: versions } = await supabase
     .from("course_versions")

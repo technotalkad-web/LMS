@@ -14,10 +14,12 @@ import {
   Pencil,
   Trash2,
   ChevronRight,
+  QrCode,
 } from "lucide-react";
 import { StatusPill, EmptyState, Card } from "@/components/admin";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
+import { QrCodeModal } from "../_components/qr-code-modal";
 
 export type FolderLite = { id: string; name: string; parent_id: string | null };
 export type CourseLite = {
@@ -59,6 +61,7 @@ export function LibraryBrowser({
   const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [qrTarget, setQrTarget] = useState<{ title: string; path: string } | null>(null);
 
   // Modals
   const [namePrompt, setNamePrompt] = useState<
@@ -369,20 +372,42 @@ export function LibraryBrowser({
                   </div>
                 </Link>
                 {canManage && (
-                  <button
-                    type="button"
-                    aria-label="Move course"
-                    title="Move to folder"
-                    onClick={() => setMovePick({ kind: "course", id: c.id, label: c.title })}
-                    className="absolute top-2 right-2 p-1.5 rounded-md bg-paper/90 border border-line text-muted hover:text-ink opacity-0 group-hover:opacity-100 transition-opacity"
-                  >
-                    <FolderInput className="w-4 h-4" />
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      aria-label="Move course"
+                      title="Move to folder"
+                      onClick={() => setMovePick({ kind: "course", id: c.id, label: c.title })}
+                      className="absolute top-2 right-2 p-1.5 rounded-md bg-paper/90 border border-line text-muted hover:text-ink opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <FolderInput className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Share QR code"
+                      title="Share via QR code"
+                      onClick={() =>
+                        setQrTarget({ title: c.title, path: `/${orgSlug}/courses/${c.id}` })
+                      }
+                      className="absolute top-2 right-11 p-1.5 rounded-md bg-paper/90 border border-line text-muted hover:text-ink opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <QrCode className="w-4 h-4" />
+                    </button>
+                  </>
                 )}
               </div>
             );
           })}
         </div>
+      )}
+
+      {qrTarget && (
+        <QrCodeModal
+          title={qrTarget.title}
+          path={qrTarget.path}
+          kind="course"
+          onClose={() => setQrTarget(null)}
+        />
       )}
 
       {namePrompt && (
