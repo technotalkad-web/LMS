@@ -254,6 +254,10 @@ export default async function DashboardPage({
           announcements={announcements}
           orgSlug={orgSlug}
         />
+        {/* A learner with NOTHING assigned is exactly who hits a denied deep
+            link (e.g. scanning a QR for an unassigned course) — the flash
+            banner must show on the empty dashboard too, not just the grid. */}
+        {sp.denied && <DeniedBanner denied={sp.denied} className="mb-6" />}
         <EmptyDashboard
           orgName={org.name}
           role={role}
@@ -508,14 +512,7 @@ export default async function DashboardPage({
       </header>
 
       {/* Flash banners */}
-      {sp.denied && (
-        <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2">
-          <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
-          <span>
-            <strong>Access denied.</strong> You don&apos;t have permission to view that page.
-          </span>
-        </div>
-      )}
+      {sp.denied && <DeniedBanner denied={sp.denied} />}
       {sp.locked && (
         <div className="border border-amber-200 bg-amber-50 text-amber-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2">
           <Lock className="w-4 h-4 mt-0.5 shrink-0" />
@@ -873,6 +870,45 @@ function EmptyDashboard({
             : "Ask an admin to assign you a course. Once they do, it will show up here automatically."}
         </p>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Flash banner for entitlement bounces. `denied=course|path` come from the
+ * access gates on those pages (including QR-code deep links); any other value
+ * keeps the historical generic copy. Rendered on both the populated grid and
+ * the empty dashboard.
+ */
+function DeniedBanner({
+  denied,
+  className = "",
+}: {
+  denied: string;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2 ${className}`}
+    >
+      <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
+      <span>
+        {denied === "course" ? (
+          <>
+            <strong>Not assigned.</strong> This course is not assigned to you — please
+            contact your admin.
+          </>
+        ) : denied === "path" ? (
+          <>
+            <strong>Not assigned.</strong> This learning path is not assigned to you —
+            please contact your admin.
+          </>
+        ) : (
+          <>
+            <strong>Access denied.</strong> You don&apos;t have permission to view that page.
+          </>
+        )}
+      </span>
     </div>
   );
 }

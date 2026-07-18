@@ -103,7 +103,7 @@ export default async function LearningPathDetailPage({
   // detail page must accept them too (otherwise the tile dead-ends in a
   // "denied" bounce). Mirrors the visibility union in dashboard/page.tsx.
   const isOrgPublic = path.visibility === "org_public";
-  if (!isAssigned && !isOrgPublic) redirect(`/${orgSlug}/dashboard?denied=1`);
+  if (!isAssigned && !isOrgPublic) redirect(`/${orgSlug}/dashboard?denied=path`);
 
   // Earliest due_at across the user's matching assignments.
   const myDueDates = assignments

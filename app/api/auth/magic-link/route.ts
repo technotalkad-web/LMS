@@ -5,12 +5,17 @@ import { sendAuthEmail } from "@/lib/auth/auth-email";
 import { dispatchResend, resendConfigured } from "@/lib/email/resend";
 
 /**
- *   POST /api/auth/magic-link   body: { email, orgSlug? }
+ *   POST /api/auth/magic-link   body: { email, orgSlug?, next? }
  *
  * White-label magic-link sign-in. Mints the link via the Admin API (no Supabase
  * auto-send) and emails it:
  *   - tenant context (orgSlug) → the tenant's branded SMTP (Resend fallback)
  *   - platform login (no orgSlug) → global Resend sender
+ *
+ * `next` (optional) is a same-app path to land on after sign-in — used by
+ * deep links (e.g. QR-code scans of a course) so the emailed link returns the
+ * learner to the exact page they scanned, not the dashboard. Validated to a
+ * single leading "/" so it can't become an open redirect.
  *
  * Always returns { ok: true } so the form can't be used to enumerate accounts.
  */
@@ -18,11 +23,16 @@ export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
     email?: string;
     orgSlug?: string;
+    next?: string;
   };
   const email = (body.email ?? "").trim().toLowerCase();
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return NextResponse.json({ error: "A valid email is required" }, { status: 400 });
   }
+  const safeNext =
+    body.next && body.next.startsWith("/") && !body.next.startsWith("//")
+      ? body.next
+      : null;
 
   const origin = (await originFromRequest()) || "";
 
@@ -44,7 +54,7 @@ export async function POST(request: Request) {
         email,
         type: "magiclink",
         origin,
-        next: `/${org.slug}/dashboard`,
+        next: safeNext ?? `/${org.slug}/dashboard`,
       });
       // Enumeration-safe regardless of whether the user exists.
       return NextResponse.json({ ok: true });

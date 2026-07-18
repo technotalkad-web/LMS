@@ -69,7 +69,10 @@ export function BrandedLogin({
     const { data, error } = await supabase.auth.signInWithSSO({
       providerId: ssoProviderId,
       options: {
-        redirectTo: `${window.location.origin}/auth/callback?next=/${orgSlug}/dashboard`,
+        // Carry the deep link (?next= from the middleware bounce — e.g. a QR
+        // scan of a course) through the SSO round trip instead of always
+        // landing on the dashboard.
+        redirectTo: `${window.location.origin}/auth/callback?next=${encodeURIComponent(safeNext(orgSlug))}`,
       },
     });
     if (error) {
@@ -97,7 +100,9 @@ export function BrandedLogin({
       const res = await fetch("/api/auth/magic-link", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email, orgSlug }),
+        // next: the emailed link returns the learner to the page they were
+        // headed to (e.g. a QR-scanned course), not just the dashboard.
+        body: JSON.stringify({ email, orgSlug, next: safeNext(orgSlug) }),
       });
       if (!res.ok) {
         const j = (await res.json().catch(() => ({}))) as { error?: string };
