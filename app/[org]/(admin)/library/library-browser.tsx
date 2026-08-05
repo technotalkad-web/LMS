@@ -20,6 +20,7 @@ import { StatusPill, EmptyState, Card } from "@/components/admin";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { QrCodeModal } from "../_components/qr-code-modal";
+import { thumbImgStyle } from "@/lib/ui/thumbnail";
 
 export type FolderLite = { id: string; name: string; parent_id: string | null };
 export type CourseLite = {
@@ -28,6 +29,9 @@ export type CourseLite = {
   description: string | null;
   current_version_id: string | null;
   thumbnail_url: string | null;
+  thumbnail_fit: string | null;
+  thumbnail_pos_x: number | null;
+  thumbnail_pos_y: number | null;
   duration_minutes: number | null;
   is_active: boolean;
   folder_id: string | null;
@@ -333,7 +337,8 @@ export function LibraryBrowser({
                     <img
                       src={c.thumbnail_url}
                       alt=""
-                      className="aspect-video w-full object-cover rounded-t-xl"
+                      className="aspect-video w-full rounded-t-xl bg-canvas"
+                      style={thumbImgStyle(c)}
                     />
                   ) : (
                     <div className="aspect-video w-full bg-canvas rounded-t-xl flex items-center justify-center text-muted">

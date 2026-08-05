@@ -48,6 +48,20 @@ function formatDuration(mins: number | null): string | null {
   return `${h}h ${m}m`;
 }
 
+/**
+ * ISO timestamp → the `datetime-local` input format in the BROWSER's timezone,
+ * so an admin sees back exactly the wall-clock time they scheduled.
+ */
+function toLocalInput(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
+    d.getHours()
+  )}:${pad(d.getMinutes())}`;
+}
+
 export function LearningPathsClient({
   orgSlug,
   paths,
@@ -259,6 +273,28 @@ export function LearningPathsClient({
       toast.error(j.error ?? "Failed");
       return;
     }
+    router.refresh();
+  }
+
+  /**
+   * Save a step's scheduled release. `local` is a datetime-local value
+   * ("2026-08-10T09:00") or "" to clear — converted to ISO in the BROWSER so
+   * the admin's own timezone is what gets stored (server-side parsing of a
+   * TZ-naive string would read it as UTC).
+   */
+  async function saveStepRelease(pathId: string, courseId: string, local: string) {
+    const releaseAt = local ? new Date(local).toISOString() : null;
+    const res = await fetch(`/api/learning-paths/${pathId}/courses`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ courseId, releaseAt }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      toast.error(j.error ?? "Failed to save release date");
+      return;
+    }
+    toast.success(releaseAt ? "Release date saved" : "Release date cleared");
     router.refresh();
   }
 
@@ -729,6 +765,26 @@ export function LearningPathsClient({
                       <div className="text-[11px] uppercase tracking-wider font-semibold text-muted mb-2">
                         Steps ({steps.length})
                       </div>
+                      {(() => {
+                        // In a strict path, a later step releasing BEFORE an
+                        // earlier one strands learners: they can't skip ahead,
+                        // so the path waits for the earlier date anyway.
+                        if (p.sequence_mode === "random") return null;
+                        const dated = steps
+                          .filter((s) => s.release_at)
+                          .map((s) => new Date(s.release_at!).getTime());
+                        const outOfOrder = dated.some(
+                          (t, i) => i > 0 && t < dated[i - 1]
+                        );
+                        if (!outOfOrder) return null;
+                        return (
+                          <p className="mb-2 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                            Release dates run out of order. This path unlocks
+                            steps in sequence, so learners still wait for the
+                            earlier step&apos;s date.
+                          </p>
+                        );
+                      })()}
                       {steps.length === 0 ? (
                         <p className="text-muted text-sm">
                           No courses yet. Add the first one below.
@@ -738,7 +794,7 @@ export function LearningPathsClient({
                           {steps.map((s, idx) => (
                             <li
                               key={s.course_id}
-                              className="flex items-center justify-between text-sm border border-line rounded-xl px-3 py-2 bg-paper"
+                              className="flex flex-wrap items-center justify-between gap-2 text-sm border border-line rounded-xl px-3 py-2 bg-paper"
                             >
                               <span>
                                 <span className="text-muted tabular-nums mr-3">
@@ -747,6 +803,22 @@ export function LearningPathsClient({
                                 {s.title}
                               </span>
                               <span className="flex items-center gap-1">
+                                <label className="flex items-center gap-1 text-[11px] text-muted mr-1">
+                                  Releases
+                                  <input
+                                    type="datetime-local"
+                                    defaultValue={toLocalInput(s.release_at)}
+                                    onChange={(e) =>
+                                      saveStepRelease(
+                                        p.id,
+                                        s.course_id,
+                                        e.target.value
+                                      )
+                                    }
+                                    title="Leave empty to release immediately"
+                                    className="px-2 py-0.5 border border-line rounded bg-paper outline-none focus:border-ink text-[11px]"
+                                  />
+                                </label>
                                 <button
                                   type="button"
                                   onClick={() => moveStep(p.id, idx, -1)}

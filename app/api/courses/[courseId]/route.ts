@@ -6,7 +6,8 @@ import { createClient } from "@/lib/supabase/server";
  *   DELETE /api/courses/[courseId]
  *
  * Admin-only via RLS. PATCH accepts any subset of: title, description,
- * duration_minutes, is_active, thumbnail_url, visibility, folder_id.
+ * duration_minutes, is_active, thumbnail_url, thumbnail_fit,
+ * thumbnail_pos_x, thumbnail_pos_y, visibility, folder_id.
  */
 
 const VISIBILITY_VALUES = ["private", "org_public"] as const;
@@ -23,6 +24,9 @@ export async function PATCH(
     duration_minutes?: number | string | null;
     is_active?: boolean;
     thumbnail_url?: string | null;
+    thumbnail_fit?: string;
+    thumbnail_pos_x?: number;
+    thumbnail_pos_y?: number;
     visibility?: string;
     folder_id?: string | null;
   };
@@ -95,6 +99,26 @@ export async function PATCH(
   }
   if (body.thumbnail_url !== undefined) {
     update.thumbnail_url = body.thumbnail_url || null;
+  }
+  if (body.thumbnail_fit !== undefined) {
+    if (body.thumbnail_fit !== "cover" && body.thumbnail_fit !== "contain") {
+      return NextResponse.json(
+        { error: "thumbnail_fit must be 'cover' or 'contain'" },
+        { status: 400 }
+      );
+    }
+    update.thumbnail_fit = body.thumbnail_fit;
+  }
+  for (const key of ["thumbnail_pos_x", "thumbnail_pos_y"] as const) {
+    const v = body[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || Number.isNaN(v) || v < 0 || v > 100) {
+      return NextResponse.json(
+        { error: `${key} must be a number between 0 and 100` },
+        { status: 400 }
+      );
+    }
+    update[key] = Math.round(v);
   }
   if (body.visibility !== undefined) {
     if (!VISIBILITY_VALUES.includes(body.visibility as Visibility)) {

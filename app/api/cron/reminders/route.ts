@@ -4,6 +4,7 @@ import { sendNotification } from "@/lib/notifications/send";
 import { resolveEmails } from "@/lib/users/emails";
 import { mapWithConcurrency } from "@/lib/util/concurrency";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
+import { isReleased } from "@/lib/learner/release";
 
 /**
  *   POST /api/cron/reminders
@@ -36,6 +37,7 @@ type Assignment = {
   assignee_type: "user" | "team" | "org";
   user_id: string | null;
   team_id: string | null;
+  release_at: string | null;
 };
 
 export async function POST(request: Request) {
@@ -92,7 +94,7 @@ export async function POST(request: Request) {
   // 2) All assignments + memberships + completed user/course pairs.
   const { data: assignmentRows } = await svc
     .from("course_assignments")
-    .select("course_id, organization_id, assignee_type, user_id, team_id")
+    .select("course_id, organization_id, assignee_type, user_id, team_id, release_at")
     .in("course_id", courseIds);
   const assignments = (assignmentRows ?? []) as Assignment[];
 
@@ -253,6 +255,9 @@ export async function POST(request: Request) {
     const learnerIds = new Set<string>();
     for (const a of assignments) {
       if (a.course_id !== course.course_id) continue;
+      // Scheduled release: don't nudge learners about content they can't open
+      // yet. A row that HAS released still qualifies its learners.
+      if (!isReleased(a.release_at, now)) continue;
       if (a.assignee_type === "user" && a.user_id) learnerIds.add(a.user_id);
       if (a.assignee_type === "team" && a.team_id) {
         for (const uid of teamUserIds.get(a.team_id) ?? []) learnerIds.add(uid);

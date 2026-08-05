@@ -43,7 +43,7 @@ export default async function CoursesPage({
   const { data: courses } = await supabase
     .from("courses")
     .select(
-      "id, slug, title, description, status, updated_at, current_version_id, thumbnail_url, duration_minutes, is_active"
+      "id, slug, title, description, status, updated_at, current_version_id, thumbnail_url, thumbnail_fit, thumbnail_pos_x, thumbnail_pos_y, duration_minutes, is_active"
     )
     .eq("organization_id", org.id)
     .order("updated_at", { ascending: false });
@@ -125,6 +125,9 @@ export default async function CoursesPage({
     description: c.description,
     current_version_id: c.current_version_id,
     thumbnail_url: c.thumbnail_url,
+    thumbnail_fit: c.thumbnail_fit,
+    thumbnail_pos_x: c.thumbnail_pos_x,
+    thumbnail_pos_y: c.thumbnail_pos_y,
     duration_minutes: c.duration_minutes,
     is_active: c.is_active,
     folder_id: folderByCourse.get(c.id) ?? null,

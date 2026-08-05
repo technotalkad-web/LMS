@@ -63,16 +63,23 @@ export default async function LaunchPage({
   const c = course as Course;
 
   // Entitlement gate (closes the private/unassigned-course IDOR): a learner may
-  // only launch an assigned (direct/org/team) or org_public course. Admins
-  // preview freely. Mirrors the dashboard so launchable == visible.
-  const canAccess = await learnerCanAccessCourse({
+  // only launch an assigned (direct/org/team) or org_public course whose
+  // assignment is released. Admins preview freely. Mirrors the dashboard so
+  // launchable == visible (upcoming cards are visible but bounce here).
+  const access = await learnerCanAccessCourse({
     supabase,
     orgId: org.id,
     userId: user.id,
     courseId: c.id,
     isAdmin: canManage(role),
   });
-  if (!canAccess) redirect(`/${orgSlug}/dashboard?denied=1`);
+  if (!access.allowed) {
+    redirect(
+      access.upcomingAt
+        ? `/${orgSlug}/dashboard?upcoming=${courseId}`
+        : `/${orgSlug}/dashboard?denied=1`
+    );
+  }
 
   // ---------------------------------------------------------------
   // Multi-language resolution (Phase 2 + Phase 3 of #158)
@@ -193,11 +200,12 @@ export default async function LaunchPage({
   // by the per-path sequence_mode lookup further down (#188).
   const { data: pathStepRows } = await supabase
     .from("learning_path_courses")
-    .select("path_id, step_number")
+    .select("path_id, step_number, release_at")
     .eq("course_id", courseId);
   const stepInPaths = (pathStepRows ?? []) as Array<{
     path_id: string;
     step_number: number;
+    release_at: string | null;
   }>;
   if (stepInPaths.length > 0) {
     const pathIds = stepInPaths.map((s) => s.path_id);
@@ -253,6 +261,20 @@ export default async function LaunchPage({
         .filter((p) => assignedPathIds.has(p.id) || p.visibility === "org_public")
         .map((p) => p.id)
     );
+    // SCHEDULED-RELEASE GATE: a step with a future release_at blocks launch
+    // while ANY enforced path (assigned or org_public) containing this course
+    // is unreleased — regardless of sequence_mode. Admins bypass for QA.
+    if (
+      !canManage(role) &&
+      stepInPaths.some(
+        (s) =>
+          enforcedPathIds.has(s.path_id) &&
+          s.release_at &&
+          new Date(s.release_at).getTime() > Date.now()
+      )
+    ) {
+      redirect(`/${orgSlug}/dashboard?upcoming=${courseId}`);
+    }
     if (enforcedPathIds.size > 0) {
       // 'random' sequence-mode paths intentionally let learners take steps in
       // any order — only 'strict' paths are prereq-locked.

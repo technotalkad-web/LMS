@@ -3,11 +3,14 @@ import {
   BookOpen,
   AlertTriangle,
   AlertCircle,
+  Clock,
   PlayCircle,
   CheckCircle2,
   Lock,
   ShieldAlert,
 } from "lucide-react";
+import { isReleased, laterOf } from "@/lib/learner/release";
+import { LocalDateTime } from "@/components/ui/local-datetime";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
@@ -24,6 +27,9 @@ type Course = {
   current_version_id: string | null;
   updated_at: string;
   thumbnail_url: string | null;
+  thumbnail_fit: string | null;
+  thumbnail_pos_x: number | null;
+  thumbnail_pos_y: number | null;
 };
 
 type Version = {
@@ -40,6 +46,7 @@ type Assignment = {
   user_id: string | null;
   team_id: string | null;
   due_at: string | null;
+  release_at: string | null;
   assigned_at: string;
 };
 
@@ -58,7 +65,8 @@ type PathStepView = {
   course_id: string;
   title: string;
   step_number: number;
-  state: "completed" | "current" | "locked";
+  state: "completed" | "current" | "locked" | "unreleased";
+  releaseAt: string | null;
 };
 
 type PathSummary = {
@@ -75,7 +83,7 @@ export default async function DashboardPage({
   searchParams,
 }: {
   params: Promise<{ org: string }>;
-  searchParams?: Promise<{ locked?: string; denied?: string }>;
+  searchParams?: Promise<{ locked?: string; denied?: string; upcoming?: string }>;
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
@@ -113,7 +121,7 @@ export default async function DashboardPage({
   const { data: assignmentRows } = await supabase
     .from("course_assignments")
     .select(
-      "id, course_id, assignee_type, user_id, team_id, due_at, assigned_at"
+      "id, course_id, assignee_type, user_id, team_id, due_at, release_at, assigned_at"
     )
     .eq("organization_id", org.id);
   const assignments = (assignmentRows ?? []) as Assignment[];
@@ -205,7 +213,7 @@ export default async function DashboardPage({
   const { data: pathRows } = myPathIds.length
     ? await supabase
         .from("learning_paths")
-        .select("id, name, description, thumbnail_url")
+        .select("id, name, description, thumbnail_url, sequence_mode")
         .eq("is_active", true)
         .in("id", myPathIds)
     : { data: [] };
@@ -214,12 +222,13 @@ export default async function DashboardPage({
     name: string;
     description: string | null;
     thumbnail_url: string | null;
+    sequence_mode: "strict" | "random" | null;
   }>;
 
   const { data: stepRows } = myPathIds.length
     ? await supabase
         .from("learning_path_courses")
-        .select("path_id, course_id, step_number, courses!inner(title)")
+        .select("path_id, course_id, step_number, release_at, courses!inner(title)")
         .in("path_id", myPathIds)
         .order("step_number", { ascending: true })
     : { data: [] };
@@ -227,6 +236,7 @@ export default async function DashboardPage({
     path_id: string;
     course_id: string;
     step_number: number;
+    release_at: string | null;
     courses: { title: string } | { title: string }[];
   };
   const allPathSteps = ((stepRows ?? []) as StepRaw[]).map((s) => {
@@ -235,6 +245,7 @@ export default async function DashboardPage({
       path_id: s.path_id,
       course_id: s.course_id,
       step_number: s.step_number,
+      release_at: s.release_at,
       title: c?.title ?? "Untitled",
     };
   });
@@ -271,7 +282,7 @@ export default async function DashboardPage({
   const { data: courseRows } = await supabase
     .from("courses")
     .select(
-      "id, title, description, current_version_id, updated_at, thumbnail_url"
+      "id, title, description, current_version_id, updated_at, thumbnail_url, thumbnail_fit, thumbnail_pos_x, thumbnail_pos_y"
     )
     .eq("is_active", true)
     .in("id", allCourseIds);
@@ -320,7 +331,8 @@ export default async function DashboardPage({
   }
 
   // 8.5) 48-hour deadline list (overdue + due-within-48h, not yet completed).
-  const horizon = Date.now() + 48 * 60 * 60 * 1000;
+  const nowMs = Date.now();
+  const horizon = nowMs + 48 * 60 * 60 * 1000;
   type Deadline = {
     courseId: string;
     courseTitle: string;
@@ -334,6 +346,9 @@ export default async function DashboardPage({
     if (!a.due_at) continue;
     if (seenForDeadline.has(a.course_id)) continue;
     if (completedCourseIds.has(a.course_id)) continue;
+    // Unreleased content never belongs in the urgency callout — its launch
+    // CTA would just bounce to "coming soon".
+    if (!isReleased(a.release_at, nowMs)) continue;
     const dueTime = new Date(a.due_at).getTime();
     if (dueTime >= horizon) continue;
     const course = courseById.get(a.course_id);
@@ -349,16 +364,22 @@ export default async function DashboardPage({
   }
   dueSoon.sort((a, b) => (a.dueAt > b.dueAt ? 1 : -1));
 
-  // 9) Path summaries.
+  // 9) Path summaries. Scheduled release: an unreleased step renders
+  // "unreleased"; in STRICT mode it consumes the "current" slot (learner is
+  // waiting), in RANDOM mode the pointer skips it. Completed always wins.
   const paths: PathSummary[] = pathsList
     .map((p) => {
       const steps = allPathSteps.filter((s) => s.path_id === p.id);
       const pathDone = pathDoneByPath.get(p.id) ?? new Set<string>();
+      const strictMode = p.sequence_mode !== "random";
       let currentSet = false;
       const stepViews: PathStepView[] = steps.map((s) => {
         let state: PathStepView["state"];
         if (pathDone.has(s.course_id)) {
           state = "completed";
+        } else if (!isReleased(s.release_at, nowMs)) {
+          state = "unreleased";
+          if (strictMode && !currentSet) currentSet = true;
         } else if (!currentSet) {
           state = "current";
           currentSet = true;
@@ -370,6 +391,7 @@ export default async function DashboardPage({
           title: s.title,
           step_number: s.step_number,
           state,
+          releaseAt: s.release_at,
         };
       });
       return {
@@ -393,6 +415,44 @@ export default async function DashboardPage({
         pathNameByCourseId.set(s.course_id, p.name);
       }
     }
+  }
+
+  // Scheduled-release gates for grid cards (mirrors the launch page):
+  // - assignment gate: open when ANY applicable row is released (null/past),
+  //   else the earliest future release_at. Uses ALL applicable rows, not just
+  //   the precedence winner. org_public courses are always open.
+  // - path gate: the LATEST future step release_at across the user's paths
+  //   (launch blocks while any enforced path is unreleased).
+  const assignmentGateByCourse = new Map<string, string | null>(); // null = open
+  for (const a of [...mine, ...mineTeams, ...orgWide]) {
+    const prev = assignmentGateByCourse.get(a.course_id);
+    if (prev === null) continue; // already open
+    if (isReleased(a.release_at, nowMs)) {
+      assignmentGateByCourse.set(a.course_id, null);
+    } else if (
+      prev === undefined ||
+      new Date(a.release_at!).getTime() < new Date(prev).getTime()
+    ) {
+      assignmentGateByCourse.set(a.course_id, a.release_at);
+    }
+  }
+  for (const cid of orgPublicCourseIds) assignmentGateByCourse.set(cid, null);
+
+  const pathGateByCourse = new Map<string, string>();
+  for (const s of allPathSteps) {
+    if (!s.release_at || isReleased(s.release_at, nowMs)) continue;
+    const prev = pathGateByCourse.get(s.course_id);
+    if (!prev || new Date(s.release_at).getTime() > new Date(prev).getTime()) {
+      pathGateByCourse.set(s.course_id, s.release_at);
+    }
+  }
+
+  /** Future release time gating this course for this learner, or null if open. */
+  function effectiveReleaseFor(courseId: string): string | null {
+    return laterOf(
+      assignmentGateByCourse.get(courseId) ?? null,
+      pathGateByCourse.get(courseId) ?? null
+    );
   }
 
   const cards: GridCard[] = [];
@@ -438,18 +498,27 @@ export default async function DashboardPage({
     if (seen.has(a.course_id)) return;
     const course = courseById.get(a.course_id);
     if (!course) return;
-    const status = attemptStatusForCourse(a.course_id);
+    let status = attemptStatusForCourse(a.course_id);
+    const releaseAt = effectiveReleaseFor(a.course_id);
+    // Completed/passed never regresses to "Coming soon".
+    if (releaseAt && status !== "completed" && status !== "passed") {
+      status = "upcoming";
+    }
     cards.push({
       course_id: course.id,
       title: course.title,
       description: course.description,
       source,
       status,
+      releaseAt,
       isRevised: false,
       dueAt: a.due_at,
       bestScore: bestScoreForCourse(course.id),
       pathName: pathNameByCourseId.get(course.id) ?? null,
       thumbnail_url: course.thumbnail_url,
+      thumbnail_fit: course.thumbnail_fit,
+      thumbnail_pos_x: course.thumbnail_pos_x,
+      thumbnail_pos_y: course.thumbnail_pos_y,
     });
     seen.add(a.course_id);
   }
@@ -462,17 +531,26 @@ export default async function DashboardPage({
     if (seen.has(cid)) continue;
     const course = courseById.get(cid);
     if (!course) continue;
+    let status = attemptStatusForCourse(cid);
+    const releaseAt = effectiveReleaseFor(cid);
+    if (releaseAt && status !== "completed" && status !== "passed") {
+      status = "upcoming";
+    }
     cards.push({
       course_id: course.id,
       title: course.title,
       description: course.description,
       source: "user",
-      status: attemptStatusForCourse(cid),
+      status,
+      releaseAt,
       isRevised: false,
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
       pathName,
       thumbnail_url: course.thumbnail_url,
+      thumbnail_fit: course.thumbnail_fit,
+      thumbnail_pos_x: course.thumbnail_pos_x,
+      thumbnail_pos_y: course.thumbnail_pos_y,
     });
     seen.add(cid);
   }
@@ -480,7 +558,10 @@ export default async function DashboardPage({
   // ----- Stats -----
   const stats = {
     assigned: cards.length,
-    notStarted: cards.filter((c) => c.status === "not_started").length,
+    // "Coming soon" cards count as not-started — they're assigned, unbegun work.
+    notStarted: cards.filter(
+      (c) => c.status === "not_started" || c.status === "upcoming"
+    ).length,
     inProgress: cards.filter((c) => c.status === "in_progress").length,
     completed: cards.filter(
       (c) => c.status === "completed" || c.status === "passed"
@@ -490,6 +571,10 @@ export default async function DashboardPage({
   const lockedTitle = sp.locked
     ? courseById.get(sp.locked)?.title ?? null
     : null;
+  const upcomingTitle = sp.upcoming
+    ? courseById.get(sp.upcoming)?.title ?? null
+    : null;
+  const upcomingReleaseAt = sp.upcoming ? effectiveReleaseFor(sp.upcoming) : null;
   const firstName = (user.email ?? "").split("@")[0];
 
   return (
@@ -521,6 +606,23 @@ export default async function DashboardPage({
             {lockedTitle
               ? `"${lockedTitle}" is part of a learning path. Finish the earlier steps first.`
               : "That course is part of a learning path. Finish the earlier steps first."}
+          </span>
+        </div>
+      )}
+      {sp.upcoming && (
+        <div className="border border-sky-200 bg-sky-50 text-sky-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2">
+          <Clock className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>
+            <strong>Coming soon.</strong>{" "}
+            {upcomingTitle ? `"${upcomingTitle}"` : "That course"} hasn&apos;t
+            been released yet
+            {upcomingReleaseAt ? (
+              <>
+                {" "}
+                — it unlocks <LocalDateTime iso={upcomingReleaseAt} />
+              </>
+            ) : null}
+            .
           </span>
         </div>
       )}
@@ -792,6 +894,12 @@ function LearningPathsSection({
                         {s.title}
                       </span>
                     )}
+                    {s.state === "unreleased" && s.releaseAt && (
+                      <span className="text-[11px] text-sky-700 shrink-0 inline-flex items-center gap-1">
+                        <Clock className="w-3 h-3" />
+                        <LocalDateTime iso={s.releaseAt} />
+                      </span>
+                    )}
                     {s.state === "locked" && (
                       <Lock className="w-3.5 h-3.5 text-muted shrink-0" />
                     )}
@@ -830,6 +938,16 @@ function PathBadge({
         aria-label="Current step"
       >
         {step}
+      </span>
+    );
+  }
+  if (state === "unreleased") {
+    return (
+      <span
+        className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-sky-100 text-sky-700 shrink-0"
+        aria-label="Not released yet"
+      >
+        <Clock className="w-3.5 h-3.5" />
       </span>
     );
   }

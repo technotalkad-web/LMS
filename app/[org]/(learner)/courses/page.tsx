@@ -3,6 +3,7 @@ import { BookOpen, ArrowRight } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import { DashboardGrid, type GridCard } from "../dashboard/dashboard-grid";
+import { isReleased, laterOf } from "@/lib/learner/release";
 
 /**
  * /{org}/courses — All my enrolled courses.
@@ -34,6 +35,9 @@ type Course = {
   current_version_id: string | null;
   updated_at: string;
   thumbnail_url: string | null;
+  thumbnail_fit: string | null;
+  thumbnail_pos_x: number | null;
+  thumbnail_pos_y: number | null;
   visibility?: "private" | "org_public";
 };
 
@@ -50,6 +54,7 @@ type Assignment = {
   user_id: string | null;
   team_id: string | null;
   due_at: string | null;
+  release_at: string | null;
   assigned_at: string;
 };
 
@@ -89,7 +94,7 @@ export default async function CoursesIndexPage({
   const { data: assignmentRows } = await supabase
     .from("course_assignments")
     .select(
-      "id, course_id, assignee_type, user_id, team_id, due_at, assigned_at"
+      "id, course_id, assignee_type, user_id, team_id, due_at, release_at, assigned_at"
     )
     .eq("organization_id", org.id);
   const assignments = (assignmentRows ?? []) as Assignment[];
@@ -135,12 +140,13 @@ export default async function CoursesIndexPage({
   const { data: stepRows } = myPathIds.length
     ? await supabase
         .from("learning_path_courses")
-        .select("path_id, course_id, learning_paths!inner(name, is_active)")
+        .select("path_id, course_id, release_at, learning_paths!inner(name, is_active)")
         .in("path_id", myPathIds)
     : { data: [] };
   type StepRaw = {
     path_id: string;
     course_id: string;
+    release_at: string | null;
     learning_paths:
       | { name: string; is_active: boolean }
       | Array<{ name: string; is_active: boolean }>;
@@ -189,7 +195,7 @@ export default async function CoursesIndexPage({
   const { data: courseRows } = await supabase
     .from("courses")
     .select(
-      "id, title, description, current_version_id, updated_at, thumbnail_url, visibility"
+      "id, title, description, current_version_id, updated_at, thumbnail_url, thumbnail_fit, thumbnail_pos_x, thumbnail_pos_y, visibility"
     )
     .eq("is_active", true)
     .in("id", allCourseIds);
@@ -252,6 +258,47 @@ export default async function CoursesIndexPage({
       );
   }
 
+  // ---- Scheduled-release gates (mirrors dashboard/page.tsx) ----
+  const nowMs = Date.now();
+  const assignmentGateByCourse = new Map<string, string | null>(); // null = open
+  for (const a of [...mine, ...mineTeams, ...orgWide]) {
+    const prev = assignmentGateByCourse.get(a.course_id);
+    if (prev === null) continue;
+    if (isReleased(a.release_at, nowMs)) {
+      assignmentGateByCourse.set(a.course_id, null);
+    } else if (
+      prev === undefined ||
+      new Date(a.release_at!).getTime() < new Date(prev).getTime()
+    ) {
+      assignmentGateByCourse.set(a.course_id, a.release_at);
+    }
+  }
+  for (const cid of orgPublicCourseIds) assignmentGateByCourse.set(cid, null);
+  const pathGateByCourse = new Map<string, string>();
+  for (const s of activePathSteps) {
+    if (!s.release_at || isReleased(s.release_at, nowMs)) continue;
+    const prev = pathGateByCourse.get(s.course_id);
+    if (!prev || new Date(s.release_at).getTime() > new Date(prev).getTime()) {
+      pathGateByCourse.set(s.course_id, s.release_at);
+    }
+  }
+  function effectiveReleaseFor(courseId: string): string | null {
+    return laterOf(
+      assignmentGateByCourse.get(courseId) ?? null,
+      pathGateByCourse.get(courseId) ?? null
+    );
+  }
+  function statusWithRelease(
+    courseId: string
+  ): { status: GridCard["status"]; releaseAt: string | null } {
+    let status = attemptStatusForCourse(courseId);
+    const releaseAt = effectiveReleaseFor(courseId);
+    if (releaseAt && status !== "completed" && status !== "passed") {
+      status = "upcoming";
+    }
+    return { status, releaseAt };
+  }
+
   // ---- Build cards. User > team > org precedence. ----
   const cards: GridCard[] = [];
   const seen = new Set<string>();
@@ -264,12 +311,15 @@ export default async function CoursesIndexPage({
       title: course.title,
       description: course.description,
       source,
-      status: attemptStatusForCourse(course.id),
+      ...statusWithRelease(course.id),
       isRevised: false,
       dueAt: a.due_at,
       bestScore: bestScoreForCourse(course.id),
       pathName: pathNameByCourseId.get(course.id) ?? null,
       thumbnail_url: course.thumbnail_url,
+      thumbnail_fit: course.thumbnail_fit,
+      thumbnail_pos_x: course.thumbnail_pos_x,
+      thumbnail_pos_y: course.thumbnail_pos_y,
     });
     seen.add(a.course_id);
   }
@@ -286,12 +336,15 @@ export default async function CoursesIndexPage({
       title: course.title,
       description: course.description,
       source: "user",
-      status: attemptStatusForCourse(cid),
+      ...statusWithRelease(cid),
       isRevised: false,
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
       pathName,
       thumbnail_url: course.thumbnail_url,
+      thumbnail_fit: course.thumbnail_fit,
+      thumbnail_pos_x: course.thumbnail_pos_x,
+      thumbnail_pos_y: course.thumbnail_pos_y,
     });
     seen.add(cid);
   }
@@ -307,12 +360,15 @@ export default async function CoursesIndexPage({
       title: course.title,
       description: course.description,
       source: "org",
-      status: attemptStatusForCourse(cid),
+      ...statusWithRelease(cid),
       isRevised: false,
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
       pathName: null,
       thumbnail_url: course.thumbnail_url,
+      thumbnail_fit: course.thumbnail_fit,
+      thumbnail_pos_x: course.thumbnail_pos_x,
+      thumbnail_pos_y: course.thumbnail_pos_y,
     });
     seen.add(cid);
   }
@@ -322,9 +378,10 @@ export default async function CoursesIndexPage({
   const statusRank: Record<GridCard["status"], number> = {
     in_progress: 0,
     not_started: 1,
-    failed: 2,
-    completed: 3,
-    passed: 4,
+    upcoming: 2,
+    failed: 3,
+    completed: 4,
+    passed: 5,
   };
   cards.sort((a, b) => {
     const r = statusRank[a.status] - statusRank[b.status];
