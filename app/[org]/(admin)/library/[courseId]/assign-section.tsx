@@ -13,10 +13,21 @@ export type AssignmentRow = {
   user_id: string | null;
   team_id: string | null;
   due_at: string | null;
+  release_at: string | null;
   assigned_at: string;
   user_email?: string | null;
   team_name?: string | null;
 };
+
+/** "Unlocks <date>" chip for a scheduled (not yet released) assignment. */
+function ReleaseChip({ releaseAt }: { releaseAt: string | null }) {
+  if (!releaseAt || new Date(releaseAt).getTime() <= Date.now()) return null;
+  return (
+    <span className="text-sky-700">
+      Unlocks {new Date(releaseAt).toISOString().slice(0, 16).replace("T", " ")} UTC
+    </span>
+  );
+}
 
 export type AssignableMember = {
   user_id: string;
@@ -59,6 +70,11 @@ export function AssignSection({
   const [selectedUser, setSelectedUser] = useState("");
   const [selectedTeam, setSelectedTeam] = useState("");
   const [dueAt, setDueAt] = useState("");
+  // datetime-local value; converted to ISO in the browser so the stored
+  // instant matches the admin's local wall-clock choice.
+  const [releaseAt, setReleaseAt] = useState("");
+  const releaseIso = () =>
+    releaseAt ? new Date(releaseAt).toISOString() : null;
 
   const orgWide = assignments.find((a) => a.assignee_type === "org");
   const userAssignments = assignments.filter((a) => a.assignee_type === "user");
@@ -102,7 +118,13 @@ export function AssignSection({
       await unassign(orgWide.id);
       return;
     }
-    await post({ orgSlug, courseId, assignToOrg: true, dueAt: dueAt || null });
+    await post({
+      orgSlug,
+      courseId,
+      assignToOrg: true,
+      dueAt: dueAt || null,
+      releaseAt: releaseIso(),
+    });
   }
 
   async function addUser() {
@@ -112,6 +134,7 @@ export function AssignSection({
       courseId,
       userIds: [selectedUser],
       dueAt: dueAt || null,
+      releaseAt: releaseIso(),
     });
     if (ok) setSelectedUser("");
   }
@@ -123,6 +146,7 @@ export function AssignSection({
       courseId,
       teamIds: [selectedTeam],
       dueAt: dueAt || null,
+      releaseAt: releaseIso(),
     });
     if (ok) setSelectedTeam("");
   }
@@ -137,6 +161,21 @@ export function AssignSection({
             <div className="font-medium">Assigned to entire org</div>
             <div className="text-xs text-muted">
               Every member of this workspace will see this course.
+              {orgWide?.release_at &&
+                new Date(orgWide.release_at).getTime() > Date.now() && (
+                  <>
+                    {" "}
+                    Unlocks{" "}
+                    <span className="text-ink">
+                      {new Date(orgWide.release_at)
+                        .toISOString()
+                        .slice(0, 16)
+                        .replace("T", " ")}{" "}
+                      UTC
+                    </span>
+                    .
+                  </>
+                )}
               {orgWide?.due_at && (
                 <>
                   {" "}
@@ -178,6 +217,7 @@ export function AssignSection({
                 >
                   <span>{a.team_name ?? a.team_id?.slice(0, 8) ?? "-"}</span>
                   <span className="flex items-center gap-3 text-xs text-muted">
+                    <ReleaseChip releaseAt={a.release_at} />
                     {a.due_at && (
                       <span>Due {new Date(a.due_at).toISOString().slice(0, 10)}</span>
                     )}
@@ -210,6 +250,7 @@ export function AssignSection({
                 >
                   <span>{a.user_email ?? a.user_id?.slice(0, 8) ?? "-"}</span>
                   <span className="flex items-center gap-3 text-xs text-muted">
+                    <ReleaseChip releaseAt={a.release_at} />
                     {a.due_at && (
                       <span>Due {new Date(a.due_at).toISOString().slice(0, 10)}</span>
                     )}
@@ -231,6 +272,40 @@ export function AssignSection({
 
         {isAdmin && (
           <div className="px-5 py-3 space-y-3">
+            {/* Schedule applies to whichever assignment you create below. */}
+            <div className="border border-line rounded-lg px-3 py-2.5 bg-canvas/40">
+              <div className="text-xs uppercase tracking-wide text-muted mb-2">
+                Schedule (applies to the assignment you create below)
+              </div>
+              <div className="flex flex-wrap gap-3 items-end">
+                <label className="text-xs text-muted">
+                  <span className="block mb-1">Available from (optional)</span>
+                  <input
+                    type="datetime-local"
+                    value={releaseAt}
+                    onChange={(e) => setReleaseAt(e.target.value)}
+                    title="Learners see the course as 'Coming soon' until this moment"
+                    className="px-3 py-2 border border-line rounded-lg bg-paper outline-none focus:border-ink text-sm"
+                  />
+                </label>
+                <label className="text-xs text-muted">
+                  <span className="block mb-1">Due date (optional)</span>
+                  <input
+                    type="date"
+                    value={dueAt}
+                    onChange={(e) => setDueAt(e.target.value)}
+                    className="px-3 py-2 border border-line rounded-lg bg-paper outline-none focus:border-ink text-sm"
+                  />
+                </label>
+              </div>
+              {releaseAt && (
+                <p className="text-[11px] text-muted mt-2">
+                  Assigned learners will see this course as{" "}
+                  <strong className="text-ink">Coming soon</strong> with the
+                  unlock time, and can start it automatically once it arrives.
+                </p>
+              )}
+            </div>
             <div>
               <div className="text-xs uppercase tracking-wide text-muted mb-2">
                 Assign team
@@ -282,13 +357,6 @@ export function AssignSection({
                   value={selectedUser}
                   onChange={setSelectedUser}
                   disabled={busy}
-                />
-                <input
-                  type="date"
-                  value={dueAt}
-                  onChange={(e) => setDueAt(e.target.value)}
-                  title="Due date (optional)"
-                  className="px-3 py-2 border border-line rounded-lg bg-canvas outline-none focus:border-ink text-sm"
                 />
                 <button
                   type="button"

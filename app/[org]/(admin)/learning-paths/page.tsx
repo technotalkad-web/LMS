@@ -33,6 +33,7 @@ export type PathCourseRow = {
   path_id: string;
   course_id: string;
   step_number: number;
+  release_at: string | null;
   title: string;
 };
 
@@ -78,7 +79,7 @@ export default async function LearningPathsPage({
   const { data: stepRows } = pathIds.length
     ? await supabase
         .from("learning_path_courses")
-        .select("path_id, course_id, step_number, courses!inner(title)")
+        .select("path_id, course_id, step_number, release_at, courses!inner(title)")
         .in("path_id", pathIds)
         .order("step_number", { ascending: true })
     : { data: [] };
@@ -87,6 +88,7 @@ export default async function LearningPathsPage({
     path_id: string;
     course_id: string;
     step_number: number;
+    release_at: string | null;
     courses: { title: string } | { title: string }[];
   };
   const pathCourses: PathCourseRow[] = ((stepRows ?? []) as StepRaw[]).map((s) => {
@@ -95,6 +97,7 @@ export default async function LearningPathsPage({
       path_id: s.path_id,
       course_id: s.course_id,
       step_number: s.step_number,
+      release_at: s.release_at,
       title: c?.title ?? "Unknown course",
     };
   });

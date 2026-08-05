@@ -34,6 +34,9 @@ type Course = {
   duration_minutes: number | null;
   is_active: boolean;
   thumbnail_url: string | null;
+  thumbnail_fit: string | null;
+  thumbnail_pos_x: number | null;
+  thumbnail_pos_y: number | null;
   visibility: "private" | "org_public";
 };
 
@@ -54,7 +57,7 @@ export default async function AdminCourseDetailPage({
   const { data: course } = await supabase
     .from("courses")
     .select(
-      "id, slug, title, description, status, current_version_id, organization_id, duration_minutes, is_active, thumbnail_url, visibility"
+      "id, slug, title, description, status, current_version_id, organization_id, duration_minutes, is_active, thumbnail_url, thumbnail_fit, thumbnail_pos_x, thumbnail_pos_y, visibility"
     )
     .eq("id", courseId)
     .eq("organization_id", org.id)
@@ -85,7 +88,7 @@ export default async function AdminCourseDetailPage({
   // Assignments
   const { data: assignmentRows } = await supabase
     .from("course_assignments")
-    .select("id, assignee_type, user_id, team_id, due_at, assigned_at")
+    .select("id, assignee_type, user_id, team_id, due_at, release_at, assigned_at")
     .eq("course_id", c.id);
 
   // Reminder settings
@@ -284,6 +287,9 @@ export default async function AdminCourseDetailPage({
     duration_minutes: c.duration_minutes,
     is_active: c.is_active,
     thumbnail_url: c.thumbnail_url,
+    thumbnail_fit: c.thumbnail_fit === "contain" ? "contain" : "cover",
+    thumbnail_pos_x: c.thumbnail_pos_x ?? 50,
+    thumbnail_pos_y: c.thumbnail_pos_y ?? 50,
     visibility: c.visibility ?? "private",
   };
 

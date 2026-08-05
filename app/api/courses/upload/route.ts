@@ -119,11 +119,22 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: 400 });
   }
 
-  // If a thumbnail URL was sent along with the upload, persist it.
+  // If a thumbnail URL was sent along with the upload, persist it together
+  // with the display options chosen in the upload editor (fit + focal point).
   if (thumbnailUrl && result.courseId) {
+    const fitRaw = form.get("thumbnail_fit");
+    const posPct = (v: FormDataEntryValue | null): number => {
+      const n = typeof v === "string" ? Number(v) : NaN;
+      return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 50;
+    };
     await supabase
       .from("courses")
-      .update({ thumbnail_url: thumbnailUrl })
+      .update({
+        thumbnail_url: thumbnailUrl,
+        thumbnail_fit: fitRaw === "contain" ? "contain" : "cover",
+        thumbnail_pos_x: posPct(form.get("thumbnail_pos_x")),
+        thumbnail_pos_y: posPct(form.get("thumbnail_pos_y")),
+      })
       .eq("id", result.courseId);
   }
 

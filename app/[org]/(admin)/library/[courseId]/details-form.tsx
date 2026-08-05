@@ -10,6 +10,9 @@ export type CourseDetails = {
   duration_minutes: number | null;
   is_active: boolean;
   thumbnail_url: string | null;
+  thumbnail_fit: "cover" | "contain";
+  thumbnail_pos_x: number;
+  thumbnail_pos_y: number;
   visibility: "private" | "org_public";
 };
 
@@ -47,6 +50,9 @@ export function DetailsForm({
         duration_minutes: form.duration_minutes,
         is_active: form.is_active,
         thumbnail_url: form.thumbnail_url,
+        thumbnail_fit: form.thumbnail_fit,
+        thumbnail_pos_x: form.thumbnail_pos_x,
+        thumbnail_pos_y: form.thumbnail_pos_y,
         visibility: form.visibility,
       }),
     });
@@ -116,6 +122,20 @@ export function DetailsForm({
           orgSlug={orgSlug}
           value={form.thumbnail_url}
           onChange={(url) => set("thumbnail_url", url)}
+          display={{
+            fit: form.thumbnail_fit,
+            posX: form.thumbnail_pos_x,
+            posY: form.thumbnail_pos_y,
+          }}
+          onDisplayChange={(d) => {
+            setForm((f) => ({
+              ...f,
+              thumbnail_fit: d.fit,
+              thumbnail_pos_x: d.posX,
+              thumbnail_pos_y: d.posY,
+            }));
+            setSaved(false);
+          }}
         />
       </Field>
 

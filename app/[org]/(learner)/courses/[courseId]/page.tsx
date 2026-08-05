@@ -37,6 +37,8 @@ type Course = {
   current_version_id: string | null;
   organization_id: string;
   thumbnail_url: string | null;
+  thumbnail_pos_x: number | null;
+  thumbnail_pos_y: number | null;
 };
 
 type Attempt = {
@@ -63,7 +65,7 @@ export default async function CourseDetailPage({
   const { data: course } = await supabase
     .from("courses")
     .select(
-      "id, slug, title, description, status, current_version_id, organization_id, is_active, thumbnail_url"
+      "id, slug, title, description, status, current_version_id, organization_id, is_active, thumbnail_url, thumbnail_pos_x, thumbnail_pos_y"
     )
     .eq("id", courseId)
     .eq("organization_id", org.id)
@@ -82,14 +84,20 @@ export default async function CourseDetailPage({
   // Entitlement: only assigned (direct/org/team) or org_public courses are
   // viewable by learners — closes the private/unassigned-course IDOR. Admins
   // preview freely.
-  const canAccess = await learnerCanAccessCourse({
+  const access = await learnerCanAccessCourse({
     supabase,
     orgId: org.id,
     userId: user.id,
     courseId: c.id,
     isAdmin,
   });
-  if (!canAccess) redirect(`/${orgSlug}/dashboard?denied=course`);
+  if (!access.allowed) {
+    redirect(
+      access.upcomingAt
+        ? `/${orgSlug}/dashboard?upcoming=${c.id}`
+        : `/${orgSlug}/dashboard?denied=course`
+    );
+  }
 
   const { data: versions } = await supabase
     .from("course_versions")
@@ -183,11 +191,16 @@ export default async function CourseDetailPage({
         <div className="relative bg-gradient-to-br from-slate-800 to-slate-950 text-white p-7 sm:p-9 overflow-hidden">
           {c.thumbnail_url ? (
             <>
+              {/* Hero stays cover (it's a darkened backdrop behind text) but
+                  honors the admin's chosen focal point. */}
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={c.thumbnail_url}
                 alt=""
                 className="absolute inset-0 w-full h-full object-cover"
+                style={{
+                  objectPosition: `${c.thumbnail_pos_x ?? 50}% ${c.thumbnail_pos_y ?? 50}%`,
+                }}
               />
               <div className="absolute inset-0 bg-gradient-to-br from-slate-900/85 to-slate-900/95" />
             </>

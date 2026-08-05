@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
+import { thumbImgStyle } from "@/lib/ui/thumbnail";
+import { LocalDateTime } from "@/components/ui/local-datetime";
 import {
   PlayCircle,
   Award,
@@ -15,7 +17,8 @@ export type CardStatus =
   | "in_progress"
   | "completed"
   | "passed"
-  | "failed";
+  | "failed"
+  | "upcoming";
 
 export type GridCard = {
   course_id: string;
@@ -23,12 +26,17 @@ export type GridCard = {
   description: string | null;
   source: "user" | "team" | "org";
   status: CardStatus;
+  /** Future release time when status is "upcoming" (scheduled release). */
+  releaseAt?: string | null;
   isRevised: boolean;
   dueAt: string | null;
   bestScore: number | null;
   /** Optional badge — e.g. "Learning path: Onboarding" when the card belongs to a path */
   pathName?: string | null;
   thumbnail_url?: string | null;
+  thumbnail_fit?: string | null;
+  thumbnail_pos_x?: number | null;
+  thumbnail_pos_y?: number | null;
 };
 
 type Filter = "all" | "in_progress" | "not_started" | "completed";
@@ -55,7 +63,7 @@ export function DashboardGrid({
     let done = 0;
     for (const c of cards) {
       if (c.status === "in_progress") inProg++;
-      else if (c.status === "not_started") notStarted++;
+      else if (c.status === "not_started" || c.status === "upcoming") notStarted++;
       else if (c.status === "completed" || c.status === "passed") done++;
     }
     return { inProg, notStarted, done };
@@ -66,7 +74,9 @@ export function DashboardGrid({
     if (filter === "in_progress")
       return cards.filter((c) => c.status === "in_progress");
     if (filter === "not_started")
-      return cards.filter((c) => c.status === "not_started");
+      return cards.filter(
+        (c) => c.status === "not_started" || c.status === "upcoming"
+      );
     return cards.filter(
       (c) => c.status === "completed" || c.status === "passed"
     );
@@ -158,8 +168,11 @@ function Tab({
 function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
   const isCompleted =
     card.status === "completed" || card.status === "passed";
+  const isUpcoming = card.status === "upcoming";
+  // Unreleased content can't be overdue — the learner couldn't have started it.
   const overdue =
     !isCompleted &&
+    !isUpcoming &&
     card.dueAt &&
     new Date(card.dueAt).getTime() < Date.now();
 
@@ -177,6 +190,8 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
     if (card.status === "in_progress")
       return { tone: "amber", label: "In progress" };
     if (card.status === "failed") return { tone: "red", label: "Failed" };
+    if (card.status === "upcoming")
+      return { tone: "sky", label: "Coming soon" };
     return { tone: "slate", label: "Not started" };
   })();
 
@@ -202,7 +217,8 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
           <img
             src={card.thumbnail_url}
             alt=""
-            className="absolute inset-0 w-full h-full object-cover"
+            className="absolute inset-0 w-full h-full"
+            style={thumbImgStyle(card)}
           />
         )}
         {overdue && (
@@ -231,7 +247,9 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
                   ? "bg-amber-100 text-amber-900"
                   : statusPill.tone === "red"
                     ? "bg-red-100 text-red-800"
-                    : "bg-white/95 text-slate-700"
+                    : statusPill.tone === "sky"
+                      ? "bg-sky-100 text-sky-800"
+                      : "bg-white/95 text-slate-700"
           }`}
         >
           {statusPill.label}
@@ -268,18 +286,26 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
                 <span className="text-muted">
                   {card.status === "in_progress"
                     ? "In progress"
-                    : "Not started"}
+                    : isUpcoming
+                      ? "Coming soon"
+                      : "Not started"}
                 </span>
-                {dueLabel && (
-                  <span
-                    className={
-                      overdue
-                        ? "text-red-700 font-semibold"
-                        : "text-muted"
-                    }
-                  >
-                    {dueLabel}
+                {isUpcoming && card.releaseAt ? (
+                  <span className="text-sky-700 font-semibold">
+                    <LocalDateTime iso={card.releaseAt} prefix="Unlocks " />
                   </span>
+                ) : (
+                  dueLabel && (
+                    <span
+                      className={
+                        overdue
+                          ? "text-red-700 font-semibold"
+                          : "text-muted"
+                      }
+                    >
+                      {dueLabel}
+                    </span>
+                  )
                 )}
               </div>
               <div className="w-full bg-canvas rounded-full h-1.5 mb-4 overflow-hidden">
@@ -300,32 +326,43 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
             </>
           )}
 
-          <Link
-            href={`/${orgSlug}/courses/${card.course_id}${
-              isCompleted ? "" : "/launch"
-            }`}
-            className={`w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-              isCompleted
-                ? "bg-canvas hover:bg-canvas/70 text-ink border border-line"
-                : overdue
-                  ? "bg-red-600 hover:bg-red-700 text-white shadow-sm"
-                  : "bg-ink text-canvas hover:opacity-90 shadow-sm"
-            }`}
-          >
-            {isCompleted ? (
-              <>
-                <Award className="w-4 h-4" /> View details
-              </>
-            ) : card.status === "in_progress" ? (
-              <>
-                <PlayCircle className="w-4 h-4" /> Resume
-              </>
-            ) : (
-              <>
-                <PlayCircle className="w-4 h-4" /> Start
-              </>
-            )}
-          </Link>
+          {isUpcoming ? (
+            <button
+              type="button"
+              disabled
+              title="This course hasn't been released yet"
+              className="w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium bg-canvas text-muted border border-line cursor-not-allowed"
+            >
+              <Clock className="w-4 h-4" /> Coming soon
+            </button>
+          ) : (
+            <Link
+              href={`/${orgSlug}/courses/${card.course_id}${
+                isCompleted ? "" : "/launch"
+              }`}
+              className={`w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                isCompleted
+                  ? "bg-canvas hover:bg-canvas/70 text-ink border border-line"
+                  : overdue
+                    ? "bg-red-600 hover:bg-red-700 text-white shadow-sm"
+                    : "bg-ink text-canvas hover:opacity-90 shadow-sm"
+              }`}
+            >
+              {isCompleted ? (
+                <>
+                  <Award className="w-4 h-4" /> View details
+                </>
+              ) : card.status === "in_progress" ? (
+                <>
+                  <PlayCircle className="w-4 h-4" /> Resume
+                </>
+              ) : (
+                <>
+                  <PlayCircle className="w-4 h-4" /> Start
+                </>
+              )}
+            </Link>
+          )}
 
           {card.source === "team" && (
             <div className="text-[10px] text-muted text-center mt-2 flex items-center justify-center gap-1">

@@ -12,6 +12,8 @@ import {
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
+import { isReleased } from "@/lib/learner/release";
+import { LocalDateTime } from "@/components/ui/local-datetime";
 
 type PathRow = {
   id: string;
@@ -20,11 +22,13 @@ type PathRow = {
   organization_id: string;
   thumbnail_url: string | null;
   visibility: "private" | "org_public" | null;
+  sequence_mode: "strict" | "random" | null;
 };
 
 type StepRow = {
   course_id: string;
   step_number: number;
+  release_at: string | null;
   course: {
     id: string;
     title: string;
@@ -45,7 +49,8 @@ type StepView = {
   step_number: number;
   title: string;
   description: string | null;
-  state: "completed" | "current" | "locked";
+  state: "completed" | "current" | "locked" | "unreleased";
+  releaseAt: string | null;
   manifestType: string | null;
 };
 
@@ -61,7 +66,7 @@ export default async function LearningPathDetailPage({
   // 1) Path metadata (must be active).
   const { data: pathRow } = await supabase
     .from("learning_paths")
-    .select("id, name, description, organization_id, is_active, thumbnail_url, visibility")
+    .select("id, name, description, organization_id, is_active, thumbnail_url, visibility, sequence_mode")
     .eq("id", pathId)
     .eq("organization_id", org.id)
     .maybeSingle();
@@ -124,13 +129,14 @@ export default async function LearningPathDetailPage({
   const { data: stepsRaw } = await supabase
     .from("learning_path_courses")
     .select(
-      "course_id, step_number, courses!inner(id, title, description, current_version_id)"
+      "course_id, step_number, release_at, courses!inner(id, title, description, current_version_id)"
     )
     .eq("path_id", pathId)
     .order("step_number", { ascending: true });
   const steps = ((stepsRaw ?? []) as unknown as Array<{
     course_id: string;
     step_number: number;
+    release_at: string | null;
     courses:
       | {
           id: string;
@@ -149,6 +155,7 @@ export default async function LearningPathDetailPage({
     return {
       course_id: s.course_id,
       step_number: s.step_number,
+      release_at: s.release_at,
       course: c,
     } as StepRow;
   });
@@ -222,12 +229,22 @@ export default async function LearningPathDetailPage({
     }
   }
 
-  // 6) Compute per-step state (completed | current | locked).
+  // 6) Compute per-step state (completed | current | locked | unreleased).
+  // Scheduled release: a non-completed step whose release_at is in the future
+  // renders "unreleased". In STRICT mode it also consumes the "current" slot —
+  // the learner is waiting, nothing later unlocks. In RANDOM mode later
+  // released steps stay reachable, so the current pointer skips it.
+  // Completed always wins: a date added after completion never regresses state.
+  const now = Date.now();
+  const sequenceMode = path.sequence_mode === "random" ? "random" : "strict";
   let currentSet = false;
   const stepViews: StepView[] = steps.map((s) => {
     let state: StepView["state"];
     if (completedCourseIds.has(s.course_id)) {
       state = "completed";
+    } else if (!isReleased(s.release_at, now)) {
+      state = "unreleased";
+      if (sequenceMode === "strict" && !currentSet) currentSet = true;
     } else if (!currentSet) {
       state = "current";
       currentSet = true;
@@ -241,6 +258,7 @@ export default async function LearningPathDetailPage({
       description: s.course.description,
       manifestType: manifestTypeByCourse.get(s.course_id) || null,
       state,
+      releaseAt: s.release_at,
     };
   });
 
@@ -398,11 +416,16 @@ function StepCard({
   const isCompleted = step.state === "completed";
   const isCurrent = step.state === "current";
   const isLocked = step.state === "locked";
+  const isUnreleased = step.state === "unreleased";
+  // Show the schedule on every future-dated step — including ones that are
+  // also prereq-locked — so learners can see the whole upcoming calendar.
+  const showsReleaseDate =
+    !isCompleted && step.releaseAt && new Date(step.releaseAt).getTime() > Date.now();
 
   return (
     <div
       className={`border rounded-2xl p-5 transition-colors ${
-        isLocked
+        isLocked || isUnreleased
           ? "border-line bg-canvas/30 opacity-80"
           : isCurrent
             ? "border-indigo-200 bg-indigo-50/40 ring-1 ring-indigo-100"
@@ -451,6 +474,12 @@ function StepCard({
                 In progress
               </span>
             )}
+            {showsReleaseDate && (
+              <span className="text-[10px] uppercase tracking-wide font-bold px-2 py-0.5 rounded bg-sky-100 text-sky-800 inline-flex items-center gap-1">
+                <Clock className="w-3 h-3" />
+                Releases <LocalDateTime iso={step.releaseAt!} />
+              </span>
+            )}
           </div>
           <h3 className="font-semibold text-base sm:text-lg leading-snug">
             {step.title}
@@ -480,7 +509,16 @@ function StepCard({
 
         {/* CTA */}
         <div className="flex flex-col sm:items-end gap-2 shrink-0 sm:min-w-[150px]">
-          {isLocked ? (
+          {isUnreleased ? (
+            <button
+              type="button"
+              disabled
+              title="This chapter hasn't been released yet"
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-canvas text-muted border border-line px-5 py-2.5 rounded-lg text-sm font-medium cursor-not-allowed"
+            >
+              <Clock className="w-4 h-4" /> Coming soon
+            </button>
+          ) : isLocked ? (
             <button
               type="button"
               disabled

@@ -9,10 +9,53 @@ import { originFromRequest } from "@/lib/http/origin";
  *   POST   /api/learning-paths/{id}/courses   body: { courseId }
  *   DELETE /api/learning-paths/{id}/courses?courseId=...
  *   PUT    /api/learning-paths/{id}/courses   body: { orderedCourseIds: string[] }
+ *   PATCH  /api/learning-paths/{id}/courses   body: { courseId, releaseAt }
  *
  * POST appends the course at the next step_number.
  * PUT resets the entire step ordering.
+ * PATCH sets/clears a step's scheduled release (releaseAt: ISO string or null);
+ * steps are addressed by (path_id, course_id) — the table has no surrogate id.
  */
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const { id: pathId } = await params;
+  const body = (await request.json().catch(() => ({}))) as {
+    courseId?: string;
+    releaseAt?: string | null;
+  };
+  if (!body.courseId) {
+    return NextResponse.json({ error: "courseId required" }, { status: 400 });
+  }
+  let releaseAt: string | null = null;
+  if (body.releaseAt !== undefined && body.releaseAt !== null) {
+    if (typeof body.releaseAt !== "string" || Number.isNaN(new Date(body.releaseAt).getTime())) {
+      return NextResponse.json(
+        { error: "releaseAt must be an ISO datetime or null" },
+        { status: 400 }
+      );
+    }
+    releaseAt = new Date(body.releaseAt).toISOString();
+  }
+
+  // Caller-RLS write, same trust model as PUT: only the path org's admins can
+  // update learning_path_courses rows.
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("learning_path_courses")
+    .update({ release_at: releaseAt })
+    .eq("path_id", pathId)
+    .eq("course_id", body.courseId)
+    .select("course_id");
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+  if (!data || data.length === 0) {
+    return NextResponse.json({ error: "Step not found" }, { status: 404 });
+  }
+  return NextResponse.json({ ok: true, release_at: releaseAt });
+}
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }

@@ -20,6 +20,11 @@ export default function CourseUploadPage() {
   const [state, setState] = useState<UploadState>({ kind: "idle" });
   const [notifyUpdate, setNotifyUpdate] = useState(true);
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+  const [thumbDisplay, setThumbDisplay] = useState<{
+    fit: "cover" | "contain";
+    posX: number;
+    posY: number;
+  }>({ fit: "cover", posX: 50, posY: 50 });
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -40,7 +45,12 @@ export default function CourseUploadPage() {
       form.set("courseId", targetCourseId);
       if (notifyUpdate) form.set("notify_update", "1");
     }
-    if (thumbnailUrl) form.set("thumbnail_url", thumbnailUrl);
+    if (thumbnailUrl) {
+      form.set("thumbnail_url", thumbnailUrl);
+      form.set("thumbnail_fit", thumbDisplay.fit);
+      form.set("thumbnail_pos_x", String(thumbDisplay.posX));
+      form.set("thumbnail_pos_y", String(thumbDisplay.posY));
+    }
 
     try {
       const res = await fetch("/api/courses/upload", {
@@ -194,6 +204,8 @@ export default function CourseUploadPage() {
               orgSlug={orgSlug}
               value={thumbnailUrl}
               onChange={setThumbnailUrl}
+              display={thumbDisplay}
+              onDisplayChange={setThumbDisplay}
             />
             <p className="text-xs text-muted mt-2">
               Shown on the dashboard, library, and course detail. JPEG or PNG,
