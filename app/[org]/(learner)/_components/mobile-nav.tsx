@@ -2,14 +2,16 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Home, User, LifeBuoy, BookOpen } from "lucide-react";
+import { Home, User, LifeBuoy, BookOpen, Trophy } from "lucide-react";
 
 export function MobileBottomNav({
   orgSlug,
   brandColor = "#4f46e5",
+  showLeaderboard = true,
 }: {
   orgSlug: string;
   brandColor?: string;
+  showLeaderboard?: boolean;
 }) {
   const pathname = usePathname();
   const isActive = (suffix: string) =>
@@ -28,6 +30,16 @@ export function MobileBottomNav({
       label: "Courses",
       active: pathname?.includes(`/${orgSlug}/courses`) ?? false,
     },
+    ...(showLeaderboard
+      ? [
+          {
+            href: `/${orgSlug}/leaderboard`,
+            icon: Trophy,
+            label: "Ranks",
+            active: isActive("/leaderboard"),
+          },
+        ]
+      : []),
     {
       href: `/${orgSlug}/profile`,
       icon: User,

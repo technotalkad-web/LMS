@@ -64,6 +64,17 @@ export async function POST(request: Request) {
     ids.push(statement.id);
   }
 
+  // Gamification engine: one fail-isolated RPC per request (idempotent —
+  // dedupe keys make replays award-neutral). cmi5 parity with the SCORM
+  // commit hook; a failure here never affects the learner's statements.
+  try {
+    await svc.rpc("gamification_record_activity", {
+      p_attempt_id: session.attemptId,
+    });
+  } catch (e) {
+    console.warn("[xapi/statements] gamification failed:", e);
+  }
+
   // Fan-out: mirror these statements to the org's external LRS if configured.
   // Fail-isolated + non-blocking — never affects this response or our own copy.
   await mirrorToExternalLrs(session.attemptId, statements);
