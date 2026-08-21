@@ -54,8 +54,10 @@ export function MotivationStrip({
     data.next_badge.remaining > 0 &&
     data.next_badge.name
   ) {
+    // Units arrive plural ("days", "perfect scores"); singularize for 1.
+    const unit = data.next_badge.unit ?? "steps";
     nudge = `${data.next_badge.remaining.toLocaleString()} more ${
-      data.next_badge.unit ?? "steps"
+      data.next_badge.remaining === 1 ? unit.replace(/s$/, "") : unit
     } to unlock ${data.next_badge.icon ?? ""} ${data.next_badge.name}.`;
   } else if (data.xp_to_next_level && data.xp_to_next_level > 0) {
     nudge = `${data.xp_to_next_level.toLocaleString()} XP to your next level.`;
