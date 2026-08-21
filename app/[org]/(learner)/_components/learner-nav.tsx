@@ -8,11 +8,20 @@ import { usePathname } from "next/navigation";
  * no current-page indication. Matches the admin sidebar treatment (accent pill
  * + aria-current) for a consistent navigation language across roles.
  */
-export function LearnerTopNav({ orgSlug }: { orgSlug: string }) {
+export function LearnerTopNav({
+  orgSlug,
+  showLeaderboard = true,
+}: {
+  orgSlug: string;
+  showLeaderboard?: boolean;
+}) {
   const pathname = usePathname();
   const items = [
     { href: `/${orgSlug}/dashboard`, label: "Dashboard" },
     { href: `/${orgSlug}/courses`, label: "Courses" },
+    ...(showLeaderboard
+      ? [{ href: `/${orgSlug}/leaderboard`, label: "Leaderboard" }]
+      : []),
     { href: `/${orgSlug}/support`, label: "Help & Support" },
   ];
   return (

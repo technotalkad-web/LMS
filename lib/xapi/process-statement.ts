@@ -85,7 +85,9 @@ export async function processStatement(opts: {
 
   if (derivedStatus !== row.status) update.status = derivedStatus;
 
-  if (Object.keys(update).length === 0) return null;
+  // Every statement counts as learning activity (streaks / "most active") —
+  // stamp unconditionally, so the update below always runs.
+  update.last_activity_at = new Date().toISOString();
 
   const { error: updErr } = await supabase
     .from("course_attempts")

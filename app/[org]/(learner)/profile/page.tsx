@@ -1,10 +1,12 @@
-import { Camera, Lock } from "lucide-react";
+import { Lock } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { roleLabel } from "@/lib/auth/permissions";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { ProfileForm, type EditablePersonal } from "./profile-form";
 import { ChangePasswordButton } from "./change-password-button";
+import { AvatarUploader } from "./avatar-uploader";
+import { LeaderboardPrivacyToggle } from "./leaderboard-privacy-toggle";
 
 export const dynamic = "force-dynamic";
 
@@ -53,9 +55,33 @@ export default async function ProfilePage({
   // form initialized with empty fields.
   const { data: profileRow } = await svc
     .from("profiles")
-    .select("first_name, last_name, username, gender, date_of_birth, phone")
+    .select("first_name, last_name, username, gender, date_of_birth, phone, avatar_url")
     .eq("id", user.id)
     .maybeSingle();
+  const avatarUrl =
+    ((profileRow as { avatar_url?: string | null } | null)?.avatar_url as
+      | string
+      | null) ?? null;
+
+  // Gamification: avatar-upload kill switch + current leaderboard visibility.
+  const { data: gsRow } = await svc
+    .from("gamification_settings")
+    .select("enabled, leaderboard_enabled, allow_opt_out, allow_avatar_uploads")
+    .eq("organization_id", org.id)
+    .maybeSingle();
+  const gs = gsRow as {
+    enabled?: boolean;
+    leaderboard_enabled?: boolean;
+    allow_opt_out?: boolean;
+    allow_avatar_uploads?: boolean;
+  } | null;
+  const { data: ugRow } = await svc
+    .from("user_gamification")
+    .select("opted_out")
+    .eq("organization_id", org.id)
+    .eq("user_id", user.id)
+    .maybeSingle();
+  const optedOut = (ugRow as { opted_out?: boolean } | null)?.opted_out ?? false;
   const profile = (profileRow ?? {
     first_name: null,
     last_name: null,
@@ -116,7 +142,6 @@ export default async function ProfilePage({
       .filter(Boolean)
       .join(" ")
       .trim() || (user.email ?? "").split("@")[0];
-  const initial = (displayName?.[0] ?? "?").toUpperCase();
 
   return (
     <div className="max-w-5xl mx-auto space-y-8">
@@ -133,20 +158,12 @@ export default async function ProfilePage({
         {/* Left: Avatar card */}
         <div className="md:col-span-1 space-y-5">
           <div className="bg-paper border border-line rounded-2xl p-6 text-center shadow-sm">
-            <div className="relative inline-block">
-              <div className="h-28 w-28 rounded-full bg-gradient-to-br from-indigo-500 to-indigo-700 text-white flex items-center justify-center text-4xl font-semibold ring-4 ring-canvas">
-                {initial}
-              </div>
-              <button
-                type="button"
-                disabled
-                title="Avatar uploads coming soon"
-                className="absolute bottom-1 right-1 bg-indigo-600 text-white p-2 rounded-full shadow-lg cursor-not-allowed opacity-70"
-                aria-label="Change photo"
-              >
-                <Camera className="w-4 h-4" />
-              </button>
-            </div>
+            <AvatarUploader
+              orgSlug={orgSlug}
+              displayName={displayName}
+              avatarUrl={avatarUrl}
+              allowUploads={gs?.allow_avatar_uploads !== false}
+            />
             <h2 className="mt-4 text-xl font-semibold">{displayName}</h2>
             <p className="text-muted text-sm mt-0.5">
               {membership.designation ?? membership.job_role ?? roleLabel(role as OrgRole)}
@@ -158,6 +175,17 @@ export default async function ProfilePage({
               <ChangePasswordButton />
             </div>
           </div>
+
+          {gs?.enabled !== false && gs?.leaderboard_enabled !== false && (
+            <div className="bg-paper border border-line rounded-2xl p-5">
+              <h3 className="text-sm font-semibold mb-3">Privacy</h3>
+              <LeaderboardPrivacyToggle
+                orgSlug={orgSlug}
+                optedOut={optedOut}
+                allowOptOut={gs?.allow_opt_out !== false}
+              />
+            </div>
+          )}
 
           <div className="bg-paper border border-line rounded-2xl p-5 text-xs text-muted leading-relaxed">
             <strong className="block text-ink mb-1 text-sm">

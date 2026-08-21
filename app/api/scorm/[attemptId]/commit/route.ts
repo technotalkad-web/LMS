@@ -114,6 +114,9 @@ export async function POST(
     status,
     completion_status,
     success_status,
+    // Activity signal for streaks/"most active" (gamification): started_at is
+    // only set at launch, so resumes would otherwise be invisible.
+    last_activity_at: new Date().toISOString(),
   };
   if (score !== null) update.score = score;
   if (
@@ -132,6 +135,20 @@ export async function POST(
   if (error) {
     console.error("[scorm/commit] update failed:", error.message);
     return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+
+  // Gamification engine: one fail-isolated RPC on EVERY commit (it self-detects
+  // completion from the row just written, dedupes via unique keys, and updates
+  // streak/XP/badges). A failure here must never fail the learner's commit.
+  try {
+    const svc = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    await svc.rpc("gamification_record_activity", { p_attempt_id: attemptId });
+  } catch (e) {
+    console.warn("[scorm/commit] gamification failed:", e);
   }
 
   // If this commit transitioned the attempt to completed/passed, fire the

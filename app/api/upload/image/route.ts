@@ -7,16 +7,19 @@ import { randomBytes } from "crypto";
  *   POST /api/upload/image
  *   form-data:
  *     file: <PNG or JPEG>
- *     kind: "thumbnail" | "logo"     (used as the storage subfolder)
- *     orgSlug: "acme"                (caller must be a member)
+ *     kind: "thumbnail" | "logo" | "avatar"   (storage subfolder)
+ *     orgSlug: "acme"                          (caller must be a member)
  *
  * Returns: { url: string }
  *
  * Uploads to Supabase Storage bucket "public-assets". Public bucket → the
- * returned URL is directly usable as an <img src>. Admin-only.
+ * returned URL is directly usable as an <img src>. thumbnail/logo are
+ * admin-only; "avatar" is open to any active org member (gamification) —
+ * user-namespaced path, 2 MB cap, and it also writes profiles.avatar_url.
  */
 
 const MAX_BYTES = 4 * 1024 * 1024; // 4 MB
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const ALLOWED = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 export async function POST(request: Request) {
@@ -25,7 +28,7 @@ export async function POST(request: Request) {
   const orgSlug = form.get("orgSlug");
   const kindRaw = form.get("kind");
   const kind =
-    kindRaw === "logo" ? "logo" : "thumbnail";
+    kindRaw === "logo" ? "logo" : kindRaw === "avatar" ? "avatar" : "thumbnail";
 
   if (!(file instanceof Blob)) {
     return NextResponse.json({ error: "Missing file" }, { status: 400 });
@@ -39,9 +42,10 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
-  if (file.size > MAX_BYTES) {
+  const maxBytes = kind === "avatar" ? AVATAR_MAX_BYTES : MAX_BYTES;
+  if (file.size > maxBytes) {
     return NextResponse.json(
-      { error: `Image must be smaller than ${MAX_BYTES / (1024 * 1024)} MB` },
+      { error: `Image must be smaller than ${maxBytes / (1024 * 1024)} MB` },
       { status: 400 }
     );
   }
@@ -64,15 +68,34 @@ export async function POST(request: Request) {
   }
   const { data: mem } = await supabase
     .from("organization_members")
-    .select("role")
+    .select("role, status")
     .eq("organization_id", org.id)
     .eq("user_id", user.id)
     .maybeSingle();
   const role = mem?.role as string | undefined;
-  const canWrite =
-    role === "super_owner" || role === "owner" || role === "admin";
-  if (!canWrite) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  if (kind === "avatar") {
+    // Any ACTIVE member may upload their own photo, unless the org's
+    // gamification settings disable avatar uploads (admin kill switch).
+    if (!mem || (mem.status as string) !== "active") {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+    const { data: gs } = await supabase
+      .from("gamification_settings")
+      .select("allow_avatar_uploads")
+      .eq("organization_id", org.id)
+      .maybeSingle();
+    if (gs && gs.allow_avatar_uploads === false) {
+      return NextResponse.json(
+        { error: "Photo uploads are disabled by your administrator" },
+        { status: 403 }
+      );
+    }
+  } else {
+    const canWrite =
+      role === "super_owner" || role === "owner" || role === "admin";
+    if (!canWrite) {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
   }
 
   // Build a short, collision-safe storage key.
@@ -83,7 +106,12 @@ export async function POST(request: Request) {
         ? "webp"
         : "jpg";
   const slug = randomBytes(12).toString("hex");
-  const path = `${org.slug}/${kind}/${Date.now()}-${slug}.${ext}`;
+  // Avatars are user-namespaced so learners can never write into the org's
+  // thumbnail/logo namespace and cleanup can target a user's folder.
+  const path =
+    kind === "avatar"
+      ? `${org.slug}/avatar/${user.id}/${Date.now()}-${slug}.${ext}`
+      : `${org.slug}/${kind}/${Date.now()}-${slug}.${ext}`;
 
   // Use service-role client to bypass storage RLS.
   const svc = createServiceClient(
@@ -104,5 +132,22 @@ export async function POST(request: Request) {
   }
 
   const { data: pub } = svc.storage.from("public-assets").getPublicUrl(path);
+
+  if (kind === "avatar") {
+    // Point the profile at the new photo and best-effort delete the old one.
+    const { data: prev } = await svc
+      .from("profiles")
+      .select("avatar_url")
+      .eq("id", user.id)
+      .maybeSingle();
+    await svc.from("profiles").update({ avatar_url: pub.publicUrl }).eq("id", user.id);
+    const prevUrl = (prev as { avatar_url?: string | null } | null)?.avatar_url;
+    const marker = "/public-assets/";
+    if (prevUrl && prevUrl.includes(marker) && prevUrl.includes(`/avatar/${user.id}/`)) {
+      const prevPath = prevUrl.slice(prevUrl.indexOf(marker) + marker.length);
+      await svc.storage.from("public-assets").remove([prevPath]);
+    }
+  }
+
   return NextResponse.json({ url: pub.publicUrl, path });
 }

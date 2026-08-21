@@ -7,6 +7,7 @@ import { LearnerTopNav } from "./_components/learner-nav";
 import { MobileBottomNav } from "./_components/mobile-nav";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
+import { createClient } from "@/lib/supabase/server";
 
 function fontStackFor(name: string | null): string {
   switch (name) {
@@ -57,6 +58,24 @@ export default async function LearnerLayout({
   const brandColor = (org.brand_color as string | null) || "#4f46e5";
   const brandFont = (org.brand_font as string | null) || "inter";
 
+  // Gamification: hide the Leaderboard nav item when boards are disabled.
+  // One PK-indexed read (members can read their org's settings under RLS);
+  // fail-open to visible — the page itself self-defends when disabled.
+  let showLeaderboard = true;
+  try {
+    const supabase = await createClient();
+    const { data: gs } = await supabase
+      .from("gamification_settings")
+      .select("enabled, leaderboard_enabled")
+      .eq("organization_id", org.id)
+      .maybeSingle();
+    if (gs && (gs.enabled === false || gs.leaderboard_enabled === false)) {
+      showLeaderboard = false;
+    }
+  } catch {
+    // fail-open
+  }
+
   return (
     <div
       className="min-h-screen flex flex-col bg-canvas"
@@ -86,7 +105,7 @@ export default async function LearnerLayout({
               <span className="font-semibold text-lg tracking-tight">{org.name}</span>
             </Link>
 
-            <LearnerTopNav orgSlug={org.slug} />
+            <LearnerTopNav orgSlug={org.slug} showLeaderboard={showLeaderboard} />
           </div>
 
           <ProfileDropdown
@@ -103,7 +122,11 @@ export default async function LearnerLayout({
         {children}
       </main>
 
-      <MobileBottomNav orgSlug={org.slug} brandColor={brandColor} />
+      <MobileBottomNav
+        orgSlug={org.slug}
+        brandColor={brandColor}
+        showLeaderboard={showLeaderboard}
+      />
     </div>
   );
 }

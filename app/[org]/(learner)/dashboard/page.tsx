@@ -19,6 +19,10 @@ import {
   type Announcement,
 } from "../_components/announcements-banner";
 import { DashboardGrid, type GridCard } from "./dashboard-grid";
+import {
+  MotivationStrip,
+  type MyGamification,
+} from "./_components/motivation-strip";
 
 type Course = {
   id: string;
@@ -329,6 +333,28 @@ export default async function DashboardPage({
       pathDoneByPath.set(a.learning_path_id, set);
     }
   }
+
+  // 8.2) Gamification: own stats in one RPC round trip (fail-soft — the
+  // dashboard renders fine without the strip if the engine is unavailable).
+  let myGamification: MyGamification | null = null;
+  try {
+    const { data: g } = await supabase.rpc("get_my_gamification", {
+      p_org: org.id,
+    });
+    myGamification = (g as MyGamification | null) ?? null;
+  } catch {
+    myGamification = null;
+  }
+  // Avg score from the attempts already fetched — no extra query.
+  const completedScores = attempts
+    .filter(
+      (a) => a.completion_status === "completed" || a.success_status === "passed"
+    )
+    .map((a) => a.score)
+    .filter((s): s is number => typeof s === "number");
+  const avgScore = completedScores.length
+    ? completedScores.reduce((x, y) => x + y, 0) / completedScores.length
+    : null;
 
   // 8.5) 48-hour deadline list (overdue + due-within-48h, not yet completed).
   const nowMs = Date.now();
@@ -713,6 +739,10 @@ export default async function DashboardPage({
           </Link>
         </div>
       )}
+
+      {/* Personal gamification strip (rank / XP / level / streak / avg score).
+          Sits below the urgency callout — deadlines outrank gamification. */}
+      <MotivationStrip orgSlug={orgSlug} data={myGamification} avgScore={avgScore} />
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
