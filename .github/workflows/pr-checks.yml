@@ -43,6 +43,12 @@ jobs:
     name: e2e (playwright)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Skip on pushes to main: deploy-staging.yml fires on the same push and
+    # replaces the staging worker WHILE this suite is hitting it — requests
+    # that land during the swap flake with non-4xx statuses (seen 2026-08-21,
+    # tenant-isolation). The PR-branch run already e2e-tested this commit,
+    # and nightly-e2e covers the deployed staging.
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
     # E2E points at the deployed STAGING worker — keeps CI simple
     # (no need to spin up next dev + a local Postgres) at the cost of
     # not testing the exact PR's code until it's deployed to staging.
