@@ -4,6 +4,11 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
+import {
+  GOVERNED_FIELDS,
+  loadOrgGovernance,
+  checkGovernedField,
+} from "@/lib/org/field-options";
 
 /**
  *   POST /api/users
@@ -166,6 +171,34 @@ export async function POST(request: Request) {
     { auth: { persistSession: false } }
   );
 
+  // ---- Master-data governance (migration 0055) ----
+  // Fields whose master list the Super Owner has populated are mandatory and
+  // restricted to the listed values; matches are canonicalized. Manager
+  // fields are mandatory when the org's toggle is on.
+  const gov = await loadOrgGovernance(svc, org.id as string);
+  const governed: Record<string, string | null> = {};
+  for (const field of GOVERNED_FIELDS) {
+    const check = checkGovernedField(gov, field, body[field]);
+    if (!check.ok) {
+      return NextResponse.json({ error: check.error }, { status: 400 });
+    }
+    governed[field] = check.canonical;
+  }
+  if (gov.requireManagers) {
+    if (!body.line_manager_id?.trim()) {
+      return NextResponse.json(
+        { error: "Line Manager (L1) is required." },
+        { status: 400 }
+      );
+    }
+    if (!body.indirect_manager_id?.trim()) {
+      return NextResponse.json(
+        { error: "Indirect Line Manager (L2) is required." },
+        { status: 400 }
+      );
+    }
+  }
+
   // ---- Find or create the auth.user ----
   let authUserId: string | null = null;
   let didInvite = false;
@@ -267,13 +300,13 @@ export async function POST(request: Request) {
     status,
     date_of_joining: body.date_of_joining?.trim() || null,
     grade: body.grade?.trim() || null,
-    designation: body.designation?.trim() || null,
-    job_role: body.job_role?.trim() || null,
+    designation: governed.designation,
+    job_role: governed.job_role,
     line_manager_id: body.line_manager_id?.trim() || null,
     indirect_manager_id: body.indirect_manager_id?.trim() || null,
-    node_id: body.node_id!.trim(),
-    city: body.city?.trim() || null,
-    state: body.state?.trim() || null,
+    node_id: governed.node_id ?? body.node_id!.trim(),
+    city: governed.city,
+    state: governed.state,
   };
 
   const memOp = priorMem

@@ -48,6 +48,28 @@ export default async function NewUserPage({
   // super_owner gate (only super_owners can assign super_owner role)
   const canAssignSuperOwner = role === "super_owner";
 
+  // Master-data governance: fields with Super-Owner-defined values render as
+  // required dropdowns limited to those values (migration 0055).
+  const [{ data: optRows }, { data: orgRow }] = await Promise.all([
+    supabase
+      .from("org_field_options")
+      .select("field, value")
+      .eq("organization_id", org.id)
+      .order("value", { ascending: true }),
+    supabase
+      .from("organizations")
+      .select("require_manager_fields")
+      .eq("id", org.id)
+      .maybeSingle(),
+  ]);
+  const fieldOptions: Record<string, string[]> = {};
+  for (const r of (optRows ?? []) as Array<{ field: string; value: string }>) {
+    (fieldOptions[r.field] ??= []).push(r.value);
+  }
+  const requireManagers =
+    (orgRow as { require_manager_fields?: boolean } | null)
+      ?.require_manager_fields === true;
+
   return (
     <div className="max-w-3xl">
       <Link
@@ -66,6 +88,8 @@ export default async function NewUserPage({
         orgSlug={orgSlug}
         managers={managers}
         canAssignSuperOwner={canAssignSuperOwner}
+        fieldOptions={fieldOptions}
+        requireManagers={requireManagers}
       />
     </div>
   );
