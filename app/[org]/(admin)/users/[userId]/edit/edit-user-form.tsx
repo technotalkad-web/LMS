@@ -35,12 +35,19 @@ export function EditUserForm({
   initial,
   managers,
   canAssignSuperOwner,
+  fieldOptions = {},
+  requireManagers = false,
 }: {
   orgSlug: string;
   userId: string;
   initial: UserDetail;
   managers: ManagerOption[];
   canAssignSuperOwner: boolean;
+  /** Master-data lists (migration 0055): field → allowed values. A field
+   *  with values here is mandatory and renders as a restricted dropdown. */
+  fieldOptions?: Record<string, string[]>;
+  /** Line Manager (L1) + Indirect Line Manager (L2) mandatory? */
+  requireManagers?: boolean;
 }) {
   const router = useRouter();
   const [form, setForm] = useState<UserDetail>(initial);
@@ -52,6 +59,46 @@ export function EditUserForm({
     setForm((f) => ({ ...f, [key]: value }));
     setSaved(false);
   }
+
+  // Governed Organization-details field (migration 0055): a restricted,
+  // required dropdown when master values exist; the legacy free-text input
+  // otherwise. A legacy value that's no longer in the master list renders
+  // the select empty, so the admin must pick a valid value to save.
+  const governed = (
+    label: string,
+    key: "designation" | "job_role" | "node_id" | "city" | "state",
+    extra?: { mono?: boolean }
+  ) => {
+    const opts = fieldOptions[key] ?? [];
+    const enforced = opts.length > 0;
+    return (
+      <Field label={label} required={enforced || key === "node_id"}>
+        {enforced ? (
+          <select
+            required
+            value={opts.includes(form[key]) ? form[key] : ""}
+            onChange={(e) => set(key, e.target.value)}
+            className="input"
+          >
+            <option value="">Select…</option>
+            {opts.map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            required={key === "node_id"}
+            value={form[key]}
+            onChange={(e) => set(key, e.target.value)}
+            className={`input${extra?.mono ? " font-mono" : ""}`}
+          />
+        )}
+      </Field>
+    );
+  };
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -212,35 +259,14 @@ export function EditUserForm({
               className="input"
             />
           </Field>
-          <Field label="Designation">
-            <input
-              type="text"
-              value={form.designation}
-              onChange={(e) => set("designation", e.target.value)}
-              className="input"
-            />
-          </Field>
+          {governed("Designation", "designation")}
 
-          <Field label="Job role / title">
-            <input
-              type="text"
-              value={form.job_role}
-              onChange={(e) => set("job_role", e.target.value)}
-              className="input"
-            />
-          </Field>
-          <Field label="Node ID (hierarchy branch)" required>
-            <input
-              type="text"
-              required
-              value={form.node_id}
-              onChange={(e) => set("node_id", e.target.value)}
-              className="input font-mono"
-            />
-          </Field>
+          {governed("Job role / title", "job_role")}
+          {governed("Node ID (hierarchy branch)", "node_id", { mono: true })}
 
-          <Field label="Line manager">
+          <Field label="Line manager" required={requireManagers}>
             <select
+              required={requireManagers}
               value={form.line_manager_id}
               onChange={(e) => set("line_manager_id", e.target.value)}
               className="input"
@@ -253,8 +279,9 @@ export function EditUserForm({
               ))}
             </select>
           </Field>
-          <Field label="Indirect line manager">
+          <Field label="Indirect line manager" required={requireManagers}>
             <select
+              required={requireManagers}
               value={form.indirect_manager_id}
               onChange={(e) => set("indirect_manager_id", e.target.value)}
               className="input"
@@ -268,22 +295,8 @@ export function EditUserForm({
             </select>
           </Field>
 
-          <Field label="City">
-            <input
-              type="text"
-              value={form.city}
-              onChange={(e) => set("city", e.target.value)}
-              className="input"
-            />
-          </Field>
-          <Field label="State / Territory">
-            <input
-              type="text"
-              value={form.state}
-              onChange={(e) => set("state", e.target.value)}
-              className="input"
-            />
-          </Field>
+          {governed("City", "city")}
+          {governed("State / Territory", "state")}
         </div>
       </section>
 

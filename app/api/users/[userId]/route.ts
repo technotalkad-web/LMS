@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import {
+  GOVERNED_FIELDS,
+  loadOrgGovernance,
+  checkGovernedField,
+} from "@/lib/org/field-options";
 
 /**
  *   PATCH /api/users/[userId]?orgSlug=...
@@ -126,6 +131,39 @@ export async function PATCH(
     { auth: { persistSession: false } }
   );
 
+  // ---- Master-data governance (migration 0055) ----
+  // Validate any governed field the caller is trying to set. Fields not in
+  // the payload stay untouched (legacy rows aren't force-backfilled by an
+  // unrelated edit), but a provided value must come from the master list
+  // and clearing a governed/mandatory field is rejected.
+  const gov = await loadOrgGovernance(svc, org.id as string);
+  const governed: Record<string, string | null> = {};
+  for (const field of GOVERNED_FIELDS) {
+    if (body[field] === undefined) continue;
+    const check = checkGovernedField(gov, field, body[field]);
+    if (!check.ok) {
+      return NextResponse.json({ error: check.error }, { status: 400 });
+    }
+    governed[field] = check.canonical;
+  }
+  if (gov.requireManagers) {
+    if (body.line_manager_id !== undefined && !body.line_manager_id.trim()) {
+      return NextResponse.json(
+        { error: "Line Manager (L1) is required." },
+        { status: 400 }
+      );
+    }
+    if (
+      body.indirect_manager_id !== undefined &&
+      !body.indirect_manager_id.trim()
+    ) {
+      return NextResponse.json(
+        { error: "Indirect Line Manager (L2) is required." },
+        { status: 400 }
+      );
+    }
+  }
+
   // ---- Profile update (only fields that were provided) ----
   const profileFields: Record<string, string | null> = {};
   if (body.first_name !== undefined)
@@ -187,16 +225,17 @@ export async function PATCH(
     memFields.date_of_joining = body.date_of_joining.trim() || null;
   if (body.grade !== undefined) memFields.grade = body.grade.trim() || null;
   if (body.designation !== undefined)
-    memFields.designation = body.designation.trim() || null;
+    memFields.designation = governed.designation ?? null;
   if (body.job_role !== undefined)
-    memFields.job_role = body.job_role.trim() || null;
+    memFields.job_role = governed.job_role ?? null;
   if (body.line_manager_id !== undefined)
     memFields.line_manager_id = body.line_manager_id.trim() || null;
   if (body.indirect_manager_id !== undefined)
     memFields.indirect_manager_id = body.indirect_manager_id.trim() || null;
-  if (body.node_id !== undefined) memFields.node_id = body.node_id.trim();
-  if (body.city !== undefined) memFields.city = body.city.trim() || null;
-  if (body.state !== undefined) memFields.state = body.state.trim() || null;
+  if (body.node_id !== undefined)
+    memFields.node_id = governed.node_id ?? body.node_id.trim();
+  if (body.city !== undefined) memFields.city = governed.city ?? null;
+  if (body.state !== undefined) memFields.state = governed.state ?? null;
 
   if (Object.keys(memFields).length > 0) {
     const { error: mErr } = await svc

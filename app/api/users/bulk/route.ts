@@ -4,6 +4,11 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
 import { checkQuota } from "@/lib/billing/enforce-quota";
+import {
+  GOVERNED_FIELDS,
+  loadOrgGovernance,
+  checkGovernedField,
+} from "@/lib/org/field-options";
 
 /**
  *   POST /api/users/bulk
@@ -114,6 +119,26 @@ export async function POST(request: Request) {
   for (const u of listed?.users ?? []) {
     if (u.email) userIdByEmail.set(u.email.toLowerCase(), u.id);
   }
+
+  // ---- Master-data governance (migration 0055), one load for all rows ----
+  const gov = await loadOrgGovernance(svc, org.id as string);
+
+  // line_manager_id / indirect_manager_id cells accept a user UUID or an
+  // email (resolved against auth users) — emails are what HR exports carry,
+  // and the mandatory-manager rule makes raw UUIDs impractical in CSVs.
+  const resolveManager = (
+    raw: string | undefined
+  ): { id: string | null; error?: string } => {
+    const v = (raw ?? "").trim();
+    if (!v) return { id: null };
+    if (v.includes("@")) {
+      const id = userIdByEmail.get(v.toLowerCase());
+      return id
+        ? { id }
+        : { id: null, error: `manager "${v}" not found` };
+    }
+    return { id: v };
+  };
 
   // ---- Quota + suspension gate (parity with POST /api/users) ----
   // The single-user create path calls checkQuota; this loop previously did
@@ -282,6 +307,59 @@ export async function POST(request: Request) {
       continue;
     }
 
+    // ---- Master-data governance: only Super-Owner-defined values pass ----
+    // CSV column "role" is the job_role/title field.
+    const csvKeyByField = {
+      designation: r.designation,
+      node_id: r.node_id,
+      job_role: r.role,
+      city: r.city,
+      state: r.state,
+    } as const;
+    const governedRow: Record<string, string | null> = {};
+    let governanceError: string | null = null;
+    for (const field of GOVERNED_FIELDS) {
+      const check = checkGovernedField(gov, field, csvKeyByField[field]);
+      if (!check.ok) {
+        governanceError = check.error;
+        break;
+      }
+      governedRow[field] = check.canonical;
+    }
+    if (governanceError) {
+      results.push({
+        row: rowNum,
+        email,
+        status: "skipped",
+        message: governanceError,
+      });
+      continue;
+    }
+
+    // Managers: accept UUID or email; mandatory when the org requires them.
+    const lm = resolveManager(r.line_manager_id);
+    const ilm = resolveManager(r.indirect_manager_id);
+    if (lm.error || ilm.error) {
+      results.push({
+        row: rowNum,
+        email,
+        status: "skipped",
+        message: lm.error ?? ilm.error,
+      });
+      continue;
+    }
+    if (gov.requireManagers && (!lm.id || !ilm.id)) {
+      results.push({
+        row: rowNum,
+        email,
+        status: "skipped",
+        message: !lm.id
+          ? "Line Manager (L1) is required."
+          : "Indirect Line Manager (L2) is required.",
+      });
+      continue;
+    }
+
     // ---- Find or create auth user ----
     let authUserId = userIdByEmail.get(email) ?? null;
     let createdThisRow: "created" | "invited" | null = null;
@@ -379,13 +457,13 @@ export async function POST(request: Request) {
       status,
       date_of_joining: r.doj?.trim() || null,
       grade: r.grade?.trim() || null,
-      designation: r.designation?.trim() || null,
-      job_role: r.role?.trim() || null,
-      line_manager_id: r.line_manager_id?.trim() || null,
-      indirect_manager_id: r.indirect_manager_id?.trim() || null,
-      node_id: r.node_id!.trim(),
-      city: r.city?.trim() || null,
-      state: r.state?.trim() || null,
+      designation: governedRow.designation,
+      job_role: governedRow.job_role,
+      line_manager_id: lm.id,
+      indirect_manager_id: ilm.id,
+      node_id: governedRow.node_id ?? r.node_id!.trim(),
+      city: governedRow.city,
+      state: governedRow.state,
     };
 
     const memOp = priorMem
