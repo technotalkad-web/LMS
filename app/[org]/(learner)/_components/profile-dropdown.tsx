@@ -16,12 +16,17 @@ type Theme = "light" | "dark";
 export function ProfileDropdown({
   orgSlug,
   email,
+  displayName,
+  avatarUrl,
   roleLabel,
   canSwitchToAdmin,
   brandColor = "#4f46e5",
 }: {
   orgSlug: string;
   email: string;
+  /** "First Last" when the profile has a name, else the email. */
+  displayName?: string;
+  avatarUrl?: string | null;
   roleLabel: string;
   canSwitchToAdmin: boolean;
   brandColor?: string;
@@ -63,8 +68,8 @@ export function ProfileDropdown({
     });
   }
 
-  const initial = email?.[0]?.toUpperCase() ?? "?";
-  const name = email?.split("@")[0] ?? "you";
+  const name = displayName || email?.split("@")[0] || "you";
+  const initial = name.trim()[0]?.toUpperCase() ?? "?";
 
   return (
     <div ref={ref} className="relative">
@@ -75,12 +80,21 @@ export function ProfileDropdown({
         aria-expanded={open}
         className="flex items-center gap-2 p-1 pr-2 rounded-full hover:bg-canvas border border-transparent hover:border-line transition"
       >
-        <span
-          className="inline-flex h-8 w-8 items-center justify-center rounded-full text-white text-sm font-medium ring-2 ring-paper"
-          style={{ background: brandColor }}
-        >
-          {initial}
-        </span>
+        {avatarUrl ? (
+          /* eslint-disable-next-line @next/next/no-img-element */
+          <img
+            src={avatarUrl}
+            alt=""
+            className="h-8 w-8 rounded-full object-cover object-center bg-canvas ring-2 ring-paper"
+          />
+        ) : (
+          <span
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full text-white text-sm font-medium ring-2 ring-paper"
+            style={{ background: brandColor }}
+          >
+            {initial}
+          </span>
+        )}
         <div className="hidden md:block text-left leading-tight">
           <div className="text-sm font-medium truncate max-w-[140px]">{name}</div>
           <div className="text-[11px] text-muted">{roleLabel}</div>
@@ -99,7 +113,10 @@ export function ProfileDropdown({
         >
           {/* Header */}
           <div className="px-4 py-3 border-b border-line">
-            <div className="text-sm font-medium truncate">{email}</div>
+            <div className="text-sm font-medium truncate">{name}</div>
+            {name !== email && (
+              <div className="text-xs text-muted truncate">{email}</div>
+            )}
             <div className="text-xs text-muted">{roleLabel}</div>
           </div>
 

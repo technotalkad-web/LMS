@@ -2,10 +2,8 @@ import Link from "next/link";
 import {
   BookOpen,
   AlertTriangle,
-  AlertCircle,
   Clock,
   PlayCircle,
-  CheckCircle2,
   Lock,
   ShieldAlert,
 } from "lucide-react";
@@ -94,6 +92,18 @@ export default async function DashboardPage({
   const { user, org, role } = await requireOrgAccess(orgSlug);
 
   const supabase = await createClient();
+
+  // 0.1) Own profile for the personalized welcome — "First Last", or the
+  // email when no name is set (own-row RLS read).
+  const { data: profRow } = await supabase
+    .from("profiles")
+    .select("first_name, last_name")
+    .eq("id", user.id)
+    .maybeSingle();
+  const displayName =
+    [profRow?.first_name, profRow?.last_name].filter(Boolean).join(" ").trim() ||
+    user.email ||
+    "";
 
   // 0) Teams this user is on.
   const { data: myTeamRows } = await supabase
@@ -276,7 +286,7 @@ export default async function DashboardPage({
         <EmptyDashboard
           orgName={org.name}
           role={role}
-          firstName={(user.email ?? "").split("@")[0]}
+          displayName={displayName}
         />
       </div>
     );
@@ -581,18 +591,38 @@ export default async function DashboardPage({
     seen.add(cid);
   }
 
-  // ----- Stats -----
-  const stats = {
-    assigned: cards.length,
-    // "Coming soon" cards count as not-started — they're assigned, unbegun work.
-    notStarted: cards.filter(
-      (c) => c.status === "not_started" || c.status === "upcoming"
-    ).length,
-    inProgress: cards.filter((c) => c.status === "in_progress").length,
-    completed: cards.filter(
-      (c) => c.status === "completed" || c.status === "passed"
-    ).length,
-  };
+  // 11) Learning paths join the course grid as labeled tiles (one card per
+  // path) instead of rendering as a separate section above it. They filter
+  // and count with everything else.
+  const pathCards: GridCard[] = paths.map((p) => {
+    const total = p.steps.length;
+    const done = p.steps.filter((s) => s.state === "completed").length;
+    const started =
+      done > 0 ||
+      attempts.some(
+        (a) =>
+          a.learning_path_id === p.id && a.completion_status !== "completed"
+      );
+    return {
+      course_id: p.id,
+      kind: "path" as const,
+      title: p.name,
+      description: p.description,
+      source: "user" as const,
+      status:
+        total > 0 && done >= total
+          ? ("completed" as const)
+          : started
+            ? ("in_progress" as const)
+            : ("not_started" as const),
+      isRevised: false,
+      dueAt: p.dueAt,
+      bestScore: null,
+      progressDone: done,
+      progressTotal: total,
+      thumbnail_url: p.thumbnail_url,
+    };
+  });
 
   const lockedTitle = sp.locked
     ? courseById.get(sp.locked)?.title ?? null
@@ -601,7 +631,6 @@ export default async function DashboardPage({
     ? courseById.get(sp.upcoming)?.title ?? null
     : null;
   const upcomingReleaseAt = sp.upcoming ? effectiveReleaseFor(sp.upcoming) : null;
-  const firstName = (user.email ?? "").split("@")[0];
 
   return (
     <div className="space-y-8">
@@ -614,7 +643,7 @@ export default async function DashboardPage({
       <header className="flex flex-col md:flex-row md:items-end justify-between gap-3">
         <div>
           <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">
-            Welcome back{firstName ? `, ${firstName}` : ""}.
+            Welcome back{displayName ? `, ${displayName}` : ""}.
           </h1>
           <p className="text-muted mt-1 text-sm">
             A learning curve is essential to growth. Pick up where you left off.
@@ -744,267 +773,29 @@ export default async function DashboardPage({
           Sits below the urgency callout — deadlines outrank gamification. */}
       <MotivationStrip orgSlug={orgSlug} data={myGamification} avgScore={avgScore} />
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-        <Stat
-          label="Assigned"
-          value={stats.assigned}
-          icon={<BookOpen className="w-5 h-5" />}
-          tone="indigo"
-        />
-        <Stat
-          label="Not started"
-          value={stats.notStarted}
-          icon={<AlertCircle className="w-5 h-5" />}
-          tone="slate"
-        />
-        <Stat
-          label="In progress"
-          value={stats.inProgress}
-          icon={<PlayCircle className="w-5 h-5" />}
-          tone="amber"
-        />
-        <Stat
-          label="Completed"
-          value={stats.completed}
-          icon={<CheckCircle2 className="w-5 h-5" />}
-          tone="emerald"
-        />
-      </div>
-
-      {/* Learning paths */}
-      {paths.length > 0 && (
-        <LearningPathsSection paths={paths} orgSlug={orgSlug} />
-      )}
-
-      {/* Filterable course grid */}
-      <DashboardGrid cards={cards} orgSlug={orgSlug} />
+      {/* Clickable status chips + filterable grid (paths render as labeled
+          tiles ahead of the course cards; the chips filter both). */}
+      <DashboardGrid cards={[...pathCards, ...cards]} orgSlug={orgSlug} />
     </div>
   );
 }
 
 /* -------- subcomponents -------- */
 
-function Stat({
-  label,
-  value,
-  icon,
-  tone,
-}: {
-  label: string;
-  value: number;
-  icon: React.ReactNode;
-  tone: "indigo" | "amber" | "emerald" | "slate";
-}) {
-  const tones = {
-    indigo: "text-indigo-600 bg-indigo-50",
-    amber: "text-amber-600 bg-amber-50",
-    emerald: "text-emerald-600 bg-emerald-50",
-    slate: "text-slate-500 bg-canvas",
-  };
-  return (
-    <div className="bg-paper border border-line rounded-2xl p-4 sm:p-5 flex items-center justify-between gap-2">
-      <div>
-        <p className="text-xs text-muted font-medium mb-1">{label}</p>
-        <p className="text-3xl font-semibold tracking-tight">{value}</p>
-      </div>
-      <div className={`shrink-0 p-2.5 rounded-xl ${tones[tone]}`}>{icon}</div>
-    </div>
-  );
-}
-
-function LearningPathsSection({
-  paths,
-  orgSlug,
-}: {
-  paths: PathSummary[];
-  orgSlug: string;
-}) {
-  return (
-    <section className="space-y-3">
-      <div className="flex items-baseline justify-between">
-        <h2 className="text-xl font-semibold tracking-tight">
-          Your learning paths
-        </h2>
-        <p className="text-muted text-xs">
-          Complete steps in order to unlock the next.
-        </p>
-      </div>
-      <ul className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-        {paths.map((p) => {
-          const total = p.steps.length;
-          const done = p.steps.filter((s) => s.state === "completed").length;
-          const pct = total === 0 ? 0 : Math.round((done / total) * 100);
-          const due = p.dueAt
-            ? new Date(p.dueAt).toISOString().slice(0, 10)
-            : null;
-          const overdue = p.dueAt
-            ? new Date(p.dueAt).getTime() < Date.now() && done < total
-            : false;
-          return (
-            <li
-              key={p.id}
-              className="border border-line rounded-2xl bg-paper overflow-hidden"
-            >
-              <Link
-                href={`/${orgSlug}/paths/${p.id}`}
-                className="block relative bg-gradient-to-br from-indigo-600 to-indigo-800 text-white p-5 hover:from-indigo-700 hover:to-indigo-900 transition-colors overflow-hidden"
-              >
-                {p.thumbnail_url && (
-                  <>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={p.thumbnail_url}
-                      alt=""
-                      className="absolute inset-0 w-full h-full object-cover"
-                    />
-                    <div className="absolute inset-0 bg-gradient-to-br from-indigo-900/80 to-indigo-900/95" />
-                  </>
-                )}
-                <div className="relative flex items-center justify-between mb-1">
-                  <div className="text-[10px] uppercase tracking-wider font-semibold opacity-80">
-                    Learning Path
-                  </div>
-                  <span className="text-[10px] uppercase tracking-wide opacity-80">
-                    View path →
-                  </span>
-                </div>
-                <h3 className="relative text-lg font-semibold leading-tight">
-                  {p.name}
-                </h3>
-                {p.description && (
-                  <p className="relative text-xs mt-1 opacity-90 line-clamp-2">
-                    {p.description}
-                  </p>
-                )}
-                <div className="relative mt-4">
-                  <div className="flex justify-between text-[11px] font-medium opacity-90 mb-1">
-                    <span>
-                      {done}/{total} complete
-                    </span>
-                    {due && (
-                      <span className={overdue ? "text-red-200" : ""}>
-                        {overdue ? "Overdue " : "Due "}
-                        {due}
-                      </span>
-                    )}
-                  </div>
-                  <div className="w-full bg-white/20 rounded-full h-1.5 overflow-hidden">
-                    <div
-                      className="h-full bg-white rounded-full transition-all"
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                </div>
-              </Link>
-
-              <ol className="p-4 space-y-2">
-                {p.steps.map((s) => (
-                  <li
-                    key={s.course_id}
-                    className="flex items-center gap-3 text-sm"
-                  >
-                    <PathBadge state={s.state} step={s.step_number} />
-                    {s.state === "current" ? (
-                      <Link
-                        href={`/${orgSlug}/courses/${s.course_id}/launch?lp=${p.id}`}
-                        className="font-medium hover:underline flex-1 truncate"
-                      >
-                        {s.title}
-                      </Link>
-                    ) : s.state === "completed" ? (
-                      <Link
-                        href={`/${orgSlug}/courses/${s.course_id}`}
-                        className="text-muted hover:text-ink hover:underline flex-1 truncate"
-                      >
-                        {s.title}
-                      </Link>
-                    ) : (
-                      <span className="text-muted flex-1 truncate">
-                        {s.title}
-                      </span>
-                    )}
-                    {s.state === "unreleased" && s.releaseAt && (
-                      <span className="text-[11px] text-sky-700 shrink-0 inline-flex items-center gap-1">
-                        <Clock className="w-3 h-3" />
-                        <LocalDateTime iso={s.releaseAt} />
-                      </span>
-                    )}
-                    {s.state === "locked" && (
-                      <Lock className="w-3.5 h-3.5 text-muted shrink-0" />
-                    )}
-                  </li>
-                ))}
-              </ol>
-            </li>
-          );
-        })}
-      </ul>
-    </section>
-  );
-}
-
-function PathBadge({
-  state,
-  step,
-}: {
-  state: PathStepView["state"];
-  step: number;
-}) {
-  if (state === "completed") {
-    return (
-      <span
-        className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 text-[10px] shrink-0"
-        aria-label="Completed"
-      >
-        ✓
-      </span>
-    );
-  }
-  if (state === "current") {
-    return (
-      <span
-        className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-indigo-600 text-white text-xs font-semibold shrink-0"
-        aria-label="Current step"
-      >
-        {step}
-      </span>
-    );
-  }
-  if (state === "unreleased") {
-    return (
-      <span
-        className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-sky-100 text-sky-700 shrink-0"
-        aria-label="Not released yet"
-      >
-        <Clock className="w-3.5 h-3.5" />
-      </span>
-    );
-  }
-  return (
-    <span
-      className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-line text-muted text-xs shrink-0"
-      aria-label="Locked"
-    >
-      {step}
-    </span>
-  );
-}
-
 function EmptyDashboard({
   orgName,
   role,
-  firstName,
+  displayName,
 }: {
   orgName: string;
   role: OrgRole;
-  firstName: string;
+  displayName: string;
 }) {
   const canUpload = role === "super_owner" || role === "admin";
   return (
     <div className="max-w-3xl">
       <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">
-        Welcome to {orgName}{firstName ? `, ${firstName}` : ""}.
+        Welcome to {orgName}{displayName ? `, ${displayName}` : ""}.
       </h1>
       <p className="text-muted mt-1 text-sm mb-8">
         Nothing&apos;s been assigned to you yet.
