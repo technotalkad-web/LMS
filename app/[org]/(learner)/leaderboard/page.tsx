@@ -207,10 +207,37 @@ export default async function LeaderboardPage({
     .maybeSingle();
   const mine = (mineRaw as Row | null) ?? null;
 
-  // Identity hydration: designation/city/team names in three batched queries.
+  // Identity hydration: designation/city/team names in batched queries.
   const userIds = Array.from(
     new Set([...rows.map((r) => r.user_id), ...(mine ? [mine.user_id] : [])])
   );
+
+  // Freshness overlay: mv_leaderboard snapshots name/avatar and lags up to
+  // 15 minutes behind, so a just-uploaded photo (or renamed profile) looked
+  // broken on the podium. Ranks/XP may lag — identity must not.
+  const { data: profRows } = userIds.length
+    ? await svc
+        .from("profiles")
+        .select("id, first_name, last_name, avatar_url")
+        .in("id", userIds)
+    : { data: [] };
+  const profById = new Map(
+    ((profRows ?? []) as Array<{
+      id: string;
+      first_name: string | null;
+      last_name: string | null;
+      avatar_url: string | null;
+    }>).map((p) => [p.id, p])
+  );
+  for (const r of [...rows, ...(mine ? [mine] : [])]) {
+    const p = profById.get(r.user_id);
+    if (p) {
+      r.first_name = p.first_name;
+      r.last_name = p.last_name;
+      r.avatar_url = p.avatar_url;
+    }
+  }
+
   const { data: memRows } = userIds.length
     ? await svc
         .from("organization_members")
