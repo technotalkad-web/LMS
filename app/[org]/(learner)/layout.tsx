@@ -61,16 +61,35 @@ export default async function LearnerLayout({
   // Gamification: hide the Leaderboard nav item when boards are disabled.
   // One PK-indexed read (members can read their org's settings under RLS);
   // fail-open to visible — the page itself self-defends when disabled.
+  // Profile (own-row RLS read) rides the same round trip for the nav's
+  // display name + photo; both fail-soft to the email-only header.
   let showLeaderboard = true;
+  let displayName = user.email ?? "you";
+  let avatarUrl: string | null = null;
   try {
     const supabase = await createClient();
-    const { data: gs } = await supabase
-      .from("gamification_settings")
-      .select("enabled, leaderboard_enabled")
-      .eq("organization_id", org.id)
-      .maybeSingle();
+    const [{ data: gs }, { data: prof }] = await Promise.all([
+      supabase
+        .from("gamification_settings")
+        .select("enabled, leaderboard_enabled")
+        .eq("organization_id", org.id)
+        .maybeSingle(),
+      supabase
+        .from("profiles")
+        .select("first_name, last_name, avatar_url")
+        .eq("id", user.id)
+        .maybeSingle(),
+    ]);
     if (gs && (gs.enabled === false || gs.leaderboard_enabled === false)) {
       showLeaderboard = false;
+    }
+    if (prof) {
+      const name = [prof.first_name, prof.last_name]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      if (name) displayName = name;
+      avatarUrl = (prof.avatar_url as string | null) ?? null;
     }
   } catch {
     // fail-open
@@ -111,6 +130,8 @@ export default async function LearnerLayout({
           <ProfileDropdown
             orgSlug={org.slug}
             email={user.email ?? "you"}
+            displayName={displayName}
+            avatarUrl={avatarUrl}
             roleLabel={roleLabel(role)}
             canSwitchToAdmin={canSwitch}
             brandColor={brandColor}
