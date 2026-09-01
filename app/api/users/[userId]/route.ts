@@ -40,6 +40,8 @@ type Body = {
   node_id?: string;
   city?: string;
   state?: string;
+  business_vertical?: string;
+  branch?: string;
 };
 
 export async function PATCH(
@@ -236,6 +238,9 @@ export async function PATCH(
     memFields.node_id = governed.node_id ?? body.node_id.trim();
   if (body.city !== undefined) memFields.city = governed.city ?? null;
   if (body.state !== undefined) memFields.state = governed.state ?? null;
+  if (body.business_vertical !== undefined)
+    memFields.business_vertical = governed.business_vertical ?? null;
+  if (body.branch !== undefined) memFields.branch = governed.branch ?? null;
 
   if (Object.keys(memFields).length > 0) {
     const { error: mErr } = await svc

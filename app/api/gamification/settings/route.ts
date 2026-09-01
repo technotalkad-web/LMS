@@ -39,6 +39,7 @@ const BOOL_FIELDS = [
   "board_most_improved",
   "board_longest_streak",
   "board_team",
+  "leaderboard_team_leader_view",
 ] as const;
 
 export async function POST(request: Request) {

@@ -44,6 +44,8 @@ type CreateUserBody = {
   node_id: string;
   city?: string;
   state?: string;
+  business_vertical?: string;
+  branch?: string;
 };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -307,6 +309,8 @@ export async function POST(request: Request) {
     node_id: governed.node_id ?? body.node_id!.trim(),
     city: governed.city,
     state: governed.state,
+    business_vertical: governed.business_vertical,
+    branch: governed.branch,
   };
 
   const memOp = priorMem

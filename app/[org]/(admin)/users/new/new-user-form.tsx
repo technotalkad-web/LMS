@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { OPTIONAL_FIELDS, type GovernedField } from "@/lib/org/field-options";
 
 export type ManagerOption = { user_id: string; email: string };
 
@@ -30,6 +31,8 @@ type FormState = {
   node_id: string;
   city: string;
   state: string;
+  business_vertical: string;
+  branch: string;
 };
 
 const INITIAL: FormState = {
@@ -53,6 +56,8 @@ const INITIAL: FormState = {
   node_id: "",
   city: "",
   state: "",
+  business_vertical: "",
+  branch: "",
 };
 
 export function NewUserForm({
@@ -102,24 +107,26 @@ export function NewUserForm({
 
   // Governed Organization-details field: renders a restricted, required
   // dropdown when the Super Owner has defined master values for it, and the
-  // legacy free-text input otherwise (node_id stays required either way).
+  // legacy free-text input otherwise (node_id stays required either way;
+  // business_vertical is restricted but optional — see lib/org/field-options).
   const governed = (
     label: string,
-    key: "designation" | "job_role" | "node_id" | "city" | "state",
+    key: Extract<GovernedField, keyof FormState>,
     extra?: { mono?: boolean; placeholder?: string }
   ) => {
     const opts = fieldOptions[key] ?? [];
-    const enforced = opts.length > 0;
+    const optional = OPTIONAL_FIELDS.has(key);
+    const enforced = opts.length > 0 && !optional;
     return (
       <Field label={label} required={enforced || key === "node_id"}>
-        {enforced ? (
+        {opts.length > 0 ? (
           <select
-            required
+            required={enforced}
             value={form[key]}
             onChange={(e) => set(key, e.target.value)}
             className="input"
           >
-            <option value="">Select…</option>
+            <option value="">{optional ? "—" : "Select…"}</option>
             {opts.map((v) => (
               <option key={v} value={v}>
                 {v}
@@ -371,7 +378,10 @@ export function NewUserForm({
           </Field>
 
           {governed("City", "city")}
+          {governed("Branch", "branch")}
+
           {governed("State / Territory", "state")}
+          {governed("Business vertical", "business_vertical")}
         </div>
       </section>
 
