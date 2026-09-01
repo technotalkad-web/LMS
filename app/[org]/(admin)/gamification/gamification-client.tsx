@@ -594,12 +594,12 @@ function PrivacyTab({
           Boards
         </div>
         <div className="divide-y divide-line">
-          <Toggle field="board_overall" label="Overall" />
-          <Toggle field="board_most_active" label="Most Active" />
-          <Toggle field="board_highest_scorer" label="Highest Scorer" />
-          <Toggle field="board_most_improved" label="Most Improved" />
-          <Toggle field="board_longest_streak" label="Longest Streak" />
-          <Toggle field="board_team" label="Verticals" hint="City → Branch → Team Leader → Members performance inside each business vertical" />
+          <Toggle field="board_overall" label="🏆 Champions" hint="Overall XP ranking" />
+          <Toggle field="board_most_active" label="🔥 On Fire" hint="Most active days in the last 30 days" />
+          <Toggle field="board_highest_scorer" label="🎯 Top Scorers" hint="Highest average course score" />
+          <Toggle field="board_most_improved" label="🚀 Rising Stars" hint="Biggest XP climb in the last 30 days" />
+          <Toggle field="board_longest_streak" label="⚡ Streak Masters" hint="Longest daily learning streak" />
+          <Toggle field="board_team" label="🏢 Team Battle" hint="City → Branch → Team Leader → Members performance inside each business vertical" />
           <Toggle
             field="leaderboard_team_leader_view"
             label="Team leaders see member details"
