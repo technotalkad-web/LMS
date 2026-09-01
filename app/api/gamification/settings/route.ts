@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { BOARD_KEYS, COPY_LIMITS } from "@/lib/gamification/board-copy";
 
 /**
  *   POST /api/gamification/settings
@@ -147,6 +148,71 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "Invalid timezone" }, { status: 400 });
       }
       update.timezone = body.timezone.trim();
+    }
+  } else if (body.section === "copy") {
+    // Org-editable engagement copy (migration 0057). Empty string = reset
+    // to the built-in default (stored as null).
+    const text = (v: unknown, max: number, label: string): string | null => {
+      if (typeof v !== "string") {
+        throw new Error(`${label} must be a string`);
+      }
+      const t = v.trim();
+      if (t.length > max) {
+        throw new Error(`${label} must be at most ${max} characters`);
+      }
+      return t || null;
+    };
+    try {
+      if (body.leaderboard_title !== undefined) {
+        update.leaderboard_title = text(
+          body.leaderboard_title,
+          COPY_LIMITS.leaderboardTitle,
+          "Leaderboard title"
+        );
+      }
+      if (body.welcome_message !== undefined) {
+        update.welcome_message = text(
+          body.welcome_message,
+          COPY_LIMITS.welcomeMessage,
+          "Welcome message"
+        );
+      }
+      if (body.board_labels !== undefined) {
+        const raw = body.board_labels;
+        if (raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
+          return NextResponse.json(
+            { error: "board_labels must be an object" },
+            { status: 400 }
+          );
+        }
+        const cleaned: Record<string, { name?: string; tagline?: string }> = {};
+        for (const key of BOARD_KEYS) {
+          const o = (raw as Record<string, unknown> | null)?.[key];
+          if (!o || typeof o !== "object") continue;
+          const name = text(
+            (o as { name?: unknown }).name ?? "",
+            COPY_LIMITS.boardName,
+            `${key} name`
+          );
+          const tagline = text(
+            (o as { tagline?: unknown }).tagline ?? "",
+            COPY_LIMITS.boardTagline,
+            `${key} tagline`
+          );
+          if (name || tagline) {
+            cleaned[key] = {
+              ...(name ? { name } : {}),
+              ...(tagline ? { tagline } : {}),
+            };
+          }
+        }
+        update.board_labels = Object.keys(cleaned).length > 0 ? cleaned : null;
+      }
+    } catch (e) {
+      return NextResponse.json(
+        { error: e instanceof Error ? e.message : "Invalid copy" },
+        { status: 400 }
+      );
     }
   } else {
     return NextResponse.json({ error: "Unknown section" }, { status: 400 });

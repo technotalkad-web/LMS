@@ -21,6 +21,7 @@ import {
   MotivationStrip,
   type MyGamification,
 } from "./_components/motivation-strip";
+import { DEFAULT_WELCOME_MESSAGE } from "@/lib/gamification/board-copy";
 
 type Course = {
   id: string;
@@ -104,6 +105,21 @@ export default async function DashboardPage({
     [profRow?.first_name, profRow?.last_name].filter(Boolean).join(" ").trim() ||
     user.email ||
     "";
+
+  // 0.2) Org-editable welcome line (migration 0057; members can read their
+  // org's gamification_settings under RLS). Fail-soft to the default — a
+  // pre-0057 database errors this select and we just keep the default.
+  let welcomeMessage = DEFAULT_WELCOME_MESSAGE;
+  const { data: gsw } = await supabase
+    .from("gamification_settings")
+    .select("welcome_message")
+    .eq("organization_id", org.id)
+    .maybeSingle();
+  const customWelcome = (gsw as { welcome_message?: string | null } | null)
+    ?.welcome_message;
+  if (typeof customWelcome === "string" && customWelcome.trim()) {
+    welcomeMessage = customWelcome.trim();
+  }
 
   // 0) Teams this user is on.
   const { data: myTeamRows } = await supabase
@@ -645,9 +661,7 @@ export default async function DashboardPage({
           <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">
             Welcome back{displayName ? `, ${displayName}` : ""}.
           </h1>
-          <p className="text-muted mt-1 text-sm">
-            A learning curve is essential to growth. Pick up where you left off.
-          </p>
+          <p className="text-muted mt-1 text-sm">{welcomeMessage}</p>
         </div>
       </header>
 
