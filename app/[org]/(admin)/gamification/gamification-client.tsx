@@ -9,6 +9,15 @@ import { TabStrip, type Tab } from "@/components/admin/tab-strip";
 import { StatusPill } from "@/components/admin/role-pill";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
+import {
+  BOARD_KEYS,
+  COPY_LIMITS,
+  DEFAULT_BOARD_COPY,
+  DEFAULT_LEADERBOARD_TITLE,
+  DEFAULT_WELCOME_MESSAGE,
+  effectiveBoardCopy,
+  type BoardCopyKey,
+} from "@/lib/gamification/board-copy";
 
 export type GamificationSettings = {
   organization_id: string;
@@ -33,6 +42,10 @@ export type GamificationSettings = {
   daily_xp_cap: number;
   min_completion_seconds: number;
   level_thresholds: Array<{ level: number; name: string; xp: number }> | null;
+  // Org-editable engagement copy (0057); null/missing = built-in defaults.
+  board_labels?: unknown;
+  leaderboard_title?: string | null;
+  welcome_message?: string | null;
 };
 
 export type BadgeRow = {
@@ -123,7 +136,12 @@ export function GamificationClient({
       {tab === "xp" && <XpRulesTab orgSlug={orgSlug} settings={settings} />}
       {tab === "levels" && <LevelsTab orgSlug={orgSlug} settings={settings} />}
       {tab === "badges" && <BadgesTab orgSlug={orgSlug} badges={badges} />}
-      {tab === "privacy" && <PrivacyTab orgSlug={orgSlug} settings={settings} />}
+      {tab === "privacy" && (
+        <>
+          <PrivacyTab orgSlug={orgSlug} settings={settings} />
+          <CopySection orgSlug={orgSlug} settings={settings} />
+        </>
+      )}
     </div>
   );
 }
@@ -554,6 +572,8 @@ function PrivacyTab({
     leaderboard_team_leader_view: settings?.leaderboard_team_leader_view !== false,
   });
   const { busy, error, saved, save } = useSectionSave();
+  // Toggle labels show the org's effective (possibly customized) board names.
+  const boardCopy = effectiveBoardCopy(settings?.board_labels);
 
   const Toggle = ({
     field,
@@ -594,12 +614,12 @@ function PrivacyTab({
           Boards
         </div>
         <div className="divide-y divide-line">
-          <Toggle field="board_overall" label="🏆 Champions" hint="Overall XP ranking" />
-          <Toggle field="board_most_active" label="🔥 On Fire" hint="Most active days in the last 30 days" />
-          <Toggle field="board_highest_scorer" label="🎯 Top Scorers" hint="Highest average course score" />
-          <Toggle field="board_most_improved" label="🚀 Rising Stars" hint="Biggest XP climb in the last 30 days" />
-          <Toggle field="board_longest_streak" label="⚡ Streak Masters" hint="Longest daily learning streak" />
-          <Toggle field="board_team" label="🏢 Team Battle" hint="City → Branch → Team Leader → Members performance inside each business vertical" />
+          <Toggle field="board_overall" label={boardCopy.overall.name} hint="Overall XP ranking" />
+          <Toggle field="board_most_active" label={boardCopy.active.name} hint="Most active days in the last 30 days" />
+          <Toggle field="board_highest_scorer" label={boardCopy.scorer.name} hint="Highest average course score" />
+          <Toggle field="board_most_improved" label={boardCopy.improved.name} hint="Biggest XP climb in the last 30 days" />
+          <Toggle field="board_longest_streak" label={boardCopy.streak.name} hint="Longest daily learning streak" />
+          <Toggle field="board_team" label={boardCopy.vertical.name} hint="City → Branch → Team Leader → Members performance inside each business vertical" />
           <Toggle
             field="leaderboard_team_leader_view"
             label="Team leaders see member details"
@@ -612,6 +632,120 @@ function PrivacyTab({
         error={error}
         saved={saved}
         onSave={() => save({ orgSlug, section: "leaderboard", ...form })}
+      />
+    </SectionCard>
+  );
+}
+
+/**
+ * Org-editable engagement copy (0057): board names + taglines, the
+ * leaderboard page title and the dashboard welcome line. Empty fields fall
+ * back to the built-in defaults (shown as placeholders), so clearing a
+ * field is how you reset it.
+ */
+function CopySection({
+  orgSlug,
+  settings,
+}: {
+  orgSlug: string;
+  settings: GamificationSettings | null;
+}) {
+  const raw = (settings?.board_labels ?? {}) as Partial<
+    Record<BoardCopyKey, { name?: string; tagline?: string }>
+  >;
+  const [labels, setLabels] = useState<
+    Record<BoardCopyKey, { name: string; tagline: string }>
+  >(() => {
+    const init = {} as Record<BoardCopyKey, { name: string; tagline: string }>;
+    for (const k of BOARD_KEYS) {
+      init[k] = { name: raw?.[k]?.name ?? "", tagline: raw?.[k]?.tagline ?? "" };
+    }
+    return init;
+  });
+  const [title, setTitle] = useState(settings?.leaderboard_title ?? "");
+  const [welcome, setWelcome] = useState(settings?.welcome_message ?? "");
+  const { busy, error, saved, save } = useSectionSave();
+
+  const setField = (k: BoardCopyKey, field: "name" | "tagline", v: string) =>
+    setLabels((l) => ({ ...l, [k]: { ...l[k], [field]: v } }));
+
+  return (
+    <SectionCard
+      title="Names & messages"
+      description="Rename the boards and their one-line hooks for your organization. Empty fields use the defaults shown in grey — clear a field to reset it."
+    >
+      <div className="grid grid-cols-1 gap-3">
+        <label className="block">
+          <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+            Leaderboard page title
+          </span>
+          <input
+            type="text"
+            value={title}
+            maxLength={COPY_LIMITS.leaderboardTitle}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder={DEFAULT_LEADERBOARD_TITLE}
+            className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+          />
+        </label>
+        <label className="block">
+          <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+            Dashboard welcome line
+          </span>
+          <input
+            type="text"
+            value={welcome}
+            maxLength={COPY_LIMITS.welcomeMessage}
+            onChange={(e) => setWelcome(e.target.value)}
+            placeholder={DEFAULT_WELCOME_MESSAGE}
+            className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+          />
+        </label>
+      </div>
+
+      <div>
+        <div className="text-[11px] uppercase tracking-wider font-semibold text-muted mt-2 mb-2">
+          Board names &amp; taglines
+        </div>
+        <div className="space-y-3">
+          {BOARD_KEYS.map((k) => (
+            <div key={k} className="grid grid-cols-1 sm:grid-cols-[200px_1fr] gap-2">
+              <input
+                type="text"
+                value={labels[k].name}
+                maxLength={COPY_LIMITS.boardName}
+                onChange={(e) => setField(k, "name", e.target.value)}
+                placeholder={DEFAULT_BOARD_COPY[k].name}
+                aria-label={`${k} board name`}
+                className="px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+              />
+              <input
+                type="text"
+                value={labels[k].tagline}
+                maxLength={COPY_LIMITS.boardTagline}
+                onChange={(e) => setField(k, "tagline", e.target.value)}
+                placeholder={DEFAULT_BOARD_COPY[k].tagline}
+                aria-label={`${k} board tagline`}
+                className="px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <SaveRow
+        busy={busy}
+        error={error}
+        saved={saved}
+        onSave={() =>
+          save({
+            orgSlug,
+            section: "copy",
+            leaderboard_title: title,
+            welcome_message: welcome,
+            board_labels: labels,
+          })
+        }
       />
     </SectionCard>
   );

@@ -7,6 +7,12 @@ import { Avatar } from "@/components/ui/avatar";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 import { Podium, type PodiumEntry } from "./_components/podium";
 import { VerticalBoard } from "./_components/vertical-board";
+import {
+  effectiveBoardCopy,
+  DEFAULT_LEADERBOARD_TITLE,
+  type BoardCopy,
+  type BoardCopyKey,
+} from "@/lib/gamification/board-copy";
 
 export const dynamic = "force-dynamic";
 
@@ -18,47 +24,19 @@ export const dynamic = "force-dynamic";
  * (?board=...), no client state.
  */
 
+// Structural board config. Names + taglines are org-editable copy — see
+// lib/gamification/board-copy.ts for defaults and the override merge.
 const BOARDS = {
-  overall: {
-    label: "🏆 Champions",
-    tagline: "Who's ruling the leaderboard?",
-    rankCol: "rank_overall",
-    metricLabel: "XP",
-  },
-  active: {
-    label: "🔥 On Fire",
-    tagline: "Who's putting in the work every day?",
-    rankCol: "rank_most_active",
-    metricLabel: "active days (30d)",
-  },
-  scorer: {
-    label: "🎯 Top Scorers",
-    tagline: "Who's turning learning into points?",
-    rankCol: "rank_highest_scorer",
-    metricLabel: "avg score",
-  },
-  improved: {
-    label: "🚀 Rising Stars",
-    tagline: "Who's leveling up the fastest?",
-    rankCol: "rank_most_improved",
-    metricLabel: "XP gained (30d)",
-  },
-  streak: {
-    label: "⚡ Streak Masters",
-    tagline: "Who just won't stop?",
-    rankCol: "rank_longest_streak",
-    metricLabel: "days",
-  },
+  overall: { rankCol: "rank_overall", metricLabel: "XP" },
+  active: { rankCol: "rank_most_active", metricLabel: "active days (30d)" },
+  scorer: { rankCol: "rank_highest_scorer", metricLabel: "avg score" },
+  improved: { rankCol: "rank_most_improved", metricLabel: "XP gained (30d)" },
+  streak: { rankCol: "rank_longest_streak", metricLabel: "days" },
   // Replaced the old Teams (avg-XP) board: City → Branch → Team Leader →
   // Members performance inside the viewer's business vertical. rankCol is
   // null on purpose — this board has no rank column and returns before the
   // generic mv_leaderboard query below.
-  vertical: {
-    label: "🏢 Team Battle",
-    tagline: "Which vertical is leading the race?",
-    rankCol: null,
-    metricLabel: "",
-  },
+  vertical: { rankCol: null, metricLabel: "" },
 } as const;
 type BoardKey = keyof typeof BOARDS;
 
@@ -159,6 +137,13 @@ export default async function LeaderboardPage({
     );
   }
 
+  // Org-editable copy (0057): board names/taglines + page title, defaulted.
+  const gsx = gsRow as Record<string, unknown> | null;
+  const copy = effectiveBoardCopy(gsx?.board_labels);
+  const pageTitle =
+    (typeof gsx?.leaderboard_title === "string" && gsx.leaderboard_title.trim()) ||
+    DEFAULT_LEADERBOARD_TITLE;
+
   const boardEnabled: Record<BoardKey, boolean> = {
     overall: gs.board_overall !== false,
     active: gs.board_most_active !== false,
@@ -185,10 +170,11 @@ export default async function LeaderboardPage({
       <div className="max-w-4xl mx-auto space-y-6">
         <Header
           orgSlug={orgSlug}
+          title={pageTitle}
           refreshedAt={(fresh as { refreshed_at?: string } | null)?.refreshed_at ?? null}
         />
-        <BoardTabs orgSlug={orgSlug} active="vertical" visible={visibleBoards} />
-        <p className="text-sm text-muted -mt-3">{BOARDS.vertical.tagline}</p>
+        <BoardTabs orgSlug={orgSlug} active="vertical" visible={visibleBoards} labels={copy} />
+        <p className="text-sm text-muted -mt-3">{copy.vertical.tagline}</p>
         <VerticalBoard
           orgId={org.id as string}
           orgSlug={orgSlug}
@@ -304,9 +290,9 @@ export default async function LeaderboardPage({
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
-      <Header orgSlug={orgSlug} refreshedAt={rows[0]?.refreshed_at ?? null} />
-      <BoardTabs orgSlug={orgSlug} active={activeBoard} visible={visibleBoards} />
-      <p className="text-sm text-muted -mt-3">{BOARDS[activeBoard].tagline}</p>
+      <Header orgSlug={orgSlug} title={pageTitle} refreshedAt={rows[0]?.refreshed_at ?? null} />
+      <BoardTabs orgSlug={orgSlug} active={activeBoard} visible={visibleBoards} labels={copy} />
+      <p className="text-sm text-muted -mt-3">{copy[activeBoard].tagline}</p>
 
       {mine?.hidden && (
         <div className="border border-line bg-canvas/60 rounded-xl px-4 py-2.5 text-xs text-muted flex items-center gap-2">
@@ -379,16 +365,18 @@ export default async function LeaderboardPage({
 
 function Header({
   orgSlug,
+  title,
   refreshedAt,
 }: {
   orgSlug: string;
+  title: string;
   refreshedAt: string | null;
 }) {
   void orgSlug;
   return (
     <header>
       <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">
-        Leaderboard
+        {title}
       </h1>
       <p className="text-muted mt-1 text-sm flex items-center gap-1.5">
         <Clock className="w-3.5 h-3.5" />
@@ -408,10 +396,12 @@ function BoardTabs({
   orgSlug,
   active,
   visible,
+  labels,
 }: {
   orgSlug: string;
   active: BoardKey;
   visible: BoardKey[];
+  labels: Record<BoardCopyKey, BoardCopy>;
 }) {
   return (
     <div className="border-b border-line overflow-x-auto">
@@ -426,7 +416,7 @@ function BoardTabs({
                 : "border-transparent text-muted hover:text-ink"
             }`}
           >
-            {BOARDS[k].label}
+            {labels[k].name}
           </Link>
         ))}
       </div>
