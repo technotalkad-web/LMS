@@ -1,18 +1,21 @@
 import Link from "next/link";
 import { Trophy, EyeOff, Clock } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { canManage } from "@/lib/auth/permissions";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { Avatar } from "@/components/ui/avatar";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 import { Podium, type PodiumEntry } from "./_components/podium";
+import { VerticalBoard } from "./_components/vertical-board";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Org leaderboard. SSR against the precomputed mv_leaderboard /
- * mv_team_leaderboard matviews (service-role reads: learners can't read
- * peers' organization_members rows under RLS — profile-page precedent).
- * Tabs are URL-driven links (?board=...), no client state.
+ * Org leaderboard. SSR against the precomputed mv_leaderboard matview and,
+ * for the Verticals board, live organization_members + mv_learner_metrics
+ * (service-role reads: learners can't read peers' organization_members rows
+ * under RLS — profile-page precedent). Tabs are URL-driven links
+ * (?board=...), no client state.
  */
 
 const BOARDS = {
@@ -21,7 +24,11 @@ const BOARDS = {
   scorer: { label: "Highest Scorer", rankCol: "rank_highest_scorer", metricLabel: "avg score" },
   improved: { label: "Most Improved", rankCol: "rank_most_improved", metricLabel: "XP gained (30d)" },
   streak: { label: "Longest Streak", rankCol: "rank_longest_streak", metricLabel: "days" },
-  team: { label: "Teams", rankCol: "rank_team", metricLabel: "avg XP" },
+  // Replaced the old Teams (avg-XP) board: City → Branch → Team Leader →
+  // Members performance inside the viewer's business vertical. rankCol is
+  // null on purpose — this board has no rank column and returns before the
+  // generic mv_leaderboard query below.
+  vertical: { label: "Verticals", rankCol: null, metricLabel: "" },
 } as const;
 type BoardKey = keyof typeof BOARDS;
 
@@ -79,17 +86,19 @@ export default async function LeaderboardPage({
   searchParams,
 }: {
   params: Promise<{ org: string }>;
-  searchParams?: Promise<{ board?: string }>;
+  searchParams?: Promise<{ board?: string; v?: string }>;
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
+  // Old bookmarks: ?board=team was the tab the Verticals board replaced.
+  const requested = sp.board === "team" ? "vertical" : sp.board;
   const board: BoardKey = (
     Object.keys(BOARDS) as BoardKey[]
-  ).includes(sp.board as BoardKey)
-    ? (sp.board as BoardKey)
+  ).includes(requested as BoardKey)
+    ? (requested as BoardKey)
     : "overall";
 
-  const { user, org } = await requireOrgAccess(orgSlug);
+  const { user, org, role } = await requireOrgAccess(orgSlug);
 
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -97,11 +106,13 @@ export default async function LeaderboardPage({
     { auth: { persistSession: false } }
   );
 
+  // select("*") on purpose: naming 0056's new columns here would error the
+  // whole query on a database that hasn't run that migration yet, turning
+  // every leaderboard off between code deploy and migration. Missing
+  // columns simply come back undefined and default on.
   const { data: gsRow } = await svc
     .from("gamification_settings")
-    .select(
-      "enabled, leaderboard_enabled, board_overall, board_most_active, board_highest_scorer, board_most_improved, board_longest_streak, board_team"
-    )
+    .select("*")
     .eq("organization_id", org.id)
     .maybeSingle();
   const gs = gsRow as Record<string, boolean> | null;
@@ -124,72 +135,44 @@ export default async function LeaderboardPage({
     scorer: gs.board_highest_scorer !== false,
     improved: gs.board_most_improved !== false,
     streak: gs.board_longest_streak !== false,
-    team: gs.board_team !== false,
+    // The verticals board reuses the old Teams-board toggle.
+    vertical: gs.board_team !== false,
   };
   const visibleBoards = (Object.keys(BOARDS) as BoardKey[]).filter(
     (k) => boardEnabled[k]
   );
   const activeBoard = boardEnabled[board] ? board : (visibleBoards[0] ?? "overall");
 
-  // ---- Team board (different shape) ----
-  if (activeBoard === "team") {
-    const { data: teamRows } = await svc
-      .from("mv_team_leaderboard")
-      .select("*")
+  // ---- Verticals board: City → Branch → Team Leader → Members ----
+  if (activeBoard === "vertical") {
+    const { data: fresh } = await svc
+      .from("mv_learner_metrics")
+      .select("refreshed_at")
       .eq("organization_id", org.id)
-      .order("rank_team", { ascending: true })
-      .limit(50);
-    const teams = (teamRows ?? []) as Array<{
-      team_id: string;
-      team_name: string;
-      member_count: number;
-      total_xp: number;
-      avg_xp: number;
-      rank_team: number;
-      refreshed_at: string;
-    }>;
+      .limit(1)
+      .maybeSingle();
     return (
       <div className="max-w-4xl mx-auto space-y-6">
-        <Header orgSlug={orgSlug} refreshedAt={teams[0]?.refreshed_at ?? null} />
-        <BoardTabs orgSlug={orgSlug} active="team" visible={visibleBoards} />
-        {teams.length === 0 ? (
-          <EmptyBoard />
-        ) : (
-          <div className="bg-paper border border-line rounded-2xl overflow-hidden">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-[11px] uppercase tracking-wider text-muted border-b border-line">
-                  <th className="px-4 py-3 w-14">Rank</th>
-                  <th className="px-4 py-3">Team</th>
-                  <th className="px-4 py-3 text-right">Members</th>
-                  <th className="px-4 py-3 text-right">Avg XP</th>
-                  <th className="px-4 py-3 text-right hidden sm:table-cell">Total XP</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-line">
-                {teams.map((t) => (
-                  <tr key={t.team_id}>
-                    <td className="px-4 py-3 font-semibold tabular-nums">#{t.rank_team}</td>
-                    <td className="px-4 py-3 font-medium">{t.team_name}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{t.member_count}</td>
-                    <td className="px-4 py-3 text-right tabular-nums font-semibold">
-                      {Math.round(Number(t.avg_xp)).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-3 text-right tabular-nums hidden sm:table-cell">
-                      {t.total_xp.toLocaleString()}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        <Header
+          orgSlug={orgSlug}
+          refreshedAt={(fresh as { refreshed_at?: string } | null)?.refreshed_at ?? null}
+        />
+        <BoardTabs orgSlug={orgSlug} active="vertical" visible={visibleBoards} />
+        <VerticalBoard
+          orgId={org.id as string}
+          orgSlug={orgSlug}
+          viewerId={user.id}
+          isAdminViewer={canManage(role)}
+          leaderViewEnabled={gs.leaderboard_team_leader_view !== false}
+          allowOptOut={gs.allow_opt_out !== false}
+          requestedVertical={sp.v}
+        />
       </div>
     );
   }
 
-  // ---- Individual boards ----
-  const rankCol = BOARDS[activeBoard].rankCol;
+  // ---- Individual boards (vertical returned above; rankCol is non-null) ----
+  const rankCol = BOARDS[activeBoard].rankCol as string;
   const { data: rowsRaw } = await svc
     .from("mv_leaderboard")
     .select("*")

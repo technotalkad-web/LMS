@@ -22,6 +22,7 @@ export type GamificationSettings = {
   board_most_improved: boolean;
   board_longest_streak: boolean;
   board_team: boolean;
+  leaderboard_team_leader_view: boolean;
   timezone: string;
   xp_course_completion: number;
   xp_perfect_score_bonus: number;
@@ -550,6 +551,7 @@ function PrivacyTab({
     board_most_improved: settings?.board_most_improved !== false,
     board_longest_streak: settings?.board_longest_streak !== false,
     board_team: settings?.board_team !== false,
+    leaderboard_team_leader_view: settings?.leaderboard_team_leader_view !== false,
   });
   const { busy, error, saved, save } = useSectionSave();
 
@@ -597,7 +599,12 @@ function PrivacyTab({
           <Toggle field="board_highest_scorer" label="Highest Scorer" />
           <Toggle field="board_most_improved" label="Most Improved" />
           <Toggle field="board_longest_streak" label="Longest Streak" />
-          <Toggle field="board_team" label="Teams" />
+          <Toggle field="board_team" label="Verticals" hint="City → Branch → Team Leader → Members performance inside each business vertical" />
+          <Toggle
+            field="leaderboard_team_leader_view"
+            label="Team leaders see member details"
+            hint="On the Verticals board, a team leader can expand member-level performance for their own reports"
+          />
         </div>
       </div>
       <SaveRow

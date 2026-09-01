@@ -7,6 +7,11 @@ export type OptionRow = { id: string; field: string; value: string };
 
 const FIELDS: Array<{ key: string; label: string; hint: string }> = [
   {
+    key: "business_vertical",
+    label: "Business Vertical",
+    hint: "Drives the Verticals leaderboard (e.g. Retail, Institutional, Fulfillment). Optional on profiles — unassigned users appear in an admin-only bucket.",
+  },
+  {
     key: "designation",
     label: "Designation",
     hint: "e.g. Sales Executive, Area Manager",
@@ -18,6 +23,11 @@ const FIELDS: Array<{ key: string; label: string; hint: string }> = [
   },
   { key: "job_role", label: "Job Role / Title", hint: "e.g. Backend Lead" },
   { key: "city", label: "City", hint: "e.g. Mumbai" },
+  {
+    key: "branch",
+    label: "Branch",
+    hint: "Branches within a city for the Verticals leaderboard (e.g. Thane, Borivali, Vashi). Optional on profiles.",
+  },
   { key: "state", label: "State / Territory", hint: "e.g. Maharashtra" },
 ];
 

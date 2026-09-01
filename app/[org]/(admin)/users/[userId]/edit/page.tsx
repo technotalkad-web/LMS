@@ -42,7 +42,7 @@ export default async function EditUserPage({
   const { data: memRow } = await svc
     .from("organization_members")
     .select(
-      "user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, node_id, city, state"
+      "user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, node_id, city, state, business_vertical, branch"
     )
     .eq("organization_id", org.id)
     .eq("user_id", userId)
@@ -77,6 +77,8 @@ export default async function EditUserPage({
     node_id: memRow.node_id ?? "",
     city: memRow.city ?? "",
     state: memRow.state ?? "",
+    business_vertical: (memRow as { business_vertical?: string | null }).business_vertical ?? "",
+    branch: (memRow as { branch?: string | null }).branch ?? "",
   };
 
   // Manager picker options (excluding self).

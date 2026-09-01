@@ -33,6 +33,8 @@ export async function GET() {
     "city",
     "state",
     "team_name",
+    "business_vertical",
+    "branch",
   ].join(",");
 
   const example = [
@@ -57,6 +59,8 @@ export async function GET() {
     "Austin",
     "TX",
     "Marketing",
+    "Retail",
+    "Thane",
   ].join(",");
 
   const body = `${header}\n${example}\n`;

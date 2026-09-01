@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { OPTIONAL_FIELDS, type GovernedField } from "@/lib/org/field-options";
 
 export type ManagerOption = { user_id: string; email: string };
 export type LmsRole = "user" | "data_analyst" | "admin" | "super_owner";
@@ -27,6 +28,8 @@ export type UserDetail = {
   node_id: string;
   city: string;
   state: string;
+  business_vertical: string;
+  branch: string;
 };
 
 export function EditUserForm({
@@ -66,21 +69,32 @@ export function EditUserForm({
   // the select empty, so the admin must pick a valid value to save.
   const governed = (
     label: string,
-    key: "designation" | "job_role" | "node_id" | "city" | "state",
+    key: Extract<GovernedField, keyof UserDetail>,
     extra?: { mono?: boolean }
   ) => {
     const opts = fieldOptions[key] ?? [];
-    const enforced = opts.length > 0;
+    const optional = OPTIONAL_FIELDS.has(key);
+    const enforced = opts.length > 0 && !optional;
+    // Optional fields keep showing a stored value that's no longer in the
+    // master list (labeled) instead of a misleading "—"; unchanged values
+    // are omitted from the PATCH, so it's preserved unless deliberately
+    // changed. Mandatory fields render empty + required, forcing a pick.
+    const stale = optional && !!form[key] && !opts.includes(form[key]);
     return (
       <Field label={label} required={enforced || key === "node_id"}>
-        {enforced ? (
+        {opts.length > 0 ? (
           <select
-            required
-            value={opts.includes(form[key]) ? form[key] : ""}
+            required={enforced}
+            value={stale || opts.includes(form[key]) ? form[key] : ""}
             onChange={(e) => set(key, e.target.value)}
             className="input"
           >
-            <option value="">Select…</option>
+            <option value="">{optional ? "—" : "Select…"}</option>
+            {stale && (
+              <option value={form[key]}>
+                {form[key]} (no longer in master list)
+              </option>
+            )}
             {opts.map((v) => (
               <option key={v} value={v}>
                 {v}
@@ -108,6 +122,16 @@ export function EditUserForm({
     const { user_id: _u, email: _e, ...payload } = form;
     void _u;
     void _e;
+    // Optional governed fields: only send what the admin actually changed.
+    // A stored value that was later removed from the master list would
+    // otherwise be re-submitted untouched and rejected ("not specified in
+    // the system database") on an unrelated edit — and must never be
+    // silently cleared either. Unchanged → omitted → preserved.
+    for (const k of OPTIONAL_FIELDS) {
+      if (payload[k] === initial[k]) {
+        delete (payload as Record<string, unknown>)[k];
+      }
+    }
     const res = await fetch(
       `/api/users/${userId}?orgSlug=${encodeURIComponent(orgSlug)}`,
       {
@@ -296,7 +320,10 @@ export function EditUserForm({
           </Field>
 
           {governed("City", "city")}
+          {governed("Branch", "branch")}
+
           {governed("State / Territory", "state")}
+          {governed("Business vertical", "business_vertical")}
         </div>
       </section>
 

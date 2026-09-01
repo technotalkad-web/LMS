@@ -315,6 +315,8 @@ export async function POST(request: Request) {
       job_role: r.role,
       city: r.city,
       state: r.state,
+      business_vertical: r.business_vertical,
+      branch: r.branch,
     } as const;
     const governedRow: Record<string, string | null> = {};
     let governanceError: string | null = null;
@@ -449,7 +451,7 @@ export async function POST(request: Request) {
       .eq("user_id", authUserId)
       .maybeSingle();
 
-    const memPayload = {
+    const memPayload: Record<string, unknown> = {
       organization_id: org.id,
       user_id: authUserId,
       role: lmsRole,
@@ -464,7 +466,16 @@ export async function POST(request: Request) {
       node_id: governedRow.node_id ?? r.node_id!.trim(),
       city: governedRow.city,
       state: governedRow.state,
+      business_vertical: governedRow.business_vertical,
+      branch: governedRow.branch,
     };
+    // OPTIONAL governed fields are never CLEARED by bulk upload: a CSV
+    // without these columns (or with empty cells) must preserve values
+    // assigned via the UI — otherwise re-running last quarter's HR export
+    // would silently wipe every member's vertical/branch. Clearing is an
+    // explicit act done on the edit form.
+    if (governedRow.business_vertical === null) delete memPayload.business_vertical;
+    if (governedRow.branch === null) delete memPayload.branch;
 
     const memOp = priorMem
       ? svc
@@ -622,6 +633,11 @@ const KNOWN_COLS = [
   // (idempotent — same team_name across multiple rows reuses the row
   // we just created).
   "team_name",
+  // ORDER MATTERS for header-less CSVs (positional mapping): new columns
+  // must APPEND so a legacy 21-column file keeps its old meaning — inserting
+  // before team_name would silently parse team names as verticals.
+  "business_vertical",
+  "branch",
 ] as const;
 
 function parseCsv(csv: string): Row[] {
