@@ -311,7 +311,7 @@ export default async function LeaderboardPage({
         <EmptyBoard />
       ) : (
         <>
-          {top3.length === 3 && <Podium top3={top3} />}
+          {top3.length === 3 && <Podium top3={top3} style={gsx?.podium_style} />}
 
           <div className="bg-paper border border-line rounded-2xl overflow-hidden">
             <table className="w-full text-sm">
