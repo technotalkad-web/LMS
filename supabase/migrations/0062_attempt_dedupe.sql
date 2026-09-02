@@ -31,6 +31,24 @@ update public.course_attempts a
  where a.id = r.id
    and r.rn > 1;
 
+-- 1b) Race twins whose sibling was COMPLETED: the duplicate pair started
+--     within seconds of each other; the learner finished one, the other is a
+--     zombie that would hijack their next relaunch with a blank resume.
+--     (The window predates the index, so step 1 can't see these — only one
+--     of the pair is still in_progress.)
+update public.course_attempts a
+   set status = 'abandoned'
+ where a.status = 'in_progress'
+   and exists (
+     select 1
+       from public.course_attempts b
+      where b.user_id = a.user_id
+        and b.course_version_id = a.course_version_id
+        and b.id <> a.id
+        and b.status in ('completed', 'passed')
+        and abs(extract(epoch from (b.started_at - a.started_at))) < 10
+   );
+
 create unique index if not exists course_attempts_one_in_progress_idx
   on public.course_attempts (user_id, course_version_id)
   where status = 'in_progress';

@@ -372,16 +372,22 @@ export default async function JourneyPage({
             </p>
             <p
               className={`mt-0.5 text-sm font-bold ${
-                state.todayUnlocked ? "text-amber-700" : "text-emerald-700"
+                state.todayUnlocked
+                  ? "text-amber-700"
+                  : notStarted
+                    ? "text-muted"
+                    : "text-emerald-700"
               }`}
             >
               {state.finished
                 ? "Journey done"
-                : state.todayUnlocked
-                  ? state.pendingDays > 1
-                    ? `${state.pendingDays} missions`
-                    : "1 mission"
-                  : "Done for today"}
+                : notStarted
+                  ? "Starts soon"
+                  : state.todayUnlocked
+                    ? state.pendingDays > 1
+                      ? `${state.pendingDays} missions`
+                      : "1 mission"
+                    : "Done for today"}
             </p>
           </div>
           <div>
@@ -511,7 +517,9 @@ export default async function JourneyPage({
                         ? missionInProgress
                           ? "In progress — pick up where you left off"
                           : "Ready to start"
-                        : "Unlocks tomorrow"}
+                        : notStarted
+                          ? "Unlocks on your start date"
+                          : "Unlocks tomorrow"}
                     </span>
                   </span>
                   {state.todayUnlocked && entry?.course_id && (
