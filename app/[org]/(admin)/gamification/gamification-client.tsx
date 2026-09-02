@@ -27,6 +27,7 @@ import {
   validatePodiumStyle,
   type PodiumStyle,
 } from "@/lib/gamification/podium-style";
+import { PodiumAnimation } from "../../(learner)/leaderboard/_components/podium-animation";
 
 export type GamificationSettings = {
   organization_id: string;
@@ -818,7 +819,26 @@ function PodiumSection({
   const [jsonOpen, setJsonOpen] = useState(false);
   const [jsonText, setJsonText] = useState("");
   const [jsonError, setJsonError] = useState<string | null>(null);
+  const [animBusy, setAnimBusy] = useState(false);
+  const [animError, setAnimError] = useState<string | null>(null);
   const { busy, error, saved, save } = useSectionSave();
+
+  async function uploadAnimation(f: File) {
+    setAnimBusy(true);
+    setAnimError(null);
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("orgSlug", orgSlug);
+    fd.append("kind", "animation");
+    const res = await fetch("/api/upload/image", { method: "POST", body: fd });
+    const j = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+    setAnimBusy(false);
+    if (!res.ok || !j.url) {
+      setAnimError(j.error ?? "Upload failed");
+      return;
+    }
+    setStyle((s) => ({ ...s, animation_url: j.url! }));
+  }
 
   const upd = (patch: Partial<PodiumStyle>) =>
     setStyle((s) => ({ ...s, ...patch }));
@@ -845,6 +865,9 @@ function PodiumSection({
         }}
         aria-label="Podium preview"
       >
+        {style.animation_url && (
+          <PodiumAnimation key={style.animation_url} url={style.animation_url} />
+        )}
         {style.confetti_enabled && (
           <div aria-hidden className="absolute inset-0 pointer-events-none">
             {confettiPieces(style).map((c, i) => (
@@ -1041,6 +1064,52 @@ function PodiumSection({
             </div>
           </div>
         )}
+      </div>
+
+      {/* Animation overlay (Lottie / SVG / GIF) */}
+      <div>
+        <div className="text-[11px] uppercase tracking-wider font-semibold text-muted mb-2">
+          Animation overlay
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="px-3 py-2 border border-line rounded-lg text-sm font-medium cursor-pointer hover:border-ink">
+            {animBusy ? "Uploading…" : style.animation_url ? "Replace file" : "Upload file"}
+            <input
+              type="file"
+              accept=".json,.lottie,.svg,.gif"
+              disabled={animBusy}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void uploadAnimation(f);
+                e.target.value = "";
+              }}
+              className="hidden"
+            />
+          </label>
+          {style.animation_url && (
+            <>
+              <span className="text-xs text-muted font-mono truncate max-w-[260px]">
+                …{style.animation_url.slice(-40)}
+              </span>
+              <button
+                type="button"
+                onClick={() => upd({ animation_url: "" })}
+                className="text-xs text-red-700 hover:underline"
+              >
+                Remove
+              </button>
+            </>
+          )}
+        </div>
+        {animError && <p className="text-sm text-red-700 mt-1.5">{animError}</p>}
+        <p className="text-[11px] text-muted mt-1.5">
+          Optional looping animation behind the podium — a free Lottie{" "}
+          <code>.json</code> (lottiefiles.com, iconscout.com…), an animated{" "}
+          <code>.svg</code>, or a <code>.gif</code>, max 2&nbsp;MB. It&apos;s
+          stored in your workspace, plays above the gradient and under the
+          winners, and is automatically skipped for reduced-motion users.
+          Confetti above can stay on or off independently.
+        </p>
       </div>
 
       {/* Advanced JSON editor */}
