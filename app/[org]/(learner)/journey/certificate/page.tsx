@@ -83,6 +83,12 @@ export default async function JourneyCertificatePage({
         @media print {
           header, nav, footer, .print\\:hidden { display: none !important; }
           body { background: white !important; }
+          /* Dark learner themes (Blueprint/Skyline/custom) paint the shell —
+             force it white in print so the certificate sits on a clean page. */
+          [data-lms-root] {
+            background: white !important;
+            background-image: none !important;
+          }
           main { padding: 0 !important; max-width: none !important; }
         }
       `}</style>
