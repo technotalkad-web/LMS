@@ -39,7 +39,10 @@ export async function newAuthedContext(
   const page = await ctx.newPage();
   await page.goto("/login");
   // The form is mount-gated — wait for the real input, not the skeleton.
-  await expect(page.getByLabel(/work email/i)).toBeVisible({ timeout: 15_000 });
+  // 30s: a staging-worker swap mid-suite briefly serves slow cold renders
+  // (2026-09-02 CI failure); the generous timeout lets a retry land after
+  // the swap instead of failing the whole run.
+  await expect(page.getByLabel(/work email/i)).toBeVisible({ timeout: 30_000 });
   await page.getByLabel(/work email/i).fill(email);
   await page.getByLabel(/^password$/i).fill(password);
   await page.getByRole("button", { name: /sign in/i }).click();
