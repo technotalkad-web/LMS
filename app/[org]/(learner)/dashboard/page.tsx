@@ -139,14 +139,18 @@ export default async function DashboardPage({
             | Array<{ is_active: boolean; copy: unknown }>;
         }
       | undefined;
-    if (j) {
+    const jProg = j
+      ? Array.isArray(j.journey_programs)
+        ? j.journey_programs[0]
+        : j.journey_programs
+      : undefined;
+    // Deactivated journey (admin Settings → Active off) is hidden from
+    // learners entirely — no banner, no nav (layout applies the same rule).
+    if (j && jProg?.is_active !== false) {
       const ver = Array.isArray(j.journey_versions)
         ? j.journey_versions[0]
         : j.journey_versions;
-      const prog = Array.isArray(j.journey_programs)
-        ? j.journey_programs[0]
-        : j.journey_programs;
-      const jc = effectiveJourneyCopy(prog?.copy);
+      const jc = effectiveJourneyCopy(jProg?.copy);
       const { count } = await supabase
         .from("journey_day_progress")
         .select("id", { count: "exact", head: true })
@@ -157,7 +161,7 @@ export default async function DashboardPage({
         total: ver?.days_total ?? 90,
         name: ver?.name ?? "90-Day Yoddha Journey",
         icon: ver?.icon ?? "🏹",
-        line: prog?.is_active === false ? jc.paused_title.toLowerCase() : jc.banner_line,
+        line: jc.banner_line,
       };
     }
   }

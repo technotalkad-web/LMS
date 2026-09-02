@@ -84,14 +84,18 @@ export default async function LearnerLayout({
         .select("first_name, last_name, avatar_url")
         .eq("id", user.id)
         .maybeSingle(),
-      // Yoddha journey (0058): nav item only for enrolled learners.
-      // Fail-soft — pre-migration this select errors and stays hidden.
+      // Yoddha journey (0058): nav item only for enrolled learners, and only
+      // while the program is active — deactivating the journey in the admin
+      // Settings hides it from learners entirely (dashboard banner applies
+      // the same rule). Fail-soft — pre-migration this select errors and
+      // the nav item stays hidden.
       supabase
         .from("journey_enrollments")
-        .select("id")
+        .select("id, journey_programs!inner(is_active)")
         .eq("organization_id", org.id)
         .eq("user_id", user.id)
         .in("status", ["active", "completed"])
+        .eq("journey_programs.is_active", true)
         .limit(1),
       supabase
         .from("organizations")
