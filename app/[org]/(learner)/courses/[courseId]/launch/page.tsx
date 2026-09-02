@@ -124,10 +124,18 @@ export default async function LaunchPage({
     ) {
       const dayEntry = parseVersionDays(prog.days).get(dayN);
       if (dayEntry?.course_id === courseId) {
-        const { count } = await supabase
+        const { data: doneRows } = await supabase
           .from("journey_day_progress")
-          .select("id", { count: "exact", head: true })
+          .select("day_number")
           .eq("enrollment_id", enr.id);
+        // Completed DAY NUMBERS, not just a count — with rest days in the
+        // curriculum the two differ, and the old `dayN > count` comparison
+        // wrongly bounced reviews of finished missions to the locked notice.
+        const doneDays = new Set(
+          ((doneRows ?? []) as Array<{ day_number: number }>).map(
+            (r) => r.day_number
+          )
+        );
         const { data: gsRow } = await supabase
           .from("gamification_settings")
           .select("timezone")
@@ -138,17 +146,19 @@ export default async function LaunchPage({
         const state = computeJourneyState({
           startDate: enr.start_date,
           today: todayStr(tz),
-          completedCount: count ?? 0,
+          completedCount: doneDays.size,
           daysTotal: prog.days_total,
           countSundays: prog.count_sundays === true,
           courseDays: courseDaysOf(prog.days, prog.days_total),
         });
         if (dayN === state.currentDay && state.todayUnlocked) {
           journeyCtx = { enrollmentId: enr.id, day: dayN };
-        } else if (dayN > (count ?? 0)) {
+        } else if (!doneDays.has(dayN)) {
           redirect(`/${orgSlug}/journey?locked=${dayN}`);
         }
-        // dayN ≤ completed → review of a finished mission: launch untagged.
+        // Completed day → revision of a finished mission: launch untagged so
+        // it can never double-credit or earn XP. Learners may revise as
+        // often as they like.
       }
     }
   }
@@ -438,7 +448,11 @@ export default async function LaunchPage({
     }
   }
 
-  // Find or create the attempt.
+  // Find or create the attempt. Resume by most recent ACTIVITY (not
+  // started_at): when historical duplicate attempts exist, the one the
+  // learner actually worked in is the one holding their bookmark — resuming
+  // the other one is exactly the "lost my place" bug (0062 also makes new
+  // duplicates impossible via a partial unique index).
   let attemptId: string | null = null;
   let cmi: CmiData = {};
   const { data: existing } = await supabase
@@ -447,6 +461,7 @@ export default async function LaunchPage({
     .eq("course_version_id", v.id)
     .eq("user_id", user.id)
     .eq("status", "in_progress")
+    .order("last_activity_at", { ascending: false, nullsFirst: false })
     .order("started_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -477,7 +492,7 @@ export default async function LaunchPage({
       const stepMatch = stepInPaths.some((s) => s.path_id === lpParam);
       if (stepMatch) pathContextId = lpParam;
     }
-    const { data: created } = await supabase
+    const { data: created, error: insErr } = await supabase
       .from("course_attempts")
       .insert({
         course_version_id: v.id,
@@ -499,6 +514,23 @@ export default async function LaunchPage({
       .select("id")
       .single();
     attemptId = created?.id ?? null;
+    // Unique-violation on 0062's one-in-progress index: a concurrent request
+    // (double click / router prefetch) created the attempt a moment ago —
+    // resume that one instead of failing the launch.
+    if (!attemptId && insErr?.code === "23505") {
+      const { data: raced } = await supabase
+        .from("course_attempts")
+        .select("id, cmi_data")
+        .eq("course_version_id", v.id)
+        .eq("user_id", user.id)
+        .eq("status", "in_progress")
+        .limit(1)
+        .maybeSingle();
+      if (raced) {
+        attemptId = raced.id;
+        cmi = (raced.cmi_data ?? {}) as CmiData;
+      }
+    }
   }
   if (!attemptId) {
     return <div className="p-10 text-red-700">Failed to create attempt.</div>;

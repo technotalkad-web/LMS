@@ -154,6 +154,21 @@ export default async function JourneyPage({
   // ---- Completed: the unlock celebration ----
   if (enrollment.status === "completed") {
     const final = milestones[milestones.length - 1];
+    // Alumni keep review access to every journey module (course-access
+    // grants it) — give them the links, batched titles in one query.
+    const missionDays = [...dayByNumber.values()]
+      .filter((d) => d.course_id)
+      .sort((a, b) => a.day - b.day);
+    const { data: courseRows } = await supabase
+      .from("courses")
+      .select("id, title")
+      .in("id", missionDays.map((d) => d.course_id as string));
+    const titleOf = new Map(
+      ((courseRows ?? []) as Array<{ id: string; title: string }>).map((c) => [
+        c.id,
+        c.title,
+      ])
+    );
     return (
       <div className="max-w-3xl mx-auto space-y-6">
         <section className="relative overflow-hidden rounded-3xl bg-gradient-to-b from-amber-400 via-orange-500 to-rose-600 text-white text-center px-6 py-14 shadow-lg">
@@ -177,6 +192,37 @@ export default async function JourneyPage({
           </p>
         </section>
         <MilestonePath milestones={milestones} completed={version.days_total} />
+
+        {/* Alumni revision — journey modules stay open forever. Plain launch
+            links (no journey tag): reviews never touch progress or XP. */}
+        {missionDays.length > 0 && (
+          <section className="bg-paper border border-line rounded-2xl p-5">
+            <h3 className="text-sm font-semibold">📚 Revisit your missions</h3>
+            <p className="text-xs text-muted mt-0.5 mb-3">
+              Your {version.days_total}-day curriculum stays open — revise any
+              module, any time.
+            </p>
+            <div className="grid sm:grid-cols-2 gap-2">
+              {missionDays.map((d) => (
+                <Link
+                  key={d.day}
+                  href={`/${orgSlug}/courses/${d.course_id}/launch`}
+                  className="flex items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
+                >
+                  <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
+                    Day {d.day}
+                  </span>
+                  <span className="truncate">
+                    {d.mission_title ??
+                      titleOf.get(d.course_id as string) ??
+                      "Module"}
+                  </span>
+                </Link>
+              ))}
+            </div>
+          </section>
+        )}
+
         <div className="text-center flex items-center justify-center gap-3 flex-wrap">
           <Link
             href={`/${orgSlug}/journey/certificate`}
@@ -211,6 +257,20 @@ export default async function JourneyPage({
 
   // ---- Active journey ----
   const mission = dayByNumber.get(state.currentDay);
+  // "Continue" instead of "Start" when the learner already began today's
+  // mission (tagged in-progress attempt) — coming back mid-module resumes
+  // from their bookmark, and the button should say so.
+  let missionInProgress = false;
+  if (mission?.course_id && state.todayUnlocked) {
+    const { data: ipRows } = await supabase
+      .from("course_attempts")
+      .select("id")
+      .eq("journey_enrollment_id", enrollment.id)
+      .eq("journey_day", state.currentDay)
+      .eq("status", "in_progress")
+      .limit(1);
+    missionInProgress = (ipRows ?? []).length > 0;
+  }
   const achieved = milestones.filter((m) => state.completedCount >= m.day);
   const latestAchieved = achieved[achieved.length - 1];
   const nextMilestone = milestones.find((m) => state.completedCount < m.day);
@@ -262,7 +322,8 @@ export default async function JourneyPage({
                   href={`/${orgSlug}/courses/${mission.course_id}/launch?journey=${enrollment.id}&day=${state.currentDay}`}
                   className="mt-4 inline-flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold shadow-sm"
                 >
-                  <PlayCircle className="w-5 h-5" /> {copy.cta_start}
+                  <PlayCircle className="w-5 h-5" />{" "}
+                  {missionInProgress ? copy.cta_resume : copy.cta_start}
                 </Link>
                 {state.pendingDays > 1 && (
                   <p className="mt-2 text-xs text-amber-700">
@@ -321,13 +382,12 @@ export default async function JourneyPage({
             const unlocked = d <= state.allowedDay;
             const rest = !courseDaySet.has(d);
             const ms = milestones.find((m) => m.day === d);
-            return (
+            const cell = (
               <div
-                key={d}
-                title={`Day ${d}${ms ? ` — ${ms.name}` : rest ? " — rest day" : ""}`}
+                title={`Day ${d}${ms ? ` — ${ms.name}` : rest ? " — rest day" : ""}${done ? " — completed · tap to revise" : ""}`}
                 className={`aspect-square rounded-md flex items-center justify-center text-[9px] font-bold ${
                   done
-                    ? "bg-indigo-600 text-white"
+                    ? "bg-indigo-600 text-white hover:bg-indigo-500 hover:ring-2 hover:ring-indigo-300 cursor-pointer transition"
                     : isCurrent
                       ? "bg-amber-400 text-amber-950 ring-2 ring-amber-500 animate-pulse"
                       : rest
@@ -340,9 +400,27 @@ export default async function JourneyPage({
                 {ms ? <span className="text-[11px]">{ms.icon}</span> : rest ? "·" : d}
               </div>
             );
+            // Completed missions stay open for revision — relaunch is
+            // untagged (validated server-side), so it can never re-credit
+            // the day, earn XP, or advance the journey.
+            const dayCourseId = dayByNumber.get(d)?.course_id;
+            return done && dayCourseId ? (
+              <Link
+                key={d}
+                href={`/${orgSlug}/courses/${dayCourseId}/launch?journey=${enrollment.id}&day=${d}`}
+                aria-label={`Revise day ${d}`}
+              >
+                {cell}
+              </Link>
+            ) : (
+              <div key={d}>{cell}</div>
+            );
           })}
         </div>
-        <p className="mt-3 text-[11px] text-muted">{copy.footer_note}</p>
+        <p className="mt-3 text-[11px] text-muted">
+          {state.completedCount > 0 ? `${copy.revise_hint} ` : ""}
+          {copy.footer_note}
+        </p>
       </section>
     </div>
   );
