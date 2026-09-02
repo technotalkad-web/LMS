@@ -11,7 +11,8 @@ export type NotificationEvent =
   | "path_completion"
   | "password_reset"
   | "magic_link"
-  | "account_invite";
+  | "account_invite"
+  | "journey_nudge";
 
 export type NotificationContext = {
   learner_name?: string;

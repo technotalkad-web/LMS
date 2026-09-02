@@ -27,6 +27,7 @@ on:
     - cron: "*/5 * * * *"  # /api/cron/lrs-forward            — every 5 min (outbox retry net)
     - cron: "7-59/15 * * * *" # /api/cron/gamification-refresh — every 15 min (leaderboard matviews; offset to dodge :00 pileups)
     - cron: "30 0 1 * *"   # /api/cron/gamification-monthly   — 1st of month 00:30 UTC (= 06:00 IST close)
+    - cron: "0 4 * * *"    # /api/cron/journey-nudges         — daily 04:00 UTC (= 09:30 IST, start of workday)
   workflow_dispatch:
     inputs:
       endpoint:
@@ -56,6 +57,7 @@ jobs:
               "*/5 * * * *") P=/api/cron/lrs-forward ;;
               "7-59/15 * * * *") P=/api/cron/gamification-refresh ;;
               "30 0 1 * *") P=/api/cron/gamification-monthly ;;
+              "0 4 * * *")  P=/api/cron/journey-nudges ;;
               *) echo "Unknown schedule '${SCHEDULE}'"; exit 1 ;;
             esac
           else

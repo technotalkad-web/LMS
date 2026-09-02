@@ -49,6 +49,7 @@ const EVENT_LABELS: Record<NotificationEvent, string> = {
   password_reset: "Password reset code",
   magic_link: "Magic-link sign-in",
   account_invite: "Account invite",
+  journey_nudge: "Journey behind-schedule nudge",
 };
 
 export type WorkspaceBranding = {
