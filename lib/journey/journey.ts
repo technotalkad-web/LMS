@@ -34,7 +34,9 @@ export const DEFAULT_JOURNEY_COPY = {
   mission_label: "Today's mission",
   mission_subtitle: "Complete today's module to continue your Yoddha journey.",
   cta_start: "Start Mission",
+  cta_resume: "Continue Mission",
   on_track_note: "You're on track — the next mission unlocks tomorrow.",
+  revise_hint: "Tap any completed day to revisit that module — revision never affects your progress.",
   locked_message:
     "That mission is still locked — the journey unlocks one day at a time. Complete today's mission first.",
   preparing_title: "Mission being prepared",

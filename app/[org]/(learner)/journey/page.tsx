@@ -1,7 +1,6 @@
 import Link from "next/link";
 import {
-  Flag,
-  Flame,
+  Check,
   Hourglass,
   Lock,
   PauseCircle,
@@ -154,6 +153,21 @@ export default async function JourneyPage({
   // ---- Completed: the unlock celebration ----
   if (enrollment.status === "completed") {
     const final = milestones[milestones.length - 1];
+    // Alumni keep review access to every journey module (course-access
+    // grants it) — give them the links, batched titles in one query.
+    const missionDays = [...dayByNumber.values()]
+      .filter((d) => d.course_id)
+      .sort((a, b) => a.day - b.day);
+    const { data: courseRows } = await supabase
+      .from("courses")
+      .select("id, title")
+      .in("id", missionDays.map((d) => d.course_id as string));
+    const titleOf = new Map(
+      ((courseRows ?? []) as Array<{ id: string; title: string }>).map((c) => [
+        c.id,
+        c.title,
+      ])
+    );
     return (
       <div className="max-w-3xl mx-auto space-y-6">
         <section className="relative overflow-hidden rounded-3xl bg-gradient-to-b from-amber-400 via-orange-500 to-rose-600 text-white text-center px-6 py-14 shadow-lg">
@@ -177,6 +191,37 @@ export default async function JourneyPage({
           </p>
         </section>
         <MilestonePath milestones={milestones} completed={version.days_total} />
+
+        {/* Alumni revision — journey modules stay open forever. Plain launch
+            links (no journey tag): reviews never touch progress or XP. */}
+        {missionDays.length > 0 && (
+          <section className="bg-paper border border-line rounded-2xl p-5">
+            <h3 className="text-sm font-semibold">📚 Revisit your missions</h3>
+            <p className="text-xs text-muted mt-0.5 mb-3">
+              Your {version.days_total}-day curriculum stays open — revise any
+              module, any time.
+            </p>
+            <div className="grid sm:grid-cols-2 gap-2">
+              {missionDays.map((d) => (
+                <Link
+                  key={d.day}
+                  href={`/${orgSlug}/courses/${d.course_id}/launch`}
+                  className="flex items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
+                >
+                  <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
+                    Day {d.day}
+                  </span>
+                  <span className="truncate">
+                    {d.mission_title ??
+                      titleOf.get(d.course_id as string) ??
+                      "Module"}
+                  </span>
+                </Link>
+              ))}
+            </div>
+          </section>
+        )}
+
         <div className="text-center flex items-center justify-center gap-3 flex-wrap">
           <Link
             href={`/${orgSlug}/journey/certificate`}
@@ -211,10 +256,61 @@ export default async function JourneyPage({
 
   // ---- Active journey ----
   const mission = dayByNumber.get(state.currentDay);
+  // "Continue" instead of "Start" when the learner already began today's
+  // mission (tagged in-progress attempt) — coming back mid-module resumes
+  // from their bookmark, and the button should say so.
+  let missionInProgress = false;
+  if (mission?.course_id && state.todayUnlocked) {
+    const { data: ipRows } = await supabase
+      .from("course_attempts")
+      .select("id")
+      .eq("journey_enrollment_id", enrollment.id)
+      .eq("journey_day", state.currentDay)
+      .eq("status", "in_progress")
+      .limit(1);
+    missionInProgress = (ipRows ?? []).length > 0;
+  }
   const achieved = milestones.filter((m) => state.completedCount >= m.day);
   const latestAchieved = achieved[achieved.length - 1];
   const nextMilestone = milestones.find((m) => state.completedCount < m.day);
   const notStarted = state.allowedDay === 0;
+
+  // Weekly roadmap: the learner's current 7-day window, as a simple list
+  // (the full path lives in the collapsible "all days" grid below it).
+  const week = Math.max(1, Math.ceil(state.currentDay / 7));
+  const weekStart = (week - 1) * 7 + 1;
+  const weekEnd = Math.min(week * 7, version.days_total);
+  const weekDayNums = Array.from(
+    { length: weekEnd - weekStart + 1 },
+    (_, i) => weekStart + i
+  );
+  const weekCourseIds = [
+    ...new Set(
+      weekDayNums
+        .map((d) => dayByNumber.get(d)?.course_id)
+        .filter((id): id is string => !!id)
+    ),
+  ];
+  const weekTitles = new Map<string, string>();
+  if (weekCourseIds.length > 0) {
+    const { data: wcRows } = await supabase
+      .from("courses")
+      .select("id, title")
+      .in("id", weekCourseIds);
+    for (const c of (wcRows ?? []) as Array<{ id: string; title: string }>) {
+      weekTitles.set(c.id, c.title);
+    }
+  }
+  const titleForDay = (d: number): string => {
+    const entry = dayByNumber.get(d);
+    return (
+      entry?.mission_title ??
+      (entry?.course_id ? weekTitles.get(entry.course_id) : undefined) ??
+      `Day ${d} mission`
+    );
+  };
+  const nextCourseDayAfterCurrent =
+    courseDays[courseDays.indexOf(state.currentDay) + 1];
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -225,20 +321,94 @@ export default async function JourneyPage({
         </div>
       )}
 
-      <header className="text-center">
-        <p className="text-xs uppercase tracking-[0.2em] text-muted font-semibold">
-          {version.icon} {version.name}
-        </p>
-        <h1 className="mt-1 text-4xl sm:text-5xl font-extrabold tracking-tight tabular-nums">
-          DAY {state.currentDay}{" "}
-          <span className="text-muted font-bold">/ {version.days_total}</span>
-        </h1>
+      {/* Identity + streak */}
+      <header className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] uppercase tracking-[0.2em] text-indigo-700 font-bold">
+            {version.days_total}-day journey
+          </p>
+          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight truncate">
+            {version.icon} {version.name}
+          </h1>
+        </div>
+        {streak > 0 && (
+          <span
+            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-full bg-amber-100 text-amber-900 text-sm font-bold shrink-0 tabular-nums"
+            title="Daily learning streak"
+          >
+            🔥 {streak} day{streak === 1 ? "" : "s"}
+          </span>
+        )}
+      </header>
+
+      {/* Progress card */}
+      <section className="bg-paper border border-line rounded-2xl p-5">
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="font-semibold tabular-nums">
+            Day {state.currentDay} of {version.days_total}
+          </h2>
+          <span className="text-sm font-semibold text-indigo-700 tabular-nums">
+            {state.pct}% complete
+          </span>
+        </div>
+        <div className="mt-2 h-2 rounded-full bg-canvas border border-line overflow-hidden">
+          <div
+            className="h-full bg-indigo-600 rounded-full transition-all"
+            style={{ width: `${Math.max(state.pct, 2)}%` }}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-3 divide-x divide-line text-center">
+          <div>
+            <p className="text-[10px] uppercase tracking-wide text-muted font-bold">
+              Missions
+            </p>
+            <p className="mt-0.5 text-sm font-bold tabular-nums">
+              {state.completedCount}/{courseDays.length}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-wide text-muted font-bold">
+              Today&apos;s goal
+            </p>
+            <p
+              className={`mt-0.5 text-sm font-bold ${
+                state.todayUnlocked
+                  ? "text-amber-700"
+                  : notStarted
+                    ? "text-muted"
+                    : "text-emerald-700"
+              }`}
+            >
+              {state.finished
+                ? "Journey done"
+                : notStarted
+                  ? "Starts soon"
+                  : state.todayUnlocked
+                    ? state.pendingDays > 1
+                      ? `${state.pendingDays} missions`
+                      : "1 mission"
+                    : "Done for today"}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-wide text-muted font-bold">
+              Next badge
+            </p>
+            <p className="mt-0.5 text-sm font-bold tabular-nums">
+              {nextMilestone
+                ? `Day ${nextMilestone.day} ${nextMilestone.icon}`
+                : latestAchieved
+                  ? `${latestAchieved.icon} earned`
+                  : "—"}
+            </p>
+          </div>
+        </div>
         {latestAchieved && (
-          <p className="mt-1 text-sm text-indigo-700 font-medium">
+          <p className="mt-3 text-center text-xs text-indigo-700 font-medium">
             {latestAchieved.icon} {latestAchieved.name}
           </p>
         )}
-      </header>
+      </section>
 
       {/* Today's mission */}
       <section className="border-2 border-indigo-200 bg-gradient-to-b from-indigo-50/70 to-paper rounded-2xl p-6 text-center shadow-sm">
@@ -260,9 +430,10 @@ export default async function JourneyPage({
               <>
                 <Link
                   href={`/${orgSlug}/courses/${mission.course_id}/launch?journey=${enrollment.id}&day=${state.currentDay}`}
-                  className="mt-4 inline-flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold shadow-sm"
+                  className="mt-4 w-full sm:max-w-md mx-auto flex items-center justify-center gap-2 px-6 py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold shadow-sm"
                 >
-                  <PlayCircle className="w-5 h-5" /> {copy.cta_start}
+                  <PlayCircle className="w-5 h-5" />{" "}
+                  {missionInProgress ? copy.cta_resume : copy.cta_start} →
                 </Link>
                 {state.pendingDays > 1 && (
                   <p className="mt-2 text-xs text-amber-700">
@@ -286,48 +457,142 @@ export default async function JourneyPage({
         )}
       </section>
 
-      {/* Milestone path */}
-      <MilestonePath milestones={milestones} completed={state.completedCount} />
-
-      {/* Stats */}
-      <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <Stat label="Missions" value={`${state.completedCount}/${courseDays.length}`} sub={`${state.pct}%`} icon={<Flag className="w-4 h-4 text-indigo-600" />} />
-        <Stat label="Streak" value={streak > 0 ? `${streak} day${streak === 1 ? "" : "s"}` : "—"} icon={<Flame className="w-4 h-4 text-orange-500" />} />
-        <Stat
-          label="Pending"
-          value={String(state.pendingDays)}
-          sub={state.behindDays > 0 ? `${state.behindDays} behind` : "on track"}
-          tone={state.behindDays > 0 ? "warn" : undefined}
-          icon={<Hourglass className="w-4 h-4 text-amber-600" />}
-        />
-        <Stat label="Days left" value={String(state.daysRemaining)} icon={<Swords className="w-4 h-4 text-slate-500" />} />
-      </section>
-
-      {/* The day-path grid */}
-      <section className="bg-paper border border-line rounded-2xl p-4 sm:p-5">
-        <div className="flex items-baseline justify-between mb-3">
-          <h3 className="text-sm font-semibold">Your journey path</h3>
+      {/* Weekly roadmap — the current 7-day window as a simple list */}
+      <section className="bg-paper border border-line rounded-2xl overflow-hidden">
+        <div className="flex items-baseline justify-between px-5 pt-4 pb-2">
+          <h3 className="text-sm font-semibold">Week {week} roadmap</h3>
+          <span className="text-[11px] text-muted">1 mission per day</span>
+        </div>
+        <div className="divide-y divide-line border-t border-line">
+          {weekDayNums.map((d) => {
+            const entry = dayByNumber.get(d);
+            const rest = !courseDaySet.has(d);
+            const done = doneDays.has(d);
+            const isCurrent = d === state.currentDay && !state.finished;
+            if (rest) {
+              return (
+                <div key={d} className="flex items-center gap-3 px-5 py-2.5 text-muted/70">
+                  <span className="h-7 w-7 rounded-full bg-canvas border border-line flex items-center justify-center text-[11px]" aria-hidden>
+                    ·
+                  </span>
+                  <span className="text-xs">Day {d} — rest day</span>
+                </div>
+              );
+            }
+            if (done && entry?.course_id) {
+              return (
+                <Link
+                  key={d}
+                  href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${d}`}
+                  className="flex items-center gap-3 px-5 py-3 hover:bg-canvas transition"
+                  aria-label={`Revise day ${d}`}
+                >
+                  <span className="h-7 w-7 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0" aria-hidden>
+                    <Check className="w-4 h-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium truncate">
+                      Day {d}: {titleForDay(d)}
+                    </span>
+                    <span className="block text-xs text-emerald-700">Completed</span>
+                  </span>
+                  <span className="text-xs font-medium text-indigo-700 shrink-0">
+                    Revise
+                  </span>
+                </Link>
+              );
+            }
+            if (isCurrent) {
+              return (
+                <div key={d} className="flex items-center gap-3 px-5 py-3 bg-indigo-50/60 border-l-4 border-indigo-500 -ml-px">
+                  <span className="h-7 w-7 rounded-full bg-amber-400 text-amber-950 flex items-center justify-center shrink-0" aria-hidden>
+                    <PlayCircle className="w-4 h-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-semibold truncate">
+                      Day {d}: {titleForDay(d)}
+                    </span>
+                    <span className="block text-xs text-amber-700 font-medium">
+                      {state.todayUnlocked
+                        ? missionInProgress
+                          ? "In progress — pick up where you left off"
+                          : "Ready to start"
+                        : notStarted
+                          ? "Unlocks on your start date"
+                          : "Unlocks tomorrow"}
+                    </span>
+                  </span>
+                  {state.todayUnlocked && entry?.course_id && (
+                    <Link
+                      href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${d}`}
+                      className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shrink-0"
+                    >
+                      {missionInProgress ? "Continue" : "Start"}
+                    </Link>
+                  )}
+                </div>
+              );
+            }
+            return (
+              <div key={d} className="flex items-center gap-3 px-5 py-3 text-muted">
+                <span className="h-7 w-7 rounded-full bg-canvas border border-line flex items-center justify-center text-[11px] font-bold shrink-0" aria-hidden>
+                  {d}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm truncate">
+                    Day {d}: {titleForDay(d)}
+                  </span>
+                  <span className="block text-xs">
+                    {d === nextCourseDayAfterCurrent ? "Up next" : `Day ${d} mission`}
+                  </span>
+                </span>
+                <Lock className="w-3.5 h-3.5 shrink-0" aria-hidden />
+              </div>
+            );
+          })}
           {nextMilestone && (
-            <p className="text-xs text-muted">
-              Next milestone: Day {nextMilestone.day} {nextMilestone.icon}{" "}
-              {nextMilestone.name}
-            </p>
+            <div className="flex items-center gap-3 px-5 py-3 bg-canvas/60">
+              <span className="h-7 w-7 rounded-full bg-ink text-canvas flex items-center justify-center text-sm shrink-0" aria-hidden>
+                {nextMilestone.icon}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-semibold truncate">
+                  Day {nextMilestone.day}: {nextMilestone.name}
+                </span>
+                {nextMilestone.message && (
+                  <span className="block text-xs text-indigo-700 truncate">
+                    {nextMilestone.message}
+                  </span>
+                )}
+              </span>
+              <span className="text-xs text-muted shrink-0 tabular-nums">
+                {nextMilestone.day - state.completedCount} mission
+                {nextMilestone.day - state.completedCount === 1 ? "" : "s"} away
+              </span>
+            </div>
           )}
         </div>
-        <div className="grid grid-cols-10 sm:grid-cols-[repeat(15,minmax(0,1fr))] gap-1.5">
+
+        {/* Full path, collapsed by default — every completed day is a
+            revise link; zero JS (native <details>). */}
+        <details className="border-t border-line">
+          <summary className="px-5 py-2.5 text-xs font-medium text-indigo-700 cursor-pointer hover:bg-canvas">
+            View all {version.days_total} days
+          </summary>
+          <div className="px-5 pb-4">
+            <div className="grid grid-cols-10 sm:grid-cols-[repeat(15,minmax(0,1fr))] gap-1.5">
           {Array.from({ length: version.days_total }, (_, i) => i + 1).map((d) => {
             const done = doneDays.has(d);
             const isCurrent = d === state.currentDay && !state.finished;
             const unlocked = d <= state.allowedDay;
             const rest = !courseDaySet.has(d);
             const ms = milestones.find((m) => m.day === d);
-            return (
+            const cell = (
               <div
-                key={d}
-                title={`Day ${d}${ms ? ` — ${ms.name}` : rest ? " — rest day" : ""}`}
+                title={`Day ${d}${ms ? ` — ${ms.name}` : rest ? " — rest day" : ""}${done ? " — completed · tap to revise" : ""}`}
                 className={`aspect-square rounded-md flex items-center justify-center text-[9px] font-bold ${
                   done
-                    ? "bg-indigo-600 text-white"
+                    ? "bg-indigo-600 text-white hover:bg-indigo-500 hover:ring-2 hover:ring-indigo-300 cursor-pointer transition"
                     : isCurrent
                       ? "bg-amber-400 text-amber-950 ring-2 ring-amber-500 animate-pulse"
                       : rest
@@ -340,9 +605,30 @@ export default async function JourneyPage({
                 {ms ? <span className="text-[11px]">{ms.icon}</span> : rest ? "·" : d}
               </div>
             );
+            // Completed missions stay open for revision — relaunch is
+            // untagged (validated server-side), so it can never re-credit
+            // the day, earn XP, or advance the journey.
+            const dayCourseId = dayByNumber.get(d)?.course_id;
+            return done && dayCourseId ? (
+              <Link
+                key={d}
+                href={`/${orgSlug}/courses/${dayCourseId}/launch?journey=${enrollment.id}&day=${d}`}
+                aria-label={`Revise day ${d}`}
+              >
+                {cell}
+              </Link>
+            ) : (
+              <div key={d}>{cell}</div>
+            );
           })}
-        </div>
-        <p className="mt-3 text-[11px] text-muted">{copy.footer_note}</p>
+            </div>
+          </div>
+        </details>
+
+        <p className="px-5 py-3 text-[11px] text-muted border-t border-line">
+          {state.completedCount > 0 ? `${copy.revise_hint} ` : ""}
+          {copy.footer_note}
+        </p>
       </section>
     </div>
   );
@@ -416,31 +702,3 @@ function MilestonePath({
   );
 }
 
-function Stat({
-  label,
-  value,
-  sub,
-  icon,
-  tone,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  icon: React.ReactNode;
-  tone?: "warn";
-}) {
-  return (
-    <div className="bg-paper border border-line rounded-2xl px-4 py-3">
-      <p className="text-[11px] uppercase tracking-wider text-muted font-bold inline-flex items-center gap-1.5">
-        {icon}
-        {label}
-      </p>
-      <p className="mt-1 text-xl font-semibold tabular-nums">{value}</p>
-      {sub && (
-        <p className={`text-[11px] ${tone === "warn" ? "text-amber-700 font-semibold" : "text-muted"}`}>
-          {sub}
-        </p>
-      )}
-    </div>
-  );
-}

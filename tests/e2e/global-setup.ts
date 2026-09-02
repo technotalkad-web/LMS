@@ -57,9 +57,45 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     );
   }
 
-  // 4. Sweep up anything left from a previous run.
+  // 4. Wait for the deployed worker to be STABLE, not just up. The suite
+  // targets the live staging worker, and a merge to main redeploys it —
+  // requests landing during the swap flake with slow/failed renders (the
+  // login mount-gate timeout seen 2026-08-21 and again 2026-09-02). Require
+  // two consecutive healthy /login responses a few seconds apart before
+  // letting any test run; a swap in progress fails the first probe and we
+  // ride it out instead of burning test retries.
+  const base = (process.env.E2E_BASE_URL ?? "").replace(/\/$/, "");
+  const healthy = async (): Promise<boolean> => {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 10_000);
+      const res = await fetch(`${base}/login`, { signal: ctl.signal, redirect: "manual" });
+      clearTimeout(t);
+      return res.status === 200 || (res.status >= 300 && res.status < 400);
+    } catch {
+      return false;
+    }
+  };
+  const deadline = Date.now() + 120_000;
+  let streak = 0;
+  while (Date.now() < deadline) {
+    if (await healthy()) {
+      streak++;
+      if (streak >= 2) break;
+    } else {
+      streak = 0;
+    }
+    await new Promise((r) => setTimeout(r, 4_000));
+  }
+  if (streak < 2) {
+    throw new Error(
+      `[e2e] staging at ${base} did not stabilize within 120s — a deploy may be stuck; retry the run.`
+    );
+  }
+
+  // 5. Sweep up anything left from a previous run.
   const purged = await purgeAllTestData();
   console.log(
-    `[e2e] global-setup: env OK, purged residue { users:${purged.users}, orgs:${purged.orgs}, otps:${purged.otps} }`
+    `[e2e] global-setup: env OK + staging stable, purged residue { users:${purged.users}, orgs:${purged.orgs}, otps:${purged.otps} }`
   );
 }
