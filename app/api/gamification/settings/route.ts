@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { BOARD_KEYS, COPY_LIMITS } from "@/lib/gamification/board-copy";
+import { validatePodiumStyle } from "@/lib/gamification/podium-style";
 
 /**
  *   POST /api/gamification/settings
@@ -213,6 +214,17 @@ export async function POST(request: Request) {
         { error: e instanceof Error ? e.message : "Invalid copy" },
         { status: 400 }
       );
+    }
+  } else if (body.section === "podium") {
+    // Podium style (0061). null = reset to the built-in look.
+    if (body.podium_style === null) {
+      update.podium_style = null;
+    } else {
+      const v = validatePodiumStyle(body.podium_style);
+      if (!v.ok) {
+        return NextResponse.json({ error: v.error }, { status: 400 });
+      }
+      update.podium_style = v.value;
     }
   } else {
     return NextResponse.json({ error: "Unknown section" }, { status: 400 });

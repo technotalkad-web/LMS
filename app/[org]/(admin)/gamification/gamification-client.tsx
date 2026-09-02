@@ -18,6 +18,15 @@ import {
   effectiveBoardCopy,
   type BoardCopyKey,
 } from "@/lib/gamification/board-copy";
+import {
+  CONFETTI_LIMITS,
+  DEFAULT_PODIUM_STYLE,
+  chipTextColor,
+  confettiPieces,
+  effectivePodiumStyle,
+  validatePodiumStyle,
+  type PodiumStyle,
+} from "@/lib/gamification/podium-style";
 
 export type GamificationSettings = {
   organization_id: string;
@@ -46,6 +55,8 @@ export type GamificationSettings = {
   board_labels?: unknown;
   leaderboard_title?: string | null;
   welcome_message?: string | null;
+  // Podium customization (0061); null/missing = built-in look.
+  podium_style?: unknown;
 };
 
 export type BadgeRow = {
@@ -140,6 +151,7 @@ export function GamificationClient({
         <>
           <PrivacyTab orgSlug={orgSlug} settings={settings} />
           <CopySection orgSlug={orgSlug} settings={settings} />
+          <PodiumSection orgSlug={orgSlug} settings={settings} />
         </>
       )}
     </div>
@@ -747,6 +759,350 @@ function CopySection({
           })
         }
       />
+    </SectionCard>
+  );
+}
+
+/**
+ * Podium customization (0061): background gradient, confetti (colors,
+ * density, speed) and per-rank avatar frames, with a live preview and an
+ * advanced JSON editor for power users. Saved via section "podium";
+ * "Reset to default" stores null (the built-in indigo look).
+ */
+function PodiumSection({
+  orgSlug,
+  settings,
+}: {
+  orgSlug: string;
+  settings: GamificationSettings | null;
+}) {
+  const [style, setStyle] = useState<PodiumStyle>(() =>
+    effectivePodiumStyle(settings?.podium_style)
+  );
+  const [jsonOpen, setJsonOpen] = useState(false);
+  const [jsonText, setJsonText] = useState("");
+  const [jsonError, setJsonError] = useState<string | null>(null);
+  const { busy, error, saved, save } = useSectionSave();
+
+  const upd = (patch: Partial<PodiumStyle>) =>
+    setStyle((s) => ({ ...s, ...patch }));
+  const updFrame = (i: number, patch: Partial<PodiumStyle["frames"][number]>) =>
+    setStyle((s) => ({
+      ...s,
+      frames: s.frames.map((f, j) => (j === i ? { ...f, ...patch } : f)) as
+        PodiumStyle["frames"],
+    }));
+
+  const ColorField = ({
+    label,
+    value,
+    onChange,
+  }: {
+    label: string;
+    value: string;
+    onChange: (v: string) => void;
+  }) => (
+    <label className="block">
+      <span className="block text-xs text-muted mb-1">{label}</span>
+      <span className="flex items-center gap-1.5">
+        <input
+          type="color"
+          value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : "#ffffff"}
+          onChange={(e) => onChange(e.target.value)}
+          className="h-8 w-9 rounded border border-line bg-canvas p-0.5 cursor-pointer shrink-0"
+          aria-label={`${label} color`}
+        />
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full min-w-0 px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs font-mono outline-none focus:border-ink"
+        />
+      </span>
+    </label>
+  );
+
+  const places = ["1st place", "2nd place", "3rd place"];
+  const previewPedestals = ["h-10", "h-14", "h-7"]; // 2-1-3 order below
+
+  return (
+    <SectionCard
+      title="Podium style"
+      description="Design the Top-3 podium: background, confetti and the frame around each winner. Changes apply to the live leaderboard as soon as you save."
+    >
+      {/* Live preview */}
+      <div
+        className="relative overflow-hidden rounded-2xl px-6 pt-5 pb-0"
+        style={{
+          background: `linear-gradient(to bottom, ${style.bg_from}, ${style.bg_via}, ${style.bg_to})`,
+        }}
+        aria-label="Podium preview"
+      >
+        {style.confetti_enabled && (
+          <div aria-hidden className="absolute inset-0 pointer-events-none">
+            {confettiPieces(style).map((c, i) => (
+              <span
+                key={i}
+                className="absolute"
+                style={{
+                  left: `${c.left}%`,
+                  top: `${(i * 41) % 90}%`,
+                  width: c.size,
+                  height: c.round ? c.size : c.size * 1.8,
+                  background: c.color,
+                  borderRadius: c.round ? "9999px" : "1px",
+                  opacity: 0.55,
+                }}
+              />
+            ))}
+          </div>
+        )}
+        <div className="relative grid grid-cols-3 items-end gap-4 max-w-sm mx-auto">
+          {[1, 0, 2].map((fi, col) => {
+            const f = style.frames[fi];
+            return (
+              <div key={fi} className="text-center">
+                <div className="relative inline-block">
+                  {f.topper && (
+                    <span aria-hidden className="absolute -top-5 left-1/2 -translate-x-1/2 text-base drop-shadow">
+                      {f.topper}
+                    </span>
+                  )}
+                  <span
+                    className={`inline-flex items-center justify-center rounded-full bg-white/25 text-white font-bold ${col === 1 ? "h-12 w-12 text-lg" : "h-9 w-9 text-sm"}`}
+                    style={{ boxShadow: `0 0 0 3px ${f.ring}` }}
+                  >
+                    {fi + 1}
+                  </span>
+                  <span
+                    className="absolute -bottom-2 left-1/2 -translate-x-1/2 px-1.5 py-px rounded-full text-[8px] font-extrabold shadow whitespace-nowrap"
+                    style={{ background: f.chip, color: chipTextColor(f.chip) }}
+                  >
+                    {f.label}
+                  </span>
+                </div>
+                <div
+                  className={`mt-3 mx-auto w-full max-w-[72px] rounded-t-xl bg-white/10 border border-b-0 border-white/20 ${previewPedestals[col]}`}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Background */}
+      <div>
+        <div className="text-[11px] uppercase tracking-wider font-semibold text-muted mb-2">
+          Background gradient
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <ColorField label="Top" value={style.bg_from} onChange={(v) => upd({ bg_from: v })} />
+          <ColorField label="Middle" value={style.bg_via} onChange={(v) => upd({ bg_via: v })} />
+          <ColorField label="Bottom" value={style.bg_to} onChange={(v) => upd({ bg_to: v })} />
+        </div>
+      </div>
+
+      {/* Frames */}
+      <div>
+        <div className="text-[11px] uppercase tracking-wider font-semibold text-muted mb-2">
+          Winner frames
+        </div>
+        <div className="space-y-3">
+          {style.frames.map((f, i) => (
+            <div key={i} className="grid grid-cols-2 sm:grid-cols-[90px_70px_1fr_1fr] gap-3 items-end">
+              <label className="block">
+                <span className="block text-xs text-muted mb-1">{places[i]}</span>
+                <input
+                  type="text"
+                  value={f.label}
+                  maxLength={12}
+                  onChange={(e) => updFrame(i, { label: e.target.value })}
+                  aria-label={`${places[i]} chip text`}
+                  className="w-full px-2 py-1.5 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+                />
+              </label>
+              <label className="block">
+                <span className="block text-xs text-muted mb-1">Topper</span>
+                <input
+                  type="text"
+                  value={f.topper}
+                  maxLength={8}
+                  onChange={(e) => updFrame(i, { topper: e.target.value })}
+                  placeholder="👑"
+                  aria-label={`${places[i]} topper emoji`}
+                  className="w-full px-2 py-1.5 border border-line rounded-lg bg-canvas text-sm text-center outline-none focus:border-ink"
+                />
+              </label>
+              <ColorField label="Ring" value={f.ring} onChange={(v) => updFrame(i, { ring: v })} />
+              <ColorField label="Chip" value={f.chip} onChange={(v) => updFrame(i, { chip: v })} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Confetti */}
+      <div>
+        <div className="text-[11px] uppercase tracking-wider font-semibold text-muted mb-2">
+          Confetti
+        </div>
+        <label className="flex items-center gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            checked={style.confetti_enabled}
+            onChange={(e) => upd({ confetti_enabled: e.target.checked })}
+            className="h-4 w-4 accent-indigo-600"
+          />
+          Continuous confetti fall
+        </label>
+        {style.confetti_enabled && (
+          <div className="mt-3 space-y-3">
+            <div className="grid sm:grid-cols-2 gap-4">
+              <label className="block">
+                <span className="block text-xs text-muted mb-1">
+                  Density — {style.confetti_density} pieces
+                </span>
+                <input
+                  type="range"
+                  min={CONFETTI_LIMITS.minDensity}
+                  max={CONFETTI_LIMITS.maxDensity}
+                  value={style.confetti_density}
+                  onChange={(e) => upd({ confetti_density: Number(e.target.value) })}
+                  className="w-full accent-indigo-600"
+                />
+              </label>
+              <label className="block">
+                <span className="block text-xs text-muted mb-1">
+                  Fall speed — {style.confetti_speed}×
+                </span>
+                <input
+                  type="range"
+                  min={CONFETTI_LIMITS.minSpeed}
+                  max={CONFETTI_LIMITS.maxSpeed}
+                  step={0.25}
+                  value={style.confetti_speed}
+                  onChange={(e) => upd({ confetti_speed: Number(e.target.value) })}
+                  className="w-full accent-indigo-600"
+                />
+              </label>
+            </div>
+            <div>
+              <span className="block text-xs text-muted mb-1.5">Colors</span>
+              <div className="flex flex-wrap items-center gap-2">
+                {style.confetti_colors.map((c, i) => (
+                  <span key={i} className="relative inline-flex">
+                    <input
+                      type="color"
+                      value={/^#[0-9a-fA-F]{6}$/.test(c) ? c : "#ffffff"}
+                      onChange={(e) =>
+                        upd({
+                          confetti_colors: style.confetti_colors.map((x, j) =>
+                            j === i ? e.target.value : x
+                          ),
+                        })
+                      }
+                      aria-label={`Confetti color ${i + 1}`}
+                      className="h-8 w-9 rounded border border-line bg-canvas p-0.5 cursor-pointer"
+                    />
+                    {style.confetti_colors.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          upd({
+                            confetti_colors: style.confetti_colors.filter((_, j) => j !== i),
+                          })
+                        }
+                        aria-label={`Remove confetti color ${i + 1}`}
+                        className="absolute -top-1.5 -right-1.5 h-4 w-4 rounded-full bg-ink text-canvas text-[9px] leading-none"
+                      >
+                        ×
+                      </button>
+                    )}
+                  </span>
+                ))}
+                {style.confetti_colors.length < CONFETTI_LIMITS.maxColors && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      upd({ confetti_colors: [...style.confetti_colors, "#E6C4FF"] })
+                    }
+                    className="h-8 px-2.5 border border-dashed border-line rounded-lg text-xs text-muted hover:border-ink"
+                  >
+                    + Add
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Advanced JSON editor */}
+      <div className="border-t border-line pt-3">
+        <button
+          type="button"
+          onClick={() => {
+            setJsonOpen((o) => !o);
+            setJsonText(JSON.stringify(style, null, 2));
+            setJsonError(null);
+          }}
+          className="text-xs font-medium text-muted hover:text-ink underline underline-offset-2"
+        >
+          {jsonOpen ? "Hide JSON editor" : "Edit as JSON (advanced)"}
+        </button>
+        {jsonOpen && (
+          <div className="mt-2 space-y-2">
+            <textarea
+              value={jsonText}
+              onChange={(e) => setJsonText(e.target.value)}
+              rows={12}
+              spellCheck={false}
+              aria-label="Podium style JSON"
+              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-xs font-mono outline-none focus:border-ink"
+            />
+            {jsonError && <p className="text-sm text-red-700">{jsonError}</p>}
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  const parsed = JSON.parse(jsonText) as unknown;
+                  const v = validatePodiumStyle(parsed);
+                  if (!v.ok) {
+                    setJsonError(v.error);
+                    return;
+                  }
+                  setStyle(v.value);
+                  setJsonError(null);
+                } catch {
+                  setJsonError("Invalid JSON — check for missing quotes or commas.");
+                }
+              }}
+              className="px-3 py-1.5 border border-line rounded-lg text-xs font-medium hover:border-ink"
+            >
+              Apply JSON to preview
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center justify-between gap-3 pt-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={async () => {
+            const ok = await save({ orgSlug, section: "podium", podium_style: null });
+            if (ok) setStyle(DEFAULT_PODIUM_STYLE);
+          }}
+          className="text-xs text-muted hover:text-ink underline underline-offset-2 disabled:opacity-50"
+        >
+          Reset to default
+        </button>
+        <SaveRow
+          busy={busy}
+          error={error}
+          saved={saved}
+          onSave={() => save({ orgSlug, section: "podium", podium_style: style })}
+        />
+      </div>
     </SectionCard>
   );
 }

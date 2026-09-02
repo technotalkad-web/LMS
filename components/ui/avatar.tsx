@@ -16,11 +16,14 @@ export function Avatar({
   avatarUrl,
   size = "md",
   className = "",
+  style,
 }: {
   name: string;
   avatarUrl?: string | null;
   size?: keyof typeof SIZES;
   className?: string;
+  /** Inline overrides (e.g. a custom --tw-ring-color for podium frames). */
+  style?: React.CSSProperties;
 }) {
   const initial = (name.trim()[0] ?? "?").toUpperCase();
   if (avatarUrl) {
@@ -29,6 +32,7 @@ export function Avatar({
       <img
         src={avatarUrl}
         alt=""
+        style={style}
         className={`${SIZES[size]} rounded-full object-cover object-center bg-canvas shrink-0 ${className}`}
       />
     );
@@ -36,6 +40,7 @@ export function Avatar({
   return (
     <div
       aria-hidden
+      style={style}
       className={`${SIZES[size]} rounded-full bg-gradient-to-br from-indigo-500 to-indigo-700 text-white flex items-center justify-center font-semibold shrink-0 ${className}`}
     >
       {initial}
