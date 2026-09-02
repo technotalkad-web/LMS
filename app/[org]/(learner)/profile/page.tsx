@@ -82,6 +82,39 @@ export default async function ProfilePage({
     .eq("user_id", user.id)
     .maybeSingle();
   const optedOut = (ugRow as { opted_out?: boolean } | null)?.opted_out ?? false;
+
+  // Earned badges (gamification + the Yoddha journey badge) — the journey
+  // completion screen promises the badge lives on the profile, so it must.
+  const { data: myBadgeRows } = await svc
+    .from("user_badges")
+    .select("badge_slug, awarded_at, period")
+    .eq("organization_id", org.id)
+    .eq("user_id", user.id)
+    .is("revoked_at", null)
+    .order("awarded_at", { ascending: false });
+  const myBadges = (myBadgeRows ?? []) as Array<{
+    badge_slug: string;
+    awarded_at: string;
+    period: string | null;
+  }>;
+  const badgeCatalog = new Map<string, { name: string; icon: string | null }>();
+  if (myBadges.length > 0) {
+    const { data: cat } = await svc
+      .from("gamification_badges")
+      .select("slug, name, icon, organization_id")
+      .or(`organization_id.is.null,organization_id.eq.${org.id}`);
+    for (const b of (cat ?? []) as Array<{
+      slug: string;
+      name: string;
+      icon: string | null;
+      organization_id: string | null;
+    }>) {
+      const existing = badgeCatalog.get(b.slug);
+      if (!existing || b.organization_id !== null) {
+        badgeCatalog.set(b.slug, { name: b.name, icon: b.icon });
+      }
+    }
+  }
   const profile = (profileRow ?? {
     first_name: null,
     last_name: null,
@@ -175,6 +208,40 @@ export default async function ProfilePage({
               <ChangePasswordButton />
             </div>
           </div>
+
+          {myBadges.length > 0 && (
+            <div className="bg-paper border border-line rounded-2xl p-5">
+              <h3 className="text-sm font-semibold mb-3">My badges</h3>
+              <ul className="space-y-2.5">
+                {myBadges.map((b) => {
+                  const meta = badgeCatalog.get(b.badge_slug);
+                  return (
+                    <li
+                      key={`${b.badge_slug}-${b.period ?? ""}`}
+                      className="flex items-center gap-2.5 text-sm"
+                    >
+                      <span className="text-xl shrink-0" aria-hidden>
+                        {meta?.icon ?? "🏅"}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block font-medium truncate">
+                          {meta?.name ?? b.badge_slug}
+                        </span>
+                        <span className="block text-[11px] text-muted">
+                          {b.period ? `${b.period} · ` : ""}
+                          {new Date(b.awarded_at).toLocaleDateString("en-IN", {
+                            day: "numeric",
+                            month: "short",
+                            year: "numeric",
+                          })}
+                        </span>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
 
           {gs?.enabled !== false && gs?.leaderboard_enabled !== false && (
             <div className="bg-paper border border-line rounded-2xl p-5">

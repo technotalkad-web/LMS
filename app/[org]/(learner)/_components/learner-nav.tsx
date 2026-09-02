@@ -11,13 +11,18 @@ import { usePathname } from "next/navigation";
 export function LearnerTopNav({
   orgSlug,
   showLeaderboard = true,
+  showJourney = false,
 }: {
   orgSlug: string;
   showLeaderboard?: boolean;
+  showJourney?: boolean;
 }) {
   const pathname = usePathname();
   const items = [
     { href: `/${orgSlug}/dashboard`, label: "Dashboard" },
+    ...(showJourney
+      ? [{ href: `/${orgSlug}/journey`, label: "My Journey" }]
+      : []),
     { href: `/${orgSlug}/courses`, label: "Courses" },
     ...(showLeaderboard
       ? [{ href: `/${orgSlug}/leaderboard`, label: "Leaderboard" }]

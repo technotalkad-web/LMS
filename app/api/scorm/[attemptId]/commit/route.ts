@@ -147,6 +147,9 @@ export async function POST(
       { auth: { persistSession: false } }
     );
     await svc.rpc("gamification_record_activity", { p_attempt_id: attemptId });
+    // Yoddha journey (0058): credits the tagged day; no-ops for untagged
+    // attempts and on databases without the function yet.
+    await svc.rpc("journey_record_completion", { p_attempt_id: attemptId });
   } catch (e) {
     console.warn("[scorm/commit] gamification failed:", e);
   }

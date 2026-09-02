@@ -1,5 +1,12 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { isReleased } from "@/lib/learner/release";
+import {
+  computeJourneyState,
+  courseDaysOf,
+  parseVersionDays,
+  todayStr,
+  DEFAULT_JOURNEY_TZ,
+} from "@/lib/journey/journey";
 
 export type CourseAccess = {
   allowed: boolean;
@@ -27,10 +34,13 @@ export type CourseAccess = {
  *
  * This mirrors the dashboard's entitlement resolution (dashboard/page.tsx) and
  * the learning-path detail page (paths/[pathId]/page.tsx) so that "launchable"
- * exactly equals "appears on your dashboard" (upcoming cards appear but don't
- * launch). It closes an IDOR where any org member could open a PRIVATE,
- * UNASSIGNED course just by visiting its URL — the course detail/launch pages
- * previously checked only `organization_id`.
+ * equals "appears on your dashboard" (upcoming cards appear but don't launch)
+ * — with ONE deliberate exception: Yoddha-journey days (0058) are launchable
+ * for enrolled learners but surface only on the /journey page, never as
+ * dashboard course cards. Do not "fix" that by removing the journey branch.
+ * It closes an IDOR where any org member could open a PRIVATE, UNASSIGNED
+ * course just by visiting its URL — the course detail/launch pages previously
+ * checked only `organization_id`.
  *
  * Pass the caller's RLS-scoped client so visibility matches the dashboard
  * (non-admins can't read pure team-assignment rows — same as the dashboard).
@@ -153,6 +163,81 @@ export async function learnerCanAccessCourse(opts: {
       if (!entitled) continue;
       if (isReleased(s.release_at, now)) return { allowed: true, upcomingAt: null };
       if (s.release_at) pending.push(s.release_at);
+    }
+  }
+
+  // Yoddha-journey entitlement (0058): a course scheduled as a journey day
+  // is launchable up to the learner's unlocked day (completed days stay
+  // reviewable; future days remain locked even by direct URL — the drip is
+  // the whole point). Journeys grant no course_assignments rows, mirroring
+  // the learning-path grant above.
+  const { data: enrRows } = await supabase
+    .from("journey_enrollments")
+    .select(
+      "id, version_id, start_date, status, journey_programs!inner(is_active)"
+    )
+    .eq("organization_id", orgId)
+    .eq("user_id", userId)
+    .in("status", ["active", "completed"]);
+  const enrollments = ((enrRows ?? []) as Array<{
+    id: string;
+    version_id: string;
+    start_date: string;
+    status: string;
+    journey_programs: { is_active: boolean } | Array<{ is_active: boolean }>;
+  }>).filter((e) => {
+    const p = Array.isArray(e.journey_programs)
+      ? e.journey_programs[0]
+      : e.journey_programs;
+    // A paused program suspends launching (completed alumni keep review).
+    return e.status === "completed" || p?.is_active !== false;
+  });
+  if (enrollments.length > 0) {
+    // Curriculum + rules come from each enrollment's PINNED version.
+    const { data: verRows } = await supabase
+      .from("journey_versions")
+      .select("id, days_total, count_sundays, days")
+      .in("id", enrollments.map((e) => e.version_id));
+    const versions = new Map(
+      ((verRows ?? []) as Array<{
+        id: string;
+        days_total: number;
+        count_sundays: boolean;
+        days: unknown;
+      }>).map((v) => [v.id, v])
+    );
+    const { data: gsRow } = await supabase
+      .from("gamification_settings")
+      .select("timezone")
+      .eq("organization_id", orgId)
+      .maybeSingle();
+    const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+    for (const enr of enrollments) {
+      const v = versions.get(enr.version_id);
+      if (!v) continue;
+      const courseDays = [...parseVersionDays(v.days).values()]
+        .filter((d) => d.course_id === courseId)
+        .map((d) => d.day);
+      if (courseDays.length === 0) continue;
+      if (enr.status === "completed") {
+        // Yoddha alumni keep review access to their journey modules.
+        return { allowed: true, upcomingAt: null };
+      }
+      const { count } = await supabase
+        .from("journey_day_progress")
+        .select("id", { count: "exact", head: true })
+        .eq("enrollment_id", enr.id);
+      const state = computeJourneyState({
+        startDate: enr.start_date,
+        today: todayStr(tz),
+        completedCount: count ?? 0,
+        daysTotal: v.days_total,
+        countSundays: v.count_sundays === true,
+        courseDays: courseDaysOf(v.days, v.days_total),
+      });
+      if (courseDays.some((d) => d <= Math.min(state.allowedDay, state.currentDay))) {
+        return { allowed: true, upcomingAt: null };
+      }
     }
   }
 

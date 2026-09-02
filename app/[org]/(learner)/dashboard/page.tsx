@@ -22,6 +22,7 @@ import {
   type MyGamification,
 } from "./_components/motivation-strip";
 import { DEFAULT_WELCOME_MESSAGE } from "@/lib/gamification/board-copy";
+import { effectiveJourneyCopy } from "@/lib/journey/journey";
 
 type Course = {
   id: string;
@@ -105,6 +106,61 @@ export default async function DashboardPage({
     [profRow?.first_name, profRow?.last_name].filter(Boolean).join(" ").trim() ||
     user.email ||
     "";
+
+  // 0.15) Yoddha journey banner data (0058) — fail-soft: pre-migration the
+  // select errors, journey stays null, banner hidden.
+  let journey: {
+    id: string;
+    day: number;
+    total: number;
+    name: string;
+    icon: string;
+    line: string;
+  } | null = null;
+  {
+    const { data: jRows } = await supabase
+      .from("journey_enrollments")
+      .select(
+        "id, start_date, journey_versions!inner(name, icon, days_total), journey_programs!inner(is_active, copy)"
+      )
+      .eq("organization_id", org.id)
+      .eq("user_id", user.id)
+      .eq("status", "active")
+      .limit(1);
+    const j = (jRows ?? [])[0] as
+      | {
+          id: string;
+          start_date: string;
+          journey_versions:
+            | { name: string; icon: string; days_total: number }
+            | Array<{ name: string; icon: string; days_total: number }>;
+          journey_programs:
+            | { is_active: boolean; copy: unknown }
+            | Array<{ is_active: boolean; copy: unknown }>;
+        }
+      | undefined;
+    if (j) {
+      const ver = Array.isArray(j.journey_versions)
+        ? j.journey_versions[0]
+        : j.journey_versions;
+      const prog = Array.isArray(j.journey_programs)
+        ? j.journey_programs[0]
+        : j.journey_programs;
+      const jc = effectiveJourneyCopy(prog?.copy);
+      const { count } = await supabase
+        .from("journey_day_progress")
+        .select("id", { count: "exact", head: true })
+        .eq("enrollment_id", j.id);
+      journey = {
+        id: j.id,
+        day: Math.min(ver?.days_total ?? 90, (count ?? 0) + 1),
+        total: ver?.days_total ?? 90,
+        name: ver?.name ?? "90-Day Yoddha Journey",
+        icon: ver?.icon ?? "🏹",
+        line: prog?.is_active === false ? jc.paused_title.toLowerCase() : jc.banner_line,
+      };
+    }
+  }
 
   // 0.2) Org-editable welcome line (migration 0057; members can read their
   // org's gamification_settings under RLS). Fail-soft to the default — a
@@ -299,6 +355,13 @@ export default async function DashboardPage({
             link (e.g. scanning a QR for an unassigned course) — the flash
             banner must show on the empty dashboard too, not just the grid. */}
         {sp.denied && <DeniedBanner denied={sp.denied} className="mb-6" />}
+        {/* New joiners often have ONLY the journey — the banner must show
+            on the empty dashboard too, or their one task is invisible. */}
+        {journey && (
+          <div className="mb-6">
+            <JourneyBanner orgSlug={orgSlug} journey={journey} />
+          </div>
+        )}
         <EmptyDashboard
           orgName={org.name}
           role={role}
@@ -783,6 +846,9 @@ export default async function DashboardPage({
         </div>
       )}
 
+      {/* Yoddha journey banner — mandatory onboarding outranks gamification. */}
+      {journey && <JourneyBanner orgSlug={orgSlug} journey={journey} />}
+
       {/* Personal gamification strip (rank / XP / level / streak / avg score).
           Sits below the urgency callout — deadlines outrank gamification. */}
       <MotivationStrip orgSlug={orgSlug} data={myGamification} avgScore={avgScore} />
@@ -795,6 +861,48 @@ export default async function DashboardPage({
 }
 
 /* -------- subcomponents -------- */
+
+function JourneyBanner({
+  orgSlug,
+  journey,
+}: {
+  orgSlug: string;
+  journey: {
+    id: string;
+    day: number;
+    total: number;
+    name: string;
+    icon: string;
+    line: string;
+  };
+}) {
+  return (
+    <Link
+      href={`/${orgSlug}/journey`}
+      className="block rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 text-white px-5 py-4 shadow-sm hover:from-indigo-700 hover:to-violet-700 transition-colors"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-[11px] uppercase tracking-[0.2em] font-bold opacity-80">
+            {journey.icon} {journey.name}
+          </p>
+          <p className="text-lg font-semibold mt-0.5">
+            Day {journey.day} of {journey.total} — {journey.line}
+          </p>
+        </div>
+        <span className="inline-flex items-center gap-1.5 bg-white/15 rounded-lg px-4 py-2 text-sm font-semibold">
+          Continue journey →
+        </span>
+      </div>
+      <div className="mt-3 h-1.5 bg-white/20 rounded-full overflow-hidden">
+        <div
+          className="h-full bg-white rounded-full"
+          style={{ width: `${Math.round(((journey.day - 1) / journey.total) * 100)}%` }}
+        />
+      </div>
+    </Link>
+  );
+}
 
 function EmptyDashboard({
   orgName,

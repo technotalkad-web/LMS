@@ -71,6 +71,10 @@ export async function POST(request: Request) {
     await svc.rpc("gamification_record_activity", {
       p_attempt_id: session.attemptId,
     });
+    // Yoddha journey (0058): credits the tagged day; no-ops otherwise.
+    await svc.rpc("journey_record_completion", {
+      p_attempt_id: session.attemptId,
+    });
   } catch (e) {
     console.warn("[xapi/statements] gamification failed:", e);
   }

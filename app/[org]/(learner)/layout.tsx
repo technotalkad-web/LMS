@@ -64,11 +64,12 @@ export default async function LearnerLayout({
   // Profile (own-row RLS read) rides the same round trip for the nav's
   // display name + photo; both fail-soft to the email-only header.
   let showLeaderboard = true;
+  let showJourney = false;
   let displayName = user.email ?? "you";
   let avatarUrl: string | null = null;
   try {
     const supabase = await createClient();
-    const [{ data: gs }, { data: prof }] = await Promise.all([
+    const [{ data: gs }, { data: prof }, { data: journeyRows }] = await Promise.all([
       supabase
         .from("gamification_settings")
         .select("enabled, leaderboard_enabled")
@@ -79,7 +80,17 @@ export default async function LearnerLayout({
         .select("first_name, last_name, avatar_url")
         .eq("id", user.id)
         .maybeSingle(),
+      // Yoddha journey (0058): nav item only for enrolled learners.
+      // Fail-soft — pre-migration this select errors and stays hidden.
+      supabase
+        .from("journey_enrollments")
+        .select("id")
+        .eq("organization_id", org.id)
+        .eq("user_id", user.id)
+        .in("status", ["active", "completed"])
+        .limit(1),
     ]);
+    showJourney = (journeyRows ?? []).length > 0;
     if (gs && (gs.enabled === false || gs.leaderboard_enabled === false)) {
       showLeaderboard = false;
     }
@@ -124,7 +135,11 @@ export default async function LearnerLayout({
               <span className="font-semibold text-lg tracking-tight">{org.name}</span>
             </Link>
 
-            <LearnerTopNav orgSlug={org.slug} showLeaderboard={showLeaderboard} />
+            <LearnerTopNav
+              orgSlug={org.slug}
+              showLeaderboard={showLeaderboard}
+              showJourney={showJourney}
+            />
           </div>
 
           <ProfileDropdown

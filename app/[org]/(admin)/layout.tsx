@@ -119,6 +119,7 @@ export default async function AdminLayout({
             {manage && <NavItem href={`/${org.slug}/learning-paths`} label="Learning paths" />}
 
             {manage && <NavGroup label="Engagement" />}
+            {manage && <NavItem href={`/${org.slug}/journey-admin`} label="Yoddha Journey" />}
             {manage && <NavItem href={`/${org.slug}/gamification`} label="Gamification" />}
             {manage && <NavItem href={`/${org.slug}/announcements`} label="Announcements" />}
             {manage && <NavItem href={`/${org.slug}/tickets`} label="Tickets" />}
