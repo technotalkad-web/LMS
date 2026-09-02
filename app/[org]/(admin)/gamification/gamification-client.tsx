@@ -764,6 +764,42 @@ function CopySection({
 }
 
 /**
+ * Color picker + hex input pair. Module-level on purpose: defining this
+ * inside PodiumSection would give it a new identity every render, and React
+ * would remount the inputs on each keystroke (the hex field loses focus).
+ */
+function ColorField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="block text-xs text-muted mb-1">{label}</span>
+      <span className="flex items-center gap-1.5">
+        <input
+          type="color"
+          value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : "#ffffff"}
+          onChange={(e) => onChange(e.target.value)}
+          className="h-8 w-9 rounded border border-line bg-canvas p-0.5 cursor-pointer shrink-0"
+          aria-label={`${label} color`}
+        />
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full min-w-0 px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs font-mono outline-none focus:border-ink"
+        />
+      </span>
+    </label>
+  );
+}
+
+/**
  * Podium customization (0061): background gradient, confetti (colors,
  * density, speed) and per-rank avatar frames, with a live preview and an
  * advanced JSON editor for power users. Saved via section "podium";
@@ -792,35 +828,6 @@ function PodiumSection({
       frames: s.frames.map((f, j) => (j === i ? { ...f, ...patch } : f)) as
         PodiumStyle["frames"],
     }));
-
-  const ColorField = ({
-    label,
-    value,
-    onChange,
-  }: {
-    label: string;
-    value: string;
-    onChange: (v: string) => void;
-  }) => (
-    <label className="block">
-      <span className="block text-xs text-muted mb-1">{label}</span>
-      <span className="flex items-center gap-1.5">
-        <input
-          type="color"
-          value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : "#ffffff"}
-          onChange={(e) => onChange(e.target.value)}
-          className="h-8 w-9 rounded border border-line bg-canvas p-0.5 cursor-pointer shrink-0"
-          aria-label={`${label} color`}
-        />
-        <input
-          type="text"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-full min-w-0 px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs font-mono outline-none focus:border-ink"
-        />
-      </span>
-    </label>
-  );
 
   const places = ["1st place", "2nd place", "3rd place"];
   const previewPedestals = ["h-10", "h-14", "h-7"]; // 2-1-3 order below
