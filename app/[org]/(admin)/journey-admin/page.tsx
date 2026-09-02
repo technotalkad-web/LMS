@@ -157,6 +157,16 @@ export default async function JourneyAdminPage({
     .maybeSingle();
   const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
 
+  // Day-by-day completion funnel (0059 RPC; admin-guarded inside). Fail-soft
+  // to empty before the migration lands.
+  let funnel: Array<{ day_number: number; learners: number }> = [];
+  if (program) {
+    const { data: funnelRows } = await supabase.rpc("journey_day_funnel", {
+      p_program_id: program.id,
+    });
+    funnel = (funnelRows ?? []) as Array<{ day_number: number; learners: number }>;
+  }
+
   return (
     <JourneyAdminClient
       orgSlug={orgSlug}
@@ -166,6 +176,7 @@ export default async function JourneyAdminPage({
       enrollments={enrollments}
       members={members}
       courses={courses}
+      funnel={funnel}
       today={todayStr(tz)}
     />
   );

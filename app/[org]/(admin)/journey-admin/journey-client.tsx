@@ -26,7 +26,12 @@ export type ProgramRow = {
   completion_title: string;
   is_active: boolean;
   current_version_id: string | null;
+  // Phase 2 (0059) — undefined before the migration runs.
+  nudge_enabled?: boolean;
+  nudge_behind_days?: number;
+  nudge_cooldown_days?: number;
 };
+export type FunnelRow = { day_number: number; learners: number };
 export type DayRow = {
   day_number: number;
   course_id: string | null;
@@ -54,6 +59,7 @@ export type CourseOption = { id: string; title: string };
 const TABS = [
   { key: "curriculum", label: "Curriculum" },
   { key: "enrollments", label: "Enrollments" },
+  { key: "reports", label: "Reports" },
   { key: "settings", label: "Settings & milestones" },
 ] as const;
 type TabKey = (typeof TABS)[number]["key"];
@@ -66,6 +72,7 @@ export function JourneyAdminClient({
   enrollments,
   members,
   courses,
+  funnel,
   today,
 }: {
   orgSlug: string;
@@ -75,6 +82,7 @@ export function JourneyAdminClient({
   enrollments: EnrollmentRow[];
   members: MemberOption[];
   courses: CourseOption[];
+  funnel: FunnelRow[];
   today: string;
 }) {
   const router = useRouter();
@@ -239,6 +247,14 @@ export function JourneyAdminClient({
           program={program}
           enrollments={enrollments}
           members={members}
+          today={today}
+        />
+      </div>
+      <div hidden={tab !== "reports"}>
+        <ReportsTab
+          program={program}
+          enrollments={enrollments}
+          funnel={funnel}
           today={today}
         />
       </div>
@@ -647,6 +663,206 @@ function EnrollmentsTab({
   );
 }
 
+/* ---------------- Reports: cohorts, funnel, overdue ---------------- */
+
+function ReportsTab({
+  program,
+  enrollments,
+  funnel,
+  today,
+}: {
+  program: ProgramRow;
+  enrollments: EnrollmentRow[];
+  funnel: FunnelRow[];
+  today: string;
+}) {
+  // Per-enrollment state against each run's PINNED version rules.
+  const rows = useMemo(
+    () =>
+      enrollments
+        .filter((e) => e.status !== "reset")
+        .map((e) => ({
+          ...e,
+          state: computeJourneyState({
+            startDate: e.start_date,
+            today,
+            completedCount: e.completed_count,
+            daysTotal: e.days_total,
+            countSundays: e.count_sundays === true,
+            courseDays: e.course_days,
+          }),
+        })),
+    [enrollments, today]
+  );
+  const active = rows.filter((r) => r.status === "active");
+  const completed = rows.filter((r) => r.status === "completed");
+  const behind = active.filter((r) => r.state.behindDays > 0);
+  const completionRate = rows.length
+    ? Math.round((completed.length / rows.length) * 100)
+    : 0;
+  const avgPct = active.length
+    ? Math.round(active.reduce((s, r) => s + r.state.pct, 0) / active.length)
+    : 0;
+
+  // Cohorts = enrollments grouped by start date (a batch enrolled together).
+  const cohorts = useMemo(() => {
+    const map = new Map<string, typeof rows>();
+    for (const r of rows) {
+      const bucket = map.get(r.start_date);
+      if (bucket) bucket.push(r);
+      else map.set(r.start_date, [r]);
+    }
+    return [...map.entries()]
+      .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+      .map(([start, list]) => ({
+        start,
+        total: list.length,
+        completed: list.filter((r) => r.status === "completed").length,
+        behind: list.filter((r) => r.status === "active" && r.state.behindDays > 0)
+          .length,
+        avgPct: Math.round(list.reduce((s, r) => s + r.state.pct, 0) / list.length),
+      }));
+  }, [rows]);
+
+  const overdue = [...behind].sort((a, b) => b.state.behindDays - a.state.behindDays);
+  const maxFunnel = Math.max(1, ...funnel.map((f) => f.learners));
+
+  return (
+    <div className="space-y-6">
+      {/* Summary */}
+      <section className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        {[
+          ["Enrolled", String(rows.length)],
+          ["Active", String(active.length)],
+          [`${program.completion_title}s`, String(completed.length)],
+          ["Completion rate", `${completionRate}%`],
+          ["Avg progress (active)", `${avgPct}%`],
+        ].map(([l, v]) => (
+          <div key={l} className="bg-paper border border-line rounded-2xl px-4 py-3">
+            <p className="text-[11px] uppercase tracking-wider text-muted font-bold">{l}</p>
+            <p className="mt-1 text-2xl font-semibold tabular-nums">{v}</p>
+          </div>
+        ))}
+      </section>
+
+      {/* Overdue / behind */}
+      <section className="border border-line rounded-2xl bg-paper overflow-hidden">
+        <div className="px-4 sm:px-5 py-3 border-b border-line flex items-center justify-between">
+          <h3 className="text-sm font-semibold">Behind schedule</h3>
+          <span className="text-xs text-muted">
+            {behind.length} of {active.length} active learner{active.length === 1 ? "" : "s"}
+          </span>
+        </div>
+        {overdue.length === 0 ? (
+          <p className="px-4 py-6 text-sm text-muted text-center">
+            Everyone is on track. 🎉
+          </p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase tracking-wider text-muted border-b border-line">
+                <th className="px-4 py-2.5">Learner</th>
+                <th className="px-4 py-2.5">Day</th>
+                <th className="px-4 py-2.5">Behind</th>
+                <th className="px-4 py-2.5">Version / started</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-line">
+              {overdue.slice(0, 15).map((r) => (
+                <tr key={r.id}>
+                  <td className="px-4 py-2.5">
+                    <span className="font-medium">{r.name}</span>
+                    <span className="block text-[11px] text-muted truncate">{r.email}</span>
+                  </td>
+                  <td className="px-4 py-2.5 tabular-nums">
+                    {r.state.currentDay}/{r.days_total}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <span className="text-amber-800 bg-amber-100 text-[11px] font-bold px-2 py-0.5 rounded-full">
+                      {r.state.behindDays} day{r.state.behindDays === 1 ? "" : "s"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5 text-xs text-muted">
+                    v{r.version_number} · started {r.start_date}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      {/* Day funnel */}
+      <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5">
+        <h3 className="text-sm font-semibold mb-1">Day-by-day completion funnel</h3>
+        <p className="text-xs text-muted mb-3">
+          How many learners have completed each day — where the bars shrink is
+          where the journey loses people.
+        </p>
+        {funnel.length === 0 ? (
+          <p className="text-sm text-muted py-4 text-center">No completions yet.</p>
+        ) : (
+          <div className="space-y-1 max-h-80 overflow-y-auto pr-1">
+            {funnel.map((f) => (
+              <div key={f.day_number} className="flex items-center gap-2 text-xs">
+                <span className="w-12 shrink-0 text-muted tabular-nums">Day {f.day_number}</span>
+                <div className="flex-1 h-4 bg-canvas rounded overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-500 rounded"
+                    style={{ width: `${Math.round((f.learners / maxFunnel) * 100)}%` }}
+                  />
+                </div>
+                <span className="w-8 shrink-0 text-right tabular-nums font-semibold">
+                  {f.learners}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Cohorts */}
+      <section className="border border-line rounded-2xl bg-paper overflow-hidden">
+        <div className="px-4 sm:px-5 py-3 border-b border-line">
+          <h3 className="text-sm font-semibold">Cohorts (by start date)</h3>
+        </div>
+        {cohorts.length === 0 ? (
+          <p className="px-4 py-6 text-sm text-muted text-center">No enrollments yet.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase tracking-wider text-muted border-b border-line">
+                <th className="px-4 py-2.5">Started</th>
+                <th className="px-4 py-2.5 text-right">Learners</th>
+                <th className="px-4 py-2.5 text-right">{program.completion_title}s</th>
+                <th className="px-4 py-2.5 text-right">Behind</th>
+                <th className="px-4 py-2.5 text-right">Avg progress</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-line">
+              {cohorts.map((c) => (
+                <tr key={c.start}>
+                  <td className="px-4 py-2.5 tabular-nums">{c.start}</td>
+                  <td className="px-4 py-2.5 text-right tabular-nums">{c.total}</td>
+                  <td className="px-4 py-2.5 text-right tabular-nums text-emerald-700 font-semibold">
+                    {c.completed}
+                  </td>
+                  <td className="px-4 py-2.5 text-right tabular-nums text-amber-700">
+                    {c.behind}
+                  </td>
+                  <td className="px-4 py-2.5 text-right tabular-nums font-semibold">
+                    {c.avgPct}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+    </div>
+  );
+}
+
 /* ---------------- Settings, rules, milestones & copy ---------------- */
 
 const COPY_LABELS: Record<keyof JourneyCopy, string> = {
@@ -678,6 +894,9 @@ function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRo
   const [isActive, setIsActive] = useState(program.is_active !== false);
   const [completionTitle, setCompletionTitle] = useState(program.completion_title);
   const [autoEnroll, setAutoEnroll] = useState(program.auto_enroll_new_users === true);
+  const [nudgeEnabled, setNudgeEnabled] = useState(program.nudge_enabled !== false);
+  const [nudgeBehind, setNudgeBehind] = useState(program.nudge_behind_days ?? 2);
+  const [nudgeCooldown, setNudgeCooldown] = useState(program.nudge_cooldown_days ?? 3);
   const [milestones, setMilestones] = useState(() =>
     effectiveMilestones(program.milestones, program.days_total)
   );
@@ -713,6 +932,9 @@ function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRo
           is_active: isActive,
           completion_title: completionTitle,
           auto_enroll_new_users: autoEnroll,
+          nudge_enabled: nudgeEnabled,
+          nudge_behind_days: nudgeBehind,
+          nudge_cooldown_days: nudgeCooldown,
           // Clamp to the journey length: a day past the end would be saved
           // yet invisible, then silently dropped by the next save.
           milestones: [...milestones]
@@ -806,6 +1028,53 @@ function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRo
             checked={autoEnroll}
             onChange={setAutoEnroll}
           />
+        </div>
+      </section>
+
+      <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 space-y-3">
+        <h3 className="text-sm font-semibold">Behind-schedule nudges</h3>
+        <p className="text-xs text-muted">
+          A daily email (09:30 IST) to learners who fall behind, sent through
+          your org&apos;s branded pipeline. The wording is editable like any
+          other template under Broadcast → Templates → &ldquo;journey_nudge&rdquo;.
+        </p>
+        <ToggleRow
+          label="Send nudge emails"
+          hint="Off = no automated reminders; the Reports tab still shows who's behind"
+          checked={nudgeEnabled}
+          onChange={setNudgeEnabled}
+        />
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+              Nudge when behind by (days)
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={nudgeBehind}
+              onChange={(e) =>
+                setNudgeBehind(Math.max(1, Math.min(30, Number(e.target.value) || 1)))
+              }
+              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
+            />
+          </label>
+          <label className="block">
+            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+              Days between nudges
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={nudgeCooldown}
+              onChange={(e) =>
+                setNudgeCooldown(Math.max(1, Math.min(30, Number(e.target.value) || 1)))
+              }
+              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
+            />
+          </label>
         </div>
       </section>
 

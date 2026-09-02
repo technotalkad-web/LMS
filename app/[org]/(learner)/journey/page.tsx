@@ -177,7 +177,13 @@ export default async function JourneyPage({
           </p>
         </section>
         <MilestonePath milestones={milestones} completed={version.days_total} />
-        <div className="text-center">
+        <div className="text-center flex items-center justify-center gap-3 flex-wrap">
+          <Link
+            href={`/${orgSlug}/journey/certificate`}
+            className="inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-semibold shadow-sm"
+          >
+            🎓 View your certificate
+          </Link>
           <Link
             href={`/${orgSlug}/dashboard`}
             className="inline-flex items-center gap-2 px-5 py-2.5 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90"

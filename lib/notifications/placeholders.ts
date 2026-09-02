@@ -33,4 +33,8 @@ export const KNOWN_TOKENS = [
   "Portal_URL",
   "Due_Date",
   "Score",
+  "Journey_Name",
+  "Day",
+  "Days_Total",
+  "Behind_Days",
 ] as const;

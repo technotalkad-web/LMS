@@ -135,6 +135,16 @@ This link is valid for a short time and can only be used once.
 
 — The {Org_Name} team`,
   },
+  journey_nudge: {
+    subject: "Your {Journey_Name} is waiting — Day {Day} of {Days_Total}",
+    body_md: `Hi {Learner_Name},
+
+Your **{Journey_Name}** on {Org_Name} has missions waiting: you're **{Behind_Days} day(s) behind**, and today's mission takes just a few minutes.
+
+Missed days can be caught up one after another — jump back in and keep your streak alive.
+
+— The {Org_Name} team`,
+  },
 };
 
 /**
@@ -177,6 +187,7 @@ export const DEFAULT_CTAS: Partial<Record<NotificationEvent, string>> = {
   path_completion: "See your progress",
   magic_link: "Sign in",
   account_invite: "Activate account",
+  journey_nudge: "Continue journey",
 };
 
 /**

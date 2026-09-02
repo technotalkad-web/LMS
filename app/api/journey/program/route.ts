@@ -143,6 +143,9 @@ export async function PATCH(request: Request) {
     count_sundays?: boolean;
     is_active?: boolean;
     auto_enroll_new_users?: boolean;
+    nudge_enabled?: boolean;
+    nudge_behind_days?: number;
+    nudge_cooldown_days?: number;
     completion_title?: string;
     copy?: Record<string, unknown> | null;
     milestones?: Array<{ day?: number; icon?: string; name?: string; message?: string }> | null;
@@ -171,12 +174,26 @@ export async function PATCH(request: Request) {
     }
     update.days_total = d;
   }
-  for (const flag of ["count_sundays", "is_active", "auto_enroll_new_users"] as const) {
+  for (const flag of [
+    "count_sundays",
+    "is_active",
+    "auto_enroll_new_users",
+    "nudge_enabled",
+  ] as const) {
     if (body[flag] !== undefined) {
       if (typeof body[flag] !== "boolean") {
         return NextResponse.json({ error: `${flag} must be boolean` }, { status: 400 });
       }
       update[flag] = body[flag];
+    }
+  }
+  for (const num of ["nudge_behind_days", "nudge_cooldown_days"] as const) {
+    if (body[num] !== undefined) {
+      const n = Math.round(Number(body[num]));
+      if (!Number.isFinite(n) || n < 1 || n > 30) {
+        return NextResponse.json({ error: `${num} must be 1–30` }, { status: 400 });
+      }
+      update[num] = n;
     }
   }
   if (body.completion_title !== undefined) {
