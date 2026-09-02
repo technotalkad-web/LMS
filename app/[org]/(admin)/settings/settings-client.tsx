@@ -8,6 +8,7 @@ import type { NotificationEvent } from "@/lib/notifications/types";
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
 import { Settings as SettingsIcon, Mail, Palette, FileText } from "lucide-react";
 import { TabStrip, type Tab } from "@/components/admin";
+import { LearnerThemeSection } from "./learner-theme-section";
 
 type Settings = {
   smtp_host: string;
@@ -64,6 +65,9 @@ export type WorkspaceBranding = {
   login_hero_image_url: string;
   login_hero_title: string;
   login_hero_subtitle: string;
+  /** "" = default look; else a preset id or "custom" (0060). */
+  learner_theme: string;
+  learner_theme_custom: Record<string, string> | null;
 };
 
 export type SsoConfig = {
@@ -1359,6 +1363,10 @@ function WorkspaceForm({
         login_hero_image_url: form.login_hero_image_url,
         login_hero_title: form.login_hero_title,
         login_hero_subtitle: form.login_hero_subtitle,
+        learner_theme: form.learner_theme,
+        ...(form.learner_theme === "custom"
+          ? { learner_theme_custom: form.learner_theme_custom }
+          : {}),
       }),
     });
     setBusy(false);
@@ -1514,6 +1522,12 @@ function WorkspaceForm({
           </button>
         </div>
       </section>
+
+      <LearnerThemeSection
+        value={form.learner_theme}
+        custom={form.learner_theme_custom}
+        onChange={(patch) => setForm({ ...form, ...patch })}
+      />
 
       <section className="border border-line rounded-2xl bg-paper p-6 space-y-4">
         <div>

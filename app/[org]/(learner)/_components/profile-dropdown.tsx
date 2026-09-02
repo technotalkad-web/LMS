@@ -7,11 +7,7 @@ import {
   User,
   Settings,
   LogOut,
-  Moon,
-  Sun,
 } from "lucide-react";
-
-type Theme = "light" | "dark";
 
 export function ProfileDropdown({
   orgSlug,
@@ -32,14 +28,7 @@ export function ProfileDropdown({
   brandColor?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>("light");
   const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const current =
-      (document.documentElement.dataset.theme as Theme | undefined) ?? "light";
-    setTheme(current);
-  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -56,17 +45,6 @@ export function ProfileDropdown({
       document.removeEventListener("keydown", onKey);
     };
   }, [open]);
-
-  async function toggleTheme() {
-    const next: Theme = theme === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    setTheme(next);
-    await fetch("/api/theme", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ theme: next }),
-    });
-  }
 
   const name = displayName || email?.split("@")[0] || "you";
   const initial = name.trim()[0]?.toUpperCase() ?? "?";
@@ -146,26 +124,6 @@ export function ProfileDropdown({
               </span>
             </Link>
           )}
-
-          {/* Theme */}
-          <button
-            type="button"
-            onClick={toggleTheme}
-            role="menuitem"
-            className="w-full flex items-center justify-between gap-3 px-4 py-2.5 text-sm hover:bg-canvas border-t border-line"
-          >
-            <span className="flex items-center gap-3">
-              {theme === "dark" ? (
-                <Sun className="w-4 h-4 text-muted" />
-              ) : (
-                <Moon className="w-4 h-4 text-muted" />
-              )}
-              {theme === "dark" ? "Light mode" : "Dark mode"}
-            </span>
-            <span className="text-[10px] uppercase tracking-wide text-muted">
-              {theme}
-            </span>
-          </button>
 
           {/* Sign out */}
           <form

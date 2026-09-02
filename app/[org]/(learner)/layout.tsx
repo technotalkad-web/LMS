@@ -8,6 +8,7 @@ import { MobileBottomNav } from "./_components/mobile-nav";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
 import { createClient } from "@/lib/supabase/server";
+import { resolveLearnerTheme } from "@/lib/theme/learner-themes";
 
 function fontStackFor(name: string | null): string {
   switch (name) {
@@ -67,9 +68,12 @@ export default async function LearnerLayout({
   let showJourney = false;
   let displayName = user.email ?? "you";
   let avatarUrl: string | null = null;
+  // Admin-chosen learner theme (0060): null = default look. Read fail-soft —
+  // pre-migration the select errors and the theme simply stays default.
+  let lmsTheme: { id: string; vars: Record<string, string> } | null = null;
   try {
     const supabase = await createClient();
-    const [{ data: gs }, { data: prof }, { data: journeyRows }] = await Promise.all([
+    const [{ data: gs }, { data: prof }, { data: journeyRows }, { data: themeRow }] = await Promise.all([
       supabase
         .from("gamification_settings")
         .select("enabled, leaderboard_enabled")
@@ -89,8 +93,17 @@ export default async function LearnerLayout({
         .eq("user_id", user.id)
         .in("status", ["active", "completed"])
         .limit(1),
+      supabase
+        .from("organizations")
+        .select("learner_theme, learner_theme_custom")
+        .eq("id", org.id)
+        .maybeSingle(),
     ]);
     showJourney = (journeyRows ?? []).length > 0;
+    lmsTheme = resolveLearnerTheme(
+      themeRow?.learner_theme,
+      themeRow?.learner_theme_custom
+    );
     if (gs && (gs.enabled === false || gs.leaderboard_enabled === false)) {
       showLeaderboard = false;
     }
@@ -108,11 +121,14 @@ export default async function LearnerLayout({
 
   return (
     <div
+      data-lms-root=""
+      data-lms-theme={lmsTheme?.id}
       className="min-h-screen flex flex-col bg-canvas"
       style={
         {
           "--brand-color": brandColor,
           fontFamily: fontStackFor(brandFont),
+          ...(lmsTheme?.vars ?? {}),
         } as React.CSSProperties
       }
     >
