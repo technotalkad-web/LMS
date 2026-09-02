@@ -23,6 +23,98 @@
   --accent: #7ea884;
 }
 
+/* ---- Learner-view themes (six, learner-selectable) ----
+   The learner layout stamps `data-lms-theme` on the learner shell from the
+   `lms_theme` cookie (see lib/theme/learner-themes.ts + /api/theme). Because
+   the design tokens resolve via var() at the point of use, redefining them on
+   the shell restyles the entire learner view while admin screens keep the
+   standard palette. A chosen theme deliberately pins its own palette — it
+   wins over the html-level light/dark attribute. */
+
+/* The shell must re-assert color/background: children that inherit color get
+   body's already-resolved value (computed at :root), not the overridden var —
+   without this, dark themes render dark headings on dark canvas. */
+[data-lms-theme] {
+  background-color: var(--canvas);
+  color: var(--ink);
+}
+
+/* 🌿 Classic — calm focus (pins the default light palette). */
+[data-lms-theme="classic"] {
+  --canvas: #faf8f4;
+  --ink: #1a1816;
+  --muted: #6b6661;
+  --line: #e8e3dc;
+  --paper: #ffffff;
+  --accent: #3a5a40;
+}
+
+/* 🌙 Midnight — late-night deep work (pins the dark palette). */
+[data-lms-theme="midnight"] {
+  --canvas: #14110e;
+  --ink: #f3eee6;
+  --muted: #8a8581;
+  --line: #2a2520;
+  --paper: #1b1814;
+  --accent: #7ea884;
+}
+
+/* 🌅 Sunrise — warm morning energy. */
+[data-lms-theme="sunrise"] {
+  --canvas: #fff5eb;
+  --ink: #332014;
+  --muted: #91684f;
+  --line: #f4dfc8;
+  --paper: #ffffff;
+  --accent: #ea580c;
+  background-image: linear-gradient(
+    180deg,
+    rgba(251, 146, 60, 0.12),
+    rgba(251, 191, 36, 0.05) 180px,
+    transparent 360px
+  );
+}
+
+/* 🌲 Growth — steady, natural progress. */
+[data-lms-theme="growth"] {
+  --canvas: #f2f7f1;
+  --ink: #17241a;
+  --muted: #5c7061;
+  --line: #dce8da;
+  --paper: #ffffff;
+  --accent: #1c7c3f;
+}
+
+/* 🏆 Arena — competition mode: deep navy + electric violet glow. */
+[data-lms-theme="arena"] {
+  --canvas: #0c1022;
+  --ink: #e9edff;
+  --muted: #97a0c3;
+  --line: #262f52;
+  --paper: #151b34;
+  --accent: #a78bfa;
+  background-image: radial-gradient(
+      900px 280px at 50% -80px,
+      rgba(139, 92, 246, 0.32),
+      transparent 70%
+    ),
+    radial-gradient(
+      600px 200px at 85% -40px,
+      rgba(245, 158, 11, 0.1),
+      transparent 70%
+    );
+}
+
+/* 🧘 Zen — soft, low-contrast reading calm. */
+[data-lms-theme="zen"] {
+  --canvas: #f6f3ec;
+  --ink: #403c36;
+  --muted: #8b857b;
+  --line: #e5dfd3;
+  --paper: #fbf9f4;
+  --accent: #7d7258;
+}
+
 @theme inline {
   --color-canvas: var(--canvas);
   --color-ink: var(--ink);
@@ -80,6 +172,64 @@ body {
 /* Branded text selection. */
 ::selection {
   background: color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* ---- Learner-view motion layer ----
+   Micro-interactions scoped to the learner shell (`data-lms-root`) so admin
+   screens stay static. Everything here is cheap CSS (opacity/transform only)
+   and is neutralized by the prefers-reduced-motion block below. */
+
+/* Content gently rises in on every navigation. The animation targets the
+   page root that swaps inside <main>, so it replays on client-side route
+   changes (animating <main> itself would only run once per full load). */
+@keyframes lms-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+[data-lms-root] main > * {
+  animation: lms-enter 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Tactile press feedback on anything clickable. The transition list is a
+   superset of Tailwind's `transition` utility so hover color/shadow
+   transitions on the same element keep working. */
+[data-lms-root] :is(button, a, [role="button"]) {
+  transition:
+    transform 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s ease;
+}
+[data-lms-root] :is(button, a, [role="button"]):active {
+  transform: scale(0.97);
+}
+
+/* Interactive cards (anything already opting into a hover shadow) get a
+   subtle lift so the whole surface feels alive. */
+[data-lms-root] :is(.hover\:shadow-md, .hover\:shadow-lg) {
+  transition:
+    transform 0.2s ease,
+    box-shadow 0.2s ease,
+    border-color 0.2s ease;
+}
+[data-lms-root] :is(.hover\:shadow-md, .hover\:shadow-lg):hover {
+  transform: translateY(-2px);
+}
+
+/* Menus/popovers pop in instead of appearing instantly. */
+@keyframes lms-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+}
+[data-lms-root] [role="menu"] {
+  animation: lms-pop 0.16s ease both;
+  transform-origin: top right;
 }
 
 /* Respect users who prefer reduced motion — disable transitions/animations. */

@@ -8,6 +8,12 @@ import { MobileBottomNav } from "./_components/mobile-nav";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
 import { createClient } from "@/lib/supabase/server";
+import { cookies } from "next/headers";
+import {
+  LEARNER_THEME_COOKIE,
+  isLearnerTheme,
+  type LearnerThemeId,
+} from "@/lib/theme/learner-themes";
 
 function fontStackFor(name: string | null): string {
   switch (name) {
@@ -57,6 +63,15 @@ export default async function LearnerLayout({
   const canSwitch = canManage(role) || canViewReports(role);
   const brandColor = (org.brand_color as string | null) || "#4f46e5";
   const brandFont = (org.brand_font as string | null) || "inter";
+
+  // Learner-view theme (per-device cookie; see lib/theme/learner-themes.ts).
+  // Stamped server-side so the chosen theme paints before any client JS runs
+  // (no flash of the default palette). No cookie → default look unchanged.
+  const cookieStore = await cookies();
+  const themeCookie = cookieStore.get(LEARNER_THEME_COOKIE)?.value;
+  const lmsTheme: LearnerThemeId | null = isLearnerTheme(themeCookie)
+    ? themeCookie
+    : null;
 
   // Gamification: hide the Leaderboard nav item when boards are disabled.
   // One PK-indexed read (members can read their org's settings under RLS);
@@ -108,6 +123,8 @@ export default async function LearnerLayout({
 
   return (
     <div
+      data-lms-root=""
+      data-lms-theme={lmsTheme ?? undefined}
       className="min-h-screen flex flex-col bg-canvas"
       style={
         {
@@ -150,6 +167,7 @@ export default async function LearnerLayout({
             roleLabel={roleLabel(role)}
             canSwitchToAdmin={canSwitch}
             brandColor={brandColor}
+            lmsTheme={lmsTheme}
           />
         </div>
       </header>

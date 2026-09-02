@@ -7,11 +7,12 @@ import {
   User,
   Settings,
   LogOut,
-  Moon,
-  Sun,
+  Palette,
 } from "lucide-react";
-
-type Theme = "light" | "dark";
+import {
+  LEARNER_THEMES,
+  type LearnerThemeId,
+} from "@/lib/theme/learner-themes";
 
 export function ProfileDropdown({
   orgSlug,
@@ -21,6 +22,7 @@ export function ProfileDropdown({
   roleLabel,
   canSwitchToAdmin,
   brandColor = "#4f46e5",
+  lmsTheme = null,
 }: {
   orgSlug: string;
   email: string;
@@ -30,16 +32,14 @@ export function ProfileDropdown({
   roleLabel: string;
   canSwitchToAdmin: boolean;
   brandColor?: string;
+  /** Active learner-view theme (null = never chosen → default look). */
+  lmsTheme?: LearnerThemeId | null;
 }) {
   const [open, setOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>("light");
+  const [activeTheme, setActiveTheme] = useState<LearnerThemeId>(
+    lmsTheme ?? "classic"
+  );
   const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const current =
-      (document.documentElement.dataset.theme as Theme | undefined) ?? "light";
-    setTheme(current);
-  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -57,14 +57,17 @@ export function ProfileDropdown({
     };
   }, [open]);
 
-  async function toggleTheme() {
-    const next: Theme = theme === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    setTheme(next);
+  async function pickTheme(id: LearnerThemeId) {
+    // Instant apply on the learner shell, then persist the cookie so the
+    // next SSR render paints the theme before hydration.
+    document
+      .querySelector("[data-lms-root]")
+      ?.setAttribute("data-lms-theme", id);
+    setActiveTheme(id);
     await fetch("/api/theme", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ theme: next }),
+      body: JSON.stringify({ lms: id }),
     });
   }
 
@@ -147,25 +150,46 @@ export function ProfileDropdown({
             </Link>
           )}
 
-          {/* Theme */}
-          <button
-            type="button"
-            onClick={toggleTheme}
-            role="menuitem"
-            className="w-full flex items-center justify-between gap-3 px-4 py-2.5 text-sm hover:bg-canvas border-t border-line"
-          >
-            <span className="flex items-center gap-3">
-              {theme === "dark" ? (
-                <Sun className="w-4 h-4 text-muted" />
-              ) : (
-                <Moon className="w-4 h-4 text-muted" />
-              )}
-              {theme === "dark" ? "Light mode" : "Dark mode"}
-            </span>
-            <span className="text-[10px] uppercase tracking-wide text-muted">
-              {theme}
-            </span>
-          </button>
+          {/* Learner-view theme picker */}
+          <div className="border-t border-line px-4 py-3">
+            <div className="flex items-center gap-2 text-xs font-medium text-muted mb-2">
+              <Palette className="w-3.5 h-3.5" />
+              Theme
+            </div>
+            <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="Theme">
+              {LEARNER_THEMES.map((t) => {
+                const active = t.id === activeTheme;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => pickTheme(t.id)}
+                    title={t.tagline}
+                    aria-pressed={active}
+                    className={`flex flex-col items-center gap-1 rounded-lg border px-1.5 py-2 text-[11px] leading-none transition ${
+                      active
+                        ? "border-accent ring-1 ring-accent bg-canvas font-medium"
+                        : "border-line hover:bg-canvas"
+                    }`}
+                  >
+                    <span
+                      aria-hidden
+                      className="h-5 w-5 rounded-full border border-line"
+                      style={{
+                        background: `linear-gradient(135deg, ${t.swatch[0]} 50%, ${t.swatch[1]} 50%)`,
+                      }}
+                    />
+                    <span>
+                      {t.emoji} {t.name}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-2 text-[11px] text-muted">
+              {LEARNER_THEMES.find((t) => t.id === activeTheme)?.tagline}
+            </p>
+          </div>
 
           {/* Sign out */}
           <form
