@@ -11,6 +11,13 @@ import { Cmi5Runtime } from "./cmi5-runtime";
 import { LaunchLanguagePicker } from "./launch-language-picker";
 import { isSupportedLanguage, languageDisplay } from "@/lib/i18n/languages";
 import type { CmiData } from "@/lib/scorm/types";
+import {
+  computeJourneyState,
+  courseDaysOf,
+  parseVersionDays,
+  todayStr,
+  DEFAULT_JOURNEY_TZ,
+} from "@/lib/journey/journey";
 
 type Course = {
   id: string;
@@ -40,10 +47,15 @@ export default async function LaunchPage({
   searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
-  searchParams: Promise<{ lang?: string; lp?: string }>;
+  searchParams: Promise<{ lang?: string; lp?: string; journey?: string; day?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
-  const { lang: langParam, lp: lpParam } = await searchParams;
+  const {
+    lang: langParam,
+    lp: lpParam,
+    journey: journeyParam,
+    day: dayParam,
+  } = await searchParams;
   const { user, org, role } = await requireOrgAccess(orgSlug);
 
   const supabase = await createClient();
@@ -62,10 +74,89 @@ export default async function LaunchPage({
   }
   const c = course as Course;
 
+  // ---- Yoddha journey context (?journey=<enrollmentId>&day=<n>) ----
+  // Runs BEFORE the generic entitlement gate: a locked journey day must
+  // bounce to the friendly journey?locked notice, not to the generic
+  // "denied" redirect the gate would produce for a journey-only course.
+  // Trusted only after re-validation: the enrollment must be the caller's
+  // own and active, that program day must point at THIS course, and the day
+  // must be the next unlockable one (catch-up allowed, never ahead of the
+  // calendar). A locked day bounces to the journey home; a completed day
+  // launches untagged (review mode). RLS scopes every read to the caller.
+  let journeyCtx: { enrollmentId: string; day: number } | null = null;
+  if (journeyParam && dayParam) {
+    const dayN = parseInt(dayParam, 10);
+    // Rules and curriculum come from the enrollment's PINNED VERSION —
+    // a later publish never changes what an in-flight run launches.
+    const { data: enrRow } = await supabase
+      .from("journey_enrollments")
+      .select(
+        "id, start_date, status, journey_versions!inner(days_total, count_sundays, days), journey_programs!inner(is_active)"
+      )
+      .eq("id", journeyParam)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    const enr = enrRow as {
+      id: string;
+      start_date: string;
+      status: string;
+      journey_versions:
+        | { days_total: number; count_sundays: boolean; days: unknown }
+        | Array<{ days_total: number; count_sundays: boolean; days: unknown }>;
+      journey_programs: { is_active: boolean } | Array<{ is_active: boolean }>;
+    } | null;
+    const prog = enr
+      ? Array.isArray(enr.journey_versions)
+        ? enr.journey_versions[0]
+        : enr.journey_versions
+      : null;
+    const parent = enr
+      ? Array.isArray(enr.journey_programs)
+        ? enr.journey_programs[0]
+        : enr.journey_programs
+      : null;
+    if (
+      enr &&
+      prog &&
+      enr.status === "active" &&
+      parent?.is_active !== false &&
+      Number.isFinite(dayN)
+    ) {
+      const dayEntry = parseVersionDays(prog.days).get(dayN);
+      if (dayEntry?.course_id === courseId) {
+        const { count } = await supabase
+          .from("journey_day_progress")
+          .select("id", { count: "exact", head: true })
+          .eq("enrollment_id", enr.id);
+        const { data: gsRow } = await supabase
+          .from("gamification_settings")
+          .select("timezone")
+          .eq("organization_id", org.id)
+          .maybeSingle();
+        const tz =
+          (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+        const state = computeJourneyState({
+          startDate: enr.start_date,
+          today: todayStr(tz),
+          completedCount: count ?? 0,
+          daysTotal: prog.days_total,
+          countSundays: prog.count_sundays === true,
+          courseDays: courseDaysOf(prog.days, prog.days_total),
+        });
+        if (dayN === state.currentDay && state.todayUnlocked) {
+          journeyCtx = { enrollmentId: enr.id, day: dayN };
+        } else if (dayN > (count ?? 0)) {
+          redirect(`/${orgSlug}/journey?locked=${dayN}`);
+        }
+        // dayN ≤ completed → review of a finished mission: launch untagged.
+      }
+    }
+  }
+
   // Entitlement gate (closes the private/unassigned-course IDOR): a learner may
   // only launch an assigned (direct/org/team) or org_public course whose
-  // assignment is released. Admins preview freely. Mirrors the dashboard so
-  // launchable == visible (upcoming cards are visible but bounce here).
+  // assignment is released, or a journey day up to their unlocked day.
+  // Admins preview freely. Mirrors the dashboard so launchable == visible.
   const access = await learnerCanAccessCourse({
     supabase,
     orgId: org.id,
@@ -363,6 +454,18 @@ export default async function LaunchPage({
   if (existing) {
     attemptId = existing.id;
     cmi = (existing.cmi_data ?? {}) as CmiData;
+    // Resuming an untagged in-progress attempt from the journey: tag it so
+    // its completion credits the journey day (and stays XP-exempt).
+    if (journeyCtx) {
+      await supabase
+        .from("course_attempts")
+        .update({
+          journey_enrollment_id: journeyCtx.enrollmentId,
+          journey_day: journeyCtx.day,
+        })
+        .eq("id", existing.id)
+        .eq("user_id", user.id);
+    }
   } else {
     // ?lp=<pathId> threads through from the path detail page so reports
     // can slice attempts by which learning path they were launched from.
@@ -383,6 +486,15 @@ export default async function LaunchPage({
         status: "in_progress",
         cmi_data: {},
         learning_path_id: pathContextId,
+        // Only name the 0058 columns when there IS journey context (which
+        // itself requires 0058) — naming them unconditionally would fail
+        // every launch on a database that hasn't run the migration yet.
+        ...(journeyCtx
+          ? {
+              journey_enrollment_id: journeyCtx.enrollmentId,
+              journey_day: journeyCtx.day,
+            }
+          : {}),
       })
       .select("id")
       .single();

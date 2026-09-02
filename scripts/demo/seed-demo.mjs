@@ -50,6 +50,15 @@ if (!SUPA || !SVC) {
   console.error("Missing NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
+// Environment guard: demo data must NEVER touch production. The prod
+// Supabase project ref is hard-refused regardless of what the env files say.
+if (SUPA.includes("alkfrcglmseksweqhwzq")) {
+  console.error(
+    "REFUSED: NEXT_PUBLIC_SUPABASE_URL points at the PRODUCTION project. " +
+      "Demo seeding only runs against staging."
+  );
+  process.exit(1);
+}
 const H = { apikey: SVC, Authorization: `Bearer ${SVC}`, "content-type": "application/json" };
 
 const SLUG = "ambak-demo";
