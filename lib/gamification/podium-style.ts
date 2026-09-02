@@ -35,6 +35,15 @@ export type PodiumStyle = {
   confetti_colors: string[];
   confetti_density: number;
   confetti_speed: number;
+  /**
+   * Optional animation overlay behind the podium: a Lottie .json (played by
+   * a lazy-loaded client player) or an animated .svg/.gif (plain <img> — an
+   * <img> never executes SVG scripts). "" = none. Admins upload the file in
+   * the Podium style panel; it lands in the org's own storage so it can't
+   * break when the source website changes. CSS confetti is independent —
+   * both layers can be on at once.
+   */
+  animation_url: string;
   /** Index 0 = 1st place, 1 = 2nd, 2 = 3rd. */
   frames: [PodiumFrame, PodiumFrame, PodiumFrame];
 };
@@ -55,6 +64,7 @@ export const DEFAULT_PODIUM_STYLE: PodiumStyle = {
   confetti_colors: ["#fcd34d", "#f9a8d4", "#ffffff", "#5eead4", "#c7d2fe"],
   confetti_density: 20,
   confetti_speed: 1,
+  animation_url: "",
   frames: [
     { ring: "#fcd34d", chip: "#fcd34d", label: "1st", topper: "👑" },
     { ring: "#e2e8f0", chip: "#e2e8f0", label: "2nd", topper: "" },
@@ -104,6 +114,11 @@ export function effectivePodiumStyle(raw: unknown): PodiumStyle {
       num(r.confetti_density, CONFETTI_LIMITS.minDensity, CONFETTI_LIMITS.maxDensity, d.confetti_density)
     ),
     confetti_speed: num(r.confetti_speed, CONFETTI_LIMITS.minSpeed, CONFETTI_LIMITS.maxSpeed, d.confetti_speed),
+    animation_url:
+      typeof r.animation_url === "string" &&
+      /^https:\/\/\S{1,500}$/.test(r.animation_url.trim())
+        ? r.animation_url.trim()
+        : "",
     frames: [
       frameOr(framesRaw[0], d.frames[0]),
       frameOr(framesRaw[1], d.frames[1]),
@@ -164,6 +179,18 @@ export function validatePodiumStyle(
       ok: false,
       error: `confetti_speed must be between ${CONFETTI_LIMITS.minSpeed} and ${CONFETTI_LIMITS.maxSpeed}`,
     };
+  }
+  if (r.animation_url !== undefined && r.animation_url !== "") {
+    if (
+      typeof r.animation_url !== "string" ||
+      r.animation_url.length > 500 ||
+      !/^https:\/\/\S+$/.test(r.animation_url.trim())
+    ) {
+      return {
+        ok: false,
+        error: "animation_url must be an https:// URL (or empty for none)",
+      };
+    }
   }
   if (!Array.isArray(r.frames) || r.frames.length !== 3) {
     return { ok: false, error: "frames must be an array of exactly 3 entries (1st, 2nd, 3rd)" };

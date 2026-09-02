@@ -6,20 +6,24 @@ import { randomBytes } from "crypto";
 /**
  *   POST /api/upload/image
  *   form-data:
- *     file: <PNG or JPEG>
- *     kind: "thumbnail" | "logo" | "avatar"   (storage subfolder)
+ *     file: <PNG or JPEG>  (kind "animation": Lottie .json, .svg or .gif)
+ *     kind: "thumbnail" | "logo" | "avatar" | "animation"  (storage subfolder)
  *     orgSlug: "acme"                          (caller must be a member)
  *
  * Returns: { url: string }
  *
  * Uploads to Supabase Storage bucket "public-assets". Public bucket → the
- * returned URL is directly usable as an <img src>. thumbnail/logo are
- * admin-only; "avatar" is open to any active org member (gamification) —
+ * returned URL is directly usable as an <img src>. thumbnail/logo/animation
+ * are admin-only; "avatar" is open to any active org member (gamification) —
  * user-namespaced path, 2 MB cap, and it also writes profiles.avatar_url.
+ * "animation" (podium overlays, 0061) is content-sniffed: a .json must parse
+ * as a Lottie document, an .svg/.gif must carry the right magic bytes. SVGs
+ * are only ever rendered through <img>, which never executes their scripts.
  */
 
 const MAX_BYTES = 4 * 1024 * 1024; // 4 MB
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
+const ANIMATION_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const ALLOWED = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 export async function POST(request: Request) {
@@ -28,7 +32,13 @@ export async function POST(request: Request) {
   const orgSlug = form.get("orgSlug");
   const kindRaw = form.get("kind");
   const kind =
-    kindRaw === "logo" ? "logo" : kindRaw === "avatar" ? "avatar" : "thumbnail";
+    kindRaw === "logo"
+      ? "logo"
+      : kindRaw === "avatar"
+        ? "avatar"
+        : kindRaw === "animation"
+          ? "animation"
+          : "thumbnail";
 
   if (!(file instanceof Blob)) {
     return NextResponse.json({ error: "Missing file" }, { status: 400 });
@@ -36,16 +46,35 @@ export async function POST(request: Request) {
   if (typeof orgSlug !== "string" || !orgSlug) {
     return NextResponse.json({ error: "Missing orgSlug" }, { status: 400 });
   }
-  if (!ALLOWED.has(file.type)) {
+  // Animation format detection: by filename extension first (browsers report
+  // inconsistent MIME types for .json/.lottie), verified against content.
+  let animExt: "json" | "svg" | "gif" | null = null;
+  if (kind === "animation") {
+    const fname = (file instanceof File ? file.name : "").toLowerCase();
+    if (fname.endsWith(".json") || fname.endsWith(".lottie")) animExt = "json";
+    else if (fname.endsWith(".svg")) animExt = "svg";
+    else if (fname.endsWith(".gif")) animExt = "gif";
+    if (!animExt) {
+      return NextResponse.json(
+        { error: "Animation must be a Lottie .json, an .svg, or a .gif file" },
+        { status: 400 }
+      );
+    }
+  } else if (!ALLOWED.has(file.type)) {
     return NextResponse.json(
       { error: "Image must be JPEG, PNG, or WebP" },
       { status: 400 }
     );
   }
-  const maxBytes = kind === "avatar" ? AVATAR_MAX_BYTES : MAX_BYTES;
+  const maxBytes =
+    kind === "avatar"
+      ? AVATAR_MAX_BYTES
+      : kind === "animation"
+        ? ANIMATION_MAX_BYTES
+        : MAX_BYTES;
   if (file.size > maxBytes) {
     return NextResponse.json(
-      { error: `Image must be smaller than ${maxBytes / (1024 * 1024)} MB` },
+      { error: `File must be smaller than ${maxBytes / (1024 * 1024)} MB` },
       { status: 400 }
     );
   }
@@ -98,21 +127,6 @@ export async function POST(request: Request) {
     }
   }
 
-  // Build a short, collision-safe storage key.
-  const ext =
-    file.type === "image/png"
-      ? "png"
-      : file.type === "image/webp"
-        ? "webp"
-        : "jpg";
-  const slug = randomBytes(12).toString("hex");
-  // Avatars are user-namespaced so learners can never write into the org's
-  // thumbnail/logo namespace and cleanup can target a user's folder.
-  const path =
-    kind === "avatar"
-      ? `${org.slug}/avatar/${user.id}/${Date.now()}-${slug}.${ext}`
-      : `${org.slug}/${kind}/${Date.now()}-${slug}.${ext}`;
-
   // Use service-role client to bypass storage RLS.
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -120,10 +134,63 @@ export async function POST(request: Request) {
     { auth: { persistSession: false } }
   );
   const bytes = Buffer.from(await file.arrayBuffer());
+
+  // Animation content sniffing — the extension must match what's inside.
+  let contentType = file.type;
+  if (kind === "animation") {
+    if (animExt === "json") {
+      try {
+        const doc = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+        if (!doc || typeof doc !== "object" || !Array.isArray(doc.layers)) {
+          throw new Error("not lottie");
+        }
+      } catch {
+        return NextResponse.json(
+          { error: "That .json file doesn't look like a Lottie animation" },
+          { status: 400 }
+        );
+      }
+      contentType = "application/json";
+    } else if (animExt === "svg") {
+      const head = bytes.subarray(0, 512).toString("utf8").trimStart();
+      if (!head.startsWith("<svg") && !head.startsWith("<?xml")) {
+        return NextResponse.json(
+          { error: "That file doesn't look like an SVG" },
+          { status: 400 }
+        );
+      }
+      contentType = "image/svg+xml";
+    } else {
+      if (bytes.subarray(0, 4).toString("latin1") !== "GIF8") {
+        return NextResponse.json(
+          { error: "That file doesn't look like a GIF" },
+          { status: 400 }
+        );
+      }
+      contentType = "image/gif";
+    }
+  }
+
+  // Build a short, collision-safe storage key.
+  const ext =
+    kind === "animation"
+      ? animExt!
+      : file.type === "image/png"
+        ? "png"
+        : file.type === "image/webp"
+          ? "webp"
+          : "jpg";
+  const slug = randomBytes(12).toString("hex");
+  // Avatars are user-namespaced so learners can never write into the org's
+  // thumbnail/logo namespace and cleanup can target a user's folder.
+  const path =
+    kind === "avatar"
+      ? `${org.slug}/avatar/${user.id}/${Date.now()}-${slug}.${ext}`
+      : `${org.slug}/${kind}/${Date.now()}-${slug}.${ext}`;
   const { error: upErr } = await svc.storage
     .from("public-assets")
     .upload(path, bytes, {
-      contentType: file.type,
+      contentType,
       cacheControl: "31536000",
       upsert: false,
     });

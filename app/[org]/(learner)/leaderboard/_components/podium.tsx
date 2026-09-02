@@ -4,6 +4,7 @@ import {
   confettiPieces,
   effectivePodiumStyle,
 } from "@/lib/gamification/podium-style";
+import { PodiumAnimation } from "./podium-animation";
 
 export type PodiumEntry = {
   rank: number;
@@ -90,6 +91,9 @@ export function Podium({ top3, style }: { top3: PodiumEntry[]; style?: unknown }
           ))}
         </div>
       )}
+
+      {/* Optional org-uploaded animation overlay (Lottie / SVG / GIF) */}
+      {ps.animation_url && <PodiumAnimation url={ps.animation_url} />}
 
       {/* Soft glow behind the champion */}
       <div
