@@ -56,6 +56,14 @@ export default async function SettingsPage({
     .eq("id", org.id)
     .maybeSingle();
 
+  // Learner-theme columns (0060) read best-effort in their own query so a
+  // pre-migration deploy degrades to "no theme" without touching the rest.
+  const { data: themeRow } = await supabase
+    .from("organizations")
+    .select("learner_theme, learner_theme_custom")
+    .eq("id", org.id)
+    .maybeSingle();
+
   const workspace = {
     name: (orgRow?.name as string | undefined) ?? org.name,
     logo_url: (orgRow?.logo_url as string | null | undefined) ?? "",
@@ -76,6 +84,10 @@ export default async function SettingsPage({
       (orgRow?.login_hero_title as string | null | undefined) ?? "",
     login_hero_subtitle:
       (orgRow?.login_hero_subtitle as string | null | undefined) ?? "",
+    learner_theme: (themeRow?.learner_theme as string | null | undefined) ?? "",
+    learner_theme_custom:
+      (themeRow?.learner_theme_custom as Record<string, string> | null | undefined) ??
+      null,
   };
 
   const { data: smtpRow } = await supabase

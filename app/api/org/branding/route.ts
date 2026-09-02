@@ -7,6 +7,10 @@ import {
   saasCnameTarget,
   type CustomHostnameStatus,
 } from "@/lib/cloudflare/custom-hostnames";
+import {
+  customThemeFrom,
+  isLearnerThemeId,
+} from "@/lib/theme/learner-themes";
 
 /**
  *   POST /api/org/branding
@@ -34,6 +38,8 @@ export async function POST(request: Request) {
     login_hero_image_url?: string | null;
     login_hero_title?: string | null;
     login_hero_subtitle?: string | null;
+    learner_theme?: string | null;
+    learner_theme_custom?: unknown;
   };
   if (!body.orgSlug) {
     return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
@@ -172,6 +178,42 @@ export async function POST(request: Request) {
     update.login_hero_subtitle = body.login_hero_subtitle
       ? body.login_hero_subtitle.trim()
       : null;
+  }
+  // Learner theme (0060): preset id, "custom", or null/"" = default look.
+  if (body.learner_theme !== undefined) {
+    const t = body.learner_theme?.trim() || null;
+    if (t !== null && t !== "custom" && !isLearnerThemeId(t)) {
+      return NextResponse.json(
+        { error: "Unknown learner_theme" },
+        { status: 400 }
+      );
+    }
+    if (t === "custom") {
+      // A custom selection must come with (or already carry) a full palette;
+      // validate whatever is being saved alongside it.
+      const c = customThemeFrom(body.learner_theme_custom);
+      if (!c) {
+        return NextResponse.json(
+          {
+            error:
+              "Custom theme needs all six colors (canvas, paper, ink, muted, line, accent) as hex values.",
+          },
+          { status: 400 }
+        );
+      }
+      update.learner_theme_custom = c;
+    }
+    update.learner_theme = t;
+  } else if (body.learner_theme_custom !== undefined) {
+    // Palette tweak without switching selection — still validated.
+    const c = customThemeFrom(body.learner_theme_custom);
+    if (!c) {
+      return NextResponse.json(
+        { error: "Invalid custom theme palette." },
+        { status: 400 }
+      );
+    }
+    update.learner_theme_custom = c;
   }
 
   if (Object.keys(update).length === 0) {

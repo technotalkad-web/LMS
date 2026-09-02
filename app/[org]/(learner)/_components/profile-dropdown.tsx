@@ -7,12 +7,7 @@ import {
   User,
   Settings,
   LogOut,
-  Palette,
 } from "lucide-react";
-import {
-  LEARNER_THEMES,
-  type LearnerThemeId,
-} from "@/lib/theme/learner-themes";
 
 export function ProfileDropdown({
   orgSlug,
@@ -22,7 +17,6 @@ export function ProfileDropdown({
   roleLabel,
   canSwitchToAdmin,
   brandColor = "#4f46e5",
-  lmsTheme = null,
 }: {
   orgSlug: string;
   email: string;
@@ -32,13 +26,8 @@ export function ProfileDropdown({
   roleLabel: string;
   canSwitchToAdmin: boolean;
   brandColor?: string;
-  /** Active learner-view theme (null = never chosen → default look). */
-  lmsTheme?: LearnerThemeId | null;
 }) {
   const [open, setOpen] = useState(false);
-  const [activeTheme, setActiveTheme] = useState<LearnerThemeId>(
-    lmsTheme ?? "classic"
-  );
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -56,20 +45,6 @@ export function ProfileDropdown({
       document.removeEventListener("keydown", onKey);
     };
   }, [open]);
-
-  async function pickTheme(id: LearnerThemeId) {
-    // Instant apply on the learner shell, then persist the cookie so the
-    // next SSR render paints the theme before hydration.
-    document
-      .querySelector("[data-lms-root]")
-      ?.setAttribute("data-lms-theme", id);
-    setActiveTheme(id);
-    await fetch("/api/theme", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ lms: id }),
-    });
-  }
 
   const name = displayName || email?.split("@")[0] || "you";
   const initial = name.trim()[0]?.toUpperCase() ?? "?";
@@ -149,47 +124,6 @@ export function ProfileDropdown({
               </span>
             </Link>
           )}
-
-          {/* Learner-view theme picker */}
-          <div className="border-t border-line px-4 py-3">
-            <div className="flex items-center gap-2 text-xs font-medium text-muted mb-2">
-              <Palette className="w-3.5 h-3.5" />
-              Theme
-            </div>
-            <div className="grid grid-cols-3 gap-1.5" role="group" aria-label="Theme">
-              {LEARNER_THEMES.map((t) => {
-                const active = t.id === activeTheme;
-                return (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() => pickTheme(t.id)}
-                    title={t.tagline}
-                    aria-pressed={active}
-                    className={`flex flex-col items-center gap-1 rounded-lg border px-1.5 py-2 text-[11px] leading-none transition ${
-                      active
-                        ? "border-accent ring-1 ring-accent bg-canvas font-medium"
-                        : "border-line hover:bg-canvas"
-                    }`}
-                  >
-                    <span
-                      aria-hidden
-                      className="h-5 w-5 rounded-full border border-line"
-                      style={{
-                        background: `linear-gradient(135deg, ${t.swatch[0]} 50%, ${t.swatch[1]} 50%)`,
-                      }}
-                    />
-                    <span>
-                      {t.emoji} {t.name}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-            <p className="mt-2 text-[11px] text-muted">
-              {LEARNER_THEMES.find((t) => t.id === activeTheme)?.tagline}
-            </p>
-          </div>
 
           {/* Sign out */}
           <form
