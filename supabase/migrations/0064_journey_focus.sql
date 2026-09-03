@@ -19,3 +19,5 @@
 alter table public.journey_programs
   add column if not exists focus_enabled boolean not null default false,
   add column if not exists focus_pinned jsonb;
+
+notify pgrst, 'reload schema';
