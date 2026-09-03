@@ -14,6 +14,7 @@ import {
   type BoardCopy,
   type BoardCopyKey,
 } from "@/lib/gamification/board-copy";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 export const dynamic = "force-dynamic";
 
@@ -101,6 +102,7 @@ export default async function LeaderboardPage({
     city?: string;
     vert?: string;
     team?: string;
+    group?: string;
   }>;
 }) {
   const { org: orgSlug } = await params;
@@ -212,7 +214,8 @@ export default async function LeaderboardPage({
   const fCity = sp.city?.trim() || null;
   const fVert = sp.vert?.trim() || null;
   const fTeam = sp.team?.trim() || null;
-  const filterActive = !!(fCity || fVert || fTeam);
+  const fGroup = sp.group?.trim() || null;
+  const filterActive = !!(fCity || fVert || fTeam || fGroup);
 
   const rankCol = BOARDS[activeBoard].rankCol as string;
   const { data: rowsRaw } = await svc
@@ -253,12 +256,22 @@ export default async function LeaderboardPage({
         .eq("team_id", fTeam);
       teamSet = new Set(((tms ?? []) as Array<{ user_id: string }>).map((t) => t.user_id));
     }
+    // Custom Group filter (0067) — membership resolved live.
+    let groupSet: Set<string> | null = null;
+    if (fGroup) {
+      try {
+        groupSet = await resolveManyGroups(svc, org.id as string, [fGroup]);
+      } catch {
+        groupSet = new Set();
+      }
+    }
     rows = rows
       .filter((r) => {
         const m = filterMembers.get(r.user_id);
         if (fCity && m?.city !== fCity) return false;
         if (fVert && m?.business_vertical !== fVert) return false;
         if (teamSet && !teamSet.has(r.user_id)) return false;
+        if (groupSet && !groupSet.has(r.user_id)) return false;
         return true;
       })
       .slice(0, 50);
@@ -283,6 +296,18 @@ export default async function LeaderboardPage({
     .eq("organization_id", org.id)
     .order("name", { ascending: true });
   const teamOptions = (teamOptRows ?? []) as Array<{ id: string; name: string }>;
+  let groupOptions: Array<{ id: string; name: string }> = [];
+  try {
+    const { data } = await svc
+      .from("org_groups")
+      .select("id, name")
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .order("name", { ascending: true });
+    groupOptions = (data ?? []) as Array<{ id: string; name: string }>;
+  } catch {
+    /* pre-0067 */
+  }
 
   const { data: mineRaw } = await svc
     .from("mv_leaderboard")
@@ -383,8 +408,8 @@ export default async function LeaderboardPage({
       <BoardTabs orgSlug={orgSlug} active={activeBoard} visible={visibleBoards} labels={copy} />
       <p className="text-sm text-muted -mt-3">{copy[activeBoard].tagline}</p>
 
-      {/* Group filters (Phase 5) — zero-JS GET form. */}
-      {(cityOptions.length > 0 || vertOptions.length > 0 || teamOptions.length > 0) && (
+      {/* Group filters (Phase 5 + G3) — zero-JS GET form. */}
+      {(cityOptions.length > 0 || vertOptions.length > 0 || teamOptions.length > 0 || groupOptions.length > 0) && (
         <form
           method="get"
           className="flex flex-wrap items-end gap-2 bg-paper border border-line rounded-xl px-3 py-2.5"
@@ -419,6 +444,17 @@ export default async function LeaderboardPage({
                 <option value="">All</option>
                 {teamOptions.map((t) => (
                   <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          {groupOptions.length > 0 && (
+            <label className="text-xs">
+              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Group</span>
+              <select name="group" defaultValue={fGroup ?? ""} className="px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs">
+                <option value="">All</option>
+                {groupOptions.map((g) => (
+                  <option key={g.id} value={g.id}>{g.name}</option>
                 ))}
               </select>
             </label>
