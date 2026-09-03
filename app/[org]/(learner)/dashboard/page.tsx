@@ -971,7 +971,11 @@ export default async function DashboardPage({
                   <summary className="px-5 py-3.5 text-sm font-medium cursor-pointer select-none text-muted hover:text-ink">
                     Other assigned learning ({rest.length})
                   </summary>
-                  <div className="px-4 pb-4">
+                  {/* DashboardGrid renders a fragment (chips + card section);
+                      it inherits sibling spacing from its container. The main
+                      dashboard gets that from the page's space-y-8 — inside
+                      this collapsible we must provide it ourselves. */}
+                  <div className="px-4 pb-4 pt-2 space-y-6">
                     <DashboardGrid cards={rest} orgSlug={orgSlug} />
                   </div>
                 </details>
