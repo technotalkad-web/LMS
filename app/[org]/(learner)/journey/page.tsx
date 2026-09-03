@@ -13,6 +13,7 @@ import { createClient } from "@/lib/supabase/server";
 import {
   computeJourneyState,
   courseDaysOf,
+  dateOfDay,
   effectiveJourneyCopy,
   effectiveMilestones,
   journeyStreak,
@@ -56,6 +57,7 @@ export default async function JourneyPage({
     completion_title?: string;
     copy?: unknown;
     is_mandatory?: boolean;
+    deadline_days?: number | null;
   };
   type EnrRow = {
     id: string;
@@ -380,6 +382,24 @@ export default async function JourneyPage({
   const nextCourseDayAfterCurrent =
     courseDays[courseDays.indexOf(state.currentDay) + 1];
 
+  // Deadline (0065, live from the program): counted like the drip.
+  const deadlineDate =
+    typeof liveProg?.deadline_days === "number" && liveProg.deadline_days > 0
+      ? dateOfDay(
+          enrollment.start_date,
+          liveProg.deadline_days,
+          version.count_sundays === true
+        )
+      : null;
+  const deadlineOverdue = deadlineDate !== null && today > deadlineDate;
+  const deadlineLabel = deadlineDate
+    ? new Date(`${deadlineDate}T00:00:00`).toLocaleDateString("en-IN", {
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      })
+    : null;
+
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       {journeySwitcher}
@@ -472,6 +492,17 @@ export default async function JourneyPage({
             </p>
           </div>
         </div>
+        {deadlineLabel && !state.finished && (
+          <p
+            className={`mt-3 text-center text-xs font-medium ${
+              deadlineOverdue ? "text-red-700" : "text-muted"
+            }`}
+          >
+            {deadlineOverdue
+              ? `⚠️ Deadline passed (${deadlineLabel}) — catch up now`
+              : `⏳ Complete by ${deadlineLabel}`}
+          </p>
+        )}
         {latestAchieved && (
           <p className="mt-3 text-center text-xs text-indigo-700 font-medium">
             {latestAchieved.icon} {latestAchieved.name}

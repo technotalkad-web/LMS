@@ -135,6 +135,18 @@ This link is valid for a short time and can only be used once.
 
 — The {Org_Name} team`,
   },
+  journey_escalation: {
+    subject: "{Learner_Name} is falling behind on {Journey_Name}",
+    body_md: `Hi {Manager_Name},
+
+**{Learner_Name}** is **{Behind_Days} day(s) behind** on the mandatory **{Journey_Name}** ({Org_Name}) — currently at Day {Day} of {Days_Total}.
+
+A quick word from you usually gets things moving: each mission takes only a few minutes, and missed days can be caught up one after another.
+
+They'll keep receiving daily reminders; you'll be copied while they remain this far behind.
+
+— The {Org_Name} team`,
+  },
   journey_nudge: {
     subject: "Your {Journey_Name} is waiting — Day {Day} of {Days_Total}",
     body_md: `Hi {Learner_Name},
@@ -188,6 +200,7 @@ export const DEFAULT_CTAS: Partial<Record<NotificationEvent, string>> = {
   magic_link: "Sign in",
   account_invite: "Activate account",
   journey_nudge: "Continue journey",
+  journey_escalation: "Open the portal",
 };
 
 /**
