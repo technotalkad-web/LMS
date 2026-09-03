@@ -121,7 +121,9 @@ export default async function DashboardPage({
     const { data: jRows } = await supabase
       .from("journey_enrollments")
       .select(
-        "id, start_date, journey_versions!inner(name, icon, days_total), journey_programs!inner(is_active, copy)"
+        // name/icon live from the PROGRAM (cosmetic renames reach everyone
+        // instantly); days_total pinned to the enrollment's version.
+        "id, start_date, journey_versions!inner(days_total), journey_programs!inner(is_active, copy, name, icon)"
       )
       .eq("organization_id", org.id)
       .eq("user_id", user.id)
@@ -132,11 +134,11 @@ export default async function DashboardPage({
           id: string;
           start_date: string;
           journey_versions:
-            | { name: string; icon: string; days_total: number }
-            | Array<{ name: string; icon: string; days_total: number }>;
+            | { days_total: number }
+            | Array<{ days_total: number }>;
           journey_programs:
-            | { is_active: boolean; copy: unknown }
-            | Array<{ is_active: boolean; copy: unknown }>;
+            | { is_active: boolean; copy: unknown; name: string; icon: string }
+            | Array<{ is_active: boolean; copy: unknown; name: string; icon: string }>;
         }
       | undefined;
     const jProg = j
@@ -159,8 +161,8 @@ export default async function DashboardPage({
         id: j.id,
         day: Math.min(ver?.days_total ?? 90, (count ?? 0) + 1),
         total: ver?.days_total ?? 90,
-        name: ver?.name ?? "90-Day Yoddha Journey",
-        icon: ver?.icon ?? "🏹",
+        name: jProg?.name ?? "90-Day Yoddha Journey",
+        icon: jProg?.icon ?? "🏹",
         line: jc.banner_line,
       };
     }

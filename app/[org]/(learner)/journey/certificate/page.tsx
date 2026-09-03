@@ -50,6 +50,25 @@ export default async function JourneyCertificatePage({
     : enrollment.journey_versions;
   const missions = courseDaysOf(version.days, version.days_total).length;
 
+  // Display fields live from the program: a rename/retitle reaches even
+  // already-issued certificates (it's the same journey, renamed). The
+  // mission/day counts stay from the learner's own pinned version.
+  const { data: liveProgRow } = await supabase
+    .from("journey_programs")
+    .select("name, icon, completion_title")
+    .eq("organization_id", org.id)
+    .maybeSingle();
+  const liveProg = liveProgRow as {
+    name?: string;
+    icon?: string;
+    completion_title?: string;
+  } | null;
+  if (liveProg) {
+    version.name = liveProg.name ?? version.name;
+    version.icon = liveProg.icon ?? version.icon;
+    version.completion_title = liveProg.completion_title ?? version.completion_title;
+  }
+
   const { data: prof } = await supabase
     .from("profiles")
     .select("first_name, last_name, email")

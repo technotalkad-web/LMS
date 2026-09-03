@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { DEFAULT_MILESTONES } from "@/lib/journey/journey";
 
 /**
@@ -42,12 +43,18 @@ export async function POST(request: Request) {
     orgSlug?: string;
     action?: string;
     program_id?: string;
+    /** "new" (default): version applies to new enrollments only.
+     *  "all": ALSO re-pin every ACTIVE enrollment to the new version —
+     *  progress is preserved (completed-mission count carries over; the
+     *  learner continues at the new curriculum's next mission). */
+    apply_to?: string;
   };
   const c = await ctx(body.orgSlug);
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
 
   // ---- Publish: freeze the current draft into an immutable version ----
-  // New enrollments pin this version; runs already in flight keep theirs.
+  // New enrollments pin this version; runs already in flight keep theirs
+  // unless apply_to === "all" (admin's explicit force-update).
   if (body.action === "publish") {
     if (!body.program_id) {
       return NextResponse.json({ error: "program_id required" }, { status: 400 });
@@ -113,7 +120,60 @@ export async function POST(request: Request) {
       .update({ current_version_id: version.id, updated_at: new Date().toISOString() })
       .eq("id", body.program_id);
     if (uErr) return NextResponse.json({ error: uErr.message }, { status: 400 });
-    return NextResponse.json({ ok: true, version_number: version.version_number });
+
+    // ---- Optional force-update: move ACTIVE learners onto the new version.
+    // Progress rows stay untouched — completed-mission COUNT carries over,
+    // so each learner resumes at the new curriculum's next mission. If a
+    // learner has already completed as many missions as the new curriculum
+    // holds, they're marked complete (badge included) rather than stranded.
+    let migrated = 0;
+    let completedNow = 0;
+    if (body.apply_to === "all") {
+      const { data: activeEnrs, error: aErr } = await c.supabase
+        .from("journey_enrollments")
+        .update({ version_id: version.id })
+        .eq("program_id", body.program_id)
+        .eq("status", "active")
+        .select("id, user_id");
+      if (aErr) return NextResponse.json({ error: aErr.message }, { status: 400 });
+      const enrs = (activeEnrs ?? []) as Array<{ id: string; user_id: string }>;
+      migrated = enrs.length;
+
+      const missionCount = days.filter((d) => d.course_id).length;
+      if (enrs.length > 0 && missionCount > 0) {
+        const svc = createServiceClient(
+          process.env.NEXT_PUBLIC_SUPABASE_URL!,
+          process.env.SUPABASE_SERVICE_ROLE_KEY!,
+          { auth: { persistSession: false } }
+        );
+        for (const enr of enrs) {
+          const { count } = await svc
+            .from("journey_day_progress")
+            .select("id", { count: "exact", head: true })
+            .eq("enrollment_id", enr.id);
+          if ((count ?? 0) >= missionCount) {
+            await svc
+              .from("journey_enrollments")
+              .update({ status: "completed", completed_at: new Date().toISOString() })
+              .eq("id", enr.id);
+            // Permanent badge — duplicate-insert errors mean "already has it".
+            await svc.from("user_badges").insert({
+              organization_id: c.org.id,
+              user_id: enr.user_id,
+              badge_slug: "yoddha",
+              metadata: { source: "journey_force_update", version: version.version_number },
+            });
+            completedNow++;
+          }
+        }
+      }
+    }
+
+    return NextResponse.json({
+      ok: true,
+      version_number: version.version_number,
+      ...(body.apply_to === "all" ? { migrated, completed_now: completedNow } : {}),
+    });
   }
 
   // ---- Create the program (draft only; publish before enrolling) ----

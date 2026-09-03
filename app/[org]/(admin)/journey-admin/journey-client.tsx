@@ -92,28 +92,52 @@ export function JourneyAdminClient({
   const [publishing, setPublishing] = useState(false);
   const [tab, setTab] = useState<TabKey>("curriculum");
 
-  async function publish() {
+  async function publish(applyTo: "new" | "all") {
     if (!program) return;
-    const ok = await confirmPublish({
-      title: "Publish this journey?",
-      message:
-        "Publishing freezes the last SAVED draft as a new version. Unsaved edits in the Curriculum or Settings tabs are NOT included — save them first. New enrollments use the new version; everyone already on the journey keeps theirs.",
-      confirmText: "Publish",
-    });
+    const ok = await confirmPublish(
+      applyTo === "all"
+        ? {
+            title: "Publish and update current learners?",
+            message:
+              "Publishing freezes the last SAVED draft as a new version (save unsaved edits first). EVERY active learner is then moved onto it immediately. Nobody's progress is reset: completed missions stay counted and each learner simply continues at the new curriculum's next mission. Anyone who has already completed as many missions as the new curriculum holds is marked complete and gets the badge.",
+            confirmText: "Publish & update everyone",
+            destructive: true,
+          }
+        : {
+            title: "Publish this journey?",
+            message:
+              "Publishing freezes the last SAVED draft as a new version. Unsaved edits in the Curriculum or Settings tabs are NOT included — save them first. New enrollments use the new version; everyone already on the journey keeps theirs.",
+            confirmText: "Publish",
+          }
+    );
     if (!ok) return;
     setPublishing(true);
     try {
       const res = await fetch("/api/journey/program", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ orgSlug, action: "publish", program_id: program.id }),
+        body: JSON.stringify({
+          orgSlug,
+          action: "publish",
+          program_id: program.id,
+          apply_to: applyTo,
+        }),
       });
-      const j = (await res.json().catch(() => ({}))) as { error?: string; version_number?: number };
+      const j = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        version_number?: number;
+        migrated?: number;
+        completed_now?: number;
+      };
       if (!res.ok) {
         toast.error(j.error ?? "Publish failed");
         return;
       }
-      toast.success(`Published v${j.version_number} — new enrollments use it; runs in flight keep their version`);
+      toast.success(
+        applyTo === "all"
+          ? `Published v${j.version_number} — ${j.migrated ?? 0} active learner${(j.migrated ?? 0) === 1 ? "" : "s"} updated${(j.completed_now ?? 0) > 0 ? `, ${j.completed_now} completed by the new curriculum` : ""}, progress preserved`
+          : `Published v${j.version_number} — new enrollments use it; runs in flight keep their version`
+      );
       router.refresh();
     } catch {
       toast.error("Publish failed — check your connection and try again");
@@ -199,21 +223,34 @@ export function JourneyAdminClient({
           </p>
         </div>
         <div className="text-right">
-          <button
-            type="button"
-            onClick={publish}
-            disabled={publishing}
-            className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50"
-          >
-            {publishing
-              ? "Publishing…"
-              : currentVersion
-                ? "Publish changes"
-                : "Publish v1"}
-          </button>
-          <p className="text-[11px] text-muted mt-1">
+          <div className="inline-flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => publish("new")}
+              disabled={publishing}
+              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50"
+            >
+              {publishing
+                ? "Publishing…"
+                : currentVersion
+                  ? "Publish changes"
+                  : "Publish v1"}
+            </button>
+            {currentVersion && (
+              <button
+                type="button"
+                onClick={() => publish("all")}
+                disabled={publishing}
+                className="px-4 py-2.5 border border-indigo-300 text-indigo-700 hover:bg-indigo-50 rounded-lg text-sm font-semibold disabled:opacity-50"
+                title="Also move every active learner onto the new version — progress preserved"
+              >
+                Publish &amp; update everyone
+              </button>
+            )}
+          </div>
+          <p className="text-[11px] text-muted mt-1 max-w-md ml-auto">
             {currentVersion
-              ? `v${currentVersion.version_number} live — edits apply to NEW enrollments only after publishing`
+              ? `v${currentVersion.version_number} live · Name, icon, milestones & messages apply to everyone on Save. Curriculum & schedule need a publish: "Publish changes" = new enrollments only · "update everyone" = current learners too, progress kept.`
               : "Not published yet — publish before enrolling anyone"}
           </p>
         </div>

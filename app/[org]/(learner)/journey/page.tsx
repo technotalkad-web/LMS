@@ -67,12 +67,19 @@ export default async function JourneyPage({
   // version-pinned below.
   const { data: progRow } = await supabase
     .from("journey_programs")
-    .select("copy, is_active")
+    .select("copy, is_active, name, icon, milestones, completion_title")
     .eq("organization_id", org.id)
     .maybeSingle();
-  const copy = effectiveJourneyCopy((progRow as { copy?: unknown } | null)?.copy);
-  const programActive =
-    (progRow as { is_active?: boolean } | null)?.is_active !== false;
+  const liveProg = progRow as {
+    copy?: unknown;
+    is_active?: boolean;
+    name?: string;
+    icon?: string;
+    milestones?: unknown;
+    completion_title?: string;
+  } | null;
+  const copy = effectiveJourneyCopy(liveProg?.copy);
+  const programActive = liveProg?.is_active !== false;
 
   if (!enrollment) {
     return (
@@ -120,6 +127,18 @@ export default async function JourneyPage({
         This journey version is no longer available.
       </div>
     );
+  }
+
+  // COSMETIC fields (name, icon, milestones, completion title — nothing that
+  // moves a learner's progress) come LIVE from the program: an admin rename
+  // or milestone tweak reaches every learner instantly, no republish and no
+  // effect on their run. STRUCTURE (days, days_total, count_sundays) stays
+  // pinned to the enrollment's published version.
+  if (liveProg) {
+    version.name = liveProg.name ?? version.name;
+    version.icon = liveProg.icon ?? version.icon;
+    version.completion_title = liveProg.completion_title ?? version.completion_title;
+    version.milestones = liveProg.milestones; // null = org reset to defaults
   }
 
   const dayByNumber = parseVersionDays(version.days);
