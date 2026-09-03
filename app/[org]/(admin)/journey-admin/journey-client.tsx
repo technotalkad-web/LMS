@@ -37,6 +37,10 @@ export type ProgramRow = {
   // Focused dashboard (0064).
   focus_enabled?: boolean;
   focus_pinned?: string[] | null;
+  // Deadline + manager escalation (0065).
+  deadline_days?: number | null;
+  escalation_enabled?: boolean;
+  escalation_after_days?: number;
 };
 export type ProgramSummary = { id: string; name: string; icon: string; priority: number };
 export type FunnelRow = { day_number: number; learners: number };
@@ -1116,6 +1120,16 @@ function SettingsTab({
   const [focusPinned, setFocusPinned] = useState<string[]>(
     Array.isArray(program.focus_pinned) ? program.focus_pinned : []
   );
+  // Deadline + manager escalation (0065).
+  const [deadlineDays, setDeadlineDays] = useState<number | "">(
+    typeof program.deadline_days === "number" ? program.deadline_days : ""
+  );
+  const [escalationEnabled, setEscalationEnabled] = useState(
+    program.escalation_enabled === true
+  );
+  const [escalateAfter, setEscalateAfter] = useState(
+    program.escalation_after_days ?? 3
+  );
   const audDim = (k: string) => (next: string[]) =>
     setAudience((a) => ({ ...a, [k]: next }));
   const audienceEmpty = Object.values(audience).every((v) => v.length === 0);
@@ -1182,6 +1196,9 @@ function SettingsTab({
           is_mandatory: isMandatory,
           focus_enabled: focusEnabled,
           focus_pinned: focusPinned.length > 0 ? focusPinned : null,
+          deadline_days: deadlineDays === "" ? null : deadlineDays,
+          escalation_enabled: escalationEnabled,
+          escalation_after_days: escalateAfter,
           audience: audienceEmpty
             ? null
             : Object.fromEntries(
@@ -1448,6 +1465,65 @@ function SettingsTab({
               className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
             />
           </label>
+        </div>
+
+        {/* Deadline + manager escalation (0065) */}
+        <div className="border-t border-line pt-3 space-y-3">
+          <h4 className="text-sm font-semibold">Deadline &amp; manager escalation</h4>
+          <p className="text-xs text-muted">
+            Early reminders go to the learner only. Once someone stays behind
+            past the threshold — or misses the deadline — their L1 manager
+            (from the profile&apos;s Line Manager mapping) is copied with a
+            manager-worded email (&ldquo;journey_escalation&rdquo; template).
+            Everything stops automatically on completion.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+                Deadline (days from start; empty = none)
+              </span>
+              <input
+                type="number"
+                min={1}
+                max={730}
+                value={deadlineDays}
+                onChange={(e) =>
+                  setDeadlineDays(
+                    e.target.value === ""
+                      ? ""
+                      : Math.max(1, Math.min(730, Number(e.target.value) || 1))
+                  )
+                }
+                placeholder="e.g. 45"
+                className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
+              />
+              <span className="block text-[11px] text-muted mt-1">
+                Counted like the drip (working days). Missing it always
+                escalates.
+              </span>
+            </label>
+            <label className="block">
+              <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+                Escalate when behind by (days)
+              </span>
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={escalateAfter}
+                onChange={(e) =>
+                  setEscalateAfter(Math.max(1, Math.min(30, Number(e.target.value) || 1)))
+                }
+                className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
+              />
+            </label>
+          </div>
+          <ToggleRow
+            label="Escalate to L1 managers"
+            hint="Copies the learner's Line Manager once the threshold or deadline is crossed; same cadence as the learner nudges"
+            checked={escalationEnabled}
+            onChange={setEscalationEnabled}
+          />
         </div>
       </section>
 

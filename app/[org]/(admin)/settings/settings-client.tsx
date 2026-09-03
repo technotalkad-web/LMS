@@ -51,6 +51,7 @@ const EVENT_LABELS: Record<NotificationEvent, string> = {
   magic_link: "Magic-link sign-in",
   account_invite: "Account invite",
   journey_nudge: "Journey behind-schedule nudge",
+  journey_escalation: "Journey manager escalation",
 };
 
 export type WorkspaceBranding = {
