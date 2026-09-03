@@ -31,10 +31,15 @@ export function MotivationStrip({
   orgSlug,
   data,
   avgScore,
+  scoreLabel = "XP",
+  scoreDescription,
 }: {
   orgSlug: string;
   data: MyGamification | null;
   avgScore: number | null;
+  /** Org-named score (0066) — e.g. "Gyanank"; default "XP". */
+  scoreLabel?: string;
+  scoreDescription?: string;
 }) {
   if (!data || !data.ok || !data.enabled) return null;
 
@@ -46,9 +51,9 @@ export function MotivationStrip({
   // One clear next goal, in priority order.
   let nudge: string;
   if (data.zero || xp === 0) {
-    nudge = "Complete your first course to start earning XP.";
+    nudge = `Complete your first course to start earning ${scoreLabel}.`;
   } else if (data.xp_to_top10 && data.xp_to_top10 > 0) {
-    nudge = `You are only ${data.xp_to_top10.toLocaleString()} XP away from the Top 10.`;
+    nudge = `You are only ${data.xp_to_top10.toLocaleString()} ${scoreLabel} away from the Top 10.`;
   } else if (
     data.next_badge?.remaining &&
     data.next_badge.remaining > 0 &&
@@ -60,7 +65,7 @@ export function MotivationStrip({
       data.next_badge.remaining === 1 ? unit.replace(/s$/, "") : unit
     } to unlock ${data.next_badge.icon ?? ""} ${data.next_badge.name}.`;
   } else if (data.xp_to_next_level && data.xp_to_next_level > 0) {
-    nudge = `${data.xp_to_next_level.toLocaleString()} XP to your next level.`;
+    nudge = `${data.xp_to_next_level.toLocaleString()} ${scoreLabel} to your next level.`;
   } else {
     nudge = "You're at the top level — defend your streak.";
   }
@@ -90,8 +95,10 @@ export function MotivationStrip({
   }
   cells.push(
     {
-      label: "XP",
-      value: xp.toLocaleString(),
+      label: scoreLabel,
+      value: (
+        <span title={scoreDescription || undefined}>{xp.toLocaleString()}</span>
+      ),
       icon: <Zap className="w-4 h-4 text-amber-500" />,
     },
     {

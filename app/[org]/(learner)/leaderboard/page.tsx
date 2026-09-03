@@ -9,6 +9,7 @@ import { Podium, type PodiumEntry } from "./_components/podium";
 import { VerticalBoard } from "./_components/vertical-board";
 import {
   effectiveBoardCopy,
+  effectiveScoreLabel,
   DEFAULT_LEADERBOARD_TITLE,
   type BoardCopy,
   type BoardCopyKey,
@@ -94,7 +95,13 @@ export default async function LeaderboardPage({
   searchParams,
 }: {
   params: Promise<{ org: string }>;
-  searchParams?: Promise<{ board?: string; v?: string }>;
+  searchParams?: Promise<{
+    board?: string;
+    v?: string;
+    city?: string;
+    vert?: string;
+    team?: string;
+  }>;
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
@@ -189,6 +196,24 @@ export default async function LeaderboardPage({
   }
 
   // ---- Individual boards (vertical returned above; rankCol is non-null) ----
+  // Org-named score (0066): "Gyanank" instead of XP, everywhere it renders.
+  const score = effectiveScoreLabel(
+    gsx as { score_label?: string | null; score_description?: string | null } | null
+  );
+  const metricLabelOf = (k: BoardKey): string =>
+    k === "overall"
+      ? score.label
+      : k === "improved"
+        ? `${score.label} gained (30d)`
+        : BOARDS[k].metricLabel;
+
+  // Filters (Phase 5): ?city= / ?vert= / ?team=<id> narrow every individual
+  // board to that group, re-ranked within it (your global rank is noted).
+  const fCity = sp.city?.trim() || null;
+  const fVert = sp.vert?.trim() || null;
+  const fTeam = sp.team?.trim() || null;
+  const filterActive = !!(fCity || fVert || fTeam);
+
   const rankCol = BOARDS[activeBoard].rankCol as string;
   const { data: rowsRaw } = await svc
     .from("mv_leaderboard")
@@ -196,8 +221,68 @@ export default async function LeaderboardPage({
     .eq("organization_id", org.id)
     .not(rankCol, "is", null)
     .order(rankCol, { ascending: true })
-    .limit(50);
-  const rows = (rowsRaw ?? []) as Row[];
+    // Filtering happens AFTER the rank ordering, so pull a deep window when
+    // a filter is active — otherwise low-ranked members of a small group
+    // would be invisible.
+    .limit(filterActive ? 1000 : 50);
+  let rows = (rowsRaw ?? []) as Row[];
+
+  if (filterActive) {
+    const filterMembers = new Map<string, { city: string | null; business_vertical: string | null }>();
+    for (let fromIdx = 0; ; fromIdx += 1000) {
+      const { data } = await svc
+        .from("organization_members")
+        .select("user_id, city, business_vertical")
+        .eq("organization_id", org.id)
+        .range(fromIdx, fromIdx + 999);
+      const pageRows = (data ?? []) as Array<{
+        user_id: string;
+        city: string | null;
+        business_vertical: string | null;
+      }>;
+      for (const m of pageRows) {
+        filterMembers.set(m.user_id, { city: m.city, business_vertical: m.business_vertical });
+      }
+      if (pageRows.length < 1000) break;
+    }
+    let teamSet: Set<string> | null = null;
+    if (fTeam) {
+      const { data: tms } = await svc
+        .from("team_members")
+        .select("user_id")
+        .eq("team_id", fTeam);
+      teamSet = new Set(((tms ?? []) as Array<{ user_id: string }>).map((t) => t.user_id));
+    }
+    rows = rows
+      .filter((r) => {
+        const m = filterMembers.get(r.user_id);
+        if (fCity && m?.city !== fCity) return false;
+        if (fVert && m?.business_vertical !== fVert) return false;
+        if (teamSet && !teamSet.has(r.user_id)) return false;
+        return true;
+      })
+      .slice(0, 50);
+  }
+
+  // Filter options: governed master values + teams (only what exists).
+  const { data: optRows } = await svc
+    .from("org_field_options")
+    .select("field, value")
+    .eq("organization_id", org.id)
+    .in("field", ["city", "business_vertical"])
+    .order("value", { ascending: true });
+  const cityOptions: string[] = [];
+  const vertOptions: string[] = [];
+  for (const o of (optRows ?? []) as Array<{ field: string; value: string }>) {
+    if (o.field === "city") cityOptions.push(o.value);
+    else vertOptions.push(o.value);
+  }
+  const { data: teamOptRows } = await svc
+    .from("teams")
+    .select("id, name")
+    .eq("organization_id", org.id)
+    .order("name", { ascending: true });
+  const teamOptions = (teamOptRows ?? []) as Array<{ id: string; name: string }>;
 
   const { data: mineRaw } = await svc
     .from("mv_leaderboard")
@@ -273,7 +358,11 @@ export default async function LeaderboardPage({
   const showCity = rows.some((r) => memById.get(r.user_id)?.city);
   const showTeam = rows.some((r) => teamByUser.has(r.user_id));
 
-  const rankOf = (r: Row) => r[rankCol as keyof Row] as number | null;
+  // Ranks: global from the matview, or position-within-group when filtered.
+  const globalRankOf = (r: Row) => r[rankCol as keyof Row] as number | null;
+  const viewRankByUser = new Map(rows.map((r, i) => [r.user_id, i + 1]));
+  const rankOf = (r: Row): number | null =>
+    filterActive ? (viewRankByUser.get(r.user_id) ?? null) : globalRankOf(r);
   const top3: PodiumEntry[] = rows
     .filter((r) => (rankOf(r) ?? 99) <= 3)
     .slice(0, 3)
@@ -282,7 +371,7 @@ export default async function LeaderboardPage({
       name: displayName(r),
       avatarUrl: r.avatar_url,
       designation: memById.get(r.user_id)?.designation ?? null,
-      metricLabel: BOARDS[activeBoard].metricLabel,
+      metricLabel: metricLabelOf(activeBoard),
       metricValue: metricFor(activeBoard, r),
     }));
   const tableRows = rows.filter((r) => (rankOf(r) ?? 99) > 3);
@@ -293,6 +382,72 @@ export default async function LeaderboardPage({
       <Header orgSlug={orgSlug} title={pageTitle} refreshedAt={rows[0]?.refreshed_at ?? null} />
       <BoardTabs orgSlug={orgSlug} active={activeBoard} visible={visibleBoards} labels={copy} />
       <p className="text-sm text-muted -mt-3">{copy[activeBoard].tagline}</p>
+
+      {/* Group filters (Phase 5) — zero-JS GET form. */}
+      {(cityOptions.length > 0 || vertOptions.length > 0 || teamOptions.length > 0) && (
+        <form
+          method="get"
+          className="flex flex-wrap items-end gap-2 bg-paper border border-line rounded-xl px-3 py-2.5"
+        >
+          <input type="hidden" name="board" value={activeBoard} />
+          {cityOptions.length > 0 && (
+            <label className="text-xs">
+              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">City</span>
+              <select name="city" defaultValue={fCity ?? ""} className="px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs">
+                <option value="">All</option>
+                {cityOptions.map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          {vertOptions.length > 0 && (
+            <label className="text-xs">
+              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Vertical</span>
+              <select name="vert" defaultValue={fVert ?? ""} className="px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs">
+                <option value="">All</option>
+                {vertOptions.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          {teamOptions.length > 0 && (
+            <label className="text-xs">
+              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Team</span>
+              <select name="team" defaultValue={fTeam ?? ""} className="px-2 py-1.5 border border-line rounded-lg bg-canvas text-xs">
+                <option value="">All</option>
+                {teamOptions.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button
+            type="submit"
+            className="px-3 py-1.5 bg-ink text-canvas rounded-lg text-xs font-semibold"
+          >
+            Apply
+          </button>
+          {filterActive && (
+            <Link
+              href={`/${orgSlug}/leaderboard?board=${activeBoard}`}
+              className="px-2 py-1.5 text-xs text-muted underline underline-offset-2 hover:text-ink"
+            >
+              Clear
+            </Link>
+          )}
+        </form>
+      )}
+      {filterActive && (
+        <p className="text-xs text-muted -mt-3">
+          Filtered standings — ranks are within this group
+          {mine && globalRankOf(mine) !== null
+            ? ` · your org-wide rank stays #${globalRankOf(mine)}`
+            : ""}
+          .
+        </p>
+      )}
 
       {mine?.hidden && (
         <div className="border border-line bg-canvas/60 rounded-xl px-4 py-2.5 text-xs text-muted flex items-center gap-2">
@@ -308,7 +463,7 @@ export default async function LeaderboardPage({
       )}
 
       {rows.length === 0 ? (
-        <EmptyBoard />
+        <EmptyBoard scoreLabel={score.label} filtered={filterActive} />
       ) : (
         <>
           {top3.length === 3 && <Podium top3={top3} style={gsx?.podium_style} />}
@@ -324,8 +479,8 @@ export default async function LeaderboardPage({
                   )}
                   {showTeam && <th className="px-4 py-3 hidden md:table-cell">Team</th>}
                   {showCity && <th className="px-4 py-3 hidden md:table-cell">City</th>}
-                  <th className="px-4 py-3 text-right">
-                    {BOARDS[activeBoard].metricLabel}
+                  <th className="px-4 py-3 text-right" title={score.description}>
+                    {metricLabelOf(activeBoard)}
                   </th>
                 </tr>
               </thead>
@@ -482,14 +637,23 @@ function LeaderRow({
   );
 }
 
-function EmptyBoard() {
+function EmptyBoard({
+  scoreLabel = "XP",
+  filtered = false,
+}: {
+  scoreLabel?: string;
+  filtered?: boolean;
+}) {
   return (
     <div className="bg-paper border border-line rounded-2xl text-center py-14 px-6">
       <Trophy className="w-10 h-10 mx-auto text-muted opacity-40" />
-      <h2 className="mt-4 font-semibold">No rankings yet</h2>
+      <h2 className="mt-4 font-semibold">
+        {filtered ? "Nobody matches these filters yet" : "No rankings yet"}
+      </h2>
       <p className="text-muted text-sm mt-1">
-        Rankings appear as soon as learners start completing courses and earning
-        XP.
+        {filtered
+          ? "Try a different city, vertical or team — or clear the filters."
+          : `Rankings appear as soon as learners start completing courses and earning ${scoreLabel}.`}
       </p>
     </div>
   );

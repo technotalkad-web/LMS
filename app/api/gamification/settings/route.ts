@@ -178,6 +178,21 @@ export async function POST(request: Request) {
           "Welcome message"
         );
       }
+      // Score naming (0066): "Gyanank" / "Knowledge Score" instead of XP.
+      if (body.score_label !== undefined) {
+        update.score_label = text(
+          body.score_label,
+          COPY_LIMITS.scoreLabel,
+          "Score name"
+        );
+      }
+      if (body.score_description !== undefined) {
+        update.score_description = text(
+          body.score_description,
+          COPY_LIMITS.scoreDescription,
+          "Score description"
+        );
+      }
       if (body.board_labels !== undefined) {
         const raw = body.board_labels;
         if (raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
