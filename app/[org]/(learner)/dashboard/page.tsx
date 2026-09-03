@@ -902,7 +902,7 @@ export default async function DashboardPage({
           const rest = allCards.filter((c) => !pinned.includes(c));
           return (
             <>
-              <p className="text-xs text-muted -mb-2">
+              <p className="text-xs text-muted">
                 🎯 Focus mode — your journey above comes first
                 {pinned.length > 0 ? ", along with these:" : "."}
               </p>
