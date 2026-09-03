@@ -338,6 +338,8 @@ export default async function CoursesIndexPage({
   }
   for (const a of mine) pushCard(a, "user");
   for (const a of mineTeams) pushCard(a, "team");
+  // Group assignments render like team assignments (matches dashboard).
+  for (const a of mineGroups) pushCard(a, "team");
   for (const a of orgWide) pushCard(a, "org");
   // Path-only courses (enrolled via a path, no direct course assignment)
   for (const [cid, pathName] of pathNameByCourseId) {
