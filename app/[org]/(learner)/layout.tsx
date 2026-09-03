@@ -10,6 +10,11 @@ import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner"
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveLearnerTheme } from "@/lib/theme/learner-themes";
+import { resolveManyGroups } from "@/lib/org/groups";
+import {
+  PopupAnnouncement,
+  type PopupData,
+} from "./_components/popup-announcement";
 
 function fontStackFor(name: string | null): string {
   switch (name) {
@@ -70,6 +75,7 @@ export default async function LearnerLayout({
   let showTeamPerformance = false;
   let displayName = user.email ?? "you";
   let avatarUrl: string | null = null;
+  let popup: PopupData | null = null;
   // Admin-chosen learner theme (0060): null = default look. Read fail-soft —
   // pre-migration the select errors and the theme simply stays default.
   let lmsTheme: { id: string; vars: Record<string, string> } | null = null;
@@ -125,6 +131,63 @@ export default async function LearnerLayout({
       .eq("line_manager_id", user.id)
       .eq("status", "active");
     showTeamPerformance = (reportCount ?? 0) > 0;
+
+    // Full-screen popup announcements (0068). Fail-soft: pre-migration the
+    // kind filter errors and no popup renders. Eligibility: active + inside
+    // its schedule window + audience match (Custom Group; null = everyone) +
+    // frequency (once = never seen; daily = not seen today; always = every
+    // visit). Newest eligible wins.
+    const nowIso = new Date().toISOString();
+    const { data: popRows } = await supabase
+      .from("org_announcements")
+      .select(
+        "id, title, body, media_landscape_url, media_portrait_url, cta_label, cta_href, duration_seconds, frequency, audience_group_id, starts_at"
+      )
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .eq("kind", "popup")
+      .or(`expires_at.is.null,expires_at.gt.${nowIso}`)
+      .or(`starts_at.is.null,starts_at.lte.${nowIso}`)
+      .order("created_at", { ascending: false })
+      .limit(5);
+    const popCandidates = (popRows ?? []) as Array<
+      PopupData & { frequency: string; audience_group_id: string | null; starts_at: string | null }
+    >;
+    if (popCandidates.length > 0) {
+      const ids = popCandidates.map((p) => p.id);
+      const { data: impRows } = await supabase
+        .from("announcement_impressions")
+        .select("announcement_id, shown_at")
+        .eq("user_id", user.id)
+        .in("announcement_id", ids)
+        .order("shown_at", { ascending: false })
+        .limit(200);
+      const lastShown = new Map<string, string>();
+      for (const r of (impRows ?? []) as Array<{ announcement_id: string; shown_at: string }>) {
+        if (!lastShown.has(r.announcement_id)) lastShown.set(r.announcement_id, r.shown_at);
+      }
+      const todayUtc = nowIso.slice(0, 10);
+      for (const p of popCandidates) {
+        const seen = lastShown.get(p.id);
+        if (p.frequency === "once" && seen) continue;
+        if (p.frequency === "daily" && seen && seen.slice(0, 10) === todayUtc) continue;
+        if (p.audience_group_id) {
+          const audience = await resolveManyGroups(svcNav, org.id, [p.audience_group_id]);
+          if (!audience.has(user.id)) continue;
+        }
+        popup = {
+          id: p.id,
+          title: p.title,
+          body: p.body,
+          media_landscape_url: p.media_landscape_url,
+          media_portrait_url: p.media_portrait_url,
+          cta_label: p.cta_label,
+          cta_href: p.cta_href,
+          duration_seconds: p.duration_seconds ?? 15,
+        };
+        break;
+      }
+    }
     if (gs && (gs.enabled === false || gs.leaderboard_enabled === false)) {
       showLeaderboard = false;
     }
@@ -157,6 +220,7 @@ export default async function LearnerLayout({
         <ImpersonationBanner orgName={org.name} expiresAt={impersonation.expiresAt} />
       )}
       <PlatformBroadcastBanner />
+      {popup && <PopupAnnouncement orgSlug={org.slug} popup={popup} />}
       <header className="sticky top-0 z-30 border-b border-line bg-paper/95 backdrop-blur">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between h-[68px] gap-3">
           <div className="flex items-center gap-6">
