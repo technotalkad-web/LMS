@@ -117,6 +117,11 @@ export default async function DashboardPage({
     icon: string;
     line: string;
   } | null = null;
+  // Focused dashboard (0064): while any RUNNING mandatory journey has focus
+  // enabled, the course grid leads with the journey + pinned courses and
+  // collapses the rest (collapse, never hide — deadlines stay reachable).
+  let focusActive = false;
+  const focusPinnedIds = new Set<string>();
   {
     const { data: jRows } = await supabase
       .from("journey_enrollments")
@@ -137,6 +142,9 @@ export default async function DashboardPage({
       name?: string;
       icon?: string;
       priority?: number;
+      is_mandatory?: boolean;
+      focus_enabled?: boolean;
+      focus_pinned?: unknown;
     };
     type JRow = {
       id: string;
@@ -157,6 +165,16 @@ export default async function DashboardPage({
       .sort((a, b) => (a.prog.priority ?? 100) - (b.prog.priority ?? 100));
     const j = jCandidates[0]?.row;
     const jProg = jCandidates[0]?.prog;
+    for (const c of jCandidates) {
+      if (c.prog.focus_enabled === true && c.prog.is_mandatory !== false) {
+        focusActive = true;
+        if (Array.isArray(c.prog.focus_pinned)) {
+          for (const id of c.prog.focus_pinned) {
+            if (typeof id === "string") focusPinnedIds.add(id);
+          }
+        }
+      }
+    }
     // Deactivated journey (admin Settings → Active off) is hidden from
     // learners entirely — no banner, no nav (layout applies the same rule).
     if (j && jProg?.is_active !== false) {
@@ -871,8 +889,42 @@ export default async function DashboardPage({
       <MotivationStrip orgSlug={orgSlug} data={myGamification} avgScore={avgScore} />
 
       {/* Clickable status chips + filterable grid (paths render as labeled
-          tiles ahead of the course cards; the chips filter both). */}
-      <DashboardGrid cards={[...pathCards, ...cards]} orgSlug={orgSlug} />
+          tiles ahead of the course cards; the chips filter both). While a
+          mandatory focus journey runs (0064), pinned courses stay up front
+          and everything else collapses into a closed disclosure — the
+          journey banner above is the learner's real to-do. */}
+      {focusActive ? (
+        (() => {
+          const allCards = [...pathCards, ...cards];
+          const pinned = allCards.filter(
+            (c) => (c.kind ?? "course") === "course" && focusPinnedIds.has(c.course_id)
+          );
+          const rest = allCards.filter((c) => !pinned.includes(c));
+          return (
+            <>
+              <p className="text-xs text-muted -mb-2">
+                🎯 Focus mode — your journey above comes first
+                {pinned.length > 0 ? ", along with these:" : "."}
+              </p>
+              {pinned.length > 0 && (
+                <DashboardGrid cards={pinned} orgSlug={orgSlug} />
+              )}
+              {rest.length > 0 && (
+                <details className="bg-paper border border-line rounded-2xl">
+                  <summary className="px-5 py-3.5 text-sm font-medium cursor-pointer select-none text-muted hover:text-ink">
+                    Other assigned learning ({rest.length})
+                  </summary>
+                  <div className="px-4 pb-4">
+                    <DashboardGrid cards={rest} orgSlug={orgSlug} />
+                  </div>
+                </details>
+              )}
+            </>
+          );
+        })()
+      ) : (
+        <DashboardGrid cards={[...pathCards, ...cards]} orgSlug={orgSlug} />
+      )}
     </div>
   );
 }

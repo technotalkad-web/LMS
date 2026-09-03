@@ -327,6 +327,8 @@ export async function PATCH(request: Request) {
     priority?: number;
     is_mandatory?: boolean;
     audience?: Record<string, unknown> | null;
+    focus_enabled?: boolean;
+    focus_pinned?: string[] | null;
   };
   const c = await ctx(body.orgSlug);
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
@@ -388,12 +390,46 @@ export async function PATCH(request: Request) {
       update.audience = Object.keys(cleaned).length > 0 ? cleaned : null;
     }
   }
+  if (body.focus_pinned !== undefined) {
+    if (body.focus_pinned === null) {
+      update.focus_pinned = null;
+    } else {
+      if (
+        !Array.isArray(body.focus_pinned) ||
+        body.focus_pinned.length > 20 ||
+        body.focus_pinned.some((v) => typeof v !== "string")
+      ) {
+        return NextResponse.json(
+          { error: "focus_pinned must be an array of course ids (max 20)" },
+          { status: 400 }
+        );
+      }
+      // Pinned courses must belong to THIS org (same guard as the
+      // curriculum PUT — never let a payload reference another tenant's).
+      const ids = Array.from(new Set(body.focus_pinned));
+      if (ids.length > 0) {
+        const { data: courseRows } = await c.supabase
+          .from("courses")
+          .select("id")
+          .eq("organization_id", c.org.id)
+          .in("id", ids);
+        if ((courseRows ?? []).length !== ids.length) {
+          return NextResponse.json(
+            { error: "One or more pinned courses don't belong to this organization" },
+            { status: 400 }
+          );
+        }
+      }
+      update.focus_pinned = ids.length > 0 ? ids : null;
+    }
+  }
   for (const flag of [
     "count_sundays",
     "is_active",
     "auto_enroll_new_users",
     "nudge_enabled",
     "is_mandatory",
+    "focus_enabled",
   ] as const) {
     if (body[flag] !== undefined) {
       if (typeof body[flag] !== "boolean") {

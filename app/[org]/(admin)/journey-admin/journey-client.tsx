@@ -34,6 +34,9 @@ export type ProgramRow = {
   priority?: number;
   is_mandatory?: boolean;
   audience?: Record<string, string[]> | null;
+  // Focused dashboard (0064).
+  focus_enabled?: boolean;
+  focus_pinned?: string[] | null;
 };
 export type ProgramSummary = { id: string; name: string; icon: string; priority: number };
 export type FunnelRow = { day_number: number; learners: number };
@@ -386,6 +389,7 @@ export function JourneyAdminClient({
           program={program}
           audienceOptions={audienceOptions}
           teams={teams}
+          courses={courses}
         />
       </div>
     </div>
@@ -1020,11 +1024,13 @@ function AudienceDim({
   options,
   selected,
   onChange,
+  emptyLabel = "all",
 }: {
   label: string;
   options: Array<{ value: string; display: string }>;
   selected: string[];
   onChange: (next: string[]) => void;
+  emptyLabel?: string;
 }) {
   if (options.length === 0) return null;
   return (
@@ -1032,7 +1038,7 @@ function AudienceDim({
       <summary className="px-3 py-2 text-xs font-medium cursor-pointer select-none flex items-center justify-between">
         <span>{label}</span>
         <span className={selected.length > 0 ? "text-indigo-700 font-bold" : "text-muted"}>
-          {selected.length > 0 ? `${selected.length} selected` : "all"}
+          {selected.length > 0 ? `${selected.length} selected` : emptyLabel}
         </span>
       </summary>
       <div className="px-3 pb-2 max-h-44 overflow-y-auto space-y-1">
@@ -1063,11 +1069,13 @@ function SettingsTab({
   program,
   audienceOptions = {},
   teams = [],
+  courses = [],
 }: {
   orgSlug: string;
   program: ProgramRow;
   audienceOptions?: Record<string, string[]>;
   teams?: Array<{ id: string; name: string }>;
+  courses?: CourseOption[];
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -1103,6 +1111,11 @@ function SettingsTab({
     };
   });
   const [syncBusy, setSyncBusy] = useState(false);
+  // Focused dashboard (0064).
+  const [focusEnabled, setFocusEnabled] = useState(program.focus_enabled === true);
+  const [focusPinned, setFocusPinned] = useState<string[]>(
+    Array.isArray(program.focus_pinned) ? program.focus_pinned : []
+  );
   const audDim = (k: string) => (next: string[]) =>
     setAudience((a) => ({ ...a, [k]: next }));
   const audienceEmpty = Object.values(audience).every((v) => v.length === 0);
@@ -1167,6 +1180,8 @@ function SettingsTab({
           nudge_cooldown_days: nudgeCooldown,
           priority,
           is_mandatory: isMandatory,
+          focus_enabled: focusEnabled,
+          focus_pinned: focusPinned.length > 0 ? focusPinned : null,
           audience: audienceEmpty
             ? null
             : Object.fromEntries(
@@ -1358,6 +1373,35 @@ function SettingsTab({
             {syncBusy ? "Syncing…" : "Sync audience now"}
           </button>
         </div>
+      </section>
+
+      {/* Focused dashboard (0064) */}
+      <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 space-y-3">
+        <h3 className="text-sm font-semibold">Focused dashboard</h3>
+        <p className="text-xs text-muted">
+          While this journey is active and mandatory, enrolled learners&apos;
+          dashboards lead with the journey (plus any courses you pin below)
+          and collapse everything else into an &ldquo;Other assigned
+          learning&rdquo; section — nothing is hidden, deadlines stay
+          reachable. The dashboard restores itself on completion.
+        </p>
+        <ToggleRow
+          label="Enable focus mode"
+          hint="Applies only to this journey's enrolled learners, only while it's active"
+          checked={focusEnabled}
+          onChange={setFocusEnabled}
+        />
+        {focusEnabled && (
+          <div className="max-w-md">
+            <AudienceDim
+              label="Pinned courses (stay visible alongside the journey)"
+              options={courses.map((cs) => ({ value: cs.id, display: cs.title }))}
+              selected={focusPinned}
+              onChange={(next) => setFocusPinned(next.slice(0, 20))}
+              emptyLabel="none"
+            />
+          </div>
+        )}
       </section>
 
       <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 space-y-3">
