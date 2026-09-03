@@ -4,6 +4,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import { DashboardGrid, type GridCard } from "../dashboard/dashboard-grid";
 import { isReleased, laterOf } from "@/lib/learner/release";
+import { myGroupIdsServer } from "@/lib/org/groups";
 
 /**
  * /{org}/courses — All my enrolled courses.
@@ -50,7 +51,8 @@ type Version = {
 type Assignment = {
   id: string;
   course_id: string;
-  assignee_type: "user" | "org" | "team";
+  assignee_type: "user" | "org" | "team" | "group";
+  group_id?: string | null;
   user_id: string | null;
   team_id: string | null;
   due_at: string | null;
@@ -90,14 +92,31 @@ export default async function CoursesIndexPage({
     })
     .map((r) => r.team_id);
 
-  // ---- Direct course assignments ----
+  // ---- Direct course assignments (select * = 0069 deploy safety) ----
   const { data: assignmentRows } = await supabase
     .from("course_assignments")
-    .select(
-      "id, course_id, assignee_type, user_id, team_id, due_at, release_at, assigned_at"
-    )
+    .select("*")
     .eq("organization_id", org.id);
   const assignments = (assignmentRows ?? []) as Assignment[];
+  // ---- Path assignments → pull in those paths' steps ----
+  const { data: pathAssignRows } = await supabase
+    .from("learning_path_assignments")
+    .select("*")
+    .eq("organization_id", org.id);
+  const allPathAssigns = (pathAssignRows ?? []) as Array<{
+    path_id: string;
+    assignee_type: "user" | "org" | "team" | "group";
+    user_id: string | null;
+    team_id: string | null;
+    group_id?: string | null;
+  }>;
+  // Custom Group assignments (0069): resolved live, only when present.
+  const myGroupIds =
+    assignments.some((a) => a.assignee_type === "group") ||
+    allPathAssigns.some((a) => a.assignee_type === "group")
+      ? await myGroupIdsServer(org.id, user.id)
+      : new Set<string>();
+
   const mine = assignments.filter(
     (a) => a.assignee_type === "user" && a.user_id === user.id
   );
@@ -107,31 +126,25 @@ export default async function CoursesIndexPage({
       a.team_id &&
       myTeamIds.includes(a.team_id)
   );
+  const mineGroups = assignments.filter(
+    (a) => a.assignee_type === "group" && a.group_id && myGroupIds.has(a.group_id)
+  );
   const orgWide = assignments.filter((a) => a.assignee_type === "org");
   const directCourseIds = Array.from(
-    new Set([...mine, ...mineTeams, ...orgWide].map((a) => a.course_id))
+    new Set([...mine, ...mineTeams, ...mineGroups, ...orgWide].map((a) => a.course_id))
   );
 
-  // ---- Path assignments → pull in those paths' steps ----
-  const { data: pathAssignRows } = await supabase
-    .from("learning_path_assignments")
-    .select("path_id, assignee_type, user_id, team_id")
-    .eq("organization_id", org.id);
   const myPathIds = Array.from(
     new Set(
-      ((pathAssignRows ?? []) as Array<{
-        path_id: string;
-        assignee_type: "user" | "org" | "team";
-        user_id: string | null;
-        team_id: string | null;
-      }>)
+      allPathAssigns
         .filter(
           (a) =>
             (a.assignee_type === "user" && a.user_id === user.id) ||
             a.assignee_type === "org" ||
             (a.assignee_type === "team" &&
               a.team_id &&
-              myTeamIds.includes(a.team_id))
+              myTeamIds.includes(a.team_id)) ||
+            (a.assignee_type === "group" && a.group_id && myGroupIds.has(a.group_id))
         )
         .map((a) => a.path_id)
     )
@@ -261,7 +274,7 @@ export default async function CoursesIndexPage({
   // ---- Scheduled-release gates (mirrors dashboard/page.tsx) ----
   const nowMs = Date.now();
   const assignmentGateByCourse = new Map<string, string | null>(); // null = open
-  for (const a of [...mine, ...mineTeams, ...orgWide]) {
+  for (const a of [...mine, ...mineTeams, ...mineGroups, ...orgWide]) {
     const prev = assignmentGateByCourse.get(a.course_id);
     if (prev === null) continue;
     if (isReleased(a.release_at, nowMs)) {

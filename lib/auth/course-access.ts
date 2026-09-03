@@ -1,5 +1,6 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isReleased } from "@/lib/learner/release";
+import { resolveUserGroupIds } from "@/lib/org/groups";
 import {
   computeJourneyState,
   courseDaysOf,
@@ -85,23 +86,48 @@ export async function learnerCanAccessCourse(opts: {
     })
     .map((r) => r.team_id);
 
+  // select("*") for deploy safety across the 0069 group_id migration.
   const { data: assignmentRows } = await supabase
     .from("course_assignments")
-    .select("assignee_type, user_id, team_id, release_at")
+    .select("*")
     .eq("course_id", courseId)
     .eq("organization_id", orgId);
   const assignments = (assignmentRows ?? []) as Array<{
     assignee_type: string;
     user_id: string | null;
     team_id: string | null;
+    group_id?: string | null;
     release_at: string | null;
   }>;
+
+  // Custom Group entitlement (0069): membership resolves LIVE through the
+  // shared resolver. Group rules live in admin-only tables, so this one
+  // check runs service-role — the decision is still made HERE, org-scoped.
+  let myGroupIds: Set<string> | null = null;
+  const groupIdsOf = async (): Promise<Set<string>> => {
+    if (myGroupIds) return myGroupIds;
+    try {
+      const svc = createServiceClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!,
+        { auth: { persistSession: false } }
+      );
+      myGroupIds = await resolveUserGroupIds(svc, orgId, userId);
+    } catch {
+      myGroupIds = new Set();
+    }
+    return myGroupIds;
+  };
+  const hasGroupRows = (rows: Array<{ assignee_type: string }>) =>
+    rows.some((a) => a.assignee_type === "group");
+  const groups = hasGroupRows(assignments) ? await groupIdsOf() : new Set<string>();
 
   const mine = assignments.filter(
     (a) =>
       (a.assignee_type === "user" && a.user_id === userId) ||
       a.assignee_type === "org" ||
-      (a.assignee_type === "team" && a.team_id && myTeamIds.includes(a.team_id))
+      (a.assignee_type === "team" && a.team_id && myTeamIds.includes(a.team_id)) ||
+      (a.assignee_type === "group" && a.group_id && groups.has(a.group_id))
   );
 
   const now = Date.now();
@@ -138,23 +164,27 @@ export async function learnerCanAccessCourse(opts: {
   if (steps.length > 0) {
     const { data: pathAssignRows } = await supabase
       .from("learning_path_assignments")
-      .select("path_id, assignee_type, user_id, team_id")
+      .select("*")
       .in(
         "path_id",
         steps.map((s) => s.path_id)
       );
+    const pathAssigns = (pathAssignRows ?? []) as Array<{
+      path_id: string;
+      assignee_type: string;
+      user_id: string | null;
+      team_id: string | null;
+      group_id?: string | null;
+    }>;
+    const pathGroups = hasGroupRows(pathAssigns) ? await groupIdsOf() : new Set<string>();
     const myPathIds = new Set(
-      ((pathAssignRows ?? []) as Array<{
-        path_id: string;
-        assignee_type: "user" | "org" | "team";
-        user_id: string | null;
-        team_id: string | null;
-      }>)
+      pathAssigns
         .filter(
           (a) =>
             (a.assignee_type === "user" && a.user_id === userId) ||
             a.assignee_type === "org" ||
-            (a.assignee_type === "team" && a.team_id && myTeamIds.includes(a.team_id))
+            (a.assignee_type === "team" && a.team_id && myTeamIds.includes(a.team_id)) ||
+            (a.assignee_type === "group" && a.group_id && pathGroups.has(a.group_id))
         )
         .map((a) => a.path_id)
     );

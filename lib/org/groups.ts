@@ -1,4 +1,7 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import {
+  createClient as createServiceClient,
+  type SupabaseClient,
+} from "@supabase/supabase-js";
 
 /**
  * Custom Groups (0067) — the LMS's reusable AUDIENCE object.
@@ -203,6 +206,109 @@ export async function resolveGroupMembers(
           (m.date_of_joining !== null && m.date_of_joining >= joinCutoff))
     )
     .map((m) => m.user_id);
+}
+
+/**
+ * The ACTIVE groups a single user belongs to right now — the learner-side
+ * entitlement primitive for group ASSIGNMENTS (G4). Static membership via
+ * rows; dynamic via evaluating each group's rules against just this user's
+ * member row (+ their team memberships) — O(groups), no org-wide scan.
+ */
+export async function resolveUserGroupIds(
+  svc: SupabaseClient,
+  orgId: string,
+  userId: string
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  const { data: groupRows } = await svc
+    .from("org_groups")
+    .select("id, organization_id, group_type, rules, is_active")
+    .eq("organization_id", orgId)
+    .eq("is_active", true);
+  const groups = (groupRows ?? []) as GroupRow[];
+  if (groups.length === 0) return out;
+
+  const staticIds = groups.filter((g) => g.group_type === "static").map((g) => g.id);
+  if (staticIds.length > 0) {
+    const { data } = await svc
+      .from("org_group_members")
+      .select("group_id")
+      .eq("user_id", userId)
+      .in("group_id", staticIds);
+    for (const r of (data ?? []) as Array<{ group_id: string }>) out.add(r.group_id);
+  }
+
+  const dynamic = groups.filter((g) => g.group_type === "dynamic");
+  if (dynamic.length === 0) return out;
+  const { data: meRow } = await svc
+    .from("organization_members")
+    .select(
+      "user_id, designation, job_role, city, state, business_vertical, branch, line_manager_id, date_of_joining, status"
+    )
+    .eq("organization_id", orgId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  const me = meRow as (MemberFields & { status?: string }) | null;
+  if (!me || me.status !== "active") return out;
+  const { data: tmRows } = await svc
+    .from("team_members")
+    .select("team_id")
+    .eq("user_id", userId);
+  const myTeams = new Set(
+    ((tmRows ?? []) as Array<{ team_id: string }>).map((t) => t.team_id)
+  );
+
+  const inList = (vals: string[] | undefined, v: string | null) =>
+    !vals || vals.length === 0 || vals.includes(v ?? "");
+  for (const g of dynamic) {
+    const rules = parseGroupRules(g.rules);
+    const joinCutoff = rules.joined_within_days
+      ? new Date(Date.now() - rules.joined_within_days * 86400000)
+          .toISOString()
+          .slice(0, 10)
+      : null;
+    const teamOk =
+      !rules.team_ids ||
+      rules.team_ids.length === 0 ||
+      rules.team_ids.some((t) => myTeams.has(t));
+    if (
+      inList(rules.designations, me.designation) &&
+      inList(rules.job_roles, me.job_role) &&
+      inList(rules.cities, me.city) &&
+      inList(rules.states, me.state) &&
+      inList(rules.verticals, me.business_vertical) &&
+      inList(rules.branches, me.branch) &&
+      inList(rules.l1_manager_ids, me.line_manager_id) &&
+      teamOk &&
+      (joinCutoff === null ||
+        (me.date_of_joining !== null && me.date_of_joining >= joinCutoff))
+    ) {
+      out.add(g.id);
+    }
+  }
+  return out;
+}
+
+/**
+ * Server-side convenience: resolveUserGroupIds with its own service-role
+ * client, failing soft to "no groups" (pre-0067 databases, resolver
+ * errors). Callers MUST have already authorized the (orgId, userId) pair —
+ * this only answers group membership, never grants org access.
+ */
+export async function myGroupIdsServer(
+  orgId: string,
+  userId: string
+): Promise<Set<string>> {
+  try {
+    const svc = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    return await resolveUserGroupIds(svc, orgId, userId);
+  } catch {
+    return new Set();
+  }
 }
 
 /** Union of several groups' members (shared member fetch). */

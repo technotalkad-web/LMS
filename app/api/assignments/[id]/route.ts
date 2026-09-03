@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
  *   DELETE /api/assignments/{id}
@@ -24,11 +25,10 @@ export async function DELETE(
   }
 
   // Snapshot the row first so the notify pass knows who to email.
+  // Wildcard on the parent table for 0069 deploy safety (group_id).
   const { data: row } = await supabase
     .from("course_assignments")
-    .select(
-      "course_id, organization_id, assignee_type, user_id, team_id, courses(title), organizations(name, slug)"
-    )
+    .select("*, courses(title), organizations(name, slug)")
     .eq("id", id)
     .maybeSingle();
 
@@ -50,9 +50,10 @@ export async function DELETE(
         const r = row as {
           course_id: string;
           organization_id: string;
-          assignee_type: "user" | "team" | "org";
+          assignee_type: "user" | "team" | "org" | "group";
           user_id: string | null;
           team_id: string | null;
+          group_id?: string | null;
           courses?: { title?: string } | { title?: string }[];
           organizations?:
             | { name?: string; slug?: string }
@@ -67,6 +68,12 @@ export async function DELETE(
             .select("user_id")
             .eq("team_id", r.team_id);
           for (const m of tm ?? []) recipientIds.add(m.user_id as string);
+        } else if (r.assignee_type === "group" && r.group_id) {
+          for (const uid of await resolveManyGroups(svc, r.organization_id, [
+            r.group_id,
+          ])) {
+            recipientIds.add(uid);
+          }
         } else if (r.assignee_type === "org") {
           const { data: om } = await svc
             .from("organization_members")

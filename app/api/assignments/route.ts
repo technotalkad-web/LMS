@@ -4,12 +4,13 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
  *   POST /api/assignments
  *   body: {
  *     orgSlug, courseId,
- *     assignToOrg?, userIds?, teamIds?,
+ *     assignToOrg?, userIds?, teamIds?, groupIds?,
  *     dueAt?, releaseAt?
  *   }
  *
@@ -26,6 +27,7 @@ export async function POST(request: Request) {
     assignToOrg?: boolean;
     userIds?: string[];
     teamIds?: string[];
+    groupIds?: string[];
     dueAt?: string | null;
     releaseAt?: string | null;
   };
@@ -101,9 +103,11 @@ export async function POST(request: Request) {
   type Row = {
     course_id: string;
     organization_id: string;
-    assignee_type: "user" | "org" | "team";
+    assignee_type: "user" | "org" | "team" | "group";
     user_id: string | null;
     team_id: string | null;
+    // Optional so pre-0069 databases never see the column on non-group rows.
+    group_id?: string | null;
     due_at: string | null;
     release_at: string | null;
     assigned_by: string;
@@ -116,8 +120,10 @@ export async function POST(request: Request) {
   // another tenant's users.
   const reqUserIds = (body.userIds ?? []).filter(Boolean);
   const reqTeamIds = (body.teamIds ?? []).filter(Boolean);
+  const reqGroupIds = (body.groupIds ?? []).filter(Boolean);
   let validUserIds: string[] = [];
   let validTeamIds: string[] = [];
+  let validGroupIds: string[] = [];
   if (reqUserIds.length) {
     const { data: m } = await supabase
       .from("organization_members")
@@ -133,6 +139,14 @@ export async function POST(request: Request) {
       .eq("organization_id", org.id)
       .in("id", reqTeamIds);
     validTeamIds = ((t ?? []) as Array<{ id: string }>).map((r) => r.id);
+  }
+  if (reqGroupIds.length) {
+    const { data: g } = await supabase
+      .from("org_groups")
+      .select("id")
+      .eq("organization_id", org.id)
+      .in("id", reqGroupIds);
+    validGroupIds = ((g ?? []) as Array<{ id: string }>).map((r) => r.id);
   }
 
   if (body.assignToOrg) {
@@ -171,6 +185,19 @@ export async function POST(request: Request) {
       assigned_by: user.id,
     });
   }
+  for (const gid of validGroupIds) {
+    rows.push({
+      course_id: course.id,
+      organization_id: org.id,
+      assignee_type: "group",
+      user_id: null,
+      team_id: null,
+      group_id: gid,
+      due_at: dueAt,
+      release_at: releaseAt,
+      assigned_by: user.id,
+    });
+  }
 
   if (rows.length === 0) {
     return NextResponse.json(
@@ -181,8 +208,8 @@ export async function POST(request: Request) {
 
   const inserted: unknown[] = [];
   let rescheduled = 0;
-  const SELECT_COLS =
-    "id, assignee_type, user_id, team_id, due_at, release_at, assigned_at";
+  // select("*") for 0069 deploy safety (group_id).
+  const SELECT_COLS = "*";
   for (const row of rows) {
     const { data, error } = await supabase
       .from("course_assignments")
@@ -209,6 +236,8 @@ export async function POST(request: Request) {
       .eq("assignee_type", row.assignee_type);
     q = row.user_id ? q.eq("user_id", row.user_id) : q.is("user_id", null);
     q = row.team_id ? q.eq("team_id", row.team_id) : q.is("team_id", null);
+    // Only group rows carry group_id (pre-0069 DBs never see the column).
+    if (row.group_id) q = q.eq("group_id", row.group_id);
     const { data: updated, error: updErr } = await q.select("id");
     if (updErr) {
       return NextResponse.json({ error: updErr.message }, { status: 400 });
@@ -241,6 +270,7 @@ export async function POST(request: Request) {
           assignee_type: string;
           user_id: string | null;
           team_id: string | null;
+          group_id?: string | null;
         }>) {
           if (ins.assignee_type === "user" && ins.user_id) {
             recipientUserIds.add(ins.user_id);
@@ -250,6 +280,10 @@ export async function POST(request: Request) {
               .select("user_id")
               .eq("team_id", ins.team_id);
             for (const m of tm ?? []) recipientUserIds.add(m.user_id as string);
+          } else if (ins.assignee_type === "group" && ins.group_id) {
+            for (const uid of await resolveManyGroups(svc, org.id, [ins.group_id])) {
+              recipientUserIds.add(uid);
+            }
           } else if (ins.assignee_type === "org") {
             const { data: om } = await svc
               .from("organization_members")

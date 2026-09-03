@@ -4,10 +4,11 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
  *   POST /api/learning-path-assignments
- *   body: { orgSlug, pathId, assignToOrg?, userIds?, teamIds?, dueAt? }
+ *   body: { orgSlug, pathId, assignToOrg?, userIds?, teamIds?, groupIds?, dueAt? }
  *
  * After successful inserts, expands each row to the affected learners and
  * fires path_assignment notifications in the background.
@@ -19,6 +20,7 @@ export async function POST(request: Request) {
     assignToOrg?: boolean;
     userIds?: string[];
     teamIds?: string[];
+    groupIds?: string[];
     dueAt?: string | null;
   };
   if (!body.orgSlug || !body.pathId) {
@@ -45,12 +47,32 @@ export async function POST(request: Request) {
   const dueAt =
     body.dueAt && body.dueAt.trim() ? new Date(body.dueAt).toISOString() : null;
 
+  // Custom Group assignees (0069): only groups belonging to THIS org count.
+  const requestedGroupIds = (body.groupIds ?? []).filter(Boolean);
+  let validGroupIds: string[] = [];
+  if (requestedGroupIds.length > 0) {
+    const { data: groupRows } = await supabase
+      .from("org_groups")
+      .select("id")
+      .eq("organization_id", org.id)
+      .in("id", requestedGroupIds);
+    validGroupIds = ((groupRows ?? []) as Array<{ id: string }>).map((g) => g.id);
+    if (validGroupIds.length !== requestedGroupIds.length) {
+      return NextResponse.json(
+        { error: "One or more groups not found in this organization" },
+        { status: 400 }
+      );
+    }
+  }
+
   type Row = {
     path_id: string;
     organization_id: string;
-    assignee_type: "user" | "org" | "team";
+    assignee_type: "user" | "org" | "team" | "group";
     user_id: string | null;
     team_id: string | null;
+    // Optional so pre-0069 databases never see the column on non-group rows.
+    group_id?: string | null;
     due_at: string | null;
     assigned_by: string;
   };
@@ -85,6 +107,18 @@ export async function POST(request: Request) {
       assignee_type: "team",
       user_id: null,
       team_id: tid,
+      due_at: dueAt,
+      assigned_by: user.id,
+    });
+  }
+  for (const gid of validGroupIds) {
+    rows.push({
+      path_id: body.pathId,
+      organization_id: org.id,
+      assignee_type: "group",
+      user_id: null,
+      team_id: null,
+      group_id: gid,
       due_at: dueAt,
       assigned_by: user.id,
     });
@@ -136,6 +170,10 @@ export async function POST(request: Request) {
               .select("user_id")
               .eq("team_id", row.team_id);
             for (const m of tm ?? []) recipientIds.add(m.user_id as string);
+          } else if (row.assignee_type === "group" && row.group_id) {
+            for (const uid of await resolveManyGroups(svc, org.id, [row.group_id])) {
+              recipientIds.add(uid);
+            }
           } else if (row.assignee_type === "org") {
             const { data: om } = await svc
               .from("organization_members")

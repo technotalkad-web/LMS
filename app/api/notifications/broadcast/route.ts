@@ -5,6 +5,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendNotification } from "@/lib/notifications/send";
 import { resolveEmails } from "@/lib/users/emails";
 import { mapWithConcurrency } from "@/lib/util/concurrency";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 // Action-button types the admin can attach to a broadcast. Course/Path
 // types reference an org-scoped entity and are resolved to a deep link
@@ -88,20 +89,24 @@ export async function POST(request: Request) {
     targetId: string
   ): Promise<Set<string>> {
     const out = new Set<string>();
+    // select("*") for 0069 deploy safety (group_id).
     const { data: rows } = await svc
       .from(table)
-      .select("assignee_type, user_id, team_id, organization_id")
+      .select("*")
       .eq(targetCol, targetId);
     const teamIds = new Set<string>();
+    const groupIds = new Set<string>();
     let coversOrg = false;
     for (const r of (rows ?? []) as Array<{
-      assignee_type: "user" | "team" | "org";
+      assignee_type: "user" | "team" | "org" | "group";
       user_id: string | null;
       team_id: string | null;
+      group_id?: string | null;
       organization_id: string;
     }>) {
       if (r.assignee_type === "user" && r.user_id) out.add(r.user_id);
       else if (r.assignee_type === "team" && r.team_id) teamIds.add(r.team_id);
+      else if (r.assignee_type === "group" && r.group_id) groupIds.add(r.group_id);
       else if (r.assignee_type === "org") coversOrg = true;
     }
     if (teamIds.size > 0) {
@@ -110,6 +115,11 @@ export async function POST(request: Request) {
         .select("user_id")
         .in("team_id", Array.from(teamIds));
       for (const m of tm ?? []) out.add(m.user_id as string);
+    }
+    if (groupIds.size > 0) {
+      for (const uid of await resolveManyGroups(svc, org.id, Array.from(groupIds))) {
+        out.add(uid);
+      }
     }
     if (coversOrg) {
       const { data: om } = await svc

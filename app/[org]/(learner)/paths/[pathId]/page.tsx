@@ -13,6 +13,7 @@ import {
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import { isReleased } from "@/lib/learner/release";
+import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 
 type PathRow = {
@@ -38,9 +39,10 @@ type StepRow = {
 };
 
 type AssignmentRow = {
-  assignee_type: "user" | "team" | "org";
+  assignee_type: "user" | "team" | "org" | "group";
   user_id: string | null;
   team_id: string | null;
+  group_id?: string | null;
   due_at: string | null;
 };
 
@@ -90,19 +92,22 @@ export default async function LearningPathDetailPage({
     })
     .map((r) => r.team_id);
 
+  // select("*") for 0069 deploy safety (group_id).
   const { data: assignmentRows } = await supabase
     .from("learning_path_assignments")
-    .select("assignee_type, user_id, team_id, due_at")
+    .select("*")
     .eq("path_id", pathId);
   const assignments = (assignmentRows ?? []) as AssignmentRow[];
-  const isAssigned = assignments.some(
-    (a) =>
-      (a.assignee_type === "user" && a.user_id === user.id) ||
-      a.assignee_type === "org" ||
-      (a.assignee_type === "team" &&
-        a.team_id &&
-        myTeamIds.includes(a.team_id))
-  );
+  // Custom Group assignments (0069) — resolved live, only when present.
+  const myGroupIds = assignments.some((a) => a.assignee_type === "group")
+    ? await myGroupIdsServer(org.id, user.id)
+    : new Set<string>();
+  const matchesMe = (a: AssignmentRow) =>
+    (a.assignee_type === "user" && a.user_id === user.id) ||
+    a.assignee_type === "org" ||
+    (a.assignee_type === "team" && a.team_id && myTeamIds.includes(a.team_id)) ||
+    (a.assignee_type === "group" && a.group_id != null && myGroupIds.has(a.group_id));
+  const isAssigned = assignments.some(matchesMe);
   // org_public paths are visible to every member of the org regardless of an
   // explicit assignment — the dashboard already surfaces them as tiles, so the
   // detail page must accept them too (otherwise the tile dead-ends in a
@@ -112,14 +117,7 @@ export default async function LearningPathDetailPage({
 
   // Earliest due_at across the user's matching assignments.
   const myDueDates = assignments
-    .filter(
-      (a) =>
-        (a.assignee_type === "user" && a.user_id === user.id) ||
-        a.assignee_type === "org" ||
-        (a.assignee_type === "team" &&
-          a.team_id &&
-          myTeamIds.includes(a.team_id))
-    )
+    .filter(matchesMe)
     .map((a) => a.due_at)
     .filter((d): d is string => !!d)
     .sort();

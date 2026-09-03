@@ -9,14 +9,16 @@ import { MemberCombobox } from "./member-combobox";
 
 export type AssignmentRow = {
   id: string;
-  assignee_type: "user" | "org" | "team";
+  assignee_type: "user" | "org" | "team" | "group";
   user_id: string | null;
   team_id: string | null;
+  group_id?: string | null;
   due_at: string | null;
   release_at: string | null;
   assigned_at: string;
   user_email?: string | null;
   team_name?: string | null;
+  group_name?: string | null;
 };
 
 /** "Unlocks <date>" chip for a scheduled (not yet released) assignment. */
@@ -47,6 +49,13 @@ export type AssignableTeam = {
   member_count: number;
 };
 
+export type AssignableGroup = {
+  id: string;
+  name: string;
+  group_type: "static" | "dynamic";
+  member_count: number | null;
+};
+
 export function AssignSection({
   orgSlug,
   courseId,
@@ -54,6 +63,7 @@ export function AssignSection({
   assignments,
   members,
   teams,
+  groups = [],
 }: {
   orgSlug: string;
   courseId: string;
@@ -61,6 +71,7 @@ export function AssignSection({
   assignments: AssignmentRow[];
   members: AssignableMember[];
   teams: AssignableTeam[];
+  groups?: AssignableGroup[];
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -69,6 +80,7 @@ export function AssignSection({
   const [error, setError] = useState<string | null>(null);
   const [selectedUser, setSelectedUser] = useState("");
   const [selectedTeam, setSelectedTeam] = useState("");
+  const [selectedGroup, setSelectedGroup] = useState("");
   const [dueAt, setDueAt] = useState("");
   // datetime-local value; converted to ISO in the browser so the stored
   // instant matches the admin's local wall-clock choice.
@@ -79,10 +91,13 @@ export function AssignSection({
   const orgWide = assignments.find((a) => a.assignee_type === "org");
   const userAssignments = assignments.filter((a) => a.assignee_type === "user");
   const teamAssignments = assignments.filter((a) => a.assignee_type === "team");
+  const groupAssignments = assignments.filter((a) => a.assignee_type === "group");
   const assignedUserIds = new Set(userAssignments.map((a) => a.user_id));
   const assignedTeamIds = new Set(teamAssignments.map((a) => a.team_id));
+  const assignedGroupIds = new Set(groupAssignments.map((a) => a.group_id));
   const userCandidates = members.filter((m) => !assignedUserIds.has(m.user_id));
   const teamCandidates = teams.filter((t) => !assignedTeamIds.has(t.id));
+  const groupCandidates = groups.filter((g) => !assignedGroupIds.has(g.id));
 
   async function post(body: object) {
     setBusy(true);
@@ -151,6 +166,18 @@ export function AssignSection({
     if (ok) setSelectedTeam("");
   }
 
+  async function addGroup() {
+    if (!selectedGroup) return;
+    const ok = await post({
+      orgSlug,
+      courseId,
+      groupIds: [selectedGroup],
+      dueAt: dueAt || null,
+      releaseAt: releaseIso(),
+    });
+    if (ok) setSelectedGroup("");
+  }
+
   return (
     <div>
       <h2 className="serif text-2xl mb-3">Assignments</h2>
@@ -216,6 +243,39 @@ export function AssignSection({
                   className="flex items-center justify-between text-sm"
                 >
                   <span>{a.team_name ?? a.team_id?.slice(0, 8) ?? "-"}</span>
+                  <span className="flex items-center gap-3 text-xs text-muted">
+                    <ReleaseChip releaseAt={a.release_at} />
+                    {a.due_at && (
+                      <span>Due {new Date(a.due_at).toISOString().slice(0, 10)}</span>
+                    )}
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => unassign(a.id)}
+                        className="px-2 py-0.5 border border-line rounded hover:border-red-500 hover:text-red-700"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {groupAssignments.length > 0 && (
+          <div className="px-5 py-3 border-b border-line">
+            <div className="text-xs uppercase tracking-wide text-muted mb-2">
+              Custom groups ({groupAssignments.length})
+            </div>
+            <ul className="space-y-1.5">
+              {groupAssignments.map((a) => (
+                <li
+                  key={a.id}
+                  className="flex items-center justify-between text-sm"
+                >
+                  <span>{a.group_name ?? a.group_id?.slice(0, 8) ?? "-"}</span>
                   <span className="flex items-center gap-3 text-xs text-muted">
                     <ReleaseChip releaseAt={a.release_at} />
                     {a.due_at && (
@@ -346,6 +406,44 @@ export function AssignSection({
                 </p>
               )}
             </div>
+
+            {groups.length > 0 && (
+              <div>
+                <div className="text-xs uppercase tracking-wide text-muted mb-2">
+                  Assign custom group
+                </div>
+                <div className="flex flex-wrap gap-2 items-center">
+                  <select
+                    value={selectedGroup}
+                    onChange={(e) => setSelectedGroup(e.target.value)}
+                    className="flex-1 min-w-[200px] px-3 py-2 border border-line rounded-lg bg-canvas outline-none focus:border-ink text-sm"
+                  >
+                    <option value="">Pick a group...</option>
+                    {groupCandidates.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
+                        {g.group_type === "dynamic" ? " (dynamic)" : ""}
+                        {typeof g.member_count === "number"
+                          ? ` — ~${g.member_count} members`
+                          : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={addGroup}
+                    disabled={busy || !selectedGroup}
+                    className="px-3 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
+                  >
+                    Assign group
+                  </button>
+                </div>
+                <p className="text-[11px] text-muted mt-1.5">
+                  Dynamic groups re-evaluate live — people who match the rules
+                  later are automatically covered.
+                </p>
+              </div>
+            )}
 
             <div>
               <div className="text-xs uppercase tracking-wide text-muted mb-2">
