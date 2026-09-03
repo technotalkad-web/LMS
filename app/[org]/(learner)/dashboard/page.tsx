@@ -21,7 +21,10 @@ import {
   MotivationStrip,
   type MyGamification,
 } from "./_components/motivation-strip";
-import { DEFAULT_WELCOME_MESSAGE } from "@/lib/gamification/board-copy";
+import {
+  DEFAULT_WELCOME_MESSAGE,
+  effectiveScoreLabel,
+} from "@/lib/gamification/board-copy";
 import { effectiveJourneyCopy } from "@/lib/journey/journey";
 
 type Course = {
@@ -201,16 +204,24 @@ export default async function DashboardPage({
   // org's gamification_settings under RLS). Fail-soft to the default — a
   // pre-0057 database errors this select and we just keep the default.
   let welcomeMessage = DEFAULT_WELCOME_MESSAGE;
+  // select("*") on purpose (house rule): naming per-migration columns here
+  // (0057 welcome_message, 0066 score_label) would error the whole query on
+  // a database that hasn't run that migration yet.
   const { data: gsw } = await supabase
     .from("gamification_settings")
-    .select("welcome_message")
+    .select("*")
     .eq("organization_id", org.id)
     .maybeSingle();
-  const customWelcome = (gsw as { welcome_message?: string | null } | null)
-    ?.welcome_message;
+  const gswRow = gsw as {
+    welcome_message?: string | null;
+    score_label?: string | null;
+    score_description?: string | null;
+  } | null;
+  const customWelcome = gswRow?.welcome_message;
   if (typeof customWelcome === "string" && customWelcome.trim()) {
     welcomeMessage = customWelcome.trim();
   }
+  const score = effectiveScoreLabel(gswRow);
 
   // 0) Teams this user is on.
   const { data: myTeamRows } = await supabase
@@ -886,7 +897,13 @@ export default async function DashboardPage({
 
       {/* Personal gamification strip (rank / XP / level / streak / avg score).
           Sits below the urgency callout — deadlines outrank gamification. */}
-      <MotivationStrip orgSlug={orgSlug} data={myGamification} avgScore={avgScore} />
+      <MotivationStrip
+        orgSlug={orgSlug}
+        data={myGamification}
+        avgScore={avgScore}
+        scoreLabel={score.label}
+        scoreDescription={score.description}
+      />
 
       {/* Clickable status chips + filterable grid (paths render as labeled
           tiles ahead of the course cards; the chips filter both). While a

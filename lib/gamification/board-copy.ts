@@ -32,12 +32,33 @@ export const DEFAULT_LEADERBOARD_TITLE = "Leaderboard";
 export const DEFAULT_WELCOME_MESSAGE =
   "A learning curve is essential to growth. Pick up where you left off.";
 
+/** Org-nameable score (0066): e.g. "Gyanank" / "Knowledge Score". */
+export const DEFAULT_SCORE_LABEL = "XP";
+export const DEFAULT_SCORE_DESCRIPTION = "Experience Points";
+
 export const COPY_LIMITS = {
   boardName: 40,
   boardTagline: 120,
   leaderboardTitle: 60,
   welcomeMessage: 200,
+  scoreLabel: 24,
+  scoreDescription: 80,
 } as const;
+
+/** The org's effective score naming, from a gamification_settings row. */
+export function effectiveScoreLabel(
+  gs: { score_label?: string | null; score_description?: string | null } | null | undefined
+): { label: string; description: string } {
+  const label =
+    typeof gs?.score_label === "string" && gs.score_label.trim()
+      ? gs.score_label.trim()
+      : DEFAULT_SCORE_LABEL;
+  const description =
+    typeof gs?.score_description === "string" && gs.score_description.trim()
+      ? gs.score_description.trim()
+      : DEFAULT_SCORE_DESCRIPTION;
+  return { label, description };
+}
 
 /** Raw jsonb from gamification_settings.board_labels (untrusted shape). */
 export type BoardLabelOverrides = Partial<

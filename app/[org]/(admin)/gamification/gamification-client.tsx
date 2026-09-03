@@ -16,6 +16,7 @@ import {
   DEFAULT_LEADERBOARD_TITLE,
   DEFAULT_WELCOME_MESSAGE,
   effectiveBoardCopy,
+  effectiveScoreLabel,
   type BoardCopyKey,
 } from "@/lib/gamification/board-copy";
 import {
@@ -56,6 +57,9 @@ export type GamificationSettings = {
   board_labels?: unknown;
   leaderboard_title?: string | null;
   welcome_message?: string | null;
+  // Org-named score (0066); null/missing = "XP".
+  score_label?: string | null;
+  score_description?: string | null;
   // Podium customization (0061); null/missing = built-in look.
   podium_style?: unknown;
 };
@@ -136,7 +140,7 @@ export function GamificationClient({
         description="XP, levels, badges and leaderboard controls. Changes apply to future activity — past XP is never recalculated."
       />
       <KpiStrip>
-        <KpiCard label="XP awarded (30d)" value={kpis.xp30d.toLocaleString()} icon={<Zap className="w-5 h-5" />} accent="text-amber-500" />
+        <KpiCard label={`${effectiveScoreLabel(settings).label} awarded (30d)`} value={kpis.xp30d.toLocaleString()} icon={<Zap className="w-5 h-5" />} accent="text-amber-500" />
         <KpiCard label="Active streaks" value={kpis.activeStreaks} icon={<Flame className="w-5 h-5" />} accent="text-orange-500" />
         <KpiCard label="Badges earned (30d)" value={kpis.badges30d} icon={<Award className="w-5 h-5" />} accent="text-emerald-600" />
         <KpiCard label="Leaderboard opt-outs" value={kpis.optOuts} icon={<EyeOff className="w-5 h-5" />} accent="text-slate-500" />
@@ -677,6 +681,8 @@ function CopySection({
   });
   const [title, setTitle] = useState(settings?.leaderboard_title ?? "");
   const [welcome, setWelcome] = useState(settings?.welcome_message ?? "");
+  const [scoreLabel, setScoreLabel] = useState(settings?.score_label ?? "");
+  const [scoreDesc, setScoreDesc] = useState(settings?.score_description ?? "");
   const { busy, error, saved, save } = useSectionSave();
 
   const setField = (k: BoardCopyKey, field: "name" | "tagline", v: string) =>
@@ -714,6 +720,39 @@ function CopySection({
             className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
           />
         </label>
+        <div className="grid grid-cols-1 sm:grid-cols-[200px_1fr] gap-2">
+          <label className="block">
+            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+              Score name
+            </span>
+            <input
+              type="text"
+              value={scoreLabel}
+              maxLength={COPY_LIMITS.scoreLabel}
+              onChange={(e) => setScoreLabel(e.target.value)}
+              placeholder="XP"
+              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+            />
+          </label>
+          <label className="block">
+            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+              Score description
+            </span>
+            <input
+              type="text"
+              value={scoreDesc}
+              maxLength={COPY_LIMITS.scoreDescription}
+              onChange={(e) => setScoreDesc(e.target.value)}
+              placeholder="Experience Points"
+              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+            />
+          </label>
+        </div>
+        <p className="text-[11px] text-muted -mt-1">
+          e.g. <strong>Gyanank</strong> · Knowledge Score — replaces
+          &ldquo;XP&rdquo; everywhere learners see the score (dashboard strip,
+          leaderboard, podium). Scoring rules stay in the XP rules tab.
+        </p>
       </div>
 
       <div>
@@ -756,6 +795,8 @@ function CopySection({
             section: "copy",
             leaderboard_title: title,
             welcome_message: welcome,
+            score_label: scoreLabel,
+            score_description: scoreDesc,
             board_labels: labels,
           })
         }
