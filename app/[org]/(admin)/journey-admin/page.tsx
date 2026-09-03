@@ -21,10 +21,13 @@ export const dynamic = "force-dynamic";
  */
 export default async function JourneyAdminPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string }>;
+  searchParams?: Promise<{ program?: string }>;
 }) {
   const { org: orgSlug } = await params;
+  const sp = (await searchParams) ?? {};
   const { org, role } = await requireOrgAccess(orgSlug);
   if (!canManage(role)) redirect(`/${orgSlug}/dashboard?denied=1`);
 
@@ -35,13 +38,18 @@ export default async function JourneyAdminPage({
     { auth: { persistSession: false } }
   );
 
+  // ALL journeys (multi-journey since 0063), highest priority rank first.
   // The DRAFT is always editable (even while paused — pausing is a setting).
-  const { data: progRow } = await supabase
+  const { data: progRows } = await supabase
     .from("journey_programs")
     .select("*")
     .eq("organization_id", org.id)
-    .maybeSingle();
-  const program = (progRow ?? null) as ProgramRow | null;
+    .order("created_at", { ascending: true });
+  const programs = ((progRows ?? []) as ProgramRow[]).sort(
+    (a, b) => (a.priority ?? 100) - (b.priority ?? 100) || a.name.localeCompare(b.name)
+  );
+  const program =
+    programs.find((p) => p.id === sp.program) ?? programs[0] ?? null;
 
   let days: DayRow[] = [];
   let enrollments: EnrollmentRow[] = [];
@@ -167,9 +175,32 @@ export default async function JourneyAdminPage({
     funnel = (funnelRows ?? []) as Array<{ day_number: number; learners: number }>;
   }
 
+  // Audience editor data: governed master values (0055/0056) + teams.
+  const { data: optRows } = await supabase
+    .from("org_field_options")
+    .select("field, value")
+    .eq("organization_id", org.id)
+    .order("value", { ascending: true });
+  const audienceOptions: Record<string, string[]> = {};
+  for (const r of (optRows ?? []) as Array<{ field: string; value: string }>) {
+    (audienceOptions[r.field] ??= []).push(r.value);
+  }
+  const { data: teamRows } = await supabase
+    .from("teams")
+    .select("id, name")
+    .eq("organization_id", org.id)
+    .order("name", { ascending: true });
+  const teams = (teamRows ?? []) as Array<{ id: string; name: string }>;
+
   return (
     <JourneyAdminClient
       orgSlug={orgSlug}
+      programs={programs.map((p) => ({
+        id: p.id,
+        name: p.name,
+        icon: p.icon,
+        priority: p.priority ?? 100,
+      }))}
       program={program}
       currentVersion={currentVersion}
       days={days}
@@ -178,6 +209,8 @@ export default async function JourneyAdminPage({
       courses={courses}
       funnel={funnel}
       today={todayStr(tz)}
+      audienceOptions={audienceOptions}
+      teams={teams}
     />
   );
 }

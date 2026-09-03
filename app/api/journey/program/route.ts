@@ -176,20 +176,135 @@ export async function POST(request: Request) {
     });
   }
 
-  // ---- Create the program (draft only; publish before enrolling) ----
-  const { data: existing } = await c.supabase
-    .from("journey_programs")
-    .select("id")
-    .eq("organization_id", c.org.id)
-    .maybeSingle();
-  if (existing) return NextResponse.json({ ok: true, program_id: existing.id });
+  // ---- Sync audience: enroll every matching member not yet on the journey.
+  // Covers team-based audiences (which the insert trigger can't see) and
+  // members who predate the journey or an audience change.
+  if (body.action === "sync_audience") {
+    if (!body.program_id) {
+      return NextResponse.json({ error: "program_id required" }, { status: 400 });
+    }
+    const { data: prog } = await c.supabase
+      .from("journey_programs")
+      .select("id, current_version_id, audience, is_active")
+      .eq("id", body.program_id)
+      .eq("organization_id", c.org.id)
+      .maybeSingle();
+    if (!prog) return NextResponse.json({ error: "Program not found" }, { status: 404 });
+    if (!prog.current_version_id) {
+      return NextResponse.json(
+        { error: "Publish the journey first — enrollments pin a published version" },
+        { status: 400 }
+      );
+    }
+    const aud = (prog.audience ?? {}) as Record<string, unknown>;
+    const arr = (k: string): string[] =>
+      Array.isArray(aud[k]) ? (aud[k] as unknown[]).filter((x): x is string => typeof x === "string") : [];
+    const designations = arr("designations");
+    const jobRoles = arr("job_roles");
+    const cities = arr("cities");
+    const verticals = arr("verticals");
+    const branches = arr("branches");
+    const teamIds = arr("team_ids");
+
+    const { data: memRows } = await c.supabase
+      .from("organization_members")
+      .select("user_id, designation, job_role, city, business_vertical, branch")
+      .eq("organization_id", c.org.id)
+      .eq("status", "active");
+    let candidates = ((memRows ?? []) as Array<{
+      user_id: string;
+      designation: string | null;
+      job_role: string | null;
+      city: string | null;
+      business_vertical: string | null;
+      branch: string | null;
+    }>).filter(
+      (m) =>
+        (designations.length === 0 || designations.includes(m.designation ?? "")) &&
+        (jobRoles.length === 0 || jobRoles.includes(m.job_role ?? "")) &&
+        (cities.length === 0 || cities.includes(m.city ?? "")) &&
+        (verticals.length === 0 || verticals.includes(m.business_vertical ?? "")) &&
+        (branches.length === 0 || branches.includes(m.branch ?? ""))
+    );
+    if (teamIds.length > 0) {
+      const { data: tmRows } = await c.supabase
+        .from("team_members")
+        .select("user_id")
+        .in("team_id", teamIds);
+      const inTeams = new Set(((tmRows ?? []) as Array<{ user_id: string }>).map((t) => t.user_id));
+      candidates = candidates.filter((m) => inTeams.has(m.user_id));
+    }
+
+    const { data: enrRows } = await c.supabase
+      .from("journey_enrollments")
+      .select("user_id")
+      .eq("program_id", prog.id)
+      .in("status", ["active", "completed"]);
+    const already = new Set(((enrRows ?? []) as Array<{ user_id: string }>).map((e) => e.user_id));
+    const toEnroll = candidates.filter((m) => !already.has(m.user_id));
+
+    const startDate = new Date().toISOString().slice(0, 10);
+    let enrolled = 0;
+    for (let i = 0; i < toEnroll.length; i += 150) {
+      const batch = toEnroll.slice(i, i + 150).map((m) => ({
+        program_id: prog.id,
+        version_id: prog.current_version_id,
+        organization_id: c.org.id,
+        user_id: m.user_id,
+        start_date: startDate,
+        enrolled_by: c.userId,
+      }));
+      const { error: iErr } = await c.supabase.from("journey_enrollments").insert(batch);
+      if (iErr) return NextResponse.json({ error: iErr.message }, { status: 400 });
+      enrolled += batch.length;
+    }
+    return NextResponse.json({
+      ok: true,
+      enrolled,
+      matched: candidates.length,
+      already_enrolled: already.size,
+    });
+  }
+
+  // ---- Create a journey (draft only; publish before enrolling) ----
+  // No name → legacy behavior: return the first existing program, or create
+  // the default one. A NAME creates an additional journey (multi-journey,
+  // 0063) — uniqueness per org enforced by the DB.
+  const newName = typeof (body as { name?: unknown }).name === "string"
+    ? ((body as { name?: string }).name ?? "").trim()
+    : "";
+  if (!newName) {
+    const { data: existing } = await c.supabase
+      .from("journey_programs")
+      .select("id")
+      .eq("organization_id", c.org.id)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (existing) return NextResponse.json({ ok: true, program_id: existing.id });
+  } else if (newName.length > 80) {
+    return NextResponse.json({ error: "Name too long (max 80)" }, { status: 400 });
+  }
 
   const { data: created, error } = await c.supabase
     .from("journey_programs")
-    .insert({ organization_id: c.org.id, created_by: c.userId })
+    .insert({
+      organization_id: c.org.id,
+      created_by: c.userId,
+      ...(newName ? { name: newName } : {}),
+    })
     .select("id")
     .single();
-  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  if (error) {
+    return NextResponse.json(
+      {
+        error: /duplicate|unique/i.test(error.message)
+          ? "A journey with that name already exists"
+          : error.message,
+      },
+      { status: 400 }
+    );
+  }
   return NextResponse.json({ ok: true, program_id: created.id });
 }
 
@@ -209,6 +324,9 @@ export async function PATCH(request: Request) {
     completion_title?: string;
     copy?: Record<string, unknown> | null;
     milestones?: Array<{ day?: number; icon?: string; name?: string; message?: string }> | null;
+    priority?: number;
+    is_mandatory?: boolean;
+    audience?: Record<string, unknown> | null;
   };
   const c = await ctx(body.orgSlug);
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
@@ -234,11 +352,48 @@ export async function PATCH(request: Request) {
     }
     update.days_total = d;
   }
+  if (body.priority !== undefined) {
+    const p = Math.round(Number(body.priority));
+    if (!Number.isFinite(p) || p < 1 || p > 999) {
+      return NextResponse.json({ error: "priority must be 1–999 (1 = highest)" }, { status: 400 });
+    }
+    update.priority = p;
+  }
+  if (body.audience !== undefined) {
+    if (body.audience === null) {
+      update.audience = null; // everyone
+    } else if (typeof body.audience !== "object" || Array.isArray(body.audience)) {
+      return NextResponse.json({ error: "audience must be an object" }, { status: 400 });
+    } else {
+      const cleaned: Record<string, string[]> = {};
+      for (const key of [
+        "designations",
+        "job_roles",
+        "cities",
+        "verticals",
+        "branches",
+        "team_ids",
+      ] as const) {
+        const raw = (body.audience as Record<string, unknown>)[key];
+        if (raw === undefined) continue;
+        if (!Array.isArray(raw) || raw.length > 200 || raw.some((v) => typeof v !== "string")) {
+          return NextResponse.json(
+            { error: `audience.${key} must be an array of strings (max 200)` },
+            { status: 400 }
+          );
+        }
+        const vals = (raw as string[]).map((v) => v.trim()).filter(Boolean);
+        if (vals.length > 0) cleaned[key] = vals;
+      }
+      update.audience = Object.keys(cleaned).length > 0 ? cleaned : null;
+    }
+  }
   for (const flag of [
     "count_sundays",
     "is_active",
     "auto_enroll_new_users",
     "nudge_enabled",
+    "is_mandatory",
   ] as const) {
     if (body[flag] !== undefined) {
       if (typeof body[flag] !== "boolean") {

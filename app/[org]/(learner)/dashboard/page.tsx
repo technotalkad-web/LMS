@@ -122,30 +122,41 @@ export default async function DashboardPage({
       .from("journey_enrollments")
       .select(
         // name/icon live from the PROGRAM (cosmetic renames reach everyone
-        // instantly); days_total pinned to the enrollment's version.
-        "id, start_date, journey_versions!inner(days_total), journey_programs!inner(is_active, copy, name, icon)"
+        // instantly); days_total pinned to the enrollment's version. `*` on
+        // the program keeps this deploy-safe across program-column
+        // migrations (0063's priority etc. arrive as undefined before it).
+        "id, start_date, journey_versions!inner(days_total), journey_programs!inner(*)"
       )
       .eq("organization_id", org.id)
       .eq("user_id", user.id)
       .eq("status", "active")
-      .limit(1);
-    const j = (jRows ?? [])[0] as
-      | {
-          id: string;
-          start_date: string;
-          journey_versions:
-            | { days_total: number }
-            | Array<{ days_total: number }>;
-          journey_programs:
-            | { is_active: boolean; copy: unknown; name: string; icon: string }
-            | Array<{ is_active: boolean; copy: unknown; name: string; icon: string }>;
-        }
-      | undefined;
-    const jProg = j
-      ? Array.isArray(j.journey_programs)
-        ? j.journey_programs[0]
-        : j.journey_programs
-      : undefined;
+      .limit(10);
+    type JProg = {
+      is_active?: boolean;
+      copy?: unknown;
+      name?: string;
+      icon?: string;
+      priority?: number;
+    };
+    type JRow = {
+      id: string;
+      start_date: string;
+      journey_versions: { days_total: number } | Array<{ days_total: number }>;
+      journey_programs: JProg | JProg[];
+    };
+    // Highest-priority RUNNING journey (rank 1 first) leads the banner when
+    // the learner holds several (multi-journey, 0063).
+    const jCandidates = ((jRows ?? []) as JRow[])
+      .map((row) => ({
+        row,
+        prog: (Array.isArray(row.journey_programs)
+          ? row.journey_programs[0]
+          : row.journey_programs) as JProg,
+      }))
+      .filter((c) => c.prog?.is_active !== false)
+      .sort((a, b) => (a.prog.priority ?? 100) - (b.prog.priority ?? 100));
+    const j = jCandidates[0]?.row;
+    const jProg = jCandidates[0]?.prog;
     // Deactivated journey (admin Settings → Active off) is hidden from
     // learners entirely — no banner, no nav (layout applies the same rule).
     if (j && jProg?.is_active !== false) {

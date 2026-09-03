@@ -30,7 +30,12 @@ export type ProgramRow = {
   nudge_enabled?: boolean;
   nudge_behind_days?: number;
   nudge_cooldown_days?: number;
+  // Multi-journey (0063) — undefined before the migration runs.
+  priority?: number;
+  is_mandatory?: boolean;
+  audience?: Record<string, string[]> | null;
 };
+export type ProgramSummary = { id: string; name: string; icon: string; priority: number };
 export type FunnelRow = { day_number: number; learners: number };
 export type DayRow = {
   day_number: number;
@@ -66,6 +71,7 @@ type TabKey = (typeof TABS)[number]["key"];
 
 export function JourneyAdminClient({
   orgSlug,
+  programs = [],
   program,
   currentVersion,
   days,
@@ -74,8 +80,11 @@ export function JourneyAdminClient({
   courses,
   funnel,
   today,
+  audienceOptions = {},
+  teams = [],
 }: {
   orgSlug: string;
+  programs?: ProgramSummary[];
   program: ProgramRow | null;
   currentVersion: { version_number: number; published_at: string } | null;
   days: DayRow[];
@@ -84,11 +93,14 @@ export function JourneyAdminClient({
   courses: CourseOption[];
   funnel: FunnelRow[];
   today: string;
+  audienceOptions?: Record<string, string[]>;
+  teams?: Array<{ id: string; name: string }>;
 }) {
   const router = useRouter();
   const toast = useToast();
   const confirmPublish = useConfirm();
   const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [tab, setTab] = useState<TabKey>("curriculum");
 
@@ -146,20 +158,27 @@ export function JourneyAdminClient({
     }
   }
 
-  async function createProgram() {
+  async function createProgram(name?: string) {
     setCreating(true);
     try {
       const res = await fetch("/api/journey/program", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ orgSlug }),
+        body: JSON.stringify({ orgSlug, ...(name ? { name } : {}) }),
       });
+      const j = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        program_id?: string;
+      };
       if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
         toast.error(j.error ?? "Could not create the journey");
         return;
       }
       toast.success("Journey created");
+      setNewName(null);
+      if (j.program_id) {
+        router.push(`/${orgSlug}/journey-admin?program=${j.program_id}`);
+      }
       router.refresh();
     } catch {
       toast.error("Could not create the journey — check your connection");
@@ -167,6 +186,68 @@ export function JourneyAdminClient({
       setCreating(false);
     }
   }
+
+  // Journey switcher + inline "new journey" creator (multi-journey, 0063).
+  const switcher = (
+    <div className="flex flex-wrap items-center gap-2">
+      {programs.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          onClick={() => router.push(`/${orgSlug}/journey-admin?program=${p.id}`)}
+          className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+            p.id === program?.id
+              ? "bg-indigo-600 text-white border-indigo-600"
+              : "border-line hover:border-ink"
+          }`}
+          title={`Priority rank ${p.priority}`}
+        >
+          {p.icon} {p.name}
+        </button>
+      ))}
+      {newName === null ? (
+        <button
+          type="button"
+          onClick={() => setNewName("")}
+          className="px-3 py-1.5 rounded-full text-xs font-semibold border border-dashed border-line text-muted hover:border-ink hover:text-ink"
+        >
+          + New journey
+        </button>
+      ) : (
+        <span className="inline-flex items-center gap-1.5">
+          <input
+            type="text"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="e.g. Sales Advisor Journey"
+            maxLength={80}
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newName.trim()) void createProgram(newName.trim());
+              if (e.key === "Escape") setNewName(null);
+            }}
+            className="px-3 py-1.5 border border-line rounded-full text-xs outline-none focus:border-ink w-56"
+          />
+          <button
+            type="button"
+            disabled={creating || !newName.trim()}
+            onClick={() => createProgram(newName.trim())}
+            className="px-3 py-1.5 bg-indigo-600 text-white rounded-full text-xs font-semibold disabled:opacity-50"
+          >
+            {creating ? "Creating…" : "Create"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setNewName(null)}
+            aria-label="Cancel"
+            className="text-muted hover:text-ink"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </span>
+      )}
+    </div>
+  );
 
   if (!program) {
     return (
@@ -186,7 +267,7 @@ export function JourneyAdminClient({
           </p>
           <button
             type="button"
-            onClick={createProgram}
+            onClick={() => createProgram()}
             disabled={creating}
             className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium disabled:opacity-50"
           >
@@ -205,6 +286,7 @@ export function JourneyAdminClient({
 
   return (
     <div className="max-w-4xl space-y-6">
+      {switcher}
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="serif text-5xl mb-1">
@@ -274,12 +356,14 @@ export function JourneyAdminClient({
       </div>
 
       {/* Tabs stay MOUNTED (hidden, not unmounted) so switching tabs never
-          discards unsaved curriculum/settings edits. */}
+          discards unsaved curriculum/settings edits. Keyed by program so
+          switching JOURNEYS remounts them with the right journey's state. */}
       <div hidden={tab !== "curriculum"}>
-        <CurriculumTab orgSlug={orgSlug} program={program} days={days} courses={courses} />
+        <CurriculumTab key={program.id} orgSlug={orgSlug} program={program} days={days} courses={courses} />
       </div>
       <div hidden={tab !== "enrollments"}>
         <EnrollmentsTab
+          key={program.id}
           orgSlug={orgSlug}
           program={program}
           enrollments={enrollments}
@@ -296,7 +380,13 @@ export function JourneyAdminClient({
         />
       </div>
       <div hidden={tab !== "settings"}>
-        <SettingsTab orgSlug={orgSlug} program={program} />
+        <SettingsTab
+          key={program.id}
+          orgSlug={orgSlug}
+          program={program}
+          audienceOptions={audienceOptions}
+          teams={teams}
+        />
       </div>
     </div>
   );
@@ -923,7 +1013,62 @@ const COPY_LABELS: Record<keyof JourneyCopy, string> = {
   completion_line: "Completion celebration line",
 };
 
-function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRow }) {
+/** One audience dimension: collapsible checkbox list. Module-level so React
+ *  keeps input identity across renders. */
+function AudienceDim({
+  label,
+  options,
+  selected,
+  onChange,
+}: {
+  label: string;
+  options: Array<{ value: string; display: string }>;
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <details className="border border-line rounded-lg">
+      <summary className="px-3 py-2 text-xs font-medium cursor-pointer select-none flex items-center justify-between">
+        <span>{label}</span>
+        <span className={selected.length > 0 ? "text-indigo-700 font-bold" : "text-muted"}>
+          {selected.length > 0 ? `${selected.length} selected` : "all"}
+        </span>
+      </summary>
+      <div className="px-3 pb-2 max-h-44 overflow-y-auto space-y-1">
+        {options.map((o) => (
+          <label key={o.value} className="flex items-center gap-2 text-xs cursor-pointer py-0.5">
+            <input
+              type="checkbox"
+              checked={selected.includes(o.value)}
+              onChange={(e) =>
+                onChange(
+                  e.target.checked
+                    ? [...selected, o.value]
+                    : selected.filter((v) => v !== o.value)
+                )
+              }
+              className="h-3.5 w-3.5 accent-indigo-600"
+            />
+            <span className="truncate">{o.display}</span>
+          </label>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function SettingsTab({
+  orgSlug,
+  program,
+  audienceOptions = {},
+  teams = [],
+}: {
+  orgSlug: string;
+  program: ProgramRow;
+  audienceOptions?: Record<string, string[]>;
+  teams?: Array<{ id: string; name: string }>;
+}) {
   const router = useRouter();
   const toast = useToast();
   const [name, setName] = useState(program.name);
@@ -943,6 +1088,52 @@ function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRo
     effectiveJourneyCopy(program.copy)
   );
   const [busy, setBusy] = useState(false);
+  // Multi-journey (0063): priority rank, mandatory flag, audience rules.
+  const [priority, setPriority] = useState(program.priority ?? 100);
+  const [isMandatory, setIsMandatory] = useState(program.is_mandatory !== false);
+  const [audience, setAudience] = useState<Record<string, string[]>>(() => {
+    const a = (program.audience ?? {}) as Record<string, string[]>;
+    return {
+      designations: a.designations ?? [],
+      job_roles: a.job_roles ?? [],
+      cities: a.cities ?? [],
+      verticals: a.verticals ?? [],
+      branches: a.branches ?? [],
+      team_ids: a.team_ids ?? [],
+    };
+  });
+  const [syncBusy, setSyncBusy] = useState(false);
+  const audDim = (k: string) => (next: string[]) =>
+    setAudience((a) => ({ ...a, [k]: next }));
+  const audienceEmpty = Object.values(audience).every((v) => v.length === 0);
+
+  async function syncAudience() {
+    setSyncBusy(true);
+    try {
+      const res = await fetch("/api/journey/program", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ orgSlug, action: "sync_audience", program_id: program.id }),
+      });
+      const j = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        enrolled?: number;
+        matched?: number;
+      };
+      if (!res.ok) {
+        toast.error(j.error ?? "Sync failed");
+        return;
+      }
+      toast.success(
+        `${j.enrolled ?? 0} member${(j.enrolled ?? 0) === 1 ? "" : "s"} enrolled (${j.matched ?? 0} match the audience)`
+      );
+      router.refresh();
+    } catch {
+      toast.error("Sync failed — check your connection");
+    } finally {
+      setSyncBusy(false);
+    }
+  }
 
   const setMs = (i: number, patch: Partial<(typeof milestones)[number]>) =>
     setMilestones((ms) => ms.map((m, idx) => (idx === i ? { ...m, ...patch } : m)));
@@ -974,6 +1165,13 @@ function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRo
           nudge_enabled: nudgeEnabled,
           nudge_behind_days: nudgeBehind,
           nudge_cooldown_days: nudgeCooldown,
+          priority,
+          is_mandatory: isMandatory,
+          audience: audienceEmpty
+            ? null
+            : Object.fromEntries(
+                Object.entries(audience).filter(([, v]) => v.length > 0)
+              ),
           // Clamp to the journey length: a day past the end would be saved
           // yet invisible, then silently dropped by the next save.
           milestones: [...milestones]
@@ -1063,10 +1261,102 @@ function SettingsTab({ orgSlug, program }: { orgSlug: string; program: ProgramRo
           />
           <ToggleRow
             label="Auto-enroll new members"
-            hint="Every new user starts automatically (needs a published version)"
+            hint="New users matching the audience below start automatically (needs a published version)"
             checked={autoEnroll}
             onChange={setAutoEnroll}
           />
+        </div>
+      </section>
+
+      {/* Audience & priority (multi-journey, 0063) */}
+      <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 space-y-3">
+        <h3 className="text-sm font-semibold">Audience &amp; priority</h3>
+        <p className="text-xs text-muted">
+          Who this journey is for, driven by the profile database. Leave a
+          filter empty to not restrict by it; leave everything empty and the
+          journey targets all active members. Filters combine with AND.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block">
+            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+              Priority rank (1 = highest)
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={999}
+              value={priority}
+              onChange={(e) =>
+                setPriority(Math.max(1, Math.min(999, Number(e.target.value) || 100)))
+              }
+              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
+            />
+            <span className="block text-[11px] text-muted mt-1">
+              When a learner holds several journeys, the best rank leads their
+              journey page and dashboard banner.
+            </span>
+          </label>
+          <div>
+            <ToggleRow
+              label="Mandatory journey"
+              hint="Drives the focused dashboard and manager escalations (later phases)"
+              checked={isMandatory}
+              onChange={setIsMandatory}
+            />
+          </div>
+        </div>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+          <AudienceDim
+            label="Designations"
+            options={(audienceOptions.designation ?? []).map((v) => ({ value: v, display: v }))}
+            selected={audience.designations}
+            onChange={audDim("designations")}
+          />
+          <AudienceDim
+            label="Job roles"
+            options={(audienceOptions.job_role ?? []).map((v) => ({ value: v, display: v }))}
+            selected={audience.job_roles}
+            onChange={audDim("job_roles")}
+          />
+          <AudienceDim
+            label="Cities"
+            options={(audienceOptions.city ?? []).map((v) => ({ value: v, display: v }))}
+            selected={audience.cities}
+            onChange={audDim("cities")}
+          />
+          <AudienceDim
+            label="Business verticals"
+            options={(audienceOptions.business_vertical ?? []).map((v) => ({ value: v, display: v }))}
+            selected={audience.verticals}
+            onChange={audDim("verticals")}
+          />
+          <AudienceDim
+            label="Branches"
+            options={(audienceOptions.branch ?? []).map((v) => ({ value: v, display: v }))}
+            selected={audience.branches}
+            onChange={audDim("branches")}
+          />
+          <AudienceDim
+            label="Teams"
+            options={teams.map((t) => ({ value: t.id, display: t.name }))}
+            selected={audience.team_ids}
+            onChange={audDim("team_ids")}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-3 pt-1">
+          <p className="text-[11px] text-muted">
+            Save first, then Sync to enroll every matching member who isn&apos;t
+            on the journey yet. New members auto-enroll on creation when the
+            toggle above is on.
+          </p>
+          <button
+            type="button"
+            onClick={syncAudience}
+            disabled={syncBusy}
+            className="px-3.5 py-2 border border-indigo-300 text-indigo-700 hover:bg-indigo-50 rounded-lg text-xs font-semibold disabled:opacity-50 shrink-0"
+          >
+            {syncBusy ? "Syncing…" : "Sync audience now"}
+          </button>
         </div>
       </section>
 

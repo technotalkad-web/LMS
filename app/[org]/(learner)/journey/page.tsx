@@ -37,49 +37,96 @@ export default async function JourneyPage({
   searchParams,
 }: {
   params: Promise<{ org: string }>;
-  searchParams?: Promise<{ locked?: string }>;
+  searchParams?: Promise<{ locked?: string; j?: string }>;
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
   const { user, org } = await requireOrgAccess(orgSlug);
   const supabase = await createClient();
 
-  const { data: enrRows } = await supabase
-    .from("journey_enrollments")
-    .select("id, program_id, version_id, start_date, status, completed_at, created_at")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .in("status", ["active", "completed"])
-    .order("created_at", { ascending: false })
-    .limit(1);
-  const enrollment = (enrRows ?? [])[0] as
-    | {
-        id: string;
-        program_id: string;
-        version_id: string;
-        start_date: string;
-        status: "active" | "completed";
-        completed_at: string | null;
-      }
-    | undefined;
-
-  // Program copy is live (typo fixes reach everyone); rules/content are
-  // version-pinned below.
-  const { data: progRow } = await supabase
-    .from("journey_programs")
-    .select("copy, is_active, name, icon, milestones, completion_title")
-    .eq("organization_id", org.id)
-    .maybeSingle();
-  const liveProg = progRow as {
-    copy?: unknown;
+  // ALL the learner's journeys (multi-journey, 0063) with their programs
+  // joined via `*` (deploy-safe: pre-0063 columns simply come back
+  // undefined). Program copy/name/etc are LIVE; rules are version-pinned.
+  type LiveProgram = {
+    priority?: number;
     is_active?: boolean;
     name?: string;
     icon?: string;
     milestones?: unknown;
     completion_title?: string;
-  } | null;
+    copy?: unknown;
+    is_mandatory?: boolean;
+  };
+  type EnrRow = {
+    id: string;
+    program_id: string;
+    version_id: string;
+    start_date: string;
+    status: "active" | "completed";
+    completed_at: string | null;
+    created_at: string;
+    journey_programs: LiveProgram | LiveProgram[];
+  };
+  const { data: enrRows } = await supabase
+    .from("journey_enrollments")
+    .select(
+      "id, program_id, version_id, start_date, status, completed_at, created_at, journey_programs!inner(*)"
+    )
+    .eq("organization_id", org.id)
+    .eq("user_id", user.id)
+    .in("status", ["active", "completed"]);
+  const all = ((enrRows ?? []) as EnrRow[]).map((e) => ({
+    ...e,
+    prog: (Array.isArray(e.journey_programs)
+      ? e.journey_programs[0]
+      : e.journey_programs) as LiveProgram,
+  }));
+
+  // Selection: explicit ?j= wins; else the highest-priority RUNNING journey
+  // (rank 1 first); else a paused one; else the most recent completed.
+  const byPriority = (a: (typeof all)[number], b: (typeof all)[number]) =>
+    (a.prog.priority ?? 100) - (b.prog.priority ?? 100) ||
+    (a.created_at < b.created_at ? 1 : -1);
+  const running = all
+    .filter((e) => e.status === "active" && e.prog.is_active !== false)
+    .sort(byPriority);
+  const pausedOnly = all
+    .filter((e) => e.status === "active" && e.prog.is_active === false)
+    .sort(byPriority);
+  const completedOnes = all
+    .filter((e) => e.status === "completed")
+    .sort((a, b) => ((a.completed_at ?? "") < (b.completed_at ?? "") ? 1 : -1));
+  const enrollment =
+    all.find((e) => e.id === sp.j) ??
+    running[0] ??
+    pausedOnly[0] ??
+    completedOnes[0];
+
+  const liveProg = enrollment?.prog ?? null;
   const copy = effectiveJourneyCopy(liveProg?.copy);
   const programActive = liveProg?.is_active !== false;
+
+  // Journey switcher (only when the learner holds more than one).
+  const switchable = [...running, ...pausedOnly, ...completedOnes];
+  const journeySwitcher =
+    switchable.length > 1 ? (
+      <div className="flex flex-wrap items-center gap-2">
+        {switchable.map((e) => (
+          <Link
+            key={e.id}
+            href={`/${orgSlug}/journey?j=${e.id}`}
+            className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+              e.id === enrollment?.id
+                ? "bg-indigo-600 text-white border-indigo-600"
+                : "border-line hover:border-ink"
+            }`}
+          >
+            {e.prog.icon ?? "🏹"} {e.prog.name ?? "Journey"}
+            {e.status === "completed" ? " ✓" : ""}
+          </Link>
+        ))}
+      </div>
+    ) : null;
 
   if (!enrollment) {
     return (
@@ -189,6 +236,7 @@ export default async function JourneyPage({
     );
     return (
       <div className="max-w-3xl mx-auto space-y-6">
+        {journeySwitcher}
         <section className="relative overflow-hidden rounded-3xl bg-gradient-to-b from-amber-400 via-orange-500 to-rose-600 text-white text-center px-6 py-14 shadow-lg">
           <div className="text-6xl mb-3" aria-hidden>
             {final?.icon ?? "👑"}
@@ -263,6 +311,7 @@ export default async function JourneyPage({
   if (!programActive) {
     return (
       <div className="max-w-2xl mx-auto text-center py-16">
+        {journeySwitcher && <div className="mb-6 flex justify-center">{journeySwitcher}</div>}
         <PauseCircle className="w-10 h-10 mx-auto text-muted opacity-60" />
         <h1 className="mt-4 text-2xl font-semibold">{copy.paused_title}</h1>
         <p className="text-muted text-sm mt-2 max-w-md mx-auto">{copy.paused_body}</p>
@@ -333,6 +382,7 @@ export default async function JourneyPage({
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
+      {journeySwitcher}
       {sp.locked && (
         <div className="border border-amber-200 bg-amber-50 text-amber-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2">
           <Lock className="w-4 h-4 mt-0.5 shrink-0" />

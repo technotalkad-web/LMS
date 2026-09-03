@@ -26,7 +26,7 @@ export default async function JourneyCertificatePage({
   const { data: enrRows } = await supabase
     .from("journey_enrollments")
     .select(
-      "id, completed_at, start_date, journey_versions!inner(name, icon, days_total, completion_title, days)"
+      "id, program_id, completed_at, start_date, journey_versions!inner(name, icon, days_total, completion_title, days)"
     )
     .eq("organization_id", org.id)
     .eq("user_id", user.id)
@@ -56,7 +56,7 @@ export default async function JourneyCertificatePage({
   const { data: liveProgRow } = await supabase
     .from("journey_programs")
     .select("name, icon, completion_title")
-    .eq("organization_id", org.id)
+    .eq("id", (enrollment as unknown as { program_id: string }).program_id)
     .maybeSingle();
   const liveProg = liveProgRow as {
     name?: string;
