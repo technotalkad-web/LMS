@@ -5,6 +5,7 @@ import { notifyBackground } from "@/lib/notifications/send";
 import {
   computeJourneyState,
   courseDaysOf,
+  dateOfDay,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
@@ -41,19 +42,20 @@ async function run() {
   // derive an origin from (same pattern as api/cron/reminders).
   const base = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
 
+  // `*` on the program keeps this deploy-safe across program-column
+  // migrations — 0065's escalation fields arrive as undefined before it.
   const { data: progRows, error: progErr } = await svc
     .from("journey_programs")
-    .select(
-      "id, organization_id, name, nudge_behind_days, nudge_cooldown_days, organizations!inner(name, slug)"
-    )
+    .select("*, organizations!inner(name, slug)")
     .eq("is_active", true)
     .eq("nudge_enabled", true)
     .not("current_version_id", "is", null);
   if (progErr) return { ok: false, error: progErr.message, total_ms: Date.now() - t0 };
 
   let nudged = 0;
+  let escalated = 0;
   let scanned = 0;
-  const details: Array<{ org: string; nudged: number }> = [];
+  const details: Array<{ org: string; nudged: number; escalated: number }> = [];
 
   for (const p of (progRows ?? []) as Array<{
     id: string;
@@ -61,6 +63,10 @@ async function run() {
     name: string;
     nudge_behind_days: number;
     nudge_cooldown_days: number;
+    // 0065 — undefined before the migration runs.
+    deadline_days?: number | null;
+    escalation_enabled?: boolean;
+    escalation_after_days?: number;
     organizations: { name: string; slug: string } | Array<{ name: string; slug: string }>;
   }>) {
     if (nudged >= MAX_NUDGES_PER_RUN) break;
@@ -75,6 +81,24 @@ async function run() {
     const cooldownCutoff = new Date(
       Date.now() - p.nudge_cooldown_days * 86400000
     ).toISOString();
+    const escalationOn = p.escalation_enabled === true;
+    const escalateAfter = p.escalation_after_days ?? 3;
+
+    // L1 managers for this org (0011 line_manager_id — the mapping that
+    // powers the Verticals board), fetched once per program.
+    let managerOf = new Map<string, string>();
+    if (escalationOn) {
+      const { data: memRows } = await svc
+        .from("organization_members")
+        .select("user_id, line_manager_id")
+        .eq("organization_id", p.organization_id)
+        .not("line_manager_id", "is", null);
+      managerOf = new Map(
+        ((memRows ?? []) as Array<{ user_id: string; line_manager_id: string }>).map(
+          (m) => [m.user_id, m.line_manager_id]
+        )
+      );
+    }
 
     const { data: enrRows } = await svc
       .from("journey_enrollments")
@@ -87,6 +111,7 @@ async function run() {
       .limit(500);
 
     let orgNudged = 0;
+    let orgEscalated = 0;
     for (const e of (enrRows ?? []) as Array<{
       id: string;
       user_id: string;
@@ -114,7 +139,18 @@ async function run() {
         countSundays: v.count_sundays === true,
         courseDays: courseDaysOf(v.days, v.days_total),
       });
-      if (state.finished || state.behindDays < p.nudge_behind_days) continue;
+      if (state.finished) continue;
+      // Deadline (0065): counted like the drip; overrunning it always
+      // escalates, regardless of the behind threshold.
+      const deadlineDate =
+        typeof p.deadline_days === "number" && p.deadline_days > 0
+          ? dateOfDay(e.start_date, p.deadline_days, v.count_sundays === true)
+          : null;
+      const overdue = deadlineDate !== null && today > deadlineDate;
+      const needsNudge = state.behindDays >= p.nudge_behind_days || overdue;
+      const needsEscalation =
+        escalationOn && (state.behindDays >= escalateAfter || overdue);
+      if (!needsNudge && !needsEscalation) continue;
 
       const { data: prof } = await svc
         .from("profiles")
@@ -128,24 +164,65 @@ async function run() {
       } | null;
       if (!profile?.email) continue;
 
-      await notifyBackground({
-        organizationId: p.organization_id,
-        event: "journey_nudge",
-        to: { user_id: e.user_id, email: profile.email },
-        context: {
-          learner_name:
-            [profile.first_name, profile.last_name].filter(Boolean).join(" ").trim() ||
-            profile.email.split("@")[0],
-          learner_email: profile.email,
-          org_name: org?.name ?? "",
-          journey_name: p.name,
-          day: String(state.currentDay),
-          days_total: String(state.daysTotal),
-          behind_days: String(state.behindDays),
-          direct_link: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
-          portal_url: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
-        },
-      });
+      const learnerName =
+        [profile.first_name, profile.last_name].filter(Boolean).join(" ").trim() ||
+        profile.email.split("@")[0];
+      const journeyCtx = {
+        learner_name: learnerName,
+        learner_email: profile.email,
+        org_name: org?.name ?? "",
+        journey_name: p.name,
+        day: String(state.currentDay),
+        days_total: String(state.daysTotal),
+        behind_days: String(state.behindDays),
+        deadline_date: deadlineDate ?? "",
+        direct_link: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
+        portal_url: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
+      };
+
+      if (needsNudge) {
+        await notifyBackground({
+          organizationId: p.organization_id,
+          event: "journey_nudge",
+          to: { user_id: e.user_id, email: profile.email },
+          context: journeyCtx,
+        });
+      }
+
+      // Manager escalation (0065): the learner's L1 gets their own
+      // manager-worded email, on the same cooldown as the learner nudge.
+      if (needsEscalation) {
+        const managerId = managerOf.get(e.user_id);
+        if (managerId) {
+          const { data: mgr } = await svc
+            .from("profiles")
+            .select("first_name, last_name, email")
+            .eq("id", managerId)
+            .maybeSingle();
+          const manager = mgr as {
+            first_name?: string | null;
+            last_name?: string | null;
+            email?: string | null;
+          } | null;
+          if (manager?.email) {
+            await notifyBackground({
+              organizationId: p.organization_id,
+              event: "journey_escalation",
+              to: { user_id: managerId, email: manager.email },
+              context: {
+                ...journeyCtx,
+                manager_name:
+                  [manager.first_name, manager.last_name].filter(Boolean).join(" ").trim() ||
+                  manager.email.split("@")[0],
+                direct_link: base ? `${base}/${org?.slug}/dashboard` : `/${org?.slug}/dashboard`,
+              },
+            });
+            escalated++;
+            orgEscalated++;
+          }
+        }
+      }
+
       await svc
         .from("journey_enrollments")
         .update({ last_nudged_at: new Date().toISOString() })
@@ -153,10 +230,16 @@ async function run() {
       nudged++;
       orgNudged++;
     }
-    if (orgNudged > 0) details.push({ org: org?.slug ?? p.organization_id, nudged: orgNudged });
+    if (orgNudged > 0 || orgEscalated > 0) {
+      details.push({
+        org: org?.slug ?? p.organization_id,
+        nudged: orgNudged,
+        escalated: orgEscalated,
+      });
+    }
   }
 
-  return { ok: true, total_ms: Date.now() - t0, scanned, nudged, details };
+  return { ok: true, total_ms: Date.now() - t0, scanned, nudged, escalated, details };
 }
 
 export async function POST(request: NextRequest) {

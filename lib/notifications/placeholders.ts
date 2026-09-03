@@ -37,4 +37,6 @@ export const KNOWN_TOKENS = [
   "Day",
   "Days_Total",
   "Behind_Days",
+  "Manager_Name",
+  "Deadline_Date",
 ] as const;

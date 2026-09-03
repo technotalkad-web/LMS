@@ -438,13 +438,31 @@ export async function PATCH(request: Request) {
       update[flag] = body[flag];
     }
   }
-  for (const num of ["nudge_behind_days", "nudge_cooldown_days"] as const) {
+  for (const num of [
+    "nudge_behind_days",
+    "nudge_cooldown_days",
+    "escalation_after_days",
+  ] as const) {
     if (body[num] !== undefined) {
       const n = Math.round(Number(body[num]));
       if (!Number.isFinite(n) || n < 1 || n > 30) {
         return NextResponse.json({ error: `${num} must be 1–30` }, { status: 400 });
       }
       update[num] = n;
+    }
+  }
+  if (body.deadline_days !== undefined) {
+    if (body.deadline_days === null) {
+      update.deadline_days = null;
+    } else {
+      const d = Math.round(Number(body.deadline_days));
+      if (!Number.isFinite(d) || d < 1 || d > 730) {
+        return NextResponse.json(
+          { error: "deadline_days must be 1–730 (or empty for none)" },
+          { status: 400 }
+        );
+      }
+      update.deadline_days = d;
     }
   }
   if (body.completion_title !== undefined) {
