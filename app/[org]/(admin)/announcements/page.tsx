@@ -18,13 +18,31 @@ export default async function AnnouncementsPage({
   }
 
   const supabase = await createClient();
+  // select("*") so the 0068 popup columns ride along when present and the
+  // page still works on a pre-migration database.
   const { data: rows } = await supabase
     .from("org_announcements")
-    .select("id, title, body, tone, is_active, created_at, expires_at")
+    .select("*")
     .eq("organization_id", org.id)
     .order("created_at", { ascending: false });
 
   const announcements = (rows ?? []) as Announcement[];
 
-  return <AnnouncementsClient orgSlug={orgSlug} announcements={announcements} />;
+  // Custom Groups (0067) as popup audiences — fail-soft to empty.
+  let groups: Array<{ id: string; name: string }> = [];
+  try {
+    const { data } = await supabase
+      .from("org_groups")
+      .select("id, name")
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .order("name", { ascending: true });
+    groups = (data ?? []) as Array<{ id: string; name: string }>;
+  } catch {
+    /* pre-0067 */
+  }
+
+  return (
+    <AnnouncementsClient orgSlug={orgSlug} announcements={announcements} groups={groups} />
+  );
 }

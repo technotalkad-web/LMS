@@ -244,6 +244,8 @@ export default async function DashboardPage({
     .select("id, title, body, tone")
     .eq("organization_id", org.id)
     .eq("is_active", true)
+    // Popups (0068) render as the full-screen overlay, never as a banner.
+    .eq("kind", "standard")
     .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
     .order("created_at", { ascending: false })
     .limit(5);
