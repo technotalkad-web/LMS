@@ -8,6 +8,7 @@ import { MobileBottomNav } from "./_components/mobile-nav";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
 import { createClient } from "@/lib/supabase/server";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveLearnerTheme } from "@/lib/theme/learner-themes";
 
 function fontStackFor(name: string | null): string {
@@ -66,6 +67,7 @@ export default async function LearnerLayout({
   // display name + photo; both fail-soft to the email-only header.
   let showLeaderboard = true;
   let showJourney = false;
+  let showTeamPerformance = false;
   let displayName = user.email ?? "you";
   let avatarUrl: string | null = null;
   // Admin-chosen learner theme (0060): null = default look. Read fail-soft —
@@ -108,6 +110,21 @@ export default async function LearnerLayout({
       themeRow?.learner_theme,
       themeRow?.learner_theme_custom
     );
+    // Team Performance nav (Phase 4): only for people who MANAGE someone.
+    // RLS hides peers' member rows, so this one count runs service-role
+    // (read-only, org+manager scoped). Fail-soft to hidden.
+    const svcNav = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    const { count: reportCount } = await svcNav
+      .from("organization_members")
+      .select("user_id", { count: "exact", head: true })
+      .eq("organization_id", org.id)
+      .eq("line_manager_id", user.id)
+      .eq("status", "active");
+    showTeamPerformance = (reportCount ?? 0) > 0;
     if (gs && (gs.enabled === false || gs.leaderboard_enabled === false)) {
       showLeaderboard = false;
     }
@@ -159,6 +176,7 @@ export default async function LearnerLayout({
               orgSlug={org.slug}
               showLeaderboard={showLeaderboard}
               showJourney={showJourney}
+              showTeamPerformance={showTeamPerformance}
             />
           </div>
 
