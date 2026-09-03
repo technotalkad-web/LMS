@@ -40,17 +40,25 @@ export type PathCourseRow = {
 export type PathAssignmentRow = {
   id: string;
   path_id: string;
-  assignee_type: "user" | "org" | "team";
+  assignee_type: "user" | "org" | "team" | "group";
   user_id: string | null;
   team_id: string | null;
+  group_id?: string | null;
   due_at: string | null;
   user_email?: string | null;
   team_name?: string | null;
+  group_name?: string | null;
 };
 
 export type CourseOption = { id: string; title: string };
 export type MemberOption = { user_id: string; email: string; role: string };
 export type TeamOption = { id: string; name: string };
+export type GroupOption = {
+  id: string;
+  name: string;
+  group_type: "static" | "dynamic";
+  member_count: number | null;
+};
 
 export default async function LearningPathsPage({
   params,
@@ -102,10 +110,11 @@ export default async function LearningPathsPage({
     };
   });
 
+  // select("*") for 0069 deploy safety (group_id).
   const { data: assignmentRows } = pathIds.length
     ? await supabase
         .from("learning_path_assignments")
-        .select("id, path_id, assignee_type, user_id, team_id, due_at")
+        .select("*")
         .in("path_id", pathIds)
     : { data: [] };
   const pathAssignments = (assignmentRows ?? []) as PathAssignmentRow[];
@@ -223,6 +232,21 @@ export default async function LearningPathsPage({
     .eq("organization_id", org.id);
   const teamOptions = (teamRows ?? []) as TeamOption[];
 
+  // Custom Groups (0067) as assignees (0069). Fail-soft: pre-0067 databases
+  // simply render no group option.
+  let groupOptions: GroupOption[] = [];
+  try {
+    const { data: groupRows } = await supabase
+      .from("org_groups")
+      .select("id, name, group_type, member_count")
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .order("name");
+    groupOptions = (groupRows ?? []) as GroupOption[];
+  } catch {
+    // org_groups not migrated yet
+  }
+
   // Resolve emails.
   const userIds = new Set<string>();
   for (const m of memberRows ?? []) userIds.add(m.user_id);
@@ -265,9 +289,11 @@ export default async function LearningPathsPage({
   }
 
   const teamNameById = new Map(teamOptions.map((t) => [t.id, t.name]));
+  const groupNameById = new Map(groupOptions.map((g) => [g.id, g.name]));
   for (const a of pathAssignments) {
     if (a.user_id) a.user_email = emailByUser.get(a.user_id) ?? null;
     if (a.team_id) a.team_name = teamNameById.get(a.team_id) ?? null;
+    if (a.group_id) a.group_name = groupNameById.get(a.group_id) ?? null;
   }
 
   return (
@@ -280,6 +306,7 @@ export default async function LearningPathsPage({
       courseOptions={courseOptions}
       memberOptions={memberOptions}
       teamOptions={teamOptions}
+      groupOptions={groupOptions}
     />
   );
 }

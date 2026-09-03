@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
  *   DELETE /api/learning-path-assignments/{id}
@@ -16,11 +17,11 @@ export async function DELETE(
   const { id } = await params;
   const supabase = await createClient();
 
+  // select("*") + separate name lookups would cost extra round trips; keep the
+  // embed but request group_id via the wildcard on the parent table only.
   const { data: row } = await supabase
     .from("learning_path_assignments")
-    .select(
-      "path_id, organization_id, assignee_type, user_id, team_id, learning_paths(name), organizations(name)"
-    )
+    .select("*, learning_paths(name), organizations(name)")
     .eq("id", id)
     .maybeSingle();
 
@@ -41,9 +42,10 @@ export async function DELETE(
         const r = row as {
           path_id: string;
           organization_id: string;
-          assignee_type: "user" | "team" | "org";
+          assignee_type: "user" | "team" | "org" | "group";
           user_id: string | null;
           team_id: string | null;
+          group_id?: string | null;
           learning_paths?: { name?: string } | { name?: string }[];
           organizations?: { name?: string } | { name?: string }[];
         };
@@ -63,6 +65,12 @@ export async function DELETE(
             .select("user_id")
             .eq("team_id", r.team_id);
           for (const m of tm ?? []) recipientIds.add(m.user_id as string);
+        } else if (r.assignee_type === "group" && r.group_id) {
+          for (const uid of await resolveManyGroups(svc, r.organization_id, [
+            r.group_id,
+          ])) {
+            recipientIds.add(uid);
+          }
         } else if (r.assignee_type === "org") {
           const { data: om } = await svc
             .from("organization_members")

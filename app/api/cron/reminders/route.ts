@@ -5,6 +5,11 @@ import { resolveEmails } from "@/lib/users/emails";
 import { mapWithConcurrency } from "@/lib/util/concurrency";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { isReleased } from "@/lib/learner/release";
+import {
+  fetchActiveMembers,
+  resolveGroupMembers,
+  type GroupRow,
+} from "@/lib/org/groups";
 
 /**
  *   POST /api/cron/reminders
@@ -34,9 +39,10 @@ type ReminderRow = {
 type Assignment = {
   course_id: string;
   organization_id: string;
-  assignee_type: "user" | "team" | "org";
+  assignee_type: "user" | "team" | "org" | "group";
   user_id: string | null;
   team_id: string | null;
+  group_id?: string | null;
   release_at: string | null;
 };
 
@@ -92,9 +98,10 @@ export async function POST(request: Request) {
   const courseIds = enabledCourses.map((c) => c.course_id);
 
   // 2) All assignments + memberships + completed user/course pairs.
+  // select("*") for 0069 deploy safety (group_id may not be migrated yet).
   const { data: assignmentRows } = await svc
     .from("course_assignments")
-    .select("course_id, organization_id, assignee_type, user_id, team_id, release_at")
+    .select("*")
     .in("course_id", courseIds);
   const assignments = (assignmentRows ?? []) as Assignment[];
 
@@ -115,6 +122,47 @@ export async function POST(request: Request) {
     const s = teamUserIds.get(tid) ?? new Set<string>();
     s.add(m.user_id as string);
     teamUserIds.set(tid, s);
+  }
+
+  // Custom Groups used by assignments (0069) — membership resolved LIVE via
+  // the shared resolver so semantics match every other audience feature.
+  // Fail-soft: a resolver error skips group nudges rather than failing the run.
+  const groupIds = Array.from(
+    new Set(
+      assignments
+        .filter((a) => a.assignee_type === "group" && a.group_id)
+        .map((a) => a.group_id as string)
+    )
+  );
+  const groupUserIds = new Map<string, Set<string>>();
+  if (groupIds.length > 0) {
+    try {
+      const { data: groupRows } = await svc
+        .from("org_groups")
+        .select("id, organization_id, group_type, rules, is_active")
+        .in("id", groupIds);
+      const groups = ((groupRows ?? []) as GroupRow[]).filter(
+        (g) => g.is_active !== false
+      );
+      // Shared active-member cache per org for dynamic-rule evaluation.
+      const membersByOrg = new Map<string, Awaited<ReturnType<typeof fetchActiveMembers>>>();
+      for (const g of groups) {
+        if (g.group_type === "dynamic" && !membersByOrg.has(g.organization_id)) {
+          membersByOrg.set(
+            g.organization_id,
+            await fetchActiveMembers(svc, g.organization_id)
+          );
+        }
+        const ids = await resolveGroupMembers(
+          svc,
+          g,
+          membersByOrg.get(g.organization_id)
+        );
+        groupUserIds.set(g.id, new Set(ids));
+      }
+    } catch {
+      // pre-0067 database or transient failure — group assignments skip this run
+    }
   }
 
   // Org members per org
@@ -205,6 +253,9 @@ export async function POST(request: Request) {
     if (a.assignee_type === "team" && a.team_id) {
       for (const uid of teamUserIds.get(a.team_id) ?? []) allUserIds.add(uid);
     }
+    if (a.assignee_type === "group" && a.group_id) {
+      for (const uid of groupUserIds.get(a.group_id) ?? []) allUserIds.add(uid);
+    }
     if (a.assignee_type === "org") {
       for (const uid of orgUserIds.get(a.organization_id) ?? []) allUserIds.add(uid);
     }
@@ -261,6 +312,9 @@ export async function POST(request: Request) {
       if (a.assignee_type === "user" && a.user_id) learnerIds.add(a.user_id);
       if (a.assignee_type === "team" && a.team_id) {
         for (const uid of teamUserIds.get(a.team_id) ?? []) learnerIds.add(uid);
+      }
+      if (a.assignee_type === "group" && a.group_id) {
+        for (const uid of groupUserIds.get(a.group_id) ?? []) learnerIds.add(uid);
       }
       if (a.assignee_type === "org") {
         for (const uid of orgUserIds.get(a.organization_id) ?? []) learnerIds.add(uid);

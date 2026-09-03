@@ -18,6 +18,7 @@ import {
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import { myGroupIdsServer } from "@/lib/org/groups";
 
 type Course = {
   id: string;
@@ -323,24 +324,32 @@ export default async function LaunchPage({
         return t?.organization_id === org.id;
       })
       .map((r) => r.team_id);
+    // select("*") for 0069 deploy safety (group_id).
     const { data: paRows } = await supabase
       .from("learning_path_assignments")
-      .select("path_id, assignee_type, user_id, team_id")
+      .select("*")
       .in("path_id", pathIds);
+    const paList = (paRows ?? []) as Array<{
+      path_id: string;
+      assignee_type: "user" | "org" | "team" | "group";
+      user_id: string | null;
+      team_id: string | null;
+      group_id?: string | null;
+    }>;
+    // Custom Group path assignments (0069) — resolved live when present.
+    const myGroupIds = paList.some((a) => a.assignee_type === "group")
+      ? await myGroupIdsServer(org.id, user.id)
+      : new Set<string>();
     const assignedPathIds = new Set(
-      ((paRows ?? []) as Array<{
-        path_id: string;
-        assignee_type: "user" | "org" | "team";
-        user_id: string | null;
-        team_id: string | null;
-      }>)
+      paList
         .filter(
           (a) =>
             (a.assignee_type === "user" && a.user_id === user.id) ||
             a.assignee_type === "org" ||
             (a.assignee_type === "team" &&
               a.team_id &&
-              myTeamIds.includes(a.team_id))
+              myTeamIds.includes(a.team_id)) ||
+            (a.assignee_type === "group" && a.group_id != null && myGroupIds.has(a.group_id))
         )
         .map((a) => a.path_id)
     );

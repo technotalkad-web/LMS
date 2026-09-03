@@ -13,6 +13,7 @@ import type {
   CourseOption,
   MemberOption,
   TeamOption,
+  GroupOption,
 } from "./page";
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
 import { QrCodeModal } from "../_components/qr-code-modal";
@@ -71,6 +72,7 @@ export function LearningPathsClient({
   courseOptions,
   memberOptions,
   teamOptions,
+  groupOptions = [],
 }: {
   orgSlug: string;
   paths: PathRow[];
@@ -80,6 +82,7 @@ export function LearningPathsClient({
   courseOptions: CourseOption[];
   memberOptions: MemberOption[];
   teamOptions: TeamOption[];
+  groupOptions?: GroupOption[];
 }) {
   void orgSlug;
   const router = useRouter();
@@ -101,6 +104,7 @@ export function LearningPathsClient({
   const [notifyOnAdd, setNotifyOnAdd] = useState<Record<string, boolean>>({});
   const [pickedUser, setPickedUser] = useState<Record<string, string>>({});
   const [pickedTeam, setPickedTeam] = useState<Record<string, string>>({});
+  const [pickedGroup, setPickedGroup] = useState<Record<string, string>>({});
   const [dueDates, setDueDates] = useState<Record<string, string>>({});
   const [showEnrollees, setShowEnrollees] = useState<Record<string, boolean>>({});
   const [editForm, setEditForm] = useState<
@@ -312,14 +316,17 @@ export function LearningPathsClient({
   async function assignPath(pathId: string, opts: {
     user?: boolean;
     team?: boolean;
+    group?: boolean;
     org?: boolean;
   }) {
     const userId = opts.user ? pickedUser[pathId] : null;
     const teamId = opts.team ? pickedTeam[pathId] : null;
+    const groupId = opts.group ? pickedGroup[pathId] : null;
     const dueAt = dueDates[pathId] || null;
 
     if (opts.user && !userId) return;
     if (opts.team && !teamId) return;
+    if (opts.group && !groupId) return;
 
     const res = await fetch("/api/learning-path-assignments", {
       method: "POST",
@@ -330,6 +337,7 @@ export function LearningPathsClient({
         assignToOrg: opts.org ?? false,
         userIds: userId ? [userId] : [],
         teamIds: teamId ? [teamId] : [],
+        groupIds: groupId ? [groupId] : [],
         dueAt,
       }),
     });
@@ -340,6 +348,7 @@ export function LearningPathsClient({
     }
     if (opts.user) setPickedUser((s) => ({ ...s, [pathId]: "" }));
     if (opts.team) setPickedTeam((s) => ({ ...s, [pathId]: "" }));
+    if (opts.group) setPickedGroup((s) => ({ ...s, [pathId]: "" }));
     router.refresh();
   }
 
@@ -516,17 +525,26 @@ export function LearningPathsClient({
             const teamAssignees = assignments.filter(
               (a) => a.assignee_type === "team"
             );
+            const groupAssignees = assignments.filter(
+              (a) => a.assignee_type === "group"
+            );
             const assignedUserIds = new Set(
               userAssignees.map((a) => a.user_id)
             );
             const assignedTeamIds = new Set(
               teamAssignees.map((a) => a.team_id)
             );
+            const assignedGroupIds = new Set(
+              groupAssignees.map((a) => a.group_id)
+            );
             const userPickerCandidates = memberOptions.filter(
               (m) => !assignedUserIds.has(m.user_id)
             );
             const teamPickerCandidates = teamOptions.filter(
               (t) => !assignedTeamIds.has(t.id)
+            );
+            const groupPickerCandidates = groupOptions.filter(
+              (g) => !assignedGroupIds.has(g.id)
             );
             const duration = formatDuration(p.duration_minutes);
             const isExpanded = !!expanded[p.id];
@@ -925,8 +943,29 @@ export function LearningPathsClient({
                       </div>
 
                       {(teamAssignees.length > 0 ||
+                        groupAssignees.length > 0 ||
                         userAssignees.length > 0) && (
                         <ul className="space-y-1 mb-3">
+                          {groupAssignees.map((a) => (
+                            <li
+                              key={a.id}
+                              className="flex items-center justify-between text-sm"
+                            >
+                              <span>
+                                <span className="text-xs uppercase tracking-wide text-muted mr-2">
+                                  Group
+                                </span>
+                                {a.group_name ?? a.group_id?.slice(0, 8)}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => unassign(a.id)}
+                                className="text-xs px-2 py-0.5 border border-line rounded hover:border-red-500 hover:text-red-700"
+                              >
+                                Remove
+                              </button>
+                            </li>
+                          ))}
                           {teamAssignees.map((a) => (
                             <li
                               key={a.id}
@@ -1025,6 +1064,36 @@ export function LearningPathsClient({
                             Add
                           </button>
                         </div>
+                        {groupOptions.length > 0 && (
+                          <div className="flex gap-2">
+                            <select
+                              value={pickedGroup[p.id] ?? ""}
+                              onChange={(e) =>
+                                setPickedGroup((s) => ({
+                                  ...s,
+                                  [p.id]: e.target.value,
+                                }))
+                              }
+                              className="flex-1 px-3 py-1.5 border border-line rounded-xl bg-paper outline-none focus:border-ink text-sm"
+                            >
+                              <option value="">Assign custom group...</option>
+                              {groupPickerCandidates.map((g) => (
+                                <option key={g.id} value={g.id}>
+                                  {g.name}
+                                  {g.group_type === "dynamic" ? " (dynamic)" : ""}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => assignPath(p.id, { group: true })}
+                              disabled={!pickedGroup[p.id]}
+                              className="px-3 py-1.5 bg-ink text-canvas rounded-xl text-sm font-medium hover:opacity-90 disabled:opacity-50"
+                            >
+                              Add
+                            </button>
+                          </div>
+                        )}
                       </div>
                       <input
                         type="date"

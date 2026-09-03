@@ -85,10 +85,10 @@ export default async function AdminCourseDetailPage({
     .order("language", { ascending: true, nullsFirst: true });
   const languagePackages = (pkgRows ?? []) as LanguagePackage[];
 
-  // Assignments
+  // Assignments — select("*") for 0069 deploy safety (group_id).
   const { data: assignmentRows } = await supabase
     .from("course_assignments")
-    .select("id, assignee_type, user_id, team_id, due_at, release_at, assigned_at")
+    .select("*")
     .eq("course_id", c.id);
 
   // Reminder settings
@@ -141,6 +141,38 @@ export default async function AdminCourseDetailPage({
     slug: t.slug,
     member_count: teamMemberCounts.get(t.id) ?? 0,
   }));
+
+  // Custom Groups (0067) as assignees (0069). Fail-soft: pre-0067 databases
+  // simply render no group option.
+  let groupList: Array<{
+    id: string;
+    name: string;
+    group_type: "static" | "dynamic";
+    member_count: number | null;
+  }> = [];
+  try {
+    const { data: groupRows } = await supabase
+      .from("org_groups")
+      .select("id, name, group_type, member_count, is_active")
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .order("name");
+    groupList = (
+      (groupRows ?? []) as Array<{
+        id: string;
+        name: string;
+        group_type: "static" | "dynamic";
+        member_count: number | null;
+      }>
+    ).map((g) => ({
+      id: g.id,
+      name: g.name,
+      group_type: g.group_type,
+      member_count: g.member_count,
+    }));
+  } catch {
+    // org_groups not migrated yet
+  }
 
   // Resolve emails for everyone we might mention.
   const allUserIds = new Set<string>();
@@ -207,9 +239,11 @@ export default async function AdminCourseDetailPage({
   });
 
   const teamNameById = new Map(teamList.map((t) => [t.id, t.name]));
+  const groupNameById = new Map(groupList.map((g) => [g.id, g.name]));
   for (const a of assignments) {
     if (a.user_id) a.user_email = emailByUser.get(a.user_id) ?? null;
     if (a.team_id) a.team_name = teamNameById.get(a.team_id) ?? null;
+    if (a.group_id) a.group_name = groupNameById.get(a.group_id) ?? null;
   }
 
   // ----- Enrolled summary -----
@@ -377,6 +411,7 @@ export default async function AdminCourseDetailPage({
         assignments={assignments}
         members={members}
         teams={teams}
+        groups={groupList}
       />
 
       {/* Reminders */}
