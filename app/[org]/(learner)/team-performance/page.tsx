@@ -1,7 +1,9 @@
+import Link from "next/link";
 import { Users, Target, Award, Trophy, MapPin } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { courseDaysOf } from "@/lib/journey/journey";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 export const dynamic = "force-dynamic";
 
@@ -45,10 +47,13 @@ type TeamAgg = {
 
 export default async function TeamPerformancePage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string }>;
+  searchParams?: Promise<{ group?: string }>;
 }) {
   const { org: orgSlug } = await params;
+  const sp = (await searchParams) ?? {};
   const { user, org } = await requireOrgAccess(orgSlug);
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -70,11 +75,39 @@ export default async function TeamPerformancePage({
     if (page.length < 1000) break;
   }
   const byId = new Map(members.map((m) => [m.user_id, m]));
+
+  // Custom Group filter (G3): scopes every section's member set. Managers
+  // themselves aren't filtered — only whose numbers are counted.
+  const fGroup = sp.group?.trim() || null;
+  let groupScope: Set<string> | null = null;
+  let groupOptions: Array<{ id: string; name: string }> = [];
+  try {
+    const { data } = await svc
+      .from("org_groups")
+      .select("id, name")
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .order("name", { ascending: true });
+    groupOptions = (data ?? []) as Array<{ id: string; name: string }>;
+    if (fGroup && groupOptions.some((g) => g.id === fGroup)) {
+      groupScope = await resolveManyGroups(svc, org.id as string, [fGroup]);
+    }
+  } catch {
+    /* pre-0067 — no group filter */
+  }
+
   const reportsOf = (managerId: string) =>
-    members.filter((m) => m.line_manager_id === managerId);
+    members.filter(
+      (m) =>
+        m.line_manager_id === managerId &&
+        (groupScope === null || groupScope.has(m.user_id))
+    );
 
   const myReports = reportsOf(user.id);
-  if (myReports.length === 0) {
+  // The manager gate uses UNFILTERED reports — a group filter narrowing your
+  // team to zero must not bounce you off your own page.
+  const rawReportCount = members.filter((m) => m.line_manager_id === user.id).length;
+  if (rawReportCount === 0) {
     return (
       <div className="max-w-2xl mx-auto text-center py-16">
         <Users className="w-10 h-10 mx-auto text-muted opacity-50" />
@@ -264,6 +297,44 @@ export default async function TeamPerformancePage({
           scores, straight from the profile database mapping.
         </p>
       </header>
+
+      {/* Custom Group scope (G3) — zero-JS GET form. */}
+      {groupOptions.length > 0 && (
+        <form method="get" className="flex flex-wrap items-end gap-2">
+          <label className="text-xs">
+            <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">
+              Scope to group
+            </span>
+            <select
+              name="group"
+              defaultValue={fGroup ?? ""}
+              className="px-2 py-1.5 border border-line rounded-lg bg-paper text-xs min-w-[200px]"
+            >
+              <option value="">Everyone</option>
+              {groupOptions.map((g) => (
+                <option key={g.id} value={g.id}>{g.name}</option>
+              ))}
+            </select>
+          </label>
+          <button type="submit" className="px-3 py-1.5 bg-ink text-canvas rounded-lg text-xs font-semibold">
+            Apply
+          </button>
+          {groupScope !== null && (
+            <Link
+              href={`/${orgSlug}/team-performance`}
+              className="px-2 py-1.5 text-xs text-muted underline underline-offset-2 hover:text-ink"
+            >
+              Clear
+            </Link>
+          )}
+        </form>
+      )}
+      {groupScope !== null && myReports.length === 0 && (
+        <p className="text-xs text-muted">
+          None of your team members are in this group — numbers below cover an
+          empty set.
+        </p>
+      )}
 
       {/* ---- L1: my team ---- */}
       <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">

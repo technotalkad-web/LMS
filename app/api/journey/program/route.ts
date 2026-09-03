@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { DEFAULT_MILESTONES } from "@/lib/journey/journey";
+import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
  *   POST  /api/journey/program { orgSlug }            create the default program
@@ -205,6 +206,7 @@ export async function POST(request: Request) {
     const verticals = arr("verticals");
     const branches = arr("branches");
     const teamIds = arr("team_ids");
+    const groupIds = arr("group_ids");
 
     const { data: memRows } = await c.supabase
       .from("organization_members")
@@ -233,6 +235,11 @@ export async function POST(request: Request) {
         .in("team_id", teamIds);
       const inTeams = new Set(((tmRows ?? []) as Array<{ user_id: string }>).map((t) => t.user_id));
       candidates = candidates.filter((m) => inTeams.has(m.user_id));
+    }
+    if (groupIds.length > 0) {
+      // Custom Groups (0067): admin RLS lets this run on the caller's client.
+      const inGroups = await resolveManyGroups(c.supabase, c.org.id, groupIds);
+      candidates = candidates.filter((m) => inGroups.has(m.user_id));
     }
 
     const { data: enrRows } = await c.supabase
@@ -378,6 +385,11 @@ export async function PATCH(request: Request) {
         "verticals",
         "branches",
         "team_ids",
+        // Custom Groups (0067, G3): member must be in ANY listed group (the
+        // groups union), AND-ed with the field rules above. The auto-enroll
+        // trigger can't evaluate group rules in SQL — like team_ids, groups
+        // apply via "Sync audience now".
+        "group_ids",
       ] as const) {
         const raw = (body.audience as Record<string, unknown>)[key];
         if (raw === undefined) continue;

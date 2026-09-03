@@ -89,6 +89,7 @@ export function JourneyAdminClient({
   today,
   audienceOptions = {},
   teams = [],
+  orgGroups = [],
 }: {
   orgSlug: string;
   programs?: ProgramSummary[];
@@ -102,6 +103,7 @@ export function JourneyAdminClient({
   today: string;
   audienceOptions?: Record<string, string[]>;
   teams?: Array<{ id: string; name: string }>;
+  orgGroups?: Array<{ id: string; name: string }>;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -394,6 +396,7 @@ export function JourneyAdminClient({
           audienceOptions={audienceOptions}
           teams={teams}
           courses={courses}
+          orgGroups={orgGroups}
         />
       </div>
     </div>
@@ -1074,12 +1077,14 @@ function SettingsTab({
   audienceOptions = {},
   teams = [],
   courses = [],
+  orgGroups = [],
 }: {
   orgSlug: string;
   program: ProgramRow;
   audienceOptions?: Record<string, string[]>;
   teams?: Array<{ id: string; name: string }>;
   courses?: CourseOption[];
+  orgGroups?: Array<{ id: string; name: string }>;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -1112,6 +1117,7 @@ function SettingsTab({
       verticals: a.verticals ?? [],
       branches: a.branches ?? [],
       team_ids: a.team_ids ?? [],
+      group_ids: a.group_ids ?? [],
     };
   });
   const [syncBusy, setSyncBusy] = useState(false);
@@ -1373,6 +1379,12 @@ function SettingsTab({
             options={teams.map((t) => ({ value: t.id, display: t.name }))}
             selected={audience.team_ids}
             onChange={audDim("team_ids")}
+          />
+          <AudienceDim
+            label="Custom groups"
+            options={orgGroups.map((g) => ({ value: g.id, display: g.name }))}
+            selected={audience.group_ids}
+            onChange={audDim("group_ids")}
           />
         </div>
         <div className="flex items-center justify-between gap-3 pt-1">

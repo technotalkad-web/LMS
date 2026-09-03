@@ -192,6 +192,20 @@ export default async function JourneyAdminPage({
     .order("name", { ascending: true });
   const teams = (teamRows ?? []) as Array<{ id: string; name: string }>;
 
+  // Custom Groups (0067) as journey audiences — fail-soft pre-migration.
+  let orgGroups: Array<{ id: string; name: string }> = [];
+  try {
+    const { data } = await supabase
+      .from("org_groups")
+      .select("id, name")
+      .eq("organization_id", org.id)
+      .eq("is_active", true)
+      .order("name", { ascending: true });
+    orgGroups = (data ?? []) as Array<{ id: string; name: string }>;
+  } catch {
+    /* pre-0067 */
+  }
+
   return (
     <JourneyAdminClient
       orgSlug={orgSlug}
@@ -211,6 +225,7 @@ export default async function JourneyAdminPage({
       today={todayStr(tz)}
       audienceOptions={audienceOptions}
       teams={teams}
+      orgGroups={orgGroups}
     />
   );
 }
