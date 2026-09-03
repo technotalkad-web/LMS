@@ -12,10 +12,13 @@ export function LearnerTopNav({
   orgSlug,
   showLeaderboard = true,
   showJourney = false,
+  showTeamPerformance = false,
 }: {
   orgSlug: string;
   showLeaderboard?: boolean;
   showJourney?: boolean;
+  /** Managers only — anyone with direct reports (line_manager mapping). */
+  showTeamPerformance?: boolean;
 }) {
   const pathname = usePathname();
   const items = [
@@ -26,6 +29,9 @@ export function LearnerTopNav({
     { href: `/${orgSlug}/courses`, label: "Courses" },
     ...(showLeaderboard
       ? [{ href: `/${orgSlug}/leaderboard`, label: "Leaderboard" }]
+      : []),
+    ...(showTeamPerformance
+      ? [{ href: `/${orgSlug}/team-performance`, label: "Team Performance" }]
       : []),
     { href: `/${orgSlug}/support`, label: "Help & Support" },
   ];

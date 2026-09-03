@@ -214,7 +214,10 @@ async function run() {
                 manager_name:
                   [manager.first_name, manager.last_name].filter(Boolean).join(" ").trim() ||
                   manager.email.split("@")[0],
-                direct_link: base ? `${base}/${org?.slug}/dashboard` : `/${org?.slug}/dashboard`,
+                // Managers land on their Team Performance view (Phase 4).
+                direct_link: base
+                  ? `${base}/${org?.slug}/team-performance`
+                  : `/${org?.slug}/team-performance`,
               },
             });
             escalated++;
