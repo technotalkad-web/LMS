@@ -129,6 +129,7 @@ export default async function AdminLayout({
             {reports && <NavItem href={`/${org.slug}/reports`} label="Reports" />}
 
             {manage && <NavGroup label="Configure" />}
+            {manage && <NavItem href={`/${org.slug}/groups`} label="Custom Groups" />}
             {role === "super_owner" && (
               <NavItem href={`/${org.slug}/master-data`} label="Master data" />
             )}
