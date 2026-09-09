@@ -126,6 +126,7 @@ export default async function AdminLayout({
             {manage && <NavItem href={`/${org.slug}/notifications`} label="Broadcast" />}
 
             {reports && <NavGroup label="Insights" />}
+            {reports && <NavItem href={`/${org.slug}/analytics`} label="Learner Analytics" />}
             {reports && <NavItem href={`/${org.slug}/reports`} label="Reports" />}
 
             {manage && <NavGroup label="Configure" />}
