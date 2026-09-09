@@ -40,7 +40,9 @@ export async function POST(request: Request) {
           ? "animation"
           : kindRaw === "creative"
             ? "creative" // popup announcement 16:9 / 9:16 images (admin-only)
-            : "thumbnail";
+            : kindRaw === "icon"
+              ? "icon" // journey icons — tiny logos rendered inline next to names
+              : "thumbnail";
 
   if (!(file instanceof Blob)) {
     return NextResponse.json({ error: "Missing file" }, { status: 400 });

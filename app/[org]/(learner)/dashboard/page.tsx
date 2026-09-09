@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { isReleased, laterOf } from "@/lib/learner/release";
 import { LocalDateTime } from "@/components/ui/local-datetime";
+import { JourneyIcon } from "@/components/ui/journey-icon";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
@@ -1014,7 +1015,7 @@ function JourneyBanner({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-[11px] uppercase tracking-[0.2em] font-bold opacity-80">
-            {journey.icon} {journey.name}
+            <JourneyIcon icon={journey.icon} imgSize="h-4 w-4" /> {journey.name}
           </p>
           <p className="text-lg font-semibold mt-0.5">
             Day {journey.day} of {journey.total} — {journey.line}

@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import { courseDaysOf } from "@/lib/journey/journey";
+import { JourneyIcon } from "@/components/ui/journey-icon";
 import { PrintButton } from "./print-button";
 
 export const dynamic = "force-dynamic";
@@ -135,7 +136,7 @@ export default async function JourneyCertificatePage({
           Certificate of Completion
         </p>
         <div className="text-5xl mt-4" aria-hidden>
-          {version.icon}
+          <JourneyIcon icon={version.icon} className="mx-auto" imgSize="h-14 w-14" />
         </div>
 
         <p className="mt-6 text-sm text-slate-500">This certifies that</p>

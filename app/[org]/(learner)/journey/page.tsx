@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
+import { JourneyIcon } from "@/components/ui/journey-icon";
 import {
   computeJourneyState,
   courseDaysOf,
@@ -123,7 +124,7 @@ export default async function JourneyPage({
                 : "border-line hover:border-ink"
             }`}
           >
-            {e.prog.icon ?? "🏹"} {e.prog.name ?? "Journey"}
+            <JourneyIcon icon={e.prog.icon ?? "🏹"} /> {e.prog.name ?? "Journey"}
             {e.status === "completed" ? " ✓" : ""}
           </Link>
         ))}
@@ -417,7 +418,7 @@ export default async function JourneyPage({
             {version.days_total}-day journey
           </p>
           <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight truncate">
-            {version.icon} {version.name}
+            <JourneyIcon icon={version.icon} /> {version.name}
           </h1>
         </div>
         {streak > 0 && (

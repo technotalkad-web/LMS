@@ -354,7 +354,11 @@ export async function PATCH(request: Request) {
   }
   if (body.icon !== undefined) {
     const i = String(body.icon).trim();
-    if (!i || i.length > 8) return NextResponse.json({ error: "Invalid icon" }, { status: 400 });
+    // Either an emoji (≤8 chars) or an uploaded logo URL (icon-upload kind).
+    const isUrl = /^https?:\/\//.test(i) && i.length <= 500;
+    if (!i || (!isUrl && i.length > 8)) {
+      return NextResponse.json({ error: "Invalid icon" }, { status: 400 });
+    }
     update.icon = i;
   }
   if (body.days_total !== undefined) {
