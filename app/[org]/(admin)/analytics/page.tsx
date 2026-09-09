@@ -284,7 +284,8 @@ export default async function AnalyticsPage({
   const nameIds = Array.from(new Set([...scopedIds, ...managerIds, learnerParam].filter(Boolean)));
   const profRows = await fetchByIds<{
     id: string; first_name: string | null; last_name: string | null; email: string | null;
-  }>(svc, "profiles", "id, first_name, last_name, email", "id", nameIds);
+    avatar_url: string | null;
+  }>(svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", nameIds);
   const profById = new Map(profRows.map((p) => [p.id, p]));
   const nameOf = (id: string) => {
     const p = profById.get(id);
@@ -295,6 +296,7 @@ export default async function AnalyticsPage({
     );
   };
   const emailOf = (id: string) => profById.get(id)?.email ?? "";
+  const avatarOf = (id: string) => profById.get(id)?.avatar_url ?? null;
 
   /* ---- content catalog ---- */
   const { data: courseRows } = await svc
@@ -834,7 +836,7 @@ export default async function AnalyticsPage({
         </Link>
 
         <div className="bg-paper border border-line rounded-2xl p-6 flex flex-wrap items-center gap-5">
-          <Avatar name={s.name} avatarUrl={null} size="lg" />
+          <Avatar name={s.name} avatarUrl={avatarOf(s.userId)} size="lg" />
           <div className="min-w-0 flex-1">
             <h1 className="serif text-3xl leading-tight">{s.name}</h1>
             <p className="text-sm text-muted mt-0.5">
@@ -1047,12 +1049,17 @@ export default async function AnalyticsPage({
                 {atRiskSorted.map((s) => (
                   <tr key={s.userId} className="border-b border-line last:border-0 hover:bg-canvas/50">
                     <td className="px-5 py-2.5">
-                      <Link href={drillHref(s.userId)} className="font-medium hover:underline">
-                        {s.name}
-                      </Link>
-                      <span className="block text-[11px] text-muted">
-                        {[s.designation, s.branch].filter(Boolean).join(" · ")}
-                      </span>
+                      <div className="flex items-center gap-2.5">
+                        <Avatar name={s.name} avatarUrl={avatarOf(s.userId)} size="sm" />
+                        <div className="min-w-0">
+                          <Link href={drillHref(s.userId)} className="font-medium hover:underline">
+                            {s.name}
+                          </Link>
+                          <span className="block text-[11px] text-muted">
+                            {[s.designation, s.branch].filter(Boolean).join(" · ")}
+                          </span>
+                        </div>
+                      </div>
                     </td>
                     <td className="px-4 py-2.5">{riskPill(s)}</td>
                     <td className="px-4 py-2.5 text-xs text-muted max-w-[260px]">{s.reasons.join(" · ")}</td>
@@ -1079,7 +1086,7 @@ export default async function AnalyticsPage({
           </div>
           {questions.length === 0 ? (
             <p className="px-5 pb-4 text-sm text-muted">
-              No question-level data yet — this course's package hasn't reported answer interactions.
+              No question-level data yet — this course&apos;s package hasn&apos;t reported answer interactions.
             </p>
           ) : (
             <div className="overflow-x-auto">
