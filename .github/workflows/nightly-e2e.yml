@@ -37,13 +37,18 @@ jobs:
   e2e:
     name: Nightly e2e (staging)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Full browser matrix (chromium + firefox + webkit + two mobile
+    # viewports) needs more headroom than the chromium-only PR job.
+    timeout-minutes: 45
     env:
       # Same secrets the PR-checks e2e job uses — points at staging.
       E2E_BASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SITE_URL }}
       NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+      # Unlocks the firefox/webkit/mobile projects in playwright.config.ts —
+      # the device/browser coverage the launch-readiness plan calls for.
+      E2E_BROWSER_MATRIX: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -52,7 +57,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium firefox webkit
       - name: Run Playwright
         run: npx playwright test --reporter=list
       - name: Upload report on failure

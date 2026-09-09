@@ -93,19 +93,30 @@ export async function DELETE(
     .eq("organization_id", badge.organization_id as string)
     .eq("badge_slug", badge.slug as string);
 
+  // RLS is the write authority, but require PROOF the row was touched —
+  // without it, a non-admin's RLS-blocked delete affects 0 rows and the
+  // route would falsely report success (permission-sweep finding).
   if ((count ?? 0) > 0) {
-    const { error } = await supabase
+    const { data: updated, error } = await supabase
       .from("gamification_badges")
       .update({ enabled: false })
-      .eq("id", id);
+      .eq("id", id)
+      .select("id");
     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+    if (!updated || updated.length === 0) {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
     return NextResponse.json({ ok: true, deactivated: true });
   }
 
-  const { error } = await supabase
+  const { data: deleted, error } = await supabase
     .from("gamification_badges")
     .delete()
-    .eq("id", id);
+    .eq("id", id)
+    .select("id");
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  if (!deleted || deleted.length === 0) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
   return NextResponse.json({ ok: true, deleted: true });
 }

@@ -67,10 +67,28 @@ export default defineConfig({
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
     },
-    // Uncomment when you're ready to spend the CI minutes:
-    // { name: "firefox", use: { ...devices["Desktop Firefox"] } },
-    // { name: "webkit",  use: { ...devices["Desktop Safari"]  } },
-    // { name: "mobile-safari", use: { ...devices["iPhone 14"] } },
+    // Full browser matrix — gated behind E2E_BROWSER_MATRIX=1 so PR checks
+    // and casual local runs stay fast on chromium only. The nightly workflow
+    // sets the flag and runs everything (launch-readiness: device/browser
+    // coverage). Mobile projects run the learner-facing flows only — admin
+    // tables are a desktop surface by design, and the mobile nav is a
+    // different component tree than the desktop nav the admin specs drive.
+    ...(process.env.E2E_BROWSER_MATRIX === "1"
+      ? [
+          { name: "firefox", use: { ...devices["Desktop Firefox"] } },
+          { name: "webkit", use: { ...devices["Desktop Safari"] } },
+          {
+            name: "mobile-chrome",
+            use: { ...devices["Pixel 7"] },
+            testMatch: ["**/auth/**", "**/security/**"],
+          },
+          {
+            name: "mobile-safari",
+            use: { ...devices["iPhone 14"] },
+            testMatch: ["**/auth/**", "**/security/**"],
+          },
+        ]
+      : []),
   ],
 
   // Boot a local Next dev server only if we're hitting localhost.
