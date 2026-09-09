@@ -351,12 +351,12 @@ export default async function LeaderboardPage({
   const { data: memRows } = userIds.length
     ? await svc
         .from("organization_members")
-        .select("user_id, designation, city")
+        .select("user_id, designation, branch, city")
         .eq("organization_id", org.id)
         .in("user_id", userIds)
     : { data: [] };
   const memById = new Map(
-    ((memRows ?? []) as Array<{ user_id: string; designation: string | null; city: string | null }>).map(
+    ((memRows ?? []) as Array<{ user_id: string; designation: string | null; branch: string | null; city: string | null }>).map(
       (m) => [m.user_id, m]
     )
   );
@@ -391,14 +391,19 @@ export default async function LeaderboardPage({
   const top3: PodiumEntry[] = rows
     .filter((r) => (rankOf(r) ?? 99) <= 3)
     .slice(0, 3)
-    .map((r) => ({
-      rank: rankOf(r)!,
-      name: displayName(r),
-      avatarUrl: r.avatar_url,
-      designation: memById.get(r.user_id)?.designation ?? null,
-      metricLabel: metricLabelOf(activeBoard),
-      metricValue: metricFor(activeBoard, r),
-    }));
+    .map((r) => {
+      const m = memById.get(r.user_id);
+      return {
+        rank: rankOf(r)!,
+        name: displayName(r),
+        avatarUrl: r.avatar_url,
+        // "Designation · Branch" when both are on the employee record.
+        designation:
+          [m?.designation, m?.branch].filter(Boolean).join(" · ") || null,
+        metricLabel: metricLabelOf(activeBoard),
+        metricValue: metricFor(activeBoard, r),
+      };
+    });
   const tableRows = rows.filter((r) => (rankOf(r) ?? 99) > 3);
   const mineInTop = mine ? rows.some((r) => r.user_id === mine.user_id) : false;
 
