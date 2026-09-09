@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, RotateCcw, Swords, X } from "lucide-react";
+import { Plus, RotateCcw, Swords, Upload, X } from "lucide-react";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
+import { JourneyIcon, isIconUrl } from "@/components/ui/journey-icon";
 import {
   computeJourneyState,
   effectiveJourneyCopy,
@@ -211,7 +212,7 @@ export function JourneyAdminClient({
           }`}
           title={`Priority rank ${p.priority}`}
         >
-          {p.icon} {p.name}
+          <JourneyIcon icon={p.icon} /> {p.name}
         </button>
       ))}
       {newName === null ? (
@@ -299,7 +300,7 @@ export function JourneyAdminClient({
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="serif text-5xl mb-1">
-            {program.icon} {program.name}
+            <JourneyIcon icon={program.icon} /> {program.name}
           </h1>
           <p className="text-muted text-sm">
             {filledDays}/{program.days_total} days have a module ·{" "}
@@ -1090,6 +1091,30 @@ function SettingsTab({
   const toast = useToast();
   const [name, setName] = useState(program.name);
   const [icon, setIcon] = useState(program.icon);
+  const [iconUploading, setIconUploading] = useState(false);
+  const iconFileRef = useRef<HTMLInputElement | null>(null);
+  async function onIconFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    setIconUploading(true);
+    try {
+      const form = new FormData();
+      form.set("file", f);
+      form.set("orgSlug", orgSlug);
+      form.set("kind", "icon");
+      const res = await fetch("/api/upload/image", { method: "POST", body: form });
+      const j = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (!res.ok || !j.url) {
+        toast.error(j.error ?? "Upload failed");
+        return;
+      }
+      setIcon(j.url);
+      toast.success("Logo uploaded — remember to Save settings");
+    } finally {
+      setIconUploading(false);
+    }
+  }
   const [daysTotal, setDaysTotal] = useState(program.days_total);
   const [countSundays, setCountSundays] = useState(program.count_sundays === true);
   const [isActive, setIsActive] = useState(program.is_active !== false);
@@ -1246,16 +1271,49 @@ function SettingsTab({
           />
         </label>
         <div className="grid grid-cols-[80px_1fr] gap-3">
-          <label className="block">
+          <div className="block">
             <span className="block text-xs uppercase tracking-wide text-muted mb-1">Icon</span>
+            {isIconUrl(icon) ? (
+              <div className="flex items-center gap-2 px-3 py-2 border border-line rounded-lg bg-canvas text-sm">
+                <JourneyIcon icon={icon} imgSize="h-5 w-5" />
+                <span className="flex-1 text-xs text-muted truncate">Uploaded logo</span>
+                <button
+                  type="button"
+                  onClick={() => setIcon("🏹")}
+                  title="Remove logo and use an emoji instead"
+                  className="text-muted hover:text-red-700"
+                  aria-label="Remove logo"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <input
+                type="text"
+                value={icon}
+                maxLength={8}
+                onChange={(e) => setIcon(e.target.value)}
+                title="An emoji, or upload a small logo below"
+                className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm text-center"
+              />
+            )}
+            <button
+              type="button"
+              onClick={() => iconFileRef.current?.click()}
+              disabled={iconUploading}
+              className="mt-1 inline-flex items-center gap-1 text-[11px] text-muted hover:text-ink underline underline-offset-2 disabled:opacity-50"
+            >
+              <Upload className="w-3 h-3" />
+              {iconUploading ? "Uploading…" : "Upload logo (PNG)"}
+            </button>
             <input
-              type="text"
-              value={icon}
-              maxLength={8}
-              onChange={(e) => setIcon(e.target.value)}
-              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm text-center"
+              ref={iconFileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              onChange={onIconFile}
+              className="hidden"
             />
-          </label>
+          </div>
           <label className="block">
             <span className="block text-xs uppercase tracking-wide text-muted mb-1">
               Completion title
