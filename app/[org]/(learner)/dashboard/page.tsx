@@ -101,7 +101,7 @@ export default async function DashboardPage({
 
   const supabase = await createClient();
 
-  // 0.1) Own profile for the personalized welcome â€” "First Last", or the
+  // 0.1) Own profile for the personalized welcome — "First Last", or the
   // email when no name is set (own-row RLS read).
   const { data: profRow } = await supabase
     .from("profiles")
@@ -113,7 +113,7 @@ export default async function DashboardPage({
     user.email ||
     "";
 
-  // 0.15) Yoddha journey banner data (0058) â€” fail-soft: pre-migration the
+  // 0.15) Yoddha journey banner data (0058) — fail-soft: pre-migration the
   // select errors, journey stays null, banner hidden.
   let journey: {
     id: string;
@@ -125,7 +125,7 @@ export default async function DashboardPage({
   } | null = null;
   // Focused dashboard (0064): while any RUNNING mandatory journey has focus
   // enabled, the course grid leads with the journey + pinned courses and
-  // collapses the rest (collapse, never hide â€” deadlines stay reachable).
+  // collapses the rest (collapse, never hide — deadlines stay reachable).
   let focusActive = false;
   const focusPinnedIds = new Set<string>();
   {
@@ -181,8 +181,8 @@ export default async function DashboardPage({
         }
       }
     }
-    // Deactivated journey (admin Settings â†’ Active off) is hidden from
-    // learners entirely â€” no banner, no nav (layout applies the same rule).
+    // Deactivated journey (admin Settings → Active off) is hidden from
+    // learners entirely — no banner, no nav (layout applies the same rule).
     if (j && jProg?.is_active !== false) {
       const ver = Array.isArray(j.journey_versions)
         ? j.journey_versions[0]
@@ -197,14 +197,14 @@ export default async function DashboardPage({
         day: Math.min(ver?.days_total ?? 90, (count ?? 0) + 1),
         total: ver?.days_total ?? 90,
         name: jProg?.name ?? "90-Day Yoddha Journey",
-        icon: jProg?.icon ?? "ðŸ¹",
+        icon: jProg?.icon ?? "🏹",
         line: jc.banner_line,
       };
     }
   }
 
   // 0.2) Org-editable welcome line (migration 0057; members can read their
-  // org's gamification_settings under RLS). Fail-soft to the default â€” a
+  // org's gamification_settings under RLS). Fail-soft to the default — a
   // pre-0057 database errors this select and we just keep the default.
   let welcomeMessage = DEFAULT_WELCOME_MESSAGE;
   // select("*") on purpose (house rule): naming per-migration columns here
@@ -261,7 +261,7 @@ export default async function DashboardPage({
     .eq("organization_id", org.id);
   const assignments = (assignmentRows ?? []) as Assignment[];
 
-  // Custom Group assignments (0069): which groups am I in, resolved LIVE â€”
+  // Custom Group assignments (0069): which groups am I in, resolved LIVE —
   // joining a group grants learning instantly, leaving revokes it. Only
   // computed when a group assignment actually exists.
   let myGroupIds = new Set<string>();
@@ -274,7 +274,7 @@ export default async function DashboardPage({
       );
       myGroupIds = await resolveUserGroupIds(svcGrp, org.id, user.id);
     } catch {
-      /* pre-0067 or resolver issue â€” group assignments just don't match */
+      /* pre-0067 or resolver issue — group assignments just don't match */
     }
   }
 
@@ -436,10 +436,10 @@ export default async function DashboardPage({
           orgSlug={orgSlug}
         />
         {/* A learner with NOTHING assigned is exactly who hits a denied deep
-            link (e.g. scanning a QR for an unassigned course) â€” the flash
+            link (e.g. scanning a QR for an unassigned course) — the flash
             banner must show on the empty dashboard too, not just the grid. */}
         {sp.denied && <DeniedBanner denied={sp.denied} className="mb-6" />}
-        {/* New joiners often have ONLY the journey â€” the banner must show
+        {/* New joiners often have ONLY the journey — the banner must show
             on the empty dashboard too, or their one task is invisible. */}
         {journey && (
           <div className="mb-6">
@@ -455,7 +455,7 @@ export default async function DashboardPage({
     );
   }
 
-  // 5) Courses (active only â€” inactive ones are hidden from learners).
+  // 5) Courses (active only — inactive ones are hidden from learners).
   const { data: courseRows } = await supabase
     .from("courses")
     .select(
@@ -487,11 +487,11 @@ export default async function DashboardPage({
     : { data: [] as Attempt[] };
   const attempts = (attemptRows ?? []) as Attempt[];
 
-  // 8) Completed course set (GLOBAL â€” any completion; used for standalone
+  // 8) Completed course set (GLOBAL — any completion; used for standalone
   // course tiles + deadlines).
   const completedCourseIds = new Set<string>();
   // Path step progress counts ONLY path-context attempts (learning_path_id),
-  // per product decision L2 â€” a standalone completion doesn't advance a path.
+  // per product decision L2 — a standalone completion doesn't advance a path.
   const pathDoneByPath = new Map<string, Set<string>>();
   for (const a of attempts) {
     const v = versionById.get(a.course_version_id);
@@ -507,7 +507,7 @@ export default async function DashboardPage({
     }
   }
 
-  // 8.2) Gamification: own stats in one RPC round trip (fail-soft â€” the
+  // 8.2) Gamification: own stats in one RPC round trip (fail-soft — the
   // dashboard renders fine without the strip if the engine is unavailable).
   let myGamification: MyGamification | null = null;
   try {
@@ -518,7 +518,7 @@ export default async function DashboardPage({
   } catch {
     myGamification = null;
   }
-  // Avg score from the attempts already fetched â€” no extra query.
+  // Avg score from the attempts already fetched — no extra query.
   const completedScores = attempts
     .filter(
       (a) => a.completion_status === "completed" || a.success_status === "passed"
@@ -545,7 +545,7 @@ export default async function DashboardPage({
     if (!a.due_at) continue;
     if (seenForDeadline.has(a.course_id)) continue;
     if (completedCourseIds.has(a.course_id)) continue;
-    // Unreleased content never belongs in the urgency callout â€” its launch
+    // Unreleased content never belongs in the urgency callout — its launch
     // CTA would just bounce to "coming soon".
     if (!isReleased(a.release_at, nowMs)) continue;
     const dueTime = new Date(a.due_at).getTime();
@@ -837,7 +837,7 @@ export default async function DashboardPage({
             {upcomingReleaseAt ? (
               <>
                 {" "}
-                â€” it unlocks <LocalDateTime iso={upcomingReleaseAt} />
+                — it unlocks <LocalDateTime iso={upcomingReleaseAt} />
               </>
             ) : null}
             .
@@ -932,11 +932,11 @@ export default async function DashboardPage({
         </div>
       )}
 
-      {/* Yoddha journey banner â€” mandatory onboarding outranks gamification. */}
+      {/* Yoddha journey banner — mandatory onboarding outranks gamification. */}
       {journey && <JourneyBanner orgSlug={orgSlug} journey={journey} />}
 
       {/* Personal gamification strip (rank / XP / level / streak / avg score).
-          Sits below the urgency callout â€” deadlines outrank gamification. */}
+          Sits below the urgency callout — deadlines outrank gamification. */}
       <MotivationStrip
         orgSlug={orgSlug}
         data={myGamification}
@@ -948,7 +948,7 @@ export default async function DashboardPage({
       {/* Clickable status chips + filterable grid (paths render as labeled
           tiles ahead of the course cards; the chips filter both). While a
           mandatory focus journey runs (0064), pinned courses stay up front
-          and everything else collapses into a closed disclosure â€” the
+          and everything else collapses into a closed disclosure — the
           journey banner above is the learner's real to-do. */}
       {focusActive ? (
         (() => {
@@ -960,7 +960,7 @@ export default async function DashboardPage({
           return (
             <>
               <p className="text-xs text-muted">
-                ðŸŽ¯ Focus mode â€” your journey above comes first
+                🎯 Focus mode — your journey above comes first
                 {pinned.length > 0 ? ", along with these:" : "."}
               </p>
               {pinned.length > 0 && (
@@ -1017,11 +1017,11 @@ function JourneyBanner({
             {journey.icon} {journey.name}
           </p>
           <p className="text-lg font-semibold mt-0.5">
-            Day {journey.day} of {journey.total} â€” {journey.line}
+            Day {journey.day} of {journey.total} — {journey.line}
           </p>
         </div>
         <span className="inline-flex items-center gap-1.5 bg-white/15 rounded-lg px-4 py-2 text-sm font-semibold">
-          Continue journey â†’
+          Continue journey →
         </span>
       </div>
       <div className="mt-3 h-1.5 bg-white/20 rounded-full overflow-hidden">
@@ -1086,12 +1086,12 @@ function DeniedBanner({
       <span>
         {denied === "course" ? (
           <>
-            <strong>Not assigned.</strong> This course is not assigned to you â€” please
+            <strong>Not assigned.</strong> This course is not assigned to you — please
             contact your admin.
           </>
         ) : denied === "path" ? (
           <>
-            <strong>Not assigned.</strong> This learning path is not assigned to you â€”
+            <strong>Not assigned.</strong> This learning path is not assigned to you —
             please contact your admin.
           </>
         ) : (
