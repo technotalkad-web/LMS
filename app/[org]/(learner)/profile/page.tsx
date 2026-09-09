@@ -28,6 +28,7 @@ type MembershipRow = {
   grade: string | null;
   designation: string | null;
   job_role: string | null;
+  branch: string | null;
   line_manager_id: string | null;
   indirect_manager_id: string | null;
   node_id: string | null;
@@ -127,7 +128,7 @@ export default async function ProfilePage({
   const { data: memRow } = await svc
     .from("organization_members")
     .select(
-      "employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, node_id, city, state"
+      "employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, branch, line_manager_id, indirect_manager_id, node_id, city, state"
     )
     .eq("organization_id", org.id)
     .eq("user_id", user.id)
@@ -141,6 +142,7 @@ export default async function ProfilePage({
     grade: null,
     designation: null,
     job_role: null,
+    branch: null,
     line_manager_id: null,
     indirect_manager_id: null,
     node_id: null,
@@ -199,7 +201,12 @@ export default async function ProfilePage({
             />
             <h2 className="mt-4 text-xl font-semibold">{displayName}</h2>
             <p className="text-muted text-sm mt-0.5">
-              {membership.designation ?? membership.job_role ?? roleLabel(role as OrgRole)}
+              {[
+                membership.designation ?? membership.job_role ?? roleLabel(role as OrgRole),
+                membership.branch,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
             </p>
 
             <div className="mt-6 border-t border-line pt-5">
@@ -329,6 +336,7 @@ export default async function ProfilePage({
                 label="Job role / title"
                 value={membership.job_role ?? "—"}
               />
+              <LockedField label="Branch" value={membership.branch ?? "—"} />
               <LockedField
                 label="Node ID"
                 value={membership.node_id ?? "—"}
