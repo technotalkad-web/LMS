@@ -398,6 +398,7 @@ export function JourneyAdminClient({
           teams={teams}
           courses={courses}
           orgGroups={orgGroups}
+          activeEnrollments={enrollments.filter((e) => e.status === "active").length}
         />
       </div>
     </div>
@@ -1079,6 +1080,7 @@ function SettingsTab({
   teams = [],
   courses = [],
   orgGroups = [],
+  activeEnrollments = 0,
 }: {
   orgSlug: string;
   program: ProgramRow;
@@ -1086,10 +1088,40 @@ function SettingsTab({
   teams?: Array<{ id: string; name: string }>;
   courses?: CourseOption[];
   orgGroups?: Array<{ id: string; name: string }>;
+  activeEnrollments?: number;
 }) {
   const router = useRouter();
   const toast = useToast();
   const [name, setName] = useState(program.name);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteTyped, setDeleteTyped] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  async function deleteJourney() {
+    setDeleting(true);
+    try {
+      const res = await fetch("/api/journey/program", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          orgSlug,
+          program_id: program.id,
+          confirm_name: deleteTyped,
+        }),
+      });
+      const j = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        toast.error(j.error ?? "Delete failed");
+        return;
+      }
+      toast.success("Journey deleted");
+      setDeleteOpen(false);
+      // Land back on journey-admin without the deleted ?program= id.
+      router.push(`/${orgSlug}/journey-admin`);
+      router.refresh();
+    } finally {
+      setDeleting(false);
+    }
+  }
   const [icon, setIcon] = useState(program.icon);
   const [iconUploading, setIconUploading] = useState(false);
   const iconFileRef = useRef<HTMLInputElement | null>(null);
@@ -1718,6 +1750,98 @@ function SettingsTab({
           {busy ? "Saving…" : "Save settings"}
         </button>
       </div>
+
+      {/* ---- Danger zone ---- */}
+      <section className="border border-red-200 rounded-xl bg-paper p-5">
+        <h3 className="font-semibold text-red-700">Danger zone</h3>
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-muted max-w-md">
+            Deleting this journey permanently removes its curriculum, every
+            published version, and all learner enrollments and day progress.
+            Completed course attempts, scores, and XP already earned are kept.
+            This cannot be undone.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setDeleteTyped("");
+              setDeleteOpen(true);
+            }}
+            disabled={busy}
+            className="px-4 py-2 border border-red-300 text-red-700 rounded-lg text-sm font-medium hover:bg-red-50 disabled:opacity-50"
+          >
+            Delete journey…
+          </button>
+        </div>
+      </section>
+
+      {/* Delete confirmation modal — the double check: an explicit warning AND
+          typing the journey's exact name before the red button arms. */}
+      {deleteOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !deleting) setDeleteOpen(false);
+          }}
+        >
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-label="Delete journey"
+            className="bg-paper border border-line rounded-2xl shadow-xl w-full max-w-md p-6"
+          >
+            <h2 className="font-semibold text-lg text-red-700">
+              Delete “{program.name}”?
+            </h2>
+            <ul className="mt-3 text-sm space-y-1.5 list-disc pl-5">
+              <li>
+                <strong>
+                  {activeEnrollments} active {activeEnrollments === 1 ? "learner" : "learners"}
+                </strong>{" "}
+                will lose this journey and all their day progress in it.
+              </li>
+              <li>The curriculum and every published version are erased.</li>
+              <li>Completed courses, scores, and XP already earned are kept.</li>
+              <li className="font-semibold">This cannot be undone.</li>
+            </ul>
+            <label className="block mt-4">
+              <span className="block text-xs text-muted mb-1">
+                Type <strong className="text-ink">{program.name}</strong> to confirm
+              </span>
+              <input
+                type="text"
+                value={deleteTyped}
+                onChange={(e) => setDeleteTyped(e.target.value)}
+                placeholder={program.name}
+                autoFocus
+                className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm"
+              />
+            </label>
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setDeleteOpen(false)}
+                disabled={deleting}
+                className="px-4 py-2 border border-line rounded-lg text-sm hover:border-ink disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={deleteJourney}
+                disabled={
+                  deleting ||
+                  deleteTyped.trim().toLowerCase() !==
+                    program.name.trim().toLowerCase()
+                }
+                className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium disabled:opacity-40"
+              >
+                {deleting ? "Deleting…" : "Delete permanently"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

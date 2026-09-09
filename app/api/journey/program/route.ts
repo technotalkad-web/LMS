@@ -5,9 +5,10 @@ import { DEFAULT_MILESTONES } from "@/lib/journey/journey";
 import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
- *   POST  /api/journey/program { orgSlug }            create the default program
- *   PATCH /api/journey/program { orgSlug, ... }       update settings/milestones
- *   PUT   /api/journey/program { orgSlug, days: [...] } bulk-upsert curriculum
+ *   POST   /api/journey/program { orgSlug }            create the default program
+ *   PATCH  /api/journey/program { orgSlug, ... }       update settings/milestones
+ *   PUT    /api/journey/program { orgSlug, days: [...] } bulk-upsert curriculum
+ *   DELETE /api/journey/program { orgSlug, program_id, confirm_name }
  *
  * Admin-only; the caller-bound client runs under RLS (admins manage journey
  * tables), so RLS is the final authority on every write.
@@ -313,6 +314,52 @@ export async function POST(request: Request) {
     );
   }
   return NextResponse.json({ ok: true, program_id: created.id });
+}
+
+export async function DELETE(request: Request) {
+  const body = (await request.json().catch(() => ({}))) as {
+    orgSlug?: string;
+    program_id?: string;
+    confirm_name?: string;
+  };
+  const c = await ctx(body.orgSlug);
+  if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
+  if (!body.program_id) {
+    return NextResponse.json({ error: "program_id required" }, { status: 400 });
+  }
+
+  // Org-scope + existence check on the caller's own client (RLS-backed).
+  const { data: prog } = await c.supabase
+    .from("journey_programs")
+    .select("id, name")
+    .eq("id", body.program_id)
+    .eq("organization_id", c.org.id)
+    .maybeSingle();
+  if (!prog) {
+    return NextResponse.json({ error: "Journey not found" }, { status: 404 });
+  }
+
+  // Server-side re-check of the typed confirmation — the UI already requires
+  // it, but the destructive path must not trust the client. Case-insensitive,
+  // whitespace-trimmed exact match on the journey's name.
+  const typed = String(body.confirm_name ?? "").trim().toLowerCase();
+  if (!typed || typed !== String(prog.name).trim().toLowerCase()) {
+    return NextResponse.json(
+      { error: "Confirmation name does not match the journey name" },
+      { status: 400 }
+    );
+  }
+
+  // Cascade removes days, versions, enrollments and day-progress. Learners'
+  // course attempts, scores and XP survive (attempts reference enrollments
+  // with on-delete-set-null) — only the journey structure and its tracking go.
+  const { error } = await c.supabase
+    .from("journey_programs")
+    .delete()
+    .eq("id", prog.id)
+    .eq("organization_id", c.org.id);
+  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  return NextResponse.json({ ok: true, deleted: prog.id });
 }
 
 export async function PATCH(request: Request) {
