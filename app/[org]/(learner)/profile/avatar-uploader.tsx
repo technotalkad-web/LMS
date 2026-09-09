@@ -105,7 +105,11 @@ export function AvatarUploader({
         return;
       }
       const s0 = Math.max(V / w, V / h);
-      setCrop({ src, w, h, z: 1, ox: (V - w * s0) / 2, oy: (V - h * s0) / 2 });
+      // Portrait photos: faces live in the upper third, so start top-aligned —
+      // a vertically centered default crops the head off if the user saves
+      // without dragging. Landscape stays centered (faces sit mid-frame).
+      const oy = h > w ? 0 : (V - h * s0) / 2;
+      setCrop({ src, w, h, z: 1, ox: (V - w * s0) / 2, oy });
     };
     probe.onerror = () => {
       URL.revokeObjectURL(src);
