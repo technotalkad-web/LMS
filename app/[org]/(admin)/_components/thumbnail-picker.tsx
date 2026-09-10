@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import { Image as ImageIcon, Upload, X } from "lucide-react";
+import { useConfirm } from "@/components/ui/confirm";
 import type { ThumbFit } from "@/lib/ui/thumbnail";
 
 export type ThumbDisplayValue = { fit: ThumbFit; posX: number; posY: number };
@@ -29,10 +30,18 @@ export function ThumbnailPicker({
   display?: ThumbDisplayValue;
   onDisplayChange?: (d: ThumbDisplayValue) => void;
 }) {
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const drag = useRef<{ x: number; y: number } | null>(null);
   const frameRef = useRef<HTMLDivElement | null>(null);
+  // Loss-free drag accumulator (props can lag a render behind fast
+  // pointermoves) + phantom-click guard: releasing a drag makes the browser
+  // dispatch click(s) that can land on the absolutely-positioned Remove (×)
+  // button and silently DELETE the thumbnail (the "can't crop" bug).
+  const posRef = useRef({ x: 50, y: 50 });
+  const dragEndedAt = useRef(0);
+  const movedInDrag = useRef(false);
 
   // Course thumbnails render in a landscape 16:9 banner in the learner view, so
   // show the picker (preview + dropzone) at that same ratio and tell admins the
@@ -77,6 +86,8 @@ export function ThumbnailPicker({
   function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     if (!canDrag) return;
     drag.current = { x: e.clientX, y: e.clientY };
+    posRef.current = { x: posX, y: posY };
+    movedInDrag.current = false;
     e.currentTarget.setPointerCapture(e.pointerId);
   }
 
@@ -86,24 +97,40 @@ export function ThumbnailPicker({
     const dx = e.clientX - drag.current.x;
     const dy = e.clientY - drag.current.y;
     drag.current = { x: e.clientX, y: e.clientY };
+    if (dx !== 0 || dy !== 0) movedInDrag.current = true;
     // Dragging the image right reveals more of its left side, i.e. the
-    // object-position percentage decreases (and vice versa).
-    const clamp = (n: number) => Math.min(100, Math.max(0, Math.round(n)));
+    // object-position percentage decreases (and vice versa). Accumulate on
+    // the ref so no movement is lost between React renders.
+    const clamp = (n: number) => Math.min(100, Math.max(0, n));
+    posRef.current = {
+      x: clamp(posRef.current.x - (dx / rect.width) * 100),
+      y: clamp(posRef.current.y - (dy / rect.height) * 100),
+    };
     onDisplayChange?.({
       fit,
-      posX: clamp(posX - (dx / rect.width) * 100),
-      posY: clamp(posY - (dy / rect.height) * 100),
+      posX: Math.round(posRef.current.x),
+      posY: Math.round(posRef.current.y),
     });
   }
 
   function onPointerUp() {
+    if (drag.current && movedInDrag.current) dragEndedAt.current = Date.now();
     drag.current = null;
+  }
+
+  /** Swallow the click(s) the browser synthesizes right after a drag —
+   * without this they can hit the Remove button and delete the image. */
+  function onClickCapture(e: React.MouseEvent) {
+    if (Date.now() - dragEndedAt.current < 400) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
   }
 
   return (
     <div className={className}>
       {value ? (
-        <div className="relative inline-block">
+        <div className="relative inline-block" onClickCapture={onClickCapture}>
           <div
             ref={frameRef}
             onPointerDown={onPointerDown}
@@ -129,7 +156,11 @@ export function ThumbnailPicker({
           </div>
           <button
             type="button"
-            onClick={() => onChange(null)}
+            onClick={async () => {
+              // Confirmation guards against any stray click ever deleting the
+              // image again — removal must be an explicit decision.
+              if (await confirm("Remove this image?")) onChange(null);
+            }}
             className="absolute top-1 right-1 bg-paper/95 border border-line rounded-full p-1 hover:bg-red-50 hover:text-red-700"
             title="Remove image"
             aria-label="Remove image"
