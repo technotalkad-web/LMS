@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { uploadCoursePackage } from "@/lib/courses/upload";
+import {
+  enforcePackageValidation,
+  linkValidationToVersion,
+} from "@/lib/courses/validation/gate";
 
 /**
  *   POST /api/courses/{courseId}/packages/{packageId}/versions
@@ -99,12 +103,31 @@ export async function POST(
     return NextResponse.json({ error: "Package not found" }, { status: 404 });
   }
 
+  // ---- Pre-Upload Validation gate (0070) ----
+  // A broken REPLACEMENT is worse than a broken new course — learners are
+  // mid-flight — so the replace flow gets the exact same gate.
+  const zipAb = new Uint8Array(await (file as File).arrayBuffer());
+  const validationIdRaw = form.get("validation_id");
+  const gate = await enforcePackageValidation({
+    supabase,
+    organizationId: org.id as string,
+    userId: caller.id,
+    courseId,
+    zipBytes: zipAb,
+    fileName: (file as File).name ?? null,
+    validationId:
+      typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
+    acknowledge: form.get("acknowledge") === "1",
+  });
+  if (!gate.ok) {
+    return NextResponse.json({ error: gate.error }, { status: gate.status });
+  }
+
   // ---- Upload a new version under this package ----
   let result;
   try {
-    const ab = await (file as File).arrayBuffer();
     result = await uploadCoursePackage({
-      zipBytes: new Uint8Array(ab),
+      zipBytes: zipAb,
       organizationId: org.id,
       uploaderId: caller.id,
       courseId,
@@ -117,6 +140,12 @@ export async function POST(
       { status: 500 }
     );
   }
+  await linkValidationToVersion({
+    supabase,
+    validationId: gate.validationId,
+    courseId,
+    versionId: result.versionId,
+  });
 
   // ---- Force-restart: silently abandon old in-progress attempts ----
   // After this, the launcher finds no resumable attempt on the package's old

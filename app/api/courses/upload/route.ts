@@ -3,6 +3,10 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { uploadCoursePackage } from "@/lib/courses/upload";
+import {
+  enforcePackageValidation,
+  linkValidationToVersion,
+} from "@/lib/courses/validation/gate";
 import { notifyBackground } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import { originFromRequest } from "@/lib/http/origin";
@@ -105,6 +109,24 @@ export async function POST(request: NextRequest) {
     typeof notifyRaw === "string" &&
     (notifyRaw === "1" || notifyRaw === "true" || notifyRaw === "on");
 
+  // Pre-Upload Package Validation gate (0070): phase-2 acceptance of a
+  // validated report, or inline validation for direct API callers.
+  const validationIdRaw = form.get("validation_id");
+  const gate = await enforcePackageValidation({
+    supabase,
+    organizationId: org.id,
+    userId: user.id,
+    courseId: courseId ?? null,
+    zipBytes,
+    fileName: file instanceof File ? file.name : null,
+    validationId:
+      typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
+    acknowledge: form.get("acknowledge") === "1",
+  });
+  if (!gate.ok) {
+    return NextResponse.json({ error: gate.error }, { status: gate.status });
+  }
+
   let result: Awaited<ReturnType<typeof uploadCoursePackage>>;
   try {
     result = await uploadCoursePackage({
@@ -118,6 +140,12 @@ export async function POST(request: NextRequest) {
     const message = err instanceof Error ? err.message : "Upload failed";
     return NextResponse.json({ error: message }, { status: 400 });
   }
+  await linkValidationToVersion({
+    supabase,
+    validationId: gate.validationId,
+    courseId: result.courseId,
+    versionId: result.versionId,
+  });
 
   // If a thumbnail URL was sent along with the upload, persist it together
   // with the display options chosen in the upload editor (fit + focal point).
