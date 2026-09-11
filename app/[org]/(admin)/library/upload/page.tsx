@@ -4,10 +4,17 @@ import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { ThumbnailPicker } from "../../_components/thumbnail-picker";
+import {
+  ValidationReportPanel,
+  rejectValidation,
+  runValidation,
+  type ValidationResult,
+} from "../_components/validation-gate";
 
 type UploadState =
   | { kind: "idle" }
-  | { kind: "uploading"; filename: string }
+  | { kind: "validating"; filename: string }
+  | { kind: "report"; file: File; result: ValidationResult; uploading: boolean }
   | { kind: "success"; courseId: string; title: string; manifestType: string }
   | { kind: "error"; message: string };
 
@@ -26,6 +33,7 @@ export default function CourseUploadPage() {
     posY: number;
   }>({ fit: "cover", posX: 50, posY: 50 });
 
+  // Phase 1: validate the package and show the quality report.
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -39,8 +47,26 @@ export default function CourseUploadPage() {
       return;
     }
 
-    setState({ kind: "uploading", filename: file.name });
+    setState({ kind: "validating", filename: file.name });
+    const v = await runValidation(file, orgSlug);
+    if (!v.ok) {
+      setState({ kind: "error", message: v.error });
+      return;
+    }
+    setState({ kind: "report", file, result: v.result, uploading: false });
+  }
+
+  // Phase 2: Accept & Upload — the real upload carries the validation id.
+  async function acceptAndUpload(fields: { validation_id: string; acknowledge: boolean }) {
+    if (state.kind !== "report") return;
+    const { file } = state;
+    setState({ ...state, uploading: true });
+
+    const form = new FormData();
+    form.set("file", file);
     form.set("orgSlug", orgSlug);
+    form.set("validation_id", fields.validation_id);
+    if (fields.acknowledge) form.set("acknowledge", "1");
     if (targetCourseId) {
       form.set("courseId", targetCourseId);
       if (notifyUpdate) form.set("notify_update", "1");
@@ -53,16 +79,10 @@ export default function CourseUploadPage() {
     }
 
     try {
-      const res = await fetch("/api/courses/upload", {
-        method: "POST",
-        body: form,
-      });
+      const res = await fetch("/api/courses/upload", { method: "POST", body: form });
       const json = await res.json();
       if (!res.ok) {
-        setState({
-          kind: "error",
-          message: json.error ?? "Upload failed",
-        });
+        setState({ kind: "error", message: json.error ?? "Upload failed" });
         return;
       }
       setState({
@@ -77,6 +97,12 @@ export default function CourseUploadPage() {
         message: err instanceof Error ? err.message : "Upload failed",
       });
     }
+  }
+
+  async function rejectPackage() {
+    if (state.kind !== "report") return;
+    await rejectValidation(state.result.validation_id, orgSlug);
+    setState({ kind: "idle" });
   }
 
   const isNewVersion = !!targetCourseId;
@@ -112,7 +138,15 @@ export default function CourseUploadPage() {
         )}
       </p>
 
-      {state.kind === "success" ? (
+      {state.kind === "report" ? (
+        <ValidationReportPanel
+          fileName={state.file.name}
+          result={state.result}
+          busy={state.uploading}
+          onAccept={acceptAndUpload}
+          onReject={rejectPackage}
+        />
+      ) : state.kind === "success" ? (
         <div className="border border-line rounded-lg bg-paper p-8">
           <h2 className="serif text-3xl mb-2">
             {isNewVersion ? "New version published" : "Uploaded"}
@@ -165,7 +199,7 @@ export default function CourseUploadPage() {
               name="file"
               accept=".zip,application/zip"
               required
-              disabled={state.kind === "uploading"}
+              disabled={state.kind === "validating"}
               className="block w-full text-sm file:mr-4 file:px-4 file:py-2 file:rounded-md file:border file:border-line file:bg-canvas file:text-ink file:font-medium hover:file:border-ink"
             />
             <p className="text-xs text-muted mt-2">
@@ -215,15 +249,18 @@ export default function CourseUploadPage() {
 
           <button
             type="submit"
-            disabled={state.kind === "uploading"}
+            disabled={state.kind === "validating"}
             className="w-full px-4 py-3 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
           >
-            {state.kind === "uploading"
-              ? `Uploading ${state.filename}…`
-              : isNewVersion
-                ? "Publish new version"
-                : "Upload"}
+            {state.kind === "validating"
+              ? `Validating ${state.filename}…`
+              : "Validate package"}
           </button>
+          <p className="text-xs text-muted -mt-3">
+            The package is checked for tracking, completion, score, and resume
+            support before anything is published — you review the report, then
+            accept or reject.
+          </p>
 
           {state.kind === "error" && (
             <p className="text-sm text-red-700">{state.message}</p>

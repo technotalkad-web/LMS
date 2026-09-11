@@ -3,6 +3,10 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { uploadCoursePackage } from "@/lib/courses/upload";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
+import {
+  enforcePackageValidation,
+  linkValidationToVersion,
+} from "@/lib/courses/validation/gate";
 
 /**
  *   POST /api/courses/{courseId}/packages
@@ -119,6 +123,24 @@ export async function POST(
     );
   }
 
+  // ---- Pre-Upload Validation gate (0070) ----
+  const zipAb = new Uint8Array(await (file as File).arrayBuffer());
+  const validationIdRaw = form.get("validation_id");
+  const gate = await enforcePackageValidation({
+    supabase,
+    organizationId: org.id as string,
+    userId: caller.id,
+    courseId,
+    zipBytes: zipAb,
+    fileName: (file as File).name ?? null,
+    validationId:
+      typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
+    acknowledge: form.get("acknowledge") === "1",
+  });
+  if (!gate.ok) {
+    return NextResponse.json({ error: gate.error }, { status: gate.status });
+  }
+
   // ---- Create the new package ----
   const { data: newPkg, error: pkgErr } = await svc
     .from("course_packages")
@@ -144,9 +166,8 @@ export async function POST(
   // per-package version sequencing and sets course_packages.current_version_id.
   let uploadResult;
   try {
-    const ab = await (file as File).arrayBuffer();
     uploadResult = await uploadCoursePackage({
-      zipBytes: new Uint8Array(ab),
+      zipBytes: zipAb,
       organizationId: org.id,
       uploaderId: caller.id,
       courseId,
@@ -161,6 +182,12 @@ export async function POST(
       { status: 500 }
     );
   }
+  await linkValidationToVersion({
+    supabase,
+    validationId: gate.validationId,
+    courseId,
+    versionId: uploadResult.versionId,
+  });
 
   return NextResponse.json({
     package_id: newPackageId,

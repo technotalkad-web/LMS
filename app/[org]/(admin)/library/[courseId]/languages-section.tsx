@@ -5,6 +5,12 @@ import { useConfirm } from "@/components/ui/confirm";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { SUPPORTED_LANGUAGES, languageDisplay } from "@/lib/i18n/languages";
+import {
+  ValidationReportPanel,
+  rejectValidation,
+  runValidation,
+  type ValidationResult,
+} from "../_components/validation-gate";
 
 export type LanguagePackage = {
   id: string;
@@ -285,12 +291,28 @@ function ReplacePackageDialog({
   const [mode, setMode] = useState<"grandfather" | "force_restart">("grandfather");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [validation, setValidation] = useState<ValidationResult | null>(null);
   const label =
     pkg.language === null
       ? "Unlabeled (legacy)"
       : `${languageDisplay(pkg.language, "english")} (${pkg.language})`;
 
+  // Phase 1: validate and show the quality report inside the dialog.
   async function submit() {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    const v = await runValidation(file, orgSlug);
+    setBusy(false);
+    if (!v.ok) {
+      setError(v.error);
+      return;
+    }
+    setValidation(v.result);
+  }
+
+  // Phase 2: Accept & Upload.
+  async function doUpload(fields: { validation_id: string; acknowledge: boolean }) {
     if (!file) return;
     setBusy(true);
     setError(null);
@@ -298,6 +320,8 @@ function ReplacePackageDialog({
     fd.append("orgSlug", orgSlug);
     fd.append("file", file);
     fd.append("mode", mode);
+    fd.append("validation_id", fields.validation_id);
+    if (fields.acknowledge) fd.append("acknowledge", "1");
     const res = await fetch(
       `/api/courses/${courseId}/packages/${pkg.id}/versions`,
       { method: "POST", body: fd }
@@ -311,13 +335,19 @@ function ReplacePackageDialog({
     onReplaced();
   }
 
+  async function rejectPackage() {
+    if (validation) await rejectValidation(validation.validation_id, orgSlug);
+    setValidation(null);
+    setFile(null);
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       onClick={onClose}
     >
       <div
-        className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4"
+        className="bg-paper border border-line rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div>
@@ -329,6 +359,23 @@ function ReplacePackageDialog({
           </p>
         </div>
 
+        {validation && file ? (
+          <>
+            <ValidationReportPanel
+              fileName={file.name}
+              result={validation}
+              busy={busy}
+              onAccept={doUpload}
+              onReject={rejectPackage}
+            />
+            {error && (
+              <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">
+                {error}
+              </div>
+            )}
+          </>
+        ) : (
+        <>
         <input
           type="file"
           accept=".zip"
@@ -399,9 +446,11 @@ function ReplacePackageDialog({
             disabled={!file || busy}
             className="px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? "Uploading…" : "Upload new version"}
+            {busy ? "Validating…" : "Validate package"}
           </button>
         </div>
+        </>
+        )}
       </div>
     </div>
   );
@@ -425,7 +474,9 @@ function AddLanguageDialog({
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [validation, setValidation] = useState<ValidationResult | null>(null);
 
+  // Phase 1: validate the zip, show the report in place of the form.
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
@@ -437,11 +488,26 @@ function AddLanguageDialog({
       setError("Pick the language for this package.");
       return;
     }
+    setBusy(true);
+    const v = await runValidation(file, orgSlug);
+    setBusy(false);
+    if (!v.ok) {
+      setError(v.error);
+      return;
+    }
+    setValidation(v.result);
+  }
+
+  // Phase 2: Accept & Upload.
+  async function doUpload(fields: { validation_id: string; acknowledge: boolean }) {
+    if (!file) return;
     const fd = new FormData();
     fd.append("file", file);
     fd.append("orgSlug", orgSlug);
     fd.append("language", language);
     if (displayName.trim()) fd.append("display_name", displayName.trim());
+    fd.append("validation_id", fields.validation_id);
+    if (fields.acknowledge) fd.append("acknowledge", "1");
 
     setBusy(true);
     const res = await fetch(`/api/courses/${courseId}/packages`, {
@@ -457,6 +523,12 @@ function AddLanguageDialog({
     onAdded();
   }
 
+  async function rejectPackage() {
+    if (validation) await rejectValidation(validation.validation_id, orgSlug);
+    setValidation(null);
+    setFile(null);
+  }
+
   return (
     <div
       role="dialog"
@@ -467,7 +539,7 @@ function AddLanguageDialog({
       <form
         onSubmit={submit}
         onClick={(e) => e.stopPropagation()}
-        className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4"
+        className="bg-paper border border-line rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-4 max-h-[90vh] overflow-y-auto"
       >
         <h3 className="serif text-2xl">Add a language</h3>
         <p className="text-sm text-muted">
@@ -475,6 +547,23 @@ function AddLanguageDialog({
           new language variant.
         </p>
 
+        {validation && file ? (
+          <>
+            <ValidationReportPanel
+              fileName={file.name}
+              result={validation}
+              busy={busy}
+              onAccept={doUpload}
+              onReject={rejectPackage}
+            />
+            {error && (
+              <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">
+                {error}
+              </div>
+            )}
+          </>
+        ) : (
+        <>
         <div>
           <label className="block text-xs uppercase tracking-wide text-muted mb-1">
             Language
@@ -545,9 +634,11 @@ function AddLanguageDialog({
             disabled={busy}
             className="px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-semibold disabled:opacity-50"
           >
-            {busy ? "Uploading…" : "Upload"}
+            {busy ? "Validating…" : "Validate package"}
           </button>
         </div>
+        </>
+        )}
       </form>
     </div>
   );

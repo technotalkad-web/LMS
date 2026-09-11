@@ -13,6 +13,7 @@ import {
 import { ReminderSection, type ReminderSettings } from "./reminder-section";
 import { DetailsForm, type CourseDetails } from "./details-form";
 import { LanguagesSection, type LanguagePackage } from "./languages-section";
+import { ValidateExistingButton } from "./validate-existing-button";
 
 type Version = {
   id: string;
@@ -103,6 +104,41 @@ export default async function AdminCourseDetailPage({
     cap_days: (reminderRow?.cap_days as number | undefined) ?? 30,
   };
   const assignments = (assignmentRows ?? []) as AssignmentRow[];
+
+  // Latest accepted package validation (0070) — fail-soft pre-migration.
+  type StoredCheck = { id: string; label: string; status: string; detail: string };
+  let latestValidation: {
+    verdict: string;
+    acknowledged_warnings: boolean;
+    created_at: string;
+    checks: StoredCheck[];
+  } | null = null;
+  try {
+    const { data: pv } = await supabase
+      .from("package_validations")
+      .select("verdict, acknowledged_warnings, created_at, report")
+      .eq("course_id", c.id)
+      .eq("status", "accepted")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (pv) {
+      const row = pv as {
+        verdict: string;
+        acknowledged_warnings: boolean;
+        created_at: string;
+        report?: { checks?: StoredCheck[] };
+      };
+      latestValidation = {
+        verdict: row.verdict,
+        acknowledged_warnings: row.acknowledged_warnings === true,
+        created_at: row.created_at,
+        checks: Array.isArray(row.report?.checks) ? row.report.checks : [],
+      };
+    }
+  } catch {
+    // package_validations not migrated yet
+  }
 
   // employee_id is selected so the assignment combobox can let admins
   // search by it. The actual profile name (first_name/last_name) is
@@ -379,6 +415,70 @@ export default async function AdminCourseDetailPage({
           <span>· {enrSummary.total.toLocaleString()} enrolled</span>
         </div>
       </div>
+
+      {/* Package quality — latest validation (0070). Courses uploaded before
+          the gate have no report yet; "Validate now" re-scans the stored
+          files and produces one on demand. */}
+      {!latestValidation && (
+        <div className="border border-line rounded-lg bg-paper px-5 py-3 text-sm flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <span className="font-medium">Package quality</span>
+            <span className="block text-xs text-muted mt-0.5">
+              No validation report yet — this course was uploaded before the
+              quality gate existed. Scan its stored files to get one.
+            </span>
+          </div>
+          <ValidateExistingButton orgSlug={orgSlug} courseId={c.id} hasReport={false} />
+        </div>
+      )}
+      {latestValidation && (
+        <details className="border border-line rounded-lg bg-paper px-5 py-3 text-sm">
+          <summary className="cursor-pointer select-none flex flex-wrap items-center gap-2.5">
+            <span className="font-medium">Package quality</span>
+            <span
+              className={`px-2 py-0.5 rounded-full text-[11px] font-bold tracking-wide ${
+                latestValidation.verdict === "pass"
+                  ? "bg-emerald-100 text-emerald-800"
+                  : latestValidation.verdict === "warning"
+                    ? "bg-amber-100 text-amber-900"
+                    : "bg-red-100 text-red-800"
+              }`}
+            >
+              {latestValidation.verdict.toUpperCase()}
+            </span>
+            {latestValidation.acknowledged_warnings && (
+              <span className="text-xs text-muted">accepted with acknowledged issues</span>
+            )}
+            <span className="text-xs text-muted">
+              validated {latestValidation.created_at.slice(0, 10)}
+            </span>
+          </summary>
+          <ul className="mt-3 space-y-1.5 text-xs">
+            {latestValidation.checks.map((ck) => (
+              <li key={ck.id}>
+                <span
+                  className={
+                    ck.status === "pass"
+                      ? "text-emerald-700 font-semibold"
+                      : ck.status === "warning"
+                        ? "text-amber-700 font-semibold"
+                        : ck.status === "fail"
+                          ? "text-red-700 font-semibold"
+                          : "text-muted font-semibold"
+                  }
+                >
+                  {ck.status.toUpperCase()}
+                </span>{" "}
+                <span className="font-medium">{ck.label}:</span>{" "}
+                <span className="text-muted">{ck.detail}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="mt-3">
+            <ValidateExistingButton orgSlug={orgSlug} courseId={c.id} hasReport={true} />
+          </div>
+        </details>
+      )}
 
       {/* Editable details */}
       <DetailsForm orgSlug={orgSlug} courseId={c.id} initial={initialDetails} />
