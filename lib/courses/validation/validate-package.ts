@@ -36,6 +36,8 @@ export type PackageValidationReport = {
     sizeBytes: number;
     fileCount: number;
     tool: string | null;
+    /** "stored" = re-scanned from extracted storage files, not the zip. */
+    source?: "upload" | "stored";
   };
   verdict: "pass" | "warning" | "fail" | "unplayable";
   checks: ValidationCheck[];

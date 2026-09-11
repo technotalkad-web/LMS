@@ -4,6 +4,7 @@ import {
   sha256Hex,
   validatePackage,
 } from "@/lib/courses/validation/validate-package";
+import { validateStoredVersion } from "@/lib/courses/validation/validate-stored";
 
 /**
  * Pre-Upload Package Validation — phase 1 of the quality gate.
@@ -24,16 +25,96 @@ import {
 export async function POST(request: NextRequest) {
   const contentType = request.headers.get("content-type") ?? "";
 
-  // ---- reject action (JSON) ----
+  // ---- JSON actions: reject | validate_existing ----
   if (contentType.includes("application/json")) {
     const body = (await request.json().catch(() => ({}))) as {
       action?: string;
       orgSlug?: string;
       validation_id?: string;
+      course_id?: string;
     };
+
+    // Re-scan an ALREADY-UPLOADED course from its stored files — the audit
+    // path for content that pre-dates the pre-upload gate.
+    if (body.action === "validate_existing") {
+      if (!body.orgSlug || !body.course_id) {
+        return NextResponse.json(
+          { error: "orgSlug and course_id required" },
+          { status: 400 }
+        );
+      }
+      const auth = await requireAdmin(body.orgSlug);
+      if ("error" in auth) {
+        return NextResponse.json({ error: auth.error }, { status: auth.status });
+      }
+      const { data: courseRow } = await auth.supabase
+        .from("courses")
+        .select("id, current_version_id")
+        .eq("id", body.course_id)
+        .eq("organization_id", auth.orgId)
+        .maybeSingle();
+      const course = courseRow as {
+        id: string;
+        current_version_id: string | null;
+      } | null;
+      if (!course) {
+        return NextResponse.json({ error: "Course not found" }, { status: 404 });
+      }
+      let vq = auth.supabase
+        .from("course_versions")
+        .select("id, version_number, storage_prefix")
+        .eq("course_id", course.id);
+      vq = course.current_version_id
+        ? vq.eq("id", course.current_version_id)
+        : vq.order("version_number", { ascending: false }).limit(1);
+      const { data: verRows } = await vq;
+      const version = (verRows ?? [])[0] as
+        | { id: string; version_number: number; storage_prefix: string }
+        | undefined;
+      if (!version?.storage_prefix) {
+        return NextResponse.json(
+          { error: "Course has no stored version to validate" },
+          { status: 404 }
+        );
+      }
+
+      const report = await validateStoredVersion(version.storage_prefix);
+      // Content is already live for learners, so the row records an audit
+      // (status accepted), not a pending gate decision.
+      const { data: inserted, error } = await auth.supabase
+        .from("package_validations")
+        .insert({
+          organization_id: auth.orgId,
+          course_id: course.id,
+          course_version_id: version.id,
+          uploaded_by: auth.userId,
+          file_name: `re-scan of v${version.version_number} (stored files)`,
+          size_bytes: null,
+          sha256: `stored:${version.id}`,
+          verdict: report.verdict,
+          report,
+          status: "accepted",
+          accepted_by: auth.userId,
+          accepted_at: new Date().toISOString(),
+          acknowledged_warnings: false,
+        })
+        .select("id")
+        .maybeSingle();
+      if (error || !inserted) {
+        return NextResponse.json(
+          { error: error?.message ?? "Could not store validation (is migration 0070 applied?)" },
+          { status: 400 }
+        );
+      }
+      return NextResponse.json({
+        validation_id: (inserted as { id: string }).id,
+        report,
+      });
+    }
+
     if (body.action !== "reject" || !body.orgSlug || !body.validation_id) {
       return NextResponse.json(
-        { error: "action 'reject', orgSlug and validation_id required" },
+        { error: "action 'reject' or 'validate_existing' required (with orgSlug + validation_id / course_id)" },
         { status: 400 }
       );
     }

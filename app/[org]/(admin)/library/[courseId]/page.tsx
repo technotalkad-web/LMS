@@ -13,6 +13,7 @@ import {
 import { ReminderSection, type ReminderSettings } from "./reminder-section";
 import { DetailsForm, type CourseDetails } from "./details-form";
 import { LanguagesSection, type LanguagePackage } from "./languages-section";
+import { ValidateExistingButton } from "./validate-existing-button";
 
 type Version = {
   id: string;
@@ -415,7 +416,21 @@ export default async function AdminCourseDetailPage({
         </div>
       </div>
 
-      {/* Package quality — latest pre-upload validation (0070). */}
+      {/* Package quality — latest validation (0070). Courses uploaded before
+          the gate have no report yet; "Validate now" re-scans the stored
+          files and produces one on demand. */}
+      {!latestValidation && (
+        <div className="border border-line rounded-lg bg-paper px-5 py-3 text-sm flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <span className="font-medium">Package quality</span>
+            <span className="block text-xs text-muted mt-0.5">
+              No validation report yet — this course was uploaded before the
+              quality gate existed. Scan its stored files to get one.
+            </span>
+          </div>
+          <ValidateExistingButton orgSlug={orgSlug} courseId={c.id} hasReport={false} />
+        </div>
+      )}
       {latestValidation && (
         <details className="border border-line rounded-lg bg-paper px-5 py-3 text-sm">
           <summary className="cursor-pointer select-none flex flex-wrap items-center gap-2.5">
@@ -459,6 +474,9 @@ export default async function AdminCourseDetailPage({
               </li>
             ))}
           </ul>
+          <div className="mt-3">
+            <ValidateExistingButton orgSlug={orgSlug} courseId={c.id} hasReport={true} />
+          </div>
         </details>
       )}
 
