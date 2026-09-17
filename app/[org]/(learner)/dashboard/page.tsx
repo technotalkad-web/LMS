@@ -920,7 +920,7 @@ export default async function DashboardPage({
             </div>
           </div>
           <Link
-            href={`/${orgSlug}/courses/${dueSoon[0].courseId}/launch`}
+            href={`/${orgSlug}/courses/${dueSoon[0].courseId}/launch?back=dashboard`}
             className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg font-semibold text-sm transition shadow-sm whitespace-nowrap ${
               dueSoon.some((d) => d.overdue)
                 ? "bg-red-600 hover:bg-red-700 text-white"

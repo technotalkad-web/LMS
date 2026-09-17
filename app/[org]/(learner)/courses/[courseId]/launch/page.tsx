@@ -49,7 +49,13 @@ export default async function LaunchPage({
   searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
-  searchParams: Promise<{ lang?: string; lp?: string; journey?: string; day?: string }>;
+  searchParams: Promise<{
+    lang?: string;
+    lp?: string;
+    journey?: string;
+    day?: string;
+    back?: string;
+  }>;
 }) {
   const { org: orgSlug, courseId } = await params;
   const {
@@ -57,6 +63,7 @@ export default async function LaunchPage({
     lp: lpParam,
     journey: journeyParam,
     day: dayParam,
+    back: backParam,
   } = await searchParams;
   const { user, org, role } = await requireOrgAccess(orgSlug);
 
@@ -574,10 +581,18 @@ export default async function LaunchPage({
   }
 
   const contentBase = `/${orgSlug}/courses/${courseId}/content/`;
-  // Exit takes the learner back to their dashboard rather than the course
-  // detail page; mid-course exits usually mean "I'm done for now", and the
-  // dashboard is where they make their next pick.
-  const backHref = `/${orgSlug}/dashboard`;
+  // Exit returns the learner to the context they launched from: the journey
+  // (?journey=), the learning path (?lp=, only when this course really is a
+  // step of it), the dashboard (?back=dashboard from its cards), otherwise
+  // the course page. Fixed targets only — never a caller-supplied URL.
+  const { backHref, backLabel } = resolveReturnTarget({
+    orgSlug,
+    courseId,
+    journeyEnrollmentId: journeyParam || null,
+    pathId:
+      lpParam && stepInPaths.some((s) => s.path_id === lpParam) ? lpParam : null,
+    back: backParam || null,
+  });
 
   // --- SCORM 1.2 path ---
   if (v.manifest_type === "scorm12") {
@@ -593,6 +608,7 @@ export default async function LaunchPage({
         iframeSrc={launchSrc}
         courseTitle={c.title}
         backHref={backHref}
+        backLabel={backLabel}
       />
     );
   }
@@ -653,6 +669,43 @@ export default async function LaunchPage({
       iframeSrc={iframeSrc}
       courseTitle={c.title}
       backHref={backHref}
+      backLabel={backLabel}
     />
   );
+}
+
+/**
+ * Where "Exit course" goes. Every target is a fixed in-app path built from
+ * validated ids, so a crafted launch URL can never bounce a learner
+ * elsewhere.
+ */
+function resolveReturnTarget({
+  orgSlug,
+  courseId,
+  journeyEnrollmentId,
+  pathId,
+  back,
+}: {
+  orgSlug: string;
+  courseId: string;
+  journeyEnrollmentId: string | null;
+  pathId: string | null;
+  back: string | null;
+}): { backHref: string; backLabel: string } {
+  if (journeyEnrollmentId) {
+    return {
+      backHref: `/${orgSlug}/journey?j=${encodeURIComponent(journeyEnrollmentId)}`,
+      backLabel: "Back to journey",
+    };
+  }
+  if (pathId) {
+    return {
+      backHref: `/${orgSlug}/paths/${encodeURIComponent(pathId)}`,
+      backLabel: "Back to path",
+    };
+  }
+  if (back === "dashboard") {
+    return { backHref: `/${orgSlug}/dashboard`, backLabel: "Back to dashboard" };
+  }
+  return { backHref: `/${orgSlug}/courses/${courseId}`, backLabel: "Back to course" };
 }
