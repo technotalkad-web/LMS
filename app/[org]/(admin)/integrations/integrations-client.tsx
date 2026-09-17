@@ -261,6 +261,16 @@ export function IntegrationsClient({
               into sso-link.
             </span>
           </li>
+          <li>
+            <code className="bg-canvas px-1 rounded">PUT / GET / DELETE /api/integrations/employees</code>
+            <span className="block text-muted mt-0.5">
+              Employee sync — the CRM stays master of people. PUT upserts by
+              employee_id (rehire = same call; master-data rules enforced;
+              managers referenced by their employee_id), DELETE deactivates a
+              leaver. Accounts created here are always learners — admin
+              accounts are refused.
+            </span>
+          </li>
         </ul>
       </section>
     </div>
