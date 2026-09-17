@@ -97,6 +97,10 @@ export async function updateSession(request: NextRequest) {
     path.startsWith("/auth") ||
     // xAPI: Bearer-token auth, not session cookies.
     path.startsWith("/api/xapi") ||
+    // CRM integration (0071): org API-key Bearer auth inside the routes
+    // (sso-link, learner-summary); enter/exit only set or clear the embed
+    // cookies and redirect to validated targets, which auth themselves.
+    path.startsWith("/api/integrations") ||
     // Invitations: token-based, no session needed to accept.
     path.startsWith("/invitations") ||
     path.startsWith("/api/invitations/accept") ||

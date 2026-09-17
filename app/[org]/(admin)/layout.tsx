@@ -134,6 +134,9 @@ export default async function AdminLayout({
             {role === "super_owner" && (
               <NavItem href={`/${org.slug}/master-data`} label="Master data" />
             )}
+            {role === "super_owner" && (
+              <NavItem href={`/${org.slug}/integrations`} label="CRM & API" />
+            )}
             {manage && <NavItem href={`/${org.slug}/settings`} label="Settings" />}
           </nav>
 

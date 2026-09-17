@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { BookOpen } from "lucide-react";
+import { cookies } from "next/headers";
+import { ArrowLeft, BookOpen } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
 import { ProfileDropdown } from "./_components/profile-dropdown";
@@ -64,6 +65,14 @@ export default async function LearnerLayout({
   const canSwitch = canManage(role) || canViewReports(role);
   const brandColor = (org.brand_color as string | null) || "#4f46e5";
   const brandFont = (org.brand_font as string | null) || "inter";
+
+  // CRM embedded mode (0071): entered via /api/integrations/enter, exited
+  // via the Back button. The LMS renders as a chrome-less learning surface
+  // inside the company's own front door — no nav, no profile menu, just the
+  // content and a way back to the CRM.
+  const cookieStore = await cookies();
+  const crmEmbed = cookieStore.get("crm_embed")?.value === "1";
+  const crmReturn = cookieStore.get("crm_return")?.value ?? "";
 
   // Gamification: hide the Leaderboard nav item when boards are disabled.
   // One PK-indexed read (members can read their org's settings under RLS);
@@ -221,50 +230,78 @@ export default async function LearnerLayout({
       )}
       <PlatformBroadcastBanner />
       {popup && <PopupAnnouncement orgSlug={org.slug} popup={popup} />}
-      <header className="sticky top-0 z-30 border-b border-line bg-paper/95 backdrop-blur">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between h-[68px] gap-3">
-          <div className="flex items-center gap-6">
-            <Link href={`/${org.slug}/dashboard`} className="flex items-center gap-2">
+      {crmEmbed ? (
+        /* Embedded mode: slim bar — brand + Back to CRM. No nav, no menus. */
+        <header className="sticky top-0 z-30 border-b border-line bg-paper/95 backdrop-blur">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between h-[52px] gap-3">
+            <div className="flex items-center gap-2 min-w-0">
               {org.logo_url ? (
                 /* eslint-disable-next-line @next/next/no-img-element */
-                <img src={org.logo_url} alt={org.name} className="h-11 w-auto max-w-[180px] object-contain" />
+                <img src={org.logo_url} alt={org.name} className="h-8 w-auto max-w-[140px] object-contain" />
               ) : (
-                <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-sm" style={{ background: brandColor }}>
-                  <BookOpen className="w-5 h-5 text-white" />
+                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: brandColor }}>
+                  <BookOpen className="w-4 h-4 text-white" />
                 </div>
               )}
-              <span className="font-semibold text-lg tracking-tight">{org.name}</span>
-            </Link>
+              <span className="font-semibold tracking-tight truncate">{org.name}</span>
+            </div>
+            <a
+              href={`/api/integrations/exit?to=${encodeURIComponent(crmReturn)}`}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-line rounded-lg text-sm font-medium hover:border-ink shrink-0"
+              data-testid="crm-back"
+            >
+              <ArrowLeft className="w-4 h-4" /> Back to CRM
+            </a>
+          </div>
+        </header>
+      ) : (
+        <header className="sticky top-0 z-30 border-b border-line bg-paper/95 backdrop-blur">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-between h-[68px] gap-3">
+            <div className="flex items-center gap-6">
+              <Link href={`/${org.slug}/dashboard`} className="flex items-center gap-2">
+                {org.logo_url ? (
+                  /* eslint-disable-next-line @next/next/no-img-element */
+                  <img src={org.logo_url} alt={org.name} className="h-11 w-auto max-w-[180px] object-contain" />
+                ) : (
+                  <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-sm" style={{ background: brandColor }}>
+                    <BookOpen className="w-5 h-5 text-white" />
+                  </div>
+                )}
+                <span className="font-semibold text-lg tracking-tight">{org.name}</span>
+              </Link>
 
-            <LearnerTopNav
+              <LearnerTopNav
+                orgSlug={org.slug}
+                showLeaderboard={showLeaderboard}
+                showJourney={showJourney}
+                showTeamPerformance={showTeamPerformance}
+              />
+            </div>
+
+            <ProfileDropdown
               orgSlug={org.slug}
-              showLeaderboard={showLeaderboard}
-              showJourney={showJourney}
-              showTeamPerformance={showTeamPerformance}
+              email={user.email ?? "you"}
+              displayName={displayName}
+              avatarUrl={avatarUrl}
+              roleLabel={roleLabel(role)}
+              canSwitchToAdmin={canSwitch}
+              brandColor={brandColor}
             />
           </div>
+        </header>
+      )}
 
-          <ProfileDropdown
-            orgSlug={org.slug}
-            email={user.email ?? "you"}
-            displayName={displayName}
-            avatarUrl={avatarUrl}
-            roleLabel={roleLabel(role)}
-            canSwitchToAdmin={canSwitch}
-            brandColor={brandColor}
-          />
-        </div>
-      </header>
-
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 pb-24 md:pb-8">
+      <main className={`flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 ${crmEmbed ? "pb-8" : "pb-24 md:pb-8"}`}>
         {children}
       </main>
 
-      <MobileBottomNav
-        orgSlug={org.slug}
-        brandColor={brandColor}
-        showLeaderboard={showLeaderboard}
-      />
+      {!crmEmbed && (
+        <MobileBottomNav
+          orgSlug={org.slug}
+          brandColor={brandColor}
+          showLeaderboard={showLeaderboard}
+        />
+      )}
     </div>
   );
 }

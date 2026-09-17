@@ -10,6 +10,7 @@ import {
 import { notifyBackground } from "@/lib/notifications/send";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
+import { fireCompletionWebhook } from "@/lib/integrations/webhook";
 
 /**
  *   POST /api/scorm/{attemptId}/commit
@@ -203,6 +204,33 @@ export async function POST(
           .eq("id", orgId)
           .maybeSingle();
         const portalBase = await originFromRequest();
+
+        // CRM completion webhook (0071) — fail-isolated inside this already
+        // fail-isolated block; the employee's CRM record updates in
+        // near-real-time without polling.
+        try {
+          const { data: memRow } = await svc
+            .from("organization_members")
+            .select("employee_id")
+            .eq("organization_id", orgId)
+            .eq("user_id", user.id)
+            .maybeSingle();
+          await fireCompletionWebhook(orgId, {
+            event: "course_completed",
+            organization: (orgRow as { slug?: string } | null)?.slug ?? "",
+            employee_id:
+              (memRow as { employee_id?: string | null } | null)?.employee_id ?? null,
+            email: user.email ?? null,
+            user_id: user.id,
+            course_id: r?.course_versions?.course_id ?? "",
+            course_title: courseTitle ?? "",
+            score: typeof r?.score === "number" ? Math.round(r.score * 100) : null,
+            passed: justPassed || success_status === "passed",
+            completed_at: new Date().toISOString(),
+          });
+        } catch (e) {
+          console.warn("[scorm/commit] CRM webhook failed:", e);
+        }
         await notifyBackground({
           organizationId: orgId,
           event: "asset_completion",
