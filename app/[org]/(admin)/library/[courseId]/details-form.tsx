@@ -14,6 +14,7 @@ export type CourseDetails = {
   thumbnail_pos_x: number;
   thumbnail_pos_y: number;
   visibility: "private" | "org_public";
+  show_attempts_history: boolean;
 };
 
 export function DetailsForm({
@@ -54,6 +55,11 @@ export function DetailsForm({
         thumbnail_pos_x: form.thumbnail_pos_x,
         thumbnail_pos_y: form.thumbnail_pos_y,
         visibility: form.visibility,
+        // 0072 deploy safety: only sent when the admin actually flipped the
+        // toggle, so pre-migration saves of the other fields keep working.
+        ...(form.show_attempts_history !== initial.show_attempts_history
+          ? { show_attempts_history: form.show_attempts_history }
+          : {}),
       }),
     });
     setBusy(false);
@@ -144,6 +150,38 @@ export function DetailsForm({
         onChange={(v) => set("visibility", v)}
         assetKind="course"
       />
+
+      {/* 0072: hide the "My attempts" section (and per-attempt breakdowns)
+          from learners. Admin reports are unaffected. */}
+      <label className="flex items-start justify-between gap-4 border border-line rounded-xl p-3 cursor-pointer">
+        <span className="block">
+          <span className="block text-sm font-medium">
+            Show attempt history to learners
+          </span>
+          <span className="block text-xs text-muted mt-1 leading-relaxed">
+            When off, learners no longer see the &quot;My attempts&quot; list
+            (scores, dates, per-question breakdowns) on this course&apos;s
+            page. Admin reports are not affected.
+          </span>
+        </span>
+        <span
+          className={`mt-0.5 relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors ${
+            form.show_attempts_history ? "bg-emerald-500" : "bg-line"
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={form.show_attempts_history}
+            onChange={(e) => set("show_attempts_history", e.target.checked)}
+            className="sr-only"
+          />
+          <span
+            className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
+              form.show_attempts_history ? "left-[18px]" : "left-0.5"
+            }`}
+          />
+        </span>
+      </label>
 
       {error && (
         <div className="border border-red-200 bg-red-50 text-red-900 rounded-lg p-3 text-sm">

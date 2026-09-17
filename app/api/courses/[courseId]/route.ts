@@ -7,7 +7,8 @@ import { createClient } from "@/lib/supabase/server";
  *
  * Admin-only via RLS. PATCH accepts any subset of: title, description,
  * duration_minutes, is_active, thumbnail_url, thumbnail_fit,
- * thumbnail_pos_x, thumbnail_pos_y, visibility, folder_id.
+ * thumbnail_pos_x, thumbnail_pos_y, visibility, folder_id,
+ * show_attempts_history.
  */
 
 const VISIBILITY_VALUES = ["private", "org_public"] as const;
@@ -29,6 +30,7 @@ export async function PATCH(
     thumbnail_pos_y?: number;
     visibility?: string;
     folder_id?: string | null;
+    show_attempts_history?: boolean;
   };
 
   const supabase = await createClient();
@@ -96,6 +98,11 @@ export async function PATCH(
   }
   if (typeof body.is_active === "boolean") {
     update.is_active = body.is_active;
+  }
+  // 0072 — only written when explicitly sent, so pre-migration saves of the
+  // other fields keep working.
+  if (typeof body.show_attempts_history === "boolean") {
+    update.show_attempts_history = body.show_attempts_history;
   }
   if (body.thumbnail_url !== undefined) {
     update.thumbnail_url = body.thumbnail_url || null;

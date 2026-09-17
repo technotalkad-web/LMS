@@ -73,13 +73,23 @@ export default async function AttemptDetailPage({
     .maybeSingle();
   const v = (versionRow ?? null) as Version | null;
 
+  // select("*") for 0072 deploy safety (show_attempts_history).
   const { data: courseRow } = await supabase
     .from("courses")
-    .select("id, title, organization_id")
+    .select("*")
     .eq("id", courseId)
     .maybeSingle();
   const c = (courseRow ?? null) as Course | null;
   if (!v || !c) redirect(`/${orgSlug}/courses/${courseId}`);
+
+  // 0072: when the admin hid the attempts history for this course, the
+  // per-attempt breakdown is off-limits to learners too (no deep links).
+  if (
+    !isAdmin &&
+    (c as { show_attempts_history?: boolean }).show_attempts_history === false
+  ) {
+    redirect(`/${orgSlug}/courses/${courseId}`);
+  }
 
   // Pull statements (cmi5) and extract interactions.
   let interactions: Interaction[] = [];

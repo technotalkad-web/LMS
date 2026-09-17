@@ -39,6 +39,8 @@ type Course = {
   thumbnail_url: string | null;
   thumbnail_pos_x: number | null;
   thumbnail_pos_y: number | null;
+  /** 0072 — optional so pre-migration rows read as "visible". */
+  show_attempts_history?: boolean;
 };
 
 type Attempt = {
@@ -62,11 +64,10 @@ export default async function CourseDetailPage({
   const isAdmin = canManage(role);
 
   const supabase = await createClient();
+  // select("*") for 0072 deploy safety (show_attempts_history).
   const { data: course } = await supabase
     .from("courses")
-    .select(
-      "id, slug, title, description, status, current_version_id, organization_id, is_active, thumbnail_url, thumbnail_pos_x, thumbnail_pos_y"
-    )
+    .select("*")
     .eq("id", courseId)
     .eq("organization_id", org.id)
     .maybeSingle();
@@ -177,6 +178,11 @@ export default async function CourseDetailPage({
       ? Math.round(current.manifest_data.masteryScore * 100)
       : null;
 
+  // 0072: admins can hide the attempts history from learners. Admins still
+  // see it (with a badge) so they can preview what they've hidden.
+  const attemptsHidden = c.show_attempts_history === false;
+  const showAttemptsSection = isAdmin || !attemptsHidden;
+
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       <Link
@@ -186,9 +192,11 @@ export default async function CourseDetailPage({
         <ArrowLeft className="w-4 h-4" /> Back to dashboard
       </Link>
 
-      <div className="bg-paper border border-line rounded-2xl overflow-hidden shadow-sm">
+      {/* No overflow-hidden here: it clipped the language dropdown that
+          opens from the launch row. The hero clips itself instead. */}
+      <div className="bg-paper border border-line rounded-2xl shadow-sm">
         {/* Hero banner */}
-        <div className="relative bg-gradient-to-br from-slate-800 to-slate-950 text-white p-7 sm:p-9 overflow-hidden">
+        <div className="relative bg-gradient-to-br from-slate-800 to-slate-950 text-white p-7 sm:p-9 overflow-hidden rounded-t-2xl">
           {c.thumbnail_url ? (
             <>
               {/* Hero stays cover (it's a darkened backdrop behind text) but
@@ -300,10 +308,19 @@ export default async function CourseDetailPage({
         </div>
       </div>
 
-      {/* Attempts */}
+      {/* Attempts — hidden from learners when the admin turned the course's
+          "show attempt history" toggle off (0072). */}
+      {showAttemptsSection && (
       <section className="bg-paper border border-line rounded-2xl overflow-hidden shadow-sm">
         <header className="px-6 py-4 border-b border-line">
-          <h2 className="font-semibold">My attempts</h2>
+          <h2 className="font-semibold flex items-center gap-2">
+            My attempts
+            {isAdmin && attemptsHidden && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-amber-100 text-amber-800 border border-amber-200">
+                Hidden from learners
+              </span>
+            )}
+          </h2>
           <p className="text-xs text-muted mt-0.5">
             Your history with this course. Click any row for the per-question
             breakdown.
@@ -328,6 +345,7 @@ export default async function CourseDetailPage({
           </ul>
         )}
       </section>
+      )}
     </div>
   );
 }

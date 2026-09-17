@@ -94,6 +94,15 @@ export function ChangeLanguageMenu({
         <ChevronDown className="w-3 h-3" />
       </button>
 
+      {/* Click-away catcher: the menu previously stayed open until the
+          trigger was clicked again, sitting on top of the launch row. */}
+      {open && (
+        <div
+          className="fixed inset-0 z-20"
+          aria-hidden="true"
+          onClick={() => setOpen(false)}
+        />
+      )}
       {open && (
         <div className="absolute right-0 mt-1 min-w-[220px] bg-paper border border-line rounded-xl shadow-lg z-30 py-1">
           {options.map((o) => {
