@@ -39,6 +39,8 @@ type Course = {
   thumbnail_pos_x: number | null;
   thumbnail_pos_y: number | null;
   visibility: "private" | "org_public";
+  /** 0072 — optional so pre-migration rows read as "visible". */
+  show_attempts_history?: boolean;
 };
 
 type TeamRow = { id: string; name: string; slug: string };
@@ -55,11 +57,10 @@ export default async function AdminCourseDetailPage({
   }
 
   const supabase = await createClient();
+  // select("*") for 0072 deploy safety (show_attempts_history).
   const { data: course } = await supabase
     .from("courses")
-    .select(
-      "id, slug, title, description, status, current_version_id, organization_id, duration_minutes, is_active, thumbnail_url, thumbnail_fit, thumbnail_pos_x, thumbnail_pos_y, visibility"
-    )
+    .select("*")
     .eq("id", courseId)
     .eq("organization_id", org.id)
     .maybeSingle();
@@ -361,6 +362,7 @@ export default async function AdminCourseDetailPage({
     thumbnail_pos_x: c.thumbnail_pos_x ?? 50,
     thumbnail_pos_y: c.thumbnail_pos_y ?? 50,
     visibility: c.visibility ?? "private",
+    show_attempts_history: c.show_attempts_history !== false,
   };
 
   return (
