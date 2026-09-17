@@ -292,10 +292,13 @@ function PathTile({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               alt=""
               className="absolute inset-0 w-full h-full object-cover"
             />
-            <div className="absolute inset-0 bg-gradient-to-br from-indigo-900/60 to-indigo-900/85" />
+            {/* Keep the artwork CRISP — only a thin bottom scrim so the
+                status chip stays legible on bright images. (A full-cover
+                indigo wash here used to drown real thumbnails.) */}
+            <div className="absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t from-black/50 to-transparent" />
           </>
         )}
-        <span className="absolute top-3 left-3 inline-flex items-center gap-1 bg-white/20 backdrop-blur-sm text-white text-[10px] font-bold tracking-wider uppercase px-2 py-1 rounded-md">
+        <span className="absolute top-3 left-3 inline-flex items-center gap-1 bg-black/45 backdrop-blur-sm text-white text-[10px] font-bold tracking-wider uppercase px-2 py-1 rounded-md">
           <ListIcon className="w-3 h-3" />
           Learning Path
         </span>
