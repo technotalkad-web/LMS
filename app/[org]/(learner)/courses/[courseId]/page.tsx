@@ -294,12 +294,19 @@ export default async function CourseDetailPage({
               <span className="text-[11px] text-muted">{describePolicy(policy)}</span>
             </div>
             <dl className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <ScoreStat
-                label="Official score"
-                value={pct(scoring.officialScore)}
-                sub={officialBasisLabel(policy)}
-              />
-              <ScoreStat label="Best scored attempt" value={pct(scoring.bestScore)} />
+              {/* Score values respect the 0072 "hide attempt history" toggle;
+                  the attempt counters stay so learners always know how many
+                  scored attempts they have left. */}
+              {showAttemptsSection && (
+                <ScoreStat
+                  label="Official score"
+                  value={pct(scoring.officialScore)}
+                  sub={officialBasisLabel(policy)}
+                />
+              )}
+              {showAttemptsSection && (
+                <ScoreStat label="Best scored attempt" value={pct(scoring.bestScore)} />
+              )}
               <ScoreStat
                 label="Scored attempts"
                 value={`${scoring.scoredAttempts} of ${policy.max_scored_attempts}`}
