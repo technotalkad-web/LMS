@@ -116,6 +116,8 @@ Rules your sync can rely on:
     {
       "course_id": "…", "title": "Objection Handling",
       "status": "in_progress", "score": 82, "attempts": 2,
+      "official_score": 82, "first_score": 74, "best_score": 82,
+      "scored_attempts": 2, "practice_attempts": 0,
       "due_at": "2026-09-30T00:00:00+00:00", "overdue": false,
       "target": "/ambak/courses/…/launch"
     }
@@ -129,7 +131,15 @@ Rules your sync can rely on:
 
 Render these as native cards in your app. Statuses:
 `not_started | in_progress | completed | passed`. Every item carries a
-ready-made `target` for Step 4. Entitlements (direct, org-wide, team, and
+ready-made `target` for Step 4.
+
+**Scores follow the LMS's attempt rules.** Admins configure, per module /
+learning path / journey, how many completed attempts are scored (default 3)
+and which one is the official score (default: the first attempt). `score`
+and `official_score` are that official value; `first_score` is retained for
+learning-gain analysis, `best_score` is the best inside the scored window,
+and `practice_attempts` counts revision attempts beyond the window — those
+never change any score. Show `official_score` on the employee's card. Entitlements (direct, org-wide, team, and
 dynamic-group assignments) are expanded with the same resolvers the LMS
 itself uses, so your card and the LMS always agree.
 

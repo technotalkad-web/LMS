@@ -262,7 +262,7 @@ export default async function CourseReportsPage({
             sub={
               avgScorePct === null
                 ? "No scored attempts yet"
-                : undefined
+                : "Official scores · practice attempts excluded"
             }
           />
           <BigStat

@@ -15,6 +15,8 @@ import { createClient } from "@/lib/supabase/server";
 import { isReleased } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
+import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { resolvePolicies } from "@/lib/scoring/resolve";
 
 type PathRow = {
   id: string;
@@ -186,28 +188,32 @@ export default async function LearningPathDetailPage({
   // a standalone completion of the same module does not advance the path.
   // (Product decision L2.) Path step links carry ?lp= so launches are tagged.
   const versionIds = versions.map((v) => v.id);
+  // ALL of the learner's attempts on these modules (any launch context): the
+  // 0073 scoring window counts every completed attempt of a module, whichever
+  // screen launched it. Path PROGRESS below still uses path-context only.
   const { data: attemptRows } = versionIds.length
     ? await supabase
         .from("course_attempts")
         .select(
-          "course_version_id, completion_status, success_status, score, started_at, completed_at"
+          "id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
         )
         .eq("user_id", user.id)
-        .eq("learning_path_id", pathId)
         .in("course_version_id", versionIds)
     : { data: [] };
   type Attempt = {
+    id: string;
     course_version_id: string;
     completion_status: string;
     success_status: string;
     score: number | null;
     started_at: string;
     completed_at: string | null;
+    learning_path_id: string | null;
   };
-  const attempts = (attemptRows ?? []) as Attempt[];
+  const allAttempts = (attemptRows ?? []) as Attempt[];
+  const attempts = allAttempts.filter((a) => a.learning_path_id === pathId);
   const completedCourseIds = new Set<string>();
   const inProgressCourseIds = new Set<string>();
-  const scoreByCourse = new Map<string, number>();
   for (const a of attempts) {
     const v = versionById.get(a.course_version_id);
     if (!v) continue;
@@ -216,15 +222,25 @@ export default async function LearningPathDetailPage({
       a.success_status === "passed"
     ) {
       completedCourseIds.add(v.course_id);
-      if (typeof a.score === "number") {
-        const prev = scoreByCourse.get(v.course_id);
-        if (prev === undefined || a.score > prev) {
-          scoreByCourse.set(v.course_id, a.score);
-        }
-      }
     } else if (a.completion_status === "in_progress") {
       inProgressCourseIds.add(v.course_id);
     }
+  }
+  // Official score per module under its attempt scoring rule (0073).
+  const attemptsByCourse = new Map<string, Attempt[]>();
+  for (const a of allAttempts) {
+    const v = versionById.get(a.course_version_id);
+    if (!v) continue;
+    attemptsByCourse.set(v.course_id, [
+      ...(attemptsByCourse.get(v.course_id) ?? []),
+      a,
+    ]);
+  }
+  const policies = await resolvePolicies(supabase, [...attemptsByCourse.keys()]);
+  const scoreByCourse = new Map<string, number>();
+  for (const [cid, list] of attemptsByCourse) {
+    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY).officialScore;
+    if (s !== null) scoreByCourse.set(cid, s);
   }
 
   // 6) Compute per-step state (completed | current | locked | unreleased).
@@ -499,7 +515,7 @@ function StepCard({
             {isCompleted && score !== null && (
               <span className="flex items-center gap-1 text-emerald-700 font-medium">
                 <Award className="w-3.5 h-3.5" />
-                Best: {(score * 100).toFixed(0)}%
+                Score: {(score * 100).toFixed(0)}%
               </span>
             )}
           </div>

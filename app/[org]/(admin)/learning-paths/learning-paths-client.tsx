@@ -18,6 +18,8 @@ import type {
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
 import { QrCodeModal } from "../_components/qr-code-modal";
 import { VisibilityRadio } from "../library/[courseId]/details-form";
+import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
+import type { ScoringRule } from "@/lib/scoring/policy";
 import {
   AdminPageHeader,
   KpiStrip,
@@ -73,6 +75,7 @@ export function LearningPathsClient({
   memberOptions,
   teamOptions,
   groupOptions = [],
+  scoringRules = {},
 }: {
   orgSlug: string;
   paths: PathRow[];
@@ -83,8 +86,9 @@ export function LearningPathsClient({
   memberOptions: MemberOption[];
   teamOptions: TeamOption[];
   groupOptions?: GroupOption[];
+  /** 0073: explicit attempt scoring rule per path id. */
+  scoringRules?: Record<string, ScoringRule>;
 }) {
-  void orgSlug;
   const router = useRouter();
   const toast = useToast();
   const confirm = useConfirm();
@@ -774,6 +778,14 @@ export function LearningPathsClient({
                               [p.id]: { ...s[p.id], sequence_mode: v },
                             }))
                           }
+                        />
+                        {/* Attempt scoring rules (0073) — saves on its own. */}
+                        <ScoringRulesCard
+                          orgSlug={orgSlug}
+                          scope="path"
+                          targetId={p.id}
+                          initialRule={scoringRules[p.id] ?? null}
+                          compact
                         />
                       </div>
                     )}

@@ -29,6 +29,8 @@ import {
   effectiveScoreLabel,
 } from "@/lib/gamification/board-copy";
 import { effectiveJourneyCopy } from "@/lib/journey/journey";
+import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { resolvePolicies } from "@/lib/scoring/resolve";
 
 type Course = {
   id: string;
@@ -487,6 +489,10 @@ export default async function DashboardPage({
         .in("course_version_id", versionIds)
     : { data: [] as Attempt[] };
   const attempts = (attemptRows ?? []) as Attempt[];
+  // 0073 scoring rules per course (one RPC; fail-soft → defaults).
+  const policies = await resolvePolicies(supabase, [
+    ...new Set(versions.map((v) => v.course_id)),
+  ]);
 
   // 8) Completed course set (GLOBAL — any completion; used for standalone
   // course tiles + deadlines).
@@ -519,12 +525,10 @@ export default async function DashboardPage({
   } catch {
     myGamification = null;
   }
-  // Avg score from the attempts already fetched — no extra query.
-  const completedScores = attempts
-    .filter(
-      (a) => a.completion_status === "completed" || a.success_status === "passed"
-    )
-    .map((a) => a.score)
+  // Avg of OFFICIAL scores per completed course (0073 scoring rules —
+  // practice attempts excluded), from the attempts already fetched.
+  const completedScores = [...completedCourseIds]
+    .map((cid) => officialScoreForCourse(cid))
     .filter((s): s is number => typeof s === "number");
   const avgScore = completedScores.length
     ? completedScores.reduce((x, y) => x + y, 0) / completedScores.length
@@ -680,18 +684,14 @@ export default async function DashboardPage({
     return "in_progress";
   }
 
-  function bestScoreForCourse(courseId: string): number | null {
+  // Official score under the course's scoring rule (0073). The card prop is
+  // still called bestScore; practice attempts never feed it.
+  function officialScoreForCourse(courseId: string): number | null {
     const my = attempts.filter((a) => {
       const v = versionById.get(a.course_version_id);
       return v?.course_id === courseId;
     });
-    return my
-      .map((a) => a.score)
-      .filter((s): s is number => typeof s === "number")
-      .reduce<number | null>(
-        (best, s) => (best === null || s > best ? s : best),
-        null
-      );
+    return computeScoring(my, policies.get(courseId) ?? DEFAULT_POLICY).officialScore;
   }
 
   function pushCard(a: Assignment, source: "user" | "team" | "org") {
@@ -713,7 +713,7 @@ export default async function DashboardPage({
       releaseAt,
       isRevised: false,
       dueAt: a.due_at,
-      bestScore: bestScoreForCourse(course.id),
+      bestScore: officialScoreForCourse(course.id),
       pathName: pathNameByCourseId.get(course.id) ?? null,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,
@@ -747,7 +747,7 @@ export default async function DashboardPage({
       releaseAt,
       isRevised: false,
       dueAt: null,
-      bestScore: bestScoreForCourse(cid),
+      bestScore: officialScoreForCourse(cid),
       pathName,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,

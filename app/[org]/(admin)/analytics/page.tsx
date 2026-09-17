@@ -12,6 +12,8 @@ import {
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canViewReports } from "@/lib/auth/permissions";
+import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { resolvePolicies } from "@/lib/scoring/resolve";
 import {
   fetchActiveMembers,
   resolveGroupMembers,
@@ -121,6 +123,7 @@ async function fetchAll<T>(
 /* ---------------- types ---------------- */
 
 type AttemptRow = {
+  id: string;
   user_id: string;
   course_version_id: string;
   completion_status: "in_progress" | "completed" | null;
@@ -130,6 +133,16 @@ type AttemptRow = {
   completed_at: string | null;
   last_activity_at: string | null;
 };
+
+/** Shape an attempt row for the 0073 scoring engine. */
+const toScorable = (a: AttemptRow) => ({
+  id: a.id,
+  score: a.score,
+  started_at: a.started_at ?? "",
+  completed_at: a.completed_at,
+  completion_status: a.completion_status,
+  success_status: a.success_status,
+});
 
 type CourseAssign = {
   course_id: string;
@@ -341,7 +354,7 @@ export default async function AnalyticsPage({
     ? await fetchByIds<AttemptRow>(
         svc,
         "course_attempts",
-        "user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at",
+        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at",
         "user_id",
         scopedIds,
         (q) => q.eq("organization_id", org.id)
@@ -514,6 +527,9 @@ export default async function AnalyticsPage({
     return done;
   };
 
+  // 0073: official-score rules per course (practice attempts excluded).
+  const policies = await resolvePolicies(svc, [...new Set(courseOfVersion.values())]);
+
   const lensCourse = filters.content.startsWith("course:") ? filters.content.slice(7) : null;
   const lensPath = filters.content.startsWith("path:") ? filters.content.slice(5) : null;
   const lensJourney = filters.content.startsWith("journey:") ? filters.content.slice(8) : null;
@@ -525,7 +541,17 @@ export default async function AnalyticsPage({
     const assignedMap = assignedByUser.get(uid) ?? new Map();
     const assigned = assignedMap.size;
     const completed = [...assignedMap.keys()].filter((c) => done.has(c)).length;
-    const scores = my.map((a) => a.score).filter((s): s is number => typeof s === "number");
+    // Average of OFFICIAL scores per course (0073), not of every attempt.
+    const byCourse = new Map<string, AttemptRow[]>();
+    for (const a of my) {
+      const cid = courseOfVersion.get(a.course_version_id);
+      if (cid) byCourse.set(cid, [...(byCourse.get(cid) ?? []), a]);
+    }
+    const scores = [...byCourse.entries()]
+      .map(([cid, list]) =>
+        computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY).officialScore
+      )
+      .filter((s): s is number => typeof s === "number");
     const avgScore = scores.length
       ? Math.round((scores.reduce((x, y) => x + y, 0) / scores.length) * 100)
       : null;
@@ -803,15 +829,23 @@ export default async function AnalyticsPage({
     for (const [cid] of assignedMap) {
       perCourse.set(cid, { attempts: 0, best: null, last: null, status: "Not started" });
     }
+    const attemptsOfCourse = new Map<string, AttemptRow[]>();
     for (const a of my) {
       const cid = courseOfVersion.get(a.course_version_id);
       if (!cid) continue;
       const row = perCourse.get(cid) ?? { attempts: 0, best: null, last: null, status: "Not started" };
       row.attempts++;
-      if (typeof a.score === "number" && (row.best === null || a.score > row.best)) row.best = a.score;
+      attemptsOfCourse.set(cid, [...(attemptsOfCourse.get(cid) ?? []), a]);
       const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
       if (t && (!row.last || t > row.last)) row.last = t;
       perCourse.set(cid, row);
+    }
+    // "best" = the OFFICIAL score under the course's 0073 rule.
+    for (const [cid, list] of attemptsOfCourse) {
+      const row = perCourse.get(cid);
+      if (row) {
+        row.best = computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY).officialScore;
+      }
     }
     for (const [cid, row] of perCourse) {
       row.status = done.has(cid)
@@ -899,7 +933,7 @@ export default async function AnalyticsPage({
                 <tr className="text-left text-[11px] uppercase tracking-wide text-muted border-b border-line">
                   <th className="px-5 py-2">Course</th>
                   <th className="px-4 py-2">Status</th>
-                  <th className="px-4 py-2">Best score</th>
+                  <th className="px-4 py-2">Official score</th>
                   <th className="px-4 py-2">Attempts</th>
                   <th className="px-4 py-2">Due</th>
                   <th className="px-4 py-2">Last activity</th>
