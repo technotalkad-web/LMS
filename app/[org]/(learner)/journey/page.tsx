@@ -275,7 +275,10 @@ export default async function JourneyPage({
               {missionDays.map((d) => (
                 <Link
                   key={d.day}
-                  href={`/${orgSlug}/courses/${d.course_id}/launch`}
+                  // ?journey= without &day= never tags the attempt (reviews
+                  // stay progress/XP-neutral); it only brings "Exit course"
+                  // back here instead of the dashboard.
+                  href={`/${orgSlug}/courses/${d.course_id}/launch?journey=${enrollment.id}`}
                   className="flex items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
                 >
                   <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">

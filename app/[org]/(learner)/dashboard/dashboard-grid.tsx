@@ -550,7 +550,7 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
           ) : (
             <Link
               href={`/${orgSlug}/courses/${card.course_id}${
-                isCompleted ? "" : "/launch"
+                isCompleted ? "" : "/launch?back=dashboard"
               }`}
               className={`w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                 isCompleted

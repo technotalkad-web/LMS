@@ -86,7 +86,12 @@ export function LaunchLanguagePicker({
       return;
     }
     // Full-page nav so the server re-evaluates with the new saved pref.
-    window.location.href = `?lang=${encodeURIComponent(language)}`;
+    // Keep the launch context (?journey=&day=, ?lp=, ?back=) — replacing
+    // the whole query string here used to untag journey/path launches and
+    // send the exit button to the wrong place.
+    const next = new URL(window.location.href);
+    next.searchParams.set("lang", language);
+    window.location.href = next.toString();
   }
 
   return (

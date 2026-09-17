@@ -17,10 +17,13 @@ export function Cmi5Runtime({
   iframeSrc,
   courseTitle,
   backHref,
+  backLabel = "Exit course",
 }: {
   iframeSrc: string;
   courseTitle: string;
   backHref: string;
+  /** Names the launch context the exit returns to ("Back to journey"). */
+  backLabel?: string;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-ink">
@@ -29,12 +32,12 @@ export function Cmi5Runtime({
           <Link
             href={backHref}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-canvas/20 hover:border-canvas/50 hover:bg-canvas/10 text-sm font-medium transition-colors shrink-0"
-            title="Exit course and return to dashboard"
+            title={`Exit course — ${backLabel.toLowerCase()}`}
           >
             <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden>
               <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 010 1.06L9.06 10l3.73 3.71a.75.75 0 11-1.06 1.06l-4.25-4.24a.75.75 0 010-1.06l4.25-4.24a.75.75 0 011.06 0z" clipRule="evenodd" />
             </svg>
-            <span className="hidden sm:inline">Exit course</span>
+            <span className="hidden sm:inline">{backLabel}</span>
             <span className="sm:hidden">Exit</span>
           </Link>
           <span className="serif text-lg sm:text-xl truncate">{courseTitle}</span>
