@@ -15,6 +15,12 @@ import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { languageDisplay } from "@/lib/i18n/languages";
 import {
+  computeScoring,
+  describePolicy,
+  officialBasisLabel,
+} from "@/lib/scoring/policy";
+import { resolvePolicy } from "@/lib/scoring/resolve";
+import {
   ChangeLanguageMenu,
   type ChangeLanguageOption,
 } from "./change-language-menu";
@@ -158,6 +164,17 @@ export default async function CourseDetailPage({
   const attempts = (attemptsResp.data ?? []) as Attempt[];
   const versionById = new Map(list.map((v) => [v.id, v]));
 
+  // 0073: which attempts count (scoring window / official basis / what
+  // happens after the window). Fail-soft → platform default pre-migration.
+  const policy = await resolvePolicy(supabase, c.id);
+  const scoring = computeScoring(attempts, policy);
+  const launchBlocked = scoring.blocked && !isAdmin;
+  const scoreTagFor = (id: string): ScoreTag => {
+    const n = scoring.attemptNumber.get(id);
+    if (n === undefined) return null;
+    return n <= policy.max_scored_attempts ? { kind: "scored", n } : { kind: "practice" };
+  };
+
   // Sticky completion: a course that was ever completed/passed stays
   // "complete" even after the learner relaunches it (which opens a fresh
   // in-progress attempt). Only show "Resume" when there's an open attempt and
@@ -270,9 +287,54 @@ export default async function CourseDetailPage({
             </div>
           )}
 
+          {/* 0073: scoring rules — learners always know which attempt counts */}
+          <div className="border border-line rounded-xl p-4 sm:p-5 bg-canvas/40">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="font-semibold text-sm">Your scoring</h2>
+              <span className="text-[11px] text-muted">{describePolicy(policy)}</span>
+            </div>
+            <dl className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <ScoreStat
+                label="Official score"
+                value={pct(scoring.officialScore)}
+                sub={officialBasisLabel(policy)}
+              />
+              <ScoreStat label="Best scored attempt" value={pct(scoring.bestScore)} />
+              <ScoreStat
+                label="Scored attempts"
+                value={`${scoring.scoredAttempts} of ${policy.max_scored_attempts}`}
+                sub={
+                  scoring.scoredAttempts >= policy.max_scored_attempts
+                    ? "all used"
+                    : `${policy.max_scored_attempts - scoring.scoredAttempts} left`
+                }
+              />
+              <ScoreStat
+                label="Practice attempts"
+                value={String(scoring.practiceAttempts)}
+                sub="never affect scores"
+              />
+            </dl>
+            {scoring.practiceMode && (
+              <p className="mt-3 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                You&apos;ve used all {policy.max_scored_attempts} scored attempts. You
+                can keep revising as often as you like — further attempts are{" "}
+                <strong>practice</strong> and won&apos;t change your official score
+                or points.
+              </p>
+            )}
+            {scoring.blocked && (
+              <p className="mt-3 text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                You&apos;ve used all {policy.max_scored_attempts} scored attempts and
+                this course doesn&apos;t allow further attempts. Contact your
+                administrator if you need another attempt.
+              </p>
+            )}
+          </div>
+
           {/* Launch CTA */}
           <div className="pt-4 border-t border-line flex flex-wrap items-center gap-3">
-            {current ? (
+            {current && !launchBlocked ? (
               <Link
                 href={`/${orgSlug}/courses/${c.id}/launch`}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3.5 rounded-xl font-semibold transition shadow-sm"
@@ -284,10 +346,24 @@ export default async function CourseDetailPage({
                     ? "Resume course"
                     : "Launch course"}
               </Link>
+            ) : current ? (
+              <button
+                type="button"
+                disabled
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-canvas text-muted border border-line px-7 py-3.5 rounded-xl font-semibold cursor-not-allowed"
+              >
+                <PlayCircle className="w-5 h-5" />
+                Attempt limit reached
+              </button>
             ) : (
               <div className="text-sm text-muted">
                 This course doesn&apos;t have a version yet.
               </div>
+            )}
+            {current && !launchBlocked && scoring.practiceMode && (
+              <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800 border border-amber-200">
+                Practice mode
+              </span>
             )}
             {/* Phase 3: Change language — auto-hides if <2 active packages */}
             <ChangeLanguageMenu
@@ -340,6 +416,7 @@ export default async function CourseDetailPage({
                 version={versionById.get(a.course_version_id)}
                 orgSlug={orgSlug}
                 courseId={c.id}
+                scoreTag={scoreTagFor(a.id)}
               />
             ))}
           </ul>
@@ -350,18 +427,45 @@ export default async function CourseDetailPage({
   );
 }
 
+/** 0073: whether a completed attempt fed the score (and its rank) or was practice. */
+type ScoreTag = { kind: "scored"; n: number } | { kind: "practice" } | null;
+
+function pct(v: number | null): string {
+  return v === null ? "—" : `${Math.round(v * 100)}%`;
+}
+
+function ScoreStat({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+}) {
+  return (
+    <div>
+      <dt className="text-[11px] uppercase tracking-wide text-muted">{label}</dt>
+      <dd className="text-lg font-semibold tabular-nums leading-tight">{value}</dd>
+      {sub && <dd className="text-[11px] text-muted">{sub}</dd>}
+    </div>
+  );
+}
+
 function AttemptRow({
   attempt,
   number,
   version,
   orgSlug,
   courseId,
+  scoreTag,
 }: {
   attempt: Attempt;
   number: number;
   version: Version | undefined;
   orgSlug: string;
   courseId: string;
+  scoreTag: ScoreTag;
 }) {
   const score =
     attempt.score === null
@@ -388,6 +492,16 @@ function AttemptRow({
           </span>
           <CompletionPill completion={attempt.completion_status} />
           <SuccessPill success={attempt.success_status} />
+          {scoreTag?.kind === "scored" && (
+            <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-indigo-100 text-indigo-800 border border-indigo-200 shrink-0">
+              Scored #{scoreTag.n}
+            </span>
+          )}
+          {scoreTag?.kind === "practice" && (
+            <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-canvas text-muted border border-line shrink-0">
+              Practice
+            </span>
+          )}
           {version && (
             <span className="text-xs text-muted shrink-0">
               v{version.version_number}

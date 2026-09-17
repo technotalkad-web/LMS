@@ -6,6 +6,8 @@ import { Plus, RotateCcw, Swords, Upload, X } from "lucide-react";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { JourneyIcon, isIconUrl } from "@/components/ui/journey-icon";
+import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
+import type { ScoringRule } from "@/lib/scoring/policy";
 import {
   computeJourneyState,
   effectiveJourneyCopy,
@@ -91,6 +93,7 @@ export function JourneyAdminClient({
   audienceOptions = {},
   teams = [],
   orgGroups = [],
+  scoringRule = null,
 }: {
   orgSlug: string;
   programs?: ProgramSummary[];
@@ -105,6 +108,8 @@ export function JourneyAdminClient({
   audienceOptions?: Record<string, string[]>;
   teams?: Array<{ id: string; name: string }>;
   orgGroups?: Array<{ id: string; name: string }>;
+  /** 0073: this journey's explicit attempt scoring rule. */
+  scoringRule?: ScoringRule | null;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -399,6 +404,7 @@ export function JourneyAdminClient({
           courses={courses}
           orgGroups={orgGroups}
           activeEnrollments={enrollments.filter((e) => e.status === "active").length}
+          scoringRule={scoringRule}
         />
       </div>
     </div>
@@ -1081,6 +1087,7 @@ function SettingsTab({
   courses = [],
   orgGroups = [],
   activeEnrollments = 0,
+  scoringRule = null,
 }: {
   orgSlug: string;
   program: ProgramRow;
@@ -1089,6 +1096,7 @@ function SettingsTab({
   courses?: CourseOption[];
   orgGroups?: Array<{ id: string; name: string }>;
   activeEnrollments?: number;
+  scoringRule?: ScoringRule | null;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -1291,6 +1299,15 @@ function SettingsTab({
 
   return (
     <div className="space-y-5">
+      {/* Attempt scoring rules for the journey's mission modules (0073).
+          Saves independently of the settings form below. */}
+      <ScoringRulesCard
+        orgSlug={orgSlug}
+        scope="journey"
+        targetId={program.id}
+        initialRule={scoringRule}
+        compact
+      />
       <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
         <label className="block">
           <span className="block text-xs uppercase tracking-wide text-muted mb-1">Journey name</span>

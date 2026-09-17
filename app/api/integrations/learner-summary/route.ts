@@ -7,6 +7,12 @@ import {
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import {
+  DEFAULT_POLICY,
+  computeScoring,
+  type ScorableAttempt,
+} from "@/lib/scoring/policy";
+import { resolvePolicies } from "@/lib/scoring/resolve";
 
 /**
  * One call, everything the CRM needs to render an employee's learning card:
@@ -132,10 +138,11 @@ export async function GET(request: Request) {
   // ---- attempts → status/score per course ----
   const { data: atRows } = await svc
     .from("course_attempts")
-    .select("course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at")
+    .select("id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at")
     .eq("organization_id", orgId)
     .eq("user_id", uid);
   type Att = {
+    id: string;
     course_version_id: string;
     completion_status: string | null;
     success_status: string | null;
@@ -152,21 +159,30 @@ export async function GET(request: Request) {
   const courseOfVer = new Map(
     ((verRows ?? []) as Array<{ id: string; course_id: string }>).map((v) => [v.id, v.course_id])
   );
-  const byCourse = new Map<string, { status: string; best: number | null; attempts: number }>();
+  const byCourse = new Map<string, { status: string; attempts: number; list: ScorableAttempt[] }>();
   let lastActive: string | null = null;
   for (const a of attempts) {
     const cid = courseOfVer.get(a.course_version_id);
     const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
     if (t && (!lastActive || t > lastActive)) lastActive = t;
     if (!cid) continue;
-    const row = byCourse.get(cid) ?? { status: "not_started", best: null, attempts: 0 };
+    const row = byCourse.get(cid) ?? { status: "not_started", attempts: 0, list: [] };
     row.attempts++;
-    if (typeof a.score === "number" && (row.best === null || a.score > row.best)) row.best = a.score;
+    row.list.push({
+      id: a.id,
+      score: a.score,
+      started_at: a.started_at ?? "",
+      completed_at: a.completed_at,
+      completion_status: a.completion_status,
+      success_status: a.success_status,
+    });
     if (a.success_status === "passed") row.status = "passed";
     else if (a.completion_status === "completed" && row.status !== "passed") row.status = "completed";
     else if (row.status === "not_started") row.status = "in_progress";
     byCourse.set(cid, row);
   }
+  // 0073: scores follow each module's admin-configured attempt rules.
+  const policies = await resolvePolicies(svc, [...byCourse.keys()]);
 
   // ---- course titles (active only) ----
   const allCourseIds = [...dueByCourse.keys()];
@@ -177,15 +193,23 @@ export async function GET(request: Request) {
         .in("id", allCourseIds)
         .eq("is_active", true)
     : { data: [] };
+  const pct = (v: number | null) => (v !== null ? Math.round(v * 100) : null);
   const courses = ((cRows ?? []) as Array<{ id: string; title: string }>).map((cr) => {
-    const st = byCourse.get(cr.id) ?? { status: "not_started", best: null, attempts: 0 };
+    const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [] };
+    const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY);
     const due = dueByCourse.get(cr.id) ?? null;
     const done = st.status === "completed" || st.status === "passed";
     return {
       course_id: cr.id,
       title: cr.title,
       status: st.status,
-      score: st.best !== null ? Math.round(st.best * 100) : null,
+      // `score` is the OFFICIAL score under the module's attempt rules.
+      score: pct(sc.officialScore),
+      official_score: pct(sc.officialScore),
+      first_score: pct(sc.firstScore),
+      best_score: pct(sc.bestScore),
+      scored_attempts: sc.scoredAttempts,
+      practice_attempts: sc.practiceAttempts,
       attempts: st.attempts,
       due_at: due,
       overdue: !!due && due < nowIso && !done,

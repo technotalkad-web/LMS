@@ -4,6 +4,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { courseDaysOf, todayStr, DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
+import { fetchScoringRule } from "@/lib/scoring/resolve";
 import {
   JourneyAdminClient,
   type ProgramRow,
@@ -206,9 +207,15 @@ export default async function JourneyAdminPage({
     /* pre-0067 */
   }
 
+  // 0073: the journey's attempt scoring rule (fail-soft pre-migration).
+  const scoringRule = program
+    ? await fetchScoringRule(supabase, "journey", program.id)
+    : null;
+
   return (
     <JourneyAdminClient
       orgSlug={orgSlug}
+      scoringRule={scoringRule}
       programs={programs.map((p) => ({
         id: p.id,
         name: p.name,

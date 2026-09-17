@@ -4,6 +4,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearningPathsClient } from "./learning-paths-client";
+import { fetchScoringRules } from "@/lib/scoring/resolve";
 
 export const dynamic = "force-dynamic";
 
@@ -118,6 +119,11 @@ export default async function LearningPathsPage({
         .in("path_id", pathIds)
     : { data: [] };
   const pathAssignments = (assignmentRows ?? []) as PathAssignmentRow[];
+
+  // 0073: per-path attempt scoring rules (fail-soft pre-migration).
+  const scoringRules = Object.fromEntries(
+    await fetchScoringRules(supabase, "path", pathIds)
+  );
 
   // Build per-path enrollment list with completion rolled up live from attempts.
   const pathCoursesByPath = new Map<string, string[]>();
@@ -307,6 +313,7 @@ export default async function LearningPathsPage({
       memberOptions={memberOptions}
       teamOptions={teamOptions}
       groupOptions={groupOptions}
+      scoringRules={scoringRules}
     />
   );
 }

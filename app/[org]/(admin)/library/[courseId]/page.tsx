@@ -14,6 +14,8 @@ import { ReminderSection, type ReminderSettings } from "./reminder-section";
 import { DetailsForm, type CourseDetails } from "./details-form";
 import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
+import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
+import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 
 type Version = {
   id: string;
@@ -365,6 +367,13 @@ export default async function AdminCourseDetailPage({
     show_attempts_history: c.show_attempts_history !== false,
   };
 
+  // 0073: attempt scoring rules — the module's own rule plus what actually
+  // applies after path/journey inheritance. Fail-soft pre-migration.
+  const [scoringRule, effectivePolicy] = await Promise.all([
+    fetchScoringRule(supabase, "course", c.id),
+    resolvePolicy(supabase, c.id),
+  ]);
+
   return (
     <div className="max-w-4xl space-y-10">
       <div>
@@ -484,6 +493,15 @@ export default async function AdminCourseDetailPage({
 
       {/* Editable details */}
       <DetailsForm orgSlug={orgSlug} courseId={c.id} initial={initialDetails} />
+
+      {/* Attempt scoring rules (0073) */}
+      <ScoringRulesCard
+        orgSlug={orgSlug}
+        scope="course"
+        targetId={c.id}
+        initialRule={scoringRule}
+        inherited={effectivePolicy}
+      />
 
       {/* Quick stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">

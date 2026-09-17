@@ -19,6 +19,7 @@ import {
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
 import { myGroupIdsServer } from "@/lib/org/groups";
+import { resolvePolicy } from "@/lib/scoring/resolve";
 
 type Course = {
   id: string;
@@ -181,6 +182,33 @@ export default async function LaunchPage({
         ? `/${orgSlug}/dashboard?upcoming=${courseId}`
         : `/${orgSlug}/dashboard?denied=1`
     );
+  }
+
+  // 0073 attempt-limit gate: when the course's scoring rule says "block"
+  // and the learner has completed every scored attempt, no further launches
+  // (practice mode never blocks). Admins preview freely. Counts completed
+  // attempts across ALL versions/languages of the course so a language
+  // switch or a new version can't reopen the window.
+  if (!canManage(role)) {
+    const policy = await resolvePolicy(supabase, c.id);
+    if (policy.after_limit === "block") {
+      const { data: verRows } = await supabase
+        .from("course_versions")
+        .select("id")
+        .eq("course_id", c.id);
+      const vIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+      if (vIds.length > 0) {
+        const { count } = await supabase
+          .from("course_attempts")
+          .select("id", { count: "exact", head: true })
+          .eq("user_id", user.id)
+          .in("course_version_id", vIds)
+          .or("completion_status.eq.completed,success_status.eq.passed");
+        if ((count ?? 0) >= policy.max_scored_attempts) {
+          redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
+        }
+      }
+    }
   }
 
   // ---------------------------------------------------------------

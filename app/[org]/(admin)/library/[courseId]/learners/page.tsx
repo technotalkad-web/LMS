@@ -5,6 +5,8 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "./learners-filters";
+import { computeScoring } from "@/lib/scoring/policy";
+import { resolvePolicy } from "@/lib/scoring/resolve";
 
 // =============================================================================
 // Dedicated enrolled-learners page for an admin viewing one course.
@@ -235,12 +237,13 @@ export default async function LearnersPage({
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
+            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
       : { data: [] };
   type AttemptRow = {
+    id: string;
     user_id: string;
     course_version_id: string;
     completion_status: string;
@@ -250,6 +253,9 @@ export default async function LearnersPage({
     completed_at: string | null;
   };
   const attempts = (attemptRows ?? []) as AttemptRow[];
+
+  // 0073: this course's attempt scoring rule (fail-soft → default).
+  const scoringPolicy = await resolvePolicy(supabase, c.id);
 
   // ---- enrich one row per enrolled user ----
   const enriched: EnrichedLearner[] = enrolledUserIds.map((uid) => {
@@ -264,13 +270,9 @@ export default async function LearnersPage({
       else if (latest.completion_status === "completed") status = "completed";
       else status = "in_progress";
     }
-    const bestScore = myAttempts
-      .map((a) => a.score)
-      .filter((s): s is number => typeof s === "number")
-      .reduce<number | null>(
-        (best, s) => (best === null || s > best ? s : best),
-        null
-      );
+    // "bestScore" = the OFFICIAL score under the course's attempt rules
+    // (0073) — practice attempts beyond the scoring window never count.
+    const bestScore = computeScoring(myAttempts, scoringPolicy).officialScore;
     const lastTouched =
       myAttempts
         .map((a) => a.completed_at ?? a.started_at)
