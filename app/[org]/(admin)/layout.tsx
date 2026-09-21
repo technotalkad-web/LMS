@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { ScrollTabs } from "@/components/ui/scroll-tabs";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
@@ -109,7 +110,8 @@ export default async function AdminLayout({
             <span className="serif text-2xl leading-none">{org.name}</span>
           </Link>
 
-          <nav className="flex-1 md:space-y-1 text-sm flex md:block gap-1 overflow-x-auto md:overflow-visible">
+          <ScrollTabs className="flex-1 -mx-4 md:mx-0" innerClassName="px-4 md:px-0 md:overflow-visible">
+          <nav className="md:space-y-1 text-sm flex md:block gap-1">
             {manage && <NavGroup label="People" />}
             {manage && <NavItem href={`/${org.slug}/users`} label="Users" />}
             {manage && <NavItem href={`/${org.slug}/teams`} label="Teams" />}
@@ -139,9 +141,10 @@ export default async function AdminLayout({
             )}
             {manage && <NavItem href={`/${org.slug}/settings`} label="Settings" />}
           </nav>
+          </ScrollTabs>
 
           <div className="border-t border-line pt-4 mt-4 px-3 text-xs text-muted">
-            <div className="truncate">{user.email}</div>
+            <div className="break-all">{user.email}</div>
             <div className="flex items-center justify-between gap-2 mt-1">
               <span>{roleLabel(role)}</span>
               <ThemePill />

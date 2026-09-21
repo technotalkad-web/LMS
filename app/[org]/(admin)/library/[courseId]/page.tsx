@@ -384,9 +384,9 @@ export default async function AdminCourseDetailPage({
           ← Library
         </Link>
 
-        <div className="flex items-baseline justify-between mt-2 mb-1 gap-4">
-          <h1 className="serif text-5xl">{c.title}</h1>
-          <div className="flex items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-baseline justify-between mt-2 mb-1 gap-x-4 gap-y-3">
+          <h1 className="serif text-3xl sm:text-5xl break-words min-w-0">{c.title}</h1>
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             <Link
               href={`/${orgSlug}/courses/${c.id}`}
               className="px-3 py-2 text-sm border border-line rounded-lg hover:border-ink transition-colors"

@@ -91,9 +91,9 @@ export function ProfileDropdown({
         >
           {/* Header */}
           <div className="px-4 py-3 border-b border-line">
-            <div className="text-sm font-medium truncate">{name}</div>
+            <div className="text-sm font-medium break-words">{name}</div>
             {name !== email && (
-              <div className="text-xs text-muted truncate">{email}</div>
+              <div className="text-xs text-muted break-all">{email}</div>
             )}
             <div className="text-xs text-muted">{roleLabel}</div>
           </div>

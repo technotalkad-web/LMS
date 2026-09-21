@@ -728,7 +728,7 @@ function EnrollmentsTab({
       </section>
 
       {/* Roster */}
-      <section className="border border-line rounded-2xl bg-paper overflow-hidden">
+      <section className="border border-line rounded-2xl bg-paper overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-[11px] uppercase tracking-wider text-muted border-b border-line">
@@ -909,7 +909,7 @@ function ReportsTab({
       </section>
 
       {/* Overdue / behind */}
-      <section className="border border-line rounded-2xl bg-paper overflow-hidden">
+      <section className="border border-line rounded-2xl bg-paper overflow-x-auto">
         <div className="px-4 sm:px-5 py-3 border-b border-line flex items-center justify-between">
           <h3 className="text-sm font-semibold">Behind schedule</h3>
           <span className="text-xs text-muted">
@@ -985,7 +985,7 @@ function ReportsTab({
       </section>
 
       {/* Cohorts */}
-      <section className="border border-line rounded-2xl bg-paper overflow-hidden">
+      <section className="border border-line rounded-2xl bg-paper overflow-x-auto">
         <div className="px-4 sm:px-5 py-3 border-b border-line">
           <h3 className="text-sm font-semibold">Cohorts (by start date)</h3>
         </div>
@@ -1438,7 +1438,7 @@ function SettingsTab({
           filter empty to not restrict by it; leave everything empty and the
           journey targets all active members. Filters combine with AND.
         </p>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="block">
             <span className="block text-xs uppercase tracking-wide text-muted mb-1">
               Priority rank (1 = highest)
@@ -1570,7 +1570,7 @@ function SettingsTab({
           checked={nudgeEnabled}
           onChange={setNudgeEnabled}
         />
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="block">
             <span className="block text-xs uppercase tracking-wide text-muted mb-1">
               Nudge when behind by (days)
@@ -1613,7 +1613,7 @@ function SettingsTab({
             manager-worded email (&ldquo;journey_escalation&rdquo; template).
             Everything stops automatically on completion.
           </p>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <label className="block">
               <span className="block text-xs uppercase tracking-wide text-muted mb-1">
                 Deadline (days from start; empty = none)

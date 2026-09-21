@@ -371,7 +371,7 @@ export function LearnersClient({
                       <Avatar email={m.email} />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-sm font-semibold truncate text-ink">
+                          <span className="text-sm font-semibold break-all text-ink">
                             {m.email}
                           </span>
                           {isSelf && (
@@ -456,7 +456,7 @@ export function LearnersClient({
                   <div className="flex items-start gap-3">
                     <Avatar email={inv.email} tone="amber" />
                     <div className="flex-1 min-w-0">
-                      <span className="text-sm font-semibold truncate block text-ink">{inv.email}</span>
+                      <span className="text-sm font-semibold break-all block text-ink">{inv.email}</span>
                       <div className="text-xs text-muted mt-0.5">
                         Invited {new Date(inv.invited_at).toISOString().slice(0, 10)} · expires {new Date(inv.expires_at).toISOString().slice(0, 10)}
                       </div>

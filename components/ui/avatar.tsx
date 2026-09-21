@@ -9,6 +9,10 @@ const SIZES = {
   md: "h-10 w-10 text-base",
   lg: "h-16 w-16 text-2xl",
   xl: "h-24 w-24 text-4xl",
+  /** Podium places 2–3: compact on phones, lg from sm up. */
+  podium: "h-14 w-14 text-xl sm:h-16 sm:w-16 sm:text-2xl",
+  /** Podium champion: compact on phones, xl from sm up. */
+  podiumFirst: "h-[4.5rem] w-[4.5rem] text-3xl sm:h-24 sm:w-24 sm:text-4xl",
 } as const;
 
 export function Avatar({

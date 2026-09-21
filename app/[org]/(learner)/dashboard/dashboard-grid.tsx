@@ -1,5 +1,6 @@
 "use client";
 
+import { ScrollTabs } from "@/components/ui/scroll-tabs";
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { thumbImgStyle } from "@/lib/ui/thumbnail";
@@ -133,7 +134,7 @@ export function DashboardGrid({
 
       <section className="bg-paper border border-line rounded-2xl overflow-hidden">
         {/* Filter tabs */}
-        <div className="border-b border-line overflow-x-auto">
+        <ScrollTabs className="border-b border-line">
           <div className="flex min-w-max">
             <Tab
               active={filter === "all"}
@@ -160,7 +161,7 @@ export function DashboardGrid({
               count={counts.done}
             />
           </div>
-        </div>
+        </ScrollTabs>
 
         {/* Grid */}
         <div className="p-5 sm:p-6">
@@ -209,6 +210,7 @@ function Stat({
   return (
     <button
       type="button"
+      data-active={active ? "true" : undefined}
       onClick={onClick}
       aria-pressed={active}
       title={`Show ${label.toLowerCase()} courses`}
@@ -241,6 +243,7 @@ function Tab({
   return (
     <button
       type="button"
+      data-active={active ? "true" : undefined}
       onClick={onClick}
       className={`whitespace-nowrap px-5 py-3.5 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${
         active

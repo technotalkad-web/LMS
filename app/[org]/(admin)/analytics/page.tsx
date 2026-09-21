@@ -1086,7 +1086,8 @@ export default async function AnalyticsPage({
           .map((d) => (
             <section key={d.title} className="bg-paper border border-line rounded-2xl overflow-hidden">
               <h2 className="font-semibold px-4 pt-3 pb-1 text-sm">{d.title}</h2>
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-xs min-w-[380px]">
                 <thead>
                   <tr className="text-left text-[10px] uppercase tracking-wide text-muted">
                     <th className="px-4 py-1.5 font-semibold">Segment</th>
@@ -1099,7 +1100,7 @@ export default async function AnalyticsPage({
                 <tbody>
                   {d.rows.map((r) => (
                     <tr key={r.key} className="border-t border-line">
-                      <td className="px-4 py-1.5 font-medium truncate max-w-[140px]">{r.key}</td>
+                      <td className="px-4 py-1.5 font-medium break-words max-w-[160px]">{r.key}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums">{r.n}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums">{r.pct}%</td>
                       <td className={`px-2 py-1.5 text-right tabular-nums ${r.overdue ? "text-red-700 font-semibold" : "text-muted"}`}>{r.overdue}</td>
@@ -1108,6 +1109,7 @@ export default async function AnalyticsPage({
                   ))}
                 </tbody>
               </table>
+              </div>
             </section>
           ))}
       </div>

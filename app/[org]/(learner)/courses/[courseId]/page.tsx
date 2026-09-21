@@ -494,9 +494,9 @@ function AttemptRow({
     <li>
       <Link
         href={`/${orgSlug}/courses/${courseId}/attempts/${attempt.id}`}
-        className="flex items-center justify-between gap-3 px-6 py-3.5 hover:bg-canvas/40 transition-colors"
+        className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 px-4 sm:px-6 py-3.5 hover:bg-canvas/40 transition-colors"
       >
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3 min-w-0">
           <span className="text-xs text-muted tabular-nums w-7 shrink-0">
             #{number}
           </span>
@@ -527,7 +527,7 @@ function AttemptRow({
             </span>
           )}
         </div>
-        <div className="flex items-center gap-5 text-xs text-muted shrink-0">
+        <div className="flex items-center gap-3 sm:gap-5 text-xs text-muted shrink-0 ml-auto pl-10 sm:pl-0">
           <span className="font-medium text-ink">{score}</span>
           <span>{date}</span>
           <span className="hidden sm:inline tabular-nums">{duration}</span>
