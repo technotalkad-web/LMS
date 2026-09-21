@@ -47,7 +47,7 @@ export function Podium({ top3, style }: { top3: PodiumEntry[]; style?: unknown }
   return (
     <section
       aria-label="Top 3"
-      className="relative overflow-hidden rounded-3xl px-4 sm:px-8 pt-8 sm:pt-10 shadow-lg"
+      className="relative overflow-hidden rounded-3xl px-2 sm:px-8 pt-8 sm:pt-10 shadow-lg"
       style={{
         background: `linear-gradient(to bottom, ${ps.bg_from}, ${ps.bg_via}, ${ps.bg_to})`,
       }}
@@ -101,12 +101,12 @@ export function Podium({ top3, style }: { top3: PodiumEntry[]; style?: unknown }
         className="absolute left-1/2 top-6 -translate-x-1/2 w-56 h-56 rounded-full bg-white/15 blur-3xl pointer-events-none"
       />
 
-      <div className="relative grid grid-cols-3 items-end gap-3 sm:gap-8 max-w-2xl mx-auto">
+      <div className="relative grid grid-cols-3 items-end gap-1.5 sm:gap-8 max-w-2xl mx-auto">
         {order.map((e) => {
           const frame = ps.frames[e.rank - 1];
           const first = e.rank === 1;
           return (
-            <div key={e.rank} className="text-center min-w-0">
+            <div key={e.rank} className="text-center min-w-0 px-0.5">
               <div className="relative inline-block">
                 {frame.topper && (
                   <span
@@ -119,7 +119,7 @@ export function Podium({ top3, style }: { top3: PodiumEntry[]; style?: unknown }
                 <Avatar
                   name={e.name}
                   avatarUrl={e.avatarUrl}
-                  size={first ? "xl" : "lg"}
+                  size={first ? "podiumFirst" : "podium"}
                   className="ring-4 shadow-xl"
                   style={{ "--tw-ring-color": frame.ring } as React.CSSProperties}
                 />
@@ -133,24 +133,32 @@ export function Podium({ top3, style }: { top3: PodiumEntry[]; style?: unknown }
                 <span className="sr-only">{PLACE_LABELS[e.rank]}</span>
               </div>
 
-              <div className="mt-4 font-semibold text-white text-sm sm:text-base leading-tight truncate">
+              {/* Names and designations wrap (up to two lines) instead of
+                  truncating — a phone column is ~100px and "Venkatasu…" is
+                  not a name anyone recognises. */}
+              <div
+                className="mt-4 font-semibold text-white text-[13px] sm:text-base leading-tight break-words [overflow-wrap:anywhere] line-clamp-3 sm:line-clamp-2"
+                title={e.name}
+              >
                 {e.name}
               </div>
               {e.designation && (
-                <div className="text-[11px] text-white/60 truncate">
+                <div
+                  className="mt-0.5 text-[10px] sm:text-[11px] leading-snug text-white/60 break-words [overflow-wrap:anywhere] line-clamp-2"
+                  title={e.designation}
+                >
                   {e.designation}
                 </div>
               )}
-              <div className="mt-1 text-sm font-bold text-white tabular-nums">
+              <div className="mt-1 text-[13px] sm:text-sm font-bold text-white tabular-nums leading-tight">
                 {e.metricValue}
-                <span className="text-white/60 font-medium text-xs">
-                  {" "}
+                <span className="block sm:inline text-white/60 font-medium text-[10px] sm:text-xs sm:ml-1">
                   {e.metricLabel}
                 </span>
               </div>
 
               <div
-                className={`mt-3 mx-auto w-full max-w-[130px] rounded-t-2xl bg-white/10 backdrop-blur-sm border border-b-0 border-white/20 ${PEDESTALS[e.rank]} flex items-start justify-center pt-2`}
+                className={`mt-3 mx-auto w-full max-w-[110px] sm:max-w-[130px] rounded-t-2xl bg-white/10 backdrop-blur-sm border border-b-0 border-white/20 ${PEDESTALS[e.rank]} flex items-start justify-center pt-2`}
               >
                 <span className="text-white/40 font-extrabold text-xl">
                   {e.rank}

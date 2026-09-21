@@ -118,7 +118,7 @@ export default async function NotificationsPage({
           />
         </Card>
       ) : (
-        <Card className="overflow-hidden">
+        <Card className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
               <tr>

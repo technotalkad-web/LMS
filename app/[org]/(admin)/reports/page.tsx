@@ -552,7 +552,7 @@ export default async function ReportsPage({
             />
           </Card>
         ) : (
-          <Card className="overflow-hidden">
+          <Card className="overflow-x-auto">
             <div className="max-h-[70vh] overflow-auto">
             <table className="w-full text-sm">
               <thead className="bg-canvas text-xs uppercase tracking-wide text-muted sticky top-0 z-10">

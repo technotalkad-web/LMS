@@ -184,7 +184,7 @@ export function NewUserForm({
       {/* PERSONAL ------------------------------------------------------- */}
       <section className="border border-line rounded-lg bg-paper p-6">
         <h2 className="serif text-2xl mb-4">Personal details</h2>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Field label="First name" required>
             <input
               type="text"
@@ -283,7 +283,7 @@ export function NewUserForm({
           These fields are locked for the learner after creation. Only admins can
           change them later.
         </p>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Field label="Unique ID (Employee ID)" required>
             <input
               type="text"

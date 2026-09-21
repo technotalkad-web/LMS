@@ -157,7 +157,7 @@ export default async function AttemptDetailPage({
         </div>
       </div>
 
-      <div className="grid grid-cols-4 gap-3 mb-8 text-sm">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8 text-sm">
         <Stat
           label="Completion"
           value={a.completion_status === "completed" ? "Completed" : "In progress"}
@@ -210,7 +210,7 @@ export default async function AttemptDetailPage({
           statements or SCORM <code>cmi.interactions.*</code>).
         </div>
       ) : (
-        <div className="border border-line rounded-lg bg-paper overflow-hidden">
+        <div className="border border-line rounded-lg bg-paper overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
               <tr>

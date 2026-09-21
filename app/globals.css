@@ -222,3 +222,12 @@ body {
     scroll-behavior: smooth;
   }
 }
+
+/* Horizontal scrollers that hide their scrollbar (tab strips, chip rows). */
+@utility scrollbar-hide {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}

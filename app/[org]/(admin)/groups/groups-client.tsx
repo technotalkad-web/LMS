@@ -439,7 +439,7 @@ export function GroupsClient({
           </p>
         </div>
       ) : (
-        <div className="bg-paper border border-line rounded-2xl overflow-hidden">
+        <div className="bg-paper border border-line rounded-2xl overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-muted border-b border-line">

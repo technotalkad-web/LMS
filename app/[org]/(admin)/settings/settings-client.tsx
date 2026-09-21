@@ -227,7 +227,7 @@ function SmtpForm({
         587 STARTTLS, 465 SSL, 25 unencrypted. Auth via app password recommended.
       </p>
 
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Host">
           <input
             type="text"
@@ -991,7 +991,7 @@ function LrsSection({
           className="ws-input"
         />
       </Field>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Auth key (Basic username)">
           <input type="text" value={authKey} onChange={(e) => setAuthKey(e.target.value)} className="ws-input" />
         </Field>

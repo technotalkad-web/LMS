@@ -284,7 +284,7 @@ export default async function JourneyPage({
                   <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
                     Day {d.day}
                   </span>
-                  <span className="truncate">
+                  <span className="min-w-0 line-clamp-2">
                     {d.mission_title ??
                       titleOf.get(d.course_id as string) ??
                       "Module"}
@@ -420,7 +420,7 @@ export default async function JourneyPage({
           <p className="text-[11px] uppercase tracking-[0.2em] text-indigo-700 font-bold">
             {version.days_total}-day journey
           </p>
-          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight truncate">
+          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight break-words">
             <JourneyIcon icon={version.icon} /> {version.name}
           </h1>
         </div>
@@ -595,7 +595,7 @@ export default async function JourneyPage({
                     <Check className="w-4 h-4" />
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium truncate">
+                    <span className="block text-sm font-medium line-clamp-2">
                       Day {d}: {titleForDay(d)}
                     </span>
                     <span className="block text-xs text-emerald-700">Completed</span>
@@ -613,7 +613,7 @@ export default async function JourneyPage({
                     <PlayCircle className="w-4 h-4" />
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-semibold truncate">
+                    <span className="block text-sm font-semibold line-clamp-2">
                       Day {d}: {titleForDay(d)}
                     </span>
                     <span className="block text-xs text-amber-700 font-medium">
@@ -643,7 +643,7 @@ export default async function JourneyPage({
                   {d}
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className="block text-sm truncate">
+                  <span className="block text-sm line-clamp-2">
                     Day {d}: {titleForDay(d)}
                   </span>
                   <span className="block text-xs">
@@ -660,11 +660,11 @@ export default async function JourneyPage({
                 {nextMilestone.icon}
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block text-sm font-semibold truncate">
+                <span className="block text-sm font-semibold line-clamp-2">
                   Day {nextMilestone.day}: {nextMilestone.name}
                 </span>
                 {nextMilestone.message && (
-                  <span className="block text-xs text-indigo-700 truncate">
+                  <span className="block text-xs text-indigo-700 line-clamp-2">
                     {nextMilestone.message}
                   </span>
                 )}

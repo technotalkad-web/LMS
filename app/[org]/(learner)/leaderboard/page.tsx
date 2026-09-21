@@ -4,6 +4,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { Avatar } from "@/components/ui/avatar";
+import { ScrollTabs } from "@/components/ui/scroll-tabs";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 import { Podium, type PodiumEntry } from "./_components/podium";
 import { VerticalBoard } from "./_components/vertical-board";
@@ -509,23 +510,42 @@ export default async function LeaderboardPage({
         <>
           {top3.length === 3 && <Podium top3={top3} style={gsx?.podium_style} />}
 
-          <div className="bg-paper border border-line rounded-2xl overflow-hidden">
-            <table className="w-full text-sm">
+          <div className="bg-paper border border-line rounded-2xl overflow-x-auto">
+            {/* Fixed layout on phones: the learner column wraps inside the
+                width left after rank + metric, so the score is never pushed
+                off the right edge. Auto layout from sm up. */}
+            <table className="w-full text-sm table-fixed sm:table-auto">
               <thead>
                 <tr className="text-left text-[11px] uppercase tracking-wider text-muted border-b border-line">
-                  <th className="px-4 py-3 w-14">Rank</th>
-                  <th className="px-4 py-3">Learner</th>
+                  <th className="px-3 sm:px-4 py-3 w-11 sm:w-14">Rank</th>
+                  <th className="px-3 sm:px-4 py-3">Learner</th>
                   {showDesignation && (
                     <th className="px-4 py-3 hidden sm:table-cell">Designation</th>
                   )}
                   {showTeam && <th className="px-4 py-3 hidden md:table-cell">Team</th>}
                   {showCity && <th className="px-4 py-3 hidden md:table-cell">City</th>}
-                  <th className="px-4 py-3 text-right" title={score.description}>
+                  <th className="px-3 sm:px-4 py-3 text-right sm:whitespace-nowrap w-[4.75rem] sm:w-auto" title={score.description}>
                     {metricLabelOf(activeBoard)}
                   </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
+                {top3.length === 3 &&
+                  rows
+                    .filter((r) => (rankOf(r) ?? 99) <= 3)
+                    .map((r) => (
+                      <LeaderRow
+                        key={`m-${r.user_id}`}
+                        r={r}
+                        rank={rankOf(r)!}
+                        metric={metricFor(activeBoard, r)}
+                        isMe={r.user_id === user.id}
+                        mobileOnly
+                        designation={showDesignation ? memById.get(r.user_id)?.designation ?? null : undefined}
+                        team={showTeam ? teamByUser.get(r.user_id) ?? null : undefined}
+                        city={showCity ? memById.get(r.user_id)?.city ?? null : undefined}
+                      />
+                    ))}
                 {(top3.length === 3 ? tableRows : rows).map((r) => (
                   <LeaderRow
                     key={r.user_id}
@@ -600,12 +620,13 @@ function BoardTabs({
   labels: Record<BoardCopyKey, BoardCopy>;
 }) {
   return (
-    <div className="border-b border-line overflow-x-auto">
+    <ScrollTabs className="border-b border-line">
       <div className="flex min-w-max gap-1">
         {visible.map((k) => (
           <Link
             key={k}
             href={`/${orgSlug}/leaderboard?board=${k}`}
+            aria-current={active === k ? "page" : undefined}
             className={`whitespace-nowrap px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
               active === k
                 ? "border-indigo-600 text-indigo-600"
@@ -616,7 +637,7 @@ function BoardTabs({
           </Link>
         ))}
       </div>
-    </div>
+    </ScrollTabs>
   );
 }
 
@@ -626,6 +647,7 @@ function LeaderRow({
   metric,
   isMe,
   separated,
+  mobileOnly,
   designation,
   team,
   city,
@@ -635,6 +657,8 @@ function LeaderRow({
   metric: string;
   isMe?: boolean;
   separated?: boolean;
+  /** Rendered only below the sm breakpoint (podium top-3 companions). */
+  mobileOnly?: boolean;
   designation?: string | null;
   team?: string | null;
   city?: string | null;
@@ -643,19 +667,19 @@ function LeaderRow({
     <tr
       className={`${isMe ? "bg-indigo-50/50" : ""} ${
         separated ? "border-t-4 border-line" : ""
-      }`}
+      } ${mobileOnly ? "sm:hidden" : ""}`}
     >
-      <td className="px-4 py-3 font-semibold tabular-nums">#{rank}</td>
-      <td className="px-4 py-3">
-        <div className="flex items-center gap-3 min-w-0">
+      <td className="px-3 sm:px-4 py-3 font-semibold tabular-nums">#{rank}</td>
+      <td className="px-3 sm:px-4 py-3">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
           <Avatar name={displayName(r)} avatarUrl={r.avatar_url} size="sm" />
           <div className="min-w-0">
-            <div className="font-medium truncate">
+            <div className="font-medium break-words text-[13px] sm:text-sm">
               {displayName(r)}
               {isMe && <span className="text-indigo-600 text-xs ml-1.5">(you)</span>}
             </div>
             {(designation || city) && (
-              <div className="text-[11px] text-muted truncate sm:hidden">
+              <div className="text-[11px] text-muted break-words sm:hidden">
                 {[designation, city].filter(Boolean).join(" · ")}
               </div>
             )}
@@ -673,7 +697,7 @@ function LeaderRow({
       {city !== undefined && (
         <td className="px-4 py-3 text-muted hidden md:table-cell">{city ?? "—"}</td>
       )}
-      <td className="px-4 py-3 text-right font-semibold tabular-nums">{metric}</td>
+      <td className="px-3 sm:px-4 py-3 text-right font-semibold tabular-nums whitespace-nowrap">{metric}</td>
     </tr>
   );
 }
