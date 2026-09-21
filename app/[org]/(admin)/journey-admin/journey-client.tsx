@@ -67,6 +67,9 @@ export type EnrollmentRow = {
   days_total: number;
   count_sundays: boolean;
   course_days: number[];
+  /** 0075: today's mission and the learner's progress inside it. */
+  current_day?: number;
+  current_pct?: number | null;
 };
 export type MemberOption = { user_id: string; name: string; email: string };
 export type CourseOption = { id: string; title: string };
@@ -766,6 +769,20 @@ function EnrollmentsTab({
                   <td className="px-4 py-3 tabular-nums text-muted">{e.start_date}</td>
                   <td className="px-4 py-3 tabular-nums">
                     {e.completed_count}/{e.days_total}
+                    {e.status === "active" && typeof e.current_day === "number" && (
+                      <span className="block text-[11px] text-muted">
+                        {e.course_days.length > 0
+                          ? `${Math.min(
+                              100,
+                              Math.round(
+                                ((e.completed_count + ((e.current_pct ?? 0) / 100)) / e.course_days.length) * 100
+                              )
+                            )}% overall · `
+                          : ""}
+                        Day {e.current_day} module:{" "}
+                        {e.current_pct === null || e.current_pct === undefined ? "not started" : `${e.current_pct}%`}
+                      </span>
+                    )}
                     {e.status === "active" && st.behindDays > 0 && (
                       <span className="ml-2 text-[11px] text-amber-700 font-semibold">
                         {st.behindDays} behind

@@ -15,6 +15,15 @@ import { canViewReports } from "@/lib/auth/permissions";
 import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import {
+  courseProgress,
+  formatCourseProgress,
+  formatPathProgress,
+  journeyProgress,
+  pathProgress,
+  type CourseProgressView,
+} from "@/lib/courses/progress-view";
+import { parseVersionDays } from "@/lib/journey/journey";
+import {
   fetchActiveMembers,
   resolveGroupMembers,
   type GroupRow,
@@ -132,6 +141,9 @@ type AttemptRow = {
   started_at: string | null;
   completed_at: string | null;
   last_activity_at: string | null;
+  /** 0075 progress (+ cmi5 screens via cmi_data->cmi5->units). */
+  progress_pct?: number | null;
+  units?: unknown;
 };
 
 /** Shape an attempt row for the 0073 scoring engine. */
@@ -330,10 +342,11 @@ export default async function AnalyticsPage({
   const paths = (pathRows ?? []) as Array<{ id: string; name: string }>;
   const pathName = new Map(paths.map((p) => [p.id, p.name]));
   const pathCourseRows = paths.length
-    ? await fetchByIds<{ path_id: string; course_id: string }>(
-        svc, "learning_path_courses", "path_id, course_id", "path_id", paths.map((p) => p.id)
+    ? await fetchByIds<{ path_id: string; course_id: string; step_number: number }>(
+        svc, "learning_path_courses", "path_id, course_id, step_number", "path_id", paths.map((p) => p.id)
       )
     : [];
+  pathCourseRows.sort((a, b) => (a.step_number ?? 0) - (b.step_number ?? 0));
   const coursesOfPath = new Map<string, string[]>();
   for (const r of pathCourseRows) {
     coursesOfPath.set(r.path_id, [...(coursesOfPath.get(r.path_id) ?? []), r.course_id]);
@@ -354,7 +367,7 @@ export default async function AnalyticsPage({
     ? await fetchByIds<AttemptRow>(
         svc,
         "course_attempts",
-        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at",
+        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
         "user_id",
         scopedIds,
         (q) => q.eq("organization_id", org.id)
@@ -362,11 +375,14 @@ export default async function AnalyticsPage({
     : [];
   const versionIds = Array.from(new Set(attempts.map((a) => a.course_version_id)));
   const versionRows = versionIds.length
-    ? await fetchByIds<{ id: string; course_id: string }>(
-        svc, "course_versions", "id, course_id", "id", versionIds
+    ? await fetchByIds<{ id: string; course_id: string; unit_count: number | null }>(
+        svc, "course_versions", "id, course_id, unit_count:manifest_data->unitCount", "id", versionIds
       )
     : [];
   const courseOfVersion = new Map(versionRows.map((v) => [v.id, v.course_id]));
+  const unitCountByVersion = new Map(
+    versionRows.map((v) => [v.id, typeof v.unit_count === "number" ? v.unit_count : null])
+  );
 
   const gamRows = scopedIds.length
     ? await fetchByIds<{
@@ -425,6 +441,8 @@ export default async function AnalyticsPage({
   type JourneyView = {
     userId: string; programId: string; programName: string; status: string;
     day: number; total: number; behind: number; overdueDeadline: boolean;
+    /** 0075: days done, course-day count, and today's mission course. */
+    daysDone: number; courseDays: number; currentCourseId: string | null;
   };
   const journeyViews: JourneyView[] = [];
   for (const e of enrollments) {
@@ -453,6 +471,12 @@ export default async function AnalyticsPage({
       behind: e.status === "active" && !state.finished ? state.behindDays : 0,
       overdueDeadline:
         e.status === "active" && deadline !== null && today > deadline,
+      daysDone: progressCount.get(e.id) ?? 0,
+      courseDays: courseDaysOf(v.days, v.days_total).length,
+      currentCourseId:
+        e.status === "active" && !state.finished
+          ? (parseVersionDays(v.days).get(state.currentDay)?.course_id ?? null)
+          : null,
     });
   }
   const journeysByUser = new Map<string, JourneyView[]>();
@@ -637,7 +661,12 @@ export default async function AnalyticsPage({
       lens = done.has(lensCourse)
         ? `Completed${a?.score != null ? ` · ${Math.round(a.score * 100)}%` : ""}`
         : a
-          ? "In progress"
+          ? formatCourseProgress(
+              courseProgress(
+                my.filter((x) => courseOfVersion.get(x.course_version_id) === lensCourse),
+                unitCountByVersion
+              )
+            )
           : assignedMap.has(lensCourse)
             ? "Not started"
             : "—";
@@ -825,15 +854,16 @@ export default async function AnalyticsPage({
     const done = completedOf(s.userId);
     const assignedMap = assignedByUser.get(s.userId) ?? new Map<string, string | null>();
     const my = attemptsByUser.get(s.userId) ?? [];
-    const perCourse = new Map<string, { attempts: number; best: number | null; last: string | null; status: string }>();
+    const perCourse = new Map<string, { attempts: number; best: number | null; last: string | null; status: string; progress: CourseProgressView }>();
+    const emptyProgress: CourseProgressView = { pct: null, done: false, started: false, screensDone: null, screensTotal: null };
     for (const [cid] of assignedMap) {
-      perCourse.set(cid, { attempts: 0, best: null, last: null, status: "Not started" });
+      perCourse.set(cid, { attempts: 0, best: null, last: null, status: "Not started", progress: emptyProgress });
     }
     const attemptsOfCourse = new Map<string, AttemptRow[]>();
     for (const a of my) {
       const cid = courseOfVersion.get(a.course_version_id);
       if (!cid) continue;
-      const row = perCourse.get(cid) ?? { attempts: 0, best: null, last: null, status: "Not started" };
+      const row = perCourse.get(cid) ?? { attempts: 0, best: null, last: null, status: "Not started", progress: emptyProgress };
       row.attempts++;
       attemptsOfCourse.set(cid, [...(attemptsOfCourse.get(cid) ?? []), a]);
       const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
@@ -845,8 +875,13 @@ export default async function AnalyticsPage({
       const row = perCourse.get(cid);
       if (row) {
         row.best = computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY).officialScore;
+        row.progress = courseProgress(list, unitCountByVersion);
       }
     }
+    // Progress per course for path / journey roll-ups (0075).
+    const progressOf = (cid: string): CourseProgressView =>
+      perCourse.get(cid)?.progress ??
+      courseProgress(my.filter((x) => courseOfVersion.get(x.course_version_id) === cid), unitCountByVersion);
     for (const [cid, row] of perCourse) {
       row.status = done.has(cid)
         ? "Completed"
@@ -909,18 +944,30 @@ export default async function AnalyticsPage({
           <section className="bg-paper border border-line rounded-2xl p-5">
             <h2 className="font-semibold mb-3">Journeys</h2>
             <ul className="space-y-2">
-              {myJourneys.map((j) => (
+              {myJourneys.map((j) => {
+                const jp = journeyProgress(
+                  j.daysDone,
+                  j.courseDays,
+                  j.currentCourseId ? j.day : null,
+                  j.currentCourseId ? progressOf(j.currentCourseId) : null
+                );
+                return (
                 <li key={j.programId} className="flex flex-wrap items-center justify-between gap-2 text-sm">
                   <span className="font-medium">{j.programName}</span>
                   <span className="text-muted">
-                    {j.status === "completed" ? "Completed 🎉" : `Day ${j.day} of ${j.total}`}
+                    {j.status === "completed"
+                      ? "Completed 🎉"
+                      : `Day ${j.day} of ${j.total} · ${jp.overallPct}% overall${
+                          jp.currentPct !== null ? ` · Day ${j.day} module: ${jp.currentPct}%` : ""
+                        }`}
                     {j.behind > 0 && (
                       <strong className="text-red-700"> · {j.behind}d behind</strong>
                     )}
                     {j.overdueDeadline && <strong className="text-red-700"> · past deadline</strong>}
                   </span>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           </section>
         )}
@@ -933,6 +980,7 @@ export default async function AnalyticsPage({
                 <tr className="text-left text-[11px] uppercase tracking-wide text-muted border-b border-line">
                   <th className="px-5 py-2">Course</th>
                   <th className="px-4 py-2">Status</th>
+                  <th className="px-4 py-2">Progress</th>
                   <th className="px-4 py-2">Official score</th>
                   <th className="px-4 py-2">Attempts</th>
                   <th className="px-4 py-2">Due</th>
@@ -947,6 +995,9 @@ export default async function AnalyticsPage({
                     <tr key={cid} className="border-b border-line last:border-0">
                       <td className="px-5 py-2.5 font-medium">{courseTitle.get(cid) ?? cid.slice(0, 8)}</td>
                       <td className="px-4 py-2.5">{r.status}</td>
+                      <td className="px-4 py-2.5 tabular-nums whitespace-nowrap">
+                        {r.status === "Not started" ? "—" : formatCourseProgress(r.progress)}
+                      </td>
                       <td className="px-4 py-2.5 tabular-nums">{r.best !== null ? `${Math.round(r.best * 100)}%` : "—"}</td>
                       <td className="px-4 py-2.5 tabular-nums">{r.attempts}</td>
                       <td className={`px-4 py-2.5 ${isOver ? "text-red-700 font-semibold" : "text-muted"}`}>
@@ -969,11 +1020,15 @@ export default async function AnalyticsPage({
                 const pcs = coursesOfPath.get(pid) ?? [];
                 const doneN = pcs.filter((c) => done.has(c)).length;
                 const over = !!due && due < nowIso && doneN < pcs.length;
+                const pp = pathProgress(
+                  pcs.map((c) => ({ course_id: c, title: courseTitle.get(c) ?? c.slice(0, 8) })),
+                  new Map(pcs.map((c) => [c, progressOf(c)]))
+                );
                 return (
                   <li key={pid} className="flex flex-wrap items-center justify-between gap-2">
                     <span className="font-medium">{pathName.get(pid) ?? pid.slice(0, 8)}</span>
                     <span className={over ? "text-red-700 font-semibold" : "text-muted"}>
-                      {doneN}/{pcs.length} steps{due ? ` · due ${fmtDate(due)}` : ""}
+                      {formatPathProgress(pp)}{due ? ` · due ${fmtDate(due)}` : ""}
                       {over ? " · overdue" : ""}
                     </span>
                   </li>

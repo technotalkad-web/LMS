@@ -19,6 +19,7 @@ import { canManage } from "@/lib/auth/permissions";
 
 type ViaKind = "user" | "team" | "org";
 type Status = "not_started" | "in_progress" | "completed" | "passed" | "failed";
+import { courseProgress, pathProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 
 function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -170,14 +171,18 @@ export async function GET(
     stepCourseIds.length > 0
       ? await supabase
           .from("course_versions")
-          .select("id, course_id")
+          .select("id, course_id, unit_count:manifest_data->unitCount")
           .in("course_id", stepCourseIds)
       : { data: [] };
   const versions = (versionRows ?? []) as Array<{
     id: string;
     course_id: string;
+    unit_count?: number | null;
   }>;
   const courseByVersion = new Map(versions.map((v) => [v.id, v.course_id]));
+  const unitCountByVersion = new Map(
+    versions.map((v) => [v.id, typeof v.unit_count === "number" ? v.unit_count : null])
+  );
   const versionIds = versions.map((v) => v.id);
 
   const { data: attemptRows } =
@@ -185,7 +190,7 @@ export async function GET(
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, started_at, completed_at"
+            "user_id, course_version_id, completion_status, success_status, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
@@ -197,8 +202,20 @@ export async function GET(
     success_status: string;
     started_at: string;
     completed_at: string | null;
+    progress_pct?: number | null;
+    units?: unknown;
   }>;
   const lastStepCourseId = steps[steps.length - 1]?.course_id ?? null;
+  // Step titles for the "Current step" column (0075).
+  const { data: stepCourseRows } = stepCourseIds.length
+    ? await supabase.from("courses").select("id, title").in("id", stepCourseIds)
+    : { data: [] };
+  const titleByCourse = new Map(
+    ((stepCourseRows ?? []) as Array<{ id: string; title: string }>).map((c) => [c.id, c.title])
+  );
+  const orderedSteps = [...steps]
+    .sort((a, b) => a.step_number - b.step_number)
+    .map((s) => ({ course_id: s.course_id, title: titleByCourse.get(s.course_id) ?? s.course_id.slice(0, 8) }));
 
   const header = [
     "Employee ID",
@@ -206,6 +223,9 @@ export async function GET(
     "First name",
     "Last name",
     "Status",
+    "Overall progress (%)",
+    "Current step",
+    "Current step progress (%)",
     "Courses done",
     "Courses total",
     "Last activity (ISO)",
@@ -254,6 +274,17 @@ export async function GET(
         .pop() ?? "";
     const profile = profileByUser.get(uid);
     const via = Array.from(viaByUser.get(uid) ?? []).join("+");
+    const byCourse = new Map<string, CourseProgressView>();
+    for (const s of orderedSteps) {
+      byCourse.set(
+        s.course_id,
+        courseProgress(
+          myAttempts.filter((a) => courseByVersion.get(a.course_version_id) === s.course_id),
+          unitCountByVersion
+        )
+      );
+    }
+    const pp = pathProgress(orderedSteps, byCourse);
 
     rows.push([
       employeeIdByUser.get(uid) ?? "",
@@ -261,6 +292,9 @@ export async function GET(
       profile?.first_name ?? "",
       profile?.last_name ?? "",
       status,
+      String(pp.overallPct),
+      pp.current ? `Step ${pp.current.index}: ${pp.current.title}` : "",
+      pp.current ? (pp.current.pct === null ? "0" : String(pp.current.pct)) : "",
       String(coursesDone),
       String(coursesTotal),
       lastTouched,

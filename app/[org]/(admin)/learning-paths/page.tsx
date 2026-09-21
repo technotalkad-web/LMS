@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearningPathsClient } from "./learning-paths-client";
 import { fetchScoringRules } from "@/lib/scoring/resolve";
+import { courseProgress, pathProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +29,9 @@ export type PathEnrollee = {
   completed: number;
   total: number;
   via: ("user" | "team" | "org")[];
+  /** 0075: overall % incl. the current step's partial, and that step. */
+  overallPct: number;
+  current: { index: number; title: string; pct: number | null } | null;
 };
 
 export type PathCourseRow = {
@@ -175,12 +179,14 @@ export default async function LearningPathsPage({
   const { data: versionsAll } = allPathCourseIds.length
     ? await supabase
         .from("course_versions")
-        .select("id, course_id")
+        .select("id, course_id, unit_count:manifest_data->unitCount")
         .in("course_id", allPathCourseIds)
     : { data: [] };
   const verToCourse = new Map<string, string>();
-  for (const v of (versionsAll ?? []) as Array<{ id: string; course_id: string }>) {
+  const unitCountByVersion = new Map<string, number | null>();
+  for (const v of (versionsAll ?? []) as Array<{ id: string; course_id: string; unit_count?: number | null }>) {
     verToCourse.set(v.id, v.course_id);
+    unitCountByVersion.set(v.id, typeof v.unit_count === "number" ? v.unit_count : null);
   }
   const allVerIds = Array.from(verToCourse.keys());
 
@@ -195,11 +201,29 @@ export default async function LearningPathsPage({
     ? await supabase
         .from("course_attempts")
         .select(
-          "user_id, course_version_id, completion_status, success_status"
+          "user_id, course_version_id, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units"
         )
         .in("user_id", enrolleeUserIds)
         .in("course_version_id", allVerIds)
     : { data: [] };
+
+  type PAttempt = {
+    user_id: string;
+    course_version_id: string;
+    completion_status: string;
+    success_status: string;
+    started_at: string | null;
+    progress_pct?: number | null;
+    units?: unknown;
+  };
+  // Attempts per (user, course) for 0075 progress roll-ups.
+  const attemptsByUserCourse = new Map<string, PAttempt[]>();
+  for (const a of (attemptsAll ?? []) as PAttempt[]) {
+    const cid = verToCourse.get(a.course_version_id);
+    if (!cid) continue;
+    const k = `${a.user_id}|${cid}`;
+    attemptsByUserCourse.set(k, [...(attemptsByUserCourse.get(k) ?? []), a]);
+  }
 
   const completedByUserCourse = new Set<string>(); // `${user}|${course}`
   for (const a of (attemptsAll ?? []) as Array<{
@@ -284,6 +308,17 @@ export default async function LearningPathsPage({
     const completed = courses.filter((cid) =>
       completedByUserCourse.has(`${uid}|${cid}`)
     ).length;
+    const steps = pathCourses
+      .filter((pc) => pc.path_id === pid)
+      .sort((a, b) => a.step_number - b.step_number)
+      .map((pc) => ({ course_id: pc.course_id, title: pc.title }));
+    const progressByCourse = new Map<string, CourseProgressView>(
+      steps.map((s) => [
+        s.course_id,
+        courseProgress(attemptsByUserCourse.get(`${uid}|${s.course_id}`) ?? [], unitCountByVersion),
+      ])
+    );
+    const pp = pathProgress(steps, progressByCourse);
     pathEnrollees.push({
       path_id: pid,
       user_id: uid,
@@ -291,6 +326,8 @@ export default async function LearningPathsPage({
       completed,
       total,
       via: Array.from(viaSet),
+      overallPct: pp.overallPct,
+      current: pp.current ? { index: pp.current.index, title: pp.current.title, pct: pp.current.pct } : null,
     });
   }
 
