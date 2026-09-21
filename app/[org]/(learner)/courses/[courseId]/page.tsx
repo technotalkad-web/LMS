@@ -58,6 +58,8 @@ type Attempt = {
   score: number | null;
   started_at: string;
   completed_at: string | null;
+  /** 0075 — undefined before the migration. */
+  progress_pct?: number | null;
 };
 
 export default async function CourseDetailPage({
@@ -154,9 +156,8 @@ export default async function CourseDetailPage({
   const attemptsResp = versionIds.length
     ? await supabase
         .from("course_attempts")
-        .select(
-          "id, course_version_id, status, completion_status, success_status, score, started_at, completed_at"
-        )
+        // select("*") for 0075 deploy safety (progress_pct).
+        .select("*")
         .eq("user_id", user.id)
         .in("course_version_id", versionIds)
         .order("started_at", { ascending: false })
@@ -498,6 +499,15 @@ function AttemptRow({
             #{number}
           </span>
           <CompletionPill completion={attempt.completion_status} />
+          {attempt.completion_status === "in_progress" &&
+            typeof attempt.progress_pct === "number" && (
+              <span
+                title="How far through the module this attempt is"
+                className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-amber-50 text-amber-800 border border-amber-200 shrink-0"
+              >
+                {attempt.progress_pct}% done
+              </span>
+            )}
           <SuccessPill success={attempt.success_status} />
           {scoreTag?.kind === "scored" && (
             <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-indigo-100 text-indigo-800 border border-indigo-200 shrink-0">

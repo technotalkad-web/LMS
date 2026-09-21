@@ -24,8 +24,15 @@ export function deriveCompletionStatus(
   cmi: CmiData,
   finished: boolean
 ): CompletionStatus {
-  const s = (cmi["cmi.core.lesson_status"] || "").toLowerCase();
+  const s = (cmi["cmi.core.lesson_status"] || "").toLowerCase().trim();
   if (s === "passed" || s === "failed" || s === "completed") return "completed";
+  // The SCO explicitly said it is NOT done — an exit (LMSFinish) must never
+  // turn "incomplete" / "browsed" / "not attempted" into a completion.
+  if (s === "incomplete" || s === "browsed" || s === "not attempted") {
+    return "in_progress";
+  }
+  // SCORM 1.2 RTE: a SCO that never sets lesson_status is treated as
+  // completed by the LMS when it finishes (legacy content that doesn't track).
   if (finished) return "completed";
   return "in_progress";
 }

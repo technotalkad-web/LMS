@@ -117,7 +117,7 @@ Rules your sync can rely on:
       "course_id": "…", "title": "Objection Handling",
       "status": "in_progress", "score": 82, "attempts": 2,
       "official_score": 82, "first_score": 74, "best_score": 82,
-      "scored_attempts": 2, "practice_attempts": 0,
+      "scored_attempts": 2, "practice_attempts": 0, "progress_pct": 45,
       "due_at": "2026-09-30T00:00:00+00:00", "overdue": false,
       "target": "/ambak/courses/…/launch"
     }
@@ -139,9 +139,17 @@ and which one is the official score (default: the first attempt). `score`
 and `official_score` are that official value; `first_score` is retained for
 learning-gain analysis, `best_score` is the best inside the scored window,
 and `practice_attempts` counts revision attempts beyond the window — those
-never change any score. Show `official_score` on the employee's card. Entitlements (direct, org-wide, team, and
-dynamic-group assignments) are expanded with the same resolvers the LMS
-itself uses, so your card and the LMS always agree.
+never change any score. Show `official_score` on the employee's card.
+
+`progress_pct` is how far through the module the employee's open attempt is
+(0–99, from the package's own screen/state signals; 100 once complete; null
+when the package reports no progress, e.g. plain SCORM 1.2). It is separate
+from `status`: a module is `completed` only on the package's course-level
+completion signal, never merely because it was opened or closed.
+
+Entitlements (direct, org-wide, team, and dynamic-group assignments) are
+expanded with the same resolvers the LMS itself uses, so your card and the
+LMS always agree.
 
 ### Step 4 — One-click launch (SSO handoff)
 

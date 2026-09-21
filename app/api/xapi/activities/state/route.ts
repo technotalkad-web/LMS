@@ -4,6 +4,7 @@ import {
   serviceClient,
   unauthorizedResponse,
 } from "@/lib/xapi/auth";
+import { updateProgressFromState } from "@/lib/courses/progress";
 
 /**
  *   GET    /api/xapi/activities/state?stateId=...&activityId=...&agent=...
@@ -81,6 +82,14 @@ export async function PUT(request: Request) {
     },
     { onConflict: "attempt_id,state_id" }
   );
+
+  // 0075: the resume blob is the most current picture of how far the
+  // learner is — raise progress from it (never lowers, never completes).
+  try {
+    await updateProgressFromState(svc, session.attemptId, content);
+  } catch (e) {
+    console.warn("[xapi/state] progress update failed:", e);
+  }
 
   return new Response(null, { status: 204 });
 }
