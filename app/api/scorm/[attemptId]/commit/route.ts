@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { updateAttemptFailSoft } from "@/lib/courses/progress";
 import {
   deriveAttemptStatus,
   deriveCompletionStatus,
@@ -53,7 +54,7 @@ export async function POST(
   const { data: attempt } = await supabase
     .from("course_attempts")
     .select(
-      "status, completion_status, success_status, completed_at, course_version_id, course_versions(manifest_data)"
+      "*, course_versions(manifest_data)"
     )
     .eq("id", attemptId)
     .eq("user_id", user.id)
@@ -120,6 +121,22 @@ export async function POST(
     last_activity_at: new Date().toISOString(),
   };
   if (score !== null) update.score = score;
+  // 0075 progress: 100 on completion; otherwise SCORM 2004's
+  // cmi.progress_measure (0..1) when the package reports it. Plain SCORM 1.2
+  // has no progress signal — leave it null (UI shows status only).
+  {
+    let pct: number | null = null;
+    if (completion_status === "completed") pct = 100;
+    else {
+      const pm = cmi["cmi.progress_measure"];
+      const n = typeof pm === "string" && pm !== "" ? parseFloat(pm) : NaN;
+      if (Number.isFinite(n)) pct = Math.min(99, Math.max(0, Math.round(n <= 1 ? n * 100 : n)));
+    }
+    const cur = typeof (a as { progress_pct?: unknown } | null)?.progress_pct === "number"
+      ? ((a as { progress_pct: number }).progress_pct)
+      : null;
+    if (pct !== null && (cur === null || pct > cur)) update.progress_pct = pct;
+  }
   if (
     !alreadyCompletedAt &&
     (finished || derivedCompletion === "completed")
@@ -127,11 +144,7 @@ export async function POST(
     update.completed_at = new Date().toISOString();
   }
 
-  const { error } = await supabase
-    .from("course_attempts")
-    .update(update)
-    .eq("id", attemptId)
-    .eq("user_id", user.id);
+  const error = await updateAttemptFailSoft(supabase, attemptId, update, { userId: user.id });
 
   if (error) {
     console.error("[scorm/commit] update failed:", error.message);

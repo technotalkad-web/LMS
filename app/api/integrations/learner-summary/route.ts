@@ -138,7 +138,8 @@ export async function GET(request: Request) {
   // ---- attempts → status/score per course ----
   const { data: atRows } = await svc
     .from("course_attempts")
-    .select("id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at")
+    // select("*") for 0075 deploy safety (progress_pct).
+    .select("*")
     .eq("organization_id", orgId)
     .eq("user_id", uid);
   type Att = {
@@ -150,6 +151,7 @@ export async function GET(request: Request) {
     started_at: string | null;
     completed_at: string | null;
     last_activity_at: string | null;
+    progress_pct?: number | null;
   };
   const attempts = (atRows ?? []) as Att[];
   const verIds = [...new Set(attempts.map((a) => a.course_version_id))];
@@ -159,15 +161,20 @@ export async function GET(request: Request) {
   const courseOfVer = new Map(
     ((verRows ?? []) as Array<{ id: string; course_id: string }>).map((v) => [v.id, v.course_id])
   );
-  const byCourse = new Map<string, { status: string; attempts: number; list: ScorableAttempt[] }>();
+  const byCourse = new Map<string, { status: string; attempts: number; list: ScorableAttempt[]; progress: number | null; progressAt: string }>();
   let lastActive: string | null = null;
   for (const a of attempts) {
     const cid = courseOfVer.get(a.course_version_id);
     const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
     if (t && (!lastActive || t > lastActive)) lastActive = t;
     if (!cid) continue;
-    const row = byCourse.get(cid) ?? { status: "not_started", attempts: 0, list: [] };
+    const row = byCourse.get(cid) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
     row.attempts++;
+    // Progress of the most recent open attempt (0075).
+    if (a.completion_status === "in_progress" && (a.started_at ?? "") >= row.progressAt) {
+      row.progressAt = a.started_at ?? "";
+      row.progress = typeof a.progress_pct === "number" ? a.progress_pct : null;
+    }
     row.list.push({
       id: a.id,
       score: a.score,
@@ -195,7 +202,7 @@ export async function GET(request: Request) {
     : { data: [] };
   const pct = (v: number | null) => (v !== null ? Math.round(v * 100) : null);
   const courses = ((cRows ?? []) as Array<{ id: string; title: string }>).map((cr) => {
-    const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [] };
+    const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
     const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY);
     const due = dueByCourse.get(cr.id) ?? null;
     const done = st.status === "completed" || st.status === "passed";
@@ -210,6 +217,9 @@ export async function GET(request: Request) {
       best_score: pct(sc.bestScore),
       scored_attempts: sc.scoredAttempts,
       practice_attempts: sc.practiceAttempts,
+      // How far through the module the open attempt is (0–99); 100 when
+      // complete; null when the package gives no progress signal.
+      progress_pct: done ? 100 : st.progress,
       attempts: st.attempts,
       due_at: due,
       overdue: !!due && due < nowIso && !done,

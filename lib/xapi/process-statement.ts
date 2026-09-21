@@ -1,10 +1,18 @@
 import { VERBS, type XapiStatement } from "./types";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import {
+  CMI5_PROGRESS_EXT,
+  clampPct,
+  ensureUnitCount,
+  partialPct,
+  updateAttemptFailSoft,
+  type VersionLite,
+} from "@/lib/courses/progress";
 
 /**
  * Inspect a single xAPI statement and update the bound attempt's
- * completion_status / success_status / score accordingly. Mirrors the
- * "never downgrade" semantics of the SCORM commit route.
+ * completion_status / success_status / score / progress accordingly.
+ * Mirrors the "never downgrade" semantics of the SCORM commit route.
  *
  * COMPLETION CRITERIA (cmi5): only a completed / passed / failed statement
  * about the AU ITSELF counts. Authoring tools also emit per-screen
@@ -13,6 +21,10 @@ import type { SupabaseClient } from "@supabase/supabase-js";
  * them as such marked modules complete seconds after launch. The AU is
  * identified by the ids the LMS launched it with (manifest auId, the
  * course id some packages use instead, or the version urn fallback).
+ *
+ * PROGRESS (0075) is a separate axis: sub-activity statements advance it
+ * (screens completed ÷ the module's unit count), the cmi5 `progress`
+ * result extension sets it directly, and AU completion makes it 100.
  *
  * Returns the delta we wrote (for logging / debugging) or null if the
  * statement was a no-op.
@@ -27,12 +39,11 @@ export async function processStatement(opts: {
   if (!verbId) return null;
 
   // Read current attempt state (+ the launched AU's identity) so we can
-  // apply non-downgrade rules and scope completion to the AU.
+  // apply non-downgrade rules and scope completion to the AU. select("*")
+  // keeps this deploy-safe across attempt-column migrations (0075).
   const { data: row, error: readErr } = await supabase
     .from("course_attempts")
-    .select(
-      "completion_status, success_status, status, completed_at, score, course_version_id, course_versions(id, manifest_data)"
-    )
+    .select("*, course_versions(id, manifest_data, launch_url, storage_prefix)")
     .eq("id", attemptId)
     .maybeSingle();
   // Distinguish a real query error from "no such attempt". On error we must NOT
@@ -44,14 +55,19 @@ export async function processStatement(opts: {
     );
   }
   if (!row) return null;
+  const r = row as Record<string, unknown> & {
+    completion_status: string;
+    success_status: string;
+    status: string;
+    completed_at: string | null;
+    score: number | null;
+    course_version_id: string;
+  };
 
-  const version = Array.isArray(row.course_versions)
-    ? row.course_versions[0]
-    : row.course_versions;
-  const auIds = launchedActivityIds(
-    (version as { id?: string; manifest_data?: unknown } | null) ?? null,
-    row.course_version_id as string
-  );
+  const version = (Array.isArray(r.course_versions)
+    ? r.course_versions[0]
+    : r.course_versions) as VersionLite | null;
+  const auIds = launchedActivityIds(version, r.course_version_id);
   const aboutAu = isAboutAu(statement, auIds);
 
   const update: Record<string, unknown> = {};
@@ -59,7 +75,8 @@ export async function processStatement(opts: {
   const isOutcome = outcomeVerbs.includes(verbId);
 
   if (isOutcome && !aboutAu) {
-    // Sub-activity outcome (a slide, a question block): activity signal only.
+    // Sub-activity outcome (a slide, a question block): progress + activity
+    // signal only.
     console.warn(
       `[xapi] ignored ${verbId.split("/").pop()} for non-AU object ${
         statement.object?.id ?? "(none)"
@@ -68,17 +85,17 @@ export async function processStatement(opts: {
   }
 
   // Completion side — AU-level outcomes only.
-  if (isOutcome && aboutAu && row.completion_status !== "completed") {
+  if (isOutcome && aboutAu && r.completion_status !== "completed") {
     update.completion_status = "completed";
   }
 
   // Success side — AU-level outcomes only.
-  if (aboutAu && verbId === VERBS.passed && row.success_status !== "passed") {
+  if (aboutAu && verbId === VERBS.passed && r.success_status !== "passed") {
     update.success_status = "passed";
   } else if (
     aboutAu &&
     verbId === VERBS.failed &&
-    row.success_status !== "passed" // don't downgrade a previous passed
+    r.success_status !== "passed" // don't downgrade a previous passed
   ) {
     update.success_status = "failed";
   }
@@ -88,7 +105,7 @@ export async function processStatement(opts: {
   const scaled = statement.result?.score?.scaled;
   if (aboutAu && typeof scaled === "number" && !Number.isNaN(scaled)) {
     const rounded = Math.round(scaled * 10000) / 10000;
-    if (row.score === null || row.score === undefined || rounded > row.score) {
+    if (r.score === null || r.score === undefined || rounded > r.score) {
       update.score = rounded;
     }
   }
@@ -98,32 +115,68 @@ export async function processStatement(opts: {
   // stamps it: an incomplete attempt has no completion time.
   const nowComplete =
     (update.completion_status as string | undefined) === "completed" ||
-    row.completion_status === "completed";
-  if (!row.completed_at && nowComplete && (isOutcome || verbId === VERBS.terminated)) {
+    r.completion_status === "completed";
+  if (!r.completed_at && nowComplete && (isOutcome || verbId === VERBS.terminated)) {
     update.completed_at = new Date().toISOString();
+  }
+
+  // ---- Progress (0075) ----
+  const currentPct = typeof r.progress_pct === "number" ? r.progress_pct : null;
+  let pct: number | null = null;
+  if (nowComplete) {
+    pct = 100;
+  } else {
+    // cmi5 result extension (0–100) on an AU-level statement.
+    const ext = (statement.result?.extensions as Record<string, unknown> | undefined)?.[
+      CMI5_PROGRESS_EXT
+    ];
+    if (aboutAu && typeof ext === "number" && Number.isFinite(ext)) {
+      pct = Math.min(99, clampPct(ext));
+    }
+    // Per-screen statements: remember which units this attempt has reached.
+    const unitId = unitIdOf(statement, auIds);
+    if (unitId) {
+      const cmi = ((r.cmi_data ?? {}) as Record<string, unknown>) ?? {};
+      const cmi5 = ((cmi.cmi5 ?? {}) as Record<string, unknown>) ?? {};
+      const units = { ...((cmi5.units ?? {}) as Record<string, string>) };
+      const level =
+        verbId === VERBS.completed || verbId === VERBS.passed || verbId === VERBS.failed
+          ? "completed"
+          : "seen";
+      if (units[unitId] !== "completed" && (level === "completed" || !units[unitId])) {
+        units[unitId] = level;
+        update.cmi_data = { ...cmi, cmi5: { ...cmi5, units } };
+      }
+      const done = Object.values(units).filter((v) => v === "completed").length;
+      if (done > 0) {
+        const total = await ensureUnitCount(supabase, version);
+        const fromUnits = total ? partialPct(done, total) : null;
+        if (fromUnits !== null && (pct === null || fromUnits > pct)) pct = fromUnits;
+      }
+    }
+  }
+  if (pct !== null && (currentPct === null || pct > currentPct)) {
+    update.progress_pct = pct;
   }
 
   // Recompute legacy combined `status` from the (possibly updated) axes.
   const newCompletion =
-    (update.completion_status as string | undefined) ?? row.completion_status;
+    (update.completion_status as string | undefined) ?? r.completion_status;
   const newSuccess =
-    (update.success_status as string | undefined) ?? row.success_status;
+    (update.success_status as string | undefined) ?? r.success_status;
   let derivedStatus: string;
   if (newSuccess === "passed") derivedStatus = "passed";
   else if (newSuccess === "failed") derivedStatus = "failed";
   else if (newCompletion === "completed") derivedStatus = "completed";
   else derivedStatus = "in_progress";
 
-  if (derivedStatus !== row.status) update.status = derivedStatus;
+  if (derivedStatus !== r.status) update.status = derivedStatus;
 
   // Every statement counts as learning activity (streaks / "most active") —
   // stamp unconditionally, so the update below always runs.
   update.last_activity_at = new Date().toISOString();
 
-  const { error: updErr } = await supabase
-    .from("course_attempts")
-    .update(update)
-    .eq("id", attemptId);
+  const updErr = await updateAttemptFailSoft(supabase, attemptId, update);
   if (updErr) {
     throw new Error(
       `processStatement: failed to update attempt ${attemptId}: ${updErr.message}`
@@ -163,4 +216,25 @@ export function isAboutAu(statement: XapiStatement, auIds: string[]): boolean {
   const oid = normalizeActivityId(object?.id);
   if (!oid) return false;
   return auIds.includes(oid);
+}
+
+/**
+ * The sub-activity ("screen") id when the statement is about something
+ * inside the AU — e.g. `<courseId>/12` → "12". Null for the AU itself or
+ * for unrelated objects.
+ */
+export function unitIdOf(statement: XapiStatement, auIds: string[]): string | null {
+  const object = statement.object as { id?: string; objectType?: string } | undefined;
+  if (object?.objectType && object.objectType !== "Activity") return null;
+  const oid = normalizeActivityId(object?.id);
+  if (!oid || auIds.includes(oid)) return null;
+  // Longest matching parent wins (auId is usually courseId + "/au/1").
+  const parents = [...auIds].sort((a, b) => b.length - a.length);
+  for (const p of parents) {
+    if (oid.startsWith(`${p}/`)) {
+      const rest = oid.slice(p.length + 1);
+      return rest || null;
+    }
+  }
+  return null;
 }

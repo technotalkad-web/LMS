@@ -78,6 +78,8 @@ type Attempt = {
   started_at: string;
   completed_at: string | null;
   learning_path_id: string | null;
+  /** 0075 — undefined before the migration. */
+  progress_pct?: number | null;
 };
 
 type PathStepView = {
@@ -516,9 +518,8 @@ export default async function DashboardPage({
   const { data: attemptRows } = versionIds.length
     ? await supabase
         .from("course_attempts")
-        .select(
-          "id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
-        )
+        // select("*") for 0075 deploy safety (progress_pct).
+        .select("*")
         .eq("user_id", user.id)
         .in("course_version_id", versionIds)
     : { data: [] as Attempt[] };
@@ -728,6 +729,18 @@ export default async function DashboardPage({
     return computeScoring(my, policies.get(courseId) ?? DEFAULT_POLICY).officialScore;
   }
 
+  // Progress of the learner's most recent open attempt (0075); null when
+  // the package gives no progress signal.
+  function progressForCourse(courseId: string): number | null {
+    const open = attempts
+      .filter((a) => {
+        const v = versionById.get(a.course_version_id);
+        return v?.course_id === courseId && a.completion_status === "in_progress";
+      })
+      .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0];
+    return typeof open?.progress_pct === "number" ? open.progress_pct : null;
+  }
+
   function pushCard(a: Assignment, source: "user" | "team" | "org") {
     if (seen.has(a.course_id)) return;
     const course = courseById.get(a.course_id);
@@ -748,6 +761,7 @@ export default async function DashboardPage({
       isRevised: false,
       dueAt: a.due_at,
       bestScore: officialScoreForCourse(course.id),
+      progressPct: progressForCourse(course.id),
       pathName: pathNameByCourseId.get(course.id) ?? null,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,

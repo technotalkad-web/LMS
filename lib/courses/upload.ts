@@ -1,5 +1,6 @@
 import { lookup as lookupMime } from "mime-types";
 import { parseManifestFromZip } from "./manifest/detect";
+import { countUnitsInZip } from "./units";
 import { getStorage } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -206,6 +207,10 @@ export async function uploadCoursePackage(opts: {
   }
   await runConcurrent(uploads, 12);
 
+  // 0075: learning-unit count (screens) for progress %. Single-file engines
+  // embed their slide list in the launch HTML; null = no usable signal.
+  const unitCount = await countUnitsInZip(zip, manifest.launchUrl);
+
   // 5) course_version row.
   const { data: version, error: versionError } = await supabase
     .from("course_versions")
@@ -221,6 +226,7 @@ export async function uploadCoursePackage(opts: {
         description: manifest.description ?? null,
         masteryScore: manifest.masteryScore ?? null,
         raw: manifest.raw,
+        unitCount,
       },
       // B5: real per-upload footprint (the uploaded package's byte size) so
       // storage quota is enforced on actual bytes, not a flat per-row estimate.

@@ -42,6 +42,8 @@ export type GridCard = {
   /** Path tiles only: steps completed / total steps. */
   progressDone?: number;
   progressTotal?: number;
+  /** Course tiles: real in-module progress % of the open attempt (0075); null = unknown. */
+  progressPct?: number | null;
   thumbnail_url?: string | null;
   thumbnail_fit?: string | null;
   thumbnail_pos_x?: number | null;
@@ -497,7 +499,9 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               <div className="flex justify-between text-[11px] mb-1 font-medium">
                 <span className="text-muted">
                   {card.status === "in_progress"
-                    ? "In progress"
+                    ? typeof card.progressPct === "number"
+                      ? `${card.progressPct}% complete`
+                      : "In progress"
                     : isUpcoming
                       ? "Coming soon"
                       : "Not started"}
@@ -528,7 +532,7 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
                   style={{
                     width:
                       card.status === "in_progress"
-                        ? "50%"
+                        ? `${typeof card.progressPct === "number" ? Math.max(3, card.progressPct) : 50}%`
                         : card.status === "not_started"
                           ? "0%"
                           : "100%",
