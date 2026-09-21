@@ -7,6 +7,7 @@ import type { NotificationEvent } from "@/lib/notifications/types";
 import { SettingsClient } from "./settings-client";
 import { serviceProviderDetails } from "@/lib/supabase/sso-admin";
 import { maskedConfig } from "@/lib/lrs/config";
+import { normalizeBackground, type DashboardBackground } from "@/lib/theme/dashboard-background";
 
 export const dynamic = "force-dynamic";
 
@@ -89,6 +90,21 @@ export default async function SettingsPage({
       (themeRow?.learner_theme_custom as Record<string, string> | null | undefined) ??
       null,
   };
+
+  // Dashboard background themes (0074) — fail-soft before the migration.
+  let dashboardBackgrounds: DashboardBackground[] = [];
+  try {
+    const { data: bgRows } = await supabase
+      .from("dashboard_backgrounds")
+      .select("*")
+      .eq("organization_id", org.id)
+      .order("updated_at", { ascending: false });
+    dashboardBackgrounds = ((bgRows ?? []) as unknown[])
+      .map(normalizeBackground)
+      .filter((b): b is DashboardBackground => !!b);
+  } catch {
+    dashboardBackgrounds = [];
+  }
 
   const { data: smtpRow } = await supabase
     .from("notification_settings")
@@ -176,6 +192,7 @@ export default async function SettingsPage({
           serviceProvider: serviceProviderDetails(),
         }}
         lrs={await maskedConfig(org.id)}
+        dashboardBackgrounds={dashboardBackgrounds}
       />
     </div>
   );
