@@ -130,7 +130,13 @@ export function analyzeLaunchHtml(html: string | null): LaunchFindings {
   const stateGatedByCmi5 =
     cmi5StateApi &&
     /function\s+cmi5(?:Put|Get)State\s*\([^)]*\)\s*\{\s*if\s*\(\s*!\s*cmi5LaunchActive\s*\)\s*return/.test(html);
-  const engineVersion = (/["']engineVersion["']\s*:\s*["']([^"']+)["']/.exec(html) ?? [])[1] ?? null;
+  const engineVersion =
+    (/["']?engineVersion["']?\s*[:=]\s*["']([^"']+)["']/.exec(html) ?? [])[1] ??
+    (/<meta[^>]+name=["'](?:engine[-_]?version|kivo[-_]?version)["'][^>]+content=["']([^"']+)["']/i.exec(html) ?? [])[1] ??
+    (/<meta[^>]+content=["']([^"']+)["'][^>]+name=["'](?:engine[-_]?version|kivo[-_]?version)["']/i.exec(html) ?? [])[1] ??
+    (/data-(?:engine|kivo)-version=["']([^"']+)["']/i.exec(html) ?? [])[1] ??
+    (/<meta[^>]+name=["']generator["'][^>]+content=["'][^"']*?(\d{4}\.\d{2}\.\d{2}(?:\.\d+)?|\d+\.\d+\.\d+)[^"']*["']/i.exec(html) ?? [])[1] ??
+    null;
   const resumePromptNever = /["']?resumePrompt["']?\s*:\s*["']never["']/.test(html);
   const basicBearerAuth = /xapiLmsAuth\s*=\s*['"]Basic ['"]\s*\+\s*token/.test(html);
   const embeddedLrsSecret = /["']lrsApi(Secret|Key)["']\s*:\s*["'][^"']{6,}["']/.test(html);
@@ -232,7 +238,13 @@ async function scanZip(
     // XML/JSON are full of namespace/schema identifiers (xmlns:adlcp=
     // "http://www.adlnet.org/…") that are never requested — skip them.
     if (/\.(html?|js|mjs|css)$/i.test(lower)) {
-      s.httpRefs += count(text, /["'=(]http:\/\/(?!localhost|127\.0\.0\.1|www\.w3\.org|schemas?\.|adlnet\.|imsglobal|purl\.org)/g);
+      // xAPI verb / activity-type / extension registries (adlnet, tincanapi,
+      // w3id, activitystrea.ms) are identifiers by spec — canonical ids are
+      // http and never requested by the browser.
+      s.httpRefs += count(
+        text,
+        /["'=(]http:\/\/(?!localhost|127\.0\.0\.1|www\.w3\.org|schemas?\.|adlnet\.|imsglobal|purl\.org|id\.tincanapi\.com|w3id\.org|activitystrea\.ms|xapi\.|ns\.adobe\.com)/g
+      );
     }
 
     if (/\.html?$/i.test(lower)) collectExternalScripts(text, s);
@@ -466,7 +478,14 @@ export async function validatePackage(
           'Sends the LMS token as "Basic <Bearer …>" instead of verbatim. This LMS tolerates it; strict LRSs reject it — fix in the engine template.'
         );
       }
-      if (L.kivo && !L.engineVersion) {
+      if (L.kivo && L.engineVersion) {
+        push(
+          "engine-version",
+          "Engine version stamp",
+          "pass",
+          `Built with engine ${L.engineVersion}.`
+        );
+      } else if (L.kivo) {
         push(
           "engine-version",
           "Engine version stamp",
