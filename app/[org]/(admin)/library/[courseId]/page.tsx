@@ -20,7 +20,7 @@ import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 type Version = {
   id: string;
   version_number: number;
-  manifest_type: "scorm12" | "cmi5";
+  manifest_type: "scorm12" | "cmi5" | "xapi";
   launch_url: string;
   manifest_data: { title?: string; description?: string; masteryScore?: number };
   uploaded_at: string;

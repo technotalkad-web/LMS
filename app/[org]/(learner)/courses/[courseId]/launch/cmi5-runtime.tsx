@@ -3,27 +3,32 @@
 import Link from "next/link";
 
 /**
- * Parent page for a cmi5 course iframe.
+ * Parent page for a cmi5 or standalone xAPI (TinCan) course iframe.
  *
- * Unlike SCORM 1.2 we don't expose a `window.API` shim — cmi5 AUs talk
- * HTTP to the LRS (our /api/xapi/* endpoints) using the Bearer token they
- * fetch from the `fetch` URL on launch. The parent's only job is to host
- * the iframe and provide a back button.
+ * Unlike SCORM 1.2 we don't expose a `window.API` shim — the package talks
+ * HTTP to the LRS (our /api/xapi/* endpoints) using the attempt token it
+ * either fetches from the cmi5 `fetch` URL or receives verbatim in the
+ * TinCan `auth` launch parameter. The parent's only job is to host the
+ * iframe and provide a back button.
  *
- * The launch URL embedded in `iframeSrc` already contains the cmi5 query
- * parameters: endpoint, fetch, actor, registration, activityId.
+ * The launch URL embedded in `iframeSrc` already contains the launch
+ * parameters (cmi5: endpoint, fetch, actor, registration, activityId;
+ * xAPI: endpoint, auth, actor, activity_id, registration).
  */
 export function Cmi5Runtime({
   iframeSrc,
   courseTitle,
   backHref,
   backLabel = "Exit course",
+  standard = "cmi5",
 }: {
   iframeSrc: string;
   courseTitle: string;
   backHref: string;
   /** Names the launch context the exit returns to ("Back to journey"). */
   backLabel?: string;
+  /** Badge in the header corner. */
+  standard?: "cmi5" | "xAPI";
 }) {
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-ink">
@@ -42,7 +47,7 @@ export function Cmi5Runtime({
           </Link>
           <span className="serif text-lg sm:text-xl truncate">{courseTitle}</span>
         </div>
-        <span className="text-xs text-canvas/50">cmi5</span>
+        <span className="text-xs text-canvas/50">{standard}</span>
       </header>
       <iframe
         src={iframeSrc}

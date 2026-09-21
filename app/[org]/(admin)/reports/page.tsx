@@ -37,7 +37,7 @@ type Course = {
 type Version = {
   id: string;
   course_id: string;
-  manifest_type: "scorm12" | "cmi5";
+  manifest_type: "scorm12" | "cmi5" | "xapi";
 };
 
 type Attempt = {

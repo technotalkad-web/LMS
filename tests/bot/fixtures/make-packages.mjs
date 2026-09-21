@@ -2,6 +2,8 @@
  * Generates valid synthetic course packages for the lifecycle bot:
  *   - scorm12.zip  (SCORM 1.2, masteryscore 80, uses window.API)
  *   - cmi5.zip     (cmi5 AU that emits xAPI statements to the launch endpoint)
+ *   - xapi.zip     (tincan.xml package: endpoint/auth on the launch URL, saves
+ *                   and resumes through the State API — no fetch handshake)
  *
  * These are intentionally tiny but spec-valid: the manifest parsers
  * (lib/courses/manifest/*) accept them and the runtimes can drive them in a
@@ -133,6 +135,103 @@ const cmi5Html = `<!doctype html><html><head><meta charset="utf-8"><title>QA cmi
 </script>
 </body></html>`;
 
+// ---------- standalone xAPI (TinCan) ----------
+// Mirrors what Storyline/Captivate/KIVO emit in "LMS-provided xAPI" mode:
+// endpoint + auth + actor + activity_id + registration on the launch URL, no
+// fetch handshake. Five "slides"; each Next completes <activity>/<n> and PUTs
+// the resume blob to the State API; launch GETs it back and resumes.
+const tincanXml = `<?xml version="1.0" encoding="UTF-8"?>
+<tincan xmlns="http://projecttincan.com/tincan.xsd">
+  <activities>
+    <activity id="https://qa.bot/xapi/course" type="http://adlnet.gov/expapi/activities/course">
+      <name>QA Bot xAPI Course</name>
+      <description lang="en-US">Synthetic TinCan package for lifecycle testing (save / exit / relaunch / resume).</description>
+      <launch lang="en-US">index.html</launch>
+    </activity>
+  </activities>
+</tincan>`;
+
+const xapiHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>QA xAPI</title></head>
+<body>
+<h1>QA Bot xAPI Course</h1>
+<p id="status" data-slide="">starting…</p>
+<button id="next">Next slide</button>
+<button id="exit">Exit (save)</button>
+<button id="pass">Finish (passed 0.9)</button>
+<script>
+  // Unit count for progress % (same shape the KIVO engine exports).
+  var COURSE_CONFIG = { "slides": [{ "id": 1 }, { "id": 2 }, { "id": 3 }, { "id": 4 }, { "id": 5 }] };
+  var STATE_ID = 'qa_state_v1';
+  var q = new URLSearchParams(location.search);
+  var endpoint = q.get('endpoint');          // https://host/api/xapi/
+  var auth = q.get('auth');                  // verbatim Authorization header value
+  var actor = JSON.parse(q.get('actor') || '{}');
+  var activityId = q.get('activity_id') || q.get('activityId');
+  var registration = q.get('registration');
+  var s = document.getElementById('status');
+  var state = { current: 1, completed: [] };
+  var H = { 'Content-Type': 'application/json', 'Authorization': auth, 'X-Experience-API-Version': '1.0.3' };
+
+  function stateUrl(){
+    return endpoint + 'activities/state?stateId=' + STATE_ID
+      + '&activityId=' + encodeURIComponent(activityId)
+      + '&agent=' + encodeURIComponent(JSON.stringify(actor))
+      + '&registration=' + encodeURIComponent(registration);
+  }
+  var VERBS = {
+    initialized: 'http://adlnet.gov/expapi/verbs/initialized',
+    completed: 'http://adlnet.gov/expapi/verbs/completed',
+    passed: 'http://adlnet.gov/expapi/verbs/passed',
+    failed: 'http://adlnet.gov/expapi/verbs/failed',
+    terminated: 'http://adlnet.gov/expapi/verbs/terminated'
+  };
+  function stmt(verb, objectId, result){
+    return { actor: actor, verb: { id: VERBS[verb], display: { 'en-US': verb } },
+      object: { objectType: 'Activity', id: objectId },
+      context: { registration: registration }, result: result };
+  }
+  function send(verb, objectId, result){
+    return fetch(endpoint + 'statements', { method: 'POST', headers: H, body: JSON.stringify(stmt(verb, objectId, result)) });
+  }
+  function saveState(){
+    return fetch(stateUrl(), { method: 'PUT', headers: H, body: JSON.stringify(state) });
+  }
+  function show(text){ s.textContent = text; s.setAttribute('data-slide', String(state.current)); }
+
+  (async function(){
+    try {
+      if (!endpoint || !auth) { show('ERROR: no endpoint/auth on launch URL'); return; }
+      // Resume: whenever the LMS gave us endpoint + auth, look for saved state.
+      var r = await fetch(stateUrl(), { headers: H });
+      if (r.status === 200) { state = await r.json(); }
+      await send('initialized', activityId);
+      // Wire the controls BEFORE announcing readiness (the harness clicks as
+      // soon as the status text appears).
+      document.getElementById('next').onclick = async function(){
+        var done = state.current;
+        if (state.completed.indexOf(done) < 0) state.completed.push(done);
+        state.current = done + 1;
+        await send('completed', activityId + '/' + done, { completion: true });
+        await saveState();
+        show('slide ' + state.current + ' saved');
+      };
+      document.getElementById('exit').onclick = async function(){
+        await saveState();
+        await send('terminated', activityId);
+        show('exited at slide ' + state.current);
+      };
+      document.getElementById('pass').onclick = async function(){
+        await send('passed', activityId, { score: { scaled: 0.9 }, success: true });
+        await send('completed', activityId, { completion: true });
+        await send('terminated', activityId);
+        show('passed + completed sent');
+      };
+      show(r.status === 200 ? 'resumed at slide ' + state.current : 'fresh start at slide 1');
+    } catch(e){ show('ERROR: ' + e.message); }
+  })();
+</script>
+</body></html>`;
+
 async function build(name, files) {
   const zip = new JSZip();
   for (const [p, content] of Object.entries(files)) zip.file(p, content);
@@ -144,4 +243,5 @@ async function build(name, files) {
 
 await build("scorm12.zip", { "imsmanifest.xml": scormManifest, "index.html": scormHtml });
 await build("cmi5.zip", { "cmi5.xml": cmi5Xml, "index.html": cmi5Html });
+await build("xapi.zip", { "tincan.xml": tincanXml, "index.html": xapiHtml });
 console.log("done.");

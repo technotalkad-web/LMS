@@ -179,8 +179,8 @@ export default function CourseUploadPage() {
           </>
         ) : (
           <>
-            SCORM 1.2 (imsmanifest.xml) and cmi5 (cmi5.xml) packages are
-            supported.
+            SCORM 1.2 (imsmanifest.xml), cmi5 (cmi5.xml) and standalone xAPI
+            (tincan.xml) packages are supported.
           </>
         )}
       </p>

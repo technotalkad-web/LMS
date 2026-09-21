@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import { parseScorm12Manifest } from "./scorm12";
 import { parseCmi5Manifest } from "./cmi5";
+import { parseTincanManifest } from "./tincan";
 import type { ParsedManifest } from "./types";
 
 /**
@@ -9,6 +10,10 @@ import type { ParsedManifest } from "./types";
  *
  *   - imsmanifest.xml at root  → SCORM 1.2
  *   - cmi5.xml at root         → cmi5
+ *   - tincan.xml at root       → standalone xAPI (Tin Can)
+ *
+ * Precedence keeps existing behaviour: a zip that carries both imsmanifest.xml
+ * and tincan.xml (some tools export both) still plays as SCORM.
  *
  * (SCORM 2004 uses imsmanifest.xml too — we treat it as SCORM 1.2 for now;
  * the spec is largely backward-compatible at the manifest level.)
@@ -30,8 +35,14 @@ export async function parseManifestFromZip(
     return { manifest: parseScorm12Manifest(xml), zip };
   }
 
+  const tincanFile = findFile(zip, "tincan.xml");
+  if (tincanFile) {
+    const xml = await tincanFile.async("string");
+    return { manifest: parseTincanManifest(xml), zip };
+  }
+
   throw new Error(
-    "No supported manifest found. Expected cmi5.xml or imsmanifest.xml at the package root."
+    "No supported manifest found. Expected cmi5.xml, imsmanifest.xml or tincan.xml at the package root."
   );
 }
 

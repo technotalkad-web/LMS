@@ -28,7 +28,7 @@ import {
 type Version = {
   id: string;
   version_number: number;
-  manifest_type: "scorm12" | "cmi5";
+  manifest_type: "scorm12" | "cmi5" | "xapi";
   launch_url: string;
   manifest_data: { title?: string; description?: string; masteryScore?: number };
   uploaded_at: string;
@@ -248,7 +248,9 @@ export default async function CourseDetailPage({
                 <Target className="w-3.5 h-3.5" />
                 {current?.manifest_type === "cmi5"
                   ? "cmi5 module"
-                  : "SCORM module"}
+                  : current?.manifest_type === "xapi"
+                    ? "xAPI module"
+                    : "SCORM module"}
               </span>
               {masteryPct !== null && (
                 <span className="flex items-center gap-1.5">

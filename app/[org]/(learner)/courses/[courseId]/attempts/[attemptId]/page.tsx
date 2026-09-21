@@ -26,7 +26,7 @@ type Attempt = {
 type Version = {
   id: string;
   course_id: string;
-  manifest_type: "scorm12" | "cmi5";
+  manifest_type: "scorm12" | "cmi5" | "xapi";
   version_number: number;
 };
 
@@ -91,10 +91,11 @@ export default async function AttemptDetailPage({
     redirect(`/${orgSlug}/courses/${courseId}`);
   }
 
-  // Pull statements (cmi5) and extract interactions.
+  // Pull statements (cmi5 / xAPI) and extract interactions.
   let interactions: Interaction[] = [];
   let rawStatements: XapiStatement[] = [];
-  if (v.manifest_type === "cmi5") {
+  const usesXapi = v.manifest_type === "cmi5" || v.manifest_type === "xapi";
+  if (usesXapi) {
     const { data: stmts } = await supabase
       .from("xapi_statements")
       .select("raw, stored")
@@ -262,7 +263,7 @@ export default async function AttemptDetailPage({
         </div>
       )}
 
-      {v.manifest_type === "cmi5" && rawStatements.length > 0 && (
+      {usesXapi && rawStatements.length > 0 && (
         <details className="mt-10 border border-line rounded-lg bg-paper">
           <summary className="px-5 py-3 cursor-pointer text-sm font-medium">
             Raw xAPI statements ({rawStatements.length})
