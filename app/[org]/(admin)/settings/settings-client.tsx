@@ -9,6 +9,8 @@ import { ThumbnailPicker } from "../_components/thumbnail-picker";
 import { Settings as SettingsIcon, Mail, Palette, FileText } from "lucide-react";
 import { TabStrip, type Tab } from "@/components/admin";
 import { LearnerThemeSection } from "./learner-theme-section";
+import { DashboardBackgroundsSection } from "./dashboard-backgrounds-section";
+import type { DashboardBackground } from "@/lib/theme/dashboard-background";
 
 type Settings = {
   smtp_host: string;
@@ -99,6 +101,7 @@ export function SettingsClient({
   workspace,
   sso,
   lrs,
+  dashboardBackgrounds = [],
 }: {
   orgSlug: string;
   settings: Settings;
@@ -107,6 +110,8 @@ export function SettingsClient({
   workspace: WorkspaceBranding;
   sso: SsoConfig;
   lrs: LrsConfigView;
+  /** 0074 dashboard background themes. */
+  dashboardBackgrounds?: DashboardBackground[];
 }) {
   const router = useRouter();
   const [tab, setTab] = useState<
@@ -136,6 +141,7 @@ export function SettingsClient({
             initial={workspace}
             onSaved={() => router.refresh()}
           />
+          <DashboardBackgroundsSection orgSlug={orgSlug} initial={dashboardBackgrounds} />
           <SsoSection orgSlug={orgSlug} initial={sso} onSaved={() => router.refresh()} />
           <LrsSection orgSlug={orgSlug} initial={lrs} onSaved={() => router.refresh()} />
         </div>

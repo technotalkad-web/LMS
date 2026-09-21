@@ -7,7 +7,9 @@ import { randomBytes } from "crypto";
  *   POST /api/upload/image
  *   form-data:
  *     file: <PNG or JPEG>  (kind "animation": Lottie .json, .svg or .gif)
- *     kind: "thumbnail" | "logo" | "avatar" | "animation"  (storage subfolder)
+ *     kind: "thumbnail" | "logo" | "avatar" | "animation" | "background"  (storage subfolder)
+ *       "background" (dashboard themes, 0074) accepts PNG/JPEG/WebP OR a
+ *       sniffed .svg/.gif/Lottie .json like "animation".
  *     orgSlug: "acme"                          (caller must be a member)
  *
  * Returns: { url: string }
@@ -42,7 +44,9 @@ export async function POST(request: Request) {
             ? "creative" // popup announcement 16:9 / 9:16 images (admin-only)
             : kindRaw === "icon"
               ? "icon" // journey icons — tiny logos rendered inline next to names
-              : "thumbnail";
+              : kindRaw === "background"
+                ? "background" // dashboard background themes (0074), admin-only
+                : "thumbnail";
 
   if (!(file instanceof Blob)) {
     return NextResponse.json({ error: "Missing file" }, { status: 400 });
@@ -53,14 +57,20 @@ export async function POST(request: Request) {
   // Animation format detection: by filename extension first (browsers report
   // inconsistent MIME types for .json/.lottie), verified against content.
   let animExt: "json" | "svg" | "gif" | null = null;
-  if (kind === "animation") {
+  if (kind === "animation" || kind === "background") {
     const fname = (file instanceof File ? file.name : "").toLowerCase();
     if (fname.endsWith(".json") || fname.endsWith(".lottie")) animExt = "json";
     else if (fname.endsWith(".svg")) animExt = "svg";
     else if (fname.endsWith(".gif")) animExt = "gif";
-    if (!animExt) {
+    if (!animExt && kind === "animation") {
       return NextResponse.json(
         { error: "Animation must be a Lottie .json, an .svg, or a .gif file" },
+        { status: 400 }
+      );
+    }
+    if (!animExt && !ALLOWED.has(file.type)) {
+      return NextResponse.json(
+        { error: "Background must be PNG, JPEG, WebP, SVG, GIF or a Lottie .json" },
         { status: 400 }
       );
     }
@@ -73,7 +83,7 @@ export async function POST(request: Request) {
   const maxBytes =
     kind === "avatar"
       ? AVATAR_MAX_BYTES
-      : kind === "animation"
+      : animExt
         ? ANIMATION_MAX_BYTES
         : MAX_BYTES;
   if (file.size > maxBytes) {
@@ -141,7 +151,7 @@ export async function POST(request: Request) {
 
   // Animation content sniffing — the extension must match what's inside.
   let contentType = file.type;
-  if (kind === "animation") {
+  if (animExt) {
     if (animExt === "json") {
       try {
         const doc = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
@@ -177,8 +187,8 @@ export async function POST(request: Request) {
 
   // Build a short, collision-safe storage key.
   const ext =
-    kind === "animation"
-      ? animExt!
+    animExt
+      ? animExt
       : file.type === "image/png"
         ? "png"
         : file.type === "image/webp"

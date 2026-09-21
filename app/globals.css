@@ -154,6 +154,15 @@ body {
 [data-lms-root] main > * {
   animation: lms-enter 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
+/* The dashboard root hosts the fixed decorative background layer (0074). A
+   transform on the root would turn position:fixed into a local box, so the
+   root stays static and its children rise in instead — same look. */
+[data-lms-root] main > [data-dashboard-root] {
+  animation: none;
+}
+[data-lms-root] main > [data-dashboard-root] > :not([data-dashboard-background]) {
+  animation: lms-enter 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
 
 /* Tactile press feedback on anything clickable. The transition list is a
    superset of Tailwind's `transition` utility so hover color/shadow

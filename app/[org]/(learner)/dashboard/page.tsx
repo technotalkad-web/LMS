@@ -29,6 +29,12 @@ import {
   effectiveScoreLabel,
 } from "@/lib/gamification/board-copy";
 import { effectiveJourneyCopy } from "@/lib/journey/journey";
+import { DashboardBackground } from "@/components/dashboard/dashboard-background";
+import {
+  normalizeBackground,
+  pickActiveBackground,
+  type DashboardBackground as DashboardBackgroundRow,
+} from "@/lib/theme/dashboard-background";
 import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 
@@ -431,9 +437,37 @@ export default async function DashboardPage({
   const allCourseIds = Array.from(
     new Set([...directCourseIds, ...pathCourseIds, ...orgPublicCourseIds])
   );
+  // Dashboard background theme (0074) — the enabled, in-window theme
+  // updated most recently. Fail-soft: pre-migration or any error = none.
+  let dashboardBackground: DashboardBackgroundRow | null = null;
+  try {
+    const { data: bgRows } = await supabase
+      .from("dashboard_backgrounds")
+      .select("*")
+      .eq("organization_id", org.id)
+      .eq("is_enabled", true);
+    dashboardBackground = pickActiveBackground(
+      ((bgRows ?? []) as unknown[])
+        .map(normalizeBackground)
+        .filter((b): b is DashboardBackgroundRow => !!b),
+      Date.now()
+    );
+  } catch {
+    dashboardBackground = null;
+  }
+  const backgroundLayer = dashboardBackground ? (
+    <DashboardBackground
+      url={dashboardBackground.asset_url}
+      kind={dashboardBackground.asset_kind}
+      fit={dashboardBackground.fit}
+      opacity={dashboardBackground.opacity}
+    />
+  ) : null;
+
   if (allCourseIds.length === 0) {
     return (
-      <div>
+      <div data-dashboard-root="" className="relative isolate">
+        {backgroundLayer}
         <AnnouncementsBanner
           announcements={announcements}
           orgSlug={orgSlug}
@@ -799,7 +833,8 @@ export default async function DashboardPage({
   const upcomingReleaseAt = sp.upcoming ? effectiveReleaseFor(sp.upcoming) : null;
 
   return (
-    <div className="space-y-8">
+    <div data-dashboard-root="" className="relative isolate space-y-8">
+      {backgroundLayer}
       <AnnouncementsBanner
         announcements={announcements}
         orgSlug={orgSlug}
