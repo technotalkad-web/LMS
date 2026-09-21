@@ -10,6 +10,7 @@ import {
 import { notifyBackground } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import { originFromRequest } from "@/lib/http/origin";
+import { isSupportedLanguage } from "@/lib/i18n/languages";
 
 /**
  * Course package upload endpoint.
@@ -21,6 +22,13 @@ import { originFromRequest } from "@/lib/http/origin";
  *     courseId?: "..."             (omit for new course; provide to add a version)
  *     notify_update?: "1" | "0"   (when truthy + courseId given, fires asset_update
  *                                  email to every currently-assigned learner)
+ *     language?: "en" | "hi" | …  (package language from SUPPORTED_LANGUAGES;
+ *                                  new courses default to "en"; on an existing
+ *                                  course it targets/creates that language's
+ *                                  package)
+ *     display_name?: string        (optional label for a NEW language package)
+ *     packageId?: "..."            (existing course: the exact package this
+ *                                  zip replaces; wins over language)
  *
  * Returns: { courseId, versionId, versionNumber, manifest }
  */
@@ -78,6 +86,48 @@ export async function POST(request: NextRequest) {
   const courseId =
     typeof courseIdRaw === "string" && courseIdRaw ? courseIdRaw : undefined;
 
+  // Language mapping: every NEW course gets a labelled package (default
+  // English) so the learner picker and reports always know what they hold.
+  const languageRaw = form.get("language");
+  let language =
+    typeof languageRaw === "string" && languageRaw.trim() ? languageRaw.trim() : null;
+  if (language && !isSupportedLanguage(language)) {
+    return NextResponse.json(
+      { error: `Unsupported language code "${language}"` },
+      { status: 400 }
+    );
+  }
+  if (!courseId && !language) language = "en";
+  const displayNameRaw = form.get("display_name");
+  const displayName =
+    typeof displayNameRaw === "string" && displayNameRaw.trim()
+      ? displayNameRaw.trim().slice(0, 80)
+      : null;
+  const packageIdRaw = form.get("packageId");
+  let packageId =
+    typeof packageIdRaw === "string" && packageIdRaw.trim() ? packageIdRaw.trim() : undefined;
+  if (packageId) {
+    if (!courseId) {
+      return NextResponse.json(
+        { error: "packageId requires courseId" },
+        { status: 400 }
+      );
+    }
+    const { data: pkg } = await supabase
+      .from("course_packages")
+      .select("id, course_id")
+      .eq("id", packageId)
+      .eq("course_id", courseId)
+      .maybeSingle();
+    if (!pkg) {
+      return NextResponse.json(
+        { error: "Package not found on this course" },
+        { status: 404 }
+      );
+    }
+    packageId = (pkg as { id: string }).id;
+  }
+
   // Only check quota when creating a NEW course (versions don't consume).
   if (!courseId) {
     const quota = await checkQuota(org.id as string, "courses");
@@ -134,6 +184,9 @@ export async function POST(request: NextRequest) {
       organizationId: org.id,
       uploaderId: user.id,
       courseId,
+      packageId,
+      language: packageId ? null : language,
+      displayName,
       supabase,
     });
   } catch (err) {

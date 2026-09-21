@@ -30,6 +30,63 @@ import {
  *
  * Returns: { package_id, version_id, version_number }
  */
+/**
+ *   GET /api/courses/{courseId}/packages?orgSlug=...
+ *
+ * Admin-only: every language package on the course (active or not), for
+ * the upload page's "which language does this replace?" selector.
+ */
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ courseId: string }> }
+) {
+  const { courseId } = await params;
+  const orgSlug = new URL(request.url).searchParams.get("orgSlug")?.trim();
+  if (!orgSlug) {
+    return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
+  }
+  const supabase = await createClient();
+  const {
+    data: { user: caller },
+  } = await supabase.auth.getUser();
+  if (!caller) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const { data: org } = await supabase
+    .from("organizations")
+    .select("id")
+    .eq("slug", orgSlug)
+    .maybeSingle();
+  if (!org) {
+    return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  }
+  const { data: callerMem } = await supabase
+    .from("organization_members")
+    .select("role")
+    .eq("organization_id", org.id)
+    .eq("user_id", caller.id)
+    .maybeSingle();
+  const cr = callerMem?.role as string | undefined;
+  if (!(cr === "super_owner" || cr === "owner" || cr === "admin")) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+  const { data: course } = await supabase
+    .from("courses")
+    .select("id")
+    .eq("id", courseId)
+    .eq("organization_id", org.id)
+    .maybeSingle();
+  if (!course) {
+    return NextResponse.json({ error: "Course not found" }, { status: 404 });
+  }
+  const { data: rows } = await supabase
+    .from("course_packages")
+    .select("id, language, display_name, is_active, current_version_id")
+    .eq("course_id", courseId)
+    .order("language", { ascending: true, nullsFirst: true });
+  return NextResponse.json({ packages: rows ?? [] });
+}
+
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ courseId: string }> }
