@@ -5,6 +5,8 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { courseDaysOf, todayStr, DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
 import { fetchScoringRule } from "@/lib/scoring/resolve";
+import { computeJourneyState, parseVersionDays } from "@/lib/journey/journey";
+import { courseProgress } from "@/lib/courses/progress-view";
 import {
   JourneyAdminClient,
   type ProgramRow,
@@ -165,6 +167,65 @@ export default async function JourneyAdminPage({
     .eq("organization_id", org.id)
     .maybeSingle();
   const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+
+  // 0075: each active enrollment's current mission and the learner's
+  // progress inside that module (from their open attempt on any version).
+  if (program && enrollments.length > 0) {
+    const tzNow = todayStr(tz);
+    const verIds = [...new Set(enrollments.map((e) => (e as unknown as { version_id: string }).version_id))];
+    const { data: vdRows } = await svc.from("journey_versions").select("id, days").in("id", verIds);
+    const verDays = new Map<string, unknown>();
+    for (const v of (vdRows ?? []) as Array<{ id: string; days: unknown }>) verDays.set(v.id, v.days);
+    const missionByEnr = new Map<string, { day: number; courseId: string }>();
+    for (const e of enrollments) {
+      if (e.status !== "active") continue;
+      const days = verDays.get((e as unknown as { version_id: string }).version_id);
+      const st = computeJourneyState({
+        startDate: e.start_date,
+        today: tzNow,
+        completedCount: e.completed_count,
+        daysTotal: e.days_total,
+        countSundays: e.count_sundays === true,
+        courseDays: e.course_days,
+      });
+      if (st.finished) continue;
+      const courseId = parseVersionDays(days).get(st.currentDay)?.course_id ?? null;
+      if (courseId) missionByEnr.set(e.id, { day: st.currentDay, courseId });
+    }
+    const courseIds = [...new Set([...missionByEnr.values()].map((m) => m.courseId))];
+    if (courseIds.length > 0) {
+      const { data: vRows } = await svc
+        .from("course_versions")
+        .select("id, course_id, unit_count:manifest_data->unitCount")
+        .in("course_id", courseIds);
+      const vers = (vRows ?? []) as Array<{ id: string; course_id: string; unit_count: number | null }>;
+      const courseOfVer = new Map(vers.map((v) => [v.id, v.course_id]));
+      const unitCountByVersion = new Map(vers.map((v) => [v.id, typeof v.unit_count === "number" ? v.unit_count : null]));
+      const userIds = [...new Set(enrollments.filter((e) => missionByEnr.has(e.id)).map((e) => e.user_id))];
+      const { data: aRows } = vers.length && userIds.length
+        ? await svc
+            .from("course_attempts")
+            .select("user_id, course_version_id, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units")
+            .in("user_id", userIds)
+            .in("course_version_id", vers.map((v) => v.id))
+        : { data: [] };
+      type A = { user_id: string; course_version_id: string; completion_status: string; success_status: string; started_at: string | null; progress_pct?: number | null; units?: unknown };
+      const byUserCourse = new Map<string, A[]>();
+      for (const a of (aRows ?? []) as A[]) {
+        const cid = courseOfVer.get(a.course_version_id);
+        if (!cid) continue;
+        const k = `${a.user_id}|${cid}`;
+        byUserCourse.set(k, [...(byUserCourse.get(k) ?? []), a]);
+      }
+      for (const e of enrollments) {
+        const m = missionByEnr.get(e.id);
+        if (!m) continue;
+        const pv = courseProgress(byUserCourse.get(`${e.user_id}|${m.courseId}`) ?? [], unitCountByVersion);
+        e.current_day = m.day;
+        e.current_pct = pv.done ? 100 : pv.pct;
+      }
+    }
+  }
 
   // Day-by-day completion funnel (0059 RPC; admin-guarded inside). Fail-soft
   // to empty before the migration lands.

@@ -49,6 +49,7 @@ type Attempt = {
   score: number | null;
   started_at: string;
   completed_at: string | null;
+  progress_pct?: number | null;
 };
 
 type Assignment = {
@@ -73,6 +74,8 @@ interface CourseRow {
   failed: number;
   inProgress: number;
   avgScore: number | null;
+  /** 0075: mean progress % of open attempts (null = no signal). */
+  avgProgress: number | null;
   lastActivity: string | null;
 }
 
@@ -152,7 +155,7 @@ export default async function ReportsPage({
     supabase
       .from("course_attempts")
       .select(
-        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
+        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct"
       )
       .eq("organization_id", org.id)
       .range(f, t)
@@ -247,6 +250,15 @@ export default async function ReportsPage({
       scored.length === 0
         ? null
         : scored.reduce((s, a) => s + (a.score ?? 0), 0) / scored.length;
+    // 0075: how far the still-open attempts are, on average (null = the
+    // package reports no progress signal).
+    const openWithProgress = myAttempts.filter(
+      (a) => a.completion_status !== "completed" && a.success_status !== "passed" && typeof a.progress_pct === "number"
+    );
+    const avgProgress =
+      openWithProgress.length === 0
+        ? null
+        : Math.round(openWithProgress.reduce((s, a) => s + (a.progress_pct ?? 0), 0) / openWithProgress.length);
     const lastActivity =
       myAttempts
         .map((a) => a.completed_at ?? a.started_at)
@@ -268,6 +280,7 @@ export default async function ReportsPage({
       failed,
       inProgress,
       avgScore,
+      avgProgress,
       lastActivity,
     };
   });
@@ -376,6 +389,7 @@ export default async function ReportsPage({
     r.passed,
     r.failed,
     r.avgScore === null ? "" : (r.avgScore * 100).toFixed(2) + "%",
+    r.avgProgress === null ? "" : r.avgProgress + "%",
     r.lastActivity ? new Date(r.lastActivity).toISOString().slice(0, 10) : "",
   ]);
   const atRiskCsvRows = atRisk.map((r) => [
@@ -595,6 +609,7 @@ export default async function ReportsPage({
               "Passed",
               "Failed",
               "Avg score",
+              "Avg progress (in progress)",
               "Last activity",
             ]}
             rows={courseCsvRows}
@@ -622,6 +637,7 @@ export default async function ReportsPage({
                   <th className="text-right px-4 py-2 font-medium">Passed</th>
                   <th className="text-right px-4 py-2 font-medium">Failed</th>
                   <th className="text-right px-4 py-2 font-medium">Avg score</th>
+                  <th className="text-right px-4 py-2 font-medium" title="Average progress of learners still in progress">Avg progress</th>
                   <th className="text-right px-4 py-2 font-medium">Last activity</th>
                 </tr>
               </thead>
@@ -648,6 +664,9 @@ export default async function ReportsPage({
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">
                       {r.avgScore === null ? "-" : fmtPct(r.avgScore)}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      {r.avgProgress === null ? "-" : `${r.avgProgress}%`}
                     </td>
                     <td className="px-4 py-3 text-right text-xs text-muted whitespace-nowrap">
                       {r.lastActivity

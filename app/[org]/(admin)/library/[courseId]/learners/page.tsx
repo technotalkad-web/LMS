@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "./learners-filters";
 import { computeScoring } from "@/lib/scoring/policy";
+import { courseProgress, formatCourseProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 
 // =============================================================================
@@ -66,6 +67,8 @@ interface EnrichedLearner {
   bestScore: number | null;
   attempts: number;
   lastTouched: string | null;
+  /** 0075 progress % + screens. */
+  progress: CourseProgressView;
 }
 
 export default async function LearnersPage({
@@ -115,10 +118,16 @@ export default async function LearnersPage({
   // ---- fetch all versions for this course (for attempts join) ----
   const { data: versionRows } = await supabase
     .from("course_versions")
-    .select("id")
+    .select("id, unit_count:manifest_data->unitCount")
     .eq("course_id", c.id);
   const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map(
     (v) => v.id
+  );
+  const unitCountByVersion = new Map(
+    ((versionRows ?? []) as Array<{ id: string; unit_count: number | null }>).map((v) => [
+      v.id,
+      typeof v.unit_count === "number" ? v.unit_count : null,
+    ])
   );
 
   // ---- fetch assignments + work out who's enrolled and how ----
@@ -237,7 +246,7 @@ export default async function LearnersPage({
       ? await supabase
           .from("course_attempts")
           .select(
-            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
+            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
@@ -245,6 +254,8 @@ export default async function LearnersPage({
   type AttemptRow = {
     id: string;
     user_id: string;
+    progress_pct?: number | null;
+    units?: unknown;
     course_version_id: string;
     completion_status: string;
     success_status: string;
@@ -291,6 +302,7 @@ export default async function LearnersPage({
       bestScore,
       attempts: myAttempts.length,
       lastTouched,
+      progress: courseProgress(myAttempts, unitCountByVersion),
     };
   });
 
@@ -505,6 +517,7 @@ export default async function LearnersPage({
                 <SortHeader label="Learner" sortKey="email_asc" />
                 <th className="text-left px-4 py-2 font-medium">Source</th>
                 <th className="text-left px-4 py-2 font-medium">Status</th>
+                <th className="text-left px-4 py-2 font-medium">Progress</th>
                 <SortHeader label="Best" sortKey="best_desc" align="right" />
                 <SortHeader
                   label="Attempts"
@@ -551,6 +564,9 @@ export default async function LearnersPage({
                     </td>
                     <td className="px-4 py-3">
                       <StatusPill status={r.status} />
+                    </td>
+                    <td className="px-4 py-3 text-xs tabular-nums whitespace-nowrap">
+                      {r.status === "not_started" ? "—" : formatCourseProgress(r.progress)}
                     </td>
                     <td className="px-4 py-3 text-right text-xs tabular-nums">
                       {r.bestScore !== null

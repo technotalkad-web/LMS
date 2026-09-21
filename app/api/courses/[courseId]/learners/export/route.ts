@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
+import { courseProgress } from "@/lib/courses/progress-view";
 
 /**
  * GET /api/courses/{courseId}/learners/export?orgSlug=...
@@ -67,10 +68,16 @@ export async function GET(
   // ---- versions for attempts join ----
   const { data: versionRows } = await supabase
     .from("course_versions")
-    .select("id")
+    .select("id, unit_count:manifest_data->unitCount")
     .eq("course_id", c.id);
   const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map(
     (v) => v.id
+  );
+  const unitCountByVersion = new Map(
+    ((versionRows ?? []) as Array<{ id: string; unit_count: number | null }>).map((v) => [
+      v.id,
+      typeof v.unit_count === "number" ? v.unit_count : null,
+    ])
   );
 
   // ---- assignments ----
@@ -180,13 +187,16 @@ export async function GET(
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, completion_status, success_status, score, started_at, completed_at"
+            "user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
       : { data: [] };
   const attempts = (attemptRows ?? []) as Array<{
     user_id: string;
+    course_version_id: string;
+    progress_pct?: number | null;
+    units?: unknown;
     completion_status: string;
     success_status: string;
     score: number | null;
@@ -201,6 +211,9 @@ export async function GET(
     "First name",
     "Last name",
     "Status",
+    "Progress (%)",
+    "Screens completed",
+    "Screens total",
     "Best score (%)",
     "Attempts",
     "Last activity (ISO)",
@@ -236,12 +249,16 @@ export async function GET(
     const profile = profileByUser.get(uid);
     const via = Array.from(viaByUser.get(uid) ?? []).join("+");
 
+    const progress = courseProgress(myAttempts, unitCountByVersion);
     rows.push([
       employeeIdByUser.get(uid) ?? "",
       emailByUser.get(uid) ?? uid.slice(0, 8),
       profile?.first_name ?? "",
       profile?.last_name ?? "",
       status,
+      progress.pct !== null ? String(progress.pct) : "",
+      progress.screensDone !== null ? String(progress.screensDone) : "",
+      progress.screensTotal !== null ? String(progress.screensTotal) : "",
       bestScore !== null ? String(Math.round(bestScore * 100)) : "",
       String(myAttempts.length),
       lastTouched,

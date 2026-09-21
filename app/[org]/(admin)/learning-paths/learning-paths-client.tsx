@@ -1195,13 +1195,19 @@ function PathEnrolledTable({ enrollees }: { enrollees: PathEnrollee[] }) {
             <th className="text-left px-4 py-2 font-medium">Learner</th>
             <th className="text-left px-4 py-2 font-medium">Source</th>
             <th className="text-left px-4 py-2 font-medium">Progress</th>
+            <th className="text-left px-4 py-2 font-medium">Current step</th>
             <th className="text-right px-4 py-2 font-medium">Done</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-line">
           {sorted.map((e) => {
+            // Overall = completed steps plus the current step's partial (0075).
             const pct =
-              e.total === 0 ? 0 : Math.round((e.completed / e.total) * 100);
+              typeof e.overallPct === "number"
+                ? e.overallPct
+                : e.total === 0
+                  ? 0
+                  : Math.round((e.completed / e.total) * 100);
             return (
               <tr key={e.user_id} className="hover:bg-canvas/40">
                 <td className="px-4 py-3 text-sm">{e.email}</td>
@@ -1230,6 +1236,19 @@ function PathEnrolledTable({ enrollees }: { enrollees: PathEnrollee[] }) {
                       {pct}%
                     </span>
                   </div>
+                </td>
+                <td className="px-4 py-3 text-xs">
+                  {e.current ? (
+                    <span>
+                      <span className="text-muted">Step {e.current.index}:</span>{" "}
+                      <span className="truncate">{e.current.title}</span>{" "}
+                      <span className="tabular-nums font-medium">
+                        {e.current.pct === null ? "not started" : `${e.current.pct}%`}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="text-emerald-700">All steps done</span>
+                  )}
                 </td>
                 <td className="px-4 py-3 text-right text-xs tabular-nums">
                   {e.completed}/{e.total}
