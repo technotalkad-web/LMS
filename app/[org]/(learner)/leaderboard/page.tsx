@@ -511,17 +511,20 @@ export default async function LeaderboardPage({
           {top3.length === 3 && <Podium top3={top3} style={gsx?.podium_style} />}
 
           <div className="bg-paper border border-line rounded-2xl overflow-x-auto">
-            <table className="w-full text-sm">
+            {/* Fixed layout on phones: the learner column wraps inside the
+                width left after rank + metric, so the score is never pushed
+                off the right edge. Auto layout from sm up. */}
+            <table className="w-full text-sm table-fixed sm:table-auto">
               <thead>
                 <tr className="text-left text-[11px] uppercase tracking-wider text-muted border-b border-line">
-                  <th className="px-3 sm:px-4 py-3 w-12 sm:w-14">Rank</th>
+                  <th className="px-3 sm:px-4 py-3 w-11 sm:w-14">Rank</th>
                   <th className="px-3 sm:px-4 py-3">Learner</th>
                   {showDesignation && (
                     <th className="px-4 py-3 hidden sm:table-cell">Designation</th>
                   )}
                   {showTeam && <th className="px-4 py-3 hidden md:table-cell">Team</th>}
                   {showCity && <th className="px-4 py-3 hidden md:table-cell">City</th>}
-                  <th className="px-3 sm:px-4 py-3 text-right whitespace-nowrap" title={score.description}>
+                  <th className="px-3 sm:px-4 py-3 text-right sm:whitespace-nowrap w-[4.75rem] sm:w-auto" title={score.description}>
                     {metricLabelOf(activeBoard)}
                   </th>
                 </tr>
@@ -671,7 +674,7 @@ function LeaderRow({
         <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
           <Avatar name={displayName(r)} avatarUrl={r.avatar_url} size="sm" />
           <div className="min-w-0">
-            <div className="font-medium break-words">
+            <div className="font-medium break-words text-[13px] sm:text-sm">
               {displayName(r)}
               {isMe && <span className="text-indigo-600 text-xs ml-1.5">(you)</span>}
             </div>
