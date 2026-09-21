@@ -20,7 +20,8 @@ import {
  * sub-activities; those never decide the module's completion — treating
  * them as such marked modules complete seconds after launch. The AU is
  * identified by the ids the LMS launched it with (manifest auId, the
- * course id some packages use instead, or the version urn fallback).
+ * tincan.xml activity id for standalone xAPI packages, the course id some
+ * packages use instead, or the version urn fallback).
  *
  * PROGRESS (0075) is a separate axis: sub-activity statements advance it
  * (screens completed ÷ the module's unit count), the cmi5 `progress`
@@ -203,7 +204,7 @@ export function launchedActivityIds(
   const raw =
     ((version?.manifest_data as { raw?: Record<string, unknown> } | undefined)?.raw ??
       {}) as Record<string, unknown>;
-  const ids = [raw.auId, raw.courseId, `urn:uuid:${version?.id ?? versionId}`]
+  const ids = [raw.auId, raw.activityId, raw.courseId, `urn:uuid:${version?.id ?? versionId}`]
     .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
     .map(normalizeActivityId);
   return [...new Set(ids)];

@@ -508,9 +508,11 @@ function StepCard({
               <BookOpen className="w-3.5 h-3.5" />
               {step.manifestType === "cmi5"
                 ? "cmi5 module"
-                : step.manifestType
-                  ? "SCORM module"
-                  : "Course"}
+                : step.manifestType === "xapi"
+                  ? "xAPI module"
+                  : step.manifestType
+                    ? "SCORM module"
+                    : "Course"}
             </span>
             {isCompleted && score !== null && (
               <span className="flex items-center gap-1 text-emerald-700 font-medium">

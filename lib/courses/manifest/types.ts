@@ -1,4 +1,4 @@
-export type ManifestType = "scorm12" | "cmi5";
+export type ManifestType = "scorm12" | "cmi5" | "xapi";
 
 export interface ParsedManifest {
   type: ManifestType;

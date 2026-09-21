@@ -31,9 +31,9 @@ type Course = {
 
 type Version = {
   id: string;
-  manifest_type: "scorm12" | "cmi5";
+  manifest_type: "scorm12" | "cmi5" | "xapi";
   launch_url: string;
-  manifest_data: { raw?: { courseId?: string; auId?: string } };
+  manifest_data: { raw?: { courseId?: string; auId?: string; activityId?: string } };
 };
 
 type PackageRow = {
@@ -613,7 +613,11 @@ export default async function LaunchPage({
     );
   }
 
-  // --- cmi5 path ---
+  // --- cmi5 / standalone xAPI (TinCan) path ---
+  // Both mint the same attempt-bound LRS token. cmi5 hands it over through
+  // the one-shot `fetch` handshake; a tincan.xml package gets it directly
+  // on the launch URL as the standard `auth` parameter. Everything after
+  // that (statements, State API resume, progress) is shared.
   const svcUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
   const svcKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
   const svc = createServiceClient(svcUrl, svcKey, {
@@ -632,7 +636,7 @@ export default async function LaunchPage({
 
   if (!token) {
     return (
-      <div className="p-10 text-red-700">Failed to mint cmi5 launch token.</div>
+      <div className="p-10 text-red-700">Failed to mint launch token.</div>
     );
   }
 
@@ -642,23 +646,45 @@ export default async function LaunchPage({
   // fallback so this never regresses to localhost.
   const host = (await originFromRequest()) || "https://localhost:3000";
 
-  const launchParams = new URLSearchParams({
-    endpoint: `${host}/api/xapi/`,
-    fetch: `${host}/api/xapi/fetch?fetch_token=${token.fetch_token}`,
-    actor: JSON.stringify({
-      objectType: "Agent",
-      name: user.email ?? "Learner",
-      account: {
-        homePage: host,
-        name: user.id,
-      },
-    }),
-    registration: attemptId,
-    activityId:
-      v.manifest_data?.raw?.auId ??
-      v.manifest_data?.raw?.courseId ??
-      `urn:uuid:${v.id}`,
+  const actor = JSON.stringify({
+    objectType: "Agent",
+    name: user.email ?? "Learner",
+    account: {
+      homePage: host,
+      name: user.id,
+    },
   });
+  const activityId =
+    v.manifest_data?.raw?.auId ??
+    v.manifest_data?.raw?.activityId ??
+    v.manifest_data?.raw?.courseId ??
+    `urn:uuid:${v.id}`;
+
+  const isXapi = v.manifest_type === "xapi";
+  const launchParams = isXapi
+    ? // TinCan launch (xAPI launch guidelines): endpoint, auth, actor,
+      // activity_id, registration. `auth` is the verbatim Authorization
+      // header value; Basic <base64(user:token)> is what every TinCan
+      // player (Storyline, Captivate, iSpring, KIVO) expects, and
+      // authenticateXapi() unwraps it back to the attempt token.
+      new URLSearchParams({
+        endpoint: `${host}/api/xapi/`,
+        auth: `Basic ${Buffer.from(`lms:${authToken}`).toString("base64")}`,
+        actor,
+        activity_id: activityId,
+        // Same attempt ⇒ same registration on relaunch, so saved state
+        // (State API) is found again and the session resumes.
+        registration: attemptId,
+        // Some engines read the cmi5-style name for the activity.
+        activityId,
+      })
+    : new URLSearchParams({
+        endpoint: `${host}/api/xapi/`,
+        fetch: `${host}/api/xapi/fetch?fetch_token=${token.fetch_token}`,
+        actor,
+        registration: attemptId,
+        activityId,
+      });
 
   const launchPath = v.launch_url.replace(/^\/+/, "");
   const sep = launchPath.includes("?") ? "&" : "?";
@@ -670,6 +696,7 @@ export default async function LaunchPage({
       courseTitle={c.title}
       backHref={backHref}
       backLabel={backLabel}
+      standard={isXapi ? "xAPI" : "cmi5"}
     />
   );
 }

@@ -295,7 +295,7 @@ export default async function CourseReportsPage({
           <div className="border border-dashed border-line rounded-2xl bg-paper p-6 text-sm text-muted">
             <strong className="text-ink">No question data yet.</strong>{" "}
             This section populates after learners submit quiz answers in a
-            cmi5 module. SCORM 1.2 packages don&apos;t emit xAPI statements
+            cmi5 or xAPI module. SCORM 1.2 packages don&apos;t emit xAPI statements
             so their per-question detail isn&apos;t aggregated here.
           </div>
         ) : (

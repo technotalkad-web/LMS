@@ -54,7 +54,7 @@ type Version = {
   id: string;
   course_id: string;
   version_number: number;
-  manifest_type: "scorm12" | "cmi5";
+  manifest_type: "scorm12" | "cmi5" | "xapi";
 };
 
 type Assignment = {

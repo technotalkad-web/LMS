@@ -30,7 +30,7 @@ export type ValidationCheck = {
 export type PackageValidationReport = {
   version: 1;
   package: {
-    type: "scorm12" | "cmi5" | "unknown";
+    type: "scorm12" | "cmi5" | "xapi" | "unknown";
     title: string | null;
     launchUrl: string | null;
     sizeBytes: number;
@@ -83,6 +83,8 @@ export type LaunchFindings = {
   cmi5ResumeNeverApplied: boolean;
   /** cmi5 state save/restore code present at all. */
   cmi5StateApi: boolean;
+  /** State API calls bail out unless a cmi5 handshake ran (KIVO template). */
+  stateGatedByCmi5: boolean;
   /** Authoring setting: resumePrompt = "never" — always restarts. */
   resumePromptNever: boolean;
   /** Sends the LMS token as "Basic <Bearer …>" instead of verbatim. */
@@ -100,7 +102,7 @@ const MAX_LAUNCH_FILE_BYTES = 16 * 1024 * 1024;
 export function analyzeLaunchHtml(html: string | null): LaunchFindings {
   const none: LaunchFindings = {
     scanned: false, kivo: false, engineVersion: null, cmi5ResumeNeverApplied: false,
-    cmi5StateApi: false, resumePromptNever: false, basicBearerAuth: false,
+    cmi5StateApi: false, stateGatedByCmi5: false, resumePromptNever: false, basicBearerAuth: false,
     embeddedLrsSecret: false, courseLevelOutcome: false, terminatedOnExit: false,
   };
   if (!html) return none;
@@ -123,6 +125,11 @@ export function analyzeLaunchHtml(html: string | null): LaunchFindings {
   const bookmarkGatedBySco =
     /if\s*\(\s*scormApi\s*\)\s*\{\s*resumedFromBookmark\s*=\s*loadBookmark\s*\(\)/.test(html);
   const cmi5ResumeNeverApplied = fetchesState && !appliesAfterFetch && bookmarkGatedBySco;
+  // KIVO: `async function cmi5PutState(...) { if (!cmi5LaunchActive) return; …`
+  // → in xAPI launch mode (no fetch URL) the State API is never touched.
+  const stateGatedByCmi5 =
+    cmi5StateApi &&
+    /function\s+cmi5(?:Put|Get)State\s*\([^)]*\)\s*\{\s*if\s*\(\s*!\s*cmi5LaunchActive\s*\)\s*return/.test(html);
   const engineVersion = (/["']engineVersion["']\s*:\s*["']([^"']+)["']/.exec(html) ?? [])[1] ?? null;
   const resumePromptNever = /["']?resumePrompt["']?\s*:\s*["']never["']/.test(html);
   const basicBearerAuth = /xapiLmsAuth\s*=\s*['"]Basic ['"]\s*\+\s*token/.test(html);
@@ -132,7 +139,7 @@ export function analyzeLaunchHtml(html: string | null): LaunchFindings {
     /verbs\/(passed|failed|completed)/.test(html);
   const terminatedOnExit = /verbs\/terminated|['"]terminated['"]/.test(html);
   return {
-    scanned: true, kivo, engineVersion, cmi5ResumeNeverApplied, cmi5StateApi,
+    scanned: true, kivo, engineVersion, cmi5ResumeNeverApplied, cmi5StateApi, stateGatedByCmi5,
     resumePromptNever, basicBearerAuth, embeddedLrsSecret, courseLevelOutcome, terminatedOnExit,
   };
 }
@@ -175,7 +182,7 @@ async function scanZip(
           s.launch = analyzeLaunchHtml(html);
           if (s.launch.kivo) s.tool = "KIVO (in-house engine)";
           s.viewportInLaunch = /<meta[^>]+viewport/i.test(html);
-          s.xapi += count(html, /sendStatement|XAPIWrapper|\bcmi5\.js\b|"actor"\s*:|xapiSend\s*\(/g);
+          s.xapi += count(html, /sendStatement|XAPIWrapper|\bcmi5\.js\b|"actor"\s*:|xapiSend\s*\(|X-Experience-API-Version|\bTinCan\.|tincan(?:-min)?\.js|expapi\/verbs\//g);
           collectExternalScripts(html, s);
         }
       } catch {
@@ -220,7 +227,7 @@ async function scanZip(
     s.score += count(text, /cmi\.core\.score\.raw|cmi\.score\.scaled/g);
     s.resume += count(text, /cmi\.suspend_data|cmi\.core\.lesson_location/g);
     s.interactions += count(text, /cmi\.interactions/g);
-    s.xapi += count(text, /sendStatement|XAPIWrapper|\bcmi5\.js\b|"actor"\s*:/g);
+    s.xapi += count(text, /sendStatement|XAPIWrapper|\bcmi5\.js\b|"actor"\s*:|X-Experience-API-Version|\bTinCan\.|tincan(?:-min)?\.js|expapi\/verbs\//g);
     // Mixed-content scan only where the browser actually fetches URLs.
     // XML/JSON are full of namespace/schema identifiers (xmlns:adlcp=
     // "http://www.adlnet.org/…") that are never requested — skip them.
@@ -277,7 +284,7 @@ export async function validatePackage(
       "manifest",
       "Package manifest",
       "pass",
-      `Detected ${manifest.type === "cmi5" ? "cmi5 (cmi5.xml)" : "SCORM 1.2 (imsmanifest.xml)"} — "${manifest.title}".`
+      `Detected ${manifest.type === "cmi5" ? "cmi5 (cmi5.xml)" : manifest.type === "xapi" ? "standalone xAPI (tincan.xml)" : "SCORM 1.2 (imsmanifest.xml)"} — "${manifest.title}".`
     );
   } catch (e) {
     push(
@@ -333,7 +340,9 @@ export async function validatePackage(
   }
 
   const isCmi5 = manifest.type === "cmi5";
-  if (isCmi5) {
+  const isXapi = manifest.type === "xapi";
+  if (isCmi5 || isXapi) {
+    const kind = isCmi5 ? "cmi5" : "xAPI";
     const hasXapi = s.xapi > 0;
     push(
       "api",
@@ -341,24 +350,57 @@ export async function validatePackage(
       hasXapi ? "pass" : "fail",
       hasXapi
         ? `xAPI statement calls detected (${s.xapi} references) — completion, score, and interactions report through statements at runtime.`
-        : "No xAPI statement calls found anywhere in the package — this cmi5 package cannot report any learner data."
+        : `No xAPI statement calls found anywhere in the package — this ${kind} package cannot report any learner data.`
     );
     const raw = manifest.raw as Record<string, unknown>;
-    const moveOn = typeof raw?.moveOn === "string" ? (raw.moveOn as string) : null;
-    push(
-      "moveon",
-      "Completion criteria (moveOn)",
-      moveOn ? "pass" : "warning",
-      moveOn
-        ? `moveOn="${moveOn}" — the LMS knows exactly when this AU counts as done.`
-        : "cmi5.xml does not declare moveOn — completion semantics are ambiguous; the LMS will fall back to Completed-or-Passed."
-    );
-    if (moveOn && /Passed/i.test(moveOn) && manifest.masteryScore == null) {
+    if (isCmi5) {
+      const moveOn = typeof raw?.moveOn === "string" ? (raw.moveOn as string) : null;
+      push(
+        "moveon",
+        "Completion criteria (moveOn)",
+        moveOn ? "pass" : "warning",
+        moveOn
+          ? `moveOn="${moveOn}" — the LMS knows exactly when this AU counts as done.`
+          : "cmi5.xml does not declare moveOn — completion semantics are ambiguous; the LMS will fall back to Completed-or-Passed."
+      );
+      if (moveOn && /Passed/i.test(moveOn) && manifest.masteryScore == null) {
+        push(
+          "mastery",
+          "Mastery score (pass threshold)",
+          "warning",
+          `moveOn="${moveOn}" requires a pass, but cmi5.xml declares no masteryScore — the package decides pass/fail on its own and the LMS cannot verify the threshold.`
+        );
+      }
+    } else {
+      // tincan.xml: the activity id is the ONLY thing that ties the
+      // package's completed / passed / failed statements to this module.
+      const activityId = typeof raw?.activityId === "string" ? (raw.activityId as string) : "";
+      const iriLike = /^(https?:\/\/|urn:)[^\s]+$/i.test(activityId);
+      push(
+        "activity-id",
+        "Launch activity id",
+        activityId ? (iriLike ? "pass" : "warning") : "fail",
+        activityId
+          ? iriLike
+            ? `Course activity "${activityId}" — completed / passed / failed statements about it mark the module complete; statements about other activities only feed progress %.`
+            : `Course activity id "${activityId}" is not an IRI (http(s)://… or urn:…). Most players still send it verbatim, but strict LRS forwarding will reject the statements.`
+          : "tincan.xml declares no activity id — the LMS cannot tell which statements belong to this module and it will never be marked Completed."
+      );
+      const count = typeof raw?.activityCount === "number" ? (raw.activityCount as number) : 1;
+      if (count > 1) {
+        push(
+          "activities",
+          "Activity tree",
+          "info",
+          `${count} activities declared; the first launchable one is the course activity. Statements about the others (screens, questions) feed progress % and analytics only.`
+        );
+      }
+      // No moveOn / masteryScore in tincan.xml: pass/fail is decided by the package.
       push(
         "mastery",
         "Mastery score (pass threshold)",
-        "warning",
-        `moveOn="${moveOn}" requires a pass, but cmi5.xml declares no masteryScore — the package decides pass/fail on its own and the LMS cannot verify the threshold.`
+        "info",
+        "tincan.xml carries no pass threshold — pass/fail comes from the package's own passed / failed statements; a completed statement without a score marks the module Completed."
       );
     }
     const L = s.launch;
@@ -367,21 +409,27 @@ export async function validatePackage(
       if (L.cmi5ResumeNeverApplied) {
         push(
           "cmi5-resume",
-          "Resume (cmi5 saved state)",
+          `Resume (${kind} saved state)`,
           "fail",
-          "This build saves the learner's position to the LMS but NEVER restores it on relaunch (its resume routine only runs for SCORM launches and before the cmi5 state has arrived). Every learner will restart from slide 1. Rebuild with the fixed engine template before assigning."
+          "This build saves the learner's position to the LMS but NEVER restores it on relaunch (its resume routine only runs for SCORM launches and before the saved state has arrived). Every learner will restart from slide 1. Rebuild with the fixed engine template before assigning."
         );
       } else if (L.cmi5StateApi) {
         push(
           "cmi5-resume",
-          "Resume (cmi5 saved state)",
+          `Resume (${kind} saved state)`,
           "pass",
-          "Saves and restores learner state through the xAPI State API — learners continue where they left off."
+          isXapi && L.stateGatedByCmi5
+            ? "Saves and restores learner state through the xAPI State API, but only after a cmi5 handshake — on a plain xAPI launch (no fetch URL) this build never reads or writes state, so learners restart from slide 1. Rebuild with an engine that also saves state when endpoint + auth come from the launch URL."
+            : "Saves and restores learner state through the xAPI State API — learners continue where they left off."
         );
+        if (isXapi && L.stateGatedByCmi5) {
+          // Make it count: downgrade the resume check for xAPI launches.
+          checks[checks.length - 1].status = "warning";
+        }
       } else {
         push(
           "cmi5-resume",
-          "Resume (cmi5 saved state)",
+          `Resume (${kind} saved state)`,
           "warning",
           "No State API usage found — this package does not save the learner's position; learners restart from the beginning on every launch."
         );
