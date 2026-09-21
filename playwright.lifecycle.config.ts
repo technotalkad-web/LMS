@@ -12,9 +12,15 @@ import path from "node:path";
  *
  * Usage: npm run test:lifecycle
  */
+// A base URL given on the command line wins over the env files (which use
+// override: true), e.g. E2E_BASE_URL=http://localhost:3000 for a dev server.
+const cliBaseURL = process.env.E2E_BASE_URL;
 dotenv.config({ path: path.resolve(__dirname, ".env.test") });
 dotenv.config({ path: path.resolve(__dirname, ".env.test.local"), override: true });
 
+// Restore it after dotenv so worker processes (which re-evaluate this file
+// with the inherited env) see the same target as the runner.
+if (cliBaseURL) process.env.E2E_BASE_URL = cliBaseURL;
 const baseURL = process.env.E2E_BASE_URL || "http://localhost:3000";
 
 export default defineConfig({

@@ -154,7 +154,7 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
       .toBe("completed");
     const done = await attemptRow(attemptId);
     expect(done.success_status).toBe("passed");
-    expect(done.score).toBe(90);
+    expect(Number(done.score)).toBeCloseTo(0.9, 4); // scores are stored 0..1
     expect(done.progress_pct).toBe(100);
     expect(done.completed_at).not.toBeNull();
 
@@ -256,7 +256,7 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
     a = await attemptRow(attemptId);
     expect(a.completion_status).toBe("completed");
     expect(a.success_status).toBe("passed");
-    expect(a.score).toBe(85);
+    expect(Number(a.score)).toBeCloseTo(0.85, 4);
     expect(a.progress_pct).toBe(100);
 
     const all = await attemptsFor(course.versionId, w.learner.id);
@@ -300,7 +300,7 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
     );
     a = await attemptRow(attemptId);
     expect(a.completion_status).toBe("completed");
-    expect(a.score).toBe(90);
+    expect(Number(a.score)).toBeCloseTo(0.9, 4); // SCORM raw 90 → 0.9, unchanged
     await ctx.close();
   });
 });

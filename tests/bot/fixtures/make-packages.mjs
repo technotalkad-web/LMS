@@ -203,9 +203,10 @@ const xapiHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="v
       if (!endpoint || !auth) { show('ERROR: no endpoint/auth on launch URL'); return; }
       // Resume: whenever the LMS gave us endpoint + auth, look for saved state.
       var r = await fetch(stateUrl(), { headers: H });
-      if (r.status === 200) { state = await r.json(); show('resumed at slide ' + state.current); }
-      else { show('fresh start at slide 1'); }
+      if (r.status === 200) { state = await r.json(); }
       await send('initialized', activityId);
+      // Wire the controls BEFORE announcing readiness (the harness clicks as
+      // soon as the status text appears).
       document.getElementById('next').onclick = async function(){
         var done = state.current;
         if (state.completed.indexOf(done) < 0) state.completed.push(done);
@@ -225,6 +226,7 @@ const xapiHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="v
         await send('terminated', activityId);
         show('passed + completed sent');
       };
+      show(r.status === 200 ? 'resumed at slide ' + state.current : 'fresh start at slide 1');
     } catch(e){ show('ERROR: ' + e.message); }
   })();
 </script>

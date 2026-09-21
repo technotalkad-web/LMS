@@ -72,7 +72,7 @@ package ("Resume (xAPI saved state)" → warning).
 
 - `tests/bot/lifecycle/43-xapi-resume.spec.ts` — browser test (fixture
   package resumes at the saved slide after exit/relaunch; exit keeps
-  In progress with 60 %; passed+completed finishes with score 90 and 100 %;
+  In progress with 60 %; passed+completed finishes with score 0.9 (stored 0..1) and 100 %;
   a finished attempt is not resumed), API-level launch contract test, and a
   SCORM 1.2 regression test.
 - Fixture: `tests/bot/fixtures/xapi.zip` (regenerate with
