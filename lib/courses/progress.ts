@@ -75,26 +75,38 @@ export async function ensureUnitCount(
  * common shapes: `{ completed: [ids] }` (KIVO engine), `{ completedSlides,
  * totalSlides }`, `{ progress: 0..1 | 0..100 }`.
  */
-export function progressFromState(content: unknown): { done: number | null; pct: number | null } {
+export function progressFromState(content: unknown): {
+  done: number | null;
+  pct: number | null;
+  /** Completed screen ids when the state lists them (merged with statements). */
+  completedIds: string[] | null;
+} {
+  const none = { done: null, pct: null, completedIds: null };
   let doc = content;
   if (typeof doc === "string") {
     try {
       doc = JSON.parse(doc);
     } catch {
-      return { done: null, pct: null };
+      return none;
     }
   }
-  if (!doc || typeof doc !== "object") return { done: null, pct: null };
+  if (!doc || typeof doc !== "object") return none;
   const o = doc as Record<string, unknown>;
+  const completedIds = Array.isArray(o.completed)
+    ? o.completed
+        .filter((v): v is string | number => typeof v === "string" || typeof v === "number")
+        .map((v) => String(v).trim().toLowerCase())
+        .filter(Boolean)
+    : null;
   if (typeof o.completedSlides === "number" && typeof o.totalSlides === "number" && o.totalSlides > 0) {
-    return { done: o.completedSlides, pct: partialPct(o.completedSlides, o.totalSlides) };
+    return { done: o.completedSlides, pct: partialPct(o.completedSlides, o.totalSlides), completedIds };
   }
   if (typeof o.progress === "number" && Number.isFinite(o.progress)) {
     const p = o.progress <= 1 ? o.progress * 100 : o.progress;
-    return { done: null, pct: Math.min(99, clampPct(p)) };
+    return { done: null, pct: Math.min(99, clampPct(p)), completedIds };
   }
-  if (Array.isArray(o.completed)) return { done: o.completed.length, pct: null };
-  return { done: null, pct: null };
+  if (completedIds) return { done: completedIds.length, pct: null, completedIds };
+  return none;
 }
 
 /**
@@ -138,15 +150,34 @@ export async function updateProgressFromState(
   if (!row) return null;
   const r = row as Record<string, unknown>;
   if (r.completion_status === "completed") return 100;
+  const update: Record<string, unknown> = {};
   let pct = p.pct;
-  if (pct === null && p.done !== null) {
+  // Screens the state lists as completed count exactly like per-screen
+  // statements — merge them into the attempt's unit map so both signals
+  // agree (a screen reached in one session isn't "lost" to the other).
+  let done = p.done;
+  if (p.completedIds && p.completedIds.length > 0) {
+    const cmi = ((r.cmi_data ?? {}) as Record<string, unknown>) ?? {};
+    const cmi5 = ((cmi.cmi5 ?? {}) as Record<string, unknown>) ?? {};
+    const units = { ...((cmi5.units ?? {}) as Record<string, string>) };
+    let changed = false;
+    for (const id of p.completedIds) {
+      if (units[id] !== "completed") {
+        units[id] = "completed";
+        changed = true;
+      }
+    }
+    if (changed) update.cmi_data = { ...cmi, cmi5: { ...cmi5, units } };
+    done = Object.values(units).filter((v) => v === "completed").length;
+  }
+  if (pct === null && done !== null) {
     const version = (Array.isArray(r.course_versions) ? r.course_versions[0] : r.course_versions) as VersionLite | null;
     const total = await ensureUnitCount(svc, version);
-    if (total) pct = partialPct(p.done, total);
+    if (total) pct = partialPct(done, total);
   }
-  if (pct === null) return null;
   const current = typeof r.progress_pct === "number" ? r.progress_pct : null;
-  if (current !== null && current >= pct) return current;
-  await updateAttemptFailSoft(svc, attemptId, { progress_pct: pct });
-  return pct;
+  if (pct !== null && (current === null || pct > current)) update.progress_pct = pct;
+  if (Object.keys(update).length === 0) return current;
+  await updateAttemptFailSoft(svc, attemptId, update);
+  return (update.progress_pct as number | undefined) ?? current;
 }
