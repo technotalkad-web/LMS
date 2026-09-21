@@ -31,10 +31,18 @@ export async function uploadCoursePackage(opts: {
   uploaderId: string;
   courseId?: string;
   packageId?: string;
+  /**
+   * Language of the package (ISO 639-1 / BCP-47 from SUPPORTED_LANGUAGES).
+   * Resolves (or creates) the course's package for that language when no
+   * packageId is given. Omitted = legacy NULL-language default package.
+   */
+  language?: string | null;
+  displayName?: string | null;
   supabase: SupabaseClient;
 }): Promise<UploadResult> {
   const { zipBytes, organizationId, uploaderId, supabase } = opts;
   let packageId = opts.packageId;
+  const language = opts.language?.trim() || null;
 
   // 1) Parse the manifest.
   const { manifest, zip } = await parseManifestFromZip(zipBytes);
@@ -90,6 +98,36 @@ export async function uploadCoursePackage(opts: {
   //     if there isn't one (brand-new course), create it now. Migration
   //     0030 enforces course_versions.package_id NOT NULL, so we MUST have
   //     a package_id before the version insert.
+  if (!packageId && language) {
+    // Language-labelled upload: reuse the course's package for that
+    // language (new version of it) or create it (new language variant).
+    const { data: langPkg } = await supabase
+      .from("course_packages")
+      .select("id")
+      .eq("course_id", courseId)
+      .eq("language", language)
+      .maybeSingle();
+    if (langPkg) {
+      packageId = (langPkg as { id: string }).id;
+    } else {
+      const { data: newPkg, error: pkgErr } = await supabase
+        .from("course_packages")
+        .insert({
+          course_id: courseId,
+          language,
+          display_name: opts.displayName?.trim() || null,
+          is_active: true,
+        })
+        .select("id")
+        .single();
+      if (pkgErr || !newPkg) {
+        throw new Error(
+          `Failed to create "${language}" package: ${pkgErr?.message ?? "unknown"}`
+        );
+      }
+      packageId = (newPkg as { id: string }).id;
+    }
+  }
   if (!packageId) {
     const { data: defaultPkg } = await supabase
       .from("course_packages")
@@ -99,7 +137,24 @@ export async function uploadCoursePackage(opts: {
       .maybeSingle();
     if (defaultPkg) {
       packageId = (defaultPkg as { id: string }).id;
-    } else {
+    } else if (opts.courseId) {
+      // Existing course, no language given: a course whose only packages are
+      // language-labelled must not sprout a stray unlabeled package. One
+      // package → that's the target; several → the caller must say which.
+      const { data: pkgs } = await supabase
+        .from("course_packages")
+        .select("id, language")
+        .eq("course_id", courseId);
+      const rows = (pkgs ?? []) as Array<{ id: string; language: string | null }>;
+      if (rows.length === 1) {
+        packageId = rows[0].id;
+      } else if (rows.length > 1) {
+        throw new Error(
+          "This course has several language packages — choose which language this package replaces."
+        );
+      }
+    }
+    if (!packageId) {
       const { data: newDefault, error: pkgErr } = await supabase
         .from("course_packages")
         .insert({

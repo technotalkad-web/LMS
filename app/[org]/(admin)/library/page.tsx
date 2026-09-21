@@ -56,6 +56,22 @@ export default async function CoursesPage({
   const list = (courses ?? []) as CourseRow[];
   const courseIds = list.map((c) => c.id);
 
+  // Language packages per course (#158) so the Library shows what each
+  // module holds. Fail-soft: an error just hides the chips.
+  const languagesByCourse = new Map<string, Array<{ language: string | null; is_active: boolean }>>();
+  if (courseIds.length > 0) {
+    const { data: pkgRows } = await supabase
+      .from("course_packages")
+      .select("course_id, language, is_active")
+      .in("course_id", courseIds);
+    for (const r of (pkgRows ?? []) as Array<{ course_id: string; language: string | null; is_active: boolean }>) {
+      languagesByCourse.set(r.course_id, [
+        ...(languagesByCourse.get(r.course_id) ?? []),
+        { language: r.language, is_active: r.is_active },
+      ]);
+    }
+  }
+
   // folder_id is added by migration 0041 — read best-effort so the Library still
   // lists courses if the code is deployed before the migration is applied.
   const folderByCourse = new Map<string, string | null>();
@@ -132,6 +148,7 @@ export default async function CoursesPage({
     is_active: c.is_active,
     folder_id: folderByCourse.get(c.id) ?? null,
     enrolled: enrolledByCourse.get(c.id)?.size ?? 0,
+    languages: languagesByCourse.get(c.id) ?? [],
   }));
 
   const totalCourses = list.length;

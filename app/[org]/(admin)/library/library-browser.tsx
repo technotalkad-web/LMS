@@ -21,6 +21,7 @@ import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { QrCodeModal } from "../_components/qr-code-modal";
 import { thumbImgStyle } from "@/lib/ui/thumbnail";
+import { languageDisplay } from "@/lib/i18n/languages";
 
 export type FolderLite = { id: string; name: string; parent_id: string | null };
 export type CourseLite = {
@@ -36,6 +37,8 @@ export type CourseLite = {
   is_active: boolean;
   folder_id: string | null;
   enrolled: number;
+  /** Language packages on the course (#158); null = unlabeled legacy. */
+  languages?: Array<{ language: string | null; is_active: boolean }>;
 };
 
 function formatDuration(mins: number | null): string | null {
@@ -374,6 +377,29 @@ export function LibraryBrowser({
                         )}
                       </div>
                     </div>
+                    {c.languages && c.languages.length > 0 && (
+                      <div className="pt-2 flex flex-wrap items-center gap-1">
+                        {c.languages.map((l, i) => (
+                          <span
+                            key={l.language ?? `default-${i}`}
+                            title={
+                              l.language === null
+                                ? "Unlabeled package — set its language on the course page"
+                                : `${languageDisplay(l.language, "english")}${l.is_active ? "" : " (hidden from learners)"}`
+                            }
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-medium uppercase tracking-wide border ${
+                              l.language === null
+                                ? "border-amber-200 bg-amber-50 text-amber-800"
+                                : l.is_active
+                                  ? "border-line bg-canvas text-muted"
+                                  : "border-line bg-canvas text-muted/60 line-through"
+                            }`}
+                          >
+                            {l.language ?? "no lang"}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </Link>
                 {canManage && (
