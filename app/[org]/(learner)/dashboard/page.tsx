@@ -466,7 +466,7 @@ export default async function DashboardPage({
 
   if (allCourseIds.length === 0) {
     return (
-      <div className="relative isolate">
+      <div data-dashboard-root="" className="relative isolate">
         {backgroundLayer}
         <AnnouncementsBanner
           announcements={announcements}
@@ -833,7 +833,7 @@ export default async function DashboardPage({
   const upcomingReleaseAt = sp.upcoming ? effectiveReleaseFor(sp.upcoming) : null;
 
   return (
-    <div className="relative isolate space-y-8">
+    <div data-dashboard-root="" className="relative isolate space-y-8">
       {backgroundLayer}
       <AnnouncementsBanner
         announcements={announcements}
