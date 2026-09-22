@@ -177,9 +177,11 @@ type InitResponse = {
   packageId: string;
   versionId: string;
   versionNumber: number;
-  uploads: Array<{ path: string; key: string; url: string; method: "PUT"; headers: Record<string, string> }>;
+  signBatch: number;
+  fileCount: number;
   error?: string;
 };
+type SignedEntry = { path: string; key: string; url: string; method: "PUT"; headers: Record<string, string> };
 
 export async function directUpload(args: {
   pkg: UnzippedPackage;
@@ -238,16 +240,40 @@ export async function directUpload(args: {
     }).catch(() => {});
   };
 
-  // ---- PUT files (6 at a time, 3 attempts each) ----
+  // ---- sign in batches, PUT files (6 at a time, 3 attempts each) ----
+  // Signing is a separate, batched call so a storage backend that needs one
+  // network hop per signature never exceeds the server's per-request budget.
   progress.phase = "uploading";
   report();
   const byPath = new Map(pkg.files.map((f) => [f.path, f]));
-  const pending = init.uploads.slice();
+  const batchSize = Math.max(1, Math.min(init.signBatch || 40, 5000));
+  const pending: SignedEntry[] = [];
+  const unsigned = pkg.files.map((f) => ({ path: f.path, contentType: f.contentType }));
+  const signNext = async () => {
+    if (unsigned.length === 0) return false;
+    const batch = unsigned.splice(0, batchSize);
+    const res = await fetch("/api/courses/upload/sign", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal,
+      body: JSON.stringify({ orgSlug: target.orgSlug, versionId: init.versionId, files: batch }),
+    });
+    const j = (await res.json().catch(() => ({}))) as { uploads?: SignedEntry[]; error?: string };
+    if (!res.ok || !j.uploads) throw new Error(j.error ?? `Could not sign uploads (HTTP ${res.status})`);
+    pending.push(...j.uploads);
+    return true;
+  };
+  await signNext();
   const done = new Set<string>();
   const failures: string[] = [];
   const worker = async () => {
-    while (pending.length) {
+    for (;;) {
       if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
+      if (pending.length === 0) {
+        // Refill from the next batch (one worker wins; the others retry).
+        if (!(await signNext())) break;
+        continue;
+      }
       const u = pending.shift()!;
       const f = byPath.get(u.path);
       if (!f) continue;
@@ -276,7 +302,7 @@ export async function directUpload(args: {
     }
   };
   try {
-    await Promise.all(Array.from({ length: Math.min(6, pending.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(6, Math.max(1, pending.length)) }, worker));
   } catch (e) {
     await abort();
     throw e;

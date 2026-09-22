@@ -1,5 +1,5 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { activeStorageDriver, getStorage, getStorageFor } from "@/lib/storage";
+import { activeStorageDriver, getStorageFor } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import { parseManifestXml } from "./manifest/parse-xml";
@@ -41,6 +41,12 @@ export const DIRECT_UPLOAD_LIMITS = {
   abandonAfterMs: 24 * 60 * 60 * 1000,
   /** Launch files bigger than this are not read for the unit count. */
   maxLaunchReadBytes: 16 * 1024 * 1024,
+  /**
+   * Signed URLs per /sign request. Supabase Storage needs one network call
+   * per signature, so stay under a free-plan Worker's 50 subrequests; R2
+   * signs locally and can take a whole package at once.
+   */
+  signBatch: { supabase: 32, r2: 5000 } as Record<string, number>,
 };
 
 export type DeclaredFile = { path: string; size: number; contentType?: string };
@@ -54,16 +60,19 @@ export type InitResult =
       versionNumber: number;
       storagePrefix: string;
       driver: string;
-      expiresAt: string;
-      uploads: Array<{
-        path: string;
-        key: string;
-        url: string;
-        method: "PUT";
-        headers: Record<string, string>;
-      }>;
+      /** How many files the browser may ask /sign for per request. */
+      signBatch: number;
+      fileCount: number;
     }
   | { ok: false; status: number; error: string };
+
+export type SignedUploadEntry = {
+  path: string;
+  key: string;
+  url: string;
+  method: "PUT";
+  headers: Record<string, string>;
+};
 
 const CONTENT_TYPE_RE = /^[\w.+-]+\/[\w.+-]+$/;
 
@@ -138,8 +147,9 @@ export async function initDirectUpload(args: {
     return { ok: false, status: 400, error: `The manifest launches "${manifest.launchUrl}" but that file is not in the package.` };
   }
 
-  // ---- 3. Validation gate (report must match this package) ----
-  const gate = await acceptValidationForDirectUpload({
+  // ---- 3. Validation gate: CHECK now, CONSUME only once the version row
+  //         exists, so a failure in between never burns the report. ----
+  const gateArgs = {
     supabase,
     organizationId: org.id,
     userId,
@@ -147,7 +157,8 @@ export async function initDirectUpload(args: {
     validationId: args.validationId,
     acknowledge: args.acknowledge,
     expect: { type: manifest.type, launchUrl: manifest.launchUrl },
-  });
+  };
+  const gate = await checkValidationForDirectUpload(gateArgs);
   if (!gate.ok) return gate;
 
   // ---- 4. Quotas (courses for a new course; storage on declared bytes) ----
@@ -225,19 +236,10 @@ export async function initDirectUpload(args: {
       error: "Direct uploads need database migration 0077 (course_versions.upload_status). Apply it and retry.",
     };
   }
+  // ---- 6. Consume the validation and link it; signing happens per batch
+  //         through signUploadBatch(). ----
+  await consumeValidationForDirectUpload(gateArgs, gate.validationId);
   await linkValidationToVersion({ supabase, validationId: gate.validationId, courseId, versionId: version.id });
-
-  // ---- 6. One signed PUT per file ----
-  const storage = await getStorage();
-  const expiresAt = new Date(Date.now() + L.signedUrlSeconds * 1000).toISOString();
-  const uploads = await mapConcurrent(files, 16, async (f) => {
-    const key = storagePrefix + sanitizeStorageKey(f.path);
-    const signed = await storage.getSignedUploadUrl(key, {
-      contentType: f.contentType,
-      expiresInSeconds: L.signedUrlSeconds,
-    });
-    return { path: f.path, key, url: signed.url, method: signed.method, headers: signed.headers };
-  });
 
   return {
     ok: true,
@@ -247,9 +249,53 @@ export async function initDirectUpload(args: {
     versionNumber: version.version_number,
     storagePrefix,
     driver,
-    expiresAt,
-    uploads,
+    signBatch: L.signBatch[driver] ?? 40,
+    fileCount: files.length,
   };
+}
+
+/**
+ * Signed PUT URLs for a batch of an 'uploading' version's files. Keys are
+ * always derived from the version's own prefix + the sanitised relative
+ * path, so a caller cannot obtain a URL outside that folder.
+ */
+export async function signUploadBatch(args: {
+  supabase: SupabaseClient;
+  org: { id: string };
+  versionId: string;
+  files: Array<{ path: string; contentType?: string }>;
+}): Promise<
+  | { ok: true; expiresAt: string; uploads: SignedUploadEntry[] }
+  | { ok: false; status: number; error: string }
+> {
+  const L = DIRECT_UPLOAD_LIMITS;
+  const loaded = await loadUploadingVersion(args.supabase, args.org.id, args.versionId);
+  if (!loaded.ok) return loaded;
+  const { version } = loaded;
+  const max = L.signBatch[version.storage_driver] ?? 40;
+  if (args.files.length === 0 || args.files.length > max) {
+    return { ok: false, status: 400, error: `Sign between 1 and ${max} files per request.` };
+  }
+  const storage = await getStorageFor(version.storage_driver);
+  const expiresAt = new Date(Date.now() + L.signedUrlSeconds * 1000).toISOString();
+  const uploads: SignedUploadEntry[] = [];
+  for (const f of args.files) {
+    const path = typeof f?.path === "string" ? cleanRelativePath(f.path) : null;
+    if (!path) return { ok: false, status: 400, error: `Invalid file path: "${String(f?.path).slice(0, 80)}"` };
+    const contentType =
+      typeof f.contentType === "string" && CONTENT_TYPE_RE.test(f.contentType)
+        ? f.contentType
+        : contentTypeFor(path) ?? "application/octet-stream";
+    uploads.push({ path, key: version.storage_prefix + sanitizeStorageKey(path), contentType } as unknown as SignedUploadEntry);
+  }
+  const signed = await mapConcurrent(uploads, 8, async (u) => {
+    const s = await storage.getSignedUploadUrl(u.key, {
+      contentType: (u as unknown as { contentType: string }).contentType,
+      expiresInSeconds: L.signedUrlSeconds,
+    });
+    return { path: u.path, key: u.key, url: s.url, method: s.method, headers: s.headers };
+  });
+  return { ok: true, expiresAt, uploads: signed };
 }
 
 export type FinalizeResult =
@@ -477,7 +523,7 @@ async function loadUploadingVersion(
  * and fresh. Only the admin UI calls this path; API callers use the legacy
  * multipart upload, which validates inline.
  */
-async function acceptValidationForDirectUpload(opts: {
+type GateArgs = {
   supabase: SupabaseClient;
   organizationId: string;
   userId: string;
@@ -485,7 +531,24 @@ async function acceptValidationForDirectUpload(opts: {
   validationId: string | null;
   acknowledge: boolean;
   expect: { type: string; launchUrl: string };
-}): Promise<{ ok: true; validationId: string } | { ok: false; status: number; error: string }> {
+};
+
+async function consumeValidationForDirectUpload(opts: GateArgs, validationId: string): Promise<void> {
+  await opts.supabase
+    .from("package_validations")
+    .update({
+      status: "accepted",
+      accepted_by: opts.userId,
+      accepted_at: new Date().toISOString(),
+      ...(opts.courseId ? { course_id: opts.courseId } : {}),
+    })
+    .eq("id", validationId)
+    .eq("status", "pending");
+}
+
+async function checkValidationForDirectUpload(
+  opts: GateArgs
+): Promise<{ ok: true; validationId: string } | { ok: false; status: number; error: string }> {
   const { supabase } = opts;
   if (!opts.validationId) {
     return { ok: false, status: 400, error: "Validate the package before uploading." };
@@ -519,16 +582,10 @@ async function acceptValidationForDirectUpload(opts: {
   if (v.verdict !== "pass" && !opts.acknowledge) {
     return { ok: false, status: 400, error: "Validation reported issues — confirm 'Accept & Upload' to acknowledge them." };
   }
-  await supabase
-    .from("package_validations")
-    .update({
-      status: "accepted",
-      accepted_by: opts.userId,
-      accepted_at: new Date().toISOString(),
-      acknowledged_warnings: v.verdict !== "pass",
-      ...(opts.courseId ? { course_id: opts.courseId } : {}),
-    })
-    .eq("id", v.id);
+  if (v.verdict !== "pass") {
+    // Record the acknowledgement now; the status flips in consume().
+    await supabase.from("package_validations").update({ acknowledged_warnings: true }).eq("id", v.id);
+  }
   return { ok: true, validationId: v.id };
 }
 

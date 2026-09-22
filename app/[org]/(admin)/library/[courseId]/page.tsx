@@ -16,7 +16,7 @@ import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
-import { ActivateVersionButton } from "./version-actions";
+import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
 
 type Version = {
   id: string;
@@ -646,15 +646,18 @@ export default async function AdminCourseDetailPage({
                     current
                   </span>
                 ) : (
-                  (!v.upload_status || v.upload_status === "ready") &&
-                  v.package_id && (
-                    <ActivateVersionButton
-                      orgSlug={orgSlug}
-                      courseId={c.id}
-                      packageId={v.package_id}
-                      versionId={v.id}
-                      versionNumber={v.version_number}
-                    />
+                  v.upload_status === "uploading" || v.upload_status === "failed" ? (
+                    <DiscardUploadButton orgSlug={orgSlug} versionId={v.id} versionNumber={v.version_number} />
+                  ) : (
+                    v.package_id && (
+                      <ActivateVersionButton
+                        orgSlug={orgSlug}
+                        courseId={c.id}
+                        packageId={v.package_id}
+                        versionId={v.id}
+                        versionNumber={v.version_number}
+                      />
+                    )
                   )
                 )}
                 {new Date(v.uploaded_at).toISOString().slice(0, 10)}

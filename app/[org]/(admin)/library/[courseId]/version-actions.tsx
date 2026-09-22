@@ -8,6 +8,60 @@ import { useConfirm } from "@/components/ui/confirm";
  * "Make current" for a non-current, fully uploaded version: the rollback /
  * roll-forward control on the course page's version list.
  */
+/** Remove a version whose upload never finished (files + row). */
+export function DiscardUploadButton({
+  orgSlug,
+  versionId,
+  versionNumber,
+}: {
+  orgSlug: string;
+  versionId: string;
+  versionNumber: number;
+}) {
+  const router = useRouter();
+  const confirm = useConfirm();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function discard() {
+    const ok = await confirm({
+      title: `Discard the unfinished upload v${versionNumber}?`,
+      message: "Its files are deleted and the version disappears from this list. Nothing learners see changes.",
+      confirmText: "Discard",
+      destructive: true,
+    });
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    const res = await fetch("/api/courses/upload/abort", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug, versionId }),
+    });
+    setBusy(false);
+    if (!res.ok) {
+      const j = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(j.error ?? `HTTP ${res.status}`);
+      return;
+    }
+    router.refresh();
+  }
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      {error && <span className="text-[11px] text-red-700">{error}</span>}
+      <button
+        type="button"
+        onClick={discard}
+        disabled={busy}
+        className="text-[11px] px-2 py-1 border border-red-200 text-red-700 rounded hover:border-red-400 disabled:opacity-50"
+      >
+        {busy ? "Discarding…" : "Discard"}
+      </button>
+    </span>
+  );
+}
+
 export function ActivateVersionButton({
   orgSlug,
   courseId,
