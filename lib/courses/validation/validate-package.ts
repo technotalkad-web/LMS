@@ -276,6 +276,39 @@ function launchFileExists(zip: JSZip, launchUrl: string): boolean {
   );
 }
 
+/**
+ * Direct-upload validation bundles: the browser unzips the package and sends
+ * the validator only the manifest, launch file and text files, plus this
+ * descriptor of the WHOLE package (media included) so size, file count and
+ * the executable/Flash checks still see every file.
+ */
+export const BUNDLE_DESCRIPTOR = "__package.json";
+
+export type BundleDescriptor = {
+  fileCount: number;
+  totalBytes: number;
+  files: Array<{ path: string; size: number }>;
+  /** Files omitted from the bundle (media), for the report's honesty line. */
+  omitted?: number;
+};
+
+async function readBundleDescriptor(zip: JSZip): Promise<BundleDescriptor | null> {
+  const f = zip.files[BUNDLE_DESCRIPTOR];
+  if (!f || f.dir) return null;
+  try {
+    const d = JSON.parse(await f.async("string")) as Partial<BundleDescriptor>;
+    if (!Array.isArray(d.files) || typeof d.totalBytes !== "number") return null;
+    return {
+      fileCount: typeof d.fileCount === "number" ? d.fileCount : d.files.length,
+      totalBytes: d.totalBytes,
+      files: d.files.filter((x) => x && typeof x.path === "string"),
+      omitted: typeof d.omitted === "number" ? d.omitted : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function validatePackage(
   zipBytes: Uint8Array
 ): Promise<PackageValidationReport> {
@@ -286,12 +319,18 @@ export async function validatePackage(
   // ---- 1. Structure: manifest + launch file (unplayable gates) ----
   let manifest: ParsedManifest | null = null;
   let zip: JSZip | null = null;
+  let bundle: BundleDescriptor | null = null;
   let fileCount = 0;
+  // Package size: the real zip, or the whole-package total the bundle declares.
+  const packageBytes = () => bundle?.totalBytes ?? zipBytes.length;
   try {
     const parsed = await parseManifestFromZip(zipBytes);
     manifest = parsed.manifest;
     zip = parsed.zip;
-    fileCount = Object.keys(zip.files).filter((p) => !zip!.files[p].dir).length;
+    bundle = await readBundleDescriptor(zip);
+    fileCount =
+      bundle?.fileCount ??
+      Object.keys(zip.files).filter((p) => !zip!.files[p].dir).length;
     push(
       "manifest",
       "Package manifest",
@@ -311,7 +350,7 @@ export async function validatePackage(
         type: "unknown",
         title: null,
         launchUrl: null,
-        sizeBytes: zipBytes.length,
+        sizeBytes: packageBytes(),
         fileCount: 0,
         tool: null,
       },
@@ -336,7 +375,7 @@ export async function validatePackage(
         type: manifest.type,
         title: manifest.title,
         launchUrl: manifest.launchUrl,
-        sizeBytes: zipBytes.length,
+        sizeBytes: packageBytes(),
         fileCount,
         tool: null,
       },
@@ -347,6 +386,21 @@ export async function validatePackage(
 
   // ---- 2. Scan content for tracking wiring ----
   const s = await scanZip(zip, manifest.launchUrl);
+  if (bundle) {
+    for (const f of bundle.files) {
+      const lower = f.path.toLowerCase();
+      if (/\.swf$/.test(lower) && !s.swfFiles.includes(f.path)) s.swfFiles.push(f.path);
+      if (/\.(exe|bat|cmd|msi|dll|sh)$/.test(lower) && !s.execFiles.includes(f.path)) s.execFiles.push(f.path);
+    }
+    if (bundle.omitted && bundle.omitted > 0) {
+      push(
+        "bundle",
+        "Scan coverage",
+        "info",
+        `Uploaded directly from the browser: ${bundle.omitted} media file(s) (audio, video, images, fonts) were checked by name and size only; text, script and markup files were scanned in full.`
+      );
+    }
+  }
   if (s.tool) {
     push("tool", "Authoring tool", "info", `${s.tool} signatures detected — a known-good tracking implementation.`);
   }
@@ -610,12 +664,12 @@ export async function validatePackage(
       `Scripts load from ${s.externalScriptHosts.slice(0, 3).join(", ")} at runtime — the module breaks if that host is down or blocked on the office network, and on poor mobile connections. Bundle dependencies inside the package.`
     );
   }
-  if (zipBytes.length > 90 * 1024 * 1024) {
+  if (packageBytes() > 250 * 1024 * 1024) {
     push(
       "size",
       "Package size",
       "warning",
-      `${Math.round(zipBytes.length / 1024 / 1024)} MB — close to the upload limit and slow to open on mobile data. Compress media (video ≤ 720p, images ≤ 200 KB) or host large video externally.`
+      `${Math.round(packageBytes() / 1024 / 1024)} MB — slow to open on mobile data. Compress media (video ≤ 720p, images ≤ 200 KB) or split very large video into shorter modules.`
     );
   }
   if (s.viewportInLaunch === false) {
@@ -648,7 +702,7 @@ export async function validatePackage(
       type: manifest.type,
       title: manifest.title,
       launchUrl: manifest.launchUrl,
-      sizeBytes: zipBytes.length,
+      sizeBytes: packageBytes(),
       fileCount,
       tool: s.tool,
     },

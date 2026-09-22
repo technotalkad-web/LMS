@@ -160,7 +160,8 @@ export async function POST(request: NextRequest) {
       organization_id: auth.orgId,
       uploaded_by: auth.userId,
       file_name: file instanceof File ? file.name : null,
-      size_bytes: zipBytes.length,
+      // Whole-package size: a direct-upload bundle declares it (media omitted from the bytes).
+      size_bytes: report.package.sizeBytes || zipBytes.length,
       sha256: sha256Hex(zipBytes),
       verdict: report.verdict,
       report,

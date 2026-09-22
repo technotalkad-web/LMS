@@ -8,9 +8,16 @@ import { SUPPORTED_LANGUAGES, languageDisplay } from "@/lib/i18n/languages";
 import {
   ValidationReportPanel,
   rejectValidation,
-  runValidation,
   type ValidationResult,
 } from "../_components/validation-gate";
+import {
+  directUpload,
+  unzipPackage,
+  validateUnzipped,
+  type UnzippedPackage,
+  type UploadProgress,
+} from "../_components/direct-upload";
+import { UploadProgressBar } from "../_components/upload-progress";
 
 export type LanguagePackage = {
   id: string;
@@ -292,6 +299,8 @@ function ReplacePackageDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
+  const [unzippedPkg, setUnzippedPkg] = useState<UnzippedPackage | null>(null);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
   const label =
     pkg.language === null
       ? "Unlabeled (legacy)"
@@ -302,7 +311,16 @@ function ReplacePackageDialog({
     if (!file) return;
     setBusy(true);
     setError(null);
-    const v = await runValidation(file, orgSlug);
+    let unzipped: UnzippedPackage;
+    try {
+      unzipped = await unzipPackage(file);
+    } catch (err) {
+      setBusy(false);
+      setError(err instanceof Error ? err.message : "Could not open the zip");
+      return;
+    }
+    setUnzippedPkg(unzipped);
+    const v = await validateUnzipped(unzipped, orgSlug);
     setBusy(false);
     if (!v.ok) {
       setError(v.error);
@@ -311,27 +329,26 @@ function ReplacePackageDialog({
     setValidation(v.result);
   }
 
-  // Phase 2: Accept & Upload.
+  // Phase 2: Accept & Upload — straight from the browser to storage.
   async function doUpload(fields: { validation_id: string; acknowledge: boolean }) {
-    if (!file) return;
+    if (!file || !unzippedPkg) return;
     setBusy(true);
     setError(null);
-    const fd = new FormData();
-    fd.append("orgSlug", orgSlug);
-    fd.append("file", file);
-    fd.append("mode", mode);
-    fd.append("validation_id", fields.validation_id);
-    if (fields.acknowledge) fd.append("acknowledge", "1");
-    const res = await fetch(
-      `/api/courses/${courseId}/packages/${pkg.id}/versions`,
-      { method: "POST", body: fd }
-    );
-    setBusy(false);
-    if (!res.ok) {
-      const j = (await res.json().catch(() => ({}))) as { error?: string };
-      setError(j.error ?? "Upload failed");
+    try {
+      await directUpload({
+        pkg: unzippedPkg,
+        validationId: fields.validation_id,
+        acknowledge: fields.acknowledge,
+        target: { orgSlug, courseId, packageId: pkg.id, mode },
+        onProgress: setProgress,
+      });
+    } catch (err) {
+      setBusy(false);
+      setProgress(null);
+      setError(err instanceof Error ? err.message : "Upload failed");
       return;
     }
+    setBusy(false);
     onReplaced();
   }
 
@@ -339,6 +356,7 @@ function ReplacePackageDialog({
     if (validation) await rejectValidation(validation.validation_id, orgSlug);
     setValidation(null);
     setFile(null);
+    setProgress(null);
   }
 
   return (
@@ -359,7 +377,9 @@ function ReplacePackageDialog({
           </p>
         </div>
 
-        {validation && file ? (
+        {progress && file ? (
+          <UploadProgressBar progress={progress} fileName={file.name} />
+        ) : validation && file ? (
           <>
             <ValidationReportPanel
               fileName={file.name}
@@ -475,6 +495,8 @@ function AddLanguageDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
+  const [pkg, setPkg] = useState<UnzippedPackage | null>(null);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
 
   // Phase 1: validate the zip, show the report in place of the form.
   async function submit(e: React.FormEvent) {
@@ -489,7 +511,16 @@ function AddLanguageDialog({
       return;
     }
     setBusy(true);
-    const v = await runValidation(file, orgSlug);
+    let unzipped: UnzippedPackage;
+    try {
+      unzipped = await unzipPackage(file);
+    } catch (err) {
+      setBusy(false);
+      setError(err instanceof Error ? err.message : "Could not open the zip");
+      return;
+    }
+    setPkg(unzipped);
+    const v = await validateUnzipped(unzipped, orgSlug);
     setBusy(false);
     if (!v.ok) {
       setError(v.error);
@@ -498,28 +529,26 @@ function AddLanguageDialog({
     setValidation(v.result);
   }
 
-  // Phase 2: Accept & Upload.
+  // Phase 2: Accept & Upload — straight from the browser to storage.
   async function doUpload(fields: { validation_id: string; acknowledge: boolean }) {
-    if (!file) return;
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("orgSlug", orgSlug);
-    fd.append("language", language);
-    if (displayName.trim()) fd.append("display_name", displayName.trim());
-    fd.append("validation_id", fields.validation_id);
-    if (fields.acknowledge) fd.append("acknowledge", "1");
-
+    if (!file || !pkg) return;
     setBusy(true);
-    const res = await fetch(`/api/courses/${courseId}/packages`, {
-      method: "POST",
-      body: fd,
-    });
-    setBusy(false);
-    if (!res.ok) {
-      const j = (await res.json().catch(() => ({}))) as { error?: string };
-      setError(j.error ?? `HTTP ${res.status}`);
+    setError(null);
+    try {
+      await directUpload({
+        pkg,
+        validationId: fields.validation_id,
+        acknowledge: fields.acknowledge,
+        target: { orgSlug, courseId, language, displayName: displayName.trim() || null },
+        onProgress: setProgress,
+      });
+    } catch (err) {
+      setBusy(false);
+      setProgress(null);
+      setError(err instanceof Error ? err.message : "Upload failed");
       return;
     }
+    setBusy(false);
     onAdded();
   }
 
@@ -527,6 +556,7 @@ function AddLanguageDialog({
     if (validation) await rejectValidation(validation.validation_id, orgSlug);
     setValidation(null);
     setFile(null);
+    setProgress(null);
   }
 
   return (
@@ -547,7 +577,9 @@ function AddLanguageDialog({
           new language variant.
         </p>
 
-        {validation && file ? (
+        {progress && file ? (
+          <UploadProgressBar progress={progress} fileName={file.name} />
+        ) : validation && file ? (
           <>
             <ValidationReportPanel
               fileName={file.name}

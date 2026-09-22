@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
+import { sweepAbandonedUploads } from "@/lib/courses/direct-upload";
 
 /**
  *   POST /api/cron/reaper
@@ -65,7 +66,11 @@ async function run() {
     reaped++;
   }
 
-  return { reaped, considered: ids.length, errors };
+  // Direct uploads nobody finalised within 24 h: files first, then the row.
+  const uploads = await sweepAbandonedUploads(svc);
+  errors.push(...uploads.errors);
+
+  return { reaped, considered: ids.length, abandonedUploadsSwept: uploads.swept, errors };
 }
 
 export async function POST(request: Request) {
