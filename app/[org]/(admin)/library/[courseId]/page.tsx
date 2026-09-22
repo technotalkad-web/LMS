@@ -17,6 +17,7 @@ import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
+import { languageDisplay } from "@/lib/i18n/languages";
 
 type Version = {
   id: string;
@@ -86,6 +87,8 @@ export default async function AdminCourseDetailPage({
   );
   const current = list.find((v) => v.id === c.current_version_id) ?? list[0];
 
+
+
   // Language packages (#158 Phase 1c). Sorted by language code so the
   // "Unlabeled (legacy)" NULL row floats to the top — it's the one
   // admins most commonly want to promote.
@@ -95,6 +98,36 @@ export default async function AdminCourseDetailPage({
     .eq("course_id", c.id)
     .order("language", { ascending: true, nullsFirst: true });
   const languagePackages = (pkgRows ?? []) as LanguagePackage[];
+
+  // Group versions by language package (0030: versions belong to packages and
+  // are numbered per package). "Current" is the package's own pointer; the
+  // course-level pointer only mirrors whichever package published last.
+  const pkgById = new Map(languagePackages.map((p) => [p.id, p]));
+  const versionGroups = (() => {
+    const groups = new Map<string, { key: string; label: string; code: string | null; currentVersionId: string | null; order: number; versions: Version[] }>();
+    for (const v of list) {
+      const pkg = v.package_id ? pkgById.get(v.package_id) : undefined;
+      const key = v.package_id ?? "legacy";
+      if (!groups.has(key)) {
+        const label = pkg
+          ? pkg.display_name?.trim() ||
+            (pkg.language ? languageDisplay(pkg.language, "english") ?? pkg.language : "Unlabeled (legacy)")
+          : "Unlabeled (legacy)";
+        groups.set(key, {
+          key,
+          label,
+          code: pkg?.language ?? null,
+          currentVersionId: pkg?.current_version_id ?? (pkg ? null : c.current_version_id),
+          order: pkg?.language === null || !pkg ? 0 : 1,
+          versions: [],
+        });
+      }
+      groups.get(key)!.versions.push(v);
+    }
+    return [...groups.values()]
+      .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
+      .map((g) => ({ ...g, versions: g.versions.sort((a, b) => b.version_number - a.version_number) }));
+  })();
 
   // Assignments — select("*") for 0069 deploy safety (group_id).
   const { data: assignmentRows } = await supabase
@@ -613,58 +646,77 @@ export default async function AdminCourseDetailPage({
             Upload new version
           </Link>
         </div>
-        <ul className="border border-line rounded-2xl bg-paper divide-y divide-line">
-          {list.map((v) => (
-            <li
-              key={v.id}
-              className="px-5 py-3 flex items-baseline justify-between gap-4"
-            >
-              <div className="min-w-0">
-                <div className="font-medium">
-                  v{v.version_number}
-                  {v.upload_status === "uploading" && (
-                    <span className="ml-2 px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 rounded-full uppercase tracking-wide text-[10px]">
-                      uploading
-                    </span>
-                  )}
-                  {v.upload_status === "failed" && (
-                    <span className="ml-2 px-2 py-0.5 bg-red-100 text-red-800 border border-red-200 rounded-full uppercase tracking-wide text-[10px]">
-                      failed
-                    </span>
-                  )}
+        {/* One block per language package: versions are numbered and made
+            current PER PACKAGE, so "current" is judged against the package's
+            pointer, not the course's single legacy pointer. */}
+        <div className="space-y-4">
+          {versionGroups.map((g) => (
+            <div key={g.key} className="border border-line rounded-2xl bg-paper overflow-hidden">
+              <div className="px-5 py-2.5 bg-canvas border-b border-line flex items-baseline justify-between gap-3">
+                <div className="text-sm font-medium">
+                  {g.label}
+                  {g.code && <span className="ml-2 text-xs text-muted font-normal">{g.code}</span>}
                 </div>
-                <div className="text-xs text-muted break-all">
-                  {v.manifest_type} - launch:{" "}
-                  <span className="font-mono">{v.launch_url}</span>
-                  {typeof v.file_count === "number" && <> · {v.file_count} files</>}
-                  {v.storage_driver && <> · {v.storage_driver === "r2" ? "R2" : "Supabase Storage"}</>}
+                <div className="text-[11px] text-muted">
+                  {g.versions.length} version{g.versions.length === 1 ? "" : "s"}
                 </div>
               </div>
-              <div className="text-xs text-muted shrink-0 flex items-center gap-2">
-                {v.id === c.current_version_id ? (
-                  <span className="px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px]">
-                    current
-                  </span>
-                ) : (
-                  v.upload_status === "uploading" || v.upload_status === "failed" ? (
-                    <DiscardUploadButton orgSlug={orgSlug} versionId={v.id} versionNumber={v.version_number} />
-                  ) : (
-                    v.package_id && (
-                      <ActivateVersionButton
-                        orgSlug={orgSlug}
-                        courseId={c.id}
-                        packageId={v.package_id}
-                        versionId={v.id}
-                        versionNumber={v.version_number}
-                      />
-                    )
-                  )
-                )}
-                {new Date(v.uploaded_at).toISOString().slice(0, 10)}
-              </div>
-            </li>
+              <ul className="divide-y divide-line">
+                {g.versions.map((v) => {
+                  const isCurrent = v.id === g.currentVersionId;
+                  return (
+                    <li
+                      key={v.id}
+                      className="px-5 py-3 flex items-baseline justify-between gap-4"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-medium">
+                          v{v.version_number}
+                          {v.upload_status === "uploading" && (
+                            <span className="ml-2 px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 rounded-full uppercase tracking-wide text-[10px]">
+                              uploading
+                            </span>
+                          )}
+                          {v.upload_status === "failed" && (
+                            <span className="ml-2 px-2 py-0.5 bg-red-100 text-red-800 border border-red-200 rounded-full uppercase tracking-wide text-[10px]">
+                              failed
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-muted break-all">
+                          {v.manifest_type} - launch:{" "}
+                          <span className="font-mono">{v.launch_url}</span>
+                          {typeof v.file_count === "number" && <> · {v.file_count} files</>}
+                          {v.storage_driver && <> · {v.storage_driver === "r2" ? "R2" : "Supabase Storage"}</>}
+                        </div>
+                      </div>
+                      <div className="text-xs text-muted shrink-0 flex items-center gap-2">
+                        {isCurrent ? (
+                          <span className="px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px]">
+                            current
+                          </span>
+                        ) : v.upload_status === "uploading" || v.upload_status === "failed" ? (
+                          <DiscardUploadButton orgSlug={orgSlug} versionId={v.id} versionNumber={v.version_number} />
+                        ) : (
+                          v.package_id && (
+                            <ActivateVersionButton
+                              orgSlug={orgSlug}
+                              courseId={c.id}
+                              packageId={v.package_id}
+                              versionId={v.id}
+                              versionNumber={v.version_number}
+                            />
+                          )
+                        )}
+                        {new Date(v.uploaded_at).toISOString().slice(0, 10)}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
           ))}
-        </ul>
+        </div>
       </section>
     </div>
   );
