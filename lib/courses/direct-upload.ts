@@ -217,7 +217,7 @@ export async function initDirectUpload(args: {
     .eq("id", version.id)
     .maybeSingle();
   if (probeErr || (probe as { upload_status?: string } | null)?.upload_status !== "uploading") {
-    await supabase.from("course_versions").delete().eq("id", version.id);
+    await serviceClient().from("course_versions").delete().eq("id", version.id);
     await undoCourse();
     return {
       ok: false,
@@ -316,12 +316,17 @@ export async function finalizeDirectUpload(args: {
     }
   }
 
+  // Service role: course_versions rows are written by the server, not by
+  // admin RLS policies (an RLS-filtered UPDATE would silently touch 0 rows).
   const md = { ...(version.manifest_data ?? {}), unitCount };
-  const { error: updErr } = await supabase
+  const { data: updated, error: updErr } = await serviceClient()
     .from("course_versions")
     .update({ upload_status: "ready", manifest_data: md, file_count: keys.length })
-    .eq("id", version.id);
+    .eq("id", version.id)
+    .eq("upload_status", "uploading")
+    .select("id");
   if (updErr) return { ok: false, status: 500, error: `Could not finalise: ${updErr.message}` };
+  if (!updated || updated.length === 0) return { ok: false, status: 409, error: "This version was finalised or removed by another request." };
 
   const hadCurrent = !!course.current_version_id;
   await publishVersion(supabase, { courseId: course.id, packageId: version.package_id, versionId: version.id });
@@ -363,7 +368,7 @@ export async function abortDirectUpload(args: {
   } catch (e) {
     console.warn("[direct-upload] abort: prefix delete failed", e);
   }
-  await args.supabase.from("course_versions").delete().eq("id", version.id);
+  await serviceClient().from("course_versions").delete().eq("id", version.id);
   return { ok: true };
 }
 
@@ -402,8 +407,12 @@ export async function sweepAbandonedUploads(svc: SupabaseClient): Promise<{ swep
  * versions so the launcher starts every learner fresh on the new one.
  * Service-role: attempts belong to other users.
  */
+function serviceClient() {
+  return createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
+}
+
 async function abandonOldAttempts(packageId: string, newVersionId: string): Promise<number> {
-  const svc = createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
+  const svc = serviceClient();
   const { data: pkgVers } = await svc.from("course_versions").select("id").eq("package_id", packageId);
   const oldIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id).filter((id) => id !== newVersionId);
   if (oldIds.length === 0) return 0;

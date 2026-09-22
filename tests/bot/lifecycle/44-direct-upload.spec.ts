@@ -79,7 +79,7 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   let versions = await versionsOf(course.id);
   expect(versions).toHaveLength(1);
   expect(versions[0].upload_status).toBe("ready");
-  expect(versions[0].storage_driver).toBe("r2");
+  expect(versions[0].storage_driver).toBe(process.env.EXPECTED_STORAGE_DRIVER ?? "r2");
   expect(versions[0].file_count).toBe(161);
   expect(versions[0].size_bytes).toBeGreaterThan(9_000_000);
   expect(versions[0].manifest_data.unitCount).toBe(5); // read from the stored launch file
@@ -128,14 +128,26 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   // Real browser playback: the package loads, reads version.txt through the
   // content route and the audio element gets its metadata via range requests.
   const lp = await learnerCtx.newPage();
+  // The <audio preload="metadata"> element makes the browser issue its own
+  // range request for the mp3; it must come back as a 206 from the content
+  // route. (The fixture bytes are not decodable audio, so we assert the
+  // transport, not playback.)
+  const mediaResponses: Array<{ status: number; range: string | null }> = [];
+  lp.on("response", (r) => {
+    if (r.url().includes("/content/assets/media/intro.mp3")) {
+      mediaResponses.push({ status: r.status(), range: r.headers()["content-range"] ?? null });
+    }
+  });
   await lp.goto(`${base}/launch`);
   const frame = lp.frameLocator("iframe");
   await expect(frame.locator("#status")).toHaveText(/fresh start at slide 1/, { timeout: 60_000 });
   await expect(frame.locator("#version")).toHaveText("version v1");
-  const audioReady = await frame.locator("#intro").evaluate(
-    (el) => new Promise<boolean>((res) => { const a = el as HTMLAudioElement; if (a.readyState >= 1) return res(true); a.addEventListener("loadedmetadata", () => res(true), { once: true }); setTimeout(() => res(a.readyState >= 1), 15_000); })
-  );
-  expect(audioReady, "audio metadata loads through the content route").toBeTruthy();
+  await expect
+    .poll(() => mediaResponses.some((r) => r.status === 206 && /^bytes \d+-\d+\/1500000$/.test(r.range ?? "")), {
+      timeout: 20_000,
+      message: `browser media request served as 206 range: ${JSON.stringify(mediaResponses)}`,
+    })
+    .toBe(true);
   await lp.close();
 
   // --- v2 through the admin UI (replace the same package)
@@ -149,7 +161,12 @@ test("direct upload: 161-file package publishes only after finalise; learner str
 
   // --- rollback: Make current on v1 from the course page
   await page.goto(`/${w.org.slug}/library/${course.id}`);
-  await page.getByRole("button", { name: /make current/i }).click();
+  // Under `next dev` the button can render before it is hydrated; retry the
+  // click until the confirm dialog actually opens.
+  await expect(async () => {
+    await page.getByRole("button", { name: /make current/i }).first().click();
+    await expect(page.getByRole("dialog")).toBeVisible({ timeout: 3_000 });
+  }).toPass({ timeout: 30_000 });
   await page.getByRole("dialog").getByRole("button", { name: /make current/i }).click();
   await expect.poll(() => currentVersionId(course.id), { timeout: 15_000 }).toBe(versions[0].id);
   expect(await (await req.get(`${base}/content/version.txt`)).text()).toBe("v1");
