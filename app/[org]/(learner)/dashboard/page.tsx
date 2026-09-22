@@ -722,11 +722,26 @@ export default async function DashboardPage({
   // Official score under the course's scoring rule (0073). The card prop is
   // still called bestScore; practice attempts never feed it.
   function officialScoreForCourse(courseId: string): number | null {
+    return scoringForCourse(courseId).scoring.officialScore;
+  }
+
+  // Scoring window state for the card: how many scored attempts remain, and
+  // whether further launches are practice-only or blocked. Evaluated live
+  // against the CURRENT rule, so an admin changing the rule re-labels every
+  // card on the next load.
+  function scoringForCourse(courseId: string) {
     const my = attempts.filter((a) => {
       const v = versionById.get(a.course_version_id);
       return v?.course_id === courseId;
     });
-    return computeScoring(my, policies.get(courseId) ?? DEFAULT_POLICY).officialScore;
+    const policy = policies.get(courseId) ?? DEFAULT_POLICY;
+    const scoring = computeScoring(my, policy);
+    return {
+      scoring,
+      scoredLeft: Math.max(0, policy.max_scored_attempts - scoring.scoredAttempts),
+      practiceMode: scoring.practiceMode,
+      blocked: scoring.blocked,
+    };
   }
 
   // Progress of the learner's most recent open attempt (0075); null when
@@ -739,6 +754,11 @@ export default async function DashboardPage({
       })
       .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0];
     return typeof open?.progress_pct === "number" ? open.progress_pct : null;
+  }
+
+  function attemptsLeftProps(courseId: string) {
+    const s = scoringForCourse(courseId);
+    return { scoredLeft: s.scoredLeft, practiceMode: s.practiceMode, blocked: s.blocked };
   }
 
   function pushCard(a: Assignment, source: "user" | "team" | "org") {
@@ -761,6 +781,7 @@ export default async function DashboardPage({
       isRevised: false,
       dueAt: a.due_at,
       bestScore: officialScoreForCourse(course.id),
+      ...attemptsLeftProps(course.id),
       progressPct: progressForCourse(course.id),
       pathName: pathNameByCourseId.get(course.id) ?? null,
       thumbnail_url: course.thumbnail_url,
@@ -796,6 +817,7 @@ export default async function DashboardPage({
       isRevised: false,
       dueAt: null,
       bestScore: officialScoreForCourse(cid),
+      ...attemptsLeftProps(cid),
       pathName,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,
