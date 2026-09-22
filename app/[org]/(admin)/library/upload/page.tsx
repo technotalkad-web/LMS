@@ -8,14 +8,22 @@ import { SUPPORTED_LANGUAGES, languageDisplay } from "@/lib/i18n/languages";
 import {
   ValidationReportPanel,
   rejectValidation,
-  runValidation,
   type ValidationResult,
 } from "../_components/validation-gate";
+import {
+  directUpload,
+  unzipPackage,
+  validateUnzipped,
+  type UnzippedPackage,
+  type UploadProgress,
+} from "../_components/direct-upload";
+import { UploadProgressBar } from "../_components/upload-progress";
 
 type UploadState =
   | { kind: "idle" }
   | { kind: "validating"; filename: string }
-  | { kind: "report"; file: File; result: ValidationResult; uploading: boolean }
+  | { kind: "report"; file: File; pkg: UnzippedPackage; result: ValidationResult; uploading: boolean }
+  | { kind: "uploading"; filename: string; progress: UploadProgress }
   | {
       kind: "success";
       courseId: string;
@@ -32,6 +40,7 @@ export default function CourseUploadPage() {
   const targetCourseId = search.get("courseId");
   const router = useRouter();
   const [state, setState] = useState<UploadState>({ kind: "idle" });
+  const [aborter, setAborter] = useState<AbortController | null>(null);
   const [notifyUpdate, setNotifyUpdate] = useState(true);
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
   const [thumbDisplay, setThumbDisplay] = useState<{
@@ -87,48 +96,53 @@ export default function CourseUploadPage() {
     }
 
     setState({ kind: "validating", filename: file.name });
-    const v = await runValidation(file, orgSlug);
+    // The browser unzips the package; the validator gets manifest, launch
+    // file and text files plus a descriptor of everything else — media never
+    // travels through the server.
+    let pkg: UnzippedPackage;
+    try {
+      pkg = await unzipPackage(file);
+    } catch (err) {
+      setState({ kind: "error", message: err instanceof Error ? err.message : "Could not open the zip" });
+      return;
+    }
+    const v = await validateUnzipped(pkg, orgSlug);
     if (!v.ok) {
       setState({ kind: "error", message: v.error });
       return;
     }
-    setState({ kind: "report", file, result: v.result, uploading: false });
+    setState({ kind: "report", file, pkg, result: v.result, uploading: false });
   }
 
-  // Phase 2: Accept & Upload — the real upload carries the validation id.
+  // Phase 2: Accept & Upload — files go straight from the browser to storage;
+  // the server only prepares the version and publishes it after every file
+  // has arrived.
   async function acceptAndUpload(fields: { validation_id: string; acknowledge: boolean }) {
     if (state.kind !== "report") return;
-    const { file } = state;
+    const { file, pkg } = state;
     setState({ ...state, uploading: true });
-
-    const form = new FormData();
-    form.set("file", file);
-    form.set("orgSlug", orgSlug);
-    form.set("validation_id", fields.validation_id);
-    if (fields.acknowledge) form.set("acknowledge", "1");
-    if (targetCourseId) {
-      form.set("courseId", targetCourseId);
-      if (notifyUpdate) form.set("notify_update", "1");
-      if (targetPackageId) form.set("packageId", targetPackageId);
-      else form.set("language", language);
-    } else {
-      form.set("language", language);
-    }
-    if (displayName.trim()) form.set("display_name", displayName.trim());
-    if (thumbnailUrl) {
-      form.set("thumbnail_url", thumbnailUrl);
-      form.set("thumbnail_fit", thumbDisplay.fit);
-      form.set("thumbnail_pos_x", String(thumbDisplay.posX));
-      form.set("thumbnail_pos_y", String(thumbDisplay.posY));
-    }
+    const controller = new AbortController();
+    setAborter(controller);
 
     try {
-      const res = await fetch("/api/courses/upload", { method: "POST", body: form });
-      const json = await res.json();
-      if (!res.ok) {
-        setState({ kind: "error", message: json.error ?? "Upload failed" });
-        return;
-      }
+      const json = await directUpload({
+        pkg,
+        signal: controller.signal,
+        validationId: fields.validation_id,
+        acknowledge: fields.acknowledge,
+        target: {
+          orgSlug,
+          courseId: targetCourseId ?? undefined,
+          packageId: targetCourseId && targetPackageId ? targetPackageId : undefined,
+          language: targetCourseId && targetPackageId ? null : language,
+          displayName: displayName.trim() || null,
+          notifyUpdate: !!targetCourseId && notifyUpdate,
+          thumbnail: thumbnailUrl
+            ? { url: thumbnailUrl, fit: thumbDisplay.fit, posX: thumbDisplay.posX, posY: thumbDisplay.posY }
+            : null,
+        },
+        onProgress: (progress) => setState({ kind: "uploading", filename: file.name, progress }),
+      });
       setState({
         kind: "success",
         courseId: json.courseId,
@@ -139,10 +153,13 @@ export default function CourseUploadPage() {
           : language,
       });
     } catch (err) {
+      const cancelled = (err as { name?: string })?.name === "AbortError";
       setState({
         kind: "error",
-        message: err instanceof Error ? err.message : "Upload failed",
+        message: cancelled ? "Upload cancelled. Nothing was published." : err instanceof Error ? err.message : "Upload failed",
       });
+    } finally {
+      setAborter(null);
     }
   }
 
@@ -185,7 +202,9 @@ export default function CourseUploadPage() {
         )}
       </p>
 
-      {state.kind === "report" ? (
+      {state.kind === "uploading" ? (
+        <UploadProgressBar progress={state.progress} fileName={state.filename} onCancel={aborter ? () => aborter.abort() : undefined} />
+      ) : state.kind === "report" ? (
         <ValidationReportPanel
           fileName={state.file.name}
           result={state.result}

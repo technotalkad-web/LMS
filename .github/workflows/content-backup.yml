@@ -1,0 +1,47 @@
+# Nightly copy of course content (Cloudflare R2) to Backblaze B2, next to the
+# database dumps produced by backup.yml. rclone syncs only what changed, so
+# the nightly run is cheap; version folders are immutable, so a restore is a
+# straight copy back (see docs/CONTENT_STORAGE.md § Backup and rollback).
+#
+# Required secrets:
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET   (source)
+#   B2_KEY_ID, B2_APPLICATION_KEY, B2_REGION, B2_BUCKET                  (target; same as backup.yml)
+name: Nightly content backup (R2 → B2)
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # 02:30 UTC, after the database dump at 02:00
+  workflow_dispatch: {}
+
+concurrency:
+  group: content-backup
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Sync R2 → B2
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RCLONE_CONFIG_B2_TYPE: s3
+          RCLONE_CONFIG_B2_PROVIDER: Other
+          RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          RCLONE_CONFIG_B2_ENDPOINT: https://s3.${{ secrets.B2_REGION }}.backblazeb2.com
+        run: |
+          set -euo pipefail
+          # --immutable never overwrites: version folders never change, so any
+          # differing object is a corruption signal, not an update.
+          rclone sync "r2:${{ secrets.R2_BUCKET }}/courses" "b2:${{ secrets.B2_BUCKET }}/content/courses" \
+            --immutable --transfers 16 --checkers 32 --fast-list --stats-one-line --stats 30s -v
+          echo "Objects in B2 mirror:"
+          rclone size "b2:${{ secrets.B2_BUCKET }}/content/courses"

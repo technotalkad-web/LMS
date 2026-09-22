@@ -244,4 +244,26 @@ async function build(name, files) {
 await build("scorm12.zip", { "imsmanifest.xml": scormManifest, "index.html": scormHtml });
 await build("cmi5.zip", { "cmi5.xml": cmi5Xml, "index.html": cmi5Html });
 await build("xapi.zip", { "tincan.xml": tincanXml, "index.html": xapiHtml });
+
+// ---------- media-heavy xAPI package (direct-upload tests) ----------
+// 160 files, ~9 MB: per-slide "audio" blobs and images, a version marker the
+// tests read back through the content route, and a launch page that plays
+// one audio file so range requests are exercised. Deterministic bytes.
+{
+  const files = { "tincan.xml": tincanXml.replace("QA Bot xAPI Course", "QA Bot Media Course").replace("https://qa.bot/xapi/course", "https://qa.bot/xapi/media-course") };
+  const seeded = (n, seed) => { const b = Buffer.alloc(n); let x = seed; for (let i = 0; i < n; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; b[i] = x & 255; } return b; };
+  for (let i = 1; i <= 60; i++) files[`assets/audio/slide-${String(i).padStart(3, "0")}.mp3`] = seeded(90_000 + i * 100, i);
+  for (let i = 1; i <= 60; i++) files[`assets/img/slide-${String(i).padStart(3, "0")}.png`] = seeded(40_000 + i * 50, 1000 + i);
+  for (let i = 1; i <= 36; i++) files[`js/module-${i}.js`] = `// module ${i}\nexport const m${i} = ${i};\n`;
+  files["assets/media/intro.mp3"] = seeded(1_500_000, 42);
+  files["version.txt"] = "v1";
+  files["css/theme.css"] = "body{font-family:sans-serif}";
+  files["index.html"] = xapiHtml
+    .replace("QA Bot xAPI Course", "QA Bot Media Course")
+    .replace("</body>", `<audio id="intro" src="assets/media/intro.mp3" controls preload="metadata"></audio>\n<p id="version"></p>\n<script>fetch('version.txt').then(r=>r.text()).then(t=>{document.getElementById('version').textContent='version '+t});</script>\n</body>`);
+  await build("xapi-media.zip", files);
+  files["version.txt"] = "v2";
+  files["index.html"] = files["index.html"].replace("QA Bot Media Course", "QA Bot Media Course v2");
+  await build("xapi-media-v2.zip", files);
+}
 console.log("done.");

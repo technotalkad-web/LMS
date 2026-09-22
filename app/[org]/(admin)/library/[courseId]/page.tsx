@@ -16,14 +16,20 @@ import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
+import { ActivateVersionButton } from "./version-actions";
 
 type Version = {
   id: string;
+  package_id?: string | null;
   version_number: number;
   manifest_type: "scorm12" | "cmi5" | "xapi";
   launch_url: string;
   manifest_data: { title?: string; description?: string; masteryScore?: number };
   uploaded_at: string;
+  /** 0077 — undefined before the migration (= ready). */
+  upload_status?: "uploading" | "ready" | "failed";
+  storage_driver?: "supabase" | "r2";
+  file_count?: number | null;
 };
 
 type Course = {
@@ -69,14 +75,15 @@ export default async function AdminCourseDetailPage({
   if (!course) redirect(`/${orgSlug}/library`);
   const c = course as Course;
 
+  // select("*") for 0077 deploy safety (upload_status, storage_driver, file_count).
   const { data: versions } = await supabase
     .from("course_versions")
-    .select(
-      "id, version_number, manifest_type, launch_url, manifest_data, uploaded_at"
-    )
+    .select("*")
     .eq("course_id", c.id)
     .order("version_number", { ascending: false });
-  const list = (versions ?? []) as Version[];
+  const list = ((versions ?? []) as Version[]).filter(
+    (v) => !v.upload_status || v.upload_status === "ready" || canManage(role)
+  );
   const current = list.find((v) => v.id === c.current_version_id) ?? list[0];
 
   // Language packages (#158 Phase 1c). Sorted by language code so the
@@ -612,18 +619,43 @@ export default async function AdminCourseDetailPage({
               key={v.id}
               className="px-5 py-3 flex items-baseline justify-between gap-4"
             >
-              <div>
-                <div className="font-medium">v{v.version_number}</div>
-                <div className="text-xs text-muted">
+              <div className="min-w-0">
+                <div className="font-medium">
+                  v{v.version_number}
+                  {v.upload_status === "uploading" && (
+                    <span className="ml-2 px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-200 rounded-full uppercase tracking-wide text-[10px]">
+                      uploading
+                    </span>
+                  )}
+                  {v.upload_status === "failed" && (
+                    <span className="ml-2 px-2 py-0.5 bg-red-100 text-red-800 border border-red-200 rounded-full uppercase tracking-wide text-[10px]">
+                      failed
+                    </span>
+                  )}
+                </div>
+                <div className="text-xs text-muted break-all">
                   {v.manifest_type} - launch:{" "}
                   <span className="font-mono">{v.launch_url}</span>
+                  {typeof v.file_count === "number" && <> · {v.file_count} files</>}
+                  {v.storage_driver && <> · {v.storage_driver === "r2" ? "R2" : "Supabase Storage"}</>}
                 </div>
               </div>
-              <div className="text-xs text-muted shrink-0">
-                {v.id === c.current_version_id && (
-                  <span className="px-2 py-0.5 bg-accent text-canvas rounded-full mr-2 uppercase tracking-wide text-[10px]">
+              <div className="text-xs text-muted shrink-0 flex items-center gap-2">
+                {v.id === c.current_version_id ? (
+                  <span className="px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px]">
                     current
                   </span>
+                ) : (
+                  (!v.upload_status || v.upload_status === "ready") &&
+                  v.package_id && (
+                    <ActivateVersionButton
+                      orgSlug={orgSlug}
+                      courseId={c.id}
+                      packageId={v.package_id}
+                      versionId={v.id}
+                      versionNumber={v.version_number}
+                    />
+                  )
                 )}
                 {new Date(v.uploaded_at).toISOString().slice(0, 10)}
               </div>
