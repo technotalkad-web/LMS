@@ -181,6 +181,11 @@ export async function initDirectUpload(args: {
   const versionNumber = await nextVersionNumber(supabase, packageId);
   const storagePrefix = storagePrefixFor(courseId, packageId, versionNumber);
   const driver = activeStorageDriver();
+  // A course created by THIS call must not survive a failure below.
+  const createdCourse = !args.courseId;
+  const undoCourse = async () => {
+    if (createdCourse) await supabase.from("courses").delete().eq("id", courseId);
+  };
 
   let version: { id: string; version_number: number };
   try {
@@ -200,6 +205,7 @@ export async function initDirectUpload(args: {
       upload_started_at: new Date().toISOString(),
     });
   } catch (e) {
+    await undoCourse();
     return { ok: false, status: 400, error: e instanceof Error ? e.message : "Could not create the version." };
   }
   // The row must really carry upload_status: without migration 0077 the
@@ -212,6 +218,7 @@ export async function initDirectUpload(args: {
     .maybeSingle();
   if (probeErr || (probe as { upload_status?: string } | null)?.upload_status !== "uploading") {
     await supabase.from("course_versions").delete().eq("id", version.id);
+    await undoCourse();
     return {
       ok: false,
       status: 500,
