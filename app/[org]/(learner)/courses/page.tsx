@@ -5,6 +5,8 @@ import { createClient } from "@/lib/supabase/server";
 import { DashboardGrid, type GridCard } from "../dashboard/dashboard-grid";
 import { isReleased, laterOf } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
+import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { resolvePolicies } from "@/lib/scoring/resolve";
 
 /**
  * /{org}/courses — All my enrolled courses.
@@ -61,11 +63,14 @@ type Assignment = {
 };
 
 type Attempt = {
+  id: string;
   course_version_id: string;
   completion_status: "in_progress" | "completed";
   success_status: "unknown" | "passed" | "failed";
   score: number | null;
   started_at: string;
+  completed_at: string | null;
+  progress_pct?: number | null;
 };
 
 export default async function CoursesIndexPage({
@@ -228,13 +233,17 @@ export default async function CoursesIndexPage({
   const { data: attemptRows } = versionIds.length
     ? await supabase
         .from("course_attempts")
-        .select(
-          "course_version_id, completion_status, success_status, score, started_at"
-        )
+        // select("*") for 0075 deploy safety (progress_pct).
+        .select("*")
         .eq("user_id", user.id)
         .in("course_version_id", versionIds)
     : { data: [] as Attempt[] };
   const attempts = (attemptRows ?? []) as Attempt[];
+  // 0073 scoring rules per course (one RPC; fail-soft → defaults) — same
+  // official score / attempts-left semantics as the dashboard.
+  const policies = await resolvePolicies(supabase, [
+    ...new Set(versions.map((v) => v.course_id)),
+  ]);
 
   function attemptStatusForCourse(courseId: string): GridCard["status"] {
     const courseAttempts = attempts.filter((a) => {
@@ -257,18 +266,41 @@ export default async function CoursesIndexPage({
     if (courseAttempts.some((a) => a.success_status === "failed")) return "failed";
     return "in_progress";
   }
-  function bestScoreForCourse(courseId: string): number | null {
+  // Official score under the course's rule (was: raw best of all attempts,
+  // which ignored practice attempts and the first/best/latest setting).
+  function scoringForCourse(courseId: string) {
     const my = attempts.filter((a) => {
       const v = versionById.get(a.course_version_id);
       return v?.course_id === courseId;
     });
-    return my
-      .map((a) => a.score)
-      .filter((s): s is number => typeof s === "number")
-      .reduce<number | null>(
-        (best, s) => (best === null || s > best ? s : best),
-        null
-      );
+    const policy = policies.get(courseId) ?? DEFAULT_POLICY;
+    const scoring = computeScoring(my, policy);
+    return {
+      scoring,
+      scoredLeft: Math.max(0, policy.max_scored_attempts - scoring.scoredAttempts),
+      practiceMode: scoring.practiceMode,
+      blocked: scoring.blocked,
+    };
+  }
+  function bestScoreForCourse(courseId: string): number | null {
+    return scoringForCourse(courseId).scoring.officialScore;
+  }
+  function cardExtras(courseId: string) {
+    const s = scoringForCourse(courseId);
+    const open = attempts
+      .filter((a) => {
+        const v = versionById.get(a.course_version_id);
+        return v?.course_id === courseId && a.completion_status === "in_progress";
+      })
+      .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0] as
+      | (Attempt & { progress_pct?: number | null })
+      | undefined;
+    return {
+      scoredLeft: s.scoredLeft,
+      practiceMode: s.practiceMode,
+      blocked: s.blocked,
+      progressPct: typeof open?.progress_pct === "number" ? open.progress_pct : null,
+    };
   }
 
   // ---- Scheduled-release gates (mirrors dashboard/page.tsx) ----
@@ -328,6 +360,7 @@ export default async function CoursesIndexPage({
       isRevised: false,
       dueAt: a.due_at,
       bestScore: bestScoreForCourse(course.id),
+      ...cardExtras(course.id),
       pathName: pathNameByCourseId.get(course.id) ?? null,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,
@@ -355,6 +388,7 @@ export default async function CoursesIndexPage({
       isRevised: false,
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
+      ...cardExtras(cid),
       pathName,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,
@@ -379,6 +413,7 @@ export default async function CoursesIndexPage({
       isRevised: false,
       dueAt: null,
       bestScore: bestScoreForCourse(cid),
+      ...cardExtras(cid),
       pathName: null,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,
