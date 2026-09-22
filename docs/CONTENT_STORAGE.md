@@ -25,8 +25,12 @@ sequenceDiagram
   W-->>A: validation report (pending row)
   A->>W: POST /api/courses/upload/init (validation_id, manifest xml, file list)
   W->>W: gate + quotas; course/package/version rows, upload_status=uploading
-  W-->>A: one signed PUT URL per file (15 min)
-  A->>R: PUT each file, 6 at a time, 3 attempts
+  W-->>A: version id + signing batch size
+  loop per batch (R2: whole package; Supabase Storage: 32 files)
+    A->>W: POST /api/courses/upload/sign (paths)
+    W-->>A: signed PUT URLs (15 min)
+    A->>R: PUT each file, 6 at a time, 3 attempts
+  end
   A->>W: POST /api/courses/upload/finalize (versionId)
   W->>R: HEAD launch file, list prefix, read launch file (unit count)
   W->>W: upload_status=ready; package + course current_version_id → this version
@@ -80,6 +84,7 @@ learners. `STORAGE_DRIVER` on the Worker decides where **new** uploads go.
 | Validation bundle | 60 MB of text files, 16 MB launch file | client bundle builder |
 | Edge-cached whole files | up to 100 MB each, 1 year (immutable path) | content route |
 | Signed upload URL life | 15 minutes | `DIRECT_UPLOAD_LIMITS` |
+| Signing batch | R2: whole package (local signature); Supabase Storage: 32 per request, one network call each, kept under a free-plan Worker's 50 subrequests | `DIRECT_UPLOAD_LIMITS.signBatch` |
 | Tenant storage quota | per plan, checked on declared bytes at init | `checkQuota` |
 
 ## Security

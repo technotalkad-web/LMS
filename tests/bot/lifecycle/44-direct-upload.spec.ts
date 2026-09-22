@@ -208,8 +208,26 @@ test("direct upload: an unfinished upload never becomes current; abort and the r
     },
   });
   expect(init.ok(), await init.text()).toBeTruthy();
-  const j = (await init.json()) as { courseId: string; versionId: string; uploads: Array<{ path: string; url: string; headers: Record<string, string> }> };
-  expect(j.uploads).toHaveLength(files.length);
+  const j = (await init.json()) as { courseId: string; versionId: string; signBatch: number; fileCount: number };
+  expect(j.fileCount).toBe(files.length);
+  expect(j.signBatch).toBeGreaterThan(0);
+
+  // Signed URLs come in batches; a batch larger than the driver's budget is refused.
+  const tooMany = await req.post("/api/courses/upload/sign", {
+    data: { orgSlug: w.org.slug, versionId: j.versionId, files: Array.from({ length: j.signBatch + 1 }, (_, i) => ({ path: `x/${i}.txt` })) },
+  });
+  expect(tooMany.status()).toBe(400);
+  const sign = await req.post("/api/courses/upload/sign", {
+    data: { orgSlug: w.org.slug, versionId: j.versionId, files: files.map((f) => ({ path: f.path })) },
+  });
+  expect(sign.ok(), await sign.text()).toBeTruthy();
+  const signed = (await sign.json()) as { uploads: Array<{ path: string; key: string; url: string; headers: Record<string, string> }> };
+  expect(signed.uploads).toHaveLength(files.length);
+  expect(signed.uploads.every((u) => u.key.startsWith(`courses/${j.courseId}/`))).toBeTruthy();
+  const escaped = await req.post("/api/courses/upload/sign", {
+    data: { orgSlug: w.org.slug, versionId: j.versionId, files: [{ path: "../../escape.txt" }] },
+  });
+  expect(escaped.status()).toBe(400);
 
   // Nothing is current yet, and the validation cannot be reused.
   expect(await currentVersionId(j.courseId)).toBeNull();
@@ -219,7 +237,7 @@ test("direct upload: an unfinished upload never becomes current; abort and the r
   expect(reuse.status()).toBe(400);
 
   // Upload only the manifest, then try to finalise → refused, retryable.
-  const only = j.uploads.find((u) => u.path === "tincan.xml")!;
+  const only = signed.uploads.find((u) => u.path === "tincan.xml")!;
   const put = await req.put(only.url, { headers: only.headers, data: await zip.file("tincan.xml")!.async("nodebuffer") });
   expect(put.ok(), `PUT to storage → ${put.status()}`).toBeTruthy();
   const fin = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId } });
