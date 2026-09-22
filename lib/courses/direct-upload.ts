@@ -405,7 +405,7 @@ export async function abortDirectUpload(args: {
   org: { id: string };
   versionId: string;
 }): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
-  const loaded = await loadUploadingVersion(args.supabase, args.org.id, args.versionId);
+  const loaded = await loadUploadingVersion(args.supabase, args.org.id, args.versionId, ["uploading", "failed"]);
   if (!loaded.ok) return loaded;
   const { version } = loaded;
   try {
@@ -487,7 +487,8 @@ type VersionRow = {
 async function loadUploadingVersion(
   supabase: SupabaseClient,
   orgId: string,
-  versionId: string
+  versionId: string,
+  allowed: string[] = ["uploading"]
 ): Promise<
   | { ok: true; version: VersionRow; course: { id: string; current_version_id: string | null } }
   | { ok: false; status: number; error: string }
@@ -506,7 +507,7 @@ async function loadUploadingVersion(
     .eq("organization_id", orgId)
     .maybeSingle();
   if (!c) return { ok: false, status: 404, error: "Course not found in this organisation." };
-  if (version.upload_status !== "uploading") {
+  if (!allowed.includes(version.upload_status)) {
     return { ok: false, status: 409, error: `This version is ${version.upload_status}, not uploading.` };
   }
   return {

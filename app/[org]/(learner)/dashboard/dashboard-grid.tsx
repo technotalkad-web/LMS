@@ -45,6 +45,12 @@ export type GridCard = {
   progressTotal?: number;
   /** Course tiles: real in-module progress % of the open attempt (0075); null = unknown. */
   progressPct?: number | null;
+  /** 0073 scoring window: scored attempts the learner still has (null = unknown). */
+  scoredLeft?: number | null;
+  /** Window used up and the rule says further launches are practice only. */
+  practiceMode?: boolean;
+  /** Window used up and the rule blocks further launches. */
+  blocked?: boolean;
   thumbnail_url?: string | null;
   thumbnail_fit?: string | null;
   thumbnail_pos_x?: number | null;
@@ -385,7 +391,27 @@ function PathTile({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
 function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
   const isCompleted =
     card.status === "completed" || card.status === "passed";
+  const isFailed = card.status === "failed";
   const isUpcoming = card.status === "upcoming";
+  // What a learner who did not pass can do next, under the current rule.
+  // An open retry (progressPct known) resumes rather than restarts.
+  const retryOpen = isFailed && typeof card.progressPct === "number";
+  const retryLabel = card.blocked
+    ? "No attempts left"
+    : retryOpen
+      ? "Resume"
+      : card.practiceMode
+        ? "Practice again"
+        : "Try again";
+  const attemptsLeftLine = card.blocked
+    ? "All scored attempts used · ask your admin for another"
+    : retryOpen
+      ? `Retry in progress · ${card.progressPct}% complete`
+      : card.practiceMode
+        ? "All scored attempts used · practice only"
+        : typeof card.scoredLeft === "number"
+          ? `${card.scoredLeft} scored attempt${card.scoredLeft === 1 ? "" : "s"} left`
+          : null;
   // Unreleased content can't be overdue — the learner couldn't have started it.
   const overdue =
     !isCompleted &&
@@ -497,6 +523,23 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
                 </span>
               )}
             </div>
+          ) : isFailed ? (
+            <div className="mb-3">
+              <div className="flex items-center justify-between bg-red-50 px-3 py-2 rounded-lg border border-red-100 text-sm">
+                <div className="flex items-center gap-1.5 text-red-700 font-semibold">
+                  <RotateCcw className="w-4 h-4" />
+                  Completed · not passed
+                </div>
+                {card.bestScore !== null && (
+                  <span className="font-bold text-red-800">
+                    {Math.round(card.bestScore * 100)}%
+                  </span>
+                )}
+              </div>
+              {attemptsLeftLine && (
+                <div className="text-[11px] text-muted mt-1.5 font-medium">{attemptsLeftLine}</div>
+              )}
+            </div>
           ) : (
             <>
               <div className="flex justify-between text-[11px] mb-1 font-medium">
@@ -557,10 +600,10 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
           ) : (
             <Link
               href={`/${orgSlug}/courses/${card.course_id}${
-                isCompleted ? "" : "/launch?back=dashboard"
+                isCompleted || (isFailed && card.blocked) ? "" : "/launch?back=dashboard"
               }`}
               className={`w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                isCompleted
+                isCompleted || (isFailed && card.blocked)
                   ? "bg-canvas hover:bg-canvas/70 text-ink border border-line"
                   : overdue
                     ? "bg-red-600 hover:bg-red-700 text-white shadow-sm"
@@ -570,6 +613,10 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               {isCompleted ? (
                 <>
                   <Award className="w-4 h-4" /> View details
+                </>
+              ) : isFailed ? (
+                <>
+                  <RotateCcw className="w-4 h-4" /> {card.blocked ? "View details" : retryLabel}
                 </>
               ) : card.status === "in_progress" ? (
                 <>
