@@ -100,7 +100,12 @@ export class SupabaseStorageAdapter implements StorageAdapter {
   async getObject(key: string, range?: string | null): Promise<StorageObject | null> {
     const url = await this.getSignedDownloadUrl(key, 300).catch(() => null);
     if (!url) return null;
-    const res = await fetch(url, { headers: range ? { range } : undefined });
+    // identity: the gateway would otherwise gzip text and report the
+    // compressed Content-Length while fetch() hands us the inflated stream —
+    // the browser then truncates the document at the wrong byte.
+    const res = await fetch(url, {
+      headers: { "accept-encoding": "identity", ...(range ? { range } : {}) },
+    });
     if (res.status === 404 || res.status === 400) return null;
     if (res.status === 416) {
       const h = await this.head(key);
@@ -110,8 +115,11 @@ export class SupabaseStorageAdapter implements StorageAdapter {
       throw new Error(`Supabase getObject failed (${key}): HTTP ${res.status}`);
     }
     const contentRange = res.headers.get("content-range");
-    const contentLength = Number(res.headers.get("content-length") ?? 0);
-    let size = contentRange ? Number(contentRange.split("/")[1]) : contentLength;
+    // If the gateway still compressed the body, the length is unknown (-1)
+    // and the caller must not advertise one.
+    const encoded = !!res.headers.get("content-encoding") && res.headers.get("content-encoding") !== "identity";
+    const contentLength = encoded ? -1 : Number(res.headers.get("content-length") ?? 0);
+    let size = contentRange ? Number(contentRange.split("/")[1]) : Math.max(contentLength, 0);
     // Some gateways ignore Range and return 200 with the whole object; treat
     // that as a full response so the caller never mislabels it.
     if (range && res.status === 200 && !contentRange) {

@@ -107,7 +107,7 @@ export async function GET(
     "cache-control": "private, max-age=3600",
     "x-lms-cache": "miss",
   });
-  headers.set("content-length", String(obj.contentLength));
+  if (obj.contentLength >= 0) headers.set("content-length", String(obj.contentLength));
   if (obj.etag) headers.set("etag", obj.etag);
   if (obj.status === 206 && obj.contentRange) headers.set("content-range", obj.contentRange);
 
