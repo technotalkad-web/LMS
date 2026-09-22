@@ -59,6 +59,18 @@ export type GridCard = {
 
 type Filter = "all" | "in_progress" | "not_started" | "completed";
 
+/**
+ * Which dashboard bucket a card belongs to. A module the learner has FINISHED
+ * is Completed whether they passed or not — a failed attempt is still a
+ * completion — even while a practice run or retry is open. Only modules
+ * never finished can be In progress or Not started.
+ */
+export function bucketOf(status: CardStatus): Exclude<Filter, "all"> {
+  if (status === "completed" || status === "passed" || status === "failed") return "completed";
+  if (status === "in_progress") return "in_progress";
+  return "not_started";
+}
+
 const labels: Record<Filter, string> = {
   all: "All",
   in_progress: "In progress",
@@ -80,24 +92,17 @@ export function DashboardGrid({
     let notStarted = 0;
     let done = 0;
     for (const c of cards) {
-      if (c.status === "in_progress") inProg++;
-      else if (c.status === "not_started" || c.status === "upcoming") notStarted++;
-      else if (c.status === "completed" || c.status === "passed") done++;
+      const b = bucketOf(c.status);
+      if (b === "in_progress") inProg++;
+      else if (b === "not_started") notStarted++;
+      else done++;
     }
     return { inProg, notStarted, done };
   }, [cards]);
 
   const filtered = useMemo(() => {
     if (filter === "all") return cards;
-    if (filter === "in_progress")
-      return cards.filter((c) => c.status === "in_progress");
-    if (filter === "not_started")
-      return cards.filter(
-        (c) => c.status === "not_started" || c.status === "upcoming"
-      );
-    return cards.filter(
-      (c) => c.status === "completed" || c.status === "passed"
-    );
+    return cards.filter((c) => bucketOf(c.status) === filter);
   }, [cards, filter]);
 
   return (
