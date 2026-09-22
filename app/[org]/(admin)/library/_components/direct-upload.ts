@@ -278,12 +278,23 @@ export async function directUpload(args: {
       const f = byPath.get(u.path);
       if (!f) continue;
       let ok = false;
+      let target: SignedEntry = u;
       for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
         try {
+          if (attempt > 1) {
+            // Re-sign: single-use tokens (Supabase Storage) cannot be replayed.
+            const res = await fetch("/api/courses/upload/sign", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              signal,
+              body: JSON.stringify({ orgSlug: args.target.orgSlug, versionId: init.versionId, files: [{ path: f.path, contentType: f.contentType }] }),
+            });
+            const j = (await res.json().catch(() => ({}))) as { uploads?: SignedEntry[] };
+            if (res.ok && j.uploads?.[0]) target = j.uploads[0];
+          }
           const body = await f.entry.async("blob");
-          const res = await fetch(u.url, { method: u.method, headers: u.headers, body, signal });
+          const res = await fetch(target.url, { method: target.method, headers: target.headers, body, signal });
           ok = res.ok;
-          if (!ok && res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) break;
         } catch (e) {
           if ((e as { name?: string })?.name === "AbortError") throw e;
           ok = false;

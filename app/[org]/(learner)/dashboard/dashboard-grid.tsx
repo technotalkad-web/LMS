@@ -394,18 +394,24 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
   const isFailed = card.status === "failed";
   const isUpcoming = card.status === "upcoming";
   // What a learner who did not pass can do next, under the current rule.
+  // An open retry (progressPct known) resumes rather than restarts.
+  const retryOpen = isFailed && typeof card.progressPct === "number";
   const retryLabel = card.blocked
     ? "No attempts left"
-    : card.practiceMode
-      ? "Practice again"
-      : "Try again";
+    : retryOpen
+      ? "Resume"
+      : card.practiceMode
+        ? "Practice again"
+        : "Try again";
   const attemptsLeftLine = card.blocked
     ? "All scored attempts used · ask your admin for another"
-    : card.practiceMode
-      ? "All scored attempts used · practice only"
-      : typeof card.scoredLeft === "number"
-        ? `${card.scoredLeft} scored attempt${card.scoredLeft === 1 ? "" : "s"} left`
-        : null;
+    : retryOpen
+      ? `Retry in progress · ${card.progressPct}% complete`
+      : card.practiceMode
+        ? "All scored attempts used · practice only"
+        : typeof card.scoredLeft === "number"
+          ? `${card.scoredLeft} scored attempt${card.scoredLeft === 1 ? "" : "s"} left`
+          : null;
   // Unreleased content can't be overdue — the learner couldn't have started it.
   const overdue =
     !isCompleted &&
