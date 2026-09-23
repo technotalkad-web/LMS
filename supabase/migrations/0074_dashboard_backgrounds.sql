@@ -45,4 +45,11 @@ create policy "admins manage dashboard backgrounds"
   using (public.is_org_admin(organization_id))
   with check (public.is_org_admin(organization_id));
 
+-- Data API grants (explicit since Supabase stops auto-granting new public
+-- tables on 2026-10-30; idempotent where the defaults already applied). RLS
+-- above still decides which rows a role can touch.
+grant select on public.dashboard_backgrounds to anon;
+grant select, insert, update, delete on public.dashboard_backgrounds to authenticated;
+grant select, insert, update, delete on public.dashboard_backgrounds to service_role;
+
 notify pgrst, 'reload schema';
