@@ -14,10 +14,28 @@ export type LrsConfig = {
   auth_key: string | null;
   auth_secret: string | null;
   xapi_version: string;
+  /** 0078 — 'ambak-v1' (enriched analytics profile) | 'raw' (engine
+   *  statements verbatim, the pre-0078 behaviour). Undefined before the
+   *  migration lands → treated as the default. */
+  statement_profile?: StatementProfile | null;
+  backfill_requested_at?: string | null;
+  backfill_started_at?: string | null;
+  backfill_completed_at?: string | null;
+  backfill_cursor?: Record<string, unknown> | null;
+  backfill_stats?: Record<string, unknown> | null;
   last_test_at: string | null;
   last_test_status: string | null;
   last_test_error: string | null;
 };
+
+export type StatementProfile = "ambak-v1" | "raw";
+export const STATEMENT_PROFILES: StatementProfile[] = ["ambak-v1", "raw"];
+export const DEFAULT_STATEMENT_PROFILE: StatementProfile = "ambak-v1";
+
+export function statementProfileOf(cfg: Pick<LrsConfig, "statement_profile"> | null): StatementProfile {
+  const v = cfg?.statement_profile;
+  return v === "raw" ? "raw" : DEFAULT_STATEMENT_PROFILE;
+}
 
 export const SECRET_MASK = "••••••";
 
@@ -55,6 +73,11 @@ export async function maskedConfig(orgId: string) {
       has_secret: false,
       auth_secret: "",
       xapi_version: "1.0.3",
+      statement_profile: DEFAULT_STATEMENT_PROFILE,
+      backfill_requested_at: null,
+      backfill_started_at: null,
+      backfill_completed_at: null,
+      backfill_stats: null,
       last_test_at: null,
       last_test_status: null,
       last_test_error: null,
@@ -67,6 +90,11 @@ export async function maskedConfig(orgId: string) {
     has_secret: Boolean(cfg.auth_secret),
     auth_secret: cfg.auth_secret ? SECRET_MASK : "",
     xapi_version: cfg.xapi_version ?? "1.0.3",
+    statement_profile: statementProfileOf(cfg),
+    backfill_requested_at: cfg.backfill_requested_at ?? null,
+    backfill_started_at: cfg.backfill_started_at ?? null,
+    backfill_completed_at: cfg.backfill_completed_at ?? null,
+    backfill_stats: cfg.backfill_stats ?? null,
     last_test_at: cfg.last_test_at,
     last_test_status: cfg.last_test_status,
     last_test_error: cfg.last_test_error,
@@ -83,6 +111,7 @@ export async function saveLrsConfig(
     auth_key?: string | null;
     auth_secret?: string | null;
     xapi_version?: string;
+    statement_profile?: StatementProfile;
   }
 ): Promise<{ ok: boolean; error?: string }> {
   const update: Record<string, unknown> = {
@@ -90,6 +119,10 @@ export async function saveLrsConfig(
     updated_at: new Date().toISOString(),
   };
   if (fields.enabled !== undefined) update.enabled = fields.enabled;
+  // Only written when supplied, so a deploy ahead of migration 0078 keeps
+  // saving the other fields.
+  if (fields.statement_profile !== undefined && STATEMENT_PROFILES.includes(fields.statement_profile))
+    update.statement_profile = fields.statement_profile;
   if (fields.endpoint !== undefined)
     update.endpoint = fields.endpoint?.trim().replace(/\/+$/, "") || null;
   if (fields.auth_key !== undefined) update.auth_key = fields.auth_key?.trim() || null;
@@ -108,6 +141,13 @@ export async function saveLrsConfig(
   const { error } = await svc()
     .from("tenant_lrs_config")
     .upsert(update, { onConflict: "organization_id" });
+  // Deploy-before-migration safety (0078): a database without the
+  // statement_profile column must still save every other field.
+  if (error && "statement_profile" in update && /statement_profile/.test(error.message)) {
+    delete update.statement_profile;
+    const retry = await svc().from("tenant_lrs_config").upsert(update, { onConflict: "organization_id" });
+    return retry.error ? { ok: false, error: retry.error.message } : { ok: true };
+  }
   return error ? { ok: false, error: error.message } : { ok: true };
 }
 

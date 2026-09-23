@@ -1,6 +1,8 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { loadLrsConfig } from "./config";
+import { loadLrsConfig, statementProfileOf } from "./config";
 import { forwardStatements } from "./forward";
+import { enrichStatement } from "./enrich";
+import { loadAttemptContexts } from "./context";
 import type { XapiStatement } from "@/lib/xapi/types";
 
 /**
@@ -38,6 +40,29 @@ async function markSent(orgId: string, statementIds: string[]) {
     .neq("status", "sent");
 }
 
+/** Enriched copies (profile 'ambak-v1'), or the raw statements for 'raw' or
+ *  whenever context/enrichment fails. Exported for the backfill job. */
+export async function enrichForOutbox(
+  attemptId: string,
+  statements: XapiStatement[],
+  profile: "ambak-v1" | "raw"
+): Promise<XapiStatement[]> {
+  if (profile === "raw") return statements;
+  try {
+    const ctx = (await loadAttemptContexts(svc(), [attemptId])).get(attemptId);
+    if (!ctx) return statements;
+    return statements.map((s) => {
+      try {
+        return enrichStatement(s, ctx);
+      } catch {
+        return s;
+      }
+    });
+  } catch {
+    return statements;
+  }
+}
+
 /**
  * Enqueue + (best-effort) immediately forward. Returns silently on any problem.
  */
@@ -55,8 +80,14 @@ export async function mirrorToExternalLrs(
     const ids = statements.map((s) => s.id).filter(Boolean) as string[];
     if (!ids.length) return;
 
+    // 0078: the external copy carries the analytics profile (stable ids,
+    // learner/content/path/journey dimensions). Our own xapi_statements row
+    // stays the raw engine statement. Enrichment failing for any reason
+    // falls back to the raw statement — the LRS never misses an event.
+    const outbound = await enrichForOutbox(attemptId, statements, statementProfileOf(cfg));
+
     // 1) Durable enqueue (idempotent on (org, statement_id)).
-    const rows = statements
+    const rows = outbound
       .filter((s) => s.id)
       .map((s) => ({
         organization_id: orgId,
@@ -80,7 +111,7 @@ export async function mirrorToExternalLrs(
             auth_secret: cfg.auth_secret,
             xapi_version: cfg.xapi_version,
           },
-          statements
+          outbound
         );
         if (res.ok) {
           await markSent(orgId, ids);

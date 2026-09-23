@@ -3,6 +3,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadLrsConfig } from "@/lib/lrs/config";
 import { forwardStatements } from "@/lib/lrs/forward";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
+import { sweepAll, type OrgSweepResult } from "@/lib/lrs/sweep";
 
 /**
  *   POST /api/cron/lrs-forward      header: x-cron-secret: <CRON_SECRET>
@@ -40,6 +41,16 @@ export async function POST(request: Request) {
   const db = svc();
   const nowIso = new Date().toISOString();
 
+  // 0078: derive LMS events / (re)enqueue history for every enabled org BEFORE
+  // draining, so this run can already deliver what it produced. Fully
+  // fail-isolated — the drainer below runs exactly as it did before.
+  let sweep: OrgSweepResult[] = [];
+  try {
+    sweep = await sweepAll();
+  } catch {
+    sweep = [];
+  }
+
   const { data: due } = await db
     .from("lrs_forward_outbox")
     .select("id, organization_id, statement_id, payload, attempts")
@@ -55,9 +66,17 @@ export async function POST(request: Request) {
     payload: unknown;
     attempts: number;
   }>;
+  const sweepSummary = sweep.map((r) => ({
+    org: r.orgId,
+    ran: r.ran,
+    enqueued: r.enqueued,
+    caughtUp: r.caughtUp,
+    ...(r.skipped ? { skipped: r.skipped } : {}),
+  }));
+
   if (rows.length === 0) {
-    await recordHeartbeat("lrs-forward", { processed: 0 });
-    return NextResponse.json({ ok: true, processed: 0 });
+    await recordHeartbeat("lrs-forward", { processed: 0, sweep: sweepSummary });
+    return NextResponse.json({ ok: true, processed: 0, sweep: sweepSummary });
   }
 
   // Group by org so we forward each LRS one batch.
@@ -118,6 +137,6 @@ export async function POST(request: Request) {
     }
   }
 
-  await recordHeartbeat("lrs-forward", { processed: rows.length, sent, failed, dead });
-  return NextResponse.json({ ok: true, processed: rows.length, sent, failed, dead });
+  await recordHeartbeat("lrs-forward", { processed: rows.length, sent, failed, dead, sweep: sweepSummary });
+  return NextResponse.json({ ok: true, processed: rows.length, sent, failed, dead, sweep: sweepSummary });
 }

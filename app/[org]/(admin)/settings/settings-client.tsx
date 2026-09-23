@@ -88,6 +88,12 @@ export type LrsConfigView = {
   has_secret: boolean;
   auth_secret: string;
   xapi_version: string;
+  /** 0078 — undefined from an older server build. */
+  statement_profile?: "ambak-v1" | "raw";
+  backfill_requested_at?: string | null;
+  backfill_started_at?: string | null;
+  backfill_completed_at?: string | null;
+  backfill_stats?: Record<string, unknown> | null;
   last_test_at: string | null;
   last_test_status: string | null;
   last_test_error: string | null;
@@ -902,8 +908,11 @@ function LrsSection({
   // Pre-filled with the mask when a secret exists; only sent if the admin edits it.
   const [authSecret, setAuthSecret] = useState(initial.auth_secret);
   const [version, setVersion] = useState(initial.xapi_version);
+  const [profile, setProfile] = useState<"ambak-v1" | "raw">(initial.statement_profile ?? "ambak-v1");
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillMsg, setBackfillMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [test, setTest] = useState<
@@ -924,6 +933,7 @@ function LrsSection({
         auth_key: authKey,
         auth_secret: authSecret,
         xapi_version: version,
+        statement_profile: profile,
       }),
     });
     setBusy(false);
@@ -965,6 +975,38 @@ function LrsSection({
 
   const testOk = test?.status === "ok";
 
+  async function requestBackfill() {
+    setBackfilling(true);
+    setBackfillMsg(null);
+    const res = await fetch("/api/org/lrs/backfill", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug }),
+    });
+    setBackfilling(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setBackfillMsg(j.error ?? "Backfill request failed");
+      return;
+    }
+    setBackfillMsg("Backfill requested. History is re-sent in small batches every few minutes; this card shows the progress.");
+    onSaved();
+  }
+
+  const stats = (initial.backfill_stats ?? null) as Record<string, unknown> | null;
+  const statTotal = stats
+    ? Object.entries(stats)
+        .filter(([k, v]) => typeof v === "number" && !k.endsWith("_error") && k !== "last_run_at")
+        .reduce((n, [, v]) => n + (v as number), 0)
+    : 0;
+  const backfillState = initial.backfill_completed_at
+    ? `History sent: ${statTotal.toLocaleString()} statements (finished ${new Date(initial.backfill_completed_at).toLocaleString()}).`
+    : initial.backfill_started_at
+      ? `Backfill in progress: ${statTotal.toLocaleString()} statements sent so far.`
+      : initial.backfill_requested_at
+        ? "Backfill requested — starts on the next run (within 5 minutes)."
+        : null;
+
   return (
     <section className="border border-line rounded-2xl bg-paper p-6 space-y-4">
       <div className="flex items-start justify-between gap-3">
@@ -1005,9 +1047,27 @@ function LrsSection({
           />
         </Field>
       </div>
-      <Field label="xAPI version">
-        <input type="text" value={version} onChange={(e) => setVersion(e.target.value)} className="ws-input" />
-      </Field>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <Field label="xAPI version">
+          <input type="text" value={version} onChange={(e) => setVersion(e.target.value)} className="ws-input" />
+        </Field>
+        <Field label="Statement format">
+          <select
+            value={profile}
+            onChange={(e) => setProfile(e.target.value as "ambak-v1" | "raw")}
+            className="ws-input"
+          >
+            <option value="ambak-v1">Analytics profile (recommended)</option>
+            <option value="raw">Raw engine statements</option>
+          </select>
+          <p className="text-[11px] text-muted mt-1">
+            The analytics profile adds stable course ids, learner, path and journey
+            dimensions to every statement so Veracity, Watershed and similar
+            platforms can compare modules, segments and journeys. Raw sends
+            statements exactly as the content package emits them.
+          </p>
+        </Field>
+      </div>
 
       {test && (
         <div
@@ -1038,6 +1098,29 @@ function LrsSection({
         Enabling this sends a copy of your learners&apos; xAPI activity to the LRS
         you configure.
       </p>
+
+      {initial.enabled && initial.statement_profile !== "raw" && (
+        <div className="border border-line rounded-xl px-4 py-3 space-y-2">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <div className="text-sm">
+              <div className="font-medium">History</div>
+              <p className="text-xs text-muted">
+                {backfillState ??
+                  "All past activity is sent automatically the first time forwarding is enabled. Use this after changing LRS or to resend everything."}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={requestBackfill}
+              disabled={backfilling}
+              className="px-4 py-2 border border-line rounded-lg text-sm hover:border-ink disabled:opacity-50 shrink-0"
+            >
+              {backfilling ? "Requesting…" : "Resend all history"}
+            </button>
+          </div>
+          {backfillMsg && <p className="text-xs text-muted">{backfillMsg}</p>}
+        </div>
+      )}
 
       <div className="flex items-center gap-3">
         <button
