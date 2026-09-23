@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { maskedConfig, saveLrsConfig } from "@/lib/lrs/config";
+import {
+  maskedConfig,
+  saveLrsConfig,
+  STATEMENT_PROFILES,
+  type StatementProfile,
+} from "@/lib/lrs/config";
 
 /**
  *   GET  /api/org/lrs?orgSlug=...        → config with auth_secret MASKED
@@ -51,9 +56,17 @@ export async function POST(request: Request) {
     auth_key?: string | null;
     auth_secret?: string | null;
     xapi_version?: string;
+    statement_profile?: string;
   };
   const ctx = await requireAdmin(body.orgSlug ?? null);
   if (ctx.error) return ctx.error;
+
+  if (
+    body.statement_profile !== undefined &&
+    !STATEMENT_PROFILES.includes(body.statement_profile as StatementProfile)
+  ) {
+    return NextResponse.json({ error: "Unknown statement profile." }, { status: 400 });
+  }
 
   // Guard: can't enable without an endpoint.
   if (body.enabled && !(body.endpoint && body.endpoint.trim())) {
@@ -69,6 +82,7 @@ export async function POST(request: Request) {
     auth_key: body.auth_key,
     auth_secret: body.auth_secret,
     xapi_version: body.xapi_version,
+    statement_profile: body.statement_profile as StatementProfile | undefined,
   });
   if (!res.ok) return NextResponse.json({ error: res.error }, { status: 400 });
   return NextResponse.json({ ok: true, config: await maskedConfig(ctx.orgId) });

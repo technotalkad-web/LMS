@@ -2,6 +2,13 @@
 
 **Status:** Proposed (for sign-off) · **Migration:** `0044_lrs_forwarding.sql` · **Ships after:** v1.0.5
 
+> **0078 update:** the payload forwarded to the external LRS is now the
+> enriched copy defined in [LRS_ANALYTICS_PROFILE.md](./LRS_ANALYTICS_PROFILE.md)
+> (stable course ids, learner / path / journey dimensions, LMS-derived events,
+> SCORM translation, history backfill). Everything below about the outbox,
+> drainer, config and security still holds; `statement_profile = 'raw'`
+> restores the verbatim behaviour described here.
+
 ## 1. Summary
 
 Every tenant can point their organisation at an external LRS (Learning Record
