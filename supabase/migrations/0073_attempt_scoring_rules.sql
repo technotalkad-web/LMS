@@ -74,6 +74,13 @@ create policy "admins manage scoring rules"
   using (public.is_org_admin(organization_id))
   with check (public.is_org_admin(organization_id));
 
+-- Data API grants (explicit since Supabase stops auto-granting new public
+-- tables on 2026-10-30; idempotent where the defaults already applied). RLS
+-- above still decides which rows a role can touch.
+grant select on public.attempt_scoring_rules to anon;
+grant select, insert, update, delete on public.attempt_scoring_rules to authenticated;
+grant select, insert, update, delete on public.attempt_scoring_rules to service_role;
+
 -- ── 2) Policy resolution ─────────────────────────────────────────────────────
 -- Always returns exactly one row (defaults when nothing is configured).
 -- SECURITY DEFINER so a learner's RLS on journey/path tables can't make the
@@ -266,6 +273,11 @@ left join public.v_course_attempt_scoring s
   on s.course_id = b.course_id and s.user_id = b.user_id;
 
 alter view public.v_course_attempt_summary set (security_invoker = on);
+
+-- Data API grants for the views (explicit since 2026-10-30; security_invoker
+-- means the caller's RLS on the underlying tables still applies).
+grant select on public.v_course_attempt_scoring to authenticated, service_role;
+grant select on public.v_course_attempt_summary to authenticated, service_role;
 
 -- ── 5) Report matviews: sticky completion + official scores ─────────────────
 -- (Matviews can't be replaced in place — drop + recreate, same columns.)
