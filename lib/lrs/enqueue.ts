@@ -113,7 +113,21 @@ export async function mirrorToExternalLrs(
           },
           outbound
         );
-        if (res.ok) {
+        if (res.results) {
+          // Split delivery after a 409: mark only the accepted ids as sent; the
+          // rest stay pending with the error for the cron drainer to retry.
+          const okIds = ids.filter((id) => res.results![id]?.ok !== false);
+          const badIds = ids.filter((id) => res.results![id]?.ok === false);
+          await markSent(orgId, okIds);
+          if (badIds.length) {
+            await svc()
+              .from("lrs_forward_outbox")
+              .update({ last_error: res.error ?? "forward failed" })
+              .eq("organization_id", orgId)
+              .in("statement_id", badIds)
+              .neq("status", "sent");
+          }
+        } else if (res.ok) {
           await markSent(orgId, ids);
         } else {
           await svc()

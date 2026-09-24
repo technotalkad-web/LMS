@@ -15,7 +15,10 @@ import { sweepAll, type OrgSweepResult } from "@/lib/lrs/sweep";
  * ids, so a re-send the LRS already has is a no-op.
  */
 const BATCH = 200;
-const MAX_ATTEMPTS = 8;
+// Retry budget before a row dead-letters. With the 5-minute cron and the backoff
+// below (2^n seconds, capped at 1 hour) 36 attempts cover roughly 27 hours of a
+// continuous LRS outage; 8 covered about 40 minutes.
+const MAX_ATTEMPTS = 36;
 
 function svc() {
   return createServiceClient(
@@ -108,6 +111,36 @@ export async function POST(request: Request) {
       },
       orgRows.map((r) => r.payload)
     );
+
+    if (res.results) {
+      // The batch was split after a 409: settle every row on its own outcome so a
+      // statement the LRS already holds never hides a new one that failed.
+      for (const r of orgRows) {
+        const o = res.results[r.statement_id];
+        if (!o || o.ok) {
+          await db
+            .from("lrs_forward_outbox")
+            .update({ status: "sent", sent_at: new Date().toISOString(), last_error: null })
+            .eq("id", r.id);
+          sent += 1;
+          continue;
+        }
+        const attempts = r.attempts + 1;
+        const isDead = o.permanent || attempts >= MAX_ATTEMPTS;
+        await db
+          .from("lrs_forward_outbox")
+          .update({
+            status: isDead ? "dead" : "failed",
+            attempts,
+            last_error: o.error ?? "forward failed",
+            next_attempt_at: new Date(Date.now() + backoffSeconds(attempts) * 1000).toISOString(),
+          })
+          .eq("id", r.id);
+        if (isDead) dead += 1;
+        else failed += 1;
+      }
+      continue;
+    }
 
     if (res.ok) {
       await db
