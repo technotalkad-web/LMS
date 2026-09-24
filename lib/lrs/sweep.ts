@@ -910,6 +910,19 @@ export async function sweepOrg(
     stats = {};
     patch.backfill_started_at = new Date().toISOString();
     patch.backfill_completed_at = null;
+    // Dead-lettered rows (an outage longer than the retry budget, or a bad
+    // credential since corrected) get a fresh start. The drainer only picks
+    // pending/failed rows and re-enqueue keeps existing rows untouched, so
+    // without this reset "Resend all history" could never deliver them.
+    try {
+      await db
+        .from("lrs_forward_outbox")
+        .update({ status: "pending", attempts: 0, last_error: null, next_attempt_at: new Date().toISOString() })
+        .eq("organization_id", orgId)
+        .eq("status", "dead");
+    } catch {
+      /* fail-soft */
+    }
   }
 
   const org = (await loadOrgs(db, [orgId])).get(orgId) ?? { id: orgId, slug: null, name: null };
