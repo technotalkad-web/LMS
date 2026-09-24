@@ -234,9 +234,10 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
             }
           : {}),
       };
+      // One rotating source per run (Worker budget) → up to ~10 runs to cover every source.
       let drains = 0;
       let last: Awaited<ReturnType<typeof drain>> = {};
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 14; i++) {
         last = await drain(baseURL!);
         drains++;
         const rows = await outboxRows(org.id, Object.values(expected));
@@ -269,7 +270,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       const before = (await lrsByReg(attempt!.id)).length;
       const { data: allBefore } = await db.from("lrs_forward_outbox").select("statement_id").eq("organization_id", org.id);
       await db.from("tenant_lrs_config").update({ backfill_requested_at: new Date().toISOString() }).eq("organization_id", org.id);
-      for (let i = 0; i < 4; i++) await drain(baseURL!);
+      for (let i = 0; i < 6; i++) await drain(baseURL!);
       const after = (await lrsByReg(attempt!.id)).length;
       const { data: allAfter } = await db.from("lrs_forward_outbox").select("statement_id, status").eq("organization_id", org.id);
       rec("S4a 'Resend all history' does not duplicate statements in the LRS", before === after && before > 0, { before, after });
@@ -340,7 +341,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       await supervisor("start");
       await waitLrs(true, 120000);
       await db.from("tenant_lrs_config").update({ backfill_requested_at: new Date().toISOString() }).eq("organization_id", org.id);
-      for (let i = 0; i < 4; i++) await drain(baseURL!);
+      for (let i = 0; i < 6; i++) await drain(baseURL!);
       row = (await outboxRows(org.id, [deadId]))[0];
       const stored = (await lrsGet(deadId)).status;
       rec("S6b 'Resend all history' recovers a dead-lettered statement (row re-queued and delivered)", row?.status === "sent" && stored === 200, { row: row ? `${row.status}/${row.attempts}` : "missing", lrs: stored, note: row?.status === "dead" ? "BUG: re-enqueue uses ignoreDuplicates, so an existing dead row is never reset; the statement never reaches the LRS" : "" });
@@ -360,7 +361,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       row = (await outboxRows(org.id, [authId]))[0];
       rec("S7a wrong secret → LRS 401 → row dead-lettered immediately as a permanent error (no endless retry)", row?.status === "dead" && /401/.test(row?.last_error ?? ""), { live, afterDrain: row ? `${row.status}/${row.attempts} ${row.last_error?.slice(0, 60)}` : "missing", drain: { dead: d.dead } });
       await db.from("tenant_lrs_config").update({ auth_secret: LRS_SECRET, backfill_requested_at: new Date().toISOString() }).eq("organization_id", org.id);
-      for (let i = 0; i < 4; i++) await drain(baseURL!);
+      for (let i = 0; i < 6; i++) await drain(baseURL!);
       row = (await outboxRows(org.id, [authId]))[0];
       rec("S7b after fixing the secret, 'Resend all history' delivers it", row?.status === "sent" && (await lrsGet(authId)).status === 200, { row: row ? `${row.status}/${row.attempts}` : "missing" });
     });

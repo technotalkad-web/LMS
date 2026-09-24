@@ -93,6 +93,8 @@ export type OrgSweepResult = {
   caughtUp: boolean;
   backfillCompleted: boolean;
   skipped?: string;
+  /** Source or persistence failures in this run (surfaced instead of swallowed). */
+  errors?: string[];
 };
 
 function svc(): SupabaseClient {
@@ -937,6 +939,7 @@ export async function sweepOrg(
   cursor._rotation = (start + Math.min(rotate, others.length)) % others.length;
 
   const doneFlags = { ...((cursor._done as Record<string, boolean> | undefined) ?? {}) };
+  const errors: string[] = [];
   for (const source of plan) {
     try {
       const from = str(cursor[source]) ?? EPOCH;
@@ -949,9 +952,25 @@ export async function sweepOrg(
       stats[source] = (num(stats[source]) ?? 0) + n;
     } catch (e) {
       doneFlags[source] = false;
-      stats[`${source}_error`] = e instanceof Error ? e.message.slice(0, 200) : "failed";
+      const msg = e instanceof Error ? e.message.slice(0, 200) : "failed";
+      stats[`${source}_error`] = msg;
+      errors.push(`${source}: ${msg}`);
+    }
+    // Persist progress after EVERY source. On Cloudflare Workers each database call
+    // is a subrequest with a hard per-request budget; if the budget runs out later
+    // in this run, the work already done is not repeated next time.
+    cursor._done = { ...doneFlags };
+    try {
+      const { error } = await db
+        .from("tenant_lrs_config")
+        .update({ ...patch, backfill_cursor: cursor, backfill_stats: stats })
+        .eq("organization_id", orgId);
+      if (error) errors.push(`persist after ${source}: ${error.message.slice(0, 120)}`);
+    } catch (e) {
+      errors.push(`persist after ${source}: ${e instanceof Error ? e.message.slice(0, 120) : "failed"}`);
     }
   }
+  if (errors.length) base.errors = errors;
   cursor._done = doneFlags;
   base.caughtUp = SWEEP_SOURCES.every((s) => doneFlags[s] === true);
   if (base.caughtUp && (started || patch.backfill_started_at) && !cfg.backfill_completed_at) {
@@ -964,10 +983,15 @@ export async function sweepOrg(
     base.backfillCompleted = true;
   }
   stats.last_run_at = new Date().toISOString();
-  await db
-    .from("tenant_lrs_config")
-    .update({ ...patch, backfill_cursor: cursor, backfill_stats: stats })
-    .eq("organization_id", orgId);
+  try {
+    const { error } = await db
+      .from("tenant_lrs_config")
+      .update({ ...patch, backfill_cursor: cursor, backfill_stats: stats })
+      .eq("organization_id", orgId);
+    if (error) base.errors = [...(base.errors ?? []), `persist: ${error.message.slice(0, 120)}`];
+  } catch (e) {
+    base.errors = [...(base.errors ?? []), `persist: ${e instanceof Error ? e.message.slice(0, 120) : "failed"}`];
+  }
   return base;
 }
 

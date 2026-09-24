@@ -44,17 +44,11 @@ export async function POST(request: Request) {
   const db = svc();
   const nowIso = new Date().toISOString();
 
-  // 0078: derive LMS events / (re)enqueue history for every enabled org BEFORE
-  // draining, so this run can already deliver what it produced. Fully
-  // fail-isolated — the drainer below runs exactly as it did before.
-  let sweep: OrgSweepResult[] = [];
-  try {
-    sweep = await sweepAll();
-  } catch {
-    sweep = [];
-  }
-
-  const { data: due } = await db
+  // Drain FIRST, sweep AFTER. On Cloudflare Workers every database call is a
+  // subrequest with a hard per-request budget; the sweeper is the expensive
+  // part, so it must never starve the delivery of rows that are already due.
+  // Rows the sweep enqueues in this run are picked up by the next run.
+  const { data: due, error: dueError } = await db
     .from("lrs_forward_outbox")
     .select("id, organization_id, statement_id, payload, attempts")
     .in("status", ["pending", "failed"])
@@ -69,17 +63,37 @@ export async function POST(request: Request) {
     payload: unknown;
     attempts: number;
   }>;
-  const sweepSummary = sweep.map((r) => ({
-    org: r.orgId,
-    ran: r.ran,
-    enqueued: r.enqueued,
-    caughtUp: r.caughtUp,
-    ...(r.skipped ? { skipped: r.skipped } : {}),
-  }));
+
+  // 0078: derive LMS events / (re)enqueue history for every enabled org, sized
+  // for the Worker budget: `statements` plus ONE rotating source per run, small
+  // chunks. Raise LRS_SWEEP_CHUNK / LRS_SWEEP_ROTATE on a plan with a larger
+  // subrequest budget. Fully fail-isolated; errors are reported, not hidden.
+  const sweepOpts = {
+    chunk: Math.max(10, parseInt(process.env.LRS_SWEEP_CHUNK || "50", 10) || 50),
+    rotate: Math.max(0, parseInt(process.env.LRS_SWEEP_ROTATE || "1", 10) || 1),
+  };
+  const runSweep = async (): Promise<OrgSweepResult[]> => {
+    try {
+      return await sweepAll(sweepOpts);
+    } catch {
+      return [];
+    }
+  };
+  const summarize = (sweep: OrgSweepResult[]) =>
+    sweep.map((r) => ({
+      org: r.orgId,
+      ran: r.ran,
+      enqueued: r.enqueued,
+      caughtUp: r.caughtUp,
+      ...(r.skipped ? { skipped: r.skipped } : {}),
+      ...(r.errors?.length ? { errors: r.errors } : {}),
+    }));
 
   if (rows.length === 0) {
-    await recordHeartbeat("lrs-forward", { processed: 0, sweep: sweepSummary });
-    return NextResponse.json({ ok: true, processed: 0, sweep: sweepSummary });
+    const sweepSummary = summarize(await runSweep());
+    const body = { ok: true, processed: 0, sweep: sweepSummary, ...(dueError ? { dueError: dueError.message } : {}) };
+    await recordHeartbeat("lrs-forward", body);
+    return NextResponse.json(body);
   }
 
   // Group by org so we forward each LRS one batch.
@@ -170,6 +184,8 @@ export async function POST(request: Request) {
     }
   }
 
-  await recordHeartbeat("lrs-forward", { processed: rows.length, sent, failed, dead, sweep: sweepSummary });
-  return NextResponse.json({ ok: true, processed: rows.length, sent, failed, dead, sweep: sweepSummary });
+  const sweepSummary = summarize(await runSweep());
+  const body = { ok: true, processed: rows.length, sent, failed, dead, sweep: sweepSummary };
+  await recordHeartbeat("lrs-forward", body);
+  return NextResponse.json(body);
 }
