@@ -1,30 +1,45 @@
 #!/usr/bin/env bash
-# Build + deploy the LMS to Cloud Run (temporary staging on Google Cloud).
-# Runbook: docs/CLOUD_RUN_STAGING.md. Run from the repo root in Git Bash,
-# WSL or Cloud Shell after `gcloud auth login` and `gcloud config set project`.
+# Build + deploy the LMS to Cloud Run (trial staging on Google Cloud).
+# Runbook: docs/CLOUD_RUN_STAGING.md. Run from the repo root in Cloud Shell
+# (recommended), Git Bash or WSL after `gcloud auth login` and
+# `gcloud config set project <trial project>`.
 #
 #   ./scripts/cloud-run-deploy.sh            # build + deploy
-#   ./scripts/cloud-run-deploy.sh deploy     # deploy the last built image only
+#   ./scripts/cloud-run-deploy.sh deploy     # redeploy the last built image
 #
-# Required env (export before running, or put in .env.cloudrun and source it):
-#   NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY   (staging Supabase)
-#   NEXT_PUBLIC_SITE_URL   the Cloud Run URL once known (first deploy: any URL,
-#                          then redeploy with the real one — it is inlined)
-# Secrets must already exist in Secret Manager (see runbook §3):
-#   lms-supabase-service-role-key, lms-cron-secret, lms-impersonation-secret,
-#   lms-resend-api-key (optional)
+# Required env (see runbook §3 — put them in .env.cloudrun and `source` it):
+#   NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY   (STAGING Supabase)
+# Optional:
+#   NEXT_PUBLIC_SITE_URL   defaults to the service's deterministic Cloud Run URL
+#   REGION (asia-south1) SERVICE (my-lms-staging) MIN_INSTANCES (0) MAX_INSTANCES (3)
+#   RESEND_SECRET=1        also mount lms-resend-api-key
+#   ALLOW_PROD=1           required to point at the PRODUCTION Supabase project
+# Secrets must already exist in Secret Manager (runbook §2):
+#   lms-supabase-service-role-key, lms-cron-secret, lms-impersonation-secret
 set -euo pipefail
 
 REGION="${REGION:-asia-south1}"
 REPO="${REPO:-lms}"
 SERVICE="${SERVICE:-my-lms-staging}"
-PROJECT="$(gcloud config get-value project 2>/dev/null)"
-IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${SERVICE}:latest"
 MODE="${1:-all}"
+PROJECT="$(gcloud config get-value project 2>/dev/null)"
+[[ -n "$PROJECT" ]] || { echo "✖ no gcloud project set — run: gcloud config set project <PROJECT_ID>"; exit 1; }
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
+IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${SERVICE}:latest"
 
-: "${NEXT_PUBLIC_SUPABASE_URL:?set NEXT_PUBLIC_SUPABASE_URL}"
-: "${NEXT_PUBLIC_SUPABASE_ANON_KEY:?set NEXT_PUBLIC_SUPABASE_ANON_KEY}"
-: "${NEXT_PUBLIC_SITE_URL:?set NEXT_PUBLIC_SITE_URL}"
+: "${NEXT_PUBLIC_SUPABASE_URL:?set NEXT_PUBLIC_SUPABASE_URL (staging Supabase project URL)}"
+: "${NEXT_PUBLIC_SUPABASE_ANON_KEY:?set NEXT_PUBLIC_SUPABASE_ANON_KEY (staging anon key)}"
+
+# Safety: the trial must not touch production data.
+if [[ "$NEXT_PUBLIC_SUPABASE_URL" == *"alkfrcglmseksweqhwzq"* && "${ALLOW_PROD:-0}" != "1" ]]; then
+  echo "✖ NEXT_PUBLIC_SUPABASE_URL points at the PRODUCTION Supabase project. Refusing (set ALLOW_PROD=1 to override)."
+  exit 1
+fi
+
+# Cloud Run service URLs are deterministic, so the site URL (inlined into the
+# build for auth redirects + xAPI endpoints) is known before the first deploy.
+NEXT_PUBLIC_SITE_URL="${NEXT_PUBLIC_SITE_URL:-https://${SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app}"
+echo "▶ project ${PROJECT} (${PROJECT_NUMBER})  service ${SERVICE}  site ${NEXT_PUBLIC_SITE_URL}"
 
 if [[ "$MODE" == "all" ]]; then
   echo "▶ building ${IMAGE} with Cloud Build"
@@ -49,6 +64,7 @@ gcloud run deploy "${SERVICE}" \
 URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')"
 echo "✓ ${SERVICE} is live at ${URL}"
 if [[ "${NEXT_PUBLIC_SITE_URL}" != "${URL}" ]]; then
-  echo "! NEXT_PUBLIC_SITE_URL (${NEXT_PUBLIC_SITE_URL}) differs from the service URL."
-  echo "  Re-run with NEXT_PUBLIC_SITE_URL=${URL} so links, xAPI endpoints and auth redirects use it."
+  echo "! The build was made for ${NEXT_PUBLIC_SITE_URL} but the service answers at ${URL}."
+  echo "  Re-run with NEXT_PUBLIC_SITE_URL=${URL} so auth redirects and xAPI endpoints match."
 fi
+echo "  Next: add ${URL}/auth/callback and ${URL}/auth/finish to Supabase → Authentication → URL Configuration."
