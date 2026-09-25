@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
+import { FullScreenLoader, InlineSpinner, handOff, usePreloadBrandLoader } from "@/components/ui/brand-loader";
 import {
   ArrowRight,
   BookOpen,
@@ -20,7 +21,7 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<
-    "idle" | "working" | "sent" | "error"
+    "idle" | "working" | "redirecting" | "sent" | "error"
   >("idle");
   const [error, setError] = useState<string | null>(null);
   // Render the form client-only so password-manager extensions
@@ -28,6 +29,7 @@ export default function LoginPage() {
   // attributes between SSR and hydrate and trigger a mismatch warning.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
+  usePreloadBrandLoader();
 
   function switchMode(next: Mode) {
     setMode(next);
@@ -65,14 +67,16 @@ export default function LoginPage() {
         setError(error.message);
         setStatus("error");
       } else {
-        // Full page nav so the server reads the new cookies.
-        window.location.href = "/select-org";
+        // Full page nav so the server reads the new cookies. The branded
+        // loader covers the hand-off until the workspace renders.
+        handOff("/select-org", () => setStatus("redirecting"));
       }
     }
   }
 
   return (
     <div className="min-h-screen flex bg-canvas">
+      {status === "redirecting" && <FullScreenLoader message="Signing you in…" delayed={false} />}
       {/* ====== Left panel: branding ============================ */}
       <aside className="hidden lg:flex lg:w-1/2 relative overflow-hidden flex-col justify-between p-12 text-white">
         {/* Dark base */}
@@ -279,9 +283,10 @@ export default function LoginPage() {
 
               <button
                 type="submit"
-                disabled={status === "working"}
+                disabled={status === "working" || status === "redirecting"}
                 className="w-full mt-2 px-4 py-3 bg-ink text-canvas rounded-xl text-sm font-semibold hover:opacity-90 disabled:opacity-50 transition-opacity flex items-center justify-center gap-2 shadow-sm"
               >
+                {status === "working" && <InlineSpinner />}
                 {status === "working"
                   ? "Working…"
                   : mode === "magic"

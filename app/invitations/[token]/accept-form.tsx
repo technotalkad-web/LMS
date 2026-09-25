@@ -1,11 +1,13 @@
 "use client";
 
 import { useState } from "react";
+import { FullScreenLoader, handOff, usePreloadBrandLoader } from "@/components/ui/brand-loader";
 
 export function AcceptForm({ token, email }: { token: string; email: string }) {
   const [password, setPassword] = useState("");
-  const [status, setStatus] = useState<"idle" | "working" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "working" | "redirecting" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
+  usePreloadBrandLoader();
 
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -29,15 +31,15 @@ export function AcceptForm({ token, email }: { token: string; email: string }) {
       setStatus("error");
       return;
     }
-    if (json.needsManualSignIn) {
-      window.location.href = "/login?msg=" + encodeURIComponent(json.message ?? "");
-      return;
-    }
-    window.location.href = "/select-org";
+    const target = json.needsManualSignIn
+      ? "/login?msg=" + encodeURIComponent(json.message ?? "")
+      : "/select-org";
+    handOff(target, () => setStatus("redirecting"));
   }
 
   return (
     <form onSubmit={onSubmit} className="space-y-3">
+      {status === "redirecting" && <FullScreenLoader message="Setting up your account…" delayed={false} />}
       <input
         type="email"
         value={email}

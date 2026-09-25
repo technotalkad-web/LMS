@@ -12,6 +12,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
+import { FullScreenLoader, handOff, usePreloadBrandLoader } from "@/components/ui/brand-loader";
 
 export type BrandedLoginProps = {
   orgSlug: string;
@@ -57,9 +58,10 @@ export function BrandedLogin({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<
-    "idle" | "working" | "sent" | "error"
+    "idle" | "working" | "redirecting" | "sent" | "error"
   >("idle");
   const [error, setError] = useState<string | null>(null);
+  usePreloadBrandLoader();
 
   async function startGoogle() {
     setStatus("working");
@@ -83,7 +85,7 @@ export function BrandedLogin({
       setStatus("error");
       return;
     }
-    if (data?.url) window.location.assign(data.url);
+    if (data?.url) handOff(data.url, () => setStatus("redirecting"));
   }
 
   async function startSso() {
@@ -105,7 +107,7 @@ export function BrandedLogin({
       setStatus("error");
       return;
     }
-    if (data?.url) window.location.assign(data.url);
+    if (data?.url) handOff(data.url, () => setStatus("redirecting"));
   }
 
   function switchMode(next: Mode) {
@@ -146,7 +148,7 @@ export function BrandedLogin({
         setError(error.message);
         setStatus("error");
       } else {
-        window.location.href = safeNext(orgSlug);
+        handOff(safeNext(orgSlug), () => setStatus("redirecting"));
       }
     }
   }
@@ -176,6 +178,7 @@ export function BrandedLogin({
 
   return (
     <div className="min-h-screen flex bg-canvas">
+      {status === "redirecting" && <FullScreenLoader message="Signing you in…" delayed={false} />}
       {/* Left: branded hero */}
       <aside className="hidden lg:flex lg:w-1/2 relative overflow-hidden flex-col justify-between p-12 text-white">
         <div className="absolute inset-0 z-0 bg-slate-900" aria-hidden />

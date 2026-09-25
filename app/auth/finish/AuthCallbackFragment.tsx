@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
+import { BrandLoader } from "@/components/ui/brand-loader";
 
 /**
  * Parses the URL fragment for Supabase Auth tokens or errors.
@@ -98,8 +99,8 @@ export function AuthCallbackFragment() {
   if (state.kind === "idle" || state.kind === "completing") {
     return (
       <div className="min-h-screen flex items-center justify-center bg-canvas">
-        <div className="text-center">
-          <div className="inline-block w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4" />
+        <div className="text-center flex flex-col items-center gap-4">
+          <BrandLoader size="lg" label="Signing you in" />
           <p className="text-muted text-sm">
             {state.kind === "completing"
               ? "Signing you in…"

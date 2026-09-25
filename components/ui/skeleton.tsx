@@ -1,3 +1,5 @@
+import { BrandLoader } from "./brand-loader";
+
 /**
  * Loading-skeleton primitives. Used by route-level loading.tsx files (App
  * Router renders them via Suspense during server data fetches/navigation) to
@@ -54,6 +56,37 @@ export function CardGridSkeleton({ count = 6 }: { count?: number }) {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Small, non-blocking brand indicator with a caption — sits above a
+ *  skeleton so data-fetching states read as "working", never as blank. */
+export function LoadingRow({ label = "Loading…" }: { label?: string }) {
+  return (
+    <div className="flex items-center gap-2 text-xs text-muted mb-4" aria-live="polite">
+      <BrandLoader size="sm" label={label} />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+/** Generic page placeholder for routes without a bespoke skeleton. */
+export function PageSkeleton({
+  kpis = 0,
+  cards = 6,
+  table = false,
+}: {
+  kpis?: number;
+  cards?: number;
+  table?: boolean;
+}) {
+  return (
+    <div>
+      <LoadingRow />
+      <PageHeaderSkeleton action />
+      {kpis > 0 && <KpiStripSkeleton count={kpis} />}
+      {table ? <TableSkeleton rows={8} /> : <CardGridSkeleton count={cards} />}
     </div>
   );
 }

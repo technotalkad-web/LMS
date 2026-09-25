@@ -93,6 +93,9 @@ export default async function LaunchPage({
   // calendar). A locked day bounces to the journey home; a completed day
   // launches untagged (review mode). RLS scopes every read to the caller.
   let journeyCtx: { enrollmentId: string; day: number } | null = null;
+  // The next journey day's course — warmed in the background by the runtime
+  // while the learner works through today's mission (never launched here).
+  let journeyNextCourseId: string | null = null;
   if (journeyParam && dayParam) {
     const dayN = parseInt(dayParam, 10);
     // Rules and curriculum come from the enrollment's PINNED VERSION —
@@ -162,6 +165,12 @@ export default async function LaunchPage({
         });
         if (dayN === state.currentDay && state.todayUnlocked) {
           journeyCtx = { enrollmentId: enr.id, day: dayN };
+          const upcoming = [...parseVersionDays(prog.days).values()]
+            .filter((d) => d.day > dayN && d.day <= prog.days_total && d.course_id)
+            .sort((a, b) => a.day - b.day)[0];
+          if (upcoming?.course_id && upcoming.course_id !== courseId) {
+            journeyNextCourseId = upcoming.course_id;
+          }
         } else if (!doneDays.has(dayN)) {
           redirect(`/${orgSlug}/journey?locked=${dayN}`);
         }
@@ -594,6 +603,51 @@ export default async function LaunchPage({
     back: backParam || null,
   });
 
+  // Background preload of the NEXT module (journey: next day with a course;
+  // learning path: next step). Only its content launch file is warmed — the
+  // runtime fetches it after this module is up and the browser is idle, so
+  // the following step opens from cache. Fail-soft: no next → nothing.
+  const preloadUrls: string[] = [];
+  try {
+    let nextCourseId: string | null = journeyNextCourseId;
+    if (!nextCourseId && lpParam && stepInPaths.some((s) => s.path_id === lpParam)) {
+      const cur = stepInPaths.find((s) => s.path_id === lpParam)!.step_number;
+      const { data: nextStep } = await supabase
+        .from("learning_path_courses")
+        .select("course_id")
+        .eq("path_id", lpParam)
+        .gt("step_number", cur)
+        .order("step_number", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      nextCourseId = (nextStep as { course_id?: string } | null)?.course_id ?? null;
+    }
+    if (nextCourseId && nextCourseId !== courseId) {
+      const { data: nextCourse } = await supabase
+        .from("courses")
+        .select("id, current_version_id")
+        .eq("id", nextCourseId)
+        .eq("organization_id", org.id)
+        .maybeSingle();
+      const nextVersionId = (nextCourse as { current_version_id?: string | null } | null)?.current_version_id;
+      if (nextVersionId) {
+        const { data: nextVersion } = await supabase
+          .from("course_versions")
+          .select("launch_url")
+          .eq("id", nextVersionId)
+          .maybeSingle();
+        const launch = (nextVersion as { launch_url?: string } | null)?.launch_url;
+        if (launch) {
+          preloadUrls.push(
+            `/${orgSlug}/courses/${nextCourseId}/content/${launch.replace(/^\/+/, "").split("?")[0]}`
+          );
+        }
+      }
+    }
+  } catch {
+    /* preloading is best effort */
+  }
+
   // --- SCORM 1.2 path ---
   if (v.manifest_type === "scorm12") {
     if (!cmi["cmi.core.student_id"]) cmi["cmi.core.student_id"] = user.id;
@@ -609,6 +663,7 @@ export default async function LaunchPage({
         courseTitle={c.title}
         backHref={backHref}
         backLabel={backLabel}
+        preloadUrls={preloadUrls}
       />
     );
   }
@@ -697,6 +752,7 @@ export default async function LaunchPage({
       backHref={backHref}
       backLabel={backLabel}
       standard={isXapi ? "xAPI" : "cmi5"}
+      preloadUrls={preloadUrls}
     />
   );
 }

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { CmiData } from "@/lib/scorm/types";
+import { ModuleFrameLoader, useModuleFrame, useNextModulePreload } from "./module-frame";
 
 /**
  * Parent page for a SCORM 1.2 course iframe.
@@ -23,6 +24,7 @@ export function ScormRuntime({
   courseTitle,
   backHref,
   backLabel = "Exit course",
+  preloadUrls = [],
 }: {
   attemptId: string;
   initialCmi: CmiData;
@@ -31,9 +33,13 @@ export function ScormRuntime({
   backHref: string;
   /** Names the launch context the exit returns to ("Back to journey"). */
   backLabel?: string;
+  /** Next module's content file(s) to warm in the background once this one is up. */
+  preloadUrls?: string[];
 }) {
   const cmiRef = useRef<CmiData>({ ...initialCmi });
   const initializedRef = useRef(false);
+  const frame = useModuleFrame();
+  useNextModulePreload(preloadUrls, frame.loaded);
   const [status, setStatus] = useState<"idle" | "syncing" | "saved" | "error">(
     "idle"
   );
@@ -144,13 +150,18 @@ export function ScormRuntime({
         </div>
         <SyncBadge status={status} />
       </header>
-      <iframe
-        src={iframeSrc}
-        className="flex-1 w-full bg-white"
-        title={courseTitle}
-        // SCORM courses commonly use document.write, inline scripts, etc.
-        // No sandbox attribute so the course has full access to window.parent.API.
-      />
+      <div className="relative flex-1 min-h-0 bg-white">
+        <iframe
+          ref={frame.ref}
+          src={iframeSrc}
+          className="absolute inset-0 w-full h-full bg-white"
+          title={courseTitle}
+          onLoad={frame.onLoad}
+          // SCORM courses commonly use document.write, inline scripts, etc.
+          // No sandbox attribute so the course has full access to window.parent.API.
+        />
+        <ModuleFrameLoader loaded={frame.loaded} />
+      </div>
     </div>
   );
 }

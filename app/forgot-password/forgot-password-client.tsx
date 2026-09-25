@@ -14,6 +14,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
+import { InlineSpinner } from "@/components/ui/brand-loader";
 
 type Step = "request" | "verify" | "reset" | "signing_in";
 
@@ -264,7 +265,7 @@ export function ForgotPasswordClient() {
 
           {busy && (
             <p className="text-center text-sm text-muted flex items-center justify-center gap-2">
-              <span className="w-3 h-3 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+              <InlineSpinner className="w-3 h-3" />
               Verifying…
             </p>
           )}
@@ -355,7 +356,7 @@ export function ForgotPasswordClient() {
           >
             {step === "signing_in" ? (
               <>
-                <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <InlineSpinner className="w-3 h-3" />
                 Signing you in…
               </>
             ) : busy ? (
