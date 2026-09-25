@@ -1,0 +1,15 @@
+node_modules
+.next
+.open-next
+.wrangler
+.git
+.github
+.env
+.env.*
+tests
+test-results
+playwright-report
+docs
+supabase/.temp
+coverage
+*.log
