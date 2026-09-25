@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { ModuleFrameLoader, useModuleFrame, useNextModulePreload } from "./module-frame";
 
 /**
  * Parent page for a cmi5 or standalone xAPI (TinCan) course iframe.
@@ -21,6 +22,7 @@ export function Cmi5Runtime({
   backHref,
   backLabel = "Exit course",
   standard = "cmi5",
+  preloadUrls = [],
 }: {
   iframeSrc: string;
   courseTitle: string;
@@ -29,7 +31,11 @@ export function Cmi5Runtime({
   backLabel?: string;
   /** Badge in the header corner. */
   standard?: "cmi5" | "xAPI";
+  /** Next module's content file(s) to warm in the background once this one is up. */
+  preloadUrls?: string[];
 }) {
+  const frame = useModuleFrame();
+  useNextModulePreload(preloadUrls, frame.loaded);
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-ink">
       <header className="flex items-center justify-between px-4 sm:px-5 py-2.5 bg-ink text-canvas border-b border-canvas/10">
@@ -49,11 +55,16 @@ export function Cmi5Runtime({
         </div>
         <span className="text-xs text-canvas/50">{standard}</span>
       </header>
-      <iframe
-        src={iframeSrc}
-        className="flex-1 w-full bg-white"
-        title={courseTitle}
-      />
+      <div className="relative flex-1 min-h-0 bg-white">
+        <iframe
+          ref={frame.ref}
+          src={iframeSrc}
+          className="absolute inset-0 w-full h-full bg-white"
+          title={courseTitle}
+          onLoad={frame.onLoad}
+        />
+        <ModuleFrameLoader loaded={frame.loaded} />
+      </div>
     </div>
   );
 }

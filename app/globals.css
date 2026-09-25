@@ -145,6 +145,20 @@ body {
 /* Content gently rises in on every navigation. The animation targets the
    page root that swaps inside <main>, so it replays on client-side route
    changes (animating <main> itself would only run once per full load). */
+/* Blocking loader (FullScreenLoader): held invisible for 150 ms so fast
+   transitions never flash it, then fades in. */
+@keyframes lms-loader-appear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.lms-loader-appear {
+  animation: lms-loader-appear 220ms ease-out 150ms both;
+}
+
 @keyframes lms-enter {
   from {
     opacity: 0;
