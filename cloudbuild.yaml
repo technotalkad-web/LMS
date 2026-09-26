@@ -9,6 +9,9 @@ substitutions:
   _REGION: asia-south1
   _REPO: lms
   _IMAGE: my-lms-staging
+  # SHORT_SHA is only set for trigger builds; local `builds submit` passes
+  # the git commit via _TAG (scripts/cloud-run-deploy.sh does this).
+  _TAG: manual
   _SUPABASE_URL: ""
   _SUPABASE_ANON_KEY: ""
   _SITE_URL: ""
@@ -19,7 +22,7 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args:
       - build
-      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA}
+      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG}
       - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
       - --build-arg=NEXT_PUBLIC_SUPABASE_URL=${_SUPABASE_URL}
       - --build-arg=NEXT_PUBLIC_SUPABASE_ANON_KEY=${_SUPABASE_ANON_KEY}
@@ -29,7 +32,7 @@ steps:
       - .
 
 images:
-  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${SHORT_SHA}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG}
   - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
 
 options:

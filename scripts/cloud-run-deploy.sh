@@ -43,8 +43,9 @@ echo "▶ project ${PROJECT} (${PROJECT_NUMBER})  service ${SERVICE}  site ${NEX
 
 if [[ "$MODE" == "all" ]]; then
   echo "▶ building ${IMAGE} with Cloud Build"
+  TAG="$(git rev-parse --short HEAD 2>/dev/null || echo manual)"
   gcloud builds submit --config cloudbuild.yaml \
-    --substitutions="_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL},_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY},_SITE_URL=${NEXT_PUBLIC_SITE_URL},_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN:-},_SENTRY_ENV=${NEXT_PUBLIC_SENTRY_ENV:-staging-gcp}"
+    --substitutions="_TAG=${TAG},_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL},_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY},_SITE_URL=${NEXT_PUBLIC_SITE_URL},_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN:-},_SENTRY_ENV=${NEXT_PUBLIC_SENTRY_ENV:-staging-gcp}"
 fi
 
 echo "▶ deploying ${SERVICE} to Cloud Run (${REGION})"
