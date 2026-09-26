@@ -1,0 +1,18 @@
+# Files NOT uploaded to Cloud Build by `gcloud builds submit`.
+# Mirrors .dockerignore; keeps secrets and bulk out of the build context.
+.gcloudignore
+.git
+.github
+node_modules
+.next
+.open-next
+.wrangler
+.env
+.env.*
+tests
+test-results
+playwright-report
+docs
+supabase/.temp
+coverage
+*.log
