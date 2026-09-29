@@ -19,8 +19,14 @@ import type { EmailOtpType } from "@supabase/supabase-js";
  * global /login.
  */
 function orgFromNext(next: string): string | null {
+  // CRM embedded-mode targets are wrapped: /api/integrations/enter?to=%2F{org}%2F...
+  // Unwrap them, otherwise a reused or expired link lands on "/api/login".
+  if (next.startsWith("/api/integrations/enter?")) {
+    const to = new URLSearchParams(next.slice(next.indexOf("?") + 1)).get("to") ?? "";
+    return orgFromNext(to);
+  }
   const m = /^\/([a-z0-9-]+)\//.exec(next);
-  return m ? m[1] : null;
+  return m && m[1] !== "api" ? m[1] : null;
 }
 
 export async function GET(request: Request) {
