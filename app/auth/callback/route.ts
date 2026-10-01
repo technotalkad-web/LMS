@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { originFromRequest } from "@/lib/http/origin";
 import type { EmailOtpType } from "@supabase/supabase-js";
 
 /**
@@ -19,12 +20,23 @@ import type { EmailOtpType } from "@supabase/supabase-js";
  * global /login.
  */
 function orgFromNext(next: string): string | null {
+  // CRM embedded-mode targets are wrapped: /api/integrations/enter?to=%2F{org}%2F...
+  // Unwrap them, otherwise a reused or expired link lands on "/api/login".
+  if (next.startsWith("/api/integrations/enter?")) {
+    const to = new URLSearchParams(next.slice(next.indexOf("?") + 1)).get("to") ?? "";
+    return orgFromNext(to);
+  }
   const m = /^\/([a-z0-9-]+)\//.exec(next);
-  return m ? m[1] : null;
+  return m && m[1] !== "api" ? m[1] : null;
 }
 
 export async function GET(request: Request) {
-  const { searchParams, origin } = new URL(request.url);
+  const { searchParams } = new URL(request.url);
+  // The public origin comes from the live Host / x-forwarded-proto headers,
+  // never from request.url: behind a proxy (Cloud Run, any container host)
+  // Next fills request.url with the listening address (https://0.0.0.0:8080),
+  // which sent Google/magic-link sign-ins to an unreachable page.
+  const origin = (await originFromRequest()) || new URL(request.url).origin;
   const code = searchParams.get("code");
   const tokenHash = searchParams.get("token_hash");
   const type = searchParams.get("type") as EmailOtpType | null;

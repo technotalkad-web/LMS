@@ -56,7 +56,7 @@ export default async function JourneyAdminPage({
 
   let days: DayRow[] = [];
   let enrollments: EnrollmentRow[] = [];
-  let currentVersion: { version_number: number; published_at: string } | null = null;
+  let currentVersion: { id: string; version_number: number; published_at: string } | null = null;
   if (program) {
     const [{ data: dayRows }, { data: enrRows }, { data: doneRows }, { data: verRows }] =
       await Promise.all([

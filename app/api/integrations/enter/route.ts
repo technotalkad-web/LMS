@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  * Embedded-mode entry (0071). The sso-link target routes through here when
@@ -9,6 +10,9 @@ import { NextResponse } from "next/server";
  */
 export async function GET(request: Request) {
   const url = new URL(request.url);
+  // Public origin from the live Host / x-forwarded-proto headers: behind a
+  // proxy (Cloud Run) request.url is the listening address (https://0.0.0.0:8080).
+  const origin = (await originFromRequest()) || url.origin;
   const to = url.searchParams.get("to") ?? "/";
   const returnUrl = url.searchParams.get("return_url") ?? "";
 
@@ -19,12 +23,12 @@ export async function GET(request: Request) {
       ? returnUrl
       : "";
 
-  const res = NextResponse.redirect(new URL(safeTo, url.origin));
+  const res = NextResponse.redirect(new URL(safeTo, origin));
   const opts = {
     path: "/",
     httpOnly: true,
     sameSite: "lax" as const,
-    secure: url.protocol === "https:",
+    secure: origin.startsWith("https:"),
   };
   res.cookies.set("crm_embed", "1", opts);
   if (safeReturn) res.cookies.set("crm_return", safeReturn, opts);

@@ -174,7 +174,7 @@ assign and launch, with the ids used everywhere else in the integration.
   "success": true, "current_page": 1, "per_page": 100, "total_records": 14, "total_pages": 1,
   "courses": [
     { "type": "course", "id": "…", "title": "Objection Handling", "description": null,
-      "format": "scorm12", "duration_minutes": 20, "status": "available",
+      "format": "scorm12", "version_id": "…", "duration_minutes": 20, "status": "available",
       "is_active": true, "has_content": true, "thumbnail_url": null, "created_at": "…", "updated_at": "…",
       "target": "/ambak/courses/…/launch" }
   ],
@@ -183,7 +183,7 @@ assign and launch, with the ids used everywhere else in the integration.
       "course_ids": ["…", "…", "…"], "target": "/ambak/paths/…" }
   ],
   "journeys": [
-    { "type": "journey", "id": "…", "title": "30 Days Yoddha Journey", "status": "available",
+    { "type": "journey", "id": "…", "title": "30 Days Yoddha Journey", "version_id": "…", "status": "available",
       "days_total": 30, "days": [ { "day": 1, "course_id": "…", "title": "Welcome to Ambak", "mission_title": null } ],
       "target": "/ambak/journey" }
   ]
@@ -201,6 +201,7 @@ disagree.
 | `employee_id` (alias `unique_id`) | list: only these employees |
 | `email` (alias `email_id`) | list: only these emails (case-insensitive) |
 | `course_id` (alias `curriculum_id`) | list: only learners with an attempt on these courses, and only those course rows |
+| `journey_id` (alias `program_id`) | list: only learners enrolled in these journeys, and only those journey rows — the OJT dashboard pull |
 | `completed_from` / `completed_to` | completion window (ISO 8601, `YYYY-MM-DD HH:MM`, or a bare date = whole UTC day) |
 | `last_access_from` / `last_access_to` | last-activity window, same formats |
 | `include_inactive` | `true` also returns deactivated members |
@@ -228,11 +229,18 @@ attempt matching *all* of them are returned (Upside semantics).
           "target": "/ambak/paths/…" }
       ],
       "journeys": [
-        { "journey_id": "…", "enrollment_id": "…", "title": "30 Days Yoddha Journey", "status": "active",
-          "start_date": "2026-09-20", "day": 12, "days_total": 30, "days_completed": 11,
+        { "journey_id": "…", "enrollment_id": "…", "version_id": "…", "title": "6-Day OJT Journey", "status": "active",
+          "start_date": "2026-09-29", "day": 3, "days_total": 6, "days_completed": 2,
           "pending_days": 1, "behind_days": 0, "on_track": false, "completed_at": null,
-          "today": { "day": 12, "course_id": "…", "title": "Handling Objections", "rest_day": false,
-                     "completed": false, "completed_at": null },
+          "timezone": "Asia/Kolkata",
+          "today": { "date": "2026-10-01", "day": 3, "course_id": "…", "title": "Handling Objections",
+                     "rest_day": false, "completed": false, "completed_at": null },
+          "days": [
+            { "day": 1, "course_id": "…", "title": "Welcome", "rest_day": false, "released": true, "completed": true, "completed_at": "2026-09-29T06:12:40+00:00" },
+            { "day": 2, "course_id": "…", "title": "Products", "rest_day": false, "released": true, "completed": true, "completed_at": "2026-09-30T05:48:03+00:00" },
+            { "day": 3, "course_id": "…", "title": "Handling Objections", "rest_day": false, "released": true, "completed": false, "completed_at": null },
+            { "day": 4, "course_id": "…", "title": "Pricing", "rest_day": false, "released": false, "completed": false, "completed_at": null }
+          ],
           "target": "/ambak/journey" }
       ],
       "summary": { "assigned": 6, "completed": 4, "overdue": 0 }
@@ -241,11 +249,15 @@ attempt matching *all* of them are returned (Upside semantics).
 }
 ```
 
-`journeys[].today` is built for new-joiner dashboards: the mission the
-calendar puts on the employee's current day, whether it is done, or
-`rest_day: true` when that day carries no module. `on_track` is true when
-nothing released so far is pending; `pending_days` counts released-but-open
-missions (`behind_days` = pending beyond today's own).
+`journeys[]` is built for new-joiner (OJT) dashboards. `today` is the
+mission the calendar puts on the employee's current day, whether it is done,
+or `rest_day: true` when that day carries no module; `days[]` is the whole
+programme with `released` (the calendar has reached it) and `completed` per
+day. Day maths run in the organisation's time zone (`timezone`, Asia/Kolkata
+by default); `today.date` is that local date. `on_track` is true when nothing
+released so far is pending; `pending_days` counts released-but-open missions
+(`behind_days` = pending beyond today's own). Filter with `journey_id` to
+pull only the joiners enrolled in the OJT journey.
 
 ### Step 4 — One-click launch (SSO handoff)
 
