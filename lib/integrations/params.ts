@@ -10,10 +10,18 @@ export type Params = Record<string, unknown>;
 
 export async function readParams(request: Request): Promise<Params> {
   const out: Params = {};
-  for (const [k, v] of new URL(request.url).searchParams) {
-    const prev = out[k];
-    out[k] = prev === undefined ? v : ([] as unknown[]).concat(prev as unknown[], v);
-  }
+  const add = (k: string, v: unknown, fresh: Set<string>) => {
+    // Repeated keys accumulate into a list (?employee_id=A&employee_id=B);
+    // a body value replaces a query value of the same name.
+    if (!fresh.has(k)) {
+      fresh.add(k);
+      out[k] = v;
+    } else {
+      out[k] = ([] as unknown[]).concat(out[k] as unknown[], v);
+    }
+  };
+  const seenQuery = new Set<string>();
+  for (const [k, v] of new URL(request.url).searchParams) add(k, v, seenQuery);
   if (request.method === "POST") {
     const ct = (request.headers.get("content-type") ?? "").toLowerCase();
     if (ct.includes("application/json")) {
@@ -21,7 +29,8 @@ export async function readParams(request: Request): Promise<Params> {
       if (body && typeof body === "object" && !Array.isArray(body)) Object.assign(out, body);
     } else if (ct.includes("form")) {
       const fd = await request.formData().catch(() => null);
-      if (fd) for (const [k, v] of fd) out[k] = typeof v === "string" ? v : String(v);
+      const seenForm = new Set<string>();
+      if (fd) for (const [k, v] of fd) add(k, typeof v === "string" ? v : String(v), seenForm);
     }
   }
   return out;
@@ -62,17 +71,61 @@ export function int(v: unknown, def: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
 }
 
+export function isUuid(v: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+}
+
+/** Minutes to ADD to a UTC instant to get wall-clock time in `tz` at that instant. */
+function tzOffsetMinutes(utcMs: number, tz: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(new Date(utcMs));
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? "0");
+  const wall = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
+  return Math.round((wall - Math.floor(utcMs / 1000) * 1000) / 60000);
+}
+
+/** A wall-clock time in `tz` → the UTC instant (two passes cover DST edges). */
+function wallToUtc(y: number, mo: number, d: number, h: number, mi: number, s: number, ms: number, tz: string): number {
+  const guess = Date.UTC(y, mo - 1, d, h, mi, s, ms);
+  let utc = guess - tzOffsetMinutes(guess, tz) * 60000;
+  utc = guess - tzOffsetMinutes(utc, tz) * 60000;
+  return utc;
+}
+
 /**
- * Accepts ISO 8601, "YYYY-MM-DD HH:MM" (Upside's format) or a bare date.
- * A bare date covers the whole UTC day: start-of-day for `from`, end-of-day
- * for `to`. Returns null when absent, "invalid" when unparseable.
+ * Accepts ISO 8601 (with offset or Z), "YYYY-MM-DD HH:MM[:SS]" (Upside's
+ * format) or a bare date. Times without an offset and bare dates are read
+ * in `tz` (the organisation's calendar, e.g. Asia/Kolkata): a bare date
+ * covers that whole local day, start-of-day for `from`, end-of-day for `to`.
+ * Returns null when absent, "invalid" when unparseable.
  */
-export function iso(v: unknown, edge: "from" | "to"): string | null | "invalid" {
+export function iso(v: unknown, edge: "from" | "to", tz = "UTC"): string | null | "invalid" {
   if (v === undefined || v === null || v === "") return null;
-  let s = String(v).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) s += edge === "from" ? "T00:00:00.000Z" : "T23:59:59.999Z";
-  else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(s)) s = s.replace(" ", "T") + "Z";
-  const t = Date.parse(s);
+  const s = String(v).trim();
+  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  const naive = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+  let t: number;
+  try {
+    if (day) {
+      const [y, mo, d] = [Number(day[1]), Number(day[2]), Number(day[3])];
+      t = edge === "from" ? wallToUtc(y, mo, d, 0, 0, 0, 0, tz) : wallToUtc(y, mo, d, 23, 59, 59, 999, tz);
+    } else if (naive) {
+      t = wallToUtc(Number(naive[1]), Number(naive[2]), Number(naive[3]), Number(naive[4]), Number(naive[5]), Number(naive[6] ?? "0"), 0, tz);
+    } else {
+      t = Date.parse(s);
+    }
+  } catch {
+    // Unknown time zone name → fall back to UTC rather than failing the call.
+    return iso(v, edge, "UTC");
+  }
   if (!Number.isFinite(t)) return "invalid";
   return new Date(t).toISOString();
 }
