@@ -151,6 +151,102 @@ Entitlements (direct, org-wide, team, and dynamic-group assignments) are
 expanded with the same resolvers the LMS itself uses, so your card and the
 LMS always agree.
 
+### Step 3b — Catalogue and bulk progress (dashboards, nightly syncs)
+
+Two list endpoints complement the per-employee summary for CRMs that keep
+their own copy of the learning data (an OJT / new-joiner dashboard, a
+nightly reconciliation). They replace the UpsideLMS "Catalogue API" and
+"Progress API" one-for-one and accept the same parameters three ways:
+GET query string, JSON body, or form-urlencoded body.
+
+**`GET|POST /api/integrations/catalog`** — everything the organisation can
+assign and launch, with the ids used everywhere else in the integration.
+
+| Parameter | Meaning |
+| --- | --- |
+| `page`, `per_page` | 1-based page, up to 100 items (default 100) |
+| `content_type` | `course`, `learning_path`, `journey` (list; default all three) |
+| `include_inactive` | `true` also lists drafts, archived and switched-off items (`status: "unavailable"`) |
+| `updated_since` | ISO 8601 or `YYYY-MM-DD`: only items changed since then |
+
+```json
+{
+  "success": true, "current_page": 1, "per_page": 100, "total_records": 14, "total_pages": 1,
+  "courses": [
+    { "type": "course", "id": "…", "title": "Objection Handling", "description": null,
+      "format": "scorm12", "duration_minutes": 20, "status": "available",
+      "is_active": true, "has_content": true, "thumbnail_url": null, "created_at": "…", "updated_at": "…",
+      "target": "/ambak/courses/…/launch" }
+  ],
+  "learning_paths": [
+    { "type": "learning_path", "id": "…", "title": "NHT HR", "status": "available", "steps_total": 3,
+      "course_ids": ["…", "…", "…"], "target": "/ambak/paths/…" }
+  ],
+  "journeys": [
+    { "type": "journey", "id": "…", "title": "30 Days Yoddha Journey", "status": "available",
+      "days_total": 30, "days": [ { "day": 1, "course_id": "…", "title": "Welcome to Ambak", "mission_title": null } ],
+      "target": "/ambak/journey" }
+  ]
+}
+```
+
+**`GET|POST /api/integrations/progress`** — a page of learners, each with
+every course, learning path and journey they hold. Same status, score,
+entitlement and journey rules as `learner-summary`, so the two never
+disagree.
+
+| Parameter | Meaning |
+| --- | --- |
+| `page`, `per_page` | learners per page, up to 100 (default 100); ordered by employee number, then email |
+| `employee_id` (alias `unique_id`) | list: only these employees |
+| `email` (alias `email_id`) | list: only these emails (case-insensitive) |
+| `course_id` (alias `curriculum_id`) | list: only learners with an attempt on these courses, and only those course rows |
+| `completed_from` / `completed_to` | completion window (ISO 8601, `YYYY-MM-DD HH:MM`, or a bare date = whole UTC day) |
+| `last_access_from` / `last_access_to` | last-activity window, same formats |
+| `include_inactive` | `true` also returns deactivated members |
+
+When any course or date filter is set, only learners with at least one
+attempt matching *all* of them are returned (Upside semantics).
+
+```json
+{
+  "success": true, "current_page": 1, "per_page": 100, "total_records": 312, "total_pages": 4,
+  "progress": [
+    {
+      "employee_id": "AMB-1042", "email": "riya.sharma@ambak.com", "name": "Riya Sharma",
+      "status": "active", "is_admin": false,
+      "courses": [
+        { "course_id": "…", "title": "Objection Handling", "status": "passed", "score": 92,
+          "official_score": 92, "first_score": 74, "best_score": 92, "scored_attempts": 2, "practice_attempts": 0,
+          "progress_pct": 100, "attempts": 2, "assigned_at": "…", "due_at": "…", "overdue": false,
+          "first_access": "…", "last_access": "…", "completed_at": "2026-09-17T10:41:00.000Z",
+          "target": "/ambak/courses/…/launch" }
+      ],
+      "learning_paths": [
+        { "path_id": "…", "title": "NHT HR", "status": "in_progress", "steps_total": 3, "steps_completed": 2,
+          "progress_pct": 67, "assigned_at": "…", "due_at": null, "overdue": false, "completed_at": null,
+          "target": "/ambak/paths/…" }
+      ],
+      "journeys": [
+        { "journey_id": "…", "enrollment_id": "…", "title": "30 Days Yoddha Journey", "status": "active",
+          "start_date": "2026-09-20", "day": 12, "days_total": 30, "days_completed": 11,
+          "pending_days": 1, "behind_days": 0, "on_track": false, "completed_at": null,
+          "today": { "day": 12, "course_id": "…", "title": "Handling Objections", "rest_day": false,
+                     "completed": false, "completed_at": null },
+          "target": "/ambak/journey" }
+      ],
+      "summary": { "assigned": 6, "completed": 4, "overdue": 0 }
+    }
+  ]
+}
+```
+
+`journeys[].today` is built for new-joiner dashboards: the mission the
+calendar puts on the employee's current day, whether it is done, or
+`rest_day: true` when that day carries no module. `on_track` is true when
+nothing released so far is pending; `pending_days` counts released-but-open
+missions (`behind_days` = pending beyond today's own).
+
 ### Step 4 — One-click launch (SSO handoff)
 
 When the employee clicks a card, your **backend** calls:
@@ -235,6 +331,8 @@ cache-refresh signal, the summary as truth.
 | `/api/integrations/employees` | PUT | API key | Upsert (hire/update/rehire) by employee_id |
 | `/api/integrations/employees` | GET | API key | Read one employee record |
 | `/api/integrations/employees` | DELETE | API key | Deactivate (leaver) |
+| `/api/integrations/catalog` | GET / POST | API key | Courses, learning paths, journeys (ids, titles, days) — the Catalogue API replacement |
+| `/api/integrations/progress` | GET / POST | API key | Bulk learner progress, paged and filterable — the Progress API replacement |
 | `/api/integrations/enter` / `exit` | GET | browser | Embedded-mode cookies (used automatically; not called by the CRM) |
 
 **Status codes:** `401` bad/revoked key · `403` admin account refused ·
