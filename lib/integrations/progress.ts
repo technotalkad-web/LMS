@@ -39,6 +39,7 @@ export type ProgressFilters = {
   employeeIds: string[];
   emails: string[];
   courseIds: string[];
+  journeyIds: string[];
   completedFrom: string | null;
   completedTo: string | null;
   lastAccessFrom: string | null;
@@ -84,6 +85,8 @@ export type PathProgress = {
 export type JourneyProgress = {
   journey_id: string;
   enrollment_id: string;
+  /** The published journey version this learner runs on. */
+  version_id: string;
   title: string;
   status: "active" | "completed";
   start_date: string;
@@ -94,8 +97,12 @@ export type JourneyProgress = {
   behind_days: number;
   on_track: boolean;
   completed_at: string | null;
+  /** Calendar used for the day maths: the organisation's time zone (Asia/Kolkata by default). */
+  timezone: string;
   /** The mission the calendar puts on today; null before the start or after the finish. */
   today: {
+    /** Today's date in `timezone`, YYYY-MM-DD. */
+    date: string;
     day: number;
     course_id: string | null;
     title: string | null;
@@ -103,6 +110,17 @@ export type JourneyProgress = {
     completed: boolean;
     completed_at: string | null;
   } | null;
+  /** Every day of the programme with its course and completion, for day-wise dashboards. */
+  days: Array<{
+    day: number;
+    course_id: string | null;
+    title: string | null;
+    rest_day: boolean;
+    /** The calendar has reached this day (counted from start_date in `timezone`). */
+    released: boolean;
+    completed: boolean;
+    completed_at: string | null;
+  }>;
   target: string;
 };
 
@@ -243,6 +261,32 @@ export async function usersMatchingAttempts(
   return out;
 }
 
+/** Users enrolled (active or completed) in any of the given journey programmes. */
+export async function usersEnrolledIn(
+  svc: SupabaseClient,
+  orgId: string,
+  journeyIds: string[]
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (journeyIds.length === 0) return out;
+  try {
+    const rows = await drain<{ user_id: string }>((from, to) =>
+      svc
+        .from("journey_enrollments")
+        .select("user_id")
+        .eq("organization_id", orgId)
+        .in("program_id", journeyIds)
+        .in("status", ["active", "completed"])
+        .order("id")
+        .range(from, to)
+    );
+    for (const r of rows) out.add(r.user_id);
+  } catch {
+    /* pre-journey database */
+  }
+  return out;
+}
+
 type Assign = {
   course_id?: string;
   path_id?: string;
@@ -363,6 +407,7 @@ export async function buildProgress(
     id: string;
     user_id: string;
     program_id: string;
+    version_id: string;
     status: string;
     start_date: string;
     completed_at: string | null;
@@ -383,7 +428,7 @@ export async function buildProgress(
       svc
         .from("journey_enrollments")
         .select(
-          "id, user_id, program_id, status, start_date, completed_at, journey_versions!inner(days, days_total, count_sundays), journey_programs!inner(name, is_active)"
+          "id, user_id, program_id, version_id, status, start_date, completed_at, journey_versions!inner(days, days_total, count_sundays), journey_programs!inner(name, is_active)"
         )
         .eq("organization_id", orgId)
         .in("user_id", uids)
@@ -434,6 +479,7 @@ export async function buildProgress(
   const attemptsOf = new Map<string, Att[]>();
   for (const a of attempts) attemptsOf.set(a.user_id, [...(attemptsOf.get(a.user_id) ?? []), a]);
   const wantCourse = f.courseIds.length ? new Set(f.courseIds) : null;
+  const wantJourney = f.journeyIds.length ? new Set(f.journeyIds) : null;
   // Compare instants, not strings: PostgREST prints "+00:00", the filters "Z".
   const inWindow = (v: string | null, from: string | null, to: string | null) => {
     if (!from && !to) return true;
@@ -548,6 +594,7 @@ export async function buildProgress(
     const journeys: JourneyProgress[] = [];
     for (const e of enrollments) {
       if (e.user_id !== uid) continue;
+      if (wantJourney && !wantJourney.has(e.program_id)) continue;
       const v = Array.isArray(e.journey_versions) ? e.journey_versions[0] : e.journey_versions;
       const prog = Array.isArray(e.journey_programs) ? e.journey_programs[0] : e.journey_programs;
       if (!v || !prog || prog.is_active === false) continue;
@@ -562,23 +609,31 @@ export async function buildProgress(
         courseDays: courseDaysOf(v.days, v.days_total),
       });
       const active = e.status === "active" && !state.finished;
-      let todayBlock: JourneyProgress["today"] = null;
-      if (active && state.allowedDay >= 1) {
-        const entry = days.get(state.allowedDay);
+      const dayRow = (d: number) => {
+        const entry = days.get(d);
         const cid = entry?.course_id ?? null;
-        const completedAt = done.get(state.allowedDay) ?? null;
-        todayBlock = {
-          day: state.allowedDay,
+        const completedAt = done.get(d) ?? null;
+        return {
+          day: d,
           course_id: cid,
-          title: cid ? courseTitle.get(cid) ?? entry?.mission_title ?? null : null,
+          title: cid ? courseTitle.get(cid) ?? entry?.mission_title ?? null : entry?.mission_title ?? null,
           rest_day: !cid,
+          released: d <= state.allowedDay,
           completed: !cid || !!completedAt,
           completed_at: completedAt,
         };
+      };
+      let todayBlock: JourneyProgress["today"] = null;
+      if (active && state.allowedDay >= 1) {
+        const { released: _released, ...row } = dayRow(state.allowedDay);
+        todayBlock = { date: today, ...row };
       }
+      const dayRows: JourneyProgress["days"] = [];
+      for (let d = 1; d <= v.days_total; d++) dayRows.push(dayRow(d));
       journeys.push({
         journey_id: e.program_id,
         enrollment_id: e.id,
+        version_id: e.version_id,
         title: prog.name,
         status: e.status === "completed" || state.finished ? "completed" : "active",
         start_date: e.start_date,
@@ -589,7 +644,9 @@ export async function buildProgress(
         behind_days: active ? state.behindDays : 0,
         on_track: !active || state.pendingDays === 0,
         completed_at: e.completed_at,
+        timezone: tz,
         today: todayBlock,
+        days: dayRows,
         target: `/${orgSlug}/journey`,
       });
     }

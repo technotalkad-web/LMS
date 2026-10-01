@@ -17,6 +17,7 @@ import type {
 } from "./page";
 import { ThumbnailPicker } from "../_components/thumbnail-picker";
 import { QrCodeModal } from "../_components/qr-code-modal";
+import { IdChip } from "@/components/ui/id-chip";
 import { VisibilityRadio } from "../library/[courseId]/details-form";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import type { ScoringRule } from "@/lib/scoring/policy";
@@ -577,6 +578,7 @@ export function LearningPathsClient({
                   <h3 className="serif text-lg leading-snug text-ink line-clamp-2">
                     {p.name}
                   </h3>
+                  <IdChip label="Path ID" value={p.id} className="self-start" />
                   {p.description ? (
                     <p className="text-sm text-muted line-clamp-2">
                       {p.description}
