@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { authenticateApiKey } from "@/lib/integrations/auth";
 import { readParams, pick, list, bool, int, iso, isUuid } from "@/lib/integrations/params";
+import { resolveIdsOrCodes } from "@/lib/reference-codes";
 import {
   buildProgress,
   hasAttemptFilters,
@@ -64,26 +65,37 @@ async function handle(request: Request) {
         );
       }
     }
+    // course_id / journey_id accept the LMS uuid OR the human-readable code
+    // (MOD0015, JUR0002). A code that matches nothing is a 400, never a
+    // silently empty page.
+    const courseSel = await resolveIdsOrCodes(svc, orgId, "courses", list(pick(p, "course_id", "curriculum_id")));
+    const journeySel = await resolveIdsOrCodes(svc, orgId, "journey_programs", list(pick(p, "journey_id", "program_id")));
+    for (const [name, sel] of [["course_id", courseSel], ["journey_id", journeySel]] as const) {
+      if (sel.unknown.length) {
+        return NextResponse.json(
+          { error: `${name}: unknown code "${sel.unknown[0]}" for this organisation` },
+          { status: 400 }
+        );
+      }
+      const bad = sel.ids.find((x) => !isUuid(x));
+      if (bad) {
+        return NextResponse.json(
+          { error: `${name} must be LMS ids (uuid) or codes (e.g. MOD0015) from the catalogue; got "${bad}"` },
+          { status: 400 }
+        );
+      }
+    }
     const f: ProgressFilters = {
       employeeIds: list(pick(p, "employee_id", "unique_id")),
       emails: list(pick(p, "email", "email_id")),
-      courseIds: list(pick(p, "course_id", "curriculum_id")),
-      journeyIds: list(pick(p, "journey_id", "program_id")),
+      courseIds: courseSel.ids,
+      journeyIds: journeySel.ids,
       completedFrom: dates.completed_from as string | null,
       completedTo: dates.completed_to as string | null,
       lastAccessFrom: dates.last_access_from as string | null,
       lastAccessTo: dates.last_access_to as string | null,
       includeInactive: bool(pick(p, "include_inactive")),
     };
-    for (const [name, ids] of [["course_id", f.courseIds], ["journey_id", f.journeyIds]] as const) {
-      const bad = ids.find((x) => !isUuid(x));
-      if (bad) {
-        return NextResponse.json(
-          { error: `${name} must be LMS ids from the catalogue (uuid); got "${bad}"` },
-          { status: 400 }
-        );
-      }
-    }
 
     let members = await loadMembers(svc, orgId, f);
     if (f.journeyIds.length) {

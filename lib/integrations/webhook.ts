@@ -24,6 +24,8 @@ export type CompletionWebhookPayload = {
   email: string | null;
   user_id: string;
   course_id: string;
+  /** Human-readable reference code (MOD0015), null before migration 0079. */
+  course_code: string | null;
   course_title: string;
   score: number | null; // 0-100
   passed: boolean;

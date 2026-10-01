@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
@@ -313,7 +314,9 @@ export async function GET(
 
   const safeName = p.name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const filename = `path_learners_${safeName}_${stamp}.csv`;
+  // Human-readable code in the file name (path_learners_PTH0005_..., 0079), fail-soft before the migration.
+  const exportCode = (await fetchReferenceCodes(supabase, "learning_paths", [pathRow.id])).get(pathRow.id);
+  const filename = `path_learners_${exportCode ? `${exportCode}_` : ""}${safeName}_${stamp}.csv`;
 
   return new NextResponse(csv, {
     status: 200,

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { IdChip } from "@/components/ui/id-chip";
 import {
   BookOpen,
   Clock,
@@ -26,6 +27,8 @@ import { languageDisplay } from "@/lib/i18n/languages";
 export type FolderLite = { id: string; name: string; parent_id: string | null };
 export type CourseLite = {
   id: string;
+  /** Human-readable reference code, MOD0015 (null before migration 0079). */
+  code?: string | null;
   title: string;
   description: string | null;
   current_version_id: string | null;
@@ -352,6 +355,7 @@ export function LibraryBrowser({
                     <h3 className="serif text-lg leading-snug text-ink line-clamp-2 pr-6">
                       {c.title}
                     </h3>
+                    {c.code && <IdChip label="Code" value={c.code} className="self-start" />}
                     {c.description ? (
                       <p className="text-sm text-muted line-clamp-2">{c.description}</p>
                     ) : (

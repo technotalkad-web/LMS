@@ -15,6 +15,7 @@ import {
   Upload,
 } from "lucide-react";
 import { LibraryBrowser, type FolderLite, type CourseLite } from "./library-browser";
+import { fetchReferenceCodes } from "@/lib/reference-codes";
 
 export default async function CoursesPage({
   params,
@@ -135,8 +136,11 @@ export default async function CoursesPage({
     enrolledByCourse.set(a.course_id, set);
   }
 
+  // Human-readable codes (0079), fail-soft before the migration.
+  const codes = await fetchReferenceCodes(supabase, "courses", courseIds);
   const courseList: CourseLite[] = list.map((c) => ({
     id: c.id,
+    code: codes.get(c.id) ?? null,
     title: c.title,
     description: c.description,
     current_version_id: c.current_version_id,

@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
@@ -20,6 +21,8 @@ export type PathRow = {
   thumbnail_url: string | null;
   visibility: "private" | "org_public";
   sequence_mode: "strict" | "random";
+  /** Human-readable reference code, PTH0005 (null before migration 0079). */
+  code?: string | null;
 };
 
 export type PathEnrollee = {
@@ -86,6 +89,9 @@ export default async function LearningPathsPage({
     .eq("organization_id", org.id)
     .order("created_at", { ascending: false });
   const paths = (pathRows ?? []) as PathRow[];
+  // Human-readable codes (0079), fail-soft before the migration.
+  const pathCodes = await fetchReferenceCodes(supabase, "learning_paths", paths.map((p) => p.id));
+  for (const p of paths) p.code = pathCodes.get(p.id) ?? null;
 
   const pathIds = paths.map((p) => p.id);
 

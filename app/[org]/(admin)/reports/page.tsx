@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canViewReports } from "@/lib/auth/permissions";
@@ -28,6 +29,8 @@ import { CsvButton } from "./_components/csv-button";
 
 type Course = {
   id: string;
+  /** Human-readable reference code, MOD0015 (null before migration 0079). */
+  code?: string | null;
   title: string;
   slug: string;
   status: "draft" | "published" | "archived";
@@ -121,6 +124,9 @@ export default async function ReportsPage({
   const courses = (courseRows ?? []) as Course[];
 
   const courseIds = courses.map((c) => c.id);
+  // Human-readable codes (0079), fail-soft before the migration.
+  const courseCodes = await fetchReferenceCodes(supabase, "courses", courseIds);
+  for (const c of courses) c.code = courseCodes.get(c.id) ?? null;
   const { data: versionRows } = courseIds.length
     ? await supabase
         .from("course_versions")
@@ -381,6 +387,7 @@ export default async function ReportsPage({
       : scoredAll.reduce((s, a) => s + (a.score ?? 0), 0) / scoredAll.length;
 
   const courseCsvRows = rows.map((r) => [
+    r.course.code ?? "",
     r.course.title,
     r.standard,
     r.attempts,
@@ -601,6 +608,7 @@ export default async function ReportsPage({
           <CsvButton
             filename="per-course.csv"
             header={[
+              "Code",
               "Course",
               "Standard",
               "Attempts",
@@ -649,6 +657,9 @@ export default async function ReportsPage({
                         href={`/${orgSlug}/library/${r.course.id}`}
                         className="text-ink hover:underline"
                       >
+                        {r.course.code && (
+                          <span className="font-mono text-xs text-muted mr-2">{r.course.code}</span>
+                        )}
                         {r.course.title}
                       </Link>
                     </td>
@@ -803,6 +814,9 @@ export default async function ReportsPage({
                             href={`/${orgSlug}/library/${course.id}`}
                             className="hover:underline"
                           >
+                            {course.code && (
+                              <span className="font-mono text-xs text-muted mr-2">{course.code}</span>
+                            )}
                             {course.title}
                           </Link>
                         ) : (

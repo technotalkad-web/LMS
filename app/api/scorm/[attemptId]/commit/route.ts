@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { updateAttemptFailSoft } from "@/lib/courses/progress";
+import { fetchReferenceCodes } from "@/lib/reference-codes";
 import {
   deriveAttemptStatus,
   deriveCompletionStatus,
@@ -228,6 +229,8 @@ export async function POST(
             .eq("organization_id", orgId)
             .eq("user_id", user.id)
             .maybeSingle();
+          const webhookCourseId = r?.course_versions?.course_id ?? "";
+          const courseCodes = await fetchReferenceCodes(svc, "courses", [webhookCourseId]);
           await fireCompletionWebhook(orgId, {
             event: "course_completed",
             organization: (orgRow as { slug?: string } | null)?.slug ?? "",
@@ -235,7 +238,8 @@ export async function POST(
               (memRow as { employee_id?: string | null } | null)?.employee_id ?? null,
             email: user.email ?? null,
             user_id: user.id,
-            course_id: r?.course_versions?.course_id ?? "",
+            course_id: webhookCourseId,
+            course_code: courseCodes.get(webhookCourseId) ?? null,
             course_title: courseTitle ?? "",
             score: typeof r?.score === "number" ? Math.round(r.score * 100) : null,
             passed: justPassed || success_status === "passed",
