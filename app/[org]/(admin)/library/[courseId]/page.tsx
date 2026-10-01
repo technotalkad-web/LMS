@@ -18,6 +18,7 @@ import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
+import { IdChip } from "@/components/ui/id-chip";
 
 type Version = {
   id: string;
@@ -465,6 +466,11 @@ export default async function AdminCourseDetailPage({
           )}
           <span>· {enrSummary.total.toLocaleString()} enrolled</span>
         </div>
+        {/* System ids, copyable: integrations (Yoddha CRM) key on these. */}
+        <div className="flex flex-wrap items-center gap-2 mt-2">
+          <IdChip label="Course ID" value={c.id} />
+          {current && <IdChip label="Version ID" value={current.id} />}
+        </div>
       </div>
 
       {/* Package quality — latest validation (0070). Courses uploaded before
@@ -653,9 +659,12 @@ export default async function AdminCourseDetailPage({
           {versionGroups.map((g) => (
             <div key={g.key} className="border border-line rounded-2xl bg-paper overflow-hidden">
               <div className="px-5 py-2.5 bg-canvas border-b border-line flex items-baseline justify-between gap-3">
-                <div className="text-sm font-medium">
-                  {g.label}
-                  {g.code && <span className="ml-2 text-xs text-muted font-normal">{g.code}</span>}
+                <div className="text-sm font-medium flex flex-wrap items-center gap-2">
+                  <span>
+                    {g.label}
+                    {g.code && <span className="ml-2 text-xs text-muted font-normal">{g.code}</span>}
+                  </span>
+                  {g.key !== "legacy" && <IdChip label="Package ID" value={g.key} />}
                 </div>
                 <div className="text-[11px] text-muted">
                   {g.versions.length} version{g.versions.length === 1 ? "" : "s"}
@@ -688,6 +697,9 @@ export default async function AdminCourseDetailPage({
                           <span className="font-mono">{v.launch_url}</span>
                           {typeof v.file_count === "number" && <> · {v.file_count} files</>}
                           {v.storage_driver && <> · {v.storage_driver === "r2" ? "R2" : "Supabase Storage"}</>}
+                        </div>
+                        <div className="mt-1">
+                          <IdChip label="Version ID" value={v.id} />
                         </div>
                       </div>
                       <div className="text-xs text-muted shrink-0 flex items-center gap-2">

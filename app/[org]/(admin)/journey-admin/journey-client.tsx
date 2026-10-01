@@ -6,6 +6,7 @@ import { Plus, RotateCcw, Swords, Upload, X } from "lucide-react";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { JourneyIcon, isIconUrl } from "@/components/ui/journey-icon";
+import { IdChip } from "@/components/ui/id-chip";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import type { ScoringRule } from "@/lib/scoring/policy";
 import {
@@ -101,7 +102,7 @@ export function JourneyAdminClient({
   orgSlug: string;
   programs?: ProgramSummary[];
   program: ProgramRow | null;
-  currentVersion: { version_number: number; published_at: string } | null;
+  currentVersion: { id: string; version_number: number; published_at: string } | null;
   days: DayRow[];
   enrollments: EnrollmentRow[];
   members: MemberOption[];
@@ -321,6 +322,11 @@ export function JourneyAdminClient({
               </span>
             )}
           </p>
+          {/* System ids, copyable: the Yoddha CRM pulls progress by Journey ID. */}
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <IdChip label="Journey ID" value={program.id} />
+            {currentVersion && <IdChip label="Version ID" value={currentVersion.id} />}
+          </div>
         </div>
         <div className="text-right">
           <div className="inline-flex items-center gap-2">

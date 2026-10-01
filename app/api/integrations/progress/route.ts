@@ -5,6 +5,7 @@ import {
   buildProgress,
   hasAttemptFilters,
   loadMembers,
+  usersEnrolledIn,
   usersMatchingAttempts,
   type ProgressFilters,
 } from "@/lib/integrations/progress";
@@ -21,6 +22,9 @@ import {
  *     employee_id   list                      (alias: unique_id)
  *     email         list                      (alias: email_id)
  *     course_id     list                      (alias: curriculum_id)
+ *     journey_id    list                      (alias: program_id) → only learners
+ *                                             enrolled in these journeys, and only
+ *                                             those journey rows (OJT dashboards)
  *     completed_from / completed_to           ISO, "YYYY-MM-DD HH:MM" or a date
  *     last_access_from / last_access_to       (aliases: *_date)
  *     include_inactive  true → deactivated members too
@@ -54,6 +58,7 @@ async function handle(request: Request) {
     employeeIds: list(pick(p, "employee_id", "unique_id")),
     emails: list(pick(p, "email", "email_id")),
     courseIds: list(pick(p, "course_id", "curriculum_id")),
+    journeyIds: list(pick(p, "journey_id", "program_id")),
     completedFrom: dates.completedFrom as string | null,
     completedTo: dates.completedTo as string | null,
     lastAccessFrom: dates.lastAccessFrom as string | null,
@@ -65,6 +70,10 @@ async function handle(request: Request) {
   if (hasAttemptFilters(f)) {
     const matching = await usersMatchingAttempts(svc, orgId, f);
     members = members.filter((m) => matching.has(m.user_id));
+  }
+  if (f.journeyIds.length) {
+    const enrolled = await usersEnrolledIn(svc, orgId, f.journeyIds);
+    members = members.filter((m) => enrolled.has(m.user_id));
   }
   const total = members.length;
   const pageMembers = members.slice((page - 1) * perPage, page * perPage);

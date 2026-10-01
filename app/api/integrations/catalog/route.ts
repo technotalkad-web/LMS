@@ -28,6 +28,8 @@ type CatalogItem =
       title: string;
       description: string | null;
       format: string | null;
+      /** The current uploaded package version the learner launches (Version ID in the admin). */
+      version_id: string | null;
       duration_minutes: number | null;
       status: "available" | "unavailable";
       is_active: boolean;
@@ -54,6 +56,8 @@ type CatalogItem =
       type: "journey";
       id: string;
       title: string;
+      /** The published version new enrolments run on (Version ID in the admin). */
+      version_id: string | null;
       status: "available" | "unavailable";
       is_active: boolean;
       days_total: number;
@@ -121,6 +125,7 @@ async function handle(request: Request) {
         title: c.title,
         description: c.description,
         format: c.current_version_id ? formatOf.get(c.current_version_id) ?? null : null,
+        version_id: c.current_version_id,
         duration_minutes: c.duration_minutes,
         status: available ? "available" : "unavailable",
         is_active: c.is_active !== false,
@@ -213,6 +218,7 @@ async function handle(request: Request) {
           type: "journey",
           id: j.id,
           title: j.name,
+          version_id: j.current_version_id,
           status: available ? "available" : "unavailable",
           is_active: j.is_active !== false,
           days_total: v?.days_total ?? j.days_total,
