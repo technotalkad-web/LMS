@@ -202,7 +202,7 @@ disagree.
 | `email` (alias `email_id`) | list: only these emails (case-insensitive) |
 | `course_id` (alias `curriculum_id`) | list: only learners with an attempt on these courses, and only those course rows |
 | `journey_id` (alias `program_id`) | list: only learners enrolled in these journeys, and only those journey rows — the OJT dashboard pull |
-| `completed_from` / `completed_to` | completion window (ISO 8601, `YYYY-MM-DD HH:MM`, or a bare date = whole UTC day) |
+| `completed_from` / `completed_to` | completion window: ISO 8601 with offset, or `YYYY-MM-DD HH:MM` / a bare date read in the organisation's time zone (a bare date = that whole local day) |
 | `last_access_from` / `last_access_to` | last-activity window, same formats |
 | `include_inactive` | `true` also returns deactivated members |
 

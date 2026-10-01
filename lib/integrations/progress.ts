@@ -145,18 +145,43 @@ function chunk<T>(arr: T[], n: number): T[][] {
   return out;
 }
 
+type QueryResult = { data: unknown; error?: { message: string } | null };
+
+/** A query error is never a silent empty result: throw so the route answers 500. */
+function must<T>(res: QueryResult): T[] {
+  if (res.error) throw new Error(res.error.message);
+  return (res.data ?? []) as T[];
+}
+
+/** True when the failure is "this table does not exist yet" (a migration not applied), which callers may treat as empty. */
+function isMissingRelation(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /does not exist|schema cache|relation/i.test(msg);
+}
+
 /** Drain a PostgREST query past the 1000-row default by ranging. */
-async function drain<T>(
-  build: (from: number, to: number) => PromiseLike<{ data: unknown }>
-): Promise<T[]> {
+async function drain<T>(build: (from: number, to: number) => PromiseLike<QueryResult>): Promise<T[]> {
   const out: T[] = [];
   for (let from = 0; ; from += PAGE) {
-    const { data } = await build(from, from + PAGE - 1);
-    const rows = (data ?? []) as T[];
+    const rows = must<T>(await build(from, from + PAGE - 1));
     out.push(...rows);
     if (rows.length < PAGE) break;
   }
   return out;
+}
+
+/** The organisation's calendar for journey day maths (Asia/Kolkata by default). */
+export async function orgTimezone(svc: SupabaseClient, orgId: string): Promise<string> {
+  try {
+    const { data } = await svc
+      .from("gamification_settings")
+      .select("timezone")
+      .eq("organization_id", orgId)
+      .maybeSingle();
+    return (data as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+  } catch {
+    return DEFAULT_JOURNEY_TZ;
+  }
 }
 
 const pct = (v: number | null) => (v !== null ? Math.round(v * 100) : null);
@@ -238,13 +263,17 @@ export async function usersMatchingAttempts(
 ): Promise<Set<string>> {
   let verIds: string[] | null = null;
   if (f.courseIds.length) {
-    const { data } = await svc
-      .from("course_versions")
-      .select("id, course_id")
-      .in("course_id", f.courseIds);
-    verIds = ((data ?? []) as Array<{ id: string }>).map((v) => v.id);
+    verIds = must<{ id: string }>(
+      await svc.from("course_versions").select("id, course_id").in("course_id", f.courseIds)
+    ).map((v) => v.id);
     if (verIds.length === 0) return new Set();
   }
+  // This is a SUPERSET: the exact row-level filter runs in buildProgress on
+  // the per-course aggregates (and the caller derives totals from what
+  // survives). Attempts whose last_activity_at is null (pre-0053 rows) are
+  // kept here so buildProgress can judge them by completed_at / started_at.
+  const win = (col: string, from: string | null, to: string | null) =>
+    [from ? `${col}.gte.${from}` : null, to ? `${col}.lte.${to}` : null].filter(Boolean).join(",");
   const out = new Set<string>();
   for (const vers of verIds ? chunk(verIds, 200) : [null]) {
     const rows = await drain<{ user_id: string }>((from, to) => {
@@ -252,8 +281,9 @@ export async function usersMatchingAttempts(
       if (vers) q = q.in("course_version_id", vers);
       if (f.completedFrom) q = q.gte("completed_at", f.completedFrom);
       if (f.completedTo) q = q.lte("completed_at", f.completedTo);
-      if (f.lastAccessFrom) q = q.gte("last_activity_at", f.lastAccessFrom);
-      if (f.lastAccessTo) q = q.lte("last_activity_at", f.lastAccessTo);
+      if (f.lastAccessFrom || f.lastAccessTo) {
+        q = q.or(`last_activity_at.is.null,and(${win("last_activity_at", f.lastAccessFrom, f.lastAccessTo)})`);
+      }
       return q.order("id").range(from, to);
     });
     for (const r of rows) out.add(r.user_id);
@@ -281,8 +311,8 @@ export async function usersEnrolledIn(
         .range(from, to)
     );
     for (const r of rows) out.add(r.user_id);
-  } catch {
-    /* pre-journey database */
+  } catch (e) {
+    if (!isMissingRelation(e)) throw e; // pre-journey database → nobody enrolled
   }
   return out;
 }
@@ -312,17 +342,23 @@ type Att = {
   progress_pct?: number | null;
 };
 
-/** Progress rows for ONE page of members (≤ 100), org-wide batch loads. */
+/**
+ * Progress rows for ONE batch of members (≤ 100), org-wide batch loads.
+ * When attempt-level filters are set, learners with no surviving course
+ * row are omitted (the caller derives totals from the result).
+ */
 export async function buildProgress(
   svc: SupabaseClient,
   orgId: string,
   orgSlug: string,
   members: MemberRow[],
-  f: ProgressFilters
+  f: ProgressFilters,
+  timezone?: string
 ): Promise<LearnerProgress[]> {
   if (members.length === 0) return [];
   const uids = members.map((m) => m.user_id);
   const nowIso = new Date().toISOString();
+  const uidList = `(${uids.join(",")})`;
 
   // ---- attempts (select * for deploy safety across 0073/0075 columns) ----
   const attempts = await drain<Att>((from, to) =>
@@ -337,23 +373,43 @@ export async function buildProgress(
   const verIds = [...new Set(attempts.map((a) => a.course_version_id))];
   const courseOfVer = new Map<string, string>();
   for (const ids of chunk(verIds, 300)) {
-    const { data } = await svc.from("course_versions").select("id, course_id").in("id", ids);
-    for (const v of (data ?? []) as Array<{ id: string; course_id: string }>) courseOfVer.set(v.id, v.course_id);
+    const rows = must<{ id: string; course_id: string }>(
+      await svc.from("course_versions").select("id, course_id").in("id", ids)
+    );
+    for (const v of rows) courseOfVer.set(v.id, v.course_id);
   }
 
   // ---- entitlements: assignments, teams, groups ----
+  // Only the rows that can apply to this batch: org / team / group
+  // assignments plus the direct ones for these users.
   const caRows = await drain<Assign>((from, to) =>
-    svc.from("course_assignments").select("*").eq("organization_id", orgId).order("id").range(from, to)
+    svc
+      .from("course_assignments")
+      .select("*")
+      .eq("organization_id", orgId)
+      .or(`assignee_type.neq.user,user_id.in.${uidList}`)
+      .order("id")
+      .range(from, to)
   );
   const paRows = await drain<Assign>((from, to) =>
-    svc.from("learning_path_assignments").select("*").eq("organization_id", orgId).order("id").range(from, to)
+    svc
+      .from("learning_path_assignments")
+      .select("*")
+      .eq("organization_id", orgId)
+      .or(`assignee_type.neq.user,user_id.in.${uidList}`)
+      .order("id")
+      .range(from, to)
   );
-  const { data: tmRows } = await svc
-    .from("team_members")
-    .select("user_id, team_id, teams!inner(organization_id)")
-    .in("user_id", uids);
+  const tmRows = await drain<{ user_id: string; team_id: string; teams: { organization_id: string } | Array<{ organization_id: string }> }>((from, to) =>
+    svc
+      .from("team_members")
+      .select("user_id, team_id, teams!inner(organization_id)")
+      .in("user_id", uids)
+      .order("team_id")
+      .range(from, to)
+  );
   const teamsOf = new Map<string, Set<string>>();
-  for (const r of (tmRows ?? []) as Array<{ user_id: string; team_id: string; teams: { organization_id: string } | Array<{ organization_id: string }> }>) {
+  for (const r of tmRows) {
     const t = Array.isArray(r.teams) ? r.teams[0] : r.teams;
     if (t?.organization_id !== orgId) continue;
     teamsOf.set(r.user_id, (teamsOf.get(r.user_id) ?? new Set()).add(r.team_id));
@@ -373,8 +429,8 @@ export async function buildProgress(
         const ids = await resolveGroupMembers(svc, g as Parameters<typeof resolveGroupMembers>[1], cache);
         groupMembers.set(g.id, new Set(ids));
       }
-    } catch {
-      /* pre-0067 */
+    } catch (e) {
+      if (!isMissingRelation(e)) throw e; // pre-0067: no groups table yet
     }
   }
   const mine = (uid: string, a: Assign) =>
@@ -388,18 +444,20 @@ export async function buildProgress(
   const coursesOfPath = new Map<string, string[]>();
   const pathName = new Map<string, string>();
   for (const ids of chunk(pathIds, 300)) {
-    const { data: pc } = await svc
-      .from("learning_path_courses")
-      .select("path_id, course_id, step_number")
-      .in("path_id", ids)
-      .order("step_number");
-    for (const r of (pc ?? []) as Array<{ path_id: string; course_id: string }>) {
-      coursesOfPath.set(r.path_id, [...(coursesOfPath.get(r.path_id) ?? []), r.course_id]);
-    }
-    const { data: pn } = await svc.from("learning_paths").select("id, name, is_active").in("id", ids);
-    for (const p of (pn ?? []) as Array<{ id: string; name: string; is_active: boolean | null }>) {
-      if (p.is_active !== false) pathName.set(p.id, p.name);
-    }
+    const pc = await drain<{ path_id: string; course_id: string }>((from, to) =>
+      svc
+        .from("learning_path_courses")
+        .select("path_id, course_id, step_number")
+        .in("path_id", ids)
+        .order("path_id")
+        .order("step_number")
+        .range(from, to)
+    );
+    for (const r of pc) coursesOfPath.set(r.path_id, [...(coursesOfPath.get(r.path_id) ?? []), r.course_id]);
+    const pn = must<{ id: string; name: string; is_active: boolean | null }>(
+      await svc.from("learning_paths").select("id, name, is_active").in("id", ids)
+    );
+    for (const p of pn) if (p.is_active !== false) pathName.set(p.id, p.name);
   }
 
   // ---- journeys ----
@@ -416,14 +474,8 @@ export async function buildProgress(
   };
   let enrollments: Enr[] = [];
   const dayDone = new Map<string, Map<number, string>>(); // enrollment → day → completed_at
-  let tz = DEFAULT_JOURNEY_TZ;
+  const tz = timezone || (await orgTimezone(svc, orgId));
   try {
-    const { data: gs } = await svc
-      .from("gamification_settings")
-      .select("timezone")
-      .eq("organization_id", orgId)
-      .maybeSingle();
-    tz = (gs as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
     enrollments = await drain<Enr>((from, to) =>
       svc
         .from("journey_enrollments")
@@ -451,8 +503,8 @@ export async function buildProgress(
         dayDone.set(r.enrollment_id, m);
       }
     }
-  } catch {
-    /* pre-journey database */
+  } catch (e) {
+    if (!isMissingRelation(e)) throw e; // pre-journey database → no journeys
   }
   const today = todayStr(tz);
 
@@ -470,8 +522,10 @@ export async function buildProgress(
   }
   const courseTitle = new Map<string, string>();
   for (const ids of chunk([...courseIdSet], 300)) {
-    const { data } = await svc.from("courses").select("id, title, is_active").in("id", ids).eq("is_active", true);
-    for (const c of (data ?? []) as Array<{ id: string; title: string }>) courseTitle.set(c.id, c.title);
+    const rows = must<{ id: string; title: string }>(
+      await svc.from("courses").select("id, title, is_active").in("id", ids).eq("is_active", true)
+    );
+    for (const c of rows) courseTitle.set(c.id, c.title);
   }
   const policies = await resolvePolicies(svc, [...courseTitle.keys()]);
 
@@ -530,7 +584,10 @@ export async function buildProgress(
       byCourse.set(cid, row);
     }
 
-    const courseIds = [...new Set([...dueByCourse.keys(), ...byCourse.keys()])].filter((c) => courseTitle.has(c));
+    // Entitled courses only (direct, org, team, group, path), exactly as
+    // learner-summary lists them; a course merely launched from the library
+    // without an assignment stays out so the two endpoints agree.
+    const courseIds = [...dueByCourse.keys()].filter((c) => courseTitle.has(c));
     const courses: CourseProgress[] = [];
     for (const cid of courseIds) {
       const st = byCourse.get(cid) ?? { status: "not_started" as const, n: 0, list: [], progress: null, progressAt: "", first: null, last: null, done: null };
@@ -643,7 +700,8 @@ export async function buildProgress(
         enrollment_id: e.id,
         version_id: e.version_id,
         title: prog.name,
-        status: e.status === "completed" || state.finished ? "completed" : "active",
+        // The enrollment's own status, as learner-summary reports it.
+        status: e.status === "completed" ? "completed" : "active",
         start_date: e.start_date,
         day: state.currentDay,
         days_total: state.daysTotal,

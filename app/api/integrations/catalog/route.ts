@@ -88,6 +88,9 @@ async function handle(request: Request) {
   const want = new Set<string>(types.length ? types : TYPES);
   const since = iso(pick(p, "updated_since"), "from");
   if (since === "invalid") return NextResponse.json({ error: "updated_since must be an ISO 8601 date" }, { status: 400 });
+  // Compare instants, not strings (PostgREST prints "+00:00", the filter "Z").
+  const sinceMs = since ? Date.parse(since) : null;
+  const changedBefore = (v: string) => sinceMs !== null && Date.parse(v) < sinceMs;
 
   const items: CatalogItem[] = [];
   const titleOf = new Map<string, string>();
@@ -118,7 +121,7 @@ async function handle(request: Request) {
       // stays "draft" after upload; the learner UI keys on is_active only.)
       const available = c.is_active !== false && !!c.current_version_id;
       if (!includeInactive && !available) continue;
-      if (since && c.updated_at < since) continue;
+      if (changedBefore(c.updated_at)) continue;
       items.push({
         type: "course",
         id: c.id,
@@ -150,12 +153,14 @@ async function handle(request: Request) {
     const paths = (pRows ?? []) as PathRow[];
     const stepsOf = new Map<string, string[]>();
     const pathIds = paths.map((x) => x.id);
-    for (let i = 0; i < pathIds.length; i += 300) {
-      const { data } = await svc
+    // Small chunks keep each answer under PostgREST's 1000-row cap.
+    for (let i = 0; i < pathIds.length; i += 25) {
+      const { data, error } = await svc
         .from("learning_path_courses")
         .select("path_id, course_id, step_number")
-        .in("path_id", pathIds.slice(i, i + 300))
+        .in("path_id", pathIds.slice(i, i + 25))
         .order("step_number");
+      if (error) return NextResponse.json({ error: error.message }, { status: 500 });
       for (const r of (data ?? []) as Array<{ path_id: string; course_id: string }>) {
         stepsOf.set(r.path_id, [...(stepsOf.get(r.path_id) ?? []), r.course_id]);
       }
@@ -163,7 +168,7 @@ async function handle(request: Request) {
     for (const lp of paths) {
       const available = lp.is_active !== false;
       if (!includeInactive && !available) continue;
-      if (since && lp.updated_at < since) continue;
+      if (changedBefore(lp.updated_at)) continue;
       const ids = stepsOf.get(lp.id) ?? [];
       items.push({
         type: "learning_path",
@@ -184,13 +189,18 @@ async function handle(request: Request) {
   // ---- journeys (day-wise programmes) ----
   if (want.has("journey")) {
     type ProgRow = { id: string; name: string; is_active: boolean | null; days_total: number; current_version_id: string | null; created_at: string; updated_at: string };
-    try {
-      const { data: jRows } = await svc
+    {
+      const { data: jRows, error: jErr } = await svc
         .from("journey_programs")
         .select("id, name, is_active, days_total, current_version_id, created_at, updated_at")
         .eq("organization_id", orgId)
         .order("name");
-      const progs = (jRows ?? []) as ProgRow[];
+      // A database without the journey tables yet lists no journeys; any
+      // other error is a real failure and must not look like "none".
+      if (jErr && !/does not exist|schema cache|relation/i.test(jErr.message)) {
+        return NextResponse.json({ error: jErr.message }, { status: 500 });
+      }
+      const progs = jErr ? [] : ((jRows ?? []) as ProgRow[]);
       const versionIds = progs.map((j) => j.current_version_id).filter((v): v is string => !!v);
       const versions = new Map<string, { days: unknown; days_total: number; published_at: string | null }>();
       if (versionIds.length) {
@@ -202,7 +212,7 @@ async function handle(request: Request) {
         const available = j.is_active !== false && !!v;
         if (!includeInactive && !available) continue;
         const changedAt = v?.published_at && v.published_at > j.updated_at ? v.published_at : j.updated_at;
-        if (since && changedAt < since) continue;
+        if (changedBefore(changedAt)) continue;
         const days = v
           ? [...parseVersionDays(v.days).values()]
               .filter((d) => d.day <= v.days_total)
@@ -229,8 +239,6 @@ async function handle(request: Request) {
           target: `/${orgSlug}/journey`,
         });
       }
-    } catch {
-      /* pre-journey database: no journeys to list */
     }
   }
 
