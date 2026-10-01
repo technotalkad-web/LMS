@@ -625,8 +625,16 @@ export async function buildProgress(
       };
       let todayBlock: JourneyProgress["today"] = null;
       if (active && state.allowedDay >= 1) {
-        const { released: _released, ...row } = dayRow(state.allowedDay);
-        todayBlock = { date: today, ...row };
+        const row = dayRow(state.allowedDay);
+        todayBlock = {
+          date: today,
+          day: row.day,
+          course_id: row.course_id,
+          title: row.title,
+          rest_day: row.rest_day,
+          completed: row.completed,
+          completed_at: row.completed_at,
+        };
       }
       const dayRows: JourneyProgress["days"] = [];
       for (let d = 1; d <= v.days_total; d++) dayRows.push(dayRow(d));
