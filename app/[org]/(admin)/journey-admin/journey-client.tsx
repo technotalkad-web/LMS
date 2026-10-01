@@ -7,6 +7,7 @@ import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { JourneyIcon, isIconUrl } from "@/components/ui/journey-icon";
 import { IdChip } from "@/components/ui/id-chip";
+import { journeyVersionCode } from "@/lib/reference-codes";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import type { ScoringRule } from "@/lib/scoring/policy";
 import {
@@ -20,6 +21,8 @@ import {
 
 export type ProgramRow = {
   id: string;
+  /** Human-readable reference code, JUR0002 (null before migration 0079). */
+  reference_code?: string | null;
   name: string;
   icon: string;
   days_total: number;
@@ -324,7 +327,11 @@ export function JourneyAdminClient({
           </p>
           {/* System ids, copyable: the Yoddha CRM pulls progress by Journey ID. */}
           <div className="flex flex-wrap items-center gap-2 mt-2">
+            {program.reference_code && <IdChip label="Code" value={program.reference_code} />}
             <IdChip label="Journey ID" value={program.id} />
+            {currentVersion && program.reference_code && (
+              <IdChip label="Code" value={journeyVersionCode(program.reference_code, currentVersion.version_number) ?? ""} />
+            )}
             {currentVersion && <IdChip label="Version ID" value={currentVersion.id} />}
           </div>
         </div>

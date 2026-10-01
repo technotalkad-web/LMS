@@ -159,6 +159,17 @@ nightly reconciliation). They replace the UpsideLMS "Catalogue API" and
 "Progress API" one-for-one and accept the same parameters three ways:
 GET query string, JSON body, or form-urlencoded body.
 
+**Reference codes.** Besides the uuid, every course, learning path and
+journey carries a short human-readable code assigned by the LMS and never
+changed: `MOD0015`, `PTH0005`, `JUR0002` (unique per organisation; versions
+derive `MOD0015-V03`, or `MOD0015-HI-V02` when a course has several language
+packages, journeys `JUR0002-V03`). The catalogue, progress and
+learner-summary responses return it as `code` (`version_code` for
+versions), the completion webhook as `course_code`, and the `course_id` /
+`journey_id` filters accept a code in place of the uuid. Admins see the
+same codes with a copy button on the course, learning-path and journey
+pages. Codes are `null` on a database that has not run migration 0079 yet.
+
 **`GET|POST /api/integrations/catalog`** — everything the organisation can
 assign and launch, with the ids used everywhere else in the integration.
 

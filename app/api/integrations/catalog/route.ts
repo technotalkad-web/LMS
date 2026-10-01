@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { authenticateApiKey } from "@/lib/integrations/auth";
 import { readParams, pick, list, bool, int, iso } from "@/lib/integrations/params";
 import { parseVersionDays } from "@/lib/journey/journey";
+import { fetchReferenceCodes, journeyVersionCode, versionCode } from "@/lib/reference-codes";
 
 /**
  * Catalogue — what the organisation can assign and launch (the UpsideLMS
@@ -25,11 +26,15 @@ type CatalogItem =
   | {
       type: "course";
       id: string;
+      /** Human-readable reference code, MOD0015 (null before migration 0079). */
+      code: string | null;
       title: string;
       description: string | null;
       format: string | null;
       /** The current uploaded package version the learner launches (Version ID in the admin). */
       version_id: string | null;
+      /** Derived: MOD0015-V03, or MOD0015-HI-V02 when the course has several language packages. */
+      version_code: string | null;
       duration_minutes: number | null;
       status: "available" | "unavailable";
       is_active: boolean;
@@ -42,6 +47,8 @@ type CatalogItem =
   | {
       type: "learning_path";
       id: string;
+      /** Human-readable reference code, PTH0005. */
+      code: string | null;
       title: string;
       description: string | null;
       status: "available" | "unavailable";
@@ -55,9 +62,13 @@ type CatalogItem =
   | {
       type: "journey";
       id: string;
+      /** Human-readable reference code, JUR0002. */
+      code: string | null;
       title: string;
       /** The published version new enrolments run on (Version ID in the admin). */
       version_id: string | null;
+      /** Derived: JUR0002-V03. */
+      version_code: string | null;
       status: "available" | "unavailable";
       is_active: boolean;
       days_total: number;
@@ -111,9 +122,32 @@ async function handle(request: Request) {
   for (const c of courses) titleOf.set(c.id, c.title);
   const verIds = courses.map((c) => c.current_version_id).filter((v): v is string => !!v);
   const formatOf = new Map<string, string>();
+  const versionOf = new Map<string, { version_number: number; package_id: string | null }>();
   for (let i = 0; i < verIds.length; i += 300) {
-    const { data } = await svc.from("course_versions").select("id, manifest_type").in("id", verIds.slice(i, i + 300));
-    for (const v of (data ?? []) as Array<{ id: string; manifest_type: string }>) formatOf.set(v.id, v.manifest_type);
+    const { data } = await svc
+      .from("course_versions")
+      .select("id, manifest_type, version_number, package_id")
+      .in("id", verIds.slice(i, i + 300));
+    for (const v of (data ?? []) as Array<{ id: string; manifest_type: string; version_number: number; package_id: string | null }>) {
+      formatOf.set(v.id, v.manifest_type);
+      versionOf.set(v.id, { version_number: v.version_number, package_id: v.package_id });
+    }
+  }
+  // Human-readable codes (0079): MOD0015 and the derived MOD0015-HI-V02; fail-soft before the migration.
+  const courseCodes = await fetchReferenceCodes(svc, "courses", courses.map((c) => c.id));
+  const packageLang = new Map<string, string | null>();
+  const packagesOf = new Map<string, number>();
+  try {
+    const { data } = await svc
+      .from("course_language_packages")
+      .select("id, course_id, language")
+      .in("course_id", courses.map((c) => c.id));
+    for (const pkg of (data ?? []) as Array<{ id: string; course_id: string; language: string | null }>) {
+      packageLang.set(pkg.id, pkg.language);
+      packagesOf.set(pkg.course_id, (packagesOf.get(pkg.course_id) ?? 0) + 1);
+    }
+  } catch {
+    /* pre-0030 */
   }
   if (want.has("course")) {
     for (const c of courses) {
@@ -122,13 +156,19 @@ async function handle(request: Request) {
       const available = c.is_active !== false && !!c.current_version_id;
       if (!includeInactive && !available) continue;
       if (changedBefore(c.updated_at)) continue;
+      const ver = c.current_version_id ? versionOf.get(c.current_version_id) : undefined;
+      const code = courseCodes.get(c.id) ?? null;
       items.push({
         type: "course",
         id: c.id,
+        code,
         title: c.title,
         description: c.description,
         format: c.current_version_id ? formatOf.get(c.current_version_id) ?? null : null,
         version_id: c.current_version_id,
+        version_code: ver
+          ? versionCode(code, ver.version_number, ver.package_id ? packageLang.get(ver.package_id) ?? null : null, (packagesOf.get(c.id) ?? 0) > 1)
+          : null,
         duration_minutes: c.duration_minutes,
         status: available ? "available" : "unavailable",
         is_active: c.is_active !== false,
@@ -165,6 +205,7 @@ async function handle(request: Request) {
         stepsOf.set(r.path_id, [...(stepsOf.get(r.path_id) ?? []), r.course_id]);
       }
     }
+    const pathCodes = await fetchReferenceCodes(svc, "learning_paths", pathIds);
     for (const lp of paths) {
       const available = lp.is_active !== false;
       if (!includeInactive && !available) continue;
@@ -173,6 +214,7 @@ async function handle(request: Request) {
       items.push({
         type: "learning_path",
         id: lp.id,
+        code: pathCodes.get(lp.id) ?? null,
         title: lp.name,
         description: lp.description,
         status: available ? "available" : "unavailable",
@@ -202,11 +244,12 @@ async function handle(request: Request) {
       }
       const progs = jErr ? [] : ((jRows ?? []) as ProgRow[]);
       const versionIds = progs.map((j) => j.current_version_id).filter((v): v is string => !!v);
-      const versions = new Map<string, { days: unknown; days_total: number; published_at: string | null }>();
+      const versions = new Map<string, { days: unknown; days_total: number; published_at: string | null; version_number: number }>();
       if (versionIds.length) {
-        const { data } = await svc.from("journey_versions").select("id, days, days_total, published_at").in("id", versionIds);
-        for (const v of (data ?? []) as Array<{ id: string; days: unknown; days_total: number; published_at: string | null }>) versions.set(v.id, v);
+        const { data } = await svc.from("journey_versions").select("id, days, days_total, published_at, version_number").in("id", versionIds);
+        for (const v of (data ?? []) as Array<{ id: string; days: unknown; days_total: number; published_at: string | null; version_number: number }>) versions.set(v.id, v);
       }
+      const journeyCodes = await fetchReferenceCodes(svc, "journey_programs", progs.map((j) => j.id));
       for (const j of progs) {
         const v = j.current_version_id ? versions.get(j.current_version_id) : undefined;
         const available = j.is_active !== false && !!v;
@@ -227,8 +270,10 @@ async function handle(request: Request) {
         items.push({
           type: "journey",
           id: j.id,
+          code: journeyCodes.get(j.id) ?? null,
           title: j.name,
           version_id: j.current_version_id,
+          version_code: journeyVersionCode(journeyCodes.get(j.id), v?.version_number),
           status: available ? "available" : "unavailable",
           is_active: j.is_active !== false,
           days_total: v?.days_total ?? j.days_total,

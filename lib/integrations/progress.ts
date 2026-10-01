@@ -13,6 +13,7 @@ import {
   type ScorableAttempt,
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { fetchReferenceCodes, journeyVersionCode } from "@/lib/reference-codes";
 
 /**
  * Bulk learner progress for the integration API (the UpsideLMS "Progress
@@ -49,6 +50,8 @@ export type ProgressFilters = {
 
 export type CourseProgress = {
   course_id: string;
+  /** Human-readable reference code, MOD0015 (null before migration 0079). */
+  code: string | null;
   title: string;
   status: "not_started" | "in_progress" | "completed" | "passed";
   score: number | null;
@@ -70,6 +73,8 @@ export type CourseProgress = {
 
 export type PathProgress = {
   path_id: string;
+  /** Human-readable reference code, PTH0005. */
+  code: string | null;
   title: string;
   status: "not_started" | "in_progress" | "completed";
   steps_total: number;
@@ -84,9 +89,13 @@ export type PathProgress = {
 
 export type JourneyProgress = {
   journey_id: string;
+  /** Human-readable reference code, JUR0002. */
+  code: string | null;
   enrollment_id: string;
   /** The published journey version this learner runs on. */
   version_id: string;
+  /** Derived: JUR0002-V03. */
+  version_code: string | null;
   title: string;
   status: "active" | "completed";
   start_date: string;
@@ -469,7 +478,7 @@ export async function buildProgress(
     status: string;
     start_date: string;
     completed_at: string | null;
-    journey_versions: { days: unknown; days_total: number; count_sundays: boolean } | Array<{ days: unknown; days_total: number; count_sundays: boolean }>;
+    journey_versions: { days: unknown; days_total: number; count_sundays: boolean; version_number: number } | Array<{ days: unknown; days_total: number; count_sundays: boolean; version_number: number }>;
     journey_programs: { name: string; is_active: boolean } | Array<{ name: string; is_active: boolean }>;
   };
   let enrollments: Enr[] = [];
@@ -480,7 +489,7 @@ export async function buildProgress(
       svc
         .from("journey_enrollments")
         .select(
-          "id, user_id, program_id, version_id, status, start_date, completed_at, journey_versions!inner(days, days_total, count_sundays), journey_programs!inner(name, is_active)"
+          "id, user_id, program_id, version_id, status, start_date, completed_at, journey_versions!inner(days, days_total, count_sundays, version_number), journey_programs!inner(name, is_active)"
         )
         .eq("organization_id", orgId)
         .in("user_id", uids)
@@ -528,6 +537,10 @@ export async function buildProgress(
     for (const c of rows) courseTitle.set(c.id, c.title);
   }
   const policies = await resolvePolicies(svc, [...courseTitle.keys()]);
+  // Human-readable codes (0079), fail-soft before the migration.
+  const courseCodes = await fetchReferenceCodes(svc, "courses", [...courseTitle.keys()]);
+  const pathCodes = await fetchReferenceCodes(svc, "learning_paths", [...pathName.keys()]);
+  const journeyCodes = await fetchReferenceCodes(svc, "journey_programs", [...new Set(enrollments.map((e) => e.program_id))]);
 
   // ---- per learner ----
   const attemptsOf = new Map<string, Att[]>();
@@ -596,6 +609,7 @@ export async function buildProgress(
       const done = st.status === "completed" || st.status === "passed";
       const row: CourseProgress = {
         course_id: cid,
+        code: courseCodes.get(cid) ?? null,
         title: courseTitle.get(cid) as string,
         status: st.status,
         score: pct(sc.officialScore),
@@ -635,6 +649,7 @@ export async function buildProgress(
       if (complete) for (const c of doneSteps) completedAt = maxIso(completedAt, doneAt.get(c) ?? null);
       learning_paths.push({
         path_id: pid,
+        code: pathCodes.get(pid) ?? null,
         title: pathName.get(pid) as string,
         status: complete ? "completed" : started || doneSteps.length ? "in_progress" : "not_started",
         steps_total: steps.length,
@@ -697,8 +712,10 @@ export async function buildProgress(
       for (let d = 1; d <= v.days_total; d++) dayRows.push(dayRow(d));
       journeys.push({
         journey_id: e.program_id,
+        code: journeyCodes.get(e.program_id) ?? null,
         enrollment_id: e.id,
         version_id: e.version_id,
+        version_code: journeyVersionCode(journeyCodes.get(e.program_id), v.version_number),
         title: prog.name,
         // The enrollment's own status, as learner-summary reports it.
         status: e.status === "completed" ? "completed" : "active",

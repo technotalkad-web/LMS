@@ -19,6 +19,7 @@ import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
+import { packageCode, versionCode } from "@/lib/reference-codes";
 
 type Version = {
   id: string;
@@ -129,6 +130,19 @@ export default async function AdminCourseDetailPage({
       .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
       .map((g) => ({ ...g, versions: g.versions.sort((a, b) => b.version_number - a.version_number) }));
   })();
+
+  // Human-readable codes (0079): MOD0015 on the course; versions and
+  // packages derive MOD0015-HI-V02 / MOD0015-HI. Null before the migration.
+  const refCode = (c as { reference_code?: string | null }).reference_code ?? null;
+  const multiPackage = versionGroups.length > 1;
+  const currentCode = current
+    ? versionCode(
+        refCode,
+        current.version_number,
+        current.package_id ? pkgById.get(current.package_id)?.language ?? null : null,
+        multiPackage
+      )
+    : null;
 
   // Assignments — select("*") for 0069 deploy safety (group_id).
   const { data: assignmentRows } = await supabase
@@ -468,7 +482,9 @@ export default async function AdminCourseDetailPage({
         </div>
         {/* System ids, copyable: integrations (Yoddha CRM) key on these. */}
         <div className="flex flex-wrap items-center gap-2 mt-2">
+          {refCode && <IdChip label="Code" value={refCode} />}
           <IdChip label="Course ID" value={c.id} />
+          {currentCode && <IdChip label="Code" value={currentCode} />}
           {current && <IdChip label="Version ID" value={current.id} />}
         </div>
       </div>
@@ -664,6 +680,7 @@ export default async function AdminCourseDetailPage({
                     {g.label}
                     {g.code && <span className="ml-2 text-xs text-muted font-normal">{g.code}</span>}
                   </span>
+                  {refCode && g.code && <IdChip label="Code" value={packageCode(refCode, g.code) ?? ""} />}
                   {g.key !== "legacy" && <IdChip label="Package ID" value={g.key} />}
                 </div>
                 <div className="text-[11px] text-muted">
@@ -698,7 +715,10 @@ export default async function AdminCourseDetailPage({
                           {typeof v.file_count === "number" && <> · {v.file_count} files</>}
                           {v.storage_driver && <> · {v.storage_driver === "r2" ? "R2" : "Supabase Storage"}</>}
                         </div>
-                        <div className="mt-1">
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                          {versionCode(refCode, v.version_number, g.code, multiPackage) && (
+                            <IdChip label="Code" value={versionCode(refCode, v.version_number, g.code, multiPackage) ?? ""} />
+                          )}
                           <IdChip label="Version ID" value={v.id} />
                         </div>
                       </div>

@@ -13,6 +13,7 @@ import {
   type ScorableAttempt,
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { fetchReferenceCodes } from "@/lib/reference-codes";
 
 /**
  * One call, everything the CRM needs to render an employee's learning card:
@@ -201,6 +202,8 @@ export async function GET(request: Request) {
         .eq("is_active", true)
     : { data: [] };
   const pct = (v: number | null) => (v !== null ? Math.round(v * 100) : null);
+  // Human-readable codes (0079), fail-soft before the migration.
+  const courseCodes = await fetchReferenceCodes(svc, "courses", allCourseIds);
   const courses = ((cRows ?? []) as Array<{ id: string; title: string }>).map((cr) => {
     const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
     const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY);
@@ -208,6 +211,7 @@ export async function GET(request: Request) {
     const done = st.status === "completed" || st.status === "passed";
     return {
       course_id: cr.id,
+      code: courseCodes.get(cr.id) ?? null,
       title: cr.title,
       status: st.status,
       // `score` is the OFFICIAL score under the module's attempt rules.
@@ -232,12 +236,14 @@ export async function GET(request: Request) {
   const { data: pnRows } = pathIds.length
     ? await svc.from("learning_paths").select("id, name, is_active").in("id", pathIds)
     : { data: [] };
+  const pathCodes = await fetchReferenceCodes(svc, "learning_paths", pathIds);
   const paths = ((pnRows ?? []) as Array<{ id: string; name: string; is_active: boolean }>)
     .filter((pr) => pr.is_active !== false)
     .map((pr) => {
       const steps = coursesOfPath.get(pr.id) ?? [];
       return {
         path_id: pr.id,
+        code: pathCodes.get(pr.id) ?? null,
         name: pr.name,
         steps_total: steps.length,
         steps_completed: steps.filter((cid) => doneSet.has(cid)).length,
@@ -248,6 +254,8 @@ export async function GET(request: Request) {
 
   // ---- journeys (behind-schedule math, same as the nudge engine) ----
   const journeys: Array<{
+    journey_id: string;
+    code: string | null;
     name: string;
     status: string;
     day: number;
@@ -266,13 +274,19 @@ export async function GET(request: Request) {
     const { data: enrRows } = await svc
       .from("journey_enrollments")
       .select(
-        "id, status, start_date, journey_versions!inner(days, days_total, count_sundays), journey_programs!inner(name, is_active)"
+        "id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays), journey_programs!inner(name, is_active)"
       )
       .eq("organization_id", orgId)
       .eq("user_id", uid)
       .in("status", ["active", "completed"]);
+    const journeyCodes = await fetchReferenceCodes(
+      svc,
+      "journey_programs",
+      ((enrRows ?? []) as Array<{ program_id: string }>).map((e) => e.program_id)
+    );
     for (const e of (enrRows ?? []) as Array<{
       id: string;
+      program_id: string;
       status: string;
       start_date: string;
       journey_versions: { days: unknown; days_total: number; count_sundays: boolean } | Array<{ days: unknown; days_total: number; count_sundays: boolean }>;
@@ -294,6 +308,8 @@ export async function GET(request: Request) {
         courseDays: courseDaysOf(v.days, v.days_total),
       });
       journeys.push({
+        journey_id: e.program_id,
+        code: journeyCodes.get(e.program_id) ?? null,
         name: prog.name,
         status: e.status,
         day: state.currentDay,

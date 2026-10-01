@@ -137,6 +137,7 @@ export function LearningPathsClient({
     return paths.filter(
       (p) =>
         p.name.toLowerCase().includes(q) ||
+        (p.code ?? "").toLowerCase().includes(q) ||
         (p.description ?? "").toLowerCase().includes(q)
     );
   }, [paths, query]);
@@ -578,7 +579,10 @@ export function LearningPathsClient({
                   <h3 className="serif text-lg leading-snug text-ink line-clamp-2">
                     {p.name}
                   </h3>
-                  <IdChip label="Path ID" value={p.id} className="self-start" />
+                  <div className="flex flex-wrap items-center gap-2">
+                    {p.code && <IdChip label="Code" value={p.code} />}
+                    <IdChip label="Path ID" value={p.id} />
+                  </div>
                   {p.description ? (
                     <p className="text-sm text-muted line-clamp-2">
                       {p.description}
