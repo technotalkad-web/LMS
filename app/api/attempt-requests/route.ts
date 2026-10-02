@@ -3,6 +3,9 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { notifyAdminsOfRequest } from "@/lib/attempts/requests";
+import { computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
+import { resolvePolicy } from "@/lib/scoring/resolve";
+import { grantRetakeIdsFor } from "@/lib/scoring/attempt-kind";
 
 /**
  *   POST /api/attempt-requests   body: { orgSlug, courseId, reason }
@@ -92,6 +95,28 @@ export async function POST(request: Request) {
       );
     }
     return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+
+  // 0085: record the learner's completed OFFICIAL attempts at request time, so
+  // the admin sees "Nth attempt failed → Requesting (N+1)th attempt" and the
+  // history/reports keep that context. Best-effort: a scoring hiccup or a
+  // pre-0085 database must never fail the learner's request.
+  try {
+    const { data: verRows } = await s.from("course_versions").select("id").eq("course_id", course.id);
+    const vIds = ((verRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+    if (vIds.length > 0 && inserted?.id) {
+      const { data: attRows } = await s
+        .from("course_attempts")
+        .select("id, score, started_at, completed_at, completion_status, success_status")
+        .eq("user_id", user.id)
+        .in("course_version_id", vIds);
+      const policy = await resolvePolicy(s, course.id);
+      const retakeIds = await grantRetakeIdsFor(s, user.id, course.id);
+      const sc = computeScoring((attRows ?? []) as ScorableAttempt[], policy, retakeIds);
+      await s.from("attempt_requests").update({ attempts_used: sc.scoredAttempts }).eq("id", inserted.id);
+    }
+  } catch (e) {
+    console.warn("[attempt-requests] attempts_used not recorded (request still created):", e);
   }
 
   // Tell the admins (background; a mail failure never fails the request).

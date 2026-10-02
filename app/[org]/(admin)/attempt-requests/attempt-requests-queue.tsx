@@ -11,6 +11,7 @@ import {
   Users,
   Check,
   X,
+  RotateCcw,
 } from "lucide-react";
 import {
   AdminPageHeader,
@@ -43,6 +44,8 @@ export type AttemptRequestRow = {
   course_code: string | null;
   current_score: number | null;
   current_status: string | null;
+  /** Completed official attempts when the request was made (0085). */
+  attempts_used: number;
 };
 
 export type BulkCourse = { id: string; title: string; code: string | null };
@@ -304,6 +307,8 @@ function RequestCard({
         </div>
       </div>
 
+      <AttemptContext row={r} />
+
       {r.reason && (
         <p className="text-sm text-muted whitespace-pre-wrap line-clamp-4 border-l-2 border-line pl-3">
           {r.reason}
@@ -411,6 +416,46 @@ function CurrentScore({ row: r }: { row: AttemptRequestRow }) {
       {r.current_score !== null ? `${r.current_score}%` : "—"}
       {r.current_status ? ` · ${r.current_status}` : ""}
     </span>
+  );
+}
+
+function ordinal(n: number): string {
+  const v = n % 100;
+  const s = ["th", "st", "nd", "rd"];
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
+}
+
+/**
+ * The attempt context the admin needs BEFORE deciding: how many official
+ * attempts the learner has used and which attempt this request is for —
+ * e.g. "1st attempt failed → Requesting 2nd attempt". Pending rows read it
+ * live; decided rows read the value stored at request time (0085).
+ */
+function AttemptContext({ row: r }: { row: AttemptRequestRow }) {
+  const used = r.attempts_used ?? 0;
+  const next = used + 1;
+  const outcome =
+    r.current_status === "passed" ? "passed" : r.current_status === "failed" ? "failed" : "not passed";
+  return (
+    <div className="text-sm font-medium text-indigo-900 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2 flex items-center gap-2">
+      <RotateCcw className="w-4 h-4 text-indigo-600 shrink-0" />
+      <span>
+        {used < 1 ? (
+          <strong>Requesting another official attempt</strong>
+        ) : r.status === "pending" ? (
+          <>
+            {ordinal(used)} attempt {outcome} →{" "}
+            <strong>Requesting {ordinal(next)} attempt</strong>
+          </>
+        ) : (
+          <>
+            <strong>{ordinal(next)} attempt</strong>{" "}
+            {r.source === "bulk" ? "granted" : "requested"} · after {ordinal(used)} attempt
+            {used === 1 ? "" : "s"} used
+          </>
+        )}
+      </span>
+    </div>
   );
 }
 

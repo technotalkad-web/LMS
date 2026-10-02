@@ -120,11 +120,15 @@ export async function POST(request: Request) {
   // whose window is used up are eligible (limitReached); otherwise they still
   // have an official attempt free and need no grant.
   const failedUserIds: string[] = [];
+  const usedByUser = new Map<string, number>(); // 0085: completed official attempts at grant time
   for (const uid of userIds) {
     const sc = computeScoring(byUser.get(uid)!, policy, retakeByUser.get(`${uid}:${course.id}`) ?? []);
     if (!sc.officialAttempt || !sc.limitReached) continue;
     const failed = sc.officialStatus === "failed" || (passRequired && sc.officialStatus !== "passed");
-    if (failed) failedUserIds.push(uid);
+    if (failed) {
+      failedUserIds.push(uid);
+      usedByUser.set(uid, sc.scoredAttempts);
+    }
   }
   if (failedUserIds.length === 0) {
     return NextResponse.json({ ok: true, granted: 0, skipped: 0, failed_total: 0 });
@@ -148,7 +152,10 @@ export async function POST(request: Request) {
 
   const nowIso = new Date().toISOString();
   const expiresAt = expiryFromDays(body.expires_in_days);
-  const rows = grantTo.map((uid) => ({
+  // 0085: attempts_used records the learner's completed official attempts at
+  // grant time ("Nth attempt failed → granting (N+1)th"), kept for the history
+  // and reports.
+  const baseRows = grantTo.map((uid) => ({
     organization_id: org.id,
     course_id: course.id,
     user_id: uid,
@@ -158,10 +165,18 @@ export async function POST(request: Request) {
     decided_at: nowIso,
     expires_at: expiresAt,
   }));
-  const { data: insertedRows, error: insErr } = await s
+  const rows = baseRows.map((r, i) => ({ ...r, attempts_used: usedByUser.get(grantTo[i]) ?? null }));
+  let { data: insertedRows, error: insErr } = await s
     .from("attempt_requests")
     .insert(rows)
     .select("user_id");
+  // Fail-soft before 0085 lands: retry without the new column.
+  if (insErr && (insErr as { code?: string }).code === "42703") {
+    ({ data: insertedRows, error: insErr } = await s
+      .from("attempt_requests")
+      .insert(baseRows)
+      .select("user_id"));
+  }
   if (insErr) return NextResponse.json({ error: insErr.message }, { status: 400 });
   const grantedIds = ((insertedRows ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
 

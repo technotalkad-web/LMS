@@ -43,13 +43,14 @@ export default async function AttemptRequestsPage({
     expires_at: string | null;
     used_at: string | null;
     created_at: string;
+    /** 0085 — undefined before the migration. */
+    attempts_used?: number | null;
   }> = [];
   try {
+    // select("*") for deploy safety across the 0085 attempts_used column.
     const { data, error } = await svc
       .from("attempt_requests")
-      .select(
-        "id, user_id, course_id, status, source, reason, decision_note, decided_by, decided_at, expires_at, used_at, created_at"
-      )
+      .select("*")
       .eq("organization_id", org.id)
       .order("created_at", { ascending: false });
     if (!error) raw = (data ?? []) as typeof raw;
@@ -81,7 +82,7 @@ export default async function AttemptRequestsPage({
   }
 
   // Current official score/status per (learner, course) across all versions.
-  const current = new Map<string, { score: number | null; status: string | null }>();
+  const current = new Map<string, { score: number | null; status: string | null; used: number }>();
   if (courseIds.length && userIds.length) {
     const { data: verRows } = await svc
       .from("course_versions")
@@ -125,13 +126,18 @@ export default async function AttemptRequestsPage({
       current.set(key, {
         score: sc.officialScore !== null ? Math.round(sc.officialScore * 100) : null,
         status: sc.officialStatus,
+        used: sc.scoredAttempts,
       });
     }
   }
 
   const rows: AttemptRequestRow[] = raw.map((r) => {
     const key = `${r.user_id}:${r.course_id}`;
-    const cur = current.get(key) ?? { score: null, status: null };
+    const cur = current.get(key) ?? { score: null, status: null, used: 0 };
+    // Attempts used when the request was made: the stored value is the truth for
+    // the history (live scoring moves on after a grant); fall back to live for
+    // pending rows and any row written before 0085.
+    const used = typeof r.attempts_used === "number" ? r.attempts_used : cur.used;
     return {
       id: r.id,
       status: r.status,
@@ -151,6 +157,7 @@ export default async function AttemptRequestsPage({
       course_code: courseCodes.get(r.course_id) ?? null,
       current_score: cur.score,
       current_status: cur.status,
+      attempts_used: used,
     };
   });
 
