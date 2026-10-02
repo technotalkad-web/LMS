@@ -102,7 +102,7 @@ export default async function AdminLayout({
             <span>Return to Learner View</span>
           </Link>
 
-          <Link href={`/${org.slug}/users`} className="flex items-center gap-2 mb-6 px-3">
+          <Link href={`/${org.slug}/${manage ? "attention" : "reports"}`} className="flex items-center gap-2 mb-6 px-3">
             {org.logo_url && (
               /* eslint-disable-next-line @next/next/no-img-element */
               <img src={org.logo_url} alt={org.name} className="h-10 w-auto max-w-[140px] object-contain" />
@@ -112,6 +112,8 @@ export default async function AdminLayout({
 
           <ScrollTabs className="flex-1 -mx-4 md:mx-0" innerClassName="px-4 md:px-0 md:overflow-visible">
           <nav className="md:space-y-1 text-sm flex md:block gap-1">
+            {manage && <NavItem href={`/${org.slug}/attention`} label="Attention Center" />}
+
             {manage && <NavGroup label="People" />}
             {manage && <NavItem href={`/${org.slug}/users`} label="Users" />}
             {manage && <NavItem href={`/${org.slug}/teams`} label="Teams" />}
