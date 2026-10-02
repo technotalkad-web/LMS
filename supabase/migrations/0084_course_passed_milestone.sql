@@ -6,9 +6,17 @@
 -- attempt (a failed attempt is still a "completion") and later PASSES on an
 -- admin-granted retake therefore never had `assessments_passed` incremented —
 -- the retake pass went uncredited for the counter and the "assessments passed"
--- badge. (Completion XP and the score bonuses were already correct: one-time
--- per course, and the bonus fires on whichever scored attempt first reaches
--- the tier — including a granted retake.)
+-- badge. Separately, the score-bonus window (`v_scored`, from 0073) was NOT
+-- grant-aware, so a granted retake that first reached the high/perfect tier
+-- earned no bonus either.
+--
+-- This migration does two things, both one-time per course:
+--   1. records the first genuine PASS (counter + badge) regardless of which
+--      official attempt it lands on; and
+--   2. widens the score-bonus window by the learner's consumed grants, so a
+--      granted retake that first reaches the tier earns the bonus ONCE (the
+--      per-course bonus dedupe keys mean it is never paid twice).
+-- Completion XP stays strictly one-time per course.
 --
 -- Fix: a once-per-course PASS marker (dedupe `passed:<user>:<course>`), a 0-XP
 -- bookkeeping event in the ledger, inserted whenever a completed attempt is a
@@ -75,6 +83,7 @@ declare
   v_pol record;
   v_attempt_no integer;
   v_scored boolean := false;
+  v_extra_grants integer := 0;
 begin
   select ca.id, ca.organization_id, ca.user_id, ca.score,
          ca.completion_status, ca.success_status, ca.started_at, ca.completed_at,
@@ -147,6 +156,12 @@ begin
 
   -- 0073: is this one of the learner's first N completed attempts for the
   -- course? Same ordering as v_course_attempt_scoring.
+  -- 0084: the window is widened by the learner's CONSUMED admin grants for the
+  -- course (approved attempt_requests with a used retake), mirroring the TS
+  -- scoring engine — so a granted official retake counts as a scored attempt
+  -- and can earn the high/perfect bonus. The bonus dedupe keys stay per-course,
+  -- so the bonus is still paid at most once for the course. Fail-soft before
+  -- 0083 (no attempt_requests table) via the undefined_table guard.
   if v_completed then
     select * into v_pol from public.effective_attempt_policy(v_att.course_id);
     select count(*) into v_attempt_no
@@ -157,7 +172,18 @@ begin
        and (ca2.completion_status = 'completed' or ca2.success_status = 'passed')
        and (coalesce(ca2.completed_at, ca2.started_at), ca2.started_at, ca2.id)
            <= (coalesce(v_att.completed_at, v_att.started_at), v_att.started_at, v_att.id);
-    v_scored := coalesce(v_attempt_no, 1) <= coalesce(v_pol.max_scored_attempts, 3);
+    begin
+      select count(*) into v_extra_grants
+        from public.attempt_requests ar
+       where ar.user_id = v_att.user_id
+         and ar.course_id = v_att.course_id
+         and ar.status = 'approved'
+         and ar.used_attempt_id is not null;
+    exception when undefined_table then
+      v_extra_grants := 0;
+    end;
+    v_scored := coalesce(v_attempt_no, 1)
+                <= coalesce(v_pol.max_scored_attempts, 3) + coalesce(v_extra_grants, 0);
   end if;
 
   -- Candidate 1: daily activity.

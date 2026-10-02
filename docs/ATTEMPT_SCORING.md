@@ -56,10 +56,12 @@ live pages.
   **perfect-score / high-score bonuses fire only on scored attempts**, so a
   memorised perfect score on attempt 7 earns nothing. Each of completion XP and
   the score bonuses is awarded **once per course** (keyed to the course, not the
-  attempt). The learner's **first genuine pass** is likewise recorded once per
-  course (the `course_passed` milestone, migration 0084) — so if the pass only
-  happens on an admin-granted retake, the pass counter and "assessments passed"
-  badge still credit it, while completion XP and bonuses are never paid twice.
+  attempt). An **admin-granted retake counts as a scored attempt** (0084), so a
+  retake that first reaches the high/perfect tier earns that bonus once — never
+  twice for the same course. The learner's **first genuine pass** is likewise
+  recorded once per course (the `course_passed` milestone, 0084), so a pass that
+  only happens on a granted retake still credits the pass counter and the
+  "assessments passed" badge. Completion XP is never paid twice.
 - **Completion** is never affected: a module completed on attempt 5 is still
   completed; it simply keeps whatever official score the scored attempts
   produced.
