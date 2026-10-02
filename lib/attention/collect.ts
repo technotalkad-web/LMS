@@ -138,94 +138,24 @@ async function failedEmailItems(svc: AnyClient, orgId: string, orgSlug: string, 
   }];
 }
 
-async function countOverdue(svc: AnyClient, orgId: string): Promise<{ count: number; latestDue: string | null }> {
-  const nowIso = new Date().toISOString();
-  const { data: caRows } = await svc
-    .from("course_assignments")
-    .select("course_id, assignee_type, user_id, team_id, due_at")
-    .eq("organization_id", orgId)
-    .not("due_at", "is", null)
-    .lt("due_at", nowIso)
-    .limit(5000);
-  const assigns = (caRows ?? []) as Array<{ course_id: string; assignee_type: string; user_id: string | null; team_id: string | null; due_at: string }>;
-  if (!assigns.length) return { count: 0, latestDue: null };
-
-  const { data: memRows } = await svc.from("organization_members").select("user_id").eq("organization_id", orgId).eq("status", "active");
-  const activeUsers = new Set<string>(((memRows ?? []) as Array<{ user_id: string }>).map((m) => m.user_id));
-  const teamIds = [...new Set(assigns.filter((a) => a.assignee_type === "team" && a.team_id).map((a) => a.team_id as string))];
-  const teamUsers = new Map<string, string[]>();
-  if (teamIds.length) {
-    const { data: tm } = await svc.from("team_members").select("team_id, user_id").in("team_id", teamIds);
-    for (const r of (tm ?? []) as Array<{ team_id: string; user_id: string }>) teamUsers.set(r.team_id, [...(teamUsers.get(r.team_id) ?? []), r.user_id]);
-  }
-
-  const dueByUC = new Map<string, string>(); // `${uid}:${cid}` → earliest past-due
-  const courseIds = new Set<string>();
-  const add = (uid: string, cid: string, due: string) => {
-    if (!activeUsers.has(uid)) return;
-    courseIds.add(cid);
-    const k = `${uid}:${cid}`;
-    const prev = dueByUC.get(k);
-    if (!prev || due < prev) dueByUC.set(k, due);
-  };
-  for (const a of assigns) {
-    if (a.assignee_type === "user" && a.user_id) add(a.user_id, a.course_id, a.due_at);
-    else if (a.assignee_type === "org") for (const uid of activeUsers) add(uid, a.course_id, a.due_at);
-    else if (a.assignee_type === "team" && a.team_id) for (const uid of teamUsers.get(a.team_id) ?? []) add(uid, a.course_id, a.due_at);
-    // group assignments (0069) are approximated out of this aggregate for v1.
-  }
-  if (!dueByUC.size) return { count: 0, latestDue: null };
-
-  const cids = [...courseIds];
-  const verToCourse = new Map<string, string>();
-  for (let i = 0; i < cids.length; i += 200) {
-    const { data: vrows } = await svc.from("course_versions").select("id, course_id").in("course_id", cids.slice(i, i + 200));
-    for (const v of (vrows ?? []) as Array<{ id: string; course_id: string }>) verToCourse.set(v.id, v.course_id);
-  }
-  const verIds = [...verToCourse.keys()];
-  const candidateUsers = [...new Set([...dueByUC.keys()].map((k) => k.split(":")[0]))];
-  const completed = new Set<string>();
-  if (verIds.length && candidateUsers.length) {
-    for (let u = 0; u < candidateUsers.length; u += 300) {
-      const uslice = candidateUsers.slice(u, u + 300);
-      for (let v = 0; v < verIds.length; v += 150) {
-        const vslice = verIds.slice(v, v + 150);
-        const { data: arows } = await svc
-          .from("course_attempts")
-          .select("user_id, course_version_id")
-          .in("course_version_id", vslice)
-          .in("user_id", uslice)
-          .or("completion_status.eq.completed,success_status.eq.passed")
-          .limit(10000);
-        for (const a of (arows ?? []) as Array<{ user_id: string; course_version_id: string }>) {
-          const cid = verToCourse.get(a.course_version_id);
-          if (cid) completed.add(`${a.user_id}:${cid}`);
-        }
-      }
-    }
-  }
-
-  let count = 0;
-  let latestDue: string | null = null;
-  for (const [k, due] of dueByUC) {
-    if (completed.has(k)) continue;
-    count++;
-    if (!latestDue || due > latestDue) latestDue = due;
-  }
-  return { count, latestDue };
-}
-
 async function overdueItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
-  const { count, latestDue } = await countOverdue(svc, orgId);
+  // Set-based count in Postgres (migration 0087) — correct (no truncation) and
+  // fast (one indexed query, never blocks the landing). Fail-soft pre-0087.
+  const { data, error } = await svc.rpc("attention_overdue_count", { p_org: orgId });
+  if (error) return [];
+  const row = Array.isArray(data) ? data[0] : data;
+  const count = Number(row?.overdue_count ?? 0);
   if (!count) return [];
   return [{
-    key: "overdue:all",
+    // Count in the key so the alert re-surfaces when the overdue population
+    // changes after being marked read (a frozen due-date timestamp would not).
+    key: `overdue:all:${count}`,
     type: "overdue",
     priority,
     title: `${count} learner${count === 1 ? "" : "s"} overdue on assigned courses`,
     who: null,
     context: "Past the due date, not completed",
-    occurredAt: latestDue ?? new Date().toISOString(),
+    occurredAt: row?.latest_due ?? new Date().toISOString(),
     actionLabel: "Review at-risk learners",
     href: `/${orgSlug}/reports#at-risk`,
     inline: null,
@@ -247,14 +177,25 @@ export async function collectAttention(args: {
   const empty = { items: [], byPriority: { critical: 0, high: 0, normal: 0, low: 0 }, total: 0 };
   if (!masterEnabled) return empty;
 
+  // No single provider may hang the admin landing: cap each at a few seconds,
+  // after which it contributes nothing this render (defense-in-depth on top of
+  // each provider's own .catch).
+  const withTimeout = (p: Promise<AttentionItem[]>, ms: number): Promise<AttentionItem[]> => {
+    let t: ReturnType<typeof setTimeout>;
+    const timer = new Promise<AttentionItem[]>((res) => { t = setTimeout(() => res([]), ms); });
+    return Promise.race([p.finally(() => clearTimeout(t)), timer]);
+  };
+  const PROVIDER_TIMEOUT_MS = 8000;
+  const run = (p: AttentionItem[] | Promise<AttentionItem[]>) => withTimeout(Promise.resolve(p).catch(() => []), PROVIDER_TIMEOUT_MS);
+
   const jobs: Promise<AttentionItem[]>[] = [];
   for (const p of ATTENTION_PROVIDERS) {
     const c = byType[p.type];
     if (!c?.enabled) continue;
-    if (p.type === "attempt-request") jobs.push(attemptRequestItems(svc, orgId, orgSlug, c.priority).catch(() => []));
-    else if (p.type === "ticket") jobs.push(ticketItems(svc, orgId, orgSlug).catch(() => []));
-    else if (p.type === "failed-email") jobs.push(failedEmailItems(svc, orgId, orgSlug, c.priority).catch(() => []));
-    else if (p.type === "overdue") jobs.push(overdueItems(svc, orgId, orgSlug, c.priority).catch(() => []));
+    if (p.type === "attempt-request") jobs.push(run(attemptRequestItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "ticket") jobs.push(run(ticketItems(svc, orgId, orgSlug)));
+    else if (p.type === "failed-email") jobs.push(run(failedEmailItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "overdue") jobs.push(run(overdueItems(svc, orgId, orgSlug, c.priority)));
   }
   let items = (await Promise.all(jobs)).flat();
 

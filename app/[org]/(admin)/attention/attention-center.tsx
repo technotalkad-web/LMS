@@ -149,7 +149,24 @@ export function AttentionCenter({
         </div>
       )}
 
-      {total === 0 ? (
+      {!masterEnabled ? (
+        <Card className="p-0">
+          <EmptyState
+            icon={<Settings2 className="w-5 h-5" />}
+            title="Attention Center is turned off"
+            description="It's not showing anything because it's disabled for this organisation. Open Configure to turn it back on."
+            action={
+              <button
+                type="button"
+                onClick={() => setShowConfig(true)}
+                className="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 border border-line rounded-lg hover:border-ink"
+              >
+                <Settings2 className="w-4 h-4" /> Configure
+              </button>
+            }
+          />
+        </Card>
+      ) : total === 0 ? (
         <Card className="p-0">
           <EmptyState
             icon={<Bell className="w-5 h-5" />}
@@ -302,18 +319,23 @@ function ConfigPanel({
   async function save() {
     setSaving(true);
     setErr(null);
-    const res = await fetch(`/api/attention/settings?orgSlug=${encodeURIComponent(orgSlug)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ enabled: master, config: state }),
-    });
-    setSaving(false);
-    if (!res.ok) {
-      const j = (await res.json().catch(() => ({}))) as { error?: string };
-      setErr(j.error ?? `HTTP ${res.status}`);
-      return;
+    try {
+      const res = await fetch(`/api/attention/settings?orgSlug=${encodeURIComponent(orgSlug)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: master, config: state }),
+      });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => ({}))) as { error?: string };
+        setErr(j.error ?? `HTTP ${res.status}`);
+        return;
+      }
+      onSaved();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't save — check your connection and try again");
+    } finally {
+      setSaving(false);
     }
-    onSaved();
   }
 
   return (

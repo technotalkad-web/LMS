@@ -108,9 +108,20 @@ export type AttentionTypeConfig = { enabled: boolean; priority: AttentionPriorit
  */
 export function effectiveConfig(raw: {
   enabled?: boolean | null;
-  config?: Record<string, { enabled?: boolean; priority?: string }> | null;
+  config?: Record<string, { enabled?: boolean; priority?: string }> | string | null;
 } | null): { masterEnabled: boolean; byType: Record<string, AttentionTypeConfig> } {
-  const cfg = (raw?.config ?? {}) as Record<string, { enabled?: boolean; priority?: string }>;
+  // `config` is a jsonb column. Most clients return it already parsed, but some
+  // runtimes hand it back as a JSON string — tolerate both so per-type config
+  // is honoured either way.
+  let parsed: unknown = raw?.config ?? {};
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      parsed = {};
+    }
+  }
+  const cfg = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, { enabled?: boolean; priority?: string }>;
   const byType: Record<string, AttentionTypeConfig> = {};
   for (const p of ATTENTION_PROVIDERS) {
     const o = cfg[p.type] ?? {};
