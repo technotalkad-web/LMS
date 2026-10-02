@@ -54,7 +54,12 @@ live pages.
 - **Gyanank / XP** — completion XP and daily-activity XP are unchanged
   (completion stays sticky; revising still counts as activity). The
   **perfect-score / high-score bonuses fire only on scored attempts**, so a
-  memorised perfect score on attempt 7 earns nothing.
+  memorised perfect score on attempt 7 earns nothing. Each of completion XP and
+  the score bonuses is awarded **once per course** (keyed to the course, not the
+  attempt). The learner's **first genuine pass** is likewise recorded once per
+  course (the `course_passed` milestone, migration 0084) — so if the pass only
+  happens on an admin-granted retake, the pass counter and "assessments passed"
+  badge still credit it, while completion XP and bonuses are never paid twice.
 - **Completion** is never affected: a module completed on attempt 5 is still
   completed; it simply keeps whatever official score the scored attempts
   produced.
