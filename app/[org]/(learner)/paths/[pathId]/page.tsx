@@ -15,8 +15,9 @@ import { createClient } from "@/lib/supabase/server";
 import { isReleased } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
-import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, officialDone } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
 
 type PathRow = {
   id: string;
@@ -212,21 +213,9 @@ export default async function LearningPathDetailPage({
   };
   const allAttempts = (attemptRows ?? []) as Attempt[];
   const attempts = allAttempts.filter((a) => a.learning_path_id === pathId);
-  const completedCourseIds = new Set<string>();
-  const inProgressCourseIds = new Set<string>();
-  for (const a of attempts) {
-    const v = versionById.get(a.course_version_id);
-    if (!v) continue;
-    if (
-      a.completion_status === "completed" ||
-      a.success_status === "passed"
-    ) {
-      completedCourseIds.add(v.course_id);
-    } else if (a.completion_status === "in_progress") {
-      inProgressCourseIds.add(v.course_id);
-    }
-  }
-  // Official score per module under its attempt scoring rule (0073).
+  // Official score per module under its attempt scoring rule (0073), and
+  // which attempts sit inside the scoring window (0081: only OFFICIAL
+  // attempts can complete a step; revision runs never do).
   const attemptsByCourse = new Map<string, Attempt[]>();
   for (const a of allAttempts) {
     const v = versionById.get(a.course_version_id);
@@ -237,10 +226,33 @@ export default async function LearningPathDetailPage({
     ]);
   }
   const policies = await resolvePolicies(supabase, [...attemptsByCourse.keys()]);
+  const passRequired = await fetchPassRequired(supabase, steps.map((s) => s.course_id));
+  // Official SCORE per course uses ALL the learner's attempts (matches the
+  // course page and CRM feeds).
   const scoreByCourse = new Map<string, number>();
   for (const [cid, list] of attemptsByCourse) {
-    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY).officialScore;
-    if (s !== null) scoreByCourse.set(cid, s);
+    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY);
+    if (s.officialScore !== null) scoreByCourse.set(cid, s.officialScore);
+  }
+  // Step COMPLETION (0081): the course's OFFICIAL attempt must satisfy
+  // officialDone, and (L2) it must be a PATH-context attempt. Judged over the
+  // path-scoped attempts only, via officialDone — never "any attempt in the
+  // window", which diverged from the CRM feeds for a legacy window >= 2.
+  const pathAttemptsByCourse = new Map<string, Attempt[]>();
+  for (const a of attempts) {
+    const v = versionById.get(a.course_version_id);
+    if (!v) continue;
+    pathAttemptsByCourse.set(v.course_id, [...(pathAttemptsByCourse.get(v.course_id) ?? []), a]);
+  }
+  const completedCourseIds = new Set<string>();
+  const inProgressCourseIds = new Set<string>();
+  for (const [cid, list] of pathAttemptsByCourse) {
+    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY);
+    if (officialDone(s, passRequired.has(cid))) {
+      completedCourseIds.add(cid);
+    } else if (list.some((a) => a.completion_status === "in_progress")) {
+      inProgressCourseIds.add(cid);
+    }
   }
 
   // 6) Compute per-step state (completed | current | locked | unreleased).

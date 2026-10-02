@@ -51,6 +51,10 @@ export type GridCard = {
   practiceMode?: boolean;
   /** Window used up and the rule blocks further launches. */
   blocked?: boolean;
+  /** Revision (practice) runs so far — informational, never change the official result. */
+  practiceCount?: number;
+  practiceBest?: number | null;
+  practicePassed?: boolean;
   thumbnail_url?: string | null;
   thumbnail_fit?: string | null;
   thumbnail_pos_x?: number | null;
@@ -404,19 +408,28 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
   const retryLabel = card.blocked
     ? "No attempts left"
     : retryOpen
-      ? "Resume"
+      ? card.practiceMode
+        ? "Resume revision"
+        : "Resume"
       : card.practiceMode
-        ? "Practice again"
+        ? "Revise (practice)"
         : "Try again";
   const attemptsLeftLine = card.blocked
-    ? "All scored attempts used · ask your admin for another"
+    ? "Official attempt used · ask your admin for another"
     : retryOpen
-      ? `Retry in progress · ${card.progressPct}% complete`
+      ? `${card.practiceMode ? "Revision" : "Retry"} in progress · ${card.progressPct}% complete`
       : card.practiceMode
-        ? "All scored attempts used · practice only"
+        ? "Official attempt used · revision only, never changes your score"
         : typeof card.scoredLeft === "number"
-          ? `${card.scoredLeft} scored attempt${card.scoredLeft === 1 ? "" : "s"} left`
+          ? `${card.scoredLeft} official attempt${card.scoredLeft === 1 ? "" : "s"} left`
           : null;
+  // Revision runs are shown for information only; the official result above never moves.
+  const revisionLine =
+    (card.practiceCount ?? 0) > 0
+      ? `Revision: ${card.practicePassed ? "passed" : "not passed yet"}` +
+        (typeof card.practiceBest === "number" ? ` · best ${Math.round(card.practiceBest * 100)}%` : "") +
+        ` · ${card.practiceCount} run${card.practiceCount === 1 ? "" : "s"}`
+      : null;
   // Unreleased content can't be overdue — the learner couldn't have started it.
   const overdue =
     !isCompleted &&
@@ -521,6 +534,7 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               <div className="flex items-center gap-1.5 text-emerald-700 font-semibold">
                 <Award className="w-4 h-4" />
                 {card.status === "passed" ? "Passed" : "Completed"}
+                <span className="font-normal text-emerald-700/70 text-xs">· official</span>
               </div>
               {card.bestScore !== null && (
                 <span className="font-bold text-emerald-800">
@@ -533,7 +547,8 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               <div className="flex items-center justify-between bg-red-50 px-3 py-2 rounded-lg border border-red-100 text-sm">
                 <div className="flex items-center gap-1.5 text-red-700 font-semibold">
                   <RotateCcw className="w-4 h-4" />
-                  Completed · not passed
+                  Completed · Failed
+                  <span className="font-normal text-red-700/70 text-xs">· official</span>
                 </div>
                 {card.bestScore !== null && (
                   <span className="font-bold text-red-800">
@@ -543,6 +558,9 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               </div>
               {attemptsLeftLine && (
                 <div className="text-[11px] text-muted mt-1.5 font-medium">{attemptsLeftLine}</div>
+              )}
+              {revisionLine && (
+                <div className="text-[11px] text-muted mt-1 font-medium" data-testid="revision-line">{revisionLine}</div>
               )}
             </div>
           ) : (

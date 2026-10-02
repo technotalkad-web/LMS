@@ -35,8 +35,9 @@ import {
   pickActiveBackground,
   type DashboardBackground as DashboardBackgroundRow,
 } from "@/lib/theme/dashboard-background";
-import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, courseStatus, officialDone } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
 
 type Course = {
   id: string;
@@ -529,24 +530,44 @@ export default async function DashboardPage({
     ...new Set(versions.map((v) => v.course_id)),
   ]);
 
-  // 8) Completed course set (GLOBAL — any completion; used for standalone
-  // course tiles + deadlines).
+  // 8) Completed course set (GLOBAL; used for standalone course tiles +
+  // deadlines). 0081 revision rule: only OFFICIAL attempts (inside the
+  // scoring window) complete anything; revision runs never do. A failed
+  // official attempt still counts as learning completed unless the module
+  // is "pass required".
+  const passRequired = await fetchPassRequired(supabase, [...new Set(versions.map((v) => v.course_id))]);
+  // Completion follows the OFFICIAL attempt (officialDone), exactly as the CRM
+  // feeds do — NOT "any attempt in the window", which diverged for a legacy
+  // window >= 2 where the official (first) attempt failed but a later scored
+  // attempt passed. The official attempt is the one officialDone judges.
   const completedCourseIds = new Set<string>();
+  const officialAttemptByCourse = new Map<string, string>(); // course_id → official attempt id
+  {
+    const byCourse = new Map<string, typeof attempts>();
+    for (const a of attempts) {
+      const v = versionById.get(a.course_version_id);
+      if (!v) continue;
+      byCourse.set(v.course_id, [...(byCourse.get(v.course_id) ?? []), a]);
+    }
+    for (const [cid, list] of byCourse) {
+      const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY);
+      if (s.officialAttempt) officialAttemptByCourse.set(cid, s.officialAttempt.id);
+      if (officialDone(s, passRequired.has(cid))) completedCourseIds.add(cid);
+    }
+  }
   // Path step progress counts ONLY path-context attempts (learning_path_id),
   // per product decision L2 — a standalone completion doesn't advance a path.
+  // The step is done when the course's OFFICIAL attempt both satisfies
+  // officialDone AND was launched inside that path.
   const pathDoneByPath = new Map<string, Set<string>>();
   for (const a of attempts) {
     const v = versionById.get(a.course_version_id);
-    if (!v) continue;
-    const done =
-      a.completion_status === "completed" || a.success_status === "passed";
-    if (!done) continue;
-    completedCourseIds.add(v.course_id);
-    if (a.learning_path_id) {
-      const set = pathDoneByPath.get(a.learning_path_id) ?? new Set<string>();
-      set.add(v.course_id);
-      pathDoneByPath.set(a.learning_path_id, set);
-    }
+    if (!v || !a.learning_path_id) continue;
+    if (!completedCourseIds.has(v.course_id)) continue;
+    if (officialAttemptByCourse.get(v.course_id) !== a.id) continue;
+    const set = pathDoneByPath.get(a.learning_path_id) ?? new Set<string>();
+    set.add(v.course_id);
+    pathDoneByPath.set(a.learning_path_id, set);
   }
 
   // 8.2) Gamification: own stats in one RPC round trip (fail-soft — the
@@ -703,20 +724,11 @@ export default async function DashboardPage({
       return v?.course_id === courseId;
     });
     if (courseAttempts.length === 0) return "not_started";
-    // Sticky completion: once a learner has ever passed or completed a course
-    // it stays in the Completed bucket forever. Relaunching opens a fresh
-    // in-progress attempt, which must NOT drag the card back to "in progress".
-    // Derive from the best terminal outcome across ALL attempts (mirrors the
-    // `completedCourseIds` logic). Priority: passed > completed > failed.
-    if (courseAttempts.some((a) => a.success_status === "passed")) return "passed";
-    if (
-      courseAttempts.some(
-        (a) => a.completion_status === "completed" && a.success_status !== "failed"
-      )
-    )
-      return "completed";
-    if (courseAttempts.some((a) => a.success_status === "failed")) return "failed";
-    return "in_progress";
+    // 0081 revision rule: the card follows the OFFICIAL attempt only. Sticky:
+    // once the official attempt is complete the card never drags back to
+    // "in progress" when a revision run opens, and a revision pass never
+    // turns a failed module green.
+    return courseStatus(scoringForCourse(courseId).scoring, courseAttempts);
   }
 
   // Official score under the course's scoring rule (0073). The card prop is
@@ -758,7 +770,14 @@ export default async function DashboardPage({
 
   function attemptsLeftProps(courseId: string) {
     const s = scoringForCourse(courseId);
-    return { scoredLeft: s.scoredLeft, practiceMode: s.practiceMode, blocked: s.blocked };
+    return {
+      scoredLeft: s.scoredLeft,
+      practiceMode: s.practiceMode,
+      blocked: s.blocked,
+      practiceCount: s.scoring.practiceAttempts,
+      practiceBest: s.scoring.practiceBestScore,
+      practicePassed: s.scoring.practicePassed,
+    };
   }
 
   function pushCard(a: Assignment, source: "user" | "team" | "org") {

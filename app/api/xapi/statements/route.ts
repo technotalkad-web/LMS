@@ -7,6 +7,8 @@ import {
 } from "@/lib/xapi/auth";
 import { processStatement } from "@/lib/xapi/process-statement";
 import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
+import { classifyAttempt } from "@/lib/scoring/attempt-kind";
+import { fireCompletionWebhookForAttempt } from "@/lib/integrations/webhook";
 import type { XapiStatement } from "@/lib/xapi/types";
 
 /**
@@ -32,6 +34,20 @@ export async function POST(request: Request) {
 
   const svc = serviceClient();
   const ids: string[] = [];
+
+  // 0081: remember whether the attempt was already complete, so a completion
+  // in this batch is reported exactly once (webhook) and only for OFFICIAL
+  // attempts (journey day, XP). Fail-soft: errors here never block statements.
+  const attemptStatus = async () => {
+    const { data } = await svc
+      .from("course_attempts")
+      .select("completion_status, success_status")
+      .eq("id", session.attemptId)
+      .maybeSingle();
+    const a = data as { completion_status?: string | null; success_status?: string | null } | null;
+    return a?.completion_status === "completed" || a?.success_status === "passed";
+  };
+  const wasComplete = await attemptStatus().catch(() => false);
 
   for (const raw of statements) {
     const statement: XapiStatement = { ...raw };
@@ -64,19 +80,40 @@ export async function POST(request: Request) {
     ids.push(statement.id);
   }
 
+  // 0081 revision rule: once complete, only an OFFICIAL attempt (inside the
+  // scoring window) moves journey days, XP and the CRM webhook; a revision
+  // run changes nothing but its own row.
+  const nowComplete = await attemptStatus().catch(() => false);
+  let kind: Awaited<ReturnType<typeof classifyAttempt>> = null;
+  if (nowComplete) {
+    try {
+      kind = await classifyAttempt(svc, session.attemptId);
+    } catch (e) {
+      console.warn("[xapi/statements] attempt classification failed (treated as official):", e);
+    }
+  }
+  const officialRun = !nowComplete || !kind || kind.official;
+
   // Gamification engine: one fail-isolated RPC per request (idempotent —
   // dedupe keys make replays award-neutral). cmi5 parity with the SCORM
   // commit hook; a failure here never affects the learner's statements.
-  try {
-    await svc.rpc("gamification_record_activity", {
-      p_attempt_id: session.attemptId,
-    });
-    // Yoddha journey (0058): credits the tagged day; no-ops otherwise.
-    await svc.rpc("journey_record_completion", {
-      p_attempt_id: session.attemptId,
-    });
-  } catch (e) {
-    console.warn("[xapi/statements] gamification failed:", e);
+  if (officialRun) {
+    try {
+      await svc.rpc("gamification_record_activity", {
+        p_attempt_id: session.attemptId,
+      });
+      // Yoddha journey (0058): credits the tagged day; no-ops otherwise.
+      await svc.rpc("journey_record_completion", {
+        p_attempt_id: session.attemptId,
+      });
+    } catch (e) {
+      console.warn("[xapi/statements] gamification failed:", e);
+    }
+  }
+  // CRM completion webhook: first transition to complete, official attempts only
+  // (cmi5 / xAPI parity with the SCORM commit path).
+  if (nowComplete && !wasComplete && officialRun) {
+    await fireCompletionWebhookForAttempt(session.attemptId, kind?.attemptNumber ?? null);
   }
 
   // Fan-out: mirror these statements to the org's external LRS if configured.

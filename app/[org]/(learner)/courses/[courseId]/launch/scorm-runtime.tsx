@@ -25,6 +25,7 @@ export function ScormRuntime({
   backHref,
   backLabel = "Exit course",
   preloadUrls = [],
+  practice = false,
 }: {
   attemptId: string;
   initialCmi: CmiData;
@@ -35,6 +36,8 @@ export function ScormRuntime({
   backLabel?: string;
   /** Next module's content file(s) to warm in the background once this one is up. */
   preloadUrls?: string[];
+  /** Revision run: the official attempt is used; this launch never changes score or pass/fail. */
+  practice?: boolean;
 }) {
   const cmiRef = useRef<CmiData>({ ...initialCmi });
   const initializedRef = useRef(false);
@@ -44,24 +47,35 @@ export function ScormRuntime({
     "idle"
   );
   const [lastError, setLastError] = useState("0");
+  // Serialize commits: packages often call LMSCommit then LMSFinish back to
+  // back (both fire-and-forget). Overlapping requests would each read the
+  // attempt as "not yet complete" and could double-fire the completion
+  // webhook / email. Chaining makes the second commit start only after the
+  // first has fully landed, so the server sees the real transition once.
+  const commitChain = useRef<Promise<boolean>>(Promise.resolve(true));
 
-  async function commit(finished: boolean): Promise<boolean> {
-    setStatus("syncing");
-    try {
-      const res = await fetch(`/api/scorm/${attemptId}/commit`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cmi: cmiRef.current, finished }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setStatus("saved");
-      window.setTimeout(() => setStatus("idle"), 1500);
-      return true;
-    } catch (err) {
-      console.error("[scorm] commit failed:", err);
-      setStatus("error");
-      return false;
-    }
+  function commit(finished: boolean): Promise<boolean> {
+    const run = commitChain.current.then(async () => {
+      setStatus("syncing");
+      try {
+        const res = await fetch(`/api/scorm/${attemptId}/commit`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cmi: cmiRef.current, finished }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setStatus("saved");
+        window.setTimeout(() => setStatus("idle"), 1500);
+        return true;
+      } catch (err) {
+        console.error("[scorm] commit failed:", err);
+        setStatus("error");
+        return false;
+      }
+    });
+    // Keep the chain alive even if one commit rejects.
+    commitChain.current = run.catch(() => false);
+    return run;
   }
 
   useEffect(() => {
@@ -147,6 +161,15 @@ export function ScormRuntime({
             <span className="sm:hidden">Exit</span>
           </Link>
           <span className="serif text-lg sm:text-xl truncate">{courseTitle}</span>
+          {practice && (
+            <span
+              className="shrink-0 px-2 py-0.5 rounded-full border border-amber-300/60 bg-amber-400/15 text-amber-200 text-[11px] font-semibold uppercase tracking-wide"
+              title="Revision (practice): your official score and pass/fail do not change"
+              data-testid="practice-badge"
+            >
+              Revision · practice
+            </span>
+          )}
         </div>
         <SyncBadge status={status} />
       </header>

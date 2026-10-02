@@ -13,6 +13,8 @@ import {
   type ScorableAttempt,
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { courseStatus, officialDone } from "@/lib/scoring/policy";
+import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
 import { fetchReferenceCodes, journeyVersionCode } from "@/lib/reference-codes";
 
 /**
@@ -53,7 +55,8 @@ export type CourseProgress = {
   /** Human-readable reference code, MOD0015 (null before migration 0079). */
   code: string | null;
   title: string;
-  status: "not_started" | "in_progress" | "completed" | "passed";
+  /** From the OFFICIAL attempt only (0081): "failed" = completed, not passed; revision runs never change it. */
+  status: "not_started" | "in_progress" | "completed" | "passed" | "failed";
   score: number | null;
   official_score: number | null;
   first_score: number | null;
@@ -539,6 +542,7 @@ export async function buildProgress(
   const policies = await resolvePolicies(svc, [...courseTitle.keys()]);
   // Human-readable codes (0079), fail-soft before the migration.
   const courseCodes = await fetchReferenceCodes(svc, "courses", [...courseTitle.keys()]);
+  const passRequired = await fetchPassRequired(svc, [...courseTitle.keys()]);
   const pathCodes = await fetchReferenceCodes(svc, "learning_paths", [...pathName.keys()]);
   const journeyCodes = await fetchReferenceCodes(svc, "journey_programs", [...new Set(enrollments.map((e) => e.program_id))]);
 
@@ -602,16 +606,21 @@ export async function buildProgress(
     // without an assignment stays out so the two endpoints agree.
     const courseIds = [...dueByCourse.keys()].filter((c) => courseTitle.has(c));
     const courses: CourseProgress[] = [];
+    // 0081: step completion per module, from the OFFICIAL attempt only.
+    const stepDone = new Map<string, { done: boolean; at: string | null }>();
     for (const cid of courseIds) {
       const st = byCourse.get(cid) ?? { status: "not_started" as const, n: 0, list: [], progress: null, progressAt: "", first: null, last: null, done: null };
       const sc = computeScoring(st.list, policies.get(cid) ?? DEFAULT_POLICY);
       const due = dueByCourse.get(cid) ?? null;
-      const done = st.status === "completed" || st.status === "passed";
+      // Status and "done" follow the OFFICIAL attempt (revision runs never change them).
+      const status = courseStatus(sc, st.list);
+      const done = sc.officialAttempt !== null;
+      stepDone.set(cid, { done: officialDone(sc, passRequired.has(cid)), at: sc.officialAttempt?.completed_at ?? null });
       const row: CourseProgress = {
         course_id: cid,
         code: courseCodes.get(cid) ?? null,
         title: courseTitle.get(cid) as string,
-        status: st.status,
+        status,
         score: pct(sc.officialScore),
         official_score: pct(sc.officialScore),
         first_score: pct(sc.firstScore),
@@ -638,7 +647,7 @@ export async function buildProgress(
 
     const doneSet = new Set<string>();
     const doneAt = new Map<string, string | null>();
-    for (const [cid, r] of byCourse) if (r.status === "completed" || r.status === "passed") { doneSet.add(cid); doneAt.set(cid, r.done); }
+    for (const [cid, d] of stepDone) if (d.done) { doneSet.add(cid); doneAt.set(cid, d.at); }
     const learning_paths: PathProgress[] = [];
     for (const [pid, due] of myPathDue) {
       const steps = coursesOfPath.get(pid) ?? [];
@@ -745,7 +754,10 @@ export async function buildProgress(
       journeys,
       summary: {
         assigned: courses.length,
-        completed: courses.filter((c) => c.status === "completed" || c.status === "passed").length,
+        // "completed" = the learner FINISHED the module's official attempt,
+        // pass or fail (0081: a failed official attempt is learning completed).
+        // Matches progress_pct=100 / overdue=false on those same rows.
+        completed: courses.filter((c) => c.status === "completed" || c.status === "passed" || c.status === "failed").length,
         overdue: courses.filter((c) => c.overdue).length,
       },
     });

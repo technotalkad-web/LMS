@@ -5,7 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "./learners-filters";
-import { computeScoring } from "@/lib/scoring/policy";
+import { computeScoring, courseStatus } from "@/lib/scoring/policy";
 import { courseProgress, formatCourseProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 
@@ -66,6 +66,8 @@ interface EnrichedLearner {
   status: Status;
   bestScore: number | null;
   attempts: number;
+  /** Revision (practice) runs beyond the scoring window — informational. */
+  revisions: number;
   lastTouched: string | null;
   /** 0075 progress % + screens. */
   progress: CourseProgressView;
@@ -274,16 +276,13 @@ export default async function LearnersPage({
     const latest = myAttempts
       .slice()
       .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
-    let status: Status = "not_started";
-    if (latest) {
-      if (latest.success_status === "passed") status = "passed";
-      else if (latest.success_status === "failed") status = "failed";
-      else if (latest.completion_status === "completed") status = "completed";
-      else status = "in_progress";
-    }
-    // "bestScore" = the OFFICIAL score under the course's attempt rules
-    // (0073) — practice attempts beyond the scoring window never count.
-    const bestScore = computeScoring(myAttempts, scoringPolicy).officialScore;
+    // 0081 revision rule: status and score follow the OFFICIAL attempt (inside
+    // the scoring window). A revision run neither changes the verdict nor the
+    // score; it is counted separately so admins can see the learner revised.
+    const scoring = computeScoring(myAttempts, scoringPolicy);
+    const status: Status = latest ? courseStatus(scoring, myAttempts) : "not_started";
+    const bestScore = scoring.officialScore;
+    const revisions = scoring.practiceAttempts;
     const lastTouched =
       myAttempts
         .map((a) => a.completed_at ?? a.started_at)
@@ -301,6 +300,7 @@ export default async function LearnersPage({
       status,
       bestScore,
       attempts: myAttempts.length,
+      revisions,
       lastTouched,
       progress: courseProgress(myAttempts, unitCountByVersion),
     };
@@ -573,8 +573,13 @@ export default async function LearnersPage({
                         ? `${(r.bestScore * 100).toFixed(0)}%`
                         : "—"}
                     </td>
-                    <td className="px-4 py-3 text-right text-xs tabular-nums">
+                    <td className="px-4 py-3 text-right text-xs tabular-nums whitespace-nowrap">
                       {r.attempts}
+                      {r.revisions > 0 && (
+                        <span className="text-muted" title="Revision (practice) runs: never change the official result">
+                          {" "}· {r.revisions} revision{r.revisions === 1 ? "" : "s"}
+                        </span>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-right text-xs text-muted whitespace-nowrap">
                       {r.lastTouched
