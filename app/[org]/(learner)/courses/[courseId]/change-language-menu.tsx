@@ -1,9 +1,28 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { Globe, ChevronDown, Check } from "lucide-react";
 import { languageDisplay } from "@/lib/i18n/languages";
+
+/** Fixed-position coordinates for the portaled options menu. */
+type MenuCoords = {
+  left: number;
+  width: number;
+  maxHeight: number;
+  /** Set when opening downward (menu top anchored below the trigger). */
+  top?: number;
+  /** Set when opening upward (menu bottom anchored above the trigger). */
+  bottom?: number;
+};
+
+// Layout constants for the viewport-aware placement.
+const GAP = 4; // breathing room between trigger and menu (was `mt-1`)
+const EDGE = 8; // keep the menu this far from the viewport edges
+const HEADER_SAFE = 64; // clear the sticky learner header when opening upward
+const NAV_SAFE = 76; // clear the fixed mobile bottom nav when opening downward
+const MOBILE_BP = 768; // Tailwind `md` — below this the bottom nav is shown
 
 export type ChangeLanguageOption = {
   id: string;
@@ -32,6 +51,8 @@ export function ChangeLanguageMenu({
 }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
+  const [coords, setCoords] = useState<MenuCoords | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const [picking, setPicking] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // The learner has an existing language; switching always prompts a
@@ -40,6 +61,62 @@ export function ChangeLanguageMenu({
     language: string;
     label: string;
   } | null>(null);
+
+  // Measure the trigger and decide whether the menu opens up or down, how tall
+  // it may be, and where its right edge aligns — all in viewport (fixed)
+  // coordinates so the portaled menu is never clipped by the course card's
+  // overflow/stacking context or hidden behind the fixed mobile bottom nav.
+  const computeCoords = useCallback((): MenuCoords | null => {
+    const el = triggerRef.current;
+    if (!el || typeof window === "undefined") return null;
+    const r = el.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const isMobile = vw < MOBILE_BP;
+    const bottomInset = isMobile ? NAV_SAFE : EDGE;
+    const spaceBelow = vh - r.bottom - GAP - bottomInset;
+    const spaceAbove = r.top - GAP - HEADER_SAFE;
+    const placeDown = spaceBelow >= spaceAbove;
+    const maxHeight = Math.min(360, Math.max(96, placeDown ? spaceBelow : spaceAbove));
+    const width = Math.min(260, vw - EDGE * 2);
+    // Align the menu's right edge to the trigger's, then clamp inside the viewport.
+    const left = Math.min(Math.max(r.right - width, EDGE), vw - width - EDGE);
+    return placeDown
+      ? { left, width, maxHeight, top: r.bottom + GAP }
+      : { left, width, maxHeight, bottom: vh - (r.top - GAP) };
+  }, []);
+
+  function toggleOpen() {
+    setError(null);
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setCoords(computeCoords());
+    setOpen(true);
+  }
+
+  // Keep the menu glued to the trigger while open: reposition on scroll/resize,
+  // and close on Escape. Closes if the trigger scrolls out of the measurement.
+  useEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const c = computeCoords();
+      if (c) setCoords(c);
+      else setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open, computeCoords]);
 
   if (options.length < 2) return null;
 
@@ -85,8 +162,11 @@ export function ChangeLanguageMenu({
   return (
     <div className="relative inline-block">
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggleOpen}
+        aria-haspopup="menu"
+        aria-expanded={open}
         className="inline-flex items-center gap-1.5 text-xs text-muted hover:text-ink px-3 py-1.5 border border-line rounded-lg bg-paper"
       >
         <Globe className="w-3.5 h-3.5" />
@@ -94,42 +174,62 @@ export function ChangeLanguageMenu({
         <ChevronDown className="w-3 h-3" />
       </button>
 
-      {/* Click-away catcher: the menu previously stayed open until the
-          trigger was clicked again, sitting on top of the launch row. */}
-      {open && (
-        <div
-          className="fixed inset-0 z-20"
-          aria-hidden="true"
-          onClick={() => setOpen(false)}
-        />
-      )}
-      {open && (
-        <div className="absolute right-0 mt-1 min-w-[220px] bg-paper border border-line rounded-xl shadow-lg z-30 py-1">
-          {options.map((o) => {
-            const isCurrent = o.language === currentLanguage;
-            return (
-              <button
-                key={o.id}
-                type="button"
-                onClick={() => o.language && requestSwitch(o.language)}
-                disabled={picking !== null || isCurrent}
-                className="w-full text-left flex items-center justify-between gap-3 px-3 py-2 text-sm hover:bg-canvas/60 disabled:opacity-50"
-              >
-                <div className="min-w-0">
-                  <div className="font-medium truncate">{o.display_label}</div>
-                  <div className="text-[11px] text-muted">
-                    {languageDisplay(o.language, "english")}
-                    {o.language ? ` · ${o.language}` : ""}
-                  </div>
-                </div>
-                {isCurrent && (
-                  <Check className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                )}
-              </button>
-            );
-          })}
-        </div>
-      )}
+      {/* The menu is portaled to <body> and positioned in fixed/viewport
+          coordinates so it escapes the course card's overflow + stacking
+          context and clears the fixed mobile bottom nav (z-40). It flips above
+          the trigger when there's more room there, and scrolls internally if
+          the options can't all fit, so none are ever hidden. */}
+      {open &&
+        coords &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <>
+            {/* Click-away catcher (above the nav, below the menu). */}
+            <div
+              className="fixed inset-0 z-[55]"
+              aria-hidden="true"
+              onClick={() => setOpen(false)}
+            />
+            <div
+              role="menu"
+              className="fixed z-[60] bg-paper border border-line rounded-xl shadow-lg py-1 overflow-y-auto overscroll-contain"
+              style={{
+                left: coords.left,
+                width: coords.width,
+                maxHeight: coords.maxHeight,
+                ...(coords.top !== undefined
+                  ? { top: coords.top }
+                  : { bottom: coords.bottom }),
+              }}
+            >
+              {options.map((o) => {
+                const isCurrent = o.language === currentLanguage;
+                return (
+                  <button
+                    key={o.id}
+                    type="button"
+                    role="menuitem"
+                    onClick={() => o.language && requestSwitch(o.language)}
+                    disabled={picking !== null || isCurrent}
+                    className="w-full text-left flex items-center justify-between gap-3 px-3 py-2 text-sm hover:bg-canvas/60 disabled:opacity-50"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-medium truncate">{o.display_label}</div>
+                      <div className="text-[11px] text-muted">
+                        {languageDisplay(o.language, "english")}
+                        {o.language ? ` · ${o.language}` : ""}
+                      </div>
+                    </div>
+                    {isCurrent && (
+                      <Check className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </>,
+          document.body
+        )}
 
       {error && (
         <div className="absolute right-0 top-full mt-1 border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-1.5 text-xs z-30">
