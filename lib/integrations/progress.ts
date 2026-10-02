@@ -14,7 +14,7 @@ import {
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { courseStatus, officialDone } from "@/lib/scoring/policy";
-import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
 import { fetchReferenceCodes, journeyVersionCode } from "@/lib/reference-codes";
 
 /**
@@ -543,6 +543,10 @@ export async function buildProgress(
   // Human-readable codes (0079), fail-soft before the migration.
   const courseCodes = await fetchReferenceCodes(svc, "courses", [...courseTitle.keys()]);
   const passRequired = await fetchPassRequired(svc, [...courseTitle.keys()]);
+  // 0083: consumed extra-attempt grants per learner+course, keyed `${uid}:${cid}`,
+  // widen each course's scoring window so a granted retake is scored/official in
+  // the bulk feed too. Fail-soft (empty) pre-0083.
+  const extraByUserCourse = await fetchGrantRetakeIdsForUsers(svc, orgId, uids);
   const pathCodes = await fetchReferenceCodes(svc, "learning_paths", [...pathName.keys()]);
   const journeyCodes = await fetchReferenceCodes(svc, "journey_programs", [...new Set(enrollments.map((e) => e.program_id))]);
 
@@ -610,7 +614,7 @@ export async function buildProgress(
     const stepDone = new Map<string, { done: boolean; at: string | null }>();
     for (const cid of courseIds) {
       const st = byCourse.get(cid) ?? { status: "not_started" as const, n: 0, list: [], progress: null, progressAt: "", first: null, last: null, done: null };
-      const sc = computeScoring(st.list, policies.get(cid) ?? DEFAULT_POLICY);
+      const sc = computeScoring(st.list, policies.get(cid) ?? DEFAULT_POLICY, extraByUserCourse.get(`${uid}:${cid}`) ?? []);
       const due = dueByCourse.get(cid) ?? null;
       // Status and "done" follow the OFFICIAL attempt (revision runs never change them).
       const status = courseStatus(sc, st.list);
