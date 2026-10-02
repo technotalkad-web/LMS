@@ -3,10 +3,7 @@ import { redirect } from "next/navigation";
 import {
   ArrowLeft,
   BookOpen,
-  Clock,
   PlayCircle,
-  Target,
-  Award,
   ChevronRight,
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
@@ -14,16 +11,14 @@ import { canManage } from "@/lib/auth/permissions";
 import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { languageDisplay } from "@/lib/i18n/languages";
-import {
-  computeScoring,
-  describePolicy,
-  officialBasisLabel,
-} from "@/lib/scoring/policy";
+import { computeScoring } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
+import { grantRetakeIdsFor, fetchPassRequired } from "@/lib/scoring/attempt-kind";
 import {
   ChangeLanguageMenu,
   type ChangeLanguageOption,
 } from "./change-language-menu";
+import { RequestAttemptButton } from "./request-attempt-button";
 
 type Version = {
   id: string;
@@ -168,13 +163,68 @@ export default async function CourseDetailPage({
   // 0073: which attempts count (scoring window / official basis / what
   // happens after the window). Fail-soft → platform default pre-migration.
   const policy = await resolvePolicy(supabase, c.id);
-  const scoring = computeScoring(attempts, policy);
-  const launchBlocked = scoring.blocked && !isAdmin;
-  const scoreTagFor = (id: string): ScoreTag => {
-    const n = scoring.attemptNumber.get(id);
-    if (n === undefined) return null;
-    return n <= policy.max_scored_attempts ? { kind: "scored", n } : { kind: "practice" };
-  };
+  const retakeIds = await grantRetakeIdsFor(supabase, user.id, c.id);
+  const scoring = computeScoring(attempts, policy, retakeIds);
+  const passRequired = (await fetchPassRequired(supabase, [c.id])).has(c.id);
+
+  // 0083: this learner's extra-attempt request/grant state for the course. A
+  // live (approved, unexpired, unused) grant unblocks the launch — the launch
+  // gate turns it into a fresh official retake — and suppresses the "limit
+  // reached"/practice messaging. Fail-soft (no state) on a pre-0083 database.
+  let attemptRequestState: "none" | "pending" | "granted" | "rejected" = "none";
+  let grantExpiresAt: string | null = null;
+  let requestRejectionNote: string | null = null;
+  let hasUnusedGrant = false;
+  try {
+    const { data: arRows } = await supabase
+      .from("attempt_requests")
+      .select("status, used_at, expires_at, decision_note, created_at")
+      .eq("user_id", user.id)
+      .eq("course_id", c.id)
+      .order("created_at", { ascending: false });
+    const reqs = (arRows ?? []) as Array<{
+      status: string;
+      used_at: string | null;
+      expires_at: string | null;
+      decision_note: string | null;
+    }>;
+    const nowMs = Date.now();
+    const liveGrant = reqs.find(
+      (r) => r.status === "approved" && !r.used_at && (!r.expires_at || new Date(r.expires_at).getTime() > nowMs)
+    );
+    const pending = reqs.find((r) => r.status === "pending");
+    if (liveGrant) {
+      attemptRequestState = "granted";
+      grantExpiresAt = liveGrant.expires_at;
+      hasUnusedGrant = true;
+    } else if (pending) {
+      attemptRequestState = "pending";
+    } else if (reqs[0]?.status === "rejected") {
+      attemptRequestState = "rejected";
+      requestRejectionNote = reqs[0].decision_note;
+    }
+  } catch {
+    /* pre-0083 */
+  }
+
+  // An in-progress attempt that is itself a consumed grant retake is an
+  // official run the learner must be able to resume — even under a block rule.
+  const hasInProgressOfficialRetake = attempts.some(
+    (a) => a.completion_status === "in_progress" && retakeIds.has(a.id)
+  );
+  const launchBlocked =
+    scoring.blocked && !hasUnusedGrant && !hasInProgressOfficialRetake && !isAdmin;
+  // The learner may ask for another attempt when they've used up their official
+  // window and did not pass (a failed verdict, or a pass-required module they
+  // didn't pass) and have no open request/grant already.
+  const officialFailed =
+    scoring.officialStatus === "failed" ||
+    (passRequired && scoring.officialAttempt !== null && scoring.officialStatus !== "passed");
+  const canRequestAttempt =
+    !isAdmin &&
+    scoring.limitReached &&
+    officialFailed &&
+    (attemptRequestState === "none" || attemptRequestState === "rejected");
 
   // Sticky completion: a course that was ever completed/passed stays
   // "complete" even after the learner relaunches it (which opens a fresh
@@ -188,11 +238,6 @@ export default async function CourseDetailPage({
 
   const manifestDescription = current?.manifest_data?.description ?? "";
   const description = c.description || manifestDescription;
-
-  const masteryPct =
-    typeof current?.manifest_data?.masteryScore === "number"
-      ? Math.round(current.manifest_data.masteryScore * 100)
-      : null;
 
   // 0072: admins can hide the attempts history from learners. Admins still
   // see it (with a badge) so they can preview what they've hidden.
@@ -241,25 +286,6 @@ export default async function CourseDetailPage({
             <h1 className="text-2xl sm:text-3xl font-semibold leading-tight">
               {c.title}
             </h1>
-            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-slate-300 mt-4 font-medium">
-              <span className="flex items-center gap-1.5">
-                <Target className="w-3.5 h-3.5" />
-                {current?.manifest_type === "cmi5"
-                  ? "cmi5 module"
-                  : current?.manifest_type === "xapi"
-                    ? "xAPI module"
-                    : "SCORM module"}
-              </span>
-              {masteryPct !== null && (
-                <span className="flex items-center gap-1.5">
-                  <Award className="w-3.5 h-3.5" />
-                  Mastery score {masteryPct}%
-                </span>
-              )}
-              <span className="flex items-center gap-1.5 capitalize">
-                <Clock className="w-3.5 h-3.5" /> {c.status}
-              </span>
-            </div>
           </div>
         </div>
 
@@ -274,68 +300,70 @@ export default async function CourseDetailPage({
             </div>
           )}
 
-          {masteryPct !== null && (
-            <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-5">
-              <h2 className="font-semibold mb-1.5 flex items-center gap-2 text-indigo-900">
-                <Target className="w-4 h-4 text-indigo-600" />
-                Learning objective
-              </h2>
-              <p className="text-sm text-indigo-900/90">
-                Achieve a score of at least{" "}
-                <strong>{masteryPct}%</strong> to pass this course. You can
-                retake the course as many times as you need.
-              </p>
-            </div>
-          )}
+          {/* Learner-friendly result + status. Only the OFFICIAL score is
+              shown — no scoring windows, attempt counts or rule internals. */}
+          <div className="space-y-3">
+            {scoring.officialAttempt && (
+              <div className="border border-line rounded-xl p-4 sm:p-5 bg-canvas/40 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-muted">
+                    Official score
+                  </div>
+                  <div className="text-2xl font-semibold tabular-nums leading-tight">
+                    {pct(scoring.officialScore)}
+                  </div>
+                </div>
+                <span
+                  className={`px-2.5 py-1 rounded-full text-xs font-semibold border ${
+                    scoring.officialStatus === "passed"
+                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                      : scoring.officialStatus === "failed"
+                        ? "bg-red-50 text-red-700 border-red-200"
+                        : "bg-slate-50 text-slate-700 border-slate-200"
+                  }`}
+                >
+                  {scoring.officialStatus === "passed"
+                    ? "Passed"
+                    : scoring.officialStatus === "failed"
+                      ? "Not passed"
+                      : "Completed"}
+                </span>
+              </div>
+            )}
 
-          {/* 0073: scoring rules — learners always know which attempt counts */}
-          <div className="border border-line rounded-xl p-4 sm:p-5 bg-canvas/40">
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h2 className="font-semibold text-sm">Your scoring</h2>
-              <span className="text-[11px] text-muted">{describePolicy(policy)}</span>
-            </div>
-            <dl className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-3">
-              {/* Score values respect the 0072 "hide attempt history" toggle;
-                  the attempt counters stay so learners always know how many
-                  scored attempts they have left. */}
-              {showAttemptsSection && (
-                <ScoreStat
-                  label="Official score"
-                  value={pct(scoring.officialScore)}
-                  sub={officialBasisLabel(policy)}
-                />
-              )}
-              {showAttemptsSection && (
-                <ScoreStat label="Best scored attempt" value={pct(scoring.bestScore)} />
-              )}
-              <ScoreStat
-                label="Scored attempts"
-                value={`${scoring.scoredAttempts} of ${policy.max_scored_attempts}`}
-                sub={
-                  scoring.scoredAttempts >= policy.max_scored_attempts
-                    ? "all used"
-                    : `${policy.max_scored_attempts - scoring.scoredAttempts} left`
-                }
-              />
-              <ScoreStat
-                label="Practice attempts"
-                value={String(scoring.practiceAttempts)}
-                sub="never affect scores"
-              />
-            </dl>
-            {scoring.practiceMode && (
-              <p className="mt-3 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                You&apos;ve used all {policy.max_scored_attempts} scored attempts. You
-                can keep revising as often as you like — further attempts are{" "}
-                <strong>practice</strong> and won&apos;t change your official score
-                or points.
+            {hasUnusedGrant && (
+              <p className="text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                You&apos;ve been granted another attempt. Launch the course to start
+                fresh — your new result replaces the previous one.
+                {grantExpiresAt ? (
+                  <> Use it before{" "}
+                    <strong>{new Date(grantExpiresAt).toLocaleDateString()}</strong>.</>
+                ) : null}
               </p>
             )}
-            {scoring.blocked && (
-              <p className="mt-3 text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-                You&apos;ve used all {policy.max_scored_attempts} scored attempts and
-                this course doesn&apos;t allow further attempts. Contact your
-                administrator if you need another attempt.
+            {!hasUnusedGrant && scoring.practiceMode && (
+              <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                You&apos;ve completed this course. You can revisit it any time to
+                review — revisiting won&apos;t change your result.
+              </p>
+            )}
+            {!hasUnusedGrant && scoring.blocked && (
+              <p className="text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                You&apos;ve used your attempt for this course.
+                {attemptRequestState === "pending"
+                  ? " Your request for another attempt is under review."
+                  : " Request another attempt below, or contact your administrator."}
+              </p>
+            )}
+            {attemptRequestState === "pending" && !scoring.blocked && (
+              <p className="text-xs text-sky-900 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2">
+                Your request for another attempt is under review.
+              </p>
+            )}
+            {attemptRequestState === "rejected" && (
+              <p className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                A previous attempt request was declined.
+                {requestRejectionNote ? <> Note: {requestRejectionNote}</> : null}
               </p>
             )}
           </div>
@@ -348,11 +376,13 @@ export default async function CourseDetailPage({
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3.5 rounded-xl font-semibold transition shadow-sm"
               >
                 <PlayCircle className="w-5 h-5" />
-                {isComplete
-                  ? "Relaunch course"
-                  : isInProgress
-                    ? "Resume course"
-                    : "Launch course"}
+                {hasUnusedGrant
+                  ? "Start granted attempt"
+                  : isComplete
+                    ? "Relaunch course"
+                    : isInProgress
+                      ? "Resume course"
+                      : "Launch course"}
               </Link>
             ) : current ? (
               <button
@@ -368,10 +398,18 @@ export default async function CourseDetailPage({
                 This course doesn&apos;t have a version yet.
               </div>
             )}
-            {current && !launchBlocked && scoring.practiceMode && (
-              <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800 border border-amber-200">
-                Practice mode
+            {current && !launchBlocked && hasUnusedGrant && (
+              <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-100 text-emerald-800 border border-emerald-200">
+                Official retake
               </span>
+            )}
+            {current && !launchBlocked && !hasUnusedGrant && scoring.practiceMode && (
+              <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800 border border-amber-200">
+                Review only
+              </span>
+            )}
+            {canRequestAttempt && (
+              <RequestAttemptButton orgSlug={orgSlug} courseId={c.id} />
             )}
             {/* Phase 3: Change language — auto-hides if <2 active packages */}
             <ChangeLanguageMenu
@@ -424,7 +462,6 @@ export default async function CourseDetailPage({
                 version={versionById.get(a.course_version_id)}
                 orgSlug={orgSlug}
                 courseId={c.id}
-                scoreTag={scoreTagFor(a.id)}
               />
             ))}
           </ul>
@@ -435,29 +472,8 @@ export default async function CourseDetailPage({
   );
 }
 
-/** 0073: whether a completed attempt fed the score (and its rank) or was practice. */
-type ScoreTag = { kind: "scored"; n: number } | { kind: "practice" } | null;
-
 function pct(v: number | null): string {
   return v === null ? "—" : `${Math.round(v * 100)}%`;
-}
-
-function ScoreStat({
-  label,
-  value,
-  sub,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-}) {
-  return (
-    <div>
-      <dt className="text-[11px] uppercase tracking-wide text-muted">{label}</dt>
-      <dd className="text-lg font-semibold tabular-nums leading-tight">{value}</dd>
-      {sub && <dd className="text-[11px] text-muted">{sub}</dd>}
-    </div>
-  );
 }
 
 function AttemptRow({
@@ -466,14 +482,12 @@ function AttemptRow({
   version,
   orgSlug,
   courseId,
-  scoreTag,
 }: {
   attempt: Attempt;
   number: number;
   version: Version | undefined;
   orgSlug: string;
   courseId: string;
-  scoreTag: ScoreTag;
 }) {
   const score =
     attempt.score === null
@@ -509,16 +523,6 @@ function AttemptRow({
               </span>
             )}
           <SuccessPill success={attempt.success_status} />
-          {scoreTag?.kind === "scored" && (
-            <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-indigo-100 text-indigo-800 border border-indigo-200 shrink-0">
-              Scored #{scoreTag.n}
-            </span>
-          )}
-          {scoreTag?.kind === "practice" && (
-            <span title="Revision run — never changes your official score or pass/fail" className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-canvas text-muted border border-line shrink-0">
-              Practice
-            </span>
-          )}
           {version && (
             <span className="text-xs text-muted shrink-0">
               v{version.version_number}

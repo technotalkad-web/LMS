@@ -7,6 +7,7 @@ import { isReleased, laterOf } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { DEFAULT_POLICY, computeScoring, courseStatus } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
 
 /**
  * /{org}/courses — All my enrolled courses.
@@ -244,6 +245,10 @@ export default async function CoursesIndexPage({
   const policies = await resolvePolicies(supabase, [
     ...new Set(versions.map((v) => v.course_id)),
   ]);
+  // Consumed extra-attempt grants (Phase 2) widen the official window.
+  const extraByCourse = await fetchGrantRetakeIds(supabase, user.id, [
+    ...new Set(versions.map((v) => v.course_id)),
+  ]);
 
   function attemptStatusForCourse(courseId: string): GridCard["status"] {
     const courseAttempts = attempts.filter((a) => {
@@ -263,10 +268,10 @@ export default async function CoursesIndexPage({
       return v?.course_id === courseId;
     });
     const policy = policies.get(courseId) ?? DEFAULT_POLICY;
-    const scoring = computeScoring(my, policy);
+    const scoring = computeScoring(my, policy, extraByCourse.get(courseId) ?? []);
     return {
       scoring,
-      scoredLeft: Math.max(0, policy.max_scored_attempts - scoring.scoredAttempts),
+      scoredLeft: Math.max(0, policy.max_scored_attempts + scoring.extraAttempts - scoring.scoredAttempts),
       practiceMode: scoring.practiceMode,
       blocked: scoring.blocked,
     };

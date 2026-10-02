@@ -15,7 +15,7 @@ import {
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { courseStatus, officialDone } from "@/lib/scoring/policy";
-import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
 
 /**
  * One call, everything the CRM needs to render an employee's learning card:
@@ -207,11 +207,14 @@ export async function GET(request: Request) {
   // Human-readable codes (0079), fail-soft before the migration.
   const courseCodes = await fetchReferenceCodes(svc, "courses", allCourseIds);
   const passRequired = await fetchPassRequired(svc, allCourseIds);
+  // 0083: consumed extra-attempt grants widen the scoring window so a granted
+  // retake is scored/official in the CRM feed too. Fail-soft (empty) pre-0083.
+  const extraByCourse = await fetchGrantRetakeIds(svc, uid, allCourseIds);
   // 0081: which modules count as learning completed for path steps.
   const stepDone = new Map<string, boolean>();
   const courses = ((cRows ?? []) as Array<{ id: string; title: string }>).map((cr) => {
     const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
-    const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY);
+    const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY, extraByCourse.get(cr.id) ?? []);
     const due = dueByCourse.get(cr.id) ?? null;
     // 0081 revision rule: status and "done" follow the OFFICIAL attempt only.
     // A failed official attempt is learning completed ("failed"); revision

@@ -56,7 +56,8 @@ export async function classifyAttempt(svc: AnyClient, attemptId: string): Promis
     .in("course_version_id", verIds.length ? verIds : [a.course_version_id]);
   const attempts = (rows ?? []) as ScorableAttempt[];
   const policy = (await resolvePolicy(svc, courseId).catch(() => DEFAULT_POLICY)) ?? DEFAULT_POLICY;
-  const scoring = computeScoring(attempts, policy, await extraAttemptsFor(svc, a.user_id, courseId));
+  const retakeIds = await grantRetakeIdsFor(svc, a.user_id, courseId);
+  const scoring = computeScoring(attempts, policy, retakeIds);
   const n = scoring.attemptNumber.get(attemptId) ?? null;
   return {
     attemptId,
@@ -64,16 +65,129 @@ export async function classifyAttempt(svc: AnyClient, attemptId: string): Promis
     courseId,
     organizationId: a.organization_id,
     attemptNumber: n,
-    // An attempt still in progress is official when a scored slot is free
-    // for it; a completed one is official when it landed inside the window.
-    official: n === null ? !scoring.limitReached : n <= scoring.policy.max_scored_attempts + scoring.extraAttempts,
+    // Official when it is a grant retake, or it landed inside the scored window,
+    // or it is still in progress with a free official slot. Revision runs and
+    // attempts beyond the window are not official — they never credit journey
+    // days, XP or the completion webhook.
+    official:
+      retakeIds.has(attemptId) ||
+      scoring.scoredWindowIds.has(attemptId) ||
+      (n === null && !scoring.limitReached),
     scoring,
   };
 }
 
-/** Extra official attempts granted to a learner for a course (Phase 2 grants; 0 until then). */
-export async function extraAttemptsFor(_svc: AnyClient, _userId: string, _courseId: string): Promise<number> {
-  return 0;
+/**
+ * The grant-designated official RETAKE attempt ids a learner has consumed for a
+ * course (Phase 2): approved grants whose retake has been started (used_at set,
+ * used_attempt_id recorded). Passing these to computeScoring widens the scored
+ * window and makes the newest completed retake the official result. Returns the
+ * set of attempt ids; empty on a pre-0083 database.
+ */
+export async function grantRetakeIdsFor(svc: AnyClient, userId: string, courseId: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (!userId || !courseId) return out;
+  try {
+    const { data, error } = await svc
+      .from("attempt_requests")
+      .select("used_attempt_id")
+      .eq("user_id", userId)
+      .eq("course_id", courseId)
+      .eq("status", "approved")
+      .not("used_attempt_id", "is", null);
+    if (error) return out;
+    for (const r of (data ?? []) as Array<{ used_attempt_id: string | null }>) {
+      if (r.used_attempt_id) out.add(r.used_attempt_id);
+    }
+  } catch {
+    /* pre-0083 */
+  }
+  return out;
+}
+
+/**
+ * Grant-retake attempt ids per course for ONE learner (batch form of
+ * grantRetakeIdsFor), for the learner surfaces that score many courses at once.
+ * Returns course_id → set of retake attempt ids; empty on pre-0083.
+ */
+export async function fetchGrantRetakeIds(svc: AnyClient, userId: string, courseIds: string[]): Promise<Map<string, Set<string>>> {
+  const out = new Map<string, Set<string>>();
+  const ids = [...new Set(courseIds.filter(Boolean))];
+  if (!userId || ids.length === 0) return out;
+  try {
+    for (let i = 0; i < ids.length; i += 300) {
+      const { data, error } = await svc
+        .from("attempt_requests")
+        .select("course_id, used_attempt_id")
+        .eq("user_id", userId)
+        .in("course_id", ids.slice(i, i + 300))
+        .eq("status", "approved")
+        .not("used_attempt_id", "is", null);
+      if (error) return out;
+      for (const r of (data ?? []) as Array<{ course_id: string; used_attempt_id: string | null }>) {
+        if (!r.used_attempt_id) continue;
+        (out.get(r.course_id) ?? out.set(r.course_id, new Set()).get(r.course_id)!).add(r.used_attempt_id);
+      }
+    }
+  } catch {
+    /* pre-0083 */
+  }
+  return out;
+}
+
+/**
+ * Grant-retake attempt ids keyed `${user_id}:${course_id}` for a page of
+ * learners (the bulk progress feed). Empty on pre-0083.
+ */
+export async function fetchGrantRetakeIdsForUsers(svc: AnyClient, orgId: string, userIds: string[]): Promise<Map<string, Set<string>>> {
+  const out = new Map<string, Set<string>>();
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (!orgId || ids.length === 0) return out;
+  try {
+    for (let i = 0; i < ids.length; i += 300) {
+      const { data, error } = await svc
+        .from("attempt_requests")
+        .select("user_id, course_id, used_attempt_id")
+        .eq("organization_id", orgId)
+        .in("user_id", ids.slice(i, i + 300))
+        .eq("status", "approved")
+        .not("used_attempt_id", "is", null);
+      if (error) return out;
+      for (const r of (data ?? []) as Array<{ user_id: string; course_id: string; used_attempt_id: string | null }>) {
+        if (!r.used_attempt_id) continue;
+        const k = `${r.user_id}:${r.course_id}`;
+        (out.get(k) ?? out.set(k, new Set()).get(k)!).add(r.used_attempt_id);
+      }
+    }
+  } catch {
+    /* pre-0083 */
+  }
+  return out;
+}
+
+/**
+ * An approved, unexpired, UNUSED grant for this learner+course, if any — the
+ * launch gate uses it to turn the next launch into a fresh OFFICIAL retake
+ * (instead of a revision run) and then marks it used. Null on pre-0083.
+ */
+export async function unusedGrantFor(svc: AnyClient, userId: string, courseId: string): Promise<{ id: string } | null> {
+  try {
+    const nowIso = new Date().toISOString();
+    const { data, error } = await svc
+      .from("attempt_requests")
+      .select("id, expires_at")
+      .eq("user_id", userId)
+      .eq("course_id", courseId)
+      .eq("status", "approved")
+      .is("used_at", null)
+      .order("created_at", { ascending: true })
+      .limit(5);
+    if (error) return null;
+    const live = (data ?? []).find((g: { expires_at: string | null }) => !g.expires_at || g.expires_at > nowIso);
+    return live ? { id: (live as { id: string }).id } : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Course ids configured "pass required" among the given ids; empty set on a pre-0081 database. */

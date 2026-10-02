@@ -515,6 +515,16 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
         >
           {statusPill.label}
         </span>
+        {/* The banner is the course "promotion": clicking it opens the Course
+            Description page. The Start button below still launches directly.
+            Upcoming (unreleased) courses have no description to open yet. */}
+        {!isUpcoming && (
+          <Link
+            href={`/${orgSlug}/courses/${card.course_id}`}
+            aria-label={`View ${card.title} details`}
+            className="absolute inset-0 z-10"
+          />
+        )}
       </div>
 
       {/* Body */}

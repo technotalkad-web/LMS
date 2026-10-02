@@ -143,6 +143,8 @@ export type ScoringResult = {
   officialStatus: "passed" | "failed" | "completed" | null;
   /** Extra scored slots granted on top of the policy window (Phase 2 grants). */
   extraAttempts: number;
+  /** Ids of the attempts in the scored window (base window + completed grant retakes). */
+  scoredWindowIds: Set<string>;
   /** Best score among practice (revision) attempts — informational only. */
   practiceBestScore: number | null;
   /** A revision attempt passed; never changes the official result. */
@@ -166,8 +168,14 @@ function ts(iso: string | null | undefined): number {
 export function computeScoring(
   attempts: ScorableAttempt[],
   policy: EffectivePolicy,
-  /** Extra official attempts granted to this learner for this module (0 = none). */
-  extraAttempts = 0
+  /**
+   * Grant-designated official retakes (0083): the attempt ids that CONSUMED an
+   * admin grant. Each adds a scored slot and, once completed, the NEWEST of
+   * them becomes the official result — while the first score is retained for
+   * learning gain. A plain number is accepted for legacy callers (it only
+   * widens the window count; with no ids the basis rule picks the official).
+   */
+  extra: number | Iterable<string> = 0
 ): ScoringResult {
   const completed = attempts
     .filter((a) => isCompletedAttempt(a))
@@ -182,13 +190,21 @@ export function computeScoring(
     });
 
   const base = Math.max(1, policy.max_scored_attempts);
-  const extra = Math.max(0, Math.floor(extraAttempts));
-  const max = base + extra;
+  const retakeIds = typeof extra === "number" ? new Set<string>() : new Set(extra);
+  const extraCount = typeof extra === "number" ? Math.max(0, Math.floor(extra)) : retakeIds.size;
   const attemptNumber = new Map<string, number>();
   completed.forEach((a, i) => attemptNumber.set(a.id, i + 1));
 
-  const scored = completed.slice(0, max);
-  const practice = completed.slice(max);
+  // The scored window = the first `base` completed attempts that are NOT grant
+  // retakes, plus every completed grant retake. Revisions are everything else.
+  // Keeping grant retakes out of the base slots means a retake never displaces
+  // the baseline first attempt, and an interleaved revision run (completed
+  // between the official attempt and the retake) never sneaks into the window.
+  const completedRetakes = completed.filter((a) => retakeIds.has(a.id));
+  const baseWindow = completed.filter((a) => !retakeIds.has(a.id)).slice(0, base);
+  const scored = [...baseWindow, ...completedRetakes];
+  const scoredWindowIds = new Set(scored.map((a) => a.id));
+  const practice = completed.filter((a) => !scoredWindowIds.has(a.id));
   const numeric = (a: ScorableAttempt | undefined) =>
     a && typeof a.score === "number" && Number.isFinite(a.score) ? a.score : null;
   const bestOf = (list: ScorableAttempt[]): ScorableAttempt | undefined =>
@@ -203,20 +219,20 @@ export function computeScoring(
   const bestScore = numeric(bestOf(scored));
   const latestScore = numeric(scored[scored.length - 1]);
 
-  // The official attempt. A granted retake supersedes the window's own
-  // basis: once the learner has completed more attempts than the base
-  // window allowed, the newest scored attempt is the official one.
+  // The official attempt. A completed grant retake supersedes the window's own
+  // basis: the NEWEST grant retake is THE official result. Otherwise the basis
+  // rule applies over the base window.
   let officialAttempt: ScorableAttempt | undefined;
-  if (extra > 0 && completed.length > base) {
-    officialAttempt = scored[scored.length - 1];
+  if (completedRetakes.length > 0) {
+    officialAttempt = completedRetakes[completedRetakes.length - 1];
   } else if (policy.official_basis === "best") {
-    officialAttempt = bestOf(scored);
+    officialAttempt = bestOf(baseWindow);
   } else if (policy.official_basis === "latest") {
-    officialAttempt = scored[scored.length - 1];
+    officialAttempt = baseWindow[baseWindow.length - 1];
   } else if (policy.official_basis === "nth") {
-    officialAttempt = scored[(policy.official_attempt_number ?? 1) - 1];
+    officialAttempt = baseWindow[(policy.official_attempt_number ?? 1) - 1];
   } else {
-    officialAttempt = scored[0];
+    officialAttempt = baseWindow[0];
   }
   const officialScore = numeric(officialAttempt);
   const officialStatus: ScoringResult["officialStatus"] = !officialAttempt
@@ -227,7 +243,10 @@ export function computeScoring(
         ? "failed"
         : "completed";
 
-  const limitReached = completed.length >= max;
+  // The base official window is full once `base` non-retake attempts are
+  // completed. A consumed grant is both a +1 slot and its own retake, so it
+  // leaves no free slot; an UNUSED grant is applied at launch, not here.
+  const limitReached = baseWindow.length >= base;
   return {
     policy,
     completedAttempts: completed.length,
@@ -239,7 +258,8 @@ export function computeScoring(
     officialScore,
     officialAttempt: officialAttempt ?? null,
     officialStatus,
-    extraAttempts: extra,
+    extraAttempts: extraCount,
+    scoredWindowIds,
     practiceBestScore: numeric(bestOf(practice)),
     practicePassed: practice.some((a) => a.success_status === "passed"),
     limitReached,

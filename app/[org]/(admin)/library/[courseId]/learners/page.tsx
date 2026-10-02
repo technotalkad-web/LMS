@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "./learners-filters";
 import { computeScoring, courseStatus } from "@/lib/scoring/policy";
+import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
 import { courseProgress, formatCourseProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 
@@ -269,6 +270,9 @@ export default async function LearnersPage({
 
   // 0073: this course's attempt scoring rule (fail-soft → default).
   const scoringPolicy = await resolvePolicy(supabase, c.id);
+  // 0083: consumed extra-attempt grants widen the scoring window so a granted
+  // retake is scored/official here too. Keyed `${uid}:${courseId}`; fail-soft pre-0083.
+  const extraByUser = await fetchGrantRetakeIdsForUsers(svc, org.id, enrolledUserIds);
 
   // ---- enrich one row per enrolled user ----
   const enriched: EnrichedLearner[] = enrolledUserIds.map((uid) => {
@@ -279,7 +283,7 @@ export default async function LearnersPage({
     // 0081 revision rule: status and score follow the OFFICIAL attempt (inside
     // the scoring window). A revision run neither changes the verdict nor the
     // score; it is counted separately so admins can see the learner revised.
-    const scoring = computeScoring(myAttempts, scoringPolicy);
+    const scoring = computeScoring(myAttempts, scoringPolicy, extraByUser.get(`${uid}:${c.id}`) ?? []);
     const status: Status = latest ? courseStatus(scoring, myAttempts) : "not_started";
     const bestScore = scoring.officialScore;
     const revisions = scoring.practiceAttempts;
