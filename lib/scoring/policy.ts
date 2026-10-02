@@ -40,8 +40,12 @@ export type ScoringRule = AttemptPolicy & {
   updated_at: string;
 };
 
+/**
+ * Platform default (0081): ONE official attempt, first attempt is official,
+ * unlimited revision afterwards. Mirrors effective_attempt_policy() in SQL.
+ */
 export const DEFAULT_POLICY: EffectivePolicy = {
-  max_scored_attempts: 3,
+  max_scored_attempts: 1,
   official_basis: "first",
   official_attempt_number: null,
   retain_first_attempt: true,
@@ -128,6 +132,21 @@ export type ScoringResult = {
   /** Most recent score inside the scoring window. */
   latestScore: number | null;
   officialScore: number | null;
+  /**
+   * The attempt whose result is official (score AND pass/fail). Under the
+   * basis rules it is the first / best / latest / nth scored attempt; when
+   * an admin granted extra attempts and one was completed, the newest scored
+   * attempt supersedes the earlier ones (the retake IS the new official).
+   */
+  officialAttempt: ScorableAttempt | null;
+  /** Pass/fail of the official attempt; "completed" when the package gave no verdict. */
+  officialStatus: "passed" | "failed" | "completed" | null;
+  /** Extra scored slots granted on top of the policy window (Phase 2 grants). */
+  extraAttempts: number;
+  /** Best score among practice (revision) attempts — informational only. */
+  practiceBestScore: number | null;
+  /** A revision attempt passed; never changes the official result. */
+  practicePassed: boolean;
   /** All scored slots used. */
   limitReached: boolean;
   /** limitReached && after_limit === "block" — launch must be refused. */
@@ -146,7 +165,9 @@ function ts(iso: string | null | undefined): number {
 
 export function computeScoring(
   attempts: ScorableAttempt[],
-  policy: EffectivePolicy
+  policy: EffectivePolicy,
+  /** Extra official attempts granted to this learner for this module (0 = none). */
+  extraAttempts = 0
 ): ScoringResult {
   const completed = attempts
     .filter((a) => isCompletedAttempt(a))
@@ -160,46 +181,91 @@ export function computeScoring(
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
 
-  const max = Math.max(1, policy.max_scored_attempts);
+  const base = Math.max(1, policy.max_scored_attempts);
+  const extra = Math.max(0, Math.floor(extraAttempts));
+  const max = base + extra;
   const attemptNumber = new Map<string, number>();
   completed.forEach((a, i) => attemptNumber.set(a.id, i + 1));
 
   const scored = completed.slice(0, max);
+  const practice = completed.slice(max);
   const numeric = (a: ScorableAttempt | undefined) =>
     a && typeof a.score === "number" && Number.isFinite(a.score) ? a.score : null;
+  const bestOf = (list: ScorableAttempt[]): ScorableAttempt | undefined =>
+    list.reduce<ScorableAttempt | undefined>((best, a) => {
+      if (!best) return a;
+      const s = numeric(a);
+      const b = numeric(best);
+      return s !== null && (b === null || s > b) ? a : best;
+    }, undefined);
 
   const firstScore = numeric(completed[0]);
-  const bestScore = scored.reduce<number | null>((best, a) => {
-    const s = numeric(a);
-    return s === null ? best : best === null || s > best ? s : best;
-  }, null);
+  const bestScore = numeric(bestOf(scored));
   const latestScore = numeric(scored[scored.length - 1]);
-  const nthScore = numeric(scored[(policy.official_attempt_number ?? 1) - 1]);
 
-  const officialScore =
-    policy.official_basis === "best"
-      ? bestScore
-      : policy.official_basis === "latest"
-        ? latestScore
-        : policy.official_basis === "nth"
-          ? nthScore
-          : firstScore;
+  // The official attempt. A granted retake supersedes the window's own
+  // basis: once the learner has completed more attempts than the base
+  // window allowed, the newest scored attempt is the official one.
+  let officialAttempt: ScorableAttempt | undefined;
+  if (extra > 0 && completed.length > base) {
+    officialAttempt = scored[scored.length - 1];
+  } else if (policy.official_basis === "best") {
+    officialAttempt = bestOf(scored);
+  } else if (policy.official_basis === "latest") {
+    officialAttempt = scored[scored.length - 1];
+  } else if (policy.official_basis === "nth") {
+    officialAttempt = scored[(policy.official_attempt_number ?? 1) - 1];
+  } else {
+    officialAttempt = scored[0];
+  }
+  const officialScore = numeric(officialAttempt);
+  const officialStatus: ScoringResult["officialStatus"] = !officialAttempt
+    ? null
+    : officialAttempt.success_status === "passed"
+      ? "passed"
+      : officialAttempt.success_status === "failed"
+        ? "failed"
+        : "completed";
 
   const limitReached = completed.length >= max;
   return {
     policy,
     completedAttempts: completed.length,
     scoredAttempts: scored.length,
-    practiceAttempts: Math.max(0, completed.length - max),
+    practiceAttempts: practice.length,
     firstScore,
     bestScore,
     latestScore,
     officialScore,
+    officialAttempt: officialAttempt ?? null,
+    officialStatus,
+    extraAttempts: extra,
+    practiceBestScore: numeric(bestOf(practice)),
+    practicePassed: practice.some((a) => a.success_status === "passed"),
     limitReached,
     blocked: limitReached && policy.after_limit === "block",
     practiceMode: limitReached && policy.after_limit === "practice",
     attemptNumber,
   };
+}
+
+export type CourseStatus = "not_started" | "in_progress" | "completed" | "passed" | "failed";
+
+/**
+ * The learner's status on a module, from the OFFICIAL attempt only: a
+ * revision (practice) pass never turns a failed module green, and a
+ * failed official attempt is "failed" — learning completed, not passed.
+ * No official attempt yet → in progress once any attempt exists.
+ */
+export function courseStatus(scoring: ScoringResult, attempts: ScorableAttempt[]): CourseStatus {
+  if (scoring.officialAttempt) return scoring.officialStatus ?? "completed";
+  return attempts.length === 0 ? "not_started" : "in_progress";
+}
+
+/** Did the official attempt complete the learning (pass required → must have passed)? */
+export function officialDone(scoring: ScoringResult, passRequired: boolean): boolean {
+  if (!scoring.officialAttempt) return false;
+  return passRequired ? scoring.officialStatus === "passed" : true;
 }
 
 export function officialBasisLabel(p: AttemptPolicy): string {

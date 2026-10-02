@@ -20,6 +20,7 @@ import {
 } from "@/lib/journey/journey";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
+import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
 
 type Course = {
   id: string;
@@ -200,30 +201,38 @@ export default async function LaunchPage({
     );
   }
 
-  // 0073 attempt-limit gate: when the course's scoring rule says "block"
-  // and the learner has completed every scored attempt, no further launches
-  // (practice mode never blocks). Admins preview freely. Counts completed
-  // attempts across ALL versions/languages of the course so a language
-  // switch or a new version can't reopen the window.
+  // 0073/0081 attempt rule, evaluated across ALL versions/languages of the
+  // course so a language switch or a new version can't reopen the window:
+  //   - window used + rule says "block"    → no further launches
+  //   - window used + rule says "practice" → this launch is a REVISION run:
+  //     it resumes from the latest saved progress (seeded below) and never
+  //     changes the official score or pass/fail.
+  // Admins preview freely.
+  type MyAttempt = ScorableAttempt & { course_version_id: string; cmi_data: CmiData | null };
+  let practiceLaunch = false;
+  let myCompleted: MyAttempt[] = [];
   if (!canManage(role)) {
     const policy = await resolvePolicy(supabase, c.id);
-    if (policy.after_limit === "block") {
-      const { data: verRows } = await supabase
-        .from("course_versions")
-        .select("id")
-        .eq("course_id", c.id);
-      const vIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
-      if (vIds.length > 0) {
-        const { count } = await supabase
-          .from("course_attempts")
-          .select("id", { count: "exact", head: true })
-          .eq("user_id", user.id)
-          .in("course_version_id", vIds)
-          .or("completion_status.eq.completed,success_status.eq.passed");
-        if ((count ?? 0) >= policy.max_scored_attempts) {
-          redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
-        }
+    const { data: verRows } = await supabase
+      .from("course_versions")
+      .select("id")
+      .eq("course_id", c.id);
+    const vIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+    if (vIds.length > 0) {
+      const { data: myRows } = await supabase
+        .from("course_attempts")
+        .select("id, score, started_at, completed_at, completion_status, success_status, course_version_id, cmi_data")
+        .eq("user_id", user.id)
+        .in("course_version_id", vIds);
+      const my = (myRows ?? []) as MyAttempt[];
+      const scoring = computeScoring(my, policy);
+      if (scoring.blocked) {
+        redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
       }
+      practiceLaunch = scoring.practiceMode;
+      myCompleted = my
+        .filter((a) => isCompletedAttempt(a))
+        .sort((a, b) => (a.completed_at ?? a.started_at) < (b.completed_at ?? b.started_at) ? 1 : -1);
     }
   }
 
@@ -545,6 +554,22 @@ export default async function LaunchPage({
       const stepMatch = stepInPaths.some((s) => s.path_id === lpParam);
       if (stepMatch) pathContextId = lpParam;
     }
+    // Revision run (0081): seed the new attempt from the latest completed
+    // attempt — this version first, otherwise the newest on any version —
+    // so the package resumes where the learner left off (completed slides,
+    // exercises and videos stay completed). SCORM: suspend_data + bookmark
+    // with entry=resume; cmi5/xAPI: the State documents are copied below.
+    // Whether it actually resumes is the package's own decision.
+    const revisionSource = practiceLaunch
+      ? (myCompleted.find((a) => a.course_version_id === v.id) ?? myCompleted[0] ?? null)
+      : null;
+    const seedCmi: CmiData = {};
+    if (revisionSource?.cmi_data) {
+      const prev = revisionSource.cmi_data as CmiData;
+      if (prev["cmi.suspend_data"]) seedCmi["cmi.suspend_data"] = prev["cmi.suspend_data"];
+      if (prev["cmi.core.lesson_location"]) seedCmi["cmi.core.lesson_location"] = prev["cmi.core.lesson_location"];
+      if (Object.keys(seedCmi).length > 0) seedCmi["cmi.core.entry"] = "resume";
+    }
     const { data: created, error: insErr } = await supabase
       .from("course_attempts")
       .insert({
@@ -552,7 +577,7 @@ export default async function LaunchPage({
         user_id: user.id,
         organization_id: org.id,
         status: "in_progress",
-        cmi_data: {},
+        cmi_data: seedCmi,
         learning_path_id: pathContextId,
         // Only name the 0058 columns when there IS journey context (which
         // itself requires 0058) — naming them unconditionally would fail
@@ -567,6 +592,32 @@ export default async function LaunchPage({
       .select("id")
       .single();
     attemptId = created?.id ?? null;
+    if (attemptId) {
+      cmi = seedCmi;
+      // cmi5 / xAPI revision: carry the package's State documents over so it
+      // resumes from the learner's latest saved progress.
+      if (revisionSource && v.manifest_type !== "scorm12") {
+        try {
+          const seedSvc = createServiceClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY!,
+            { auth: { persistSession: false } }
+          );
+          const { data: states } = await seedSvc
+            .from("xapi_state")
+            .select("state_id, content, content_type")
+            .eq("attempt_id", revisionSource.id);
+          const rows = (states ?? []) as Array<{ state_id: string; content: unknown; content_type: string | null }>;
+          if (rows.length > 0) {
+            await seedSvc
+              .from("xapi_state")
+              .upsert(rows.map((r) => ({ ...r, attempt_id: attemptId })), { onConflict: "attempt_id,state_id" });
+          }
+        } catch (e) {
+          console.warn("[launch] revision state seed failed (package starts fresh):", e);
+        }
+      }
+    }
     // Unique-violation on 0062's one-in-progress index: a concurrent request
     // (double click / router prefetch) created the attempt a moment ago —
     // resume that one instead of failing the launch.
@@ -664,6 +715,7 @@ export default async function LaunchPage({
         backHref={backHref}
         backLabel={backLabel}
         preloadUrls={preloadUrls}
+        practice={practiceLaunch}
       />
     );
   }
@@ -753,6 +805,7 @@ export default async function LaunchPage({
       backLabel={backLabel}
       standard={isXapi ? "xAPI" : "cmi5"}
       preloadUrls={preloadUrls}
+      practice={practiceLaunch}
     />
   );
 }

@@ -180,10 +180,8 @@ export default async function CourseDetailPage({
   // "complete" even after the learner relaunches it (which opens a fresh
   // in-progress attempt). Only show "Resume" when there's an open attempt and
   // the course has never been finished. Otherwise "Relaunch" / "Launch".
-  const isComplete = attempts.some(
-    (a) =>
-      a.completion_status === "completed" || a.success_status === "passed"
-  );
+  // 0081: completion follows the OFFICIAL attempt; revision runs never count.
+  const isComplete = scoring.officialAttempt !== null;
   const isInProgress =
     !isComplete &&
     attempts.some((a) => a.completion_status === "in_progress");
@@ -517,7 +515,7 @@ function AttemptRow({
             </span>
           )}
           {scoreTag?.kind === "practice" && (
-            <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-canvas text-muted border border-line shrink-0">
+            <span title="Revision run — never changes your official score or pass/fail" className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-canvas text-muted border border-line shrink-0">
               Practice
             </span>
           )}

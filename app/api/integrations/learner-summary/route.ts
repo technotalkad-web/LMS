@@ -14,6 +14,8 @@ import {
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
+import { courseStatus, officialDone } from "@/lib/scoring/policy";
+import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
 
 /**
  * One call, everything the CRM needs to render an employee's learning card:
@@ -204,16 +206,24 @@ export async function GET(request: Request) {
   const pct = (v: number | null) => (v !== null ? Math.round(v * 100) : null);
   // Human-readable codes (0079), fail-soft before the migration.
   const courseCodes = await fetchReferenceCodes(svc, "courses", allCourseIds);
+  const passRequired = await fetchPassRequired(svc, allCourseIds);
+  // 0081: which modules count as learning completed for path steps.
+  const stepDone = new Map<string, boolean>();
   const courses = ((cRows ?? []) as Array<{ id: string; title: string }>).map((cr) => {
     const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
     const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY);
     const due = dueByCourse.get(cr.id) ?? null;
-    const done = st.status === "completed" || st.status === "passed";
+    // 0081 revision rule: status and "done" follow the OFFICIAL attempt only.
+    // A failed official attempt is learning completed ("failed"); revision
+    // runs never change it.
+    const status = courseStatus(sc, st.list);
+    const done = sc.officialAttempt !== null;
+    stepDone.set(cr.id, officialDone(sc, passRequired.has(cr.id)));
     return {
       course_id: cr.id,
       code: courseCodes.get(cr.id) ?? null,
       title: cr.title,
-      status: st.status,
+      status,
       // `score` is the OFFICIAL score under the module's attempt rules.
       score: pct(sc.officialScore),
       official_score: pct(sc.officialScore),
@@ -232,7 +242,7 @@ export async function GET(request: Request) {
     };
   });
 
-  const doneSet = new Set(courses.filter((cs) => cs.status === "completed" || cs.status === "passed").map((cs) => cs.course_id));
+  const doneSet = new Set([...stepDone].filter(([, d]) => d).map(([cid]) => cid));
   const { data: pnRows } = pathIds.length
     ? await svc.from("learning_paths").select("id, name, is_active").in("id", pathIds)
     : { data: [] };
@@ -352,7 +362,9 @@ export async function GET(request: Request) {
     engagement: { xp, streak_days: streak, last_active: lastActive },
     summary: {
       assigned: courses.length,
-      completed: courses.filter((cs) => cs.status === "completed" || cs.status === "passed").length,
+      // "completed" = finished the official attempt, pass or fail (0081);
+      // consistent with progress_pct=100 / overdue=false on those rows.
+      completed: courses.filter((cs) => cs.status === "completed" || cs.status === "passed" || cs.status === "failed").length,
       overdue: courses.filter((cs) => cs.overdue).length,
     },
   });

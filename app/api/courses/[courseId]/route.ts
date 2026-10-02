@@ -31,6 +31,7 @@ export async function PATCH(
     visibility?: string;
     folder_id?: string | null;
     show_attempts_history?: boolean;
+    pass_required?: boolean;
   };
 
   const supabase = await createClient();
@@ -103,6 +104,10 @@ export async function PATCH(
   // other fields keep working.
   if (typeof body.show_attempts_history === "boolean") {
     update.show_attempts_history = body.show_attempts_history;
+  }
+  // 0081 — pass required: a path step / journey day completes only on a pass.
+  if (typeof body.pass_required === "boolean") {
+    update.pass_required = body.pass_required;
   }
   if (body.thumbnail_url !== undefined) {
     update.thumbnail_url = body.thumbnail_url || null;

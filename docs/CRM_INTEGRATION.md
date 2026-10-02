@@ -130,8 +130,18 @@ Rules your sync can rely on:
 ```
 
 Render these as native cards in your app. Statuses:
-`not_started | in_progress | completed | passed`. Every item carries a
-ready-made `target` for Step 4.
+`not_started | in_progress | completed | passed | failed`. Every item
+carries a ready-made `target` for Step 4.
+
+**Official vs revision (0081).** Status and score follow the learner's
+OFFICIAL attempt only (by default the first completed attempt; an admin can
+widen the window per module). `failed` means the official attempt was
+completed but not passed. Learners may revise a module as often as they
+like afterwards; those revision (practice) runs resume from their saved
+progress and are counted in `practice_attempts`, but they never change
+`status`, `score` or the completion webhook. A learning-path step counts as
+done on any official completion, or only on a pass when the module is
+configured "Pass required".
 
 **Scores follow the LMS's attempt rules.** Admins configure, per module /
 learning path / journey, how many completed attempts are scored (default 3)
@@ -321,7 +331,9 @@ course completion the LMS POSTs:
 
 Headers: `x-ambak-event: course_completed` and
 `x-ambak-signature: sha256=<hex>` — the HMAC-SHA256 of the **raw body**
-keyed by your secret. Verify before trusting:
+keyed by your secret. The payload also carries `attempt_number` and
+`official: true`; the webhook fires for OFFICIAL attempts only (SCORM,
+cmi5 and xAPI alike), never for revision runs. Verify before trusting:
 
 ```js
 const expected = "sha256=" +

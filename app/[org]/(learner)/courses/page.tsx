@@ -5,7 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { DashboardGrid, type GridCard } from "../dashboard/dashboard-grid";
 import { isReleased, laterOf } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
-import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, courseStatus } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 
 /**
@@ -251,20 +251,9 @@ export default async function CoursesIndexPage({
       return v?.course_id === courseId;
     });
     if (courseAttempts.length === 0) return "not_started";
-    // Sticky completion: once a learner has ever passed or completed a course
-    // it stays in the Completed bucket forever. Relaunching opens a fresh
-    // in-progress attempt, which must NOT drag the card back to "in progress".
-    // Derive from the best terminal outcome across ALL attempts (mirrors the
-    // `completedCourseIds` logic). Priority: passed > completed > failed.
-    if (courseAttempts.some((a) => a.success_status === "passed")) return "passed";
-    if (
-      courseAttempts.some(
-        (a) => a.completion_status === "completed" && a.success_status !== "failed"
-      )
-    )
-      return "completed";
-    if (courseAttempts.some((a) => a.success_status === "failed")) return "failed";
-    return "in_progress";
+    // 0081 revision rule: the card follows the OFFICIAL attempt only (sticky;
+    // a revision run never drags it back or turns a failed module green).
+    return courseStatus(scoringForCourse(courseId).scoring, courseAttempts);
   }
   // Official score under the course's rule (was: raw best of all attempts,
   // which ignored practice attempts and the first/best/latest setting).
@@ -299,6 +288,9 @@ export default async function CoursesIndexPage({
       scoredLeft: s.scoredLeft,
       practiceMode: s.practiceMode,
       blocked: s.blocked,
+      practiceCount: s.scoring.practiceAttempts,
+      practiceBest: s.scoring.practiceBestScore,
+      practicePassed: s.scoring.practicePassed,
       progressPct: typeof open?.progress_pct === "number" ? open.progress_pct : null,
     };
   }

@@ -420,6 +420,7 @@ export default async function AdminCourseDetailPage({
     thumbnail_pos_y: c.thumbnail_pos_y ?? 50,
     visibility: c.visibility ?? "private",
     show_attempts_history: c.show_attempts_history !== false,
+    pass_required: (c as { pass_required?: boolean | null }).pass_required === true,
   };
 
   // 0073: attempt scoring rules — the module's own rule plus what actually

@@ -15,6 +15,8 @@ export type CourseDetails = {
   thumbnail_pos_y: number;
   visibility: "private" | "org_public";
   show_attempts_history: boolean;
+  /** 0081: a path step / journey day completes only when the official attempt PASSED. */
+  pass_required: boolean;
 };
 
 export function DetailsForm({
@@ -59,6 +61,10 @@ export function DetailsForm({
         // toggle, so pre-migration saves of the other fields keep working.
         ...(form.show_attempts_history !== initial.show_attempts_history
           ? { show_attempts_history: form.show_attempts_history }
+          : {}),
+        // 0081 deploy safety: same rule for pass_required.
+        ...(form.pass_required !== initial.pass_required
+          ? { pass_required: form.pass_required }
           : {}),
       }),
     });
@@ -178,6 +184,38 @@ export function DetailsForm({
           <span
             className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
               form.show_attempts_history ? "left-[18px]" : "left-0.5"
+            }`}
+          />
+        </span>
+      </label>
+
+      {/* 0081: pass required. A failed official attempt still counts as
+          learning completed; with this on, the step / journey day waits for a pass. */}
+      <label className="flex items-start justify-between gap-4 border border-line rounded-xl p-3 cursor-pointer">
+        <span className="block">
+          <span className="block text-sm font-medium">Pass required</span>
+          <span className="block text-xs text-muted mt-1 leading-relaxed">
+            When on, a learning-path step or journey day that contains this
+            module is complete only once the learner&apos;s official attempt
+            passed. When off, a completed-but-failed attempt still completes
+            the step or day. Revision runs never count either way.
+          </span>
+        </span>
+        <span
+          className={`mt-0.5 relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors ${
+            form.pass_required ? "bg-emerald-500" : "bg-line"
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={form.pass_required}
+            onChange={(e) => set("pass_required", e.target.checked)}
+            className="sr-only"
+            data-testid="pass-required-toggle"
+          />
+          <span
+            className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
+              form.pass_required ? "left-[18px]" : "left-0.5"
             }`}
           />
         </span>

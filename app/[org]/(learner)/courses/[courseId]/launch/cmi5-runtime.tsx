@@ -23,6 +23,7 @@ export function Cmi5Runtime({
   backLabel = "Exit course",
   standard = "cmi5",
   preloadUrls = [],
+  practice = false,
 }: {
   iframeSrc: string;
   courseTitle: string;
@@ -33,6 +34,8 @@ export function Cmi5Runtime({
   standard?: "cmi5" | "xAPI";
   /** Next module's content file(s) to warm in the background once this one is up. */
   preloadUrls?: string[];
+  /** Revision run: the official attempt is used; this launch never changes score or pass/fail. */
+  practice?: boolean;
 }) {
   const frame = useModuleFrame();
   useNextModulePreload(preloadUrls, frame.loaded);
@@ -52,6 +55,15 @@ export function Cmi5Runtime({
             <span className="sm:hidden">Exit</span>
           </Link>
           <span className="serif text-lg sm:text-xl truncate">{courseTitle}</span>
+          {practice && (
+            <span
+              className="shrink-0 px-2 py-0.5 rounded-full border border-amber-300/60 bg-amber-400/15 text-amber-200 text-[11px] font-semibold uppercase tracking-wide"
+              title="Revision (practice): your official score and pass/fail do not change"
+              data-testid="practice-badge"
+            >
+              Revision · practice
+            </span>
+          )}
         </div>
         <span className="text-xs text-canvas/50">{standard}</span>
       </header>

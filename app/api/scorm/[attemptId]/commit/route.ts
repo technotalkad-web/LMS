@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { updateAttemptFailSoft } from "@/lib/courses/progress";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
+import { classifyAttempt } from "@/lib/scoring/attempt-kind";
 import {
   deriveAttemptStatus,
   deriveCompletionStatus,
@@ -152,21 +153,45 @@ export async function POST(
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
 
+  // 0081 revision rule: once the attempt is complete, decide whether it is
+  // the learner's OFFICIAL attempt (inside the scoring window) or a revision
+  // run. Only official completions move journey days, XP and the CRM
+  // webhook; a revision run changes nothing but its own row.
+  const nowComplete = completion_status === "completed" || success_status === "passed";
+  let kind: Awaited<ReturnType<typeof classifyAttempt>> = null;
+  if (nowComplete) {
+    try {
+      kind = await classifyAttempt(
+        createServiceClient(
+          process.env.NEXT_PUBLIC_SUPABASE_URL!,
+          process.env.SUPABASE_SERVICE_ROLE_KEY!,
+          { auth: { persistSession: false } }
+        ),
+        attemptId
+      );
+    } catch (e) {
+      console.warn("[scorm/commit] attempt classification failed (treated as official):", e);
+    }
+  }
+  const officialRun = !nowComplete || !kind || kind.official;
+
   // Gamification engine: one fail-isolated RPC on EVERY commit (it self-detects
   // completion from the row just written, dedupes via unique keys, and updates
   // streak/XP/badges). A failure here must never fail the learner's commit.
-  try {
-    const svc = createServiceClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
-      { auth: { persistSession: false } }
-    );
-    await svc.rpc("gamification_record_activity", { p_attempt_id: attemptId });
-    // Yoddha journey (0058): credits the tagged day; no-ops for untagged
-    // attempts and on databases without the function yet.
-    await svc.rpc("journey_record_completion", { p_attempt_id: attemptId });
-  } catch (e) {
-    console.warn("[scorm/commit] gamification failed:", e);
+  if (officialRun) {
+    try {
+      const svc = createServiceClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!,
+        { auth: { persistSession: false } }
+      );
+      await svc.rpc("gamification_record_activity", { p_attempt_id: attemptId });
+      // Yoddha journey (0058): credits the tagged day; no-ops for untagged
+      // attempts and on databases without the function yet.
+      await svc.rpc("journey_record_completion", { p_attempt_id: attemptId });
+    } catch (e) {
+      console.warn("[scorm/commit] gamification failed:", e);
+    }
   }
 
   // If this commit transitioned the attempt to completed/passed, fire the
@@ -175,7 +200,7 @@ export async function POST(
     currentCompletion !== "completed" && completion_status === "completed";
   const justPassed =
     currentSuccess !== "passed" && success_status === "passed";
-  if (justCompleted || justPassed) {
+  if ((justCompleted || justPassed) && officialRun) {
     await (async () => {
       try {
         const svc = createServiceClient(
@@ -244,6 +269,8 @@ export async function POST(
             score: typeof r?.score === "number" ? Math.round(r.score * 100) : null,
             passed: justPassed || success_status === "passed",
             completed_at: new Date().toISOString(),
+            attempt_number: kind?.attemptNumber ?? null,
+            official: true,
           });
         } catch (e) {
           console.warn("[scorm/commit] CRM webhook failed:", e);
