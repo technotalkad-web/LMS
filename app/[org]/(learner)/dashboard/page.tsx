@@ -37,7 +37,7 @@ import {
 } from "@/lib/theme/dashboard-background";
 import { DEFAULT_POLICY, computeScoring, courseStatus, officialDone } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
 
 type Course = {
   id: string;
@@ -536,6 +536,9 @@ export default async function DashboardPage({
   // official attempt still counts as learning completed unless the module
   // is "pass required".
   const passRequired = await fetchPassRequired(supabase, [...new Set(versions.map((v) => v.course_id))]);
+  // Consumed extra-attempt grants (Phase 2) widen a learner's official window
+  // so a granted retake is scored and becomes official on every surface.
+  const extraByCourse = await fetchGrantRetakeIds(supabase, user.id, [...new Set(versions.map((v) => v.course_id))]);
   // Completion follows the OFFICIAL attempt (officialDone), exactly as the CRM
   // feeds do — NOT "any attempt in the window", which diverged for a legacy
   // window >= 2 where the official (first) attempt failed but a later scored
@@ -550,7 +553,7 @@ export default async function DashboardPage({
       byCourse.set(v.course_id, [...(byCourse.get(v.course_id) ?? []), a]);
     }
     for (const [cid, list] of byCourse) {
-      const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY);
+      const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
       if (s.officialAttempt) officialAttemptByCourse.set(cid, s.officialAttempt.id);
       if (officialDone(s, passRequired.has(cid))) completedCourseIds.add(cid);
     }
@@ -747,10 +750,10 @@ export default async function DashboardPage({
       return v?.course_id === courseId;
     });
     const policy = policies.get(courseId) ?? DEFAULT_POLICY;
-    const scoring = computeScoring(my, policy);
+    const scoring = computeScoring(my, policy, extraByCourse.get(courseId) ?? []);
     return {
       scoring,
-      scoredLeft: Math.max(0, policy.max_scored_attempts - scoring.scoredAttempts),
+      scoredLeft: Math.max(0, policy.max_scored_attempts + scoring.extraAttempts - scoring.scoredAttempts),
       practiceMode: scoring.practiceMode,
       blocked: scoring.blocked,
     };

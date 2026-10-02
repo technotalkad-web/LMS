@@ -21,6 +21,7 @@ import {
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
+import { grantRetakeIdsFor, unusedGrantFor } from "@/lib/scoring/attempt-kind";
 
 type Course = {
   id: string;
@@ -210,6 +211,9 @@ export default async function LaunchPage({
   // Admins preview freely.
   type MyAttempt = ScorableAttempt & { course_version_id: string; cmi_data: CmiData | null };
   let practiceLaunch = false;
+  // 0083: the grant we consume on THIS launch, stamped used once the fresh
+  // official retake attempt exists (below). null = normal launch.
+  let consumeGrantId: string | null = null;
   let myCompleted: MyAttempt[] = [];
   if (!canManage(role)) {
     const policy = await resolvePolicy(supabase, c.id);
@@ -225,11 +229,43 @@ export default async function LaunchPage({
         .eq("user_id", user.id)
         .in("course_version_id", vIds);
       const my = (myRows ?? []) as MyAttempt[];
-      const scoring = computeScoring(my, policy);
-      if (scoring.blocked) {
+      // Grants already consumed widen the official window (0083).
+      const retakeIds = await grantRetakeIdsFor(supabase, user.id, c.id);
+      const scoring = computeScoring(my, policy, retakeIds);
+      // Resuming an in-progress attempt that is itself a grant retake is an
+      // OFFICIAL run, never a revision — don't let the window verdict relabel it.
+      const resumingOfficialRetake = my.some(
+        (a) => a.completion_status === "in_progress" && retakeIds.has(a.id)
+      );
+      if (scoring.limitReached && !resumingOfficialRetake) {
+        // The base official window is used up: this would be a revision run.
+        // If the learner holds an approved, unexpired, UNUSED grant, consume it
+        // so this launch is a fresh OFFICIAL retake instead. Any in-progress
+        // attempt is abandoned so the retake starts clean ("reset completed
+        // progress"); the first score and full history are retained for L&D.
+        const grant = await unusedGrantFor(supabase, user.id, c.id);
+        if (grant) {
+          consumeGrantId = grant.id;
+          const svcReset = createServiceClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY!,
+            { auth: { persistSession: false } }
+          );
+          await svcReset
+            .from("course_attempts")
+            .update({ status: "abandoned" })
+            .eq("user_id", user.id)
+            .in("course_version_id", vIds)
+            .eq("status", "in_progress");
+        }
+      }
+      // Refuse only when the window is used up and the rule blocks further
+      // launches — unless a grant is being consumed (fresh official retake) or
+      // we are resuming an in-progress official retake. Both must proceed.
+      if (scoring.blocked && !consumeGrantId && !resumingOfficialRetake) {
         redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
       }
-      practiceLaunch = scoring.practiceMode;
+      practiceLaunch = scoring.practiceMode && !consumeGrantId && !resumingOfficialRetake;
       myCompleted = my
         .filter((a) => isCompletedAttempt(a))
         .sort((a, b) => (a.completed_at ?? a.started_at) < (b.completed_at ?? b.started_at) ? 1 : -1);
@@ -638,6 +674,27 @@ export default async function LaunchPage({
   }
   if (!attemptId) {
     return <div className="p-10 text-red-700">Failed to create attempt.</div>;
+  }
+
+  // 0083: mark the consumed grant used, bound to the attempt it opened. The
+  // `used_at is null` guard makes it idempotent and single-use under a double
+  // launch; once stamped, grantRetakeIdsFor counts this attempt as the official
+  // retake so the next scoring pass supersedes the earlier official score.
+  if (consumeGrantId) {
+    try {
+      const svcGrant = createServiceClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!,
+        { auth: { persistSession: false } }
+      );
+      await svcGrant
+        .from("attempt_requests")
+        .update({ used_at: new Date().toISOString(), used_attempt_id: attemptId })
+        .eq("id", consumeGrantId)
+        .is("used_at", null);
+    } catch (e) {
+      console.warn("[launch] grant stamp failed (retake still proceeds):", e);
+    }
   }
 
   const contentBase = `/${orgSlug}/courses/${courseId}/content/`;

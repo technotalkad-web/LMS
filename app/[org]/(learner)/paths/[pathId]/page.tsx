@@ -17,7 +17,7 @@ import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 import { DEFAULT_POLICY, computeScoring, officialDone } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
 
 type PathRow = {
   id: string;
@@ -227,11 +227,14 @@ export default async function LearningPathDetailPage({
   }
   const policies = await resolvePolicies(supabase, [...attemptsByCourse.keys()]);
   const passRequired = await fetchPassRequired(supabase, steps.map((s) => s.course_id));
+  // Consumed extra-attempt grants (0083) widen each course's scoring window so
+  // a granted retake is scored and becomes official. Fail-soft (empty) pre-0083.
+  const extraByCourse = await fetchGrantRetakeIds(supabase, user.id, steps.map((s) => s.course_id));
   // Official SCORE per course uses ALL the learner's attempts (matches the
   // course page and CRM feeds).
   const scoreByCourse = new Map<string, number>();
   for (const [cid, list] of attemptsByCourse) {
-    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY);
+    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
     if (s.officialScore !== null) scoreByCourse.set(cid, s.officialScore);
   }
   // Step COMPLETION (0081): the course's OFFICIAL attempt must satisfy
@@ -247,7 +250,7 @@ export default async function LearningPathDetailPage({
   const completedCourseIds = new Set<string>();
   const inProgressCourseIds = new Set<string>();
   for (const [cid, list] of pathAttemptsByCourse) {
-    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY);
+    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
     if (officialDone(s, passRequired.has(cid))) {
       completedCourseIds.add(cid);
     } else if (list.some((a) => a.completion_status === "in_progress")) {

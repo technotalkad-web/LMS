@@ -9,10 +9,16 @@ reports, the leaderboard and score bonuses. Configured by admins per
 
 | Setting | Meaning | Default |
 |---|---|---|
-| **Maximum scored attempts** | How many *completed* attempts count. Abandoned / interrupted attempts never use a slot. | 3 |
+| **Maximum scored attempts** | How many *completed* attempts count. Abandoned / interrupted attempts never use a slot. | 1 |
 | **Official score** | Which scored attempt is the official number: **first**, **best** of the scored attempts, **latest** scored attempt, or a **specific attempt #N**. | first |
 | **Keep first-attempt score** | Retain the first attempt separately for learning-gain analysis (first vs official). The first attempt is always stored; this controls reporting. | on |
-| **After the window** | **Practice mode** — learners may keep relaunching; attempts are labelled *Practice* and never change scores or points. **Block** — the Launch button is disabled once the window is used (admins still preview). | practice |
+| **After the window** | **Practice mode** — learners may keep relaunching; attempts are labelled *Revision / practice* and never change scores or points. **Block** — the Launch button is disabled once the window is used (admins still preview). | practice |
+
+Since the revision rule (migration 0081) the platform default is **one
+official attempt**, then unlimited revision: the first completed attempt is
+the official result (pass or fail), and every later launch is a *Revision*
+run that resumes the learner's saved progress and never changes the official
+score or pass/fail. Admins can still widen the window per module/path/journey.
 
 Example: *3 scored attempts + Best* → the highest score from the learner's
 first three completed attempts is the official score. Attempt four onwards
@@ -25,7 +31,7 @@ is practice.
    module sits in several paths with rules, the **most restrictive window**
    (fewest scored attempts) wins.
 3. Otherwise, the rule of a **journey** whose curriculum contains the module.
-4. Otherwise the platform default: 3 scored attempts, first attempt official,
+4. Otherwise the platform default: 1 scored attempt, first attempt official,
    practice after.
 
 The module page always shows which rule is in effect and where it came from.
@@ -67,13 +73,35 @@ live pages.
   reclassifies later attempts as practice immediately (and blocks further
   launches if *Block* is chosen).
 
+## Requesting another attempt (extra-attempt grants — migration 0083)
+
+A learner who has used up their official window and did **not** pass can ask
+for another official attempt:
+
+1. **Request** — on the course page, *Request another attempt* opens a short
+   reason box and files a request. Admins are emailed.
+2. **Decide** — admins review in **Attempt Requests** (admin nav): learner
+   name, module, current official score, and the reason. They **Approve**
+   (with an optional note and an expiry — 7/14/30/60/90 days or never) or
+   **Decline** (with an optional note). The learner is emailed either way.
+3. **Bulk grant** — the same page can grant one extra attempt to *every*
+   learner who failed a module's official attempt, with no individual request.
+4. **Retake** — the learner's next launch of that module becomes a fresh
+   **official** attempt (not a revision): completed progress is reset so they
+   start clean. The **newest** granted attempt becomes the official result,
+   while the first (baseline) score and the full attempt history are retained
+   for L&D. The grant is one-time and marked used the moment the retake starts.
+
+One row models both the request and the grant (`attempt_requests`): at most
+one *open* row (pending, or approved-and-unused) per learner per module, so a
+bulk grant and an individual request can't double-grant. Grants are counted on
+reports (*Extra attempts granted*) and surfaced on the admin learners view.
+
 ## Honest limits
 
 - Identical questions on every attempt can still be memorised inside the
   window. The rule limits the damage; question banks with random draws in
   the authoring tool remove the cause. Use both.
-- There is no per-learner override yet ("grant one extra attempt"). Until
-  then, temporarily raise the module's window or switch it to practice mode.
 
 ## API
 
@@ -82,4 +110,13 @@ the contract). `public.effective_attempt_policy(course_id)` /
 `effective_attempt_policies(uuid[])` resolve the rule that applies to a
 module; `public.v_course_attempt_scoring` and `v_course_attempt_summary`
 expose `official_score`, `first_score`, `best_score`, `scored_attempts`,
-`practice_attempts` per learner per module.
+`practice_attempts` per learner per module. Extra-attempt grants are applied
+in the application layer (`lib/scoring/attempt-kind.ts` →
+`computeScoring(…, retakeIds)`), not in those SQL views.
+
+Extra-attempt endpoints (all org-scoped, service-role writes after auth):
+- `POST /api/attempt-requests` — learner files a request (`reason`).
+- `PATCH /api/attempt-requests/{id}` — admin approve/reject (`action`, `note`,
+  `expires_in_days`).
+- `POST /api/attempt-requests/bulk` — admin grants to all failed learners of a
+  module (`courseId`, `expires_in_days`).

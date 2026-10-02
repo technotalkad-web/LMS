@@ -14,6 +14,7 @@ import {
   ChevronRight,
   GraduationCap,
   Map as MapIcon,
+  RotateCcw,
   TrendingUp,
   Users as UsersIcon,
 } from "lucide-react";
@@ -217,6 +218,25 @@ export default async function ReportsPage({
     for (const u of data?.users ?? []) {
       if (u.email && userIdSet.has(u.id)) emailByUser.set(u.id, u.email);
     }
+  }
+
+  // 0083: extra official attempts granted (approved requests + bulk grants).
+  // Fail-soft (0) before the migration lands.
+  let extraAttemptsGranted = 0;
+  try {
+    const svcGrants = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    const { count } = await svcGrants
+      .from("attempt_requests")
+      .select("id", { count: "exact", head: true })
+      .eq("organization_id", org.id)
+      .eq("status", "approved");
+    extraAttemptsGranted = count ?? 0;
+  } catch {
+    /* pre-0083 */
   }
 
   const versionsByCourse = new Map<string, Version[]>();
@@ -501,6 +521,11 @@ export default async function ReportsPage({
           value={atRisk.length}
           icon={<AlertTriangle className="w-4 h-4" />}
           accent={atRisk.length > 0 ? "text-red-600" : undefined}
+        />
+        <KpiCard
+          label="Extra attempts granted"
+          value={extraAttemptsGranted}
+          icon={<RotateCcw className="w-4 h-4" />}
         />
       </KpiStrip>
 
