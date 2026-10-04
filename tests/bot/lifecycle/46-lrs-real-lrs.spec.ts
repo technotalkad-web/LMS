@@ -302,6 +302,25 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       const settled = await outboxRows(org.id, [ids.exp, newStmt.id]);
       const newStored = (await lrsGet(newStmt.id)).status;
       rec("S4f LMS forwarder: conflicting + new statement in one batch → both settled 'sent' and the NEW one is stored (split on 409)", settled.every((r) => r.status === "sent") && newStored === 200, { drain: { processed: d.processed, sent: d.sent, failed: d.failed, dead: d.dead }, rows: settled.map((r) => `${r.statement_id === newStmt.id ? "new" : "conflict"}:${r.status}`), newStored });
+      // A POISON statement (malformed: no verb) in a batch with good ones: the LRS
+      // rejects the whole batch with 400; the forwarder must isolate it so the good
+      // statements are stored and only the bad one dead-letters.
+      const good = [randomUUID(), randomUUID(), randomUUID()].map((id, i) => {
+        const g = JSON.parse(JSON.stringify(rows.find((r) => r.statement_id === ids.exp)!.payload)) as Stmt;
+        g.id = id;
+        g.object.id = `${NS}activities/course/${course!.id}/slide/${90 + i}`;
+        return g;
+      });
+      const poison = JSON.parse(JSON.stringify(good[0])) as Stmt & { verb?: unknown };
+      poison.id = randomUUID();
+      delete poison.verb;
+      const batch = [good[0], poison, good[1], good[2]];
+      await db.from("lrs_forward_outbox").insert(batch.map((s) => ({ organization_id: org.id, attempt_id: attempt!.id, statement_id: s.id, payload: s as unknown as Record<string, unknown>, status: "pending", origin: "engine", next_attempt_at: new Date(Date.now() - 1000).toISOString() })));
+      const dp = await drain(baseURL!);
+      const after4g = await outboxRows(org.id, batch.map((s) => s.id));
+      const goodStored = await Promise.all(good.map(async (g) => (await lrsGet(g.id)).status));
+      const poisonRow = after4g.find((r) => r.statement_id === poison.id);
+      rec("S4g LMS forwarder: one malformed statement in a batch of 4 → the 3 good ones are stored and sent, the bad one dead-letters alone", goodStored.every((s) => s === 200) && after4g.filter((r) => r.statement_id !== poison.id).every((r) => r.status === "sent") && poisonRow?.status === "dead", { drain: { processed: dp.processed, sent: dp.sent, failed: dp.failed, dead: dp.dead }, goodStored, poison: poisonRow ? `${poisonRow.status} ${poisonRow.last_error?.slice(0, 60)}` : "missing" });
     });
 
     // ---------- S5 outage + recovery ---------------------------------------
