@@ -912,16 +912,23 @@ export async function sweepOrg(
     stats = {};
     patch.backfill_started_at = new Date().toISOString();
     patch.backfill_completed_at = null;
-    // Dead-lettered rows (an outage longer than the retry budget, or a bad
-    // credential since corrected) get a fresh start. The drainer only picks
-    // pending/failed rows and re-enqueue keeps existing rows untouched, so
-    // without this reset "Resend all history" could never deliver them.
+    // "Resend all history" must really re-send EVERYTHING already in the
+    // outbox, not only rows that are missing from it: re-enqueue keeps existing
+    // rows untouched (ignoreDuplicates), so without this reset
+    //  - switching the endpoint to a new or rebuilt LRS replays nothing
+    //    (every row is already 'sent' to the previous endpoint),
+    //  - after restoring an LRS from a backup, statements sent since that
+    //    backup are never re-delivered, and
+    //  - dead-lettered rows (outage past the retry budget, corrected
+    //    credentials) are never retried.
+    // Safe to repeat: statements keep their ids, the LRS keeps the first copy,
+    // and a differing copy (409) is settled per statement by the forwarder.
     try {
       await db
         .from("lrs_forward_outbox")
         .update({ status: "pending", attempts: 0, last_error: null, next_attempt_at: new Date().toISOString() })
         .eq("organization_id", orgId)
-        .eq("status", "dead");
+        .neq("status", "pending");
     } catch {
       /* fail-soft */
     }
