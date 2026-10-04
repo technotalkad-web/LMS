@@ -122,20 +122,20 @@ export function DashboardGrid({
           onClick={() => setFilter("all")}
         />
         <Stat
-          label="Not started"
-          value={counts.notStarted}
-          icon={<AlertCircle className="w-5 h-5" />}
-          tone="slate"
-          active={filter === "not_started"}
-          onClick={() => setFilter("not_started")}
-        />
-        <Stat
           label="In progress"
           value={counts.inProg}
           icon={<PlayCircle className="w-5 h-5" />}
           tone="amber"
           active={filter === "in_progress"}
           onClick={() => setFilter("in_progress")}
+        />
+        <Stat
+          label="Not started"
+          value={counts.notStarted}
+          icon={<AlertCircle className="w-5 h-5" />}
+          tone="slate"
+          active={filter === "not_started"}
+          onClick={() => setFilter("not_started")}
         />
         <Stat
           label="Completed"
