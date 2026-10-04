@@ -29,12 +29,20 @@ export type StatementOutcome = {
 
 export type ForwardResult = StatementOutcome & {
   /**
-   * Per-statement outcomes (keyed by statement id), present only when the LRS
-   * rejected the batch with 409 and the statements were re-sent one by one.
-   * Callers settle each row on its own outcome instead of the batch's.
+   * Per-statement outcomes (keyed by statement id), present when the LRS
+   * rejected the batch (409 or a 4xx/5xx) and the statements were isolated by
+   * halving the batch. Callers settle each row on its own outcome.
    */
   results?: Record<string, StatementOutcome>;
 };
+
+/**
+ * Upper bound on LRS requests spent isolating a bad batch. Every request is a
+ * Worker subrequest, so this keeps one poison statement from exhausting the
+ * per-invocation budget: halving a batch of 50 costs ~12 requests to isolate
+ * one bad statement; a wholesale outage stops after the first split.
+ */
+const MAX_ISOLATION_POSTS = 16;
 
 function headers(cfg: ForwardCfg): Record<string, string> {
   return {
@@ -68,6 +76,8 @@ function classify(r: { status: number; text: string } | { error: string }): Stat
   return { ok: false, permanent, status: r.status, error: `LRS HTTP ${r.status}: ${r.text.slice(0, 200)}` };
 }
 
+const idOf = (s: unknown) => String((s as { id?: string }).id ?? "");
+
 /** POST a batch of statements to the tenant LRS. */
 export async function forwardStatements(
   cfg: ForwardCfg,
@@ -75,27 +85,55 @@ export async function forwardStatements(
 ): Promise<ForwardResult> {
   if (!cfg.endpoint) return { ok: false, permanent: true, error: "no endpoint" };
   const first = await post(cfg, statements);
-  if ("error" in first || first.status !== 409 || statements.length <= 1) return classify(first);
+  const whole = classify(first);
+  // Stored (2xx), a network error (retry the batch later) or a single statement:
+  // the batch outcome is the outcome. A 409 on a MULTI-statement batch is not a
+  // success for the others, so it falls through to isolation like any rejection.
+  const stored = !("error" in first) && first.status >= 200 && first.status < 300;
+  if (stored || "error" in first || statements.length <= 1) return whole;
 
-  // A conformant LRS answers 409 for the WHOLE batch when any id already exists
-  // with different content (e.g. a backfilled copy whose learner dimensions
-  // changed since the first send). Treating that as "all sent" would lose every
-  // NEW statement in the batch, so re-send one by one and report each outcome.
+  // An LRS stores a batch atomically: ONE statement it cannot accept (409 = an id
+  // already stored with different content; 400 = malformed; 500 = e.g. a
+  // character its database cannot store) rejects the WHOLE batch. Treating that
+  // as a batch outcome either loses every other statement (409 → "sent") or
+  // blocks them behind the bad one forever (4xx/5xx → "failed"). So isolate by
+  // halving: good halves are accepted in one request each, and only the bad
+  // statement(s) end up with their own outcome. Bounded by MAX_ISOLATION_POSTS
+  // so a wholesale outage (every half fails) costs a couple of requests, not n.
   const results: Record<string, StatementOutcome> = {};
+  let budget = MAX_ISOLATION_POSTS;
+  const settle = async (list: unknown[]): Promise<void> => {
+    if (budget <= 0) {
+      // Out of requests: leave the rest retryable for the next run.
+      for (const s of list) results[idOf(s)] = { ok: false, permanent: false, error: whole.error ?? "batch rejected; isolation budget exhausted" };
+      return;
+    }
+    budget -= 1;
+    const r = await post(cfg, list);
+    const out = classify(r);
+    if (out.ok || "error" in r || list.length === 1) {
+      for (const s of list) results[idOf(s)] = out;
+      return;
+    }
+    const mid = Math.ceil(list.length / 2);
+    await settle(list.slice(0, mid));
+    await settle(list.slice(mid));
+  };
+  const mid = Math.ceil(statements.length / 2);
+  await settle(statements.slice(0, mid));
+  await settle(statements.slice(mid));
+
   let anyFailed = false;
   let anyPermanent = false;
   let lastError: string | undefined;
-  for (const s of statements) {
-    const id = String((s as { id?: string }).id ?? "");
-    const out = classify(await post(cfg, [s]));
-    results[id] = out;
-    if (!out.ok) {
+  for (const o of Object.values(results)) {
+    if (!o.ok) {
       anyFailed = true;
-      anyPermanent = anyPermanent || out.permanent;
-      lastError = out.error;
+      anyPermanent = anyPermanent || o.permanent;
+      lastError = o.error;
     }
   }
-  return { ok: !anyFailed, permanent: anyFailed && anyPermanent, status: 409, error: lastError, results };
+  return { ok: !anyFailed, permanent: anyFailed && anyPermanent, status: first.status, error: lastError, results };
 }
 
 export type TestResult = {

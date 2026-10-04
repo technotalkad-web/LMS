@@ -126,61 +126,44 @@ export async function POST(request: Request) {
       orgRows.map((r) => r.payload)
     );
 
-    if (res.results) {
-      // The batch was split after a 409: settle every row on its own outcome so a
-      // statement the LRS already holds never hides a new one that failed.
-      for (const r of orgRows) {
-        const o = res.results[r.statement_id];
-        if (!o || o.ok) {
-          await db
-            .from("lrs_forward_outbox")
-            .update({ status: "sent", sent_at: new Date().toISOString(), last_error: null })
-            .eq("id", r.id);
-          sent += 1;
-          continue;
-        }
-        const attempts = r.attempts + 1;
-        const isDead = o.permanent || attempts >= MAX_ATTEMPTS;
-        await db
-          .from("lrs_forward_outbox")
-          .update({
-            status: isDead ? "dead" : "failed",
-            attempts,
-            last_error: o.error ?? "forward failed",
-            next_attempt_at: new Date(Date.now() + backoffSeconds(attempts) * 1000).toISOString(),
-          })
-          .eq("id", r.id);
-        if (isDead) dead += 1;
-        else failed += 1;
+    // Settle every row on its own outcome (the batch's when it was not split),
+    // writing GROUPED updates: one per distinct (status, attempts) instead of one
+    // per row, because every update is a Worker subrequest and a failed batch of
+    // 50 rows used to cost 50 of them.
+    const okIds: string[] = [];
+    const groups = new Map<string, { ids: string[]; status: "failed" | "dead"; attempts: number; error: string }>();
+    for (const r of orgRows) {
+      const o = res.results ? res.results[r.statement_id] : res;
+      if (!o || o.ok) {
+        okIds.push(r.id);
+        continue;
       }
-      continue;
+      const attempts = r.attempts + 1;
+      const isDead = o.permanent || attempts >= MAX_ATTEMPTS;
+      const key = `${isDead ? "dead" : "failed"}|${attempts}`;
+      const g = groups.get(key) ?? { ids: [], status: isDead ? "dead" : "failed", attempts, error: o.error ?? "forward failed" };
+      g.ids.push(r.id);
+      groups.set(key, g);
     }
-
-    if (res.ok) {
+    if (okIds.length) {
       await db
         .from("lrs_forward_outbox")
         .update({ status: "sent", sent_at: new Date().toISOString(), last_error: null })
-        .in("id", orgRows.map((r) => r.id));
-      sent += orgRows.length;
-      continue;
+        .in("id", okIds);
+      sent += okIds.length;
     }
-
-    // Failure: per-row attempts++, backoff, dead-letter past the cap or on
-    // permanent errors (bad creds / malformed) that won't improve with retry.
-    for (const r of orgRows) {
-      const attempts = r.attempts + 1;
-      const isDead = res.permanent || attempts >= MAX_ATTEMPTS;
+    for (const g of groups.values()) {
       await db
         .from("lrs_forward_outbox")
         .update({
-          status: isDead ? "dead" : "failed",
-          attempts,
-          last_error: res.error ?? "forward failed",
-          next_attempt_at: new Date(Date.now() + backoffSeconds(attempts) * 1000).toISOString(),
+          status: g.status,
+          attempts: g.attempts,
+          last_error: g.error,
+          next_attempt_at: new Date(Date.now() + backoffSeconds(g.attempts) * 1000).toISOString(),
         })
-        .eq("id", r.id);
-      if (isDead) dead += 1;
-      else failed += 1;
+        .in("id", g.ids);
+      if (g.status === "dead") dead += g.ids.length;
+      else failed += g.ids.length;
     }
   }
 
