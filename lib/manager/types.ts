@@ -97,6 +97,8 @@ export type LearnerInsight = {
   designation: string | null;
   city: string | null;
   branch: string | null;
+  /** business_vertical, for the L3 vertical filter. */
+  vertical: string | null;
   joined: string | null;
   // Signals
   assigned: number;
@@ -266,4 +268,32 @@ export type CommonStruggle = {
   overdue: number;
   pending: number;
   diagnosis: "content" | "spread" | null;
+};
+
+// ---------------------------------------------------------------------------
+// Phase 3 — L3 organisation view (§7)
+// ---------------------------------------------------------------------------
+
+/** An org-wide learning gap: content that fails / stalls across the hierarchy. */
+export type OrgGap = {
+  id: string;
+  kind: "course" | "journey-day";
+  title: string;
+  /** Learners in the hierarchy flagged on it (distinct). */
+  learners: number;
+  failed: number;
+  notStarted: number;
+  stuck: number;
+  overdue: number;
+  pending: number;
+  /** Hierarchy fail rate (%) among people with the course, and the org benchmark. */
+  failRate: number | null;
+  orgFailRate: number | null;
+  /** Share of assigned people who have not started (%). */
+  notStartedRate: number | null;
+  /** Cities / groups affected. */
+  groupsAffected: number;
+  groupsTotal: number;
+  /** One line a national head can act on. */
+  advice: string;
 };

@@ -28,6 +28,7 @@ on:
     - cron: "7-59/15 * * * *" # /api/cron/gamification-refresh — every 15 min (leaderboard matviews; offset to dodge :00 pileups)
     - cron: "30 0 1 * *"   # /api/cron/gamification-monthly   — 1st of month 00:30 UTC (= 06:00 IST close)
     - cron: "0 * * * *"    # /api/cron/journey-nudges         — hourly; each journey emails at its admin-set reminder hour (org-local), once/day
+    - cron: "3-59/15 * * * *" # /api/cron/report-card-refresh — every 15 min (Manager Report Card precompute for L3 screens; offset from the gamification refresh)
   workflow_dispatch:
     inputs:
       endpoint:
@@ -58,6 +59,7 @@ jobs:
               "7-59/15 * * * *") P=/api/cron/gamification-refresh ;;
               "30 0 1 * *") P=/api/cron/gamification-monthly ;;
               "0 * * * *")  P=/api/cron/journey-nudges ;;
+              "3-59/15 * * * *") P=/api/cron/report-card-refresh ;;
               *) echo "Unknown schedule '${SCHEDULE}'"; exit 1 ;;
             esac
           else

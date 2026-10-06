@@ -1,21 +1,24 @@
-# Manager Report Card — Phases 1 (L1) and 2 (L2)
+# Manager Report Card — Phases 1 (L1), 2 (L2) and 3 (L3)
 
 Approved proposal: "Manager Report Card" (decisions 1–11, 2026-10-06).
 Phase 0a = official pass/fail everywhere (0090), Phase 0b = explicit reporting
 line + Master Data (0091, `docs/REPORTING_LINES.md`). Phase 1 = the L1 screen,
 the employee report and three manager actions. Phase 2 = the L2 "team of
 teams" screen (teams compared, team-level exceptions, common struggles, team
-drill-down, compare). L3 (city/region grouping, org gaps) follows.
+drill-down, compare). Phase 3 = the L3 organisation view (cities / L2 groups
+compared, org-wide learning gaps, people filters, the 15-minute precompute).
 
 ## Where it lives
 
 | Piece | Path |
 |---|---|
-| Level-aware entry (L1 screen for level 1, L2 screen for level ≥ 2) | `app/[org]/(learner)/team-performance/page.tsx` |
+| Level-aware entry (L1 screen for level 1, L2 for level 2, L3 for level 3) | `app/[org]/(learner)/team-performance/page.tsx` |
 | L1 screen as a component (own team and any team drilled into) | `_components/l1-view.tsx` |
-| L2 screen (§6) | `_components/l2-view.tsx` |
+| L2 screen (§6; also a city / L2 group opened from the L3 screen via `?city=` / `?l2=`) | `_components/l2-view.tsx` |
+| L3 screen (§7) | `_components/l3-view.tsx` |
 | Team drill-down (a team inside the viewer's hierarchy) | `team-performance/team/[managerId]/page.tsx` |
-| Compare 2–3 teams (§8) | `team-performance/compare/page.tsx` (`?teams=a,b[,c]`) |
+| Compare 2–3 teams / cities / L2 groups, optionally against "everyone under you" (§8) | `team-performance/compare/page.tsx` (`?teams=a&teams=b` or `a,b`; `?cities=` repeated; `?l2s=`; id `org` = hierarchy average; `?vertical=`/`?branch=` honoured) |
+| Precompute for the L3 screen (§13) | `lib/manager/cache.ts` + `POST /api/cron/report-card-refresh` (every 15 min, `cron.yml`) + `0093_report_card_cache.sql` |
 | Employee report | `app/[org]/(learner)/team-performance/[userId]/page.tsx` |
 | Client pieces (filters, action buttons, assign dialog) | `app/[org]/(learner)/team-performance/_components/` |
 | Access / scope | `lib/manager/access.ts` |
@@ -31,11 +34,20 @@ drill-down, compare). L3 (city/region grouping, org gaps) follows.
   `loadManagerContext` — a suspended/inactive manager sees nothing, matching
   the action routes). Role is not consulted; a `user`-role manager reaches it through the learner shell
   (desktop top nav and the mobile bottom nav "Team" item).
-- Level 1 shows the **direct team** (`scope.direct`). Level 2/3 shows **teams
+- Level 1 shows the **direct team** (`scope.direct`). Level 2 shows **teams
   compared** over everyone in the hierarchy (`scope.teamsByL1`; the viewer's
   own direct team is one of the teams; people whose L1 is outside the
-  hierarchy are counted but listed separately). An L3 viewer gets the same
-  screen until Phase 3 adds the city/region grouping.
+  hierarchy are counted but listed separately).
+- Level 3 shows the **organisation view** (§7) over everyone in the hierarchy:
+  Organisation Learning Score, top teams / teams needing support, **cities
+  compared** (or **L2 groups** compared — `?by=l2`; an L2 group is that L2's
+  L1 teams plus their own direct reports, `l2GroupsOf`), major learning gaps
+  (content-level, `buildOrgGaps`), and people filters (`?city=`, `?vertical=`,
+  `?branch=`) on top of period and content. No individual is named on the L3
+  screen. Clicking a city / L2 group opens it as a teams-compared screen
+  (`?city=X` / `?l2=<id>`, filtered to people in the hierarchy); clicking a
+  team opens its L1 screen; the employee report sits under that. Compare
+  accepts cities / L2 groups and the hierarchy average (`org`).
 - Team drill-down, the employee report and every action re-check the
   hierarchy (`scope.all` / `teamsOf`) on the server; an out-of-scope id is a
   404 / 403, never a partial result. Email shows only for the viewer's own
@@ -126,16 +138,45 @@ write.
   in the org's time zone; today or later), re-assign updates the due date,
   learners emailed (`asset_assignment`).
 
+## The L3 precompute (§13)
+
+An L3 hierarchy is hundreds of people, so the L3 screen (and compare with a
+city / L2 group / the hierarchy average) reads per-learner insights that the
+15-minute refresh stored in `report_card_cache` (0093): one row per learner
+per period window (7 / 30 / 90 / all), written by
+`POST /api/cron/report-card-refresh` (`x-cron-secret`, `cron.yml` schedule
+`3-59/15 * * * *`) for every organisation with an L3 mapping in use. The
+refresh calls the same `computeLearnerInsights` as the live path — one rule
+set, no SQL re-implementation — and stores its output; the page then runs the
+pure rules (`teamScore`, `teamCards`, `buildOrgGaps`) over the cached rows.
+
+Fallback (`loadScopedInsights`): when the table does not exist yet, when more
+than a tenth of the people are missing or older than 45 minutes, or when a
+content lens is applied (`?content=`), the page computes live exactly as L1/L2
+do; the few people missing from an otherwise fresh cache (a team mapped since
+the last refresh) are computed live and merged, so nobody vanishes. The footer
+says "Numbers as of HH:MM UTC (refreshed every 15 minutes)" or "Computed live".
+Rows for people who are no longer active are pruned on each refresh. L1/L2
+never read the cache. The refresh has a 50 s budget per run shared across
+organisations (stalest people first inside each; `pending` in the response
+says how many were left for the next run) and rotates its starting
+organisation so a long list is never cut at the same place.
+
 ## Deploy order
 
 Apply `0092_manager_actions.sql` on staging before merging and on prod before
 tagging (the grant action works without it but labels the grant `bulk` and
 cannot re-grant a learner whose earlier grant lapsed unused).
 
+Apply `0093_report_card_cache.sql` on staging before merging and on prod
+before tagging. The L3 screen works without it (live fallback); the cron
+endpoint 404s on prod until a tag deploys the route and then fills the cache
+on its first run.
+
 ## Tests
 
 - `npx tsx tests/unit/report-card.test.ts` — score, status, exceptions,
-  struggles, period summary (no DB).
+  struggles, period summary, L2 rules, L3 org gaps and L2 groups (no DB).
 - Staging harness (`node_modules/.qa/check-report-card.mjs` in the dev
   session): seeds a manager + team with every exception kind, checks the
   page, the employee report, scope refusals and the three actions end to end.

@@ -59,6 +59,22 @@ export function teamsOf(ctx: ManagerContext): TeamRef[] {
     .filter((t) => t.memberIds.length > 0);
 }
 
+/**
+ * L2 groups for an L3 viewer: each L2 manager in the hierarchy with every
+ * person under their L1s (from scope.l1sByL2) plus their own direct reports.
+ */
+export function l2GroupsOf(ctx: ManagerContext): Array<{ id: string; memberIds: string[] }> {
+  const out: Array<{ id: string; memberIds: string[] }> = [];
+  for (const [l2Id, l1s] of ctx.scope.l1sByL2) {
+    if (l2Id === ctx.scope.viewerId) continue;
+    const members = new Set<string>();
+    for (const l1 of l1s) for (const m of ctx.scope.teamsByL1.get(l1) ?? []) members.add(m);
+    for (const m of ctx.scope.teamsByL1.get(l2Id) ?? []) members.add(m);
+    if (members.size) out.push({ id: l2Id, memberIds: [...members] });
+  }
+  return out;
+}
+
 /** The team led by `managerId` inside the viewer's hierarchy, or null. */
 export function teamOf(ctx: ManagerContext, managerId: string): TeamRef | null {
   return teamsOf(ctx).find((t) => t.managerId === managerId) ?? null;

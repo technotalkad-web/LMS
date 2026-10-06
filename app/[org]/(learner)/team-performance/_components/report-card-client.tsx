@@ -16,6 +16,8 @@ import { PERIODS, STATUS_FILTERS, type ExceptionAction } from "@/lib/manager/typ
 
 export type ContentOption = { value: string; label: string };
 export type TeamMember = { userId: string; name: string };
+/** An additional URL-driven select (L3: group by, city, vertical, branch). */
+export type ExtraFilter = { key: string; label: string; value: string; options: ContentOption[] };
 
 const selectCls = "px-2 py-1.5 border border-line rounded-lg bg-paper text-xs min-w-[150px]";
 const btnPrimary = "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-ink text-canvas hover:opacity-90 disabled:opacity-50";
@@ -27,21 +29,36 @@ export function ReportFilters({
   current,
   contents,
   hideStatus = false,
+  extras = [],
+  keep = {},
 }: {
   orgSlug: string;
   basePath: string;
   current: { period: string; content: string; status: string };
   contents: Array<{ label: string; options: ContentOption[] }>;
-  /** The L2 screen has no per-person status filter (§9). */
+  /** The L2/L3 screens have no per-person status filter (§9). */
   hideStatus?: boolean;
+  /** Extra selects written to the URL under their own keys (L3: by, city, vertical, branch). */
+  extras?: ExtraFilter[];
+  /** URL params preserved verbatim on every change and on Reset (a city / L2 group drill-down). */
+  keep?: Record<string, string>;
 }) {
   const router = useRouter();
-  const apply = (patch: Partial<typeof current>) => {
-    const next = { ...current, ...patch };
+  const keepQs = () => {
     const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(keep)) if (v) qs.set(k, v);
+    return qs;
+  };
+  const apply = (patch: Partial<typeof current>, extra: Record<string, string> = {}) => {
+    const next = { ...current, ...patch };
+    const qs = keepQs();
     if (next.period && next.period !== "30") qs.set("period", next.period);
     if (next.content) qs.set("content", next.content);
     if (next.status) qs.set("status", next.status);
+    for (const e of extras) {
+      const v = e.key in extra ? extra[e.key] : e.value;
+      if (v && !(e.key === "by" && v === "city")) qs.set(e.key, v);
+    }
     const q = qs.toString();
     router.push(`/${orgSlug}/${basePath}${q ? `?${q}` : ""}`);
   };
@@ -80,8 +97,18 @@ export function ReportFilters({
           </select>
         </label>
       )}
-      {(current.period !== "30" || current.content || current.status) && (
-        <button type="button" className="text-xs text-muted underline underline-offset-2 hover:text-ink pb-2" onClick={() => apply({ period: "30", content: "", status: "" })}>
+      {extras.map((e) => (
+        <label key={e.key} className="text-xs">
+          <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">{e.label}</span>
+          <select value={e.value} onChange={(ev) => apply({}, { [e.key]: ev.target.value })} className={selectCls}>
+            {e.options.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </label>
+      ))}
+      {(current.period !== "30" || current.content || current.status || extras.some((e) => e.value && !(e.key === "by" && e.value === "city"))) && (
+        <button type="button" className="text-xs text-muted underline underline-offset-2 hover:text-ink pb-2" onClick={() => { const q = keepQs().toString(); router.push(`/${orgSlug}/${basePath}${q ? `?${q}` : ""}`); }}>
           Reset
         </button>
       )}
@@ -279,7 +306,20 @@ function useDialogKeys(open: boolean, onClose: () => void) {
   }, [open, onClose]);
 }
 
-export function ComparePicker({ orgSlug, teams, query = "" }: { orgSlug: string; teams: Array<{ managerId: string; name: string }>; query?: string }) {
+export function ComparePicker({
+  orgSlug,
+  teams,
+  query = "",
+  label = "Compare teams",
+  param = "teams",
+}: {
+  orgSlug: string;
+  teams: Array<{ managerId: string; name: string }>;
+  query?: string;
+  label?: string;
+  /** URL key on the compare page: teams | cities | l2s. */
+  param?: "teams" | "cities" | "l2s";
+}) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [picked, setPicked] = useState<string[]>([]);
@@ -295,16 +335,16 @@ export function ComparePicker({ orgSlug, teams, query = "" }: { orgSlug: string;
   return (
     <>
       <button type="button" className={btnSecondary} onClick={() => setOpen(true)}>
-        Compare teams
+        {label}
       </button>
       {open && mounted && createPortal(
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Compare teams">
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={label}>
           <div className="bg-paper border border-line rounded-2xl w-full max-w-sm p-5 space-y-3 max-h-[90vh] overflow-y-auto">
             <div className="flex items-start justify-between gap-3">
-              <h2 className="font-semibold">Compare teams</h2>
+              <h2 className="font-semibold">{label}</h2>
               <button type="button" aria-label="Dismiss" autoFocus className="p-1 rounded-lg hover:bg-canvas" onClick={() => setOpen(false)}><X className="w-4 h-4" /></button>
             </div>
-            <p className="text-[10px] uppercase tracking-wide text-muted">Pick 2–3 teams</p>
+            <p className="text-[10px] uppercase tracking-wide text-muted">Pick 2–3</p>
             <ul className="max-h-64 overflow-y-auto divide-y divide-line border border-line rounded-lg">
               {teams.map((t) => (
                 <li key={t.managerId}>
@@ -317,7 +357,7 @@ export function ComparePicker({ orgSlug, teams, query = "" }: { orgSlug: string;
             </ul>
             <div className="flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setOpen(false)}>Close</button>
-              <button type="button" className={btnPrimary} disabled={picked.length < 2} onClick={() => router.push(`/${orgSlug}/team-performance/compare?teams=${picked.join(",")}${query ? `&${query.slice(1)}` : ""}`)}>
+              <button type="button" className={btnPrimary} disabled={picked.length < 2} onClick={() => router.push(`/${orgSlug}/team-performance/compare?${picked.map((v) => `${param}=${encodeURIComponent(v)}`).join("&")}${query ? `&${query.slice(1)}` : ""}`)}>
                 Compare {picked.length ? `(${picked.length})` : ""}
               </button>
             </div>
