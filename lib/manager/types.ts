@@ -210,3 +210,60 @@ export const STATUS_FILTERS: Array<{ value: string; label: string }> = [
   { value: "stuck", label: "Stuck" },
   { value: "inactive", label: "Inactive" },
 ];
+
+// ---------------------------------------------------------------------------
+// Phase 2 — L2 "team of teams" (§6)
+// ---------------------------------------------------------------------------
+
+/** One L1 team inside the viewer's hierarchy, scored like a person. */
+export type TeamCard = {
+  managerId: string;
+  managerName: string;
+  /** The viewer's own direct team (they are also someone's L1). */
+  isOwn: boolean;
+  size: number;
+  score: TeamScore;
+  failed: number;
+  overdue: number;
+  behind: number;
+  stuck: number;
+  notStarted: number;
+  inactive: number;
+  needsSupport: number;
+  /** Most-failed module in this team, if any. */
+  topFailed: { id: string; title: string; n: number } | null;
+  /** Completions this period minus the previous period (null for all time). */
+  completionsDelta: number | null;
+};
+
+/** A team that needs the L2's attention, with one suggested step. */
+export type TeamException = {
+  managerId: string;
+  managerName: string;
+  isOwn: boolean;
+  severity: Severity;
+  /** e.g. "5 failed Objection Handling · 6 overdue · journey on track 43%" */
+  summary: string;
+  suggestion: string;
+  actions: ExceptionAction[];
+};
+
+/** Content that several teams struggle with → likely a content/training gap, not one manager. */
+export type CommonStruggle = {
+  id: string;
+  kind: "course" | "journey-day";
+  title: string;
+  teamsAffected: number;
+  /** Teams where at least one person FAILED it (drives the "content gap" rule). */
+  teamsFailing: number;
+  teamsTotal: number;
+  /** Distinct learners flagged on it across the hierarchy. */
+  learners: number;
+  /** Breakdown by exception kind. */
+  failed: number;
+  stuck: number;
+  notStarted: number;
+  overdue: number;
+  pending: number;
+  diagnosis: "content" | "spread" | null;
+};

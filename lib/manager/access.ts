@@ -6,9 +6,11 @@ import { fetchHierarchyMembers, resolveManagerScope, type HierarchyMember, type 
  * the explicit L1/L2/L3 fields and nothing else. Every page and every action
  * goes through here; the browser never supplies a scope.
  *
- * Phase 1 serves the L1 view: the people who list the viewer as L1. An L2/L3
- * viewer (named at a higher level by someone) is a manager for access purposes
- * even with no direct team — their team-of-teams view arrives in Phase 2.
+ * L1 view = the people who list the viewer as L1 (`scope.direct`). L2/L3 view
+ * (Phase 2) = every team under the viewer (`scope.teamsByL1`, grouped by its
+ * L1 manager) — the viewer's own direct team is one of those teams. Drill-downs
+ * and actions are allowed for anyone in `scope.all`; emails only for the
+ * direct team (§12: names, never emails, outside the L1 view).
  */
 
 export type ManagerContext = {
@@ -16,9 +18,14 @@ export type ManagerContext = {
   members: HierarchyMember[];
   /** Named as L1/L2/L3 by at least one active employee. */
   isManager: boolean;
-  /** Phase 1 visible set: the direct team. */
+  /** The direct team. */
   directIds: string[];
+  /** Everyone in the hierarchy (direct ∪ via L2 ∪ via L3). */
+  allIds: string[];
 };
+
+/** One L1 team inside the viewer's hierarchy. */
+export type TeamRef = { managerId: string; memberIds: string[]; isOwn: boolean };
 
 export async function loadManagerContext(
   svc: SupabaseClient,
@@ -36,18 +43,43 @@ export async function loadManagerContext(
     members,
     isManager: scope.level > 0,
     directIds: [...scope.direct],
+    allIds: [...scope.all],
   };
 }
 
 /**
- * The learners a manager may ACT on in Phase 1: their direct team. Returns
- * the ids that are in scope and the ones that are not (the caller refuses the
- * whole request when any id is outside — an action must never partially leak).
+ * The teams the viewer sees on the L2/L3 screen: every L1 manager in scope
+ * with their in-scope members, plus the viewer's own direct team. People whose
+ * L1 is outside the hierarchy (`scope.ungrouped`) have no team to sit under and
+ * are shown separately by the page.
+ */
+export function teamsOf(ctx: ManagerContext): TeamRef[] {
+  return [...ctx.scope.teamsByL1.entries()]
+    .map(([managerId, members]) => ({ managerId, memberIds: [...members], isOwn: managerId === ctx.scope.viewerId }))
+    .filter((t) => t.memberIds.length > 0);
+}
+
+/** The team led by `managerId` inside the viewer's hierarchy, or null. */
+export function teamOf(ctx: ManagerContext, managerId: string): TeamRef | null {
+  return teamsOf(ctx).find((t) => t.managerId === managerId) ?? null;
+}
+
+/** Only an L1 sees their own people's email (§12). */
+export function canSeeEmail(ctx: ManagerContext, userId: string): boolean {
+  return ctx.scope.direct.has(userId);
+}
+
+/**
+ * The learners a manager may ACT on: anyone in their hierarchy (decision 3 —
+ * "every manager action re-checks that the learner is in the manager's
+ * hierarchy"). Returns the ids in scope and the ones outside (the caller
+ * refuses the whole request when any id is outside — an action must never
+ * partially leak).
  */
 export function partitionByScope(ctx: ManagerContext, userIds: string[]): { allowed: string[]; denied: string[] } {
   const allowed: string[] = [];
   const denied: string[] = [];
-  for (const id of new Set(userIds)) (ctx.scope.direct.has(id) ? allowed : denied).push(id);
+  for (const id of new Set(userIds)) (ctx.scope.all.has(id) ? allowed : denied).push(id);
   return { allowed, denied };
 }
 

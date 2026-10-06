@@ -1,5 +1,6 @@
 import {
   SEVERITY_RANK,
+  type CommonStruggle,
   type ExceptionAction,
   type ExceptionFlag,
   type ExceptionGroup,
@@ -10,6 +11,8 @@ import {
   type Severity,
   type Signal,
   type Struggle,
+  type TeamCard,
+  type TeamException,
   type TeamScore,
   type Tone,
 } from "./types";
@@ -180,7 +183,10 @@ export function teamScore(learners: LearnerInsight[]): TeamScore {
   // a brand-new team without assessments from scoring 0 on them).
   const live = signals.filter((s) => s.value !== null);
   const wsum = live.reduce((s, x) => s + x.weight, 0);
-  const score = wsum > 0 ? Math.round(live.reduce((s, x) => s + x.value! * x.weight, 0) / wsum) : null;
+  // Engagement alone is not a learning score: with nothing assigned, no
+  // assessment and no journey (e.g. a team of managers), there is no score.
+  const hasLearningData = live.some((s) => s.key !== "engagement");
+  const score = wsum > 0 && hasLearningData ? Math.round(live.reduce((s, x) => s + x.value! * x.weight, 0) / wsum) : null;
   const tone = toneFor(score, THRESHOLDS.score);
   const label = score === null ? "No data yet" : tone === "ok" ? "Good" : tone === "warn" ? "Needs attention" : "Needs support";
   return { score, tone, label, signals };
@@ -390,4 +396,173 @@ export function matchesStatusFilter(l: LearnerInsight, filter: string): boolean 
   if (!filter) return true;
   if (filter === "on_track" || filter === "watch" || filter === "needs_support") return l.status === filter;
   return l.flags.some((f) => f.kind === filter);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — L2 "team of teams" (§6): teams compared, team-level exceptions,
+// common struggles. The same four signals, applied per team.
+// ---------------------------------------------------------------------------
+
+export type TeamInput = { managerId: string; managerName: string; memberIds: string[]; isOwn: boolean };
+
+/** Score every team like a person; worst first (teams with no data last). */
+export function teamCards(teams: TeamInput[], byId: Map<string, LearnerInsight>, periodDays: number | null): TeamCard[] {
+  const cards: TeamCard[] = teams.map((t) => {
+    const ls = t.memberIds.map((id) => byId.get(id)).filter((l): l is LearnerInsight => !!l);
+    // People with at least one flag of the kind (a person failed on two modules counts once).
+    const has = (k: ExceptionKind) => ls.filter((l) => l.flags.some((f) => f.kind === k)).length;
+    const failedTally = new Map<string, { id: string; title: string; n: number }>();
+    for (const l of ls) for (const f of l.flags) {
+      if (f.kind !== "failed" || !f.contentId) continue;
+      const cur = failedTally.get(f.contentId) ?? { id: f.contentId, title: f.contentTitle ?? "", n: 0 };
+      cur.n++;
+      failedTally.set(f.contentId, cur);
+    }
+    const topFailed = [...failedTally.values()].sort((a, b) => b.n - a.n || a.title.localeCompare(b.title))[0] ?? null;
+    const summary = periodSummary(ls, periodDays);
+    return {
+      managerId: t.managerId,
+      managerName: t.managerName,
+      isOwn: t.isOwn,
+      size: ls.length,
+      score: teamScore(ls),
+      failed: has("failed"),
+      overdue: has("overdue"),
+      behind: has("behind"),
+      stuck: has("stuck"),
+      notStarted: has("not_started"),
+      inactive: has("inactive"),
+      needsSupport: ls.filter((l) => l.status === "needs_support").length,
+      topFailed,
+      completionsDelta: summary.completionsDelta,
+    };
+  });
+  return cards.sort(compareTeamsWorstFirst);
+}
+
+export function compareTeamsWorstFirst(a: TeamCard, b: TeamCard): number {
+  const sa = a.score.score, sb = b.score.score;
+  if (sa === null && sb === null) return b.size - a.size || a.managerName.localeCompare(b.managerName);
+  if (sa === null) return 1;
+  if (sb === null) return -1;
+  return sa - sb || b.needsSupport - a.needsSupport || a.managerName.localeCompare(b.managerName);
+}
+
+/** Severity of a team as a whole: the score tone, escalated by its critical counts. */
+export function teamSeverity(c: TeamCard): Severity | null {
+  const critical = c.failed + c.overdue;
+  if (c.score.tone === "bad" || critical >= 3 || c.needsSupport >= 3) return "critical";
+  if (c.score.tone === "warn" || critical >= 1 || c.behind >= 1 || c.needsSupport >= 1) return "high";
+  if (c.stuck + c.notStarted + c.inactive >= 2) return "normal";
+  return null;
+}
+
+/**
+ * "What needs your attention" at L2: the teams that need intervention, worst
+ * first, each with a one-line why and a suggested step ("review with the
+ * manager this week"). Max five.
+ */
+export function buildTeamExceptions(
+  cards: TeamCard[],
+  opts: {
+    orgSlug: string;
+    max?: number;
+    /** Email for the "Email <manager>" action — the caller decides who may see it (§12: direct reports only). */
+    managerEmail?: (managerId: string) => string | null;
+    /** Query string (e.g. "?period=90&content=course:x") appended to the team link so the opened page matches the card. */
+    query?: string;
+  }
+): TeamException[] {
+  const out: TeamException[] = [];
+  for (const c of cards) {
+    const severity = teamSeverity(c);
+    if (!severity) continue;
+    const journey = c.score.signals.find((s) => s.key === "journey");
+    // "5 failed Objection Handling" only when all five failed that module;
+    // otherwise say how many and name the most common one.
+    const failedText = !c.failed
+      ? ""
+      : c.topFailed && c.topFailed.n === c.failed
+        ? `${c.failed} failed ${c.topFailed.title}`
+        : c.topFailed
+          ? `${c.failed} failed (most on ${c.topFailed.title}: ${c.topFailed.n})`
+          : `${c.failed} failed`;
+    const parts = [
+      failedText,
+      c.overdue ? `${c.overdue} overdue` : "",
+      c.behind ? `${c.behind} behind on journey` : "",
+      journey && journey.value !== null && journey.tone !== "ok" ? `journey on track ${journey.value}%` : "",
+      c.stuck ? `${c.stuck} stuck` : "",
+      c.notStarted ? `${c.notStarted} not started` : "",
+      c.inactive ? `${c.inactive} inactive` : "",
+    ].filter(Boolean);
+    const first = c.managerName.split(" ")[0];
+    const email = opts.managerEmail?.(c.managerId) ?? null;
+    out.push({
+      managerId: c.managerId,
+      managerName: c.managerName,
+      isOwn: c.isOwn,
+      severity,
+      summary: parts.join(" · ") || `score ${c.score.score ?? "—"}`,
+      suggestion:
+        severity === "critical"
+          ? c.isOwn ? "Work through the exceptions with your team this week" : `Review with ${first} this week`
+          : c.isOwn ? "Keep an eye on the flagged people" : `Check in with ${first}`,
+      actions: [
+        { kind: "link", label: c.isOwn ? "Open your team" : "Open team report", href: `/${opts.orgSlug}/team-performance/team/${c.managerId}${opts.query ?? ""}` },
+        ...(!c.isOwn && email ? [{ kind: "link" as const, label: `Email ${first}`, href: `mailto:${email}` }] : []),
+      ],
+    });
+  }
+  out.sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+  return out.slice(0, opts.max ?? 5);
+}
+
+/**
+ * Common struggles across teams (§6/§10): content flagged in several teams is
+ * a content or training gap rather than one manager's problem.
+ */
+export function buildCommonStruggles(teams: TeamInput[], byId: Map<string, LearnerInsight>, max = 5): CommonStruggle[] {
+  type Row = CommonStruggle & { teams: Set<string>; failingTeams: Set<string>; people: Set<string> };
+  const rows = new Map<string, Row>();
+  const touch = (id: string, kind: CommonStruggle["kind"], title: string, managerId: string, userId: string) => {
+    const cur = rows.get(id) ?? { id, kind, title, teamsAffected: 0, teamsFailing: 0, teamsTotal: teams.length, learners: 0, failed: 0, stuck: 0, notStarted: 0, overdue: 0, pending: 0, diagnosis: null, teams: new Set<string>(), failingTeams: new Set<string>(), people: new Set<string>() };
+    cur.teams.add(managerId);
+    cur.people.add(userId);
+    rows.set(id, cur);
+    return cur;
+  };
+  for (const t of teams) {
+    for (const id of t.memberIds) {
+      const l = byId.get(id);
+      if (!l) continue;
+      for (const f of l.flags) {
+        if (f.contentKind !== "course" || !f.contentId) continue;
+        const row = f.kind === "failed" || f.kind === "stuck" || f.kind === "not_started" || f.kind === "overdue"
+          ? touch(f.contentId, "course", f.contentTitle ?? "", t.managerId, l.userId)
+          : null;
+        if (!row) continue;
+        if (f.kind === "failed") { row.failed++; row.failingTeams.add(t.managerId); }
+        else if (f.kind === "stuck") row.stuck++;
+        else if (f.kind === "not_started") row.notStarted++;
+        else row.overdue++;
+      }
+      for (const j of l.journeys) {
+        if (j.status !== "active" || j.behind <= 0 || !j.nextModule) continue;
+        touch(`${j.programId}:${j.day}`, "journey-day", `Day ${j.day} · ${j.nextModule}`, t.managerId, l.userId).pending++;
+      }
+    }
+  }
+  const out = [...rows.values()].map(({ teams: set, failingTeams, people, ...r }) => {
+    const teamsAffected = set.size;
+    const teamsFailing = failingTeams.size;
+    // Content gap (§10): the module FAILS in at least two teams and in at
+    // least half of them. Any other spread is just "spread".
+    const diagnosis: CommonStruggle["diagnosis"] =
+      teamsFailing >= 2 && teamsFailing >= Math.ceil(teams.length / 2) ? "content" : teamsAffected >= 2 ? "spread" : null;
+    return { ...r, teamsAffected, teamsFailing, learners: people.size, diagnosis };
+  });
+  return out
+    .sort((a, b) => b.teamsAffected - a.teamsAffected || b.learners - a.learners || a.title.localeCompare(b.title))
+    .slice(0, max);
 }

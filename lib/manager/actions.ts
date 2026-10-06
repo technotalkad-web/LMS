@@ -78,7 +78,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 /** One action emails up to this many people; each email is several Workers subrequests. */
 export const MAX_TARGETS = 50;
 
-/** Every target must be in the manager's direct team (Phase 1). */
+/** Every target must be inside the manager's hierarchy. */
 function requireAllInScope(a: ManagerActionContext, userIds: unknown): ActionError | string[] {
   if (!Array.isArray(userIds)) return { error: "userIds must be an array", status: 400 };
   const ids = [...new Set(userIds.filter((x): x is string => typeof x === "string" && UUID_RE.test(x)))];
@@ -86,7 +86,7 @@ function requireAllInScope(a: ManagerActionContext, userIds: unknown): ActionErr
   if (ids.length !== userIds.length) return { error: "Invalid learner id", status: 400 };
   if (ids.length > MAX_TARGETS) return { error: `Too many learners in one action (max ${MAX_TARGETS})`, status: 400 };
   const { denied } = partitionByScope(a.ctx, ids);
-  if (denied.length > 0) return { error: "One or more learners are not in your team.", status: 403 };
+  if (denied.length > 0) return { error: "One or more learners are not in your reporting line.", status: 403 };
   return ids;
 }
 

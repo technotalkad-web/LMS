@@ -8,8 +8,12 @@
  * (No DB. Typechecked by `npm run typecheck`.)
  */
 import {
+  buildCommonStruggles,
   buildExceptions,
   buildStruggles,
+  buildTeamExceptions,
+  teamCards,
+  teamSeverity,
   compareWorstFirst,
   matchesStatusFilter,
   periodSummary,
@@ -62,7 +66,7 @@ console.log("\nteam score (decision 4)");
   const s = teamScore(team);
   eq("no journey → weight redistributed (100*35+90*25+100*15)/75 = 97", [s.signals[2].value, s.score, s.label], [null, 97, "Good"]);
   eq("empty team → no score", teamScore([]).score, null);
-  eq("one idle learner, nothing assigned → engagement 0 is the only live signal", [teamScore([learner({ userId: "z" })]).score, teamScore([learner({ userId: "z" })]).signals.filter((x) => x.value !== null).map((x) => x.key)], [0, ["engagement"]]);
+  eq("one idle learner, nothing assigned → engagement alone gives NO score", [teamScore([learner({ userId: "z" })]).score, teamScore([learner({ userId: "z" })]).signals.filter((x) => x.value !== null).map((x) => x.key)], [null, ["engagement"]]);
 }
 eq("toneFor thresholds", [toneFor(85, THRESHOLDS.completion), toneFor(84, THRESHOLDS.completion), toneFor(64, THRESHOLDS.completion), toneFor(null, THRESHOLDS.completion)], ["ok", "warn", "bad", "none"]);
 
@@ -153,6 +157,62 @@ console.log("\nperiod summary");
   const team = [learner({ userId: "a", completedInPeriod: 3, completedInPrevPeriod: 1, passedFirstTimeInPeriod: 2, assessmentsWithResult: 2, journeyDaysInPeriod: 10 }), learner({ userId: "b", completedInPeriod: 1, completedInPrevPeriod: 2 })];
   eq("sums + delta", periodSummary(team, 30), { days: 30, coursesCompleted: 4, passedFirstTime: 2, assessmentsWithResult: 2, journeyMissions: 10, completionsDelta: 1 });
   eq("all-time has no delta", periodSummary(team, null).completionsDelta, null);
+}
+
+
+console.log("\nL2 (§6): teams compared, team exceptions, common struggles");
+{
+  const fl = (courseId: string, title: string) => ({ courseId, title, status: "failed" as const, officialScore: 40, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached: true });
+  const people = [
+    // Team A (bad): two failed Objection Handling, one overdue
+    learner({ userId: "a1", assigned: 4, completed: 1, avgScore: 50, status: "needs_support", risk: 6, flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("overdue", "critical", "c2", "Compliance")], courses: [fl("c1", "Objection Handling")] }),
+    learner({ userId: "a2", assigned: 4, completed: 2, avgScore: 55, status: "watch", risk: 2, flags: [flag("failed", "critical", "c1", "Objection Handling")], courses: [fl("c1", "Objection Handling")] }),
+    // Team B (ok-ish): one failed Objection Handling, everyone active
+    learner({ userId: "b1", assigned: 4, completed: 4, avgScore: 85, activeLast7d: true, status: "watch", risk: 2, flags: [flag("failed", "critical", "c1", "Objection Handling")], courses: [fl("c1", "Objection Handling")] }),
+    learner({ userId: "b2", assigned: 4, completed: 4, avgScore: 90, activeLast7d: true }),
+    // Own team (good)
+    learner({ userId: "o1", assigned: 3, completed: 3, avgScore: 88, activeLast7d: true }),
+  ];
+  const byId = new Map(people.map((l) => [l.userId, l]));
+  const teams = [
+    { managerId: "mgrA", managerName: "Asha", memberIds: ["a1", "a2"], isOwn: false },
+    { managerId: "mgrB", managerName: "Bala", memberIds: ["b1", "b2"], isOwn: false },
+    { managerId: "me", managerName: "Me", memberIds: ["o1"], isOwn: true },
+  ];
+  const cards = teamCards(teams, byId, 30);
+  eq("worst team first, own (good) team last", cards.map((c) => c.managerId), ["mgrA", "mgrB", "me"]);
+  const A = cards[0];
+  eq("team counts are PEOPLE with the flag", [A.failed, A.overdue, A.needsSupport, A.topFailed?.title, A.topFailed?.n], [2, 1, 1, "Objection Handling", 2]);
+  eq("severity: bad score / 3 critical → critical; a clean team → none", [teamSeverity(A), teamSeverity(cards[2])], ["critical", null]);
+  const ex = buildTeamExceptions(cards, { orgSlug: "acme", managerEmail: (id) => (id === "mgrA" ? "asha@x.test" : null) });
+  eq("team exceptions: Asha first with a why + review suggestion + open/email actions", [ex[0].managerId, /2 failed Objection Handling/.test(ex[0].summary), /1 overdue/.test(ex[0].summary), ex[0].suggestion, ex[0].actions.map((a) => a.label)], ["mgrA", true, true, "Review with Asha this week", ["Open team report", "Email Asha"]]);
+  eq("clean own team is not listed", ex.some((e) => e.managerId === "me"), false);
+  const cs = buildCommonStruggles(teams, byId);
+  eq("Objection Handling fails in 2 of 3 teams → content gap", [cs[0].title, cs[0].teamsAffected, cs[0].teamsFailing, cs[0].teamsTotal, cs[0].failed, cs[0].diagnosis], ["Objection Handling", 2, 2, 3, 3, "content"]);
+  eq("no email callback / non-direct manager → no mailto action", buildTeamExceptions(cards, { orgSlug: "acme", managerEmail: () => null })[0].actions.map((a) => a.label), ["Open team report"]);
+  eq("team link carries the page's query", buildTeamExceptions(cards, { orgSlug: "acme", query: "?period=90" })[0].actions[0], { kind: "link", label: "Open team report", href: "/acme/team-performance/team/mgrA?period=90" });
+  // A person failed TWO modules in one team: still one failed person; the module tally counts both.
+  const twice = [learner({ userId: "t1", flags: [flag("failed", "critical", "c1", "Alpha"), flag("failed", "critical", "c2", "Beta")], courses: [fl("c1", "Alpha"), fl("c2", "Beta")] })];
+  const tc = teamCards([{ managerId: "m", managerName: "M", memberIds: ["t1"], isOwn: false }], new Map(twice.map((l) => [l.userId, l])), 30)[0];
+  eq("team counts people, not flags", [tc.failed, tc.topFailed?.n], [1, 1]);
+  // Three people failing three different modules: the summary must not say "3 failed Alpha".
+  const three = ["x", "y", "z"].map((id, i) => learner({ userId: id, assigned: 2, completed: 0, avgScore: 30, flags: [flag("failed", "critical", `c${i}`, ["Alpha", "Beta", "Gamma"][i])], courses: [fl(`c${i}`, ["Alpha", "Beta", "Gamma"][i])] }));
+  const tex = buildTeamExceptions(teamCards([{ managerId: "m3", managerName: "Mo", memberIds: ["x", "y", "z"], isOwn: false }], new Map(three.map((l) => [l.userId, l])), 30), { orgSlug: "acme" })[0];
+  eq("summary names the most-failed module only with its own count", /^3 failed \(most on Alpha: 1\)/.test(tex.summary), true);
+  // Common struggles: a module failing in ONE team but merely not started in two others is NOT a content gap, and a double-flagged learner counts once.
+  const spread = [
+    learner({ userId: "s1", flags: [flag("failed", "critical", "k", "Kappa"), flag("overdue", "critical", "k", "Kappa")], courses: [fl("k", "Kappa")] }),
+    learner({ userId: "s2", flags: [flag("not_started", "normal", "k", "Kappa")] }),
+    learner({ userId: "s3", flags: [flag("not_started", "normal", "k", "Kappa")] }),
+  ];
+  const sp = buildCommonStruggles([
+    { managerId: "a", managerName: "A", memberIds: ["s1"], isOwn: false },
+    { managerId: "b", managerName: "B", memberIds: ["s2"], isOwn: false },
+    { managerId: "c", managerName: "C", memberIds: ["s3"], isOwn: false },
+  ], new Map(spread.map((l) => [l.userId, l])))[0];
+  eq("flagged in 3 teams but failing in 1 → spread, not content; learners are distinct people", [sp.teamsAffected, sp.teamsFailing, sp.learners, sp.diagnosis], [3, 1, 3, "spread"]);
+  const c2 = cs.find((x) => x.id === "c2");
+  eq("Compliance overdue in one team only → listed, no diagnosis", c2 ? [c2.teamsAffected, c2.overdue, c2.diagnosis] : "missing", [1, 1, null]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
