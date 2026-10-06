@@ -1,16 +1,21 @@
-# Manager Report Card — Phase 1 (L1)
+# Manager Report Card — Phases 1 (L1) and 2 (L2)
 
 Approved proposal: "Manager Report Card" (decisions 1–11, 2026-10-06).
 Phase 0a = official pass/fail everywhere (0090), Phase 0b = explicit reporting
-line + Master Data (0091, `docs/REPORTING_LINES.md`). This phase ships the L1
-screen, the employee report and three manager actions. L2 (teams compared) and
-L3 (org view, compare) follow.
+line + Master Data (0091, `docs/REPORTING_LINES.md`). Phase 1 = the L1 screen,
+the employee report and three manager actions. Phase 2 = the L2 "team of
+teams" screen (teams compared, team-level exceptions, common struggles, team
+drill-down, compare). L3 (city/region grouping, org gaps) follows.
 
 ## Where it lives
 
 | Piece | Path |
 |---|---|
-| L1 screen (replaces the old Team Performance page, same URL) | `app/[org]/(learner)/team-performance/page.tsx` |
+| Level-aware entry (L1 screen for level 1, L2 screen for level ≥ 2) | `app/[org]/(learner)/team-performance/page.tsx` |
+| L1 screen as a component (own team and any team drilled into) | `_components/l1-view.tsx` |
+| L2 screen (§6) | `_components/l2-view.tsx` |
+| Team drill-down (a team inside the viewer's hierarchy) | `team-performance/team/[managerId]/page.tsx` |
+| Compare 2–3 teams (§8) | `team-performance/compare/page.tsx` (`?teams=a,b[,c]`) |
 | Employee report | `app/[org]/(learner)/team-performance/[userId]/page.tsx` |
 | Client pieces (filters, action buttons, assign dialog) | `app/[org]/(learner)/team-performance/_components/` |
 | Access / scope | `lib/manager/access.ts` |
@@ -26,10 +31,15 @@ L3 (org view, compare) follow.
   `loadManagerContext` — a suspended/inactive manager sees nothing, matching
   the action routes). Role is not consulted; a `user`-role manager reaches it through the learner shell
   (desktop top nav and the mobile bottom nav "Team" item).
-- Phase 1 shows the **direct team** (`scope.direct`). A viewer named only at
-  L2/L3 sees an interim notice; their team-of-teams view is Phase 2.
-- The employee report and every action re-check `scope.direct` on the server;
-  an out-of-scope id is a 404 / 403, never a partial result.
+- Level 1 shows the **direct team** (`scope.direct`). Level 2/3 shows **teams
+  compared** over everyone in the hierarchy (`scope.teamsByL1`; the viewer's
+  own direct team is one of the teams; people whose L1 is outside the
+  hierarchy are counted but listed separately). An L3 viewer gets the same
+  screen until Phase 3 adds the city/region grouping.
+- Team drill-down, the employee report and every action re-check the
+  hierarchy (`scope.all` / `teamsOf`) on the server; an out-of-scope id is a
+  404 / 403, never a partial result. Email shows only for the viewer's own
+  direct reports (§12: names, never emails, outside the L1 view).
 - The old `gamification_settings.leaderboard_team_leader_view` toggle no
   longer affects this page (decision 10); it still governs the Verticals
   leaderboard.
@@ -71,6 +81,18 @@ Needs support**.
 team fail rate vs org fail rate → *team problem* (team far above org),
 *content problem* (org rate high too), *timing* (fresh not-started).
 
+**L2 (§6)**: every team scored with the same four signals (`teamCards`, worst
+first), team-level exceptions (`teamSeverity`: critical = bad score or ≥3
+failed+overdue or ≥3 needing support; high = amber score or any
+failed/overdue/behind; normal = several stuck/not started/inactive) with
+"review with <manager> this week" + Open team report / Email <manager>, and
+**common struggles** (`buildCommonStruggles`: a module that FAILS in at least
+two teams and in ≥ half of them is flagged as a content/training gap; "Failing
+in X of Y" counts failing teams, "Flagged in X of Y" any flag). "Email
+<manager>" appears only when that L1 manager is the viewer's own direct report
+(§12); drill-down and compare links carry the active period/content. Filters:
+period, content, `?team=` (→ the drill-down).
+
 Filters (§9) live in the URL: `period` (7/30/90/all — period counts only;
 flags are always "now"), `content` (`course:` / `path:` / `journey:`),
 `status`.
@@ -78,8 +100,9 @@ flags are always "now"), `content` (`course:` / `path:` / `journey:`),
 ## Actions (decision 6)
 
 All three: session → org → `loadManagerContext` → every target must be in
-`scope.direct` (else 403 for the whole request; ≤ 50 people per call — each
-email is several Workers subrequests) → service-role write.
+`scope.all` — the viewer's hierarchy (else 403 for the whole request; ≤ 50
+people per call — each email is several Workers subrequests) → service-role
+write.
 
 - **Send reminder now** — course: re-derives entitlement/status for the
   course now (dynamic groups change), skips completed/not-assigned, rate-limits

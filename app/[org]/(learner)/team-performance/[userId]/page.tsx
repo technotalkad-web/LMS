@@ -4,7 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { Avatar } from "@/components/ui/avatar";
-import { loadManagerContext } from "@/lib/manager/access";
+import { canSeeEmail, loadManagerContext } from "@/lib/manager/access";
 import { computeLearnerInsights } from "@/lib/manager/insights";
 import { PERIODS, type ExceptionAction } from "@/lib/manager/types";
 import { Card, Kpi, Pill, StatusPill, fmtDate, relativeDays } from "../_components/ui";
@@ -15,8 +15,10 @@ export const dynamic = "force-dynamic";
 /**
  * Employee report (§5): opens from any name on the Report Card. The admin
  * Learner 360, re-skinned for managers — plain status, the next thing to do,
- * and the actions a manager may take. Scope-checked: Phase 1 shows a manager
- * their DIRECT reports only; anyone else is a 404, never a leak.
+ * and the actions a manager may take. Scope-checked: anyone in the viewer's
+ * hierarchy (direct team, or a team under them as L2/L3); anyone else is a
+ * 404, never a leak. Email shows only for the viewer's own direct reports
+ * (§12: names, never emails, outside the L1 view).
  */
 export default async function EmployeeReportPage({
   params,
@@ -34,7 +36,12 @@ export default async function EmployeeReportPage({
     { auth: { persistSession: false } }
   );
   const ctx = await loadManagerContext(svc, org.id, user.id);
-  if (!ctx.scope.direct.has(userId)) notFound();
+  if (!ctx.scope.all.has(userId)) notFound();
+  const showEmail = canSeeEmail(ctx, userId);
+  const isDirect = ctx.scope.direct.has(userId);
+  // Where this person sits: their L1 inside the hierarchy (for the back link).
+  const l1Id = ctx.members.find((m) => m.user_id === userId)?.line_manager_id ?? null;
+  const backHref = isDirect || !l1Id || !ctx.scope.teamsByL1.has(l1Id) ? `/${orgSlug}/team-performance` : `/${orgSlug}/team-performance/team/${l1Id}`;
 
   const period = PERIODS.find((p) => p.value === (sp.period ?? "30")) ?? PERIODS[1];
   const { learners, catalog } = await computeLearnerInsights(svc, {
@@ -78,8 +85,8 @@ export default async function EmployeeReportPage({
   return (
     // data-dashboard-root: keeps the page root untransformed so the assign dialog's fixed overlay positions correctly.
     <div data-dashboard-root="" className="max-w-5xl mx-auto space-y-6">
-      <Link href={`/${orgSlug}/team-performance`} className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink">
-        <ArrowLeft className="w-4 h-4" /> Back to Team Performance
+      <Link href={backHref} className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink">
+        <ArrowLeft className="w-4 h-4" /> {isDirect ? "Back to Team Performance" : "Back to the team"}
       </Link>
 
       <div className="bg-paper border border-line rounded-2xl p-6 flex flex-wrap items-center gap-5">
@@ -88,9 +95,9 @@ export default async function EmployeeReportPage({
           <h1 className="serif text-3xl leading-tight">{l.name}</h1>
           <p className="text-sm text-muted mt-0.5">
             {[l.designation, l.city, l.branch].filter(Boolean).join(" · ") || "—"}
-            {l.email ? ` · ${l.email}` : ""}
+            {showEmail && l.email ? ` · ${l.email}` : ""}
           </p>
-          <p className="text-xs text-muted mt-1">{l.joined ? `Joined ${fmtDate(l.joined)} · ` : ""}Reports to you</p>
+          <p className="text-xs text-muted mt-1">{l.joined ? `Joined ${fmtDate(l.joined)} · ` : ""}{isDirect ? "Reports to you" : "In your reporting line"}</p>
         </div>
         <div className="text-right">
           <StatusPill status={l.status} />

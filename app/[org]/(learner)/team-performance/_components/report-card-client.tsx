@@ -26,11 +26,14 @@ export function ReportFilters({
   basePath,
   current,
   contents,
+  hideStatus = false,
 }: {
   orgSlug: string;
   basePath: string;
   current: { period: string; content: string; status: string };
   contents: Array<{ label: string; options: ContentOption[] }>;
+  /** The L2 screen has no per-person status filter (§9). */
+  hideStatus?: boolean;
 }) {
   const router = useRouter();
   const apply = (patch: Partial<typeof current>) => {
@@ -67,14 +70,16 @@ export function ReportFilters({
           )}
         </select>
       </label>
-      <label className="text-xs">
-        <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Status</span>
-        <select value={current.status} onChange={(e) => apply({ status: e.target.value })} className={selectCls}>
-          {STATUS_FILTERS.map((s) => (
-            <option key={s.value} value={s.value}>{s.label}</option>
-          ))}
-        </select>
-      </label>
+      {!hideStatus && (
+        <label className="text-xs">
+          <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Status</span>
+          <select value={current.status} onChange={(e) => apply({ status: e.target.value })} className={selectCls}>
+            {STATUS_FILTERS.map((s) => (
+              <option key={s.value} value={s.value}>{s.label}</option>
+            ))}
+          </select>
+        </label>
+      )}
       {(current.period !== "30" || current.content || current.status) && (
         <button type="button" className="text-xs text-muted underline underline-offset-2 hover:text-ink pb-2" onClick={() => apply({ period: "30", content: "", status: "" })}>
           Reset
@@ -173,6 +178,7 @@ export function AssignCourseDialog({
   // place into a box clipped to its (animated) ancestor.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
+  useDialogKeys(open, () => setOpen(false));
 
   const toggle = (id: string) =>
     setPicked((p) => {
@@ -211,7 +217,7 @@ export function AssignCourseDialog({
           <div className="bg-paper border border-line rounded-2xl w-full max-w-lg p-5 space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-start justify-between gap-3">
               <h2 className="font-semibold">Assign a course</h2>
-              <button type="button" aria-label="Dismiss" className="p-1 rounded-lg hover:bg-canvas" onClick={() => setOpen(false)}><X className="w-4 h-4" /></button>
+              <button type="button" aria-label="Dismiss" autoFocus className="p-1 rounded-lg hover:bg-canvas" onClick={() => setOpen(false)}><X className="w-4 h-4" /></button>
             </div>
             <label className="block text-xs">
               <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Course</span>
@@ -248,6 +254,71 @@ export function AssignCourseDialog({
               <button type="button" className={btnSecondary} onClick={() => setOpen(false)}>Close</button>
               <button type="button" className={btnPrimary} disabled={busy || !courseId || picked.size === 0} onClick={submit}>
                 {busy && <Loader2 className="w-3 h-3 animate-spin" />} Assign to {picked.size}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+    </>
+  );
+}
+
+/** §8 Compare: pick two or three teams, open the side-by-side page. */
+/** Escape closes an open dialog; focus moves into it on open and back to the trigger on close. */
+function useDialogKeys(open: boolean, onClose: () => void) {
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      previous?.focus?.();
+    };
+  }, [open, onClose]);
+}
+
+export function ComparePicker({ orgSlug, teams, query = "" }: { orgSlug: string; teams: Array<{ managerId: string; name: string }>; query?: string }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [picked, setPicked] = useState<string[]>([]);
+  // Portalled like the assign dialog: page children are animated with a
+  // transform (own stacking context), so an in-place popover paints behind
+  // the next card.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  useDialogKeys(open, () => setOpen(false));
+  if (teams.length < 2) return null;
+  const toggle = (id: string) =>
+    setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : p.length >= 3 ? p : [...p, id]));
+  return (
+    <>
+      <button type="button" className={btnSecondary} onClick={() => setOpen(true)}>
+        Compare teams
+      </button>
+      {open && mounted && createPortal(
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Compare teams">
+          <div className="bg-paper border border-line rounded-2xl w-full max-w-sm p-5 space-y-3 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-3">
+              <h2 className="font-semibold">Compare teams</h2>
+              <button type="button" aria-label="Dismiss" autoFocus className="p-1 rounded-lg hover:bg-canvas" onClick={() => setOpen(false)}><X className="w-4 h-4" /></button>
+            </div>
+            <p className="text-[10px] uppercase tracking-wide text-muted">Pick 2–3 teams</p>
+            <ul className="max-h-64 overflow-y-auto divide-y divide-line border border-line rounded-lg">
+              {teams.map((t) => (
+                <li key={t.managerId}>
+                  <label className="flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer">
+                    <input type="checkbox" checked={picked.includes(t.managerId)} onChange={() => toggle(t.managerId)} disabled={!picked.includes(t.managerId) && picked.length >= 3} />
+                    {t.name}
+                  </label>
+                </li>
+              ))}
+            </ul>
+            <div className="flex justify-end gap-2">
+              <button type="button" className={btnSecondary} onClick={() => setOpen(false)}>Close</button>
+              <button type="button" className={btnPrimary} disabled={picked.length < 2} onClick={() => router.push(`/${orgSlug}/team-performance/compare?teams=${picked.join(",")}${query ? `&${query.slice(1)}` : ""}`)}>
+                Compare {picked.length ? `(${picked.length})` : ""}
               </button>
             </div>
           </div>
