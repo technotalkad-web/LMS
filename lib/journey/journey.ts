@@ -181,18 +181,28 @@ export function dateOfDay(
   return d;
 }
 
+export type JourneyUnlockMode = "calendar" | "progress";
+
 export type JourneyState = {
   daysTotal: number;
   completedCount: number;
-  /** Highest day the calendar allows (1..daysTotal; 0 before start). */
+  /** Highest day the CALENDAR allows (1..daysTotal; 0 before start). In
+   *  progress mode this is still computed (start_date gating uses it) but it
+   *  no longer gates which mission opens. */
   allowedDay: number;
   /** The next mission's day number (completedCount + 1, capped). */
   currentDay: number;
-  /** Is the next mission launchable today? */
+  /** Is the next mission launchable right now? */
   todayUnlocked: boolean;
-  /** Missions the calendar has released but aren't done yet. */
+  /** The day the learner may OPEN right now (0 = nothing: not started yet,
+   *  waiting on the calendar, or finished). Use this — not allowedDay — to
+   *  decide launchability and the per-day "released/openable" flag. */
+  openableDay: number;
+  /** Calendar missions released but not done yet (always 0 in progress mode —
+   *  a self-paced journey has no calendar "behind" concept). */
   pendingDays: number;
-  /** pendingDays beyond today's own mission (0 = on track). */
+  /** pendingDays beyond today's own mission (0 = on track; always 0 in
+   *  progress mode). */
   behindDays: number;
   daysRemaining: number;
   pct: number;
@@ -206,6 +216,13 @@ export function computeJourneyState(opts: {
   daysTotal: number;
   countSundays: boolean;
   /**
+   * How missions unlock. 'calendar' (default) = day N opens on its calendar
+   * day, catch-up in order, never ahead of the calendar. 'progress' = the
+   * next day opens as soon as the previous is completed (self-paced, still in
+   * order); only Day 1 waits for start_date.
+   */
+  unlockMode?: JourneyUnlockMode;
+  /**
    * Day numbers that actually carry a module, ascending. Days without one
    * are REST DAYS: the journey skips over them (they can never complete, so
    * treating them as missions would deadlock a pinned version forever).
@@ -214,31 +231,51 @@ export function computeJourneyState(opts: {
   courseDays?: number[];
 }): JourneyState {
   const { startDate, today, completedCount, daysTotal, countSundays } = opts;
+  const progress = opts.unlockMode === "progress";
   const courseDays =
     opts.courseDays && opts.courseDays.length > 0
       ? [...opts.courseDays].filter((d) => d >= 1 && d <= daysTotal).sort((a, b) => a - b)
       : Array.from({ length: daysTotal }, (_, i) => i + 1);
   const missionsTotal = courseDays.length;
+  // The calendar ceiling — counted days elapsed since start. Still computed in
+  // progress mode because start_date gating (allowedDay >= 1) uses it.
   const allowedDay = Math.min(
     daysTotal,
     countedDaysElapsed(startDate, today, countSundays)
   );
+  const started = allowedDay >= 1; // today >= start_date (counted)
   const finished = missionsTotal > 0 && completedCount >= missionsTotal;
   // The next MISSION's day number (rest days are skipped automatically).
   const currentDay = finished
     ? daysTotal
     : (courseDays[completedCount] ?? daysTotal);
-  const todayUnlocked = !finished && currentDay <= allowedDay;
-  const releasedMissions = courseDays.filter((d) => d <= allowedDay).length;
-  const pendingDays = Math.max(0, releasedMissions - completedCount);
+  // Progress mode drops the calendar ceiling: the next mission is open as soon
+  // as it exists, provided the journey has started. Calendar mode keeps the
+  // ceiling (can't get ahead of the drip).
+  const todayUnlocked = !finished && (progress ? started : currentDay <= allowedDay);
+  const openableDay = todayUnlocked ? currentDay : 0;
+  // Released/openable missions: calendar counts everything the drip has
+  // reached; progress counts the completed ones plus the single open next day
+  // (all days once finished).
+  const releasedMissions = progress
+    ? finished
+      ? missionsTotal
+      : started
+        ? courseDays.filter((d) => d <= currentDay).length
+        : 0
+    : courseDays.filter((d) => d <= allowedDay).length;
+  // "Behind" is a calendar concept only — a self-paced (progress) learner can
+  // never be behind a schedule, so pending/behind are 0 there.
+  const pendingDays = progress ? 0 : Math.max(0, releasedMissions - completedCount);
   return {
     daysTotal,
     completedCount,
     allowedDay,
     currentDay,
     todayUnlocked,
+    openableDay,
     pendingDays,
-    behindDays: Math.max(0, pendingDays - 1),
+    behindDays: progress ? 0 : Math.max(0, pendingDays - 1),
     daysRemaining: Math.max(0, missionsTotal - completedCount),
     pct: missionsTotal > 0 ? Math.round((completedCount / missionsTotal) * 100) : 0,
     finished,

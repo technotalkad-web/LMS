@@ -148,12 +148,12 @@ They'll keep receiving daily reminders; you'll be copied while they remain this 
 — The {Org_Name} team`,
   },
   journey_nudge: {
-    subject: "Your {Journey_Name} is waiting — Day {Day} of {Days_Total}",
+    subject: "Your next {Journey_Name} mission — Day {Day} of {Days_Total}",
     body_md: `Hi {Learner_Name},
 
-Your **{Journey_Name}** on {Org_Name} has missions waiting: you're **{Behind_Days} day(s) behind**, and today's mission takes just a few minutes.
+Your next mission in **{Journey_Name}** ({Org_Name}) is ready: **{Next_Module}** — Day {Day} of {Days_Total}.
 
-Missed days can be caught up one after another — jump back in and keep your streak alive.
+{Reminder_Line}
 
 — The {Org_Name} team`,
   },

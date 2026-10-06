@@ -48,6 +48,9 @@ export type ProgramRow = {
   deadline_days?: number | null;
   escalation_enabled?: boolean;
   escalation_after_days?: number;
+  // Unlock mode + reminder time (0088).
+  unlock_mode?: "calendar" | "progress";
+  reminder_hour?: number;
 };
 export type ProgramSummary = { id: string; name: string; icon: string; priority: number };
 export type FunnelRow = { day_number: number; learners: number };
@@ -70,6 +73,7 @@ export type EnrollmentRow = {
   version_number: number;
   days_total: number;
   count_sundays: boolean;
+  unlock_mode: "calendar" | "progress";
   course_days: number[];
   /** 0075: today's mission and the learner's progress inside it. */
   current_day?: number;
@@ -768,6 +772,7 @@ function EnrollmentsTab({
                 completedCount: e.completed_count,
                 daysTotal: e.days_total,
                 countSundays: e.count_sundays === true,
+                unlockMode: e.unlock_mode,
                 courseDays: e.course_days,
               });
               return (
@@ -865,6 +870,7 @@ function ReportsTab({
             completedCount: e.completed_count,
             daysTotal: e.days_total,
             countSundays: e.count_sundays === true,
+            unlockMode: e.unlock_mode,
             courseDays: e.course_days,
           }),
         })),
@@ -1191,8 +1197,13 @@ function SettingsTab({
   const [completionTitle, setCompletionTitle] = useState(program.completion_title);
   const [autoEnroll, setAutoEnroll] = useState(program.auto_enroll_new_users === true);
   const [nudgeEnabled, setNudgeEnabled] = useState(program.nudge_enabled !== false);
-  const [nudgeBehind, setNudgeBehind] = useState(program.nudge_behind_days ?? 2);
   const [nudgeCooldown, setNudgeCooldown] = useState(program.nudge_cooldown_days ?? 3);
+  const [unlockMode, setUnlockMode] = useState<"calendar" | "progress">(
+    program.unlock_mode === "progress" ? "progress" : "calendar"
+  );
+  const [reminderHour, setReminderHour] = useState(
+    typeof program.reminder_hour === "number" ? program.reminder_hour : 11
+  );
   const [milestones, setMilestones] = useState(() =>
     effectiveMilestones(program.milestones, program.days_total)
   );
@@ -1291,8 +1302,9 @@ function SettingsTab({
           completion_title: completionTitle,
           auto_enroll_new_users: autoEnroll,
           nudge_enabled: nudgeEnabled,
-          nudge_behind_days: nudgeBehind,
           nudge_cooldown_days: nudgeCooldown,
+          unlock_mode: unlockMode,
+          reminder_hour: reminderHour,
           priority,
           is_mandatory: isMandatory,
           focus_enabled: focusEnabled,
@@ -1441,6 +1453,45 @@ function SettingsTab({
             onChange={setAutoEnroll}
           />
         </div>
+        <div className="sm:col-span-2 space-y-1.5 border-t border-line pt-3">
+          <p className="text-sm font-medium">Daily module unlocking</p>
+          <p className="text-xs text-muted">
+            How each day&apos;s mission becomes available. Pins at publish — changing it
+            affects new enrollments (or everyone, via &ldquo;Publish &amp; update everyone&rdquo;).
+          </p>
+          <div className="flex flex-col gap-2 pt-1">
+            <label className="flex items-start gap-2 text-sm cursor-pointer">
+              <input
+                type="radio"
+                name="unlock_mode"
+                className="mt-0.5"
+                checked={unlockMode === "calendar"}
+                onChange={() => setUnlockMode("calendar")}
+              />
+              <span>
+                <span className="font-medium">Calendar-based</span>
+                <span className="block text-xs text-muted">
+                  Day N opens on its calendar day; missed days can be caught up in order.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm cursor-pointer">
+              <input
+                type="radio"
+                name="unlock_mode"
+                className="mt-0.5"
+                checked={unlockMode === "progress"}
+                onChange={() => setUnlockMode("progress")}
+              />
+              <span>
+                <span className="font-medium">Progress-based</span>
+                <span className="block text-xs text-muted">
+                  The next day opens as soon as the previous one is completed (self-paced, still in order).
+                </span>
+              </span>
+            </label>
+          </div>
+        </div>
       </section>
 
       {/* Audience & priority (multi-journey, 0063) */}
@@ -1571,50 +1622,39 @@ function SettingsTab({
       </section>
 
       <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 space-y-3">
-        <h3 className="text-sm font-semibold">Behind-schedule nudges</h3>
+        <h3 className="text-sm font-semibold">Daily reminders</h3>
         <p className="text-xs text-muted">
-          A daily email (09:30 IST) to learners who fall behind, sent through
-          your org&apos;s branded pipeline. The wording is editable like any
-          other template under Broadcast → Templates → &ldquo;journey_nudge&rdquo;.
+          A once-a-day email to every learner with a pending mission — naming
+          their next module and linking straight to the journey. It stops
+          automatically when they catch up, never sends twice in a day, and
+          works on both Calendar and Progress journeys. Wording is editable
+          under Broadcast → Templates → &ldquo;journey_nudge&rdquo;.
         </p>
         <ToggleRow
-          label="Send nudge emails"
+          label="Send daily reminders"
           hint="Off = no automated reminders; the Reports tab still shows who's behind"
           checked={nudgeEnabled}
           onChange={setNudgeEnabled}
         />
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <label className="block">
-            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
-              Nudge when behind by (days)
-            </span>
-            <input
-              type="number"
-              min={1}
-              max={30}
-              value={nudgeBehind}
-              onChange={(e) =>
-                setNudgeBehind(Math.max(1, Math.min(30, Number(e.target.value) || 1)))
-              }
-              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
-            />
-          </label>
-          <label className="block">
-            <span className="block text-xs uppercase tracking-wide text-muted mb-1">
-              Days between nudges
-            </span>
-            <input
-              type="number"
-              min={1}
-              max={30}
-              value={nudgeCooldown}
-              onChange={(e) =>
-                setNudgeCooldown(Math.max(1, Math.min(30, Number(e.target.value) || 1)))
-              }
-              className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
-            />
-          </label>
-        </div>
+        <label className="block max-w-[14rem]">
+          <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+            Reminder time (org local)
+          </span>
+          <select
+            value={reminderHour}
+            onChange={(e) => setReminderHour(Number(e.target.value))}
+            className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm"
+          >
+            {Array.from({ length: 24 }, (_, h) => (
+              <option key={h} value={h}>
+                {String(h).padStart(2, "0")}:00
+              </option>
+            ))}
+          </select>
+          <span className="block text-[11px] text-muted mt-1">
+            Sent at or just after this hour each day.
+          </span>
+        </label>
 
         {/* Deadline + manager escalation (0065) */}
         <div className="border-t border-line pt-3 space-y-3">
@@ -1666,10 +1706,28 @@ function SettingsTab({
                 className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
               />
             </label>
+            <label className="block">
+              <span className="block text-xs uppercase tracking-wide text-muted mb-1">
+                Days between manager emails
+              </span>
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={nudgeCooldown}
+                onChange={(e) =>
+                  setNudgeCooldown(Math.max(1, Math.min(30, Number(e.target.value) || 1)))
+                }
+                className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm tabular-nums"
+              />
+              <span className="block text-[11px] text-muted mt-1">
+                Manager escalation applies to Calendar journeys only.
+              </span>
+            </label>
           </div>
           <ToggleRow
             label="Escalate to L1 managers"
-            hint="Copies the learner's Line Manager once the threshold or deadline is crossed; same cadence as the learner nudges"
+            hint="Copies the learner's Line Manager once the threshold or deadline is crossed (Calendar journeys only)"
             checked={escalationEnabled}
             onChange={setEscalationEnabled}
           />

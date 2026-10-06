@@ -481,7 +481,7 @@ export async function buildProgress(
     status: string;
     start_date: string;
     completed_at: string | null;
-    journey_versions: { days: unknown; days_total: number; count_sundays: boolean; version_number: number } | Array<{ days: unknown; days_total: number; count_sundays: boolean; version_number: number }>;
+    journey_versions: { days: unknown; days_total: number; count_sundays: boolean; version_number: number; unlock_mode?: string | null } | Array<{ days: unknown; days_total: number; count_sundays: boolean; version_number: number; unlock_mode?: string | null }>;
     journey_programs: { name: string; is_active: boolean } | Array<{ name: string; is_active: boolean }>;
   };
   let enrollments: Enr[] = [];
@@ -492,7 +492,7 @@ export async function buildProgress(
       svc
         .from("journey_enrollments")
         .select(
-          "id, user_id, program_id, version_id, status, start_date, completed_at, journey_versions!inner(days, days_total, count_sundays, version_number), journey_programs!inner(name, is_active)"
+          "id, user_id, program_id, version_id, status, start_date, completed_at, journey_versions!inner(days, days_total, count_sundays, version_number, unlock_mode), journey_programs!inner(name, is_active)"
         )
         .eq("organization_id", orgId)
         .in("user_id", uids)
@@ -685,15 +685,25 @@ export async function buildProgress(
       if (!v || !prog || prog.is_active === false) continue;
       const days = parseVersionDays(v.days);
       const done = dayDone.get(e.id) ?? new Map<number, string>();
+      const unlockMode = v.unlock_mode === "progress" ? "progress" : "calendar";
       const state = computeJourneyState({
         startDate: e.start_date,
         today,
         completedCount: done.size,
         daysTotal: v.days_total,
         countSundays: v.count_sundays === true,
+        unlockMode,
         courseDays: courseDaysOf(v.days, v.days_total),
       });
       const active = e.status === "active" && !state.finished;
+      // In progress mode "released" means openable-by-completion (completed
+      // days + the one open next day), not a calendar window.
+      const releasedCeiling =
+        unlockMode === "progress"
+          ? state.finished
+            ? v.days_total
+            : state.openableDay
+          : state.allowedDay;
       const dayRow = (d: number) => {
         const entry = days.get(d);
         const cid = entry?.course_id ?? null;
@@ -703,14 +713,17 @@ export async function buildProgress(
           course_id: cid,
           title: cid ? courseTitle.get(cid) ?? entry?.mission_title ?? null : entry?.mission_title ?? null,
           rest_day: !cid,
-          released: d <= state.allowedDay,
+          released: d <= releasedCeiling,
           completed: !cid || !!completedAt,
           completed_at: completedAt,
         };
       };
+      // The mission to surface as "today": the calendar's highest released day
+      // (calendar mode) or the single openable day (progress mode).
+      const todayDayNum = unlockMode === "progress" ? state.openableDay : state.allowedDay;
       let todayBlock: JourneyProgress["today"] = null;
-      if (active && state.allowedDay >= 1) {
-        const row = dayRow(state.allowedDay);
+      if (active && todayDayNum >= 1) {
+        const row = dayRow(todayDayNum);
         todayBlock = {
           date: today,
           day: row.day,

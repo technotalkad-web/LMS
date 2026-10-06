@@ -287,7 +287,7 @@ export async function GET(request: Request) {
     const { data: enrRows } = await svc
       .from("journey_enrollments")
       .select(
-        "id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays), journey_programs!inner(name, is_active)"
+        "id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode), journey_programs!inner(name, is_active)"
       )
       .eq("organization_id", orgId)
       .eq("user_id", uid)
@@ -302,7 +302,7 @@ export async function GET(request: Request) {
       program_id: string;
       status: string;
       start_date: string;
-      journey_versions: { days: unknown; days_total: number; count_sundays: boolean } | Array<{ days: unknown; days_total: number; count_sundays: boolean }>;
+      journey_versions: { days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null } | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
       journey_programs: { name: string; is_active: boolean } | Array<{ name: string; is_active: boolean }>;
     }>) {
       const v = Array.isArray(e.journey_versions) ? e.journey_versions[0] : e.journey_versions;
@@ -318,6 +318,7 @@ export async function GET(request: Request) {
         completedCount: count ?? 0,
         daysTotal: v.days_total,
         countSundays: v.count_sundays === true,
+        unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
         courseDays: courseDaysOf(v.days, v.days_total),
       });
       journeys.push({
