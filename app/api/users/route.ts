@@ -9,6 +9,11 @@ import {
   loadOrgGovernance,
   checkGovernedField,
 } from "@/lib/org/field-options";
+import {
+  fetchHierarchyMembers,
+  messagesOf,
+  validateManagerAssignment,
+} from "@/lib/org/reporting-line";
 
 /**
  *   POST /api/users
@@ -40,6 +45,7 @@ type CreateUserBody = {
   job_role?: string;
   line_manager_id?: string;
   indirect_manager_id?: string;
+  l3_manager_id?: string;
   lms_role: "user" | "data_analyst" | "admin" | "super_owner";
   node_id: string;
   city?: string;
@@ -199,6 +205,29 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
+    if (!body.l3_manager_id?.trim()) {
+      return NextResponse.json(
+        { error: "L3 Manager is required." },
+        { status: 400 }
+      );
+    }
+  }
+
+  // ---- Reporting-line integrity (migration 0091) ----
+  // Managers must be active members of this org and never the person
+  // themselves; a chain mismatch only warns. Checked before any write.
+  const managerNext = {
+    line_manager_id: body.line_manager_id?.trim() || null,
+    indirect_manager_id: body.indirect_manager_id?.trim() || null,
+    l3_manager_id: body.l3_manager_id?.trim() || null,
+  };
+  const hierarchy = await fetchHierarchyMembers(svc, org.id as string);
+  const managerCheck = validateManagerAssignment(hierarchy, null, managerNext);
+  if (managerCheck.errors.length > 0) {
+    return NextResponse.json(
+      { error: messagesOf(managerCheck.errors).join(" ") },
+      { status: 400 }
+    );
   }
 
   // ---- Find or create the auth.user ----
@@ -255,6 +284,21 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Could not provision user" }, { status: 500 });
   }
 
+  // An existing account may already sit in someone's chain: re-run the
+  // self-reference / cycle checks with its id. Nothing has been written yet
+  // on this path (`found`), so a 400 here is clean.
+  let managerWarnings = messagesOf(managerCheck.warnings);
+  if (found) {
+    const recheck = validateManagerAssignment(hierarchy, authUserId, managerNext);
+    if (recheck.errors.length > 0) {
+      return NextResponse.json(
+        { error: messagesOf(recheck.errors).join(" ") },
+        { status: 400 }
+      );
+    }
+    managerWarnings = messagesOf(recheck.warnings);
+  }
+
   // ---- Upsert the profile (global, per-user) ----
   const username = body.username?.trim() || email;
   // When the admin let us auto-generate the password (wantsInvite = true)
@@ -304,8 +348,9 @@ export async function POST(request: Request) {
     grade: body.grade?.trim() || null,
     designation: governed.designation,
     job_role: governed.job_role,
-    line_manager_id: body.line_manager_id?.trim() || null,
-    indirect_manager_id: body.indirect_manager_id?.trim() || null,
+    line_manager_id: managerNext.line_manager_id,
+    indirect_manager_id: managerNext.indirect_manager_id,
+    l3_manager_id: managerNext.l3_manager_id,
     node_id: governed.node_id ?? body.node_id!.trim(),
     city: governed.city,
     state: governed.state,
@@ -381,5 +426,6 @@ export async function POST(request: Request) {
   return NextResponse.json({
     user_id: authUserId,
     invited: didInvite,
+    warnings: managerWarnings,
   });
 }

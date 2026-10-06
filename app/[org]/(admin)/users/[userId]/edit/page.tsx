@@ -42,7 +42,7 @@ export default async function EditUserPage({
   const { data: memRow } = await svc
     .from("organization_members")
     .select(
-      "user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, node_id, city, state, business_vertical, branch"
+      "user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state, business_vertical, branch"
     )
     .eq("organization_id", org.id)
     .eq("user_id", userId)
@@ -73,6 +73,7 @@ export default async function EditUserPage({
     job_role: memRow.job_role ?? "",
     line_manager_id: memRow.line_manager_id ?? "",
     indirect_manager_id: memRow.indirect_manager_id ?? "",
+    l3_manager_id: (memRow as { l3_manager_id?: string | null }).l3_manager_id ?? "",
     lms_role: memRow.role as UserDetail["lms_role"],
     node_id: memRow.node_id ?? "",
     city: memRow.city ?? "",
@@ -81,11 +82,15 @@ export default async function EditUserPage({
     branch: (memRow as { branch?: string | null }).branch ?? "",
   };
 
-  // Manager picker options (excluding self).
+  // Manager picker options: ACTIVE members, excluding self — the
+  // reporting-line rules (0091) refuse an inactive/suspended manager. A
+  // stored manager who is no longer active is shown by the form as a
+  // labelled stale option.
   const { data: peerRows } = await supabase
     .from("organization_members")
     .select("user_id")
-    .eq("organization_id", org.id);
+    .eq("organization_id", org.id)
+    .eq("status", "active");
   const peerIds = (peerRows ?? [])
     .map((m) => m.user_id)
     .filter((id) => id !== userId);

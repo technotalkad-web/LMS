@@ -24,6 +24,7 @@ export type UserDetail = {
   job_role: string;
   line_manager_id: string;
   indirect_manager_id: string;
+  l3_manager_id: string;
   lms_role: LmsRole;
   node_id: string;
   city: string;
@@ -49,7 +50,7 @@ export function EditUserForm({
   /** Master-data lists (migration 0055): field → allowed values. A field
    *  with values here is mandatory and renders as a restricted dropdown. */
   fieldOptions?: Record<string, string[]>;
-  /** Line Manager (L1) + Indirect Line Manager (L2) mandatory? */
+  /** Reporting-line managers (L1 + L2 + L3) mandatory? */
   requireManagers?: boolean;
 }) {
   const router = useRouter();
@@ -57,11 +58,44 @@ export function EditUserForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  // Reporting-line warnings (chain mismatch) — saved, but worth a look.
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   function set<K extends keyof UserDetail>(key: K, value: UserDetail[K]) {
     setForm((f) => ({ ...f, [key]: value }));
     setSaved(false);
+    setWarnings([]);
   }
+
+  // Reporting-line manager picker (L1/L2/L3). A stored manager who is no
+  // longer an active member has no option in `managers`; render them as a
+  // labelled stale option so the control shows the real value and the admin
+  // can see what to replace or clear (same idea as governed() below).
+  const managerSelect = (label: string, key: "line_manager_id" | "indirect_manager_id" | "l3_manager_id") => {
+    const stale = !!form[key] && !managers.some((m) => m.user_id === form[key]);
+    return (
+      <Field label={label} required={requireManagers}>
+        <select
+          required={requireManagers}
+          value={form[key]}
+          onChange={(e) => set(key, e.target.value)}
+          className="input"
+        >
+          <option value="">—</option>
+          {stale && (
+            <option value={form[key]}>
+              {form[key].slice(0, 8)}… (no longer an active member)
+            </option>
+          )}
+          {managers.map((m) => (
+            <option key={m.user_id} value={m.user_id}>
+              {m.email}
+            </option>
+          ))}
+        </select>
+      </Field>
+    );
+  };
 
   // Governed Organization-details field (migration 0055): a restricted,
   // required dropdown when master values exist; the legacy free-text input
@@ -119,6 +153,7 @@ export function EditUserForm({
     setBusy(true);
     setError(null);
     setSaved(false);
+    setWarnings([]);
     const { user_id: _u, email: _e, ...payload } = form;
     void _u;
     void _e;
@@ -132,6 +167,14 @@ export function EditUserForm({
         delete (payload as Record<string, unknown>)[k];
       }
     }
+    // Same for the reporting-line managers: an untouched pointer at someone
+    // who has since left the org must not fail an unrelated edit — the
+    // integrity rules only re-validate what the admin actually changed.
+    for (const k of ["line_manager_id", "indirect_manager_id", "l3_manager_id"] as const) {
+      if (payload[k] === initial[k]) {
+        delete (payload as Record<string, unknown>)[k];
+      }
+    }
     const res = await fetch(
       `/api/users/${userId}?orgSlug=${encodeURIComponent(orgSlug)}`,
       {
@@ -141,11 +184,15 @@ export function EditUserForm({
       }
     );
     setBusy(false);
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    const j = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      warnings?: string[];
+    };
     if (!res.ok) {
       setError(j.error ?? "Save failed");
       return;
     }
+    setWarnings(j.warnings ?? []);
     setSaved(true);
     router.refresh();
   }
@@ -288,36 +335,9 @@ export function EditUserForm({
           {governed("Job role / title", "job_role")}
           {governed("Node ID (hierarchy branch)", "node_id", { mono: true })}
 
-          <Field label="Line manager" required={requireManagers}>
-            <select
-              required={requireManagers}
-              value={form.line_manager_id}
-              onChange={(e) => set("line_manager_id", e.target.value)}
-              className="input"
-            >
-              <option value="">—</option>
-              {managers.map((m) => (
-                <option key={m.user_id} value={m.user_id}>
-                  {m.email}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Indirect line manager" required={requireManagers}>
-            <select
-              required={requireManagers}
-              value={form.indirect_manager_id}
-              onChange={(e) => set("indirect_manager_id", e.target.value)}
-              className="input"
-            >
-              <option value="">—</option>
-              {managers.map((m) => (
-                <option key={m.user_id} value={m.user_id}>
-                  {m.email}
-                </option>
-              ))}
-            </select>
-          </Field>
+          {managerSelect("Line manager (L1)", "line_manager_id")}
+          {managerSelect("Indirect line manager (L2)", "indirect_manager_id")}
+          {managerSelect("L3 manager", "l3_manager_id")}
 
           {governed("City", "city")}
           {governed("Branch", "branch")}
@@ -325,6 +345,15 @@ export function EditUserForm({
           {governed("State / Territory", "state")}
           {governed("Business vertical", "business_vertical")}
         </div>
+        {/* Reporting-line warnings from the last save (chain mismatch) —
+            saved, but worth a look. Cleared on the next edit. */}
+        {warnings.length > 0 && (
+          <div className="mt-4 border border-amber-200 bg-amber-50 text-amber-900 rounded-lg p-3 text-xs space-y-0.5">
+            {warnings.map((w) => (
+              <p key={w}>{w}</p>
+            ))}
+          </div>
+        )}
       </section>
 
       {error && (

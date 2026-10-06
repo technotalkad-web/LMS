@@ -6,6 +6,12 @@ import {
   loadOrgGovernance,
   checkGovernedField,
 } from "@/lib/org/field-options";
+import {
+  fetchHierarchyMembers,
+  messagesOf,
+  validateManagerAssignment,
+  type ManagerAssignment,
+} from "@/lib/org/reporting-line";
 
 /**
  *   PATCH /api/users/[userId]?orgSlug=...
@@ -36,6 +42,7 @@ type Body = {
   job_role?: string;
   line_manager_id?: string;
   indirect_manager_id?: string;
+  l3_manager_id?: string;
   lms_role?: string;
   node_id?: string;
   city?: string;
@@ -164,6 +171,35 @@ export async function PATCH(
         { status: 400 }
       );
     }
+    if (body.l3_manager_id !== undefined && !body.l3_manager_id.trim()) {
+      return NextResponse.json(
+        { error: "L3 Manager is required." },
+        { status: 400 }
+      );
+    }
+  }
+
+  // ---- Reporting-line integrity (migration 0091) ----
+  // Only the manager fields in the payload are checked: self-reference,
+  // inactive/non-member managers and L1 cycles block; a chain mismatch warns.
+  const managerPatch: ManagerAssignment = {};
+  if (body.line_manager_id !== undefined)
+    managerPatch.line_manager_id = body.line_manager_id.trim() || null;
+  if (body.indirect_manager_id !== undefined)
+    managerPatch.indirect_manager_id = body.indirect_manager_id.trim() || null;
+  if (body.l3_manager_id !== undefined)
+    managerPatch.l3_manager_id = body.l3_manager_id.trim() || null;
+  let managerWarnings: string[] = [];
+  if (Object.keys(managerPatch).length > 0) {
+    const hierarchy = await fetchHierarchyMembers(svc, org.id as string);
+    const check = validateManagerAssignment(hierarchy, userId, managerPatch);
+    if (check.errors.length > 0) {
+      return NextResponse.json(
+        { error: messagesOf(check.errors).join(" ") },
+        { status: 400 }
+      );
+    }
+    managerWarnings = messagesOf(check.warnings);
   }
 
   // ---- Profile update (only fields that were provided) ----
@@ -230,10 +266,7 @@ export async function PATCH(
     memFields.designation = governed.designation ?? null;
   if (body.job_role !== undefined)
     memFields.job_role = governed.job_role ?? null;
-  if (body.line_manager_id !== undefined)
-    memFields.line_manager_id = body.line_manager_id.trim() || null;
-  if (body.indirect_manager_id !== undefined)
-    memFields.indirect_manager_id = body.indirect_manager_id.trim() || null;
+  Object.assign(memFields, managerPatch);
   if (body.node_id !== undefined)
     memFields.node_id = governed.node_id ?? body.node_id.trim();
   if (body.city !== undefined) memFields.city = governed.city ?? null;
@@ -256,5 +289,5 @@ export async function PATCH(
     }
   }
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, warnings: managerWarnings });
 }

@@ -19,12 +19,14 @@ export default async function NewUserPage({
     redirect(`/${orgSlug}/dashboard?denied=1`);
   }
 
-  // Fetch existing org members so admin can pick a line manager.
+  // Fetch existing ACTIVE org members so admin can pick a manager — the
+  // reporting-line rules (0091) refuse an inactive/suspended manager.
   const supabase = await createClient();
   const { data: memberRows } = await supabase
     .from("organization_members")
     .select("user_id")
-    .eq("organization_id", org.id);
+    .eq("organization_id", org.id)
+    .eq("status", "active");
   const memberIds = (memberRows ?? []).map((m) => m.user_id);
 
   const emailByUser = new Map<string, string>();

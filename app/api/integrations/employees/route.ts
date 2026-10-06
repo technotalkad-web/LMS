@@ -8,6 +8,11 @@ import {
   type GovernedField,
 } from "@/lib/org/field-options";
 import { checkQuota } from "@/lib/billing/enforce-quota";
+import {
+  fetchHierarchyMembers,
+  validateManagerAssignment,
+  LEVEL_FIELDS,
+} from "@/lib/org/reporting-line";
 
 /**
  * Employee sync — the "CRM is master of employee records" half of the
@@ -29,8 +34,10 @@ import { checkQuota } from "@/lib/billing/enforce-quota";
  *     fields (designation, city, …) must use master values → 400 with the
  *     same message admins see.
  *   - Managers are referenced by THEIR employee_id (line_manager_employee_id
- *     / indirect_manager_employee_id); an unresolvable manager is reported
- *     in `warnings` and skipped, never fails the sync.
+ *     / indirect_manager_employee_id / l3_manager_employee_id — the explicit
+ *     reporting line, migration 0091); an unresolvable manager, or one that
+ *     breaks the reporting-line rules (self-reference, cycle), is reported
+ *     in `warnings` and that field is skipped — never fails the sync.
  *   - Email is identity: it is required at create and cannot be changed via
  *     sync (reported in warnings) — change it in the LMS admin if ever
  *     needed.
@@ -59,6 +66,7 @@ type UpsertBody = {
   branch?: string | null;
   line_manager_employee_id?: string | null;
   indirect_manager_employee_id?: string | null;
+  l3_manager_employee_id?: string | null;
 };
 
 export async function GET(request: Request) {
@@ -70,7 +78,7 @@ export async function GET(request: Request) {
   const { data } = await auth.svc
     .from("organization_members")
     .select(
-      "user_id, role, status, employee_id, designation, job_role, city, state, business_vertical, branch, grade, node_id, date_of_joining, line_manager_id, indirect_manager_id"
+      "user_id, role, status, employee_id, designation, job_role, city, state, business_vertical, branch, grade, node_id, date_of_joining, line_manager_id, indirect_manager_id, l3_manager_id"
     )
     .eq("organization_id", auth.orgId)
     .eq("employee_id", employeeId)
@@ -82,6 +90,23 @@ export async function GET(request: Request) {
     .select("email, first_name, last_name")
     .eq("id", m.user_id as string)
     .maybeSingle();
+  // Managers are echoed back as employee_ids — the key the CRM speaks.
+  const managerUserIds = [m.line_manager_id, m.indirect_manager_id, m.l3_manager_id].filter(
+    (v): v is string => typeof v === "string"
+  );
+  const employeeIdByUser = new Map<string, string | null>();
+  if (managerUserIds.length > 0) {
+    const { data: mgrs } = await auth.svc
+      .from("organization_members")
+      .select("user_id, employee_id")
+      .eq("organization_id", auth.orgId)
+      .in("user_id", managerUserIds);
+    for (const row of (mgrs ?? []) as Array<{ user_id: string; employee_id: string | null }>) {
+      employeeIdByUser.set(row.user_id, row.employee_id);
+    }
+  }
+  const managerEmployeeId = (v: unknown) =>
+    typeof v === "string" ? employeeIdByUser.get(v) ?? null : null;
   return NextResponse.json({
     employee_id: m.employee_id,
     status: m.status,
@@ -98,6 +123,9 @@ export async function GET(request: Request) {
     grade: m.grade,
     node_id: m.node_id,
     date_of_joining: m.date_of_joining,
+    line_manager_employee_id: managerEmployeeId(m.line_manager_id),
+    indirect_manager_employee_id: managerEmployeeId(m.indirect_manager_id),
+    l3_manager_employee_id: managerEmployeeId(m.l3_manager_id),
   });
 }
 
@@ -140,11 +168,17 @@ export async function PUT(request: Request) {
   }
 
   // ---- Manager linkage by employee_id (warn + skip when unresolvable).
-  const managerIds: { line_manager_id?: string | null; indirect_manager_id?: string | null } = {};
-  for (const [key, col] of [
+  const managerIds: {
+    line_manager_id?: string | null;
+    indirect_manager_id?: string | null;
+    l3_manager_id?: string | null;
+  } = {};
+  const MANAGER_KEYS = [
     ["line_manager_employee_id", "line_manager_id"],
     ["indirect_manager_employee_id", "indirect_manager_id"],
-  ] as const) {
+    ["l3_manager_employee_id", "l3_manager_id"],
+  ] as const;
+  for (const [key, col] of MANAGER_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
     const ref = body[key]?.trim();
     if (!ref) {
@@ -155,11 +189,30 @@ export async function PUT(request: Request) {
     if (mgr) managerIds[col] = mgr.userId;
     else warnings.push(`${key} "${ref}" has no active LMS account yet — left unchanged`);
   }
-  if (!existing && gov.requireManagers && managerIds.line_manager_id === undefined) {
-    return NextResponse.json(
-      { error: "line_manager_employee_id is required by this organization" },
-      { status: 400 }
-    );
+  // Reporting-line integrity (0091): a manager that would be the person
+  // themselves or close an L1 cycle is dropped (warned), never fatal — the
+  // sync keeps its "never fails on ordering" contract and Master Data →
+  // Reporting lines surfaces what is left to fix.
+  if (Object.keys(managerIds).length > 0) {
+    const hierarchy = await fetchHierarchyMembers(svc, orgId);
+    const check = validateManagerAssignment(hierarchy, existing?.user_id ?? null, managerIds);
+    for (const e of check.errors) {
+      const col = LEVEL_FIELDS[e.level];
+      const key = MANAGER_KEYS.find(([, c]) => c === col)![0];
+      warnings.push(`${key} "${body[key]?.trim()}" skipped — ${e.message}`);
+      delete managerIds[col];
+    }
+    for (const w of check.warnings) warnings.push(w.message);
+  }
+  if (!existing && gov.requireManagers) {
+    for (const [key, col] of MANAGER_KEYS) {
+      if (managerIds[col] === undefined || managerIds[col] === null) {
+        return NextResponse.json(
+          { error: `${key} is required by this organization` },
+          { status: 400 }
+        );
+      }
+    }
   }
 
   // ================= UPDATE =================
@@ -291,6 +344,7 @@ export async function PUT(request: Request) {
       branch: governed.branch ?? null,
       line_manager_id: managerIds.line_manager_id ?? null,
       indirect_manager_id: managerIds.indirect_manager_id ?? null,
+      l3_manager_id: managerIds.l3_manager_id ?? null,
     },
     { onConflict: "organization_id,user_id" }
   );

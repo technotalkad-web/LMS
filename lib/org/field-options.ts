@@ -51,7 +51,7 @@ export const MASTER_VALUE_ERROR =
 export type OrgGovernance = {
   /** field → (lowercased value → canonical master value) */
   options: Map<GovernedField, Map<string, string>>;
-  /** Are Line Manager (L1) + Indirect Line Manager (L2) mandatory? */
+  /** Are the reporting-line managers (L1 + L2 + L3, migration 0091) mandatory? */
   requireManagers: boolean;
 };
 

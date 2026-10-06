@@ -672,15 +672,17 @@ export function LearnersClient({
                   />
                 )}
               </div>
+              {/* Skipped/errored rows, plus rows saved with a note (e.g. a
+                  reporting-line chain mismatch — saved, but worth a look). */}
               {(
                 bulkSummary.results?.filter(
-                  (r) => r.status === "skipped" || r.status === "error"
+                  (r) => r.status === "skipped" || r.status === "error" || !!r.message
                 ) ?? []
               ).length > 0 && (
                 <ul className="mt-3 text-xs text-muted space-y-1">
                   {bulkSummary.results
                     ?.filter(
-                      (r) => r.status === "skipped" || r.status === "error"
+                      (r) => r.status === "skipped" || r.status === "error" || !!r.message
                     )
                     .map((r) => (
                       <li key={r.row}>
@@ -688,9 +690,14 @@ export function LearnersClient({
                         <span className="text-ink">{r.email || "—"}</span>:{" "}
                         <span
                           className={
-                            r.status === "error" ? "text-red-700" : ""
+                            r.status === "error"
+                              ? "text-red-700"
+                              : r.status === "skipped"
+                                ? ""
+                                : "text-amber-700"
                           }
                         >
+                          {r.status !== "skipped" && r.status !== "error" ? `${r.status} — ` : ""}
                           {r.message}
                         </span>
                       </li>
