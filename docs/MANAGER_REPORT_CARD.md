@@ -168,10 +168,13 @@ Apply `0092_manager_actions.sql` on staging before merging and on prod before
 tagging (the grant action works without it but labels the grant `bulk` and
 cannot re-grant a learner whose earlier grant lapsed unused).
 
-Apply `0093_report_card_cache.sql` on staging before merging and on prod
-before tagging. The L3 screen works without it (live fallback); the cron
-endpoint 404s on prod until a tag deploys the route and then fills the cache
-on its first run.
+Apply `0093_report_card_cache.sql` and `0094_report_card_cache_rls_policy.sql`
+on staging before merging and on prod before tagging. The L3 screen works
+without them (live fallback); the cron endpoint 404s on prod until a tag
+deploys the route and then fills the cache on its first run. 0094 adds the
+explicit deny-all policy the RLS cross-tenant audit requires (an org-scoped
+table with zero policies is reported as FAIL even when fully locked); the
+table shows as WARN in the audit, never OK, because no user may read it.
 
 ## Tests
 
