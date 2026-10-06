@@ -144,12 +144,14 @@ done on any official completion, or only on a pass when the module is
 configured "Pass required".
 
 **Scores follow the LMS's attempt rules.** Admins configure, per module /
-learning path / journey, how many completed attempts are scored (default 3)
-and which one is the official score (default: the first attempt). `score`
-and `official_score` are that official value; `first_score` is retained for
-learning-gain analysis, `best_score` is the best inside the scored window,
-and `practice_attempts` counts revision attempts beyond the window — those
-never change any score. Show `official_score` on the employee's card.
+learning path / journey, how many completed attempts are scored (default 1)
+and which one is the official score (default: the first attempt). When an
+admin grants an extra attempt, the newest completed granted retake becomes
+the official attempt (its score and pass/fail). `score` and `official_score`
+are that official value; `first_score` is retained for learning-gain
+analysis, `best_score` is the best inside the scored window, and
+`practice_attempts` counts revision attempts beyond the window — those never
+change any score or status. Show `official_score` on the employee's card.
 
 `progress_pct` is how far through the module the employee's open attempt is
 (0–99, from the package's own screen/state signals; 100 once complete; null

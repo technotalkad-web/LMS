@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
+import { officialStatuses, statusOf } from "@/lib/scoring/status";
 
 /**
  *   GET /api/learning-paths/{id}/learners/export?orgSlug=...
@@ -191,22 +192,34 @@ export async function GET(
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
+            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
       : { data: [] };
   const attempts = (attemptRows ?? []) as Array<{
+    id: string;
     user_id: string;
     course_version_id: string;
     completion_status: string;
     success_status: string;
+    score: number | null;
     started_at: string;
     completed_at: string | null;
     progress_pct?: number | null;
     units?: unknown;
   }>;
   const lastStepCourseId = steps[steps.length - 1]?.course_id ?? null;
+  // Decision 1 (Phase 0a): the path's pass/fail comes from the final step's
+  // OFFICIAL attempt — never the latest or a practice run.
+  const official = await officialStatuses(
+    svc,
+    org.id,
+    attempts.flatMap((a) => {
+      const cid = courseByVersion.get(a.course_version_id);
+      return cid ? [{ ...a, course_id: cid }] : [];
+    })
+  );
   // Step titles for the "Current step" column (0075).
   const { data: stepCourseRows } = stepCourseIds.length
     ? await supabase.from("courses").select("id, title").in("id", stepCourseIds)
@@ -257,15 +270,8 @@ export async function GET(
     } else if (coursesDone < coursesTotal) {
       status = "in_progress";
     } else {
-      const finalAttempts = myAttempts.filter(
-        (a) => courseByVersion.get(a.course_version_id) === lastStepCourseId
-      );
-      const latestFinal = finalAttempts
-        .slice()
-        .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
-      if (latestFinal?.success_status === "passed") status = "passed";
-      else if (latestFinal?.success_status === "failed") status = "failed";
-      else status = "completed";
+      const verdict = lastStepCourseId ? statusOf(official, uid, lastStepCourseId) : "completed";
+      status = verdict === "passed" ? "passed" : verdict === "failed" ? "failed" : "completed";
     }
     const lastTouched =
       myAttempts

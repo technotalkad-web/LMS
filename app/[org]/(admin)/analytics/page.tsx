@@ -12,8 +12,10 @@ import {
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canViewReports } from "@/lib/auth/permissions";
-import { DEFAULT_POLICY, computeScoring } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, type ScoringResult } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { isOfficialFailed } from "@/lib/scoring/status";
+import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
 import {
   courseProgress,
   formatCourseProgress,
@@ -59,7 +61,7 @@ import { FilterBar, type FilterOption, type FilterState } from "./filter-bar";
  * At-risk scoring (v1, deliberately simple and explainable):
  *   +3 journey ≥3 days behind (or past its deadline)   +1 if 1–2 days behind
  *   +2 per overdue assignment (capped at 3)
- *   +2 latest attempt on any course FAILED
+ *   +2 OFFICIAL attempt on any course FAILED (practice runs never count)
  *   +2 inactive 14+ days (+1 more at 21+)
  *   +2 chronically nudged (3+ reminders on one course)
  * ≥5 = high risk, 3–4 = watch.
@@ -197,7 +199,8 @@ type LearnerStat = {
   behindDays: number; // worst across journeys
   journeyLabel: string | null; // "Day 4/30 · 3 behind"
   maxNudges: number;
-  failedLatest: boolean;
+  /** Decision 1: the OFFICIAL attempt on some course failed (practice runs never count). */
+  officialFailed: boolean;
   risk: number;
   reasons: string[];
   // Content-lens extras
@@ -552,8 +555,11 @@ export default async function AnalyticsPage({
     return done;
   };
 
-  // 0073: official-score rules per course (practice attempts excluded).
+  // 0073: official-score rules per course (practice attempts excluded), and
+  // 0083: each learner's consumed grant retakes, so the OFFICIAL attempt here
+  // is the same one every other surface uses.
   const policies = await resolvePolicies(svc, [...new Set(courseOfVersion.values())]);
+  const grants = await fetchGrantRetakeIdsForUsers(svc, org.id, scoped.map((m) => m.user_id));
 
   const lensCourse = filters.content.startsWith("course:") ? filters.content.slice(7) : null;
   const lensPath = filters.content.startsWith("path:") ? filters.content.slice(5) : null;
@@ -566,16 +572,26 @@ export default async function AnalyticsPage({
     const assignedMap = assignedByUser.get(uid) ?? new Map();
     const assigned = assignedMap.size;
     const completed = [...assignedMap.keys()].filter((c) => done.has(c)).length;
-    // Average of OFFICIAL scores per course (0073), not of every attempt.
+    // Official result per course (0073 policy + 0083 grant retakes): the
+    // average score AND the "failed" flag both come from the OFFICIAL attempt.
     const byCourse = new Map<string, AttemptRow[]>();
     for (const a of my) {
       const cid = courseOfVersion.get(a.course_version_id);
       if (cid) byCourse.set(cid, [...(byCourse.get(cid) ?? []), a]);
     }
-    const scores = [...byCourse.entries()]
-      .map(([cid, list]) =>
-        computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY).officialScore
-      )
+    const scoringByCourse = new Map<string, ScoringResult>();
+    for (const [cid, list] of byCourse) {
+      scoringByCourse.set(
+        cid,
+        computeScoring(
+          list.map(toScorable),
+          policies.get(cid) ?? DEFAULT_POLICY,
+          grants.get(`${uid}:${cid}`) ?? new Set<string>()
+        )
+      );
+    }
+    const scores = [...scoringByCourse.values()]
+      .map((s) => s.officialScore)
       .filter((s): s is number => typeof s === "number");
     const avgScore = scores.length
       ? Math.round((scores.reduce((x, y) => x + y, 0) / scores.length) * 100)
@@ -617,9 +633,9 @@ export default async function AnalyticsPage({
       const pt = prev ? prev.last_activity_at ?? prev.completed_at ?? prev.started_at ?? "" : "";
       if (!prev || t > pt) latestByCourse.set(cid, a);
     }
-    const failedLatest = [...latestByCourse.values()].some(
-      (a) => a.success_status === "failed" && a.completion_status !== "completed"
-    );
+    // Decision 1 (Phase 0a): "failed" = the OFFICIAL attempt failed. The
+    // latest attempt is kept only for the content-lens display below.
+    const officialFailed = [...scoringByCourse.values()].some(isOfficialFailed);
     const maxNudges = Math.max(0, ...(nudgesByUser.get(uid) ?? []).map((n) => n.nudge_count));
 
     const inactiveDays = lastActive
@@ -639,9 +655,9 @@ export default async function AnalyticsPage({
       risk += Math.min(overdue, 3) * 2;
       reasons.push(`${overdue} overdue`);
     }
-    if (failedLatest) {
+    if (officialFailed) {
       risk += 2;
-      reasons.push("failed attempt");
+      reasons.push("failed assessment");
     }
     if (inactiveDays !== null && inactiveDays >= 14) {
       risk += inactiveDays >= 21 ? 3 : 2;
@@ -659,8 +675,9 @@ export default async function AnalyticsPage({
     let lens: string | null = null;
     if (lensCourse) {
       const a = latestByCourse.get(lensCourse);
+      const officialScore = scoringByCourse.get(lensCourse)?.officialScore ?? null;
       lens = done.has(lensCourse)
-        ? `Completed${a?.score != null ? ` · ${Math.round(a.score * 100)}%` : ""}`
+        ? `Completed${officialScore != null ? ` · ${Math.round(officialScore * 100)}%` : ""}`
         : a
           ? formatCourseProgress(
               courseProgress(
@@ -708,7 +725,7 @@ export default async function AnalyticsPage({
         ? `Day ${activeJourney.day}/${activeJourney.total}`
         : null,
       maxNudges,
-      failedLatest,
+      officialFailed,
       risk,
       reasons,
       lens,
@@ -875,7 +892,11 @@ export default async function AnalyticsPage({
     for (const [cid, list] of attemptsOfCourse) {
       const row = perCourse.get(cid);
       if (row) {
-        row.best = computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY).officialScore;
+        row.best = computeScoring(
+          list.map(toScorable),
+          policies.get(cid) ?? DEFAULT_POLICY,
+          grants.get(`${list[0]?.user_id ?? ""}:${cid}`) ?? new Set<string>()
+        ).officialScore;
         row.progress = courseProgress(list, unitCountByVersion);
       }
     }

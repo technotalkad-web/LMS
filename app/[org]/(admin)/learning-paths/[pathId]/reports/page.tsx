@@ -4,6 +4,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { officialStatuses, statusOf } from "@/lib/scoring/status";
 
 // =============================================================================
 // /[org]/learning-paths/[pathId]/reports — Path Reports surface.
@@ -46,6 +47,7 @@ type Step = {
 };
 
 type Attempt = {
+  id: string;
   user_id: string;
   course_version_id: string;
   completion_status: string;
@@ -191,7 +193,7 @@ export default async function PathReportsPage({
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
+            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
           )
           .eq("learning_path_id", pathId)
           .in("user_id", assignedIdArr)
@@ -210,8 +212,8 @@ export default async function PathReportsPage({
   type CourseAgg = {
     touched: boolean;
     done: boolean; // any attempt completed or passed
-    passed: boolean; // any attempt passed
-    failed: boolean; // any attempt failed
+    passed: boolean; // OFFICIAL attempt passed (decision 1)
+    failed: boolean; // OFFICIAL attempt failed (decision 1)
     bestScore: number | null;
     firstStarted: string | null;
     lastCompleted: string | null;
@@ -234,8 +236,6 @@ export default async function PathReportsPage({
     };
     cur.touched = true;
     if (a.completion_status === "completed" || a.success_status === "passed") cur.done = true;
-    if (a.success_status === "passed") cur.passed = true;
-    if (a.success_status === "failed") cur.failed = true;
     if (typeof a.score === "number" && (cur.bestScore === null || a.score > cur.bestScore)) {
       cur.bestScore = a.score;
     }
@@ -248,6 +248,37 @@ export default async function PathReportsPage({
     const act = a.completed_at ?? a.started_at ?? null;
     if (act && (!cur.lastActivity || act > cur.lastActivity)) cur.lastActivity = act;
     aggByUserCourse.set(key, cur);
+  }
+
+  // Decision 1 (Phase 0a): a step's pass/fail per learner comes from their
+  // OFFICIAL attempt — a practice pass never flips a failed step, and a
+  // practice fail after an official pass is not a failure. "done" stays
+  // sticky (any completed attempt).
+  // The OFFICIAL verdict considers EVERY attempt on a step's course (any
+  // path context or a direct launch), exactly as the course pages and the
+  // path Learners tab do — the path-filtered set above stays for
+  // touched / done / time.
+  const { data: allAttemptRows } =
+    assignedIdArr.length && allVersionIds.length
+      ? await supabase
+          .from("course_attempts")
+          .select("id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at")
+          .in("user_id", assignedIdArr)
+          .in("course_version_id", allVersionIds)
+      : { data: [] };
+  const official = await officialStatuses(
+    supabase,
+    org.id,
+    ((allAttemptRows ?? []) as Attempt[]).flatMap((a) => {
+      const cid = versionToCourse.get(a.course_version_id);
+      return cid ? [{ ...a, course_id: cid }] : [];
+    })
+  );
+  for (const [key, agg] of aggByUserCourse) {
+    const [uid, cid] = key.split("::");
+    const verdict = statusOf(official, uid, cid);
+    agg.passed = verdict === "passed";
+    agg.failed = verdict === "failed";
   }
 
   // ---- Per-step metrics ----
