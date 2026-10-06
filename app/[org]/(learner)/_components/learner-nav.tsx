@@ -17,7 +17,7 @@ export function LearnerTopNav({
   orgSlug: string;
   showLeaderboard?: boolean;
   showJourney?: boolean;
-  /** Managers only — anyone with direct reports (line_manager mapping). */
+  /** Managers only — anyone named as L1/L2/L3 by an active employee (reporting line). */
   showTeamPerformance?: boolean;
 }) {
   const pathname = usePathname();

@@ -640,7 +640,7 @@ function PrivacyTab({
           <Toggle
             field="leaderboard_team_leader_view"
             label="Team leaders see member details"
-            hint="On the Verticals board, a team leader can expand member-level performance for their own reports"
+            hint="On the Verticals board, a team leader can expand member-level performance for their own reports. (Team Performance follows the reporting line instead and is not affected.)"
           />
         </div>
       </div>

@@ -34,8 +34,8 @@ export default async function AttemptRequestsPage({
     id: string;
     user_id: string;
     course_id: string;
-    status: "pending" | "approved" | "rejected";
-    source: "request" | "bulk";
+    status: "pending" | "approved" | "rejected" | "expired";
+    source: "request" | "bulk" | "manager";
     reason: string | null;
     decision_note: string | null;
     decided_by: string | null;

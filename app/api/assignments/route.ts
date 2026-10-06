@@ -309,7 +309,7 @@ export async function POST(request: Request) {
           dueAt ? `Due ${new Date(dueAt).toISOString().slice(0, 10)}.` : "",
         ]
           .filter(Boolean)
-          .join(" ");
+          .join(" ") || "No due date."; // an empty value would leave the literal {Due_Date} token in the email
 
         for (const uid of recipientUserIds) {
           const email = emailById.get(uid);
