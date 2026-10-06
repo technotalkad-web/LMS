@@ -37,6 +37,8 @@ export type InsightOptions = {
   userIds: string[];
   /** 7 / 30 / 90 / null (all time). Affects period counts only; flags are always "now". */
   periodDays: number | null;
+  /** Extra period windows to roll up from the same data load (the precompute cache fills all four at once). */
+  periods?: Array<number | null>;
   /** "" | course:<id> | path:<id> | journey:<id> — narrows every number to that content. */
   content?: string;
   now?: Date;
@@ -51,6 +53,8 @@ export type Catalog = {
 
 export type InsightsResult = {
   learners: LearnerInsight[];
+  /** Per extra period requested via `periods` (key = days or "all"). */
+  byPeriod?: Map<string, LearnerInsight[]>;
   catalog: Catalog;
   /** Org-wide fail rate per course (%) from the nightly matview, for §10 benchmarks. */
   benchmark: Map<string, { failRate: number | null; enrolled: number }>;
@@ -187,13 +191,14 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   };
 
   if (userIds.length === 0) {
-    return { learners: [], catalog, benchmark: new Map(), today, tz };
+    // Catalog-only call (the L3 cached path still needs the org benchmark for §7 gaps).
+    return { learners: [], catalog, benchmark: await loadBenchmark(svc, catalog.courses.map((c) => c.id)), today, tz };
   }
 
   /* ---- people ---- */
   const memberRows = await fetchByIds<{
-    user_id: string; designation: string | null; city: string | null; branch: string | null; date_of_joining: string | null;
-  }>(svc, "organization_members", "user_id, designation, city, branch, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
+    user_id: string; designation: string | null; city: string | null; branch: string | null; business_vertical: string | null; date_of_joining: string | null;
+  }>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
   const memberById = new Map(memberRows.map((m) => [m.user_id, m]));
   const profRows = await fetchByIds<{ id: string; first_name: string | null; last_name: string | null; email: string | null; avatar_url: string | null }>(
     svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", userIds
@@ -377,29 +382,17 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   ]);
 
   /* ---- org benchmark (nightly matview; fail-soft) ---- */
-  const benchmark = new Map<string, { failRate: number | null; enrolled: number }>();
-  if (courseIdList.length) {
-    try {
-      const rows = await fetchByIds<{ course_id: string; total_enrolled: number | null; total_failed: number | null }>(
-        svc, "mv_course_performance", "course_id, total_enrolled, total_failed", "course_id", courseIdList, undefined, "course_id"
-      );
-      for (const r of rows) {
-        const enrolled = r.total_enrolled ?? 0;
-        benchmark.set(r.course_id, { enrolled, failRate: enrolled > 0 ? Math.round(((r.total_failed ?? 0) / enrolled) * 100) : null });
-      }
-    } catch {
-      /* matview absent / not refreshed yet */
-    }
-  }
+  const benchmark = await loadBenchmark(svc, courseIdList);
 
-  /* ---- per-learner rollup ---- */
-  const periodStart = opts.periodDays === null ? null : new Date(nowMs - opts.periodDays * DAY).toISOString();
-  const prevStart = opts.periodDays === null ? null : new Date(nowMs - 2 * opts.periodDays * DAY).toISOString();
+  /* ---- per-learner rollup (one data load, any number of period windows) ---- */
+  const activeCutoff = new Date(nowMs - THRESHOLDS.activeWindowDays * DAY).toISOString();
+  const rollup = (periodDays: number | null): LearnerInsight[] => {
+  const periodStart = periodDays === null ? null : new Date(nowMs - periodDays * DAY).toISOString();
+  const prevStart = periodDays === null ? null : new Date(nowMs - 2 * periodDays * DAY).toISOString();
   const inPeriod = (iso: string | null) => !!iso && (periodStart === null || iso >= periodStart);
   const inPrev = (iso: string | null) => !!iso && prevStart !== null && periodStart !== null && iso >= prevStart && iso < periodStart;
-  const activeCutoff = new Date(nowMs - THRESHOLDS.activeWindowDays * DAY).toISOString();
 
-  const learners: LearnerInsight[] = userIds.map((uid) => {
+  return userIds.map((uid): LearnerInsight => {
     const m = memberById.get(uid);
     const p = profById.get(uid);
     const my = attemptsByUser.get(uid) ?? [];
@@ -570,6 +563,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       designation: m?.designation ?? null,
       city: m?.city ?? null,
       branch: m?.branch ?? null,
+      vertical: m?.business_vertical ?? null,
       joined: m?.date_of_joining ?? null,
       assigned,
       completed,
@@ -592,6 +586,34 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       completedInPrevPeriod,
     };
   });
+  };
 
-  return { learners, catalog, benchmark, today, tz };
+  const learners = rollup(opts.periodDays);
+  const byPeriod = opts.periods
+    ? new Map(opts.periods.map((d) => [periodKey(d), periodKey(d) === periodKey(opts.periodDays) ? learners : rollup(d)]))
+    : undefined;
+  return { learners, byPeriod, catalog, benchmark, today, tz };
+}
+
+/** Cache / map key for a period window. */
+export function periodKey(days: number | null): string {
+  return days === null ? "all" : String(days);
+}
+
+/** Org-wide fail rate per course from the nightly matview (fail-soft: absent/unrefreshed → empty). */
+async function loadBenchmark(svc: SupabaseClient, courseIds: string[]): Promise<InsightsResult["benchmark"]> {
+  const benchmark = new Map<string, { failRate: number | null; enrolled: number }>();
+  if (courseIds.length === 0) return benchmark;
+  try {
+    const rows = await fetchByIds<{ course_id: string; total_enrolled: number | null; total_failed: number | null }>(
+      svc, "mv_course_performance", "course_id, total_enrolled, total_failed", "course_id", courseIds, undefined, "course_id"
+    );
+    for (const r of rows) {
+      const enrolled = r.total_enrolled ?? 0;
+      benchmark.set(r.course_id, { enrolled, failRate: enrolled > 0 ? Math.round(((r.total_failed ?? 0) / enrolled) * 100) : null });
+    }
+  } catch {
+    /* matview absent / not refreshed yet */
+  }
+  return benchmark;
 }

@@ -1,6 +1,7 @@
 import {
   SEVERITY_RANK,
   type CommonStruggle,
+  type OrgGap,
   type ExceptionAction,
   type ExceptionFlag,
   type ExceptionGroup,
@@ -564,5 +565,84 @@ export function buildCommonStruggles(teams: TeamInput[], byId: Map<string, Learn
   });
   return out
     .sort((a, b) => b.teamsAffected - a.teamsAffected || b.learners - a.learners || a.title.localeCompare(b.title))
+    .slice(0, max);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — L3 organisation view (§7): major learning gaps across the
+// hierarchy, grouped by city (or L2 group). Content-level, no individuals.
+// ---------------------------------------------------------------------------
+
+/**
+ * Rank content by how much of the hierarchy it holds back. `groupOf` maps a
+ * learner to their city / L2 group so a gap can say "across 7 cities".
+ */
+export function buildOrgGaps(
+  learners: LearnerInsight[],
+  benchmark: Map<string, { failRate: number | null; enrolled: number }>,
+  groupOf: (l: LearnerInsight) => string | null,
+  groupsTotal: number,
+  max = 5
+): OrgGap[] {
+  type Row = Omit<OrgGap, "groupsAffected" | "advice"> & { people: Set<string>; groups: Set<string>; withCourse: number; assigned: number };
+  const rows = new Map<string, Row>();
+  const row = (id: string, kind: OrgGap["kind"], title: string): Row => {
+    const cur = rows.get(id) ?? { id, kind, title, learners: 0, failed: 0, notStarted: 0, stuck: 0, overdue: 0, pending: 0, failRate: null, orgFailRate: null, notStartedRate: null, groupsTotal, people: new Set<string>(), groups: new Set<string>(), withCourse: 0, assigned: 0 };
+    rows.set(id, cur);
+    return cur;
+  };
+  // Denominators per course across the hierarchy.
+  for (const l of learners) {
+    for (const c of l.courses) {
+      const r = row(c.courseId, "course", c.title);
+      r.withCourse++;
+      if (c.assignedAt !== null || c.dueAt !== null) r.assigned++;
+    }
+  }
+  for (const l of learners) {
+    const g = groupOf(l);
+    for (const f of l.flags) {
+      if (!f.contentId) continue;
+      let r: Row | null = null;
+      if (f.contentKind === "course") {
+        r = row(f.contentId, "course", f.contentTitle ?? "");
+        if (f.kind === "failed") r.failed++;
+        else if (f.kind === "not_started") r.notStarted++;
+        else if (f.kind === "stuck") r.stuck++;
+        else if (f.kind === "overdue") r.overdue++;
+        else r = null;
+      }
+      if (!r) continue;
+      r.people.add(l.userId);
+      if (g) r.groups.add(g);
+    }
+    for (const j of l.journeys) {
+      if (j.status !== "active" || j.behind <= 0 || !j.nextModule) continue;
+      const r = row(`${j.programId}:${j.day}`, "journey-day", `Day ${j.day} · ${j.nextModule}`);
+      r.pending++;
+      r.people.add(l.userId);
+      if (g) r.groups.add(g);
+    }
+  }
+  const out: OrgGap[] = [];
+  for (const r of rows.values()) {
+    if (r.people.size === 0) continue;
+    const failRate = r.kind === "course" && r.withCourse > 0 ? Math.round((r.failed / r.withCourse) * 100) : null;
+    const notStartedRate = r.kind === "course" && r.assigned > 0 ? Math.round((r.notStarted / r.assigned) * 100) : null;
+    const orgFailRate = r.kind === "course" ? benchmark.get(r.id)?.failRate ?? null : null;
+    const across = r.groups.size >= 2 ? ` across ${r.groups.size} ${groupsTotal > 0 ? "of " + groupsTotal + " " : ""}groups` : "";
+    let advice = "";
+    if (r.kind === "journey-day") advice = `most-missed mission${across} — consider a lighter mission or a reminder tweak`;
+    else if (failRate !== null && failRate >= THRESHOLDS.stuckPct && r.groups.size >= 2) advice = `${failRate}% fail rate${across} — review the content and assessment`;
+    else if (failRate !== null && failRate >= 15) advice = `${failRate}% fail rate${across}${orgFailRate !== null && orgFailRate < failRate / 2 ? " — above the org, a coaching gap" : " — review the module"}`;
+    else if (notStartedRate !== null && notStartedRate >= 30) advice = `${notStartedRate}% not started${across} — check the assignment timing and access`;
+    else if (r.stuck >= 2) advice = `${r.stuck} stuck${across} — the module may be too long or unclear`;
+    else advice = `${r.people.size} ${r.people.size === 1 ? "person" : "people"} flagged${across}`;
+    const { people, groups, withCourse: _w, assigned: _a, ...rest } = r;
+    void _w; void _a;
+    out.push({ ...rest, learners: people.size, failRate, orgFailRate, notStartedRate, groupsAffected: groups.size, advice });
+  }
+  return out
+    .sort((a, b) => b.learners - a.learners || b.failed - a.failed || b.groupsAffected - a.groupsAffected || a.title.localeCompare(b.title))
     .slice(0, max);
 }

@@ -2,11 +2,13 @@ import { Users } from "lucide-react";
 import { redirect } from "next/navigation";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { canSeeEmail, loadManagerContext, teamsOf } from "@/lib/manager/access";
+import { canSeeEmail, l2GroupsOf, loadManagerContext, teamsOf } from "@/lib/manager/access";
 import { computeLearnerInsights } from "@/lib/manager/insights";
-import { PERIODS } from "@/lib/manager/types";
+import { loadScopedInsights } from "@/lib/manager/cache";
+import { PERIODS, type LearnerInsight } from "@/lib/manager/types";
 import { L1View } from "./_components/l1-view";
 import { L2View } from "./_components/l2-view";
+import { L3View } from "./_components/l3-view";
 import { managerNames } from "./_components/names";
 
 export const dynamic = "force-dynamic";
@@ -14,9 +16,13 @@ export const dynamic = "force-dynamic";
 /**
  * Team Performance — the Manager Report Card, at the viewer's level:
  *   - L1 (named as L1 only): their direct team (§4).
- *   - L2 / L3 (named higher by someone): teams compared across everyone under
- *     them (§6) — their own direct team is one of those teams. Clicking a team
+ *   - L2 (named as L2 by someone): teams compared across everyone under them
+ *     (§6) — their own direct team is one of those teams. Clicking a team
  *     opens its L1 screen at /team-performance/team/[managerId].
+ *   - L3 (named as L3 by someone): the organisation view (§7) — cities or L2
+ *     groups compared and org-wide learning gaps, read from the 15-minute
+ *     precompute (lib/manager/cache.ts) when fresh, else computed live.
+ *     ?city= / ?l2= open that group as a teams-compared screen.
  *
  * Access and scope (decision 3): the server resolves the viewer's people from
  * the explicit L1/L2/L3 fields (lib/manager/access.ts) and reads only those
@@ -28,7 +34,10 @@ export default async function TeamPerformancePage({
   searchParams,
 }: {
   params: Promise<{ org: string }>;
-  searchParams?: Promise<{ period?: string; content?: string; status?: string; team?: string }>;
+  searchParams?: Promise<{
+    period?: string; content?: string; status?: string; team?: string;
+    city?: string; l2?: string; vertical?: string; branch?: string; by?: string;
+  }>;
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
@@ -97,33 +106,89 @@ export default async function TeamPerformancePage({
     );
   }
 
-  // L2 / L3: everyone under the viewer, grouped by L1 team.
-  const teams = teamsOf(ctx);
-  const { learners, catalog, today } = await computeLearnerInsights(svc, {
-    orgId: org.id,
-    orgSlug,
-    userIds: ctx.allIds,
-    periodDays: period.days,
-    content,
-  });
-  const names = await managerNames(svc, teams.map((t) => t.managerId));
-  const byId = new Map(learners.map((l) => [l.userId, l]));
+  // L2 / L3: everyone under the viewer. The L3 view reads the 15-minute
+  // precompute when it is fresh and no content lens is applied; otherwise
+  // (and always for L2) the numbers are computed live.
+  const allTeams = teamsOf(ctx);
   const level = ctx.scope.level === 3 ? 3 : 2;
+  const cityParam = level === 3 ? str(sp.city) : "";
+  const l2Param = level === 3 ? str(sp.l2) : "";
+  const vertical = level === 3 ? str(sp.vertical) : "";
+  const branch = level === 3 ? str(sp.branch) : "";
+  const by = str(sp.by) === "l2" ? "l2" : "city";
+  const { learners, catalog, benchmark, today, computedAt } = await loadScopedInsights(svc, {
+    orgId: org.id, orgSlug, userIds: ctx.allIds, periodDays: period.days, content, useCache: level === 3,
+  });
+  const l2GroupsAll = level === 3 ? l2GroupsOf(ctx) : [];
+  const names = await managerNames(svc, [...allTeams.map((t) => t.managerId), ...l2GroupsAll.map((g) => g.id)]);
+  const nameOf = (id: string, own: boolean) => (own ? firstName ?? "You" : names.get(id)?.name ?? "Manager");
+
+  // People filters (§9, L3 only): narrow the population, then the teams to those people.
+  const keep = (l: LearnerInsight) =>
+    (!vertical || l.vertical === vertical) && (!branch || l.branch === branch) && (!cityParam || (l.city ?? "No city") === cityParam);
+  const l2Group = l2Param ? l2GroupsAll.find((g) => g.id === l2Param) ?? null : null;
+  const l2Members = l2Group ? new Set(l2Group.memberIds) : null;
+  const population = learners.filter((l) => keep(l) && (!l2Members || l2Members.has(l.userId)));
+  const popIds = new Set(population.map((l) => l.userId));
+  const teams = allTeams
+    .map((t) => ({ ...t, memberIds: t.memberIds.filter((id) => popIds.has(id)), managerName: nameOf(t.managerId, t.isOwn) }))
+    .filter((t) => t.memberIds.length > 0);
+  const byId = new Map(population.map((l) => [l.userId, l]));
+  const narrowed = !!cityParam || !!l2Group;
+  const lens = `${vertical ? ` · ${vertical}` : ""}${branch ? ` · ${branch}` : ""}`;
+
+  if (level === 2 || narrowed) {
+    const scopeLabel = cityParam ? cityParam : l2Group ? `${nameOf(l2Group.id, false)}'s group` : `${firstName ? `${firstName}'s` : "Your"} teams`;
+    const back = new URLSearchParams();
+    if (period.value !== "30") back.set("period", period.value);
+    if (content) back.set("content", content);
+    if (vertical) back.set("vertical", vertical);
+    if (branch) back.set("branch", branch);
+    if (by === "l2") back.set("by", "l2");
+    const backQ = back.toString();
+    // The narrowing survives every filter change / compare inside the drill-down.
+    const keep = narrowed ? { city: cityParam, l2: l2Group?.id ?? "", vertical, branch, by: by === "l2" ? "l2" : "" } : undefined;
+    return (
+      <L2View
+        orgSlug={orgSlug}
+        title={narrowed ? scopeLabel : "Team Performance"}
+        subtitle={`${narrowed ? "Teams in this group" : scopeLabel} · ${teams.length} team${teams.length === 1 ? "" : "s"} · ${population.length} people${lens}`}
+        level={level}
+        teams={teams}
+        learners={population}
+        ungrouped={[...ctx.scope.ungrouped].map((id) => byId.get(id)).filter((l): l is NonNullable<typeof l> => !!l)}
+        catalog={catalog}
+        today={today}
+        period={period}
+        content={content}
+        backHref={narrowed ? { href: `/${orgSlug}/team-performance${backQ ? `?${backQ}` : ""}`, label: "Back to the organisation view" } : null}
+        keep={keep}
+        // §12: an email only for an L1 manager who is the viewer's own direct report.
+        managerEmail={(id) => (canSeeEmail(ctx, id) ? names.get(id)?.email ?? null : null)}
+      />
+    );
+  }
+
+  const l2Groups = l2GroupsAll
+    .map((g) => ({ id: g.id, name: `${nameOf(g.id, false)}'s group`, memberIds: g.memberIds.filter((id) => popIds.has(id)) }))
+    .filter((g) => g.memberIds.length > 0);
+  const distinct = (vals: Array<string | null>) => [...new Set(vals.filter((v): v is string => !!v))].sort();
   return (
-    <L2View
+    <L3View
       orgSlug={orgSlug}
       title="Team Performance"
-      subtitle={`${firstName ? `${firstName}'s` : "Your"} teams · ${teams.length} team${teams.length === 1 ? "" : "s"} · ${learners.length} people${level === 3 ? " · you are mapped as an L3 manager — the city/region grouping arrives in the next release" : ""}`}
-      level={level}
-      teams={teams.map((t) => ({ ...t, managerName: t.isOwn ? firstName ?? "You" : names.get(t.managerId)?.name ?? "Manager" }))}
-      learners={learners}
-      ungrouped={[...ctx.scope.ungrouped].map((id) => byId.get(id)).filter((l): l is NonNullable<typeof l> => !!l)}
+      subtitle={`Everyone under ${firstName ?? "you"} · ${population.length} ${population.length === 1 ? "person" : "people"} · ${teams.length} team${teams.length === 1 ? "" : "s"}${lens}`}
+      teams={teams}
+      l2Groups={l2Groups}
+      learners={population}
       catalog={catalog}
+      benchmark={benchmark}
       today={today}
       period={period}
       content={content}
-      // §12: an email only for an L1 manager who is the viewer's own direct report.
-      managerEmail={(id) => (canSeeEmail(ctx, id) ? names.get(id)?.email ?? null : null)}
+      filters={{ city: cityParam, vertical, branch, by }}
+      options={{ cities: distinct(learners.map((l) => l.city)), verticals: distinct(learners.map((l) => l.vertical)), branches: distinct(learners.map((l) => l.branch)) }}
+      computedAt={computedAt}
     />
   );
 }

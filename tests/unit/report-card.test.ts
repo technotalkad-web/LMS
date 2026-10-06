@@ -10,6 +10,7 @@
 import {
   buildCommonStruggles,
   buildExceptions,
+  buildOrgGaps,
   buildStruggles,
   buildTeamExceptions,
   teamCards,
@@ -24,6 +25,8 @@ import {
   THRESHOLDS,
 } from "../../lib/manager/report-card";
 import type { ExceptionFlag, LearnerInsight } from "../../lib/manager/types";
+import { l2GroupsOf, type ManagerContext } from "../../lib/manager/access";
+import { resolveManagerScope, type HierarchyMember } from "../../lib/org/reporting-line";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -35,7 +38,7 @@ const flag = (kind: ExceptionFlag["kind"], severity: ExceptionFlag["severity"] =
   ({ kind, severity, contentId, contentKind: contentId ? "course" : null, contentTitle: title, detail: `${kind}` });
 
 const learner = (over: Partial<LearnerInsight> & { userId: string }): LearnerInsight => ({
-  name: over.userId, email: `${over.userId}@example.test`, avatarUrl: null, designation: null, city: null, branch: null, joined: null,
+  name: over.userId, email: `${over.userId}@example.test`, avatarUrl: null, designation: null, city: null, branch: null, vertical: null, joined: null,
   assigned: 0, completed: 0, completionPct: null, avgScore: null, assessmentsWithResult: 0, passedFirstTime: 0,
   lastActive: null, inactiveDays: null, activeLast7d: false, journeys: [], courses: [], paths: [],
   flags: [], risk: 0, status: "on_track", completedInPeriod: 0, passedFirstTimeInPeriod: 0, journeyDaysInPeriod: 0, completedInPrevPeriod: 0,
@@ -213,6 +216,51 @@ console.log("\nL2 (§6): teams compared, team exceptions, common struggles");
   eq("flagged in 3 teams but failing in 1 → spread, not content; learners are distinct people", [sp.teamsAffected, sp.teamsFailing, sp.learners, sp.diagnosis], [3, 1, 3, "spread"]);
   const c2 = cs.find((x) => x.id === "c2");
   eq("Compliance overdue in one team only → listed, no diagnosis", c2 ? [c2.teamsAffected, c2.overdue, c2.diagnosis] : "missing", [1, 1, null]);
+}
+
+console.log("\nL3 (§7): org-wide learning gaps, L2 groups");
+{
+  const fl = (courseId: string, title: string, status: "failed" | "not_started" | "in_progress" = "failed", assignedAt: string | null = "2026-09-01") =>
+    ({ courseId, title, status, officialScore: status === "failed" ? 40 : null, attempts: status === "failed" ? 1 : 0, progressPct: status === "failed" ? 100 : 0, assignedAt, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached: status === "failed" });
+  const people = [
+    // Objection Handling fails in Mumbai (2) and Pune (1); Compliance not started in 3 of 4 assigned; a journey day pending in two cities.
+    learner({ userId: "m1", city: "Mumbai", flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("not_started", "normal", "c2", "Compliance")], courses: [fl("c1", "Objection Handling"), fl("c2", "Compliance", "not_started")], journeys: [journey(2)] }),
+    learner({ userId: "m2", city: "Mumbai", flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("not_started", "normal", "c2", "Compliance")], courses: [fl("c1", "Objection Handling"), fl("c2", "Compliance", "not_started")] }),
+    learner({ userId: "p1", city: "Pune", flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("not_started", "normal", "c2", "Compliance")], courses: [fl("c1", "Objection Handling"), fl("c2", "Compliance", "not_started")], journeys: [journey(3)] }),
+    learner({ userId: "p2", city: "Pune", courses: [fl("c1", "Objection Handling", "in_progress"), fl("c2", "Compliance", "in_progress")] }),
+    learner({ userId: "d1", city: null, courses: [fl("c1", "Objection Handling", "in_progress")] }),
+  ];
+  const bench = new Map([["c1", { failRate: 12, enrolled: 400 }]]);
+  const gaps = buildOrgGaps(people, bench, (l) => l.city ?? "No city", 3);
+  eq("ranked by distinct people flagged, then groups", gaps.map((g) => [g.id, g.learners, g.groupsAffected]), [["c1", 3, 2], ["c2", 3, 2], ["j1:5", 2, 2]]);
+  const c1 = gaps[0];
+  eq("fail rate over everyone WITH the course (3 of 5), org benchmark attached", [c1.failed, c1.failRate, c1.orgFailRate, c1.groupsTotal], [3, 60, 12, 3]);
+  eq("≥30% failing across ≥2 groups → content/assessment advice", /60% fail rate across 2 of 3 groups — review the content and assessment/.test(c1.advice), true);
+  const c2 = gaps[1];
+  eq("not-started rate over ASSIGNED people (3 of 4)", [c2.notStarted, c2.notStartedRate, c2.failRate], [3, 75, 0]);
+  eq("≥30% not started → timing/access advice", /75% not started across 2 of 3 groups — check the assignment timing and access/.test(c2.advice), true);
+  const jd = gaps[2];
+  eq("journey day pending: title from the next mission, people counted once", [jd.kind, jd.title, jd.pending, /most-missed mission across 2/.test(jd.advice)], ["journey-day", "Day 5 · Pricing", 2, true]);
+  eq("max cap respected", buildOrgGaps(people, bench, () => null, 0, 1).length, 1);
+  eq("nobody flagged → no gaps", buildOrgGaps([learner({ userId: "z", courses: [fl("c1", "X", "in_progress")] })], bench, () => null, 0), []);
+  // A person flagged on a course that is also failed above the org → coaching wording when the org rate is low.
+  const coach = [learner({ userId: "q", city: "A", flags: [flag("failed", "critical", "k", "Kappa")], courses: [fl("k", "Kappa")] }), ...Array.from({ length: 4 }, (_, i) => learner({ userId: `w${i}`, city: "A", courses: [fl("k", "Kappa", "in_progress")] }))];
+  eq("20% fail vs 5% org → coaching gap wording", /20% fail rate — above the org, a coaching gap/.test(buildOrgGaps(coach, new Map([["k", { failRate: 5, enrolled: 50 }]]), (l) => l.city, 1)[0].advice), true);
+
+  // L2 groups for an L3: each L2 manager's L1 teams plus their own direct reports; the viewer never becomes a group.
+  const hm = (id: string, l1: string | null = null, l2: string | null = null, l3: string | null = null, status = "active"): HierarchyMember =>
+    ({ user_id: id, status, line_manager_id: l1, indirect_manager_id: l2, l3_manager_id: l3 });
+  const members = [
+    hm("nat"), hm("cityA", "nat"), hm("cityB", "nat"),
+    hm("tlA1", "cityA", "nat"), hm("tlA2", "cityA", "nat"), hm("tlB1", "cityB", "nat"),
+    hm("a1", "tlA1", "cityA", "nat"), hm("a2", "tlA1", "cityA", "nat"), hm("a3", "tlA2", "cityA", "nat"),
+    hm("b1", "tlB1", "cityB", "nat"), hm("b2", "tlB1", "cityB", "nat", "inactive"),
+    hm("x1", "tlX", "cityX", "nat"),
+  ];
+  const scope = resolveManagerScope(members, "nat");
+  const ctx: ManagerContext = { scope, members, isManager: scope.level > 0, directIds: [...scope.direct], allIds: [...scope.all] };
+  const groups = l2GroupsOf(ctx).map((g) => [g.id, [...g.memberIds].sort()]);
+  eq("L2 groups = L2's L1 teams + L2's own direct reports; inactive and out-of-hierarchy L2s excluded", groups, [["cityA", ["a1", "a2", "a3", "tlA1", "tlA2"]], ["cityB", ["b1", "tlB1"]]]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

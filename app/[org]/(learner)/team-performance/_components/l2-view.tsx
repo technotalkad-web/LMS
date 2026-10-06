@@ -26,6 +26,10 @@ export type L2ViewProps = {
   period: { value: string; days: number | null };
   content: string;
   managerEmail: (managerId: string) => string | null;
+  /** Set when this screen is a drill-down from the L3 view (a city / L2 group). */
+  backHref?: { href: string; label: string } | null;
+  /** Narrowing params (city / l2 / vertical / branch / by) every filter change and compare must keep. */
+  keep?: Record<string, string>;
 };
 
 export function L2View(p: L2ViewProps) {
@@ -37,6 +41,7 @@ export function L2View(p: L2ViewProps) {
   const q = new URLSearchParams();
   if (p.period.value !== "30") q.set("period", p.period.value);
   if (p.content) q.set("content", p.content);
+  for (const [k, v] of Object.entries(p.keep ?? {})) if (v) q.set(k, v);
   const query = q.toString() ? `?${q.toString()}` : "";
   const exceptions = buildTeamExceptions(cards, { orgSlug, managerEmail: p.managerEmail, query });
   const common = buildCommonStruggles(teams, byId);
@@ -49,13 +54,18 @@ export function L2View(p: L2ViewProps) {
 
   return (
     <div data-dashboard-root="" className="max-w-6xl mx-auto space-y-6">
+      {p.backHref && (
+        <Link href={p.backHref.href} className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink">
+          ← {p.backHref.label}
+        </Link>
+      )}
       <header className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
         <div>
           <h1 className="serif text-4xl">{p.title}</h1>
           <p className="text-muted text-sm mt-1">{p.subtitle}</p>
         </div>
         <div className="flex flex-wrap items-end gap-2">
-          <ReportFilters orgSlug={orgSlug} basePath="team-performance" current={current} contents={contents} hideStatus />
+          <ReportFilters orgSlug={orgSlug} basePath="team-performance" current={current} contents={contents} hideStatus keep={p.keep} />
           <ComparePicker orgSlug={orgSlug} query={query} teams={cards.map((c) => ({ managerId: c.managerId, name: c.isOwn ? "Your direct team" : `${c.managerName}'s team` }))} />
         </div>
       </header>
