@@ -267,7 +267,7 @@ contained courses.
 | Metric | Definition | Data source | Refresh |
 |---|---|---|---|
 | Total Enrolled | Distinct learners with at least one assignment to the course/path (direct + team + org-wide) | `course_assignments` + `learning_path_assignments` joined with `team_members` + `organization_members` | Real-time |
-| Completed | Distinct learners with latest attempt `completion_status = completed` OR `success_status = passed` | `course_attempts` | Real-time |
+| Completed | Distinct learners with an official attempt (a completed or passed attempt under the scoring policy) | `course_attempts` | Real-time |
 | In Progress | Distinct learners with at least one attempt but not yet completed | `course_attempts` | Real-time |
 | Not Started | Total Enrolled minus (Completed + In Progress) | derived | Real-time |
 
@@ -276,8 +276,8 @@ contained courses.
 | Metric | Definition | Data source | Refresh |
 |---|---|---|---|
 | Completion Rate | Completed ÷ Total Enrolled, expressed as % | derived from §4.1 | Real-time |
-| Total Passed | Distinct learners with `success_status = passed` | `course_attempts` | Real-time |
-| Total Failed | Distinct learners with `success_status = failed` (no later passing attempt) | `course_attempts` | Real-time |
+| Total Passed | Distinct learners whose OFFICIAL attempt passed (practice runs never count) | `v_course_attempt_summary.official_status` | Real-time |
+| Total Failed | Distinct learners whose OFFICIAL attempt failed (practice runs never count) | `v_course_attempt_summary.official_status` | Real-time |
 | Average Score | Mean of best score per learner, across all completed attempts | `course_attempts.score` | Nightly (materialized) |
 | Average Time Spent | Mean of `completed_at − started_at` per learner, OR `result.duration` from cmi5 xAPI statements when present | `course_attempts` + `xapi_statements` | Nightly (materialized) |
 | Overall Rating | Mean of learner-submitted ratings (1–5 stars) for this course/path | **NEW** — needs a `course_ratings` table (see §4.4) | Real-time |

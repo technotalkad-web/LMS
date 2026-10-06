@@ -16,6 +16,7 @@ import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
+import { officialStatuses } from "@/lib/scoring/status";
 import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
@@ -368,35 +369,35 @@ export default async function AdminCourseDetailPage({
     enrolledIdArr.length && versionIds.length
       ? await supabase
           .from("course_attempts")
-          .select("user_id, completion_status, success_status, started_at")
+          .select("id, user_id, completion_status, success_status, score, started_at, completed_at")
           .in("user_id", enrolledIdArr)
           .in("course_version_id", versionIds)
       : { data: [] };
   type SummaryAttempt = {
+    id: string;
     user_id: string;
     completion_status: string;
     success_status: string;
+    score: number | null;
     started_at: string;
+    completed_at: string | null;
   };
   const summaryAttempts = (attemptRows ?? []) as SummaryAttempt[];
 
-  // Latest-per-user wins for status classification.
+  // Decision 1 (Phase 0a): status from each learner's OFFICIAL attempt — not
+  // the latest one — so this summary agrees with the learners list and reports.
+  const officialByUser = await officialStatuses(
+    supabase,
+    org.id,
+    summaryAttempts.map((a) => ({ ...a, course_id: courseId }))
+  );
   const statusByUser = new Map<
     string,
     "passed" | "failed" | "completed" | "in_progress"
   >();
-  for (const a of summaryAttempts) {
-    const prevStartedAt = statusByUser.has(a.user_id)
-      ? summaryAttempts
-          .filter((x) => x.user_id === a.user_id)
-          .reduce((latest, x) => (x.started_at > latest ? x.started_at : latest), "")
-      : "";
-    if (a.started_at !== prevStartedAt && statusByUser.has(a.user_id)) continue;
-    if (a.success_status === "passed") statusByUser.set(a.user_id, "passed");
-    else if (a.success_status === "failed") statusByUser.set(a.user_id, "failed");
-    else if (a.completion_status === "completed")
-      statusByUser.set(a.user_id, "completed");
-    else statusByUser.set(a.user_id, "in_progress");
+  for (const v of officialByUser.values()) {
+    if (v.status === "not_started") continue;
+    statusByUser.set(v.user_id, v.status);
   }
   const enrSummary = {
     total: enrolledUserIds.size,
@@ -406,6 +407,7 @@ export default async function AdminCourseDetailPage({
     inProgress: Array.from(statusByUser.values()).filter(
       (s) => s === "in_progress"
     ).length,
+    failed: Array.from(statusByUser.values()).filter((s) => s === "failed").length,
     notStarted: enrolledUserIds.size - statusByUser.size,
   };
 
@@ -630,7 +632,7 @@ export default async function AdminCourseDetailPage({
             above.
           </div>
         ) : (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
             <Stat
               label="Total enrolled"
               value={enrSummary.total.toLocaleString()}
@@ -638,6 +640,10 @@ export default async function AdminCourseDetailPage({
             <Stat
               label="Completed"
               value={enrSummary.completed.toLocaleString()}
+            />
+            <Stat
+              label="Failed"
+              value={enrSummary.failed.toLocaleString()}
             />
             <Stat
               label="In progress"

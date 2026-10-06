@@ -232,7 +232,8 @@ test.describe.serial("Phase 3+5 — learner journeys & admin validation", () => 
     await ctx.close();
   });
 
-  // ---- Authoritative org-wide roll-up (what admin reporting aggregates) ----
+  // ---- Raw org-wide attempt roll-up (a sanity count of attempt rows; admin
+  // reporting itself uses the OFFICIAL-attempt rule per learner, decision 1) ----
   test("org attempt roll-up matches the seeded journeys", async () => {
     const { data } = await svc()
       .from("course_attempts")

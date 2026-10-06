@@ -2,6 +2,7 @@ import Link from "next/link";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { officialStatuses, countsByCourse, hasOfficialResult, EMPTY_STATUS_COUNTS } from "@/lib/scoring/status";
 import { canViewReports } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
@@ -256,18 +257,31 @@ export default async function ReportsPage({
     teamUserIds.set(tl.team_id, s);
   }
 
+  // Decision 1 (Phase 0a): per-course "failed" = learners whose OFFICIAL
+  // attempt failed — not a count of failed attempt rows, which included
+  // practice runs. Resolved once for every (learner, course) pair.
+  const officialByPair = await officialStatuses(
+    supabase,
+    org.id,
+    attempts.flatMap((a) => {
+      const cid = versionById.get(a.course_version_id)?.course_id;
+      return cid ? [{ ...a, course_id: cid }] : [];
+    })
+  );
+  const officialCounts = countsByCourse(officialByPair);
+  const officialPairs = [...officialByPair.values()];
+
   const rows: CourseRow[] = courses.map((c) => {
     const courseVersions = versionsByCourse.get(c.id) ?? [];
     const versionIds = new Set(courseVersions.map((v) => v.id));
     const myAttempts = attempts.filter((a) => versionIds.has(a.course_version_id));
-    // "Completed" = completion_status completed OR success_status passed —
-    // passing a graded module is a successful completion. Unified across all
-    // reporting surfaces (product decision R1); matches the report matviews.
-    const completed = myAttempts.filter(
-      (a) => a.completion_status === "completed" || a.success_status === "passed"
-    ).length;
-    const passed = myAttempts.filter((a) => a.success_status === "passed").length;
-    const failed = myAttempts.filter((a) => a.success_status === "failed").length;
+    // Decision 1 (Phase 0a): Completed / Passed / Failed are LEARNER counts
+    // from each learner's OFFICIAL attempt (a practice run never counts), so
+    // the three columns share one unit and agree with the report matviews.
+    const oc = officialCounts.get(c.id) ?? EMPTY_STATUS_COUNTS;
+    const completed = oc.completed + oc.passed + oc.failed;
+    const passed = oc.passed;
+    const failed = oc.failed;
     const inProgress = myAttempts.filter(
       (a) => a.completion_status !== "completed" && a.success_status !== "passed"
     ).length;
@@ -364,15 +378,13 @@ export default async function ReportsPage({
   const teamSummaries: TeamSummary[] = teams.map((t) => {
     const memberSet = teamUserIds.get(t.id) ?? new Set<string>();
     const teamAttempts = attempts.filter((a) => memberSet.has(a.user_id));
-    const completed = teamAttempts.filter(
-      (a) => a.completion_status === "completed" || a.success_status === "passed"
-    ).length;
-    const passed = teamAttempts.filter(
-      (a) => a.success_status === "passed"
-    ).length;
+    // Learner×course results under the OFFICIAL rule (decision 1): one unit
+    // for completed / passed, and a rate over the pairs the team attempted.
+    const teamPairs = officialPairs.filter((v) => memberSet.has(v.user_id));
+    const completed = teamPairs.filter((v) => hasOfficialResult(v.status)).length;
+    const passed = teamPairs.filter((v) => v.status === "passed").length;
     const learnersActive = new Set(teamAttempts.map((a) => a.user_id)).size;
-    const completionRate =
-      teamAttempts.length === 0 ? 0 : completed / teamAttempts.length;
+    const completionRate = teamPairs.length === 0 ? 0 : completed / teamPairs.length;
     return {
       team_id: t.id,
       team_name: t.name,
@@ -391,14 +403,14 @@ export default async function ReportsPage({
     attempts: attempts.length,
     learnersWithActivity: new Set(attempts.map((a) => a.user_id)).size,
     totalUsers: members.length,
-    completed: attempts.filter(
-      (a) => a.completion_status === "completed" || a.success_status === "passed"
-    ).length,
-    passed: attempts.filter((a) => a.success_status === "passed").length,
+    // Learner×course results under the OFFICIAL rule (decision 1).
+    completed: officialPairs.filter((v) => hasOfficialResult(v.status)).length,
+    passed: officialPairs.filter((v) => v.status === "passed").length,
   };
-  const completionRate =
-    totals.attempts === 0 ? 0 : totals.completed / totals.attempts;
-  const passRate = totals.attempts === 0 ? 0 : totals.passed / totals.attempts;
+  // Of the learner×course pairs attempted, the share with an official result;
+  // of those with a result, the share that passed.
+  const completionRate = officialPairs.length === 0 ? 0 : totals.completed / officialPairs.length;
+  const passRate = totals.completed === 0 ? 0 : totals.passed / totals.completed;
 
   const scoredAll = attempts.filter((a) => typeof a.score === "number");
   const avgScoreOverall =
@@ -638,9 +650,9 @@ export default async function ReportsPage({
               "Standard",
               "Attempts",
               "Learners",
-              "Completed",
-              "Passed",
-              "Failed",
+              "Completed (learners)",
+              "Passed (learners)",
+              "Failed (learners)",
               "Avg score",
               "Avg progress (in progress)",
               "Last activity",
@@ -666,9 +678,9 @@ export default async function ReportsPage({
                   <th className="text-left px-4 py-2 font-medium">Std</th>
                   <th className="text-right px-4 py-2 font-medium">Attempts</th>
                   <th className="text-right px-4 py-2 font-medium">Learners</th>
-                  <th className="text-right px-4 py-2 font-medium">Completed</th>
-                  <th className="text-right px-4 py-2 font-medium">Passed</th>
-                  <th className="text-right px-4 py-2 font-medium">Failed</th>
+                  <th className="text-right px-4 py-2 font-medium" title="Learners whose official attempt has a result">Completed</th>
+                  <th className="text-right px-4 py-2 font-medium" title="Learners whose official attempt passed (practice runs never count)">Passed</th>
+                  <th className="text-right px-4 py-2 font-medium" title="Learners whose official attempt failed (practice runs never count)">Failed</th>
                   <th className="text-right px-4 py-2 font-medium">Avg score</th>
                   <th className="text-right px-4 py-2 font-medium" title="Average progress of learners still in progress">Avg progress</th>
                   <th className="text-right px-4 py-2 font-medium">Last activity</th>

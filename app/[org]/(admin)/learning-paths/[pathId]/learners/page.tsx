@@ -5,6 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "../../../library/[courseId]/learners/learners-filters";
+import { officialStatuses, statusOf } from "@/lib/scoring/status";
 
 // =============================================================================
 // Dedicated enrolled-learners page for an admin viewing one learning path.
@@ -15,9 +16,9 @@ import { LearnersFilters } from "../../../library/[courseId]/learners/learners-f
 //   - "completion" = learner has completed every course in the path
 //   - "in_progress" = at least one course done OR in progress
 //   - "not_started" = no course attempts on any step
-//   - "passed" / "failed" map to whether the FINAL step's attempt
-//     surfaced a pass/fail (mostly relevant for paths whose last
-//     course is an assessment)
+//   - "passed" / "failed" = the learner's OFFICIAL attempt on the FINAL
+//     step (decision 1: a practice run never changes it; mostly relevant
+//     for paths whose last course is an assessment)
 //
 // Score / attempts aren't meaningful at path level — those columns
 // are dropped from the table. "Last activity" rolls up to the latest
@@ -236,22 +237,34 @@ export default async function PathLearnersPage({
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, started_at, completed_at"
+            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
       : { data: [] };
   type AttemptRow = {
+    id: string;
     user_id: string;
     course_version_id: string;
     completion_status: string;
     success_status: string;
+    score: number | null;
     started_at: string;
     completed_at: string | null;
   };
   const attempts = (attemptRows ?? []) as AttemptRow[];
 
   const lastStepCourseId = steps[steps.length - 1]?.course_id ?? null;
+  // Decision 1 (Phase 0a): the path's pass/fail comes from the final step's
+  // OFFICIAL attempt — never the latest or a practice run.
+  const official = await officialStatuses(
+    supabase,
+    org.id,
+    attempts.flatMap((a) => {
+      const cid = courseByVersion.get(a.course_version_id);
+      return cid ? [{ ...a, course_id: cid }] : [];
+    })
+  );
 
   // ---- enrich one row per enrolled user ----
   const enriched: EnrichedPathLearner[] = enrolledUserIds.map((uid) => {
@@ -278,17 +291,9 @@ export default async function PathLearnersPage({
     } else if (coursesDone < coursesTotal) {
       status = "in_progress";
     } else {
-      // All done — surface pass/fail of the FINAL step if available,
-      // otherwise plain "completed".
-      const finalAttempts = myAttempts.filter(
-        (a) => courseByVersion.get(a.course_version_id) === lastStepCourseId
-      );
-      const latestFinal = finalAttempts
-        .slice()
-        .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
-      if (latestFinal?.success_status === "passed") status = "passed";
-      else if (latestFinal?.success_status === "failed") status = "failed";
-      else status = "completed";
+      // All done — the FINAL step's OFFICIAL verdict, otherwise "completed".
+      const verdict = lastStepCourseId ? statusOf(official, uid, lastStepCourseId) : "completed";
+      status = verdict === "passed" ? "passed" : verdict === "failed" ? "failed" : "completed";
     }
 
     const lastTouched =

@@ -117,9 +117,11 @@ the contract). `public.effective_attempt_policy(course_id)` /
 `effective_attempt_policies(uuid[])` resolve the rule that applies to a
 module; `public.v_course_attempt_scoring` and `v_course_attempt_summary`
 expose `official_score`, `first_score`, `best_score`, `scored_attempts`,
-`practice_attempts` per learner per module. Extra-attempt grants are applied
-in the application layer (`lib/scoring/attempt-kind.ts` →
-`computeScoring(…, retakeIds)`), not in those SQL views.
+`practice_attempts` per learner per module, and (since 0090) the official
+verdict as `official_status` / `official_attempt_id`. Extra-attempt grants are
+applied both in the application layer (`lib/scoring/attempt-kind.ts` →
+`computeScoring(…, retakeIds)`) and in those SQL views (via
+`attempt_requests.used_attempt_id`), so the two agree.
 
 Extra-attempt endpoints (all org-scoped, service-role writes after auth):
 - `POST /api/attempt-requests` — learner files a request (`reason`).
@@ -127,3 +129,28 @@ Extra-attempt endpoints (all org-scoped, service-role writes after auth):
   `expires_in_days`).
 - `POST /api/attempt-requests/bulk` — admin grants to all failed learners of a
   module (`courseId`, `expires_in_days`).
+
+## Canonical status definitions (Phase 0a, decision 1 — 2026-10-06)
+
+A learner's result on a course comes from their **official attempt only**
+(`computeScoring` → `courseStatus` in `lib/scoring/policy.ts`, re-exported with
+helpers from `lib/scoring/status.ts`):
+
+| Status | Meaning |
+| --- | --- |
+| `not_started` | no attempt on any version of the course |
+| `in_progress` | attempts exist, none official yet (nothing completed) |
+| `completed` | official attempt completed with no pass/fail verdict |
+| `passed` | official attempt passed |
+| `failed` | official attempt **failed** — a later practice pass never turns it green, and a practice fail after an official pass is **not** a failure |
+
+The official attempt is the one the scoring policy designates (first / best /
+latest / nth of the scored window) or, once completed, the **newest
+admin-granted retake** (0083). **Every surface must use these helpers** —
+learner pages, Admin Analytics, Org Reports, per-course/path learners pages and
+CSV exports, the CRM/Yoddha APIs — and the SQL side mirrors it in
+`v_course_attempt_summary.official_status` / `official_attempt_id` (migration
+0090, grant-aware), which `mv_course_performance.total_failed` now counts.
+Never derive a status from "the latest attempt" or count failed attempt rows.
+Use `officialStatuses()` for batch (learner × course) resolution and
+`countByStatus()` for per-course counts.

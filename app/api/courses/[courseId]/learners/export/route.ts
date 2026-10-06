@@ -5,6 +5,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { courseProgress } from "@/lib/courses/progress-view";
+import { officialStatuses, statusOf, userCourseKey } from "@/lib/scoring/status";
 
 /**
  * GET /api/courses/{courseId}/learners/export?orgSlug=...
@@ -188,12 +189,13 @@ export async function GET(
       ? await supabase
           .from("course_attempts")
           .select(
-            "user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
+            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
       : { data: [] };
   const attempts = (attemptRows ?? []) as Array<{
+    id: string;
     user_id: string;
     course_version_id: string;
     progress_pct?: number | null;
@@ -215,32 +217,27 @@ export async function GET(
     "Progress (%)",
     "Screens completed",
     "Screens total",
-    "Best score (%)",
+    "Official score (%)",
     "Attempts",
     "Last activity (ISO)",
     "Enrolled via",
   ];
   const rows: string[][] = [header];
 
+  // Decision 1 (Phase 0a): the CSV status is the OFFICIAL attempt's verdict,
+  // identical to the learners page — never the latest attempt.
+  const official = await officialStatuses(
+    svc,
+    org.id,
+    attempts.map((a) => ({ ...a, course_id: courseId }))
+  );
+
   for (const uid of enrolledUserIds) {
     const myAttempts = attempts.filter((a) => a.user_id === uid);
-    const latest = myAttempts
-      .slice()
-      .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
-    let status: Status = "not_started";
-    if (latest) {
-      if (latest.success_status === "passed") status = "passed";
-      else if (latest.success_status === "failed") status = "failed";
-      else if (latest.completion_status === "completed") status = "completed";
-      else status = "in_progress";
-    }
-    const bestScore = myAttempts
-      .map((a) => a.score)
-      .filter((s): s is number => typeof s === "number")
-      .reduce<number | null>(
-        (best, s) => (best === null || s > best ? s : best),
-        null
-      );
+    const status: Status = statusOf(official, uid, courseId);
+    // The OFFICIAL score (same value the learners page shows), not the best
+    // of every attempt including practice runs.
+    const bestScore = official.get(userCourseKey(uid, courseId))?.scoring.officialScore ?? null;
     const lastTouched =
       myAttempts
         .map((a) => a.completed_at ?? a.started_at)
