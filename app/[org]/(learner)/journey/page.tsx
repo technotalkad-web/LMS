@@ -146,7 +146,7 @@ export default async function JourneyPage({
       supabase
         .from("journey_versions")
         .select(
-          "id, name, icon, days_total, count_sundays, milestones, completion_title, days"
+          "id, name, icon, days_total, count_sundays, milestones, completion_title, days, unlock_mode"
         )
         .eq("id", enrollment.version_id)
         .maybeSingle(),
@@ -170,6 +170,7 @@ export default async function JourneyPage({
     milestones: unknown;
     completion_title: string;
     days: unknown;
+    unlock_mode?: string | null;
   } | null;
   if (!version) {
     return (
@@ -201,12 +202,14 @@ export default async function JourneyPage({
   const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
   const today = todayStr(tz);
 
+  const unlockMode = version.unlock_mode === "progress" ? "progress" : "calendar";
   const state = computeJourneyState({
     startDate: enrollment.start_date,
     today,
     completedCount: progress.length,
     daysTotal: version.days_total,
     countSundays: version.count_sundays === true,
+    unlockMode,
     courseDays,
   });
   const milestones = effectiveMilestones(version.milestones, version.days_total);
@@ -688,7 +691,10 @@ export default async function JourneyPage({
           {Array.from({ length: version.days_total }, (_, i) => i + 1).map((d) => {
             const done = doneDays.has(d);
             const isCurrent = d === state.currentDay && !state.finished;
-            const unlocked = d <= state.allowedDay;
+            const unlocked =
+              unlockMode === "progress"
+                ? d <= (state.finished ? version.days_total : state.openableDay)
+                : d <= state.allowedDay;
             const rest = !courseDaySet.has(d);
             const ms = milestones.find((m) => m.day === d);
             const cell = (

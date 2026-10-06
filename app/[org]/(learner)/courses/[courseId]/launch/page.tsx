@@ -105,7 +105,7 @@ export default async function LaunchPage({
     const { data: enrRow } = await supabase
       .from("journey_enrollments")
       .select(
-        "id, start_date, status, journey_versions!inner(days_total, count_sundays, days), journey_programs!inner(is_active)"
+        "id, start_date, status, journey_versions!inner(days_total, count_sundays, days, unlock_mode), journey_programs!inner(is_active)"
       )
       .eq("id", journeyParam)
       .eq("user_id", user.id)
@@ -115,8 +115,8 @@ export default async function LaunchPage({
       start_date: string;
       status: string;
       journey_versions:
-        | { days_total: number; count_sundays: boolean; days: unknown }
-        | Array<{ days_total: number; count_sundays: boolean; days: unknown }>;
+        | { days_total: number; count_sundays: boolean; days: unknown; unlock_mode?: string | null }
+        | Array<{ days_total: number; count_sundays: boolean; days: unknown; unlock_mode?: string | null }>;
       journey_programs: { is_active: boolean } | Array<{ is_active: boolean }>;
     } | null;
     const prog = enr
@@ -163,6 +163,7 @@ export default async function LaunchPage({
           completedCount: doneDays.size,
           daysTotal: prog.days_total,
           countSundays: prog.count_sundays === true,
+          unlockMode: prog.unlock_mode === "progress" ? "progress" : "calendar",
           courseDays: courseDaysOf(prog.days, prog.days_total),
         });
         if (dayN === state.currentDay && state.todayUnlocked) {

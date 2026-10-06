@@ -226,7 +226,7 @@ export async function learnerCanAccessCourse(opts: {
     // Curriculum + rules come from each enrollment's PINNED version.
     const { data: verRows } = await supabase
       .from("journey_versions")
-      .select("id, days_total, count_sundays, days")
+      .select("id, days_total, count_sundays, days, unlock_mode")
       .in("id", enrollments.map((e) => e.version_id));
     const versions = new Map(
       ((verRows ?? []) as Array<{
@@ -234,6 +234,7 @@ export async function learnerCanAccessCourse(opts: {
         days_total: number;
         count_sundays: boolean;
         days: unknown;
+        unlock_mode?: string | null;
       }>).map((v) => [v.id, v])
     );
     const { data: gsRow } = await supabase
@@ -263,9 +264,19 @@ export async function learnerCanAccessCourse(opts: {
         completedCount: count ?? 0,
         daysTotal: v.days_total,
         countSundays: v.count_sundays === true,
+        unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
         courseDays: courseDaysOf(v.days, v.days_total),
       });
-      if (courseDays.some((d) => d <= Math.min(state.allowedDay, state.currentDay))) {
+      // Launchable day = the day the learner may open now, plus earlier
+      // (completed) days for revision. Progress mode has no calendar ceiling,
+      // so it keys off openableDay; calendar keeps the drip ceiling.
+      const ceiling =
+        v.unlock_mode === "progress"
+          ? state.finished
+            ? v.days_total
+            : state.openableDay
+          : Math.min(state.allowedDay, state.currentDay);
+      if (courseDays.some((d) => d <= ceiling)) {
         return { allowed: true, upcomingAt: null };
       }
     }

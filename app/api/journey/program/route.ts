@@ -108,6 +108,7 @@ export async function POST(request: Request) {
         icon: prog.icon,
         days_total: prog.days_total,
         count_sundays: prog.count_sundays,
+        unlock_mode: prog.unlock_mode ?? "calendar",
         milestones: prog.milestones,
         copy: prog.copy,
         completion_title: prog.completion_title,
@@ -370,6 +371,8 @@ export async function PATCH(request: Request) {
     icon?: string;
     days_total?: number;
     count_sundays?: boolean;
+    unlock_mode?: string;
+    reminder_hour?: number;
     is_active?: boolean;
     auto_enroll_new_users?: boolean;
     nudge_enabled?: boolean;
@@ -517,6 +520,22 @@ export async function PATCH(request: Request) {
       }
       update[num] = n;
     }
+  }
+  if (body.unlock_mode !== undefined) {
+    if (body.unlock_mode !== "calendar" && body.unlock_mode !== "progress") {
+      return NextResponse.json(
+        { error: "unlock_mode must be 'calendar' or 'progress'" },
+        { status: 400 }
+      );
+    }
+    update.unlock_mode = body.unlock_mode;
+  }
+  if (body.reminder_hour !== undefined) {
+    const h = Math.round(Number(body.reminder_hour));
+    if (!Number.isFinite(h) || h < 0 || h > 23) {
+      return NextResponse.json({ error: "reminder_hour must be 0–23" }, { status: 400 });
+    }
+    update.reminder_hour = h;
   }
   if (body.deadline_days !== undefined) {
     if (body.deadline_days === null) {

@@ -418,13 +418,13 @@ export default async function AnalyticsPage({
   type EnrRow = {
     id: string; user_id: string; program_id: string; status: string; start_date: string;
     journey_versions:
-      | { days: unknown; days_total: number; count_sundays: boolean }
-      | Array<{ days: unknown; days_total: number; count_sundays: boolean }>;
+      | { days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }
+      | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
   };
   const enrollments = scopedIds.length
     ? await fetchByIds<EnrRow>(
         svc, "journey_enrollments",
-        "id, user_id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays)",
+        "id, user_id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
         "user_id", scopedIds, (q) => q.eq("organization_id", org.id)
       )
     : [];
@@ -455,6 +455,7 @@ export default async function AnalyticsPage({
       completedCount: progressCount.get(e.id) ?? 0,
       daysTotal: v.days_total,
       countSundays: v.count_sundays === true,
+      unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
       courseDays: courseDaysOf(v.days, v.days_total),
     });
     const deadline =

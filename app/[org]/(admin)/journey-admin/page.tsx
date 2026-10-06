@@ -76,7 +76,7 @@ export default async function JourneyAdminPage({
           .eq("organization_id", org.id),
         supabase
           .from("journey_versions")
-          .select("id, version_number, published_at, days_total, count_sundays, days")
+          .select("id, version_number, published_at, days_total, count_sundays, days, unlock_mode")
           .eq("program_id", program.id),
       ]);
     days = (dayRows ?? []) as DayRow[];
@@ -87,6 +87,7 @@ export default async function JourneyAdminPage({
       days_total: number;
       count_sundays: boolean;
       days: unknown;
+      unlock_mode?: string | null;
     }>;
     const verById = new Map(versions.map((v) => [v.id, v]));
     currentVersion = program.current_version_id
@@ -99,7 +100,7 @@ export default async function JourneyAdminPage({
     enrollments = ((enrRows ?? []) as Array<
       Omit<
         EnrollmentRow,
-        "completed_count" | "name" | "email" | "version_number" | "days_total" | "count_sundays"
+        "completed_count" | "name" | "email" | "version_number" | "days_total" | "count_sundays" | "unlock_mode"
       > & { version_id: string }
     >).map((e) => {
       const v = verById.get(e.version_id);
@@ -111,6 +112,8 @@ export default async function JourneyAdminPage({
         version_number: v?.version_number ?? 0,
         days_total: v?.days_total ?? program.days_total,
         count_sundays: v?.count_sundays ?? program.count_sundays,
+        unlock_mode:
+          (v?.unlock_mode ?? program.unlock_mode) === "progress" ? "progress" : "calendar",
         // Behind/on-track math walks the pinned version's COURSE days.
         course_days: v ? courseDaysOf(v.days, v.days_total) : [],
       };
@@ -186,6 +189,7 @@ export default async function JourneyAdminPage({
         completedCount: e.completed_count,
         daysTotal: e.days_total,
         countSundays: e.count_sundays === true,
+        unlockMode: e.unlock_mode,
         courseDays: e.course_days,
       });
       if (st.finished) continue;
