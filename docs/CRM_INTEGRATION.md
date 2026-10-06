@@ -93,10 +93,17 @@ Rules your sync can rely on:
 - **Master-data governance applies**: fields the Super Owner governs
   (designation, city, …) must use master values → `400` with the exact
   message admins see. Sync the master lists first or map values in the CRM.
-- **Managers by employee_id**: `line_manager_employee_id` /
-  `indirect_manager_employee_id`. Unresolvable references come back in a
-  `warnings` array and are skipped — the sync never fails on ordering. Sync
-  managers before their reports, or run a second reconciliation pass.
+- **Managers by employee_id** — the explicit reporting line
+  Employee → L1 → L2 → L3: `line_manager_employee_id` (L1),
+  `indirect_manager_employee_id` (L2), `l3_manager_employee_id` (L3).
+  Nothing is inferred: a blank L2/L3 means that manager cannot see the
+  person at that level. Unresolvable references, and ones that would break
+  the reporting-line rules (self-reference, cycle), come back in a
+  `warnings` array and that field is skipped — the sync never fails on
+  ordering. Sync managers before their reports, or run a second
+  reconciliation pass. When the org requires managers (Master data toggle),
+  all three are mandatory at create. `GET` echoes all three back as
+  employee_ids.
 - **Email is identity**: required at create, immutable via sync (change it in
   the LMS admin if ever truly needed).
 - Created accounts are always **learners** with **no password** — they will

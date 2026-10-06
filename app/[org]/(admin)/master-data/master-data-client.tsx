@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { Plus, X, ShieldCheck } from "lucide-react";
+import Link from "next/link";
+import { Plus, X, ShieldCheck, Network } from "lucide-react";
 
 export type OptionRow = { id: string; field: string; value: string };
 
@@ -127,12 +128,12 @@ export function MasterDataClient({
           <ShieldCheck className="w-5 h-5 text-indigo-600 mt-0.5 shrink-0" />
           <div>
             <h2 className="font-semibold text-sm">
-              Require Line Manager (L1) &amp; Indirect Line Manager (L2)
+              Require the full reporting line (L1, L2 &amp; L3 managers)
             </h2>
             <p className="text-xs text-muted mt-1">
-              When on, both manager fields are mandatory for every user created
-              manually or via bulk upload. Bulk CSVs may reference managers by
-              email address.
+              When on, all three manager fields are mandatory for every user
+              created manually, via bulk upload or via the CRM sync. Bulk CSVs
+              may reference managers by email address.
             </p>
           </div>
         </div>
@@ -151,6 +152,28 @@ export function MasterDataClient({
             }`}
           />
         </button>
+      </section>
+
+      {/* Reporting lines (migration 0091) */}
+      <section className="border border-line rounded-lg bg-paper p-5 flex items-start justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <Network className="w-5 h-5 text-indigo-600 mt-0.5 shrink-0" />
+          <div>
+            <h2 className="font-semibold text-sm">Reporting lines</h2>
+            <p className="text-xs text-muted mt-1">
+              Employee → L1 → L2 → L3. Review who reports to whom, fix broken
+              links (self-references, cycles, inactive managers) and fill in
+              missing L2/L3 managers from the L1 chain with one confirmation.
+              Managers only ever see the people who list them.
+            </p>
+          </div>
+        </div>
+        <Link
+          href={`/${orgSlug}/master-data/reporting-lines`}
+          className="shrink-0 inline-flex items-center px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90"
+        >
+          Open
+        </Link>
       </section>
 
       {/* Per-field master lists */}

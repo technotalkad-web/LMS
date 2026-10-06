@@ -9,6 +9,13 @@ import {
   loadOrgGovernance,
   checkGovernedField,
 } from "@/lib/org/field-options";
+import {
+  fetchHierarchyMembers,
+  messagesOf,
+  upsertSnapshot,
+  validateManagerAssignment,
+  type ManagerAssignment,
+} from "@/lib/org/reporting-line";
 
 /**
  *   POST /api/users/bulk
@@ -20,7 +27,17 @@ import {
  *   username, password, phone, grade, designation, role, line_manager_id,
  *   indirect_manager_id, lms_role, node_id, city, state,
  *   team_name (optional — auto-creates the team in this org if missing,
- *              or adds to an existing team if name matches case-insensitively)
+ *              or adds to an existing team if name matches case-insensitively),
+ *   business_vertical, branch, l3_manager_id
+ *
+ * Manager cells (L1/L2/L3, migration 0091) take an email or user id. The
+ * reporting-line integrity rules apply per row (self-reference, a manager
+ * who is not an active member, a cycle → row skipped; a chain mismatch →
+ * noted in the row message). Rows are processed managers-first: a manager
+ * referenced by email that is itself a row of this file is written before
+ * the rows that point at them, whatever the file order. A manager column
+ * that is ABSENT from the file leaves that level untouched (like
+ * business_vertical/branch); a present-but-empty cell clears it.
  *
  * For every row:
  *   - If email already exists in auth.users -> existing user_id reused.
@@ -123,9 +140,18 @@ export async function POST(request: Request) {
   // ---- Master-data governance (migration 0055), one load for all rows ----
   const gov = await loadOrgGovernance(svc, org.id as string);
 
-  // line_manager_id / indirect_manager_id cells accept a user UUID or an
-  // email (resolved against auth users) — emails are what HR exports carry,
-  // and the mandatory-manager rule makes raw UUIDs impractical in CSVs.
+  // Reporting-line snapshot (migration 0091) for per-row integrity checks;
+  // each written row updates it in place. Rows are processed managers-first
+  // (see managerFirstOrder) so a manager that is itself a row of this file
+  // is already a member — or has already failed, in which case the rows
+  // pointing at them are refused like any other non-member reference.
+  const hierarchy = await fetchHierarchyMembers(svc, org.id as string);
+  const order = managerFirstOrder(rows);
+
+  // line_manager_id / indirect_manager_id / l3_manager_id cells accept a
+  // user UUID or an email (resolved against auth users) — emails are what HR
+  // exports carry, and the mandatory-manager rule makes raw UUIDs
+  // impractical in CSVs.
   const resolveManager = (
     raw: string | undefined
   ): { id: string | null; error?: string } => {
@@ -223,7 +249,7 @@ export async function POST(request: Request) {
 
   const results: ResultRow[] = [];
 
-  for (let i = 0; i < rows.length; i++) {
+  for (const i of order) {
     const r = rows[i];
     const rowNum = i + 1;
     const email = (r.email ?? "").trim().toLowerCase();
@@ -339,28 +365,59 @@ export async function POST(request: Request) {
     }
 
     // Managers: accept UUID or email; mandatory when the org requires them.
+    // A column that is absent from the file (undefined) leaves that level
+    // untouched — re-running last quarter's export must not wipe the L3s
+    // set since, nor be refused for a mandatory level that is already set.
     const lm = resolveManager(r.line_manager_id);
     const ilm = resolveManager(r.indirect_manager_id);
-    if (lm.error || ilm.error) {
+    const l3m = resolveManager(r.l3_manager_id);
+    if (lm.error || ilm.error || l3m.error) {
       results.push({
         row: rowNum,
         email,
         status: "skipped",
-        message: lm.error ?? ilm.error,
+        message: lm.error ?? ilm.error ?? l3m.error,
       });
       continue;
     }
-    if (gov.requireManagers && (!lm.id || !ilm.id)) {
+    const existingId = userIdByEmail.get(email) ?? null;
+    const existingMem = existingId ? hierarchy.find((m) => m.user_id === existingId) : undefined;
+    const managerNext: ManagerAssignment = {};
+    if (r.line_manager_id !== undefined) managerNext.line_manager_id = lm.id;
+    if (r.indirect_manager_id !== undefined) managerNext.indirect_manager_id = ilm.id;
+    if (r.l3_manager_id !== undefined) managerNext.l3_manager_id = l3m.id;
+    const effective = {
+      line_manager_id: managerNext.line_manager_id !== undefined ? managerNext.line_manager_id : existingMem?.line_manager_id ?? null,
+      indirect_manager_id: managerNext.indirect_manager_id !== undefined ? managerNext.indirect_manager_id : existingMem?.indirect_manager_id ?? null,
+      l3_manager_id: managerNext.l3_manager_id !== undefined ? managerNext.l3_manager_id : existingMem?.l3_manager_id ?? null,
+    };
+    if (gov.requireManagers && (!effective.line_manager_id || !effective.indirect_manager_id || !effective.l3_manager_id)) {
       results.push({
         row: rowNum,
         email,
         status: "skipped",
-        message: !lm.id
+        message: !effective.line_manager_id
           ? "Line Manager (L1) is required."
-          : "Indirect Line Manager (L2) is required.",
+          : !effective.indirect_manager_id
+            ? "Indirect Line Manager (L2) is required."
+            : "L3 Manager is required.",
       });
       continue;
     }
+    // Reporting-line integrity (0091). A brand-new account cannot be in
+    // anyone's chain, so an existing id (or null) is enough for the cycle
+    // check, and nothing has been written for this row yet.
+    const managerCheck = validateManagerAssignment(hierarchy, existingId, managerNext);
+    if (managerCheck.errors.length > 0) {
+      results.push({
+        row: rowNum,
+        email,
+        status: "skipped",
+        message: messagesOf(managerCheck.errors).join(" "),
+      });
+      continue;
+    }
+    const managerNote = messagesOf(managerCheck.warnings).join(" ") || undefined;
 
     // ---- Find or create auth user ----
     let authUserId = userIdByEmail.get(email) ?? null;
@@ -461,8 +518,7 @@ export async function POST(request: Request) {
       grade: r.grade?.trim() || null,
       designation: governedRow.designation,
       job_role: governedRow.job_role,
-      line_manager_id: lm.id,
-      indirect_manager_id: ilm.id,
+      ...managerNext, // only the manager columns present in the file
       node_id: governedRow.node_id ?? r.node_id!.trim(),
       city: governedRow.city,
       state: governedRow.state,
@@ -495,6 +551,8 @@ export async function POST(request: Request) {
       });
       continue;
     }
+
+    upsertSnapshot(hierarchy, { user_id: authUserId, status, ...effective });
 
     let outcome: ResultRow["status"];
     if (createdThisRow === "invited") outcome = "invited";
@@ -561,9 +619,12 @@ export async function POST(request: Request) {
       row: rowNum,
       email,
       status: outcome,
+      ...(managerNote ? { message: managerNote } : {}),
       ...(teamAdded ? { team_added: teamAdded } : {}),
     });
   }
+  // Rows were processed managers-first; report them in file order.
+  results.sort((a, b) => a.row - b.row);
 
   // ---- #162: flush queued team memberships in one batch ----
   let teamMembershipsAdded = 0;
@@ -638,7 +699,57 @@ const KNOWN_COLS = [
   // before team_name would silently parse team names as verticals.
   "business_vertical",
   "branch",
+  // Explicit reporting line, level 3 (migration 0091).
+  "l3_manager_id",
 ] as const;
+
+/**
+ * Processing order with managers before their reports (migration 0091): a
+ * manager referenced by EMAIL that is itself a row of this file is visited
+ * first (depth-first over the three manager cells), so by the time a report's
+ * row is validated the manager's row has been written — or has failed, and
+ * the reference is refused as a non-member like any other. Rows that
+ * reference each other in a loop keep file order; the integrity check
+ * decides. Returns row indexes.
+ */
+function managerFirstOrder(rows: Row[]): number[] {
+  const idxByEmail = new Map<string, number>();
+  rows.forEach((r, i) => {
+    const e = (r.email ?? "").trim().toLowerCase();
+    if (e && !idxByEmail.has(e)) idxByEmail.set(e, i);
+  });
+  const deps = (i: number): number[] => {
+    const out: number[] = [];
+    for (const k of ["line_manager_id", "indirect_manager_id", "l3_manager_id"] as const) {
+      const v = (rows[i][k] ?? "").trim().toLowerCase();
+      const j = v.includes("@") ? idxByEmail.get(v) : undefined;
+      if (j !== undefined && j !== i) out.push(j);
+    }
+    return out;
+  };
+  const state: Array<0 | 1 | 2> = new Array(rows.length).fill(0);
+  const order: number[] = [];
+  for (let start = 0; start < rows.length; start++) {
+    if (state[start] !== 0) continue;
+    const stack: Array<{ i: number; deps: number[]; next: number }> = [{ i: start, deps: deps(start), next: 0 }];
+    state[start] = 1;
+    while (stack.length) {
+      const top = stack[stack.length - 1];
+      if (top.next < top.deps.length) {
+        const d = top.deps[top.next++];
+        if (state[d] === 0) {
+          state[d] = 1;
+          stack.push({ i: d, deps: deps(d), next: 0 });
+        }
+        continue;
+      }
+      state[top.i] = 2;
+      order.push(top.i);
+      stack.pop();
+    }
+  }
+  return order;
+}
 
 function parseCsv(csv: string): Row[] {
   const lines = csv.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -655,8 +766,11 @@ function parseCsv(csv: string): Row[] {
     const row: Row = {};
     for (let i = 0; i < headers.length; i++) {
       const key = headers[i];
-      if ((KNOWN_COLS as readonly string[]).includes(key)) {
-        row[key] = cells[i] ? cells[i].trim() : "";
+      // A column the line does not reach stays undefined ("not provided"),
+      // which is how a legacy, shorter header-less file keeps its trailing
+      // columns (branch, l3_manager_id, …) untouched instead of cleared.
+      if ((KNOWN_COLS as readonly string[]).includes(key) && cells[i] !== undefined) {
+        row[key] = cells[i].trim();
       }
     }
     return row;

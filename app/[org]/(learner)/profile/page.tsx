@@ -31,6 +31,7 @@ type MembershipRow = {
   branch: string | null;
   line_manager_id: string | null;
   indirect_manager_id: string | null;
+  l3_manager_id: string | null;
   node_id: string | null;
   city: string | null;
   state: string | null;
@@ -128,7 +129,7 @@ export default async function ProfilePage({
   const { data: memRow } = await svc
     .from("organization_members")
     .select(
-      "employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, branch, line_manager_id, indirect_manager_id, node_id, city, state"
+      "employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, branch, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state"
     )
     .eq("organization_id", org.id)
     .eq("user_id", user.id)
@@ -145,6 +146,7 @@ export default async function ProfilePage({
     branch: null,
     line_manager_id: null,
     indirect_manager_id: null,
+    l3_manager_id: null,
     node_id: null,
     city: null,
     state: null,
@@ -154,6 +156,7 @@ export default async function ProfilePage({
   const managerIds = [
     membership.line_manager_id,
     membership.indirect_manager_id,
+    membership.l3_manager_id,
   ].filter((id): id is string => !!id);
   const managerEmailById = new Map<string, string>();
   if (managerIds.length > 0) {
@@ -350,11 +353,19 @@ export default async function ProfilePage({
                 }
               />
               <LockedField
-                label="Indirect manager"
+                label="Indirect manager (L2)"
                 value={
                   membership.indirect_manager_id
                     ? managerEmailById.get(membership.indirect_manager_id) ??
                       "—"
+                    : "—"
+                }
+              />
+              <LockedField
+                label="L3 manager"
+                value={
+                  membership.l3_manager_id
+                    ? managerEmailById.get(membership.l3_manager_id) ?? "—"
                     : "—"
                 }
               />

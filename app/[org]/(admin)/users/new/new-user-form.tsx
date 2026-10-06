@@ -27,6 +27,7 @@ type FormState = {
   job_role: string;
   line_manager_id: string;
   indirect_manager_id: string;
+  l3_manager_id: string;
   lms_role: LmsRole;
   node_id: string;
   city: string;
@@ -52,6 +53,7 @@ const INITIAL: FormState = {
   job_role: "",
   line_manager_id: "",
   indirect_manager_id: "",
+  l3_manager_id: "",
   lms_role: "user",
   node_id: "",
   city: "",
@@ -73,7 +75,7 @@ export function NewUserForm({
   /** Master-data lists (migration 0055): field → allowed values. A field
    *  with values here is mandatory and renders as a restricted dropdown. */
   fieldOptions?: Record<string, string[]>;
-  /** Line Manager (L1) + Indirect Line Manager (L2) mandatory? */
+  /** Reporting-line managers (L1 + L2 + L3) mandatory? */
   requireManagers?: boolean;
 }) {
   const router = useRouter();
@@ -84,6 +86,8 @@ export function NewUserForm({
     email: string;
     invited: boolean;
     updated: boolean;
+    /** Reporting-line warnings (chain mismatch) — created, but worth a look. */
+    warnings: string[];
   } | null>(null);
   const [usernameTouched, setUsernameTouched] = useState(false);
 
@@ -163,6 +167,7 @@ export function NewUserForm({
       email?: string;
       invited?: boolean;
       updated_existing?: boolean;
+      warnings?: string[];
       error?: string;
     };
     if (!res.ok) {
@@ -173,6 +178,7 @@ export function NewUserForm({
       email: j.email ?? form.email,
       invited: !!j.invited,
       updated: !!j.updated_existing,
+      warnings: j.warnings ?? [],
     });
     setForm(INITIAL);
     setUsernameTouched(false);
@@ -346,7 +352,7 @@ export function NewUserForm({
             placeholder: "e.g. SALES-WEST-3",
           })}
 
-          <Field label="Line manager" required={requireManagers}>
+          <Field label="Line manager (L1)" required={requireManagers}>
             <select
               required={requireManagers}
               value={form.line_manager_id}
@@ -361,11 +367,26 @@ export function NewUserForm({
               ))}
             </select>
           </Field>
-          <Field label="Indirect line manager" required={requireManagers}>
+          <Field label="Indirect line manager (L2)" required={requireManagers}>
             <select
               required={requireManagers}
               value={form.indirect_manager_id}
               onChange={(e) => set("indirect_manager_id", e.target.value)}
+              className="input"
+            >
+              <option value="">—</option>
+              {managers.map((m) => (
+                <option key={m.user_id} value={m.user_id}>
+                  {m.email}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="L3 manager" required={requireManagers}>
+            <select
+              required={requireManagers}
+              value={form.l3_manager_id}
+              onChange={(e) => set("l3_manager_id", e.target.value)}
               className="input"
             >
               <option value="">—</option>
@@ -399,6 +420,13 @@ export function NewUserForm({
           {success.invited
             ? "An invite link has been emailed for them to set a password."
             : "The account is active with the password you set."}
+          {success.warnings.length > 0 && (
+            <div className="mt-2 border border-amber-200 bg-amber-50 text-amber-900 rounded-lg p-2 text-xs space-y-0.5">
+              {success.warnings.map((w) => (
+                <p key={w}>{w}</p>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
