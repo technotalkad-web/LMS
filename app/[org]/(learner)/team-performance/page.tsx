@@ -1,56 +1,41 @@
 import Link from "next/link";
-import { Users, Target, Award, Trophy, MapPin } from "lucide-react";
-import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { Users } from "lucide-react";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { courseDaysOf } from "@/lib/journey/journey";
-import { resolveManyGroups } from "@/lib/org/groups";
+import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { loadManagerContext } from "@/lib/manager/access";
+import { computeLearnerInsights } from "@/lib/manager/insights";
+import {
+  buildExceptions,
+  buildStruggles,
+  compareWorstFirst,
+  matchesStatusFilter,
+  periodSummary,
+  teamScore,
+} from "@/lib/manager/report-card";
+import { PERIODS, SEVERITY_RANK, type LearnerInsight } from "@/lib/manager/types";
+import { SEVERITY_META } from "@/lib/manager/report-card";
+import { Card, Dot, Pill, SEVERITY_TONE, StatusPill, relativeDays } from "./_components/ui";
+import { ActionButton, AssignCourseDialog, ReportFilters } from "./_components/report-card-client";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Team Performance (Phase 4 of the Personalised Journeys program) — the
- * MANAGER-facing view, gated by the profile database's Line Manager mapping
- * (organization_members.line_manager_id — the same field that powers the
- * Verticals board and journey escalations). Product decisions (2026-09-03):
+ * Team Performance — the L1 Manager Report Card (Phase 1 of the approved
+ * proposal). One screen, top to bottom: team score → four signals → what
+ * needs your attention (≤5, severity first, one action each) → the team,
+ * worst first → where the team struggles vs the organisation → this period.
  *
- *   - L1 (has direct reports): own-team AGGREGATES — size, journey
- *     completion, courses completed, avg knowledge score. Member-level rows
- *     appear only when the org's existing "team leaders see member details"
- *     toggle allows it (gamification_settings.leaderboard_team_leader_view).
- *   - L2 (manages managers — L2 = the manager's manager, derived): a
- *     sub-team COMPARISON, aggregates only, never other teams' individuals.
- *   - City competition: teams led by same-city managers, ranked by journey
- *     completion — awareness between managers, not a public employee
- *     ranking.
- *
- * Reads run service-role after requireOrgAccess (RLS hides peers' member
- * rows from non-admins; same precedent as the leaderboard page) and every
- * gamification/journey read is fail-soft.
+ * Access and scope (decision 3): the server resolves the viewer's people from
+ * the explicit L1/L2/L3 fields (lib/manager/access.ts) and reads only those
+ * people; the old "team leaders see member details" toggle no longer applies
+ * here (decision 10). Computation is live — a team is small.
  */
-
-type MemberRow = {
-  user_id: string;
-  line_manager_id: string | null;
-  city: string | null;
-  business_vertical: string | null;
-  branch: string | null;
-};
-
-type TeamAgg = {
-  size: number;
-  journeyPct: number | null; // avg journey completion 0–100 across enrolled
-  journeyEnrolled: number;
-  journeyCompleted: number;
-  coursesCompleted: number;
-  avgScore: number | null; // 0–1
-};
-
 export default async function TeamPerformancePage({
   params,
   searchParams,
 }: {
   params: Promise<{ org: string }>;
-  searchParams?: Promise<{ group?: string }>;
+  searchParams?: Promise<{ period?: string; content?: string; status?: string }>;
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
@@ -60,434 +45,239 @@ export default async function TeamPerformancePage({
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+  const ctx = await loadManagerContext(svc, org.id, user.id);
 
-  // Active members + hierarchy fields (paginate past PostgREST's 1000 cap).
-  const members: MemberRow[] = [];
-  for (let fromIdx = 0; ; fromIdx += 1000) {
-    const { data } = await svc
-      .from("organization_members")
-      .select("user_id, line_manager_id, city, business_vertical, branch")
-      .eq("organization_id", org.id)
-      .eq("status", "active")
-      .range(fromIdx, fromIdx + 999);
-    const page = (data ?? []) as MemberRow[];
-    members.push(...page);
-    if (page.length < 1000) break;
-  }
-  const byId = new Map(members.map((m) => [m.user_id, m]));
-
-  // Custom Group filter (G3): scopes every section's member set. Managers
-  // themselves aren't filtered — only whose numbers are counted.
-  const fGroup = sp.group?.trim() || null;
-  let groupScope: Set<string> | null = null;
-  let groupOptions: Array<{ id: string; name: string }> = [];
-  try {
-    const { data } = await svc
-      .from("org_groups")
-      .select("id, name")
-      .eq("organization_id", org.id)
-      .eq("is_active", true)
-      .order("name", { ascending: true });
-    groupOptions = (data ?? []) as Array<{ id: string; name: string }>;
-    if (fGroup && groupOptions.some((g) => g.id === fGroup)) {
-      groupScope = await resolveManyGroups(svc, org.id as string, [fGroup]);
-    }
-  } catch {
-    /* pre-0067 — no group filter */
-  }
-
-  const reportsOf = (managerId: string) =>
-    members.filter(
-      (m) =>
-        m.line_manager_id === managerId &&
-        (groupScope === null || groupScope.has(m.user_id))
-    );
-
-  const myReports = reportsOf(user.id);
-  // The manager gate uses UNFILTERED reports — a group filter narrowing your
-  // team to zero must not bounce you off your own page.
-  const rawReportCount = members.filter((m) => m.line_manager_id === user.id).length;
-  if (rawReportCount === 0) {
+  if (!ctx.isManager) {
     return (
       <div className="max-w-2xl mx-auto text-center py-16">
         <Users className="w-10 h-10 mx-auto text-muted opacity-50" />
         <h1 className="mt-4 text-2xl font-semibold">No team mapped yet</h1>
         <p className="text-muted text-sm mt-2 max-w-md mx-auto">
-          Team Performance appears once employees are mapped to you as their
-          Line Manager in the user profiles. Ask your administrator to set
-          the mapping.
+          Team Performance appears once employees are mapped to you as their manager in the reporting line. Ask your
+          administrator to set the mapping.
         </p>
       </div>
     );
   }
 
-  // ---- Org-wide raw stats, aggregated in JS (small orgs; all fail-soft) ---
-  // Gamification per user: lifetime courses completed + avg score.
-  const mvStats = new Map<string, { courses: number; score: number | null }>();
-  try {
-    const { data } = await svc
-      .from("mv_leaderboard")
-      .select("user_id, courses_completed, avg_score")
-      .eq("organization_id", org.id);
-    for (const r of (data ?? []) as Array<{
-      user_id: string;
-      courses_completed: number;
-      avg_score: number | null;
-    }>) {
-      mvStats.set(r.user_id, { courses: r.courses_completed ?? 0, score: r.avg_score });
-    }
-  } catch {
-    /* pre-0053 or refresh issues — cards show em-dashes */
-  }
+  // searchParams can repeat a key (?content=a&content=b → array): take strings only.
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const period = PERIODS.find((p) => p.value === (str(sp.period) || "30")) ?? PERIODS[1];
+  const content = str(sp.content);
+  const statusFilter = str(sp.status);
+  const current = { period: period.value, content, status: statusFilter };
+  const nowMs = Date.now();
 
-  // Journey completion per user across their enrollments (completed = 100%).
-  const userJourney = new Map<string, { pctSum: number; n: number; completed: number }>();
-  try {
-    const { data: enrRows } = await svc
-      .from("journey_enrollments")
-      .select("id, user_id, status, journey_versions!inner(days, days_total)")
-      .eq("organization_id", org.id)
-      .in("status", ["active", "completed"])
-      .limit(2000);
-    const enrs = (enrRows ?? []) as Array<{
-      id: string;
-      user_id: string;
-      status: string;
-      journey_versions:
-        | { days: unknown; days_total: number }
-        | Array<{ days: unknown; days_total: number }>;
-    }>;
-    const doneByEnr = new Map<string, number>();
-    const { data: progRows } = await svc
-      .from("journey_day_progress")
-      .select("enrollment_id")
-      .eq("organization_id", org.id)
-      .limit(5000);
-    for (const r of (progRows ?? []) as Array<{ enrollment_id: string }>) {
-      doneByEnr.set(r.enrollment_id, (doneByEnr.get(r.enrollment_id) ?? 0) + 1);
-    }
-    for (const e of enrs) {
-      const v = Array.isArray(e.journey_versions)
-        ? e.journey_versions[0]
-        : e.journey_versions;
-      const missions = v ? courseDaysOf(v.days, v.days_total).length : 0;
-      const pct =
-        e.status === "completed"
-          ? 100
-          : missions > 0
-            ? Math.round(((doneByEnr.get(e.id) ?? 0) / missions) * 100)
-            : 0;
-      const cur = userJourney.get(e.user_id) ?? { pctSum: 0, n: 0, completed: 0 };
-      cur.pctSum += pct;
-      cur.n += 1;
-      if (e.status === "completed") cur.completed += 1;
-      userJourney.set(e.user_id, cur);
-    }
-  } catch {
-    /* pre-0058 — journey columns show em-dashes */
-  }
+  const { learners, catalog, benchmark, today } = await computeLearnerInsights(svc, {
+    orgId: org.id,
+    orgSlug,
+    userIds: ctx.directIds,
+    periodDays: period.days,
+    content,
+  });
+  const score = teamScore(learners);
+  const exceptions = buildExceptions(learners, { orgSlug });
+  const struggles = buildStruggles(learners, benchmark);
+  const summary = periodSummary(learners, period.days);
+  const roster = [...learners].sort(compareWorstFirst).filter((l) => matchesStatusFilter(l, statusFilter));
 
-  const aggFor = (ids: string[]): TeamAgg => {
-    let journeyPctSum = 0;
-    let journeyEnrolled = 0;
-    let journeyCompleted = 0;
-    let coursesCompleted = 0;
-    let scoreSum = 0;
-    let scoreN = 0;
-    for (const id of ids) {
-      const j = userJourney.get(id);
-      if (j && j.n > 0) {
-        journeyEnrolled++;
-        journeyPctSum += j.pctSum / j.n;
-        if (j.completed > 0) journeyCompleted++;
-      }
-      const s = mvStats.get(id);
-      if (s) {
-        coursesCompleted += s.courses;
-        if (typeof s.score === "number") {
-          scoreSum += s.score;
-          scoreN++;
-        }
-      }
-    }
-    return {
-      size: ids.length,
-      journeyPct: journeyEnrolled > 0 ? Math.round(journeyPctSum / journeyEnrolled) : null,
-      journeyEnrolled,
-      journeyCompleted,
-      coursesCompleted,
-      avgScore: scoreN > 0 ? scoreSum / scoreN : null,
-    };
+  const { data: me } = await svc.from("profiles").select("first_name").eq("id", user.id).maybeSingle();
+  const firstName = (me as { first_name?: string | null } | null)?.first_name ?? null;
+  const contents = [
+    { label: "Journeys", options: catalog.journeys.map((j) => ({ value: `journey:${j.id}`, label: j.title })) },
+    { label: "Learning paths", options: catalog.paths.map((p) => ({ value: `path:${p.id}`, label: p.title })) },
+    { label: "Courses", options: catalog.courses.map((c) => ({ value: `course:${c.id}`, label: c.title })) },
+  ];
+  const team = learners.map((l) => ({ userId: l.userId, name: l.name }));
+  const journeyLabel = (l: LearnerInsight) => {
+    const j = l.journeys.find((x) => x.status === "active") ?? l.journeys[0];
+    if (!j) return "—";
+    if (j.status === "completed") return "Completed";
+    return `Day ${j.day}/${j.total}${j.behind ? ` · ${j.behind} behind` : j.overdueDeadline ? " · past deadline" : " · on track"}`;
+  };
+  const flagsLabel = (l: LearnerInsight) => {
+    const kinds = [...new Set(l.flags.filter((f) => f.kind !== "needs_support").map((f) => f.kind))];
+    return kinds.length ? kinds.map((k) => ({ failed: "Failed", overdue: "Overdue", behind: "Behind", stuck: "Stuck", not_started: "Not started", inactive: "Inactive", needs_support: "" } as Record<string, string>)[k]).join(" · ") : "—";
   };
 
-  const myTeam = aggFor(myReports.map((m) => m.user_id));
-
-  // L2: my direct reports who lead teams of their own.
-  const subTeams = myReports
-    .map((r) => ({ leaderId: r.user_id, memberIds: reportsOf(r.user_id).map((m) => m.user_id) }))
-    .filter((t) => t.memberIds.length > 0)
-    .map((t) => ({ ...t, agg: aggFor(t.memberIds) }))
-    .sort((a, b) => (b.agg.journeyPct ?? -1) - (a.agg.journeyPct ?? -1));
-
-  // City competition: teams led by managers in MY city.
-  const myRow = byId.get(user.id);
-  const myCity = myRow?.city ?? null;
-  const leaderIds = [
-    ...new Set(members.map((m) => m.line_manager_id).filter((x): x is string => !!x)),
-  ].filter((id) => byId.has(id));
-  const cityTeams = myCity
-    ? leaderIds
-        .filter((id) => byId.get(id)?.city === myCity)
-        .map((id) => ({ leaderId: id, agg: aggFor(reportsOf(id).map((m) => m.user_id)) }))
-        .sort((a, b) => (b.agg.journeyPct ?? -1) - (a.agg.journeyPct ?? -1))
-    : [];
-
-  // Names for every leader we display + own members (chunked).
-  const nameIds = new Set<string>([user.id]);
-  for (const t of subTeams) nameIds.add(t.leaderId);
-  for (const t of cityTeams) nameIds.add(t.leaderId);
-  for (const m of myReports) nameIds.add(m.user_id);
-  const names = new Map<string, string>();
-  const idList = [...nameIds];
-  for (let i = 0; i < idList.length; i += 150) {
-    const { data } = await svc
-      .from("profiles")
-      .select("id, first_name, last_name, email")
-      .in("id", idList.slice(i, i + 150));
-    for (const p of (data ?? []) as Array<{
-      id: string;
-      first_name: string | null;
-      last_name: string | null;
-      email: string | null;
-    }>) {
-      names.set(
-        p.id,
-        [p.first_name, p.last_name].filter(Boolean).join(" ").trim() ||
-          (p.email ?? "").split("@")[0]
-      );
-    }
-  }
-  const nameOf = (id: string) => names.get(id) ?? "—";
-
-  // Existing org privacy toggle: may leaders see their own members' rows?
-  let showMembers = true;
-  try {
-    const { data: gs } = await svc
-      .from("gamification_settings")
-      .select("leaderboard_team_leader_view")
-      .eq("organization_id", org.id)
-      .maybeSingle();
-    if ((gs as { leaderboard_team_leader_view?: boolean } | null)?.leaderboard_team_leader_view === false) {
-      showMembers = false;
-    }
-  } catch {
-    /* default: visible */
-  }
-
-  const pctLabel = (v: number | null) => (v === null ? "—" : `${v}%`);
-  const scoreLabel = (v: number | null) =>
-    v === null ? "—" : `${Math.round(v * 100)}%`;
-
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <header>
-        <h1 className="serif text-4xl">Team Performance</h1>
-        <p className="text-muted text-sm mt-1">
-          How your team is progressing — journeys, courses and knowledge
-          scores, straight from the profile database mapping.
-        </p>
+    // data-dashboard-root: the learner shell animates `main > *` with a
+    // transform, which would turn this page's fixed-position dialog into a
+    // locally positioned box; the root stays static and its children rise in.
+    <div data-dashboard-root="" className="max-w-6xl mx-auto space-y-6">
+      <header className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+        <div>
+          <h1 className="serif text-4xl">Team Performance</h1>
+          <p className="text-muted text-sm mt-1">
+            {firstName ? `${firstName}'s team` : "Your team"} · {learners.length} {learners.length === 1 ? "person" : "people"}
+            {ctx.scope.level > 1 && (
+              <span className="ml-2 text-xs">· you are also mapped as an L{ctx.scope.level} manager — the team-of-teams view is coming next</span>
+            )}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <ReportFilters orgSlug={orgSlug} basePath="team-performance" current={current} contents={contents} />
+          <AssignCourseDialog orgSlug={orgSlug} courses={contents[2].options.map((o) => ({ value: o.value.slice(7), label: o.label }))} team={team} />
+        </div>
       </header>
 
-      {/* Custom Group scope (G3) — zero-JS GET form. */}
-      {groupOptions.length > 0 && (
-        <form method="get" className="flex flex-wrap items-end gap-2">
-          <label className="text-xs">
-            <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">
-              Scope to group
-            </span>
-            <select
-              name="group"
-              defaultValue={fGroup ?? ""}
-              className="px-2 py-1.5 border border-line rounded-lg bg-paper text-xs min-w-[200px]"
-            >
-              <option value="">Everyone</option>
-              {groupOptions.map((g) => (
-                <option key={g.id} value={g.id}>{g.name}</option>
-              ))}
-            </select>
-          </label>
-          <button type="submit" className="px-3 py-1.5 bg-ink text-canvas rounded-lg text-xs font-semibold">
-            Apply
-          </button>
-          {groupScope !== null && (
-            <Link
-              href={`/${orgSlug}/team-performance`}
-              className="px-2 py-1.5 text-xs text-muted underline underline-offset-2 hover:text-ink"
-            >
-              Clear
-            </Link>
-          )}
-        </form>
-      )}
-      {groupScope !== null && myReports.length === 0 && (
-        <p className="text-xs text-muted">
-          None of your team members are in this group — numbers below cover an
-          empty set.
-        </p>
-      )}
+      {learners.length === 0 ? (
+        <Card>
+          <p className="text-sm text-muted">
+            Nobody lists you as their L1 manager yet. {ctx.scope.all.size > 0 ? `${ctx.scope.all.size} people are mapped under you at L2/L3; that view arrives in the next release.` : ""}
+          </p>
+        </Card>
+      ) : (
+        <>
+          {/* Score + what needs attention */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <Card eyebrow="Team Learning Score">
+              <div className="flex items-baseline gap-3">
+                <span className="serif text-5xl font-semibold tabular-nums">{score.score ?? "—"}</span>
+                <Pill tone={score.tone}>{score.label}</Pill>
+              </div>
+              <ul className="mt-3 space-y-1.5 text-sm">
+                {score.signals.map((s) => (
+                  <li key={s.key} className="flex items-baseline justify-between gap-3" title={s.note ?? undefined}>
+                    <span><Dot tone={s.tone} />{s.label}</span>
+                    <span className="tabular-nums font-medium">{s.display}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="text-[11px] text-muted mt-3">Weights 35 · 25 · 25 · 15. Status flags are always current; the period filter only changes the counts below.</p>
+            </Card>
 
-      {/* ---- L1: my team ---- */}
-      <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <Kpi icon={<Users className="w-4 h-4 text-indigo-600" />} label="Team members" value={String(myTeam.size)} />
-        <Kpi
-          icon={<Target className="w-4 h-4 text-amber-600" />}
-          label="Journey completion"
-          value={pctLabel(myTeam.journeyPct)}
-          sub={`${myTeam.journeyCompleted}/${myTeam.journeyEnrolled || "0"} finished`}
-        />
-        <Kpi icon={<Award className="w-4 h-4 text-emerald-600" />} label="Courses completed" value={String(myTeam.coursesCompleted)} />
-        <Kpi icon={<Trophy className="w-4 h-4 text-slate-500" />} label="Avg knowledge score" value={scoreLabel(myTeam.avgScore)} />
-      </section>
+            <Card eyebrow="What needs your attention" className="lg:col-span-2">
+              {exceptions.length === 0 ? (
+                <p className="text-sm text-muted">Nothing needs your attention right now — everyone is on track.</p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {exceptions
+                    .slice()
+                    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity])
+                    .map((g) => (
+                      <div key={g.kind} className={`rounded-xl border-l-4 bg-canvas/60 p-3 ${g.severity === "critical" ? "border-red-500" : "border-amber-500"}`}>
+                        <div className="flex items-baseline justify-between gap-2">
+                          <p className="font-semibold text-sm">{g.title}</p>
+                          <Pill tone={SEVERITY_TONE[g.severity]}>{SEVERITY_META[g.severity].label}</Pill>
+                        </div>
+                        <p className="text-xs text-muted mt-0.5">
+                          {g.people.map((p) => p.name).join(", ")}
+                          {g.count > g.people.length ? ` +${g.count - g.people.length}` : ""}
+                          {g.content ? ` · ${g.content.title}` : ""}
+                        </p>
+                        <p className="text-xs mt-1"><span className="text-muted">Suggested:</span> {g.suggestion}</p>
+                        {g.actions.length > 0 && (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {g.actions.map((a, i) => (
+                              <ActionButton key={`${a.kind}:${a.label}`} orgSlug={orgSlug} action={a} primary={i === 0} />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                </div>
+              )}
+            </Card>
+          </div>
 
-      {showMembers && (
-        <section className="bg-paper border border-line rounded-2xl overflow-hidden">
-          <h3 className="text-sm font-semibold px-5 pt-4 pb-2">Your team</h3>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-[11px] uppercase tracking-wide text-muted border-b border-line">
-                <th className="text-left font-semibold px-5 py-2">Member</th>
-                <th className="text-right font-semibold px-3 py-2">Journey</th>
-                <th className="text-right font-semibold px-3 py-2">Courses done</th>
-                <th className="text-right font-semibold px-5 py-2">Avg score</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {myReports.map((m) => {
-                const j = userJourney.get(m.user_id);
-                const jm = j && j.n > 0 ? Math.round(j.pctSum / j.n) : null;
-                const s = mvStats.get(m.user_id);
-                return (
-                  <tr key={m.user_id}>
-                    <td className="px-5 py-2.5 font-medium">{nameOf(m.user_id)}</td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">
-                      {jm === null ? (
-                        <span className="text-muted">not enrolled</span>
-                      ) : (
-                        <span className={jm >= 100 ? "text-emerald-700 font-semibold" : ""}>{jm}%</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{s?.courses ?? 0}</td>
-                    <td className="px-5 py-2.5 text-right tabular-nums">{scoreLabel(s?.score ?? null)}</td>
+          {/* Roster */}
+          <section className="bg-paper border border-line rounded-2xl overflow-hidden">
+            <div className="px-5 pt-4 pb-2 flex items-baseline justify-between gap-3">
+              <h2 className="font-semibold text-sm">Your team · click a name for their report</h2>
+              <span className="text-xs text-muted">{roster.length} of {learners.length}{statusFilter ? " match the filter" : " · worst first"}</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm min-w-[720px]">
+                <thead>
+                  <tr className="text-[11px] uppercase tracking-wide text-muted border-b border-line">
+                    <th className="text-left font-semibold px-5 py-2">Employee</th>
+                    <th className="text-left font-semibold px-3 py-2">Status</th>
+                    <th className="text-right font-semibold px-3 py-2">Completion</th>
+                    <th className="text-right font-semibold px-3 py-2">Avg score</th>
+                    <th className="text-left font-semibold px-3 py-2">Journey</th>
+                    <th className="text-left font-semibold px-3 py-2">Last active</th>
+                    <th className="text-left font-semibold px-5 py-2">Flags</th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </section>
-      )}
+                </thead>
+                <tbody className="divide-y divide-line">
+                  {roster.map((l) => (
+                    <tr key={l.userId} className="hover:bg-canvas/60">
+                      <td className="px-5 py-2.5 font-medium">
+                        <Link href={`/${orgSlug}/team-performance/${l.userId}`} className="hover:underline">{l.name}</Link>
+                        {l.designation && <span className="block text-[11px] text-muted font-normal">{l.designation}</span>}
+                      </td>
+                      <td className="px-3 py-2.5"><StatusPill status={l.status} /></td>
+                      <td className="px-3 py-2.5 text-right tabular-nums">{l.completionPct === null ? <span className="text-muted">—</span> : `${l.completionPct}%`}</td>
+                      <td className="px-3 py-2.5 text-right tabular-nums">{l.avgScore === null ? <span className="text-muted">—</span> : l.avgScore}</td>
+                      <td className="px-3 py-2.5 text-xs">{journeyLabel(l)}</td>
+                      <td className="px-3 py-2.5 text-xs text-muted">{relativeDays(l.lastActive, nowMs)}</td>
+                      <td className="px-5 py-2.5 text-xs text-muted">{flagsLabel(l)}</td>
+                    </tr>
+                  ))}
+                  {roster.length === 0 && (
+                    <tr><td colSpan={7} className="px-5 py-6 text-sm text-muted text-center">Nobody matches this filter.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
 
-      {/* ---- L2: sub-team comparison ---- */}
-      {subTeams.length > 0 && (
-        <section className="bg-paper border border-line rounded-2xl overflow-hidden">
-          <div className="px-5 pt-4 pb-2">
-            <h3 className="text-sm font-semibold">Teams under you</h3>
-            <p className="text-xs text-muted">
-              Aggregate comparison of the teams your managers lead —
-              individual performance stays with each team&apos;s own leader.
-            </p>
-          </div>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-[11px] uppercase tracking-wide text-muted border-b border-line">
-                <th className="text-left font-semibold px-5 py-2">Team</th>
-                <th className="text-right font-semibold px-3 py-2">Members</th>
-                <th className="text-right font-semibold px-3 py-2">Journey</th>
-                <th className="text-right font-semibold px-5 py-2">Avg score</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {subTeams.map((t) => (
-                <tr key={t.leaderId}>
-                  <td className="px-5 py-2.5 font-medium">{nameOf(t.leaderId)}&apos;s team</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums">{t.agg.size}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums font-semibold">{pctLabel(t.agg.journeyPct)}</td>
-                  <td className="px-5 py-2.5 text-right tabular-nums">{scoreLabel(t.agg.avgScore)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-
-      {/* ---- City competition ---- */}
-      {myCity && cityTeams.length > 1 && (
-        <section className="bg-paper border border-line rounded-2xl overflow-hidden">
-          <div className="px-5 pt-4 pb-2">
-            <h3 className="text-sm font-semibold inline-flex items-center gap-1.5">
-              <MapPin className="w-4 h-4 text-indigo-600" /> {myCity} — team standings
-            </h3>
-            <p className="text-xs text-muted">
-              Team-level journey completion across {myCity}. Friendly
-              competition between teams — no individual rankings here.
-            </p>
-          </div>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-[11px] uppercase tracking-wide text-muted border-b border-line">
-                <th className="text-left font-semibold px-5 py-2">#</th>
-                <th className="text-left font-semibold px-3 py-2">Team</th>
-                <th className="text-right font-semibold px-3 py-2">Members</th>
-                <th className="text-right font-semibold px-5 py-2">Journey</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {cityTeams.map((t, i) => {
-                const mine = t.leaderId === user.id;
-                return (
-                  <tr key={t.leaderId} className={mine ? "bg-indigo-50/60" : undefined}>
-                    <td className="px-5 py-2.5 tabular-nums font-bold text-muted">
-                      {i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : i + 1}
-                    </td>
-                    <td className="px-3 py-2.5 font-medium">
-                      {nameOf(t.leaderId)}&apos;s team
-                      {mine && (
-                        <span className="ml-2 text-[10px] font-bold uppercase bg-indigo-600 text-white px-1.5 py-0.5 rounded-full">
-                          yours
+          {/* Struggles + period */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card eyebrow="Where your team struggles">
+              {struggles.length === 0 ? (
+                <p className="text-sm text-muted">No course or journey day is holding the team back right now.</p>
+              ) : (
+                <ul className="space-y-2 text-sm">
+                  {struggles.map((s) => {
+                    const parts = [
+                      s.failed ? `${s.failed} failed` : "",
+                      s.stuck ? `${s.stuck} stuck` : "",
+                      s.notStarted ? `${s.notStarted} not started` : "",
+                      s.overdue ? `${s.overdue} overdue` : "",
+                      s.pending ? `${s.pending} pending` : "",
+                    ].filter(Boolean);
+                    const tone = s.failed || s.overdue ? "bad" : "warn";
+                    return (
+                      <li key={s.id} className="flex flex-wrap items-baseline justify-between gap-2">
+                        <span className="font-medium">
+                          {s.kind === "course" ? (
+                            <Link href={`/${orgSlug}/team-performance?content=course:${s.id}`} className="hover:underline">{s.title}</Link>
+                          ) : s.title}
                         </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2.5 text-right tabular-nums">{t.agg.size}</td>
-                    <td className="px-5 py-2.5 text-right tabular-nums font-semibold">{pctLabel(t.agg.journeyPct)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </section>
+                        <span className="text-xs">
+                          <Pill tone={tone}>{parts.join(" · ")}</Pill>
+                          {s.teamFailRate !== null && s.failed > 0 && (
+                            <span className="ml-2 text-muted">
+                              your team {s.teamFailRate}% fail{s.orgFailRate !== null ? ` · org ${s.orgFailRate}%` : ""}
+                              {s.diagnosis === "content" ? " — likely a content gap, not your team" : s.diagnosis === "team" ? " — a team problem" : ""}
+                            </span>
+                          )}
+                          {s.orgFailRate === null && s.failed > 0 && <span className="ml-2 text-muted">no org benchmark yet</span>}
+                          {s.diagnosis === "timing" && <span className="ml-2 text-muted">recently assigned — nudge, don&rsquo;t escalate</span>}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+              {struggles.some((s) => s.orgFailRate !== null) && (
+                <p className="text-[11px] text-muted mt-3">Org fail rate = learners whose official attempt failed, over everyone assigned the course (refreshed nightly; custom-group assignments not included).</p>
+              )}
+            </Card>
+            <Card eyebrow={period.days ? `Last ${period.days} days` : "All time"}>
+              <ul className="space-y-1.5 text-sm">
+                <li className="flex justify-between"><span>Courses completed</span><span className="tabular-nums font-medium">{summary.coursesCompleted}{summary.completionsDelta !== null ? <span className={`ml-2 text-xs ${summary.completionsDelta >= 0 ? "text-emerald-700" : "text-red-700"}`}>{summary.completionsDelta >= 0 ? "+" : ""}{summary.completionsDelta} vs previous</span> : null}</span></li>
+                <li className="flex justify-between"><span>Assessments passed first time</span><span className="tabular-nums font-medium">{summary.passedFirstTime}{period.days ? "" : ` / ${summary.assessmentsWithResult}`}</span></li>
+                <li className="flex justify-between"><span>Journey missions done</span><span className="tabular-nums font-medium">{summary.journeyMissions}</span></li>
+                <li className="flex justify-between"><span>Active this week</span><span className="tabular-nums font-medium">{learners.filter((l) => l.activeLast7d).length} / {learners.length}</span></li>
+              </ul>
+              <p className="text-[11px] text-muted mt-3">As of {today} (organisation calendar).</p>
+            </Card>
+          </div>
+        </>
       )}
-    </div>
-  );
-}
-
-function Kpi({
-  icon,
-  label,
-  value,
-  sub,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: string;
-  sub?: string;
-}) {
-  return (
-    <div className="bg-paper border border-line rounded-2xl px-4 py-3">
-      <p className="text-[11px] uppercase tracking-wider text-muted font-bold inline-flex items-center gap-1.5">
-        {icon}
-        {label}
-      </p>
-      <p className="mt-1 text-xl font-semibold tabular-nums">{value}</p>
-      {sub && <p className="text-[11px] text-muted">{sub}</p>}
     </div>
   );
 }

@@ -27,8 +27,8 @@ import {
 
 export type AttemptRequestRow = {
   id: string;
-  status: "pending" | "approved" | "rejected";
-  source: "request" | "bulk";
+  status: "pending" | "approved" | "rejected" | "expired";
+  source: "request" | "bulk" | "manager";
   reason: string | null;
   decision_note: string | null;
   decided_at: string | null;
@@ -285,9 +285,9 @@ function RequestCard({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <StatusBadge row={r} />
-            {r.source === "bulk" && (
+            {r.source !== "request" && (
               <span className="text-[10px] uppercase tracking-wider font-semibold text-muted border border-line rounded-full px-2 py-0.5">
-                Bulk grant
+                {r.source === "manager" ? "Manager grant" : "Bulk grant"}
               </span>
             )}
             <CurrentScore row={r} />
@@ -397,6 +397,7 @@ function DecidedFooter({ row: r }: { row: AttemptRequestRow }) {
 function StatusBadge({ row: r }: { row: AttemptRequestRow }) {
   if (r.status === "pending") return <StatusPill tone="warning">Pending</StatusPill>;
   if (r.status === "rejected") return <StatusPill tone="neutral">Declined</StatusPill>;
+  if (r.status === "expired") return <StatusPill tone="neutral">Expired unused</StatusPill>;
   if (r.used_at) return <StatusPill tone="success">Granted · used</StatusPill>;
   if (r.expires_at && new Date(r.expires_at) < new Date()) return <StatusPill tone="neutral">Expired</StatusPill>;
   return <StatusPill tone="success">Granted</StatusPill>;
@@ -450,7 +451,7 @@ function AttemptContext({ row: r }: { row: AttemptRequestRow }) {
         ) : (
           <>
             <strong>{ordinal(next)} attempt</strong>{" "}
-            {r.source === "bulk" ? "granted" : "requested"} · after {ordinal(used)} attempt
+            {r.source === "request" ? "requested" : "granted"} · after {ordinal(used)} attempt
             {used === 1 ? "" : "s"} used
           </>
         )}

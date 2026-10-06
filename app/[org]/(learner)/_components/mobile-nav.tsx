@@ -2,16 +2,19 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Home, User, LifeBuoy, BookOpen, Trophy } from "lucide-react";
+import { Home, User, LifeBuoy, BookOpen, Trophy, Users } from "lucide-react";
 
 export function MobileBottomNav({
   orgSlug,
   brandColor = "#4f46e5",
   showLeaderboard = true,
+  showTeamPerformance = false,
 }: {
   orgSlug: string;
   brandColor?: string;
   showLeaderboard?: boolean;
+  /** Managers only (named as L1/L2/L3 by an active employee) — the Report Card. */
+  showTeamPerformance?: boolean;
 }) {
   const pathname = usePathname();
   const isActive = (suffix: string) =>
@@ -37,6 +40,16 @@ export function MobileBottomNav({
             icon: Trophy,
             label: "Ranks",
             active: isActive("/leaderboard"),
+          },
+        ]
+      : []),
+    ...(showTeamPerformance
+      ? [
+          {
+            href: `/${orgSlug}/team-performance`,
+            icon: Users,
+            label: "Team",
+            active: isActive("/team-performance"),
           },
         ]
       : []),

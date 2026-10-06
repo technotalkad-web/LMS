@@ -53,6 +53,16 @@ possible on any probed route. Middleware redirects anonymous callers
 2. Service-role clients are only reached **after** the gate (or inside
    fan-outs whose trigger was a gated write).
 3. Cron endpoints require `x-cron-secret`; xAPI requires the attempt token.
+4. **Manager-scoped routes** (`/api/manager/*`, the Team Performance pages):
+   "manager of this person" is not a role. The server resolves the viewer's
+   people from the three reporting-line fields (`lib/manager/access.ts` →
+   `resolveManagerScope`) and refuses the whole request if any target is
+   outside `scope.direct`; writes then run on the service role. The Report
+   Card harness (`check-report-card.mjs`, kept with the other live harnesses in
+   the dev session's scratch area, not in the repo) probes a non-manager, an
+   L2-only viewer, a suspended manager and an in-team manager targeting an
+   outsider (403 / empty state + unchanged rows) — re-run it when adding a
+   manager action.
 
 ## Re-running
 

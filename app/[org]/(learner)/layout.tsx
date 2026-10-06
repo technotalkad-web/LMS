@@ -12,6 +12,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveLearnerTheme } from "@/lib/theme/learner-themes";
 import { resolveManyGroups } from "@/lib/org/groups";
+import { isNamedManager } from "@/lib/manager/access";
 import {
   PopupAnnouncement,
   type PopupData,
@@ -125,21 +126,16 @@ export default async function LearnerLayout({
       themeRow?.learner_theme,
       themeRow?.learner_theme_custom
     );
-    // Team Performance nav (Phase 4): only for people who MANAGE someone.
-    // RLS hides peers' member rows, so this one count runs service-role
-    // (read-only, org+manager scoped). Fail-soft to hidden.
+    // Team Performance nav (Report Card, decision 3): for anyone named as a
+    // manager — L1, L2 or L3 — by at least one active employee. RLS hides
+    // peers' member rows, so this one count runs service-role (read-only,
+    // org+manager scoped). Fail-soft to hidden.
     const svcNav = createServiceClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    const { count: reportCount } = await svcNav
-      .from("organization_members")
-      .select("user_id", { count: "exact", head: true })
-      .eq("organization_id", org.id)
-      .eq("line_manager_id", user.id)
-      .eq("status", "active");
-    showTeamPerformance = (reportCount ?? 0) > 0;
+    showTeamPerformance = await isNamedManager(svcNav, org.id, user.id);
 
     // Full-screen popup announcements (0068). Fail-soft: pre-migration the
     // kind filter errors and no popup renders. Eligibility: active + inside
@@ -300,6 +296,7 @@ export default async function LearnerLayout({
           orgSlug={org.slug}
           brandColor={brandColor}
           showLeaderboard={showLeaderboard}
+          showTeamPerformance={showTeamPerformance}
         />
       )}
     </div>
