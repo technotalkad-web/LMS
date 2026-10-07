@@ -10,7 +10,7 @@ import { loadFieldOptionRows } from "@/lib/org/field-options";
  *   GET    /api/org-field-options?orgSlug=...        → { options, require_manager_fields }
  *   POST   /api/org-field-options { orgSlug, field, value }         (Super Owner)
  *   DELETE /api/org-field-options { orgSlug, id }                   (Super Owner)
- *   PATCH  /api/org-field-options { orgSlug, require_manager_fields } (Super Owner)
+ *   PATCH  /api/org-field-options { orgSlug, require_manager_fields?, enforce_content_mapping? } (Super Owner)
  *
  * Master value lists for the governed Organization-details fields. Reads are
  * open to any admin-page caller via RLS (members read); writes are enforced
@@ -53,11 +53,13 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: ctx.error }, { status: ctx.status });
   }
   const { data: rows } = await loadFieldOptionRows(ctx.supabase, ctx.org.id).then((rows) => ({ data: rows }));
+  const { data: flags } = await ctx.supabase.from("organizations").select("enforce_content_mapping").eq("id", ctx.org.id).maybeSingle();
   return NextResponse.json({
     options: rows ?? [],
     require_manager_fields:
       (ctx.org as { require_manager_fields?: boolean }).require_manager_fields ===
       true,
+    enforce_content_mapping: (flags as { enforce_content_mapping?: boolean } | null)?.enforce_content_mapping === true,
   });
 }
 
@@ -143,6 +145,8 @@ export async function PATCH(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
     orgSlug?: string;
     require_manager_fields?: boolean;
+    /** 0097 (decision 15): hide unmapped content from managers. */
+    enforce_content_mapping?: boolean;
   };
   const ctx = await resolveOrg(body.orgSlug ?? null);
   if ("error" in ctx) {
@@ -154,16 +158,22 @@ export async function PATCH(request: Request) {
       { status: 403 }
     );
   }
-  if (typeof body.require_manager_fields !== "boolean") {
+  const update: Record<string, boolean> = {};
+  if (typeof body.require_manager_fields === "boolean") update.require_manager_fields = body.require_manager_fields;
+  if (typeof body.enforce_content_mapping === "boolean") update.enforce_content_mapping = body.enforce_content_mapping;
+  if (Object.keys(update).length === 0) {
     return NextResponse.json(
-      { error: "require_manager_fields boolean required" },
+      { error: "require_manager_fields or enforce_content_mapping boolean required" },
       { status: 400 }
     );
   }
   const { error } = await ctx.supabase
     .from("organizations")
-    .update({ require_manager_fields: body.require_manager_fields })
+    .update(update)
     .eq("id", ctx.org.id);
-  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  if (error) {
+    const msg = /enforce_content_mapping/.test(error.message) ? "Enforcing content mapping needs migration 0097." : error.message;
+    return NextResponse.json({ error: msg }, { status: 400 });
+  }
   return NextResponse.json({ ok: true });
 }

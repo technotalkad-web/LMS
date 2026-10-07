@@ -26,6 +26,9 @@ export type HierarchyMember = {
   l3_manager_id: string | null;
   employee_id?: string | null;
   designation?: string | null;
+  /** 0096/0097: the manager's own coverage comes from these. */
+  business_vertical?: string | null;
+  department?: string | null;
 };
 
 export type ManagerLevel = 0 | 1 | 2 | 3;
@@ -48,12 +51,17 @@ export async function fetchHierarchyMembers(
 ): Promise<HierarchyMember[]> {
   const out: HierarchyMember[] = [];
   for (let from = 0; ; from += 1000) {
-    const { data, error } = await svc
-      .from("organization_members")
-      .select("user_id, status, line_manager_id, indirect_manager_id, l3_manager_id, employee_id, designation")
-      .eq("organization_id", orgId)
-      .order("user_id") // stable pages: offset pagination without ORDER BY can skip/duplicate rows
-      .range(from, from + 999);
+    const q = (cols: string) =>
+      svc
+        .from("organization_members")
+        .select(cols)
+        .eq("organization_id", orgId)
+        .order("user_id") // stable pages: offset pagination without ORDER BY can skip/duplicate rows
+        .range(from, from + 999);
+    let res = await q("user_id, status, line_manager_id, indirect_manager_id, l3_manager_id, employee_id, designation, business_vertical, department");
+    // 0096 deploy safety: no department column yet.
+    if (res.error && /department/.test(res.error.message)) res = await q("user_id, status, line_manager_id, indirect_manager_id, l3_manager_id, employee_id, designation, business_vertical");
+    const { data, error } = res as { data: unknown[] | null; error: { message: string } | null };
     if (error) throw new Error(`fetchHierarchyMembers: ${error.message}`);
     const page = (data ?? []) as HierarchyMember[];
     out.push(...page);
@@ -157,7 +165,10 @@ export type IssueCode =
   | "chain_mismatch_l3"
   | "missing_l1"
   | "missing_l2"
-  | "missing_l3";
+  | "missing_l3"
+  // Phase 4c: a manager's coverage comes from their own record (decision 14).
+  | "manager_no_vertical"
+  | "manager_no_department";
 
 export type IntegrityIssue = {
   /** block = must be fixed (serious); warn = minor, surfaced only. */
@@ -258,11 +269,31 @@ function cycleComponents(byId: Map<string, HierarchyMember>): Map<string, number
  * inactive/missing managers are BLOCKING; chain mismatch and missing levels
  * are WARNINGS.
  */
-export function checkIntegrity(members: HierarchyMember[]): IntegrityIssue[] {
+export function checkIntegrity(members: HierarchyMember[], opts: { verticalsDefined?: boolean; departmentsDefined?: boolean } = {}): IntegrityIssue[] {
   const byId = indexMembers(members);
   const issues: IntegrityIssue[] = [];
   const push = (i: Omit<IntegrityIssue, "message"> & { message: string }) => issues.push(i);
   const cycles = cycleComponents(byId);
+
+  // Phase 4c (decision 14): a manager with no Business Vertical sees no mapped
+  // content; a missing department narrows nothing but is worth a look once
+  // the org defines departments.
+  const named = new Set<string>();
+  for (const m of members) {
+    if (!isActive(m)) continue;
+    for (const id of [m.line_manager_id, m.indirect_manager_id, m.l3_manager_id]) if (id && byId.has(id)) named.add(id);
+  }
+  for (const id of named) {
+    const mgr = byId.get(id);
+    if (!mgr || !isActive(mgr)) continue;
+    if (!mgr.business_vertical) {
+      if (opts.verticalsDefined) push({ severity: "warn", code: "manager_no_vertical", user_id: id, level: null, manager_id: null,
+        message: "This manager has no Business Vertical, so no mapped content is visible on their Report Card." });
+    } else if (opts.departmentsDefined && !mgr.department) {
+      push({ severity: "warn", code: "manager_no_department", user_id: id, level: null, manager_id: null,
+        message: "This manager has a Business Vertical but no Department; they see the whole vertical." });
+    }
+  }
 
   for (const m of members) {
     if (!isActive(m)) continue;

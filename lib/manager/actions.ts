@@ -12,7 +12,9 @@ import {
   parseVersionDays,
   todayStr,
 } from "@/lib/journey/journey";
+import { loadScopes } from "@/lib/content/scopes";
 import { loadManagerContext, partitionByScope, type ManagerContext } from "./access";
+import { isVisible, loadCoverage } from "./coverage";
 import { computeLearnerInsights } from "./insights";
 
 /**
@@ -130,9 +132,14 @@ export async function sendReminders(
   const results: PerLearnerResult[] = [];
   const nowIso = new Date().toISOString();
 
+  // Rule 1 (Phase 4c): a manager may only act on content they can see.
+  const coverage = await loadCoverage(a.svc, a.org.id, a.user.id);
+
   if (target === "course") {
     const course = await orgCourse(a.svc, a.org.id, body.contentId ?? undefined);
     if (!course) return { error: "Course not found", status: 404 };
+    const scopes = await loadScopes(a.svc, a.org.id, [{ type: "course", id: course.id }]);
+    if (!isVisible(coverage, scopes.get(`course:${course.id}`))) return { error: "Course not found", status: 404 };
     // Re-derive entitlement and status NOW (dynamic groups change; the page
     // the manager clicked may be stale): the same rules as the Report Card,
     // narrowed to this course. Not assigned/attempted → skip; official result
@@ -221,6 +228,10 @@ export async function sendReminders(
   };
   const byUser = new Map<string, Enr>();
   for (const e of (enrRows ?? []) as Enr[]) if (!byUser.has(e.user_id)) byUser.set(e.user_id, e);
+  // Enrollments on journeys outside the manager's coverage are not theirs to remind.
+  const programIds = [...new Set([...byUser.values()].map((e) => e.program_id))];
+  const journeyScopes = await loadScopes(a.svc, a.org.id, programIds.map((id) => ({ type: "journey" as const, id })));
+  for (const [uid, e] of [...byUser]) if (!isVisible(coverage, journeyScopes.get(`journey:${e.program_id}`))) byUser.delete(uid);
   // One batched round-trip for completed-day counts + "done today" (the same
   // RPC the hourly cron uses), instead of a query per learner.
   const counts = new Map<string, { done: number; done_today: boolean }>();

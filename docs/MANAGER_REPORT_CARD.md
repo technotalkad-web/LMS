@@ -208,11 +208,17 @@ organisations (stalest people first inside each; `pending` in the response
 says how many were left for the next run) and rotates its starting
 organisation so a long list is never cut at the same place.
 
-## Phase 4b — Department master data, content mapping, assign to vertical
+## Phase 4b/4c — Department master data, content mapping, the visibility rule
 
-See `docs/CONTENT_MAPPING.md`. `LearnerInsight.department` now carries the
-member's department; the visibility rule (content mapping + actual
-assignment + reporting hierarchy) is Phase 4c and is not applied yet.
+See `docs/CONTENT_MAPPING.md`. Since Phase 4c every Report Card page runs
+`scopeForManager` (lib/manager/coverage.ts): content mapping + actual
+assignment + reporting hierarchy = visibility. Numbers are computed over the
+content the viewer may see (decision 22); the content lens only offers that
+content; the employee report counts what is hidden. The per-learner numbers
+are derived in `lib/manager/derive.ts` from the content lines (course lines
+carry `completedAt`, `done`, `isAssigned`; journeys carry `daysInPeriod`), so
+the same derivation runs inside `computeLearnerInsights` and again after the
+rule hides content.
 
 ## Deploy order
 

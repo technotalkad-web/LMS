@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Plus, X, ShieldCheck, Network, Tags } from "lucide-react";
+import { Plus, X, ShieldCheck, Network, Tags, Eye, Users } from "lucide-react";
 
 export type OptionRow = { id: string; field: string; value: string; parent_id?: string | null };
 
@@ -42,15 +42,19 @@ export function MasterDataClient({
   initialOptions,
   initialRequireManagers,
   unmappedContent = null,
+  initialEnforce = null,
 }: {
   orgSlug: string;
   initialOptions: OptionRow[];
   initialRequireManagers: boolean;
   /** 0096: active content with no vertical / department mapping (null before the migration). */
   unmappedContent?: number | null;
+  /** 0097: hide unmapped content from managers (null before the migration). */
+  initialEnforce?: boolean | null;
 }) {
   const [options, setOptions] = useState<OptionRow[]>(initialOptions);
   const [requireManagers, setRequireManagers] = useState(initialRequireManagers);
+  const [enforce, setEnforce] = useState(initialEnforce === true);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [busyField, setBusyField] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -94,6 +98,21 @@ export function MasterDataClient({
       const j = (await res.json().catch(() => ({}))) as { error?: string };
       setError(j.error ?? "Could not remove value");
       setOptions(prev);
+    }
+  }
+
+  async function toggleEnforce(next: boolean) {
+    setError(null);
+    setEnforce(next);
+    const res = await fetch("/api/org-field-options", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug, enforce_content_mapping: next }),
+    });
+    if (!res.ok) {
+      const j = (await res.json().catch(() => ({}))) as { error?: string };
+      setError(j.error ?? "Could not save setting");
+      setEnforce(!next);
     }
   }
 
@@ -179,6 +198,51 @@ export function MasterDataClient({
         </div>
         <Link
           href={`/${orgSlug}/master-data/reporting-lines`}
+          className="shrink-0 inline-flex items-center px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90"
+        >
+          Open
+        </Link>
+      </section>
+
+      {/* Enforce content mapping for managers (0097, decision 15) */}
+      <section className="border border-line rounded-lg bg-paper p-5 flex items-start justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <Eye className="w-5 h-5 text-indigo-600 mt-0.5 shrink-0" />
+          <div>
+            <h2 className="font-semibold text-sm">Enforce content mapping for managers</h2>
+            <p className="text-xs text-muted mt-1">
+              Managers see content only when it belongs to their Business Vertical + Department and is assigned to people in their reporting line.
+              While this is off, content that has not been mapped yet stays visible to them (transition). Turn it on once the mapping below is complete
+              {unmappedContent !== null && unmappedContent > 0 ? ` — ${unmappedContent} active item${unmappedContent === 1 ? " is" : "s are"} still unmapped.` : "."}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enforce}
+          aria-label="Enforce content mapping for managers"
+          disabled={initialEnforce === null}
+          onClick={() => toggleEnforce(!enforce)}
+          className={`relative shrink-0 inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-50 ${enforce ? "bg-indigo-600" : "bg-line"}`}
+        >
+          <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${enforce ? "translate-x-6" : "translate-x-1"}`} />
+        </button>
+      </section>
+
+      {/* Manager coverage (0097, decision 14) */}
+      <section className="border border-line rounded-lg bg-paper p-5 flex items-start justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <Users className="w-5 h-5 text-indigo-600 mt-0.5 shrink-0" />
+          <div>
+            <h2 className="font-semibold text-sm">Manager coverage</h2>
+            <p className="text-xs text-muted mt-1">
+              Each manager&apos;s vertical and department come from their own record. Grant extra Vertical + Department pairs to a head whose hierarchy spans verticals, and spot managers with no vertical set.
+            </p>
+          </div>
+        </div>
+        <Link
+          href={`/${orgSlug}/master-data/manager-coverage`}
           className="shrink-0 inline-flex items-center px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90"
         >
           Open

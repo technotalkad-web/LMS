@@ -54,9 +54,14 @@ export async function loadReportingLines(
       email: profileById.get(m.user_id)?.email ?? null,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+  // Phase 4c: a missing department is only worth a warning once the org defines departments.
+  const [{ count: departmentValues }, { count: verticalValues }] = await Promise.all([
+    svc.from("org_field_options").select("id", { count: "exact", head: true }).eq("organization_id", orgId).eq("field", "department"),
+    svc.from("org_field_options").select("id", { count: "exact", head: true }).eq("organization_id", orgId).eq("field", "business_vertical"),
+  ]);
   return {
     members,
-    issues: checkIntegrity(hierarchy),
+    issues: checkIntegrity(hierarchy, { verticalsDefined: (verticalValues ?? 0) > 0, departmentsDefined: (departmentValues ?? 0) > 0 }),
     suggestions: suggestBackfill(hierarchy),
   };
 }

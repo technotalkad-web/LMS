@@ -70,10 +70,57 @@ or named people whose vertical + department is outside it. The assign
 screens show the warning; the assignment still happens. Unmapped and
 common-to-all content never warns.
 
+## The visibility rule (Phase 4c, migration 0097)
+
+    content mapping + actual assignment + reporting hierarchy = visibility
+
+A manager's Report Card includes a course / path / journey only when:
+
+1. it is mapped to the manager's **coverage** — their own Business Vertical +
+   Department from their employee record, plus any pairs an admin grants on
+   Master data → **Manager coverage** (`manager_coverage`, decision 14); a
+   whole-vertical mapping matches every manager of that vertical, and
+   "common to all" matches everyone; **unmapped** content stays visible until
+   the Super Owner turns on **Enforce content mapping for managers** on Master
+   data (`organizations.enforce_content_mapping`, decision 15);
+2. it is actually assigned to someone in the manager's hierarchy (inherent:
+   insights are built from assignments reaching the people in scope);
+3. the learner is in scope (decision 3, unchanged).
+
+Where it runs: `lib/manager/coverage.ts` — `loadCoverage`, `isVisible`,
+`applyCoverage` (drops hidden lines and re-derives every content-dependent
+number through `lib/manager/derive.ts`, the same pure step
+`computeLearnerInsights` uses), `scopeForManager` (one call per page: the
+learners after rule 1, the catalog narrowed so the content lens never offers
+hidden content, hidden counts per person). It runs at read time over live
+insights and over the 15-minute precompute alike, so one cached row serves
+every manager. Engagement (last activity) stays person-level. Rows cached
+before Phase 4c (no `done` on the course lines or no `daysInPeriod` on the
+journeys) pass through untouched until the next refresh.
+
+What managers see: every number on the card is computed over visible content
+only (decision 22) and the header says "within Retail · Home Loan Sales". A
+manager with no Business Vertical sees a notice asking their administrator to
+set it (and, until enforcement, only unmapped content). The employee report
+lists the visible content and says how many items outside the coverage are
+not shown. The L3 vertical filter narrows inside the coverage, never beyond.
+
+Integrity: Reporting lines warns "Manager has no Business Vertical" for any
+active manager without one once the org defines verticals, and "Manager has
+no Department" once the org defines departments.
+
+Actions follow the same rule: "send reminder now" (`lib/manager/actions.ts`)
+refuses a course outside the manager's coverage (404) and skips journey
+enrollments on programs they cannot see, so a stale page can never trigger a
+send on hidden content.
+
 ## Deploy order
 
-Apply `0096_department_content_mapping.sql` on staging before merging and on
-prod before tagging. Before 0096: the Department section says departments
+Apply `0096_department_content_mapping.sql` (Phase 4b) and
+`0097_manager_visibility.sql` (Phase 4c) on staging before merging and on
+prod before tagging. Before 0097 the rule still applies with enforcement off
+and no extra coverage (the switch and the coverage page say the migration is
+needed). Before 0096: the Department section says departments
 need the migration, content mapping answers "not enabled yet", scope
 pickers read as unmapped, and assignments to a vertical fail with the same
 message. Nothing else changes behaviour.
@@ -83,6 +130,12 @@ message. Nothing else changes behaviour.
 - `npx tsx tests/unit/content-mapping.test.ts` — department ⊂ vertical,
   `checkScopes`, `scopesCover`, scope-group keys/names, group rules with
   departments (no DB).
+- `npx tsx tests/unit/visibility.test.ts` — rule 1 cases, the derive step and
+  `applyCoverage` (numbers over visible content only).
+- Staging harness `node_modules/.qa/check-visibility.mjs` (dev session): a
+  Retail · Home Loan Sales manager vs mapped / unmapped / common / foreign
+  content, enforcement on and off, coverage pairs, a manager without a
+  vertical, the employee report count, the L3 cached path, the content lens.
 - Staging harness `node_modules/.qa/check-content-mapping.mjs` (dev
   session): master data departments, employee department paths (API, bulk
   CSV, CRM), content mapping API + review page, assign to vertical /

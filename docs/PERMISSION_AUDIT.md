@@ -60,7 +60,11 @@ possible on any probed route. Middleware redirects anonymous callers
    and refuses the whole request if any target is outside `scope.all`; writes
    then run on the service role. Since Phase 4a managers have no assign /
    grant endpoints at all — a ticket carries the context and an admin acts
-   (`/api/tickets/[id]/act`, admin role checked explicitly). The Report
+   (`/api/tickets/[id]/act`, admin role checked explicitly). Since Phase 4c
+   the pages also apply the content visibility rule (`lib/manager/coverage.ts`):
+   a manager never sees content outside their vertical / department coverage.
+   `/api/manager-coverage` (grant / revoke coverage pairs) and the enforce
+   switch on `/api/org-field-options` are admin / Super Owner only. The Report
    Card harness (`check-report-card.mjs`, kept with the other live harnesses in
    the dev session's scratch area, not in the repo) probes a non-manager, an
    L2-only viewer, a suspended manager and an in-team manager targeting an
