@@ -81,14 +81,29 @@ async function attemptRequestItems(svc: AnyClient, orgId: string, orgSlug: strin
 }
 
 async function ticketItems(svc: AnyClient, orgId: string, orgSlug: string): Promise<AttentionItem[]> {
-  const { data } = await svc
-    .from("help_tickets")
-    .select("id, user_id, subject, status, priority, created_at")
-    .eq("organization_id", orgId)
-    .in("status", ["open", "in_progress"])
-    .order("created_at", { ascending: false })
-    .limit(200);
-  const rows = (data ?? []) as Array<{ id: string; user_id: string; subject: string; status: string; priority: string; created_at: string }>;
+  // source / category arrive with 0095; fall back to the old shape before it.
+  let data: unknown[] | null = null;
+  {
+    const r = await svc
+      .from("help_tickets")
+      .select("id, user_id, subject, status, priority, created_at, source, category")
+      .eq("organization_id", orgId)
+      .in("status", ["open", "in_progress"])
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (!r.error) data = r.data;
+    else {
+      const o = await svc
+        .from("help_tickets")
+        .select("id, user_id, subject, status, priority, created_at")
+        .eq("organization_id", orgId)
+        .in("status", ["open", "in_progress"])
+        .order("created_at", { ascending: false })
+        .limit(200);
+      data = o.data;
+    }
+  }
+  const rows = (data ?? []) as Array<{ id: string; user_id: string; subject: string; status: string; priority: string; created_at: string; source?: string; category?: string | null }>;
   if (!rows.length) return [];
   const [emails, names] = await Promise.all([
     resolveEmails(svc, rows.map((r) => r.user_id)),
@@ -100,9 +115,9 @@ async function ticketItems(svc: AnyClient, orgId: string, orgSlug: string): Prom
     key: `ticket:${r.id}`,
     type: "ticket",
     priority: mapP[r.priority] ?? "normal",
-    title: `${r.status === "in_progress" ? "Ticket in progress" : "Open ticket"}: ${r.subject}`,
+    title: `${r.source === "manager" ? (r.status === "in_progress" ? "Manager request in progress" : "Manager request") : r.status === "in_progress" ? "Ticket in progress" : "Open ticket"}: ${r.subject}`,
     who: names.get(r.user_id) ?? emails.get(r.user_id) ?? r.user_id.slice(0, 8),
-    context: `${r.priority} priority`,
+    context: `${r.priority} priority${r.source === "manager" ? " · raised from the Report Card" : ""}`,
     occurredAt: r.created_at,
     actionLabel: r.status === "open" ? "Triage & resolve" : "Resolve",
     href: `/${orgSlug}/tickets`,

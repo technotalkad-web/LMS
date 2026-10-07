@@ -160,8 +160,19 @@ export type ExceptionGroup = {
   actions: ExceptionAction[];
 };
 
+/** A person a ticket may name (id + display name; the server re-checks the id). */
+export type TicketPerson = { userId: string; name: string };
+
 export type ExceptionAction =
-  | { kind: "grant"; label: string; courseId: string; userIds: string[] }
+  /** Raise a support ticket with this context (decision 12: managers view, analyse, support). */
+  | {
+      kind: "ticket";
+      label: string;
+      category: "grant_retry" | "assign_content" | "extend_due" | "content_issue" | "other";
+      people: TicketPerson[];
+      content: { kind: "course" | "journey" | "path"; id: string; title: string } | null;
+      exception: ExceptionKind | null;
+    }
   | { kind: "remind"; label: string; target: "course" | "journey" | "start"; contentId: string | null; userIds: string[] }
   | { kind: "link"; label: string; href: string }
   | { kind: "report"; label: string; userId: string };
@@ -236,6 +247,8 @@ export type TeamCard = {
   topFailed: { id: string; title: string; n: number } | null;
   /** Completions this period minus the previous period (null for all time). */
   completionsDelta: number | null;
+  /** People in the team with at least one exception (for a ticket raised about the team). */
+  flagged: TicketPerson[];
 };
 
 /** A team that needs the L2's attention, with one suggested step. */

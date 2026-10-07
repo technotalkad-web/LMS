@@ -8,7 +8,7 @@ import { canSeeEmail, loadManagerContext } from "@/lib/manager/access";
 import { computeLearnerInsights } from "@/lib/manager/insights";
 import { PERIODS, type ExceptionAction } from "@/lib/manager/types";
 import { Card, Kpi, Pill, StatusPill, fmtDate, relativeDays } from "../_components/ui";
-import { ActionButton, AssignCourseDialog } from "../_components/report-card-client";
+import { ActionButton, RaiseTicketButton } from "../_components/report-card-client";
 
 export const dynamic = "force-dynamic";
 
@@ -44,7 +44,7 @@ export default async function EmployeeReportPage({
   const backHref = isDirect || !l1Id || !ctx.scope.teamsByL1.has(l1Id) ? `/${orgSlug}/team-performance` : `/${orgSlug}/team-performance/team/${l1Id}`;
 
   const period = PERIODS.find((p) => p.value === (sp.period ?? "30")) ?? PERIODS[1];
-  const { learners, catalog } = await computeLearnerInsights(svc, {
+  const { learners } = await computeLearnerInsights(svc, {
     orgId: org.id,
     orgSlug,
     userIds: [userId],
@@ -59,7 +59,9 @@ export default async function EmployeeReportPage({
   // Suggested actions (§5): one per exception the person actually has.
   const actions: ExceptionAction[] = [];
   for (const c of l.courses) {
-    if ((c.status === "failed" || c.passRequiredUnmet) && c.limitReached && !c.openGrant) actions.push({ kind: "grant", label: `Grant retry · ${c.title}`, courseId: c.courseId, userIds: [l.userId] });
+    if ((c.status === "failed" || c.passRequiredUnmet) && c.limitReached && !c.openGrant) {
+      actions.push({ kind: "ticket", label: `Raise ticket · retry on ${c.title}`, category: "grant_retry", people: [{ userId: l.userId, name: l.name }], content: { kind: "course", id: c.courseId, title: c.title }, exception: "failed" });
+    }
   }
   if (activeJourney && !activeJourney.onTrack) actions.push({ kind: "remind", label: "Send journey reminder", target: "journey", contentId: activeJourney.programId, userIds: [l.userId] });
   for (const f of l.flags) {
@@ -69,7 +71,7 @@ export default async function EmployeeReportPage({
   }
   const seen = new Set<string>();
   const uniqueActions = actions.filter((a) => {
-    const k = a.kind === "grant" ? `g:${a.courseId}` : a.kind === "remind" ? `r:${a.contentId}` : "";
+    const k = a.kind === "ticket" ? `t:${a.category}:${a.content?.id ?? ""}` : a.kind === "remind" ? `r:${a.contentId}` : "";
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
@@ -117,7 +119,7 @@ export default async function EmployeeReportPage({
           {uniqueActions.map((a, i) => (
             <ActionButton key={i} orgSlug={orgSlug} action={a} primary={i === 0} />
           ))}
-          <AssignCourseDialog orgSlug={orgSlug} courses={catalog.courses.map((c) => ({ value: c.id, label: c.title }))} team={[{ userId: l.userId, name: l.name }]} preselected={[l.userId]} />
+          <RaiseTicketButton orgSlug={orgSlug} label="Raise a support ticket" category="other" people={[{ userId: l.userId, name: l.name }]} content={null} exception={null} origin={`team-performance/${l.userId}`} />
         </div>
         {openGrants.length > 0 && (
           <p className="text-xs text-muted mt-2">Already holds an unused extra attempt on {openGrants.map((c) => c.title).join(", ")}.</p>

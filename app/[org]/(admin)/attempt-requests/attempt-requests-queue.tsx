@@ -28,7 +28,7 @@ import {
 export type AttemptRequestRow = {
   id: string;
   status: "pending" | "approved" | "rejected" | "expired";
-  source: "request" | "bulk" | "manager";
+  source: "request" | "bulk" | "manager" | "ticket";
   reason: string | null;
   decision_note: string | null;
   decided_at: string | null;
@@ -287,7 +287,7 @@ function RequestCard({
             <StatusBadge row={r} />
             {r.source !== "request" && (
               <span className="text-[10px] uppercase tracking-wider font-semibold text-muted border border-line rounded-full px-2 py-0.5">
-                {r.source === "manager" ? "Manager grant" : "Bulk grant"}
+                {r.source === "manager" ? "Manager grant" : r.source === "ticket" ? "Granted from a ticket" : "Bulk grant"}
               </span>
             )}
             <CurrentScore row={r} />

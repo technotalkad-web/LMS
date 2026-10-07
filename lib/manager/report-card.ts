@@ -3,6 +3,7 @@ import {
   type CommonStruggle,
   type OrgGap,
   type ExceptionAction,
+  type TicketPerson,
   type ExceptionFlag,
   type ExceptionGroup,
   type ExceptionKind,
@@ -61,7 +62,7 @@ export const EXCEPTION_META: Record<
   ExceptionKind,
   { title: (n: number) => string; suggestion: string }
 > = {
-  failed: { title: (n) => `${n} failed an assessment`, suggestion: "Coach, then grant a retry" },
+  failed: { title: (n) => `${n} failed an assessment`, suggestion: "Coach, then ask your admin for a retry" },
   overdue: { title: (n) => `${n} overdue`, suggestion: "Agree a catch-up date this week" },
   behind: { title: (n) => `${n} behind on journey`, suggestion: "Follow up; ask what is blocking" },
   stuck: { title: (n) => `${n} stuck on a course`, suggestion: "Unblock: content, time or access?" },
@@ -249,6 +250,18 @@ export function buildExceptions(
   return groups.slice(0, max);
 }
 
+/** Distinct people (id + name) from flag hits, in first-seen order. */
+function uniquePeople(hits: Array<{ l: LearnerInsight }>): TicketPerson[] {
+  const seen = new Set<string>();
+  const out: TicketPerson[] = [];
+  for (const { l } of hits) {
+    if (seen.has(l.userId)) continue;
+    seen.add(l.userId);
+    out.push({ userId: l.userId, name: l.name });
+  }
+  return out;
+}
+
 function actionsFor(
   kind: ExceptionKind,
   content: ExceptionGroup["content"],
@@ -262,30 +275,32 @@ function actionsFor(
     content ? [...new Set(all.filter((h) => h.f.contentId === content.id).map((h) => h.l.userId))] : [];
   switch (kind) {
     case "failed": {
-      // Grant retries on the most common failed module, for the people who
-      // failed THAT module, have used their official window and do not
-      // already hold an open grant.
+      // Ask the admin for a retry on the most common failed module, for the
+      // people who failed THAT module, have used their official window and
+      // do not already hold an open grant (decision 12: the manager raises a
+      // ticket; the admin grants).
       const eligible = content
-        ? [...new Set(all
-            .filter(({ l, f }) => {
-              if (f.contentId !== content.id) return false;
-              const line = l.courses.find((c) => c.courseId === content.id);
-              return !!line && line.limitReached && !line.openGrant;
-            })
-            .map((h) => h.l.userId))]
+        ? uniquePeople(all.filter(({ l, f }) => {
+            if (f.contentId !== content.id) return false;
+            const line = l.courses.find((c) => c.courseId === content.id);
+            return !!line && line.limitReached && !line.openGrant;
+          }))
         : [];
       return [
         ...(content && eligible.length
-          ? [{ kind: "grant" as const, label: `Grant retry · ${content.title}`, courseId: content.id, userIds: eligible }]
+          ? [{ kind: "ticket" as const, label: `Raise ticket · grant retry`, category: "grant_retry" as const, people: eligible, content: { kind: "course" as const, id: content.id, title: content.title }, exception: "failed" as const }]
           : []),
         ...(content ? [{ kind: "link" as const, label: "View module", href: `${base}?content=course:${content.id}` }] : []),
       ];
     }
     case "overdue":
       return [
-        { kind: "link", label: "View overdue", href: `${base}?status=overdue` },
         ...(content && content.kind === "course"
           ? [{ kind: "remind" as const, label: "Send reminder", target: "course" as const, contentId: content.id, userIds: onContent() }]
+          : []),
+        { kind: "link", label: "View overdue", href: `${base}?status=overdue` },
+        ...(content && content.kind === "course"
+          ? [{ kind: "ticket" as const, label: "Raise ticket · extend due date", category: "extend_due" as const, people: uniquePeople(all.filter((h) => h.f.contentId === content.id)), content: { kind: "course" as const, id: content.id, title: content.title }, exception: "overdue" as const }]
           : []),
       ];
     case "behind":
@@ -436,6 +451,7 @@ export function teamCards(teams: TeamInput[], byId: Map<string, LearnerInsight>,
       needsSupport: ls.filter((l) => l.status === "needs_support").length,
       topFailed,
       completionsDelta: summary.completionsDelta,
+      flagged: ls.filter((l) => l.flags.length > 0).map((l) => ({ userId: l.userId, name: l.name })),
     };
   });
   return cards.sort(compareTeamsWorstFirst);
@@ -512,6 +528,9 @@ export function buildTeamExceptions(
       actions: [
         { kind: "link", label: c.isOwn ? "Open your team" : "Open team report", href: `/${opts.orgSlug}/team-performance/team/${c.managerId}${opts.query ?? ""}` },
         ...(!c.isOwn && email ? [{ kind: "link" as const, label: `Email ${first}`, href: `mailto:${email}` }] : []),
+        ...(c.flagged.length
+          ? [{ kind: "ticket" as const, label: "Raise ticket", category: "other" as const, people: c.flagged.slice(0, 50), content: c.topFailed ? { kind: "course" as const, id: c.topFailed.id, title: c.topFailed.title } : null, exception: c.failed ? ("failed" as const) : null }]
+          : []),
       ],
     });
   }

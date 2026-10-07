@@ -567,11 +567,17 @@ export async function buildProgress(
     const uid = m.user_id;
     const dueByCourse = new Map<string, string | null>();
     const assignedByCourse = new Map<string, string | null>();
+    // Earliest due date of the rows that reach the person — except that a
+    // DIRECT (per-person) row's date is the most specific and wins (same rule
+    // as the Manager Report Card; an admin can extend one person's date).
+    const directDue = new Set<string>();
     for (const a of caRows) {
       if (!a.course_id || !mine(uid, a)) continue;
       if (a.release_at && a.release_at > nowIso) continue;
+      const direct = a.assignee_type === "user";
       const prev = dueByCourse.get(a.course_id);
-      if (prev === undefined || (a.due_at && (!prev || a.due_at < prev))) dueByCourse.set(a.course_id, a.due_at ?? prev ?? null);
+      if (direct && !directDue.has(a.course_id)) { dueByCourse.set(a.course_id, a.due_at ?? null); directDue.add(a.course_id); }
+      else if (!directDue.has(a.course_id) && (prev === undefined || (a.due_at && (!prev || a.due_at < prev)))) dueByCourse.set(a.course_id, a.due_at ?? prev ?? null);
       assignedByCourse.set(a.course_id, minIso(assignedByCourse.get(a.course_id) ?? null, a.assigned_at));
     }
     const myPathDue = new Map<string, string | null>();

@@ -156,7 +156,9 @@ export function L2View(p: L2ViewProps) {
                   <p className="text-xs mt-1"><span className="text-muted">Suggested:</span> {e.suggestion}</p>
                   <div className="mt-2 flex flex-wrap gap-1.5">
                     {e.actions.map((a, i) => (
-                      <ActionButton key={`${a.kind}:${a.label}`} orgSlug={orgSlug} action={a} primary={i === 0} />
+                      // §6: no individual names on the L2 first screen — the ticket names people by id only
+                      // (client props are serialised into the page); the admin resolves them.
+                      <ActionButton key={`${a.kind}:${a.label}`} orgSlug={orgSlug} action={a.kind === "ticket" ? { ...a, people: a.people.map((p) => ({ userId: p.userId, name: "" })) } : a} primary={i === 0} />
                     ))}
                   </div>
                 </div>
