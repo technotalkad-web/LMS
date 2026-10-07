@@ -99,6 +99,8 @@ export type LearnerInsight = {
   branch: string | null;
   /** business_vertical, for the L3 vertical filter. */
   vertical: string | null;
+  /** department under the vertical (0096; the visibility rule of Phase 4c reads it). */
+  department: string | null;
   joined: string | null;
   // Signals
   assigned: number;

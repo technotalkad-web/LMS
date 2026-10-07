@@ -38,7 +38,7 @@ const flag = (kind: ExceptionFlag["kind"], severity: ExceptionFlag["severity"] =
   ({ kind, severity, contentId, contentKind: contentId ? "course" : null, contentTitle: title, detail: `${kind}` });
 
 const learner = (over: Partial<LearnerInsight> & { userId: string }): LearnerInsight => ({
-  name: over.userId, email: `${over.userId}@example.test`, avatarUrl: null, designation: null, city: null, branch: null, vertical: null, joined: null,
+  name: over.userId, email: `${over.userId}@example.test`, avatarUrl: null, designation: null, city: null, branch: null, vertical: null, department: null, joined: null,
   assigned: 0, completed: 0, completionPct: null, avgScore: null, assessmentsWithResult: 0, passedFirstTime: 0,
   lastActive: null, inactiveDays: null, activeLast7d: false, journeys: [], courses: [], paths: [],
   flags: [], risk: 0, status: "on_track", completedInPeriod: 0, passedFirstTimeInPeriod: 0, journeyDaysInPeriod: 0, completedInPrevPeriod: 0,

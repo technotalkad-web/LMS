@@ -5,6 +5,7 @@ import {
   GOVERNED_FIELDS,
   loadOrgGovernance,
   checkGovernedField,
+  checkDepartmentInVertical,
   type GovernedField,
 } from "@/lib/org/field-options";
 import { checkQuota } from "@/lib/billing/enforce-quota";
@@ -63,6 +64,8 @@ type UpsertBody = {
   city?: string | null;
   state?: string | null;
   business_vertical?: string | null;
+  /** Department under the business vertical (0096); optional. */
+  department?: string | null;
   branch?: string | null;
   line_manager_employee_id?: string | null;
   indirect_manager_employee_id?: string | null;
@@ -75,14 +78,10 @@ export async function GET(request: Request) {
   const employeeId = new URL(request.url).searchParams.get("employee_id")?.trim();
   if (!employeeId) return NextResponse.json({ error: "employee_id required" }, { status: 400 });
 
-  const { data } = await auth.svc
-    .from("organization_members")
-    .select(
-      "user_id, role, status, employee_id, designation, job_role, city, state, business_vertical, branch, grade, node_id, date_of_joining, line_manager_id, indirect_manager_id, l3_manager_id"
-    )
-    .eq("organization_id", auth.orgId)
-    .eq("employee_id", employeeId)
-    .maybeSingle();
+  const memQ = (cols: string) => auth.svc.from("organization_members").select(cols).eq("organization_id", auth.orgId).eq("employee_id", employeeId).maybeSingle();
+  let memRes = await memQ("user_id, role, status, employee_id, designation, job_role, city, state, business_vertical, branch, grade, node_id, date_of_joining, line_manager_id, indirect_manager_id, l3_manager_id, department");
+  if (memRes.error && /department/.test(memRes.error.message)) memRes = await memQ("user_id, role, status, employee_id, designation, job_role, city, state, business_vertical, branch, grade, node_id, date_of_joining, line_manager_id, indirect_manager_id, l3_manager_id"); // pre-0096
+  const data = memRes.data as unknown;
   if (!data) return NextResponse.json({ error: "Employee not found" }, { status: 404 });
   const m = data as Record<string, unknown>;
   const { data: prof } = await auth.svc
@@ -120,6 +119,7 @@ export async function GET(request: Request) {
     state: m.state,
     business_vertical: m.business_vertical,
     branch: m.branch,
+    department: m.department ?? null,
     grade: m.grade,
     node_id: m.node_id,
     date_of_joining: m.date_of_joining,
@@ -139,13 +139,11 @@ export async function PUT(request: Request) {
   const warnings: string[] = [];
 
   // Existing member with this employee_id? (any status — rehires included)
-  const { data: existingRow } = await svc
-    .from("organization_members")
-    .select("user_id, role")
-    .eq("organization_id", orgId)
-    .eq("employee_id", employeeId)
-    .maybeSingle();
-  const existing = existingRow as { user_id: string; role: string } | null;
+  const exQ = (cols: string) => svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("employee_id", employeeId).maybeSingle();
+  let exRes = await exQ("user_id, role, business_vertical, department");
+  if (exRes.error && /department/.test(exRes.error.message)) exRes = await exQ("user_id, role, business_vertical"); // pre-0096
+  const existingRow = exRes.data as unknown;
+  const existing = existingRow as { user_id: string; role: string; business_vertical?: string | null; department?: string | null } | null;
   if (existing && ["super_owner", "owner", "admin"].includes(existing.role)) {
     return NextResponse.json(
       { error: "Admin accounts are not managed via the integration" },
@@ -164,6 +162,20 @@ export async function PUT(request: Request) {
       const check = checkGovernedField(gov, field, body[field]);
       if (!check.ok) return NextResponse.json({ error: check.error }, { status: 400 });
       governed[field] = check.canonical;
+    }
+  }
+  // 0096: department ⊂ vertical (the stored vertical when this sync does not send one).
+  // A vertical change that orphans the STORED department clears it.
+  {
+    const vertical = governed.business_vertical !== undefined ? governed.business_vertical : existing?.business_vertical ?? null;
+    const department = governed.department !== undefined ? governed.department : existing?.department ?? null;
+    if (department) {
+      const dv = checkDepartmentInVertical(gov, department, vertical);
+      if (!dv.ok) {
+        if (governed.department !== undefined) return NextResponse.json({ error: dv.error }, { status: 400 });
+        governed.department = null; // stored department no longer under the new vertical
+        warnings.push(`Department "${department}" is not defined under the ${vertical ?? "—"} vertical and was cleared.`);
+      } else if (governed.department !== undefined) governed.department = dv.canonical;
     }
   }
 
@@ -342,6 +354,8 @@ export async function PUT(request: Request) {
       state: governed.state ?? null,
       business_vertical: governed.business_vertical ?? null,
       branch: governed.branch ?? null,
+      // 0096 deploy safety: only written when provided.
+      ...(governed.department !== undefined ? { department: governed.department ?? null } : {}),
       line_manager_id: managerIds.line_manager_id ?? null,
       indirect_manager_id: managerIds.indirect_manager_id ?? null,
       l3_manager_id: managerIds.l3_manager_id ?? null,

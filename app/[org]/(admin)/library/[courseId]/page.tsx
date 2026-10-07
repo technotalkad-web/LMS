@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   AssignSection,
@@ -12,6 +13,8 @@ import {
 } from "./assign-section";
 import { ReminderSection, type ReminderSettings } from "./reminder-section";
 import { DetailsForm, type CourseDetails } from "./details-form";
+import { ScopePicker } from "../../_components/scope-picker";
+import { loadScopesFor } from "@/lib/content/scopes";
 import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
@@ -268,6 +271,19 @@ export default async function AdminCourseDetailPage({
   } catch {
     // org_groups not migrated yet
   }
+
+  // 0096: where this course belongs + the master data for the pickers.
+  const scopes = await loadScopesFor(supabase, org.id, "course", c.id);
+  const { data: optRows } = await loadFieldOptionRows(supabase, org.id).then((rows) => ({ data: rows }));
+  const optList = (optRows ?? []) as Array<{ id: string; field: string; value: string; parent_id?: string | null }>;
+  const verticalById = new Map(optList.filter((o) => o.field === "business_vertical").map((o) => [o.id, o.value]));
+  const departmentsByVertical: Record<string, string[]> = {};
+  for (const o of optList) {
+    if (o.field !== "department" || !o.parent_id) continue;
+    const v = verticalById.get(o.parent_id);
+    if (v) (departmentsByVertical[v] ??= []).push(o.value);
+  }
+  const scopeOptions = { verticals: [...verticalById.values()].sort(), departmentsByVertical };
 
   // Resolve emails for everyone we might mention.
   const allUserIds = new Set<string>();
@@ -559,6 +575,12 @@ export default async function AdminCourseDetailPage({
       {/* Editable details */}
       <DetailsForm orgSlug={orgSlug} courseId={c.id} initial={initialDetails} />
 
+      {/* Belongs to (0096): Business Vertical + Department mapping */}
+      <section className="bg-paper border border-line rounded-xl p-5">
+        <h2 className="serif text-2xl mb-1">Belongs to</h2>
+        <ScopePicker orgSlug={orgSlug} items={[{ type: "course", id: c.id }]} initial={scopes} options={scopeOptions} />
+      </section>
+
       {/* Attempt scoring rules (0073) */}
       <ScoringRulesCard
         orgSlug={orgSlug}
@@ -597,6 +619,8 @@ export default async function AdminCourseDetailPage({
         members={members}
         teams={teams}
         groups={groupList}
+        scopeOptions={scopeOptions}
+        scopes={scopes}
       />
 
       {/* Reminders */}

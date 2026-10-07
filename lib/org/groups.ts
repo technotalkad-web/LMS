@@ -24,6 +24,8 @@ export type GroupRules = {
   states?: string[];
   verticals?: string[];
   branches?: string[];
+  /** organization_members.department (0096). */
+  departments?: string[];
   team_ids?: string[];
   l1_manager_ids?: string[];
   /** Members whose date_of_joining is within the last N days. */
@@ -42,6 +44,8 @@ export type GroupRow = {
   member_count_at: string | null;
   created_by: string | null;
   created_at: string;
+  /** 0096: set on system-managed groups ("assign to vertical / department"); not hand-editable. */
+  system_key?: string | null;
 };
 
 export const RULE_ARRAY_KEYS = [
@@ -51,6 +55,7 @@ export const RULE_ARRAY_KEYS = [
   "states",
   "verticals",
   "branches",
+  "departments",
   "team_ids",
   "l1_manager_ids",
 ] as const;
@@ -104,6 +109,7 @@ export function summarizeRules(
   dim("State", rules.states);
   dim("Vertical", rules.verticals);
   dim("Branch", rules.branches);
+  dim("Department", rules.departments);
   dim("Team", rules.team_ids, labels?.teams);
   dim("L1 manager", rules.l1_manager_ids, labels?.managers);
   if (rules.joined_within_days) parts.push(`Joined ≤ ${rules.joined_within_days}d`);
@@ -118,9 +124,13 @@ type MemberFields = {
   state: string | null;
   business_vertical: string | null;
   branch: string | null;
+  department: string | null;
   line_manager_id: string | null;
   date_of_joining: string | null;
 };
+
+const MEMBER_FIELD_COLS = "user_id, designation, job_role, city, state, business_vertical, branch, department, line_manager_id, date_of_joining";
+const MEMBER_FIELD_COLS_LEGACY = "user_id, designation, job_role, city, state, business_vertical, branch, line_manager_id, date_of_joining";
 
 /** All ACTIVE members with the fields rules can touch (paginated). */
 export async function fetchActiveMembers(
@@ -129,15 +139,17 @@ export async function fetchActiveMembers(
 ): Promise<MemberFields[]> {
   const members: MemberFields[] = [];
   for (let fromIdx = 0; ; fromIdx += 1000) {
-    const { data } = await svc
-      .from("organization_members")
-      .select(
-        "user_id, designation, job_role, city, state, business_vertical, branch, line_manager_id, date_of_joining"
-      )
-      .eq("organization_id", orgId)
-      .eq("status", "active")
-      .range(fromIdx, fromIdx + 999);
-    const page = (data ?? []) as MemberFields[];
+    const q = (cols: string) =>
+      svc
+        .from("organization_members")
+        .select(cols)
+        .eq("organization_id", orgId)
+        .eq("status", "active")
+        .range(fromIdx, fromIdx + 999);
+    // 0096 deploy safety: retry without `department` when the column is not there yet.
+    let res = await q(MEMBER_FIELD_COLS);
+    if (res.error && /department/.test(res.error.message)) res = await q(MEMBER_FIELD_COLS_LEGACY);
+    const page = ((res.data ?? []) as unknown[]).map((r) => { const m = r as Partial<MemberFields>; return { ...m, department: m.department ?? null } as MemberFields; });
     members.push(...page);
     if (page.length < 1000) break;
   }
@@ -200,6 +212,7 @@ export async function resolveGroupMembers(
         inList(rules.states, m.state) &&
         inList(rules.verticals, m.business_vertical) &&
         inList(rules.branches, m.branch) &&
+        inList(rules.departments, m.department) &&
         inList(rules.l1_manager_ids, m.line_manager_id) &&
         (teamSet === null || teamSet.has(m.user_id)) &&
         (joinCutoff === null ||
@@ -240,15 +253,10 @@ export async function resolveUserGroupIds(
 
   const dynamic = groups.filter((g) => g.group_type === "dynamic");
   if (dynamic.length === 0) return out;
-  const { data: meRow } = await svc
-    .from("organization_members")
-    .select(
-      "user_id, designation, job_role, city, state, business_vertical, branch, line_manager_id, date_of_joining, status"
-    )
-    .eq("organization_id", orgId)
-    .eq("user_id", userId)
-    .maybeSingle();
-  const me = meRow as (MemberFields & { status?: string }) | null;
+  const meQ = (cols: string) => svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("user_id", userId).maybeSingle();
+  let meRes = await meQ(`${MEMBER_FIELD_COLS}, status`);
+  if (meRes.error && /department/.test(meRes.error.message)) meRes = await meQ(`${MEMBER_FIELD_COLS_LEGACY}, status`);
+  const me = meRes.data ? (() => { const m = meRes.data as unknown as Partial<MemberFields> & { status?: string }; return { ...m, department: m.department ?? null } as MemberFields & { status?: string }; })() : null;
   if (!me || me.status !== "active") return out;
   const { data: tmRows } = await svc
     .from("team_members")
@@ -278,6 +286,7 @@ export async function resolveUserGroupIds(
       inList(rules.states, me.state) &&
       inList(rules.verticals, me.business_vertical) &&
       inList(rules.branches, me.branch) &&
+      inList(rules.departments, me.department) &&
       inList(rules.l1_manager_ids, me.line_manager_id) &&
       teamOk &&
       (joinCutoff === null ||

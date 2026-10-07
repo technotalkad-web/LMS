@@ -3,8 +3,10 @@ import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearningPathsClient } from "./learning-paths-client";
+import { loadScopes, type ContentScopes } from "@/lib/content/scopes";
 import { fetchScoringRules } from "@/lib/scoring/resolve";
 import { courseProgress, pathProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 
@@ -337,6 +339,21 @@ export default async function LearningPathsPage({
     });
   }
 
+  // 0096: where each path belongs + master data for the pickers.
+  const scopeMap = await loadScopes(supabase, org.id, paths.map((p) => ({ type: "path" as const, id: p.id })));
+  const scopesByPath: Record<string, ContentScopes> = {};
+  for (const p of paths) scopesByPath[p.id] = scopeMap.get(`path:${p.id}`) ?? { common: false, pairs: [] };
+  const { data: optRows } = await loadFieldOptionRows(supabase, org.id).then((rows) => ({ data: rows }));
+  const optList = (optRows ?? []) as Array<{ id: string; field: string; value: string; parent_id?: string | null }>;
+  const verticalById = new Map(optList.filter((o) => o.field === "business_vertical").map((o) => [o.id, o.value]));
+  const departmentsByVertical: Record<string, string[]> = {};
+  for (const o of optList) {
+    if (o.field !== "department" || !o.parent_id) continue;
+    const v = verticalById.get(o.parent_id);
+    if (v) (departmentsByVertical[v] ??= []).push(o.value);
+  }
+  const scopeOptions = { verticals: [...verticalById.values()].sort(), departmentsByVertical };
+
   const teamNameById = new Map(teamOptions.map((t) => [t.id, t.name]));
   const groupNameById = new Map(groupOptions.map((g) => [g.id, g.name]));
   for (const a of pathAssignments) {
@@ -357,6 +374,8 @@ export default async function LearningPathsPage({
       teamOptions={teamOptions}
       groupOptions={groupOptions}
       scoringRules={scoringRules}
+      scopesByPath={scopesByPath}
+      scopeOptions={scopeOptions}
     />
   );
 }

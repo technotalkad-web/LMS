@@ -207,14 +207,14 @@ export async function POST(request: Request) {
     const cities = arr("cities");
     const verticals = arr("verticals");
     const branches = arr("branches");
+    const departments = arr("departments");
     const teamIds = arr("team_ids");
     const groupIds = arr("group_ids");
 
-    const { data: memRows } = await c.supabase
-      .from("organization_members")
-      .select("user_id, designation, job_role, city, business_vertical, branch")
-      .eq("organization_id", c.org.id)
-      .eq("status", "active");
+    const memQ = (cols: string) => c.supabase.from("organization_members").select(cols).eq("organization_id", c.org.id).eq("status", "active");
+    let memRes = await memQ("user_id, designation, job_role, city, business_vertical, branch, department");
+    if (memRes.error && /department/.test(memRes.error.message)) memRes = await memQ("user_id, designation, job_role, city, business_vertical, branch"); // pre-0096
+    const memRows = memRes.data as unknown;
     let candidates = ((memRows ?? []) as Array<{
       user_id: string;
       designation: string | null;
@@ -222,13 +222,15 @@ export async function POST(request: Request) {
       city: string | null;
       business_vertical: string | null;
       branch: string | null;
+      department?: string | null;
     }>).filter(
       (m) =>
         (designations.length === 0 || designations.includes(m.designation ?? "")) &&
         (jobRoles.length === 0 || jobRoles.includes(m.job_role ?? "")) &&
         (cities.length === 0 || cities.includes(m.city ?? "")) &&
         (verticals.length === 0 || verticals.includes(m.business_vertical ?? "")) &&
-        (branches.length === 0 || branches.includes(m.branch ?? ""))
+        (branches.length === 0 || branches.includes(m.branch ?? "")) &&
+        (departments.length === 0 || departments.includes(m.department ?? ""))
     );
     if (teamIds.length > 0) {
       const { data: tmRows } = await c.supabase
@@ -438,6 +440,8 @@ export async function PATCH(request: Request) {
         "cities",
         "verticals",
         "branches",
+        // Department under the vertical (0096); the trigger evaluates it in SQL too.
+        "departments",
         "team_ids",
         // Custom Groups (0067, G3): member must be in ANY listed group (the
         // groups union), AND-ed with the field rules above. The auto-enroll

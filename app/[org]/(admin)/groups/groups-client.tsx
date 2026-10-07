@@ -88,6 +88,7 @@ function RulesEditor({
         <RuleDim label="States" options={vals("state")} selected={rules.states ?? []} onChange={dim("states")} />
         <RuleDim label="Business verticals" options={vals("business_vertical")} selected={rules.verticals ?? []} onChange={dim("verticals")} />
         <RuleDim label="Branches" options={vals("branch")} selected={rules.branches ?? []} onChange={dim("branches")} />
+        <RuleDim label="Departments" options={vals("department")} selected={rules.departments ?? []} onChange={dim("departments")} />
         <RuleDim label="Teams" options={teams.map((t) => ({ value: t.id, display: t.name }))} selected={rules.team_ids ?? []} onChange={dim("team_ids")} />
         <RuleDim label="L1 managers" options={managers.map((m) => ({ value: m.id, display: m.name }))} selected={rules.l1_manager_ids ?? []} onChange={dim("l1_manager_ids")} />
         <label className="border border-line rounded-lg px-3 py-2 block">
@@ -588,15 +589,21 @@ function GroupRowView({
             <button type="button" onClick={onDuplicate} disabled={busy} title="Duplicate" className="p-1.5 rounded hover:bg-canvas hover:text-ink disabled:opacity-50">
               <Copy className="w-4 h-4" />
             </button>
-            <button type="button" onClick={onEdit} title="Edit" className="px-2 py-1 rounded text-xs font-medium hover:bg-canvas hover:text-ink">
-              Edit
-            </button>
+            {g.system_key ? (
+              <span className="px-2 py-1 rounded text-[10px] uppercase tracking-wide font-semibold text-indigo-700 bg-indigo-50" title="Managed by “Assign to vertical / department” — rules follow the master data value">System</span>
+            ) : (
+              <button type="button" onClick={onEdit} title="Edit" className="px-2 py-1 rounded text-xs font-medium hover:bg-canvas hover:text-ink">
+                Edit
+              </button>
+            )}
             <button type="button" onClick={onToggle} disabled={busy} title={inactive ? "Activate" : "Deactivate"} className="px-2 py-1 rounded text-xs font-medium hover:bg-canvas hover:text-ink disabled:opacity-50">
               {inactive ? "Activate" : "Deactivate"}
             </button>
-            <button type="button" onClick={onDelete} disabled={busy} title="Delete" className="p-1.5 rounded hover:bg-red-50 hover:text-red-700 disabled:opacity-50">
-              <Trash2 className="w-4 h-4" />
-            </button>
+            {!g.system_key && (
+              <button type="button" onClick={onDelete} disabled={busy} title="Delete" className="p-1.5 rounded hover:bg-red-50 hover:text-red-700 disabled:opacity-50">
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </td>
       </tr>

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { loadScopes } from "@/lib/content/scopes";
 import { authenticateApiKey } from "@/lib/integrations/auth";
 import { readParams, pick, list, bool, int, iso } from "@/lib/integrations/params";
 import { parseVersionDays } from "@/lib/journey/journey";
@@ -289,15 +290,22 @@ async function handle(request: Request) {
 
   const total = items.length;
   const slice = items.slice((page - 1) * perPage, page * perPage);
+  // 0096: where each item belongs (Business Vertical + Department pairs).
+  const scopeType = (t: CatalogItem["type"]) => (t === "learning_path" ? "path" : t) as "course" | "path" | "journey";
+  const scopeMap = await loadScopes(svc, orgId, slice.map((i) => ({ type: scopeType(i.type), id: i.id })));
+  const withScopes = (i: CatalogItem) => {
+    const s = scopeMap.get(`${scopeType(i.type)}:${i.id}`) ?? { common: false, pairs: [] };
+    return { ...i, scopes: s.pairs, common_to_all: s.common };
+  };
   return NextResponse.json({
     success: true,
     current_page: page,
     per_page: perPage,
     total_records: total,
     total_pages: Math.max(1, Math.ceil(total / perPage)),
-    courses: slice.filter((i) => i.type === "course"),
-    learning_paths: slice.filter((i) => i.type === "learning_path"),
-    journeys: slice.filter((i) => i.type === "journey"),
+    courses: slice.filter((i) => i.type === "course").map(withScopes),
+    learning_paths: slice.filter((i) => i.type === "learning_path").map(withScopes),
+    journeys: slice.filter((i) => i.type === "journey").map(withScopes),
   });
 }
 

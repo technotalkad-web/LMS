@@ -31,6 +31,7 @@ export type UserDetail = {
   state: string;
   business_vertical: string;
   branch: string;
+  department: string;
 };
 
 export function EditUserForm({
@@ -40,6 +41,7 @@ export function EditUserForm({
   managers,
   canAssignSuperOwner,
   fieldOptions = {},
+  departmentsByVertical = {},
   requireManagers = false,
 }: {
   orgSlug: string;
@@ -50,6 +52,8 @@ export function EditUserForm({
   /** Master-data lists (migration 0055): field → allowed values. A field
    *  with values here is mandatory and renders as a restricted dropdown. */
   fieldOptions?: Record<string, string[]>;
+  /** 0096: department master values keyed by their Business Vertical. */
+  departmentsByVertical?: Record<string, string[]>;
   /** Reporting-line managers (L1 + L2 + L3) mandatory? */
   requireManagers?: boolean;
 }) {
@@ -106,7 +110,25 @@ export function EditUserForm({
     key: Extract<GovernedField, keyof UserDetail>,
     extra?: { mono?: boolean }
   ) => {
-    const opts = fieldOptions[key] ?? [];
+    const hasDeptMasters = Object.keys(departmentsByVertical).length > 0;
+    const opts =
+      key === "department"
+        ? !hasDeptMasters
+          ? []
+          : form.business_vertical
+            ? departmentsByVertical[form.business_vertical] ?? []
+            : []
+        : fieldOptions[key] ?? [];
+    if (key === "department" && hasDeptMasters && opts.length === 0) {
+      // Departments are master data, but none applies yet: never offer free text.
+      return (
+        <Field label={label}>
+          <select disabled className="input" value="">
+            <option value="">{form.business_vertical ? `No departments under ${form.business_vertical}` : "Pick a business vertical first"}</option>
+          </select>
+        </Field>
+      );
+    }
     const optional = OPTIONAL_FIELDS.has(key);
     const enforced = opts.length > 0 && !optional;
     // Optional fields keep showing a stored value that's no longer in the
@@ -120,7 +142,10 @@ export function EditUserForm({
           <select
             required={enforced}
             value={stale || opts.includes(form[key]) ? form[key] : ""}
-            onChange={(e) => set(key, e.target.value)}
+            onChange={(e) => {
+              set(key, e.target.value);
+              if (key === "business_vertical") set("department", "");
+            }}
             className="input"
           >
             <option value="">{optional ? "—" : "Select…"}</option>
@@ -344,6 +369,7 @@ export function EditUserForm({
 
           {governed("State / Territory", "state")}
           {governed("Business vertical", "business_vertical")}
+          {governed("Department", "department")}
         </div>
         {/* Reporting-line warnings from the last save (chain mismatch) —
             saved, but worth a look. Cleared on the next edit. */}

@@ -254,6 +254,10 @@ export async function PATCH(request: Request) {
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
   const group = await loadGroup(c, body.group_id);
   if (!group) return NextResponse.json({ error: "Group not found" }, { status: 404 });
+  // 0096: a system group's name / rules follow its vertical + department; only activation may change.
+  if ((group as { system_key?: string | null }).system_key && (body.name !== undefined || body.description !== undefined || body.rules !== undefined)) {
+    return NextResponse.json({ error: "This is a system group (assign to vertical / department); its name and rules cannot be edited" }, { status: 409 });
+  }
 
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if (body.name !== undefined) {
@@ -310,6 +314,9 @@ export async function DELETE(request: Request) {
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
   const group = await loadGroup(c, body.group_id);
   if (!group) return NextResponse.json({ error: "Group not found" }, { status: 404 });
+  if ((group as { system_key?: string | null }).system_key) {
+    return NextResponse.json({ error: "System groups cannot be deleted; deactivate them instead" }, { status: 409 });
+  }
   const { error } = await c.supabase
     .from("org_groups")
     .delete()

@@ -34,6 +34,7 @@ type FormState = {
   state: string;
   business_vertical: string;
   branch: string;
+  department: string;
 };
 
 const INITIAL: FormState = {
@@ -60,6 +61,7 @@ const INITIAL: FormState = {
   state: "",
   business_vertical: "",
   branch: "",
+  department: "",
 };
 
 export function NewUserForm({
@@ -67,6 +69,7 @@ export function NewUserForm({
   managers,
   canAssignSuperOwner,
   fieldOptions = {},
+  departmentsByVertical = {},
   requireManagers = false,
 }: {
   orgSlug: string;
@@ -75,6 +78,8 @@ export function NewUserForm({
   /** Master-data lists (migration 0055): field → allowed values. A field
    *  with values here is mandatory and renders as a restricted dropdown. */
   fieldOptions?: Record<string, string[]>;
+  /** 0096: department master values keyed by their Business Vertical. */
+  departmentsByVertical?: Record<string, string[]>;
   /** Reporting-line managers (L1 + L2 + L3) mandatory? */
   requireManagers?: boolean;
 }) {
@@ -118,7 +123,25 @@ export function NewUserForm({
     key: Extract<GovernedField, keyof FormState>,
     extra?: { mono?: boolean; placeholder?: string }
   ) => {
-    const opts = fieldOptions[key] ?? [];
+    const hasDeptMasters = Object.keys(departmentsByVertical).length > 0;
+    const opts =
+      key === "department"
+        ? !hasDeptMasters
+          ? []
+          : form.business_vertical
+            ? departmentsByVertical[form.business_vertical] ?? []
+            : []
+        : fieldOptions[key] ?? [];
+    if (key === "department" && hasDeptMasters && opts.length === 0) {
+      // Departments are master data, but none applies yet: never offer free text.
+      return (
+        <Field label={label}>
+          <select disabled className="input" value="">
+            <option value="">{form.business_vertical ? `No departments under ${form.business_vertical}` : "Pick a business vertical first"}</option>
+          </select>
+        </Field>
+      );
+    }
     const optional = OPTIONAL_FIELDS.has(key);
     const enforced = opts.length > 0 && !optional;
     return (
@@ -127,7 +150,10 @@ export function NewUserForm({
           <select
             required={enforced}
             value={form[key]}
-            onChange={(e) => set(key, e.target.value)}
+            onChange={(e) => {
+              set(key, e.target.value);
+              if (key === "business_vertical") set("department", "");
+            }}
             className="input"
           >
             <option value="">{optional ? "—" : "Select…"}</option>
@@ -403,6 +429,7 @@ export function NewUserForm({
 
           {governed("State / Territory", "state")}
           {governed("Business vertical", "business_vertical")}
+          {governed("Department", "department")}
         </div>
       </section>
 

@@ -5,6 +5,7 @@ import {
   GOVERNED_FIELDS,
   loadOrgGovernance,
   checkGovernedField,
+  checkDepartmentInVertical,
 } from "@/lib/org/field-options";
 import {
   fetchHierarchyMembers,
@@ -48,6 +49,7 @@ type Body = {
   city?: string;
   state?: string;
   business_vertical?: string;
+  department?: string;
   branch?: string;
 };
 
@@ -154,6 +156,29 @@ export async function PATCH(
       return NextResponse.json({ error: check.error }, { status: 400 });
     }
     governed[field] = check.canonical;
+  }
+  // 0096: department ⊂ vertical — checked against the vertical being set, or
+  // the stored one when only the department changes (and vice versa).
+  if (body.department !== undefined || body.business_vertical !== undefined) {
+    const { data: cur } = await svc
+      .from("organization_members")
+      .select("business_vertical, department")
+      .eq("organization_id", org.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    const c = cur as { business_vertical?: string | null; department?: string | null } | null;
+    const vertical = body.business_vertical !== undefined ? governed.business_vertical : c?.business_vertical ?? null;
+    const department = body.department !== undefined ? governed.department : c?.department ?? null;
+    const dv = checkDepartmentInVertical(gov, department, vertical);
+    if (!dv.ok) {
+      // A vertical change that orphans the stored department clears it instead of failing.
+      if (body.department === undefined) governed.department = null;
+      else return NextResponse.json({ error: dv.error }, { status: 400 });
+    } else if (body.department !== undefined) governed.department = dv.canonical;
+    if (body.department === undefined && body.business_vertical !== undefined && governed.department === null && c?.department) {
+      // mark for clearing below
+      (governed as Record<string, string | null>).__clearDepartment = "1";
+    }
   }
   if (gov.requireManagers) {
     if (body.line_manager_id !== undefined && !body.line_manager_id.trim()) {
@@ -274,6 +299,8 @@ export async function PATCH(
   if (body.business_vertical !== undefined)
     memFields.business_vertical = governed.business_vertical ?? null;
   if (body.branch !== undefined) memFields.branch = governed.branch ?? null;
+  if (body.department !== undefined) memFields.department = governed.department ?? null;
+  else if ((governed as Record<string, string | null>).__clearDepartment) memFields.department = null;
 
   if (Object.keys(memFields).length > 0) {
     const { error: mErr } = await svc

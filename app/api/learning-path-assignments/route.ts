@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { loadOrgGovernance } from "@/lib/org/field-options";
+import { checkScopeTarget, ensureScopeGroup } from "@/lib/org/scope-groups";
+import { describeScopes, loadScopesFor, scopeLabel, scopesCover, type ScopePair } from "@/lib/content/scopes";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
@@ -21,6 +24,8 @@ export async function POST(request: Request) {
     userIds?: string[];
     teamIds?: string[];
     groupIds?: string[];
+    /** 0096: assign to a Vertical / Department — each pair becomes a system group assignment. */
+    scopes?: Array<{ vertical?: string; department?: string | null }>;
     dueAt?: string | null;
   };
   if (!body.orgSlug || !body.pathId) {
@@ -62,6 +67,50 @@ export async function POST(request: Request) {
         { error: "One or more groups not found in this organization" },
         { status: 400 }
       );
+    }
+  }
+
+
+  // ---- Assign to a Vertical / Department (0096, decision 18): each pair maps
+  // to a system-managed dynamic group. Decision 20: warn, never block, when
+  // the content's mapping does not cover the target.
+  const warnings: string[] = [];
+  const reqScopes = Array.isArray(body.scopes) ? body.scopes : [];
+  if (reqScopes.length > 20) return NextResponse.json({ error: "At most 20 vertical / department targets per call" }, { status: 400 });
+  const scopeTargets: ScopePair[] = [];
+  if (reqScopes.length) {
+    const gov = await loadOrgGovernance(supabase, org.id);
+    for (const raw of reqScopes) {
+      const t = checkScopeTarget(gov, raw);
+      if (!t.ok) return NextResponse.json({ error: t.error }, { status: 400 });
+      scopeTargets.push(t.pair);
+    }
+    for (const pair of scopeTargets) {
+      const g = await ensureScopeGroup(supabase, org.id, pair, user.id);
+      if ("error" in g) {
+        const msg = /system_key|does not exist|schema cache/.test(g.error) ? "Assigning to a vertical / department needs migration 0096" : g.error;
+        return NextResponse.json({ error: msg }, { status: 400 });
+      }
+      if (!validGroupIds.includes(g.id)) validGroupIds.push(g.id);
+    }
+  }
+  {
+    const mapping = await loadScopesFor(supabase, org.id, "path", body.pathId);
+    if (mapping.common || mapping.pairs.length) {
+      for (const pair of scopeTargets) {
+        if (!scopesCover(mapping, pair)) warnings.push(`${scopeLabel(pair)} is outside this learning path's mapping (${describeScopes(mapping)}).`);
+      }
+      const namedIds = (body.userIds ?? []).filter(Boolean);
+      if (namedIds.length) {
+        const { data: mm } = await supabase
+          .from("organization_members")
+          .select("user_id, business_vertical, department")
+          .eq("organization_id", org.id)
+          .in("user_id", namedIds);
+        const outside = ((mm ?? []) as Array<{ user_id: string; business_vertical: string | null; department: string | null }>)
+          .filter((m) => !m.business_vertical || !scopesCover(mapping, { vertical: m.business_vertical, department: m.department }));
+        if (outside.length) warnings.push(`${outside.length} of ${namedIds.length} named ${outside.length === 1 ? "person is" : "people are"} outside this learning path's mapping (${describeScopes(mapping)}).`);
+      }
     }
   }
 
@@ -216,5 +265,5 @@ export async function POST(request: Request) {
     })();
   }
 
-  return NextResponse.json({ assigned: inserted.length, assignments: inserted });
+  return NextResponse.json({ assigned: inserted.length, assignments: inserted, warnings });
 }

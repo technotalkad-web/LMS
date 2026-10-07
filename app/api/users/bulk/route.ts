@@ -8,6 +8,7 @@ import {
   GOVERNED_FIELDS,
   loadOrgGovernance,
   checkGovernedField,
+  checkDepartmentInVertical,
 } from "@/lib/org/field-options";
 import {
   fetchHierarchyMembers,
@@ -28,7 +29,7 @@ import {
  *   indirect_manager_id, lms_role, node_id, city, state,
  *   team_name (optional — auto-creates the team in this org if missing,
  *              or adds to an existing team if name matches case-insensitively),
- *   business_vertical, branch, l3_manager_id
+ *   business_vertical, branch, l3_manager_id, department
  *
  * Manager cells (L1/L2/L3, migration 0091) take an email or user id. The
  * reporting-line integrity rules apply per row (self-reference, a manager
@@ -343,6 +344,7 @@ export async function POST(request: Request) {
       state: r.state,
       business_vertical: r.business_vertical,
       branch: r.branch,
+      department: r.department,
     } as const;
     const governedRow: Record<string, string | null> = {};
     let governanceError: string | null = null;
@@ -501,12 +503,24 @@ export async function POST(request: Request) {
     }
 
     // ---- Insert or update membership ----
-    const { data: priorMem } = await svc
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", org.id)
-      .eq("user_id", authUserId)
-      .maybeSingle();
+    const pmQ = (cols: string) => svc.from("organization_members").select(cols).eq("organization_id", org.id).eq("user_id", authUserId).maybeSingle();
+    let pmRes = await pmQ("user_id, business_vertical, department");
+    if (pmRes.error && /department/.test(pmRes.error.message)) pmRes = await pmQ("user_id, business_vertical"); // pre-0096
+    const priorMem = pmRes.data as { user_id: string; business_vertical?: string | null; department?: string | null } | null;
+    let clearDepartment = false;
+    {
+      // 0096: the department must sit under the row's vertical (or the stored one when the file has no vertical column);
+      // a vertical change that orphans the stored department clears it.
+      const vertical = governedRow.business_vertical ?? priorMem?.business_vertical ?? null;
+      const department = governedRow.department ?? priorMem?.department ?? null;
+      if (department) {
+        const dv = checkDepartmentInVertical(gov, department, vertical);
+        if (!dv.ok) {
+          if (governedRow.department) { results.push({ row: rowNum, email, status: "skipped", message: dv.error }); continue; }
+          clearDepartment = true;
+        } else if (governedRow.department) governedRow.department = dv.canonical;
+      }
+    }
 
     const memPayload: Record<string, unknown> = {
       organization_id: org.id,
@@ -524,6 +538,9 @@ export async function POST(request: Request) {
       state: governedRow.state,
       business_vertical: governedRow.business_vertical,
       branch: governedRow.branch,
+      // 0096 deploy safety: only sent when set (and never cleared by bulk, like vertical / branch —
+      // except when a vertical change orphans the stored department).
+      ...(governedRow.department ? { department: governedRow.department } : clearDepartment ? { department: null } : {}),
     };
     // OPTIONAL governed fields are never CLEARED by bulk upload: a CSV
     // without these columns (or with empty cells) must preserve values
@@ -701,6 +718,8 @@ const KNOWN_COLS = [
   "branch",
   // Explicit reporting line, level 3 (migration 0091).
   "l3_manager_id",
+  // Department under the business vertical (migration 0096). Appended last.
+  "department",
 ] as const;
 
 /**

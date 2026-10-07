@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { NewUserForm, type ManagerOption } from "./new-user-form";
 
@@ -53,11 +54,7 @@ export default async function NewUserPage({
   // Master-data governance: fields with Super-Owner-defined values render as
   // required dropdowns limited to those values (migration 0055).
   const [{ data: optRows }, { data: orgRow }] = await Promise.all([
-    supabase
-      .from("org_field_options")
-      .select("field, value")
-      .eq("organization_id", org.id)
-      .order("value", { ascending: true }),
+    loadFieldOptionRows(supabase, org.id).then((rows) => ({ data: rows })),
     supabase
       .from("organizations")
       .select("require_manager_fields")
@@ -65,8 +62,17 @@ export default async function NewUserPage({
       .maybeSingle(),
   ]);
   const fieldOptions: Record<string, string[]> = {};
-  for (const r of (optRows ?? []) as Array<{ field: string; value: string }>) {
+  const optionRows = (optRows ?? []) as Array<{ id: string; field: string; value: string; parent_id?: string | null }>;
+  for (const r of optionRows) {
     (fieldOptions[r.field] ??= []).push(r.value);
+  }
+  // 0096: departments hang under a vertical (pre-0096 rows have no parent_id → none).
+  const verticalById = new Map(optionRows.filter((r) => r.field === "business_vertical").map((r) => [r.id, r.value]));
+  const departmentsByVertical: Record<string, string[]> = {};
+  for (const r of optionRows) {
+    if (r.field !== "department" || !r.parent_id) continue;
+    const v = verticalById.get(r.parent_id);
+    if (v) (departmentsByVertical[v] ??= []).push(r.value);
   }
   const requireManagers =
     (orgRow as { require_manager_fields?: boolean } | null)
@@ -91,6 +97,7 @@ export default async function NewUserPage({
         managers={managers}
         canAssignSuperOwner={canAssignSuperOwner}
         fieldOptions={fieldOptions}
+        departmentsByVertical={departmentsByVertical}
         requireManagers={requireManagers}
       />
     </div>

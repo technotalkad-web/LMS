@@ -208,6 +208,12 @@ organisations (stalest people first inside each; `pending` in the response
 says how many were left for the next run) and rotates its starting
 organisation so a long list is never cut at the same place.
 
+## Phase 4b — Department master data, content mapping, assign to vertical
+
+See `docs/CONTENT_MAPPING.md`. `LearnerInsight.department` now carries the
+member's department; the visibility rule (content mapping + actual
+assignment + reporting hierarchy) is Phase 4c and is not applied yet.
+
 ## Deploy order
 
 Apply `0092_manager_actions.sql` on staging before merging and on prod before

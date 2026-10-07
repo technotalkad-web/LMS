@@ -40,6 +40,7 @@ export async function GET() {
     "business_vertical",
     "branch",
     "l3_manager_id",
+    "department",
   ].join(",");
 
   const example = [

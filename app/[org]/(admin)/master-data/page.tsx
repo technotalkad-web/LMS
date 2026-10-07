@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
 import { MasterDataClient, type OptionRow } from "./master-data-client";
 
 export const dynamic = "force-dynamic";
@@ -22,11 +23,7 @@ export default async function MasterDataPage({
 
   const supabase = await createClient();
   const [{ data: optRows }, { data: orgRow }] = await Promise.all([
-    supabase
-      .from("org_field_options")
-      .select("id, field, value")
-      .eq("organization_id", org.id)
-      .order("value", { ascending: true }),
+    loadFieldOptionRows(supabase, org.id).then((rows) => ({ data: rows })),
     supabase
       .from("organizations")
       .select("require_manager_fields")
@@ -34,9 +31,30 @@ export default async function MasterDataPage({
       .maybeSingle(),
   ]);
 
+  // 0096: how much active content is still unmapped (null before the migration).
+  let unmappedContent: number | null = null;
+  {
+    const [{ data: cs }, { data: ps }, { data: js }, mapped] = await Promise.all([
+      supabase.from("courses").select("id").eq("organization_id", org.id).eq("is_active", true),
+      supabase.from("learning_paths").select("id").eq("organization_id", org.id).eq("is_active", true),
+      supabase.from("journey_programs").select("id").eq("organization_id", org.id).eq("is_active", true),
+      supabase.from("content_scopes").select("content_type, content_id").eq("organization_id", org.id),
+    ]);
+    if (!mapped.error) {
+      const done = new Set(((mapped.data ?? []) as Array<{ content_type: string; content_id: string }>).map((r) => `${r.content_type}:${r.content_id}`));
+      const all = [
+        ...((cs ?? []) as Array<{ id: string }>).map((r) => `course:${r.id}`),
+        ...((ps ?? []) as Array<{ id: string }>).map((r) => `path:${r.id}`),
+        ...((js ?? []) as Array<{ id: string }>).map((r) => `journey:${r.id}`),
+      ];
+      unmappedContent = all.filter((k) => !done.has(k)).length;
+    }
+  }
+
   return (
     <MasterDataClient
       orgSlug={orgSlug}
+      unmappedContent={unmappedContent}
       initialOptions={(optRows ?? []) as OptionRow[]}
       initialRequireManagers={
         (orgRow as { require_manager_fields?: boolean } | null)
