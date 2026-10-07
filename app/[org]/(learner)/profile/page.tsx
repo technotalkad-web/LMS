@@ -29,6 +29,7 @@ type MembershipRow = {
   designation: string | null;
   job_role: string | null;
   branch: string | null;
+  department?: string | null;
   line_manager_id: string | null;
   indirect_manager_id: string | null;
   l3_manager_id: string | null;
@@ -126,14 +127,10 @@ export default async function ProfilePage({
     phone: null,
   }) as ProfileRow;
 
-  const { data: memRow } = await svc
-    .from("organization_members")
-    .select(
-      "employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, branch, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state"
-    )
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
+  const memQ = (cols: string) => svc.from("organization_members").select(cols).eq("organization_id", org.id).eq("user_id", user.id).maybeSingle();
+  let memRes = await memQ("employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, branch, department, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state");
+  if (memRes.error && /department/.test(memRes.error.message)) memRes = await memQ("employee_id, role, status, joined_at, date_of_joining, grade, designation, job_role, branch, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state"); // pre-0096
+  const memRow = memRes.data as Record<string, string | null | undefined> | null;
   const membership = (memRow ?? {
     employee_id: null,
     role,
@@ -144,6 +141,7 @@ export default async function ProfilePage({
     designation: null,
     job_role: null,
     branch: null,
+    department: null,
     line_manager_id: null,
     indirect_manager_id: null,
     l3_manager_id: null,
@@ -340,6 +338,7 @@ export default async function ProfilePage({
                 value={membership.job_role ?? "—"}
               />
               <LockedField label="Branch" value={membership.branch ?? "—"} />
+              <LockedField label="Department" value={(membership as { department?: string | null }).department ?? "—"} />
               <LockedField
                 label="Node ID"
                 value={membership.node_id ?? "—"}

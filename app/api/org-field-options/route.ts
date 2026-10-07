@@ -4,6 +4,7 @@ import {
   GOVERNED_FIELDS,
   type GovernedField,
 } from "@/lib/org/field-options";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
 
 /**
  *   GET    /api/org-field-options?orgSlug=...        → { options, require_manager_fields }
@@ -51,11 +52,7 @@ export async function GET(request: Request) {
   if ("error" in ctx) {
     return NextResponse.json({ error: ctx.error }, { status: ctx.status });
   }
-  const { data: rows } = await ctx.supabase
-    .from("org_field_options")
-    .select("id, field, value")
-    .eq("organization_id", ctx.org.id)
-    .order("value", { ascending: true });
+  const { data: rows } = await loadFieldOptionRows(ctx.supabase, ctx.org.id).then((rows) => ({ data: rows }));
   return NextResponse.json({
     options: rows ?? [],
     require_manager_fields:
@@ -69,6 +66,8 @@ export async function POST(request: Request) {
     orgSlug?: string;
     field?: string;
     value?: string;
+    /** For field = department: the id of the Business Vertical option it belongs to (0096). */
+    parent_id?: string;
   };
   const ctx = await resolveOrg(body.orgSlug ?? null);
   if ("error" in ctx) {
@@ -88,14 +87,28 @@ export async function POST(request: Request) {
   if (!value) {
     return NextResponse.json({ error: "Value required" }, { status: 400 });
   }
+  // 0096: a department hangs under one of this org's Business Vertical values.
+  let parent_id: string | null = null;
+  if (field === "department") {
+    if (!body.parent_id) return NextResponse.json({ error: "A department needs its Business Vertical" }, { status: 400 });
+    const { data: parent } = await ctx.supabase
+      .from("org_field_options")
+      .select("id")
+      .eq("organization_id", ctx.org.id)
+      .eq("field", "business_vertical")
+      .eq("id", body.parent_id)
+      .maybeSingle();
+    if (!parent) return NextResponse.json({ error: "That Business Vertical does not exist" }, { status: 400 });
+    parent_id = body.parent_id;
+  }
   // RLS (super owner) is the write authority; unique index dedupes (23505).
   const { data: row, error } = await ctx.supabase
     .from("org_field_options")
-    .insert({ organization_id: ctx.org.id, field, value })
-    .select("id, field, value")
+    .insert({ organization_id: ctx.org.id, field, value, ...(parent_id ? { parent_id } : {}) })
+    .select("id, field, value, parent_id")
     .single();
   if (error) {
-    const msg = error.code === "23505" ? "That value already exists." : error.message;
+    const msg = error.code === "23505" ? "That value already exists." : error.code === "23514" && field === "department" ? "Departments need migration 0096 on this database." : error.message;
     return NextResponse.json({ error: msg }, { status: 400 });
   }
   return NextResponse.json({ ok: true, option: row });

@@ -2,6 +2,8 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
+import { loadScopesFor } from "@/lib/content/scopes";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { courseDaysOf, todayStr, DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
 import { fetchScoringRule } from "@/lib/scoring/resolve";
@@ -277,6 +279,19 @@ export default async function JourneyAdminPage({
     ? await fetchScoringRule(supabase, "journey", program.id)
     : null;
 
+  // 0096: where this journey belongs + master data for the picker.
+  const scopes = program ? await loadScopesFor(supabase, org.id, "journey", program.id) : null;
+  const { data: scopeOptRows } = await loadFieldOptionRows(supabase, org.id).then((rows) => ({ data: rows }));
+  const scopeOptList = (scopeOptRows ?? []) as Array<{ id: string; field: string; value: string; parent_id?: string | null }>;
+  const verticalById = new Map(scopeOptList.filter((o) => o.field === "business_vertical").map((o) => [o.id, o.value]));
+  const departmentsByVertical: Record<string, string[]> = {};
+  for (const o of scopeOptList) {
+    if (o.field !== "department" || !o.parent_id) continue;
+    const v = verticalById.get(o.parent_id);
+    if (v) (departmentsByVertical[v] ??= []).push(o.value);
+  }
+  const scopeOptions = { verticals: [...verticalById.values()].sort(), departmentsByVertical };
+
   return (
     <JourneyAdminClient
       orgSlug={orgSlug}
@@ -298,6 +313,8 @@ export default async function JourneyAdminPage({
       audienceOptions={audienceOptions}
       teams={teams}
       orgGroups={orgGroups}
+      scopes={scopes}
+      scopeOptions={scopeOptions}
     />
   );
 }

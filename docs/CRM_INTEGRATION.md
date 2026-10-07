@@ -76,6 +76,7 @@ Never ship the key to browser code. All calls below are backend-to-backend.
   "designation": "Sales Advisor",
   "city": "Mumbai",
   "business_vertical": "Retail",
+  "department": "Home Loan Sales",
   "branch": "Andheri",
   "date_of_joining": "2026-09-01",
   "line_manager_employee_id": "AMB-0007"
@@ -93,6 +94,8 @@ Rules your sync can rely on:
 - **Master-data governance applies**: fields the Super Owner governs
   (designation, city, …) must use master values → `400` with the exact
   message admins see. Sync the master lists first or map values in the CRM.
+  `department` (optional) must be one defined under the employee's
+  `business_vertical` in Master data; `GET` echoes it back.
 - **Managers by employee_id** — the explicit reporting line
   Employee → L1 → L2 → L3: `line_manager_employee_id` (L1),
   `indirect_manager_employee_id` (L2), `l3_manager_employee_id` (L3).
@@ -206,6 +209,7 @@ assign and launch, with the ids used everywhere else in the integration.
     { "type": "course", "id": "…", "title": "Objection Handling", "description": null,
       "format": "scorm12", "version_id": "…", "duration_minutes": 20, "status": "available",
       "is_active": true, "has_content": true, "thumbnail_url": null, "created_at": "…", "updated_at": "…",
+      "scopes": [ { "vertical": "Retail", "department": "Home Loan Sales" } ], "common_to_all": false,
       "target": "/ambak/courses/…/launch" }
   ],
   "learning_paths": [

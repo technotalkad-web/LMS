@@ -1,5 +1,8 @@
 "use client";
 
+import { ScopePicker, type ScopeOptions } from "../_components/scope-picker";
+import type { ContentScopes } from "@/lib/content/scopes";
+
 import { useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Plus, RotateCcw, Swords, Upload, X } from "lucide-react";
@@ -105,6 +108,8 @@ export function JourneyAdminClient({
   teams = [],
   orgGroups = [],
   scoringRule = null,
+  scopes = null,
+  scopeOptions,
 }: {
   orgSlug: string;
   programs?: ProgramSummary[];
@@ -121,6 +126,9 @@ export function JourneyAdminClient({
   orgGroups?: Array<{ id: string; name: string }>;
   /** 0073: this journey's explicit attempt scoring rule. */
   scoringRule?: ScoringRule | null;
+  /** 0096: where this journey belongs + the master data for the picker. */
+  scopes?: ContentScopes | null;
+  scopeOptions?: ScopeOptions;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -425,6 +433,8 @@ export function JourneyAdminClient({
           orgGroups={orgGroups}
           activeEnrollments={enrollments.filter((e) => e.status === "active").length}
           scoringRule={scoringRule}
+          scopes={scopes}
+          scopeOptions={scopeOptions}
         />
       </div>
     </div>
@@ -1124,6 +1134,8 @@ function SettingsTab({
   orgGroups = [],
   activeEnrollments = 0,
   scoringRule = null,
+  scopes = null,
+  scopeOptions,
 }: {
   orgSlug: string;
   program: ProgramRow;
@@ -1133,6 +1145,8 @@ function SettingsTab({
   orgGroups?: Array<{ id: string; name: string }>;
   activeEnrollments?: number;
   scoringRule?: ScoringRule | null;
+  scopes?: ContentScopes | null;
+  scopeOptions?: ScopeOptions;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -1222,6 +1236,7 @@ function SettingsTab({
       cities: a.cities ?? [],
       verticals: a.verticals ?? [],
       branches: a.branches ?? [],
+      departments: a.departments ?? [],
       team_ids: a.team_ids ?? [],
       group_ids: a.group_ids ?? [],
     };
@@ -1494,6 +1509,13 @@ function SettingsTab({
         </div>
       </section>
 
+      {/* Belongs to (0096) — saves on its own */}
+      {scopeOptions && (
+        <section className="border border-line rounded-xl p-4 space-y-2">
+          <h3 className="font-semibold text-sm">Belongs to</h3>
+          <ScopePicker orgSlug={orgSlug} items={[{ type: "journey", id: program.id }]} initial={scopes ?? { common: false, pairs: [] }} options={scopeOptions} />
+        </section>
+      )}
       {/* Audience & priority (multi-journey, 0063) */}
       <section className="border border-line rounded-2xl bg-paper p-4 sm:p-5 space-y-3">
         <h3 className="text-sm font-semibold">Audience &amp; priority</h3>
@@ -1561,6 +1583,12 @@ function SettingsTab({
             options={(audienceOptions.branch ?? []).map((v) => ({ value: v, display: v }))}
             selected={audience.branches}
             onChange={audDim("branches")}
+          />
+          <AudienceDim
+            label="Departments"
+            options={(audienceOptions.department ?? []).map((v) => ({ value: v, display: v }))}
+            selected={audience.departments ?? []}
+            onChange={audDim("departments")}
           />
           <AudienceDim
             label="Teams"

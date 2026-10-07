@@ -196,9 +196,15 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   }
 
   /* ---- people ---- */
-  const memberRows = await fetchByIds<{
-    user_id: string; designation: string | null; city: string | null; branch: string | null; business_vertical: string | null; date_of_joining: string | null;
-  }>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
+  type MemberRow = { user_id: string; designation: string | null; city: string | null; branch: string | null; business_vertical: string | null; department?: string | null; date_of_joining: string | null };
+  let memberRows: MemberRow[];
+  try {
+    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, department, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
+  } catch (e) {
+    // 0096 deploy safety: no department column yet.
+    if (!/department/.test(String((e as Error)?.message ?? e))) throw e;
+    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
+  }
   const memberById = new Map(memberRows.map((m) => [m.user_id, m]));
   const profRows = await fetchByIds<{ id: string; first_name: string | null; last_name: string | null; email: string | null; avatar_url: string | null }>(
     svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", userIds
@@ -572,6 +578,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       city: m?.city ?? null,
       branch: m?.branch ?? null,
       vertical: m?.business_vertical ?? null,
+      department: m?.department ?? null,
       joined: m?.date_of_joining ?? null,
       assigned,
       completed,

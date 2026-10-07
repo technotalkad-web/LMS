@@ -6,6 +6,8 @@ import { useConfirm } from "@/components/ui/confirm";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { MemberCombobox } from "./member-combobox";
+import type { ScopeOptions } from "../../_components/scope-picker";
+import { describeScopes, scopesCover, type ContentScopes } from "@/lib/content/scopes";
 
 export type AssignmentRow = {
   id: string;
@@ -64,6 +66,8 @@ export function AssignSection({
   members,
   teams,
   groups = [],
+  scopeOptions,
+  scopes,
 }: {
   orgSlug: string;
   courseId: string;
@@ -72,6 +76,10 @@ export function AssignSection({
   members: AssignableMember[];
   teams: AssignableTeam[];
   groups?: AssignableGroup[];
+  /** 0096: master data for "Assign to vertical / department". */
+  scopeOptions?: ScopeOptions;
+  /** 0096: where this course belongs (decision 20 warning). */
+  scopes?: ContentScopes;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -81,6 +89,9 @@ export function AssignSection({
   const [selectedUser, setSelectedUser] = useState("");
   const [selectedTeam, setSelectedTeam] = useState("");
   const [selectedGroup, setSelectedGroup] = useState("");
+  const [selectedVertical, setSelectedVertical] = useState("");
+  const [selectedDepartment, setSelectedDepartment] = useState("");
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [dueAt, setDueAt] = useState("");
   // datetime-local value; converted to ISO in the browser so the stored
   // instant matches the admin's local wall-clock choice.
@@ -102,20 +113,39 @@ export function AssignSection({
   async function post(body: object) {
     setBusy(true);
     setError(null);
+    setWarnings([]);
     const res = await fetch("/api/assignments", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
     setBusy(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string; warnings?: string[] };
     if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
       setError(j.error ?? "Failed");
       return false;
     }
+    // Decision 20: the assignment went through; the mapping mismatch is a warning.
+    if (j.warnings?.length) setWarnings(j.warnings);
     router.refresh();
     return true;
   }
+
+  async function addScope() {
+    if (!selectedVertical) return;
+    const ok = await post({
+      orgSlug,
+      courseId,
+      scopes: [{ vertical: selectedVertical, department: selectedDepartment || null }],
+      dueAt: dueAt || null,
+      releaseAt: releaseIso(),
+    });
+    if (ok) { setSelectedVertical(""); setSelectedDepartment(""); }
+  }
+  const scopeMismatch =
+    scopes && selectedVertical && (scopes.common || scopes.pairs.length) && !scopesCover(scopes, { vertical: selectedVertical, department: selectedDepartment || null })
+      ? `This course belongs to ${describeScopes(scopes)} — you are assigning it to ${selectedVertical}${selectedDepartment ? ` · ${selectedDepartment}` : ""}. It will still be assigned.`
+      : null;
 
   async function unassign(id: string) {
     if (!await confirm("Remove this assignment?")) return;
@@ -407,6 +437,54 @@ export function AssignSection({
               )}
             </div>
 
+            {scopeOptions && scopeOptions.verticals.length > 0 && (
+              <div>
+                <div className="text-xs uppercase tracking-wide text-muted mb-2">
+                  Assign vertical / department
+                </div>
+                <div className="flex flex-wrap gap-2 items-center">
+                  <select
+                    value={selectedVertical}
+                    onChange={(e) => { setSelectedVertical(e.target.value); setSelectedDepartment(""); }}
+                    aria-label="Assign to business vertical"
+                    className="flex-1 min-w-[180px] px-3 py-2 border border-line rounded-lg bg-canvas outline-none focus:border-ink text-sm"
+                  >
+                    <option value="">Pick a business vertical...</option>
+                    {scopeOptions.verticals.map((v) => (
+                      <option key={v} value={v}>{v}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={selectedDepartment}
+                    onChange={(e) => setSelectedDepartment(e.target.value)}
+                    disabled={!selectedVertical || (scopeOptions.departmentsByVertical[selectedVertical] ?? []).length === 0}
+                    aria-label="Assign to department"
+                    className="flex-1 min-w-[180px] px-3 py-2 border border-line rounded-lg bg-canvas outline-none focus:border-ink text-sm disabled:opacity-50"
+                  >
+                    <option value="">Whole vertical</option>
+                    {(scopeOptions.departmentsByVertical[selectedVertical] ?? []).map((d) => (
+                      <option key={d} value={d}>{d}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={addScope}
+                    disabled={busy || !selectedVertical}
+                    className="px-3 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
+                  >
+                    Assign vertical
+                  </button>
+                </div>
+                {scopeMismatch ? (
+                  <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 mt-1.5">{scopeMismatch}</p>
+                ) : (
+                  <p className="text-[11px] text-muted mt-1.5">
+                    Everyone whose profile is in that vertical (and department) — people who join it later are covered automatically.
+                  </p>
+                )}
+              </div>
+            )}
+
             {groups.length > 0 && (
               <div>
                 <div className="text-xs uppercase tracking-wide text-muted mb-2">
@@ -476,6 +554,13 @@ export function AssignSection({
       </div>
 
       {error && <p className="text-sm text-red-700 mt-2">{error}</p>}
+      {warnings.length > 0 && (
+        <ul role="status" className="mt-2 space-y-1">
+          {warnings.map((w) => (
+            <li key={w} className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">Assigned. {w}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

@@ -8,6 +8,7 @@ import {
   GOVERNED_FIELDS,
   loadOrgGovernance,
   checkGovernedField,
+  checkDepartmentInVertical,
 } from "@/lib/org/field-options";
 import {
   fetchHierarchyMembers,
@@ -51,6 +52,7 @@ type CreateUserBody = {
   city?: string;
   state?: string;
   business_vertical?: string;
+  department?: string;
   branch?: string;
 };
 
@@ -191,6 +193,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: check.error }, { status: 400 });
     }
     governed[field] = check.canonical;
+  }
+  // 0096: a department must be one defined under the member's own vertical.
+  {
+    const dv = checkDepartmentInVertical(gov, governed.department, governed.business_vertical);
+    if (!dv.ok) return NextResponse.json({ error: dv.error }, { status: 400 });
+    governed.department = dv.canonical;
   }
   if (gov.requireManagers) {
     if (!body.line_manager_id?.trim()) {
@@ -356,6 +364,8 @@ export async function POST(request: Request) {
     state: governed.state,
     business_vertical: governed.business_vertical,
     branch: governed.branch,
+    // 0096 deploy safety: only sent when set, so a pre-migration database still creates users.
+    ...(governed.department ? { department: governed.department } : {}),
   };
 
   const memOp = priorMem
@@ -369,7 +379,7 @@ export async function POST(request: Request) {
   const { error: memErr } = await memOp;
   if (memErr) {
     return NextResponse.json(
-      { error: `Membership write failed: ${memErr.message}` },
+      { error: /department/.test(memErr.message) ? "Departments need migration 0096 on this database." : `Membership write failed: ${memErr.message}` },
       { status: 400 }
     );
   }

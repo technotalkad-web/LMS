@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { loadFieldOptionRows } from "@/lib/org/field-options";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { EditUserForm, type ManagerOption, type UserDetail } from "./edit-user-form";
 
@@ -39,14 +40,10 @@ export default async function EditUserPage({
     .eq("id", userId)
     .maybeSingle();
 
-  const { data: memRow } = await svc
-    .from("organization_members")
-    .select(
-      "user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state, business_vertical, branch"
-    )
-    .eq("organization_id", org.id)
-    .eq("user_id", userId)
-    .maybeSingle();
+  const memQ = (cols: string) => svc.from("organization_members").select(cols).eq("organization_id", org.id).eq("user_id", userId).maybeSingle();
+  let memRes = await memQ("user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state, business_vertical, branch, department");
+  if (memRes.error && /department/.test(memRes.error.message)) memRes = await memQ("user_id, role, employee_id, status, date_of_joining, grade, designation, job_role, line_manager_id, indirect_manager_id, l3_manager_id, node_id, city, state, business_vertical, branch"); // pre-0096
+  const memRow = memRes.data as Record<string, string | null | undefined> | null;
 
   if (!memRow) {
     redirect(`/${orgSlug}/users`);
@@ -80,6 +77,7 @@ export default async function EditUserPage({
     state: memRow.state ?? "",
     business_vertical: (memRow as { business_vertical?: string | null }).business_vertical ?? "",
     branch: (memRow as { branch?: string | null }).branch ?? "",
+    department: (memRow as { department?: string | null }).department ?? "",
   };
 
   // Manager picker options: ACTIVE members, excluding self — the
@@ -116,11 +114,7 @@ export default async function EditUserPage({
   // Master-data governance: fields with Super-Owner-defined values render as
   // required dropdowns limited to those values (migration 0055).
   const [{ data: optRows }, { data: orgRow }] = await Promise.all([
-    supabase
-      .from("org_field_options")
-      .select("field, value")
-      .eq("organization_id", org.id)
-      .order("value", { ascending: true }),
+    loadFieldOptionRows(supabase, org.id).then((rows) => ({ data: rows })),
     supabase
       .from("organizations")
       .select("require_manager_fields")
@@ -128,8 +122,17 @@ export default async function EditUserPage({
       .maybeSingle(),
   ]);
   const fieldOptions: Record<string, string[]> = {};
-  for (const r of (optRows ?? []) as Array<{ field: string; value: string }>) {
+  const optionRows = (optRows ?? []) as Array<{ id: string; field: string; value: string; parent_id?: string | null }>;
+  for (const r of optionRows) {
     (fieldOptions[r.field] ??= []).push(r.value);
+  }
+  // 0096: departments hang under a vertical (pre-0096 rows have no parent_id → none).
+  const verticalById = new Map(optionRows.filter((r) => r.field === "business_vertical").map((r) => [r.id, r.value]));
+  const departmentsByVertical: Record<string, string[]> = {};
+  for (const r of optionRows) {
+    if (r.field !== "department" || !r.parent_id) continue;
+    const v = verticalById.get(r.parent_id);
+    if (v) (departmentsByVertical[v] ??= []).push(r.value);
   }
   const requireManagers =
     (orgRow as { require_manager_fields?: boolean } | null)
@@ -160,6 +163,7 @@ export default async function EditUserPage({
         managers={managers}
         canAssignSuperOwner={canAssignSuperOwner}
         fieldOptions={fieldOptions}
+        departmentsByVertical={departmentsByVertical}
         requireManagers={requireManagers}
       />
     </div>

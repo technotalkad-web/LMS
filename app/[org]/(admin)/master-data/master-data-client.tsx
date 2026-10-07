@@ -2,15 +2,20 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Plus, X, ShieldCheck, Network } from "lucide-react";
+import { Plus, X, ShieldCheck, Network, Tags } from "lucide-react";
 
-export type OptionRow = { id: string; field: string; value: string };
+export type OptionRow = { id: string; field: string; value: string; parent_id?: string | null };
 
 const FIELDS: Array<{ key: string; label: string; hint: string }> = [
   {
     key: "business_vertical",
     label: "Business Vertical",
     hint: "Drives the Verticals leaderboard (e.g. Retail, Institutional, Fulfillment). Optional on profiles — unassigned users appear in an admin-only bucket.",
+  },
+  {
+    key: "department",
+    label: "Department",
+    hint: "Departments sit under a Business Vertical (e.g. Retail → Home Loan Sales). Optional on profiles; a person's department must belong to their vertical. Content can be mapped to a vertical + department.",
   },
   {
     key: "designation",
@@ -36,10 +41,13 @@ export function MasterDataClient({
   orgSlug,
   initialOptions,
   initialRequireManagers,
+  unmappedContent = null,
 }: {
   orgSlug: string;
   initialOptions: OptionRow[];
   initialRequireManagers: boolean;
+  /** 0096: active content with no vertical / department mapping (null before the migration). */
+  unmappedContent?: number | null;
 }) {
   const [options, setOptions] = useState<OptionRow[]>(initialOptions);
   const [requireManagers, setRequireManagers] = useState(initialRequireManagers);
@@ -47,15 +55,16 @@ export function MasterDataClient({
   const [busyField, setBusyField] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  async function addValue(field: string) {
-    const value = (drafts[field] ?? "").trim();
+  async function addValue(field: string, parentId?: string) {
+    const draftKey = parentId ? `${field}:${parentId}` : field;
+    const value = (drafts[draftKey] ?? "").trim();
     if (!value) return;
-    setBusyField(field);
+    setBusyField(draftKey);
     setError(null);
     const res = await fetch("/api/org-field-options", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ orgSlug, field, value }),
+      body: JSON.stringify({ orgSlug, field, value, ...(parentId ? { parent_id: parentId } : {}) }),
     });
     const j = (await res.json().catch(() => ({}))) as {
       option?: OptionRow;
@@ -69,7 +78,7 @@ export function MasterDataClient({
     setOptions((o) =>
       [...o, j.option!].sort((a, b) => a.value.localeCompare(b.value))
     );
-    setDrafts((d) => ({ ...d, [field]: "" }));
+    setDrafts((d) => ({ ...d, [draftKey]: "" }));
   }
 
   async function removeValue(id: string) {
@@ -176,9 +185,83 @@ export function MasterDataClient({
         </Link>
       </section>
 
+      {/* Content mapping (0096) */}
+      <section className="border border-line rounded-lg bg-paper p-5 flex items-start justify-between gap-4">
+        <div className="flex items-start gap-3">
+          <Tags className="w-5 h-5 text-indigo-600 mt-0.5 shrink-0" />
+          <div>
+            <h2 className="font-semibold text-sm">Content mapping</h2>
+            <p className="text-xs text-muted mt-1">
+              Map every course, learning path and journey to the Business Vertical + Department it belongs to.
+              {unmappedContent === null ? " Needs migration 0096." : unmappedContent > 0 ? ` ${unmappedContent} active item${unmappedContent === 1 ? "" : "s"} still unmapped.` : " Everything is mapped."}
+            </p>
+          </div>
+        </div>
+        <Link
+          href={`/${orgSlug}/master-data/content-mapping`}
+          className="shrink-0 inline-flex items-center px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90"
+        >
+          Open
+        </Link>
+      </section>
+
       {/* Per-field master lists */}
       {FIELDS.map((f) => {
         const values = options.filter((o) => o.field === f.key);
+        if (f.key === "department") {
+          const verticals = options.filter((o) => o.field === "business_vertical");
+          return (
+            <section key={f.key} className="border border-line rounded-lg bg-paper p-5">
+              <div className="flex items-baseline justify-between mb-1">
+                <h2 className="font-semibold text-sm">{f.label}</h2>
+                <span className={`text-[10px] uppercase tracking-wider font-semibold px-2 py-0.5 rounded-full ${values.length > 0 ? "bg-indigo-50 text-indigo-700" : "bg-canvas text-muted"}`}>
+                  {values.length > 0 ? `Enforced · ${values.length} value${values.length === 1 ? "" : "s"}` : "Free text"}
+                </span>
+              </div>
+              <p className="text-xs text-muted mb-3">{f.hint}</p>
+              {verticals.length === 0 ? (
+                <p className="text-xs text-muted">Add a Business Vertical first.</p>
+              ) : (
+                <div className="space-y-3">
+                  {verticals.map((v) => {
+                    const depts = values.filter((d) => d.parent_id === v.id);
+                    const draftKey = `department:${v.id}`;
+                    return (
+                      <div key={v.id} className="border border-line rounded-lg p-3" data-testid={`department-group-${v.value}`}>
+                        <div className="text-xs font-semibold mb-2">{v.value}</div>
+                        {depts.length > 0 && (
+                          <ul className="flex flex-wrap gap-2 mb-2">
+                            {depts.map((d) => (
+                              <li key={d.id} className="inline-flex items-center gap-1.5 border border-line bg-canvas rounded-full pl-3 pr-1.5 py-1 text-sm">
+                                {d.value}
+                                <button type="button" onClick={() => removeValue(d.id)} title={`Remove ${d.value}`} className="p-0.5 rounded-full text-muted hover:text-red-600 hover:bg-red-50">
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        <form onSubmit={(e) => { e.preventDefault(); addValue("department", v.id); }} className="flex gap-2">
+                          <input
+                            type="text"
+                            value={drafts[draftKey] ?? ""}
+                            onChange={(e) => setDrafts((d) => ({ ...d, [draftKey]: e.target.value }))}
+                            placeholder={`Add a department under ${v.value}`}
+                            aria-label={`Add a department under ${v.value}`}
+                            className="flex-1 px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+                          />
+                          <button type="submit" disabled={busyField === draftKey || !(drafts[draftKey] ?? "").trim()} className="inline-flex items-center gap-1.5 px-4 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50">
+                            <Plus className="w-4 h-4" /> Add
+                          </button>
+                        </form>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          );
+        }
         return (
           <section key={f.key} className="border border-line rounded-lg bg-paper p-5">
             <div className="flex items-baseline justify-between mb-1">

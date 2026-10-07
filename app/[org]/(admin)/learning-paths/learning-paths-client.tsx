@@ -1,5 +1,8 @@
 "use client";
 
+import { ScopePicker, type ScopeOptions } from "../_components/scope-picker";
+import type { ContentScopes } from "@/lib/content/scopes";
+
 
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
@@ -77,6 +80,8 @@ export function LearningPathsClient({
   teamOptions,
   groupOptions = [],
   scoringRules = {},
+  scopesByPath = {},
+  scopeOptions,
 }: {
   orgSlug: string;
   paths: PathRow[];
@@ -89,6 +94,10 @@ export function LearningPathsClient({
   groupOptions?: GroupOption[];
   /** 0073: explicit attempt scoring rule per path id. */
   scoringRules?: Record<string, ScoringRule>;
+  /** 0096: where each path belongs. */
+  scopesByPath?: Record<string, ContentScopes>;
+  /** 0096: master data for the mapping picker and "assign to vertical". */
+  scopeOptions?: ScopeOptions;
 }) {
   const router = useRouter();
   const toast = useToast();
@@ -110,6 +119,8 @@ export function LearningPathsClient({
   const [pickedUser, setPickedUser] = useState<Record<string, string>>({});
   const [pickedTeam, setPickedTeam] = useState<Record<string, string>>({});
   const [pickedGroup, setPickedGroup] = useState<Record<string, string>>({});
+  const [pickedVertical, setPickedVertical] = useState<Record<string, string>>({});
+  const [pickedDepartment, setPickedDepartment] = useState<Record<string, string>>({});
   const [dueDates, setDueDates] = useState<Record<string, string>>({});
   const [showEnrollees, setShowEnrollees] = useState<Record<string, boolean>>({});
   const [editForm, setEditForm] = useState<
@@ -324,15 +335,19 @@ export function LearningPathsClient({
     team?: boolean;
     group?: boolean;
     org?: boolean;
+    /** 0096: assign to the picked vertical / department. */
+    scope?: boolean;
   }) {
     const userId = opts.user ? pickedUser[pathId] : null;
     const teamId = opts.team ? pickedTeam[pathId] : null;
     const groupId = opts.group ? pickedGroup[pathId] : null;
+    const vertical = opts.scope ? pickedVertical[pathId] : null;
     const dueAt = dueDates[pathId] || null;
 
     if (opts.user && !userId) return;
     if (opts.team && !teamId) return;
     if (opts.group && !groupId) return;
+    if (opts.scope && !vertical) return;
 
     const res = await fetch("/api/learning-path-assignments", {
       method: "POST",
@@ -344,14 +359,17 @@ export function LearningPathsClient({
         userIds: userId ? [userId] : [],
         teamIds: teamId ? [teamId] : [],
         groupIds: groupId ? [groupId] : [],
+        scopes: vertical ? [{ vertical, department: pickedDepartment[pathId] || null }] : [],
         dueAt,
       }),
     });
+    const j = (await res.json().catch(() => ({}))) as { error?: string; warnings?: string[] };
     if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
       toast.error(j.error ?? "Failed");
       return;
     }
+    for (const w of j.warnings ?? []) toast.info(`Assigned. ${w}`);
+    if (opts.scope) { setPickedVertical((s) => ({ ...s, [pathId]: "" })); setPickedDepartment((s) => ({ ...s, [pathId]: "" })); }
     if (opts.user) setPickedUser((s) => ({ ...s, [pathId]: "" }));
     if (opts.team) setPickedTeam((s) => ({ ...s, [pathId]: "" }));
     if (opts.group) setPickedGroup((s) => ({ ...s, [pathId]: "" }));
@@ -785,6 +803,13 @@ export function LearningPathsClient({
                             }))
                           }
                         />
+                        {/* Belongs to (0096) — saves on its own. */}
+                        {scopeOptions && (
+                          <div className="border border-line rounded-xl p-3">
+                            <div className="text-xs font-medium mb-2">Belongs to</div>
+                            <ScopePicker orgSlug={orgSlug} items={[{ type: "path", id: p.id }]} initial={scopesByPath[p.id] ?? { common: false, pairs: [] }} options={scopeOptions} compact />
+                          </div>
+                        )}
                         {/* Attempt scoring rules (0073) — saves on its own. */}
                         <ScoringRulesCard
                           orgSlug={orgSlug}
@@ -1082,6 +1107,41 @@ export function LearningPathsClient({
                             Add
                           </button>
                         </div>
+                        {scopeOptions && scopeOptions.verticals.length > 0 && (
+                          <div className="flex gap-2">
+                            <select
+                              value={pickedVertical[p.id] ?? ""}
+                              onChange={(e) => { const v = e.target.value; setPickedVertical((s) => ({ ...s, [p.id]: v })); setPickedDepartment((s) => ({ ...s, [p.id]: "" })); }}
+                              aria-label="Assign to business vertical"
+                              className="flex-1 px-3 py-1.5 border border-line rounded-xl bg-paper outline-none focus:border-ink text-sm"
+                            >
+                              <option value="">Assign to vertical...</option>
+                              {scopeOptions.verticals.map((v) => (
+                                <option key={v} value={v}>{v}</option>
+                              ))}
+                            </select>
+                            <select
+                              value={pickedDepartment[p.id] ?? ""}
+                              onChange={(e) => { const v = e.target.value; setPickedDepartment((s) => ({ ...s, [p.id]: v })); }}
+                              disabled={!pickedVertical[p.id] || (scopeOptions.departmentsByVertical[pickedVertical[p.id] ?? ""] ?? []).length === 0}
+                              aria-label="Assign to department"
+                              className="flex-1 px-3 py-1.5 border border-line rounded-xl bg-paper outline-none focus:border-ink text-sm disabled:opacity-50"
+                            >
+                              <option value="">Whole vertical</option>
+                              {(scopeOptions.departmentsByVertical[pickedVertical[p.id] ?? ""] ?? []).map((d) => (
+                                <option key={d} value={d}>{d}</option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => assignPath(p.id, { scope: true })}
+                              disabled={!pickedVertical[p.id]}
+                              className="px-3 py-1.5 bg-ink text-canvas rounded-xl text-sm font-medium hover:opacity-90 disabled:opacity-50"
+                            >
+                              Add
+                            </button>
+                          </div>
+                        )}
                         {groupOptions.length > 0 && (
                           <div className="flex gap-2">
                             <select
