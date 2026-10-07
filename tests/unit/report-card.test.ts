@@ -105,8 +105,9 @@ console.log("\nexceptions (§3): severity first, max five, content + actions");
   ]);
   const failed = g.find((x) => x.kind === "failed")!;
   eq("failed group names the module and the people (worst first)", [failed.content?.title, failed.people.map((p) => p.name)], ["Objection Handling", ["Arjun", "Meera"]]);
-  const grant = failed.actions.find((a) => a.kind === "grant");
-  eq("grant action excludes a learner who already holds an open grant", grant && grant.kind === "grant" ? grant.userIds : null, ["arjun"]);
+  const tk = failed.actions.find((a) => a.kind === "ticket");
+  eq("ticket (grant retry) names only learners without an open grant, with the module", tk && tk.kind === "ticket" ? [tk.category, tk.people.map((p) => p.userId), tk.content?.id, tk.exception] : null, ["grant_retry", ["arjun"], "c1", "failed"]);
+  eq("no direct grant action exists any more (decision 12)", failed.actions.some((a) => (a as { kind: string }).kind === "grant"), false);
   eq("not_started dropped by the cap (lowest severity, count 1)", g.some((x) => x.kind === "not_started"), false);
   eq("names can be hidden for non-L1 views", buildExceptions(team, { orgSlug: "acme", namesVisible: false })[1].people[0].name, "A team member");
   eq("stuck group links to the stuck filter", g.find((x) => x.kind === "stuck")?.actions.find((a) => a.kind === "link"), { kind: "link", label: "View learners", href: "/acme/team-performance?status=stuck" });
@@ -122,9 +123,9 @@ console.log("\nexceptions (§3): severity first, max five, content + actions");
     learner({ userId: "sahil", name: "Sahil", flags: [flag("failed", "critical", "c2", "Objection Handling")], courses: [l("c2", "Objection Handling", false)] }),
   ];
   const g = buildExceptions(team, { orgSlug: "acme" })[0];
-  const grant = g.actions.find((a) => a.kind === "grant");
+  const grant = g.actions.find((a) => a.kind === "ticket");
   eq("most common module across ALL failed flags", [g.count, g.content?.title], [3, "Objection Handling"]);
-  eq("grant targets = everyone who failed THAT module with the window used up", grant && grant.kind === "grant" ? [grant.courseId, grant.userIds.sort()] : null, ["c2", ["arjun", "meera"]]);
+  eq("ticket people = everyone who failed THAT module with the window used up", grant && grant.kind === "ticket" ? [grant.content?.id, grant.people.map((p) => p.userId).sort()] : null, ["c2", ["arjun", "meera"]]);
   // behind: the reminder goes only to people behind on the chosen journey
   const b = [
     learner({ userId: "a", flags: [flag("behind", "high", "j1", "30-day")] }),
@@ -188,11 +189,11 @@ console.log("\nL2 (§6): teams compared, team exceptions, common struggles");
   eq("team counts are PEOPLE with the flag", [A.failed, A.overdue, A.needsSupport, A.topFailed?.title, A.topFailed?.n], [2, 1, 1, "Objection Handling", 2]);
   eq("severity: bad score / 3 critical → critical; a clean team → none", [teamSeverity(A), teamSeverity(cards[2])], ["critical", null]);
   const ex = buildTeamExceptions(cards, { orgSlug: "acme", managerEmail: (id) => (id === "mgrA" ? "asha@x.test" : null) });
-  eq("team exceptions: Asha first with a why + review suggestion + open/email actions", [ex[0].managerId, /2 failed Objection Handling/.test(ex[0].summary), /1 overdue/.test(ex[0].summary), ex[0].suggestion, ex[0].actions.map((a) => a.label)], ["mgrA", true, true, "Review with Asha this week", ["Open team report", "Email Asha"]]);
+  eq("team exceptions: Asha first with a why + review suggestion + open/email actions", [ex[0].managerId, /2 failed Objection Handling/.test(ex[0].summary), /1 overdue/.test(ex[0].summary), ex[0].suggestion, ex[0].actions.map((a) => a.label)], ["mgrA", true, true, "Review with Asha this week", ["Open team report", "Email Asha", "Raise ticket"]]);
   eq("clean own team is not listed", ex.some((e) => e.managerId === "me"), false);
   const cs = buildCommonStruggles(teams, byId);
   eq("Objection Handling fails in 2 of 3 teams → content gap", [cs[0].title, cs[0].teamsAffected, cs[0].teamsFailing, cs[0].teamsTotal, cs[0].failed, cs[0].diagnosis], ["Objection Handling", 2, 2, 3, 3, "content"]);
-  eq("no email callback / non-direct manager → no mailto action", buildTeamExceptions(cards, { orgSlug: "acme", managerEmail: () => null })[0].actions.map((a) => a.label), ["Open team report"]);
+  eq("no email callback / non-direct manager → no mailto action; the ticket names the team's flagged people", (() => { const acts = buildTeamExceptions(cards, { orgSlug: "acme", managerEmail: () => null })[0].actions; const t = acts.find((x) => x.kind === "ticket"); return [acts.map((x) => x.label), t && t.kind === "ticket" ? t.people.map((p) => p.userId).sort() : null]; })(), [["Open team report", "Raise ticket"], ["a1", "a2"]]);
   eq("team link carries the page's query", buildTeamExceptions(cards, { orgSlug: "acme", query: "?period=90" })[0].actions[0], { kind: "link", label: "Open team report", href: "/acme/team-performance/team/mgrA?period=90" });
   // A person failed TWO modules in one team: still one failed person; the module tally counts both.
   const twice = [learner({ userId: "t1", flags: [flag("failed", "critical", "c1", "Alpha"), flag("failed", "critical", "c2", "Beta")], courses: [fl("c1", "Alpha"), fl("c2", "Beta")] })];

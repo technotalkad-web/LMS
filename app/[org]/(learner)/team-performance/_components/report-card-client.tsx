@@ -1,17 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
-import { BookPlus, Loader2, X } from "lucide-react";
-import { PERIODS, STATUS_FILTERS, type ExceptionAction } from "@/lib/manager/types";
+import { LifeBuoy, Loader2, X } from "lucide-react";
+import { PERIODS, STATUS_FILTERS, type ExceptionAction, type TicketPerson } from "@/lib/manager/types";
+import { TICKET_CATEGORIES, type TicketCategory } from "@/lib/tickets/types";
 
 /**
  * Client pieces of the Report Card: URL-driven filters (the server re-derives
  * everything, so views are shareable), the action buttons behind each
- * exception (send reminder / grant retry), and the assign-a-course dialog.
- * Every action re-checks the hierarchy on the server; the browser only names
- * people it was shown.
+ * exception (send reminder, or raise a support ticket with the context —
+ * decision 12: managers view, analyse and support; admins act), and the
+ * compare picker. Every action re-checks the hierarchy on the server; the
+ * browser only names people it was shown.
  */
 
 export type ContentOption = { value: string; label: string };
@@ -121,8 +123,8 @@ type ActionResult = { results?: Array<{ userId: string; status: string; reason?:
 function summarize(r: ActionResult, verb: string): string {
   if (r.error) return r.error;
   const rs = r.results ?? [];
-  const did = rs.filter((x) => x.status === "sent" || x.status === "granted" || x.status === "assigned").length;
-  const skipped = rs.filter((x) => x.status !== "sent" && x.status !== "granted" && x.status !== "assigned");
+  const did = rs.filter((x) => x.status === "sent").length;
+  const skipped = rs.filter((x) => x.status !== "sent");
   const reasons = [...new Set(skipped.map((x) => x.reason).filter(Boolean))];
   return `${verb} ${did}` + (skipped.length ? ` · ${skipped.length} skipped${reasons.length ? ` (${reasons.join("; ")})` : ""}` : "") + ".";
 }
@@ -137,20 +139,19 @@ export function ActionButton({ orgSlug, action, primary }: { orgSlug: string; ac
 
   if (action.kind === "link") return <a href={action.href} className={cls}>{action.label}</a>;
   if (action.kind === "report") return <a href={`/${orgSlug}/team-performance/${action.userId}`} className={cls}>{action.label}</a>;
+  if (action.kind === "ticket") {
+    return <RaiseTicketButton orgSlug={orgSlug} label={action.label} category={action.category} people={action.people} content={action.content} exception={action.exception} origin="team-performance" primary={primary} />;
+  }
 
   const run = async () => {
     setBusy(true);
     setNote(null);
     setConfirming(false);
-    const path = action.kind === "grant" ? "/api/manager/grant" : "/api/manager/remind";
-    const body =
-      action.kind === "grant"
-        ? { orgSlug, userIds: action.userIds, courseId: action.courseId }
-        : { orgSlug, userIds: action.userIds, target: action.target, contentId: action.contentId };
+    const body = { orgSlug, userIds: action.userIds, target: action.target, contentId: action.contentId };
     try {
-      const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const res = await fetch("/api/manager/remind", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       const j = (await res.json().catch(() => ({}))) as ActionResult;
-      setNote(res.ok ? summarize(j, action.kind === "grant" ? "Granted" : "Sent") : j.error ?? "Something went wrong");
+      setNote(res.ok ? summarize(j, "Sent") : j.error ?? "Something went wrong");
       if (res.ok) router.refresh();
     } catch {
       setNote("Network error — please try again");
@@ -163,9 +164,7 @@ export function ActionButton({ orgSlug, action, primary }: { orgSlug: string; ac
     <span className="inline-flex flex-wrap items-center gap-1.5">
       {confirming ? (
         <>
-          <span className="text-xs">
-            {action.kind === "grant" ? `Grant 1 extra attempt to ${action.userIds.length}?` : `Email ${action.userIds.length} now?`}
-          </span>
+          <span className="text-xs">{`Email ${action.userIds.length} now?`}</span>
           <button type="button" className={btnPrimary} onClick={run}>Yes</button>
           <button type="button" className={btnSecondary} aria-label="Cancel" onClick={() => setConfirming(false)}><X className="w-3 h-3" /></button>
         </>
@@ -180,33 +179,53 @@ export function ActionButton({ orgSlug, action, primary }: { orgSlug: string; ac
   );
 }
 
-export function AssignCourseDialog({
+export type TicketContent = { kind: "course" | "journey" | "path"; id: string; title: string } | null;
+
+/**
+ * "Raise ticket": opens the support form with the Report Card context already
+ * filled in — the people (locked when the exception names them, pickable from
+ * the team otherwise), the content and the exception. The server re-checks
+ * every id against the manager's hierarchy. After a successful raise the
+ * button turns into a confirmation with a link to Help & Support.
+ */
+export function RaiseTicketButton({
   orgSlug,
-  courses,
-  team,
-  preselected = [],
-  label = "Assign a course",
+  label,
+  category,
+  people,
+  team = [],
+  content,
+  exception,
+  origin,
+  primary = false,
 }: {
   orgSlug: string;
-  courses: ContentOption[];
-  team: TeamMember[];
-  preselected?: string[];
-  label?: string;
+  label: string;
+  category: TicketCategory;
+  /** Pre-filled people (locked). */
+  people: TicketPerson[];
+  /** When `people` is empty, the manager may pick from this list. */
+  team?: TeamMember[];
+  content: TicketContent;
+  exception: string | null;
+  origin: string;
+  primary?: boolean;
 }) {
-  const router = useRouter();
   const [open, setOpen] = useState(false);
-  const [courseId, setCourseId] = useState("");
+  const [cat, setCat] = useState<TicketCategory>(category);
+  const [priority, setPriority] = useState<"low" | "normal" | "high">("normal");
+  const [note, setNote] = useState("");
   const [dueAt, setDueAt] = useState("");
-  const [picked, setPicked] = useState<Set<string>>(new Set(preselected.length ? preselected : team.map((t) => t.userId)));
+  const [picked, setPicked] = useState<Set<string>>(new Set(people.map((p) => p.userId)));
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
-  // The overlay is portalled to <body>: the learner shell animates page
-  // children with a transform, which would turn a fixed overlay rendered in
-  // place into a box clipped to its (animated) ancestor.
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  // Portalled to <body>: the learner shell animates page children with a
+  // transform, which would clip a fixed overlay rendered in place.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   useDialogKeys(open, () => setOpen(false));
-
+  const locked = people.length > 0;
   const toggle = (id: string) =>
     setPicked((p) => {
       const n = new Set(p);
@@ -214,73 +233,134 @@ export function AssignCourseDialog({
       else n.add(id);
       return n;
     });
+  const names = locked ? people : team.filter((t) => picked.has(t.userId)).map((t) => ({ userId: t.userId, name: t.name }));
+  const needsPeople = cat === "grant_retry" || cat === "assign_content" || cat === "extend_due";
 
   const submit = async () => {
     setBusy(true);
-    setNote(null);
+    setError(null);
     try {
-      const res = await fetch("/api/manager/assign", {
+      const res = await fetch("/api/tickets", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ orgSlug, userIds: [...picked], courseId, dueAt: dueAt || null }),
+        body: JSON.stringify({
+          orgSlug,
+          body: note,
+          priority,
+          category: cat,
+          context: {
+            userIds: names.map((p) => p.userId),
+            contentKind: content?.kind ?? null,
+            contentId: content?.id ?? null,
+            exception,
+            origin,
+            dueAt: cat === "extend_due" && dueAt ? dueAt : null,
+          },
+        }),
       });
-      const j = (await res.json().catch(() => ({}))) as ActionResult;
-      setNote(res.ok ? summarize(j, "Assigned") : j.error ?? "Something went wrong");
-      if (res.ok) router.refresh();
+      const j = (await res.json().catch(() => ({}))) as { id?: string; subject?: string; error?: string };
+      if (!res.ok) { setError(j.error ?? "Something went wrong"); return; }
+      setDone(j.subject ?? "Ticket raised");
+      setOpen(false);
     } catch {
-      setNote("Network error — please try again");
+      setError("Network error — please try again");
     } finally {
       setBusy(false);
     }
   };
 
+  if (done) {
+    return (
+      <span role="status" className="inline-flex flex-wrap items-center gap-1.5 text-xs text-muted">
+        Ticket raised: {done} · <a href={`/${orgSlug}/support`} className="underline">Track it in Help &amp; Support</a>
+        · <button type="button" className="underline" onClick={() => { setDone(null); setNote(""); }}>Raise another</button>
+      </span>
+    );
+  }
+  // Requests that need named people are offered only when people can be named.
+  const canNamePeople = locked || team.length > 0;
+  const categories = TICKET_CATEGORIES.filter((c) => canNamePeople || (c.value !== "grant_retry" && c.value !== "assign_content" && c.value !== "extend_due"));
   return (
     <>
-      <button type="button" className={btnSecondary} onClick={() => setOpen(true)}>
-        <BookPlus className="w-3.5 h-3.5" /> {label}
+      <button type="button" className={primary ? btnPrimary : btnSecondary} onClick={() => setOpen(true)}>
+        <LifeBuoy className="w-3.5 h-3.5" /> {label}
+        {locked && people.length > 1 ? ` (${people.length})` : ""}
       </button>
       {open && mounted && createPortal(
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Assign a course">
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Raise a support ticket">
           <div className="bg-paper border border-line rounded-2xl w-full max-w-lg p-5 space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-start justify-between gap-3">
-              <h2 className="font-semibold">Assign a course</h2>
+              <div>
+                <h2 className="font-semibold">Raise a support ticket</h2>
+                <p className="text-xs text-muted mt-0.5">Your admin reviews it and takes the action. You will be emailed with the outcome.</p>
+              </div>
               <button type="button" aria-label="Dismiss" autoFocus className="p-1 rounded-lg hover:bg-canvas" onClick={() => setOpen(false)}><X className="w-4 h-4" /></button>
             </div>
+
+            <div className="rounded-xl bg-canvas/70 border border-line p-3 text-xs space-y-1">
+              <div className="text-[10px] uppercase tracking-wide text-muted">Context (from your Report Card)</div>
+              {content && <div><span className="text-muted">{content.kind === "journey" ? "Journey" : content.kind === "path" ? "Learning path" : "Course"}:</span> {content.title}</div>}
+              {exception && <div><span className="text-muted">Flagged as:</span> {exception.replace(/_/g, " ")}</div>}
+              {locked && (
+                <div>
+                  <span className="text-muted">{people.length === 1 ? "Employee" : "Employees"}:</span>{" "}
+                  {people.some((p) => p.name)
+                    ? `${people.slice(0, 8).map((p) => p.name || "—").join(", ")}${people.length > 8 ? ` +${people.length - 8}` : ""}`
+                    : `${people.length} ${people.length === 1 ? "person" : "people"} from this team (named on the ticket)`}
+                </div>
+              )}
+              {!content && !exception && !locked && <div className="text-muted">No specific employee or content — describe the issue below.</div>}
+            </div>
+
+            {!locked && team.length > 0 && (
+              <fieldset className="text-xs">
+                <legend className="text-[10px] uppercase tracking-wide text-muted mb-1">Employees ({picked.size} of {team.length})</legend>
+                <div className="flex gap-2 mb-1">
+                  <button type="button" className="underline text-muted" onClick={() => setPicked(new Set(team.map((t) => t.userId)))}>All</button>
+                  <button type="button" className="underline text-muted" onClick={() => setPicked(new Set())}>None</button>
+                </div>
+                <ul className="max-h-40 overflow-y-auto divide-y divide-line border border-line rounded-lg">
+                  {team.map((t) => (
+                    <li key={t.userId}>
+                      <label className="flex items-center gap-2 px-3 py-1.5 cursor-pointer">
+                        <input type="checkbox" checked={picked.has(t.userId)} onChange={() => toggle(t.userId)} />
+                        {t.name}
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </fieldset>
+            )}
+
             <label className="block text-xs">
-              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Course</span>
-              <select value={courseId} onChange={(e) => setCourseId(e.target.value)} className={`${selectCls} w-full`}>
-                <option value="">Select a course…</option>
-                {courses.map((c) => (
+              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Request</span>
+              <select value={cat} onChange={(e) => setCat(e.target.value as TicketCategory)} className={`${selectCls} w-full`}>
+                {categories.map((c) => (
                   <option key={c.value} value={c.value}>{c.label}</option>
                 ))}
               </select>
             </label>
+            {cat === "extend_due" && (
+              <label className="block text-xs">
+                <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">New due date</span>
+                <input type="date" value={dueAt} onChange={(e) => setDueAt(e.target.value)} className={`${selectCls} w-full`} />
+              </label>
+            )}
             <label className="block text-xs">
-              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Due date (optional)</span>
-              <input type="date" value={dueAt} onChange={(e) => setDueAt(e.target.value)} className={`${selectCls} w-full`} />
+              <span className="block text-[10px] uppercase tracking-wide text-muted mb-0.5">Note for your admin</span>
+              <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3} placeholder="What you observed and what you are asking for…" className="w-full px-3 py-2 border border-line rounded-lg bg-paper text-sm" />
             </label>
-            <fieldset className="text-xs">
-              <legend className="text-[10px] uppercase tracking-wide text-muted mb-1">Who ({picked.size} of {team.length})</legend>
-              <div className="flex gap-2 mb-1">
-                <button type="button" className="underline text-muted" onClick={() => setPicked(new Set(team.map((t) => t.userId)))}>All</button>
-                <button type="button" className="underline text-muted" onClick={() => setPicked(new Set())}>None</button>
-              </div>
-              <ul className="max-h-48 overflow-y-auto divide-y divide-line border border-line rounded-lg">
-                {team.map((t) => (
-                  <li key={t.userId}>
-                    <label className="flex items-center gap-2 px-3 py-1.5 cursor-pointer">
-                      <input type="checkbox" checked={picked.has(t.userId)} onChange={() => toggle(t.userId)} />
-                      {t.name}
-                    </label>
-                  </li>
-                ))}
-              </ul>
-            </fieldset>
-            {note && <p role="status" className="text-xs text-muted">{note}</p>}
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-[10px] uppercase tracking-wide text-muted">Priority</span>
+              {(["low", "normal", "high"] as const).map((p) => (
+                <button key={p} type="button" aria-pressed={priority === p} onClick={() => setPriority(p)} className={`px-2.5 py-1 rounded-lg border ${priority === p ? "border-ink bg-ink text-canvas" : "border-line"}`}>{p}</button>
+              ))}
+            </div>
+            {error && <p role="alert" className="text-xs text-red-700">{error}</p>}
             <div className="flex justify-end gap-2">
               <button type="button" className={btnSecondary} onClick={() => setOpen(false)}>Close</button>
-              <button type="button" className={btnPrimary} disabled={busy || !courseId || picked.size === 0} onClick={submit}>
-                {busy && <Loader2 className="w-3 h-3 animate-spin" />} Assign to {picked.size}
+              <button type="button" className={btnPrimary} disabled={busy || (needsPeople && names.length === 0) || (cat === "extend_due" && !dueAt) || (!content && !locked && names.length === 0 && !note.trim())} onClick={submit}>
+                {busy && <Loader2 className="w-3 h-3 animate-spin" />} Raise ticket
               </button>
             </div>
           </div>
@@ -294,16 +374,21 @@ export function AssignCourseDialog({
 /** §8 Compare: pick two or three teams, open the side-by-side page. */
 /** Escape closes an open dialog; focus moves into it on open and back to the trigger on close. */
 function useDialogKeys(open: boolean, onClose: () => void) {
+  // The callback is read through a ref so an inline arrow does not re-run the
+  // effect on every render (which would move focus back to the trigger on
+  // each keystroke inside the dialog).
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement as HTMLElement | null;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeRef.current(); };
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
       previous?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 }
 
 export function ComparePicker({

@@ -2,11 +2,8 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { notifyBackground } from "@/lib/notifications/send";
-import { resolveEmails } from "@/lib/users/emails";
-import { DEFAULT_POLICY, computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
-import { resolvePolicy } from "@/lib/scoring/resolve";
-import { fetchGrantRetakeIdsForUsers, fetchPassRequired } from "@/lib/scoring/attempt-kind";
-import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from "@/lib/attempts/requests";
+import { type ActionError, type PerLearnerResult } from "@/lib/actions/types";
+import { namesAndEmails } from "@/lib/users/people";
 import {
   DEFAULT_JOURNEY_TZ,
   computeJourneyState,
@@ -19,12 +16,14 @@ import { loadManagerContext, partitionByScope, type ManagerContext } from "./acc
 import { computeLearnerInsights } from "./insights";
 
 /**
- * Manager actions (decision 6): send a reminder now, grant a retry, assign a
- * course — each a MANAGER-SCOPED wrapper around behaviour the admin APIs and
- * crons already have. The pattern is the one every manager surface uses:
- * verify the session, resolve the viewer's people on the server from the
- * three hierarchy fields, refuse the whole request if any target is outside
- * them (never a partial leak), then write on the service role.
+ * Manager actions. Since Phase 4a (approved addendum, decision 12) managers
+ * VIEW + ANALYSE + SUPPORT: the only direct action left is "send a reminder
+ * now" (decision 13). Grant retry and assign a course were withdrawn — a
+ * manager raises a support ticket with the context and an admin acts from it
+ * (lib/tickets/*). The pattern stays: verify the session, resolve the viewer's
+ * people on the server from the three hierarchy fields, refuse the whole
+ * request if any target is outside them (never a partial leak), then write
+ * on the service role.
  */
 
 export type ManagerActionContext = {
@@ -35,7 +34,7 @@ export type ManagerActionContext = {
   origin: string;
 };
 
-export type ActionError = { error: string; status: 400 | 401 | 403 | 404 | 409 };
+export type { ActionError, PerLearnerResult } from "@/lib/actions/types";
 
 const svcClient = () =>
   createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
@@ -90,18 +89,6 @@ function requireAllInScope(a: ManagerActionContext, userIds: unknown): ActionErr
   return ids;
 }
 
-/** End of a calendar day in the org's time zone, as an ISO instant. */
-function endOfDayInTz(date: string, tz: string): Date {
-  // Find the UTC instant at which `date 23:59:59` occurs in `tz` by measuring the zone offset at that moment.
-  const guess = new Date(`${date}T23:59:59Z`);
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })
-    .formatToParts(guess)
-    .reduce<Record<string, string>>((acc, p) => (p.type !== "literal" ? { ...acc, [p.type]: p.value } : acc), {});
-  const local = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour % 24, +parts.minute, +parts.second);
-  const offsetMs = local - guess.getTime();
-  return new Date(guess.getTime() - offsetMs);
-}
-
 async function orgTimezone(svc: SupabaseClient, orgId: string): Promise<string> {
   const { data } = await svc.from("gamification_settings").select("timezone").eq("organization_id", orgId).maybeSingle();
   return (data as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
@@ -117,17 +104,6 @@ async function orgCourse(svc: SupabaseClient, orgId: string, courseId: string | 
     .maybeSingle();
   return (data as { id: string; title: string; is_active: boolean } | null) ?? null;
 }
-
-async function namesAndEmails(svc: SupabaseClient, ids: string[]) {
-  const { data } = await svc.from("profiles").select("id, first_name, last_name, email").in("id", ids);
-  const out = new Map<string, { name: string; email: string | null }>();
-  for (const p of (data ?? []) as Array<{ id: string; first_name: string | null; last_name: string | null; email: string | null }>) {
-    out.set(p.id, { name: [p.first_name, p.last_name].filter(Boolean).join(" ").trim() || p.email?.split("@")[0] || "there", email: p.email });
-  }
-  return out;
-}
-
-export type PerLearnerResult = { userId: string; status: "sent" | "skipped" | "failed" | "granted" | "assigned" | "already"; reason?: string };
 
 /** A send that did not go out, in words the manager can act on. */
 function sendReason(status: string | undefined): string {
@@ -326,198 +302,4 @@ export async function sendReminders(
     }
   }
   return { results };
-}
-
-// ---------------------------------------------------------------------------
-// 2. Grant a retry (one extra official attempt), per learner
-// ---------------------------------------------------------------------------
-
-export async function grantRetries(
-  a: ManagerActionContext,
-  body: { userIds?: string[]; courseId?: string; expires_in_days?: number | null }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string }> {
-  const ids = requireAllInScope(a, body.userIds ?? []);
-  if (isActionError(ids)) return ids;
-  const course = await orgCourse(a.svc, a.org.id, body.courseId);
-  if (!course) return { error: "Course not found", status: 404 };
-
-  const { data: verRows } = await a.svc.from("course_versions").select("id").eq("course_id", course.id);
-  const verIds = ((verRows ?? []) as Array<{ id: string }>).map((v) => v.id);
-  type Att = ScorableAttempt & { user_id: string };
-  const attempts: Att[] = [];
-  if (verIds.length) {
-    for (let from = 0; ; from += 1000) {
-      const { data } = await a.svc
-        .from("course_attempts")
-        .select("id, user_id, score, started_at, completed_at, completion_status, success_status")
-        .eq("organization_id", a.org.id)
-        .in("user_id", ids)
-        .in("course_version_id", verIds)
-        .order("id")
-        .range(from, from + 999);
-      const page = (data ?? []) as Att[];
-      attempts.push(...page);
-      if (page.length < 1000) break;
-    }
-  }
-  const byUser = new Map<string, Att[]>();
-  for (const x of attempts) byUser.set(x.user_id, [...(byUser.get(x.user_id) ?? []), x]);
-  const policy = (await resolvePolicy(a.svc, course.id).catch(() => DEFAULT_POLICY)) ?? DEFAULT_POLICY;
-  const passRequired = (await fetchPassRequired(a.svc, [course.id])).has(course.id);
-  const retakes = await fetchGrantRetakeIdsForUsers(a.svc, a.org.id, ids);
-
-  // A lapsed grant (approved, unused, expired) still occupies the one-open
-  // slot; close it so a new grant can be made.
-  await a.svc
-    .from("attempt_requests")
-    .update({ status: "expired" })
-    .eq("organization_id", a.org.id)
-    .eq("course_id", course.id)
-    .in("user_id", ids)
-    .eq("status", "approved")
-    .is("used_at", null)
-    .lt("expires_at", new Date().toISOString())
-    .then(({ error }) => {
-      // Pre-0092 the status CHECK has no 'expired' → the lapsed row stays and the learner is reported "already".
-      if (error && (error as { code?: string }).code !== "23514") console.warn("[manager/grant] expiry sweep:", error.message);
-    });
-  const { data: openRows } = await a.svc
-    .from("attempt_requests")
-    .select("user_id, status, used_at")
-    .eq("course_id", course.id)
-    .in("user_id", ids);
-  const open = new Set<string>();
-  for (const r of (openRows ?? []) as Array<{ user_id: string; status: string; used_at: string | null }>) {
-    if (r.status === "pending" || (r.status === "approved" && r.used_at === null)) open.add(r.user_id);
-  }
-
-  const results: PerLearnerResult[] = [];
-  const nowIso = new Date().toISOString();
-  // Only the admin UI's expiry choices are accepted (null = never).
-  const days = body.expires_in_days;
-  const expiresAt = expiryFromDays(days === null || (typeof days === "number" && GRANT_EXPIRY_CHOICES.includes(days)) ? days : undefined);
-  const people = await namesAndEmails(a.svc, ids);
-  for (const uid of ids) {
-    const mine = byUser.get(uid) ?? [];
-    const retakeIds = retakes.get(`${uid}:${course.id}`) ?? new Set<string>();
-    const sc = computeScoring(mine, policy, retakeIds);
-    const failed = sc.officialStatus === "failed" || (passRequired && sc.officialStatus !== null && sc.officialStatus !== "passed");
-    if (!sc.officialAttempt || !failed) { results.push({ userId: uid, status: "skipped", reason: "has not failed this module" }); continue; }
-    if (!sc.limitReached) { results.push({ userId: uid, status: "skipped", reason: "still has an official attempt available" }); continue; }
-    // A granted retake that is still in progress counts as the attempt they are using.
-    if (mine.some((x) => retakeIds.has(x.id) && !(x.completion_status === "completed" || x.success_status === "passed"))) {
-      results.push({ userId: uid, status: "skipped", reason: "a granted retake is still in progress" });
-      continue;
-    }
-    if (open.has(uid)) { results.push({ userId: uid, status: "already", reason: "already has an open request or grant" }); continue; }
-    const base = {
-      organization_id: a.org.id,
-      course_id: course.id,
-      user_id: uid,
-      status: "approved",
-      source: "manager",
-      decided_by: a.user.id,
-      decided_at: nowIso,
-      expires_at: expiresAt,
-    };
-    // Insert, degrading only as far as the database requires: pre-0092 the
-    // source CHECK rejects 'manager' (23514 → record it as a bulk-style grant;
-    // decided_by still names the manager), pre-0085 there is no
-    // attempts_used column (42703 → drop it).
-    let row: Record<string, unknown> = { ...base, attempts_used: sc.scoredAttempts };
-    let { error } = await a.svc.from("attempt_requests").insert(row);
-    for (let i = 0; error && i < 2; i++) {
-      const code = (error as { code?: string }).code;
-      if (code === "23514" && row.source === "manager") row = { ...row, source: "bulk" };
-      else if (code === "42703" && "attempts_used" in row) {
-        const { attempts_used: _dropped, ...rest } = row;
-        void _dropped;
-        row = rest;
-      } else break;
-      ({ error } = await a.svc.from("attempt_requests").insert(row));
-    }
-    if (error) {
-      results.push({ userId: uid, status: "failed", reason: (error as { code?: string }).code === "23505" ? "already has an open request or grant" : "the grant could not be saved" });
-      continue;
-    }
-    results.push({ userId: uid, status: "granted" });
-    const who = people.get(uid);
-    await notifyLearnerOfDecision(a.svc, {
-      orgId: a.org.id, orgName: a.org.name, orgSlug: a.org.slug, origin: a.origin,
-      courseId: course.id, courseTitle: course.title,
-      learner: { id: uid, email: who?.email ?? "" }, approved: true, note: null, expiresAt,
-    });
-  }
-  return { results, courseTitle: course.title };
-}
-
-// ---------------------------------------------------------------------------
-// 3. Assign a course
-// ---------------------------------------------------------------------------
-
-export async function assignCourse(
-  a: ManagerActionContext,
-  body: { userIds?: string[]; courseId?: string; dueAt?: string | null }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string }> {
-  const ids = requireAllInScope(a, body.userIds ?? []);
-  if (isActionError(ids)) return ids;
-  const course = await orgCourse(a.svc, a.org.id, body.courseId);
-  if (!course || !course.is_active) return { error: "Course not found", status: 404 };
-  let dueAt: string | null = null;
-  if (body.dueAt && body.dueAt.trim()) {
-    const raw = body.dueAt.trim();
-    // A date-only value means the END of that day in the org's time zone
-    // (so "due today" is allowed and nobody is overdue at 05:30 local).
-    const d = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? endOfDayInTz(raw, await orgTimezone(a.svc, a.org.id)) : new Date(raw);
-    if (Number.isNaN(d.getTime())) return { error: "dueAt must be a date", status: 400 };
-    if (d.getTime() < Date.now()) return { error: "Due date must be today or later", status: 400 };
-    dueAt = d.toISOString();
-  }
-  const results: PerLearnerResult[] = [];
-  const inserted: string[] = [];
-  for (const uid of ids) {
-    const { data, error } = await a.svc
-      .from("course_assignments")
-      .insert({
-        course_id: course.id, organization_id: a.org.id, assignee_type: "user", user_id: uid, team_id: null,
-        due_at: dueAt, release_at: null, assigned_by: a.user.id,
-      })
-      .select("id")
-      .maybeSingle();
-    if (data) { inserted.push(uid); results.push({ userId: uid, status: "assigned" }); continue; }
-    if (error && error.code === "23505") {
-      // Already assigned directly: a new due date reschedules, like the admin API.
-      if (dueAt) {
-        await a.svc.from("course_assignments").update({ due_at: dueAt })
-          .eq("course_id", course.id).eq("organization_id", a.org.id).eq("assignee_type", "user").eq("user_id", uid);
-      }
-      results.push({ userId: uid, status: "already", reason: dueAt ? "already assigned — due date updated" : "already assigned" });
-      continue;
-    }
-    results.push({ userId: uid, status: "failed", reason: error?.message ?? "insert failed" });
-  }
-  if (inserted.length) {
-    const emails = await resolveEmails(a.svc, inserted);
-    const people = await namesAndEmails(a.svc, inserted);
-    const link = a.origin ? `${a.origin}/${a.org.slug}/courses/${course.id}/launch` : `/${a.org.slug}/courses/${course.id}/launch`;
-    for (const uid of inserted) {
-      const email = emails.get(uid);
-      if (!email) continue;
-      await notifyBackground({
-        organizationId: a.org.id,
-        event: "asset_assignment",
-        to: { user_id: uid, email },
-        context: {
-          learner_name: people.get(uid)?.name ?? email,
-          learner_email: email,
-          course_name: course.title,
-          course_id: course.id,
-          org_name: a.org.name,
-          direct_link: link,
-          due_date: dueAt ? `Due ${dueAt.slice(0, 10)}.` : "No due date.",
-        },
-      });
-    }
-  }
-  return { results, courseTitle: course.title };
 }

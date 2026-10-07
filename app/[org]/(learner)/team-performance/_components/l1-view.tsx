@@ -11,7 +11,7 @@ import {
 import { SEVERITY_RANK, type LearnerInsight } from "@/lib/manager/types";
 import type { Catalog } from "@/lib/manager/insights";
 import { Card, Dot, Pill, SEVERITY_TONE, StatusPill, relativeDays } from "./ui";
-import { ActionButton, AssignCourseDialog, ReportFilters } from "./report-card-client";
+import { ActionButton, RaiseTicketButton, ReportFilters } from "./report-card-client";
 
 /**
  * The L1 screen (§4), as a component so it serves both the manager's own team
@@ -88,7 +88,7 @@ export function L1View(p: L1ViewProps) {
         </div>
         <div className="flex flex-wrap items-end gap-2">
           <ReportFilters orgSlug={orgSlug} basePath={basePath} current={current} contents={contents} />
-          <AssignCourseDialog orgSlug={orgSlug} courses={contents[2].options.map((o) => ({ value: o.value.slice(7), label: o.label }))} team={team} />
+          <RaiseTicketButton orgSlug={orgSlug} label="Raise a support ticket" category="other" people={[]} team={team} content={null} exception={null} origin={basePath} />
         </div>
       </header>
 

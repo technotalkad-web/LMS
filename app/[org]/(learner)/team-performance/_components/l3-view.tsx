@@ -3,7 +3,7 @@ import { buildOrgGaps, teamCards, teamScore, type TeamInput } from "@/lib/manage
 import type { LearnerInsight } from "@/lib/manager/types";
 import type { Catalog } from "@/lib/manager/insights";
 import { Card, Dot, Pill } from "./ui";
-import { ComparePicker, ReportFilters, type ExtraFilter } from "./report-card-client";
+import { ComparePicker, RaiseTicketButton, ReportFilters, type ExtraFilter } from "./report-card-client";
 import { contentOptions } from "./l1-view";
 
 /**
@@ -212,6 +212,11 @@ export function L3View(p: L3ViewProps) {
                     {g.advice}
                     {g.kind === "course" && g.orgFailRate !== null ? ` · org benchmark ${g.orgFailRate}%` : ""}
                   </p>
+                  {g.kind === "course" && (
+                    <div className="mt-1.5">
+                      <RaiseTicketButton orgSlug={orgSlug} label="Raise ticket · content problem" category="content_issue" people={[]} content={{ kind: "course", id: g.id, title: g.title }} exception={g.failed ? "failed" : g.notStarted ? "not_started" : null} origin="team-performance" />
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>

@@ -266,22 +266,30 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     if (a.assignee_type === "org") return userIds;
     return [];
   };
-  type AssignInfo = { due: string | null; assignedAt: string | null; viaPath: boolean };
+  type AssignInfo = { due: string | null; assignedAt: string | null; viaPath: boolean; direct: boolean };
   const assignedByUser = new Map<string, Map<string, AssignInfo>>();
   const pathsByUser = new Map<string, Map<string, { due: string | null; assignedAt: string | null }>>();
-  const addCourse = (uid: string, cid: string, due: string | null, at: string | null, viaPath: boolean) => {
+  // Due date: the earliest of the rows that reach the person — except that a
+  // DIRECT (per-person) assignment's date is the most specific and wins, so an
+  // admin can extend one person's date without touching the team's.
+  const addCourse = (uid: string, cid: string, due: string | null, at: string | null, viaPath: boolean, direct = false) => {
     const m = assignedByUser.get(uid) ?? new Map<string, AssignInfo>();
     const prev = m.get(cid);
+    const mergedDue = !prev ? due
+      : direct && !prev.direct ? due
+      : prev.direct && !direct ? prev.due
+      : due && (!prev.due || due < prev.due) ? due : prev.due;
     m.set(cid, {
-      due: prev ? (due && (!prev.due || due < prev.due) ? due : prev.due) : due,
+      due: mergedDue,
       assignedAt: prev ? minIso(prev.assignedAt, at) : at,
       viaPath: prev ? prev.viaPath && viaPath : viaPath,
+      direct: (prev?.direct ?? false) || direct,
     });
     assignedByUser.set(uid, m);
   };
   for (const a of courseAssigns) {
     if (!isReleased(a.release_at, nowMs) || !activeCourse.has(a.course_id)) continue;
-    for (const uid of targetsOf(a)) addCourse(uid, a.course_id, a.due_at, a.assigned_at, false);
+    for (const uid of targetsOf(a)) addCourse(uid, a.course_id, a.due_at, a.assigned_at, false, a.assignee_type === "user");
   }
   for (const a of pathAssigns) {
     if (!activePath.has(a.path_id)) continue;
