@@ -2,7 +2,7 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { ArrowLeft, BookOpen } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
+import { adminHome, roleLabel } from "@/lib/auth/permissions";
 import { ProfileDropdown } from "./_components/profile-dropdown";
 import { LearnerTopNav } from "./_components/learner-nav";
 import { MobileBottomNav } from "./_components/mobile-nav";
@@ -63,7 +63,7 @@ export default async function LearnerLayout({
   };
   const { org, user, role } = orgData;
   const impersonation = (orgData as { impersonation?: { expiresAt: string } | null }).impersonation;
-  const canSwitch = canManage(role) || canViewReports(role);
+  const home = adminHome(role);
   const brandColor = (org.brand_color as string | null) || "#4f46e5";
   const brandFont = (org.brand_font as string | null) || "inter";
 
@@ -280,7 +280,10 @@ export default async function LearnerLayout({
               displayName={displayName}
               avatarUrl={avatarUrl}
               roleLabel={roleLabel(role)}
-              canSwitchToAdmin={canSwitch}
+              canSwitchToAdmin={home !== null}
+              adminHref={home ? `/${org.slug}/${home.path}` : undefined}
+              adminLabel={home?.label}
+              adminHint={home?.hint}
               brandColor={brandColor}
             />
           </div>

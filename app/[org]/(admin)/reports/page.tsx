@@ -4,7 +4,6 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { officialStatuses, countsByCourse, hasOfficialResult, EMPTY_STATUS_COUNTS } from "@/lib/scoring/status";
 import { canViewReports } from "@/lib/auth/permissions";
-import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   AlertTriangle,
@@ -113,10 +112,18 @@ export default async function ReportsPage({
   const { org, role } = await requireOrgAccess(orgSlug);
 
   if (!canViewReports(role)) {
-    redirect(`/${orgSlug}/dashboard`);
+    redirect(`/${orgSlug}/dashboard?denied=1`);
   }
 
-  const supabase = await createClient();
+  // Aggregate with the service role AFTER the role gate (as Learner Analytics
+  // does): the SELECT policies on course_attempts / organization_members /
+  // course_assignments admit admins only, so a Data Analyst reading through
+  // their own session would see every KPI as 0 with no error.
+  const supabase = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
 
   const { data: courseRows } = await supabase
     .from("courses")

@@ -73,7 +73,7 @@ export const roleEntryRoutes: Record<Exclude<BotRole, "anonymous">, string[]> = 
     "/:org/notifications",
     "/:org/settings",
   ],
-  data_analyst: ["/:org/dashboard", "/:org/reports", "/:org/library"],
+  data_analyst: ["/:org/dashboard", "/:org/analytics", "/:org/reports", "/:org/library"],
   learner: [
     "/:org/dashboard",
     "/:org/courses",

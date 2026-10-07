@@ -16,6 +16,9 @@ export function ProfileDropdown({
   avatarUrl,
   roleLabel,
   canSwitchToAdmin,
+  adminHref,
+  adminLabel = "Switch to Admin View",
+  adminHint = "Manage workspace",
   brandColor = "#4f46e5",
 }: {
   orgSlug: string;
@@ -25,6 +28,10 @@ export function ProfileDropdown({
   avatarUrl?: string | null;
   roleLabel: string;
   canSwitchToAdmin: boolean;
+  /** Where the admin link lands (lib/auth/permissions adminHome): admins → Attention Center, analysts → Reports. */
+  adminHref?: string;
+  adminLabel?: string;
+  adminHint?: string;
   brandColor?: string;
 }) {
   const [open, setOpen] = useState(false);
@@ -112,15 +119,15 @@ export function ProfileDropdown({
           {/* Switch to admin */}
           {canSwitchToAdmin && (
             <Link
-              href={`/${orgSlug}/users`}
+              href={adminHref ?? `/${orgSlug}/attention`}
               onClick={() => setOpen(false)}
               role="menuitem"
               className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-canvas border-t border-line"
             >
               <Settings className="w-4 h-4 text-muted" />
               <span>
-                <span className="block font-medium">Switch to Admin View</span>
-                <span className="block text-xs text-muted">Manage workspace</span>
+                <span className="block font-medium">{adminLabel}</span>
+                <span className="block text-xs text-muted">{adminHint}</span>
               </span>
             </Link>
           )}
