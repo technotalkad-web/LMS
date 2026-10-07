@@ -86,6 +86,13 @@ console.log("\nintegrity (decision 9: block serious, warn minor)");
   const issues = checkIntegrity(org);
   eq("clean org has no blocking issues", issues.filter((i) => i.severity === "block").length, 0);
   eq("ceo/vp/mgr gaps are warnings only", issues.every((i) => i.severity === "warn" && i.code.startsWith("missing_")), true);
+  // Phase 4c (decision 14): a manager without a Business Vertical is warned about; with one, only a missing department (when departments exist).
+  eq("without vertical master values nobody is flagged for a missing vertical", issues.some((i) => i.code === "manager_no_vertical"), false);
+  const managers = new Set(checkIntegrity(org, { verticalsDefined: true }).filter((i) => i.code === "manager_no_vertical").map((i) => i.user_id));
+  eq("with verticals defined, every manager in the clean org (none set) is flagged manager_no_vertical", [...managers].sort(), [...new Set(org.flatMap((m) => [m.line_manager_id, m.indirect_manager_id, m.l3_manager_id].filter(Boolean)))].sort());
+  const withVertical = org.map((m) => ({ ...m, business_vertical: "Retail" }));
+  eq("vertical set → no vertical warning; departments undefined → no department warning", checkIntegrity(withVertical).filter((i) => i.code.startsWith("manager_no_")).length, 0);
+  eq("departments defined but none set → manager_no_department (warn)", checkIntegrity(withVertical, { departmentsDefined: true }).filter((i) => i.code === "manager_no_department").every((i) => i.severity === "warn") && checkIntegrity(withVertical, { departmentsDefined: true }).some((i) => i.code === "manager_no_department"), true);
 }
 {
   const bad = [m("a", "a"), m("b", "c"), m("c", "b"), m("d", "z"), m("e", "gone"), m("gone", null, null, null, "inactive")];

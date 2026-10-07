@@ -52,6 +52,8 @@ export type JourneyInsight = {
   /** Today's / the current mission's title, for the reminder and the card. */
   nextModule: string | null;
   onTrack: boolean;
+  /** Missions completed inside the period window (for the period summary). */
+  daysInPeriod: number;
 };
 
 export type CourseLine = {
@@ -78,6 +80,12 @@ export type CourseLine = {
   openGrant: boolean;
   /** The official window is used up — a grant is the only way to another official attempt. */
   limitReached: boolean;
+  /** Completion instant of the OFFICIAL attempt (decision 1), for the period counters. */
+  completedAt: string | null;
+  /** Done under the official rule incl. pass_required (what "completed" counts). */
+  done: boolean;
+  /** Reached by an assignment (not only attempted); what "assigned" counts. */
+  isAssigned: boolean;
 };
 
 export type PathLine = {

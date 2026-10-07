@@ -14,8 +14,9 @@ import {
 } from "@/lib/journey/journey";
 import { fetchActiveMembers, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
 import { isReleased } from "@/lib/learner/release";
-import { THRESHOLDS, riskOf, statusOf } from "./report-card";
-import type { CourseLine, ExceptionFlag, JourneyInsight, LearnerInsight, PathLine, Severity } from "./types";
+import { THRESHOLDS } from "./report-card";
+import { DAY, daysAgo, deriveLearner, fmtDay, maxIso, minIso } from "./derive";
+import type { CourseLine, JourneyInsight, LearnerInsight, PathLine } from "./types";
 
 /**
  * Per-learner insights for a SCOPED list of people (a manager's team), live.
@@ -105,7 +106,6 @@ type EnrRow = {
     | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
 };
 
-const DAY = 86400000;
 /** A relation that does not exist yet (pre-migration database) — the only read failure tolerated. */
 function isMissingRelation(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
@@ -119,11 +119,7 @@ const toScorable = (a: AttemptRow) => ({
   completion_status: a.completion_status,
   success_status: a.success_status,
 });
-const minIso = (a: string | null, b: string | null) => (!a ? b : !b ? a : a < b ? a : b);
-const maxIso = (a: string | null, b: string | null) => (!a ? b : !b ? a : a > b ? a : b);
-const daysAgo = (iso: string | null, nowMs: number): number | null =>
-  iso ? Math.floor((nowMs - new Date(iso).getTime()) / DAY) : null;
-const fmtDay = (iso: string) => iso.slice(0, 10);
+void fmtDay; void daysAgo;
 
 export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightOptions): Promise<InsightsResult> {
   const { orgId, orgSlug } = opts;
@@ -366,6 +362,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       courseDays: courseDaysOf(v.days, v.days_total).length,
       nextModule,
       onTrack: !active || (behind === 0 && !overdueDeadline),
+      daysInPeriod: 0, // per-period value is computed in the rollup
       dayCompletions: done,
       courseIds,
     };
@@ -399,12 +396,11 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const benchmark = await loadBenchmark(svc, courseIdList);
 
   /* ---- per-learner rollup (one data load, any number of period windows) ---- */
-  const activeCutoff = new Date(nowMs - THRESHOLDS.activeWindowDays * DAY).toISOString();
   const rollup = (periodDays: number | null): LearnerInsight[] => {
   const periodStart = periodDays === null ? null : new Date(nowMs - periodDays * DAY).toISOString();
   const prevStart = periodDays === null ? null : new Date(nowMs - 2 * periodDays * DAY).toISOString();
   const inPeriod = (iso: string | null) => !!iso && (periodStart === null || iso >= periodStart);
-  const inPrev = (iso: string | null) => !!iso && prevStart !== null && periodStart !== null && iso >= prevStart && iso < periodStart;
+  void prevStart;
 
   return userIds.map((uid): LearnerInsight => {
     const m = memberById.get(uid);
@@ -439,7 +435,6 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
 
     const courses: CourseLine[] = [];
     const stepDone = new Map<string, boolean>(); // official rule incl. pass_required, for path steps
-    let completedInPeriod = 0, completedInPrevPeriod = 0, passedFirstTimeInPeriod = 0;
     for (const cid of courseIds) {
       const list = byCourse.get(cid) ?? [];
       const info = assignedMap.get(cid);
@@ -483,21 +478,15 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
         nudges: nudges.get(`${uid}:${cid}`) ?? 0,
         openGrant: openGrants.has(`${uid}:${cid}`),
         limitReached: scoring.limitReached,
+        completedAt: officialCompletedAt,
+        done,
+        isAssigned: assignedMap.has(cid),
       });
-      if (inPeriod(officialCompletedAt)) completedInPeriod++;
-      if (inPrev(officialCompletedAt)) completedInPrevPeriod++;
-      if (passedFirstTime && inPeriod(officialCompletedAt)) passedFirstTimeInPeriod++;
     }
     courses.sort((a, b) => {
       const order = (c: CourseLine) => (c.status === "failed" || c.overdue ? 0 : c.status === "in_progress" ? 1 : c.status === "not_started" ? 2 : 3);
       return order(a) - order(b) || a.title.localeCompare(b.title);
     });
-
-    const assignedCourses = courses.filter((c) => assignedMap.has(c.courseId));
-    const assigned = assignedCourses.length;
-    const completed = assignedCourses.filter((c) => stepDone.get(c.courseId)).length;
-    const withResult = courses.filter((c) => c.officialScore !== null);
-    const avgScore = withResult.length ? Math.round(withResult.reduce((s, c) => s + (c.officialScore ?? 0), 0) / withResult.length) : null;
 
     const paths: PathLine[] = [];
     for (const [pid, info] of pathsByUser.get(uid) ?? new Map<string, { due: string | null; assignedAt: string | null }>()) {
@@ -508,66 +497,8 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       paths.push({ pathId: pid, name: pathName.get(pid) ?? "Learning path", stepsTotal: steps.length, stepsDone: doneN, dueAt: info.due, overdue: !!info.due && info.due < nowIso && doneN < steps.length });
     }
 
-    let journeyDaysInPeriod = 0;
-    for (const j of myJourneys) for (const d of j.dayCompletions) if (inPeriod(d)) journeyDaysInPeriod++;
-    const inactiveDays = daysAgo(lastActive, nowMs);
-    const earliestAssigned = [...assignedMap.entries()].reduce<string | null>((acc, [cid, i]) => (counts(cid) ? minIso(acc, i.assignedAt) : acc), null);
-
-    /* ---- §3 exception rules ---- */
-    const flags: ExceptionFlag[] = [];
-    for (const c of courses) {
-      if (c.status === "failed" || c.passRequiredUnmet) {
-        flags.push({ kind: "failed", severity: "critical", contentId: c.courseId, contentKind: "course", contentTitle: c.title,
-          detail: c.officialScore !== null ? `${c.title} · ${c.officialScore}%` : `${c.title} · not passed` });
-      }
-      if (c.overdue) {
-        flags.push({ kind: "overdue", severity: "critical", contentId: c.courseId, contentKind: "course", contentTitle: c.title,
-          detail: `${c.title} · due ${fmtDay(c.dueAt!)}` });
-      }
-      if (c.status === "in_progress") {
-        const openDays = daysAgo(c.startedAt, nowMs) ?? 0;
-        const idleDays = daysAgo(c.lastActivity, nowMs) ?? 0;
-        if ((openDays >= THRESHOLDS.stuckDays && (c.progressPct ?? 0) < THRESHOLDS.stuckPct) || idleDays >= THRESHOLDS.stuckIdleDays) {
-          flags.push({ kind: "stuck", severity: "high", contentId: c.courseId, contentKind: "course", contentTitle: c.title,
-            detail: `${c.title} · opened ${openDays}d ago${c.progressPct !== null ? `, ${c.progressPct}%` : ""}${idleDays >= THRESHOLDS.stuckIdleDays ? `, idle ${idleDays}d` : ""}` });
-        }
-      }
-      if (c.status === "not_started" && c.assignedAt && (daysAgo(c.assignedAt, nowMs) ?? 0) >= THRESHOLDS.notStartedDays) {
-        flags.push({ kind: "not_started", severity: "normal", contentId: c.courseId, contentKind: "course", contentTitle: c.title,
-          detail: `${c.title} · assigned ${daysAgo(c.assignedAt, nowMs)}d ago` });
-      }
-    }
-    for (const pth of paths) {
-      if (pth.overdue) flags.push({ kind: "overdue", severity: "critical", contentId: pth.pathId, contentKind: "path", contentTitle: pth.name, detail: `${pth.name} · due ${fmtDay(pth.dueAt!)}` });
-    }
-    for (const j of myJourneys) {
-      if (j.status !== "active") continue;
-      if (j.overdueDeadline || j.behind >= 1) {
-        const sev: Severity = j.overdueDeadline || j.behind >= THRESHOLDS.journeyEscalateBehind ? "critical" : "high";
-        flags.push({ kind: "behind", severity: sev, contentId: j.programId, contentKind: "journey", contentTitle: j.name,
-          detail: j.overdueDeadline ? `${j.name} · past deadline` : `${j.behind} day${j.behind === 1 ? "" : "s"} behind · next: ${j.nextModule ?? `Day ${j.day}`}` });
-      }
-    }
-    if (inactiveDays !== null && inactiveDays >= THRESHOLDS.inactiveDays) {
-      flags.push({ kind: "inactive", severity: inactiveDays >= THRESHOLDS.inactiveHighDays ? "high" : "normal", contentId: null, contentKind: null, contentTitle: null, detail: `no activity for ${inactiveDays} days` });
-    } else if (
-      inactiveDays === null &&
-      earliestAssigned &&
-      (daysAgo(earliestAssigned, nowMs) ?? 0) >= THRESHOLDS.inactiveDays &&
-      !flags.some((f) => f.kind === "not_started")
-    ) {
-      // Never active at all: one flag, not two — "not started" already says it
-      // when there is an assignment to start.
-      flags.push({ kind: "inactive", severity: "normal", contentId: null, contentKind: null, contentTitle: null, detail: "never active since being assigned" });
-    }
-    const maxNudges = Math.max(0, ...courses.map((c) => c.nudges));
-    const risk = riskOf(flags, inactiveDays, maxNudges);
-    const status = statusOf(flags, risk);
-    if (status === "needs_support") {
-      const distinct = [...new Set(flags.map((f) => f.kind))];
-      flags.push({ kind: "needs_support", severity: "critical", contentId: null, contentKind: null, contentTitle: null,
-        detail: distinct.map((k) => k.replace("_", " ")).join(" · ") });
-    }
+    const journeys = myJourneys.map(({ dayCompletions, courseIds: _c, ...j }) => { void _c; return { ...j, daysInPeriod: dayCompletions.filter((d) => inPeriod(d)).length }; });
+    const derived = deriveLearner({ courses, paths, journeys, lastActive, periodDays, nowMs });
 
     return {
       userId: uid,
@@ -580,25 +511,11 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       vertical: m?.business_vertical ?? null,
       department: m?.department ?? null,
       joined: m?.date_of_joining ?? null,
-      assigned,
-      completed,
-      completionPct: assigned > 0 ? Math.round((completed / assigned) * 100) : null,
-      avgScore,
-      assessmentsWithResult: withResult.length,
-      passedFirstTime: courses.filter((c) => c.passedFirstTime).length,
       lastActive,
-      inactiveDays,
-      activeLast7d: !!lastActive && lastActive >= activeCutoff,
-      journeys: myJourneys.map(({ dayCompletions: _d, courseIds: _c, ...j }) => { void _d; void _c; return j; }),
+      journeys,
       courses,
       paths,
-      flags,
-      risk,
-      status,
-      completedInPeriod,
-      passedFirstTimeInPeriod,
-      journeyDaysInPeriod,
-      completedInPrevPeriod,
+      ...derived,
     };
   });
   };

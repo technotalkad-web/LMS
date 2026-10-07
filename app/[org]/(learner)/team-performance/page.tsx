@@ -5,6 +5,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canSeeEmail, l2GroupsOf, loadManagerContext, teamsOf } from "@/lib/manager/access";
 import { computeLearnerInsights } from "@/lib/manager/insights";
 import { loadScopedInsights } from "@/lib/manager/cache";
+import { lensVisible, loadCoverage, scopeForManager } from "@/lib/manager/coverage";
 import { PERIODS, type LearnerInsight } from "@/lib/manager/types";
 import { L1View } from "./_components/l1-view";
 import { L2View } from "./_components/l2-view";
@@ -27,8 +28,14 @@ export const dynamic = "force-dynamic";
  * Access and scope (decision 3): the server resolves the viewer's people from
  * the explicit L1/L2/L3 fields (lib/manager/access.ts) and reads only those
  * people; the old "team leaders see member details" toggle no longer applies
- * here (decision 10). Computation is live.
+ * here (decision 10).
+ *
+ * Visibility (Phase 4c, addendum §6): content mapping + actual assignment +
+ * reporting hierarchy. lib/manager/coverage.ts applies the mapping rule over
+ * the insights (live or cached) and narrows the content lens; every number
+ * on the card is computed over visible content only (decision 22).
  */
+const noVerticalNote = "Your Business Vertical is not set, so no mapped content is visible. Ask your administrator to set your vertical and department.";
 export default async function TeamPerformancePage({
   params,
   searchParams,
@@ -79,27 +86,31 @@ export default async function TeamPerformancePage({
 
   const { data: me } = await svc.from("profiles").select("first_name").eq("id", user.id).maybeSingle();
   const firstName = (me as { first_name?: string | null } | null)?.first_name ?? null;
+  // The manager's coverage decides which content counts (rule 1); a lens on hidden content is ignored.
+  const coverage = await loadCoverage(svc, org.id, user.id);
+  const withinLabel = coverage.hasVertical ? ` · within ${coverage.label}` : "";
 
   if (ctx.scope.level === 1) {
-    const { learners, catalog, benchmark, today } = await computeLearnerInsights(svc, {
-      orgId: org.id,
-      orgSlug,
-      userIds: ctx.directIds,
-      periodDays: period.days,
-      content,
-    });
+    const raw = await computeLearnerInsights(svc, { orgId: org.id, orgSlug, userIds: ctx.directIds, periodDays: period.days, content });
+    const scoped = await scopeForManager(svc, { orgId: org.id, viewerId: user.id, learners: raw.learners, catalog: raw.catalog, periodDays: period.days, nowMs, coverage });
+    const lensOk = lensVisible(scoped.visible, content);
+    const { learners, catalog } = lensOk ? scoped : await (async () => {
+      const again = await computeLearnerInsights(svc, { orgId: org.id, orgSlug, userIds: ctx.directIds, periodDays: period.days });
+      return scopeForManager(svc, { orgId: org.id, viewerId: user.id, learners: again.learners, catalog: again.catalog, periodDays: period.days, nowMs, coverage });
+    })();
     return (
       <L1View
         orgSlug={orgSlug}
         basePath="team-performance"
         title="Team Performance"
-        subtitle={`${firstName ? `${firstName}'s team` : "Your team"} · ${learners.length} ${learners.length === 1 ? "person" : "people"}`}
+        subtitle={`${firstName ? `${firstName}'s team` : "Your team"} · ${learners.length} ${learners.length === 1 ? "person" : "people"}${withinLabel}`}
+        note={coverage.hasVertical ? null : noVerticalNote}
         learners={learners}
         catalog={catalog}
-        benchmark={benchmark}
-        today={today}
+        benchmark={raw.benchmark}
+        today={raw.today}
         period={period}
-        content={content}
+        content={lensOk ? content : ""}
         statusFilter={statusFilter}
         nowMs={nowMs}
       />
@@ -116,9 +127,21 @@ export default async function TeamPerformancePage({
   const vertical = level === 3 ? str(sp.vertical) : "";
   const branch = level === 3 ? str(sp.branch) : "";
   const by = str(sp.by) === "l2" ? "l2" : "city";
-  const { learners, catalog, benchmark, today, computedAt } = await loadScopedInsights(svc, {
-    orgId: org.id, orgSlug, userIds: ctx.allIds, periodDays: period.days, content, useCache: level === 3,
-  });
+  // Rule 1 over everyone under the viewer (cached rows included), then the content lens.
+  const loadAll = async (lens: string) => {
+    const loaded = await loadScopedInsights(svc, {
+      orgId: org.id, orgSlug, userIds: ctx.allIds, periodDays: period.days, content: lens, useCache: level === 3,
+    });
+    const scopedAll = await scopeForManager(svc, { orgId: org.id, viewerId: user.id, learners: loaded.learners, catalog: loaded.catalog, periodDays: period.days, nowMs, coverage });
+    return { loaded, scopedAll };
+  };
+  let { loaded, scopedAll } = await loadAll(content);
+  const lensOk = lensVisible(scopedAll.visible, content);
+  // A lens on hidden content is ignored: reload without it (this also restores the L3 cache path).
+  if (!lensOk) ({ loaded, scopedAll } = await loadAll(""));
+  const contentLens = lensOk ? content : "";
+  const { learners, catalog } = scopedAll;
+  const { benchmark, today, computedAt } = loaded;
   const l2GroupsAll = level === 3 ? l2GroupsOf(ctx) : [];
   const names = await managerNames(svc, [...allTeams.map((t) => t.managerId), ...l2GroupsAll.map((g) => g.id)]);
   const nameOf = (id: string, own: boolean) => (own ? firstName ?? "You" : names.get(id)?.name ?? "Manager");
@@ -141,7 +164,7 @@ export default async function TeamPerformancePage({
     const scopeLabel = cityParam ? cityParam : l2Group ? `${nameOf(l2Group.id, false)}'s group` : `${firstName ? `${firstName}'s` : "Your"} teams`;
     const back = new URLSearchParams();
     if (period.value !== "30") back.set("period", period.value);
-    if (content) back.set("content", content);
+    if (contentLens) back.set("content", contentLens);
     if (vertical) back.set("vertical", vertical);
     if (branch) back.set("branch", branch);
     if (by === "l2") back.set("by", "l2");
@@ -152,7 +175,7 @@ export default async function TeamPerformancePage({
       <L2View
         orgSlug={orgSlug}
         title={narrowed ? scopeLabel : "Team Performance"}
-        subtitle={`${narrowed ? "Teams in this group" : scopeLabel} · ${teams.length} team${teams.length === 1 ? "" : "s"} · ${population.length} people${lens}`}
+        subtitle={`${narrowed ? "Teams in this group" : scopeLabel} · ${teams.length} team${teams.length === 1 ? "" : "s"} · ${population.length} people${lens}${withinLabel}${coverage.hasVertical ? "" : ` · ${noVerticalNote}`}`}
         level={level}
         teams={teams}
         learners={population}
@@ -160,7 +183,7 @@ export default async function TeamPerformancePage({
         catalog={catalog}
         today={today}
         period={period}
-        content={content}
+        content={contentLens}
         backHref={narrowed ? { href: `/${orgSlug}/team-performance${backQ ? `?${backQ}` : ""}`, label: "Back to the organisation view" } : null}
         keep={keep}
         // §12: an email only for an L1 manager who is the viewer's own direct report.
@@ -177,7 +200,7 @@ export default async function TeamPerformancePage({
     <L3View
       orgSlug={orgSlug}
       title="Team Performance"
-      subtitle={`Everyone under ${firstName ?? "you"} · ${population.length} ${population.length === 1 ? "person" : "people"} · ${teams.length} team${teams.length === 1 ? "" : "s"}${lens}`}
+      subtitle={`Everyone under ${firstName ?? "you"} · ${population.length} ${population.length === 1 ? "person" : "people"} · ${teams.length} team${teams.length === 1 ? "" : "s"}${lens}${withinLabel}${coverage.hasVertical ? "" : ` · ${noVerticalNote}`}`}
       teams={teams}
       l2Groups={l2Groups}
       learners={population}
@@ -185,9 +208,10 @@ export default async function TeamPerformancePage({
       benchmark={benchmark}
       today={today}
       period={period}
-      content={content}
+      content={contentLens}
       filters={{ city: cityParam, vertical, branch, by }}
-      options={{ cities: distinct(learners.map((l) => l.city)), verticals: distinct(learners.map((l) => l.vertical)), branches: distinct(learners.map((l) => l.branch)) }}
+      // The vertical filter narrows people INSIDE the coverage; it never widens it.
+      options={{ cities: distinct(learners.map((l) => l.city)), verticals: distinct(learners.map((l) => l.vertical)).filter((v) => !coverage.hasVertical || coverage.pairs.some((p) => p.vertical.toLowerCase() === v.toLowerCase())), branches: distinct(learners.map((l) => l.branch)) }}
       computedAt={computedAt}
     />
   );

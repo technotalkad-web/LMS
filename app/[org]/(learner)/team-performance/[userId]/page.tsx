@@ -6,6 +6,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { Avatar } from "@/components/ui/avatar";
 import { canSeeEmail, loadManagerContext } from "@/lib/manager/access";
 import { computeLearnerInsights } from "@/lib/manager/insights";
+import { scopeForManager } from "@/lib/manager/coverage";
 import { PERIODS, type ExceptionAction } from "@/lib/manager/types";
 import { Card, Kpi, Pill, StatusPill, fmtDate, relativeDays } from "../_components/ui";
 import { ActionButton, RaiseTicketButton } from "../_components/report-card-client";
@@ -44,15 +45,19 @@ export default async function EmployeeReportPage({
   const backHref = isDirect || !l1Id || !ctx.scope.teamsByL1.has(l1Id) ? `/${orgSlug}/team-performance` : `/${orgSlug}/team-performance/team/${l1Id}`;
 
   const period = PERIODS.find((p) => p.value === (sp.period ?? "30")) ?? PERIODS[1];
-  const { learners } = await computeLearnerInsights(svc, {
+  const raw = await computeLearnerInsights(svc, {
     orgId: org.id,
     orgSlug,
     userIds: [userId],
     periodDays: period.days,
   });
-  const l = learners[0];
-  if (!l) notFound();
   const nowMs = Date.now();
+  // Phase 4c: only content inside the viewer's coverage is shown; the rest is a count.
+  const scoped = await scopeForManager(svc, { orgId: org.id, viewerId: user.id, learners: raw.learners, catalog: raw.catalog, periodDays: period.days, nowMs });
+  const l = scoped.learners[0];
+  if (!l) notFound();
+  const hiddenCount = scoped.hiddenByUser.get(userId) ?? 0;
+  const coverage = scoped.coverage;
   const activeJourney = l.journeys.find((j) => j.status === "active") ?? null;
   const reasons = l.flags.filter((f) => f.kind !== "needs_support").map((f) => f.detail);
 
@@ -128,7 +133,11 @@ export default async function EmployeeReportPage({
       </Card>
 
       <section className="bg-paper border border-line rounded-2xl overflow-hidden">
-        <h2 className="font-semibold text-sm px-5 pt-4 pb-2">Courses ({l.courses.length})</h2>
+        <h2 className="font-semibold text-sm px-5 pt-4 pb-2">
+          Courses ({l.courses.length})
+          {coverage.hasVertical ? <span className="ml-2 text-[11px] font-normal text-muted">within {coverage.label}</span> : <span className="ml-2 text-[11px] font-normal text-amber-700">your Business Vertical is not set — ask your administrator</span>}
+          {hiddenCount > 0 && <span className="ml-2 text-[11px] font-normal text-muted" data-testid="hidden-count">· {hiddenCount} {hiddenCount === 1 ? "item" : "items"} outside your coverage not shown</span>}
+        </h2>
         <div className="overflow-x-auto">
           <table className="w-full text-sm min-w-[680px]">
             <thead>

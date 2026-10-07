@@ -4,6 +4,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { l2GroupsOf, loadManagerContext, teamsOf } from "@/lib/manager/access";
 import { loadScopedInsights } from "@/lib/manager/cache";
+import { lensVisible, scopeForManager } from "@/lib/manager/coverage";
 import { teamCards, type TeamInput } from "@/lib/manager/report-card";
 import { PERIODS } from "@/lib/manager/types";
 import { Card, Dot, Pill } from "../_components/ui";
@@ -85,9 +86,19 @@ export default async function CompareTeamsPage({
   // hierarchy average / a people filter is involved; otherwise just the chosen teams.
   const needAll = mode !== "teams" || picked.some((g) => g.managerId === "org") || !!vertical || !!branch;
   const userIds = needAll ? ctx.allIds : [...new Set(picked.flatMap((g) => g.memberIds))];
-  const { learners: all, today } = await loadScopedInsights(svc, {
+  const loaded = await loadScopedInsights(svc, {
     orgId: org.id, orgSlug, userIds, periodDays: period.days, content, useCache: needAll && ctx.scope.level === 3,
   });
+  const nowMs = Date.now();
+  // Phase 4c: rule 1 over the compared people (same coverage as the screen that launched the compare).
+  const scoped = await scopeForManager(svc, { orgId: org.id, viewerId: user.id, learners: loaded.learners, catalog: loaded.catalog, periodDays: period.days, nowMs });
+  const lensOk = lensVisible(scoped.visible, content);
+  const all = lensOk ? scoped.learners : (await (async () => {
+    const again = await loadScopedInsights(svc, { orgId: org.id, orgSlug, userIds, periodDays: period.days, useCache: needAll && ctx.scope.level === 3 });
+    return scopeForManager(svc, { orgId: org.id, viewerId: user.id, learners: again.learners, catalog: again.catalog, periodDays: period.days, nowMs, coverage: scoped.coverage });
+  })()).learners;
+  const today = loaded.today;
+  const lens = lensOk ? content : "";
   const learners = all.filter((l) => (!vertical || l.vertical === vertical) && (!branch || l.branch === branch));
   const byId = new Map(learners.map((l) => [l.userId, l]));
   const groups = picked
@@ -98,7 +109,7 @@ export default async function CompareTeamsPage({
   const cards = teamCards(groups, byId, period.days).sort((a, b) => wanted.indexOf(a.managerId) - wanted.indexOf(b.managerId));
   const back = new URLSearchParams();
   if (period.value !== "30") back.set("period", period.value);
-  if (content) back.set("content", content);
+  if (lens) back.set("content", lens);
   if (vertical) back.set("vertical", vertical);
   if (branch) back.set("branch", branch);
   if (mode === "l2s") back.set("by", "l2");
@@ -117,7 +128,7 @@ export default async function CompareTeamsPage({
       <Link href={`/${orgSlug}/team-performance${backQ}`} className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink">← Back to {mode === "teams" ? "teams" : "the organisation view"}</Link>
       <header>
         <h1 className="serif text-4xl">Compare {noun}</h1>
-        <p className="text-muted text-sm mt-1">Same four signals, side by side · {period.days ? `last ${period.days} days` : "all time"} for the counts{content ? " · narrowed to the selected content" : ""} · as of {today}.</p>
+        <p className="text-muted text-sm mt-1">Same four signals, side by side · {period.days ? `last ${period.days} days` : "all time"} for the counts{lens ? " · narrowed to the selected content" : ""} · as of {today}.</p>
       </header>
       <div className={`grid grid-cols-1 gap-4 ${cards.length === 3 ? "md:grid-cols-3" : "md:grid-cols-2"}`}>
         {cards.map((c) => (

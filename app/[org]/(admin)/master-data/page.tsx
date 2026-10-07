@@ -30,6 +30,9 @@ export default async function MasterDataPage({
       .eq("id", org.id)
       .maybeSingle(),
   ]);
+  // 0097: the enforce switch (fail-soft before the migration).
+  const enforceRes = await supabase.from("organizations").select("enforce_content_mapping").eq("id", org.id).maybeSingle();
+  const enforceContentMapping: boolean | null = enforceRes.error ? null : (enforceRes.data as { enforce_content_mapping?: boolean } | null)?.enforce_content_mapping === true;
 
   // 0096: how much active content is still unmapped (null before the migration).
   let unmappedContent: number | null = null;
@@ -55,6 +58,7 @@ export default async function MasterDataPage({
     <MasterDataClient
       orgSlug={orgSlug}
       unmappedContent={unmappedContent}
+      initialEnforce={enforceContentMapping}
       initialOptions={(optRows ?? []) as OptionRow[]}
       initialRequireManagers={
         (orgRow as { require_manager_fields?: boolean } | null)

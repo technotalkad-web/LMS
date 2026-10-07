@@ -23,6 +23,8 @@ const ISSUE_TITLES: Record<IntegrityIssue["code"], string> = {
   missing_l1: "No L1 manager",
   missing_l2: "No L2 manager",
   missing_l3: "No L3 manager",
+  manager_no_vertical: "Manager has no Business Vertical",
+  manager_no_department: "Manager has no Department",
 };
 /** Suggestions per backfill request; the API caps a request at 5000. */
 const BACKFILL_CHUNK = 2000;

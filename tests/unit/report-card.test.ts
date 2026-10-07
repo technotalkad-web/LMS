@@ -46,7 +46,7 @@ const learner = (over: Partial<LearnerInsight> & { userId: string }): LearnerIns
 });
 const journey = (behind: number, status: "active" | "completed" = "active") => ({
   programId: "j1", name: "30-day", status, unlockMode: "calendar" as const, day: 5, total: 30, behind, overdueDeadline: false,
-  daysDone: 4, courseDays: 30, nextModule: "Pricing", onTrack: status !== "active" || behind === 0,
+  daysDone: 4, courseDays: 30, nextModule: "Pricing", onTrack: status !== "active" || behind === 0, daysInPeriod: 0,
 });
 
 console.log("\nteam score (decision 4)");
@@ -90,9 +90,9 @@ console.log("\nexceptions (§3): severity first, max five, content + actions");
 {
   const team = [
     learner({ userId: "arjun", name: "Arjun", risk: 7, status: "needs_support", flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("inactive", "high"), flag("needs_support", "critical")],
-      courses: [{ courseId: "c1", title: "Objection Handling", status: "failed", officialScore: 48, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached: true }] }),
+      courses: [{ courseId: "c1", title: "Objection Handling", status: "failed", officialScore: 48, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, completedAt: null, done: false, isAssigned: true, openGrant: false, limitReached: true }] }),
     learner({ userId: "meera", name: "Meera", risk: 2, status: "watch", flags: [flag("failed", "critical", "c1", "Objection Handling")],
-      courses: [{ courseId: "c1", title: "Objection Handling", status: "failed", officialScore: 55, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: true, limitReached: true }] }),
+      courses: [{ courseId: "c1", title: "Objection Handling", status: "failed", officialScore: 55, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, completedAt: null, done: false, isAssigned: true, openGrant: true, limitReached: true }] }),
     learner({ userId: "nikhil", name: "Nikhil", risk: 2, status: "watch", flags: [flag("not_started", "normal", "c2", "Compliance Basics")] }),
     learner({ userId: "pooja", name: "Pooja", risk: 1, status: "watch", flags: [flag("behind", "high", "j1", "30-day")] }),
     learner({ userId: "sahil", name: "Sahil", risk: 0, status: "watch", flags: [flag("stuck", "high", "c3", "Pricing")] }),
@@ -116,7 +116,7 @@ console.log("\nexceptions (§3): severity first, max five, content + actions");
   // A learner failed on TWO modules: the tally counts every flag, so the module
   // two people failed wins and both are offered the retry; a learner whose
   // official window is not used up is never offered a grant.
-  const l = (courseId: string, title: string, limitReached = true) => ({ courseId, title, status: "failed" as const, officialScore: 40, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached });
+  const l = (courseId: string, title: string, limitReached = true) => ({ courseId, title, status: "failed" as const, officialScore: 40, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, completedAt: null, done: false, isAssigned: true, openGrant: false, limitReached });
   const team = [
     learner({ userId: "arjun", name: "Arjun", flags: [flag("failed", "critical", "c1", "Alpha"), flag("failed", "critical", "c2", "Objection Handling")], courses: [l("c1", "Alpha"), l("c2", "Objection Handling")] }),
     learner({ userId: "meera", name: "Meera", flags: [flag("failed", "critical", "c2", "Objection Handling")], courses: [l("c2", "Objection Handling")] }),
@@ -140,7 +140,7 @@ console.log("\nexceptions (§3): severity first, max five, content + actions");
 console.log("\nstruggles (§10): pivot + benchmark diagnosis");
 {
   const line = (courseId: string, title: string, status: "failed" | "passed" | "not_started"): LearnerInsight["courses"][number] =>
-    ({ courseId, title, status, officialScore: status === "not_started" ? null : 50, attempts: status === "not_started" ? 0 : 1, progressPct: null, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached: status === "failed" });
+    ({ courseId, title, status, officialScore: status === "not_started" ? null : 50, attempts: status === "not_started" ? 0 : 1, progressPct: null, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, completedAt: null, done: false, isAssigned: true, openGrant: false, limitReached: status === "failed" });
   const team = [
     learner({ userId: "a", flags: [flag("failed", "critical", "c1", "Objection Handling")], courses: [line("c1", "Objection Handling", "failed")] }),
     learner({ userId: "b", flags: [flag("failed", "critical", "c1", "Objection Handling")], courses: [line("c1", "Objection Handling", "failed")] }),
@@ -166,7 +166,7 @@ console.log("\nperiod summary");
 
 console.log("\nL2 (§6): teams compared, team exceptions, common struggles");
 {
-  const fl = (courseId: string, title: string) => ({ courseId, title, status: "failed" as const, officialScore: 40, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached: true });
+  const fl = (courseId: string, title: string) => ({ courseId, title, status: "failed" as const, officialScore: 40, attempts: 1, progressPct: 100, assignedAt: null, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, completedAt: null, done: false, isAssigned: true, openGrant: false, limitReached: true });
   const people = [
     // Team A (bad): two failed Objection Handling, one overdue
     learner({ userId: "a1", assigned: 4, completed: 1, avgScore: 50, status: "needs_support", risk: 6, flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("overdue", "critical", "c2", "Compliance")], courses: [fl("c1", "Objection Handling")] }),
@@ -222,7 +222,7 @@ console.log("\nL2 (§6): teams compared, team exceptions, common struggles");
 console.log("\nL3 (§7): org-wide learning gaps, L2 groups");
 {
   const fl = (courseId: string, title: string, status: "failed" | "not_started" | "in_progress" = "failed", assignedAt: string | null = "2026-09-01") =>
-    ({ courseId, title, status, officialScore: status === "failed" ? 40 : null, attempts: status === "failed" ? 1 : 0, progressPct: status === "failed" ? 100 : 0, assignedAt, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, openGrant: false, limitReached: status === "failed" });
+    ({ courseId, title, status, officialScore: status === "failed" ? 40 : null, attempts: status === "failed" ? 1 : 0, progressPct: status === "failed" ? 100 : 0, assignedAt, dueAt: null, overdue: false, startedAt: null, lastActivity: null, passedFirstTime: false, passRequiredUnmet: false, nudges: 0, completedAt: null, done: false, isAssigned: true, openGrant: false, limitReached: status === "failed" });
   const people = [
     // Objection Handling fails in Mumbai (2) and Pune (1); Compliance not started in 3 of 4 assigned; a journey day pending in two cities.
     learner({ userId: "m1", city: "Mumbai", flags: [flag("failed", "critical", "c1", "Objection Handling"), flag("not_started", "normal", "c2", "Compliance")], courses: [fl("c1", "Objection Handling"), fl("c2", "Compliance", "not_started")], journeys: [journey(2)] }),
