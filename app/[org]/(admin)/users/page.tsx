@@ -43,7 +43,7 @@ export default async function LearnersPage({
   const { org: orgSlug } = await params;
   const { org, role, user } = await requireOrgAccess(orgSlug);
   if (!canManage(role)) {
-    redirect(`/${orgSlug}/dashboard`);
+    redirect(`/${orgSlug}/dashboard?denied=1`);
   }
 
   const supabase = await createClient();

@@ -20,7 +20,7 @@ export default async function ReportingLinesPage({
 }) {
   const { org: orgSlug } = await params;
   const { org, role } = await requireOrgAccess(orgSlug);
-  if (role !== "super_owner") redirect(`/${orgSlug}/users?denied=1`);
+  if (role !== "super_owner") redirect(`/${orgSlug}/dashboard?denied=1`);
 
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,

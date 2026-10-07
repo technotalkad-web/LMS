@@ -19,7 +19,7 @@ export default async function MasterDataPage({
 }) {
   const { org: orgSlug } = await params;
   const { org, role } = await requireOrgAccess(orgSlug);
-  if (role !== "super_owner") redirect(`/${orgSlug}/users?denied=1`);
+  if (role !== "super_owner") redirect(`/${orgSlug}/dashboard?denied=1`);
 
   const supabase = await createClient();
   const [{ data: optRows }, { data: orgRow }] = await Promise.all([

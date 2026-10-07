@@ -2,7 +2,7 @@ import Link from "next/link";
 import { ScrollTabs } from "@/components/ui/scroll-tabs";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
+import { adminHome, canManage, canViewReports, roleLabel } from "@/lib/auth/permissions";
 import { ThemePill } from "./_components/theme-pill";
 import { NavItem } from "./_components/nav-item";
 import { Breadcrumbs } from "./_components/breadcrumbs";
@@ -102,7 +102,7 @@ export default async function AdminLayout({
             <span>Return to Learner View</span>
           </Link>
 
-          <Link href={`/${org.slug}/${manage ? "attention" : "reports"}`} className="flex items-center gap-2 mb-6 px-3">
+          <Link href={`/${org.slug}/${adminHome(role)?.path ?? "analytics"}`} className="flex items-center gap-2 mb-6 px-3">
             {org.logo_url && (
               /* eslint-disable-next-line @next/next/no-img-element */
               <img src={org.logo_url} alt={org.name} className="h-10 w-auto max-w-[140px] object-contain" />
