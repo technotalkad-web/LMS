@@ -1,10 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "crypto";
-import {
-  authenticateXapi,
-  serviceClient,
-  unauthorizedResponse,
-} from "@/lib/xapi/auth";
+import { bindXapi, serviceClient } from "@/lib/xapi/auth";
+import { attemptAbandonedResponse, isAttemptAbandonedError } from "@/lib/attempts/abandon";
 import { processStatement } from "@/lib/xapi/process-statement";
 import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
@@ -19,8 +16,10 @@ import type { XapiStatement } from "@/lib/xapi/types";
  * Auth: Authorization: Bearer <auth_token from /api/xapi/fetch>
  */
 export async function POST(request: Request) {
-  const session = await authenticateXapi(request);
-  if (!session) return unauthorizedResponse();
+  // P4: an abandoned attempt (or its expired token) → 410 before any write.
+  const bound = await bindXapi(request);
+  if (!bound.ok) return bound.response;
+  const session = bound.session;
 
   let body: unknown;
   try {
@@ -71,11 +70,18 @@ export async function POST(request: Request) {
       { onConflict: "attempt_id,statement_id" }
     );
 
-    await processStatement({
-      statement,
-      attemptId: session.attemptId,
-      supabase: svc,
-    });
+    // The attempt update inside is conditional on status <> 'abandoned';
+    // abandoned since the bind (another tab switched language) → 410.
+    try {
+      await processStatement({
+        statement,
+        attemptId: session.attemptId,
+        supabase: svc,
+      });
+    } catch (e) {
+      if (isAttemptAbandonedError(e)) return attemptAbandonedResponse();
+      throw e;
+    }
 
     ids.push(statement.id);
   }
@@ -130,8 +136,9 @@ export async function PUT(request: Request) {
 }
 
 export async function GET(request: Request) {
-  const session = await authenticateXapi(request);
-  if (!session) return unauthorizedResponse();
+  const bound = await bindXapi(request);
+  if (!bound.ok) return bound.response;
+  const session = bound.session;
 
   const { searchParams } = new URL(request.url);
   const verb = searchParams.get("verb");

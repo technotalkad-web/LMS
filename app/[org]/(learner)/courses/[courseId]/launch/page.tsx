@@ -22,6 +22,7 @@ import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
 import { grantRetakeIdsFor, unusedGrantFor } from "@/lib/scoring/attempt-kind";
+import { expireLaunchTokens } from "@/lib/attempts/abandon";
 
 type Course = {
   id: string;
@@ -210,7 +211,7 @@ export default async function LaunchPage({
   //     it resumes from the latest saved progress (seeded below) and never
   //     changes the official score or pass/fail.
   // Admins preview freely.
-  type MyAttempt = ScorableAttempt & { course_version_id: string; cmi_data: CmiData | null };
+  type MyAttempt = ScorableAttempt & { course_version_id: string; cmi_data: CmiData | null; status?: string };
   let practiceLaunch = false;
   // 0083: the grant we consume on THIS launch, stamped used once the fresh
   // official retake attempt exists (below). null = normal launch.
@@ -226,7 +227,7 @@ export default async function LaunchPage({
     if (vIds.length > 0) {
       const { data: myRows } = await supabase
         .from("course_attempts")
-        .select("id, score, started_at, completed_at, completion_status, success_status, course_version_id, cmi_data")
+        .select("id, score, started_at, completed_at, completion_status, success_status, course_version_id, cmi_data, status")
         .eq("user_id", user.id)
         .in("course_version_id", vIds);
       const my = (myRows ?? []) as MyAttempt[];
@@ -235,8 +236,10 @@ export default async function LaunchPage({
       const scoring = computeScoring(my, policy, retakeIds);
       // Resuming an in-progress attempt that is itself a grant retake is an
       // OFFICIAL run, never a revision — don't let the window verdict relabel it.
+      // `status`, not completion_status: an ABANDONED retake keeps
+      // completion_status 'in_progress' but is terminal (ALDS step 0, P4).
       const resumingOfficialRetake = my.some(
-        (a) => a.completion_status === "in_progress" && retakeIds.has(a.id)
+        (a) => a.status === "in_progress" && retakeIds.has(a.id)
       );
       if (scoring.limitReached && !resumingOfficialRetake) {
         // The base official window is used up: this would be a revision run.
@@ -252,12 +255,20 @@ export default async function LaunchPage({
             process.env.SUPABASE_SERVICE_ROLE_KEY!,
             { auth: { persistSession: false } }
           );
-          await svcReset
+          const { data: resetRows } = await svcReset
             .from("course_attempts")
             .update({ status: "abandoned" })
             .eq("user_id", user.id)
             .in("course_version_id", vIds)
-            .eq("status", "in_progress");
+            .eq("status", "in_progress")
+            .select("id");
+          // ALDS step 0 (P4): an abandoned attempt's launch tokens die with
+          // it, so an open tab of the old run can't keep writing.
+          const tokErr = await expireLaunchTokens(
+            svcReset,
+            ((resetRows ?? []) as Array<{ id: string }>).map((r) => r.id)
+          );
+          if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
         }
       }
       // Refuse only when the window is used up and the rule blocks further
@@ -698,7 +709,13 @@ export default async function LaunchPage({
     }
   }
 
-  const contentBase = `/${orgSlug}/courses/${courseId}/content/`;
+  // ALDS step 0 (P1): every content URL names the ATTEMPT's version, so the
+  // iframe runs the package this attempt was opened on (its language, or a
+  // retired version it is grandfathered on) — never the course's current
+  // one. The attempt above was selected/inserted with course_version_id =
+  // v.id, so v.id IS course_attempts.course_version_id.
+  const attemptVersionId = v.id;
+  const contentBase = `/${orgSlug}/courses/${courseId}/content/v/${attemptVersionId}/`;
   // Exit returns the learner to the context they launched from: the journey
   // (?journey=), the learning path (?lp=, only when this course really is a
   // step of it), the dashboard (?back=dashboard from its cards), otherwise
@@ -748,7 +765,7 @@ export default async function LaunchPage({
         const launch = (nextVersion as { launch_url?: string } | null)?.launch_url;
         if (launch) {
           preloadUrls.push(
-            `/${orgSlug}/courses/${nextCourseId}/content/${launch.replace(/^\/+/, "").split("?")[0]}`
+            `/${orgSlug}/courses/${nextCourseId}/content/v/${nextVersionId}/${launch.replace(/^\/+/, "").split("?")[0]}`
           );
         }
       }

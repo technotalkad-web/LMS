@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getStorage } from "@/lib/storage";
+import { ATTEMPT_ABANDONED, AttemptAbandonedError } from "@/lib/attempts/abandon";
 import { countLearningUnits } from "./units";
 
 /**
@@ -112,29 +113,45 @@ export function progressFromState(content: unknown): {
 /**
  * Update an attempt, tolerating a database that hasn't run 0075 yet: if
  * the write fails because progress_pct doesn't exist, retry without it.
+ *
+ * ALDS step 0 (P4): the write is conditional on `status <> 'abandoned'` —
+ * an abandoned attempt is terminal and no content write may revive it. A
+ * write that matches no row returns `{ abandoned: true }` (callers answer
+ * 410 attempt_abandoned); callers read the attempt first, so "no row" here
+ * means it was abandoned in between.
  */
 export async function updateAttemptFailSoft(
   svc: SupabaseClient,
   attemptId: string,
   update: Record<string, unknown>,
   extra?: { userId?: string }
-): Promise<{ message: string } | null> {
+): Promise<{ message: string; abandoned?: true } | null> {
   const run = async (u: Record<string, unknown>) => {
-    let q = svc.from("course_attempts").update(u).eq("id", attemptId);
+    let q = svc
+      .from("course_attempts")
+      .update(u)
+      .eq("id", attemptId)
+      .neq("status", "abandoned");
     if (extra?.userId) q = q.eq("user_id", extra.userId);
-    const { error } = await q;
-    return error;
+    const { data, error } = await q.select("id");
+    return { error, rows: Array.isArray(data) ? data.length : 0 };
   };
-  let error = await run(update);
-  if (error && "progress_pct" in update && /progress_pct/i.test(error.message)) {
+  let res = await run(update);
+  if (res.error && "progress_pct" in update && /progress_pct/i.test(res.error.message)) {
     const rest = { ...update };
     delete rest.progress_pct;
-    error = await run(rest);
+    res = await run(rest);
   }
-  return error ? { message: error.message } : null;
+  if (res.error) return { message: res.error.message };
+  if (res.rows === 0) return { message: ATTEMPT_ABANDONED, abandoned: true };
+  return null;
 }
 
-/** Raise an attempt's progress from its saved state (never lowers it). */
+/**
+ * Raise an attempt's progress from its saved state (never lowers it).
+ * Throws AttemptAbandonedError when the attempt is abandoned (P4) — the
+ * State route answers 410.
+ */
 export async function updateProgressFromState(
   svc: SupabaseClient,
   attemptId: string,
@@ -149,6 +166,7 @@ export async function updateProgressFromState(
     .maybeSingle();
   if (!row) return null;
   const r = row as Record<string, unknown>;
+  if (r.status === "abandoned") throw new AttemptAbandonedError(attemptId);
   if (r.completion_status === "completed") return 100;
   const update: Record<string, unknown> = {};
   let pct = p.pct;
@@ -178,6 +196,7 @@ export async function updateProgressFromState(
   const current = typeof r.progress_pct === "number" ? r.progress_pct : null;
   if (pct !== null && (current === null || pct > current)) update.progress_pct = pct;
   if (Object.keys(update).length === 0) return current;
-  await updateAttemptFailSoft(svc, attemptId, update);
+  const err = await updateAttemptFailSoft(svc, attemptId, update);
+  if (err?.abandoned) throw new AttemptAbandonedError(attemptId);
   return (update.progress_pct as number | undefined) ?? current;
 }

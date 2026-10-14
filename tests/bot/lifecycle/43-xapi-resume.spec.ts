@@ -158,10 +158,12 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
     expect(done.progress_pct).toBe(100);
     expect(done.completed_at).not.toBeNull();
 
-    // A finished attempt is not resumed: the next launch starts attempt #2.
+    // A finished attempt is not resumed: the next launch starts attempt #2 —
+    // a revision run (0081) seeded from the completed attempt's State, so the
+    // package picks up where the learner finished.
     await page.goto(`/${w.org.slug}/dashboard`);
     await page.goto(launchUrl);
-    await expect(status).toHaveText(/fresh start at slide 1/, { timeout: 30_000 });
+    await expect(status).toHaveText("resumed at slide 5", { timeout: 30_000 });
     expect(await latestAttemptId(course.versionId, w.learner.id)).not.toBe(attemptId);
     await ctx.close();
   });
@@ -276,7 +278,8 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
     const l = await launchParams(ctx.request, w.org.slug, course.courseId);
     expect(l.qs.get("auth")).toBeNull();
     expect(l.qs.get("endpoint")).toBeNull();
-    expect(l.src).toMatch(/\/content\/index\.html$/);
+    // ALDS step 0 (P1): content is served from the attempt's version.
+    expect(l.src).toBe(`/${w.org.slug}/courses/${course.courseId}/content/v/${course.versionId}/index.html`);
 
     const attemptId = await latestAttemptId(course.versionId, w.learner.id);
     await scormCommit(

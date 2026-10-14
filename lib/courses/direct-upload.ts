@@ -16,6 +16,7 @@ import {
   storagePrefixFor,
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
+import { expireLaunchTokens } from "@/lib/attempts/abandon";
 
 /**
  * Direct browser-to-storage uploads.
@@ -462,12 +463,17 @@ async function abandonOldAttempts(packageId: string, newVersionId: string): Prom
   const { data: pkgVers } = await svc.from("course_versions").select("id").eq("package_id", packageId);
   const oldIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id).filter((id) => id !== newVersionId);
   if (oldIds.length === 0) return 0;
-  const { count } = await svc
+  const { data: abRows } = await svc
     .from("course_attempts")
-    .update({ status: "abandoned" }, { count: "exact" })
+    .update({ status: "abandoned" })
     .in("course_version_id", oldIds)
-    .eq("status", "in_progress");
-  return count ?? 0;
+    .eq("status", "in_progress")
+    .select("id");
+  const abIds = ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+  // ALDS step 0 (P4): an abandoned attempt's launch tokens die with it.
+  const tokErr = await expireLaunchTokens(svc, abIds);
+  if (tokErr) console.warn("[direct-upload] token expiry failed:", tokErr.message);
+  return abIds.length;
 }
 
 type VersionRow = {
