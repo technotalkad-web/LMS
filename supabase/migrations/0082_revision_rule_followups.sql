@@ -72,6 +72,10 @@ left join public.v_course_attempt_scoring s
 
 alter view public.v_course_attempt_summary set (security_invoker = on);
 
+-- Data API grants (explicit since Supabase stops auto-granting on 2026-10-30;
+-- CREATE OR REPLACE keeps existing privileges, so this is idempotent).
+grant select on public.v_course_attempt_summary to authenticated, service_role;
+
 -- ---- 1. path enrollment matview: pass-required → official attempt passed ----
 drop materialized view if exists public.mv_path_enrollment_status;
 create materialized view public.mv_path_enrollment_status as

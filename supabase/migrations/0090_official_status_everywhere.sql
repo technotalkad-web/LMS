@@ -134,6 +134,10 @@ group by x.course_id, x.user_id, x.max_scored_attempts, x.official_basis, x.offi
 
 alter view public.v_course_attempt_scoring set (security_invoker = on);
 
+-- Data API grants (explicit since Supabase stops auto-granting on 2026-10-30;
+-- CREATE OR REPLACE keeps existing privileges, so this is idempotent).
+grant select on public.v_course_attempt_scoring to authenticated, service_role;
+
 -- ---- 2. v_course_attempt_summary: pass the official verdict through ----------
 create or replace view public.v_course_attempt_summary as
 with base as (
@@ -182,6 +186,9 @@ left join public.v_course_attempt_scoring s
   on s.course_id = b.course_id and s.user_id = b.user_id;
 
 alter view public.v_course_attempt_summary set (security_invoker = on);
+
+-- Data API grants (explicit since 2026-10-30; idempotent, see above).
+grant select on public.v_course_attempt_summary to authenticated, service_role;
 
 -- ---- 3. mv_course_performance: total_failed = official attempt failed --------
 drop materialized view if exists public.mv_course_performance;
