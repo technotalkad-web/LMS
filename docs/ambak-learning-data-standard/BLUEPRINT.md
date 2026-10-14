@@ -333,6 +333,9 @@ alter table public.course_attempts
 create index if not exists course_attempts_registration_idx on public.course_attempts (registration_id, attempt_index);
 create index if not exists course_attempts_ingest_idx on public.course_attempts (last_activity_at)
   where alds_ingested_at is null or alds_ingested_at < last_activity_at;
+-- PostgREST: served_version_id is a SECOND foreign key from course_attempts to course_versions. Every supabase-js embed
+-- `course_versions(...)` on course_attempts MUST be qualified by constraint name (`course_versions!course_attempts_course_version_id_fkey(...)`)
+-- BEFORE this migration is applied, or PostgREST answers 300 "more than one relationship" (step-1 prerequisite; see §9.1).
 
 -- 3. sessions ------------------------------------------------------------------------------------
 create table if not exists public.learning_sessions (
@@ -1068,7 +1071,7 @@ Unit tests cover every shape seen on staging (B9): `option_0 (confidence=2)`, `s
 | Step | Contents | Harness / measurement (gate) |
 |---|---|---|
 | 0 | P1–P6 | specs 47, 48, 49 + extended 32 green on Cloud Run staging; `storage_prefix` uniqueness SQL returns 0 rows |
-| 1 | 0098 + `alds_open_attempt` + launch contract §4 (legacy tolerance) + SCORM session token | `50-registrations.spec.ts`: one active registration, `attempt_index`, LaunchData body, launch URL `registration`/`activityId`, `launched`/`abandoned` LMS statements, admin launch ⇒ `is_preview`, official attempt unchanged after a retake registration completes, SCORM commit with/without token (401); backfill verification queries (§3.2) all as expected |
+| 1 | FK-qualified embeds (§9.1 first row) → 0098 + `alds_open_attempt` + launch contract §4 (legacy tolerance) + SCORM session token | `50-registrations.spec.ts`: one active registration, `attempt_index`, LaunchData body, launch URL `registration`/`activityId`, `launched`/`abandoned` LMS statements, admin launch ⇒ `is_preview`, official attempt unchanged after a retake registration completes, SCORM commit with/without token (401); backfill verification queries (§3.2) all as expected |
 | 2 | 0099 + gateway G0–G9 (strict off by default) + SCORM C0–C4 + runtime `_count` + resolution API §5.5 + forwarder changes (§9.1) | `51-gateway.spec.ts` (matrix: void → 403; Browse `completed` → 403; second `completed` in one registration → 403, in a new retake registration → 200; PUT → 204; GET hides quarantined/voided; LaunchData PUT → 403; state write after abandon → 410), `52-scorm-journal.spec.ts` (answer twice → indices 0 and 1; concurrent commits → distinct seq; 410 path); **CATAPULT LMS Test Suite green on a strict test org** (`alds_strict_level2 = true`); replay: `scripts/alds-replay.mjs` runs the exported pure `evaluateBatch()` (`lib/alds/gateway.ts`) over the last 30 days of `xapi_statements.raw` with synthetic sessions, in legacy mode, and prints counts per rule — gate: 0 REJECTs other than S9/W-rules |
 | 3 | KIVO 2.0 export (manifest, QIDs, extensions, launch id, launchMode, single AU) + CATAPULT Content Test Suite | first Level 2 package uploaded on staging; U1–U7 outcomes visible in the validation report (`53-level2-upload.spec.ts`) |
 | 4 | 0100 + upload hooks + KIVO migration tool + alias import | `54-catalogue.spec.ts`; `select count(*) from guardian_findings where invariant='R3' and status='open'` = 0 |
@@ -1083,6 +1086,7 @@ Unit tests cover every shape seen on staging (B9): `option_0 (confidence=2)`, `s
 | Types | `lib/alds/types.ts` (new) | §1.4 verbatim |
 | Launch | `lib/alds/launch.ts` (new), `launch/page.tsx`, `launch/scorm-runtime.tsx`, `app/api/courses/[courseId]/language-preference/route.ts` | §4 |
 | Gateway | `lib/alds/gateway.ts` (new, pure `evaluateBatch()`), `app/api/xapi/statements/route.ts`, `app/api/xapi/activities/state/route.ts`, `app/api/scorm/[attemptId]/commit/route.ts` | §5.2 |
+| Embeds (before 0098) | `app/api/scorm/[attemptId]/commit/route.ts`, `lib/xapi/process-statement.ts`, `lib/courses/progress.ts`, `lib/scoring/attempt-kind.ts`, `lib/courses/content-delivery.ts` (`legacyCourseVersion`) and any other `course_versions(...)` embed on `course_attempts` | qualify by FK name `course_versions!course_attempts_course_version_id_fkey` — 0098 adds a second FK (`served_version_id`) and unqualified embeds fail with 300 | §3.2 |
 | Processing | `lib/xapi/process-statement.ts`: `launchedActivityIds(version, versionId, sessionActivityId, lmsActivityIds)` includes the LMS AU id; `isAboutAu` unchanged; status derivation never leaves `abandoned`; one read + one conditional write per batch | §5.2 G7, P4 |
 | Forwarder | `lib/lrs/profile.ts`: `PROFILE_VERSION = "2.0"` for LMS-originated statements; `lib/lrs/enrich.ts`: engine-supplied keys under `E` are never overwritten (`cext[k] ??= v` for `profile-version`, `content/*`, `question/*`); `profile-version` := `xapi_statements.standard_version ?? "1.0.0"`; `context.registration` kept when present; `lib/lrs/context.ts`: `attempt/number` unchanged; `lib/lrs/sweep.ts`: `srcAttempts` only for attempts without `learning_sessions` rows; voiding statements forwarded with the LMS actor | §1.3, §4, §5.1 |
 | Upload | `lib/alds/manifest.ts` (new), `lib/courses/validation/validate-package.ts`, `lib/courses/upload.ts insertVersionRow`, `app/api/courses/upload/finalize/route.ts` | §2 |
