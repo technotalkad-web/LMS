@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { updateAttemptFailSoft } from "@/lib/courses/progress";
+import { attemptAbandonedResponse } from "@/lib/attempts/abandon";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
 import {
@@ -28,6 +29,8 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  * RLS on `course_attempts` enforces user_id = auth.uid() on updates.
  * Terminal values are never downgraded by a later commit (e.g. an unload
  * beacon arriving after LMSFinish must not erase a completed attempt).
+ * An abandoned attempt is terminal for good: 410 `{error:"attempt_abandoned"}`
+ * and nothing is written (ALDS step 0, P4); an unknown attempt is 404.
  */
 export async function POST(
   request: NextRequest,
@@ -53,7 +56,7 @@ export async function POST(
   const finished = Boolean(payload.finished);
 
   // Load current state + mastery threshold.
-  const { data: attempt } = await supabase
+  const { data: attempt, error: readErr } = await supabase
     .from("course_attempts")
     .select(
       "*, course_versions(manifest_data)"
@@ -61,6 +64,10 @@ export async function POST(
     .eq("id", attemptId)
     .eq("user_id", user.id)
     .maybeSingle();
+  // A failed READ degrades as before (the write below still runs, and its
+  // status <> 'abandoned' condition still protects an abandoned attempt);
+  // only a clean "no such attempt for this user" is a 404.
+  if (readErr) console.error("[scorm/commit] attempt read failed:", readErr.message);
 
   const a = attempt as
     | {
@@ -71,6 +78,12 @@ export async function POST(
         course_versions?: { manifest_data?: { masteryScore?: number | null } };
       }
     | null;
+  if (!a && !readErr) {
+    return NextResponse.json({ error: "attempt_not_found" }, { status: 404 });
+  }
+  // ALDS step 0 (P4): abandoned is terminal — a stale tab's commit or unload
+  // beacon must never write to (and so revive) an abandoned attempt.
+  if (a?.status === "abandoned") return attemptAbandonedResponse();
 
   const currentStatus = a?.status;
   const currentCompletion = a?.completion_status;
@@ -103,7 +116,7 @@ export async function POST(
         ? "failed"
         : derivedSuccess;
 
-  const terminal: Array<string | undefined> = ["passed", "failed", "completed"];
+  const terminal: Array<string | undefined> = ["passed", "failed", "completed", "abandoned"];
   const status =
     currentStatus === "passed" && derivedStatus !== "passed"
       ? "passed"
@@ -146,8 +159,11 @@ export async function POST(
     update.completed_at = new Date().toISOString();
   }
 
+  // Conditional on status <> 'abandoned' (P4): abandoned since the read
+  // above (a language switch in another tab) → 410, nothing written.
   const error = await updateAttemptFailSoft(supabase, attemptId, update, { userId: user.id });
 
+  if (error?.abandoned) return attemptAbandonedResponse();
   if (error) {
     console.error("[scorm/commit] update failed:", error.message);
     return NextResponse.json({ error: error.message }, { status: 400 });

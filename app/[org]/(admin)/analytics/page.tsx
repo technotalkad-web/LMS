@@ -16,6 +16,7 @@ import { DEFAULT_POLICY, computeScoring, type ScoringResult } from "@/lib/scorin
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { isOfficialFailed } from "@/lib/scoring/status";
 import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
+import { contentFilterInOrg } from "@/lib/content/analytics-filter";
 import {
   courseProgress,
   formatCourseProgress,
@@ -364,6 +365,38 @@ export default async function AnalyticsPage({
     deadline_days?: number | null;
   }>;
   const programById = new Map(programs.map((p) => [p.id, p]));
+
+  // ALDS step 0 (P5): honour ?content= only for content of THIS org. The
+  // question-level views below are read with the service role and keyed by
+  // course id alone, so a foreign id must never reach them. Anything else is
+  // treated as no content filter. The allow-list covers inactive courses and
+  // paths too (the picker only offers active ones, but a bookmarked lens on
+  // a since-deactivated course of this org keeps working).
+  if (filters.content) {
+    const sep = filters.content.indexOf(":");
+    const kind = sep > 0 ? filters.content.slice(0, sep) : "";
+    const id = sep > 0 ? filters.content.slice(sep + 1) : "";
+    // Inactive courses/paths of this org are not in the active maps above.
+    const ownInactive = async (table: "courses" | "learning_paths") => {
+      if (!id) return false;
+      const { data } = await svc
+        .from(table)
+        .select("id")
+        .eq("organization_id", org.id)
+        .eq("id", id)
+        .maybeSingle();
+      return !!data;
+    };
+    const inOrg =
+      contentFilterInOrg(filters.content, {
+        courseIds: courseTitle,
+        pathIds: pathName,
+        programIds: programById,
+      }) ||
+      (kind === "course" && (await ownInactive("courses"))) ||
+      (kind === "path" && (await ownInactive("learning_paths")));
+    if (!inOrg) filters.content = "";
+  }
 
   /* ---- learning data for the scope ---- */
   const attempts = scopedIds.length

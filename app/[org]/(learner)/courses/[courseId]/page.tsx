@@ -27,6 +27,7 @@ type Version = {
   launch_url: string;
   manifest_data: { title?: string; description?: string; masteryScore?: number };
   uploaded_at: string;
+  package_id: string | null;
 };
 
 type Course = {
@@ -106,7 +107,7 @@ export default async function CourseDetailPage({
   const { data: versions } = await supabase
     .from("course_versions")
     .select(
-      "id, version_number, manifest_type, launch_url, manifest_data, uploaded_at"
+      "id, version_number, manifest_type, launch_url, manifest_data, uploaded_at, package_id"
     )
     .eq("course_id", c.id)
     .order("version_number", { ascending: false });
@@ -137,6 +138,8 @@ export default async function CourseDetailPage({
       p.language ??
       "Default",
   }));
+  // Package → language, for the switch confirmation copy (ALDS P4).
+  const packageLanguageOf = new Map(languageOptions.map((o) => [o.id, o.language]));
   let savedLanguage: string | null = null;
   if (languageOptions.length >= 2) {
     const { data: prefRow } = await supabase
@@ -209,8 +212,10 @@ export default async function CourseDetailPage({
 
   // An in-progress attempt that is itself a consumed grant retake is an
   // official run the learner must be able to resume — even under a block rule.
+  // status, not completion_status: an ABANDONED retake keeps
+  // completion_status 'in_progress' but is terminal (ALDS step 0, P4).
   const hasInProgressOfficialRetake = attempts.some(
-    (a) => a.completion_status === "in_progress" && retakeIds.has(a.id)
+    (a) => a.status === "in_progress" && retakeIds.has(a.id)
   );
   const launchBlocked =
     scoring.blocked && !hasUnusedGrant && !hasInProgressOfficialRetake && !isAdmin;
@@ -417,6 +422,14 @@ export default async function CourseDetailPage({
               courseId={c.id}
               options={languageOptions}
               currentLanguage={savedLanguage}
+              inProgress={attempts
+                .filter((a) => a.status === "in_progress")
+                .map((a) => ({
+                  language: packageLanguageOf.get(
+                    versionById.get(a.course_version_id)?.package_id ?? ""
+                  ) ?? null,
+                  grantedRetake: retakeIds.has(a.id),
+                }))}
             />
             {isAdmin && (
               <Link

@@ -8,6 +8,7 @@ import {
   updateAttemptFailSoft,
   type VersionLite,
 } from "@/lib/courses/progress";
+import { AttemptAbandonedError } from "@/lib/attempts/abandon";
 
 /**
  * Inspect a single xAPI statement and update the bound attempt's
@@ -64,6 +65,10 @@ export async function processStatement(opts: {
     score: number | null;
     course_version_id: string;
   };
+  // ALDS step 0 (P4): abandoned is terminal. Never derive a status for it
+  // (that is exactly how stale tabs revived abandoned attempts); the
+  // statements route answers 410.
+  if (r.status === "abandoned") throw new AttemptAbandonedError(attemptId);
 
   const version = (Array.isArray(r.course_versions)
     ? r.course_versions[0]
@@ -177,7 +182,9 @@ export async function processStatement(opts: {
   // stamp unconditionally, so the update below always runs.
   update.last_activity_at = new Date().toISOString();
 
+  // Conditional on status <> 'abandoned' (P4): abandoned in between → 410.
   const updErr = await updateAttemptFailSoft(supabase, attemptId, update);
+  if (updErr?.abandoned) throw new AttemptAbandonedError(attemptId);
   if (updErr) {
     throw new Error(
       `processStatement: failed to update attempt ${attemptId}: ${updErr.message}`

@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { attemptAbandonedResponse } from "@/lib/attempts/abandon";
 
 const serviceClient = () => {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
@@ -9,15 +10,53 @@ const serviceClient = () => {
 export interface XapiSession {
   attemptId: string;
   authToken: string;
+  /** course_attempts.status at bind time (null if it could not be read). */
+  attemptStatus?: string | null;
+}
+
+type TokenMatch = XapiSession & { expired: boolean };
+
+export type XapiBinding =
+  | { ok: true; session: XapiSession }
+  | { ok: false; response: Response };
+
+/**
+ * Bind an xAPI request to its attempt (ALDS step 0, P4). One query
+ * (token → attempt). An abandoned attempt answers 410 attempt_abandoned for
+ * every resource — also when its token was expired by the abandon itself, so
+ * a stale tab learns WHY it is shut out; any other missing/unknown/expired
+ * token answers 401.
+ */
+export async function bindXapi(request: Request): Promise<XapiBinding> {
+  const match = await matchToken(request);
+  if (!match) return { ok: false, response: unauthorizedResponse() };
+  if (match.attemptStatus === "abandoned") {
+    return { ok: false, response: attemptAbandonedResponse() };
+  }
+  if (match.expired) return { ok: false, response: unauthorizedResponse() };
+  const { attemptId, authToken, attemptStatus } = match;
+  return { ok: true, session: { attemptId, authToken, attemptStatus } };
 }
 
 /**
- * Verify the Authorization header and return the bound session.
- * Logs the raw header on miss so we can see what shape the AU sent.
+ * Verify the Authorization header and return the bound session (null when
+ * missing, unknown or expired). Kept for callers that only need the binding;
+ * the statements/state routes use bindXapi().
  */
 export async function authenticateXapi(
   request: Request
 ): Promise<XapiSession | null> {
+  const match = await matchToken(request);
+  if (!match || match.expired) return null;
+  const { attemptId, authToken, attemptStatus } = match;
+  return { attemptId, authToken, attemptStatus };
+}
+
+/**
+ * Find the launch token in the Authorization header (any shape the AU
+ * sent). Logs the raw header on miss so we can see what shape it was.
+ */
+async function matchToken(request: Request): Promise<TokenMatch | null> {
   const header = request.headers.get("authorization") ?? "";
   if (!header) {
     console.error("[xapi/auth] MISS: no Authorization header. url=", request.url);
@@ -74,17 +113,36 @@ export async function authenticateXapi(
   for (const cand of candidates) {
     const trimmed = cand.trim();
     if (!trimmed) continue;
-    const { data } = await svc
+    let { data, error } = await svc
       .from("cmi5_launch_tokens")
-      .select("attempt_id, expires_at")
+      .select("attempt_id, expires_at, course_attempts(status)")
       .eq("auth_token", trimmed)
       .maybeSingle();
+    if (error) {
+      // Never let the attempt embed lock everyone out (schema cache hiccup):
+      // bind without the status; the conditional attempt writes still hold.
+      console.warn("[xapi/auth] token+attempt lookup failed, retrying plain:", error.message);
+      ({ data, error } = await svc
+        .from("cmi5_launch_tokens")
+        .select("attempt_id, expires_at")
+        .eq("auth_token", trimmed)
+        .maybeSingle());
+    }
     if (data) {
-      if (new Date(data.expires_at).getTime() < Date.now()) {
-        console.error("[xapi/auth] token expired at", data.expires_at);
-        return null;
-      }
-      return { attemptId: data.attempt_id, authToken: trimmed };
+      const row = data as {
+        attempt_id: string;
+        expires_at: string;
+        course_attempts?: { status?: string | null } | Array<{ status?: string | null }> | null;
+      };
+      const att = Array.isArray(row.course_attempts) ? row.course_attempts[0] : row.course_attempts;
+      const expired = new Date(row.expires_at).getTime() < Date.now();
+      if (expired) console.error("[xapi/auth] token expired at", row.expires_at);
+      return {
+        attemptId: row.attempt_id,
+        authToken: trimmed,
+        attemptStatus: att?.status ?? null,
+        expired,
+      };
     }
   }
 

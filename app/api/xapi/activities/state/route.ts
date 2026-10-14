@@ -1,9 +1,6 @@
 import { NextResponse } from "next/server";
-import {
-  authenticateXapi,
-  serviceClient,
-  unauthorizedResponse,
-} from "@/lib/xapi/auth";
+import { bindXapi, serviceClient } from "@/lib/xapi/auth";
+import { attemptAbandonedResponse, isAttemptAbandonedError } from "@/lib/attempts/abandon";
 import { updateProgressFromState } from "@/lib/courses/progress";
 
 /**
@@ -17,11 +14,13 @@ import { updateProgressFromState } from "@/lib/courses/progress";
  * by the xAPI spec but for our purposes (single attempt = single session)
  * stateId alone is the meaningful key.
  *
- * Auth: Bearer token from /api/xapi/fetch.
+ * Auth: Bearer token from /api/xapi/fetch. An abandoned attempt answers 410
+ * attempt_abandoned on every method (ALDS step 0, P4).
  */
 export async function GET(request: Request) {
-  const session = await authenticateXapi(request);
-  if (!session) return unauthorizedResponse();
+  const bound = await bindXapi(request);
+  if (!bound.ok) return bound.response;
+  const session = bound.session;
 
   const { searchParams } = new URL(request.url);
   const stateId = searchParams.get("stateId");
@@ -51,8 +50,9 @@ export async function GET(request: Request) {
 }
 
 export async function PUT(request: Request) {
-  const session = await authenticateXapi(request);
-  if (!session) return unauthorizedResponse();
+  const bound = await bindXapi(request);
+  if (!bound.ok) return bound.response;
+  const session = bound.session;
 
   const { searchParams } = new URL(request.url);
   const stateId = searchParams.get("stateId");
@@ -85,9 +85,12 @@ export async function PUT(request: Request) {
 
   // 0075: the resume blob is the most current picture of how far the
   // learner is — raise progress from it (never lowers, never completes).
+  // P4: that write is conditional on status <> 'abandoned'; abandoned since
+  // the bind → 410.
   try {
     await updateProgressFromState(svc, session.attemptId, content);
   } catch (e) {
+    if (isAttemptAbandonedError(e)) return attemptAbandonedResponse();
     console.warn("[xapi/state] progress update failed:", e);
   }
 
@@ -101,8 +104,9 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const session = await authenticateXapi(request);
-  if (!session) return unauthorizedResponse();
+  const bound = await bindXapi(request);
+  if (!bound.ok) return bound.response;
+  const session = bound.session;
 
   const { searchParams } = new URL(request.url);
   const stateId = searchParams.get("stateId");

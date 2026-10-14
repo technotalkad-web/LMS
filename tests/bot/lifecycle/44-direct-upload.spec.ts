@@ -104,25 +104,31 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   const launch = await req.get(`${base}/launch`);
   expect(launch.ok()).toBeTruthy();
 
-  const vtxt = await req.get(`${base}/content/version.txt`);
+  // Legacy URL space (kept one release) still answers.
+  expect(await (await req.get(`${base}/content/version.txt`)).text()).toBe("v1");
+  // The launch page serves the attempt's version through the versioned route
+  // (ALDS step 0, P1) — the delivery checks below run against it.
+  const vbase = `${base}/content/v/${versions[0].id}`;
+  const vtxt = await req.get(`${vbase}/version.txt`);
   expect(vtxt.status()).toBe(200);
   expect(await vtxt.text()).toBe("v1");
   expect(vtxt.headers()["accept-ranges"]).toBe("bytes");
   expect(vtxt.headers()["content-type"]).toContain("text/plain");
 
   // Range: the first KB of a 1.5 MB audio file → 206 with the right window.
-  const part = await req.get(`${base}/content/assets/media/intro.mp3`, { headers: { Range: "bytes=0-1023" } });
+  const part = await req.get(`${vbase}/assets/media/intro.mp3`, { headers: { Range: "bytes=0-1023" } });
   expect(part.status()).toBe(206);
   expect(part.headers()["content-range"]).toBe("bytes 0-1023/1500000");
   expect((await part.body()).length).toBe(1024);
   expect(part.headers()["content-type"]).toContain("audio/mpeg");
-  const tail = await req.get(`${base}/content/assets/media/intro.mp3`, { headers: { Range: "bytes=1499000-" } });
+  const tail = await req.get(`${vbase}/assets/media/intro.mp3`, { headers: { Range: "bytes=1499000-" } });
   expect(tail.status()).toBe(206);
   expect((await tail.body()).length).toBe(1000);
-  const bad = await req.get(`${base}/content/assets/media/intro.mp3`, { headers: { Range: "bytes=9999999-" } });
+  const bad = await req.get(`${vbase}/assets/media/intro.mp3`, { headers: { Range: "bytes=9999999-" } });
   expect(bad.status()).toBe(416);
   expect(bad.headers()["content-range"]).toBe("bytes */1500000");
   // Traversal is refused; a foreign course id is not found.
+  expect((await req.get(`${vbase}/..%2F..%2Fother/index.html`)).status()).toBe(403);
   expect((await req.get(`${base}/content/..%2F..%2Fother/index.html`)).status()).toBe(403);
 
   // Real browser playback: the package loads, reads version.txt through the
@@ -134,7 +140,7 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   // transport, not playback.)
   const mediaResponses: Array<{ status: number; range: string | null }> = [];
   lp.on("response", (r) => {
-    if (r.url().includes("/content/assets/media/intro.mp3")) {
+    if (r.url().includes(`/content/v/${versions[0].id}/assets/media/intro.mp3`)) {
       mediaResponses.push({ status: r.status(), range: r.headers()["content-range"] ?? null });
     }
   });
@@ -157,7 +163,12 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   expect(versions[1].version_number).toBe(2);
   expect(versions[1].package_id).toBe(versions[0].package_id);
   expect(await currentVersionId(course.id)).toBe(versions[1].id);
-  expect(await (await req.get(`${base}/content/version.txt`)).text()).toBe("v2");
+  // ALDS step 0 (P1): the legacy route serves the learner's in-progress
+  // attempt's version (v1, launched above); the versioned route serves v2.
+  expect(await (await req.get(`${base}/content/version.txt`)).text()).toBe("v1");
+  expect(await (await req.get(`${base}/content/v/${versions[1].id}/version.txt`)).text()).toBe("v2");
+  // The admin (no attempt) gets the course's current version from the legacy route.
+  expect(await (await page.request.get(`${base}/content/version.txt`)).text()).toBe("v2");
 
   // --- rollback: Make current on v1 from the course page
   await page.goto(`/${w.org.slug}/library/${course.id}`);
@@ -169,7 +180,8 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   }).toPass({ timeout: 30_000 });
   await page.getByRole("dialog").getByRole("button", { name: /make current/i }).click();
   await expect.poll(() => currentVersionId(course.id), { timeout: 15_000 }).toBe(versions[0].id);
-  expect(await (await req.get(`${base}/content/version.txt`)).text()).toBe("v1");
+  // Rollback is visible to someone with no attempt (the admin) on the legacy route.
+  expect(await (await page.request.get(`${base}/content/version.txt`)).text()).toBe("v1");
   const { data: audit } = await svc()
     .from("platform_audit_log")
     .select("action, target_id")
@@ -249,6 +261,9 @@ test("direct upload: an unfinished upload never becomes current; abort and the r
   const learnerCtx = await authedContext(browser, baseURL!, w.learner.email, w.learner.password);
   await assignCourse(req, w.org.slug, j.courseId, w.learner.id);
   expect((await learnerCtx.request.get(`/${w.org.slug}/courses/${j.courseId}/content/index.html`)).status()).toBe(404);
+  // …nor through the versioned route, although tincan.xml IS in storage: only
+  // finished ('ready') uploads are servable (ALDS step 0, P1).
+  expect((await learnerCtx.request.get(`/${w.org.slug}/courses/${j.courseId}/content/v/${j.versionId}/tincan.xml`)).status()).toBe(404);
   await learnerCtx.close();
 
   // Abort: row and files go away.

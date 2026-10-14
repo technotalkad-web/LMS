@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { uploadCoursePackage } from "@/lib/courses/upload";
+import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import {
   enforcePackageValidation,
   linkValidationToVersion,
@@ -161,18 +162,23 @@ export async function POST(
       .map((r) => r.id)
       .filter((id) => id !== result.versionId);
     if (oldVerIds.length > 0) {
-      const { count, error: abErr } = await svc
+      const { data: abRows, error: abErr } = await svc
         .from("course_attempts")
-        .update({ status: "abandoned" }, { count: "exact" })
+        .update({ status: "abandoned" })
         .in("course_version_id", oldVerIds)
-        .eq("status", "in_progress");
+        .eq("status", "in_progress")
+        .select("id");
       if (abErr) {
         return NextResponse.json(
           { error: `New version uploaded, but restart failed: ${abErr.message}` },
           { status: 500 }
         );
       }
-      restarted = count ?? 0;
+      const abIds = ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+      restarted = abIds.length;
+      // ALDS step 0 (P4): an abandoned attempt's launch tokens die with it.
+      const tokErr = await expireLaunchTokens(svc, abIds);
+      if (tokErr) console.warn("[versions] token expiry failed:", tokErr.message);
     }
   }
 

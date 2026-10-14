@@ -30,6 +30,13 @@ export type ChangeLanguageOption = {
   display_label: string;
 };
 
+export type InProgressAttemptLang = {
+  /** Package language of the attempt's version (null = legacy/unknown). */
+  language: string | null;
+  /** A consumed admin grant (official retake) — never reset by a switch. */
+  grantedRetake: boolean;
+};
+
 /**
  * Compact "Change language" dropdown on the learner course detail
  * page (#158 Phase 3). Reuses the PUT /api/courses/:courseId/language-preference
@@ -43,11 +50,20 @@ export function ChangeLanguageMenu({
   courseId,
   options,
   currentLanguage,
+  inProgress = [],
 }: {
   orgSlug: string;
   courseId: string;
   options: ChangeLanguageOption[];
   currentLanguage: string | null;
+  /**
+   * The learner's in-progress attempts on this course, by package language.
+   * A switch resets the ones in other languages EXCEPT an extra attempt an
+   * admin granted (ALDS Decision 9). When such an attempt is involved the
+   * copy is chosen per target language; otherwise the original confirmation
+   * text is shown unchanged.
+   */
+  inProgress?: InProgressAttemptLang[];
 }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -123,8 +139,26 @@ export function ChangeLanguageMenu({
   const currentOption =
     options.find((o) => o.language === currentLanguage) ?? null;
 
-  // Switching away from the current language always resets progress, so it
-  // requires explicit confirmation before any change is made.
+  // What a confirmed switch to `target` does to the in-progress attempts
+  // (mirrors PUT /language-preference): attempts in other languages are
+  // reset, except an admin-granted extra attempt, which is kept.
+  function switchSummary(target: string) {
+    const labelOf = (lang: string | null) =>
+      options.find((o) => o.language === lang)?.display_label ??
+      languageDisplay(lang, "english");
+    const others = inProgress.filter((a) => a.language !== target);
+    const kept = others.find((a) => a.grantedRetake);
+    return {
+      keptRetakeLabel: kept ? labelOf(kept.language) : null,
+      continuesRetake: inProgress.some((a) => a.grantedRetake && a.language === target),
+      resets: others.some((a) => !a.grantedRetake),
+      freshInTarget: !inProgress.some((a) => a.language === target),
+    };
+  }
+
+  // Switching away from the current language resets in-progress work (except
+  // an admin-granted extra attempt), so it requires explicit confirmation
+  // before any change is made.
   function requestSwitch(language: string) {
     setError(null);
     setOpen(false);
@@ -245,10 +279,29 @@ export function ChangeLanguageMenu({
         >
           <div className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4">
             <h3 className="serif text-2xl">Change Course Language?</h3>
-            <p className="text-sm text-ink leading-relaxed">
-              Changing the language will reset your current progress and start the
-              course from the beginning in the new language.
-            </p>
+            {(() => {
+              const s = switchSummary(confirmFor.language);
+              if (!s.keptRetakeLabel && !s.continuesRetake) {
+                return (
+                  <p className="text-sm text-ink leading-relaxed">
+                    Changing the language will reset your current progress and start the
+                    course from the beginning in the new language.
+                  </p>
+                );
+              }
+              return (
+                <p className="text-sm text-ink leading-relaxed">
+                  {s.continuesRetake
+                    ? `Switching to ${confirmFor.label} lets you continue your extra attempt. `
+                    : ""}
+                  {s.keptRetakeLabel
+                    ? `Your extra attempt in progress is kept: it stays in ${s.keptRetakeLabel}, and you can continue it by switching back. `
+                    : ""}
+                  {s.resets ? "Other progress you have in another language will be reset. " : ""}
+                  {s.freshInTarget ? `In ${confirmFor.label} the course starts from the beginning.` : ""}
+                </p>
+              );
+            })()}
             <div className="flex justify-end gap-2 pt-2">
               <button
                 type="button"
