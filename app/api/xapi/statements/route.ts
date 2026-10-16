@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { randomUUID } from "crypto";
 import { bindXapi, serviceClient } from "@/lib/xapi/auth";
+import { deterministicStatementId } from "@/lib/lrs/statement-id";
+import { isSameStatementAsReceived } from "@/lib/xapi/statement-equality";
 import { attemptAbandonedResponse, isAttemptAbandonedError } from "@/lib/attempts/abandon";
 import { processStatement } from "@/lib/xapi/process-statement";
 import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
@@ -48,42 +49,88 @@ export async function POST(request: Request) {
   };
   const wasComplete = await attemptStatus().catch(() => false);
 
-  for (const raw of statements) {
-    const statement: XapiStatement = { ...raw };
-    if (!statement.id) statement.id = randomUUID();
-    if (!statement.timestamp) statement.timestamp = new Date().toISOString();
+  // What reaches the tenant LRS mirror: the statements as stored. A resent id
+  // with different content is left out (ADR 0003 step 5).
+  const mirror: XapiStatement[] = [];
 
-    if (!statement.verb?.id) {
+  for (const received of statements) {
+    // The deterministic id below is derived from verb.id, so the 400 comes first.
+    if (!received || typeof received !== "object" || !received.verb?.id) {
       return NextResponse.json(
         { error: "Statement missing verb.id" },
         { status: 400 }
       );
     }
+    const statement: XapiStatement = { ...received };
+    // ADR 0003 step 6: an id-less statement gets a deterministic id, computed
+    // from the statement AS SENT (before a missing timestamp is filled), so
+    // the engine's re-POST of the same queued object collapses to one row.
+    if (!statement.id) statement.id = deterministicStatementId(session.attemptId, received);
+    if (!statement.timestamp) statement.timestamp = new Date().toISOString();
+    const statementId = statement.id;
 
-    await svc.from("xapi_statements").upsert(
-      {
-        attempt_id: session.attemptId,
-        statement_id: statement.id,
-        verb: statement.verb.id,
-        raw: statement,
-      },
-      { onConflict: "attempt_id,statement_id" }
-    );
+    // ADR 0003 step 5: statements are write-once (ON CONFLICT DO NOTHING).
+    // A resent id never changes the stored raw.
+    const { data: inserted, error: insertErr } = await svc
+      .from("xapi_statements")
+      .upsert(
+        {
+          attempt_id: session.attemptId,
+          statement_id: statementId,
+          verb: statement.verb.id,
+          raw: statement,
+        },
+        { onConflict: "attempt_id,statement_id", ignoreDuplicates: true }
+      )
+      .select("statement_id");
 
-    // The attempt update inside is conditional on status <> 'abandoned';
-    // abandoned since the bind (another tab switched language) → 410.
-    try {
-      await processStatement({
-        statement,
-        attemptId: session.attemptId,
-        supabase: svc,
-      });
-    } catch (e) {
-      if (isAttemptAbandonedError(e)) return attemptAbandonedResponse();
-      throw e;
+    let toProcess: XapiStatement | null = statement;
+    if (insertErr) {
+      // Unchanged from before write-once: a storage error never blocks the
+      // learner's progress from being derived.
+      console.warn("[xapi/statements] statement insert failed:", insertErr.message);
+    } else if (!inserted || inserted.length === 0) {
+      // The id already exists on this attempt. An exact retry re-runs the
+      // (idempotent) derivation on the stored copy; different content under
+      // the same id is ignored and logged.
+      const { data: storedRow } = await svc
+        .from("xapi_statements")
+        .select("raw")
+        .eq("attempt_id", session.attemptId)
+        .eq("statement_id", statementId)
+        .maybeSingle();
+      const storedRaw = (storedRow as { raw?: unknown } | null)?.raw;
+      if (storedRaw && isSameStatementAsReceived(storedRaw, received)) {
+        toProcess = storedRaw as XapiStatement;
+      } else {
+        toProcess = null;
+        console.warn(
+          JSON.stringify({
+            event: "statement_conflict",
+            attempt_id: session.attemptId,
+            statement_id: statementId,
+          })
+        );
+      }
     }
 
-    ids.push(statement.id);
+    if (toProcess) {
+      // The attempt update inside is conditional on status <> 'abandoned';
+      // abandoned since the bind (another tab switched language) → 410.
+      try {
+        await processStatement({
+          statement: toProcess,
+          attemptId: session.attemptId,
+          supabase: svc,
+        });
+      } catch (e) {
+        if (isAttemptAbandonedError(e)) return attemptAbandonedResponse();
+        throw e;
+      }
+      mirror.push(toProcess);
+    }
+
+    ids.push(statementId);
   }
 
   // 0081 revision rule: once complete, only an OFFICIAL attempt (inside the
@@ -124,7 +171,7 @@ export async function POST(request: Request) {
 
   // Fan-out: mirror these statements to the org's external LRS if configured.
   // Fail-isolated + non-blocking — never affects this response or our own copy.
-  await mirrorToExternalLrs(session.attemptId, statements);
+  await mirrorToExternalLrs(session.attemptId, mirror);
 
   return NextResponse.json(ids, { status: 200 });
 }
