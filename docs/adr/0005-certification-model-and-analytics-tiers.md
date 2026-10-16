@@ -1,6 +1,7 @@
 # 0005. Certification model and analytics tiers
 
-Status: Proposed
+Status: Accepted (owner, 2026-10-16)
+Acceptance: accepted by the owner on 2026-10-16 after two checks (the migration numbering, ADR 0003 step 7a; the per-attempt learner impact, ADR 0004 §5), on two conditions that bind ADR 0002–0007: (a) no learner attempt is restarted or abandoned until the owner gives an explicit go after seeing the per-attempt impact list; (b) production migration state is confirmed in the P1 read-only audit (ADR 0007 step 2) before any production apply; for this record, (b) also means `0099_alds_core.sql` reaches production only after the audit has confirmed 0098 there. All steps are accepted as written; the owner's answers to the decisions requested below are recorded in that section.
 Date: 2026-10-15
 Deciders: owner; architect (Fable 5.1)
 
@@ -80,10 +81,10 @@ Deciders: owner; architect (Fable 5.1)
 
 ## Decisions requested from the owner
 
-1. D1: reliable analytics = KIVO cmi5 question analytics only; completions, Report Card, CRM and journeys never tier-filtered. Recommended: yes.
-2. D3: the certification model of steps 4–7 with the in-editor export self-check; the browser runner only on the P6 trigger. Recommended: yes.
-3. Expose `analytics_tier` next to `version_id` on `/api/integrations/catalog` so Yoddha and analysts can join forwarded statements to the current tier (a review suggestion, not in the reviewed plan). Recommended: yes; one optional field, no contract break.
-4. Default "publish on certification" for Level 2 uploads (version ready but not current until the static check passes; admin may "Publish now anyway", audited) — a review suggestion, not in the reviewed plan. Recommended: no for now; the static check is synchronous and short, and the "unpublished versions" Attention Center provider requested in ADR 0004 would cover the gap if accepted.
+1. D1: reliable analytics = KIVO cmi5 question analytics only; completions, Report Card, CRM and journeys never tier-filtered. Recommended: yes. Decided (owner, 2026-10-16): yes.
+2. D3: the certification model of steps 4–7 with the in-editor export self-check; the browser runner only on the P6 trigger. Recommended: yes. Decided (owner, 2026-10-16): yes.
+3. Expose `analytics_tier` next to `version_id` on `/api/integrations/catalog` so Yoddha and analysts can join forwarded statements to the current tier (a review suggestion, not in the reviewed plan). Recommended: yes; one optional field, no contract break. Decided (owner, 2026-10-16): yes, optional field.
+4. Default "publish on certification" for Level 2 uploads (version ready but not current until the static check passes; admin may "Publish now anyway", audited) — a review suggestion, not in the reviewed plan. Recommended: no for now; the static check is synchronous and short, and the "unpublished versions" Attention Center provider requested in ADR 0004 would cover the gap if accepted. Decided (owner, 2026-10-16): no for now; the ADR 0004 provider is accepted.
 
 ## References
 

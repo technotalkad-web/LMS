@@ -1,6 +1,7 @@
 # 0002. Future-first strategy: legacy frozen and protected, future packages certified
 
-Status: Proposed
+Status: Accepted (owner, 2026-10-16)
+Acceptance: accepted by the owner on 2026-10-16 after two checks (the migration numbering against the database history, ADR 0003 step 7a; the per-attempt learner impact of the Hindi and Gujarati corrections, ADR 0004 §5), on two conditions that bind ADR 0002–0007: (a) no learner attempt is restarted or abandoned until the owner gives an explicit go after seeing the per-attempt impact list; (b) production migration state is confirmed in the P1 read-only audit (ADR 0007 step 2) before any production apply. All steps of this record are accepted as written; the owner's answers to the decisions requested below are recorded in that section. One Context fact is corrected by the 2026-10-16 impact check: the two other versions repointed in step 0 (887d4aaf and 3b005ed1, the Hindi and default slots of "The A.M.B.A.K. Framework") are not correct; they hold Turning Escalations Level 1 SCORM with no attempts. ADR 0004 records the finding and its D5a handles it.
 Date: 2026-10-15
 Deciders: owner; architect (Fable 5.1)
 
@@ -41,8 +42,8 @@ Facts behind it (staging, read-only, at a89832f):
 
 ## Decisions requested from the owner
 
-1. Confirm the not-doing list in Decision 4 as binding scope. Recommended: yes.
-2. Confirm that the only Hinglish measure in P0 is the `display_name` relabel by L&D (no `hi-Latn` slot code). Recommended: yes; a `hi-Latn` code is added only if a script rule ever becomes gating, which ADR 0004 does not propose.
+1. Confirm the not-doing list in Decision 4 as binding scope. Recommended: yes. Decided (owner, 2026-10-16): yes. The abandon actions of ADR 0004 D5b run through app flows and are not the "attempt surgery" this list excludes.
+2. Confirm that the only Hinglish measure in P0 is the `display_name` relabel by L&D (no `hi-Latn` slot code). Recommended: yes; a `hi-Latn` code is added only if a script rule ever becomes gating, which ADR 0004 does not propose. Decided (owner, 2026-10-16): yes.
 
 ## References
 
