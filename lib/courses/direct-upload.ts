@@ -9,6 +9,7 @@ import {
   contentTypeFor,
   createCourseFromManifest,
   insertVersionRow,
+  isVersionConflictError,
   manifestData,
   nextVersionNumber,
   publishVersion,
@@ -218,7 +219,14 @@ export async function initDirectUpload(args: {
     });
   } catch (e) {
     await undoCourse();
-    return { ok: false, status: 400, error: e instanceof Error ? e.message : "Could not create the version." };
+    // ADR 0003 step 8: 23505 — another upload to this package holds the
+    // version number / folder. Nothing was written and the validation is
+    // not consumed yet, so the admin can simply retry.
+    return {
+      ok: false,
+      status: isVersionConflictError(e) ? 409 : 400,
+      error: e instanceof Error ? e.message : "Could not create the version.",
+    };
   }
   // The row must really carry upload_status: without migration 0077 the
   // insert silently fell back to a 'ready'-looking legacy row, which would

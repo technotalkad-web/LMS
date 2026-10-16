@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { uploadCoursePackage } from "@/lib/courses/upload";
+import { isVersionConflictError, uploadCoursePackage } from "@/lib/courses/upload";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import {
   enforcePackageValidation,
@@ -136,9 +136,10 @@ export async function POST(
       supabase: svc,
     });
   } catch (e) {
+    // ADR 0003 step 8: a concurrent upload holds this package's next version.
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Upload failed" },
-      { status: 500 }
+      { status: isVersionConflictError(e) ? 409 : 500 }
     );
   }
   await linkValidationToVersion({

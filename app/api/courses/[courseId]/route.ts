@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { countLearnerAttemptsOnCourse, isLearnerHistoryError } from "@/lib/courses/learner-history";
 
 /**
  *   PATCH  /api/courses/[courseId]
@@ -156,16 +158,73 @@ export async function PATCH(
   return NextResponse.json({ ok: true });
 }
 
+/**
+ * DELETE refuses (409) while learner attempts exist on any version of the
+ * course (ADR 0003 step 12; same definition as the 0098 delete guard: staff
+ * attempts don't count, former members' do). The delete itself stays an RLS
+ * delete, so a non-admin still deletes nothing.
+ */
 export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ courseId: string }> }
 ) {
   const { courseId } = await params;
   const supabase = await createClient();
+  const refuse = (count: number | null) =>
+    NextResponse.json(
+      {
+        error: `Cannot delete: ${count ?? "some"} learner attempts exist on this course. Deactivate instead (PATCH { is_active: false }) to preserve history.`,
+        attempt_count: count,
+      },
+      { status: 409 }
+    );
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (user) {
+    const { data: course } = await supabase
+      .from("courses")
+      .select("id, organization_id")
+      .eq("id", courseId)
+      .maybeSingle();
+    const orgId = (course as { organization_id?: string } | null)?.organization_id;
+    if (orgId) {
+      const { data: mem } = await supabase
+        .from("organization_members")
+        .select("role")
+        .eq("organization_id", orgId)
+        .eq("user_id", user.id)
+        .maybeSingle();
+      const role = (mem?.role as string | undefined) ?? "";
+      if (role === "super_owner" || role === "owner" || role === "admin") {
+        // Attempts belong to other users: count with the service role, after
+        // the admin check. Fail closed when the count cannot be read.
+        const svc = createServiceClient(
+          process.env.NEXT_PUBLIC_SUPABASE_URL!,
+          process.env.SUPABASE_SERVICE_ROLE_KEY!,
+          { auth: { persistSession: false } }
+        );
+        let learnerAttempts: number;
+        try {
+          learnerAttempts = await countLearnerAttemptsOnCourse(svc, courseId);
+        } catch (e) {
+          return NextResponse.json(
+            { error: e instanceof Error ? e.message : "Could not check learner history" },
+            { status: 503 }
+          );
+        }
+        if (learnerAttempts > 0) return refuse(learnerAttempts);
+      }
+    }
+  }
+
   const { error } = await supabase
     .from("courses")
     .delete()
     .eq("id", courseId);
+  // A learner attempt that arrived after the count: the 0098 trigger refuses.
+  if (isLearnerHistoryError(error)) return refuse(null);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
   return NextResponse.json({ ok: true });
 }

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { uploadCoursePackage } from "@/lib/courses/upload";
+import { isVersionConflictError, uploadCoursePackage } from "@/lib/courses/upload";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
 import {
   enforcePackageValidation,
@@ -236,7 +236,7 @@ export async function POST(
     await svc.from("course_packages").delete().eq("id", newPackageId);
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Upload failed" },
-      { status: 500 }
+      { status: isVersionConflictError(e) ? 409 : 500 }
     );
   }
   await linkValidationToVersion({

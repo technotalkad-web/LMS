@@ -3,7 +3,7 @@ import { parseManifestFromZip } from "./manifest/detect";
 import { countUnitsInZip } from "./units";
 import { activeStorageDriver, getStorage } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ParsedManifest } from "./manifest/types";
 
 export interface UploadResult {
@@ -31,6 +31,11 @@ export interface UploadResult {
  * package auto-resolved / auto-created so the insert always has a valid
  * package_id. Version numbers sequence per-package, not per-course, so that
  * uploading v3 of the English variant doesn't make Hindi skip from v1 to v4.
+ *
+ * Reserve-first (ADR 0003 step 8a): the version row is inserted as
+ * 'uploading' before any byte is written, so a concurrent upload to the same
+ * package fails with VersionConflictError (409) instead of overwriting the
+ * first upload's objects; the row turns 'ready' only after every file landed.
  */
 export async function uploadCoursePackage(opts: {
   zipBytes: Buffer | Uint8Array;
@@ -66,48 +71,75 @@ export async function uploadCoursePackage(opts: {
     existingCourse: !!opts.courseId,
   });
   const versionNumber = await nextVersionNumber(supabase, packageId);
-
-  // 4) Upload every file in the zip to storage.
   const storagePrefix = storagePrefixFor(courseId, packageId, versionNumber);
-  const storage = await getStorage();
+  const files = Object.entries(zip.files)
+    .filter(([, file]) => !file.dir)
+    .map(([path, file]) => ({ cleanPath: stripPackageRoot(path), file }))
+    .filter((f) => !!f.cleanPath);
 
-  const uploads: Array<Promise<void>> = [];
-  let fileCount = 0;
-  for (const [path, file] of Object.entries(zip.files)) {
-    if (file.dir) continue;
-    const cleanPath = stripPackageRoot(path);
-    if (!cleanPath) continue;
-    fileCount++;
-    const key = storagePrefix + sanitizeStorageKey(cleanPath);
-    uploads.push(
-      file.async("uint8array").then((bytes) =>
-        storage.upload(key, bytes, contentTypeFor(cleanPath))
-      )
-    );
+  // 4) Reserve the version BEFORE any byte is written (ADR 0003 step 8a).
+  //    The unique (package_id, version_number) and storage_prefix constraints
+  //    make a second concurrent upload to this package fail here with 23505
+  //    (VersionConflictError → 409) before it can overwrite anything. The row
+  //    is 'uploading', which the content route never serves.
+  const createdCourse = !opts.courseId;
+  const svc = serviceClient();
+  let version: { id: string; version_number: number };
+  try {
+    version = await insertVersionRow(supabase, {
+      course_id: courseId,
+      package_id: packageId,
+      version_number: versionNumber,
+      manifest_type: manifest.type,
+      launch_url: manifest.launchUrl,
+      storage_prefix: storagePrefix,
+      manifest_data: manifestData(manifest, null),
+      // B5: real per-upload footprint (the uploaded package's byte size) so
+      // storage quota is enforced on actual bytes, not a flat per-row estimate.
+      size_bytes: (zipBytes as Uint8Array).byteLength,
+      uploaded_by: uploaderId,
+      upload_status: "uploading",
+      storage_driver: activeStorageDriver(),
+      file_count: files.length,
+      upload_started_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    // Nothing was written; a course created by THIS call must not survive.
+    if (createdCourse) await svc.from("courses").delete().eq("id", courseId);
+    throw e;
   }
-  await runConcurrent(uploads, 12);
 
-  // 0075: learning-unit count (screens) for progress %. Single-file engines
-  // embed their slide list in the launch HTML; null = no usable signal.
-  const unitCount = await countUnitsInZip(zip, manifest.launchUrl);
+  // 5) Upload every file, then flip the row to 'ready'. On any error the
+  //    reserved row and its prefix are removed (crashes: the reaper's
+  //    sweepAbandonedUploads covers 'uploading' rows older than a day).
+  const storage = await getStorage();
+  try {
+    const uploads: Array<Promise<void>> = files.map(({ cleanPath, file }) =>
+      file
+        .async("uint8array")
+        .then((bytes) =>
+          storage.upload(storagePrefix + sanitizeStorageKey(cleanPath), bytes, contentTypeFor(cleanPath))
+        )
+    );
+    await runConcurrent(uploads, 12);
 
-  // 5) course_version row (already 'ready': the files are in place).
-  const version = await insertVersionRow(supabase, {
-    course_id: courseId,
-    package_id: packageId,
-    version_number: versionNumber,
-    manifest_type: manifest.type,
-    launch_url: manifest.launchUrl,
-    storage_prefix: storagePrefix,
-    manifest_data: manifestData(manifest, unitCount),
-    // B5: real per-upload footprint (the uploaded package's byte size) so
-    // storage quota is enforced on actual bytes, not a flat per-row estimate.
-    size_bytes: (zipBytes as Uint8Array).byteLength,
-    uploaded_by: uploaderId,
-    upload_status: "ready",
-    storage_driver: activeStorageDriver(),
-    file_count: fileCount,
-  });
+    // 0075: learning-unit count (screens) for progress %. Single-file engines
+    // embed their slide list in the launch HTML; null = no usable signal.
+    const unitCount = await countUnitsInZip(zip, manifest.launchUrl);
+    await markVersionReady(svc, version.id, {
+      manifest_data: manifestData(manifest, unitCount),
+      file_count: files.length,
+    });
+  } catch (e) {
+    try {
+      await storage.deletePrefix(storagePrefix.replace(/\/$/, ""));
+    } catch (delErr) {
+      console.warn("[upload] cleanup: prefix delete failed", delErr);
+    }
+    await svc.from("course_versions").delete().eq("id", version.id);
+    if (createdCourse) await svc.from("courses").delete().eq("id", courseId);
+    throw e;
+  }
 
   // 6) Point the package and the course at this version.
   await publishVersion(supabase, { courseId, packageId, versionId: version.id });
@@ -304,15 +336,68 @@ export async function insertVersionRow(
   const attempt = async (r: Record<string, unknown>) =>
     supabase.from("course_versions").insert(r).select("id, version_number").single();
   let { data, error } = await attempt(row);
-  if (error && /upload_status|storage_driver|file_count|upload_started_at|schema cache/i.test(error.message)) {
+  if (error && error.code !== "23505" && /upload_status|storage_driver|file_count|upload_started_at|schema cache/i.test(error.message)) {
     const legacy = { ...row };
     for (const k of ["upload_status", "storage_driver", "file_count", "upload_started_at"]) delete legacy[k];
     ({ data, error } = await attempt(legacy));
   }
+  // ADR 0003 step 8: the version number or the storage folder is already
+  // taken — another upload to the same package got there first.
+  if (error?.code === "23505") throw new VersionConflictError();
   if (error || !data) {
     throw new Error(`Failed to create course_version: ${error?.message}`);
   }
   return data as { id: string; version_number: number };
+}
+
+/**
+ * A concurrent upload already holds this package's next version (SQLSTATE
+ * 23505 on (package_id, version_number) or storage_prefix). Routes answer 409.
+ */
+export class VersionConflictError extends Error {
+  readonly status = 409;
+  constructor() {
+    super("Another upload to this language is in progress. Wait for it to finish, then try again.");
+    this.name = "VersionConflictError";
+  }
+}
+
+export function isVersionConflictError(e: unknown): e is VersionConflictError {
+  return e instanceof VersionConflictError || (e as { name?: string } | null)?.name === "VersionConflictError";
+}
+
+/**
+ * uploading → ready for a reserved multipart version. Service role: there is
+ * no admin UPDATE policy on course_versions, so an RLS update would touch 0
+ * rows. Deploy-safe before 0077 (no upload_status / file_count columns).
+ */
+async function markVersionReady(
+  svc: SupabaseClient,
+  versionId: string,
+  patch: { manifest_data: Record<string, unknown>; file_count: number }
+): Promise<void> {
+  let { data, error } = await svc
+    .from("course_versions")
+    .update({ upload_status: "ready", ...patch })
+    .eq("id", versionId)
+    .select("id");
+  if (error && /upload_status|file_count|schema cache/i.test(error.message)) {
+    ({ data, error } = await svc
+      .from("course_versions")
+      .update({ manifest_data: patch.manifest_data })
+      .eq("id", versionId)
+      .select("id"));
+  }
+  if (error) throw new Error(`Failed to finalise course_version: ${error.message}`);
+  if (!data || data.length === 0) throw new Error("Failed to finalise course_version: the reserved row is gone.");
+}
+
+function serviceClient(): SupabaseClient {
+  return createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
 }
 
 /**
