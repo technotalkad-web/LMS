@@ -7,7 +7,7 @@
  * Run:  npx tsx tests/unit/scoring-status.test.ts
  * (No DB. Typechecked by `npm run typecheck`.)
  */
-import { DEFAULT_POLICY } from "../../lib/scoring/policy";
+import { DEFAULT_POLICY, hasLiveGrantedRetake } from "../../lib/scoring/policy";
 import {
   computeScoring,
   courseStatus,
@@ -153,6 +153,17 @@ console.log("\nenrolment summary: Library card = course Reports tiles");
   });
   eq("the four status numbers sum to total", s.completed + s.failed + s.inProgress + s.notStarted, s.total);
   eq("nobody enrolled -> all zero", enrolledStatusSummary(new Set(), m, "c1"), { total: 0, completed: 0, failed: 0, inProgress: 0, notStarted: 0 });
+}
+
+console.log("\na granted retake blocks a new grant only while it is live (gap 5)");
+{
+  const g = new Set(["r1"]);
+  const row = (status: string, cs = "in_progress", ss = "unknown") => [{ id: "r1", status, completion_status: cs, success_status: ss }];
+  eq("in progress -> blocks", hasLiveGrantedRetake(row("in_progress"), g), true);
+  eq("reset by a force restart (abandoned) -> never blocks", hasLiveGrantedRetake(row("abandoned"), g), false);
+  eq("completed -> does not block", hasLiveGrantedRetake(row("completed", "completed"), g), false);
+  eq("status lagging but passed -> does not block", hasLiveGrantedRetake(row("in_progress", "in_progress", "passed"), g), false);
+  eq("an in-progress attempt that is not the retake -> does not block", hasLiveGrantedRetake(row("in_progress"), new Set(["other"])), false);
 }
 
 console.log(`\n==== status: ${pass} passed, ${fail} failed ====`);

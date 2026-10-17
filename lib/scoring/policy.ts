@@ -130,6 +130,20 @@ export function excludeAbandoned<T extends object>(attempts: T[]): T[] {
 }
 
 /**
+ * A granted retake that still blocks a new grant: one of `retakeIds` that is
+ * in progress and not finished. One a force restart reset (status
+ * 'abandoned') is closed for good and never blocks (ADR 0004 step 11).
+ */
+export function hasLiveGrantedRetake(
+  attempts: Array<{ id: string; status?: string | null; completion_status?: string | null; success_status?: string | null }>,
+  retakeIds: ReadonlySet<string>
+): boolean {
+  return attempts.some(
+    (x) => retakeIds.has(x.id) && x.status === "in_progress" && !(x.completion_status === "completed" || x.success_status === "passed")
+  );
+}
+
+/**
  * Attempt counts for admin tables (ADR 0004 step 11): `live` = attempts that
  * were not reset, the number a table shows; `reset` = abandoned attempts,
  * shown as a small "· N reset" suffix when N > 0.

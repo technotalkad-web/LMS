@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { DEFAULT_POLICY, computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, hasLiveGrantedRetake, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { fetchGrantRetakeIdsForUsers, fetchPassRequired } from "@/lib/scoring/attempt-kind";
 import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from "./requests";
@@ -100,7 +100,7 @@ export async function grantExtraAttempts(
     if (!sc.limitReached) { results.push({ userId: uid, status: "skipped", reason: "still has an official attempt available" }); continue; }
     // Only a LIVE granted retake blocks a new grant: one a force restart reset
     // (status 'abandoned') is closed for good (ADR 0004 step 11).
-    if (mine.some((x) => retakeIds.has(x.id) && x.status === "in_progress" && !(x.completion_status === "completed" || x.success_status === "passed"))) {
+    if (hasLiveGrantedRetake(mine, retakeIds)) {
       results.push({ userId: uid, status: "skipped", reason: "a granted retake is still in progress" });
       continue;
     }
