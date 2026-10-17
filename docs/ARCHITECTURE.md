@@ -1,6 +1,6 @@
 # Ambak University LMS — Architecture
 
-Status: governing document. `CLAUDE.md` names this file and `docs/adr/` as the source of truth. Written 2026-10-15 against a89832f (`origin/main`) plus the local governance commit 31bddd5 (`CLAUDE.md`, `.claude/agents/architect.md`). It says what the system is, which document rules which area, and where each structural decision is recorded. It does not repeat the design documents it points at. Sections 5 (second table), 6 and 7 describe decisions that are still Proposed (ADR 0002–0007); until the owner accepts them, the blueprint as written governs learning data and no phase work starts.
+Status: governing document. `CLAUDE.md` names this file and `docs/adr/` as the source of truth. Written 2026-10-15 against a89832f (`origin/main`) plus the local governance commit 31bddd5 (`CLAUDE.md`, `.claude/agents/architect.md`); updated 2026-10-16 at d2073a6 to record the acceptance of ADR 0002–0007. It says what the system is, which document rules which area, and where each structural decision is recorded. It does not repeat the design documents it points at. ADR 0002–0007 were accepted by the owner on 2026-10-16 on two conditions that bind every phase: (a) no learner attempt is restarted or abandoned until the owner gives an explicit go after seeing the per-attempt impact list; (b) production migration state is confirmed in the P1 read-only audit before any production apply. The section map (§5, second table), the roadmap (§6) and the decisions (§7) are in force; P0 implementation may start.
 
 ## 1. The system today
 
@@ -15,7 +15,7 @@ Status: governing document. `CLAUDE.md` names this file and `docs/adr/` as the s
 
 | | Staging | Production |
 |---|---|---|
-| Supabase | project `zeaclbapadosqqttexxh`; migrations applied through 0097 (plus the out-of-repo 0032 hotfix) | separate project; believed at migration 0071 (`scripts/check-migration-grants.mjs` says 0073 is the first pending; the P1 audit settles whether 0072 is applied); free tier, t4g.nano, no PITR |
+| Supabase | project `zeaclbapadosqqttexxh`; migrations applied through 0097 (plus the hand-applied 0032 hotfix, `0032_course_versions_unique_per_package.sql`, verified 2026-10-16: 0093/0096/0097 objects present, no 0098/0099 objects) | separate project; believed at migration 0071 (`scripts/check-migration-grants.mjs` says 0073 is the first pending; the P1 audit settles whether 0072 is applied); free tier, t4g.nano, no PITR |
 | App | Workers `my-lms.mentora.workers.dev` (free plan, 10 ms CPU cap, random 1102), auto-deployed on push to `main`; Cloud Run trial project `lms-cloudrun-trial-01` against the staging Supabase, owner-run deploy, currently on the 2026-10-07 build | Workers `my-lms-prod`, deployed by tag `v*.*.*` or `workflow_dispatch` (`deploy-prod.yml`); runs code from 2026-09-17; no `v1.2.0` tag exists on `origin` |
 | Crons | none scheduled (`OPS_EXPECT_CRONS` unset) | `cron.yml` POSTs `/api/cron/*`; `ops-watch.yml` probes `/api/ops/health` |
 | Tests | `pr-checks` e2e and `nightly-e2e` run against the Workers staging URL and purge every `qa-*` org and `@example.test` user first | never |
@@ -51,8 +51,8 @@ Drift to close: production is 25–26 migrations and one month of code behind st
 | `lib/integrations/` | CRM API auth, progress, webhook |
 | `lib/manager/`, `lib/attention/`, `lib/notifications/` | Report Card, Attention Center providers, email templates |
 | `lib/storage/` | `supabase.ts`, `r2.ts`, `keys.ts` |
-| `lib/alds/` (planned, Proposed) | ALDS types, rules bundle, launch contract, ingest (ADR 0005, 0006) |
-| `supabase/migrations/` | `0001…0097`, hand-applied; 0032 exists only outside the repository until committed (ADR 0003); conventions in `docs/MIGRATIONS.md` |
+| `lib/alds/` (planned; accepted, built in P3/P4) | ALDS types, rules bundle, launch contract, ingest (ADR 0005, 0006) |
+| `supabase/migrations/` | `0001…0097` on `main` with the single gap at 0032, hand-applied; P0 commits the hotfix as `0032_course_versions_unique_per_package.sql` (its name on the unmerged branch `fix/158-versions-unique-per-package`, made idempotent; ADR 0003 step 7); no branch carries 0098 or higher; conventions in `docs/MIGRATIONS.md` |
 | `tests/unit/` | seven standalone `tsx` test files, not yet run in CI |
 | `tests/e2e/` | the `pr-checks` suite (its global setup purges `qa-*` data) |
 | `tests/bot/lifecycle/` | lifecycle specs `00…49`, run by hand with `npm run test:lifecycle` |
@@ -90,7 +90,7 @@ Drift to close: production is 25–26 migrations and one month of code behind st
 | Scoring and official attempts | `docs/ATTEMPT_SCORING.md` | — |
 | Cloud Run staging | `docs/CLOUD_RUN_STAGING.md` | ADR 0007 |
 
-Blueprint sections under the future-first profile (ADR 0002). Proposed: this map takes effect only when the owner accepts ADR 0002–0007; until then the blueprint as written governs.
+Blueprint sections under the future-first profile (ADR 0002). In force since 2026-10-16 (ADR 0002–0007 accepted); where this map and the blueprint differ, this map governs.
 
 | Section | Status |
 |---|---|
@@ -108,58 +108,61 @@ Blueprint sections under the future-first profile (ADR 0002). Proposed: this map
 
 ## 6. Roadmap
 
-Proposed: this roadmap takes effect only when the owner accepts ADR 0002–0007.
+In force since 2026-10-16 (ADR 0002–0007 accepted). Status as of 2026-10-16: P0 approved to start (the acceptance PR precedes it; D5a on staging is owner-run now; D5b waits for the owner's go); P1–P5 not started; P6 conditional. Both acceptance conditions apply to every phase: no attempt restarted or abandoned without the owner's go after the per-attempt list, and no production apply before the P1 audit confirms production's migration state.
 
-| Phase | Contents | ADR | Production release | Gate |
-|---|---|---|---|---|
-| P0 | Protect and preserve: content backups, no statement overwrite, write-once versions (reserve-first upload), delete guard, collision block with super_owner override, launch-time slot handling, abandoned-attempt visibility, unit job in CI, D5 clean-up on staging | 0003, 0004 | v1.3.0 (with P1) | On staging: 0098 applied (storage-prefix gate SQL = 0 rows before apply); lifecycle 47, 48, 49, 32, 50-record-guard, 51-no-overwrite, 52-integrity-check and 53-launch-routing green; the pr-checks `unit` job green, including the scoring-status abandoned cases; staging and production Storage snapshots present in B2 and `content-backup.yml` green for one night |
-| P1 | Production release v1.3.0: read-only audit (`ops/release-v1.3.0-audit.sql`), rehearsal on a scratch project including the restore drill (moved here from P0, ADR 0003 step 4), 0032 (guarded) and 0072–0098 on production, tag, D5 clean-up on production for audited slots only | 0007, 0004 | v1.3.0 | post-apply probe file clean; release notes signed off; `report-card-refresh` schedule re-added only after the deploy is verified |
-| P2 | KIVO engine release A (parallel, KIVO repo, owner redeploys the editor) | 0006 | — | every-kind fixture with statement-shape assertions passes on Linux chromium |
-| P3 | ALDS rules as code (`lib/alds/rules`, hashed bundle, golden fixtures) | 0005 | — | golden fixtures pass in the pr-checks `unit` job |
-| P4 | KIVO 2.0 export, LMS launch contract, Package Guardian and tier UI, shipped per environment together; removal of the legacy `content/[...path]` route | 0005, 0006 | v1.4.0 | Entry condition: `lifecycle-nightly.yml` running (ADR 0007 step 15). Exit: first Level 2 package certified on staging; nightly golden canary green |
-| P5 | Certified question analytics (0100/0101 trimmed incl. `guardian_findings`/`guardian_runs`, ingest, pg_cron, readers behind `question_analytics_v2`) | 0005, 0007 | v1.5.0 | facts appear within one sweeper cadence; R-rules return 0 |
-| P6 | Conditional: sandbox certification runner, evaluate/enforce gateway, registrations | 0005 (trigger stated) | — | only on its trigger |
+| Phase | Contents | ADR | Production release | Gate | Status (2026-10-16) |
+|---|---|---|---|---|---|
+| P0 | Protect and preserve: content backups, no statement overwrite, write-once versions (reserve-first upload), delete guard, collision block with super_owner override, launch-time slot handling, abandoned-attempt visibility, unit job in CI, 0032 committed, per-version restart action (ADR 0004 step 14a, pending decision 0004/6); D5a on staging (grandfather upload of the corrected Hindi module, course defaults corrected, Framework course's two empty wrong slots deactivated; zero restarts); D5b on staging only on the owner's explicit go after the visibility fixes ship | 0003, 0004 | v1.3.0 (with P1) | On staging: 0098 applied (storage-prefix gate SQL = 0 rows before apply); lifecycle 47, 48, 49, 32, 50-record-guard, 51-no-overwrite, 52-integrity-check and 53-launch-routing green; the pr-checks `unit` job green, including the scoring-status abandoned cases; staging and production Storage snapshots present in B2 and `content-backup.yml` green for one night | Approved to start; D5a owner-run now; D5b gated |
+| P1 | Production release v1.3.0: read-only audit (`ops/release-v1.3.0-audit.sql`, with the checks added at acceptance: constraint state, 0072–0097 object probes, absence of 0098/0099 objects, inactive packages with in-progress attempts, course default versus slot titles), rehearsal on a scratch project including the restore drill (moved here from P0, ADR 0003 step 4), 0032 (guarded) and 0072–0098 on production, tag, D5a on production for audited slots only; D5b on production only on a separate owner go against the audit's per-attempt list | 0007, 0004 | v1.3.0 | post-apply probe file clean; release notes signed off; `report-card-refresh` schedule re-added only after the deploy is verified; the owner has seen the audit's list of in-progress attempts on inactive packages before the tag | Not started; blocked on the P0 gate and the audit |
+| P2 | KIVO engine release A (parallel, KIVO repo, owner redeploys the editor) | 0006 | — | every-kind fixture with statement-shape assertions passes on Linux chromium | Not started |
+| P3 | ALDS rules as code (`lib/alds/rules`, hashed bundle, golden fixtures) | 0005 | — | golden fixtures pass in the pr-checks `unit` job | Not started |
+| P4 | KIVO 2.0 export, LMS launch contract, Package Guardian and tier UI, shipped per environment together; removal of the legacy `content/[...path]` route | 0005, 0006 | v1.4.0 | Entry condition: `lifecycle-nightly.yml` running (ADR 0007 step 15). Exit: first Level 2 package certified on staging; nightly golden canary green | Not started |
+| P5 | Certified question analytics (0100/0101 trimmed incl. `guardian_findings`/`guardian_runs`, ingest, pg_cron, readers behind `question_analytics_v2`) | 0005, 0007 | v1.5.0 | facts appear within one sweeper cadence; R-rules return 0 | Not started |
+| P6 | Conditional: sandbox certification runner, evaluate/enforce gateway, registrations | 0005 (trigger stated) | — | only on its trigger | Conditional; trigger not met |
 
 Effort: 23–35 executor-days over 6–8 calendar weeks, bounded by owner events (about 8 migration applies, 3 tags, 2–3 editor redeploys, 3 or more Cloud Run deploys).
 
-## 7. Open decisions
+## 7. Owner decisions and their status
 
-Owner decisions D1–D7 (the recommended answer is what each ADR specifies):
+Owner decisions D1–D7 (the owner accepted the recommended answers on 2026-10-16; D5 was split at acceptance):
 
-| # | Question | Recommended answer | ADR |
-|---|---|---|---|
-| D1 | "Reliable analytics" means KIVO cmi5 question analytics only; completions, Report Card, CRM and journeys are never tier-filtered | Yes | 0005 |
-| D2 | Integrity: block only on a cross-course KIVO id/title collision in the org (super_owner override with a mandatory reason through the mechanism of ADR 0004 step 3a, audited, raised in the Attention Center); warn and confirm on same-slot drift; script detection informational; uncertified packages still launch | Yes | 0004 (launch rule restated in 0005) |
-| D3 | Certification model: certified engine + static checks on stored bytes + ingest validation; observation revokes, never grants; in-editor export self-check; browser runner only on triggers | Yes | 0005 |
-| D4 | v1.3.0 within about a week of a clean audit; no v1.2.1 hotfix fallback unless the owner funds about one executor-day to keep one warm | Yes | 0007 |
-| D5 | Turning Escalations on staging: replace-package with force_restart using TEST LMS.zip into the Hindi slot (7ff60dde) after the abandoned-attempt visibility fixes and a targeted announcement to the affected learners; deactivate or replace the Gujarati slot (d4f05fac, added after reconciling the review evidence); the two failed staff attempts are left untouched and logged; 9dcdad9b left as is, never re-activated; on production only for slots the P1 audit flags | Yes | 0004 |
-| D6 | KIVO engine release A with the widened defect list; 2.0 requirements as listed | Yes | 0006 |
-| D7 | Object lock (immutability) on a dedicated B2 content bucket, retention at least 30 days | Yes | 0003 |
+| # | Question | Answer | Status | ADR |
+|---|---|---|---|---|
+| D1 | "Reliable analytics" means KIVO cmi5 question analytics only; completions, Report Card, CRM and journeys are never tier-filtered | Yes | Accepted 2026-10-16 | 0005 |
+| D2 | Integrity: block only on a cross-course KIVO id/title collision in the org (super_owner override with a mandatory reason through the mechanism of ADR 0004 step 3a, audited, raised in the Attention Center); warn and confirm on same-slot drift; script detection informational; uncertified packages still launch | Yes | Accepted 2026-10-16 | 0004 (launch rule restated in 0005) |
+| D3 | Certification model: certified engine + static checks on stored bytes + ingest validation; observation revokes, never grants; in-editor export self-check; browser runner only on triggers | Yes | Accepted 2026-10-16 | 0005 |
+| D4 | v1.3.0 within about a week of a clean audit (including the checks added at acceptance); no v1.2.1 hotfix fallback unless the owner funds about one executor-day to keep one warm | Yes | Accepted 2026-10-16 | 0007 |
+| D5a | Now, zero restarts, on staging: upload TEST LMS.zip into the Hindi slot of Turning Escalations (7ff60dde) as a new version in grandfather mode, which also makes it the course default (the default was the Gujarati slot d4f05fac); deactivate the Framework course's two empty wrong slots (3b005ed1, 887d4aaf; 0 attempts) and make its correct Marathi version 2e404b48 the default; the grandfather-window risk is stated and accepted; the upload page's update-notification email is unticked | Yes | Accepted 2026-10-16; owner-run | 0004 step 13 |
+| D5b | Later: close the listed in-progress attempts on 7ff60dde (three learners, three staff) and the Gujarati attempt, deactivate the Gujarati slot, targeted announcement to the three learners; failed and abandoned staff attempts untouched and logged; 9dcdad9b left as is, never re-activated; on production only for slots the P1 audit flags | Yes as the plan | Gated: runs only on the owner's explicit go after the P0 visibility fixes ship on staging and the per-attempt list is re-read (condition a); separate go on production | 0004 step 14 |
+| D6 | KIVO engine release A with the widened defect list; 2.0 requirements as listed | Yes | Accepted 2026-10-16 | 0006 |
+| D7 | Object lock (immutability) on a dedicated B2 content bucket, retention at least 30 days | Yes | Accepted 2026-10-16; the exact retention is set by the owner at bucket creation | 0003 |
 
-Other decisions requested in the ADRs (items marked "not in the reviewed plan" were added by the reviews):
+Other decisions requested in the ADRs (items marked "not in the reviewed plan" were added by the reviews). "Decided" means the owner accepted the recommended answer on 2026-10-16:
 
-| ADR | # | Question | Recommended answer |
-|---|---|---|---|
-| 0001 | 1 | Confirm the ten-section template and the phase-scoped, steps-individually-acceptable rule | Confirm |
-| 0001 | 2 | Align `.claude/agents/architect.md` with ADR 0001 decision 2 (owner edit) | Yes |
-| 0002 | 1 | Confirm the not-doing list as binding scope | Yes |
-| 0002 | 2 | The only Hinglish measure in P0 is the `display_name` relabel (no `hi-Latn` slot code) | Yes |
-| 0003 | 2 | Migration numbering: commit 0032; P0 = 0098; P4 = 0099 alds core; guardian migration split across P5/P6 | Yes |
-| 0003 | 3 | Pre-0099 learner attempt = any attempt unless its user is currently staff; former members' attempts always block | Yes |
-| 0003 | 4 | Delete-guard bypass = the service_role JWT claim (not a GUC plus purge RPC) | Yes |
-| 0004 | 3 | Incident ledger location | `ops/INCIDENT_LEDGER.md`, ids and reasons only |
-| 0004 | 4 | `display_name = 'Hinglish'` on Hindi slots that hold Hinglish | Yes, L&D action |
-| 0004 | 5 | Second Attention Center provider for unpublished versions (not in the reviewed plan) | Yes |
-| 0005 | 3 | `analytics_tier` on `/api/integrations/catalog` (not in the reviewed plan) | Yes, optional field |
-| 0005 | 4 | Publish-on-certification default for Level 2 uploads (not in the reviewed plan) | No for now |
-| 0006 | 2 | Fold the KIVO-P2-P3 patch into release A | Yes |
-| 0006 | 3 | Second Pages project for 2.0 testing | No |
-| 0006 | 4 | Guardian reason `launch_contract_missing` (review suggestion) | Yes |
-| 0007 | 2 | Lifecycle-nightly target | Cloud Run staging with continuous deploy; else Workers with retries |
-| 0007 | 3 | `statement_profile` per enabled tenant LRS configuration | `raw` unless the consumer was told |
-| 0007 | 4 | Accept the `lrs-forward` watchdog noise until pg_cron lands | Yes |
-| 0007 | 5 | Fund about one executor-day for a warm v1.2.1 branch | No |
-| 0007 | 6 | Audit additions: `validate_existing` and a listing baseline (not in the reviewed plan) | Yes for `validate_existing`; baseline with P5 |
+| ADR | # | Question | Answer | Status |
+|---|---|---|---|---|
+| 0001 | 1 | Confirm the ten-section template and the phase-scoped, steps-individually-acceptable rule | Confirm | Standing (ADR 0001 is accepted; changeable only by a superseding ADR) |
+| 0001 | 2 | Align `.claude/agents/architect.md` with ADR 0001 decision 2 (owner edit) | Yes | Owner edit still to be made |
+| 0002 | 1 | Confirm the not-doing list as binding scope | Yes | Decided |
+| 0002 | 2 | The only Hinglish measure in P0 is the `display_name` relabel (no `hi-Latn` slot code) | Yes | Decided |
+| 0003 | 2 | Migration numbering: commit 0032 as `0032_course_versions_unique_per_package.sql` (its original name); P0 = 0098; P4 = 0099 alds core; guardian migration split across P5/P6 | Yes | Decided after the numbering was verified (ADR 0003 step 7a) |
+| 0003 | 3 | Pre-0099 learner attempt = any attempt unless its user is currently staff; former members' attempts always block | Yes | Decided |
+| 0003 | 4 | Delete-guard bypass = the service_role JWT claim (not a GUC plus purge RPC) | Yes | Decided |
+| 0004 | 3 | Incident ledger location | `ops/INCIDENT_LEDGER.md`, ids and reasons only | Decided |
+| 0004 | 4 | `display_name = 'Hinglish'` on Hindi slots that hold Hinglish | Yes, L&D action | Decided |
+| 0004 | 5 | Second Attention Center provider for unpublished versions (not in the reviewed plan) | Yes | Decided |
+| 0004 | 6 | D5b mechanism: a per-version restart action (new route plus Library action, P0) instead of re-running `force_restart`, which would also reset learners on the corrected version (raised at acceptance from the force-restart code; not in the inputs) | Yes | Open: awaiting the owner |
+| 0004 | 7 | Course default rule: `publishVersion()` repoints the course default only when the published slot already holds it; a deliberate change of default slot becomes an explicit admin action (raised by the wrong-default finding; not in the inputs) | Yes, small P0 change | Open: awaiting the owner |
+| 0005 | 3 | `analytics_tier` on `/api/integrations/catalog` (not in the reviewed plan) | Yes, optional field | Decided |
+| 0005 | 4 | Publish-on-certification default for Level 2 uploads (not in the reviewed plan) | No for now | Decided |
+| 0006 | 2 | Fold the KIVO-P2-P3 patch into release A | Yes | Decided |
+| 0006 | 3 | Second Pages project for 2.0 testing | No | Decided |
+| 0006 | 4 | Guardian reason `launch_contract_missing` (review suggestion) | Yes | Decided |
+| 0007 | 2 | Lifecycle-nightly target | Cloud Run staging with continuous deploy; else Workers with retries | Decided; the Cloud Run continuous deploy is an owner action still to be done |
+| 0007 | 3 | `statement_profile` per enabled tenant LRS configuration | `raw` unless the consumer was told | Decided |
+| 0007 | 4 | Accept the `lrs-forward` watchdog noise until pg_cron lands | Yes | Decided |
+| 0007 | 5 | Fund about one executor-day for a warm v1.2.1 branch | No | Decided |
+| 0007 | 6 | Audit additions: `validate_existing` and a listing baseline (not in the reviewed plan) | Yes for `validate_existing`; baseline with P5 | Decided |
 
 ## 8. Verification map
 
@@ -169,7 +172,8 @@ Other decisions requested in the ADRs (items marked "not in the reviewed plan" w
 | Cross-tenant RLS | `rls-audit.yml` | migration PRs and weekly |
 | Core e2e | `tests/e2e/` (`npx playwright test`) | `pr-checks` on non-main pushes and PRs; `nightly-e2e` 04:00 UTC |
 | Step 0 (versioned delivery, abandoned terminal, org scope, language switch) | `tests/bot/lifecycle/47`, `48`, `49`, `32` | by hand (`npm run test:lifecycle`) until the lifecycle nightly exists (ADR 0007) |
-| P0 record protection and integrity | lifecycle `50-record-guard`, `51-no-overwrite`, `52-integrity-check`, `53-launch-routing`; `tests/unit/statement-id.test.ts`, `scoring-status.test.ts` | lifecycle by hand; `unit` job (`npm run test:unit`) in `pr-checks` (ADR 0003 step 15) |
+| P0 record protection and integrity | lifecycle `50-record-guard`, `51-no-overwrite`, `52-integrity-check`, `53-launch-routing`, plus the per-version restart cases in `33-replace-package` or 53 (ADR 0004 step 17); `tests/unit/statement-id.test.ts`, `scoring-status.test.ts` | lifecycle by hand; `unit` job (`npm run test:unit`) in `pr-checks` (ADR 0003 step 15) |
+| D5a on staging (zero restarts) | before: the six in-progress attempts on 7ff60dde listed in ADR 0004 step 12a; after the upload: the same six still `in_progress` on 7ff60dde, `courses.current_version_id` of both courses on the corrected version, no `asset_update` email sent | owner-run through the Library UI; the executor reads the rows and records the ledger entries |
 | ALDS rules | golden fixtures under `tests/unit/` | `unit` job (ADR 0005) |
 | First certified package, launch contract | KIVO every-kind fixture (KIVO repo); nightly golden canary | KIVO CI; lifecycle nightly (ADR 0006, 0007) |
 | Production release | `ops/release-v1.3.0-audit.sql`, scratch-project rehearsal with the restore drill, the same file post-apply | owner, SQL editor (ADR 0007) |
@@ -183,3 +187,6 @@ Other decisions requested in the ADRs (items marked "not in the reviewed plan" w
 - supabase-js head/count probes report a missing table as present; verify schema with real selects in the SQL editor.
 - The Supabase CLI in this repository is linked to production; it is never used for migrations.
 - Inside a `security definer` function or an FK cascade, `current_user` is the owner, not the caller; role checks in triggers use the JWT role claim (ADR 0003 step 10).
+- `publishVersion()` (`lib/courses/upload.ts`) repoints `courses.current_version_id` on every upload and every "Make current" on any slot: the last published slot becomes the course default. This is how the Gujarati slot became the Turning Escalations default (ADR 0004 step 12a). Until decision 0004/7 is taken, an upload to any slot can move a course's default again; the P1 audit checks each course's default against its slots.
+- Both `force_restart` paths (replace-package and direct-upload finalize) abandon the in-progress attempts of every prior version of the package, not only the one being replaced (ADR 0004 step 14a).
+- The Library upload page pre-ticks "Send update notification email to affected learners" when replacing a course; a corrective upload emails every assigned learner unless it is unticked (ADR 0004 step 13).

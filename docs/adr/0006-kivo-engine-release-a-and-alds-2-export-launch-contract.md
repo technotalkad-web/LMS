@@ -1,6 +1,7 @@
 # 0006. KIVO engine release A and the ALDS 2.0 export and launch contract
 
-Status: Proposed
+Status: Accepted (owner, 2026-10-16)
+Acceptance: accepted by the owner on 2026-10-16 after two checks (the migration numbering, ADR 0003 step 7a; the per-attempt learner impact, ADR 0004 §5), on two conditions that bind ADR 0002–0007: (a) no learner attempt is restarted or abandoned until the owner gives an explicit go after seeing the per-attempt impact list; (b) production migration state is confirmed in the P1 read-only audit (ADR 0007 step 2) before any production apply (for this record: the launch contract of §C reaches an environment only after `0099_alds_core.sql` is confirmed there). All steps are accepted as written; the owner's answers to the decisions requested below are recorded in that section.
 Date: 2026-10-15
 Deciders: owner; architect (Fable 5.1)
 
@@ -75,10 +76,10 @@ Deciders: owner; architect (Fable 5.1)
 
 ## Decisions requested from the owner
 
-1. D6: approve engine release A with the widened defect list (steps 1–9) and the 2.0 requirements (steps 10–15). Recommended: yes.
-2. Fold the pending KIVO-P2-P3 patch into release A rather than shipping it alone first. Recommended: yes; same functions, one redeploy.
-3. Run a second Pages project for 2.0 testing before release B. Recommended: no; the staging-only menu entry suffices.
-4. Have the Guardian mark a 2.0 version `uncertified` with reason `launch_contract_missing` when its environment lacks the launch contract (a review suggestion that makes the rule of step 18 visible in the tier UI). Recommended: yes; it is one reason string in the static check of ADR 0005.
+1. D6: approve engine release A with the widened defect list (steps 1–9) and the 2.0 requirements (steps 10–15). Recommended: yes. Decided (owner, 2026-10-16): yes.
+2. Fold the pending KIVO-P2-P3 patch into release A rather than shipping it alone first. Recommended: yes; same functions, one redeploy. Decided (owner, 2026-10-16): yes.
+3. Run a second Pages project for 2.0 testing before release B. Recommended: no; the staging-only menu entry suffices. Decided (owner, 2026-10-16): no.
+4. Have the Guardian mark a 2.0 version `uncertified` with reason `launch_contract_missing` when its environment lacks the launch contract (a review suggestion that makes the rule of step 18 visible in the tier UI). Recommended: yes; it is one reason string in the static check of ADR 0005. Decided (owner, 2026-10-16): yes.
 
 ## References
 
