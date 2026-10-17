@@ -30,6 +30,11 @@
 #   --use-server-modtime  the age filter reads LastModified from the listing
 #                         instead of a HEAD per object (the filter also runs on
 #                         the destination listing)
+# Because the destination's LastModified is its copy time, a REAL copy
+# started within an hour of another real copy sees the objects the first
+# one wrote as absent and writes them again (a second locked version, no
+# overwrite, no error): do not start a real copy by hand within an hour of
+# another (the nightly cadence never does; a dry run is unaffected).
 # Rehearsal: run the workflow by hand with dry_run = true (rclone copy
 # --dry-run, same flags; conflicts are reported, nothing is copied). Once
 # the first real copy exists, a dry run with zero conflicts also shows that
