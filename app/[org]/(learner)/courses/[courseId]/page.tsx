@@ -61,10 +61,14 @@ type Attempt = {
 
 export default async function CourseDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
+  /** ?switch=<lang>: the launch page sent the learner here to confirm a language switch (ADR 0004 step 9). */
+  searchParams: Promise<{ switch?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
+  const { switch: switchParam } = await searchParams;
   const { org, user, role } = await requireOrgAccess(orgSlug);
   const isAdmin = canManage(role);
 
@@ -449,6 +453,7 @@ export default async function CourseDetailPage({
               courseId={c.id}
               options={languageOptions}
               currentLanguage={savedLanguage}
+              initialSwitch={switchParam ?? null}
               inProgress={attempts
                 .filter((a) => a.status === "in_progress")
                 .map((a) => ({
