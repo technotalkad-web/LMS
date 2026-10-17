@@ -5,6 +5,7 @@
  * broken or pre-migration source yields no items rather than breaking the page.
  */
 import { resolveEmails } from "@/lib/users/emails";
+import { defaultSlotFinding, isReadyVersion } from "@/lib/courses/default-rule";
 import {
   ATTENTION_PROVIDERS,
   PRIORITY_RANK,
@@ -317,6 +318,92 @@ async function unpublishedVersionItems(svc: AnyClient, orgId: string, orgSlug: s
   return items.slice(0, 200);
 }
 
+/**
+ * ADR 0008 step 15: courses whose default (`courses.current_version_id`) is
+ * null while an active language has a ready version, whose default version's
+ * language is hidden from learners, or whose default version is not its
+ * language's current version. No migration; fail-soft.
+ */
+async function defaultSlotItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
+  const { data: courseData, error: courseErr } = await svc
+    .from("courses")
+    .select("id, title, current_version_id, updated_at")
+    .eq("organization_id", orgId)
+    .limit(2000);
+  if (courseErr) return [];
+  const courses = (courseData ?? []) as Array<{ id: string; title: string; current_version_id: string | null; updated_at: string }>;
+  if (!courses.length) return [];
+  const { data: pkgData, error: pkgErr } = await svc
+    .from("course_packages")
+    .select("id, course_id, language, display_name, current_version_id, is_active, courses!inner(organization_id)")
+    .eq("courses.organization_id", orgId)
+    .limit(4000);
+  if (pkgErr) return [];
+  const pkgs = (pkgData ?? []) as Array<{
+    id: string;
+    course_id: string;
+    language: string | null;
+    display_name: string | null;
+    current_version_id: string | null;
+    is_active: boolean;
+  }>;
+  // The default versions and every package's current version: package and readiness.
+  const versionIds = [
+    ...new Set([...courses.map((c) => c.current_version_id), ...pkgs.map((p) => p.current_version_id)].filter((x): x is string => !!x)),
+  ];
+  const versionInfo = new Map<string, { package_id: string | null; ready: boolean }>();
+  for (let i = 0; i < versionIds.length; i += 200) {
+    // select("*") for 0077 deploy safety (upload_status).
+    const { data, error } = await svc.from("course_versions").select("*").in("id", versionIds.slice(i, i + 200));
+    if (error) return [];
+    for (const v of (data ?? []) as Array<{ id: string; package_id: string | null; upload_status?: string | null }>) {
+      versionInfo.set(v.id, { package_id: v.package_id, ready: isReadyVersion(v.upload_status) });
+    }
+  }
+  const pkgsByCourse = new Map<string, typeof pkgs>();
+  for (const p of pkgs) (pkgsByCourse.get(p.course_id) ?? pkgsByCourse.set(p.course_id, []).get(p.course_id)!).push(p);
+  const slotLabel = (p: { language: string | null; display_name: string | null } | undefined) =>
+    p ? p.display_name?.trim() || p.language || "unlabeled language" : "a language";
+
+  const items: AttentionItem[] = [];
+  for (const c of courses) {
+    const coursePkgs = pkgsByCourse.get(c.id) ?? [];
+    if (!coursePkgs.length) continue;
+    const finding = defaultSlotFinding({
+      defaultVersionId: c.current_version_id,
+      defaultPackageId: c.current_version_id ? versionInfo.get(c.current_version_id)?.package_id ?? null : null,
+      packages: coursePkgs.map((p) => ({
+        id: p.id,
+        is_active: p.is_active,
+        current_version_id: p.current_version_id,
+        currentReady: !!p.current_version_id && (versionInfo.get(p.current_version_id)?.ready ?? false),
+      })),
+    });
+    if (!finding) continue;
+    const slot = finding.kind === "no_default" ? undefined : coursePkgs.find((p) => p.id === finding.packageId);
+    const title =
+      finding.kind === "no_default"
+        ? "Course has no default language"
+        : finding.kind === "default_hidden"
+          ? `Default language is hidden from learners (${slotLabel(slot)})`
+          : `Course default is not the current version of ${slotLabel(slot)}`;
+    items.push({
+      key: `default-slot:${c.id}:${finding.kind}:${c.current_version_id ?? "none"}`,
+      type: "default-slot",
+      priority,
+      title,
+      who: null,
+      context: `${c.title} · the catalogue and Library show the default; set the right language as the default`,
+      occurredAt: c.updated_at,
+      actionLabel: "Set a default language",
+      href: `/${orgSlug}/library/${c.id}`,
+      inline: null,
+      dismissible: true,
+    });
+  }
+  return items.slice(0, 200);
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 export async function collectAttention(args: {
@@ -352,6 +439,7 @@ export async function collectAttention(args: {
     else if (p.type === "overdue") jobs.push(run(overdueItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "integrity-override") jobs.push(run(integrityOverrideItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "unpublished-versions") jobs.push(run(unpublishedVersionItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "default-slot") jobs.push(run(defaultSlotItems(svc, orgId, orgSlug, c.priority)));
   }
   let items = (await Promise.all(jobs)).flat();
 

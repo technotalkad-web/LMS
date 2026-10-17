@@ -118,6 +118,17 @@ export const ATTENTION_PROVIDERS: AttentionProviderMeta[] = [
     defaultPriority: "normal",
     configurablePriority: true,
   },
+  {
+    // ADR 0008 step 15: the course default is an explicit slot choice, so a
+    // default that is missing, hidden or stale must not sit unnoticed.
+    type: "default-slot",
+    label: "Course default language",
+    description:
+      "Courses with no default language, a default language hidden from learners, or a default that is not its language's current version.",
+    defaultEnabled: true,
+    defaultPriority: "high",
+    configurablePriority: true,
+  },
 ];
 
 export type AttentionTypeConfig = { enabled: boolean; priority: AttentionPriority };
