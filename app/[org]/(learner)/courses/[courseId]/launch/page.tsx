@@ -23,6 +23,7 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
 import { grantRetakeIdsFor, unusedGrantFor } from "@/lib/scoring/attempt-kind";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
+import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
 
 type Course = {
@@ -265,11 +266,11 @@ export default async function LaunchPage({
             .select("id");
           // ALDS step 0 (P4): an abandoned attempt's launch tokens die with
           // it, so an open tab of the old run can't keep writing.
-          const tokErr = await expireLaunchTokens(
-            svcReset,
-            ((resetRows ?? []) as Array<{ id: string }>).map((r) => r.id)
-          );
+          const resetIds = ((resetRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+          const tokErr = await expireLaunchTokens(svcReset, resetIds);
           if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+          // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
+          await enqueueAbandonedStatements(svcReset, resetIds);
         }
       }
       // Refuse only when the window is used up and the rule blocks further
@@ -655,11 +656,11 @@ export default async function LaunchPage({
         .eq("status", "in_progress")
         .select("id");
       if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
-      const tokErr = await expireLaunchTokens(
-        svcSlot,
-        ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id)
-      );
+      const closedIds = ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+      const tokErr = await expireLaunchTokens(svcSlot, closedIds);
       if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+      // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
+      await enqueueAbandonedStatements(svcSlot, closedIds);
     }
   }
 

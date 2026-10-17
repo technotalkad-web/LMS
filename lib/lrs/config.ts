@@ -1,4 +1,4 @@
-import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /**
  * Per-org external-LRS configuration. RLS denies all client access to
@@ -37,6 +37,21 @@ export function statementProfileOf(cfg: Pick<LrsConfig, "statement_profile"> | n
   return v === "raw" ? "raw" : DEFAULT_STATEMENT_PROFILE;
 }
 
+/**
+ * Why an org gets no LMS-derived statements (launched, abandoned, path,
+ * journey, XP …), or null when it does. The ONE gate for that statement
+ * class: the sweeper (sweepOrg) and the live abandoned enqueue
+ * (lib/lrs/abandoned.ts) both call it. No config row, forwarding off or no
+ * endpoint → no outbox row; the 'raw' profile forwards engine statements
+ * verbatim and nothing derived; pre-0078 there is no cursor/origin column.
+ */
+export function derivedStatementsSkip(cfg: LrsConfig | null): string | null {
+  if (!cfg || !cfg.enabled || !cfg.endpoint) return "disabled";
+  if (!("backfill_cursor" in cfg)) return "migration 0078 not applied";
+  if (statementProfileOf(cfg) === "raw") return "raw profile";
+  return null;
+}
+
 export const SECRET_MASK = "••••••";
 
 function svc() {
@@ -49,9 +64,9 @@ function svc() {
 
 /** Full config (incl. secret) for server-side use. Null if the table/row is
  *  absent — callers treat that as "forwarding disabled". */
-export async function loadLrsConfig(orgId: string): Promise<LrsConfig | null> {
+export async function loadLrsConfig(orgId: string, db?: SupabaseClient): Promise<LrsConfig | null> {
   try {
-    const { data } = await svc()
+    const { data } = await (db ?? svc())
       .from("tenant_lrs_config")
       .select("*")
       .eq("organization_id", orgId)

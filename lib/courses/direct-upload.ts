@@ -29,6 +29,7 @@ import {
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
+import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 
 /**
  * Direct browser-to-storage uploads.
@@ -672,6 +673,8 @@ async function abandonOldAttempts(packageId: string, newVersionId: string): Prom
   // ALDS step 0 (P4): an abandoned attempt's launch tokens die with it.
   const tokErr = await expireLaunchTokens(svc, abIds);
   if (tokErr) console.warn("[direct-upload] token expiry failed:", tokErr.message);
+  // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
+  await enqueueAbandonedStatements(svc, abIds);
   return abIds.length;
 }
 

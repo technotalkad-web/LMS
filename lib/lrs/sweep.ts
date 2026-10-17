@@ -31,7 +31,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import type { XapiStatement } from "@/lib/xapi/types";
-import { type LrsConfig, statementProfileOf } from "./config";
+import { type LrsConfig, derivedStatementsSkip } from "./config";
 import { enrichStatement, buildActor, type AttemptContext } from "./enrich";
 import {
   currentEnvironment,
@@ -53,6 +53,7 @@ import {
   verbDisplay,
 } from "./profile";
 import { uuid5 } from "./uuid5";
+import { abandonedStatementId } from "./statement-id";
 
 type Row = Record<string, unknown>;
 type Obj = Record<string, unknown>;
@@ -115,7 +116,7 @@ async function rows(p: PromiseLike<any>): Promise<Row[]> {
   }
 }
 
-type Built = {
+export type Built = {
   statementId: string;
   attemptId: string | null;
   payload: XapiStatement;
@@ -222,7 +223,7 @@ function lmsStatement(p: {
 
 /** Attempt-bound derived statement: built through enrichStatement so it gets
  *  exactly the same ids, hierarchy and dimensions as an engine statement. */
-function attemptStatement(
+export function attemptStatement(
   ctx: AttemptContext,
   p: { id: string; verbId: string; timestamp: string; result?: Obj; object?: Obj; parent?: Obj[]; extensions?: Obj },
   origin: "lms" | "scorm"
@@ -328,20 +329,33 @@ async function srcAttempts(env: Env, cursor: string): Promise<SourceResult> {
       origin: "lms",
     });
     if (r.status === "abandoned") {
-      built.push({
-        statementId: uuid5(`abandoned:${r.id}`),
-        attemptId: String(r.id),
-        payload: attemptStatement(
-          ctx,
-          { id: uuid5(`abandoned:${r.id}`), verbId: verb.abandoned, timestamp: str(r.last_activity_at) ?? started },
-          "lms"
-        ),
-        origin: "lms",
-      });
+      const ab = abandonedBuilt(ctx, { id: String(r.id), started_at: started, last_activity_at: str(r.last_activity_at) });
+      if (ab) built.push(ab);
     }
   }
   const last = list.length ? str(list[list.length - 1].started_at) : null;
   return { built, nextCursor: advance(cursor, last, list.length >= env.chunk), done: list.length < env.chunk };
+}
+
+/**
+ * The "abandoned" statement of one attempt, exactly as the sweeper builds it:
+ * deterministic id (abandonedStatementId), timestamp = last activity, else
+ * start. Shared with the live enqueue at the abandon sites (lib/lrs/abandoned.ts)
+ * so both produce the same outbox row id and the outbox keeps one copy.
+ */
+export function abandonedBuilt(
+  ctx: AttemptContext,
+  r: { id: string; started_at: string | null; last_activity_at: string | null }
+): Built | null {
+  const timestamp = str(r.last_activity_at) ?? str(r.started_at);
+  if (!timestamp) return null;
+  const id = abandonedStatementId(r.id);
+  return {
+    statementId: id,
+    attemptId: r.id,
+    payload: attemptStatement(ctx, { id, verbId: verb.abandoned, timestamp }, "lms"),
+    origin: "lms",
+  };
 }
 
 async function srcPathSteps(env: Env, cursor: string): Promise<SourceResult> {
@@ -862,7 +876,9 @@ export async function runSource(
 
 // ---- Orchestration ----------------------------------------------------------
 
-async function enqueue(db: SupabaseClient, orgId: string, built: Built[]): Promise<number> {
+/** Outbox write for derived statements: one row per (org, statement id), the
+ *  first copy wins (ignoreDuplicates). Shared with lib/lrs/abandoned.ts. */
+export async function enqueueBuilt(db: SupabaseClient, orgId: string, built: Built[]): Promise<number> {
   if (!built.length) return 0;
   const seen = new Set<string>();
   const rowsToInsert = built
@@ -896,9 +912,8 @@ export async function sweepOrg(
   const rotate = opts.rotate ?? 3;
   const orgId = cfg.organization_id;
   const base: OrgSweepResult = { orgId, ran: [], enqueued: {}, caughtUp: false, backfillCompleted: false };
-  if (!cfg.enabled || !cfg.endpoint) return { ...base, skipped: "disabled" };
-  if (!("backfill_cursor" in cfg)) return { ...base, skipped: "migration 0078 not applied" };
-  if (statementProfileOf(cfg) === "raw") return { ...base, skipped: "raw profile" };
+  const skip = derivedStatementsSkip(cfg);
+  if (skip) return { ...base, skipped: skip };
 
   let cursor: Record<string, unknown> = (cfg.backfill_cursor ?? {}) as Record<string, unknown>;
   let stats: Record<string, unknown> = (cfg.backfill_stats ?? {}) as Record<string, unknown>;
@@ -951,7 +966,7 @@ export async function sweepOrg(
     try {
       const from = str(cursor[source]) ?? EPOCH;
       const res = await RUNNERS[source](env, from);
-      const n = await enqueue(db, orgId, res.built);
+      const n = await enqueueBuilt(db, orgId, res.built);
       base.ran.push(source);
       base.enqueued[source] = n;
       cursor[source] = res.nextCursor;
