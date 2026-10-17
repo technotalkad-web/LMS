@@ -91,7 +91,10 @@ export async function POST(
     ? update.eq("current_version_id", previous)
     : update.is("current_version_id", null)
   ).select("id");
-  if (error) return NextResponse.json({ error: `Could not set the default: ${error.message}` }, { status: 500 });
+  if (error) {
+    console.error("[default] course update failed:", error.message);
+    return NextResponse.json({ error: "Could not set the default. Try again." }, { status: 500 });
+  }
   if (!written || written.length === 0) {
     return NextResponse.json(
       { error: "default_changed", message: "The course default changed while you were setting it. Reload and try again." },

@@ -17,7 +17,10 @@ import { deactivationRefusal, isReadyVersion, type DeactivationRefusal } from "@
  * - is_active: false hides the package from the learner picker without
  *   losing learner attempts/data. True re-enables. Hiding the language
  *   that holds the course default answers 409 `default_slot` while another
- *   active language with a ready current version exists (ADR 0008 step 12).
+ *   active language with a ready current version exists (ADR 0008 step 12);
+ *   a failed default-slot read answers 503 with nothing changed. Showing or
+ *   hiding the default language bumps `courses.updated_at`, since it changes
+ *   the course's catalogue availability (step 14).
  * - language: lets admins PROMOTE a legacy NULL-language default
  *   package to a real language code when they\'re adding a 2nd
  *   variant. (E.g. existing course was effectively English; admin
@@ -135,11 +138,15 @@ export async function PATCH(
   // hidden while another active language with a ready current version
   // exists (set that one as the default first). The only active language
   // may be hidden; the course then has no launchable language until a
-  // default is set.
-  if (update.is_active === false && pkgRow.is_active !== false) {
-    const refusal = await defaultSlotDeactivationRefusal(svc, courseId, packageId);
-    if (refusal) {
-      return NextResponse.json({ error: refusal.error, message: refusal.message }, { status: refusal.status });
+  // default is set. Fail closed: a failed read changes nothing (503).
+  const activeChanges = update.is_active !== undefined && update.is_active !== (pkgRow.is_active !== false);
+  let holdsDefault = false;
+  if (activeChanges) {
+    const check = await defaultSlotGuard(svc, courseId, packageId);
+    if ("error" in check) return defaultSlotReadFailed(check.error);
+    holdsDefault = check.holdsDefault;
+    if (update.is_active === false && check.refusal) {
+      return NextResponse.json({ error: check.refusal.error, message: check.refusal.message }, { status: check.refusal.status });
     }
   }
 
@@ -149,45 +156,68 @@ export async function PATCH(
     .eq("id", packageId);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
 
+  // Showing or hiding the default language changes the course's catalogue
+  // availability (step 14): date the course so an `updated_since` delta sees it.
+  if (holdsDefault) await touchCourse(svc, courseId);
+
   return NextResponse.json({ ok: true });
 }
 
 /**
- * Does hiding `packageId` take the course default away from learners while
- * another language could hold it? Holding = the course default version
- * belongs to this package. Reads only; service role (the caller passed the
- * admin and tenant checks).
+ * Does `packageId` hold the course default (the default version belongs to
+ * it), and would hiding or deleting it take the default away from learners
+ * while another active language with a ready current version could hold it?
+ * Reads only; service role (the caller passed the admin and tenant checks).
+ * Any failed read answers `{ error }` so the caller changes nothing.
  */
-async function defaultSlotDeactivationRefusal(
+async function defaultSlotGuard(
   svc: SupabaseClient,
   courseId: string,
   packageId: string
-): Promise<DeactivationRefusal | null> {
-  const { data: c } = await svc.from("courses").select("current_version_id").eq("id", courseId).maybeSingle();
+): Promise<{ holdsDefault: boolean; refusal: DeactivationRefusal | null } | { error: string }> {
+  const { data: c, error: cErr } = await svc.from("courses").select("current_version_id").eq("id", courseId).maybeSingle();
+  if (cErr) return { error: cErr.message };
   const defaultVersionId = (c as { current_version_id: string | null } | null)?.current_version_id ?? null;
-  if (!defaultVersionId) return null;
-  const { data: dv } = await svc.from("course_versions").select("package_id").eq("id", defaultVersionId).maybeSingle();
+  if (!defaultVersionId) return { holdsDefault: false, refusal: null };
+  const { data: dv, error: dvErr } = await svc.from("course_versions").select("package_id").eq("id", defaultVersionId).maybeSingle();
+  if (dvErr) return { error: dvErr.message };
   const holdsDefault = (dv as { package_id: string | null } | null)?.package_id === packageId;
-  if (!holdsDefault) return null;
+  if (!holdsDefault) return { holdsDefault: false, refusal: null };
 
-  const { data: others } = await svc
+  const { data: others, error: oErr } = await svc
     .from("course_packages")
     .select("id, current_version_id")
     .eq("course_id", courseId)
     .eq("is_active", true)
     .neq("id", packageId);
+  if (oErr) return { error: oErr.message };
   const currentIds = ((others ?? []) as Array<{ current_version_id: string | null }>)
     .map((p) => p.current_version_id)
     .filter((id): id is string => !!id);
   let otherActiveReadySlotExists = false;
   if (currentIds.length > 0) {
     // select("*") for 0077 deploy safety (upload_status).
-    const { data: vers } = await svc.from("course_versions").select("*").in("id", currentIds);
+    const { data: vers, error: vErr } = await svc.from("course_versions").select("*").in("id", currentIds);
+    if (vErr) return { error: vErr.message };
     otherActiveReadySlotExists = ((vers ?? []) as Array<{ upload_status?: string | null }>).some((v) =>
       isReadyVersion(v.upload_status)
     );
   }
-  return deactivationRefusal({ holdsDefault, otherActiveReadySlotExists });
+  return { holdsDefault, refusal: deactivationRefusal({ holdsDefault, otherActiveReadySlotExists }) };
+}
+
+function defaultSlotReadFailed(message: string) {
+  console.error("[packages] default-slot check failed:", message);
+  return NextResponse.json(
+    { error: "Could not check the course default; nothing was changed. Try again." },
+    { status: 503 }
+  );
+}
+
+/** Bumps courses.updated_at (no trigger maintains it). Fail-soft. */
+async function touchCourse(svc: SupabaseClient, courseId: string) {
+  const { error } = await svc.from("courses").update({ updated_at: new Date().toISOString() }).eq("id", courseId);
+  if (error) console.warn("[packages] course updated_at bump failed:", error.message);
 }
 
 /**
@@ -195,7 +225,9 @@ async function defaultSlotDeactivationRefusal(
  *
  * Hard-delete a package. Refuses with 409 if any course_attempts exist
  * for versions in this package (admin should deactivate via PATCH
- * is_active: false instead, preserving learner history).
+ * is_active: false instead, preserving learner history), and with 409
+ * `default_slot` when it holds the course default while another active
+ * language with a ready current version exists (ADR 0008 step 12).
  *
  * Closes #158 Phase 1c (DELETE half).
  */
@@ -275,8 +307,27 @@ export async function DELETE(
     return NextResponse.json({ error: "Package not found" }, { status: 404 });
   }
 
+  // ADR 0008 step 12, applied to delete: deleting the language that holds
+  // the course default clears the default (the FK sets it to null), so it is
+  // refused while another active language with a ready current version could
+  // hold it. Fail closed on a failed read.
+  const check = await defaultSlotGuard(svc, courseId, packageId);
+  if ("error" in check) return defaultSlotReadFailed(check.error);
+  if (check.refusal) {
+    return NextResponse.json(
+      {
+        error: check.refusal.error,
+        message: "This language holds the course default. Set another language as the default first, then delete this one.",
+      },
+      { status: check.refusal.status }
+    );
+  }
+
   const { error } = await svc.from("course_packages").delete().eq("id", packageId);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+
+  // The default went with it: date the course for catalogue deltas.
+  if (check.holdsDefault) await touchCourse(svc, courseId);
 
   return NextResponse.json({ ok: true });
 }

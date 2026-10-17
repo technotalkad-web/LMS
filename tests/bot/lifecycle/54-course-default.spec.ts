@@ -10,9 +10,10 @@
  *   - replace / Make current in another slot → unchanged;
  *   - Set as default (Library UI) → moves, audit row; again → noop, no row;
  *     on an inactive slot or one without a ready version → 409;
- *   - hiding the default slot while another active slot exists → 409;
- *     hiding the only active slot → allowed, and the launch goes back to
- *     the course page;
+ *   - hiding (or deleting) the default slot while another active slot
+ *     exists → 409; hiding the only active slot → allowed, the launch goes
+ *     back to the course page, which offers "Not available right now", and
+ *     an `updated_since` catalogue delta sees the course;
  *   - catalogue `version_id` = the default slot's current version after each
  *     step; `available` is false while no active slot holds the default;
  *   - the Attention Center lists the hidden default.
@@ -23,7 +24,14 @@ import { assignCourse, authedContext } from "./helpers";
 import { directUpload, scormZip, uploadNew, zipFile } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
-type CatalogCourse = { id: string; version_id: string | null; status: string; has_content: boolean };
+type CatalogCourse = {
+  id: string;
+  code: string | null;
+  version_id: string | null;
+  version_code: string | null;
+  status: string;
+  has_content: boolean;
+};
 
 const TITLE_A = "QA Default Course A";
 const TITLE_B = "QA Default Course B";
@@ -68,9 +76,15 @@ test.describe.serial("ADR 0008 B — explicit course default", () => {
   const areq = () => s.adminCtx!.request;
   const slug = () => s.org!.slug;
 
-  async function catalogCourse(request: APIRequestContext, courseId: string, includeInactive = true): Promise<CatalogCourse | undefined> {
+  async function catalogCourse(
+    request: APIRequestContext,
+    courseId: string,
+    includeInactive = true,
+    updatedSince?: string
+  ): Promise<CatalogCourse | undefined> {
+    const since = updatedSince ? `&updated_since=${encodeURIComponent(updatedSince)}` : "";
     const res = await request.get(
-      `/api/integrations/catalog?content_type=course${includeInactive ? "&include_inactive=true" : ""}`,
+      `/api/integrations/catalog?content_type=course${includeInactive ? "&include_inactive=true" : ""}${since}`,
       { headers: { Authorization: `Bearer ${s.apiKey}` } }
     );
     expect(res.status(), await res.text()).toBe(200);
@@ -300,17 +314,29 @@ test.describe.serial("ADR 0008 B — explicit course default", () => {
     const offHi = await patchPkg(s.hiPkg!, { is_active: false });
     expect(offHi.status(), await offHi.text()).toBe(409);
     expect((await offHi.json()).error).toBe("default_slot");
+    // Deleting the default language is refused the same way (it would clear the default).
+    const delHi = await areq().delete(`/api/courses/${s.courseA}/packages/${s.hiPkg}?orgSlug=${slug()}`);
+    expect(delHi.status(), await delHi.text()).toBe(409);
+    expect((await delHi.json()).error).toBe("default_slot");
     const { data: hi } = await svc().from("course_packages").select("is_active").eq("id", s.hiPkg!).single();
     expect((hi as { is_active: boolean }).is_active).toBe(true);
     await expectDefault(request, s.courseA!, s.hiV1!);
+    // A multi-language course's version_code carries the default's language.
+    const item = await catalogCourse(request, s.courseA!);
+    if (item?.code) expect(item.version_code).toBe(`${item.code}-HI-V01`);
   });
 
   test("hiding the only active slot → allowed; launch goes to the course page; catalogue unavailable; Attention item", async ({ browser, baseURL, request }) => {
     expect((await patchPkg(s.enPkg!, { is_active: false })).status()).toBe(200);
+    const beforeHide = new Date(Date.now() - 1000).toISOString();
     const offHi = await patchPkg(s.hiPkg!, { is_active: false });
     expect(offHi.status(), await offHi.text()).toBe(200);
     await expectDefault(request, s.courseA!, s.hiV1!, "unavailable");
     expect(await catalogCourse(request, s.courseA!, false), "hidden from the default listing").toBeUndefined();
+    // Hiding the default language dates the course, so a delta sync sees it.
+    const delta = await catalogCourse(request, s.courseA!, true, beforeHide);
+    expect(delta, "in the updated_since delta").toBeTruthy();
+    expect(delta!.status).toBe("unavailable");
 
     // The launch never falls back to the course default while packages exist.
     const ctx = await authedContext(browser, baseURL!, s.learner!.email, s.learner!.password);
@@ -322,6 +348,12 @@ test.describe.serial("ADR 0008 B — explicit course default", () => {
     const viaBody = new RegExp(`NEXT_REDIRECT;(?:replace|push);${target.replace(/[/-]/g, "\\$&")};`).test(body);
     expect(viaHeader || viaBody, `launch → ${res.status()} ${location}`).toBe(true);
     expect(body).not.toContain("<iframe");
+    // The course page says so instead of offering a Launch that bounces.
+    const coursePage = await ctx.request.get(target, { timeout: 120_000 });
+    expect(coursePage.ok(), `course page → ${coursePage.status()}`).toBeTruthy();
+    const courseHtml = await coursePage.text();
+    expect(courseHtml).toContain("Not available right now");
+    expect(courseHtml).not.toContain("Launch course");
     const { count } = await svc()
       .from("course_attempts")
       .select("id", { count: "exact", head: true })

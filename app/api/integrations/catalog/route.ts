@@ -143,17 +143,24 @@ async function handle(request: Request) {
   const courseCodes = await fetchReferenceCodes(svc, "courses", courses.map((c) => c.id));
   const packageLang = new Map<string, string | null>();
   const packagesOf = new Map<string, number>();
-  try {
-    const { data } = await svc
-      .from("course_language_packages")
+  // Language packages (0030 `course_packages`), for the "-HI-" part of a
+  // multi-language course's version_code. Fail-soft: a read error (pre-0030)
+  // leaves the codes without the language part, as before.
+  const courseIdList = courses.map((c) => c.id);
+  for (let i = 0; i < courseIdList.length; i += 150) {
+    const { data, error } = await svc
+      .from("course_packages")
       .select("id, course_id, language")
-      .in("course_id", courses.map((c) => c.id));
+      .in("course_id", courseIdList.slice(i, i + 150));
+    if (error) {
+      packageLang.clear();
+      packagesOf.clear();
+      break;
+    }
     for (const pkg of (data ?? []) as Array<{ id: string; course_id: string; language: string | null }>) {
       packageLang.set(pkg.id, pkg.language);
       packagesOf.set(pkg.course_id, (packagesOf.get(pkg.course_id) ?? 0) + 1);
     }
-  } catch {
-    /* pre-0030 */
   }
   // ADR 0008 step 14: is the default version's language package active?
   // Fail-soft: a read error leaves the state unknown, which never makes a
