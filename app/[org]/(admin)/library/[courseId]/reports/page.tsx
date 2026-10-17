@@ -4,14 +4,14 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { enrolledStatusSummary, officialStatuses, userCourseKey } from "@/lib/scoring/status";
+import { loadEnrolledCourseStatus, userCourseKey } from "@/lib/scoring/status";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
 //
 // §4.1 (Enrolled / Completed / In Progress / Not Started) is computed live
 // from the attempts with the official-status rule, through the same counter
-// as the Library course card (enrolledStatusSummary), so the two pages always
+// as the Library course card (loadEnrolledCourseStatus), so the two pages always
 // agree and a learner whose only attempts were reset (abandoned, ADR 0004
 // step 11) reads as not started. mv_course_enrollment_status counts any
 // attempt as a start and is no longer read here (its fix waits for the next
@@ -90,100 +90,22 @@ export default async function CourseReportsPage({
   );
 
   // ---- §4.1 Enrollment & status (live) ----
-  // Enrolled = direct, team and org-wide assignments, expanded exactly as the
-  // Library course card does; status = each learner's OFFICIAL attempt
-  // (courseStatus: abandoned attempts never count as a start). Read with the
-  // caller's client, as the Library card does (the page is admin-gated above).
-  // Attempts are read by version and paged, then narrowed to the enrolled
-  // learners, so a large org-wide course stays within the URL and row limits.
-  const PAGE = 1000;
-  const { data: assignmentRows } = await supabase
-    .from("course_assignments")
-    .select("assignee_type, user_id, team_id")
-    .eq("course_id", c.id);
-  const assignments = (assignmentRows ?? []) as Array<{
-    assignee_type: string;
-    user_id: string | null;
-    team_id: string | null;
-  }>;
-  const assignedTeamIds = [
-    ...new Set(
-      assignments
-        .filter((a) => a.assignee_type === "team" && a.team_id)
-        .map((a) => a.team_id as string)
-    ),
-  ];
-  const teamUserIds = new Map<string, Set<string>>();
-  if (assignedTeamIds.length > 0) {
-    const { data: tmRows } = await supabase
-      .from("team_members")
-      .select("team_id, user_id")
-      .in("team_id", assignedTeamIds);
-    for (const r of (tmRows ?? []) as Array<{ team_id: string; user_id: string }>) {
-      const set = teamUserIds.get(r.team_id) ?? new Set<string>();
-      set.add(r.user_id);
-      teamUserIds.set(r.team_id, set);
-    }
-  }
-  const orgMemberIds: string[] = [];
-  if (assignments.some((a) => a.assignee_type === "org")) {
-    for (let from = 0; ; from += PAGE) {
-      const { data } = await supabase
-        .from("organization_members")
-        .select("user_id")
-        .eq("organization_id", org.id)
-        .order("user_id")
-        .range(from, from + PAGE - 1);
-      const rows = (data ?? []) as Array<{ user_id: string }>;
-      for (const r of rows) orgMemberIds.push(r.user_id);
-      if (rows.length < PAGE) break;
-    }
-  }
-  const enrolledUserIds = new Set<string>();
-  for (const a of assignments) {
-    if (a.assignee_type === "user" && a.user_id) enrolledUserIds.add(a.user_id);
-    else if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUserIds.get(a.team_id) ?? []) enrolledUserIds.add(uid);
-    } else if (a.assignee_type === "org") {
-      for (const uid of orgMemberIds) enrolledUserIds.add(uid);
-    }
-  }
-
+  // Enrolled = direct, team and org-wide assignments; status = each
+  // learner's OFFICIAL attempt (courseStatus: abandoned attempts never count
+  // as a start). One loader with the Library course card (paged, chunked,
+  // caller's client as the card; the page is admin-gated above), so the two
+  // pages always agree.
   const { data: versionRows } = await supabase
     .from("course_versions")
     .select("id")
     .eq("course_id", c.id);
   const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map((v) => v.id);
-  type EnrollmentAttempt = {
-    id: string;
-    user_id: string;
-    status: string | null;
-    completion_status: string;
-    success_status: string;
-    score: number | null;
-    started_at: string;
-    completed_at: string | null;
-  };
-  const enrolledAttempts: EnrollmentAttempt[] = [];
-  if (enrolledUserIds.size > 0 && versionIds.length > 0) {
-    for (let from = 0; ; from += PAGE) {
-      const { data } = await supabase
-        .from("course_attempts")
-        .select("id, user_id, status, completion_status, success_status, score, started_at, completed_at")
-        .in("course_version_id", versionIds)
-        .order("id")
-        .range(from, from + PAGE - 1);
-      const rows = (data ?? []) as EnrollmentAttempt[];
-      for (const a of rows) if (enrolledUserIds.has(a.user_id)) enrolledAttempts.push(a);
-      if (rows.length < PAGE) break;
-    }
-  }
-  const officialByUser = await officialStatuses(
+  const { enrolledUserIds, officialByUser, summary: enr } = await loadEnrolledCourseStatus(
     supabase,
     org.id,
-    enrolledAttempts.map((a) => ({ ...a, course_id: c.id }))
+    c.id,
+    versionIds
   );
-  const enr = enrolledStatusSummary(enrolledUserIds, officialByUser, c.id);
   // "Completed" keeps its meaning: an official result, passed or failed.
   const enrCompleted = enr.completed + enr.failed;
   // Not started although they launched once: every attempt was reset.

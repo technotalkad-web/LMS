@@ -19,7 +19,7 @@ import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
-import { enrolledStatusSummary, officialStatuses } from "@/lib/scoring/status";
+import { loadEnrolledCourseStatus } from "@/lib/scoring/status";
 import { ActivateVersionButton, DiscardUploadButton, RestartVersionButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
@@ -235,13 +235,9 @@ export default async function AdminCourseDetailPage({
       teamList.map((t) => t.id)
     );
   const teamMemberCounts = new Map<string, number>();
-  const teamUserIds = new Map<string, Set<string>>();
   for (const r of teamMemberRows ?? []) {
     const tid = r.team_id as string;
     teamMemberCounts.set(tid, (teamMemberCounts.get(tid) ?? 0) + 1);
-    const s = teamUserIds.get(tid) ?? new Set<string>();
-    s.add(r.user_id as string);
-    teamUserIds.set(tid, s);
   }
 
   const teams: AssignableTeam[] = teamList.map((t) => ({
@@ -369,60 +365,18 @@ export default async function AdminCourseDetailPage({
   }
 
   // ----- Enrolled summary -----
-  // Compute totals (total / done / in-progress / not-started) but do
-  // NOT fetch every attempt row here — the full per-learner table now
-  // lives at /[org]/library/[courseId]/learners so this page stays a
-  // clean "settings" surface even at 10k+ enrollments.
-  // Step 1: who's enrolled?
-  const memberIds = (memberRows ?? []).map((m) => m.user_id as string);
-  const enrolledUserIds = new Set<string>();
-  for (const a of assignments) {
-    if (a.assignee_type === "user" && a.user_id) enrolledUserIds.add(a.user_id);
-    else if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUserIds.get(a.team_id) ?? []) enrolledUserIds.add(uid);
-    } else if (a.assignee_type === "org") {
-      for (const uid of memberIds) enrolledUserIds.add(uid);
-    }
-  }
-
-  // Step 2: pull attempts ONLY for enrolled users + the course's versions,
-  // and just the fields we need for status classification. (10k users with
-  // ~3 attempts each ≈ 30k rows × 3 columns ≈ ~1MB — fine for an admin
-  // page. If this becomes a hotspot, switch to a materialized view of
-  // last-attempt-per-user-per-course or a PG function returning counts.)
-  const versionIds = list.map((v) => v.id);
-  const enrolledIdArr = Array.from(enrolledUserIds);
-  const { data: attemptRows } =
-    enrolledIdArr.length && versionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select("id, user_id, status, completion_status, success_status, score, started_at, completed_at")
-          .in("user_id", enrolledIdArr)
-          .in("course_version_id", versionIds)
-      : { data: [] };
-  type SummaryAttempt = {
-    id: string;
-    user_id: string;
-    /** ADR 0004 step 11: an abandoned attempt never counts as in progress. */
-    status: string | null;
-    completion_status: string;
-    success_status: string;
-    score: number | null;
-    started_at: string;
-    completed_at: string | null;
-  };
-  const summaryAttempts = (attemptRows ?? []) as SummaryAttempt[];
-
-  // Decision 1 (Phase 0a): status from each learner's OFFICIAL attempt — not
-  // the latest one — so this summary agrees with the learners list and reports.
-  const officialByUser = await officialStatuses(
+  // Totals (total / completed / failed / in progress / not started) from each
+  // learner's OFFICIAL attempt (decision 1), through the one loader the
+  // course Reports tab uses, so the two pages always agree: assignments
+  // expanded and attempts read completely (paged, chunked), a learner whose
+  // only attempts were reset reads as not started. The per-learner table
+  // lives at /[org]/library/[courseId]/learners.
+  const { summary: enrSummary } = await loadEnrolledCourseStatus(
     supabase,
     org.id,
-    summaryAttempts.map((a) => ({ ...a, course_id: courseId }))
+    courseId,
+    list.map((v) => v.id)
   );
-  // One shared counter with the course Reports tab, so the two never disagree;
-  // a learner whose only attempts were reset reads as not started.
-  const enrSummary = enrolledStatusSummary(enrolledUserIds, officialByUser, courseId);
 
   const initialDetails: CourseDetails = {
     title: c.title,

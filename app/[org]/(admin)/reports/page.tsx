@@ -306,7 +306,9 @@ export default async function ReportsPage({
     const inProgress = myAttempts.filter(
       (a) => a.completion_status !== "completed" && a.success_status !== "passed" && a.status !== "abandoned"
     ).length;
-    const scored = myAttempts.filter((a) => typeof a.score === "number");
+    const myLive = excludeAbandoned(myAttempts);
+    // A reset attempt can carry a mid-run score; it never counts (ADR 0004 step 11).
+    const scored = myLive.filter((a) => typeof a.score === "number");
     const avgScore =
       scored.length === 0
         ? null
@@ -324,7 +326,6 @@ export default async function ReportsPage({
       openWithProgress.length === 0
         ? null
         : Math.round(openWithProgress.reduce((s, a) => s + (a.progress_pct ?? 0), 0) / openWithProgress.length);
-    const myLive = excludeAbandoned(myAttempts);
     const myCounts = attemptCounts(myAttempts);
     const lastActivity =
       myLive

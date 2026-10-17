@@ -640,9 +640,11 @@ export default async function AnalyticsPage({
       if (t && (!lastActive || t > lastActive)) lastActive = t;
     }
     // ADR 0004 step 11: a learner whose only attempts were reset (abandoned)
-    // has not started, as every status surface says. lastActive above keeps
-    // every attempt for engagement.
-    const hasStarted = !!gam?.last_active_day || my.some((a) => a.status !== "abandoned");
+    // has not started, as every status surface says. Decided from the
+    // attempts alone: gamification's last_active_day is stamped on any
+    // official-run commit, so it would keep a reset-only learner "started".
+    // lastActive above keeps every attempt and the XP day for engagement.
+    const hasStarted = my.some((a) => a.status !== "abandoned");
 
     let overdue = 0;
     for (const [cid, due] of assignedMap) {
