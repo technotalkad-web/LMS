@@ -21,6 +21,17 @@ export function isStaffRole(role: string | null | undefined): boolean {
   return !!role && STAFF_ROLES.has(role);
 }
 
+/**
+ * `dry_run` is optional; when present it must be a JSON boolean. Anything
+ * else ("true", 1, null) is refused rather than read as a real run, because
+ * a real run cannot be undone.
+ */
+export function parseDryRun(raw: unknown): { ok: true; dryRun: boolean } | { ok: false; message: string } {
+  if (raw === undefined) return { ok: true, dryRun: false };
+  if (typeof raw === "boolean") return { ok: true, dryRun: raw };
+  return { ok: false, message: "dry_run must be true or false." };
+}
+
 /** A real run needs a reason: trimmed, 1–500 characters. */
 export function parseRestartReason(raw: unknown): { ok: true; reason: string } | { ok: false; message: string } {
   const reason = typeof raw === "string" ? raw.trim() : "";

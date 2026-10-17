@@ -58,6 +58,12 @@ export async function requirePlatformOwner() {
   return { user };
 }
 
+/**
+ * Writes one platform_audit_log row. Fail-soft: never throws. Resolves to
+ * `{ error }` (null when the row was written) so a caller whose record names
+ * the audit row as its control can say when it is missing; callers that
+ * ignore the result keep the old behaviour.
+ */
 export async function auditLog(args: {
   actorUserId: string;
   action: string;
@@ -66,14 +72,14 @@ export async function auditLog(args: {
   metadata?: Record<string, unknown>;
   ip?: string | null;
   userAgent?: string | null;
-}) {
+}): Promise<{ error: string | null }> {
   try {
     const svc = createServiceClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    await svc.from("platform_audit_log").insert({
+    const { error } = await svc.from("platform_audit_log").insert({
       actor_user_id: args.actorUserId,
       action: args.action,
       target_type: args.targetType ?? null,
@@ -82,7 +88,13 @@ export async function auditLog(args: {
       ip: args.ip ?? null,
       user_agent: args.userAgent ?? null,
     });
+    if (error) {
+      console.warn("[audit] log failed:", args.action, error.message);
+      return { error: error.message };
+    }
+    return { error: null };
   } catch (e) {
     console.warn("[audit] log failed:", e);
+    return { error: e instanceof Error ? e.message : "audit insert failed" };
   }
 }

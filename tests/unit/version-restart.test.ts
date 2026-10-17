@@ -11,6 +11,7 @@ import {
   byRoleClass,
   isStaffRole,
   memberKey,
+  parseDryRun,
   parseRestartReason,
   planRestart,
   restartRefusal,
@@ -21,6 +22,14 @@ const eq = (n: string, got: unknown, want: unknown) => {
   const ok = JSON.stringify(got) === JSON.stringify(want);
   if (ok) { pass++; console.log(`  ✓ ${n}`); } else { fail++; console.log(`  ✗ ${n} — got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
 };
+
+console.log("\ndry_run (step 1)");
+eq("absent → real run", parseDryRun(undefined), { ok: true, dryRun: false });
+eq("true → dry run", parseDryRun(true), { ok: true, dryRun: true });
+eq("false → real run", parseDryRun(false), { ok: true, dryRun: false });
+for (const bad of ["true", "false", 1, 0, null, {}, []]) {
+  eq(`${JSON.stringify(bad)} → refused, never a real run`, parseDryRun(bad).ok, false);
+}
 
 console.log("\nreason (step 1)");
 eq("missing → refused", parseRestartReason(undefined).ok, false);

@@ -7,6 +7,7 @@ import {
   byRoleClass,
   isStaffRole,
   memberKey,
+  parseDryRun,
   parseRestartReason,
   planRestart,
   restartRefusal,
@@ -34,10 +35,16 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
  * Refused (409, nothing changed): a version that is not fully uploaded; the
  * current version of an ACTIVE package. The current version of an inactive
  * package is allowed. Admin-only, tenant-guarded like the activate route.
+ * 400 `invalid_dry_run` when dry_run is present but not a boolean (a real
+ * run cannot be undone, so "true" or 1 is never read as one). 503, nothing
+ * changed, when the grant or membership lookup fails.
  *
  * Response: { dry_run, version_id, attempt_ids, excluded_grant_retake_ids,
  *             by_role: { learner, staff }, restarted? } — `attempt_ids` is
  * the selection on a dry run and the attempts actually reset on a real run.
+ * A real run adds `tokens_expired: false` when the token expiry failed and
+ * `audit: false` when the audit row could not be written (keep the
+ * response's attempt ids for the ledger then).
  */
 export async function POST(
   request: NextRequest,
@@ -52,7 +59,9 @@ export async function POST(
   const auth = await requireOrgAdminApi(body.orgSlug ?? request.nextUrl.searchParams.get("orgSlug"));
   if ("error" in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
   const { supabase, org, userId } = auth;
-  const dryRun = body.dry_run === true;
+  const dry = parseDryRun(body.dry_run);
+  if (!dry.ok) return NextResponse.json({ error: "invalid_dry_run", message: dry.message }, { status: 400 });
+  const dryRun = dry.dryRun;
 
   // ---- Tenant guard (as the activate route) ----
   const { data: course } = await supabase
@@ -150,11 +159,20 @@ export async function POST(
   for (const [orgId, users] of usersByOrg) {
     const list = [...users];
     for (let i = 0; i < list.length; i += 150) {
-      const { data: mems } = await svc
+      const { data: mems, error: memErr } = await svc
         .from("organization_members")
         .select("user_id, role")
         .eq("organization_id", orgId)
         .in("user_id", list.slice(i, i + 150));
+      if (memErr) {
+        // The role classes are what the owner approves on the dry run: never
+        // report staff as learners because a read failed.
+        console.error("[restart] membership lookup failed:", memErr.message);
+        return NextResponse.json(
+          { error: "Could not read the learners' roles; nothing was restarted. Try again." },
+          { status: 503 }
+        );
+      }
       for (const m of (mems ?? []) as Array<{ user_id: string; role: string | null }>) {
         if (isStaffRole(m.role)) staffKeys.add(memberKey(orgId, m.user_id));
       }
@@ -200,7 +218,7 @@ export async function POST(
   // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
   await enqueueAbandonedStatements(svc, restartedIds);
 
-  await auditLog({
+  const audit = await auditLog({
     actorUserId: userId,
     action: "course.version.attempts_restarted",
     targetType: "course_version",
@@ -216,6 +234,8 @@ export async function POST(
     },
   });
 
+  if (audit.error) console.error("[restart] audit row not written for version", versionId);
+
   const restartedSet = new Set(restartedIds);
   return NextResponse.json(
     {
@@ -228,6 +248,8 @@ export async function POST(
       excluded_grant_retake_ids: plan.excludedGrantRetakeIds,
       by_role: byRoleClass(plan.selected.filter((a) => restartedSet.has(a.id)), staffKeys),
       restarted: restartedIds.length,
+      ...(tokErr ? { tokens_expired: false } : {}),
+      ...(audit.error ? { audit: false } : {}),
     },
     { status: updateError ? 500 : 200 }
   );

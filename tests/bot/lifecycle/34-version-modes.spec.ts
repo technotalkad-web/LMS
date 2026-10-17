@@ -357,6 +357,13 @@ test.describe.serial("per-version restart (ADR 0008 A)", () => {
       expect(res.status(), `reason ${JSON.stringify(reason)?.slice(0, 20)}`).toBe(400);
       expect((await res.json()).error).toBe("reason_required");
     }
+    // dry_run must be a JSON boolean: a string "true" sent with a reason is
+    // refused, never read as a real (irreversible) run.
+    for (const dry_run of ["true", 1, null]) {
+      const res = await req.post(url(s.v1!), { data: { orgSlug: slug, dry_run, reason: "QA: dry run sent as a string" } });
+      expect(res.status(), `dry_run ${JSON.stringify(dry_run)}`).toBe(400);
+      expect((await res.json()).error).toBe("invalid_dry_run");
+    }
     // An unknown version of this package.
     const ghost = await req.post(url(randomUUID()), { data: { orgSlug: slug, dry_run: true } });
     expect(ghost.status()).toBe(404);
@@ -526,6 +533,8 @@ test.describe.serial("per-version restart (ADR 0008 A)", () => {
     await expect(row).toBeVisible({ timeout: 60_000 });
     await expect(row).toContainText("Not started");
     await expect(row).not.toContainText("In progress");
+    // Gap 6/10: the reset attempt is not counted as an attempt; it shows as a suffix.
+    await expect(row).toContainText("· 1 reset");
     await rc.close();
     await mgr.close();
   });
