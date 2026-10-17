@@ -7,6 +7,7 @@ import {
 } from "@/lib/courses/validation/validate-package";
 import { validateStoredVersion } from "@/lib/courses/validation/validate-stored";
 import { applyIntegrity, checkIntegrity, type IntegrityFindings } from "@/lib/courses/validation/integrity";
+import { isReadyVersion } from "@/lib/courses/default-rule";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 
 /**
@@ -166,17 +167,20 @@ export async function POST(request: NextRequest) {
       if (!course) {
         return NextResponse.json({ error: "Course not found" }, { status: 404 });
       }
-      let vq = auth.supabase
-        .from("course_versions")
-        .select("id, version_number, storage_prefix")
-        .eq("course_id", course.id);
+      // Without a course default: the newest FINISHED version. An unfinished
+      // or failed upload (ADR 0008 D1: failed rows stay, their folder empty)
+      // is never re-scanned. select("*") for 0077 deploy safety.
+      let vq = auth.supabase.from("course_versions").select("*").eq("course_id", course.id);
       vq = course.current_version_id
         ? vq.eq("id", course.current_version_id)
-        : vq.order("version_number", { ascending: false }).limit(1);
+        : vq.order("version_number", { ascending: false });
       const { data: verRows } = await vq;
-      const version = (verRows ?? [])[0] as
-        | { id: string; version_number: number; storage_prefix: string }
-        | undefined;
+      const version = ((verRows ?? []) as Array<{
+        id: string;
+        version_number: number;
+        storage_prefix: string;
+        upload_status?: string | null;
+      }>).find((v) => isReadyVersion(v.upload_status));
       if (!version?.storage_prefix) {
         return NextResponse.json(
           { error: "Course has no stored version to validate" },

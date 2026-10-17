@@ -19,6 +19,7 @@ import {
   type ChangeLanguageOption,
 } from "./change-language-menu";
 import { RequestAttemptButton } from "./request-attempt-button";
+import { isReadyVersion } from "@/lib/courses/default-rule";
 
 type Version = {
   id: string;
@@ -28,6 +29,8 @@ type Version = {
   manifest_data: { title?: string; description?: string; masteryScore?: number };
   uploaded_at: string;
   package_id: string | null;
+  /** 0077 — undefined before the migration (= ready). */
+  upload_status?: string | null;
 };
 
 type Course = {
@@ -109,15 +112,16 @@ export default async function CourseDetailPage({
     );
   }
 
+  // select("*") for 0077 deploy safety (upload_status).
   const { data: versions } = await supabase
     .from("course_versions")
-    .select(
-      "id, version_number, manifest_type, launch_url, manifest_data, uploaded_at, package_id"
-    )
+    .select("*")
     .eq("course_id", c.id)
     .order("version_number", { ascending: false });
   const list = (versions ?? []) as Version[];
-  const current = list.find((v) => v.id === c.current_version_id) ?? list[0];
+  // Without a course default: the newest finished version, never an
+  // unfinished or failed upload (ADR 0008 D1 keeps failed rows).
+  const current = list.find((v) => v.id === c.current_version_id) ?? list.find((v) => isReadyVersion(v.upload_status));
   const versionIds = list.map((v) => v.id);
 
   // Multi-language packages for this course (#158 Phase 3). The
