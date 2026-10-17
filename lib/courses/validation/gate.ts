@@ -88,6 +88,19 @@ export async function enforcePackageValidation(opts: {
     }
     // A super_owner-overridden block counts as an acknowledged warning.
     const overriddenBlock = v.verdict === "blocked";
+    // ADR 0004 step 2: the collision lookup again at accept time, on the
+    // RECEIVED bytes (never on the row's own report, which a stale or
+    // hand-written row could leave empty), as the direct path's finalize
+    // does. A collision that no super_owner overrode is refused; the row is
+    // marked blocked so the override has something to target.
+    const recheck = await recheckIntegrityAtAccept({
+      zipBytes,
+      organizationId,
+      courseId,
+      packageId: opts.packageId ?? null,
+      row: v,
+    });
+    if (!recheck.ok) return recheck;
     if (v.verdict !== "pass" && !overriddenBlock && !opts.acknowledge) {
       return {
         ok: false, status: 400,
@@ -186,6 +199,62 @@ export async function enforcePackageValidation(opts: {
     // Pre-0070 database hiccup — never break uploads for it.
     return { ok: true, validationId: null };
   }
+}
+
+/**
+ * The accept-time integrity re-check of the validation_id branch. Fails
+ * closed: bytes that cannot be read or a lookup that cannot run never wave a
+ * package through (phase 1 already validated these exact bytes, matched by
+ * sha256, so a validator failure here means the row did not come from it).
+ */
+async function recheckIntegrityAtAccept(args: {
+  zipBytes: Uint8Array;
+  organizationId: string;
+  courseId: string | null;
+  packageId: string | null;
+  row: GateValidationRow & { id: string };
+}): Promise<{ ok: true } | { ok: false; status: number; error: string; validationId?: string | null }> {
+  let received: Awaited<ReturnType<typeof validatePackage>>;
+  try {
+    received = await validatePackage(args.zipBytes);
+  } catch {
+    return { ok: false, status: 400, error: "The package could not be read for the integrity check. Re-validate the package." };
+  }
+  const identity = received.package.identity;
+  if (!identity) return { ok: true };
+  const svc = serviceClient();
+  let findings: Awaited<ReturnType<typeof checkIntegrity>>;
+  try {
+    findings = await checkIntegrity(svc, {
+      organizationId: args.organizationId,
+      courseId: args.courseId,
+      packageId: args.packageId,
+      identity,
+      stage: "inline",
+    });
+  } catch (e) {
+    return { ok: false, status: 503, error: e instanceof Error ? e.message : "Integrity check failed" };
+  }
+  const overridden = args.row.verdict === "blocked" && !!args.row.overridden_at;
+  if (!findings.blocked || overridden) return { ok: true };
+  // Keep the row pending, now blocked with the fresh findings. Before 0098
+  // the verdict cannot be stored: the call still answers 409, with no id.
+  const base = (args.row.report ?? {}) as unknown as { verdict?: string; checks?: unknown[] };
+  const report = applyIntegrity(
+    { ...base, verdict: args.row.verdict, checks: Array.isArray(base.checks) ? base.checks : [] } as {
+      verdict: string;
+      checks: Array<{ id: string; label: string; status: "pass" | "warning" | "fail" | "info"; detail: string }>;
+    },
+    findings
+  );
+  const { data: marked, error } = await svc
+    .from("package_validations")
+    .update({ verdict: "blocked", report })
+    .eq("id", args.row.id)
+    .eq("status", "pending")
+    .select("id");
+  const stored = !error && (marked ?? []).length > 0;
+  return { ok: false, status: 409, error: BLOCKED_UPLOAD_ERROR, validationId: stored ? args.row.id : null };
 }
 
 function serviceClient(): SupabaseClient {

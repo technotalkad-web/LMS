@@ -89,14 +89,25 @@ export async function POST(request: NextRequest) {
           { status: 409 }
         );
       }
+      // One override per block: a second one would overwrite who overrode it
+      // and why (the Attention item names that super owner).
+      if (row.overridden_at) {
+        return NextResponse.json(
+          { error: "This block has already been overridden" },
+          { status: 409 }
+        );
+      }
       const nowIso = new Date().toISOString();
-      const { data: updated, error } = await auth.supabase
+      // Written by the server after the super_owner check above (the caller's
+      // RLS session is not what authorises an override).
+      const { data: updated, error } = await serviceClient()
         .from("package_validations")
         .update({ override_reason: reason, overridden_by: auth.userId, overridden_at: nowIso })
         .eq("id", row.id)
         .eq("organization_id", auth.orgId)
         .eq("status", "pending")
         .eq("verdict", "blocked")
+        .is("overridden_at", null)
         .select("id");
       if (error) {
         return NextResponse.json(
@@ -105,7 +116,8 @@ export async function POST(request: NextRequest) {
         );
       }
       if (!updated || updated.length === 0) {
-        return NextResponse.json({ error: "Validation not found" }, { status: 404 });
+        // Consumed, rejected or overridden by a concurrent request since the read.
+        return NextResponse.json({ error: "Only a pending, blocked validation can be overridden" }, { status: 409 });
       }
       const collisions = row.report?.integrity?.collisions ?? [];
       await auditLog({
