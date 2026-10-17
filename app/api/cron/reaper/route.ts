@@ -66,7 +66,8 @@ async function run() {
     reaped++;
   }
 
-  // Direct uploads nobody finalised within 24 h: files first, then the row.
+  // Direct uploads nobody finalised within 24 h: the row turns 'failed'
+  // (kept, ADR 0008 D1), then its files go.
   const uploads = await sweepAbandonedUploads(svc);
   errors.push(...uploads.errors);
 

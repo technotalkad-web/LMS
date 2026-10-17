@@ -112,18 +112,21 @@ export async function uploadCoursePackage(opts: {
   }
 
   // 5) Upload every file, then flip the row to 'ready'. On any error the
-  //    reserved row and its prefix are removed (crashes: the reaper's
+  //    reserved row turns 'failed' and its prefix is emptied (ADR 0008 D1:
+  //    the number and folder stay taken; crashes: the reaper's
   //    sweepAbandonedUploads covers 'uploading' rows older than a day).
   const storage = await getStorage();
   try {
-    const uploads: Array<Promise<void>> = files.map(({ cleanPath, file }) =>
-      file
-        .async("uint8array")
-        .then((bytes) =>
-          storage.upload(storagePrefix + sanitizeStorageKey(cleanPath), bytes, contentTypeFor(cleanPath))
-        )
+    // Tasks, not promises: at most 12 files are read and written at a time,
+    // and when one fails no new write starts and every running one settles
+    // before the catch below empties the folder (nothing lands after it).
+    await runPool(
+      files.map(({ cleanPath, file }) => async () => {
+        const bytes = await file.async("uint8array");
+        await storage.upload(storagePrefix + sanitizeStorageKey(cleanPath), bytes, contentTypeFor(cleanPath));
+      }),
+      12
     );
-    await runConcurrent(uploads, 12);
 
     // 0075: learning-unit count (screens) for progress %. Single-file engines
     // embed their slide list in the launch HTML; null = no usable signal.
@@ -136,12 +139,28 @@ export async function uploadCoursePackage(opts: {
       file_count: files.length,
     });
   } catch (e) {
+    // ADR 0008 D1: the row is kept as 'failed' (never deleted), so
+    // nextVersionNumber moves on and this folder is never written again.
+    // Before 0077 there is no upload_status column (and no 'failed'):
+    // remove the row as before.
+    const mark = await markVersionFailed(svc, version.id);
+    if (mark.error) {
+      if (/upload_status|schema cache/i.test(mark.error)) {
+        await svc.from("course_versions").delete().eq("id", version.id);
+      } else {
+        console.warn("[upload] cleanup: could not mark the version failed:", mark.error);
+      }
+    }
+    // Every write of this request has settled (runPool), so emptying the
+    // folder now is final.
     try {
       await storage.deletePrefix(storagePrefix.replace(/\/$/, ""));
     } catch (delErr) {
       console.warn("[upload] cleanup: prefix delete failed", delErr);
     }
-    await svc.from("course_versions").delete().eq("id", version.id);
+    // A course created by THIS call goes, and its failed row with it
+    // (cascade; no attempts). The folder carried that course's id, so it
+    // can never come back either.
     if (createdCourse) await svc.from("courses").delete().eq("id", courseId);
     throw e;
   }
@@ -343,7 +362,12 @@ export async function resolveTargetPackage(
   return packageId;
 }
 
-/** Next version number — sequenced PER PACKAGE (each language has its own v1, v2, …). */
+/**
+ * Next version number — sequenced PER PACKAGE (each language has its own
+ * v1, v2, …). max+1 over every row, 'failed' ones included: a failed upload
+ * keeps its number, so a number (and its folder) is never reused (ADR 0008
+ * D1); numbers may have gaps (v3 failed, v4 ready).
+ */
 export async function nextVersionNumber(
   supabase: SupabaseClient,
   packageId: string
@@ -402,6 +426,8 @@ export function isVersionConflictError(e: unknown): e is VersionConflictError {
  * uploading → ready for a reserved multipart version. Service role: there is
  * no admin UPDATE policy on course_versions, so an RLS update would touch 0
  * rows. Deploy-safe before 0077 (no upload_status / file_count columns).
+ * Conditional on 'uploading': a row discarded meanwhile stays 'failed'
+ * (ADR 0008 D1) and is never made ready.
  */
 async function markVersionReady(
   svc: SupabaseClient,
@@ -412,6 +438,7 @@ async function markVersionReady(
     .from("course_versions")
     .update({ upload_status: "ready", ...patch })
     .eq("id", versionId)
+    .eq("upload_status", "uploading")
     .select("id");
   if (error && /upload_status|file_count|schema cache/i.test(error.message)) {
     ({ data, error } = await svc
@@ -421,7 +448,33 @@ async function markVersionReady(
       .select("id"));
   }
   if (error) throw new Error(`Failed to finalise course_version: ${error.message}`);
-  if (!data || data.length === 0) throw new Error("Failed to finalise course_version: the reserved row is gone.");
+  if (!data || data.length === 0) throw new Error("Failed to finalise course_version: the reserved row is gone or was discarded.");
+}
+
+/**
+ * ADR 0008 D1: a version that will never be ready keeps its row, and so
+ * its version number and storage folder, as 'failed'; callers then empty
+ * the folder. The claim comes first and is conditional on `from`, so a
+ * version a concurrent finalize made ready is never touched and its files
+ * are never deleted: delete the folder only when `claimed` is true.
+ * `size_bytes` drops to 0 because the files are gone (the storage quota,
+ * 0038 current_quota_usage, sums it over every row).
+ * 0077's check constraint allows 'failed'; 0098's freeze trigger only
+ * guards rows that are already 'ready'. Service client only.
+ */
+export async function markVersionFailed(
+  svc: SupabaseClient,
+  versionId: string,
+  from: ReadonlyArray<"uploading" | "failed"> = ["uploading"]
+): Promise<{ claimed: boolean; error: string | null }> {
+  const { data, error } = await svc
+    .from("course_versions")
+    .update({ upload_status: "failed", size_bytes: 0 })
+    .eq("id", versionId)
+    .in("upload_status", [...from])
+    .select("id");
+  if (error) return { claimed: false, error: error.message };
+  return { claimed: ((data ?? []) as unknown[]).length > 0, error: null };
 }
 
 function serviceClient(): SupabaseClient {
@@ -514,18 +567,25 @@ function slugify(s: string): string {
   );
 }
 
-async function runConcurrent<T>(
-  promises: Array<Promise<T>>,
-  concurrency: number
-): Promise<T[]> {
-  const results: T[] = [];
+/**
+ * Run `tasks` at most `concurrency` at a time. After the first failure no
+ * new task starts; the call rejects with that failure only once every
+ * running task has settled, so the caller's cleanup runs after the last
+ * write.
+ */
+async function runPool(tasks: Array<() => Promise<void>>, concurrency: number): Promise<void> {
   let cursor = 0;
-  const workers = Array.from({ length: concurrency }, async () => {
-    while (cursor < promises.length) {
+  let failure: { error: unknown } | null = null;
+  const worker = async () => {
+    while (!failure && cursor < tasks.length) {
       const idx = cursor++;
-      results[idx] = await promises[idx];
+      try {
+        await tasks[idx]();
+      } catch (e) {
+        failure ??= { error: e };
+      }
     }
-  });
-  await Promise.all(workers);
-  return results;
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  if (failure) throw (failure as { error: unknown }).error;
 }

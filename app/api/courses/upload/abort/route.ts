@@ -5,8 +5,10 @@ import { abortDirectUpload } from "@/lib/courses/direct-upload";
 /**
  *   POST /api/courses/upload/abort   { orgSlug, versionId }
  *
- * Cancels an in-progress direct upload: deletes whatever landed under the
- * version's prefix and the 'uploading' row. Ready versions cannot be
+ * Cancels an in-progress direct upload: the 'uploading' row turns 'failed'
+ * and stays (its version number and folder are never reused, ADR 0008 D1),
+ * then whatever landed under the version's prefix is deleted. Repeating it
+ * on a 'failed' row only empties the prefix again. Ready versions cannot be
  * aborted (use the version list to roll back instead).
  */
 export async function POST(request: NextRequest) {
