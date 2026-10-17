@@ -145,6 +145,7 @@ async function listAll(bucket, prefix = "") {
 }
 
 const objects = [];
+const emptyBuckets = [];
 for (const b of buckets) {
   let list;
   try { list = await listAll(b); }
@@ -157,10 +158,15 @@ for (const b of buckets) {
     const names = (all ?? []).map((x) => x.name);
     if (bErr || names.length === 0) fail(`bucket "${b}" listed 0 objects and no bucket is visible to this key${bErr ? ` (${bErr.message})` : ""}: the key has no service rights. Nothing was copied.`);
     if (!names.includes(b)) fail(`bucket "${b}" does not exist in this project. Buckets here: ${names.join(", ")}. Set SNAPSHOT_BUCKETS to the right names. Nothing was copied.`);
-    fail(`bucket "${b}" exists but is empty. Nothing was copied.`);
+    // The key sees the buckets, so this is a genuinely empty bucket (production had no course
+    // packages on 2026-10-17): note it and copy the others. Ready versions without files are
+    // still reported from course_versions below.
+    console.log(`NOTE      bucket "${b}" exists and is empty; nothing to copy from it.`);
+    emptyBuckets.push(b);
   }
   objects.push(...list);
 }
+if (objects.length === 0) fail(`every bucket is empty (${buckets.join(", ")}): nothing to back up.`);
 
 // ---- 2. download + hash -------------------------------------------------------------------
 const manifestPath = path.join(outDir, "manifest.ndjson");
@@ -288,7 +294,7 @@ if (b2Wanted) {
 
 // ---- 5. summary -----------------------------------------------------------------------------
 const summary = {
-  status: "finished", env, project: PROJECTS[env], stamp, buckets, local: outDir,
+  status: "finished", env, project: PROJECTS[env], stamp, buckets, emptyBuckets, local: outDir,
   objectsListed: objects.length, objectsSaved: objects.filter((o) => o.sha256).length, bytes,
   versions: versions.length, versionsByDriver: drivers,
   versionsReadyWithoutFiles: versionsWithoutFiles.length, versionsReadyWithoutFilesSample: versionsWithoutFiles.slice(0, 20),
