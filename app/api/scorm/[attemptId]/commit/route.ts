@@ -26,7 +26,10 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  *
  * Plus the legacy single-axis `status` for backward compatibility.
  *
- * RLS on `course_attempts` enforces user_id = auth.uid() on updates.
+ * The route authorises (the learner's session, and the read below is on
+ * their RLS client: own attempts only); the service client writes, filtered
+ * on id + user_id + status <> 'abandoned' (ADR 0009 step 4: attempt rows are
+ * written by the server only).
  * Terminal values are never downgraded by a later commit (e.g. an unload
  * beacon arriving after LMSFinish must not erase a completed attempt).
  * An abandoned attempt is terminal for good: 410 `{error:"attempt_abandoned"}`
@@ -159,9 +162,16 @@ export async function POST(
     update.completed_at = new Date().toISOString();
   }
 
+  // ADR 0009 step 4: the write goes through the service client; the
+  // user_id filter (mandatory here) keeps it to the caller's own attempt.
+  const svc = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
   // Conditional on status <> 'abandoned' (P4): abandoned since the read
   // above (a language switch in another tab) → 410, nothing written.
-  const error = await updateAttemptFailSoft(supabase, attemptId, update, { userId: user.id });
+  const error = await updateAttemptFailSoft(svc, attemptId, update, { userId: user.id });
 
   if (error?.abandoned) return attemptAbandonedResponse();
   if (error) {
@@ -177,14 +187,7 @@ export async function POST(
   let kind: Awaited<ReturnType<typeof classifyAttempt>> = null;
   if (nowComplete) {
     try {
-      kind = await classifyAttempt(
-        createServiceClient(
-          process.env.NEXT_PUBLIC_SUPABASE_URL!,
-          process.env.SUPABASE_SERVICE_ROLE_KEY!,
-          { auth: { persistSession: false } }
-        ),
-        attemptId
-      );
+      kind = await classifyAttempt(svc, attemptId);
     } catch (e) {
       console.warn("[scorm/commit] attempt classification failed (treated as official):", e);
     }
@@ -196,11 +199,6 @@ export async function POST(
   // streak/XP/badges). A failure here must never fail the learner's commit.
   if (officialRun) {
     try {
-      const svc = createServiceClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY!,
-        { auth: { persistSession: false } }
-      );
       await svc.rpc("gamification_record_activity", { p_attempt_id: attemptId });
       // Yoddha journey (0058): credits the tagged day; no-ops for untagged
       // attempts and on databases without the function yet.
@@ -219,11 +217,6 @@ export async function POST(
   if ((justCompleted || justPassed) && officialRun) {
     await (async () => {
       try {
-        const svc = createServiceClient(
-          process.env.NEXT_PUBLIC_SUPABASE_URL!,
-          process.env.SUPABASE_SERVICE_ROLE_KEY!,
-          { auth: { persistSession: false } }
-        );
         const { data: row } = await svc
           .from("course_attempts")
           .select(

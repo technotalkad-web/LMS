@@ -119,6 +119,12 @@ export function progressFromState(content: unknown): {
  * write that matches no row returns `{ abandoned: true }` (callers answer
  * 410 attempt_abandoned); callers read the attempt first, so "no row" here
  * means it was abandoned in between.
+ *
+ * ADR 0009: `svc` is always a service client (attempt rows are written by
+ * the server only), so RLS no longer checks ownership. `extra.userId` is
+ * mandatory for a user-session caller (the SCORM commit passes the session
+ * user); the token-bound xAPI callers have none, their launch token binds
+ * the attempt.
  */
 export async function updateAttemptFailSoft(
   svc: SupabaseClient,
