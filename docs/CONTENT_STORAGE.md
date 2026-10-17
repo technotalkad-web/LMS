@@ -105,13 +105,21 @@ learners. `STORAGE_DRIVER` on the Worker decides where **new** uploads go.
 
 ## Backup and rollback
 
-- **Content backup:** `.github/workflows/content-backup.yml` runs nightly at
-  02:30 UTC and `rclone sync`s `courses/` from R2 to Backblaze B2 under
-  `content/courses`, next to the database dumps. `--immutable` never
-  overwrites an existing object, because version folders never change.
-- **Restore a version's files:** copy `content/courses/{course}/{package}/v{n}/`
-  from B2 back to R2 with `rclone copy` (or `aws s3 sync`); no database change
-  is needed because the row still points at that prefix.
+- **Content backup (ADR 0003 step 2):** `.github/workflows/content-backup.yml`
+  runs nightly at 02:30 UTC and `rclone copy`s (never `sync`) the production
+  Supabase Storage bucket `course-content`, read through its S3-compatible
+  endpoint, to `content/prod/supabase/course-content/` in the dedicated,
+  Object-Locked B2 content bucket (`B2_CONTENT_BUCKET`), not the dump bucket.
+  `--immutable` never overwrites an existing object, because version folders
+  never change; nothing is deleted from the copy when it disappears from the
+  source. The secrets it needs are listed in the workflow header; it fails
+  with a message naming any that are missing. The R2 source returns only when
+  `STORAGE_DRIVER` flips to `r2` (step 7).
+- **Restore a version's files:** copy
+  `content/prod/supabase/course-content/courses/{course}/{package}/v{n}/` from
+  the B2 content bucket back to the live bucket with `rclone copy` (or
+  `aws s3 cp --recursive`); no database change is needed because the row
+  still points at that prefix.
 - **Roll a course back to an earlier version:** Library → course → Versions →
   **Make current** on any fully uploaded version. This repoints the language
   package (and the course) at that version; learners get it on their next
