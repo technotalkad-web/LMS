@@ -29,6 +29,24 @@ export async function has0098(): Promise<boolean> {
 }
 export const NEEDS_0098 = "needs 0098 on staging (migration not applied yet)";
 
+let probe0099: boolean | null = null;
+/**
+ * Is migration 0099 (PostgREST write guards, ADR 0008 C + ADR 0009) applied?
+ * Its section 3 adds v_course_attempt_summary.live_attempt_count in the same
+ * transaction as the policy drops, so one real select of that column settles
+ * all of it (ADR 0009 step 12). Postgres answers 42703 (undefined column)
+ * before the apply; any other error is an environment problem and throws,
+ * so a broken setup never silently skips every guard case.
+ */
+export async function has0099(): Promise<boolean> {
+  if (probe0099 !== null) return probe0099;
+  const { error } = await svc().from("v_course_attempt_summary").select("live_attempt_count").limit(1);
+  if (error && error.code !== "42703") throw new Error(`has0099 probe failed: ${error.code ?? ""} ${error.message}`);
+  probe0099 = !error;
+  return probe0099;
+}
+export const NEEDS_0099 = "needs 0099";
+
 export function sha256(bytes: Uint8Array | Buffer | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
