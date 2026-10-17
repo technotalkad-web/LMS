@@ -62,7 +62,10 @@ export type CourseLine = {
   status: "not_started" | "in_progress" | "completed" | "passed" | "failed";
   /** Official score 0–100, null until an official result exists. */
   officialScore: number | null;
+  /** Attempts that were not reset (abandoned attempts are counted in resetAttempts). */
   attempts: number;
+  /** Attempts reset by a module update or language switch (ADR 0004 step 11); shown as "· N reset". */
+  resetAttempts?: number;
   /** Learner-visible progress 0–100 (null when unknown). */
   progressPct: number | null;
   assignedAt: string | null;

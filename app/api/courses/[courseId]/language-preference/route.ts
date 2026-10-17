@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
+import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 
 /**
  * PUT /api/courses/{courseId}/language-preference
@@ -193,6 +194,8 @@ export async function PUT(
     abandoned = abIds.length;
     const tokErr = await expireLaunchTokens(svc, abIds);
     if (tokErr) console.warn("[language-preference] token expiry failed:", tokErr.message);
+    // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
+    await enqueueAbandonedStatements(svc, abIds);
   }
 
   return NextResponse.json({ ok: true, abandoned, kept_grant_retakes: keptRetakes });

@@ -46,3 +46,15 @@ export function statementIdName(attemptId: string, statement: StatementLike): st
 export function deterministicStatementId(attemptId: string, statement: StatementLike): string {
   return uuid5(statementIdName(attemptId, statement), ALDS_NS);
 }
+
+/**
+ * Id of the LMS-derived "abandoned" statement for one attempt. The LRS
+ * sweeper (srcAttempts) and the live enqueue at every abandon site
+ * (lib/lrs/abandoned.ts) both use it, so the outbox (unique on org +
+ * statement id) and a conformant LRS keep one copy. LMS namespace
+ * (uuid5's default), not ALDS_NS: it names an LMS event, not a content
+ * statement.
+ */
+export function abandonedStatementId(attemptId: string): string {
+  return uuid5(`abandoned:${attemptId}`);
+}

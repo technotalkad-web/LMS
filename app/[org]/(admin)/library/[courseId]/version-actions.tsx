@@ -1,7 +1,9 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useId, useState } from "react";
+import { createPortal } from "react-dom";
+import { AlertTriangle } from "lucide-react";
 import { useConfirm } from "@/components/ui/confirm";
 
 /**
@@ -116,5 +118,234 @@ export function ActivateVersionButton({
         {busy ? "Switching…" : "Make current"}
       </button>
     </span>
+  );
+}
+
+type RestartPlan = {
+  attempt_ids: string[];
+  excluded_grant_retake_ids: string[];
+  by_role: { learner: number; staff: number };
+};
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * "Restart learners on this version" (ADR 0008 step 6): for a ready version
+ * that is not its package's current one, or the current version of an
+ * inactive package. Click → dry run → a dialog with the counts and a required
+ * reason → the real call → refresh. Zero attempts: the dialog says so and
+ * offers nothing. Ids and counts only, never names.
+ */
+export function RestartVersionButton({
+  orgSlug,
+  courseId,
+  packageId,
+  versionId,
+  versionNumber,
+}: {
+  orgSlug: string;
+  courseId: string;
+  packageId: string;
+  versionId: string;
+  versionNumber: number;
+}) {
+  const router = useRouter();
+  const [checking, setChecking] = useState(false);
+  const [plan, setPlan] = useState<RestartPlan | null>(null);
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<number | null>(null);
+  const url = `/api/courses/${courseId}/packages/${packageId}/versions/${versionId}/restart`;
+
+  async function post(body: Record<string, unknown>) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug, ...body }),
+    });
+    const j = (await res.json().catch(() => ({}))) as Partial<RestartPlan> & {
+      error?: string;
+      message?: string;
+      restarted?: number;
+    };
+    return { ok: res.ok, status: res.status, j };
+  }
+
+  async function open() {
+    setChecking(true);
+    setError(null);
+    setDone(null);
+    const { ok, status, j } = await post({ dry_run: true });
+    setChecking(false);
+    if (!ok) {
+      setError(j.message ?? j.error ?? `HTTP ${status}`);
+      return;
+    }
+    setReason("");
+    setPlan({
+      attempt_ids: j.attempt_ids ?? [],
+      excluded_grant_retake_ids: j.excluded_grant_retake_ids ?? [],
+      by_role: j.by_role ?? { learner: 0, staff: 0 },
+    });
+  }
+
+  function close() {
+    if (busy) return;
+    setPlan(null);
+    setError(null);
+  }
+
+  async function restart() {
+    if (!reason.trim()) return;
+    setBusy(true);
+    setError(null);
+    const { ok, status, j } = await post({ reason: reason.trim() });
+    setBusy(false);
+    if (!ok) {
+      setError(j.message ?? j.error ?? `HTTP ${status}`);
+      return;
+    }
+    setPlan(null);
+    setDone(j.restarted ?? j.attempt_ids?.length ?? 0);
+    router.refresh();
+  }
+
+  const total = plan?.attempt_ids.length ?? 0;
+  const excluded = plan?.excluded_grant_retake_ids.length ?? 0;
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      {error && !plan && <span className="text-[11px] text-red-700">{error}</span>}
+      {done !== null && (
+        <span className="text-[11px] text-muted" data-testid="restart-done">
+          {plural(done, "attempt", "attempts")} reset
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={open}
+        disabled={checking || busy}
+        className="text-[11px] px-2 py-1 border border-red-200 text-red-700 rounded hover:border-red-400 disabled:opacity-50"
+        title="Close the in-progress attempts on this version only; those learners start the current version"
+      >
+        {checking ? "Checking…" : "Restart learners on this version"}
+      </button>
+      {plan && (
+        <RestartDialog
+          title={total === 0 ? `No learners to restart on v${versionNumber}` : `Restart learners on v${versionNumber}?`}
+          onClose={close}
+        >
+          {total === 0 ? (
+            <>
+              <p className="mt-1 text-sm text-muted leading-relaxed" data-testid="restart-counts">
+                No in-progress attempts on this version. Nothing to restart.
+                {excluded > 0 && ` ${plural(excluded, "grant retake is", "grant retakes are")} excluded and stay in progress.`}
+              </p>
+              <div className="mt-6 flex justify-end">
+                <button
+                  type="button"
+                  onClick={close}
+                  className="px-4 py-2 rounded-lg border border-line text-sm text-muted hover:text-ink hover:border-ink transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="mt-1 text-sm text-ink leading-relaxed" data-testid="restart-counts">
+                {plural(total, "in-progress attempt", "in-progress attempts")}:{" "}
+                {plural(plan.by_role.learner, "learner", "learners")}, {plan.by_role.staff} staff;{" "}
+                {plural(excluded, "grant retake", "grant retakes")} excluded.
+              </p>
+              <p className="mt-2 text-xs text-muted leading-relaxed">
+                Each of these attempts is closed and shows as “Reset — module updated”; those people start the
+                current version from 0% at their next launch. Completed attempts, grant retakes and every other
+                version are not touched. This cannot be undone.
+              </p>
+              <label className="block mt-4 text-xs font-medium text-ink" htmlFor={`restart-reason-${versionId}`}>
+                Reason (required, kept in the audit log)
+              </label>
+              <textarea
+                id={`restart-reason-${versionId}`}
+                autoFocus
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                maxLength={500}
+                rows={3}
+                disabled={busy}
+                className="mt-1 w-full rounded-lg border border-line bg-canvas px-3 py-2 text-sm"
+                placeholder="e.g. wrong module uploaded on this version"
+              />
+              {error && <p className="mt-2 text-xs text-red-700">{error}</p>}
+              <div className="mt-6 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={close}
+                  disabled={busy}
+                  className="px-4 py-2 rounded-lg border border-line text-sm text-muted hover:text-ink hover:border-ink transition-colors disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={restart}
+                  disabled={busy || !reason.trim()}
+                  className="px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-semibold hover:bg-red-700 transition-colors disabled:opacity-50"
+                >
+                  {busy ? "Restarting…" : `Restart ${plural(total, "attempt", "attempts")}`}
+                </button>
+              </div>
+            </>
+          )}
+        </RestartDialog>
+      )}
+    </span>
+  );
+}
+
+/** Modal shell local to this file (same look as components/ui/confirm),
+ *  portalled to <body> so no ancestor's layout or text style reaches it. */
+function RestartDialog({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const titleId = useId();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[110] flex items-center justify-center p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+    >
+      <div className="absolute inset-0 bg-ink/40 backdrop-blur-[1px]" onClick={onClose} />
+      <div className="relative w-full max-w-md rounded-2xl border border-line bg-paper p-6 shadow-2xl text-left whitespace-normal">
+        <div className="flex items-start gap-3">
+          <span className="mt-0.5 shrink-0 rounded-full bg-red-100 p-1.5">
+            <AlertTriangle className="w-5 h-5 text-red-600" />
+          </span>
+          <div className="flex-1 min-w-0">
+            <h2 id={titleId} className="serif text-lg text-ink">
+              {title}
+            </h2>
+            {children}
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
   );
 }

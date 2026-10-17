@@ -7,7 +7,7 @@
  * Run:  npx tsx tests/unit/scoring-status.test.ts
  * (No DB. Typechecked by `npm run typecheck`.)
  */
-import { DEFAULT_POLICY } from "../../lib/scoring/policy";
+import { DEFAULT_POLICY, hasLiveGrantedRetake } from "../../lib/scoring/policy";
 import {
   computeScoring,
   courseStatus,
@@ -18,6 +18,8 @@ import {
   countsByCourse,
   excludeAbandoned,
   isAbandonedAttempt,
+  attemptCounts,
+  enrolledStatusSummary,
   userCourseKey,
   type UserCourseStatus,
 } from "../../lib/scoring/status";
@@ -121,6 +123,47 @@ console.log("\nabandoned is never official and never in progress (ADR 0004 step 
   eq("progress: abandoned only → not started, no %", (({ started, pct }) => ({ started, pct }))(courseProgress(onlyReset)), { started: false, pct: null });
   const newerReset = [live("l1", "2026-10-01T09:00Z", 30), ab("r1", "2026-10-02T09:00Z", 80)];
   eq("progress: a newer abandoned attempt never supplies the %", courseProgress(newerReset).pct, 30);
+}
+
+console.log("\nadmin tables: live attempts + reset suffix (ADR 0004 step 11)");
+{
+  const rows = [{ status: "in_progress" }, { status: "abandoned" }, { status: "completed" }, { status: "abandoned" }, {}];
+  eq("attemptCounts splits live and reset", attemptCounts(rows), { live: 3, reset: 2 });
+  eq("attemptCounts on no attempts", attemptCounts([]), { live: 0, reset: 0 });
+  eq("attemptCounts without status selected -> all live", attemptCounts([{}, {}]), { live: 2, reset: 0 });
+}
+
+console.log("\nenrolment summary: Library card = course Reports tiles");
+{
+  const mk = (u: string, c: string, st: UserCourseStatus["status"]): UserCourseStatus => ({ user_id: u, course_id: c, status: st, scoring: computeScoring([], P), attempts: [] });
+  const m = new Map<string, UserCourseStatus>();
+  for (const v of [
+    mk("u1", "c1", "passed"),
+    mk("u2", "c1", "completed"),
+    mk("u3", "c1", "failed"),
+    mk("u4", "c1", "in_progress"),
+    mk("u5", "c1", "not_started"), // only reset attempts
+    mk("u6", "c2", "in_progress"), // another course
+    mk("u9", "c1", "in_progress"), // not enrolled
+  ]) m.set(userCourseKey(v.user_id, v.course_id), v);
+  const enrolled = new Set(["u1", "u2", "u3", "u4", "u5", "u6", "u7"]);
+  const s = enrolledStatusSummary(enrolled, m, "c1");
+  eq("counts by official status; reset-only, other-course and attemptless learners are not started", s, {
+    total: 7, completed: 2, failed: 1, inProgress: 1, notStarted: 3,
+  });
+  eq("the four status numbers sum to total", s.completed + s.failed + s.inProgress + s.notStarted, s.total);
+  eq("nobody enrolled -> all zero", enrolledStatusSummary(new Set(), m, "c1"), { total: 0, completed: 0, failed: 0, inProgress: 0, notStarted: 0 });
+}
+
+console.log("\na granted retake blocks a new grant only while it is live (gap 5)");
+{
+  const g = new Set(["r1"]);
+  const row = (status: string, cs = "in_progress", ss = "unknown") => [{ id: "r1", status, completion_status: cs, success_status: ss }];
+  eq("in progress -> blocks", hasLiveGrantedRetake(row("in_progress"), g), true);
+  eq("reset by a force restart (abandoned) -> never blocks", hasLiveGrantedRetake(row("abandoned"), g), false);
+  eq("completed -> does not block", hasLiveGrantedRetake(row("completed", "completed"), g), false);
+  eq("status lagging but passed -> does not block", hasLiveGrantedRetake(row("in_progress", "in_progress", "passed"), g), false);
+  eq("an in-progress attempt that is not the retake -> does not block", hasLiveGrantedRetake(row("in_progress"), new Set(["other"])), false);
 }
 
 console.log(`\n==== status: ${pass} passed, ${fail} failed ====`);

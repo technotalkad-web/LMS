@@ -212,8 +212,9 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
     const att = await attemptsOf(s.learnerB!.id, [s.v1!, s.v2!, s.hi1!]);
     expect(att.map((x) => [x.course_version_id, x.status])).toEqual([[s.hi1, "in_progress"]]);
 
-    // The admin now publishes a new ENGLISH version: the course's current
-    // version is English again, while B's attempt is Hindi.
+    // The admin now publishes a new ENGLISH version. English is the default
+    // slot (adding Hindi never moved the default, ADR 0008 step 9), so the
+    // course default follows to v3 inside that slot, while B's attempt is Hindi.
     const rep = await areq.post(`/api/courses/${s.courseId}/packages/${s.pkgId}/versions`, {
       multipart: {
         orgSlug: s.org!.slug,

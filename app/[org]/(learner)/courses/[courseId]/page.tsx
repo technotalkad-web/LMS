@@ -122,19 +122,24 @@ export default async function CourseDetailPage({
 
   // Multi-language packages for this course (#158 Phase 3). The
   // ChangeLanguageMenu silently renders nothing if there are <2 active
-  // packages, so this fetch is cheap noise on monolingual courses.
+  // packages, so this fetch is cheap noise on monolingual courses. Every
+  // package is read (the menu keeps the active ones) so the page knows when
+  // the course has languages but all of them are hidden: the launch page
+  // then sends learners straight back here (ADR 0008 step 13), so the
+  // Launch button is replaced by a "Not available right now" state.
   const { data: pkgRows } = await supabase
     .from("course_packages")
     .select("id, language, display_name, is_active")
-    .eq("course_id", c.id)
-    .eq("is_active", true);
-  const languageOptions: ChangeLanguageOption[] = (
-    (pkgRows ?? []) as Array<{
-      id: string;
-      language: string | null;
-      display_name: string | null;
-    }>
-  ).map((p) => ({
+    .eq("course_id", c.id);
+  const allPkgs = (pkgRows ?? []) as Array<{
+    id: string;
+    language: string | null;
+    display_name: string | null;
+    is_active: boolean | null;
+  }>;
+  const activePkgs = allPkgs.filter((p) => p.is_active === true);
+  const noActiveLanguage = allPkgs.length > 0 && activePkgs.length === 0;
+  const languageOptions: ChangeLanguageOption[] = activePkgs.map((p) => ({
     id: p.id,
     language: p.language,
     display_label:
@@ -416,7 +421,18 @@ export default async function CourseDetailPage({
 
           {/* Launch CTA */}
           <div className="pt-4 border-t border-line flex flex-wrap items-center gap-3">
-            {current && !launchBlocked ? (
+            {current && noActiveLanguage ? (
+              <button
+                type="button"
+                disabled
+                data-testid="launch-unavailable"
+                title="Every language of this course is hidden right now."
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-canvas text-muted border border-line px-7 py-3.5 rounded-xl font-semibold cursor-not-allowed"
+              >
+                <PlayCircle className="w-5 h-5" />
+                Not available right now
+              </button>
+            ) : current && !launchBlocked ? (
               <Link
                 href={`/${orgSlug}/courses/${c.id}/launch`}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3.5 rounded-xl font-semibold transition shadow-sm"
@@ -444,12 +460,12 @@ export default async function CourseDetailPage({
                 This course doesn&apos;t have a version yet.
               </div>
             )}
-            {current && !launchBlocked && hasUnusedGrant && (
+            {current && !noActiveLanguage && !launchBlocked && hasUnusedGrant && (
               <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-100 text-emerald-800 border border-emerald-200">
                 Official retake
               </span>
             )}
-            {current && !launchBlocked && !hasUnusedGrant && scoring.practiceMode && (
+            {current && !noActiveLanguage && !launchBlocked && !hasUnusedGrant && scoring.practiceMode && (
               <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800 border border-amber-200">
                 Review only
               </span>
@@ -505,7 +521,11 @@ export default async function CourseDetailPage({
         </header>
         {attempts.length === 0 ? (
           <div className="p-8 text-center text-muted text-sm">
-            No attempts yet. Click <strong>Launch course</strong> to start.
+            {noActiveLanguage ? (
+              <>No attempts yet.</>
+            ) : (
+              <>No attempts yet. Click <strong>Launch course</strong> to start.</>
+            )}
           </div>
         ) : (
           <ul className="divide-y divide-line">

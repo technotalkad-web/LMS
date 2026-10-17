@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { DEFAULT_POLICY, computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, hasLiveGrantedRetake, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { fetchGrantRetakeIdsForUsers, fetchPassRequired } from "@/lib/scoring/attempt-kind";
 import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from "./requests";
@@ -45,7 +45,7 @@ export async function grantExtraAttempts(
     for (let from = 0; ; from += 1000) {
       const { data } = await svc
         .from("course_attempts")
-        .select("id, user_id, score, started_at, completed_at, completion_status, success_status")
+        .select("id, user_id, status, score, started_at, completed_at, completion_status, success_status")
         .eq("organization_id", args.orgId)
         .in("user_id", ids)
         .in("course_version_id", verIds)
@@ -98,7 +98,9 @@ export async function grantExtraAttempts(
     const failed = sc.officialStatus === "failed" || (passRequired && sc.officialStatus !== null && sc.officialStatus !== "passed");
     if (!sc.officialAttempt || !failed) { results.push({ userId: uid, status: "skipped", reason: "has not failed this module" }); continue; }
     if (!sc.limitReached) { results.push({ userId: uid, status: "skipped", reason: "still has an official attempt available" }); continue; }
-    if (mine.some((x) => retakeIds.has(x.id) && !(x.completion_status === "completed" || x.success_status === "passed"))) {
+    // Only a LIVE granted retake blocks a new grant: one a force restart reset
+    // (status 'abandoned') is closed for good (ADR 0004 step 11).
+    if (hasLiveGrantedRetake(mine, retakeIds)) {
       results.push({ userId: uid, status: "skipped", reason: "a granted retake is still in progress" });
       continue;
     }

@@ -25,6 +25,8 @@ export type LanguagePackage = {
   display_name: string | null;
   is_active: boolean;
   current_version_id: string | null;
+  /** The current version is fully uploaded (computed by the page). */
+  current_version_ready: boolean;
 };
 
 /**
@@ -34,25 +36,47 @@ export type LanguagePackage = {
  * upload dialog + per-package PATCH (rename / activate-deactivate /
  * promote NULL-language to a real code) and DELETE actions.
  *
+ * Course default (ADR 0008 step 11): a "Default" badge on the language
+ * whose current version is the course default, "Set as default" on every
+ * other active language with a ready current version, and a warning when
+ * no active language holds the default.
+ *
  * Closes #158 Phase 1c (UI half).
  */
 export function LanguagesSection({
   orgSlug,
   courseId,
   packages: initialPackages,
+  defaultVersionId: initialDefaultVersionId,
 }: {
   orgSlug: string;
   courseId: string;
   packages: LanguagePackage[];
+  /** courses.current_version_id: the current version of the default language. */
+  defaultVersionId: string | null;
 }) {
   const router = useRouter();
+  const confirmDialog = useConfirm();
   const [packages, setPackages] = useState(initialPackages);
+  const [defaultVersionId, setDefaultVersionId] = useState(initialDefaultVersionId);
   const [showAdd, setShowAdd] = useState(false);
   const [replaceFor, setReplaceFor] = useState<LanguagePackage | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const hasNullDefault = packages.some((p) => p.language === null);
+  const slotLabel = (p: LanguagePackage) =>
+    p.display_name?.trim() || (p.language === null ? "Unlabeled (legacy)" : languageDisplay(p.language, "english") ?? p.language);
+  const holdsDefault = (p: LanguagePackage) => !!defaultVersionId && p.current_version_id === defaultVersionId;
+  const activeHolder = packages.find((p) => p.is_active && holdsDefault(p));
+  const defaultWarning =
+    packages.length === 0 || activeHolder
+      ? null
+      : !defaultVersionId
+        ? "This course has no default language — set a default."
+        : packages.some((p) => holdsDefault(p))
+          ? "The default version belongs to a hidden language — set a default."
+          : "The default version is not the current version of any active language — set a default.";
 
   async function toggleActive(pkg: LanguagePackage) {
     setBusyId(pkg.id);
@@ -67,8 +91,9 @@ export function LanguagesSection({
     );
     setBusyId(null);
     if (!res.ok) {
-      const j = (await res.json().catch(() => ({}))) as { error?: string };
-      setError(j.error ?? "Failed to update");
+      // 409 default_slot (ADR 0008 step 12) carries a readable message.
+      const j = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
+      setError(j.message ?? j.error ?? "Failed to update");
       return;
     }
     setPackages((ps) =>
@@ -76,6 +101,32 @@ export function LanguagesSection({
         p.id === pkg.id ? { ...p, is_active: !pkg.is_active } : p
       )
     );
+    router.refresh();
+  }
+
+  async function setAsDefault(pkg: LanguagePackage) {
+    const ok = await confirmDialog({
+      title: `Make ${slotLabel(pkg)} the default language?`,
+      message:
+        "The course default (what the catalogue, integrations and learners without a language choice see) becomes this language's current version. Learners who chose a language keep it.",
+      confirmText: "Set as default",
+    });
+    if (!ok) return;
+    setBusyId(pkg.id);
+    setError(null);
+    const res = await fetch(`/api/courses/${courseId}/packages/${pkg.id}/default`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug }),
+    });
+    setBusyId(null);
+    const j = (await res.json().catch(() => ({}))) as { error?: string; message?: string; versionId?: string };
+    if (!res.ok) {
+      setError(j.message ?? j.error ?? "Could not set the default");
+      return;
+    }
+    if (j.versionId) setDefaultVersionId(j.versionId);
+    router.refresh();
   }
 
   async function promoteNull(pkg: LanguagePackage, language: string) {
@@ -142,6 +193,15 @@ export function LanguagesSection({
         </div>
       )}
 
+      {defaultWarning && (
+        <div
+          className="border border-amber-200 bg-amber-50 text-amber-900 rounded-xl px-4 py-2 text-sm mb-3"
+          data-testid="default-warning"
+        >
+          {defaultWarning}
+        </div>
+      )}
+
       <div className="border border-line rounded-2xl bg-paper overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-canvas text-xs uppercase tracking-wide text-muted">
@@ -165,7 +225,10 @@ export function LanguagesSection({
                 <td className="px-4 py-3">
                   {p.language === null ? (
                     <div>
-                      <div className="font-medium text-muted">Unlabeled (legacy)</div>
+                      <div className="font-medium text-muted">
+                        Unlabeled (legacy)
+                        {holdsDefault(p) && <DefaultBadge />}
+                      </div>
                       <div className="text-xs text-muted mt-0.5">
                         Promote to:{" "}
                         <select
@@ -189,6 +252,7 @@ export function LanguagesSection({
                     <div>
                       <div className="font-medium">
                         {languageDisplay(p.language, "native")}
+                        {holdsDefault(p) && <DefaultBadge />}
                       </div>
                       <div className="text-xs text-muted mt-0.5">
                         {languageDisplay(p.language, "english")} · {p.language}
@@ -213,6 +277,16 @@ export function LanguagesSection({
                   </label>
                 </td>
                 <td className="px-4 py-3 text-right whitespace-nowrap">
+                  {p.is_active && p.current_version_ready && !holdsDefault(p) && (
+                    <button
+                      type="button"
+                      onClick={() => setAsDefault(p)}
+                      disabled={busyId === p.id}
+                      className="text-xs text-ink hover:underline disabled:opacity-40 mr-3"
+                    >
+                      Set as default
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setReplaceFor(p)}
@@ -278,6 +352,18 @@ export function LanguagesSection({
         />
       )}
     </section>
+  );
+}
+
+function DefaultBadge() {
+  return (
+    <span
+      className="ml-2 align-middle px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px] font-normal"
+      title="The course default: its current version is what the catalogue and integrations report"
+      data-testid="default-badge"
+    >
+      Default
+    </span>
   );
 }
 
@@ -440,7 +526,10 @@ function ReplacePackageDialog({
               <span className="font-medium text-ink">Force restart on new version</span>
               <span className="block text-muted">
                 Active attempts are silently reset; every learner starts the new
-                version from 0% on their next launch.
+                version from 0% on their next launch. This resets in-progress
+                learners on every earlier version of this language; to reset one
+                version only, use “Restart learners on this version” in the
+                Versions list.
               </span>
             </span>
           </label>

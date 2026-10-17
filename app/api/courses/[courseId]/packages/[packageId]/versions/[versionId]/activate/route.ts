@@ -10,7 +10,9 @@ import { publishVersion } from "@/lib/courses/upload";
  * Rollback / roll-forward: makes an existing, fully uploaded version the
  * current one for its language package. Version folders are immutable, so
  * this is a pointer change; learners get the chosen version on their next
- * launch and open attempts keep the version they started on.
+ * launch and open attempts keep the version they started on. The course
+ * default follows only when this package holds it (ADR 0008 step 9);
+ * `courseDefaultMoved` says whether it did.
  */
 export async function POST(
   request: NextRequest,
@@ -53,13 +55,20 @@ export async function POST(
     .maybeSingle();
   const previous = (pkg as { current_version_id: string | null } | null)?.current_version_id ?? null;
 
-  await publishVersion(supabase, { courseId, packageId, versionId });
+  // ADR 0008 step 9: the course default follows only inside the default slot.
+  const { courseDefaultMoved } = await publishVersion(supabase, { courseId, packageId, versionId });
   await auditLog({
     actorUserId: userId,
     action: "course.version.activated",
     targetType: "course_version",
     targetId: versionId,
-    metadata: { courseId, packageId, versionNumber: version.version_number, previousVersionId: previous },
+    metadata: { courseId, packageId, versionNumber: version.version_number, previousVersionId: previous, courseDefaultMoved },
   });
-  return NextResponse.json({ ok: true, versionId, versionNumber: version.version_number, previousVersionId: previous });
+  return NextResponse.json({
+    ok: true,
+    versionId,
+    versionNumber: version.version_number,
+    previousVersionId: previous,
+    courseDefaultMoved,
+  });
 }

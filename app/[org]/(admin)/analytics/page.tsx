@@ -639,6 +639,12 @@ export default async function AnalyticsPage({
       const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
       if (t && (!lastActive || t > lastActive)) lastActive = t;
     }
+    // ADR 0004 step 11: a learner whose only attempts were reset (abandoned)
+    // has not started, as every status surface says. Decided from the
+    // attempts alone: gamification's last_active_day is stamped on any
+    // official-run commit, so it would keep a reset-only learner "started".
+    // lastActive above keeps every attempt and the XP day for engagement.
+    const hasStarted = my.some((a) => a.status !== "abandoned");
 
     let overdue = 0;
     for (const [cid, due] of assignedMap) {
@@ -695,12 +701,12 @@ export default async function AnalyticsPage({
       risk += 2;
       reasons.push("failed assessment");
     }
-    if (inactiveDays !== null && inactiveDays >= 14) {
-      risk += inactiveDays >= 21 ? 3 : 2;
-      reasons.push(`inactive ${inactiveDays}d`);
-    } else if (inactiveDays === null && assigned > 0) {
+    if (!hasStarted && assigned > 0) {
       risk += 2;
       reasons.push("never started");
+    } else if (inactiveDays !== null && inactiveDays >= 14) {
+      risk += inactiveDays >= 21 ? 3 : 2;
+      reasons.push(`inactive ${inactiveDays}d`);
     }
     if (maxNudges >= 3) {
       risk += 2;
@@ -751,7 +757,8 @@ export default async function AnalyticsPage({
       completed,
       pct: assigned > 0 ? Math.round((completed / assigned) * 100) : -1,
       avgScore,
-      attempts: my.length,
+      // Attempts that were not reset (ADR 0004 step 11).
+      attempts: my.filter((a) => a.status !== "abandoned").length,
       xp: gam?.total_xp ?? 0,
       streak: gam?.current_streak_days ?? 0,
       lastActive,
@@ -909,6 +916,9 @@ export default async function AnalyticsPage({
     const assignedMap = assignedByUser.get(s.userId) ?? new Map<string, string | null>();
     const my = attemptsByUser.get(s.userId) ?? [];
     const perCourse = new Map<string, { attempts: number; live: number; best: number | null; last: string | null; status: string; progress: CourseProgressView }>();
+    // `attempts` = every attempt, `live` = not reset (ADR 0004 step 11): the
+    // table shows live attempts with a "· N reset" suffix, and a reset attempt
+    // never dates the course's last activity.
     const emptyProgress: CourseProgressView = { pct: null, done: false, started: false, screensDone: null, screensTotal: null };
     for (const [cid] of assignedMap) {
       perCourse.set(cid, { attempts: 0, live: 0, best: null, last: null, status: "Not started", progress: emptyProgress });
@@ -922,7 +932,7 @@ export default async function AnalyticsPage({
       // ADR 0004 step 11: an abandoned (reset) attempt is never "in progress".
       if (a.status !== "abandoned") row.live++;
       attemptsOfCourse.set(cid, [...(attemptsOfCourse.get(cid) ?? []), a]);
-      const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
+      const t = a.status !== "abandoned" ? a.last_activity_at ?? a.completed_at ?? a.started_at : null;
       if (t && (!row.last || t > row.last)) row.last = t;
       perCourse.set(cid, row);
     }
@@ -1059,7 +1069,14 @@ export default async function AnalyticsPage({
                         {r.status === "Not started" ? "—" : formatCourseProgress(r.progress)}
                       </td>
                       <td className="px-4 py-2.5 tabular-nums">{r.best !== null ? `${Math.round(r.best * 100)}%` : "—"}</td>
-                      <td className="px-4 py-2.5 tabular-nums">{r.attempts}</td>
+                      <td className="px-4 py-2.5 tabular-nums whitespace-nowrap">
+                        {r.live}
+                        {r.attempts > r.live && (
+                          <span className="text-muted" title="Attempts reset by a module update or language switch: never in progress, never official">
+                            {" "}· {r.attempts - r.live} reset
+                          </span>
+                        )}
+                      </td>
                       <td className={`px-4 py-2.5 ${isOver ? "text-red-700 font-semibold" : "text-muted"}`}>
                         {due ? `${fmtDate(due)}${isOver ? " · overdue" : ""}` : "—"}
                       </td>

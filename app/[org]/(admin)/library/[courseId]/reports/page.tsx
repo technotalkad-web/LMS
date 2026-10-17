@@ -4,17 +4,25 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { loadEnrolledCourseStatus, userCourseKey } from "@/lib/scoring/status";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
 //
+// §4.1 (Enrolled / Completed / In Progress / Not Started) is computed live
+// from the attempts with the official-status rule, through the same counter
+// as the Library course card (loadEnrolledCourseStatus), so the two pages always
+// agree and a learner whose only attempts were reset (abandoned, ADR 0004
+// step 11) reads as not started. mv_course_enrollment_status counts any
+// attempt as a start and is no longer read here (its fix waits for the next
+// migration window).
+//
 // Reads from the materialized views shipped in migration 0031 (#175):
-//   - mv_course_enrollment_status  → §4.1 (Enrolled / Completed / In Progress / Not Started)
 //   - mv_course_performance        → §4.2 (Completion Rate / Passed / Failed / Avg Score / Avg Time / Rating)
 //
-// Both views refresh nightly at 03:30 UTC via /api/cron/refresh-report-views (#176).
+// The views refresh nightly at 03:30 UTC via /api/cron/refresh-report-views (#176).
 // The page surfaces the most recent refreshed_at timestamp so admins know how
-// fresh the numbers are.
+// fresh those numbers are.
 //
 // Granular per-question breakdown (§4.3) is deferred to #179 — a separate tab
 // on this page when shipped.
@@ -30,15 +38,6 @@ type Course = {
   id: string;
   title: string;
   organization_id: string;
-};
-
-type EnrollmentRow = {
-  course_id: string;
-  total_enrolled: number;
-  completed: number;
-  in_progress: number;
-  not_started: number;
-  refreshed_at: string;
 };
 
 type PerformanceRow = {
@@ -90,21 +89,32 @@ export default async function CourseReportsPage({
     { auth: { persistSession: false } }
   );
 
-  // ---- Read the two matviews ----
-  const { data: enrRow } = await svc
-    .from("mv_course_enrollment_status")
-    .select("*")
-    .eq("course_id", c.id)
-    .maybeSingle();
-  const enr = (enrRow as EnrollmentRow | null) ?? {
-    course_id: c.id,
-    total_enrolled: 0,
-    completed: 0,
-    in_progress: 0,
-    not_started: 0,
-    refreshed_at: new Date(0).toISOString(),
-  };
+  // ---- §4.1 Enrollment & status (live) ----
+  // Enrolled = direct, team and org-wide assignments; status = each
+  // learner's OFFICIAL attempt (courseStatus: abandoned attempts never count
+  // as a start). One loader with the Library course card (paged, chunked,
+  // caller's client as the card; the page is admin-gated above), so the two
+  // pages always agree.
+  const { data: versionRows } = await supabase
+    .from("course_versions")
+    .select("id")
+    .eq("course_id", c.id);
+  const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+  const { enrolledUserIds, officialByUser, summary: enr } = await loadEnrolledCourseStatus(
+    supabase,
+    org.id,
+    c.id,
+    versionIds
+  );
+  // "Completed" keeps its meaning: an official result, passed or failed.
+  const enrCompleted = enr.completed + enr.failed;
+  // Not started although they launched once: every attempt was reset.
+  let enrResetOnly = 0;
+  for (const uid of enrolledUserIds) {
+    if (officialByUser.get(userCourseKey(uid, c.id))?.status === "not_started") enrResetOnly++;
+  }
 
+  // ---- Read the performance matview ----
   const { data: perfRow } = await svc
     .from("mv_course_performance")
     .select("*")
@@ -166,11 +176,8 @@ export default async function CourseReportsPage({
     topWrongByInteraction.set(w.interaction_id, list);
   }
 
-  // Use the most recent refresh stamp across the two views (they refresh
-  // together in the cron but reading both makes the staleness display
-  // robust to manual partial refreshes during debug).
-  const lastRefreshed =
-    enr.refreshed_at > perf.refreshed_at ? enr.refreshed_at : perf.refreshed_at;
+  // Refresh stamp of the performance view (the enrollment tiles are live).
+  const lastRefreshed = perf.refreshed_at;
   const refreshedAgo = humanizeAgo(lastRefreshed);
 
   // ---- Derived display values ----
@@ -206,7 +213,8 @@ export default async function CourseReportsPage({
           </div>
         </div>
         <p className="text-xs text-muted mt-1">
-          Numbers refresh nightly at 03:30 UTC ·{" "}
+          Enrollment &amp; status is live · performance and question numbers
+          refresh nightly at 03:30 UTC ·{" "}
           <span title={lastRefreshed}>last refreshed {refreshedAgo}</span>
         </p>
       </div>
@@ -217,22 +225,32 @@ export default async function CourseReportsPage({
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
           <BigStat
             label="Total enrolled"
-            value={enr.total_enrolled.toLocaleString()}
+            value={enr.total.toLocaleString()}
+            testId="enr-total"
           />
           <BigStat
             label="Completed"
-            value={enr.completed.toLocaleString()}
+            value={enrCompleted.toLocaleString()}
             tone="emerald"
+            sub={enr.failed > 0 ? `incl. ${enr.failed.toLocaleString()} failed` : undefined}
+            testId="enr-completed"
           />
           <BigStat
             label="In progress"
-            value={enr.in_progress.toLocaleString()}
+            value={enr.inProgress.toLocaleString()}
             tone="amber"
+            testId="enr-in-progress"
           />
           <BigStat
             label="Not started"
-            value={enr.not_started.toLocaleString()}
+            value={enr.notStarted.toLocaleString()}
             tone="muted"
+            sub={
+              enrResetOnly > 0
+                ? `incl. ${enrResetOnly.toLocaleString()} whose attempts were reset`
+                : undefined
+            }
+            testId="enr-not-started"
           />
         </div>
       </section>
@@ -405,11 +423,13 @@ function BigStat({
   value,
   sub,
   tone = "default",
+  testId,
 }: {
   label: string;
   value: string;
   sub?: string;
   tone?: StatTone;
+  testId?: string;
 }) {
   const toneClass =
     tone === "emerald"
@@ -426,7 +446,9 @@ function BigStat({
       <div className="text-[10px] text-muted uppercase tracking-wide">
         {label}
       </div>
-      <div className={`serif text-3xl mt-1 ${toneClass}`}>{value}</div>
+      <div className={`serif text-3xl mt-1 ${toneClass}`} data-testid={testId}>
+        {value}
+      </div>
       {sub && <div className="text-[11px] text-muted mt-0.5">{sub}</div>}
     </div>
   );

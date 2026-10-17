@@ -19,8 +19,8 @@ import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
-import { officialStatuses } from "@/lib/scoring/status";
-import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
+import { loadEnrolledCourseStatus } from "@/lib/scoring/status";
+import { ActivateVersionButton, DiscardUploadButton, RestartVersionButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
 import { packageCode, versionCode } from "@/lib/reference-codes";
@@ -103,12 +103,23 @@ export default async function AdminCourseDetailPage({
     .select("id, language, display_name, is_active, current_version_id")
     .eq("course_id", c.id)
     .order("language", { ascending: true, nullsFirst: true });
-  const languagePackages = (pkgRows ?? []) as LanguagePackage[];
+  // current_version_ready: "Set as default" needs a fully uploaded current
+  // version (ADR 0008 steps 10–11).
+  const readyIds = new Set(list.filter((v) => !v.upload_status || v.upload_status === "ready").map((v) => v.id));
+  const languagePackages = ((pkgRows ?? []) as Omit<LanguagePackage, "current_version_ready">[]).map((p) => ({
+    ...p,
+    current_version_ready: !!p.current_version_id && readyIds.has(p.current_version_id),
+  })) as LanguagePackage[];
 
   // Group versions by language package (0030: versions belong to packages and
   // are numbered per package). "Current" is the package's own pointer; the
-  // course-level pointer only mirrors whichever package published last.
+  // course-level pointer is the course DEFAULT: the current version of the
+  // default slot, moved between slots only by "Set as default" (ADR 0008).
   const pkgById = new Map(languagePackages.map((p) => [p.id, p]));
+  const defaultVersion = c.current_version_id ? list.find((v) => v.id === c.current_version_id) : undefined;
+  const defaultPkg = defaultVersion?.package_id ? pkgById.get(defaultVersion.package_id) : undefined;
+  const slotName = (p: { language: string | null; display_name: string | null }) =>
+    p.display_name?.trim() || (p.language ? languageDisplay(p.language, "english") ?? p.language : "Unlabeled (legacy)");
   const versionGroups = (() => {
     const groups = new Map<string, { key: string; label: string; code: string | null; currentVersionId: string | null; order: number; versions: Version[] }>();
     for (const v of list) {
@@ -224,13 +235,9 @@ export default async function AdminCourseDetailPage({
       teamList.map((t) => t.id)
     );
   const teamMemberCounts = new Map<string, number>();
-  const teamUserIds = new Map<string, Set<string>>();
   for (const r of teamMemberRows ?? []) {
     const tid = r.team_id as string;
     teamMemberCounts.set(tid, (teamMemberCounts.get(tid) ?? 0) + 1);
-    const s = teamUserIds.get(tid) ?? new Set<string>();
-    s.add(r.user_id as string);
-    teamUserIds.set(tid, s);
   }
 
   const teams: AssignableTeam[] = teamList.map((t) => ({
@@ -358,76 +365,18 @@ export default async function AdminCourseDetailPage({
   }
 
   // ----- Enrolled summary -----
-  // Compute totals (total / done / in-progress / not-started) but do
-  // NOT fetch every attempt row here — the full per-learner table now
-  // lives at /[org]/library/[courseId]/learners so this page stays a
-  // clean "settings" surface even at 10k+ enrollments.
-  // Step 1: who's enrolled?
-  const memberIds = (memberRows ?? []).map((m) => m.user_id as string);
-  const enrolledUserIds = new Set<string>();
-  for (const a of assignments) {
-    if (a.assignee_type === "user" && a.user_id) enrolledUserIds.add(a.user_id);
-    else if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUserIds.get(a.team_id) ?? []) enrolledUserIds.add(uid);
-    } else if (a.assignee_type === "org") {
-      for (const uid of memberIds) enrolledUserIds.add(uid);
-    }
-  }
-
-  // Step 2: pull attempts ONLY for enrolled users + the course's versions,
-  // and just the fields we need for status classification. (10k users with
-  // ~3 attempts each ≈ 30k rows × 3 columns ≈ ~1MB — fine for an admin
-  // page. If this becomes a hotspot, switch to a materialized view of
-  // last-attempt-per-user-per-course or a PG function returning counts.)
-  const versionIds = list.map((v) => v.id);
-  const enrolledIdArr = Array.from(enrolledUserIds);
-  const { data: attemptRows } =
-    enrolledIdArr.length && versionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select("id, user_id, status, completion_status, success_status, score, started_at, completed_at")
-          .in("user_id", enrolledIdArr)
-          .in("course_version_id", versionIds)
-      : { data: [] };
-  type SummaryAttempt = {
-    id: string;
-    user_id: string;
-    /** ADR 0004 step 11: an abandoned attempt never counts as in progress. */
-    status: string | null;
-    completion_status: string;
-    success_status: string;
-    score: number | null;
-    started_at: string;
-    completed_at: string | null;
-  };
-  const summaryAttempts = (attemptRows ?? []) as SummaryAttempt[];
-
-  // Decision 1 (Phase 0a): status from each learner's OFFICIAL attempt — not
-  // the latest one — so this summary agrees with the learners list and reports.
-  const officialByUser = await officialStatuses(
+  // Totals (total / completed / failed / in progress / not started) from each
+  // learner's OFFICIAL attempt (decision 1), through the one loader the
+  // course Reports tab uses, so the two pages always agree: assignments
+  // expanded and attempts read completely (paged, chunked), a learner whose
+  // only attempts were reset reads as not started. The per-learner table
+  // lives at /[org]/library/[courseId]/learners.
+  const { summary: enrSummary } = await loadEnrolledCourseStatus(
     supabase,
     org.id,
-    summaryAttempts.map((a) => ({ ...a, course_id: courseId }))
+    courseId,
+    list.map((v) => v.id)
   );
-  const statusByUser = new Map<
-    string,
-    "passed" | "failed" | "completed" | "in_progress"
-  >();
-  for (const v of officialByUser.values()) {
-    if (v.status === "not_started") continue;
-    statusByUser.set(v.user_id, v.status);
-  }
-  const enrSummary = {
-    total: enrolledUserIds.size,
-    completed: Array.from(statusByUser.values()).filter(
-      (s) => s === "completed" || s === "passed"
-    ).length,
-    inProgress: Array.from(statusByUser.values()).filter(
-      (s) => s === "in_progress"
-    ).length,
-    failed: Array.from(statusByUser.values()).filter((s) => s === "failed").length,
-    notStarted: enrolledUserIds.size - statusByUser.size,
-  };
 
   const initialDetails: CourseDetails = {
     title: c.title,
@@ -500,6 +449,19 @@ export default async function AdminCourseDetailPage({
             <span>· {c.duration_minutes} min</span>
           )}
           <span>· {enrSummary.total.toLocaleString()} enrolled</span>
+          {languagePackages.length > 0 && (
+            <span data-testid="default-language">
+              · Default language:{" "}
+              {defaultPkg ? (
+                <>
+                  <span className="text-ink">{slotName(defaultPkg)}</span>
+                  {!defaultPkg.is_active && " (hidden from learners)"}
+                </>
+              ) : (
+                "none set"
+              )}
+            </span>
+          )}
         </div>
         {/* System ids, copyable: integrations (Yoddha CRM) key on these. */}
         <div className="flex flex-wrap items-center gap-2 mt-2">
@@ -662,22 +624,27 @@ export default async function AdminCourseDetailPage({
             <Stat
               label="Total enrolled"
               value={enrSummary.total.toLocaleString()}
+              testId="sum-total"
             />
             <Stat
               label="Completed"
               value={enrSummary.completed.toLocaleString()}
+              testId="sum-completed"
             />
             <Stat
               label="Failed"
               value={enrSummary.failed.toLocaleString()}
+              testId="sum-failed"
             />
             <Stat
               label="In progress"
               value={enrSummary.inProgress.toLocaleString()}
+              testId="sum-in-progress"
             />
             <Stat
               label="Not started"
               value={enrSummary.notStarted.toLocaleString()}
+              testId="sum-not-started"
             />
           </div>
         )}
@@ -685,9 +652,13 @@ export default async function AdminCourseDetailPage({
 
       {/* Languages (#158 Phase 1c) */}
       <LanguagesSection
+        // Remount on fresh server data (router.refresh keeps client state):
+        // the default badge and the slot rows always match the database.
+        key={[c.current_version_id ?? "-", ...languagePackages.map((p) => `${p.id}:${p.is_active}:${p.current_version_id ?? "-"}`)].join("|")}
         orgSlug={orgSlug}
         courseId={c.id}
         packages={languagePackages}
+        defaultVersionId={c.current_version_id}
       />
 
       {/* Versions */}
@@ -723,6 +694,12 @@ export default async function AdminCourseDetailPage({
               <ul className="divide-y divide-line">
                 {g.versions.map((v) => {
                   const isCurrent = v.id === g.currentVersionId;
+                  // ADR 0008 step 6: restart one version's in-progress learners —
+                  // a ready version that is not its package's current one, or
+                  // the current version of a package that is no longer active.
+                  const isReady = !v.upload_status || v.upload_status === "ready";
+                  const canRestart =
+                    !!v.package_id && isReady && (!isCurrent || pkgById.get(v.package_id)?.is_active === false);
                   return (
                     <li
                       key={v.id}
@@ -741,6 +718,15 @@ export default async function AdminCourseDetailPage({
                               failed
                             </span>
                           )}
+                          {v.id === c.current_version_id && (
+                            <span
+                              className="ml-2 px-2 py-0.5 bg-canvas text-ink border border-line rounded-full uppercase tracking-wide text-[10px]"
+                              title="The course default: the catalogue and integrations report this version"
+                              data-testid="course-default-version"
+                            >
+                              course default
+                            </span>
+                          )}
                         </div>
                         <div className="text-xs text-muted break-all">
                           {v.manifest_type} - launch:{" "}
@@ -756,6 +742,15 @@ export default async function AdminCourseDetailPage({
                         </div>
                       </div>
                       <div className="text-xs text-muted shrink-0 flex items-center gap-2">
+                        {canRestart && v.package_id && (
+                          <RestartVersionButton
+                            orgSlug={orgSlug}
+                            courseId={c.id}
+                            packageId={v.package_id}
+                            versionId={v.id}
+                            versionNumber={v.version_number}
+                          />
+                        )}
                         {isCurrent ? (
                           <span className="px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px]">
                             current
@@ -787,13 +782,13 @@ export default async function AdminCourseDetailPage({
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value, testId }: { label: string; value: string; testId?: string }) {
   return (
     <div className="border border-line rounded-xl bg-paper p-4">
       <div className="text-[10px] text-muted uppercase tracking-wide">
         {label}
       </div>
-      <div className="serif text-xl mt-1">{value}</div>
+      <div className="serif text-xl mt-1" data-testid={testId}>{value}</div>
     </div>
   );
 }

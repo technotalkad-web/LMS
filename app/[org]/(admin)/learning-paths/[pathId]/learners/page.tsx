@@ -5,7 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "../../../library/[courseId]/learners/learners-filters";
-import { officialStatuses, statusOf } from "@/lib/scoring/status";
+import { excludeAbandoned, officialStatuses, statusOf } from "@/lib/scoring/status";
 
 // =============================================================================
 // Dedicated enrolled-learners page for an admin viewing one learning path.
@@ -300,8 +300,9 @@ export default async function PathLearnersPage({
       status = verdict === "passed" ? "passed" : verdict === "failed" ? "failed" : "completed";
     }
 
+    // ADR 0004 step 11: a reset (abandoned) attempt never dates last activity.
     const lastTouched =
-      myAttempts
+      excludeAbandoned(myAttempts)
         .map((a) => a.completed_at ?? a.started_at)
         .filter((x): x is string => !!x)
         .sort()

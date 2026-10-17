@@ -158,7 +158,13 @@ learner confirmed a language switch, an admin replaced the module with
 "force restart" or deactivated that language) is `abandoned`: it is never
 official and never in progress. A learner whose only attempts on a module
 were reset reads as `not_started` with no `progress_pct` from them; the
-next launch starts a new attempt. `attempts` still counts every attempt.
+next launch starts a new attempt. `status` is authoritative: `attempts`
+(here and in `/api/integrations/progress`) and the progress feed's
+`first_access` and `last_access` include attempts that were reset
+(abandoned) after a module update or a language switch, so a learner whose
+only attempts were reset can show `attempts > 0` and a non-null
+`first_access` while `status` is `not_started`. Decide "started" from
+`status`, never from `attempts` or `first_access`.
 
 **Scores follow the LMS's attempt rules.** Admins configure, per module /
 learning path / journey, how many completed attempts are scored (default 1)
@@ -231,6 +237,11 @@ assign and launch, with the ids used everywhere else in the integration.
 }
 ```
 
+A course's `version_id` is the current version of its default language
+(chosen by an admin with "Set as default"); uploading to or switching
+versions in any other language never changes it, and while the default
+language is hidden from learners the course is `"unavailable"`.
+
 **`GET|POST /api/integrations/progress`** — a page of learners, each with
 every course, learning path and journey they hold. Same status, score,
 entitlement and journey rules as `learner-summary`, so the two never
@@ -248,7 +259,9 @@ disagree.
 | `include_inactive` | `true` also returns deactivated members |
 
 When any course or date filter is set, only learners with at least one
-attempt matching *all* of them are returned (Upside semantics).
+attempt matching *all* of them are returned (Upside semantics). Reset
+(abandoned) attempts count for these filters, as they do for `attempts`,
+`first_access` and `last_access` (see "Reset attempts" above).
 
 ```json
 {
