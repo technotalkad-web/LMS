@@ -453,26 +453,51 @@ async function finalizeIntegrity(args: {
   const svc = serviceClient();
   const storage = await getStorageFor(version.storage_driver);
 
-  // The stored manifest (root first), else what init recorded.
+  // The STORED manifest (root first). Never the text the browser sent at
+  // init: that is the client's claim, and the identity must come from the
+  // bytes learners will get (ADR 0004 risk table). A package whose manifest
+  // did not arrive, or arrived unreadable as a manifest, is refused and
+  // removed; a storage read that fails is retryable and removes nothing.
   const manifestName =
     version.manifest_type === "cmi5" ? "cmi5.xml" : version.manifest_type === "xapi" ? "tincan.xml" : "imsmanifest.xml";
-  let stored: ParsedManifest | null = null;
   const manifestKey = keys
     .filter((k) => k.toLowerCase().endsWith(`/${manifestName}`))
     .sort((a, b) => a.length - b.length)[0];
-  if (manifestKey) {
-    try {
-      const obj = await storage.getObject(manifestKey);
-      if (obj?.body) stored = parseManifestXml(manifestName, await new Response(obj.body).text());
-    } catch {
-      stored = null;
-    }
+  if (!manifestKey) {
+    await removeRefusedUpload({ version, course, prefix, storage });
+    return {
+      ok: false,
+      status: 409,
+      retryable: false,
+      error: `The package's ${manifestName} did not arrive in storage, so its identity cannot be checked. Upload the whole package again.`,
+    };
   }
-  const md = (version.manifest_data ?? {}) as { title?: string; raw?: Record<string, unknown> };
-  const identity = packageIdentity(
-    stored ?? { type: version.manifest_type, title: md.title ?? null, raw: md.raw ?? {} },
-    launchHtml
-  );
+  let manifestText: string;
+  try {
+    const obj = await storage.getObject(manifestKey);
+    if (!obj?.body) throw new Error("empty manifest object");
+    manifestText = await new Response(obj.body).text();
+  } catch (e) {
+    return {
+      ok: false,
+      status: 409,
+      retryable: true,
+      error: `The stored ${manifestName} could not be read (${e instanceof Error ? e.message : "storage error"}). Retry.`,
+    };
+  }
+  let stored: ParsedManifest;
+  try {
+    stored = parseManifestXml(manifestName, manifestText);
+  } catch {
+    await removeRefusedUpload({ version, course, prefix, storage });
+    return {
+      ok: false,
+      status: 409,
+      retryable: false,
+      error: `The stored ${manifestName} is not a readable manifest (it differs from the one validated). Upload the whole package again.`,
+    };
+  }
+  const identity = packageIdentity(stored, launchHtml);
 
   let findings: IntegrityFindings;
   try {
@@ -485,8 +510,10 @@ async function finalizeIntegrity(args: {
       excludeVersionId: version.id,
     });
   } catch (e) {
-    // Fail closed, but let the browser retry finalize.
-    return { ok: false, status: 503, retryable: true, error: e instanceof Error ? e.message : "Integrity check failed" };
+    // Fail closed, but let the browser retry finalize: like every retryable
+    // finalize failure here it is a 409, which the browser does not abort
+    // (any other status deletes the uploaded files and the row).
+    return { ok: false, status: 409, retryable: true, error: e instanceof Error ? e.message : "Integrity check failed" };
   }
 
   const { data: linkedRow } = await svc
@@ -524,16 +551,30 @@ async function finalizeIntegrity(args: {
 
   if (!blocked) return { ok: true, findings };
 
-  // Remove the upload before it can become ready.
+  await removeRefusedUpload({ version, course, prefix, storage });
+  return { ok: false, status: 409, retryable: false, error: BLOCKED_UPLOAD_ERROR };
+}
+
+/**
+ * Remove an upload finalize refused, before it can become ready: its files,
+ * its 'uploading' row and, when this upload created it, the course (nothing
+ * current, no other version, and created by init right before this version
+ * was reserved; an older empty course is left alone).
+ */
+async function removeRefusedUpload(args: {
+  version: VersionRow;
+  course: { id: string; current_version_id: string | null };
+  prefix: string;
+  storage: Awaited<ReturnType<typeof getStorageFor>>;
+}): Promise<void> {
+  const { version, course, prefix, storage } = args;
+  const svc = serviceClient();
   try {
     await storage.deletePrefix(prefix.replace(/\/$/, ""));
   } catch (e) {
-    console.warn("[direct-upload] blocked finalize: prefix delete failed", e);
+    console.warn("[direct-upload] refused finalize: prefix delete failed", e);
   }
-  await svc.from("course_versions").delete().eq("id", version.id);
-  // A course this upload created goes too: nothing current, no other
-  // version, and created by init right before this version was reserved
-  // (an older empty course is left alone).
+  await svc.from("course_versions").delete().eq("id", version.id).eq("upload_status", "uploading");
   if (!course.current_version_id) {
     const [{ count }, { data: courseRow }] = await Promise.all([
       svc.from("course_versions").select("id", { count: "exact", head: true }).eq("course_id", course.id),
@@ -545,7 +586,6 @@ async function finalizeIntegrity(args: {
       Number.isFinite(createdAt) && Number.isFinite(startedAt) && startedAt - createdAt > -60_000 && startedAt - createdAt < 10 * 60_000;
     if ((count ?? 0) === 0 && createdByThisUpload) await svc.from("courses").delete().eq("id", course.id);
   }
-  return { ok: false, status: 409, retryable: false, error: BLOCKED_UPLOAD_ERROR };
 }
 
 export async function abortDirectUpload(args: {
@@ -583,9 +623,21 @@ export async function sweepAbandonedUploads(svc: SupabaseClient): Promise<{ swep
   const errors: string[] = [];
   for (const v of (data ?? []) as Array<{ id: string; storage_prefix: string; storage_driver: string }>) {
     try {
+      // An 'uploading' version is never served, so it holds no attempts. If
+      // one does (a ready row set back to 'uploading' by hand), deleting it
+      // would cascade learner history away: leave it and report it.
+      const { count: attempts, error: attErr } = await svc
+        .from("course_attempts")
+        .select("id", { count: "exact", head: true })
+        .eq("course_version_id", v.id);
+      if (attErr) throw new Error(`attempt check failed: ${attErr.message}`);
+      if ((attempts ?? 0) > 0) {
+        errors.push(`${v.id}: skipped, ${attempts} attempt(s) on an 'uploading' version`);
+        continue;
+      }
       const storage = await getStorageFor(v.storage_driver);
       await storage.deletePrefix(v.storage_prefix.replace(/\/$/, ""));
-      await svc.from("course_versions").delete().eq("id", v.id);
+      await svc.from("course_versions").delete().eq("id", v.id).eq("upload_status", "uploading");
       swept++;
     } catch (e) {
       errors.push(`${v.id}: ${e instanceof Error ? e.message : String(e)}`);
