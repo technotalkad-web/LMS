@@ -4,7 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
-import { officialStatuses, statusOf } from "@/lib/scoring/status";
+import { excludeAbandoned, officialStatuses, statusOf } from "@/lib/scoring/status";
 
 /**
  *   GET /api/learning-paths/{id}/learners/export?orgSlug=...
@@ -277,8 +277,9 @@ export async function GET(
       const verdict = lastStepCourseId ? statusOf(official, uid, lastStepCourseId) : "completed";
       status = verdict === "passed" ? "passed" : verdict === "failed" ? "failed" : "completed";
     }
+    // ADR 0004 step 11: a reset (abandoned) attempt never dates last activity.
     const lastTouched =
-      myAttempts
+      excludeAbandoned(myAttempts)
         .map((a) => a.completed_at ?? a.started_at)
         .filter((x): x is string => !!x)
         .sort()

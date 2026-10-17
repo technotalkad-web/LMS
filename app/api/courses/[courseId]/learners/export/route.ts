@@ -5,7 +5,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { courseProgress } from "@/lib/courses/progress-view";
-import { officialStatuses, statusOf, userCourseKey } from "@/lib/scoring/status";
+import { excludeAbandoned, officialStatuses, statusOf, userCourseKey } from "@/lib/scoring/status";
 
 /**
  * GET /api/courses/{courseId}/learners/export?orgSlug=...
@@ -240,8 +240,11 @@ export async function GET(
     // The OFFICIAL score (same value the learners page shows), not the best
     // of every attempt including practice runs.
     const bestScore = official.get(userCourseKey(uid, courseId))?.scoring.officialScore ?? null;
+    // Same numbers as the learners page: attempts and last activity count the
+    // attempts that were not reset (ADR 0004 step 11).
+    const liveAttempts = excludeAbandoned(myAttempts);
     const lastTouched =
-      myAttempts
+      liveAttempts
         .map((a) => a.completed_at ?? a.started_at)
         .filter((x): x is string => !!x)
         .sort()
@@ -260,7 +263,7 @@ export async function GET(
       progress.screensDone !== null ? String(progress.screensDone) : "",
       progress.screensTotal !== null ? String(progress.screensTotal) : "",
       bestScore !== null ? String(Math.round(bestScore * 100)) : "",
-      String(myAttempts.length),
+      String(liveAttempts.length),
       lastTouched,
       via,
     ]);

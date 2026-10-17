@@ -5,7 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "./learners-filters";
-import { computeScoring, courseStatus } from "@/lib/scoring/policy";
+import { attemptCounts, computeScoring, courseStatus, excludeAbandoned } from "@/lib/scoring/policy";
 import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
 import { courseProgress, formatCourseProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { resolvePolicy } from "@/lib/scoring/resolve";
@@ -66,7 +66,10 @@ interface EnrichedLearner {
   via: ViaKind[];
   status: Status;
   bestScore: number | null;
+  /** Attempts that were not reset (ADR 0004 step 11). */
   attempts: number;
+  /** Reset (abandoned) attempts, shown as "· N reset". */
+  resetAttempts: number;
   /** Revision (practice) runs beyond the scoring window — informational. */
   revisions: number;
   lastTouched: string | null;
@@ -289,8 +292,11 @@ export default async function LearnersPage({
     const status: Status = latest ? courseStatus(scoring, myAttempts) : "not_started";
     const bestScore = scoring.officialScore;
     const revisions = scoring.practiceAttempts;
+    // ADR 0004 step 11: a reset (abandoned) attempt is counted apart and
+    // never dates the learner's last activity on the course.
+    const counts = attemptCounts(myAttempts);
     const lastTouched =
-      myAttempts
+      excludeAbandoned(myAttempts)
         .map((a) => a.completed_at ?? a.started_at)
         .filter((x): x is string => !!x)
         .sort()
@@ -305,7 +311,8 @@ export default async function LearnersPage({
       via: Array.from(viaByUser.get(uid) ?? []),
       status,
       bestScore,
-      attempts: myAttempts.length,
+      attempts: counts.live,
+      resetAttempts: counts.reset,
       revisions,
       lastTouched,
       progress: courseProgress(myAttempts, unitCountByVersion),
@@ -584,6 +591,11 @@ export default async function LearnersPage({
                       {r.revisions > 0 && (
                         <span className="text-muted" title="Revision (practice) runs: never change the official result">
                           {" "}· {r.revisions} revision{r.revisions === 1 ? "" : "s"}
+                        </span>
+                      )}
+                      {r.resetAttempts > 0 && (
+                        <span className="text-muted" title="Attempts reset by a module update or language switch: never in progress, never official">
+                          {" "}· {r.resetAttempts} reset
                         </span>
                       )}
                     </td>
