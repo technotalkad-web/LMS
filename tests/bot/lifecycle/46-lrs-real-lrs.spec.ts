@@ -179,7 +179,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
         const grouping = (ans.context.contextActivities.grouping ?? []).map((g) => g.id);
         rec("S2d enriched object id (stable course/question)", ans.object.id === `${NS}activities/course/${course!.id}/question/3_q_k1`, ans.object.id);
         rec("S2e actor is mbox email only", ans.actor.mbox === `mailto:${learner.email.toLowerCase()}` && !ans.actor.account, ans.actor);
-        rec("S2f segment E2E, team, employee id, tenure present", E[`${NS}ext/learner/segment`] === "E2E" && (E[`${NS}ext/learner/teams`] as string[] | undefined)?.includes("West Sales QA") && E[`${NS}ext/learner/employee-id`] === "QA-EMP-46" && typeof E[`${NS}ext/learner/tenure-days`] === "number", { segment: E[`${NS}ext/learner/segment`], teams: E[`${NS}ext/learner/teams`], emp: E[`${NS}ext/learner/employee-id`], tenure: E[`${NS}ext/learner/tenure-days`] });
+        rec("S2f segment E2E, team, employee id, tenure present", E[`${NS}ext/learner/segment`] === "E2E" && (E[`${NS}ext/learner/teams`] as string[] | undefined)?.includes("West Sales QA") === true && E[`${NS}ext/learner/employee-id`] === "QA-EMP-46" && typeof E[`${NS}ext/learner/tenure-days`] === "number", { segment: E[`${NS}ext/learner/segment`], teams: E[`${NS}ext/learner/teams`], emp: E[`${NS}ext/learner/employee-id`], tenure: E[`${NS}ext/learner/tenure-days`] });
         rec("S2g grouping carries course, path+step, journey+day, org", [`${NS}activities/course/${course!.id}`, `${NS}activities/path/${path!.id}`, `${NS}activities/path/${path!.id}/step/1`, `${NS}activities/journey/${program!.id}`, `${NS}activities/journey/${program!.id}/day/3`, `${NS}activities/org/${org.id}`].every((g) => grouping.includes(g)), grouping);
         rec("S2h parent = slide 3; cmi5 category + profile category kept; registration = attempt", ans.context.contextActivities.parent?.[0]?.id === `${NS}activities/course/${course!.id}/slide/3` && (ans.context.contextActivities.category ?? []).some((c) => c.id.includes("cmi5")) && (ans.context.contextActivities.category ?? []).some((c) => c.id === `${NS}profile/v1`) && ans.context.registration === attempt!.id, { parent: ans.context.contextActivities.parent, category: ans.context.contextActivities.category });
         rec("S2i result preserved (success=false, response=a, duration)", ans.result?.success === false && ans.result?.response === "a" && ans.result?.duration === "PT23S", ans.result);
@@ -313,7 +313,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       });
       const poison = JSON.parse(JSON.stringify(good[0])) as Stmt & { verb?: unknown };
       poison.id = randomUUID();
-      delete poison.verb;
+      delete (poison as { verb?: unknown }).verb;
       const batch = [good[0], poison, good[1], good[2]];
       await db.from("lrs_forward_outbox").insert(batch.map((s) => ({ organization_id: org.id, attempt_id: attempt!.id, statement_id: s.id, payload: s as unknown as Record<string, unknown>, status: "pending", origin: "engine", next_attempt_at: new Date(Date.now() - 1000).toISOString() })));
       const dp = await drain(baseURL!);

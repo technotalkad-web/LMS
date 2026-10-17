@@ -26,6 +26,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      # tests/bot (lifecycle and bot specs) is outside the app tsconfig.
+      - run: npm run typecheck:bot
 
   lint:
     name: lint
