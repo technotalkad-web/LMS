@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
+import { deactivationRefusal, isReadyVersion, type DeactivationRefusal } from "@/lib/courses/default-rule";
 
 /**
  * PATCH /api/courses/{courseId}/packages/{packageId}
@@ -14,7 +15,9 @@ import { isSupportedLanguage } from "@/lib/i18n/languages";
  * - display_name: human-friendly label shown in the picker. NULL falls
  *   back to the canonical native name of the language code.
  * - is_active: false hides the package from the learner picker without
- *   losing learner attempts/data. True re-enables.
+ *   losing learner attempts/data. True re-enables. Hiding the language
+ *   that holds the course default answers 409 `default_slot` while another
+ *   active language with a ready current version exists (ADR 0008 step 12).
  * - language: lets admins PROMOTE a legacy NULL-language default
  *   package to a real language code when they\'re adding a 2nd
  *   variant. (E.g. existing course was effectively English; admin
@@ -66,7 +69,7 @@ export async function PATCH(
   // Verify the package belongs to a course in this org.
   const { data: pkg } = await svc
     .from("course_packages")
-    .select("id, course_id, language, courses!inner(organization_id)")
+    .select("id, course_id, language, is_active, courses!inner(organization_id)")
     .eq("id", packageId)
     .maybeSingle();
   if (!pkg || (pkg as { course_id: string }).course_id !== courseId) {
@@ -76,6 +79,7 @@ export async function PATCH(
     id: string;
     course_id: string;
     language: string | null;
+    is_active: boolean | null;
     courses: { organization_id: string } | Array<{ organization_id: string }>;
   };
   const orgIdFromJoin = Array.isArray(pkgRow.courses)
@@ -127,6 +131,18 @@ export async function PATCH(
     return NextResponse.json({ ok: true, noop: true });
   }
 
+  // ADR 0008 step 12: the language holding the course default cannot be
+  // hidden while another active language with a ready current version
+  // exists (set that one as the default first). The only active language
+  // may be hidden; the course then has no launchable language until a
+  // default is set.
+  if (update.is_active === false && pkgRow.is_active !== false) {
+    const refusal = await defaultSlotDeactivationRefusal(svc, courseId, packageId);
+    if (refusal) {
+      return NextResponse.json({ error: refusal.error, message: refusal.message }, { status: refusal.status });
+    }
+  }
+
   const { error } = await svc
     .from("course_packages")
     .update(update)
@@ -134,6 +150,44 @@ export async function PATCH(
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
 
   return NextResponse.json({ ok: true });
+}
+
+/**
+ * Does hiding `packageId` take the course default away from learners while
+ * another language could hold it? Holding = the course default version
+ * belongs to this package. Reads only; service role (the caller passed the
+ * admin and tenant checks).
+ */
+async function defaultSlotDeactivationRefusal(
+  svc: SupabaseClient,
+  courseId: string,
+  packageId: string
+): Promise<DeactivationRefusal | null> {
+  const { data: c } = await svc.from("courses").select("current_version_id").eq("id", courseId).maybeSingle();
+  const defaultVersionId = (c as { current_version_id: string | null } | null)?.current_version_id ?? null;
+  if (!defaultVersionId) return null;
+  const { data: dv } = await svc.from("course_versions").select("package_id").eq("id", defaultVersionId).maybeSingle();
+  const holdsDefault = (dv as { package_id: string | null } | null)?.package_id === packageId;
+  if (!holdsDefault) return null;
+
+  const { data: others } = await svc
+    .from("course_packages")
+    .select("id, current_version_id")
+    .eq("course_id", courseId)
+    .eq("is_active", true)
+    .neq("id", packageId);
+  const currentIds = ((others ?? []) as Array<{ current_version_id: string | null }>)
+    .map((p) => p.current_version_id)
+    .filter((id): id is string => !!id);
+  let otherActiveReadySlotExists = false;
+  if (currentIds.length > 0) {
+    // select("*") for 0077 deploy safety (upload_status).
+    const { data: vers } = await svc.from("course_versions").select("*").in("id", currentIds);
+    otherActiveReadySlotExists = ((vers ?? []) as Array<{ upload_status?: string | null }>).some((v) =>
+      isReadyVersion(v.upload_status)
+    );
+  }
+  return deactivationRefusal({ holdsDefault, otherActiveReadySlotExists });
 }
 
 /**
