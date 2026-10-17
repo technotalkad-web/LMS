@@ -7,9 +7,11 @@
  *   - an attempt by a user since removed from the org still blocks
  *   - staff-only attempts do not block (decision 3's definition)
  *   - delete of a course_versions row with learner attempts through an
- *     admin session → learner_history_exists            (needs 0098)
- *   - update of storage_prefix on a ready version → course_version_frozen
+ *     admin session → learner_history_exists, for a current member's attempt
+ *     and for a removed member's attempt (no membership = learner)
  *                                                          (needs 0098)
+ *   - update of storage_prefix or launch_url on a ready version →
+ *     course_version_frozen; storage_driver stays writable  (needs 0098)
  *   - a qa-* org with learner attempts deleted through the service client
  *     by cascade succeeds (the CI purge path; meaningful once 0098's guard
  *     exists, harmless before)
@@ -92,6 +94,13 @@ test.describe.serial("ADR 0003 — record guard", () => {
   });
 
   test("staff-only attempts do not block: course C deletes", async () => {
+    // The case only means something if course C really holds the admin's attempt.
+    const { data: cVersions } = await svc().from("course_versions").select("id").eq("course_id", s.courseC!);
+    const { data: cAttempts } = await svc()
+      .from("course_attempts")
+      .select("user_id")
+      .in("course_version_id", ((cVersions ?? []) as Array<{ id: string }>).map((v) => v.id));
+    expect(((cAttempts ?? []) as Array<{ user_id: string }>).map((a) => a.user_id), "course C holds exactly the admin's attempt").toEqual([s.admin!.id]);
     const res = await s.adminCtx!.request.delete(`/api/courses/${s.courseC}`);
     expect(res.status(), await res.text()).toBe(200);
     const { data } = await svc().from("courses").select("id").eq("id", s.courseC!).maybeSingle();
@@ -108,12 +117,16 @@ test.describe.serial("ADR 0003 — record guard", () => {
     });
     const { error: signErr } = await anon.auth.signInWithPassword({ email: s.admin!.email, password: s.admin!.password });
     expect(signErr).toBeNull();
-    const { data: c } = await svc().from("courses").select("current_version_id").eq("id", s.courseA!).single();
-    const versionId = (c as { current_version_id: string }).current_version_id;
-    const { error } = await anon.from("course_versions").delete().eq("id", versionId);
-    expect(error?.message ?? "", "the delete guard refuses").toMatch(/learner_history_exists/);
-    const { data: still } = await svc().from("course_versions").select("id").eq("id", versionId).maybeSingle();
-    expect(still).toBeTruthy();
+    // Course A: a current member's attempt. Course B: the attempt of the
+    // member removed above (a missing membership counts as a learner).
+    for (const [courseId, who] of [[s.courseA!, "a current member"], [s.courseB!, "a removed member"]] as Array<[string, string]>) {
+      const { data: c } = await svc().from("courses").select("current_version_id").eq("id", courseId).single();
+      const versionId = (c as { current_version_id: string }).current_version_id;
+      const { error } = await anon.from("course_versions").delete().eq("id", versionId);
+      expect(error?.message ?? "", `the delete guard refuses (attempt by ${who})`).toMatch(/learner_history_exists/);
+      const { data: still } = await svc().from("course_versions").select("id").eq("id", versionId).maybeSingle();
+      expect(still, `course ${courseId === s.courseA ? "A" : "B"}'s version still exists`).toBeTruthy();
+    }
     void browser; void baseURL;
   });
 
@@ -129,6 +142,22 @@ test.describe.serial("ADR 0003 — record guard", () => {
       .eq("id", versionId);
     expect(error?.message ?? "").toMatch(/course_version_frozen/);
     const { data: after } = await svc().from("course_versions").select("storage_prefix").eq("id", versionId).single();
+    expect(after).toEqual(before);
+  });
+
+  test("a ready version's launch_url is frozen too; storage_driver stays writable", async () => {
+    test.skip(!(await has0098()), NEEDS_0098);
+    const { data: c } = await svc().from("courses").select("current_version_id").eq("id", s.courseA!).single();
+    const versionId = (c as { current_version_id: string }).current_version_id;
+    const { data: before } = await svc().from("course_versions").select("launch_url, storage_driver").eq("id", versionId).single();
+    const row = before as { launch_url: string; storage_driver: string };
+    const { error } = await svc().from("course_versions").update({ launch_url: `${row.launch_url}?moved=1` }).eq("id", versionId);
+    expect(error?.message ?? "").toMatch(/course_version_frozen/);
+    // The R2 copy script flips storage_driver after verification: the trigger
+    // must let it through. Written with its current value, so nothing changes.
+    const { error: driverErr } = await svc().from("course_versions").update({ storage_driver: row.storage_driver }).eq("id", versionId);
+    expect(driverErr, "storage_driver is not frozen").toBeNull();
+    const { data: after } = await svc().from("course_versions").select("launch_url, storage_driver").eq("id", versionId).single();
     expect(after).toEqual(before);
   });
 

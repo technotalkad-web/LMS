@@ -10,8 +10,11 @@
  *   - two id-less statements that differ only in their content timestamp →
  *     two rows
  *
- * The statement_conflict log line is asserted when LIFECYCLE_SERVER_LOG
- * names the app's log file (a local `next dev` run); otherwise annotated.
+ * Runs against a LOCAL dev server only: the completion-webhook listener
+ * binds to 127.0.0.1 on the runner, which a deployed app cannot reach (keep
+ * it out of a nightly against a remote URL). The statement_conflict log
+ * line is its own case and needs LIFECYCLE_SERVER_LOG = the dev server's log
+ * file; without it that case is skipped with that reason, never passed.
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
 import fs from "node:fs";
@@ -35,6 +38,7 @@ test.describe.serial("ADR 0003 — statements are write-once", () => {
     auth?: string;
     hooks: string[];
     server?: http.Server;
+    conflictId?: string;
   } = { hooks: [] };
 
   test.afterAll(async () => {
@@ -98,8 +102,9 @@ test.describe.serial("ADR 0003 — statements are write-once", () => {
     s.auth = await authTokenFor(s.learnerCtx.request, s.attemptId);
   });
 
-  test("same id, different body → 200 both times; stored raw unchanged; statement_conflict logged", async () => {
+  test("same id, different body → 200 both times; stored raw unchanged", async () => {
     const id = randomUUID();
+    s.conflictId = id;
     const base = { id, actor: actor(), verb: { id: VERB("experienced") }, object: { objectType: "Activity", id: `${AU}/slide-1` }, context: { registration: s.attemptId } };
     const first = await post({ ...base, result: { response: "first" } });
     expect(first.status(), await first.text()).toBe(200);
@@ -116,15 +121,23 @@ test.describe.serial("ADR 0003 — statements are write-once", () => {
     const retry = await post({ ...base, result: { response: "first" } });
     expect(retry.status()).toBe(200);
     expect(await rows([id])).toHaveLength(1);
+  });
 
+  test("the conflicting resend is logged as statement_conflict (attempt id + statement id)", async () => {
     const log = process.env.LIFECYCLE_SERVER_LOG;
-    if (log && fs.existsSync(log)) {
-      await expect
-        .poll(() => fs.readFileSync(log, "utf8").split(/\r?\n/).some((l) => l.includes('"statement_conflict"') && l.includes(id)), { timeout: 10_000 })
-        .toBe(true);
-    } else {
-      test.info().annotations.push({ type: "note", description: "statement_conflict log not asserted (set LIFECYCLE_SERVER_LOG to the app's log file)" });
-    }
+    test.skip(!log || !fs.existsSync(log), "needs LIFECYCLE_SERVER_LOG = the local dev server's log file");
+    const id = s.conflictId!;
+    expect(id, "the previous case ran").toBeTruthy();
+    await expect
+      .poll(
+        () =>
+          fs
+            .readFileSync(log!, "utf8")
+            .split(/\r?\n/)
+            .some((l) => l.includes('"statement_conflict"') && l.includes(id) && l.includes(s.attemptId!)),
+        { timeout: 10_000 }
+      )
+      .toBe(true);
   });
 
   test("id-less statement re-POSTed → one row (deterministic id); no second webhook or XP event", async () => {
@@ -151,6 +164,7 @@ test.describe.serial("ADR 0003 — statements are write-once", () => {
     expect(att).toEqual({ completion_status: "completed", success_status: "passed" });
     await expect.poll(() => s.hooks.length, { timeout: 15_000, message: "the completion webhook fires once" }).toBe(1);
     const xpAfterFirst = await xpCount();
+    expect(xpAfterFirst, "the first completion awarded XP (so 'no second XP event' checks something)").toBeGreaterThan(0);
 
     // The engine re-POSTs the identical queued batch after a 5xx.
     const r2 = await post(batch);
