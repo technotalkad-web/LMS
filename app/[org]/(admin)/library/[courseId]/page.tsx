@@ -103,12 +103,23 @@ export default async function AdminCourseDetailPage({
     .select("id, language, display_name, is_active, current_version_id")
     .eq("course_id", c.id)
     .order("language", { ascending: true, nullsFirst: true });
-  const languagePackages = (pkgRows ?? []) as LanguagePackage[];
+  // current_version_ready: "Set as default" needs a fully uploaded current
+  // version (ADR 0008 steps 10–11).
+  const readyIds = new Set(list.filter((v) => !v.upload_status || v.upload_status === "ready").map((v) => v.id));
+  const languagePackages = ((pkgRows ?? []) as Omit<LanguagePackage, "current_version_ready">[]).map((p) => ({
+    ...p,
+    current_version_ready: !!p.current_version_id && readyIds.has(p.current_version_id),
+  })) as LanguagePackage[];
 
   // Group versions by language package (0030: versions belong to packages and
   // are numbered per package). "Current" is the package's own pointer; the
-  // course-level pointer only mirrors whichever package published last.
+  // course-level pointer is the course DEFAULT: the current version of the
+  // default slot, moved between slots only by "Set as default" (ADR 0008).
   const pkgById = new Map(languagePackages.map((p) => [p.id, p]));
+  const defaultVersion = c.current_version_id ? list.find((v) => v.id === c.current_version_id) : undefined;
+  const defaultPkg = defaultVersion?.package_id ? pkgById.get(defaultVersion.package_id) : undefined;
+  const slotName = (p: { language: string | null; display_name: string | null }) =>
+    p.display_name?.trim() || (p.language ? languageDisplay(p.language, "english") ?? p.language : "Unlabeled (legacy)");
   const versionGroups = (() => {
     const groups = new Map<string, { key: string; label: string; code: string | null; currentVersionId: string | null; order: number; versions: Version[] }>();
     for (const v of list) {
@@ -484,6 +495,19 @@ export default async function AdminCourseDetailPage({
             <span>· {c.duration_minutes} min</span>
           )}
           <span>· {enrSummary.total.toLocaleString()} enrolled</span>
+          {languagePackages.length > 0 && (
+            <span data-testid="default-language">
+              · Default language:{" "}
+              {defaultPkg ? (
+                <>
+                  <span className="text-ink">{slotName(defaultPkg)}</span>
+                  {!defaultPkg.is_active && " (hidden from learners)"}
+                </>
+              ) : (
+                "none set"
+              )}
+            </span>
+          )}
         </div>
         {/* System ids, copyable: integrations (Yoddha CRM) key on these. */}
         <div className="flex flex-wrap items-center gap-2 mt-2">
@@ -674,9 +698,13 @@ export default async function AdminCourseDetailPage({
 
       {/* Languages (#158 Phase 1c) */}
       <LanguagesSection
+        // Remount on fresh server data (router.refresh keeps client state):
+        // the default badge and the slot rows always match the database.
+        key={[c.current_version_id ?? "-", ...languagePackages.map((p) => `${p.id}:${p.is_active}:${p.current_version_id ?? "-"}`)].join("|")}
         orgSlug={orgSlug}
         courseId={c.id}
         packages={languagePackages}
+        defaultVersionId={c.current_version_id}
       />
 
       {/* Versions */}
@@ -734,6 +762,15 @@ export default async function AdminCourseDetailPage({
                           {v.upload_status === "failed" && (
                             <span className="ml-2 px-2 py-0.5 bg-red-100 text-red-800 border border-red-200 rounded-full uppercase tracking-wide text-[10px]">
                               failed
+                            </span>
+                          )}
+                          {v.id === c.current_version_id && (
+                            <span
+                              className="ml-2 px-2 py-0.5 bg-canvas text-ink border border-line rounded-full uppercase tracking-wide text-[10px]"
+                              title="The course default: the catalogue and integrations report this version"
+                              data-testid="course-default-version"
+                            >
+                              course default
                             </span>
                           )}
                         </div>
