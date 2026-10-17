@@ -50,6 +50,8 @@ type Attempt = {
   id: string;
   user_id: string;
   course_version_id: string;
+  /** ADR 0004 step 11: an abandoned attempt never makes a step "started". */
+  status: string | null;
   completion_status: string;
   success_status: string;
   score: number | null;
@@ -193,7 +195,7 @@ export default async function PathReportsPage({
       ? await supabase
           .from("course_attempts")
           .select(
-            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
+            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id"
           )
           .eq("learning_path_id", pathId)
           .in("user_id", assignedIdArr)
@@ -234,7 +236,8 @@ export default async function PathReportsPage({
       lastCompleted: null,
       lastActivity: null,
     };
-    cur.touched = true;
+    // ADR 0004 step 11: a reset (abandoned) attempt alone is not a start.
+    if (a.status !== "abandoned") cur.touched = true;
     if (a.completion_status === "completed" || a.success_status === "passed") cur.done = true;
     if (typeof a.score === "number" && (cur.bestScore === null || a.score > cur.bestScore)) {
       cur.bestScore = a.score;
@@ -262,7 +265,7 @@ export default async function PathReportsPage({
     assignedIdArr.length && allVersionIds.length
       ? await supabase
           .from("course_attempts")
-          .select("id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at")
+          .select("id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at")
           .in("user_id", assignedIdArr)
           .in("course_version_id", allVersionIds)
       : { data: [] };

@@ -72,6 +72,8 @@ type Attempt = {
   started_at: string;
   completed_at: string | null;
   progress_pct?: number | null;
+  /** ADR 0004 step 11: an abandoned (reset) attempt is never in progress. */
+  status?: string | null;
 };
 
 export default async function CoursesIndexPage({
@@ -284,7 +286,7 @@ export default async function CoursesIndexPage({
     const open = attempts
       .filter((a) => {
         const v = versionById.get(a.course_version_id);
-        return v?.course_id === courseId && a.completion_status === "in_progress";
+        return v?.course_id === courseId && a.completion_status === "in_progress" && a.status !== "abandoned";
       })
       .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0] as
       | (Attempt & { progress_pct?: number | null })

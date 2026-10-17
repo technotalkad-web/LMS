@@ -48,6 +48,8 @@ type Attempt = {
   id: string;
   user_id: string;
   course_version_id: string;
+  /** ADR 0004 step 11: 'abandoned' attempts are never in progress. */
+  status: string | null;
   completion_status: "in_progress" | "completed";
   success_status: "unknown" | "passed" | "failed";
   score: number | null;
@@ -170,7 +172,7 @@ export default async function ReportsPage({
     supabase
       .from("course_attempts")
       .select(
-        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct"
+        "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct"
       )
       .eq("organization_id", org.id)
       .range(f, t)
@@ -289,8 +291,9 @@ export default async function ReportsPage({
     const completed = oc.completed + oc.passed + oc.failed;
     const passed = oc.passed;
     const failed = oc.failed;
+    // ADR 0004 step 11: an abandoned (reset) attempt is never in progress.
     const inProgress = myAttempts.filter(
-      (a) => a.completion_status !== "completed" && a.success_status !== "passed"
+      (a) => a.completion_status !== "completed" && a.success_status !== "passed" && a.status !== "abandoned"
     ).length;
     const scored = myAttempts.filter((a) => typeof a.score === "number");
     const avgScore =
@@ -300,7 +303,11 @@ export default async function ReportsPage({
     // 0075: how far the still-open attempts are, on average (null = the
     // package reports no progress signal).
     const openWithProgress = myAttempts.filter(
-      (a) => a.completion_status !== "completed" && a.success_status !== "passed" && typeof a.progress_pct === "number"
+      (a) =>
+        a.completion_status !== "completed" &&
+        a.success_status !== "passed" &&
+        a.status !== "abandoned" &&
+        typeof a.progress_pct === "number"
     );
     const avgProgress =
       openWithProgress.length === 0

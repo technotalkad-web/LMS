@@ -385,13 +385,15 @@ export default async function AdminCourseDetailPage({
     enrolledIdArr.length && versionIds.length
       ? await supabase
           .from("course_attempts")
-          .select("id, user_id, completion_status, success_status, score, started_at, completed_at")
+          .select("id, user_id, status, completion_status, success_status, score, started_at, completed_at")
           .in("user_id", enrolledIdArr)
           .in("course_version_id", versionIds)
       : { data: [] };
   type SummaryAttempt = {
     id: string;
     user_id: string;
+    /** ADR 0004 step 11: an abandoned attempt never counts as in progress. */
+    status: string | null;
     completion_status: string;
     success_status: string;
     score: number | null;

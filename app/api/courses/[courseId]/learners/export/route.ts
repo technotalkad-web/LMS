@@ -189,7 +189,7 @@ export async function GET(
       ? await supabase
           .from("course_attempts")
           .select(
-            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
+            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
@@ -200,6 +200,8 @@ export async function GET(
     course_version_id: string;
     progress_pct?: number | null;
     units?: unknown;
+    /** ADR 0004 step 11: courseStatus()/courseProgress() leave abandoned attempts out. */
+    status: string | null;
     completion_status: string;
     success_status: string;
     score: number | null;
