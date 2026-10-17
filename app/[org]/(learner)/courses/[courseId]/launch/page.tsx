@@ -418,19 +418,37 @@ export default async function LaunchPage({
         process.env.SUPABASE_SERVICE_ROLE_KEY!,
         { auth: { persistSession: false } }
       );
-      const { data: abRows, error: abErr } = await svcSlot
-        .from("course_attempts")
-        .update({ status: "abandoned" })
-        .in("id", decision.abandon)
-        .eq("user_id", user.id)
-        .eq("status", "in_progress")
-        .select("id");
-      if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
-      const tokErr = await expireLaunchTokens(
-        svcSlot,
-        ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id)
-      );
-      if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+      // Abandoning is irreversible: re-check (4) with an error-checked read
+      // and close nothing if it cannot be read (grantRetakeIdsFor is
+      // fail-soft). A database without attempt_requests (pre-0083) has no grants.
+      const { data: grantRows, error: grantErr } = await svcSlot
+        .from("attempt_requests")
+        .select("used_attempt_id")
+        .in("used_attempt_id", decision.abandon)
+        .eq("status", "approved");
+      const grantMissing = (grantErr as { code?: string } | null)?.code === "42P01";
+      const closable =
+        grantErr && !grantMissing
+          ? []
+          : decision.abandon.filter(
+              (id) => !((grantRows ?? []) as Array<{ used_attempt_id: string | null }>).some((g) => g.used_attempt_id === id)
+            );
+      if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
+      if (closable.length > 0) {
+        const { data: abRows, error: abErr } = await svcSlot
+          .from("course_attempts")
+          .update({ status: "abandoned" })
+          .in("id", closable)
+          .eq("user_id", user.id)
+          .eq("status", "in_progress")
+          .select("id");
+        if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
+        const tokErr = await expireLaunchTokens(
+          svcSlot,
+          ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id)
+        );
+        if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+      }
     }
     if (decision.kind === "cross-slot") {
       // (2) Grandfather across slots: run the attempt the learner already has.
