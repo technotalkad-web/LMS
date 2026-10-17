@@ -24,6 +24,11 @@
 # Optional: B2_CONTENT_KEY_ID + B2_CONTENT_APPLICATION_KEY, when the existing
 # B2 key is restricted to the dump bucket; they replace B2_KEY_ID /
 # B2_APPLICATION_KEY for this job.
+#
+# Hardening: the secrets reach only the two steps that need them (the check
+# and the copy), the token has read-only scope, and rclone is a pinned
+# release verified against a pinned sha256 (taken from the vendor's
+# SHA256SUMS), never an install script piped into a root shell.
 name: Nightly content backup (Supabase Storage → B2)
 
 on:
@@ -35,21 +40,27 @@ concurrency:
   group: content-backup
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   copy:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      SUPABASE_S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
-      SUPABASE_S3_REGION: ${{ secrets.SUPABASE_S3_REGION }}
-      SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
-      SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
-      B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
-      B2_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
-      B2_APPLICATION_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
-      B2_REGION: ${{ secrets.B2_REGION }}
+      RCLONE_VERSION: v1.68.2
+      RCLONE_SHA256: 0e6fa18051e67fc600d803a2dcb10ddedb092247fc6eee61be97f64ec080a13c
     steps:
       - name: Check secrets
+        env:
+          SUPABASE_S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          SUPABASE_S3_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
+          B2_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
+          B2_REGION: ${{ secrets.B2_REGION }}
         run: |
           set -euo pipefail
           missing=()
@@ -65,23 +76,33 @@ jobs:
             *) echo "::error title=content-backup misconfigured::SUPABASE_S3_ENDPOINT must look like https://<project-ref>.storage.supabase.co/storage/v1/s3"; exit 1 ;;
           esac
 
-      - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+      - name: Install rclone (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          zip="rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$zip" "https://downloads.rclone.org/${RCLONE_VERSION}/$zip"
+          echo "${RCLONE_SHA256}  $RUNNER_TEMP/$zip" | sha256sum -c -
+          unzip -q -o "$RUNNER_TEMP/$zip" -d "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$RUNNER_TEMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" "$RUNNER_TEMP/bin/rclone"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/rclone" version
 
       - name: Copy Supabase Storage → B2 (copy, never sync)
         env:
+          B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
           RCLONE_CONFIG_SUPA_TYPE: s3
           RCLONE_CONFIG_SUPA_PROVIDER: Other
-          RCLONE_CONFIG_SUPA_ENDPOINT: ${{ env.SUPABASE_S3_ENDPOINT }}
-          RCLONE_CONFIG_SUPA_REGION: ${{ env.SUPABASE_S3_REGION }}
-          RCLONE_CONFIG_SUPA_ACCESS_KEY_ID: ${{ env.SUPABASE_S3_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_SUPA_SECRET_ACCESS_KEY: ${{ env.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_SUPA_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          RCLONE_CONFIG_SUPA_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          RCLONE_CONFIG_SUPA_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_SUPA_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
           RCLONE_CONFIG_SUPA_FORCE_PATH_STYLE: "true"
           RCLONE_CONFIG_B2_TYPE: s3
           RCLONE_CONFIG_B2_PROVIDER: Other
-          RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ env.B2_KEY_ID }}
-          RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ env.B2_APPLICATION_KEY }}
-          RCLONE_CONFIG_B2_ENDPOINT: https://s3.${{ env.B2_REGION }}.backblazeb2.com
+          RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
+          RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
+          RCLONE_CONFIG_B2_ENDPOINT: https://s3.${{ secrets.B2_REGION }}.backblazeb2.com
         run: |
           set -euo pipefail
           dest="b2:${B2_CONTENT_BUCKET}/content/prod/supabase/course-content"
