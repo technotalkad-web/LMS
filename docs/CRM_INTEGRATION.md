@@ -153,6 +153,13 @@ progress and are counted in `practice_attempts`, but they never change
 done on any official completion, or only on a pass when the module is
 configured "Pass required".
 
+**Reset attempts (ADR 0004 step 11).** An attempt the LMS closed (the
+learner confirmed a language switch, an admin replaced the module with
+"force restart" or deactivated that language) is `abandoned`: it is never
+official and never in progress. A learner whose only attempts on a module
+were reset reads as `not_started` with no `progress_pct` from them; the
+next launch starts a new attempt. `attempts` still counts every attempt.
+
 **Scores follow the LMS's attempt rules.** Admins configure, per module /
 learning path / journey, how many completed attempts are scored (default 1)
 and which one is the official score (default: the first attempt). When an
