@@ -158,7 +158,14 @@ export default async function EmployeeReportPage({
                   <td className="px-3 py-2.5"><Pill tone={statusTone(c)}>{statusWord(c)}</Pill></td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{c.status === "not_started" ? "—" : c.progressPct === null ? "In progress" : `${c.progressPct}%`}</td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{c.officialScore === null ? "—" : c.officialScore}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums">{c.attempts}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">
+                    {c.attempts}
+                    {(c.resetAttempts ?? 0) > 0 && (
+                      <span className="text-muted" title="Attempts reset by a module update or language switch: never in progress, never official">
+                        {" "}· {c.resetAttempts} reset
+                      </span>
+                    )}
+                  </td>
                   <td className={`px-3 py-2.5 text-xs ${c.overdue ? "text-red-700 font-semibold" : "text-muted"}`}>{c.dueAt ? `${fmtDate(c.dueAt)}${c.overdue ? " · overdue" : ""}` : "—"}</td>
                   <td className="px-5 py-2.5 text-xs text-muted">{c.lastActivity ? relativeDays(c.lastActivity, nowMs) : "—"}{c.nudges ? ` · ${c.nudges} reminder${c.nudges === 1 ? "" : "s"}` : ""}</td>
                 </tr>

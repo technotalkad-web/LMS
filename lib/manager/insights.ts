@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { fetchAll, fetchByIds } from "@/lib/db/chunked";
-import { DEFAULT_POLICY, computeScoring, courseStatus, officialDone } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, attemptCounts, computeScoring, courseStatus, excludeAbandoned, officialDone } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchGrantRetakeIdsForUsers, fetchPassRequired } from "@/lib/scoring/attempt-kind";
 import { courseProgress } from "@/lib/courses/progress-view";
@@ -444,8 +444,13 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       const scoring = computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY, grants.get(`${uid}:${cid}`) ?? new Set<string>());
       const status = courseStatus(scoring, list.map(toScorable));
       const progress = courseProgress(list, unitCountByVersion);
+      // ADR 0004 step 11: a reset (abandoned) attempt never dates the course:
+      // "opened Nd ago" / idle days come from the live attempts only, so a
+      // relaunch after a reset is not flagged stuck from the dead attempt's
+      // start. Engagement (lastActive above) keeps every attempt.
+      const tally = attemptCounts(list);
       let startedAt: string | null = null, lastActivity: string | null = null;
-      for (const a of list) {
+      for (const a of excludeAbandoned(list)) {
         startedAt = minIso(startedAt, a.started_at);
         lastActivity = maxIso(lastActivity, maxIso(a.last_activity_at, maxIso(a.completed_at, a.started_at)));
       }
@@ -469,7 +474,9 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
         title: courseTitle.get(cid) ?? "Untitled course",
         status,
         officialScore: scoring.officialScore === null ? null : Math.round(scoring.officialScore * 100),
-        attempts: list.length,
+        // Admin tables show live attempts plus a "· N reset" suffix.
+        attempts: tally.live,
+        resetAttempts: tally.reset,
         progressPct: progress.done ? 100 : progress.pct,
         assignedAt: info?.assignedAt ?? null,
         dueAt: info?.due ?? null,
