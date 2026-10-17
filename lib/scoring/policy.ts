@@ -129,6 +129,17 @@ export function excludeAbandoned<T extends object>(attempts: T[]): T[] {
   return attempts.some(isAbandonedAttempt) ? attempts.filter((a) => !isAbandonedAttempt(a)) : attempts;
 }
 
+/**
+ * Attempt counts for admin tables (ADR 0004 step 11): `live` = attempts that
+ * were not reset, the number a table shows; `reset` = abandoned attempts,
+ * shown as a small "· N reset" suffix when N > 0.
+ */
+export function attemptCounts(attempts: object[]): { live: number; reset: number } {
+  let reset = 0;
+  for (const a of attempts) if (isAbandonedAttempt(a)) reset++;
+  return { live: attempts.length - reset, reset };
+}
+
 /** House completion definition (matches the SQL everywhere). */
 export function isCompletedAttempt(a: {
   completion_status?: string | null;

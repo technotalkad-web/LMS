@@ -1,5 +1,6 @@
 import {
   DEFAULT_POLICY,
+  attemptCounts,
   computeScoring,
   courseStatus,
   excludeAbandoned,
@@ -36,7 +37,7 @@ import { fetchGrantRetakeIdsForUsers } from "./attempt-kind";
  * from "the latest attempt" or count failed attempt rows anywhere else.
  */
 
-export { computeScoring, courseStatus, excludeAbandoned, isAbandonedAttempt, isCompletedAttempt, officialDone, DEFAULT_POLICY };
+export { attemptCounts, computeScoring, courseStatus, excludeAbandoned, isAbandonedAttempt, isCompletedAttempt, officialDone, DEFAULT_POLICY };
 export type { CourseStatus, ScorableAttempt, ScoringResult };
 
 /** "Failed" = the official attempt failed. Never a practice/revision run. */
@@ -142,4 +143,42 @@ export function countsByCourse(map: Map<string, UserCourseStatus>): Map<string, 
 /** A learner×course pair has an official result (completed, passed or failed). */
 export function hasOfficialResult(status: CourseStatus): boolean {
   return status === "completed" || status === "passed" || status === "failed";
+}
+
+/** Enrolment summary of one course: the Library course card and its Reports tab. */
+export type EnrolledSummary = {
+  total: number;
+  /** Official attempt completed or passed. */
+  completed: number;
+  /** Official attempt failed. */
+  failed: number;
+  inProgress: number;
+  /** No attempt, or only reset (abandoned) attempts (ADR 0004 step 11). */
+  notStarted: number;
+};
+
+/**
+ * Counts the enrolled learners of `courseId` by official status, from a batch
+ * `officialStatuses()` result over their attempts on that course. Learners
+ * with no entry, or whose only attempts were reset, are not started, so the
+ * five numbers always sum to `total`. One function for both pages, so the
+ * Library card and the course Reports tab can never disagree.
+ */
+export function enrolledStatusSummary(
+  enrolled: ReadonlySet<string>,
+  official: Map<string, UserCourseStatus>,
+  courseId: string
+): EnrolledSummary {
+  const out: EnrolledSummary = { total: enrolled.size, completed: 0, failed: 0, inProgress: 0, notStarted: 0 };
+  let started = 0;
+  for (const uid of enrolled) {
+    const s = official.get(userCourseKey(uid, courseId))?.status ?? "not_started";
+    if (s === "not_started") continue;
+    started++;
+    if (s === "completed" || s === "passed") out.completed++;
+    else if (s === "failed") out.failed++;
+    else out.inProgress++;
+  }
+  out.notStarted = enrolled.size - started;
+  return out;
 }
