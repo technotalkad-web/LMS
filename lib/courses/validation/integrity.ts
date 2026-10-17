@@ -147,7 +147,7 @@ export async function checkIntegrity(
     for (let from = 0; ; from += 1000) {
       let q = svc
         .from("course_versions")
-        .select(`${VERSION_IDENTITY_SELECT}, courses!inner(organization_id, title)`)
+        .select(`${VERSION_IDENTITY_SELECT}, courses!course_versions_course_id_fkey!inner(organization_id, title)`)
         .eq("courses.organization_id", args.organizationId)
         .order("id")
         .range(from, from + 999);
