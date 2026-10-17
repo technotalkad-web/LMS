@@ -20,7 +20,7 @@ import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 import { enrolledStatusSummary, officialStatuses } from "@/lib/scoring/status";
-import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
+import { ActivateVersionButton, DiscardUploadButton, RestartVersionButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
 import { packageCode, versionCode } from "@/lib/reference-codes";
@@ -646,22 +646,27 @@ export default async function AdminCourseDetailPage({
             <Stat
               label="Total enrolled"
               value={enrSummary.total.toLocaleString()}
+              testId="sum-total"
             />
             <Stat
               label="Completed"
               value={enrSummary.completed.toLocaleString()}
+              testId="sum-completed"
             />
             <Stat
               label="Failed"
               value={enrSummary.failed.toLocaleString()}
+              testId="sum-failed"
             />
             <Stat
               label="In progress"
               value={enrSummary.inProgress.toLocaleString()}
+              testId="sum-in-progress"
             />
             <Stat
               label="Not started"
               value={enrSummary.notStarted.toLocaleString()}
+              testId="sum-not-started"
             />
           </div>
         )}
@@ -707,6 +712,12 @@ export default async function AdminCourseDetailPage({
               <ul className="divide-y divide-line">
                 {g.versions.map((v) => {
                   const isCurrent = v.id === g.currentVersionId;
+                  // ADR 0008 step 6: restart one version's in-progress learners —
+                  // a ready version that is not its package's current one, or
+                  // the current version of a package that is no longer active.
+                  const isReady = !v.upload_status || v.upload_status === "ready";
+                  const canRestart =
+                    !!v.package_id && isReady && (!isCurrent || pkgById.get(v.package_id)?.is_active === false);
                   return (
                     <li
                       key={v.id}
@@ -740,6 +751,15 @@ export default async function AdminCourseDetailPage({
                         </div>
                       </div>
                       <div className="text-xs text-muted shrink-0 flex items-center gap-2">
+                        {canRestart && v.package_id && (
+                          <RestartVersionButton
+                            orgSlug={orgSlug}
+                            courseId={c.id}
+                            packageId={v.package_id}
+                            versionId={v.id}
+                            versionNumber={v.version_number}
+                          />
+                        )}
                         {isCurrent ? (
                           <span className="px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px]">
                             current
@@ -771,13 +791,13 @@ export default async function AdminCourseDetailPage({
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value, testId }: { label: string; value: string; testId?: string }) {
   return (
     <div className="border border-line rounded-xl bg-paper p-4">
       <div className="text-[10px] text-muted uppercase tracking-wide">
         {label}
       </div>
-      <div className="serif text-xl mt-1">{value}</div>
+      <div className="serif text-xl mt-1" data-testid={testId}>{value}</div>
     </div>
   );
 }

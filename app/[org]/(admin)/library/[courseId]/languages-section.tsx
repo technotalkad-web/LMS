@@ -440,7 +440,10 @@ function ReplacePackageDialog({
               <span className="font-medium text-ink">Force restart on new version</span>
               <span className="block text-muted">
                 Active attempts are silently reset; every learner starts the new
-                version from 0% on their next launch.
+                version from 0% on their next launch. This resets in-progress
+                learners on every earlier version of this language; to reset one
+                version only, use “Restart learners on this version” in the
+                Versions list.
               </span>
             </span>
           </label>
