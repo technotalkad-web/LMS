@@ -1,5 +1,5 @@
 # PR checks — runs on every push to any branch and every PR.
-# Three parallel jobs: typecheck, lint, e2e.
+# Four parallel jobs: typecheck, lint, unit, e2e.
 # Failure on any blocks PR merge (when branch protection is enabled).
 name: PR checks
 
@@ -40,6 +40,22 @@ jobs:
       - run: npm run lint
       - name: Migration grants (Supabase 2026-10-30 rule)
         run: node scripts/check-migration-grants.mjs
+
+  # Every tests/unit/*.test.ts file, each in its own tsx process, failing on
+  # the first failure (ADR 0003 step 15, ADR 0007 step 14). No database, no
+  # secrets: these are pure-logic tests.
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
 
   e2e:
     name: e2e (playwright)
