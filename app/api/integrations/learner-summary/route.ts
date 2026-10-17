@@ -155,6 +155,8 @@ export async function GET(request: Request) {
     completed_at: string | null;
     last_activity_at: string | null;
     progress_pct?: number | null;
+    /** select("*"): 'abandoned' never counts as in progress or official (ADR 0004 step 11). */
+    status?: string | null;
   };
   const attempts = (atRows ?? []) as Att[];
   const verIds = [...new Set(attempts.map((a) => a.course_version_id))];
@@ -173,8 +175,11 @@ export async function GET(request: Request) {
     if (!cid) continue;
     const row = byCourse.get(cid) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
     row.attempts++;
+    // ADR 0004 step 11: an abandoned attempt never supplies progress_pct and
+    // never makes the course "in progress".
+    const abandoned = a.status === "abandoned";
     // Progress of the most recent open attempt (0075).
-    if (a.completion_status === "in_progress" && (a.started_at ?? "") >= row.progressAt) {
+    if (!abandoned && a.completion_status === "in_progress" && (a.started_at ?? "") >= row.progressAt) {
       row.progressAt = a.started_at ?? "";
       row.progress = typeof a.progress_pct === "number" ? a.progress_pct : null;
     }
@@ -185,10 +190,11 @@ export async function GET(request: Request) {
       completed_at: a.completed_at,
       completion_status: a.completion_status,
       success_status: a.success_status,
+      status: a.status ?? null,
     });
     if (a.success_status === "passed") row.status = "passed";
     else if (a.completion_status === "completed" && row.status !== "passed") row.status = "completed";
-    else if (row.status === "not_started") row.status = "in_progress";
+    else if (row.status === "not_started" && !abandoned) row.status = "in_progress";
     byCourse.set(cid, row);
   }
   // 0073: scores follow each module's admin-configured attempt rules.

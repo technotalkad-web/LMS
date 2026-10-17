@@ -138,6 +138,8 @@ type AttemptRow = {
   id: string;
   user_id: string;
   course_version_id: string;
+  /** 'abandoned' never counts as in progress or official (ADR 0004 step 11). */
+  status?: string | null;
   completion_status: "in_progress" | "completed" | null;
   success_status: "unknown" | "passed" | "failed" | null;
   score: number | null;
@@ -157,6 +159,7 @@ const toScorable = (a: AttemptRow) => ({
   completed_at: a.completed_at,
   completion_status: a.completion_status,
   success_status: a.success_status,
+  status: a.status ?? null,
 });
 
 type CourseAssign = {
@@ -403,7 +406,7 @@ export default async function AnalyticsPage({
     ? await fetchByIds<AttemptRow>(
         svc,
         "course_attempts",
-        "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
+        "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
         "user_id",
         scopedIds,
         (q) => q.eq("organization_id", org.id)
@@ -905,17 +908,19 @@ export default async function AnalyticsPage({
     const done = completedOf(s.userId);
     const assignedMap = assignedByUser.get(s.userId) ?? new Map<string, string | null>();
     const my = attemptsByUser.get(s.userId) ?? [];
-    const perCourse = new Map<string, { attempts: number; best: number | null; last: string | null; status: string; progress: CourseProgressView }>();
+    const perCourse = new Map<string, { attempts: number; live: number; best: number | null; last: string | null; status: string; progress: CourseProgressView }>();
     const emptyProgress: CourseProgressView = { pct: null, done: false, started: false, screensDone: null, screensTotal: null };
     for (const [cid] of assignedMap) {
-      perCourse.set(cid, { attempts: 0, best: null, last: null, status: "Not started", progress: emptyProgress });
+      perCourse.set(cid, { attempts: 0, live: 0, best: null, last: null, status: "Not started", progress: emptyProgress });
     }
     const attemptsOfCourse = new Map<string, AttemptRow[]>();
     for (const a of my) {
       const cid = courseOfVersion.get(a.course_version_id);
       if (!cid) continue;
-      const row = perCourse.get(cid) ?? { attempts: 0, best: null, last: null, status: "Not started", progress: emptyProgress };
+      const row = perCourse.get(cid) ?? { attempts: 0, live: 0, best: null, last: null, status: "Not started", progress: emptyProgress };
       row.attempts++;
+      // ADR 0004 step 11: an abandoned (reset) attempt is never "in progress".
+      if (a.status !== "abandoned") row.live++;
       attemptsOfCourse.set(cid, [...(attemptsOfCourse.get(cid) ?? []), a]);
       const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
       if (t && (!row.last || t > row.last)) row.last = t;
@@ -940,7 +945,7 @@ export default async function AnalyticsPage({
     for (const [cid, row] of perCourse) {
       row.status = done.has(cid)
         ? "Completed"
-        : row.attempts > 0
+        : row.live > 0
           ? "In progress"
           : "Not started";
       void cid;

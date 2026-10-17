@@ -352,6 +352,8 @@ type Att = {
   completed_at: string | null;
   last_activity_at: string | null;
   progress_pct?: number | null;
+  /** select("*"): 'abandoned' never counts as in progress or official (ADR 0004 step 11). */
+  status?: string | null;
 };
 
 /**
@@ -597,17 +599,20 @@ export async function buildProgress(
       if (!cid) continue;
       const row = byCourse.get(cid) ?? { status: "not_started", n: 0, list: [], progress: null, progressAt: "", first: null, last: null, done: null };
       row.n++;
-      if (a.completion_status === "in_progress" && (a.started_at ?? "") >= row.progressAt) {
+      // ADR 0004 step 11: an abandoned attempt never supplies progress_pct
+      // and never makes the course "in progress".
+      const abandoned = a.status === "abandoned";
+      if (!abandoned && a.completion_status === "in_progress" && (a.started_at ?? "") >= row.progressAt) {
         row.progressAt = a.started_at ?? "";
         row.progress = typeof a.progress_pct === "number" ? a.progress_pct : null;
       }
-      row.list.push({ id: a.id, score: a.score, started_at: a.started_at ?? "", completed_at: a.completed_at, completion_status: a.completion_status, success_status: a.success_status });
+      row.list.push({ id: a.id, score: a.score, started_at: a.started_at ?? "", completed_at: a.completed_at, completion_status: a.completion_status, success_status: a.success_status, status: a.status ?? null });
       row.first = minIso(row.first, a.started_at);
       row.last = maxIso(row.last, a.last_activity_at ?? a.completed_at ?? a.started_at);
       if (a.completion_status === "completed" || a.success_status === "passed") row.done = minIso(row.done, a.completed_at);
       if (a.success_status === "passed") row.status = "passed";
       else if (a.completion_status === "completed" && row.status !== "passed") row.status = "completed";
-      else if (row.status === "not_started") row.status = "in_progress";
+      else if (row.status === "not_started" && !abandoned) row.status = "in_progress";
       byCourse.set(cid, row);
     }
 
@@ -662,7 +667,8 @@ export async function buildProgress(
     for (const [pid, due] of myPathDue) {
       const steps = coursesOfPath.get(pid) ?? [];
       const doneSteps = steps.filter((c) => doneSet.has(c));
-      const started = steps.some((c) => byCourse.has(c));
+      // A step whose only attempts were abandoned (reset) is not started (ADR 0004 step 11).
+      const started = steps.some((c) => (byCourse.get(c)?.status ?? "not_started") !== "not_started");
       const complete = steps.length > 0 && doneSteps.length === steps.length;
       let completedAt: string | null = null;
       if (complete) for (const c of doneSteps) completedAt = maxIso(completedAt, doneAt.get(c) ?? null);

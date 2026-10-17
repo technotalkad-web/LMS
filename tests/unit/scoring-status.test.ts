@@ -16,9 +16,12 @@ import {
   statusOf,
   countByStatus,
   countsByCourse,
+  excludeAbandoned,
+  isAbandonedAttempt,
   userCourseKey,
   type UserCourseStatus,
 } from "../../lib/scoring/status";
+import { courseProgress } from "../../lib/courses/progress-view";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -72,6 +75,52 @@ console.log("\nofficial status (decision 1)");
   eq("statusOf present / absent", [statusOf(m, "u1", "c1"), statusOf(m, "u9", "c1")], ["failed", "not_started"]);
   eq("countByStatus per course", countByStatus(m, "c1"), { not_started: 0, in_progress: 0, completed: 0, passed: 1, failed: 2 });
   eq("countsByCourse one pass", Object.fromEntries(countsByCourse(m)), { c1: { not_started: 0, in_progress: 0, completed: 0, passed: 1, failed: 2 }, c2: { not_started: 0, in_progress: 1, completed: 0, passed: 0, failed: 0 } });
+}
+
+console.log("\nabandoned is never official and never in progress (ADR 0004 step 11)");
+{
+  const ab = (id: string, started: string, progress?: number) => ({
+    ...at(id, started, null, "in_progress", "unknown", null),
+    status: "abandoned",
+    course_version_id: "v1",
+    progress_pct: progress ?? null,
+  });
+  const live = (id: string, started: string, progress?: number) => ({
+    ...at(id, started, null, "in_progress", "unknown", null),
+    status: "in_progress",
+    course_version_id: "v2",
+    progress_pct: progress ?? null,
+  });
+
+  const onlyReset = [ab("r1", "2026-10-01T09:00Z", 40)];
+  eq("abandoned only → not_started", courseStatus(computeScoring(onlyReset, P), onlyReset), "not_started");
+  eq("excludeAbandoned drops it", excludeAbandoned(onlyReset).length, 0);
+  eq("isAbandonedAttempt", [isAbandonedAttempt(onlyReset[0]), isAbandonedAttempt({ status: "in_progress" }), isAbandonedAttempt({})], [true, false, false]);
+
+  const resetThenRelaunch = [ab("r1", "2026-10-01T09:00Z", 40), live("l1", "2026-10-02T09:00Z", 10)];
+  eq("abandoned + new live attempt → in_progress", courseStatus(computeScoring(resetThenRelaunch, P), resetThenRelaunch), "in_progress");
+
+  const passedThenReset = [
+    { ...at("p1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "completed", "passed", 0.9), status: "passed" },
+    ab("r2", "2026-10-03T09:00Z", 20),
+  ];
+  const sp = computeScoring(passedThenReset, P);
+  eq("official pass + later reset → still passed, official unchanged", [courseStatus(sp, passedThenReset), sp.officialAttempt?.id], ["passed", "p1"]);
+
+  // A mislabelled row (completed axes, status abandoned) is never official (R6).
+  const mislabelled = [{ ...at("m1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "completed", "passed", 0.9), status: "abandoned" }];
+  const sm = computeScoring(mislabelled, P);
+  eq("abandoned completed row → no official, not_started", [sm.officialAttempt, sm.completedAttempts, courseStatus(sm, mislabelled)], [null, 0, "not_started"]);
+
+  // Rows without a status (callers that do not select it) are unchanged.
+  const noStatus = [at("n1", "2026-10-01T09:00Z", null, "in_progress", "unknown", null)];
+  eq("no status field → unchanged (in_progress)", courseStatus(computeScoring(noStatus, P), noStatus), "in_progress");
+  eq("excludeAbandoned keeps the same array when nothing is abandoned", excludeAbandoned(noStatus) === noStatus, true);
+
+  // progress_pct selection: never from an abandoned attempt.
+  eq("progress: abandoned only → not started, no %", (({ started, pct }) => ({ started, pct }))(courseProgress(onlyReset)), { started: false, pct: null });
+  const newerReset = [live("l1", "2026-10-01T09:00Z", 30), ab("r1", "2026-10-02T09:00Z", 80)];
+  eq("progress: a newer abandoned attempt never supplies the %", courseProgress(newerReset).pct, 30);
 }
 
 console.log(`\n==== status: ${pass} passed, ${fail} failed ====`);

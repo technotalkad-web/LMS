@@ -67,6 +67,8 @@ type AttemptRow = {
   id: string;
   user_id: string;
   course_version_id: string;
+  /** 'abandoned' never counts as in progress or official (ADR 0004 step 11). */
+  status?: string | null;
   completion_status: "in_progress" | "completed" | null;
   success_status: "unknown" | "passed" | "failed" | null;
   score: number | null;
@@ -118,6 +120,7 @@ const toScorable = (a: AttemptRow) => ({
   completed_at: a.completed_at,
   completion_status: a.completion_status,
   success_status: a.success_status,
+  status: a.status ?? null,
 });
 void fmtDay; void daysAgo;
 
@@ -214,7 +217,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   /* ---- attempts + versions ---- */
   const attempts = await fetchByIds<AttemptRow>(
     svc, "course_attempts",
-    "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
     "user_id", userIds, (q) => q.eq("organization_id", orgId)
   );
   const versionIds = [...new Set(attempts.map((a) => a.course_version_id))];
