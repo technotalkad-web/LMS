@@ -29,6 +29,11 @@
 
 begin;
 
+-- A lock wait must never queue the app's reads of course_versions behind
+-- this file: if a lock is not granted within 5 s the whole transaction rolls
+-- back cleanly and can simply be applied again.
+set local lock_timeout = '5s';
+
 -- Drop the legacy constraint. The constraint name is the Postgres default
 -- ("<table>_<col1>_<col2>_key") — verified by inspecting pg_constraint on
 -- the live DB. If a migration ever renamed it, this DROP will no-op

@@ -1,6 +1,17 @@
 -- 0098_record_protection.sql — P0 record protection (ADR 0003 §3, items 8–11;
 -- ADR 0004 item 3 DDL). Hand-apply in the SQL editor, staging first, then
--- production in the P1 sitting (ADR 0007 step 5). Idempotent: safe to re-run.
+-- production in the P1 sitting (ADR 0007 step 5).
+--
+-- Idempotent: safe to re-run BEFORE 0099. 0099 replaces the two delete-guard
+-- functions (learner attempt = is_preview = false, ADR 0005 step 10); pasting
+-- this file again after 0099 would silently restore the membership rule.
+--
+-- PREREQUISITES (the DO block below refuses to run without them):
+--   0030  course_versions.package_id (per-package version numbers)
+--   0070  public.package_validations
+--   0077  course_versions.upload_status (read by the freeze trigger; without
+--         it the file would apply and every later UPDATE on course_versions
+--         would fail with 'record "old" has no field "upload_status"')
 --
 -- PRECONDITION (gate SQL, must return 0 rows; the DO block below refuses to
 -- continue otherwise):
@@ -36,6 +47,34 @@
 -- follow docs/MIGRATIONS.md and the BLUEPRINT Conventions paragraph.
 
 begin;
+
+-- A lock wait must never queue the app's reads of course_versions behind
+-- this file: if a lock is not granted within 5 s the whole transaction rolls
+-- back cleanly and can simply be applied again.
+set local lock_timeout = '5s';
+
+-- ---------------------------------------------------------------------------
+-- 0. Prerequisites
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_versions' and column_name = 'package_id'
+  ) then
+    raise exception '0098 refused: course_versions.package_id is missing (apply 0030 first).';
+  end if;
+  if to_regclass('public.package_validations') is null then
+    raise exception '0098 refused: public.package_validations is missing (apply 0070 first).';
+  end if;
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_versions' and column_name = 'upload_status'
+  ) then
+    raise exception '0098 refused: course_versions.upload_status is missing (apply 0077 first).';
+  end if;
+end
+$$;
 
 -- ---------------------------------------------------------------------------
 -- 1. Unique storage prefix
