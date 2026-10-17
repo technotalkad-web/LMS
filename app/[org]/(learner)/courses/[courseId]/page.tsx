@@ -245,9 +245,19 @@ export default async function CourseDetailPage({
   // ADR 0004 step 10: in progress = an attempt whose STATUS is in_progress.
   // An abandoned attempt keeps completion_status 'in_progress' but is dead,
   // so it never offers "Resume" (the learner would land on 0 %).
+  // Only an attempt the launch can resume counts: its version belongs to an
+  // ACTIVE language slot (or to no slot: legacy courses launch through
+  // current_version_id). An in-progress attempt on a deactivated slot is
+  // closed at the next launch (step 9 rule 3) and the learner starts on an
+  // active slot, so offering "Resume" there would land them on 0 %.
+  const activePackageIds = new Set(languageOptions.map((o) => o.id));
+  const resumable = (a: Attempt) => {
+    const pkg = versionById.get(a.course_version_id)?.package_id ?? null;
+    return pkg === null || activePackageIds.has(pkg);
+  };
   const isInProgress =
     !isComplete &&
-    attempts.some((a) => a.status === "in_progress");
+    attempts.some((a) => a.status === "in_progress" && resumable(a));
 
   // A one-line note when the learner's latest attempt was reset by an admin
   // action: its package was deactivated or its version is no longer that

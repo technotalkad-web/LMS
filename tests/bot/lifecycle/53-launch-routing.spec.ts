@@ -7,7 +7,8 @@
  *       page's language-switch confirm, nothing abandoned
  *   (2) saved preference with progress on another active slot → that
  *       attempt's version is launched (grandfather across slots)
- *   (3) progress on a DEACTIVATED slot → abandoned, tokens expired, the
+ *   (3) progress on a DEACTIVATED slot → the course page offers Launch, not
+ *       Resume; at the next launch the attempt is abandoned, tokens expired, the
  *       "Reset — module updated" pill shows, the launch continues
  *   (4) a consumed grant retake is never abandoned or rerouted
  *
@@ -145,11 +146,22 @@ test.describe.serial("ADR 0004 step 9 — launch routing across language slots",
     expect(await iframeSrc(ctx.request, `${base}/launch?lang=hi`)).toContain(`/content/v/${s.cmi5!.hiVersion}/`);
     const hiAttempt = await inProgressAttempt(s.learners.deact.id, s.cmi5!.hiVersion);
     expect(await tokensExpired(hiAttempt)).toContain(false);
+    const label = async () => {
+      const res = await ctx.request.get(base);
+      expect(res.ok(), `course page → ${res.status()}`).toBeTruthy();
+      const html = await res.text();
+      return html.includes("Resume course") ? "resume" : html.includes("Launch course") ? "launch" : "other";
+    };
+    expect(await label(), "an attempt on an active slot offers Resume").toBe("resume");
 
     const off = await s.adminCtx!.request.patch(`/api/courses/${s.cmi5!.courseId}/packages/${s.cmi5!.hiPkg}`, {
       data: { orgSlug: s.org!.slug, is_active: false },
     });
     expect(off.ok(), `deactivate hi → ${off.status()}: ${await off.text()}`).toBeTruthy();
+    // Before the next launch closes it, the deactivated slot's attempt is
+    // still in progress, but the course page no longer offers to resume it.
+    expect(await attemptStatuses(s.learners.deact.id, s.cmi5!.hiVersion)).toEqual(["in_progress"]);
+    expect(await label(), "no Resume for an attempt on a deactivated slot").toBe("launch");
 
     // English is now the only active slot: the launch closes the Hindi attempt and starts English.
     expect(await iframeSrc(ctx.request, `${base}/launch`)).toContain(`/content/v/${s.cmi5!.enVersion}/`);

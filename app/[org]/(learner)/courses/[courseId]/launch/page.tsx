@@ -371,6 +371,7 @@ export default async function LaunchPage({
   // continues the other slot's attempt; only an attempt on a DEACTIVATED
   // slot is closed (conditional on status = 'in_progress', tokens expired).
   // Grant retakes are never touched. Skipped on the legacy no-package path.
+  let deactivatedSlotAttempts: string[] = [];
   if (chosenPackageId) {
     const [{ data: allPkgRows }, { data: courseVerRows }] = await Promise.all([
       supabase.from("course_packages").select("id, is_active").eq("course_id", courseId),
@@ -409,47 +410,10 @@ export default async function LaunchPage({
       // this language (a confirmed switch resets the other slot's progress).
       redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
     }
-    if (decision.abandon.length > 0) {
-      // (3) The slot was deactivated by an admin: this attempt can never be
-      // resumed from the picker again. Conditional on in_progress, own rows
-      // only; fail-soft (a failed close leaves it in progress, as before).
-      const svcSlot = createServiceClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY!,
-        { auth: { persistSession: false } }
-      );
-      // Abandoning is irreversible: re-check (4) with an error-checked read
-      // and close nothing if it cannot be read (grantRetakeIdsFor is
-      // fail-soft). A database without attempt_requests (pre-0083) has no grants.
-      const { data: grantRows, error: grantErr } = await svcSlot
-        .from("attempt_requests")
-        .select("used_attempt_id")
-        .in("used_attempt_id", decision.abandon)
-        .eq("status", "approved");
-      const grantMissing = (grantErr as { code?: string } | null)?.code === "42P01";
-      const closable =
-        grantErr && !grantMissing
-          ? []
-          : decision.abandon.filter(
-              (id) => !((grantRows ?? []) as Array<{ used_attempt_id: string | null }>).some((g) => g.used_attempt_id === id)
-            );
-      if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
-      if (closable.length > 0) {
-        const { data: abRows, error: abErr } = await svcSlot
-          .from("course_attempts")
-          .update({ status: "abandoned" })
-          .in("id", closable)
-          .eq("user_id", user.id)
-          .eq("status", "in_progress")
-          .select("id");
-        if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
-        const tokErr = await expireLaunchTokens(
-          svcSlot,
-          ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id)
-        );
-        if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
-      }
-    }
+    // (3) is carried out below, only once every launch gate has passed: a
+    // launch that is then refused (no version, prerequisite lock, scheduled
+    // release) closes nothing.
+    deactivatedSlotAttempts = [...decision.abandon];
     if (decision.kind === "cross-slot") {
       // (2) Grandfather across slots: run the attempt the learner already has.
       chosenPackageId = decision.packageId;
@@ -654,6 +618,48 @@ export default async function LaunchPage({
           redirect(`/${orgSlug}/dashboard?locked=${courseId}`);
         }
       }
+    }
+  }
+
+  if (deactivatedSlotAttempts.length > 0) {
+    // (3) The slot was deactivated by an admin: this attempt can never be
+    // resumed from the picker again. Conditional on in_progress, own rows
+    // only; fail-soft (a failed close leaves it in progress, as before).
+    const svcSlot = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    // Abandoning is irreversible: re-check (4) with an error-checked read
+    // and close nothing if it cannot be read (grantRetakeIdsFor is
+    // fail-soft). A database without attempt_requests (pre-0083) has no grants.
+    const { data: grantRows, error: grantErr } = await svcSlot
+      .from("attempt_requests")
+      .select("used_attempt_id")
+      .in("used_attempt_id", deactivatedSlotAttempts)
+      .eq("status", "approved");
+    const grantMissing = (grantErr as { code?: string } | null)?.code === "42P01";
+    const closable =
+      grantErr && !grantMissing
+        ? []
+        : deactivatedSlotAttempts.filter(
+            (id) => !((grantRows ?? []) as Array<{ used_attempt_id: string | null }>).some((g) => g.used_attempt_id === id)
+          );
+    if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
+    if (closable.length > 0) {
+      const { data: abRows, error: abErr } = await svcSlot
+        .from("course_attempts")
+        .update({ status: "abandoned" })
+        .in("id", closable)
+        .eq("user_id", user.id)
+        .eq("status", "in_progress")
+        .select("id");
+      if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
+      const tokErr = await expireLaunchTokens(
+        svcSlot,
+        ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id)
+      );
+      if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
     }
   }
 
