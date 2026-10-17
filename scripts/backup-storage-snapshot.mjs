@@ -78,6 +78,14 @@ try { host = new URL(url).host; } catch { fail("SUPABASE_URL is missing or not a
 if (host !== `${PROJECTS[env]}.supabase.co`) fail(`SUPABASE_URL (${host}) does not belong to the ${env} project`);
 const key = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
 if (!key) fail("SUPABASE_SERVICE_ROLE_KEY is missing");
+// Storage lists come back EMPTY (not an error) for a key without service rights, so refuse
+// anything that is not the service-role / secret key before listing.
+if (key.startsWith("sb_publishable_")) fail("SUPABASE_SERVICE_ROLE_KEY holds the publishable (anon) key; use the secret / service_role key (Project Settings -> API keys)");
+if (key.startsWith("eyJ")) {
+  let role = null;
+  try { role = JSON.parse(Buffer.from(key.split(".")[1], "base64url").toString("utf8")).role ?? null; } catch {}
+  if (role !== "service_role") fail(`SUPABASE_SERVICE_ROLE_KEY is a JWT for role "${role ?? "unknown"}", not service_role; use the service_role key`);
+}
 const buckets = (process.env.SNAPSHOT_BUCKETS ?? "course-content").split(",").map((s) => s.trim()).filter(Boolean);
 const root = process.env.SNAPSHOT_DIR ?? "D:/LMS/backups/storage";
 const stamp = opt("--resume") ?? new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
@@ -123,8 +131,11 @@ async function listAll(bucket, prefix = "") {
 
 const objects = [];
 for (const b of buckets) {
-  const list = await listAll(b);
+  let list;
+  try { list = await listAll(b); }
+  catch (e) { fail(`could not list bucket "${b}": ${e.message ?? e}. Check SNAPSHOT_BUCKETS and the key. Nothing was copied.`); }
   console.log(`Listed    ${b}: ${list.length} objects`);
+  if (list.length === 0) fail(`bucket "${b}" listed 0 objects. Either the key has no service rights or the bucket name is wrong (SNAPSHOT_BUCKETS). Nothing was copied.`);
   objects.push(...list);
 }
 
@@ -166,10 +177,14 @@ console.log(`Downloaded ${downloaded} new, ${objects.length - errors.length} tot
 const versions = [];
 for (let from = 0; ; from += 1000) {
   const { data, error } = await sb.from("course_versions")
-    .select("id,course_id,package_id,version_number,storage_prefix,storage_driver,upload_status,manifest_type,launch_url,uploaded_at,size_bytes")
+    .select("*") // production may predate 0077 (no storage_driver / upload_status): never name optional columns
     .order("id").range(from, from + 999);
   if (error) { errors.push({ stage: "versions", error: error.message }); break; }
-  versions.push(...data);
+  versions.push(...data.map((v) => ({
+    id: v.id, course_id: v.course_id, package_id: v.package_id ?? null, version_number: v.version_number,
+    storage_prefix: v.storage_prefix, storage_driver: v.storage_driver ?? "supabase", upload_status: v.upload_status ?? "ready",
+    manifest_type: v.manifest_type, launch_url: v.launch_url, uploaded_at: v.uploaded_at, size_bytes: v.size_bytes ?? null,
+  })));
   if (data.length < 1000) break;
 }
 fs.writeFileSync(path.join(outDir, "versions.json"), JSON.stringify(versions, null, 1));
