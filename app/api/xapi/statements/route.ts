@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { bindXapi, serviceClient } from "@/lib/xapi/auth";
 import { deterministicStatementId } from "@/lib/lrs/statement-id";
-import { isSameStatementAsReceived } from "@/lib/xapi/statement-equality";
+import { decideResend } from "@/lib/xapi/statement-equality";
 import { attemptAbandonedResponse, isAttemptAbandonedError } from "@/lib/attempts/abandon";
 import { processStatement } from "@/lib/xapi/process-statement";
 import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
@@ -92,16 +92,21 @@ export async function POST(request: Request) {
     } else if (!inserted || inserted.length === 0) {
       // The id already exists on this attempt. An exact retry re-runs the
       // (idempotent) derivation on the stored copy; different content under
-      // the same id is ignored and logged.
-      const { data: storedRow } = await svc
+      // the same id is ignored and logged. A stored copy that cannot be read
+      // is not a difference: the statement is processed as received, like
+      // the insert-error branch above (decideResend).
+      const { data: storedRow, error: readErr } = await svc
         .from("xapi_statements")
         .select("raw")
         .eq("attempt_id", session.attemptId)
         .eq("statement_id", statementId)
         .maybeSingle();
       const storedRaw = (storedRow as { raw?: unknown } | null)?.raw;
-      if (storedRaw && isSameStatementAsReceived(storedRaw, received)) {
+      const decision = decideResend({ raw: storedRaw, error: readErr }, received);
+      if (decision === "process-stored") {
         toProcess = storedRaw as XapiStatement;
+      } else if (decision === "process-received") {
+        console.warn("[xapi/statements] stored statement unreadable; processed as received:", readErr?.message ?? "no row");
       } else {
         toProcess = null;
         console.warn(

@@ -15,7 +15,7 @@ import {
   deterministicStatementId,
   statementIdName,
 } from "../../lib/lrs/statement-id";
-import { canonicalJson, isSameStatementAsReceived } from "../../lib/xapi/statement-equality";
+import { canonicalJson, decideResend, isSameStatementAsReceived } from "../../lib/xapi/statement-equality";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -93,6 +93,17 @@ eq("canonical JSON sorts keys at every level", canonicalJson({ b: 1, a: { d: [2,
   eq("a different content timestamp is a conflict", isSameStatementAsReceived({ ...received, timestamp: "2026-10-05T09:00:05.000Z" }, received), false);
 }
 eq("no stored copy → not the same", isSameStatementAsReceived(null, { verb: { id: "v" } }), false);
+
+console.log("\nresend decision (ADR 0003 step 5: skip only on a content difference)");
+{
+  const received = { verb: { id: "v" }, object: { id: "o" } };
+  const stored = { id: "lms-id", timestamp: "2026-10-16T00:00:00.000Z", verb: { id: "v" }, object: { id: "o" } };
+  eq("exact retry → process the stored copy", decideResend({ raw: stored, error: null }, received), "process-stored");
+  eq("different content → conflict", decideResend({ raw: { ...stored, object: { id: "other" } }, error: null }, received), "conflict");
+  eq("read error → process as received (never dropped)", decideResend({ raw: undefined, error: { message: "timeout" } }, received), "process-received");
+  eq("read error with a row → still process as received", decideResend({ raw: stored, error: { message: "x" } }, received), "process-received");
+  eq("no row came back → process as received", decideResend({ raw: null, error: null }, received), "process-received");
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

@@ -48,3 +48,22 @@ export function isSameStatementAsReceived(stored: unknown, received: unknown): b
   }
   return canonicalJson(s) === canonicalJson(r);
 }
+
+/** What the statements route does with a statement whose id already exists. */
+export type ResendDecision =
+  /** An exact retry: re-run the (idempotent) derivation on the stored copy. */
+  | "process-stored"
+  /** The stored copy could not be read: process the statement as received, as the insert-error branch does (a read that never happened is not a difference). */
+  | "process-received"
+  /** Different content under a reused id: skip it, keep it out of the LRS mirror, log statement_conflict. */
+  | "conflict";
+
+/**
+ * ADR 0003 step 5: processing is skipped ONLY when the stored statement was
+ * read and differs from the one received. `read` is the result of reading
+ * the stored row (`raw` undefined/null when no row came back).
+ */
+export function decideResend(read: { raw: unknown; error: unknown }, received: unknown): ResendDecision {
+  if (read.error || read.raw === undefined || read.raw === null) return "process-received";
+  return isSameStatementAsReceived(read.raw, received) ? "process-stored" : "conflict";
+}
