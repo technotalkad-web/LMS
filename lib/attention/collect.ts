@@ -178,6 +178,145 @@ async function overdueItems(svc: AnyClient, orgId: string, orgSlug: string, prio
   }];
 }
 
+function ageLabel(iso: string): string {
+  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 864e5);
+  if (days < 1) return "today";
+  return days === 1 ? "1 day ago" : `${days} days ago`;
+}
+
+/**
+ * ADR 0004 step 3a: integrity blocks a super owner overrode, naming the
+ * overriding super owner and the colliding course. Fail-soft before 0098
+ * (no override columns -> no items).
+ */
+async function integrityOverrideItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
+  const { data, error } = await svc
+    .from("package_validations")
+    .select("id, file_name, course_id, overridden_by, overridden_at, override_reason, integrity:report->integrity")
+    .eq("organization_id", orgId)
+    .not("overridden_at", "is", null)
+    .order("overridden_at", { ascending: false })
+    .limit(100);
+  if (error) return [];
+  const rows = (data ?? []) as Array<{
+    id: string;
+    file_name: string | null;
+    course_id: string | null;
+    overridden_by: string | null;
+    overridden_at: string;
+    override_reason: string | null;
+    integrity: {
+      context?: { courseId?: string | null } | null;
+      collisions?: Array<{ courseId: string; courseTitle?: string | null }> | null;
+    } | null;
+  }>;
+  if (!rows.length) return [];
+  const actorIds = rows.map((r) => r.overridden_by).filter((x): x is string => !!x);
+  const targetIds = rows.map((r) => r.course_id ?? r.integrity?.context?.courseId ?? null).filter((x): x is string => !!x);
+  const [emails, names, titles] = await Promise.all([
+    resolveEmails(svc, actorIds),
+    resolveNames(svc, actorIds),
+    courseTitles(svc, targetIds),
+  ]);
+  return rows.map((r) => {
+    const collisions = r.integrity?.collisions ?? [];
+    const colliding = collisions[0]?.courseTitle ?? (collisions[0]?.courseId ? collisions[0].courseId.slice(0, 8) : "another course");
+    const more = collisions.length > 1 ? ` (+${collisions.length - 1} more)` : "";
+    const target = r.course_id ?? r.integrity?.context?.courseId ?? null;
+    const actor = r.overridden_by ? names.get(r.overridden_by) ?? emails.get(r.overridden_by) ?? r.overridden_by.slice(0, 8) : "A super owner";
+    return {
+      key: `integrity-override:${r.id}`,
+      type: "integrity-override",
+      priority,
+      title: `Integrity block overridden${r.file_name ? `: ${r.file_name}` : ""}`,
+      who: actor,
+      context: `Matched "${colliding}"${more}${target ? ` · uploaded to "${titles.get(target) ?? "a new course"}"` : ""}${r.override_reason ? ` · reason: ${r.override_reason}` : ""}`,
+      occurredAt: r.overridden_at,
+      actionLabel: "Check the module is in the right course",
+      href: target ? `/${orgSlug}/library/${target}` : `/${orgSlug}/library`,
+      inline: null,
+      dismissible: true,
+    };
+  });
+}
+
+/**
+ * ADR 0004 step 8 (decision 5): versions with upload_status 'ready' that are
+ * not the current version of their package and are older than 24 hours,
+ * with the reason and the age. No migration; fail-soft.
+ */
+async function unpublishedVersionItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
+  const { data: pkgData, error: pkgErr } = await svc
+    .from("course_packages")
+    .select("id, course_id, language, display_name, current_version_id, is_active, courses!inner(organization_id, title)")
+    .eq("courses.organization_id", orgId)
+    .limit(2000);
+  if (pkgErr) return [];
+  const pkgs = (pkgData ?? []) as Array<{
+    id: string;
+    course_id: string;
+    language: string | null;
+    display_name: string | null;
+    current_version_id: string | null;
+    is_active: boolean;
+    courses: { title?: string | null } | Array<{ title?: string | null }> | null;
+  }>;
+  if (!pkgs.length) return [];
+  const byPkg = new Map(pkgs.map((p) => [p.id, p]));
+  const cutoff = new Date(Date.now() - 864e5).toISOString();
+  type V = { id: string; package_id: string; version_number: number; uploaded_at: string };
+  const versions: V[] = [];
+  const ids = pkgs.map((p) => p.id);
+  for (let i = 0; i < ids.length; i += 200) {
+    const { data, error } = await svc
+      .from("course_versions")
+      .select("id, package_id, version_number, uploaded_at")
+      .in("package_id", ids.slice(i, i + 200))
+      .eq("upload_status", "ready")
+      .lt("uploaded_at", cutoff)
+      .limit(2000);
+    if (error) return [];
+    versions.push(...((data ?? []) as V[]));
+  }
+  // The current version's number per package (it may be younger than 24 h,
+  // in which case it is not in `versions`: read it separately).
+  const currentNumber = new Map<string, number>();
+  for (const v of versions) if (byPkg.get(v.package_id)?.current_version_id === v.id) currentNumber.set(v.package_id, v.version_number);
+  const missing = pkgs.filter((p) => p.current_version_id && !currentNumber.has(p.id)).map((p) => p.current_version_id as string);
+  for (let i = 0; i < missing.length; i += 200) {
+    const { data } = await svc.from("course_versions").select("id, package_id, version_number").in("id", missing.slice(i, i + 200));
+    for (const v of (data ?? []) as Array<{ package_id: string; version_number: number }>) currentNumber.set(v.package_id, v.version_number);
+  }
+  const items: AttentionItem[] = [];
+  for (const v of versions) {
+    const p = byPkg.get(v.package_id);
+    if (!p || p.current_version_id === v.id) continue;
+    const course = Array.isArray(p.courses) ? p.courses[0] : p.courses;
+    const slot = p.display_name ?? p.language ?? "default language";
+    const cur = currentNumber.get(v.package_id);
+    const reason =
+      cur == null
+        ? "its language has no current version"
+        : v.version_number > cur
+          ? `uploaded after v${cur}, which learners still get; never made current`
+          : `superseded by v${cur}`;
+    items.push({
+      key: `unpublished-version:${v.id}`,
+      type: "unpublished-versions",
+      priority,
+      title: `v${v.version_number} is not the current version (${slot})`,
+      who: null,
+      context: `${course?.title ?? "a course"} · ${reason}${p.is_active ? "" : " · language hidden from learners"} · uploaded ${ageLabel(v.uploaded_at)}`,
+      occurredAt: v.uploaded_at,
+      actionLabel: "Make it current or leave it as history",
+      href: `/${orgSlug}/library/${p.course_id}`,
+      inline: null,
+      dismissible: true,
+    });
+  }
+  return items.slice(0, 200);
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 export async function collectAttention(args: {
@@ -211,6 +350,8 @@ export async function collectAttention(args: {
     else if (p.type === "ticket") jobs.push(run(ticketItems(svc, orgId, orgSlug)));
     else if (p.type === "failed-email") jobs.push(run(failedEmailItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "overdue") jobs.push(run(overdueItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "integrity-override") jobs.push(run(integrityOverrideItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "unpublished-versions") jobs.push(run(unpublishedVersionItems(svc, orgId, orgSlug, c.priority)));
   }
   let items = (await Promise.all(jobs)).flat();
 
