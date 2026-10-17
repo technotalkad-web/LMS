@@ -521,7 +521,11 @@ export default async function CourseDetailPage({
         </header>
         {attempts.length === 0 ? (
           <div className="p-8 text-center text-muted text-sm">
-            No attempts yet. Click <strong>Launch course</strong> to start.
+            {noActiveLanguage ? (
+              <>No attempts yet.</>
+            ) : (
+              <>No attempts yet. Click <strong>Launch course</strong> to start.</>
+            )}
           </div>
         ) : (
           <ul className="divide-y divide-line">
