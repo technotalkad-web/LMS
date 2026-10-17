@@ -99,6 +99,8 @@ export async function directUpload(
     validationId?: string;
     /** PUT these bytes instead of the validated package (the stored-bytes binding test). */
     filesFrom?: Buffer;
+    /** Stop after init: the version stays 'uploading' (spec 54: a slot without a ready version). */
+    initOnly?: boolean;
   }
 ): Promise<{
   validate: { status: number; body: Record<string, unknown> } | null;
@@ -140,6 +142,7 @@ export async function directUpload(
   const initBody = (await init.json().catch(() => ({}))) as Record<string, unknown>;
   if (!init.ok()) return { validate, init: { status: init.status(), body: initBody } };
   const versionId = initBody.versionId as string;
+  if (opts.initOnly) return { validate, init: { status: init.status(), body: initBody }, versionId };
   const sign = await req.post("/api/courses/upload/sign", {
     data: { orgSlug: opts.orgSlug, versionId, files: files.map((f) => ({ path: f.path })) },
   });
