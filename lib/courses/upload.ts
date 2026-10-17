@@ -6,6 +6,7 @@ import { sanitizeStorageKey } from "@/lib/storage/keys";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ParsedManifest } from "./manifest/types";
 import { packageIdentity, type PackageIdentity } from "./validation/integrity";
+import { shouldMoveCourseDefault } from "./default-rule";
 
 export interface UploadResult {
   courseId: string;
@@ -145,7 +146,8 @@ export async function uploadCoursePackage(opts: {
     throw e;
   }
 
-  // 6) Point the package and the course at this version.
+  // 6) Point the package at this version; the course default follows only
+  //    for a new course or the default slot (ADR 0008 step 9).
   await publishVersion(supabase, { courseId, packageId, versionId: version.id });
 
   return {
@@ -432,25 +434,63 @@ function serviceClient(): SupabaseClient {
 
 /**
  * Make a version current: the package points at it (the launcher picks it
- * up as that language's current variant) and so does the course (back-compat
- * with paths that still read course.current_version_id directly). Rollback
- * is the same call with an older version id.
+ * up as that language's current variant). Rollback is the same call with an
+ * older version id.
+ *
+ * The course default (`courses.current_version_id`) is the current version
+ * of the course's default slot (ADR 0008 step 9): it follows this publish
+ * only when the course has no default yet, or when its default version
+ * belongs to this same package. A publish never moves the default to
+ * another slot; "Set as default" (packages/[packageId]/default) does that.
+ * The write is conditional on the default read here, so a concurrent
+ * publish cannot cross slots. Returns whether the course default moved.
  */
 export async function publishVersion(
   supabase: SupabaseClient,
   args: { courseId: string; packageId: string; versionId: string }
-): Promise<void> {
+): Promise<{ courseDefaultMoved: boolean }> {
   await supabase
     .from("course_packages")
     .update({ current_version_id: args.versionId })
     .eq("id", args.packageId);
-  await supabase
+
+  // Read the default fresh: callers may hold a course row loaded earlier.
+  const { data: courseRow } = await supabase
+    .from("courses")
+    .select("current_version_id")
+    .eq("id", args.courseId)
+    .maybeSingle();
+  const previous = (courseRow as { current_version_id: string | null } | null)?.current_version_id ?? null;
+  let previousPackageId: string | null = null;
+  if (previous) {
+    const { data: dv } = await supabase.from("course_versions").select("package_id").eq("id", previous).maybeSingle();
+    previousPackageId = (dv as { package_id: string | null } | null)?.package_id ?? null;
+    if (!previousPackageId) console.warn("[publish] could not read the course default's package; the default is left as is");
+  }
+  if (
+    !shouldMoveCourseDefault({
+      currentDefaultVersionId: previous,
+      currentDefaultPackageId: previousPackageId,
+      publishedPackageId: args.packageId,
+    })
+  ) {
+    return { courseDefaultMoved: false };
+  }
+  if (previous === args.versionId) return { courseDefaultMoved: false };
+
+  const update = supabase
     .from("courses")
     .update({
       current_version_id: args.versionId,
       updated_at: new Date().toISOString(),
     })
     .eq("id", args.courseId);
+  const { data: moved, error } = await (previous
+    ? update.eq("current_version_id", previous)
+    : update.is("current_version_id", null)
+  ).select("id");
+  if (error) console.warn("[publish] course default update failed:", error.message);
+  return { courseDefaultMoved: !error && (moved ?? []).length > 0 };
 }
 
 /** Many authoring tools wrap the package in a single root folder. Strip it. */
