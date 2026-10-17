@@ -25,6 +25,7 @@ import { grantRetakeIdsFor, unusedGrantFor } from "@/lib/scoring/attempt-kind";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
+import { launchFallback } from "@/lib/courses/default-rule";
 
 type Course = {
   id: string;
@@ -294,14 +295,17 @@ export default async function LaunchPage({
   //   2. user's saved preference in course_language_preferences
   //   3. if only ONE active package exists, auto-use it
   //   4. otherwise render the picker (early return)
-  //   5. legacy fallback to course.current_version_id when no packages
+  //   5. legacy fallback to course.current_version_id only when the course
+  //      has NO package rows at all; packages exist but none is active →
+  //      back to the course page (ADR 0008 step 13). The course default
+  //      never chooses a learner's language.
   // ---------------------------------------------------------------
   const { data: pkgRows } = await supabase
     .from("course_packages")
     .select("id, language, display_name, current_version_id, is_active")
-    .eq("course_id", courseId)
-    .eq("is_active", true);
-  const activePackages = (pkgRows ?? []) as PackageRow[];
+    .eq("course_id", courseId);
+  const allPackages = (pkgRows ?? []) as PackageRow[];
+  const activePackages = allPackages.filter((p) => p.is_active);
 
   let resolvedVersionId: string | null = null;
   let chosenPackageId: string | null = null;
@@ -309,8 +313,13 @@ export default async function LaunchPage({
   // picker navigates there too), the saved preference, or the only active one.
   let slotSource: SlotSource = "single";
 
-  if (activePackages.length === 0) {
-    // Legacy path: no packages yet — fall back to course.current_version_id
+  const fallback = launchFallback({ packageCount: allPackages.length, activeCount: activePackages.length });
+  if (fallback === "redirect") {
+    // Every language is hidden from learners: nothing to launch.
+    redirect(`/${orgSlug}/courses/${courseId}`);
+  }
+  if (fallback === "legacy") {
+    // Legacy path: no packages at all — fall back to course.current_version_id
     resolvedVersionId = c.current_version_id;
   } else if (activePackages.length === 1) {
     resolvedVersionId = activePackages[0].current_version_id;
