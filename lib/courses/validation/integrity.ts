@@ -135,6 +135,8 @@ export async function checkIntegrity(
     packageId: string | null;
     identity: PackageIdentity;
     stage: IntegrityFindings["stage"];
+    /** The version being finalized (direct path): never its own "previous version". */
+    excludeVersionId?: string | null;
   }
 ): Promise<IntegrityFindings> {
   const id = normalizeIdentityId(args.identity.kivoCourseId);
@@ -189,7 +191,12 @@ export async function checkIntegrity(
       .maybeSingle();
     const currentId = (pkg as { current_version_id?: string | null } | null)?.current_version_id ?? null;
     let q = svc.from("course_versions").select(VERSION_IDENTITY_SELECT).eq("package_id", args.packageId);
-    q = currentId ? q.eq("id", currentId) : q.order("version_number", { ascending: false }).limit(1);
+    if (args.excludeVersionId) q = q.neq("id", args.excludeVersionId);
+    // Without a current version: the latest finished one (an in-flight
+    // upload is not a "previous version").
+    q = currentId && currentId !== args.excludeVersionId
+      ? q.eq("id", currentId)
+      : q.eq("upload_status", "ready").order("version_number", { ascending: false }).limit(1);
     const { data: prevRows } = await q;
     const prev = ((prevRows ?? []) as unknown as VersionIdentityRow[])[0];
     if (prev) {

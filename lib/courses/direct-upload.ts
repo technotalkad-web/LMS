@@ -482,6 +482,7 @@ async function finalizeIntegrity(args: {
       packageId: version.package_id,
       identity,
       stage: "finalize",
+      excludeVersionId: version.id,
     });
   } catch (e) {
     // Fail closed, but let the browser retry finalize.
