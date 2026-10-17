@@ -3,6 +3,7 @@ import { loadScopes } from "@/lib/content/scopes";
 import { authenticateApiKey } from "@/lib/integrations/auth";
 import { readParams, pick, list, bool, int, iso } from "@/lib/integrations/params";
 import { parseVersionDays } from "@/lib/journey/journey";
+import { catalogAvailable } from "@/lib/courses/default-rule";
 import { fetchReferenceCodes, journeyVersionCode, versionCode } from "@/lib/reference-codes";
 
 /**
@@ -32,7 +33,11 @@ type CatalogItem =
       title: string;
       description: string | null;
       format: string | null;
-      /** The current uploaded package version the learner launches (Version ID in the admin). */
+      /**
+       * The current version of the course's DEFAULT language slot (Version ID
+       * in the admin; ADR 0008 step 14). Uploads to other languages never
+       * change it; a learner's own language may launch another version.
+       */
       version_id: string | null;
       /** Derived: MOD0015-V03, or MOD0015-HI-V02 when the course has several language packages. */
       version_code: string | null;
@@ -150,11 +155,27 @@ async function handle(request: Request) {
   } catch {
     /* pre-0030 */
   }
+  // ADR 0008 step 14: is the default version's language package active?
+  // Fail-soft: a read error leaves the state unknown, which never makes a
+  // course unavailable.
+  const packageActive = new Map<string, boolean>();
+  const defaultPkgIds = [...new Set([...versionOf.values()].map((v) => v.package_id).filter((id): id is string => !!id))];
+  for (let i = 0; i < defaultPkgIds.length; i += 300) {
+    const { data, error } = await svc.from("course_packages").select("id, is_active").in("id", defaultPkgIds.slice(i, i + 300));
+    if (error) break;
+    for (const pkg of (data ?? []) as Array<{ id: string; is_active: boolean | null }>) packageActive.set(pkg.id, pkg.is_active !== false);
+  }
   if (want.has("course")) {
     for (const c of courses) {
-      // Launchable = switched on AND has an uploaded package. (courses.status
+      // Launchable = switched on AND has an uploaded package AND the default
+      // version's language is not hidden from learners. (courses.status
       // stays "draft" after upload; the learner UI keys on is_active only.)
-      const available = c.is_active !== false && !!c.current_version_id;
+      const defaultPkg = c.current_version_id ? versionOf.get(c.current_version_id)?.package_id : null;
+      const available = catalogAvailable({
+        courseActive: c.is_active,
+        defaultVersionId: c.current_version_id,
+        defaultPackageActive: defaultPkg ? packageActive.get(defaultPkg) : undefined,
+      });
       if (!includeInactive && !available) continue;
       if (changedBefore(c.updated_at)) continue;
       const ver = c.current_version_id ? versionOf.get(c.current_version_id) : undefined;
