@@ -213,7 +213,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: isVersionConflictError(err) ? 409 : 400 });
   }
   await linkValidationToVersion({
-    supabase,
+    organizationId: org.id as string,
     validationId: gate.validationId,
     courseId: result.courseId,
     versionId: result.versionId,

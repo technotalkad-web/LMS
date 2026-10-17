@@ -29,7 +29,11 @@ import { auditLog } from "@/lib/auth/require-platform-owner";
  *         pending 'blocked' row so the upload gates accept it; the row stays
  *         pending and blocked until the upload consumes it. Audited.
  *
- * Admin-only. Phase 2 (Accept & Upload) happens on the real upload
+ * Admin-only. Every package_validations write here goes through the service
+ * client after requireAdmin, with the admin's organization_id (ADR 0008 C);
+ * reads stay on the caller's RLS session.
+ *
+ * Phase 2 (Accept & Upload) happens on the real upload
  * endpoints with `validation_id` + `acknowledge` — see
  * lib/courses/validation/gate.ts.
  */
@@ -182,8 +186,10 @@ export async function POST(request: NextRequest) {
 
       const report = await validateStoredVersion(version.storage_prefix);
       // Content is already live for learners, so the row records an audit
-      // (status accepted), not a pending gate decision.
-      const { data: inserted, error } = await auth.supabase
+      // (status accepted), not a pending gate decision. Written by the server
+      // after the admin check (ADR 0008 C: package_validations is written by
+      // service_role only); the organisation is the admin's own.
+      const { data: inserted, error } = await serviceClient()
         .from("package_validations")
         .insert({
           organization_id: auth.orgId,
@@ -224,7 +230,9 @@ export async function POST(request: NextRequest) {
     if ("error" in auth) {
       return NextResponse.json({ error: auth.error }, { status: auth.status });
     }
-    const { data: updated, error } = await auth.supabase
+    // Server write after the admin check (ADR 0008 C), scoped to the admin's
+    // organisation and to a still-pending row.
+    const { data: updated, error } = await serviceClient()
       .from("package_validations")
       .update({ status: "rejected" })
       .eq("id", body.validation_id)
@@ -305,7 +313,9 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  const { data: inserted, error } = await auth.supabase
+  // Server write after the admin check (ADR 0008 C); the organisation is the
+  // admin's own.
+  const { data: inserted, error } = await serviceClient()
     .from("package_validations")
     .insert({
       organization_id: auth.orgId,

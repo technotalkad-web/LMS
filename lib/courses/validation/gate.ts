@@ -34,7 +34,12 @@ import {
  *     (with that validation_id) is re-bound by sha256.
  */
 export async function enforcePackageValidation(opts: {
-  /** Caller-bound client (RLS: admins manage package_validations). */
+  /**
+   * Caller-bound client, used for READS only (RLS: admins read
+   * package_validations). Every write goes through the service client with
+   * an explicit organization_id (ADR 0008 C): the upload route's admin check
+   * is the authorisation.
+   */
   supabase: SupabaseClient;
   organizationId: string;
   userId: string;
@@ -107,7 +112,7 @@ export async function enforcePackageValidation(opts: {
         error: "Validation reported issues — confirm 'Accept & Upload' to acknowledge them.",
       };
     }
-    await supabase
+    await serviceClient()
       .from("package_validations")
       .update({
         status: "accepted",
@@ -116,7 +121,8 @@ export async function enforcePackageValidation(opts: {
         acknowledged_warnings: v.verdict !== "pass",
         ...(courseId ? { course_id: courseId } : {}),
       })
-      .eq("id", v.id);
+      .eq("id", v.id)
+      .eq("organization_id", organizationId);
     return { ok: true, validationId: v.id };
   }
 
@@ -154,7 +160,7 @@ export async function enforcePackageValidation(opts: {
     // Stored PENDING (not accepted): the super_owner override targets it and
     // the re-POST with this validation_id is re-bound by sha256. Before 0098
     // the verdict cannot be stored; the call still answers 409.
-    const { data: pending } = await supabase
+    const { data: pending } = await serviceClient()
       .from("package_validations")
       .insert({
         organization_id: organizationId,
@@ -176,7 +182,7 @@ export async function enforcePackageValidation(opts: {
     };
   }
   try {
-    const { data: inserted } = await supabase
+    const { data: inserted } = await serviceClient()
       .from("package_validations")
       .insert({
         organization_id: organizationId,
@@ -251,6 +257,7 @@ async function recheckIntegrityAtAccept(args: {
     .from("package_validations")
     .update({ verdict: "blocked", report })
     .eq("id", args.row.id)
+    .eq("organization_id", args.organizationId)
     .eq("status", "pending")
     .select("id");
   const stored = !error && (marked ?? []).length > 0;
@@ -265,19 +272,23 @@ function serviceClient(): SupabaseClient {
   );
 }
 
-/** After the upload succeeds, link the created version to its report. */
+/**
+ * After the upload succeeds, link the created version to its report. A
+ * server write (ADR 0008 C), scoped to the uploading admin's organisation.
+ */
 export async function linkValidationToVersion(opts: {
-  supabase: SupabaseClient;
+  organizationId: string;
   validationId: string | null;
   courseId: string;
   versionId: string;
 }): Promise<void> {
   if (!opts.validationId) return;
   try {
-    await opts.supabase
+    await serviceClient()
       .from("package_validations")
       .update({ course_id: opts.courseId, course_version_id: opts.versionId })
-      .eq("id", opts.validationId);
+      .eq("id", opts.validationId)
+      .eq("organization_id", opts.organizationId);
   } catch {
     // linking is best-effort
   }

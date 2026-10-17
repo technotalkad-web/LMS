@@ -265,7 +265,7 @@ export async function initDirectUpload(args: {
   // ---- 6. Consume the validation and link it; signing happens per batch
   //         through signUploadBatch(). ----
   await consumeValidationForDirectUpload(gateArgs, gate.validationId);
-  await linkValidationToVersion({ supabase, validationId: gate.validationId, courseId, versionId: version.id });
+  await linkValidationToVersion({ organizationId: org.id, validationId: gate.validationId, courseId, versionId: version.id });
 
   return {
     ok: true,
@@ -540,13 +540,18 @@ async function finalizeIntegrity(args: {
     const patch: Record<string, unknown> = blocked
       ? { report, verdict: "blocked", status: "rejected", course_id: null, course_version_id: null }
       : { report };
-    const { error } = await svc.from("package_validations").update(patch).eq("id", linked.id);
+    const { error } = await svc
+      .from("package_validations")
+      .update(patch)
+      .eq("id", linked.id)
+      .eq("organization_id", org.id);
     // Before 0098 'blocked' cannot be stored: keep the findings at least.
     if (error && blocked) {
       await svc
         .from("package_validations")
         .update({ report, status: "rejected", course_id: null, course_version_id: null })
-        .eq("id", linked.id);
+        .eq("id", linked.id)
+        .eq("organization_id", org.id);
     }
   }
 
@@ -743,8 +748,11 @@ type GateArgs = {
   expect: { type: string; launchUrl: string };
 };
 
+// package_validations is written by the server only (ADR 0008 C): the two
+// writes below use the service client, scoped to the admin's organisation;
+// the read in check() stays on the caller's RLS session (opts.supabase).
 async function consumeValidationForDirectUpload(opts: GateArgs, validationId: string): Promise<void> {
-  await opts.supabase
+  await serviceClient()
     .from("package_validations")
     .update({
       status: "accepted",
@@ -753,6 +761,7 @@ async function consumeValidationForDirectUpload(opts: GateArgs, validationId: st
       ...(opts.courseId ? { course_id: opts.courseId } : {}),
     })
     .eq("id", validationId)
+    .eq("organization_id", opts.organizationId)
     .eq("status", "pending");
 }
 
@@ -803,7 +812,11 @@ async function checkValidationForDirectUpload(
   }
   if (v.verdict !== "pass") {
     // Record the acknowledgement now; the status flips in consume().
-    await supabase.from("package_validations").update({ acknowledged_warnings: true }).eq("id", v.id);
+    await serviceClient()
+      .from("package_validations")
+      .update({ acknowledged_warnings: true })
+      .eq("id", v.id)
+      .eq("organization_id", opts.organizationId);
   }
   return { ok: true, validationId: v.id };
 }
