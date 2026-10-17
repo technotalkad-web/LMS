@@ -33,17 +33,26 @@ export function sha256(bytes: Uint8Array | Buffer | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * Every entry these builders write carries this fixed date, so the same
+ * inputs always give the same bytes (JSZip stamps a replaced entry with the
+ * current time otherwise, which changes the zip's sha256 between builds and
+ * breaks any re-POST bound to a stored validation by sha256).
+ */
+const FIXED_ENTRY_DATE = new Date("2026-01-01T00:00:00Z");
+const fixed = { date: FIXED_ENTRY_DATE };
+
 /** scorm12.zip retitled, with an optional marker in index.html and version.txt. */
 export async function scormZip(opts: { title?: string; marker?: string } = {}): Promise<Buffer> {
   const zip = await JSZip.loadAsync(fs.readFileSync(path.join(FIXTURES, "scorm12.zip")));
   if (opts.title) {
     const m = await zip.file("imsmanifest.xml")!.async("string");
-    zip.file("imsmanifest.xml", m.replace("<title>QA Bot SCORM 1.2 Course</title>", `<title>${opts.title}</title>`));
+    zip.file("imsmanifest.xml", m.replace("<title>QA Bot SCORM 1.2 Course</title>", `<title>${opts.title}</title>`), fixed);
   }
   if (opts.marker) {
     const html = await zip.file("index.html")!.async("string");
-    zip.file("index.html", html.replace("</body>", `<!-- ${opts.marker} --></body>`));
-    zip.file("version.txt", opts.marker);
+    zip.file("index.html", html.replace("</body>", `<!-- ${opts.marker} --></body>`), fixed);
+    zip.file("version.txt", opts.marker, fixed);
   }
   return zip.generateAsync({ type: "nodebuffer" });
 }
@@ -59,8 +68,8 @@ export async function cmi5Zip(opts: { courseId?: string; title?: string; marker?
       `<title><langstring lang="en">${opts.title}</langstring></title>`
     );
   }
-  zip.file("cmi5.xml", xml);
-  if (opts.marker) zip.file("version.txt", opts.marker);
+  zip.file("cmi5.xml", xml, fixed);
+  if (opts.marker) zip.file("version.txt", opts.marker, fixed);
   return zip.generateAsync({ type: "nodebuffer" });
 }
 

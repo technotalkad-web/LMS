@@ -6,10 +6,16 @@
  *   - the direct path re-checks the STORED bytes at finalize: a package whose
  *     uploaded files differ from the validated manifest is blocked and
  *     removed before it becomes ready
+ *   - the multipart path re-checks the RECEIVED bytes when it accepts a
+ *     validation_id: a package validated before its id was taken by another
+ *     course is blocked at upload, and a validation run for one course is
+ *     refused for another target
  *   - admin override attempt → 403; bad reasons → 400
  *   - super_owner override with a reason → the row stays pending with
  *     overridden_at set; the re-POSTed upload creates the version; the row
- *     becomes accepted; audit row; Attention Center item       (needs 0098)
+ *     becomes accepted; audit row; Attention Center item naming the
+ *     overriding super owner and the colliding course; a second override of
+ *     the same block is refused                                 (needs 0098)
  *   - a blocked row without override is still refused       (needs 0098)
  *   - same-slot retitle → warning + confirm
  *   - urn:elearning-engine:untitled-course → warning only; two untitled
@@ -56,6 +62,8 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     courseX?: string;
     pkgX?: string;
     inlineBlockedId?: string | null;
+    /** The exact bytes the inline 409 bound its row to (sha256): every re-POST reuses this Buffer. */
+    inlineZip?: Buffer;
   } = {};
 
   test.afterAll(async () => {
@@ -112,7 +120,8 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
 
   test("multipart inline path: collision → 409 with validation_id; nothing created", async () => {
     const before = await courseCount(s.org!.id);
-    const r = await uploadNew(s.adminCtx!.request, s.org!.slug, "c.zip", await cmi5Zip({ courseId: X_ID, title: "QA Integrity X copy" }));
+    s.inlineZip = await cmi5Zip({ courseId: X_ID, title: "QA Integrity X copy" });
+    const r = await uploadNew(s.adminCtx!.request, s.org!.slug, "c.zip", s.inlineZip);
     expect(r.status(), await r.text()).toBe(409);
     const j = await r.json();
     expect(j.error).toMatch(BLOCKED);
@@ -152,6 +161,53 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     expect(admin.status(), await admin.text()).toBe(403);
     expect((await s.ownerCtx!.request.post("/api/courses/validate-package", { data: body("   ") })).status()).toBe(400);
     expect((await s.ownerCtx!.request.post("/api/courses/validate-package", { data: body("x".repeat(501)) })).status()).toBe(400);
+  });
+
+  test("multipart: a validation run for course X is refused for a different target (a new course)", async () => {
+    const areq = s.adminCtx!.request;
+    const zip = await cmi5Zip({ courseId: "urn:elearning-engine:qa-integrity-bound", title: "QA Integrity Bound" });
+    const v = await areq.post("/api/courses/validate-package", {
+      multipart: { orgSlug: s.org!.slug, courseId: s.courseX!, file: zipFile("bound.zip", zip) },
+    });
+    expect(v.status(), await v.text()).toBe(200);
+    const j = await v.json();
+    expect(j.report.integrity.context.courseId).toBe(s.courseX);
+    const before = await courseCount(s.org!.id);
+    const up = await uploadNew(areq, s.org!.slug, "bound.zip", zip, { validation_id: j.validation_id, acknowledge: "1" });
+    expect(up.status(), await up.text()).toBe(400);
+    expect((await up.json()).error).toMatch(/run for a different course/);
+    expect(await courseCount(s.org!.id)).toBe(before);
+  });
+
+  test("multipart: a package validated before another course took its id is blocked when the upload accepts it", async () => {
+    const areq = s.adminCtx!.request;
+    const LATE_ID = "urn:elearning-engine:qa-integrity-late";
+    const zip = await cmi5Zip({ courseId: LATE_ID, title: "QA Integrity Late" });
+    const v = await areq.post("/api/courses/validate-package", { multipart: { orgSlug: s.org!.slug, file: zipFile("late.zip", zip) } });
+    expect(v.status(), await v.text()).toBe(200);
+    const j = await v.json();
+    expect(j.report.integrity.blocked, "nothing carries this id yet").toBe(false);
+    // Meanwhile another course is created with the same course id.
+    const other = await uploadNew(areq, s.org!.slug, "late-other.zip", await cmi5Zip({ courseId: LATE_ID, title: "QA Integrity Late Other" }));
+    expect(other.status(), await other.text()).toBe(200);
+    const otherCourse = (await other.json()).courseId as string;
+    const before = await courseCount(s.org!.id);
+    const up = await uploadNew(areq, s.org!.slug, "late.zip", zip, { validation_id: j.validation_id, acknowledge: "1" });
+    expect(up.status(), await up.text()).toBe(409);
+    const body = await up.json();
+    expect(body.error).toMatch(BLOCKED);
+    expect(await courseCount(s.org!.id), "nothing created").toBe(before);
+    const { data: row } = await svc().from("package_validations").select("*").eq("id", j.validation_id).single();
+    const r = row as { status: string; verdict: string; report: { integrity?: { collisions?: Array<{ courseId: string }> } } };
+    expect(r.status, "the row stays pending (an override can still target it)").toBe("pending");
+    if (await has0098()) {
+      expect(body.validation_id).toBe(j.validation_id);
+      expect(r.verdict).toBe("blocked");
+      expect((r.report.integrity?.collisions ?? []).map((c) => c.courseId)).toEqual([otherCourse]);
+    } else {
+      expect(body.validation_id).toBeNull();
+      test.info().annotations.push({ type: "note", description: `the row cannot be marked blocked until 0098 (${NEEDS_0098})` });
+    }
   });
 
 
@@ -239,9 +295,8 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
   // ---- needs 0098: rows with verdict 'blocked' and the override columns ----
   test("a blocked row without an override is still refused (multipart re-POST; the direct gate is covered above)", async () => {
     test.skip(!(await has0098()), NEEDS_0098);
-    const zip = await cmi5Zip({ courseId: X_ID, title: "QA Integrity X copy" });
-    // multipart re-POST of the inline-blocked row, no override
-    const again = await uploadNew(s.adminCtx!.request, s.org!.slug, "c.zip", zip, { validation_id: s.inlineBlockedId! });
+    // multipart re-POST of the inline-blocked row (the same bytes), no override
+    const again = await uploadNew(s.adminCtx!.request, s.org!.slug, "c.zip", s.inlineZip!, { validation_id: s.inlineBlockedId! });
     expect(again.status(), await again.text()).toBe(409);
     expect((await again.json()).validation_id).toBe(s.inlineBlockedId);
   });
@@ -259,10 +314,22 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
       .eq("id", s.inlineBlockedId!)
       .single();
     expect(row).toMatchObject({ status: "pending", verdict: "blocked", override_reason: reason, overridden_by: s.owner!.id });
-    expect((row as { overridden_at: string | null }).overridden_at).toBeTruthy();
+    const firstOverrideAt = (row as { overridden_at: string | null }).overridden_at;
+    expect(firstOverrideAt).toBeTruthy();
 
-    // A second override of the same row is refused (only pending + blocked rows).
-    const zip = await cmi5Zip({ courseId: X_ID, title: "QA Integrity X copy" });
+    // A second override of the same block is refused and changes nothing.
+    const again = await s.ownerCtx!.request.post("/api/courses/validate-package", {
+      data: { action: "override", orgSlug: s.org!.slug, validation_id: s.inlineBlockedId, override_reason: "QA: second reason" },
+    });
+    expect(again.status(), await again.text()).toBe(409);
+    const { data: row2 } = await svc()
+      .from("package_validations")
+      .select("override_reason, overridden_at")
+      .eq("id", s.inlineBlockedId!)
+      .single();
+    expect(row2).toEqual({ override_reason: reason, overridden_at: firstOverrideAt });
+
+    const zip = s.inlineZip!;
     const up = await uploadNew(s.adminCtx!.request, s.org!.slug, "c.zip", zip, { validation_id: s.inlineBlockedId! });
     expect(up.status(), await up.text()).toBe(200);
     const courseId = (await up.json()).courseId as string;
@@ -282,8 +349,10 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
 
     const page = await s.adminCtx!.request.get(`/${s.org!.slug}/attention`);
     expect(page.ok()).toBeTruthy();
-    const html = await page.text();
+    // Text nodes escape quotes as &quot;, the RSC payload as \".
+    const html = (await page.text()).replace(/&quot;/g, '"').replace(/\\"/g, '"');
     expect(html).toContain("Integrity block overridden");
-    expect(html).toContain(X_TITLE);
+    expect(html, "the item names the colliding course").toContain(`Matched "${X_TITLE}"`);
+    expect(html, "the item names the overriding super owner").toContain("Integ Owner");
   });
 });
