@@ -108,6 +108,23 @@ export function storedIdentity(md: {
   };
 }
 
+/**
+ * What a stored identity shares with the incoming package (the collision
+ * rule of ADR 0004 steps 3 and 5): the same normalised course id, unless
+ * either side is the untitled KIVO id (that id never collides); and/or the
+ * same normalised title (the title rule applies to untitled exports too).
+ */
+export function matchedOn(incoming: PackageIdentity, other: PackageIdentity): Array<"id" | "title"> {
+  const id = normalizeIdentityId(incoming.kivoCourseId);
+  const idForMatch = id === UNTITLED_KIVO_ID ? null : id;
+  const title = normalizeTitle(incoming.title);
+  const otherId = normalizeIdentityId(other.kivoCourseId);
+  const out: Array<"id" | "title"> = [];
+  if (idForMatch && otherId && otherId !== UNTITLED_KIVO_ID && otherId === idForMatch) out.push("id");
+  if (title && normalizeTitle(other.title) === title) out.push("title");
+  return out;
+}
+
 type VersionIdentityRow = {
   id: string;
   course_id: string;
@@ -159,21 +176,18 @@ export async function checkIntegrity(
       const rows = (data ?? []) as unknown as VersionIdentityRow[];
       for (const r of rows) {
         const other = storedIdentity({ identity: r.identity, title: r.mtitle, rawCourseId: r.raw_course_id });
-        const otherId = normalizeIdentityId(other.kivoCourseId);
-        const matchedOn: Array<"id" | "title"> = [];
-        if (idForMatch && otherId && otherId !== UNTITLED_KIVO_ID && otherId === idForMatch) matchedOn.push("id");
-        if (title && normalizeTitle(other.title) === title) matchedOn.push("title");
-        if (matchedOn.length === 0) continue;
+        const matched = matchedOn(args.identity, other);
+        if (matched.length === 0) continue;
         const course = Array.isArray(r.courses) ? r.courses[0] : r.courses;
         const prev = collisions.get(r.course_id);
         if (prev) {
-          for (const m of matchedOn) if (!prev.matchedOn.includes(m)) prev.matchedOn.push(m);
+          for (const m of matched) if (!prev.matchedOn.includes(m)) prev.matchedOn.push(m);
         } else {
           collisions.set(r.course_id, {
             courseId: r.course_id,
             courseTitle: course?.title ?? null,
             versionId: r.id,
-            matchedOn,
+            matchedOn: matched,
           });
         }
       }
