@@ -57,24 +57,43 @@ eq("raw profile → skipped", derivedStatementsSkip(cfg({ statement_profile: "ra
 eq("enabled ambak-v1 → queued", derivedStatementsSkip(cfg()), null);
 
 // ---- fake Supabase client --------------------------------------------------
+// Answers by table name and honours .eq / .neq / .in on top-level columns
+// (embedded "a.b" filters and columns a row does not carry are ignored), so a
+// read returns only the ids it asked for. Every .in() list length is recorded.
 type Upsert = { table: string; rows: Array<Record<string, unknown>>; opts: unknown };
 function fakeDb(tables: Record<string, unknown[]>, opts: { failUpsert?: boolean; failRead?: string } = {}) {
   const upserts: Upsert[] = [];
+  const inLists: Array<{ table: string; col: string; n: number }> = [];
   const from = (table: string) => {
     let single = false;
     let result: unknown = null;
+    const preds: Array<(r: Record<string, unknown>) => boolean> = [];
+    const onCol = (col: string, test: (v: unknown) => boolean) => {
+      if (col.includes(".")) return;
+      preds.push((r) => !(col in r) || test(r[col]));
+    };
     const builder: Record<string | symbol, unknown> = {};
     const proxy: unknown = new Proxy(builder, {
       get(_t, prop) {
         if (prop === "then") {
+          const rows = ((tables[table] ?? []) as Array<Record<string, unknown>>).filter((r) => preds.every((p) => p(r)));
           const value =
             result ??
             (opts.failRead === table
               ? { data: null, error: { message: "boom", code: "XX000" } }
-              : { data: single ? (tables[table] ?? [])[0] ?? null : tables[table] ?? [], error: null });
+              : { data: single ? rows[0] ?? null : rows, error: null });
           return (res: (v: unknown) => unknown, rej: (e: unknown) => unknown) => Promise.resolve(value).then(res, rej);
         }
         if (prop === "maybeSingle" || prop === "single") return () => ((single = true), proxy);
+        if (prop === "eq") return (col: string, v: unknown) => (onCol(col, (x) => x === v), proxy);
+        if (prop === "neq") return (col: string, v: unknown) => (onCol(col, (x) => x !== v), proxy);
+        if (prop === "in") {
+          return (col: string, list: unknown[]) => {
+            inLists.push({ table, col, n: list.length });
+            onCol(col, (x) => list.includes(x));
+            return proxy;
+          };
+        }
         if (prop === "upsert") {
           return (rows: Array<Record<string, unknown>>, o: unknown) => {
             if (opts.failUpsert) throw new Error("outbox down");
@@ -88,12 +107,12 @@ function fakeDb(tables: Record<string, unknown[]>, opts: { failUpsert?: boolean;
     });
     return proxy;
   };
-  return { db: { from } as unknown as SupabaseClient, upserts };
+  return { db: { from } as unknown as SupabaseClient, upserts, inLists };
 }
 
-const attemptRow = (status: string) => ({
-  id: ATTEMPT,
-  user_id: USER,
+const attemptRow = (status: string, id = ATTEMPT, user = USER) => ({
+  id,
+  user_id: user,
   organization_id: ORG,
   course_version_id: VERSION,
   learning_path_id: null,
@@ -148,6 +167,50 @@ async function main() {
     eq("sweeper builds the abandoned statement", !!ab, true);
     eq("sweeper id = live id", ab?.id, row.statement_id);
     eq("sweeper payload = live payload", ab, payload);
+  }
+
+  console.log("\na large batch: sliced, every attempt queued");
+  {
+    const hex = (n: number) => n.toString(16).padStart(12, "0");
+    const ids = Array.from({ length: 320 }, (_, n) => `00000000-0000-4000-8000-${hex(n + 1)}`);
+    const users = Array.from({ length: 320 }, (_, n) => `00000000-0000-4000-9000-${hex(n + 1)}`);
+    const live = fakeDb({ course_attempts: ids.map((id, n) => attemptRow("abandoned", id, users[n])), tenant_lrs_config: [cfg()] });
+    await enqueueAbandonedStatements(live.db, ids);
+    eq("no .in() list is longer than 150 ids", Math.max(0, ...live.inLists.map((l) => l.n)) <= 150, true);
+    const queued = live.upserts.filter((u) => u.table === "lrs_forward_outbox").flatMap((u) => u.rows);
+    eq("every attempt reaches the outbox once", queued.length, ids.length);
+    eq("no attempt missing", new Set(queued.map((r) => r.attempt_id)).size, ids.length);
+    eq(
+      "each with the sweeper's statement id",
+      queued.every((r) => r.statement_id === abandonedStatementId(String(r.attempt_id))),
+      true
+    );
+  }
+
+  console.log("\nmore than 3 attempts: the learners' groups stay on the statement (= the sweeper)");
+  {
+    const GROUP = "55555555-6666-4777-8888-999999999999";
+    const ids = [1, 2, 3, 4].map((n) => `00000000-0000-4000-8000-00000000000${n}`);
+    const users = [1, 2, 3, 4].map((n) => `00000000-0000-4000-9000-00000000000${n}`);
+    const tables = {
+      course_attempts: ids.map((id, n) => attemptRow("abandoned", id, users[n])),
+      tenant_lrs_config: [cfg()],
+      org_groups: [{ id: GROUP, organization_id: ORG, group_type: "static", rules: null, is_active: true, name: "QA Group" }],
+      org_group_members: users.map((u) => ({ group_id: GROUP, user_id: u })),
+    };
+    const live = fakeDb(tables);
+    await enqueueAbandonedStatements(live.db, ids);
+    const queued = live.upserts.filter((u) => u.table === "lrs_forward_outbox").flatMap((u) => u.rows);
+    eq("four statements queued", queued.length, 4);
+    eq("each carries the learner's group", queued.every((r) => JSON.stringify(r.payload).includes("QA Group")), true);
+    const sweep = await runSource(fakeDb(tables).db, "attempts", ORG);
+    const byId = new Map(sweep.statements.filter((st) => st.verb?.id === verb.abandoned).map((st) => [st.id, st]));
+    eq("the sweeper builds all four", byId.size, 4);
+    eq(
+      "sweeper payload = live payload for each",
+      queued.every((r) => JSON.stringify(byId.get(String(r.statement_id))) === JSON.stringify(r.payload)),
+      true
+    );
   }
 
   console.log("\nonly abandoned rows, only gated orgs");
