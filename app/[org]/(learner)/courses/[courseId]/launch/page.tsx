@@ -207,6 +207,26 @@ export default async function LaunchPage({
     );
   }
 
+  // Language packages (ADR 0008 step 13), read BEFORE the attempt rule below:
+  // a launch with every language hidden goes back to the course page before
+  // a granted retake resets anything. A failed read goes back too, never to
+  // the course-default fallback (which may be a hidden language's version).
+  const { data: pkgRows, error: pkgErr } = await supabase
+    .from("course_packages")
+    .select("id, language, display_name, current_version_id, is_active")
+    .eq("course_id", courseId);
+  if (pkgErr) {
+    console.warn("[launch] package read failed:", pkgErr.message);
+    redirect(`/${orgSlug}/courses/${courseId}`);
+  }
+  const allPackages = (pkgRows ?? []) as PackageRow[];
+  const activePackages = allPackages.filter((p) => p.is_active);
+  const fallback = launchFallback({ packageCount: allPackages.length, activeCount: activePackages.length });
+  if (fallback === "redirect") {
+    // Every language is hidden from learners: nothing to launch.
+    redirect(`/${orgSlug}/courses/${courseId}`);
+  }
+
   // 0073/0081 attempt rule, evaluated across ALL versions/languages of the
   // course so a language switch or a new version can't reopen the window:
   //   - window used + rule says "block"    → no further launches
@@ -297,27 +317,16 @@ export default async function LaunchPage({
   //   4. otherwise render the picker (early return)
   //   5. legacy fallback to course.current_version_id only when the course
   //      has NO package rows at all; packages exist but none is active →
-  //      back to the course page (ADR 0008 step 13). The course default
-  //      never chooses a learner's language.
+  //      back to the course page (ADR 0008 step 13, checked above, before
+  //      the attempt rule). The course default never chooses a learner's
+  //      language.
   // ---------------------------------------------------------------
-  const { data: pkgRows } = await supabase
-    .from("course_packages")
-    .select("id, language, display_name, current_version_id, is_active")
-    .eq("course_id", courseId);
-  const allPackages = (pkgRows ?? []) as PackageRow[];
-  const activePackages = allPackages.filter((p) => p.is_active);
-
   let resolvedVersionId: string | null = null;
   let chosenPackageId: string | null = null;
   // How the package was chosen (ADR 0004 step 9): an explicit ?lang= (the
   // picker navigates there too), the saved preference, or the only active one.
   let slotSource: SlotSource = "single";
 
-  const fallback = launchFallback({ packageCount: allPackages.length, activeCount: activePackages.length });
-  if (fallback === "redirect") {
-    // Every language is hidden from learners: nothing to launch.
-    redirect(`/${orgSlug}/courses/${courseId}`);
-  }
   if (fallback === "legacy") {
     // Legacy path: no packages at all — fall back to course.current_version_id
     resolvedVersionId = c.current_version_id;
