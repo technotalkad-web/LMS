@@ -324,6 +324,14 @@ test("direct upload: an unfinished upload never becomes current; abort keeps a f
   // finished ('ready') uploads are servable (ALDS step 0, P1).
   expect((await learnerCtx.request.get(`/${w.org.slug}/courses/${j.courseId}/content/v/${j.versionId}/tincan.xml`)).status()).toBe(404);
 
+  // The same package for another (new) course: v1, still uploading, holds
+  // its identity, so that validation is blocked (ADR 0004)…
+  const verdictElsewhere = async () => {
+    const r = await req.post("/api/courses/validate-package", { multipart: { orgSlug: w.org.slug, file: zipFile("xapi.zip", zipBuf) } });
+    return ((await r.json()) as { report?: { verdict?: string } }).report?.verdict;
+  };
+  expect(await verdictElsewhere()).toBe("blocked");
+
   // --- Abort v1 (ADR 0008 D1): the row stays as 'failed', its files go.
   let versions = await versionsOf(j.courseId);
   expect(await keysUnder(versions[0]), "the manifest PUT landed").toHaveLength(1);
@@ -332,6 +340,8 @@ test("direct upload: an unfinished upload never becomes current; abort keeps a f
   versions = await versionsOf(j.courseId);
   expect(versions.map((v) => [v.version_number, v.upload_status, v.size_bytes])).toEqual([[1, "failed", 0]]);
   expect(await keysUnder(versions[0]), "v1's folder is empty").toEqual([]);
+  // …but a failed row holds no content, so it is never a collision.
+  expect(await verdictElsewhere()).not.toBe("blocked");
   // A failed row is not uploading: no more signing or finalising…
   const finFailed = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId } });
   expect(finFailed.status()).toBe(409);
