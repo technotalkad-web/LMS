@@ -156,6 +156,21 @@ export async function POST(request: NextRequest) {
     typeof notifyRaw === "string" &&
     (notifyRaw === "1" || notifyRaw === "true" || notifyRaw === "on");
 
+  // ADR 0004 step 4: the existing slot this upload lands in (read-only,
+  // mirrors resolveTargetPackage) for the same-slot warning.
+  let slotId: string | null = packageId ?? null;
+  if (!slotId && courseId) {
+    const { data: pkgs } = await supabase
+      .from("course_packages")
+      .select("id, language")
+      .eq("course_id", courseId);
+    const rows = (pkgs ?? []) as Array<{ id: string; language: string | null }>;
+    const slot = language
+      ? rows.find((r) => r.language === language)
+      : rows.find((r) => r.language === null) ?? (rows.length === 1 ? rows[0] : undefined);
+    slotId = slot?.id ?? null;
+  }
+
   // Pre-Upload Package Validation gate (0070): phase-2 acceptance of a
   // validated report, or inline validation for direct API callers.
   const validationIdRaw = form.get("validation_id");
@@ -169,9 +184,15 @@ export async function POST(request: NextRequest) {
     validationId:
       typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
     acknowledge: form.get("acknowledge") === "1",
+    packageId: slotId,
   });
   if (!gate.ok) {
-    return NextResponse.json({ error: gate.error }, { status: gate.status });
+    // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id
+    // a super_owner override can target.
+    return NextResponse.json(
+      { error: gate.error, ...(gate.validationId !== undefined ? { validation_id: gate.validationId } : {}) },
+      { status: gate.status }
+    );
   }
 
   let result: Awaited<ReturnType<typeof uploadCoursePackage>>;

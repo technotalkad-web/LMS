@@ -195,7 +195,12 @@ export async function POST(
     acknowledge: form.get("acknowledge") === "1",
   });
   if (!gate.ok) {
-    return NextResponse.json({ error: gate.error }, { status: gate.status });
+    // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id
+    // a super_owner override can target.
+    return NextResponse.json(
+      { error: gate.error, ...(gate.validationId !== undefined ? { validation_id: gate.validationId } : {}) },
+      { status: gate.status }
+    );
   }
 
   // ---- Create the new package ----

@@ -320,7 +320,7 @@ function ReplacePackageDialog({
       return;
     }
     setUnzippedPkg(unzipped);
-    const v = await validateUnzipped(unzipped, orgSlug);
+    const v = await validateUnzipped(unzipped, orgSlug, { courseId, packageId: pkg.id });
     setBusy(false);
     if (!v.ok) {
       setError(v.error);
@@ -387,6 +387,7 @@ function ReplacePackageDialog({
               busy={busy}
               onAccept={doUpload}
               onReject={rejectPackage}
+              orgSlug={orgSlug}
             />
             {error && (
               <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">
@@ -520,7 +521,7 @@ function AddLanguageDialog({
       return;
     }
     setPkg(unzipped);
-    const v = await validateUnzipped(unzipped, orgSlug);
+    const v = await validateUnzipped(unzipped, orgSlug, { courseId });
     setBusy(false);
     if (!v.ok) {
       setError(v.error);
@@ -587,6 +588,7 @@ function AddLanguageDialog({
               busy={busy}
               onAccept={doUpload}
               onReject={rejectPackage}
+              orgSlug={orgSlug}
             />
             {error && (
               <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">

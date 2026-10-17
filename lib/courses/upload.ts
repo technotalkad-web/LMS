@@ -5,6 +5,7 @@ import { activeStorageDriver, getStorage } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ParsedManifest } from "./manifest/types";
+import { packageIdentity, type PackageIdentity } from "./validation/integrity";
 
 export interface UploadResult {
   courseId: string;
@@ -126,8 +127,11 @@ export async function uploadCoursePackage(opts: {
     // 0075: learning-unit count (screens) for progress %. Single-file engines
     // embed their slide list in the launch HTML; null = no usable signal.
     const unitCount = await countUnitsInZip(zip, manifest.launchUrl);
+    // ADR 0004 step 2: new versions persist the identity the integrity
+    // lookup matches on (manifest ids + the launch file's KIVO activity id).
+    const identity = packageIdentity(manifest, await launchHtmlFromZip(zip, manifest.launchUrl));
     await markVersionReady(svc, version.id, {
-      manifest_data: manifestData(manifest, unitCount),
+      manifest_data: manifestData(manifest, unitCount, identity),
       file_count: files.length,
     });
   } catch (e) {
@@ -160,14 +164,40 @@ export function storagePrefixFor(courseId: string, packageId: string, versionNum
   return `courses/${courseId}/${packageId}/v${versionNumber}/`;
 }
 
-export function manifestData(manifest: ParsedManifest, unitCount: number | null) {
+export function manifestData(
+  manifest: ParsedManifest,
+  unitCount: number | null,
+  identity?: PackageIdentity
+) {
   return {
     title: manifest.title,
     description: manifest.description ?? null,
     masteryScore: manifest.masteryScore ?? null,
     raw: manifest.raw,
     unitCount,
+    ...(identity ? { identity } : {}),
   };
+}
+
+/** The launch file's text from a package zip (≤ 16 MB), for the identity check. */
+async function launchHtmlFromZip(
+  zip: Awaited<ReturnType<typeof parseManifestFromZip>>["zip"],
+  launchUrl: string
+): Promise<string | null> {
+  const target = launchUrl.replace(/^\/+/, "").split("?")[0].split("#")[0].toLowerCase();
+  if (!/\.html?$/.test(target)) return null;
+  const path = Object.keys(zip.files).find((p) => {
+    if (zip.files[p].dir) return false;
+    const lower = p.toLowerCase();
+    return lower === target || lower.endsWith(`/${target}`);
+  });
+  if (!path) return null;
+  try {
+    const bytes = await zip.files[path].async("uint8array");
+    return bytes.length <= 16 * 1024 * 1024 ? Buffer.from(bytes).toString("utf8") : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

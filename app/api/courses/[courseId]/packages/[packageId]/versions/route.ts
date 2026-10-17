@@ -119,9 +119,15 @@ export async function POST(
     validationId:
       typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
     acknowledge: form.get("acknowledge") === "1",
+    packageId,
   });
   if (!gate.ok) {
-    return NextResponse.json({ error: gate.error }, { status: gate.status });
+    // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id
+    // a super_owner override can target.
+    return NextResponse.json(
+      { error: gate.error, ...(gate.validationId !== undefined ? { validation_id: gate.validationId } : {}) },
+      { status: gate.status }
+    );
   }
 
   // ---- Upload a new version under this package ----

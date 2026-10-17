@@ -106,7 +106,12 @@ export default function CourseUploadPage() {
       setState({ kind: "error", message: err instanceof Error ? err.message : "Could not open the zip" });
       return;
     }
-    const v = await validateUnzipped(pkg, orgSlug);
+    // The collision lookup excludes the course being uploaded into and
+    // compares against the slot being replaced (ADR 0004 step 2).
+    const v = await validateUnzipped(pkg, orgSlug, {
+      courseId: targetCourseId,
+      packageId: targetCourseId && targetPackageId ? targetPackageId : null,
+    });
     if (!v.ok) {
       setState({ kind: "error", message: v.error });
       return;
@@ -211,6 +216,7 @@ export default function CourseUploadPage() {
           busy={state.uploading}
           onAccept={acceptAndUpload}
           onReject={rejectPackage}
+          orgSlug={orgSlug}
         />
       ) : state.kind === "success" ? (
         <div className="border border-line rounded-lg bg-paper p-8">

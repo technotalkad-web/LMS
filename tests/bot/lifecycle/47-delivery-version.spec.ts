@@ -22,10 +22,19 @@ import { assignCourse, authedContext } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 
-/** scorm12.zip plus a version.txt marker. */
-async function markedZip(marker: string): Promise<Buffer> {
+/**
+ * scorm12.zip plus a version.txt marker. `title` retitles the manifest: a
+ * second COURSE in the same org must not carry the first course's title, or
+ * the content-integrity check (ADR 0004 step 3) blocks it as a wrong-course
+ * upload.
+ */
+async function markedZip(marker: string, title?: string): Promise<Buffer> {
   const zip = await JSZip.loadAsync(fs.readFileSync(path.join(FIXTURES, "scorm12.zip")));
   zip.file("version.txt", marker);
+  if (title) {
+    const manifest = await zip.file("imsmanifest.xml")!.async("string");
+    zip.file("imsmanifest.xml", manifest.replace("<title>QA Bot SCORM 1.2 Course</title>", `<title>${title}</title>`));
+  }
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
@@ -242,7 +251,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
     const up2 = await areq.post("/api/courses/upload", {
       multipart: {
         orgSlug: s.org!.slug,
-        file: { name: "alds47-other.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-OTHER") },
+        file: { name: "alds47-other.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-OTHER", "QA ALDS47 Other Course") },
       },
     });
     expect(up2.ok(), `upload other → ${up2.status()}`).toBeTruthy();
