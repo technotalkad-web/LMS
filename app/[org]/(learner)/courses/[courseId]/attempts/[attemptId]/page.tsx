@@ -132,6 +132,15 @@ export default async function AttemptDetailPage({
       ? new Date(a.completed_at).getTime() - new Date(a.started_at).getTime()
       : null;
 
+  // ADR 0004 step 10: an abandoned attempt is a neutral, terminal "reset",
+  // never "In progress" (same rule and wording as the course page's pill).
+  const isReset = a.status === "abandoned" && a.completion_status !== "completed";
+  const completionLabel = isReset
+    ? "Reset — module updated"
+    : a.completion_status === "completed"
+      ? "Completed"
+      : "In progress";
+
   return (
     <div className="max-w-5xl">
       <Link
@@ -160,8 +169,9 @@ export default async function AttemptDetailPage({
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8 text-sm">
         <Stat
           label="Completion"
-          value={a.completion_status === "completed" ? "Completed" : "In progress"}
+          value={completionLabel}
           tone={a.completion_status === "completed" ? "ink" : "muted"}
+          testId="attempt-completion"
         />
         <Stat
           label="Result"
@@ -320,10 +330,12 @@ function Stat({
   label,
   value,
   tone = "ink",
+  testId,
 }: {
   label: string;
   value: string;
   tone?: "ink" | "muted" | "green" | "red";
+  testId?: string;
 }) {
   const toneCls =
     tone === "green"
@@ -336,7 +348,9 @@ function Stat({
   return (
     <div className="border border-line rounded-lg bg-paper p-4">
       <div className="text-xs text-muted uppercase tracking-wide">{label}</div>
-      <div className={`serif text-2xl mt-1 ${toneCls}`}>{value}</div>
+      <div className={`serif text-2xl mt-1 ${toneCls}`} data-testid={testId}>
+        {value}
+      </div>
     </div>
   );
 }

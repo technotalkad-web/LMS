@@ -19,7 +19,7 @@ import { LanguagesSection, type LanguagePackage } from "./languages-section";
 import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
-import { officialStatuses } from "@/lib/scoring/status";
+import { enrolledStatusSummary, officialStatuses } from "@/lib/scoring/status";
 import { ActivateVersionButton, DiscardUploadButton } from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
@@ -409,25 +409,9 @@ export default async function AdminCourseDetailPage({
     org.id,
     summaryAttempts.map((a) => ({ ...a, course_id: courseId }))
   );
-  const statusByUser = new Map<
-    string,
-    "passed" | "failed" | "completed" | "in_progress"
-  >();
-  for (const v of officialByUser.values()) {
-    if (v.status === "not_started") continue;
-    statusByUser.set(v.user_id, v.status);
-  }
-  const enrSummary = {
-    total: enrolledUserIds.size,
-    completed: Array.from(statusByUser.values()).filter(
-      (s) => s === "completed" || s === "passed"
-    ).length,
-    inProgress: Array.from(statusByUser.values()).filter(
-      (s) => s === "in_progress"
-    ).length,
-    failed: Array.from(statusByUser.values()).filter((s) => s === "failed").length,
-    notStarted: enrolledUserIds.size - statusByUser.size,
-  };
+  // One shared counter with the course Reports tab, so the two never disagree;
+  // a learner whose only attempts were reset reads as not started.
+  const enrSummary = enrolledStatusSummary(enrolledUserIds, officialByUser, courseId);
 
   const initialDetails: CourseDetails = {
     title: c.title,

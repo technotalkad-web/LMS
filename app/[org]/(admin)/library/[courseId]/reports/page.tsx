@@ -4,17 +4,25 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { enrolledStatusSummary, officialStatuses, userCourseKey } from "@/lib/scoring/status";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
 //
+// §4.1 (Enrolled / Completed / In Progress / Not Started) is computed live
+// from the attempts with the official-status rule, through the same counter
+// as the Library course card (enrolledStatusSummary), so the two pages always
+// agree and a learner whose only attempts were reset (abandoned, ADR 0004
+// step 11) reads as not started. mv_course_enrollment_status counts any
+// attempt as a start and is no longer read here (its fix waits for the next
+// migration window).
+//
 // Reads from the materialized views shipped in migration 0031 (#175):
-//   - mv_course_enrollment_status  → §4.1 (Enrolled / Completed / In Progress / Not Started)
 //   - mv_course_performance        → §4.2 (Completion Rate / Passed / Failed / Avg Score / Avg Time / Rating)
 //
-// Both views refresh nightly at 03:30 UTC via /api/cron/refresh-report-views (#176).
+// The views refresh nightly at 03:30 UTC via /api/cron/refresh-report-views (#176).
 // The page surfaces the most recent refreshed_at timestamp so admins know how
-// fresh the numbers are.
+// fresh those numbers are.
 //
 // Granular per-question breakdown (§4.3) is deferred to #179 — a separate tab
 // on this page when shipped.
@@ -30,15 +38,6 @@ type Course = {
   id: string;
   title: string;
   organization_id: string;
-};
-
-type EnrollmentRow = {
-  course_id: string;
-  total_enrolled: number;
-  completed: number;
-  in_progress: number;
-  not_started: number;
-  refreshed_at: string;
 };
 
 type PerformanceRow = {
@@ -90,21 +89,110 @@ export default async function CourseReportsPage({
     { auth: { persistSession: false } }
   );
 
-  // ---- Read the two matviews ----
-  const { data: enrRow } = await svc
-    .from("mv_course_enrollment_status")
-    .select("*")
-    .eq("course_id", c.id)
-    .maybeSingle();
-  const enr = (enrRow as EnrollmentRow | null) ?? {
-    course_id: c.id,
-    total_enrolled: 0,
-    completed: 0,
-    in_progress: 0,
-    not_started: 0,
-    refreshed_at: new Date(0).toISOString(),
-  };
+  // ---- §4.1 Enrollment & status (live) ----
+  // Enrolled = direct, team and org-wide assignments, expanded exactly as the
+  // Library course card does; status = each learner's OFFICIAL attempt
+  // (courseStatus: abandoned attempts never count as a start). Read with the
+  // caller's client, as the Library card does (the page is admin-gated above).
+  // Attempts are read by version and paged, then narrowed to the enrolled
+  // learners, so a large org-wide course stays within the URL and row limits.
+  const PAGE = 1000;
+  const { data: assignmentRows } = await supabase
+    .from("course_assignments")
+    .select("assignee_type, user_id, team_id")
+    .eq("course_id", c.id);
+  const assignments = (assignmentRows ?? []) as Array<{
+    assignee_type: string;
+    user_id: string | null;
+    team_id: string | null;
+  }>;
+  const assignedTeamIds = [
+    ...new Set(
+      assignments
+        .filter((a) => a.assignee_type === "team" && a.team_id)
+        .map((a) => a.team_id as string)
+    ),
+  ];
+  const teamUserIds = new Map<string, Set<string>>();
+  if (assignedTeamIds.length > 0) {
+    const { data: tmRows } = await supabase
+      .from("team_members")
+      .select("team_id, user_id")
+      .in("team_id", assignedTeamIds);
+    for (const r of (tmRows ?? []) as Array<{ team_id: string; user_id: string }>) {
+      const set = teamUserIds.get(r.team_id) ?? new Set<string>();
+      set.add(r.user_id);
+      teamUserIds.set(r.team_id, set);
+    }
+  }
+  const orgMemberIds: string[] = [];
+  if (assignments.some((a) => a.assignee_type === "org")) {
+    for (let from = 0; ; from += PAGE) {
+      const { data } = await supabase
+        .from("organization_members")
+        .select("user_id")
+        .eq("organization_id", org.id)
+        .order("user_id")
+        .range(from, from + PAGE - 1);
+      const rows = (data ?? []) as Array<{ user_id: string }>;
+      for (const r of rows) orgMemberIds.push(r.user_id);
+      if (rows.length < PAGE) break;
+    }
+  }
+  const enrolledUserIds = new Set<string>();
+  for (const a of assignments) {
+    if (a.assignee_type === "user" && a.user_id) enrolledUserIds.add(a.user_id);
+    else if (a.assignee_type === "team" && a.team_id) {
+      for (const uid of teamUserIds.get(a.team_id) ?? []) enrolledUserIds.add(uid);
+    } else if (a.assignee_type === "org") {
+      for (const uid of orgMemberIds) enrolledUserIds.add(uid);
+    }
+  }
 
+  const { data: versionRows } = await supabase
+    .from("course_versions")
+    .select("id")
+    .eq("course_id", c.id);
+  const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+  type EnrollmentAttempt = {
+    id: string;
+    user_id: string;
+    status: string | null;
+    completion_status: string;
+    success_status: string;
+    score: number | null;
+    started_at: string;
+    completed_at: string | null;
+  };
+  const enrolledAttempts: EnrollmentAttempt[] = [];
+  if (enrolledUserIds.size > 0 && versionIds.length > 0) {
+    for (let from = 0; ; from += PAGE) {
+      const { data } = await supabase
+        .from("course_attempts")
+        .select("id, user_id, status, completion_status, success_status, score, started_at, completed_at")
+        .in("course_version_id", versionIds)
+        .order("id")
+        .range(from, from + PAGE - 1);
+      const rows = (data ?? []) as EnrollmentAttempt[];
+      for (const a of rows) if (enrolledUserIds.has(a.user_id)) enrolledAttempts.push(a);
+      if (rows.length < PAGE) break;
+    }
+  }
+  const officialByUser = await officialStatuses(
+    supabase,
+    org.id,
+    enrolledAttempts.map((a) => ({ ...a, course_id: c.id }))
+  );
+  const enr = enrolledStatusSummary(enrolledUserIds, officialByUser, c.id);
+  // "Completed" keeps its meaning: an official result, passed or failed.
+  const enrCompleted = enr.completed + enr.failed;
+  // Not started although they launched once: every attempt was reset.
+  let enrResetOnly = 0;
+  for (const uid of enrolledUserIds) {
+    if (officialByUser.get(userCourseKey(uid, c.id))?.status === "not_started") enrResetOnly++;
+  }
+
+  // ---- Read the performance matview ----
   const { data: perfRow } = await svc
     .from("mv_course_performance")
     .select("*")
@@ -166,11 +254,8 @@ export default async function CourseReportsPage({
     topWrongByInteraction.set(w.interaction_id, list);
   }
 
-  // Use the most recent refresh stamp across the two views (they refresh
-  // together in the cron but reading both makes the staleness display
-  // robust to manual partial refreshes during debug).
-  const lastRefreshed =
-    enr.refreshed_at > perf.refreshed_at ? enr.refreshed_at : perf.refreshed_at;
+  // Refresh stamp of the performance view (the enrollment tiles are live).
+  const lastRefreshed = perf.refreshed_at;
   const refreshedAgo = humanizeAgo(lastRefreshed);
 
   // ---- Derived display values ----
@@ -206,7 +291,8 @@ export default async function CourseReportsPage({
           </div>
         </div>
         <p className="text-xs text-muted mt-1">
-          Numbers refresh nightly at 03:30 UTC ·{" "}
+          Enrollment &amp; status is live · performance and question numbers
+          refresh nightly at 03:30 UTC ·{" "}
           <span title={lastRefreshed}>last refreshed {refreshedAgo}</span>
         </p>
       </div>
@@ -217,22 +303,32 @@ export default async function CourseReportsPage({
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
           <BigStat
             label="Total enrolled"
-            value={enr.total_enrolled.toLocaleString()}
+            value={enr.total.toLocaleString()}
+            testId="enr-total"
           />
           <BigStat
             label="Completed"
-            value={enr.completed.toLocaleString()}
+            value={enrCompleted.toLocaleString()}
             tone="emerald"
+            sub={enr.failed > 0 ? `incl. ${enr.failed.toLocaleString()} failed` : undefined}
+            testId="enr-completed"
           />
           <BigStat
             label="In progress"
-            value={enr.in_progress.toLocaleString()}
+            value={enr.inProgress.toLocaleString()}
             tone="amber"
+            testId="enr-in-progress"
           />
           <BigStat
             label="Not started"
-            value={enr.not_started.toLocaleString()}
+            value={enr.notStarted.toLocaleString()}
             tone="muted"
+            sub={
+              enrResetOnly > 0
+                ? `incl. ${enrResetOnly.toLocaleString()} whose attempts were reset`
+                : undefined
+            }
+            testId="enr-not-started"
           />
         </div>
       </section>
@@ -405,11 +501,13 @@ function BigStat({
   value,
   sub,
   tone = "default",
+  testId,
 }: {
   label: string;
   value: string;
   sub?: string;
   tone?: StatTone;
+  testId?: string;
 }) {
   const toneClass =
     tone === "emerald"
@@ -426,7 +524,9 @@ function BigStat({
       <div className="text-[10px] text-muted uppercase tracking-wide">
         {label}
       </div>
-      <div className={`serif text-3xl mt-1 ${toneClass}`}>{value}</div>
+      <div className={`serif text-3xl mt-1 ${toneClass}`} data-testid={testId}>
+        {value}
+      </div>
       {sub && <div className="text-[11px] text-muted mt-0.5">{sub}</div>}
     </div>
   );

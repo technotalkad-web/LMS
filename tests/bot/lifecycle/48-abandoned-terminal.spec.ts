@@ -7,6 +7,10 @@
  * 410 `{error:"attempt_abandoned"}` and the row is left exactly as it was
  * (stale tabs used to revive abandoned attempts). The abandoning path also
  * expires the attempt's cmi5 launch tokens.
+ *
+ * Approval 2 (owner): a reset attempt is never shown as "In progress" — the
+ * attempt detail page, the admin Reports "Recent attempts" pill and the
+ * Library course Reports tiles (a reset-only learner is Not started).
  */
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
 import fs from "node:fs";
@@ -326,5 +330,52 @@ test.describe.serial("ALDS P4 — abandoned is terminal", () => {
     });
     expect(res.status()).toBe(401);
     await ctx.close();
+  });
+
+  // Approval 2 (owner): a reset attempt is never shown as "In progress".
+  // From here on every attempt of this learner is abandoned (the English
+  // cmi5 and SCORM attempts by the switch, the Hindi cmi5 one by the
+  // force-restart), so the learner is reset-only on both courses.
+  const RESET = "Reset — module updated";
+
+  test("attempt detail page shows the reset, never In progress (learner and admin)", async ({ browser, baseURL }) => {
+    expect((await attempt(s.scormAttempt!)).status).toBe("abandoned");
+    expect((await attempt(s.cmi5Attempt!)).status).toBe("abandoned");
+    const ctx = await authedContext(browser, baseURL!, s.learner!.email, s.learner!.password);
+    const page = await ctx.newPage();
+    await page.goto(`/${s.org!.slug}/courses/${s.scorm!.courseId}/attempts/${s.scormAttempt}`);
+    await expect(page.getByTestId("attempt-completion")).toHaveText(RESET, { timeout: 60_000 });
+    await ctx.close();
+
+    const admin = await s.adminCtx!.newPage();
+    await admin.goto(`/${s.org!.slug}/courses/${s.cmi5!.courseId}/attempts/${s.cmi5Attempt}`);
+    await expect(admin.getByTestId("attempt-completion")).toHaveText(RESET, { timeout: 60_000 });
+    await admin.close();
+  });
+
+  test("admin Reports → Recent attempts shows the Reset pill, never In progress", async () => {
+    const page = await s.adminCtx!.newPage();
+    await page.goto(`/${s.org!.slug}/reports`);
+    const recent = page.locator("#recent");
+    await expect(recent).toBeVisible({ timeout: 60_000 });
+    for (const id of [s.cmi5Attempt!, s.scormAttempt!]) {
+      const row = recent.locator("tr", { has: page.locator(`a[href$="/attempts/${id}"]`) });
+      await expect(row).toContainText(RESET);
+      await expect(row).not.toContainText("In progress");
+    }
+    // Every attempt in this org is abandoned: no amber "In progress" anywhere.
+    await expect(recent).not.toContainText("In progress");
+    await page.close();
+  });
+
+  test("Library course Reports tiles count a reset-only learner as Not started", async () => {
+    const page = await s.adminCtx!.newPage();
+    await page.goto(`/${s.org!.slug}/library/${s.scorm!.courseId}/reports`);
+    await expect(page.getByTestId("enr-total")).toHaveText("1", { timeout: 60_000 });
+    await expect(page.getByTestId("enr-in-progress")).toHaveText("0");
+    await expect(page.getByTestId("enr-not-started")).toHaveText("1");
+    await expect(page.getByTestId("enr-completed")).toHaveText("0");
+    await expect(page.getByText("incl. 1 whose attempts were reset")).toBeVisible();
+    await page.close();
   });
 });

@@ -2,7 +2,7 @@ import Link from "next/link";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { officialStatuses, countsByCourse, hasOfficialResult, EMPTY_STATUS_COUNTS } from "@/lib/scoring/status";
+import { officialStatuses, countsByCourse, hasOfficialResult, EMPTY_STATUS_COUNTS, attemptCounts, excludeAbandoned } from "@/lib/scoring/status";
 import { canViewReports } from "@/lib/auth/permissions";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
@@ -73,7 +73,10 @@ type TeamLink = { team_id: string; user_id: string };
 interface CourseRow {
   course: Course;
   standard: string;
+  /** Attempts that were not reset (ADR 0004 step 11). */
   attempts: number;
+  /** Reset (abandoned) attempts, shown as "· N reset". */
+  resetAttempts: number;
   learners: number;
   completed: number;
   passed: number;
@@ -98,7 +101,10 @@ interface TeamSummary {
   team_id: string;
   team_name: string;
   members: number;
+  /** Attempts that were not reset (ADR 0004 step 11). */
   attempts: number;
+  /** Reset (abandoned) attempts, shown as "· N reset". */
+  resetAttempts: number;
   learnersActive: number;
   completed: number;
   passed: number;
@@ -278,7 +284,12 @@ export default async function ReportsPage({
     })
   );
   const officialCounts = countsByCourse(officialByPair);
-  const officialPairs = [...officialByPair.values()];
+  // ADR 0004 step 11: a pair whose only attempts were reset is not started,
+  // so it never enters the "attempted" denominators of the completion rates.
+  const officialPairs = [...officialByPair.values()].filter((v) => v.status !== "not_started");
+  // Activity (learners, last activity, attempt counts) comes from the attempts
+  // that were not reset; reset ones are shown as a "· N reset" suffix.
+  const liveAttempts = excludeAbandoned(attempts);
 
   const rows: CourseRow[] = courses.map((c) => {
     const courseVersions = versionsByCourse.get(c.id) ?? [];
@@ -313,8 +324,10 @@ export default async function ReportsPage({
       openWithProgress.length === 0
         ? null
         : Math.round(openWithProgress.reduce((s, a) => s + (a.progress_pct ?? 0), 0) / openWithProgress.length);
+    const myLive = excludeAbandoned(myAttempts);
+    const myCounts = attemptCounts(myAttempts);
     const lastActivity =
-      myAttempts
+      myLive
         .map((a) => a.completed_at ?? a.started_at)
         .filter((x): x is string => !!x)
         .sort()
@@ -327,8 +340,9 @@ export default async function ReportsPage({
     return {
       course: c,
       standard: currentVersion?.manifest_type ?? "-",
-      attempts: myAttempts.length,
-      learners: new Set(myAttempts.map((a) => a.user_id)).size,
+      attempts: myCounts.live,
+      resetAttempts: myCounts.reset,
+      learners: new Set(myLive.map((a) => a.user_id)).size,
       completed,
       passed,
       failed,
@@ -392,18 +406,20 @@ export default async function ReportsPage({
   const teamSummaries: TeamSummary[] = teams.map((t) => {
     const memberSet = teamUserIds.get(t.id) ?? new Set<string>();
     const teamAttempts = attempts.filter((a) => memberSet.has(a.user_id));
+    const teamCounts = attemptCounts(teamAttempts);
     // Learner×course results under the OFFICIAL rule (decision 1): one unit
     // for completed / passed, and a rate over the pairs the team attempted.
     const teamPairs = officialPairs.filter((v) => memberSet.has(v.user_id));
     const completed = teamPairs.filter((v) => hasOfficialResult(v.status)).length;
     const passed = teamPairs.filter((v) => v.status === "passed").length;
-    const learnersActive = new Set(teamAttempts.map((a) => a.user_id)).size;
+    const learnersActive = new Set(excludeAbandoned(teamAttempts).map((a) => a.user_id)).size;
     const completionRate = teamPairs.length === 0 ? 0 : completed / teamPairs.length;
     return {
       team_id: t.id,
       team_name: t.name,
       members: memberSet.size,
-      attempts: teamAttempts.length,
+      attempts: teamCounts.live,
+      resetAttempts: teamCounts.reset,
       learnersActive,
       completed,
       passed,
@@ -414,8 +430,9 @@ export default async function ReportsPage({
   const totals = {
     courses: courses.length,
     coursesWithActivity: rows.filter((r) => r.attempts > 0).length,
-    attempts: attempts.length,
-    learnersWithActivity: new Set(attempts.map((a) => a.user_id)).size,
+    attempts: liveAttempts.length,
+    resetAttempts: attempts.length - liveAttempts.length,
+    learnersWithActivity: new Set(liveAttempts.map((a) => a.user_id)).size,
     totalUsers: members.length,
     // Learner×course results under the OFFICIAL rule (decision 1).
     completed: officialPairs.filter((v) => hasOfficialResult(v.status)).length,
@@ -588,7 +605,11 @@ export default async function ReportsPage({
           label="Active courses"
           value={`${totals.coursesWithActivity} / ${totals.courses}`}
         />
-        <KpiCard label="Attempts" value={totals.attempts} />
+        <KpiCard
+          label="Attempts"
+          value={totals.attempts}
+          trend={totals.resetAttempts > 0 ? `+ ${totals.resetAttempts} reset` : undefined}
+        />
         <KpiCard label="Completion rate" value={fmtPct(completionRate)} />
       </div>
 
@@ -715,7 +736,10 @@ export default async function ReportsPage({
                       </Link>
                     </td>
                     <td className="px-4 py-3 text-xs text-muted">{r.standard}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{r.attempts}</td>
+                    <td className="px-4 py-3 text-right tabular-nums whitespace-nowrap">
+                      {r.attempts}
+                      <ResetSuffix n={r.resetAttempts} />
+                    </td>
                     <td className="px-4 py-3 text-right tabular-nums">{r.learners}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{r.completed}</td>
                     <td className="px-4 py-3 text-right tabular-nums text-emerald-700">
@@ -789,7 +813,10 @@ export default async function ReportsPage({
                   <tr key={t.team_id} className="hover:bg-canvas/50">
                     <td className="px-4 py-3">{t.team_name}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{t.members}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{t.attempts}</td>
+                    <td className="px-4 py-3 text-right tabular-nums whitespace-nowrap">
+                      {t.attempts}
+                      <ResetSuffix n={t.resetAttempts} />
+                    </td>
                     <td className="px-4 py-3 text-right tabular-nums">
                       {t.learnersActive}
                     </td>
@@ -878,6 +905,7 @@ export default async function ReportsPage({
                         <ResultPill
                           completion={a.completion_status}
                           success={a.success_status}
+                          status={a.status}
                         />
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
@@ -907,9 +935,11 @@ export default async function ReportsPage({
 function ResultPill({
   completion,
   success,
+  status,
 }: {
   completion: "in_progress" | "completed";
   success: "unknown" | "passed" | "failed";
+  status: string | null;
 }) {
   if (success === "passed") {
     return <StatusPill tone="success">Passed</StatusPill>;
@@ -920,7 +950,25 @@ function ResultPill({
   if (completion === "completed") {
     return <StatusPill tone="neutral">Completed</StatusPill>;
   }
+  // ADR 0004 step 10: an abandoned attempt is a neutral, terminal "reset",
+  // never "In progress" (same wording as the learner course page).
+  if (status === "abandoned") {
+    return <StatusPill tone="neutral">Reset — module updated</StatusPill>;
+  }
   return <StatusPill tone="warning">In progress</StatusPill>;
+}
+
+/** "· N reset" after an attempt count (ADR 0004 step 11); nothing when N = 0. */
+function ResetSuffix({ n }: { n: number }) {
+  if (n <= 0) return null;
+  return (
+    <span
+      className="text-muted text-xs"
+      title="Attempts reset by a module update or language switch: never in progress, never official"
+    >
+      {" "}· {n} reset
+    </span>
+  );
 }
 
 function fmtPct(n: number): string {
