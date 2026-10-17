@@ -12,6 +12,10 @@
  *    uploads, moves or deletes anything in Supabase.
  *  - B2: writes only under  storage-snapshots/<env>/<stamp>/  and never deletes. Re-runs
  *    with --resume skip objects already present with the same size.
+ *  - B2 cost: existence checks and verification use paged bucket listings (Class C, 1,000 keys
+ *    per call), not one HEAD per object (Class B). The free tier allows 2,500 Class B calls a
+ *    day, fewer than one snapshot has objects; per-object HEADs are only a fallback when the
+ *    endpoint cannot list. Only the three-object restore drill downloads (Class B).
  *  - Refuses to run unless SUPABASE_URL belongs to the project named by SNAPSHOT_ENV.
  *  - Never prints keys.
  *
@@ -36,7 +40,7 @@
  *   summary.json             counts, bytes, errors, versions with no stored files, B2 verification
  */
 import { createClient } from "@supabase/supabase-js";
-import { S3Client, PutObjectCommand, HeadObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, HeadObjectCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -49,13 +53,24 @@ const args = process.argv.slice(2);
 const flag = (k) => args.includes(k);
 const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : undefined; };
 
-function fail(msg) { console.error(`\nSTOP: ${msg}`); process.exit(1); }
+// No process.exit(): on Windows, Node 24 can abort with a libuv assertion (UV_HANDLE_CLOSING)
+// when it exits while HTTP keep-alive sockets close. A STOP throws; the handler prints it and sets
+// the exit code, and the process ends on its own.
+class Stop extends Error {}
+process.on("uncaughtException", (e) => {
+  console.error(e instanceof Stop ? `\nSTOP: ${e.message}` : `\nSTOP: unexpected error: ${e?.stack ?? e}`);
+  process.exitCode = 1;
+});
+function fail(msg) { throw new Stop(msg); }
+// Backblaze refuses calls above the account's daily cap (Caps & Alerts) with "... cap exceeded".
+const isCapError = (e) => /cap exceeded/i.test(String(e?.message ?? e));
+const CAP_HELP = "Backblaze daily free limit reached (B2 > Caps & Alerts). The files on this PC are kept. Re-run after 00:00 UTC with --resume and the same stamp: nothing is downloaded again and only missing files are uploaded.";
 const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function retry(label, fn) {
   let last;
   for (let i = 1; i <= RETRIES; i++) {
-    try { return await fn(); } catch (e) { last = e; if (i < RETRIES) await sleep(1000 * i * i); }
+    try { return await fn(); } catch (e) { last = e; if (isCapError(e)) break; if (i < RETRIES) await sleep(1000 * i * i); }
   }
   throw new Error(`${label}: ${last?.message ?? last}`);
 }
@@ -130,14 +145,28 @@ async function listAll(bucket, prefix = "") {
 }
 
 const objects = [];
+const emptyBuckets = [];
 for (const b of buckets) {
   let list;
   try { list = await listAll(b); }
   catch (e) { fail(`could not list bucket "${b}": ${e.message ?? e}. Check SNAPSHOT_BUCKETS and the key. Nothing was copied.`); }
   console.log(`Listed    ${b}: ${list.length} objects`);
-  if (list.length === 0) fail(`bucket "${b}" listed 0 objects. Either the key has no service rights or the bucket name is wrong (SNAPSHOT_BUCKETS). Nothing was copied.`);
+  if (list.length === 0) {
+    // Storage answers an empty list (no error) both for a missing bucket and for a key without
+    // service rights; the bucket list tells the two apart.
+    const { data: all, error: bErr } = await sb.storage.listBuckets();
+    const names = (all ?? []).map((x) => x.name);
+    if (bErr || names.length === 0) fail(`bucket "${b}" listed 0 objects and no bucket is visible to this key${bErr ? ` (${bErr.message})` : ""}: the key has no service rights. Nothing was copied.`);
+    if (!names.includes(b)) fail(`bucket "${b}" does not exist in this project. Buckets here: ${names.join(", ")}. Set SNAPSHOT_BUCKETS to the right names. Nothing was copied.`);
+    // The key sees the buckets, so this is a genuinely empty bucket (production had no course
+    // packages on 2026-10-17): note it and copy the others. Ready versions without files are
+    // still reported from course_versions below.
+    console.log(`NOTE      bucket "${b}" exists and is empty; nothing to copy from it.`);
+    emptyBuckets.push(b);
+  }
   objects.push(...list);
 }
+if (objects.length === 0) fail(`every bucket is empty (${buckets.join(", ")}): nothing to back up.`);
 
 // ---- 2. download + hash -------------------------------------------------------------------
 const manifestPath = path.join(outDir, "manifest.ndjson");
@@ -194,7 +223,7 @@ const versionsWithoutFiles = buckets.includes("course-content")
   : [];
 const drivers = versions.reduce((m, v) => { const d = v.storage_driver ?? "supabase"; m[d] = (m[d] ?? 0) + 1; return m; }, {});
 
-// ---- 4. copy to B2 + verify (HEAD per object; no bucket listing needed) ---------------------
+// ---- 4. copy to B2 + verify (paged listing; HEAD per object only as a fallback) -------------
 const b2Report = { enabled: b2Wanted };
 const s3 = b2Wanted
   ? new S3Client({ region: b2.region, endpoint: b2.endpoint, forcePathStyle: true, credentials: { accessKeyId: b2.keyId, secretAccessKey: b2.appKey } })
@@ -203,14 +232,36 @@ async function headSize(k) {
   try { return (await s3.send(new HeadObjectCommand({ Bucket: b2.bucket, Key: k }))).ContentLength ?? null; }
   catch (e) { if (e?.$metadata?.httpStatusCode === 404 || e?.name === "NotFound" || e?.name === "NoSuchKey") return null; throw e; }
 }
+// Sizes of the objects already under this snapshot's prefix (key -> size).
+async function b2Sizes(keys) {
+  try {
+    const sizes = new Map();
+    let token;
+    do {
+      const r = await retry("b2 list", () => s3.send(new ListObjectsV2Command({ Bucket: b2.bucket, Prefix: b2Prefix, ContinuationToken: token, MaxKeys: 1000 })));
+      for (const o of r.Contents ?? []) sizes.set(o.Key, o.Size ?? null);
+      token = r.IsTruncated ? r.NextContinuationToken : undefined;
+    } while (token);
+    return sizes;
+  } catch (e) {
+    if (isCapError(e)) throw e;
+    console.log(`B2        listing unavailable (${e.message ?? e}); checking ${keys.length} objects one by one`);
+    const sizes = new Map();
+    await pool(keys, CONCURRENCY, async (k) => { sizes.set(k, await retry(`b2 head ${k}`, () => headSize(k))); });
+    return sizes;
+  }
+}
 if (b2Wanted) {
   try {
     const toUpload = objects.filter((o) => o.sha256);
+    const keyOf = (o) => `${b2Prefix}files/${o.bucket}/${o.key}`;
+    // A fresh stamp is a new prefix, so nothing can be there yet: only --resume checks.
+    const present = opt("--resume") ? await b2Sizes(toUpload.map(keyOf)) : new Map();
     let uploaded = 0, skipped = 0;
     await pool(toUpload, CONCURRENCY, async (o) => {
-      const k = `${b2Prefix}files/${o.bucket}/${o.key}`;
+      const k = keyOf(o);
+      if (present.get(k) === o.size) { skipped++; return; }
       try {
-        if ((await retry(`b2 head ${k}`, () => headSize(k))) === o.size) { skipped++; return; }
         const body = fs.readFileSync(path.join(filesDir, o.bucket, ...o.key.split("/")));
         await retry(`b2 put ${k}`, () => s3.send(new PutObjectCommand({ Bucket: b2.bucket, Key: k, Body: body, ContentType: o.contentType ?? undefined, Metadata: { sha256: o.sha256 } })));
         uploaded++;
@@ -221,17 +272,13 @@ if (b2Wanted) {
       await retry(`b2 put ${f}`, () => s3.send(new PutObjectCommand({ Bucket: b2.bucket, Key: `${b2Prefix}${f}`, Body: fs.readFileSync(path.join(outDir, f)) })));
     }
     // verify: every object present in B2 with the right size, then a restore drill on three objects
-    const missing = [];
-    await pool(toUpload, CONCURRENCY, async (o) => {
-      const k = `${b2Prefix}files/${o.bucket}/${o.key}`;
-      const size = await retry(`b2 verify ${k}`, () => headSize(k)).catch(() => null);
-      if (size !== o.size) missing.push(`${o.bucket}/${o.key}`);
-    });
+    const after = await b2Sizes(toUpload.map(keyOf));
+    const missing = toUpload.filter((o) => after.get(keyOf(o)) !== o.size).map((o) => `${o.bucket}/${o.key}`);
     const sorted = [...toUpload].sort((a, b) => (a.key < b.key ? -1 : 1));
     const drill = [sorted[0], sorted[Math.floor(sorted.length / 2)], sorted[sorted.length - 1]].filter(Boolean);
     const drillResults = [];
     for (const o of drill) {
-      const r = await retry("b2 get", () => s3.send(new GetObjectCommand({ Bucket: b2.bucket, Key: `${b2Prefix}files/${o.bucket}/${o.key}` })));
+      const r = await retry("b2 get", () => s3.send(new GetObjectCommand({ Bucket: b2.bucket, Key: keyOf(o) })));
       const got = sha256(Buffer.from(await r.Body.transformToByteArray()));
       drillResults.push({ key: `${o.bucket}/${o.key}`, ok: got === o.sha256 });
     }
@@ -239,14 +286,15 @@ if (b2Wanted) {
     console.log(`B2        uploaded ${uploaded}, already there ${skipped}, verified ${toUpload.length - missing.length}/${toUpload.length}, drill ${drillResults.length && drillResults.every((d) => d.ok) ? "OK" : "FAILED"}`);
   } catch (e) {
     errors.push({ stage: "b2", error: String(e.message ?? e) });
-    Object.assign(b2Report, { failed: true, missingOrWrongSize: -1, restoreDrill: [] });
+    Object.assign(b2Report, { failed: true, capExceeded: isCapError(e), missingOrWrongSize: -1, restoreDrill: [] });
     console.log(`B2        FAILED: ${e.message ?? e}`);
+    if (isCapError(e)) console.log(`          ${CAP_HELP}`);
   }
 }
 
 // ---- 5. summary -----------------------------------------------------------------------------
 const summary = {
-  status: "finished", env, project: PROJECTS[env], stamp, buckets, local: outDir,
+  status: "finished", env, project: PROJECTS[env], stamp, buckets, emptyBuckets, local: outDir,
   objectsListed: objects.length, objectsSaved: objects.filter((o) => o.sha256).length, bytes,
   versions: versions.length, versionsByDriver: drivers,
   versionsReadyWithoutFiles: versionsWithoutFiles.length, versionsReadyWithoutFilesSample: versionsWithoutFiles.slice(0, 20),
@@ -261,4 +309,4 @@ if (b2Wanted && !b2Report.failed) {
 if (drivers.r2) console.log(`NOTE      ${drivers.r2} version(s) use the R2 driver; their files are not in Supabase Storage and need the R2 backup.`);
 if (versionsWithoutFiles.length) console.log(`NOTE      ${versionsWithoutFiles.length} ready version(s) have no stored files (see summary.json).`);
 console.log(summary.ok ? `\nRESULT    OK — snapshot ${stamp} complete` : `\nRESULT    INCOMPLETE — ${errors.length} error(s); re-run with --resume ${stamp}`);
-process.exit(summary.ok ? 0 : 2);
+process.exitCode = summary.ok ? 0 : 2;
