@@ -51,11 +51,19 @@ export function ChangeLanguageMenu({
   options,
   currentLanguage,
   inProgress = [],
+  initialSwitch = null,
 }: {
   orgSlug: string;
   courseId: string;
   options: ChangeLanguageOption[];
   currentLanguage: string | null;
+  /**
+   * ADR 0004 step 9 (1): the launch page redirected here because the learner
+   * chose this language while progress is open in another one. Opens the
+   * same confirmation as picking it from the menu; nothing changes until the
+   * learner confirms.
+   */
+  initialSwitch?: string | null;
   /**
    * The learner's in-progress attempts on this course, by package language.
    * A switch resets the ones in other languages EXCEPT an extra attempt an
@@ -133,6 +141,16 @@ export function ChangeLanguageMenu({
       window.removeEventListener("keydown", onKey);
     };
   }, [open, computeCoords]);
+
+  // Open the confirm once for a launch-page redirect (?switch=<lang>).
+  const initialSwitchDone = useRef(false);
+  useEffect(() => {
+    if (initialSwitchDone.current || !initialSwitch) return;
+    initialSwitchDone.current = true;
+    const target = options.find((o) => o.language === initialSwitch);
+    if (!target || options.length < 2) return;
+    setConfirmFor({ language: initialSwitch, label: target.display_label });
+  }, [initialSwitch, options]);
 
   if (options.length < 2) return null;
 

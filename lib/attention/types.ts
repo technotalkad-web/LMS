@@ -98,6 +98,26 @@ export const ATTENTION_PROVIDERS: AttentionProviderMeta[] = [
     defaultPriority: "normal",
     configurablePriority: true,
   },
+  {
+    // ADR 0004 step 3a: every admin sees when a super owner pushed a
+    // wrong-course block through, with the reason and the colliding course.
+    type: "integrity-override",
+    label: "Integrity overrides",
+    description: "A super owner overrode a content-integrity block (the module matched another course).",
+    defaultEnabled: true,
+    defaultPriority: "high",
+    configurablePriority: true,
+  },
+  {
+    // ADR 0004 step 8 (decision 5): an uploaded version that is not what
+    // learners get must not sit unnoticed.
+    type: "unpublished-versions",
+    label: "Versions not current",
+    description: "Uploaded versions that are not their language's current version, older than 24 hours.",
+    defaultEnabled: true,
+    defaultPriority: "normal",
+    configurablePriority: true,
+  },
 ];
 
 export type AttentionTypeConfig = { enabled: boolean; priority: AttentionPriority };

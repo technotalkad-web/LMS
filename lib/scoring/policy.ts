@@ -110,7 +110,24 @@ export type ScorableAttempt = {
   completed_at: string | null;
   completion_status?: string | null;
   success_status?: string | null;
+  /** course_attempts.status; 'abandoned' attempts never count (see excludeAbandoned). */
+  status?: string | null;
 };
+
+/**
+ * Blueprint R6, extended by ADR 0004 step 11: an abandoned attempt is never
+ * official AND never in progress. It is terminal history (a reset learner
+ * reads as not started until they launch again). Callers that do not select
+ * `status` are unaffected.
+ */
+export function isAbandonedAttempt(a: object): boolean {
+  return (a as { status?: unknown }).status === "abandoned";
+}
+
+/** The attempts that count for status, scoring and progress (ADR 0004 step 11). */
+export function excludeAbandoned<T extends object>(attempts: T[]): T[] {
+  return attempts.some(isAbandonedAttempt) ? attempts.filter((a) => !isAbandonedAttempt(a)) : attempts;
+}
 
 /** House completion definition (matches the SQL everywhere). */
 export function isCompletedAttempt(a: {
@@ -177,7 +194,9 @@ export function computeScoring(
    */
   extra: number | Iterable<string> = 0
 ): ScoringResult {
-  const completed = attempts
+  // Abandoned is never official (R6); it never completes either, so this
+  // only guards against a mislabelled row.
+  const completed = excludeAbandoned(attempts)
     .filter((a) => isCompletedAttempt(a))
     .sort((a, b) => {
       const ka = ts(a.completed_at ?? a.started_at);
@@ -279,7 +298,8 @@ export type CourseStatus = "not_started" | "in_progress" | "completed" | "passed
  */
 export function courseStatus(scoring: ScoringResult, attempts: ScorableAttempt[]): CourseStatus {
   if (scoring.officialAttempt) return scoring.officialStatus ?? "completed";
-  return attempts.length === 0 ? "not_started" : "in_progress";
+  // ADR 0004 step 11: abandoned is never in progress.
+  return excludeAbandoned(attempts).length === 0 ? "not_started" : "in_progress";
 }
 
 /** Did the official attempt complete the learning (pass required → must have passed)? */

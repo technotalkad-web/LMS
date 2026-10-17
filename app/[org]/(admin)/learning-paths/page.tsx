@@ -209,7 +209,7 @@ export default async function LearningPathsPage({
     ? await supabase
         .from("course_attempts")
         .select(
-          "user_id, course_version_id, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units"
+          "user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units"
         )
         .in("user_id", enrolleeUserIds)
         .in("course_version_id", allVerIds)
@@ -218,6 +218,8 @@ export default async function LearningPathsPage({
   type PAttempt = {
     user_id: string;
     course_version_id: string;
+    /** ADR 0004 step 11: courseProgress() leaves abandoned attempts out. */
+    status: string | null;
     completion_status: string;
     success_status: string;
     started_at: string | null;

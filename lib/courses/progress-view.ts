@@ -13,6 +13,8 @@ export type ProgressAttemptRow = {
   completion_status: string | null;
   success_status: string | null;
   started_at: string | null;
+  /** course_attempts.status: abandoned attempts are skipped (ADR 0004 step 11). */
+  status?: string | null;
   progress_pct?: number | null;
   /** cmi_data->cmi5->units (PostgREST JSON path select) or the full cmi_data. */
   units?: unknown;
@@ -46,9 +48,13 @@ function unitsOf(a: ProgressAttemptRow): Record<string, string> | null {
  * versions. `unitCountByVersion` maps version id → manifest unitCount.
  */
 export function courseProgress(
-  attempts: ProgressAttemptRow[],
+  all: ProgressAttemptRow[],
   unitCountByVersion?: Map<string, number | null>
 ): CourseProgressView {
+  // ADR 0004 step 11: an abandoned attempt is never in progress and never
+  // supplies progress_pct; a learner whose only attempts were reset reads as
+  // not started.
+  const attempts = all.filter((a) => a.status !== "abandoned");
   if (attempts.length === 0) {
     return { pct: null, done: false, started: false, screensDone: null, screensTotal: null };
   }

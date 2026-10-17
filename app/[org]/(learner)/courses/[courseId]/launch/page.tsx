@@ -23,6 +23,7 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
 import { grantRetakeIdsFor, unusedGrantFor } from "@/lib/scoring/attempt-kind";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
+import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
 
 type Course = {
   id: string;
@@ -303,6 +304,9 @@ export default async function LaunchPage({
 
   let resolvedVersionId: string | null = null;
   let chosenPackageId: string | null = null;
+  // How the package was chosen (ADR 0004 step 9): an explicit ?lang= (the
+  // picker navigates there too), the saved preference, or the only active one.
+  let slotSource: SlotSource = "single";
 
   if (activePackages.length === 0) {
     // Legacy path: no packages yet — fall back to course.current_version_id
@@ -316,8 +320,10 @@ export default async function LaunchPage({
     if (langParam && isSupportedLanguage(langParam)) {
       chosen =
         activePackages.find((p) => p.language === langParam) ?? null;
+      if (chosen) slotSource = "explicit";
     }
     if (!chosen) {
+      slotSource = "preference";
       // Look up saved preference.
       const { data: prefRow } = await supabase
         .from("course_language_preferences")
@@ -356,6 +362,63 @@ export default async function LaunchPage({
 
   if (!resolvedVersionId) {
     redirect(`/${orgSlug}/courses/${courseId}`);
+  }
+
+  // OTHER-SLOT HANDLING (ADR 0004 step 9, lib/courses/slot-routing.ts): an
+  // in-progress attempt on ANOTHER language slot of this course. Own-slot
+  // resume wins; an explicit ?lang= goes back to the course page's language
+  // switch confirm (nothing abandoned); a preference / single-slot launch
+  // continues the other slot's attempt; only an attempt on a DEACTIVATED
+  // slot is closed (conditional on status = 'in_progress', tokens expired).
+  // Grant retakes are never touched. Skipped on the legacy no-package path.
+  let deactivatedSlotAttempts: string[] = [];
+  if (chosenPackageId) {
+    const [{ data: allPkgRows }, { data: courseVerRows }] = await Promise.all([
+      supabase.from("course_packages").select("id, is_active").eq("course_id", courseId),
+      supabase.from("course_versions").select("id, package_id").eq("course_id", courseId),
+    ]);
+    const packageOfVersion = new Map(
+      ((courseVerRows ?? []) as Array<{ id: string; package_id: string | null }>)
+        .filter((r) => !!r.package_id)
+        .map((r) => [r.id, r.package_id as string] as [string, string])
+    );
+    const allVersionIds = [...packageOfVersion.keys()];
+    const { data: ipRows } = allVersionIds.length
+      ? await supabase
+          .from("course_attempts")
+          .select("id, course_version_id, started_at, last_activity_at")
+          .eq("user_id", user.id)
+          .in("course_version_id", allVersionIds)
+          .eq("status", "in_progress")
+      : { data: [] };
+    const inProgress = (ipRows ?? []) as SlotAttempt[];
+    const decision = inProgress.length
+      ? decideSlotRouting({
+          source: slotSource,
+          chosenPackageId,
+          packageOfVersion,
+          activePackageIds: new Set(
+            ((allPkgRows ?? []) as Array<{ id: string; is_active: boolean }>).filter((p) => p.is_active).map((p) => p.id)
+          ),
+          inProgress,
+          retakeIds: await grantRetakeIdsFor(supabase, user.id, c.id),
+        })
+      : ({ kind: "continue", abandon: [] } as const);
+
+    if (decision.kind === "confirm-switch") {
+      // (1) Back to the course page, which opens the existing confirm for
+      // this language (a confirmed switch resets the other slot's progress).
+      redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
+    }
+    // (3) is carried out below, only once every launch gate has passed: a
+    // launch that is then refused (no version, prerequisite lock, scheduled
+    // release) closes nothing.
+    deactivatedSlotAttempts = [...decision.abandon];
+    if (decision.kind === "cross-slot") {
+      // (2) Grandfather across slots: run the attempt the learner already has.
+      chosenPackageId = decision.packageId;
+      resolvedVersionId = decision.versionId;
+    }
   }
 
   // GRANDFATHER ROUTING (silent module versioning):
@@ -555,6 +618,48 @@ export default async function LaunchPage({
           redirect(`/${orgSlug}/dashboard?locked=${courseId}`);
         }
       }
+    }
+  }
+
+  if (deactivatedSlotAttempts.length > 0) {
+    // (3) The slot was deactivated by an admin: this attempt can never be
+    // resumed from the picker again. Conditional on in_progress, own rows
+    // only; fail-soft (a failed close leaves it in progress, as before).
+    const svcSlot = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    // Abandoning is irreversible: re-check (4) with an error-checked read
+    // and close nothing if it cannot be read (grantRetakeIdsFor is
+    // fail-soft). A database without attempt_requests (pre-0083) has no grants.
+    const { data: grantRows, error: grantErr } = await svcSlot
+      .from("attempt_requests")
+      .select("used_attempt_id")
+      .in("used_attempt_id", deactivatedSlotAttempts)
+      .eq("status", "approved");
+    const grantMissing = (grantErr as { code?: string } | null)?.code === "42P01";
+    const closable =
+      grantErr && !grantMissing
+        ? []
+        : deactivatedSlotAttempts.filter(
+            (id) => !((grantRows ?? []) as Array<{ used_attempt_id: string | null }>).some((g) => g.used_attempt_id === id)
+          );
+    if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
+    if (closable.length > 0) {
+      const { data: abRows, error: abErr } = await svcSlot
+        .from("course_attempts")
+        .update({ status: "abandoned" })
+        .in("id", closable)
+        .eq("user_id", user.id)
+        .eq("status", "in_progress")
+        .select("id");
+      if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
+      const tokErr = await expireLaunchTokens(
+        svcSlot,
+        ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id)
+      );
+      if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
     }
   }
 

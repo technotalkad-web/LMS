@@ -3,12 +3,24 @@ import { activeStorageDriver, getStorageFor } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import { parseManifestXml } from "./manifest/parse-xml";
+import type { ParsedManifest } from "./manifest/types";
 import { countLearningUnits } from "./units";
 import { linkValidationToVersion } from "./validation/gate";
+import {
+  BLOCKED_UPLOAD_ERROR,
+  applyIntegrity,
+  checkIntegrity,
+  isUnresolvedBlock,
+  packageIdentity,
+  validatedForOtherCourse,
+  type GateValidationRow,
+  type IntegrityFindings,
+} from "./validation/integrity";
 import {
   contentTypeFor,
   createCourseFromManifest,
   insertVersionRow,
+  isVersionConflictError,
   manifestData,
   nextVersionNumber,
   publishVersion,
@@ -27,9 +39,13 @@ import { expireLaunchTokens } from "@/lib/attempts/abandon";
  *              Worker nothing.
  *   [browser PUTs every file straight to storage]
  *   finalize → proves the files arrived (launch file + object count), counts
- *              learning units, flips upload_status to 'ready' and ONLY THEN
- *              makes the version current. An interrupted upload never
- *              reaches learners; the reaper sweeps abandoned ones.
+ *              learning units, re-runs the content-integrity lookup on the
+ *              STORED manifest + launch file (ADR 0004 step 2: the only
+ *              binding to actual bytes on this path; a collision deletes the
+ *              upload before it becomes ready), flips upload_status to
+ *              'ready' and ONLY THEN makes the version current. An
+ *              interrupted upload never reaches learners; the reaper sweeps
+ *              abandoned ones.
  *   abort    → deletes the prefix + row of an 'uploading' version.
  */
 
@@ -208,7 +224,8 @@ export async function initDirectUpload(args: {
       manifest_type: manifest.type,
       launch_url: manifest.launchUrl,
       storage_prefix: storagePrefix,
-      manifest_data: manifestData(manifest, null),
+      // Identity from the manifest text; finalize re-derives it from the stored bytes.
+      manifest_data: manifestData(manifest, null, packageIdentity(manifest)),
       size_bytes: totalBytes,
       uploaded_by: userId,
       upload_status: "uploading",
@@ -218,7 +235,14 @@ export async function initDirectUpload(args: {
     });
   } catch (e) {
     await undoCourse();
-    return { ok: false, status: 400, error: e instanceof Error ? e.message : "Could not create the version." };
+    // ADR 0003 step 8: 23505 — another upload to this package holds the
+    // version number / folder. Nothing was written and the validation is
+    // not consumed yet, so the admin can simply retry.
+    return {
+      ok: false,
+      status: isVersionConflictError(e) ? 409 : 400,
+      error: e instanceof Error ? e.message : "Could not create the version.",
+    };
   }
   // The row must really carry upload_status: without migration 0077 the
   // insert silently fell back to a 'ready'-looking legacy row, which would
@@ -354,18 +378,27 @@ export async function finalizeDirectUpload(args: {
 
   // 0075: learning-unit count for progress %, read from the stored launch file.
   let unitCount: number | null = null;
+  let launchHtml: string | null = null;
   if (launchHead.size <= DIRECT_UPLOAD_LIMITS.maxLaunchReadBytes) {
     try {
       const obj = await storage.getObject(launchKey);
-      if (obj?.body) unitCount = countLearningUnits(await new Response(obj.body).text());
+      if (obj?.body) {
+        launchHtml = await new Response(obj.body).text();
+        unitCount = countLearningUnits(launchHtml);
+      }
     } catch {
       unitCount = null;
     }
   }
 
+  // ADR 0004 step 2: the integrity lookup again, on the stored bytes (the
+  // init check only saw the manifest text the browser sent).
+  const integrity = await finalizeIntegrity({ org, version, course, keys, prefix, launchHtml });
+  if (!integrity.ok) return integrity;
+
   // Service role: course_versions rows are written by the server, not by
   // admin RLS policies (an RLS-filtered UPDATE would silently touch 0 rows).
-  const md = { ...(version.manifest_data ?? {}), unitCount };
+  const md = { ...(version.manifest_data ?? {}), unitCount, identity: integrity.findings.identity };
   const { data: updated, error: updErr } = await serviceClient()
     .from("course_versions")
     .update({ upload_status: "ready", manifest_data: md, file_count: keys.length })
@@ -399,6 +432,160 @@ export async function finalizeDirectUpload(args: {
     fileCount: keys.length,
     unitCount,
   };
+}
+
+/**
+ * The finalize-time collision check on the stored manifest and launch file.
+ * A collision that no super_owner overrode deletes the upload (prefix, row,
+ * and the course when this upload created it) before it can become ready;
+ * the findings are recorded on the linked validation either way, so both
+ * upload paths end with the same findings.
+ */
+async function finalizeIntegrity(args: {
+  org: { id: string };
+  version: VersionRow;
+  course: { id: string; current_version_id: string | null };
+  keys: string[];
+  prefix: string;
+  launchHtml: string | null;
+}): Promise<{ ok: true; findings: IntegrityFindings } | { ok: false; status: number; error: string; retryable?: boolean }> {
+  const { org, version, course, keys, prefix, launchHtml } = args;
+  const svc = serviceClient();
+  const storage = await getStorageFor(version.storage_driver);
+
+  // The STORED manifest (root first). Never the text the browser sent at
+  // init: that is the client's claim, and the identity must come from the
+  // bytes learners will get (ADR 0004 risk table). A package whose manifest
+  // did not arrive, or arrived unreadable as a manifest, is refused and
+  // removed; a storage read that fails is retryable and removes nothing.
+  const manifestName =
+    version.manifest_type === "cmi5" ? "cmi5.xml" : version.manifest_type === "xapi" ? "tincan.xml" : "imsmanifest.xml";
+  const manifestKey = keys
+    .filter((k) => k.toLowerCase().endsWith(`/${manifestName}`))
+    .sort((a, b) => a.length - b.length)[0];
+  if (!manifestKey) {
+    await removeRefusedUpload({ version, course, prefix, storage });
+    return {
+      ok: false,
+      status: 409,
+      retryable: false,
+      error: `The package's ${manifestName} did not arrive in storage, so its identity cannot be checked. Upload the whole package again.`,
+    };
+  }
+  let manifestText: string;
+  try {
+    const obj = await storage.getObject(manifestKey);
+    if (!obj?.body) throw new Error("empty manifest object");
+    manifestText = await new Response(obj.body).text();
+  } catch (e) {
+    return {
+      ok: false,
+      status: 409,
+      retryable: true,
+      error: `The stored ${manifestName} could not be read (${e instanceof Error ? e.message : "storage error"}). Retry.`,
+    };
+  }
+  let stored: ParsedManifest;
+  try {
+    stored = parseManifestXml(manifestName, manifestText);
+  } catch {
+    await removeRefusedUpload({ version, course, prefix, storage });
+    return {
+      ok: false,
+      status: 409,
+      retryable: false,
+      error: `The stored ${manifestName} is not a readable manifest (it differs from the one validated). Upload the whole package again.`,
+    };
+  }
+  const identity = packageIdentity(stored, launchHtml);
+
+  let findings: IntegrityFindings;
+  try {
+    findings = await checkIntegrity(svc, {
+      organizationId: org.id,
+      courseId: course.id,
+      packageId: version.package_id,
+      identity,
+      stage: "finalize",
+      excludeVersionId: version.id,
+    });
+  } catch (e) {
+    // Fail closed, but let the browser retry finalize: like every retryable
+    // finalize failure here it is a 409, which the browser does not abort
+    // (any other status deletes the uploaded files and the row).
+    return { ok: false, status: 409, retryable: true, error: e instanceof Error ? e.message : "Integrity check failed" };
+  }
+
+  const { data: linkedRow } = await svc
+    .from("package_validations")
+    .select("*")
+    .eq("course_version_id", version.id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const linked = linkedRow as (GateValidationRow & { id: string; report?: Record<string, unknown> | null }) | null;
+  const overridden = !!linked && linked.verdict === "blocked" && !!linked.overridden_at;
+  const blocked = findings.blocked && !overridden;
+
+  if (linked) {
+    const report = applyIntegrity(
+      { verdict: linked.verdict, checks: [], ...(linked.report ?? {}) } as {
+        verdict: string;
+        checks: Array<{ id: string; label: string; status: "pass" | "warning" | "fail" | "info"; detail: string }>;
+        integrity?: IntegrityFindings | null;
+      },
+      findings
+    );
+    const patch: Record<string, unknown> = blocked
+      ? { report, verdict: "blocked", status: "rejected", course_id: null, course_version_id: null }
+      : { report };
+    const { error } = await svc.from("package_validations").update(patch).eq("id", linked.id);
+    // Before 0098 'blocked' cannot be stored: keep the findings at least.
+    if (error && blocked) {
+      await svc
+        .from("package_validations")
+        .update({ report, status: "rejected", course_id: null, course_version_id: null })
+        .eq("id", linked.id);
+    }
+  }
+
+  if (!blocked) return { ok: true, findings };
+
+  await removeRefusedUpload({ version, course, prefix, storage });
+  return { ok: false, status: 409, retryable: false, error: BLOCKED_UPLOAD_ERROR };
+}
+
+/**
+ * Remove an upload finalize refused, before it can become ready: its files,
+ * its 'uploading' row and, when this upload created it, the course (nothing
+ * current, no other version, and created by init right before this version
+ * was reserved; an older empty course is left alone).
+ */
+async function removeRefusedUpload(args: {
+  version: VersionRow;
+  course: { id: string; current_version_id: string | null };
+  prefix: string;
+  storage: Awaited<ReturnType<typeof getStorageFor>>;
+}): Promise<void> {
+  const { version, course, prefix, storage } = args;
+  const svc = serviceClient();
+  try {
+    await storage.deletePrefix(prefix.replace(/\/$/, ""));
+  } catch (e) {
+    console.warn("[direct-upload] refused finalize: prefix delete failed", e);
+  }
+  await svc.from("course_versions").delete().eq("id", version.id).eq("upload_status", "uploading");
+  if (!course.current_version_id) {
+    const [{ count }, { data: courseRow }] = await Promise.all([
+      svc.from("course_versions").select("id", { count: "exact", head: true }).eq("course_id", course.id),
+      svc.from("courses").select("created_at").eq("id", course.id).maybeSingle(),
+    ]);
+    const createdAt = Date.parse((courseRow as { created_at?: string } | null)?.created_at ?? "");
+    const startedAt = Date.parse(version.upload_started_at ?? "");
+    const createdByThisUpload =
+      Number.isFinite(createdAt) && Number.isFinite(startedAt) && startedAt - createdAt > -60_000 && startedAt - createdAt < 10 * 60_000;
+    if ((count ?? 0) === 0 && createdByThisUpload) await svc.from("courses").delete().eq("id", course.id);
+  }
 }
 
 export async function abortDirectUpload(args: {
@@ -436,9 +623,21 @@ export async function sweepAbandonedUploads(svc: SupabaseClient): Promise<{ swep
   const errors: string[] = [];
   for (const v of (data ?? []) as Array<{ id: string; storage_prefix: string; storage_driver: string }>) {
     try {
+      // An 'uploading' version is never served, so it holds no attempts. If
+      // one does (a ready row set back to 'uploading' by hand), deleting it
+      // would cascade learner history away: leave it and report it.
+      const { count: attempts, error: attErr } = await svc
+        .from("course_attempts")
+        .select("id", { count: "exact", head: true })
+        .eq("course_version_id", v.id);
+      if (attErr) throw new Error(`attempt check failed: ${attErr.message}`);
+      if ((attempts ?? 0) > 0) {
+        errors.push(`${v.id}: skipped, ${attempts} attempt(s) on an 'uploading' version`);
+        continue;
+      }
       const storage = await getStorageFor(v.storage_driver);
       await storage.deletePrefix(v.storage_prefix.replace(/\/$/, ""));
-      await svc.from("course_versions").delete().eq("id", v.id);
+      await svc.from("course_versions").delete().eq("id", v.id).eq("upload_status", "uploading");
       swept++;
     } catch (e) {
       errors.push(`${v.id}: ${e instanceof Error ? e.message : String(e)}`);
@@ -488,6 +687,7 @@ type VersionRow = {
   upload_status: string;
   file_count: number | null;
   manifest_data: Record<string, unknown> | null;
+  upload_started_at?: string | null;
 };
 
 async function loadUploadingVersion(
@@ -560,19 +760,20 @@ async function checkValidationForDirectUpload(
   if (!opts.validationId) {
     return { ok: false, status: 400, error: "Validate the package before uploading." };
   }
+  // select("*"): deploy-safe across 0098 (overridden_at).
   const { data: row } = await supabase
     .from("package_validations")
-    .select("id, verdict, status, created_at, report")
+    .select("*")
     .eq("id", opts.validationId)
     .eq("organization_id", opts.organizationId)
     .maybeSingle();
-  const v = row as {
+  const v = row as (GateValidationRow & {
     id: string;
     verdict: string;
     status: string;
     created_at: string;
     report: { package?: { type?: string; launchUrl?: string | null } } | null;
-  } | null;
+  }) | null;
   if (!v || v.status !== "pending") {
     return { ok: false, status: 400, error: "Validation not found or already used — re-validate the package." };
   }
@@ -583,10 +784,18 @@ async function checkValidationForDirectUpload(
   if (v.report?.package?.type !== opts.expect.type || norm(v.report?.package?.launchUrl) !== norm(opts.expect.launchUrl)) {
     return { ok: false, status: 400, error: "The validated package differs from the one being uploaded. Re-validate this exact package." };
   }
+  if (validatedForOtherCourse(v, opts.courseId)) {
+    return { ok: false, status: 400, error: "This validation was run for a different course. Re-validate the package for this course." };
+  }
   if (v.verdict === "unplayable") {
     return { ok: false, status: 400, error: "This package failed structural validation (no playable content) and cannot be uploaded. Fix the package and validate again." };
   }
-  if (v.verdict !== "pass" && !opts.acknowledge) {
+  // ADR 0004 step 3: a cross-course collision is refused unless a super_owner
+  // overrode it; an overridden block counts as an acknowledged warning.
+  if (isUnresolvedBlock(v)) {
+    return { ok: false, status: 409, error: BLOCKED_UPLOAD_ERROR };
+  }
+  if (v.verdict !== "pass" && v.verdict !== "blocked" && !opts.acknowledge) {
     return { ok: false, status: 400, error: "Validation reported issues — confirm 'Accept & Upload' to acknowledge them." };
   }
   if (v.verdict !== "pass") {

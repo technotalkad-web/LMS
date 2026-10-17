@@ -233,6 +233,25 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
     baseURL,
   }) => {
     const ctx = await authedContext(browser, baseURL!, s.learner!.email, s.learner!.password);
+    // ADR 0004 step 9 (1): with the Hindi attempt in progress, an explicit
+    // ?lang=en no longer launches straight away: it goes back to the course
+    // page with the language-switch confirm, and nothing is abandoned.
+    const first = await ctx.request.get(`/${s.org!.slug}/courses/${s.courseId}/launch?lang=en`, { maxRedirects: 0 });
+    const location = first.headers()["location"] ?? "";
+    const body = first.status() === 200 ? await first.text() : "";
+    expect(
+      location.includes(`/courses/${s.courseId}?switch=en`) || body.includes(`/courses/${s.courseId}?switch=en`),
+      `?lang=en with Hindi in progress → the switch confirm (status ${first.status()}, location "${location}")`
+    ).toBeTruthy();
+    expect(body).not.toContain(`/content/v/${s.enVersionId}/`);
+    expect(await statuses(s.learner!.id, s.hiVersionId!)).toEqual(["in_progress"]);
+    // The learner confirms the switch (the dialog's PUT): Hindi resets.
+    const confirm = await ctx.request.put(`/api/courses/${s.courseId}/language-preference`, {
+      data: { orgSlug: s.org!.slug, language: "en", restart_if_in_progress: true },
+    });
+    expect(confirm.status(), await confirm.text()).toBe(200);
+    expect(await statuses(s.learner!.id, s.hiVersionId!)).toEqual(["abandoned"]);
+
     const res = await ctx.request.get(`/${s.org!.slug}/courses/${s.courseId}/launch?lang=en`);
     expect(res.ok(), `launch ?lang=en → ${res.status()}`).toBeTruthy();
     expect(await res.text()).toContain(`/courses/${s.courseId}/content/v/${s.enVersionId}/index.html`);

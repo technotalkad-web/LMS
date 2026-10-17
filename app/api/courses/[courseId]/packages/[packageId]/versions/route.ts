@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { uploadCoursePackage } from "@/lib/courses/upload";
+import { isVersionConflictError, uploadCoursePackage } from "@/lib/courses/upload";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import {
   enforcePackageValidation,
@@ -119,9 +119,15 @@ export async function POST(
     validationId:
       typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
     acknowledge: form.get("acknowledge") === "1",
+    packageId,
   });
   if (!gate.ok) {
-    return NextResponse.json({ error: gate.error }, { status: gate.status });
+    // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id
+    // a super_owner override can target.
+    return NextResponse.json(
+      { error: gate.error, ...(gate.validationId !== undefined ? { validation_id: gate.validationId } : {}) },
+      { status: gate.status }
+    );
   }
 
   // ---- Upload a new version under this package ----
@@ -136,9 +142,10 @@ export async function POST(
       supabase: svc,
     });
   } catch (e) {
+    // ADR 0003 step 8: a concurrent upload holds this package's next version.
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Upload failed" },
-      { status: 500 }
+      { status: isVersionConflictError(e) ? 409 : 500 }
     );
   }
   await linkValidationToVersion({

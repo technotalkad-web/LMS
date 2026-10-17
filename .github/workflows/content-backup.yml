@@ -1,12 +1,35 @@
-# Nightly copy of course content (Cloudflare R2) to Backblaze B2, next to the
-# database dumps produced by backup.yml. rclone syncs only what changed, so
-# the nightly run is cheap; version folders are immutable, so a restore is a
-# straight copy back (see docs/CONTENT_STORAGE.md § Backup and rollback).
+# Nightly copy of PRODUCTION course content to a dedicated Backblaze B2 bucket
+# (ADR 0003 step 2).
 #
-# Required secrets:
-#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET   (source)
-#   B2_KEY_ID, B2_APPLICATION_KEY, B2_REGION, B2_BUCKET                  (target; same as backup.yml)
-name: Nightly content backup (R2 → B2)
+# Source: the production Supabase Storage bucket `course-content`, read through
+# its S3-compatible endpoint (STORAGE_DRIVER is "supabase" on both
+# environments; the R2 source returns only when the driver flips to r2,
+# docs/CONTENT_STORAGE.md step 7).
+# Target: content/prod/supabase/course-content/ in the dedicated content bucket
+# (D7: created with Object Lock and a default retention), never the dump
+# bucket — backup.yml overwrites latest/ there every night.
+#
+# `rclone copy --immutable`, never `sync`: nothing is ever deleted from the
+# backup when it disappears from the source (that loss is what the copy
+# insures against), and an object that already exists with different content
+# is an error, not an update (version folders are write-once).
+#
+# Required secrets (the job fails with a message naming any that are missing):
+#   SUPABASE_S3_ENDPOINT           https://<project-ref>.storage.supabase.co/storage/v1/s3
+#   SUPABASE_S3_REGION             the production project's region, e.g. ap-south-1
+#   SUPABASE_S3_ACCESS_KEY_ID      production project → Storage → S3 access keys
+#   SUPABASE_S3_SECRET_ACCESS_KEY  (owner action: generate the key pair there)
+#   B2_CONTENT_BUCKET              the dedicated, Object-Locked content bucket
+#   B2_KEY_ID, B2_APPLICATION_KEY, B2_REGION   B2 account access (as backup.yml)
+# Optional: B2_CONTENT_KEY_ID + B2_CONTENT_APPLICATION_KEY, when the existing
+# B2 key is restricted to the dump bucket; they replace B2_KEY_ID /
+# B2_APPLICATION_KEY for this job.
+#
+# Hardening: the secrets reach only the two steps that need them (the check
+# and the copy), the token has read-only scope, and rclone is a pinned
+# release verified against a pinned sha256 (taken from the vendor's
+# SHA256SUMS), never an install script piped into a root shell.
+name: Nightly content backup (Supabase Storage → B2)
 
 on:
   schedule:
@@ -17,31 +40,77 @@ concurrency:
   group: content-backup
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  sync:
+  copy:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      RCLONE_VERSION: v1.68.2
+      RCLONE_SHA256: 0e6fa18051e67fc600d803a2dcb10ddedb092247fc6eee61be97f64ec080a13c
     steps:
-      - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: Sync R2 → B2
+      - name: Check secrets
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          SUPABASE_S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          SUPABASE_S3_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
+          B2_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
+          B2_REGION: ${{ secrets.B2_REGION }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in SUPABASE_S3_ENDPOINT SUPABASE_S3_REGION SUPABASE_S3_ACCESS_KEY_ID SUPABASE_S3_SECRET_ACCESS_KEY B2_CONTENT_BUCKET B2_KEY_ID B2_APPLICATION_KEY B2_REGION; do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=content-backup not configured::Missing GitHub secrets: ${missing[*]}. See the header of .github/workflows/content-backup.yml (ADR 0003 step 2): generate an S3 access key in the PRODUCTION Supabase project (Storage settings) and name the dedicated Object-Locked B2 content bucket. Nothing was copied."
+            exit 1
+          fi
+          case "$SUPABASE_S3_ENDPOINT" in
+            https://*/storage/v1/s3) ;;
+            *) echo "::error title=content-backup misconfigured::SUPABASE_S3_ENDPOINT must look like https://<project-ref>.storage.supabase.co/storage/v1/s3"; exit 1 ;;
+          esac
+
+      - name: Install rclone (pinned release, sha256-verified)
+        run: |
+          set -euo pipefail
+          zip="rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$zip" "https://downloads.rclone.org/${RCLONE_VERSION}/$zip"
+          echo "${RCLONE_SHA256}  $RUNNER_TEMP/$zip" | sha256sum -c -
+          unzip -q -o "$RUNNER_TEMP/$zip" -d "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$RUNNER_TEMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" "$RUNNER_TEMP/bin/rclone"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/rclone" version
+
+      - name: Copy Supabase Storage → B2 (copy, never sync)
+        env:
+          B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
+          RCLONE_CONFIG_SUPA_TYPE: s3
+          RCLONE_CONFIG_SUPA_PROVIDER: Other
+          RCLONE_CONFIG_SUPA_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          RCLONE_CONFIG_SUPA_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          RCLONE_CONFIG_SUPA_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_SUPA_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_SUPA_FORCE_PATH_STYLE: "true"
           RCLONE_CONFIG_B2_TYPE: s3
           RCLONE_CONFIG_B2_PROVIDER: Other
-          RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
+          RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
           RCLONE_CONFIG_B2_ENDPOINT: https://s3.${{ secrets.B2_REGION }}.backblazeb2.com
         run: |
           set -euo pipefail
-          # --immutable never overwrites: version folders never change, so any
-          # differing object is a corruption signal, not an update.
-          rclone sync "r2:${{ secrets.R2_BUCKET }}/courses" "b2:${{ secrets.B2_BUCKET }}/content/courses" \
-            --immutable --transfers 16 --checkers 32 --fast-list --stats-one-line --stats 30s -v
-          echo "Objects in B2 mirror:"
-          rclone size "b2:${{ secrets.B2_BUCKET }}/content/courses"
+          dest="b2:${B2_CONTENT_BUCKET}/content/prod/supabase/course-content"
+          # Read-only on the source; --immutable refuses to overwrite a
+          # differing object; --s3-no-check-bucket skips CreateBucket on the
+          # (pre-created, locked) destination.
+          rclone copy "supa:course-content" "$dest" \
+            --immutable --s3-no-check-bucket \
+            --transfers 16 --checkers 32 --fast-list --stats-one-line --stats 30s -v
+          echo "Objects in the B2 content copy:"
+          rclone size "$dest"

@@ -2,6 +2,13 @@ import { createHash } from "crypto";
 import JSZip from "jszip";
 import { parseManifestFromZip } from "../manifest/detect";
 import type { ParsedManifest } from "../manifest/types";
+import {
+  detectScript,
+  packageIdentity,
+  scriptCheck,
+  type IntegrityFindings,
+  type PackageIdentity,
+} from "./integrity";
 
 /**
  * Static package validation — the quality-control gate that runs BEFORE a
@@ -38,9 +45,14 @@ export type PackageValidationReport = {
     tool: string | null;
     /** "stored" = re-scanned from extracted storage files, not the zip. */
     source?: "upload" | "stored";
+    /** ADR 0004 step 2: the course id + title the integrity lookup matches on. */
+    identity?: PackageIdentity;
   };
-  verdict: "pass" | "warning" | "fail" | "unplayable";
+  /** 'blocked' = cross-course collision (ADR 0004 step 3), set by applyIntegrity(). */
+  verdict: "pass" | "warning" | "fail" | "unplayable" | "blocked";
   checks: ValidationCheck[];
+  /** Findings of the org-scoped collision lookup (absent on a content-only scan). */
+  integrity?: IntegrityFindings | null;
 };
 
 export function sha256Hex(bytes: Uint8Array): string {
@@ -72,6 +84,8 @@ type Signals = {
   externalScriptHosts: string[];
   /** Launch-file findings (read separately — single-file engines exceed the text cap). */
   launch: LaunchFindings;
+  /** The launch file's text (when read), for the identity and script checks. */
+  launchHtml: string | null;
 };
 
 export type LaunchFindings = {
@@ -171,6 +185,7 @@ async function scanZip(
     tool: null,
     externalScriptHosts: [],
     launch: analyzeLaunchHtml(null),
+    launchHtml: null,
   };
 
   const paths = Object.keys(zip.files).filter((p) => !zip.files[p].dir);
@@ -185,6 +200,7 @@ async function scanZip(
         const bytes = await zip.files[lp].async("uint8array");
         if (bytes.length <= MAX_LAUNCH_FILE_BYTES) {
           const html = Buffer.from(bytes).toString("utf8");
+          s.launchHtml = html;
           s.launch = analyzeLaunchHtml(html);
           if (s.launch.kivo) s.tool = "KIVO (in-house engine)";
           s.viewportInLaunch = /<meta[^>]+viewport/i.test(html);
@@ -404,6 +420,9 @@ export async function validatePackage(
   if (s.tool) {
     push("tool", "Authoring tool", "info", `${s.tool} signatures detected — a known-good tracking implementation.`);
   }
+  // ADR 0004 step 6: script / language detection is informational only.
+  const script = scriptCheck(detectScript(s.launchHtml));
+  if (script) checks.push(script);
 
   const isCmi5 = manifest.type === "cmi5";
   const isXapi = manifest.type === "xapi";
@@ -705,6 +724,7 @@ export async function validatePackage(
       sizeBytes: packageBytes(),
       fileCount,
       tool: s.tool,
+      identity: packageIdentity(manifest, s.launchHtml),
     },
     verdict,
     checks,

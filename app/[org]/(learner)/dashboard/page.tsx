@@ -81,6 +81,8 @@ type Attempt = {
   learning_path_id: string | null;
   /** 0075 — undefined before the migration. */
   progress_pct?: number | null;
+  /** ADR 0004 step 11: an abandoned (reset) attempt is never in progress. */
+  status?: string | null;
 };
 
 type PathStepView = {
@@ -765,7 +767,7 @@ export default async function DashboardPage({
     const open = attempts
       .filter((a) => {
         const v = versionById.get(a.course_version_id);
-        return v?.course_id === courseId && a.completion_status === "in_progress";
+        return v?.course_id === courseId && a.completion_status === "in_progress" && a.status !== "abandoned";
       })
       .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0];
     return typeof open?.progress_pct === "number" ? open.progress_pct : null;
@@ -859,7 +861,7 @@ export default async function DashboardPage({
       done > 0 ||
       attempts.some(
         (a) =>
-          a.learning_path_id === p.id && a.completion_status !== "completed"
+          a.learning_path_id === p.id && a.completion_status !== "completed" && a.status !== "abandoned"
       );
     return {
       course_id: p.id,

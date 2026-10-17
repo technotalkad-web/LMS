@@ -2,6 +2,8 @@ import {
   DEFAULT_POLICY,
   computeScoring,
   courseStatus,
+  excludeAbandoned,
+  isAbandonedAttempt,
   isCompletedAttempt,
   officialDone,
   type CourseStatus,
@@ -34,7 +36,7 @@ import { fetchGrantRetakeIdsForUsers } from "./attempt-kind";
  * from "the latest attempt" or count failed attempt rows anywhere else.
  */
 
-export { computeScoring, courseStatus, isCompletedAttempt, officialDone, DEFAULT_POLICY };
+export { computeScoring, courseStatus, excludeAbandoned, isAbandonedAttempt, isCompletedAttempt, officialDone, DEFAULT_POLICY };
 export type { CourseStatus, ScorableAttempt, ScoringResult };
 
 /** "Failed" = the official attempt failed. Never a practice/revision run. */

@@ -196,7 +196,7 @@ export default async function LearningPathDetailPage({
     ? await supabase
         .from("course_attempts")
         .select(
-          "id, course_version_id, completion_status, success_status, score, started_at, completed_at, learning_path_id"
+          "id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id"
         )
         .eq("user_id", user.id)
         .in("course_version_id", versionIds)
@@ -204,6 +204,8 @@ export default async function LearningPathDetailPage({
   type Attempt = {
     id: string;
     course_version_id: string;
+    /** ADR 0004 step 11: an abandoned attempt is never official and never in progress. */
+    status: string | null;
     completion_status: string;
     success_status: string;
     score: number | null;
@@ -253,7 +255,7 @@ export default async function LearningPathDetailPage({
     const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
     if (officialDone(s, passRequired.has(cid))) {
       completedCourseIds.add(cid);
-    } else if (list.some((a) => a.completion_status === "in_progress")) {
+    } else if (list.some((a) => a.completion_status === "in_progress" && a.status !== "abandoned")) {
       inProgressCourseIds.add(cid);
     }
   }

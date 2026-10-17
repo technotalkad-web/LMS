@@ -243,7 +243,14 @@ export async function purgeAllTestData(): Promise<{
     .like("slug", `${TEST_PREFIX}-%`);
   const orgIds = (orgs ?? []).map((o) => o.id as string);
   if (orgIds.length > 0) {
-    await s.from("organizations").delete().in("id", orgIds);
+    // Logged, not thrown: a refusal here (for example the 0098 delete guard,
+    // if the service-role exemption ever stopped matching) must be visible
+    // in the CI log instead of leaving qa-* orgs behind in silence, but it
+    // must not fail an otherwise green run.
+    const { error } = await s.from("organizations").delete().in("id", orgIds);
+    if (error) {
+      console.error(`[purgeAllTestData] deleting ${orgIds.length} qa-* org(s) failed: ${error.message}`);
+    }
   }
 
   // 3. Stray OTP rows.

@@ -48,7 +48,8 @@ type Course = {
 type Attempt = {
   id: string;
   course_version_id: string;
-  status: "in_progress" | "completed" | "passed" | "failed";
+  /** 'abandoned' = reset (module updated, language switched or a retake started): terminal, never in progress. */
+  status: "in_progress" | "completed" | "passed" | "failed" | "abandoned";
   completion_status: "in_progress" | "completed";
   success_status: "unknown" | "passed" | "failed";
   score: number | null;
@@ -60,10 +61,14 @@ type Attempt = {
 
 export default async function CourseDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
+  /** ?switch=<lang>: the launch page sent the learner here to confirm a language switch (ADR 0004 step 9). */
+  searchParams: Promise<{ switch?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
+  const { switch: switchParam } = await searchParams;
   const { org, user, role } = await requireOrgAccess(orgSlug);
   const isAdmin = canManage(role);
 
@@ -237,9 +242,40 @@ export default async function CourseDetailPage({
   // the course has never been finished. Otherwise "Relaunch" / "Launch".
   // 0081: completion follows the OFFICIAL attempt; revision runs never count.
   const isComplete = scoring.officialAttempt !== null;
+  // ADR 0004 step 10: in progress = an attempt whose STATUS is in_progress.
+  // An abandoned attempt keeps completion_status 'in_progress' but is dead,
+  // so it never offers "Resume" (the learner would land on 0 %).
+  // Only an attempt the launch can resume counts: its version belongs to an
+  // ACTIVE language slot (or to no slot: legacy courses launch through
+  // current_version_id). An in-progress attempt on a deactivated slot is
+  // closed at the next launch (step 9 rule 3) and the learner starts on an
+  // active slot, so offering "Resume" there would land them on 0 %.
+  const activePackageIds = new Set(languageOptions.map((o) => o.id));
+  const resumable = (a: Attempt) => {
+    const pkg = versionById.get(a.course_version_id)?.package_id ?? null;
+    return pkg === null || activePackageIds.has(pkg);
+  };
   const isInProgress =
     !isComplete &&
-    attempts.some((a) => a.completion_status === "in_progress");
+    attempts.some((a) => a.status === "in_progress" && resumable(a));
+
+  // A one-line note when the learner's latest attempt was reset by an admin
+  // action: its package was deactivated or its version is no longer that
+  // language's current version (replaced with force-restart). A reset the
+  // learner chose (language switch, granted retake) gets no note.
+  let resetByAdmin = false;
+  const latestAttempt = attempts[0];
+  if (latestAttempt?.status === "abandoned") {
+    const { data: allPkgRows } = await supabase
+      .from("course_packages")
+      .select("id, current_version_id, is_active")
+      .eq("course_id", c.id);
+    const pkgOfLatest = ((allPkgRows ?? []) as Array<{ id: string; current_version_id: string | null; is_active: boolean }>).find(
+      (p) => p.id === versionById.get(latestAttempt.course_version_id)?.package_id
+    );
+    resetByAdmin =
+      !!pkgOfLatest && (pkgOfLatest.is_active === false || pkgOfLatest.current_version_id !== latestAttempt.course_version_id);
+  }
 
   const manifestDescription = current?.manifest_data?.description ?? "";
   const description = c.description || manifestDescription;
@@ -365,6 +401,11 @@ export default async function CourseDetailPage({
                 Your request for another attempt is under review.
               </p>
             )}
+            {resetByAdmin && !isInProgress && !isComplete && (
+              <p className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                Your earlier progress was reset because the module was updated. Launch the course to start the current version.
+              </p>
+            )}
             {attemptRequestState === "rejected" && (
               <p className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
                 A previous attempt request was declined.
@@ -422,6 +463,7 @@ export default async function CourseDetailPage({
               courseId={c.id}
               options={languageOptions}
               currentLanguage={savedLanguage}
+              initialSwitch={switchParam ?? null}
               inProgress={attempts
                 .filter((a) => a.status === "in_progress")
                 .map((a) => ({
@@ -525,8 +567,9 @@ function AttemptRow({
           <span className="text-xs text-muted tabular-nums w-7 shrink-0">
             #{number}
           </span>
-          <CompletionPill completion={attempt.completion_status} />
-          {attempt.completion_status === "in_progress" &&
+          <CompletionPill completion={attempt.completion_status} status={attempt.status} />
+          {attempt.status === "in_progress" &&
+            attempt.completion_status === "in_progress" &&
             typeof attempt.progress_pct === "number" && (
               <span
                 title="How far through the module this attempt is"
@@ -554,9 +597,23 @@ function AttemptRow({
 
 function CompletionPill({
   completion,
+  status,
 }: {
   completion: "in_progress" | "completed";
+  status: Attempt["status"];
 }) {
+  // ADR 0004 step 10: an abandoned attempt is a neutral, terminal "reset",
+  // never "In progress".
+  if (status === "abandoned" && completion !== "completed") {
+    return (
+      <span
+        title="This attempt was closed; its progress does not carry over"
+        className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-slate-100 text-slate-600 border border-slate-200"
+      >
+        Reset — module updated
+      </span>
+    );
+  }
   if (completion === "completed") {
     return (
       <span className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-ink text-canvas">

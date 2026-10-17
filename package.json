@@ -21,6 +21,7 @@
     "test:lifecycle:headed": "playwright test --config=playwright.lifecycle.config.ts --headed",
     "test:lifecycle:report": "playwright show-report lifecycle-playwright-report",
     "typecheck:bot": "tsc --noEmit -p tests/bot/tsconfig.json",
+    "test:unit": "node scripts/run-unit-tests.mjs",
     "cf:build": "opennextjs-cloudflare build",
     "cf:preview": "opennextjs-cloudflare preview",
     "cf:deploy": "opennextjs-cloudflare deploy",
@@ -59,6 +60,7 @@
     "mailparser": "^3.9.12",
     "s3rver": "^3.7.1",
     "tailwindcss": "^4",
+    "tsx": "4.23.15",
     "typescript": "^5",
     "wrangler": "^4.86.0"
   }

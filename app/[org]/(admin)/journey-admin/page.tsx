@@ -211,11 +211,11 @@ export default async function JourneyAdminPage({
       const { data: aRows } = vers.length && userIds.length
         ? await svc
             .from("course_attempts")
-            .select("user_id, course_version_id, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units")
+            .select("user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units")
             .in("user_id", userIds)
             .in("course_version_id", vers.map((v) => v.id))
         : { data: [] };
-      type A = { user_id: string; course_version_id: string; completion_status: string; success_status: string; started_at: string | null; progress_pct?: number | null; units?: unknown };
+      type A = { user_id: string; course_version_id: string; status: string | null; completion_status: string; success_status: string; started_at: string | null; progress_pct?: number | null; units?: unknown };
       const byUserCourse = new Map<string, A[]>();
       for (const a of (aRows ?? []) as A[]) {
         const cid = courseOfVer.get(a.course_version_id);

@@ -192,7 +192,7 @@ export async function GET(
       ? await supabase
           .from("course_attempts")
           .select(
-            "id, user_id, course_version_id, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
+            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
           )
           .in("user_id", enrolledUserIds)
           .in("course_version_id", versionIds)
@@ -201,6 +201,8 @@ export async function GET(
     id: string;
     user_id: string;
     course_version_id: string;
+    /** ADR 0004 step 11: abandoned attempts never make a learner "in progress". */
+    status: string | null;
     completion_status: string;
     success_status: string;
     score: number | null;
@@ -265,7 +267,9 @@ export async function GET(
     ).length;
 
     let status: Status;
-    if (coursesDone === 0 && myAttempts.length === 0) {
+    // ADR 0004 step 11: a learner whose only attempts were reset (abandoned)
+    // has not started.
+    if (coursesDone === 0 && !myAttempts.some((a) => a.status !== "abandoned")) {
       status = "not_started";
     } else if (coursesDone < coursesTotal) {
       status = "in_progress";
