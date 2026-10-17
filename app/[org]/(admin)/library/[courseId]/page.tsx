@@ -24,6 +24,7 @@ import { ActivateVersionButton, DiscardUploadButton, RestartVersionButton } from
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
 import { packageCode, versionCode } from "@/lib/reference-codes";
+import { isReadyVersion } from "@/lib/courses/default-rule";
 
 type Version = {
   id: string;
@@ -62,10 +63,14 @@ type TeamRow = { id: string; name: string; slug: string };
 
 export default async function AdminCourseDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
+  /** ?showFailed=1: list failed uploads too (hidden by default, ADR 0008 D1). */
+  searchParams: Promise<{ showFailed?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
+  const showFailed = (await searchParams).showFailed === "1";
   const { org, role } = await requireOrgAccess(orgSlug);
   if (!canManage(role)) {
     redirect(`/${orgSlug}/dashboard?denied=1`);
@@ -91,7 +96,12 @@ export default async function AdminCourseDetailPage({
   const list = ((versions ?? []) as Version[]).filter(
     (v) => !v.upload_status || v.upload_status === "ready" || canManage(role)
   );
-  const current = list.find((v) => v.id === c.current_version_id) ?? list[0];
+  // Without a course default, the header describes the newest finished
+  // version, never an unfinished or failed upload.
+  const current = list.find((v) => v.id === c.current_version_id) ?? list.find((v) => isReadyVersion(v.upload_status));
+  // Failed uploads keep their row (ADR 0008 D1: the version number and folder
+  // are never reused); the version list hides them unless asked.
+  const failedCount = list.filter((v) => v.upload_status === "failed").length;
 
 
 
@@ -123,6 +133,7 @@ export default async function AdminCourseDetailPage({
   const versionGroups = (() => {
     const groups = new Map<string, { key: string; label: string; code: string | null; currentVersionId: string | null; order: number; versions: Version[] }>();
     for (const v of list) {
+      if (v.upload_status === "failed" && !showFailed) continue;
       const pkg = v.package_id ? pkgById.get(v.package_id) : undefined;
       const key = v.package_id ?? "legacy";
       if (!groups.has(key)) {
@@ -665,12 +676,28 @@ export default async function AdminCourseDetailPage({
       <section>
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="serif text-2xl">Versions</h2>
-          <Link
-            href={`/${orgSlug}/library/upload?courseId=${c.id}`}
-            className="text-xs px-3 py-1.5 border border-line rounded hover:border-ink"
-          >
-            Upload new version
-          </Link>
+          <div className="flex items-baseline gap-3">
+            {/* Failed uploads keep their version number (ADR 0008 D1); they are
+                history, not choices, so they stay out of the list by default. */}
+            {failedCount > 0 && (
+              <Link
+                href={showFailed ? `/${orgSlug}/library/${c.id}` : `/${orgSlug}/library/${c.id}?showFailed=1`}
+                scroll={false}
+                className="text-xs text-muted hover:text-ink underline underline-offset-2"
+                data-testid="toggle-failed-uploads"
+              >
+                {showFailed
+                  ? "Hide failed uploads"
+                  : `Show failed uploads (${failedCount})`}
+              </Link>
+            )}
+            <Link
+              href={`/${orgSlug}/library/upload?courseId=${c.id}`}
+              className="text-xs px-3 py-1.5 border border-line rounded hover:border-ink"
+            >
+              Upload new version
+            </Link>
+          </div>
         </div>
         {/* One block per language package: versions are numbered and made
             current PER PACKAGE, so "current" is judged against the package's
@@ -704,6 +731,9 @@ export default async function AdminCourseDetailPage({
                     <li
                       key={v.id}
                       className="px-5 py-3 flex items-baseline justify-between gap-4"
+                      data-testid="version-row"
+                      data-version-id={v.id}
+                      data-upload-status={v.upload_status ?? "ready"}
                     >
                       <div className="min-w-0">
                         <div className="font-medium">
@@ -755,9 +785,9 @@ export default async function AdminCourseDetailPage({
                           <span className="px-2 py-0.5 bg-accent text-canvas rounded-full uppercase tracking-wide text-[10px]">
                             current
                           </span>
-                        ) : v.upload_status === "uploading" || v.upload_status === "failed" ? (
+                        ) : v.upload_status === "uploading" ? (
                           <DiscardUploadButton orgSlug={orgSlug} versionId={v.id} versionNumber={v.version_number} />
-                        ) : (
+                        ) : v.upload_status === "failed" ? null : (
                           v.package_id && (
                             <ActivateVersionButton
                               orgSlug={orgSlug}
