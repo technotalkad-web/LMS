@@ -3,9 +3,9 @@
   "bundles": [
     {
       "n": 1,
-      "rulesBundleHash": "sha256:813d6d96ff983c58166f3e9a14e5ab0d869f73ae730998c539267514c9678b8a",
+      "rulesBundleHash": "sha256:25269326922cf703b820d2577e6e83cd22a4ec5d0fb779fc7ae5426729425a46",
       "file": "alds-rules-1.js",
-      "bytes": 77870,
+      "bytes": 62706,
       "standardVersion": "2.0",
       "esbuild": "0.25.4",
       "target": "es2020",
