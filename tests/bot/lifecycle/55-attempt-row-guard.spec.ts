@@ -40,8 +40,9 @@
  *     force restart, (h) and (j) still run.
  *   - The staging probe of ADR 0009 step 13 (owner decision 4: one run,
  *     staging test accounts only) ran once, at 2026-10-17T19:45:55Z with
- *     ATTEMPT_GUARD_PROBE=1 at commit 63c1e28 (that commit holds the probe
- *     branch); its results are recorded under ADR 0009 decision 4 and it is
+ *     ATTEMPT_GUARD_PROBE=1 at commit 63c1e28 (local, before the branch was
+ *     rebased onto main; the same change is 0693193 on the pushed branch, and
+ *     it holds the probe branch); its results are recorded under ADR 0009 decision 4 and it is
  *     not to be repeated. The branch is retired: ATTEMPT_GUARD_PROBE=1 on a
  *     database without 0099 now fails the run instead of probing (after the
  *     staging apply such a database is production).
@@ -86,7 +87,7 @@ async function branch(): Promise<Branch> {
   if (await has0099()) return "guard";
   if (PROBE_REQUESTED) {
     throw new Error(
-      "ATTEMPT_GUARD_PROBE=1 refused: the one approved probe (ADR 0009 decision 4) ran at 2026-10-17T19:45:55Z (commit 63c1e28) and is not to be repeated. Unset the variable."
+      "ATTEMPT_GUARD_PROBE=1 refused: the one approved probe (ADR 0009 decision 4) ran at 2026-10-17T19:45:55Z (commit 63c1e28, rebased as 0693193) and is not to be repeated. Unset the variable."
     );
   }
   return "skip";
