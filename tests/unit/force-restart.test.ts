@@ -10,11 +10,12 @@
  *   (ii)  forceRestartMessage: every outcome, singular and plural;
  *   (iii) forceRestartOlderVersions on the recording fake: the versions read
  *         excludes the new version; the update is conditional on id,
- *         course_version_id and status = 'in_progress', 150 ids at a time;
- *         the selection pages by keyset, so a row leaving 'in_progress'
- *         between pages skips no other row;
- *         an empty answer at R1, R2, R3 or the update is that step's
- *         failure; a failed read issues no update; `[]` is the genuine zero;
+ *         course_version_id and status = 'in_progress', 150 ids at a time,
+ *         and stops at the first failed chunk; the selection pages by keyset,
+ *         so a row leaving 'in_progress' between pages skips no other row;
+ *         an empty answer at R1, R2, R3 or the update (applied or not) is
+ *         that step's failure; a failed read issues no update; `[]` is the
+ *         genuine zero;
  *         token expiry and the LRS enqueue get exactly the reset ids; a
  *         client that throws still yields a value;
  *   (iv)  the route answers: the multipart 200/500 shapes, finalizeAnswer;
@@ -24,7 +25,10 @@
  *   (vi)  RULE 2 (stale clients): abortDirectUpload refuses a ready row
  *         before the row or storage is touched;
  *   (vii) the browser client never aborts a published version and throws
- *         PublishedButRestartFailedError on that 500.
+ *         PublishedButRestartFailedError on that 500;
+ *   (viii) the Library's Replace dialog passes that error's restart to
+ *         onReplaced, which picks the banner (a source check: the repo has
+ *         no React test rig, so the banner itself is not rendered here).
  *
  * No database, no storage, no network: a recording fake stands in for the
  * supabase-js query builder (the failed-uploads.test.ts shape, built on a
@@ -466,25 +470,42 @@ async function io() {
     eq("…the row after the page boundary is reset, nothing left in progress", [rows[1000].status, rows.filter((x) => x.status === "in_progress").length], ["abandoned", 0]);
   }
   {
-    // Update error on the second chunk: stop; the first chunk is kept.
-    const rows: Row[] = ids(200).map((id) => ({ id, course_version_id: OLD1, status: "in_progress" }));
+    // Update error on the second of three chunks (150 + 150 + 1): stop there;
+    // the first chunk is kept and the third is never sent.
+    const rows: Row[] = ids(301).map((id) => ({ id, course_version_id: OLD1, status: "in_progress" }));
     const { client, queries } = attemptsWorld(rows, { update: (_q, n) => (n === 1 ? { error: { message: "deadlock", code: "40P01" } } : undefined) });
     const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
-    eq("update error after one chunk → failed, restarted 150, unresolved 50", pick(r), {
-      status: "failed", expected: 200, restarted: 150, resolved: 0, unresolved: 50, unresolved_version_ids: [OLD1],
+    eq("update error after one chunk → failed, restarted 150, unresolved 151", pick(r), {
+      status: "failed", expected: 301, restarted: 150, resolved: 0, unresolved: 151, unresolved_version_ids: [OLD1],
     });
     eq("…stops at the first error (no third update)", updatesOf(queries).length, 2);
+    eq("…the third chunk's row is still in progress", rows[300].status, "in_progress");
     const tok = queries.find((q) => q.table === "cmi5_launch_tokens")!;
     eq("…tokens expired for the 150 that were reset, exactly", inList(tok, "attempt_id"), ids(150));
     const reread = queries.filter((q) => sel(q) === "id, status, course_version_id");
-    eq("…R3 re-reads the 50 shortfall ids", reread.map((q) => inList(q, "id").length), [50]);
-    eq("…the message", r.message, "The new version is published, but resetting 200 learners failed. Use 'Restart learners on this version' on the older version to retry. 150 were reset, 50 could not be.");
+    eq("…R3 re-reads the 151 shortfall ids", reread.map((q) => inList(q, "id").length), [150, 1]);
+    eq("…the message", r.message, "The new version is published, but resetting 301 learners failed. Use 'Restart learners on this version' on the older version to retry. 150 were reset, 151 could not be.");
   }
   {
     const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "in_progress" }];
     const { client } = attemptsWorld(rows, { update: () => ({ data: null, error: null }) });
     const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
     eq("U { data: null, error: null } → update failure → failed", [r.status, r.restarted, r.unresolved], ["failed", 0, 1]);
+  }
+  {
+    // The update commits but answers { data: null, error: null }: the re-read
+    // finds the row abandoned, yet the run fails closed (the update's answer
+    // is the failure), and nothing is expired or queued for an unconfirmed id.
+    const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "in_progress" }];
+    const { client, queries } = attemptsWorld(rows, {
+      update: (q) => {
+        for (const x of rows) if (inList(q, "id").includes(x.id)) x.status = "abandoned";
+        return { data: null, error: null };
+      },
+    });
+    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    eq("U applied but answers null → failed, restarted 0, resolved 1, unresolved 0", [r.status, r.restarted, r.resolved, r.unresolved], ["failed", 0, 1, 0]);
+    eq("…no token expiry or LRS enqueue for it", [queries.some((q) => q.table === "cmi5_launch_tokens"), queries.some((q) => sel(q) === LRS_SELECT)], [false, false]);
   }
   {
     // A completion lands between the selection and the update: it wins.
@@ -863,6 +884,28 @@ async function browser() {
   }
 }
 
+/* ---------------- (viii) the Library wiring (source check) ---------------- */
+
+function library() {
+  console.log("\n(viii) the Library's Replace dialog: the published-but-failed path (source check; no React rig)");
+  const src = fs.readFileSync(path.join(root, "app/[org]/(admin)/library/[courseId]/languages-section.tsx"), "utf8");
+  const at = src.indexOf("if (err instanceof PublishedButRestartFailedError) {");
+  const own = at === -1 ? -1 : src.indexOf("setError(err instanceof Error", at);
+  const block = own === -1 ? "" : src.slice(at, own);
+  eq("doUpload: the published-but-failed catch hands err.restart to onReplaced and returns before the dialog's own setError", /onReplaced\(\{ restart: err\.restart \}\);\s*return;\s*\}\s*$/.test(block), true);
+  const h = src.indexOf("onReplaced={(outcome) => {");
+  const handler = h === -1 ? "" : src.slice(h, src.indexOf("/>", h));
+  const refresh = handler.indexOf("router.refresh();");
+  const grand = handler.indexOf("if (!r) {");
+  const failed = handler.indexOf('} else if (r.status === "failed") {');
+  const okBranch = handler.indexOf("} else {", failed);
+  eq("onReplaced: refreshes before choosing a banner", refresh !== -1 && refresh < grand, true);
+  eq("onReplaced: grandfather clears both banners", /setError\(null\);[\s\S]*setNotice\(null\);/.test(handler.slice(grand, failed)), true);
+  eq("onReplaced: failed → the red error banner with the restart message", handler.slice(failed, okBranch).includes("setError(r.message);"), true);
+  eq("onReplaced: ok → the replace-result notice", handler.slice(okBranch).includes("setNotice(`Replaced. ${r.message}`);"), true);
+  eq("the notice renders as data-testid=replace-result", src.includes('data-testid="replace-result"'), true);
+}
+
 async function main() {
   // The direct-upload test doubles are honoured only under NODE_ENV=test.
   (process.env as Record<string, string>).NODE_ENV = "test";
@@ -873,6 +916,7 @@ async function main() {
   await ruleOne();
   await ruleTwo();
   await browser();
+  library();
   setDirectUploadTestDoubles({ svc: null, storageFor: null });
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail) process.exit(1);
