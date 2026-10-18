@@ -16,6 +16,7 @@
  *   ["set", path, value]  ["del", path]  ["push", path, value]  ["replace", value]
  *   ["each", arrayPath, field, value] (set a field on every element)
  *   packages only: ["rehash", ["manifest","questions",i]]  ["rehashAll"]
+ *                  ["bom"] (serialise the manifest with a leading U+FEFF)
  * Expected findings: [rule, code] or [rule, code, {severity?, attribution?, index?, path?}];
  * the (rule, code) multiset must match exactly, and each expected finding is
  * matched one-to-one with a produced finding of the same severity (default
@@ -204,11 +205,17 @@ export function loadGolden(): { base: Base; cases: GoldenCase[] } {
             for (const q of r.manifest.questions) q.contentHash = api.contentHash(q);
             return true;
           }
+          if (op[0] === "bom") {
+            (root as Record<string, unknown>).bom = true;
+            return true;
+          }
           return false;
         }) as Record<string, unknown>;
         const input: Record<string, unknown> = { ...doc };
         delete input.manifest;
-        if (!("manifestText" in doc)) input.manifestText = JSON.stringify(doc.manifest);
+        delete input.bom;
+        const bom = doc.bom === true ? String.fromCharCode(0xfeff) : "";
+        if (!("manifestText" in doc)) input.manifestText = bom + JSON.stringify(doc.manifest);
         return api.checkPackage(input);
       },
       expect: c.expect,
