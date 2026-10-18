@@ -6,9 +6,13 @@ name: Ops watchdog (prod)
 #                   opens (or updates) a GitHub issue labelled `ops-incident` and
 #                   fails the run. On recovery it comments + auto-closes the
 #                   issue. GitHub notifications deliver the page (email/mobile).
-#   01:30 digest  — daily UTC (07:00 IST): posts the full health JSON as a
+#   01:30 digest  — daily UTC (07:00 IST): posts the health status as a
 #                   comment on the rolling `ops-digest` issue, so there is a
 #                   browsable daily history and a hook for the AI review.
+#
+# The repository is public (step summaries and issue comments too), so both
+# places print only {status, ts, checks.<name>.status}: never latencies,
+# counts, cron timestamps or error messages, and never a non-JSON body.
 #
 # Reuses the same repo secrets as cron.yml: PROD_BASE_URL + PROD_CRON_SECRET.
 # NOTE: GitHub scheduled workflows run from the default branch only — this
@@ -22,6 +26,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read
   issues: write
 
 concurrency:
@@ -49,7 +54,7 @@ jobs:
           {
             echo "## Prod health: \`$status\` (HTTP $code)"
             echo '```json'
-            jq . /tmp/health.json 2>/dev/null || cat /tmp/health.json 2>/dev/null || echo "{}"
+            jq '{status, ts, checks: (.checks // {} | map_values({status}))}' /tmp/health.json 2>/dev/null || echo '{"status":"unreachable"}'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -81,7 +86,7 @@ jobs:
 
           body="**Watchdog probe failed** at $now — prod health is \`$STATUS\` (HTTP $CODE).
 
-          - Run (health JSON in the step summary): $run_url
+          - Run (health status in the step summary): $run_url
           - Playbooks: \`ops/RUNBOOK.md\`
           - Health endpoint: \`GET /api/ops/health\` with \`x-cron-secret\`"
           if [ -n "$existing" ]; then
@@ -117,11 +122,11 @@ jobs:
           fi
           curl -sS -m 25 -H "x-cron-secret: ${CRON_SECRET}" \
             "${BASE}/api/ops/health" -o /tmp/health.json || echo '{"status":"unreachable"}' > /tmp/health.json
-          status=$(jq -r '.status // "unreachable"' /tmp/health.json)
+          status=$(jq -r '.status // "unreachable"' /tmp/health.json 2>/dev/null || echo "unreachable")
           {
             echo "### $(date -u +%F) — prod health: \`$status\`"
             echo '```json'
-            jq . /tmp/health.json
+            jq '{status, ts, checks: (.checks // {} | map_values({status}))}' /tmp/health.json 2>/dev/null || echo '{"status":"unreachable"}'
             echo '```'
           } > /tmp/digest.md
           gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file /tmp/digest.md

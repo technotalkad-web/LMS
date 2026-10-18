@@ -57,6 +57,8 @@ jobs:
       ENGINE: ${{ github.event.inputs.engine || vars.OPS_REVIEW_ENGINE || 'claude' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Announce engine + load the shared prompt
         id: prompt
@@ -71,8 +73,11 @@ jobs:
       # ── ENGINE: claude (default) ──────────────────────────────────────────
       - name: Review with Claude
         if: env.ENGINE == 'claude'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@f27be6b65a4652f08a2ba3cff79114829b588967 # v1
         with:
+          # Never re-emit the agent's transcript (tool results: other runs'
+          # logs, issue text) into this run's public log.
+          show_full_output: "false"
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: >-
@@ -86,7 +91,7 @@ jobs:
       # insufficient). Trust var required for headless runs (CLI 0.50+).
       - name: Review with Gemini
         if: env.ENGINE == 'gemini'
-        uses: google-github-actions/run-gemini-cli@v0
+        uses: google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489 # v0
         env:
           GEMINI_CLI_TRUST_WORKSPACE: "true"
         with:

@@ -3,11 +3,12 @@
 The `Nightly Supabase backup` workflow (`.github/workflows/backup.yml`)
 runs at 02:00 UTC daily and produces:
 
-- **B2 `daily/lms-prod-YYYY-MM-DDTHH-MM-SSZ.sql.gz[.asc]`** — durable, kept until you delete (or until a B2 Lifecycle Rule expires it).
-- **B2 `latest/lms-prod.sql.gz[.asc]`** — stable pointer to the most recent successful dump. Restore tooling can hit this without knowing the timestamp.
-- **GitHub artifact `lms-prod-backup-<stamp>`** — quick-grab hot copy, retained 7 days. Useful when you don't have R2 credentials handy.
+- **B2 `daily/lms-prod-YYYY-MM-DDTHH-MM-SSZ.sql.gz.asc`** — durable, kept until you delete (or until a B2 Lifecycle Rule expires it).
+- **B2 `latest/lms-prod.sql.gz.asc`** — stable pointer to the most recent successful dump. Restore tooling can hit this without knowing the timestamp.
 
-The `.asc` suffix means the dump was GPG-encrypted (because the `BACKUP_GPG_PUBKEY` secret was set when it ran). If it ends in `.sql.gz`, it's plaintext.
+Every dump is GPG-encrypted to the `BACKUP_GPG_PUBKEY` secret: without a usable key the workflow fails and uploads nothing, so it never uploads plaintext. Objects ending in plain `.sql.gz` predate that rule and are plaintext. Nothing is published as a GitHub artifact: the repository is public, so any signed-in GitHub user could download one.
+
+The dump bucket must stay private: never make it public, never put a public URL in front of it, and never monitor it through one. Check freshness with the workflow's failure email or an authenticated `aws s3 ls "s3://${B2_BUCKET}/daily/" --endpoint-url "${B2_ENDPOINT}"`.
 
 ---
 
@@ -30,21 +31,15 @@ B2_ENDPOINT="https://s3.${B2_REGION}.backblazeb2.com"
 B2_BUCKET="lms-backups"
 
 # Latest:
-aws s3 cp "s3://${B2_BUCKET}/latest/lms-prod.sql.gz" ./latest.sql.gz \
+aws s3 cp "s3://${B2_BUCKET}/latest/lms-prod.sql.gz.asc" ./latest.sql.gz.asc \
     --endpoint-url "${B2_ENDPOINT}"
 
 # Or specific date:
-aws s3 cp "s3://${B2_BUCKET}/daily/lms-prod-2026-05-28T02-00-00Z.sql.gz" ./backup.sql.gz \
+aws s3 cp "s3://${B2_BUCKET}/daily/lms-prod-2026-05-28T02-00-00Z.sql.gz.asc" ./backup.sql.gz.asc \
     --endpoint-url "${B2_ENDPOINT}"
 ```
 
-**From GitHub artifact** (faster if it's <7 days old):
-
-1. GitHub repo → **Actions** → **Nightly Supabase backup** → pick the run
-2. Scroll to **Artifacts** → click `lms-prod-backup-<stamp>` to download a zip
-3. Unzip it.
-
-### Step 2: Decrypt (only if `.asc`)
+### Step 2: Decrypt (every `.asc` dump)
 
 You need the GPG private key matching the public key used during backup. Stored in your password manager / hardware key — **without it the backup is permanently unreadable.**
 
@@ -126,9 +121,8 @@ Plain `pg_dump` backups are **daily snapshots**, not point-in-time. If you need 
 - **Lifecycle rules.** Set a retention policy on the B2 bucket: B2 dashboard → Buckets → `lms-backups` → Lifecycle Settings. Typical: keep `daily/*` for 30 days (B2 auto-deletes older versions), keep `latest/*` forever. B2's free 10GB tier covers ~100 days of 100MB dumps.
 
 - **First-run validation.** After setting up the workflow, manually trigger it once (Actions → Nightly Supabase backup → Run workflow). Confirm:
-  - B2 has both `daily/<stamp>` and `latest/<stamp-stripped>` objects
-  - GitHub artifact is downloadable
-  - `gunzip` + `psql` against a test Supabase project successfully restores it
+  - B2 has both `daily/<stamp>.sql.gz.asc` and `latest/lms-prod.sql.gz.asc` objects
+  - `gpg --decrypt` + `gunzip` + `psql` against a test Supabase project successfully restores it
 
 - **The dump excludes ownership/grant statements** (`--no-owner --no-privileges`) so it's portable across Supabase projects with different role names. RLS policies, sequences, indexes, foreign keys, and triggers are preserved.
 
@@ -142,9 +136,9 @@ GitHub will email repo admins on failed workflow runs. Common causes:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `pg_dump: error: connection to server ... failed` | Wrong PROD_DATABASE_URL secret (probably pooled URL instead of direct) | Set PROD_DATABASE_URL to the **Direct connection** string from Supabase dashboard |
+| `::error title=backup failed::pg_dump failed` (the public log never shows pg_dump's own message, which can contain parts of the URL) | Wrong PROD_DATABASE_URL secret, or the pooler is unreachable | Run `pg_dump` with the same URL from your own machine to read the error, then fix the secret (session pooler URI, see the header of `backup.yml`) |
+| `::error title=backup not encrypted::...` | `BACKUP_GPG_PUBKEY` is unset, not an armored public key, or expired | Set or re-export it (`gpg --armor --export <fingerprint>`); nothing was uploaded that night |
 | `aws: An error occurred (InvalidAccessKeyId)` | B2 Application Key revoked or scope mismatch | Regenerate at B2 → App Keys → Add a New Application Key with **Read and Write** caps on the backup bucket |
-| `gpg: encryption failed: Unusable public key` | Pubkey in secret is malformed or expired | Re-export and re-paste: `gpg --armor --export your@email.com` |
 | Cron didn't run at all | GitHub disables scheduled workflows after 60 days of repo inactivity | Make any commit, or manually `workflow_dispatch` |
 
 If two consecutive nightly runs fail, treat it as P1: the backup window is your recovery guarantee.

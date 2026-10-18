@@ -1,13 +1,25 @@
 # Nightly Supabase Postgres backup.
 #
 # Runs daily at 02:00 UTC (07:30 IST). Dumps the production database
-# with pg_dump, gzips it, optionally GPG-encrypts (if BACKUP_GPG_PUBKEY
-# is set), uploads to Cloudflare R2 for durable storage, and publishes
-# a GitHub artifact for quick same-day access.
+# with pg_dump, gzips it, GPG-encrypts it to BACKUP_GPG_PUBKEY, and uploads
+# the encrypted file to a PRIVATE Backblaze B2 bucket (daily/<file> plus a
+# latest/ pointer). Encryption is mandatory: with no usable key the job
+# fails before the upload step, so a plaintext dump never leaves the runner.
+# Nothing is published as a GitHub artifact: this repository is public, and
+# its artifacts can be downloaded by any signed-in GitHub user.
 #
-# On failure: GitHub will email the repo admins automatically. Worth
-# pairing with a UptimeRobot keyword check on the latest-backup R2 URL
-# if you want external alerting.
+# The dump bucket must stay private. Never make it public, never serve it
+# from a public URL, and never monitor it through one (latest/ is a fixed,
+# guessable key). Watch freshness through GitHub's failure email for this
+# workflow, or an authenticated `aws s3 ls` of daily/
+# (docs/ops/backup-restore.md).
+#
+# Restoring needs the PRIVATE GPG key that matches BACKUP_GPG_PUBKEY:
+# without it every dump is permanently unreadable.
+#
+# The run log is public: it shows only the file name and size. pg_dump and
+# gpg errors go to files on the runner (libpq can echo parts of the
+# connection string), and the job prints a fixed ::error:: line instead.
 #
 # Required GitHub Secrets:
 #   PROD_DATABASE_URL          Supabase connection string, URL-encoded password.
@@ -18,6 +30,7 @@
 #                              the transaction pooler (6543) can't run pg_dump.
 #                              Example: postgresql://postgres.<ref>:[pass]@aws-1-<region>.pooler.supabase.com:5432/postgres
 #   B2_BUCKET                  Backblaze B2 bucket name, e.g. "lms-backups"
+#                              (a private bucket)
 #   B2_REGION                  Bucket region — visible on the B2 bucket page.
 #                              Examples: "us-west-002", "eu-central-003"
 #   B2_KEY_ID                  Application Key ID (B2 dashboard →
@@ -26,22 +39,18 @@
 #                              "Read and Write" capabilities)
 #   B2_APPLICATION_KEY         Application Key (shown ONCE on creation —
 #                              save it before you navigate away)
+#   BACKUP_GPG_PUBKEY          Armored public key (paste the full block
+#                              including "-----BEGIN PGP PUBLIC KEY BLOCK-----").
+#                              Generate with: gpg --gen-key, export with
+#                              `gpg --armor --export <fingerprint>`. The job
+#                              encrypts to the key's primary fingerprint.
+#                              Store the matching PRIVATE key somewhere safe
+#                              (1Password, hardware key, secure offline storage).
 #
-# Why Backblaze B2 instead of S3/R2:
+# Why Backblaze B2:
 #   - Truly free 10GB tier + 1GB/day egress, no credit card required
 #   - S3-compatible API (same `aws s3 cp` invocation works)
 #   - In production since 2015, widely used for backups
-#
-# Optional:
-#   BACKUP_GPG_PUBKEY          Armored public key (paste the full block
-#                              including "-----BEGIN PGP PUBLIC KEY BLOCK-----").
-#                              If unset, backups are uploaded plaintext.
-#                              Generate with: gpg --gen-key, export with
-#                              `gpg --armor --export your@email.com`.
-#                              Store the matching PRIVATE key somewhere safe
-#                              (1Password, hardware key, secure offline storage)
-#                              — without it, the backups are permanently
-#                              unreadable.
 name: Nightly Supabase backup
 
 on:
@@ -54,12 +63,14 @@ concurrency:
   group: nightly-backup
   cancel-in-progress: false
 
+# No checkout and no GitHub API calls: read-only token.
+permissions:
+  contents: read
+
 jobs:
   backup:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
     steps:
       - name: Install Postgres client + tooling
         run: |
@@ -103,14 +114,20 @@ jobs:
           # --no-owner / --no-privileges keeps the dump portable across
           # Supabase projects (different role names). --clean + --if-exists
           # lets restore against an existing DB without manual DROPs.
-          pg_dump \
+          # stderr goes to a file, never the public log: on a failed
+          # connection libpq prints the pooler host and user, and for a
+          # malformed URL it can echo a fragment of the password.
+          if ! pg_dump \
             --no-owner \
             --no-privileges \
             --clean \
             --if-exists \
             --format=plain \
             --file="${OUT}" \
-            "${DATABASE_URL}"
+            "${DATABASE_URL}" 2>"$RUNNER_TEMP/pg_dump.err"; then
+            echo "::error title=backup failed::pg_dump failed. Its error output is not printed in this public log; run pg_dump against the same URL privately to see it."
+            exit 1
+          fi
           ls -lh "${OUT}"
           # Compress
           gzip -9 "${OUT}"
@@ -119,22 +136,37 @@ jobs:
           echo "BACKUP_FILE=${OUT}.gz" >> $GITHUB_ENV
           echo "BACKUP_STAMP=${STAMP}" >> $GITHUB_ENV
 
-      - name: Optional GPG encryption
+      - name: Encrypt with GPG (required)
         env:
           GPG_PUBKEY: ${{ secrets.BACKUP_GPG_PUBKEY }}
         run: |
           set -euo pipefail
           if [ -z "${GPG_PUBKEY}" ]; then
-            echo "BACKUP_GPG_PUBKEY not set — uploading plaintext."
-            exit 0
+            echo "::error title=backup not encrypted::The BACKUP_GPG_PUBKEY secret is not set. A plaintext dump is never uploaded, so nothing was uploaded. Set the secret (see the header of .github/workflows/backup.yml) and re-run."
+            exit 1
           fi
-          echo "Encrypting with provided GPG public key..."
-          echo "${GPG_PUBKEY}" | gpg --import
-          RECIPIENT=$(echo "${GPG_PUBKEY}" | gpg --show-keys --with-colons | awk -F: '/^uid/ { print $10; exit }')
-          gpg --trust-model always --encrypt --armor \
-            --recipient "${RECIPIENT}" \
+          echo "Encrypting with the BACKUP_GPG_PUBKEY public key..."
+          # Quiet import: gpg would print the key's user id (name and email),
+          # which is not in the armored secret, so GitHub would not mask it.
+          if ! printf '%s\n' "${GPG_PUBKEY}" | gpg --batch --quiet --import 2>/dev/null; then
+            echo "::error title=backup not encrypted::BACKUP_GPG_PUBKEY could not be imported. Nothing was uploaded."
+            exit 1
+          fi
+          # Encrypt to the primary key's fingerprint (the first fpr record),
+          # never to a user id parsed from the key.
+          FINGERPRINT=$(printf '%s\n' "${GPG_PUBKEY}" | gpg --batch --show-keys --with-colons 2>/dev/null \
+            | awk -F: '$1 == "fpr" && !seen { print $10; seen = 1 }' || true)
+          if ! [[ "${FINGERPRINT}" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]]; then
+            echo "::error title=backup not encrypted::No fingerprint could be read from BACKUP_GPG_PUBKEY. Nothing was uploaded."
+            exit 1
+          fi
+          if ! gpg --batch --quiet --trust-model always --encrypt --armor \
+            --recipient "${FINGERPRINT}" \
             --output "${BACKUP_FILE}.asc" \
-            "${BACKUP_FILE}"
+            "${BACKUP_FILE}" 2>"$RUNNER_TEMP/gpg.err"; then
+            echo "::error title=backup not encrypted::gpg could not encrypt to BACKUP_GPG_PUBKEY (expired or unusable key?). Nothing was uploaded."
+            exit 1
+          fi
           rm "${BACKUP_FILE}"
           echo "BACKUP_FILE=${BACKUP_FILE}.asc" >> $GITHUB_ENV
           ls -lh "${BACKUP_FILE}.asc"
@@ -163,22 +195,13 @@ jobs:
             --endpoint-url "${ENDPOINT}"
           echo "B2 upload complete."
 
-      - name: Publish as GitHub artifact (7-day hot copy)
-        uses: actions/upload-artifact@v4
-        with:
-          name: lms-prod-backup-${{ env.BACKUP_STAMP }}
-          path: ${{ env.BACKUP_FILE }}
-          retention-days: 7
-          if-no-files-found: error
-
       - name: Summary
         run: |
-          echo "## Backup complete ✅" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **File:** \`${BACKUP_FILE}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Size:** $(ls -lh "${BACKUP_FILE}" | awk '{print $5}')" >> $GITHUB_STEP_SUMMARY
-          echo "- **B2:** \`b2://${B2_BUCKET:-(unset)}/daily/${BACKUP_FILE}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **B2 latest pointer:** \`b2://${B2_BUCKET:-(unset)}/latest/...\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **GitHub artifact:** retained 7 days" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Restore instructions: docs/ops/backup-restore.md" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Backup complete ✅"
+            echo ""
+            echo "- **Object:** \`daily/${BACKUP_FILE}\`"
+            echo "- **Size:** $(ls -lh "${BACKUP_FILE}" | awk '{print $5}')"
+            echo ""
+            echo "Restore instructions: docs/ops/backup-restore.md"
+          } >> $GITHUB_STEP_SUMMARY

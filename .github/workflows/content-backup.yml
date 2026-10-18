@@ -13,10 +13,20 @@
 # backup when it disappears from the source (that loss is what the copy
 # insures against), and an object that already exists with different content
 # is an error, not an update (version folders are write-once). Every such
-# "immutable file modified" key is written to the job summary, grouped by
+# "immutable file modified" conflict is counted in the job summary per
 # version folder, so the owner can tell a folder reused before ADR 0008 D1
 # (a failed upload no longer gives its number back) from a ready version
 # whose bytes changed (the step-0 incident class: ledger entry).
+#
+# The repository is public, so its run logs and job summaries are public:
+# rclone writes only to a file on the runner (never to the log). The log
+# prints only counts. The job summary prints counts and, for each version
+# folder with a conflict, that folder's prefix,
+# courses/<course id>/<package id>/v<n>/ (opaque ids, printed so the owner
+# can match the folder to its course_versions row), with a count. File names
+# inside a folder, and keys outside a version folder, are never printed; to
+# see them, list the folder privately (an authenticated `rclone lsl` or the
+# B2 dashboard).
 #
 # Flags (ADR 0008 step 23 and the decision-3 budget note: B2's free tier
 # caps Class B and Class C transactions at 2,500 a day each, so nothing may
@@ -157,7 +167,7 @@ jobs:
           flags=(
             --immutable --checksum --min-age 1h --use-server-modtime --fast-list
             --s3-no-check-bucket
-            --transfers 16 --checkers 32 --stats-one-line --stats 30s -v
+            --transfers 16 --checkers 32 --stats-one-line --stats 30s
           )
           mode="copy"
           if [ "$DRY_RUN" = "true" ]; then
@@ -167,9 +177,12 @@ jobs:
 
           # Keep the log for the summary even when rclone fails (a conflict
           # exits non-zero); the job still fails after the summary is written.
+          # rclone output goes ONLY to "$log": even without -v it logs one
+          # NOTICE line per object in a dry run and one ERROR line per
+          # conflict, each naming an object key.
           set +e
-          rclone copy "supa:course-content" "$dest" "${flags[@]}" 2>&1 | tee "$log"
-          rc=${PIPESTATUS[0]}
+          rclone copy "supa:course-content" "$dest" "${flags[@]}" > "$log" 2>&1
+          rc=$?
           set -e
 
           # One key per line, from rclone's per-object errors only (not its
@@ -178,37 +191,37 @@ jobs:
             | sed -E 's#^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8} +[A-Z]+ +: ##; s#: (Source and destination exist but do not match|Timestamp mismatch between immutable objects).*$##' \
             | sort -u > "$conflicts"
           n=$(wc -l < "$conflicts" | tr -d ' ')
+          errors=$(grep -c ' ERROR ' "$log" || true)
+          echo "Content backup (${mode}): rclone exit code ${rc}; immutable conflicts ${n}; rclone ERROR lines ${errors}. Object keys are not printed (public log)."
           {
             echo "## Content backup: ${mode}"
             echo ""
-            echo "rclone exit code: ${rc}. Immutable conflicts (\"immutable file modified\"): ${n}."
+            echo "rclone exit code: ${rc}. Immutable conflicts (\"immutable file modified\"): ${n}. rclone ERROR lines: ${errors}."
+            echo ""
+            echo "This repository is public: a conflicting object is shown only by its version folder (course id, package id, version number), never by file name; list the folder privately to see its keys."
             if [ "$n" -gt 0 ]; then
               echo ""
-              echo "Each key below already exists in the backup with different content and was NOT overwritten."
+              echo "Each object counted below already exists in the backup with different content and was NOT overwritten."
               echo "Match each folder to its course_versions row: a folder reused before ADR 0008 D1 reached production goes to the owner's choice of ADR 0008 step 24 (an --exclude line or a fresh destination prefix);"
               echo "a ready version whose bytes changed is an incident for ops/INCIDENT_LEDGER.md."
               echo ""
               echo "| Version folder | Conflicting objects |"
               echo "|---|---|"
-              sed -E 's#^(courses/[^/]+/[^/]+/v[0-9]+/).*#\1#' "$conflicts" | sort | uniq -c \
-                | awk '{ printf "| `%s` | %s |\n", $2, $1 }'
-              echo ""
-              echo "<details><summary>All ${n} keys</summary>"
-              echo ""
-              echo '```'
-              # The step summary is capped at 1 MiB; the full list is in the job log.
-              head -c 800000 "$conflicts"
-              echo '```'
-              if [ "$(wc -c < "$conflicts")" -gt 800000 ]; then
-                echo "(list truncated here; every key is in the job log above)"
-              fi
-              echo "</details>"
+              # Only the version-folder prefix of a key is printed; a key outside
+              # a courses/<course>/<package>/v<n>/ folder is counted as (other),
+              # never printed.
+              awk '{ if (match($0, /^courses\/[^\/]+\/[^\/]+\/v[0-9]+\//)) print substr($0, 1, RLENGTH); else print "(other)" }' "$conflicts" \
+                | sort | uniq -c \
+                | sed -E 's#^ *([0-9]+) (.*)$#| `\2` | \1 |#'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$n" -gt 0 ]; then
-            echo "::error title=content-backup immutable conflicts::${n} object(s) exist in the backup with different content. Keys and folders are in the job summary."
+            echo "::error title=content-backup immutable conflicts::${n} object(s) exist in the backup with different content. Per-folder counts are in the job summary; keys are not printed."
           fi
-          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=content-backup failed::rclone exited ${rc}. Its log is not printed (public repository); re-run the same copy privately to see the errors."
+            exit "$rc"
+          fi
 
           echo "Objects in the B2 content copy:"
           rclone size "$dest" --fast-list

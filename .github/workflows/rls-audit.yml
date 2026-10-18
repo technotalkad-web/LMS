@@ -26,6 +26,9 @@ on:
       - 'tests/rls-audit/**'
       - '.github/workflows/rls-audit.yml'
 
+permissions:
+  contents: read
+
 jobs:
   audit:
     name: psql audit.sql against staging
@@ -35,6 +38,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install psql client
         run: |
@@ -61,27 +66,42 @@ jobs:
           PGPASSWORD_PROMPT: never
           STAGING_URL: ${{ secrets.SUPABASE_STAGING_DB_URL }}
         run: |
-          set -o pipefail
           mkdir -p ./_audit-out
           # -v ON_ERROR_STOP=1 makes psql exit on the first SQL error.
           # The script itself RAISES EXCEPTION on any FAIL row, so this
           # is how the job propagates that to a non-zero exit code.
+          #
+          # This log is public, so psql writes ONLY to the file (stdout and
+          # stderr: the per-table report, the RAISE naming the first failing
+          # table, and any libpq connection error). Nothing from it is
+          # printed except the step-13 counts, and the file is not uploaded.
+          set +e
           psql "$STAGING_URL" \
             -v ON_ERROR_STOP=1 \
             -f tests/rls-audit/audit.sql \
-            2>&1 | tee ./_audit-out/audit.log
-
-      - name: Upload audit log
-        # Always upload, even on failure — the log shows which table
-        # failed and why, which is what the on-call engineer needs.
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rls-audit-log
-          path: ./_audit-out/audit.log
-          retention-days: 30
+            > ./_audit-out/audit.log 2>&1
+          rc=$?
+          set -e
+          # Step 13 prints one row under the header "fails | warns | oks | total".
+          # Print it only when all four cells are integers, so no table row,
+          # error text or connection detail can ever reach the log.
+          summary=$(awk '
+            /^[[:space:]]*fails[[:space:]]*[|][[:space:]]*warns[[:space:]]*[|][[:space:]]*oks[[:space:]]*[|][[:space:]]*total[[:space:]]*$/ { hdr = NR; next }
+            hdr && NR == hdr + 2 {
+              line = $0; gsub(/[[:space:]]/, "", line)
+              if (split(line, c, "|") == 4 && c[1] ~ /^[0-9]+$/ && c[2] ~ /^[0-9]+$/ && c[3] ~ /^[0-9]+$/ && c[4] ~ /^[0-9]+$/)
+                printf "fails=%s warns=%s oks=%s total=%s\n", c[1], c[2], c[3], c[4]
+              exit
+            }
+          ' ./_audit-out/audit.log)
+          echo "RLS audit summary: ${summary:-not reached (the audit stopped before step 13)}"
+          echo "psql exit code: ${rc}"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::RLS audit failed (psql exit ${rc}). Details are not printed in this public log."
+          fi
+          exit "$rc"
 
       - name: Failure summary
         if: failure()
         run: |
-          echo "::error title=RLS Audit FAILED::Cross-tenant isolation regressed on staging. Download the rls-audit-log artifact for the per-table report and HALT prod deploys until it's green again."
+          echo "::error title=RLS Audit FAILED::Cross-tenant isolation regressed on staging, or the audit could not run. The per-table report is never published (this repository is public): on-call re-runs tests/rls-audit/audit.sql against staging in the Supabase SQL editor for the per-table detail, and HALTS prod deploys until it's green again."

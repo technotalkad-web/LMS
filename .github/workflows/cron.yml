@@ -36,6 +36,10 @@ on:
         required: true
         default: "/api/cron/reminders"
 
+# The job only POSTs with curl: it never checks out or calls the GitHub API.
+permissions:
+  contents: read
+
 jobs:
   invoke:
     runs-on: ubuntu-latest
@@ -65,12 +69,20 @@ jobs:
           else
             P="${MANUAL}"
           fi
+          # A manual endpoint is appended to BASE: only a plain cron path may
+          # reach curl (no host, port, query or traversal), so the secret
+          # header can only ever go to the prod Worker.
+          [[ "$P" =~ ^/api/cron/[a-z0-9-]+$ ]] || { echo "::error::invalid endpoint"; exit 1; }
           echo "POST ${BASE}${P}"
-          code=$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \
+          code=$(curl -sS --proto =https --max-redirs 0 -o /tmp/body -w "%{http_code}" -X POST \
             -H "x-cron-secret: ${CRON_SECRET}" "${BASE}${P}")
           echo "HTTP ${code}"
-          cat /tmp/body || true
-          echo
+          # This log is public: print only the top-level numbers and booleans
+          # of the response (counters, ok). Strings, arrays and objects (tenant
+          # slugs, org ids, table names, error text) and any non-JSON body
+          # (an HTML error page) are never printed; the routes keep their
+          # detail in their heartbeat and audit rows.
+          jq -c 'with_entries(select(.value|type=="number" or type=="boolean"))' /tmp/body 2>/dev/null || echo '(non-JSON body suppressed)'
           if [ "${code}" != "200" ]; then
             echo "::error::Cron ${P} returned ${code}"
             exit 1
