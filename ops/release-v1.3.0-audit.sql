@@ -11,10 +11,13 @@
 -- private CSV export; never paste it into GitHub, an issue, a PR or a chat
 -- that is not private. ops/INCIDENT_LEDGER.md takes ids only (first 8 hex).
 --
--- HOW: SQL editor -> New query -> paste this whole file -> Run. The result
--- is ONE grid. Its last row is "ZZ END OF AUDIT": if that row is missing,
--- the editor cut the result (raise the row limit, or export CSV) before
--- reading anything.
+-- HOW: SQL editor -> New query -> the editor's role selector on postgres
+-- (its default; any other role filters the D rows through row-level
+-- security, and A04 then reads MISMATCH) -> paste this whole file, select
+-- nothing -> Run. The result is ONE grid. Its last row is "ZZ END OF AUDIT":
+-- if that row is missing, the editor cut the result (raise the row limit, or
+-- export CSV) before reading anything. The editor may ask to confirm a
+-- destructive operation: the only drop here is the temporary table's below.
 --
 -- WHAT IT CHANGES: nothing in the application. The file creates a temporary
 -- table (pg_temp.release_audit, private to this editor session and dropped
@@ -56,7 +59,7 @@
 --   production after the later 0099 apply   -> at_0099
 --
 -- STOP CONDITIONS before the sitting (docs/release/v1.3.0.md has the full
--- runbook): any ERROR row; any 0070/0071 baseline probe absent; a migration
+-- runbook): any ERROR row; A04 not postgres; any 0070/0071 baseline probe absent; a migration
 -- present above the first absent one (Z02 not "none"); C04 (duplicate
 -- package/version pairs) not 0; D02 (shared storage prefixes) not 0 until
 -- the duplicates are repointed (ADR 0007 step 3); a planned 0099 or 0100
@@ -90,14 +93,25 @@ select 'A03', 'environment', 'organisations whose slug starts qa- (test data; pr
        case when to_regclass('public.organizations') is null then 'absent'
             else (select count(*)::text from public.organizations where slug like 'qa-%') end,
        '0', '0', 'info',
-       'Non-zero on production would mean test data there: stop and ask. Staging has qa-* data from the CI suites; the D lists below leave qa-* organisations out and say how many qa rows they skipped.';
+       'Non-zero on production would mean test data there: stop and ask (after the later 0099 apply too: the at_0099 column does not compare this row, because staging has qa data). Staging has qa-* data from the CI suites; the D rows below leave qa-* organisations out and say how many qa rows they skipped.';
+insert into pg_temp.release_audit
+select 'A04', 'environment', 'role the audit ran as (current_user)',
+       current_user::text, 'postgres', 'postgres', 'postgres',
+       'Anything else: the D rows are filtered by row-level security and read falsely clean (0 rows, no error). Switch the SQL editor''s role selector to postgres and run again; read nothing from this grid.';
 
 -- ---------------------------------------------------------------------------
 -- B. One presence probe per migration (catalog selects naming the object)
 -- ---------------------------------------------------------------------------
 -- kind: table (any relation: table, view, matview, index), column, function
 -- (regprocedure signature), policy, trigger, checkdef (a named constraint
--- whose definition contains a value only that migration adds).
+-- whose definition contains a value only that migration adds), funcdef (a
+-- function whose definition contains a token only that migration's version
+-- has), viewdef (the same for a view or materialized view).
+-- A file that creates many objects gets a second probe (suffix b) on the last
+-- object it creates whose final state is set by that file, so a paste that
+-- stopped early but reported success reads absent. No second probe: 0081 and
+-- 0082 (their later objects are recreated by 0082/0088/0089/0090, which the
+-- b probes of 0088 and 0090 cover), 0089 (B0089 is already its last object).
 insert into pg_temp.release_audit
 select p.check_id, 'migration probe', p.label,
        case when case p.kind
@@ -117,6 +131,10 @@ select p.check_id, 'migration probe', p.label,
            select 1 from pg_catalog.pg_constraint c
            where c.conrelid = to_regclass('public.' || p.rel) and c.conname = p.obj
              and pg_catalog.pg_get_constraintdef(c.oid) like '%' || p.val || '%')
+         when 'funcdef' then to_regprocedure('public.' || p.obj) is not null
+           and pg_catalog.pg_get_functiondef(to_regprocedure('public.' || p.obj)::oid) like '%' || p.val || '%'
+         when 'viewdef' then to_regclass('public.' || p.rel) is not null
+           and pg_catalog.pg_get_viewdef(to_regclass('public.' || p.rel)::oid) like '%' || p.val || '%'
        end then 'present' else 'absent' end,
        p.exp_before, p.exp_after, p.exp_0099, p.note
 from (values
@@ -136,6 +154,9 @@ from (values
    'May already be on production (scripts/check-migration-grants.mjs names 0073 as the first pending). Present = start the sitting at 0073.'),
   ('B0073',  'table',    'attempt_scoring_rules', null, null,
    '0073 table attempt_scoring_rules', 'absent', 'present', 'present', null),
+  ('B0073b', 'funcdef',  null, 'gamification_close_month()', 'attempt_no',
+   '0073 end of file: gamification_close_month() has the 0073 body (attempt_no)', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0074',  'table',    'dashboard_backgrounds', null, null,
    '0074 table dashboard_backgrounds', 'absent', 'present', 'present', null),
   ('B0075',  'column',   'course_attempts', 'progress_pct', null,
@@ -151,6 +172,9 @@ from (values
    'Right after 0078 the runbook sets statement_profile = raw on every enabled configuration whose consumer was not told about ambak-v1 (ADR 0007 step 6, decision 3; see D08).'),
   ('B0079',  'table',    'org_reference_counters', null, null,
    '0079 table org_reference_counters', 'absent', 'present', 'present', null),
+  ('B0079b', 'table',    'journey_programs_reference_code_uq', null, null,
+   '0079 end of file: unique index journey_programs_reference_code_uq', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0080',  'policy',   'org_reference_counters', 'org admins read their reference counters', null,
    '0080 policy "org admins read their reference counters"', 'absent', 'present', 'present', null),
   ('B0081',  'column',   'courses', 'pass_required', null,
@@ -162,6 +186,9 @@ from (values
   ('B0084',  'checkdef', 'xp_events', 'xp_events_rule_check', '''course_passed''',
    '0084 xp_events_rule_check admits ''course_passed''', 'absent', 'present', 'present',
    'The constraint exists since 0053; only 0084 adds ''course_passed''.'),
+  ('B0084b', 'funcdef',  null, 'gamification_record_activity_core(uuid)', 'course_passed',
+   '0084 end of file: gamification_record_activity_core(uuid) has the 0084 body (course_passed)', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0085',  'column',   'attempt_requests', 'attempts_used', null,
    '0085 column attempt_requests.attempts_used', 'absent', 'present', 'present', null),
   ('B0086',  'table',    'attention_settings', null, null,
@@ -170,11 +197,17 @@ from (values
    '0087 function attention_overdue_count(uuid)', 'absent', 'present', 'present', null),
   ('B0088',  'column',   'journey_programs', 'unlock_mode', null,
    '0088 column journey_programs.unlock_mode', 'absent', 'present', 'present', null),
+  ('B0088b', 'table',    'journey_enrollments_daily_reminder_idx', null, null,
+   '0088 end of file: index journey_enrollments_daily_reminder_idx (its later journey_record_completion is replaced by 0089)', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0089',  'function', null, 'journey_reminder_counts(uuid[])', null,
    '0089 function journey_reminder_counts(uuid[])', 'absent', 'present', 'present', null),
   ('B0090',  'column',   'v_course_attempt_summary', 'official_attempt_id', null,
    '0090 column v_course_attempt_summary.official_attempt_id', 'absent', 'present', 'present',
    '0099 refuses to run without it (its prerequisite block).'),
+  ('B0090b', 'viewdef',  'mv_path_enrollment_status', null, 'official_status',
+   '0090 end of file: mv_path_enrollment_status has the 0090 definition (official_status)', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0091',  'column',   'organization_members', 'l3_manager_id', null,
    '0091 column organization_members.l3_manager_id', 'absent', 'present', 'present', null),
   ('B0092',  'checkdef', 'attempt_requests', 'attempt_requests_status_check', '''expired''',
@@ -186,8 +219,14 @@ from (values
    '0094 policy "no direct access to report card cache"', 'absent', 'present', 'present', null),
   ('B0095',  'table',    'help_ticket_messages', null, null,
    '0095 table help_ticket_messages', 'absent', 'present', 'present', null),
+  ('B0095b', 'checkdef', 'attempt_requests', 'attempt_requests_source_check', '''ticket''',
+   '0095 end of file: attempt_requests_source_check admits ''ticket''', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0096',  'table',    'content_scopes', null, null,
    '0096 table content_scopes', 'absent', 'present', 'present', null),
+  ('B0096b', 'funcdef',  null, 'journey_auto_enroll()', 'new.department',
+   '0096 end of file: journey_auto_enroll() has the 0096 body (new.department)', 'absent', 'present', 'present',
+   'End of file: absent while the first probe is present = the paste stopped early. Paste the file again, then every later file of the sitting in order (runbook §4.5).'),
   ('B0097a', 'column',   'organizations', 'enforce_content_mapping', null,
    '0097 column organizations.enforce_content_mapping', 'absent', 'present', 'present', null),
   ('B0097b', 'table',    'manager_coverage', null, null,
@@ -263,8 +302,8 @@ do $audit$
 declare
   n bigint;
   m bigint;
+  k bigint;
   txt text;
-  txt2 text;
 begin
   -- C03 duplicate (course_id, version_number) pairs
   begin
@@ -358,7 +397,8 @@ begin
       'storage-prefix gate: storage_prefix values shared by more than one version', n::text,
       '0', '0', '0',
       case when n = 0 then 'Gate open: 0098 can create course_versions_storage_prefix_key.'
-           else 'STOP: repoint each listed version to its own package-scoped folder first (ADR 0007 step 3, ops/release-v1.3.0-repoint.md, written on demand), ledger every repoint, then re-run. Shared (prefix <- version ids): ' || txt end);
+           else 'STOP: repoint each listed version to its own package-scoped folder first (ADR 0007 step 3, ops/release-v1.3.0-repoint.md, written on demand), ledger every repoint, then re-run. Shared (prefix <- version ids, oldest first): ' || txt
+                || case when n > 50 then ' (+' || (n - 50) || ' more prefixes; list cut at 50: repoint these, then re-run for the rest)' else '' end end);
   exception when others then
     insert into pg_temp.release_audit values ('D02', 'data',
       'storage-prefix gate: storage_prefix values shared by more than one version',
@@ -379,9 +419,9 @@ begin
     insert into pg_temp.release_audit values ('D03', 'data',
       'in-progress attempts on inactive packages (non-qa organisations)', n::text,
       'review', 'review', 'review',
-      'After v1.3.0 the launch rule (ADR 0004 step 9 (3)) abandons each of these at the learner''s next launch. The owner reads the D03.nnn rows before the tag (acceptance condition a). qa-* rows skipped: ' || m || '.');
+      'After v1.3.0 the launch rule (ADR 0004 step 9 (3)) abandons each of these at the learner''s next launch. The owner reads the D03.nnnnn rows before the tag (acceptance condition a). qa-* rows skipped: ' || m || '.');
     insert into pg_temp.release_audit
-    select 'D03.' || lpad(row_number() over (order by p.id)::text, 3, '0'), 'data',
+    select 'D03.' || lpad(row_number() over (order by p.id)::text, 5, '0'), 'data',
            'inactive package ' || p.id || ' (course ' || p.course_id || ', slot ' || coalesce(p.language, 'default') || ')',
            count(*)::text, 'review', 'review', 'review',
            'attempt ids (role class): ' || string_agg(
@@ -465,7 +505,7 @@ begin
                                     || ' "' || coalesce(s.title, '-') || '"', ' | ' order by s.lang)
                   from slot s where s.course_id = d.course_id), 'none') as detail
     from d)
-    select 'D04.' || lpad(row_number() over (order by (f.flags is null), f.course_id)::text, 3, '0'), 'data',
+    select 'D04.' || lpad(row_number() over (order by (f.flags is null), f.course_id)::text, 5, '0'), 'data',
            'course ' || f.course_id, coalesce(f.flags, 'no flag'),
            'review', 'review', 'review', f.detail
     from f;
@@ -475,7 +515,7 @@ begin
     insert into pg_temp.release_audit values ('D04', 'data',
       'courses whose default (courses.current_version_id) looks wrong against its slots (non-qa)',
       m::text, 'review', 'review', 'review',
-      'Of ' || n || ' non-qa courses. Flags are heuristics (a translated slot title differs legitimately); TITLE_BELONGS_TO_ANOTHER_COURSE and DEFAULT_SLOT_INACTIVE are the wrong-default class of ADR 0004 step 12a. Each course is listed as D04.nnn, flagged first. Production clean-up of a flagged course follows ADR 0008 step 16 after v1.3.0. The stored-bytes check (ADR 0004 step 16) is separate: SQL cannot read package bytes.');
+      'Of ' || n || ' non-qa courses. Flags are heuristics (a translated slot title differs legitimately); TITLE_BELONGS_TO_ANOTHER_COURSE and DEFAULT_SLOT_INACTIVE are the wrong-default class of ADR 0004 step 12a. Each course is listed as D04.nnnnn, flagged first. Production clean-up of a flagged course follows ADR 0008 step 16 after v1.3.0. The stored-bytes check (ADR 0004 step 16) is separate: SQL cannot read package bytes.');
   exception when others then
     insert into pg_temp.release_audit values ('D04', 'data',
       'courses whose default (courses.current_version_id) looks wrong against its slots (non-qa)',
@@ -483,11 +523,15 @@ begin
   end;
 
   -- D05 cmi5 attempts completed in under 60 s (ADR 0007 steps 2 and 8:
-  -- first-slide completions before #118; history, never rewritten)
+  -- first-slide completions before #118; history, never rewritten). Counts
+  -- completion_status = 'completed' only: before #118 a "terminated" verb
+  -- also stamped completed_at on an attempt that was not complete, and those
+  -- quick exits are not completions.
   begin
-    select count(*) filter (where not q), count(*) filter (where q) into n, m
+    select count(*) filter (where not q), count(*) filter (where q),
+           count(distinct version_id) filter (where not q) into n, m, k
     from (
-      select coalesce(o.slug like 'qa-%', false) as q
+      select coalesce(o.slug like 'qa-%', false) as q, v.id as version_id
       from public.course_attempts a
       join public.course_versions v on v.id = a.course_version_id
       left join public.organizations o on o.id = a.organization_id
@@ -507,7 +551,8 @@ begin
     insert into pg_temp.release_audit values ('D05', 'data',
       'cmi5 attempts completed less than 60 s after they started (non-qa)', n::text,
       'info', 'info', 'info',
-      'History, never rewritten (ADR 0002 decision 4). This count goes into the release notes labelled as history. qa-* rows skipped: ' || m || '. Per version: ' || coalesce(txt, 'none'));
+      'Counted: completion_status = completed and completed_at less than 60 s after started_at; exits without completion before #118 (completed_at stamped by terminated) are excluded. History, never rewritten (ADR 0002 decision 4). This count goes into the release notes labelled as history, with this definition. qa-* rows skipped: ' || m || '. Per version (most first): ' || coalesce(txt, 'none')
+        || case when k > 50 then ' (+' || (k - 50) || ' more versions; list cut at 50)' else '' end);
   exception when others then
     insert into pg_temp.release_audit values ('D05', 'data',
       'cmi5 attempts completed less than 60 s after they started (non-qa)',
@@ -515,7 +560,10 @@ begin
   end;
 
   -- D06 completed cmi5/xAPI attempts with zero AU-level outcome statements
-  -- (mirrors lib/xapi/process-statement.ts launchedActivityIds + isAboutAu)
+  -- (approximates lib/xapi/process-statement.ts launchedActivityIds +
+  -- isAboutAu: btrim strips spaces only where JS trim() also strips tabs,
+  -- newlines and NBSP, and lower() may fold non-ASCII letters differently from
+  -- toLowerCase(); either can only move a rare attempt in or out. Info only.)
   begin
     with z as (
     select a.id as attempt_id, coalesce(o.slug like 'qa-%', false) as q
@@ -529,14 +577,15 @@ begin
           and s.raw -> 'verb' ->> 'id' in ('http://adlnet.gov/expapi/verbs/completed',
                                            'http://adlnet.gov/expapi/verbs/passed',
                                            'http://adlnet.gov/expapi/verbs/failed')
-          and coalesce(s.raw -> 'object' ->> 'objectType', 'Activity') = 'Activity'
+          and coalesce(nullif(s.raw -> 'object' ->> 'objectType', ''), 'Activity') = 'Activity'
           and lower(regexp_replace(btrim(s.raw -> 'object' ->> 'id'), '/+$', '')) in (
-                select lower(regexp_replace(btrim(x), '/+$', ''))
-                from unnest(array[v.manifest_data -> 'raw' ->> 'auId',
-                                  v.manifest_data -> 'raw' ->> 'activityId',
-                                  v.manifest_data -> 'raw' ->> 'courseId',
-                                  'urn:uuid:' || v.id::text]) as u(x)
-                where x is not null and btrim(x) <> '')))
+                select lower(regexp_replace(btrim(u.x), '/+$', ''))
+                from (select v.manifest_data -> 'raw' ->> ids.idkey
+                        from unnest(array['auId', 'activityId', 'courseId']) as ids(idkey)
+                       where jsonb_typeof(v.manifest_data -> 'raw' -> ids.idkey) = 'string'
+                      union all
+                      select 'urn:uuid:' || v.id::text) as u(x)
+                where btrim(u.x) <> '')))
     select count(*) filter (where not q), count(*) filter (where q),
            (select string_agg(attempt_id::text, ', ' order by attempt_id)
               from (select attempt_id from z where not q order by attempt_id limit 100) l)
@@ -545,7 +594,8 @@ begin
     insert into pg_temp.release_audit values ('D06', 'data',
       'completed cmi5/xAPI attempts with zero AU-level completed/passed/failed statements (non-qa)', n::text,
       'info', 'info', 'info',
-      'History (completions before #118 counted screen-level statements); never rewritten. qa-* rows skipped: ' || m || '. Attempt ids (first 100): ' || coalesce(txt, 'none'));
+      'History (completions before #118 counted screen-level statements); never rewritten. The match approximates the app''s AU-id rule (see the comment in the file). qa-* rows skipped: ' || m || '. Attempt ids (first 100): ' || coalesce(txt, 'none')
+        || case when n > 100 then ' (+' || (n - 100) || ' more; list cut at 100)' else '' end);
   exception when others then
     insert into pg_temp.release_audit values ('D06', 'data',
       'completed cmi5/xAPI attempts with zero AU-level completed/passed/failed statements (non-qa)',
@@ -565,9 +615,9 @@ begin
       insert into pg_temp.release_audit values ('D07', 'data',
         'organisations with a CRM completion webhook configured', n::text,
         'review', 'review', 'review',
-        'Each one receives cmi5/xAPI completion webhooks for the first time after v1.3.0 (official attempts only): the CRM consumer signs off before the tag (ADR 0007 step 8). Listed as D07.nnn (host only; the secret is never read).');
+        'Each one receives cmi5/xAPI completion webhooks for the first time after v1.3.0 (official attempts only): the CRM consumer signs off before the tag (ADR 0007 step 8). Listed as D07.nnnnn (host only; the secret is never read).');
       insert into pg_temp.release_audit
-      select 'D07.' || lpad(row_number() over (order by s.organization_id)::text, 3, '0'), 'data',
+      select 'D07.' || lpad(row_number() over (order by s.organization_id)::text, 5, '0'), 'data',
              'organisation ' || s.organization_id || coalesce(' (' || o.slug || ')', ''),
              'webhook host ' || coalesce(nullif(regexp_replace(regexp_replace(regexp_replace(
                btrim(s.webhook_url), '^[a-zA-Z][a-zA-Z0-9+.-]*://', ''), '^[^@/?#]*@', ''), '[/?#:].*$', ''), ''), '(unparsed)'),
@@ -589,9 +639,9 @@ begin
     insert into pg_temp.release_audit values ('D08', 'data',
       'enabled tenant_lrs_config rows', n::text,
       'review', 'review', 'review',
-      '0078 switches every enabled feed to the ambak-v1 profile when the code deploys. Decision 3 (ADR 0007): set statement_profile = raw on each one right after 0078 unless its consumer was told about ambak-v1 (the runbook has the UPDATE). Listed as D08.nnn (endpoint host only).');
+      '0078 switches every enabled feed to the ambak-v1 profile when the code deploys. Decision 3 (ADR 0007): set statement_profile = raw on each one right after 0078 unless its consumer was told about ambak-v1 (the runbook has the UPDATE). Listed as D08.nnnnn (endpoint host only). After the sitting and before the tag, each D08.nnnnn statement_profile must match the per-organisation decision recorded before the sitting (runbook §4.6, §5).');
     insert into pg_temp.release_audit
-    select 'D08.' || lpad(row_number() over (order by c.organization_id)::text, 3, '0'), 'data',
+    select 'D08.' || lpad(row_number() over (order by c.organization_id)::text, 5, '0'), 'data',
            'organisation ' || c.organization_id || coalesce(' (' || o.slug || ')', ''),
            'statement_profile ' || coalesce(to_jsonb(c) ->> 'statement_profile', 'n/a (before 0078)'),
            'review', 'review', 'review',
@@ -615,29 +665,31 @@ begin
         'current versions (one per slot) with no package_validations row (non-qa)', 'table absent',
         'no error', 'no error', 'no error', 'package_validations is missing: production is below 0070 (see B0070): STOP.');
     else
+      insert into pg_temp.release_audit
       with cur as (
         select p.course_id, coalesce(p.language, 'default') as lang, v.id as version_id,
-               (c.current_version_id = v.id) as is_default
+               coalesce(c.current_version_id = v.id, false) as is_default
         from public.course_packages p
         join public.course_versions v on v.id = p.current_version_id
         join public.courses c on c.id = p.course_id
         left join public.organizations o on o.id = c.organization_id
         where not coalesce(o.slug like 'qa-%', false)
           and not exists (select 1 from public.package_validations pv where pv.course_version_id = v.id))
-      select count(*),
-             string_agg(case when is_default then 'course ' || course_id || ' (' || lang || ', version ' || version_id || ')' end,
-                        ' | ' order by course_id),
-             string_agg(case when not is_default then 'course ' || course_id || ' (' || lang || ', version ' || version_id || ')' end,
-                        ' | ' order by course_id, lang)
-        into n, txt, txt2
+      select 'D09.' || lpad(row_number() over (order by (not is_default), course_id, lang)::text, 5, '0'), 'data',
+             'course ' || course_id || ' (slot ' || lang || ', version ' || version_id || ')',
+             case when is_default then 'course default' else 'other slot' end,
+             'info', 'info', 'info',
+             case when is_default
+                  then 'After the v1.3.0 deploy: Library -> the course page -> "Validate now" (ADR 0007 decision 6).'
+                  else 'Not the course default: the "Validate now" button scans only the default; no app path validates this slot today.' end
       from cur;
+      select count(*), count(*) filter (where observed = 'course default') into n, m
+      from pg_temp.release_audit where check_id like 'D09.%';
       insert into pg_temp.release_audit values ('D09', 'data',
         'current versions (one per slot) with no package_validations row (non-qa)', n::text,
         'info', 'info', 'info',
-        'After the v1.3.0 deploy: course defaults are scanned with Library -> the course page -> "Validate now" (ADR 0007 decision 6): '
-          || coalesce(left(txt, 2500), 'none')
-          || '. Other slots (the button scans only the course default; no app path validates them today): '
-          || coalesce(left(txt2, 2500), 'none') || '.');
+        'Of these, ' || m || ' are course defaults (after the v1.3.0 deploy: Library -> the course page -> "Validate now", ADR 0007 decision 6) and '
+          || (n - m) || ' are other slots (the button scans only the course default; no app path validates them today). Every one is listed as D09.nnnnn, course defaults first.');
     end if;
   exception when others then
     insert into pg_temp.release_audit values ('D09', 'data',
@@ -647,33 +699,53 @@ begin
 
   -- D10 ADR 0010 step 7: abandoned attempts that are completed or passed
   begin
-    select count(*) into n from public.course_attempts
-    where status = 'abandoned'
-      and (completion_status = 'completed' or success_status = 'passed');
+    with z as (
+      select a.id, coalesce(o.slug like 'qa-%', false) as q
+      from public.course_attempts a
+      left join public.organizations o on o.id = a.organization_id
+      where a.status = 'abandoned'
+        and (a.completion_status = 'completed' or a.success_status = 'passed'))
+    select count(*) filter (where not q), count(*) filter (where q),
+           (select string_agg(id::text, ', ' order by id)
+              from (select id from z where not q order by id limit 100) l)
+      into n, m, txt
+    from z;
     insert into pg_temp.release_audit values ('D10', 'data',
-      'abandoned attempts that are completed or passed (ADR 0010 step 7 count)', n::text,
+      'abandoned attempts that are completed or passed, non-qa (ADR 0010 step 7 count)', n::text,
       '0', '0', '0',
-      'The binding runs are right after each 0099 apply (staging done: 0 on 2026-10-18; production after v1.3.0); before that it is a baseline. Non-zero: report to the owner, ledger the ids, change nothing (ADR 0010 decision 2).');
+      'The binding runs are right after each 0099 apply (staging done: 0 on 2026-10-18; production after v1.3.0); before that it is a baseline. Non-zero: report to the owner, ledger the ids, change nothing (ADR 0010 decision 2). qa-* rows skipped: ' || m
+        || ' (production has none, A03). Attempt ids (first 100): ' || coalesce(txt, 'none')
+        || case when n > 100 then ' (+' || (n - 100) || ' more; list cut at 100)' else '' end);
   exception when others then
     insert into pg_temp.release_audit values ('D10', 'data',
-      'abandoned attempts that are completed or passed (ADR 0010 step 7 count)',
+      'abandoned attempts that are completed or passed, non-qa (ADR 0010 step 7 count)',
       'ERROR ' || sqlstate || ': ' || sqlerrm, 'no error', 'no error', 'no error', 'Read the error; stop and ask.');
   end;
 
   -- D11 the 0099 header's cross-organisation read (forged attempt rows)
   begin
-    select count(*) into n
-    from public.course_attempts a
-    join public.course_versions v on v.id = a.course_version_id
-    join public.courses c on c.id = v.course_id
-    where a.organization_id <> c.organization_id;
+    with z as (
+      select a.id, coalesce(oa.slug like 'qa-%', false) or coalesce(oc.slug like 'qa-%', false) as q
+      from public.course_attempts a
+      join public.course_versions v on v.id = a.course_version_id
+      join public.courses c on c.id = v.course_id
+      left join public.organizations oa on oa.id = a.organization_id
+      left join public.organizations oc on oc.id = c.organization_id
+      where a.organization_id <> c.organization_id)
+    select count(*) filter (where not q), count(*) filter (where q),
+           (select string_agg(id::text, ', ' order by id)
+              from (select id from z where not q order by id limit 100) l)
+      into n, m, txt
+    from z;
     insert into pg_temp.release_audit values ('D11', 'data',
-      'attempt rows whose organisation differs from their course''s', n::text,
+      'attempt rows whose organisation differs from their course''s, non-qa', n::text,
       '0', '0', '0',
-      'Non-zero = a row forged through PostgREST before 0099 (or qa rows of the ADR 0009 probe on staging before a CI purge). Ledger the ids, change nothing (ADR 0002 decision 4).');
+      'Non-zero = a row forged through PostgREST before 0099. Ledger the ids, change nothing (ADR 0002 decision 4). qa-* rows skipped (either organisation qa-*, e.g. the ADR 0009 probe on staging before a CI purge): ' || m
+        || '. Attempt ids (first 100): ' || coalesce(txt, 'none')
+        || case when n > 100 then ' (+' || (n - 100) || ' more; list cut at 100)' else '' end);
   exception when others then
     insert into pg_temp.release_audit values ('D11', 'data',
-      'attempt rows whose organisation differs from their course''s',
+      'attempt rows whose organisation differs from their course''s, non-qa',
       'ERROR ' || sqlstate || ': ' || sqlerrm, 'no error', 'no error', 'no error', 'Read the error; stop and ask.');
   end;
 
