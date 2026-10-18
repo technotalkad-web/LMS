@@ -12,7 +12,42 @@
 # `rclone copy --immutable`, never `sync`: nothing is ever deleted from the
 # backup when it disappears from the source (that loss is what the copy
 # insures against), and an object that already exists with different content
-# is an error, not an update (version folders are write-once).
+# is an error, not an update (version folders are write-once). Every such
+# "immutable file modified" key is written to the job summary, grouped by
+# version folder, so the owner can tell a folder reused before ADR 0008 D1
+# (a failed upload no longer gives its number back) from a ready version
+# whose bytes changed (the step-0 incident class: ledger entry).
+#
+# Flags (ADR 0008 step 23 and the decision-3 budget note: B2's free tier
+# caps Class B and Class C transactions at 2,500 a day each, so nothing may
+# cost one request per object or per folder against B2):
+#   --fast-list           one listing call per 1,000 objects, not one per folder
+#   --checksum            "modified" = size or MD5 differs. For a single-part
+#                         object the MD5 is its ETag, read from the listing; an
+#                         object with a multipart ETag (not an MD5) has no hash
+#                         there, and rclone may HEAD it (one B2 Class B call per
+#                         such object per night) for X-Amz-Meta-Md5chksum.
+#                         Default size+modtime would HEAD every object on both
+#                         sides to read X-Amz-Meta-Mtime. Check the Class B
+#                         count in B2's transaction report the day after the
+#                         first real copy: well inside 2,500/day, or switch to
+#                         --size-only.
+#   --min-age 1h          objects that arrived in the last hour wait for the next
+#                         night (an upload still in progress is never half-copied)
+#   --use-server-modtime  the age filter reads LastModified from the listing
+#                         instead of a HEAD per object (the filter also runs on
+#                         the destination listing)
+# Because the destination's LastModified is its copy time, a REAL copy
+# started within an hour of another real copy sees the objects the first
+# one wrote as absent and writes them again (a second locked version, no
+# overwrite, no error): do not start a real copy by hand within an hour of
+# another (the nightly cadence never does; a dry run is unaffected).
+# Rehearsal: run the workflow by hand with dry_run = true (rclone copy
+# --dry-run, same flags; conflicts are reported, nothing is copied). Once
+# the first real copy exists, a dry run with zero conflicts also shows that
+# both endpoints return comparable MD5s; if every existing key conflicts
+# instead, the hashes are not comparable: replace --checksum with
+# --size-only (ADR 0008 step 23).
 #
 # Required secrets (the job fails with a message naming any that are missing):
 #   SUPABASE_S3_ENDPOINT           https://<project-ref>.storage.supabase.co/storage/v1/s3
@@ -34,7 +69,12 @@ name: Nightly content backup (Supabase Storage → B2)
 on:
   schedule:
     - cron: "30 2 * * *" # 02:30 UTC, after the database dump at 02:00
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Rehearsal: rclone copy --dry-run with the nightly flags (nothing is copied; conflicts are still reported)"
+        type: boolean
+        default: false
 
 concurrency:
   group: content-backup
@@ -90,6 +130,8 @@ jobs:
 
       - name: Copy Supabase Storage → B2 (copy, never sync)
         env:
+          # Scheduled runs have no inputs: always a real copy.
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
           RCLONE_CONFIG_SUPA_TYPE: s3
           RCLONE_CONFIG_SUPA_PROVIDER: Other
@@ -106,11 +148,67 @@ jobs:
         run: |
           set -euo pipefail
           dest="b2:${B2_CONTENT_BUCKET}/content/prod/supabase/course-content"
+          log="$RUNNER_TEMP/rclone-copy.log"
+          conflicts="$RUNNER_TEMP/immutable-conflicts.txt"
           # Read-only on the source; --immutable refuses to overwrite a
           # differing object; --s3-no-check-bucket skips CreateBucket on the
-          # (pre-created, locked) destination.
-          rclone copy "supa:course-content" "$dest" \
-            --immutable --s3-no-check-bucket \
-            --transfers 16 --checkers 32 --fast-list --stats-one-line --stats 30s -v
+          # (pre-created, locked) destination. The comparison and age flags
+          # are explained in the header (transaction budget).
+          flags=(
+            --immutable --checksum --min-age 1h --use-server-modtime --fast-list
+            --s3-no-check-bucket
+            --transfers 16 --checkers 32 --stats-one-line --stats 30s -v
+          )
+          mode="copy"
+          if [ "$DRY_RUN" = "true" ]; then
+            flags+=(--dry-run)
+            mode="dry run (nothing copied)"
+          fi
+
+          # Keep the log for the summary even when rclone fails (a conflict
+          # exits non-zero); the job still fails after the summary is written.
+          set +e
+          rclone copy "supa:course-content" "$dest" "${flags[@]}" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          # One key per line, from rclone's per-object errors only (not its
+          # "Attempt 1/3 failed ... immutable file modified" totals).
+          { grep -E ': (Source and destination exist but do not match: immutable file modified|Timestamp mismatch between immutable objects)' "$log" || true; } \
+            | sed -E 's#^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8} +[A-Z]+ +: ##; s#: (Source and destination exist but do not match|Timestamp mismatch between immutable objects).*$##' \
+            | sort -u > "$conflicts"
+          n=$(wc -l < "$conflicts" | tr -d ' ')
+          {
+            echo "## Content backup: ${mode}"
+            echo ""
+            echo "rclone exit code: ${rc}. Immutable conflicts (\"immutable file modified\"): ${n}."
+            if [ "$n" -gt 0 ]; then
+              echo ""
+              echo "Each key below already exists in the backup with different content and was NOT overwritten."
+              echo "Match each folder to its course_versions row: a folder reused before ADR 0008 D1 reached production goes to the owner's choice of ADR 0008 step 24 (an --exclude line or a fresh destination prefix);"
+              echo "a ready version whose bytes changed is an incident for ops/INCIDENT_LEDGER.md."
+              echo ""
+              echo "| Version folder | Conflicting objects |"
+              echo "|---|---|"
+              sed -E 's#^(courses/[^/]+/[^/]+/v[0-9]+/).*#\1#' "$conflicts" | sort | uniq -c \
+                | awk '{ printf "| `%s` | %s |\n", $2, $1 }'
+              echo ""
+              echo "<details><summary>All ${n} keys</summary>"
+              echo ""
+              echo '```'
+              # The step summary is capped at 1 MiB; the full list is in the job log.
+              head -c 800000 "$conflicts"
+              echo '```'
+              if [ "$(wc -c < "$conflicts")" -gt 800000 ]; then
+                echo "(list truncated here; every key is in the job log above)"
+              fi
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$n" -gt 0 ]; then
+            echo "::error title=content-backup immutable conflicts::${n} object(s) exist in the backup with different content. Keys and folders are in the job summary."
+          fi
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
           echo "Objects in the B2 content copy:"
-          rclone size "$dest"
+          rclone size "$dest" --fast-list

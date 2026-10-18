@@ -112,18 +112,23 @@ export async function uploadCoursePackage(opts: {
   }
 
   // 5) Upload every file, then flip the row to 'ready'. On any error the
-  //    reserved row and its prefix are removed (crashes: the reaper's
+  //    reserved row turns 'failed' and its prefix is emptied (ADR 0008 D1:
+  //    the number and folder stay taken; crashes: the reaper's
   //    sweepAbandonedUploads covers 'uploading' rows older than a day).
+  //    A row that is already 'ready' never loses its files
+  //    (failedUploadCleanup).
   const storage = await getStorage();
   try {
-    const uploads: Array<Promise<void>> = files.map(({ cleanPath, file }) =>
-      file
-        .async("uint8array")
-        .then((bytes) =>
-          storage.upload(storagePrefix + sanitizeStorageKey(cleanPath), bytes, contentTypeFor(cleanPath))
-        )
+    // Tasks, not promises: at most 12 files are read and written at a time,
+    // and when one fails no new write starts and every running one settles
+    // before the catch below empties the folder (nothing lands after it).
+    await runPool(
+      files.map(({ cleanPath, file }) => async () => {
+        const bytes = await file.async("uint8array");
+        await storage.upload(storagePrefix + sanitizeStorageKey(cleanPath), bytes, contentTypeFor(cleanPath));
+      }),
+      12
     );
-    await runConcurrent(uploads, 12);
 
     // 0075: learning-unit count (screens) for progress %. Single-file engines
     // embed their slide list in the launch HTML; null = no usable signal.
@@ -136,14 +141,44 @@ export async function uploadCoursePackage(opts: {
       file_count: files.length,
     });
   } catch (e) {
-    try {
-      await storage.deletePrefix(storagePrefix.replace(/\/$/, ""));
-    } catch (delErr) {
-      console.warn("[upload] cleanup: prefix delete failed", delErr);
+    // ADR 0008 D1: the row is kept as 'failed' (never deleted), so
+    // nextVersionNumber moves on and this folder is never written again.
+    // Before 0077 there is no upload_status column (and no 'failed'):
+    // remove the row as before.
+    const mark = await markVersionFailed(svc, version.id);
+    let rowDeleted = false;
+    let status: UploadRowStatus | null = null;
+    if (mark.error && /upload_status|schema cache/i.test(mark.error)) {
+      await svc.from("course_versions").delete().eq("id", version.id);
+      rowDeleted = true;
+    } else if (!mark.claimed) {
+      if (mark.error) console.warn("[upload] cleanup: could not mark the version failed:", mark.error);
+      // Not claimed: discarded meanwhile, gone, or made ready by the last
+      // statement of the try with only its answer lost. Look before
+      // deleting anything.
+      status = await uploadStatusOf(svc, version.id);
     }
-    await svc.from("course_versions").delete().eq("id", version.id);
-    if (createdCourse) await svc.from("courses").delete().eq("id", courseId);
-    throw e;
+    const plan = failedUploadCleanup({ claimed: mark.claimed, rowDeleted, status, createdCourse });
+    if (!plan.landed) {
+      // Every write of this request has settled (runPool), so emptying the
+      // folder now is final.
+      if (plan.emptyFolder) {
+        try {
+          await storage.deletePrefix(storagePrefix.replace(/\/$/, ""));
+        } catch (delErr) {
+          console.warn("[upload] cleanup: prefix delete failed", delErr);
+        }
+      } else {
+        console.warn(`[upload] cleanup: version ${version.id} keeps its files (status ${status}); the reaper retires an 'uploading' row`);
+      }
+      // A course created by THIS call goes, and its row with it (cascade;
+      // no attempts). The folder carried that course's id, so it can never
+      // come back either.
+      if (plan.deleteCourse) await svc.from("courses").delete().eq("id", courseId);
+      throw e;
+    }
+    // Every file landed and the row is 'ready': finish the upload.
+    console.warn(`[upload] version ${version.id} is ready although its confirmation failed; publishing it:`, e);
   }
 
   // 6) Point the package at this version; the course default follows only
@@ -343,7 +378,12 @@ export async function resolveTargetPackage(
   return packageId;
 }
 
-/** Next version number — sequenced PER PACKAGE (each language has its own v1, v2, …). */
+/**
+ * Next version number — sequenced PER PACKAGE (each language has its own
+ * v1, v2, …). max+1 over every row, 'failed' ones included: a failed upload
+ * keeps its number, so a number (and its folder) is never reused (ADR 0008
+ * D1); numbers may have gaps (v3 failed, v4 ready).
+ */
 export async function nextVersionNumber(
   supabase: SupabaseClient,
   packageId: string
@@ -402,6 +442,8 @@ export function isVersionConflictError(e: unknown): e is VersionConflictError {
  * uploading → ready for a reserved multipart version. Service role: there is
  * no admin UPDATE policy on course_versions, so an RLS update would touch 0
  * rows. Deploy-safe before 0077 (no upload_status / file_count columns).
+ * Conditional on 'uploading': a row discarded meanwhile stays 'failed'
+ * (ADR 0008 D1) and is never made ready.
  */
 async function markVersionReady(
   svc: SupabaseClient,
@@ -412,6 +454,7 @@ async function markVersionReady(
     .from("course_versions")
     .update({ upload_status: "ready", ...patch })
     .eq("id", versionId)
+    .eq("upload_status", "uploading")
     .select("id");
   if (error && /upload_status|file_count|schema cache/i.test(error.message)) {
     ({ data, error } = await svc
@@ -421,7 +464,72 @@ async function markVersionReady(
       .select("id"));
   }
   if (error) throw new Error(`Failed to finalise course_version: ${error.message}`);
-  if (!data || data.length === 0) throw new Error("Failed to finalise course_version: the reserved row is gone.");
+  if (!data || data.length === 0) throw new Error("Failed to finalise course_version: the reserved row is gone or was discarded.");
+}
+
+/**
+ * ADR 0008 D1: a version that will never be ready keeps its row, and so
+ * its version number and storage folder, as 'failed'; callers then empty
+ * the folder. The claim comes first and is conditional on `from`, so a
+ * version a concurrent finalize made ready is never touched and its files
+ * are never deleted: delete the folder only when `claimed` is true.
+ * `size_bytes` drops to 0 because the files are gone (the storage quota,
+ * 0038 current_quota_usage, sums it over every row).
+ * 0077's check constraint allows 'failed'; 0098's freeze trigger only
+ * guards rows that are already 'ready'. Service client only.
+ */
+export async function markVersionFailed(
+  svc: SupabaseClient,
+  versionId: string,
+  from: ReadonlyArray<"uploading" | "failed"> = ["uploading"]
+): Promise<{ claimed: boolean; error: string | null }> {
+  const { data, error } = await svc
+    .from("course_versions")
+    .update({ upload_status: "failed", size_bytes: 0 })
+    .eq("id", versionId)
+    .in("upload_status", [...from])
+    .select("id");
+  if (error) return { claimed: false, error: error.message };
+  return { claimed: ((data ?? []) as unknown[]).length > 0, error: null };
+}
+
+/** A reserved version's upload_status as re-read by the multipart error path. */
+export type UploadRowStatus = "ready" | "failed" | "uploading" | "missing" | "unknown";
+
+async function uploadStatusOf(svc: SupabaseClient, versionId: string): Promise<UploadRowStatus> {
+  const { data, error } = await svc.from("course_versions").select("upload_status").eq("id", versionId).maybeSingle();
+  if (error) return "unknown";
+  if (!data) return "missing";
+  const s = (data as { upload_status?: string | null }).upload_status;
+  return s === "ready" || s === "failed" || s === "uploading" ? s : "unknown";
+}
+
+/**
+ * What the multipart error path of uploadCoursePackage does once its
+ * claim (markVersionFailed) has run. The folder is emptied only when the
+ * row is known not to be a ready version:
+ *   - claimed by this call, or deleted (pre-0077)        → empty the folder
+ *   - not claimed, re-read 'failed' (Discard retired it
+ *     mid-upload; files written after that land here)
+ *     or the row is gone                                 → empty the folder
+ *   - not claimed, re-read 'ready': markVersionReady
+ *     committed and only its answer was lost; every file
+ *     landed                                             → keep it, publish
+ *   - not claimed, 'uploading' or unreadable             → keep the files
+ *     (the reaper retires an 'uploading' row after a day)
+ * A course created by this call goes together with its folder whenever the
+ * upload did not land (it holds no attempts: it was never published).
+ */
+export function failedUploadCleanup(input: {
+  claimed: boolean;
+  rowDeleted: boolean;
+  status: UploadRowStatus | null;
+  createdCourse: boolean;
+}): { landed: boolean; emptyFolder: boolean; deleteCourse: boolean } {
+  const { claimed, rowDeleted, status, createdCourse } = input;
+  if (!claimed && !rowDeleted && status === "ready") return { landed: true, emptyFolder: false, deleteCourse: false };
+  const knownNotReady = claimed || rowDeleted || status === "failed" || status === "missing";
+  return { landed: false, emptyFolder: knownNotReady || createdCourse, deleteCourse: createdCourse };
 }
 
 function serviceClient(): SupabaseClient {
@@ -514,18 +622,25 @@ function slugify(s: string): string {
   );
 }
 
-async function runConcurrent<T>(
-  promises: Array<Promise<T>>,
-  concurrency: number
-): Promise<T[]> {
-  const results: T[] = [];
+/**
+ * Run `tasks` at most `concurrency` at a time. After the first failure no
+ * new task starts; the call rejects with that failure only once every
+ * running task has settled, so the caller's cleanup runs after the last
+ * write.
+ */
+async function runPool(tasks: Array<() => Promise<void>>, concurrency: number): Promise<void> {
   let cursor = 0;
-  const workers = Array.from({ length: concurrency }, async () => {
-    while (cursor < promises.length) {
+  let failure: { error: unknown } | null = null;
+  const worker = async () => {
+    while (!failure && cursor < tasks.length) {
       const idx = cursor++;
-      results[idx] = await promises[idx];
+      try {
+        await tasks[idx]();
+      } catch (e) {
+        failure ??= { error: e };
+      }
     }
-  });
-  await Promise.all(workers);
-  return results;
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+  if (failure) throw (failure as { error: unknown }).error;
 }

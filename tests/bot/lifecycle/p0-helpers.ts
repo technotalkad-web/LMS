@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { svc } from "../../e2e/helpers/supabase";
 
 export const FIXTURES = path.resolve(__dirname, "../fixtures");
@@ -28,6 +29,44 @@ export async function has0098(): Promise<boolean> {
   return probe;
 }
 export const NEEDS_0098 = "needs 0098 on staging (migration not applied yet)";
+
+let probe0099: boolean | null = null;
+/**
+ * Is migration 0099 (PostgREST write guards, ADR 0008 C + ADR 0009) applied?
+ * Its section 3 adds v_course_attempt_summary.live_attempt_count in the same
+ * transaction as the policy drops, so one real select of that column settles
+ * all of it (ADR 0009 step 12). Postgres answers 42703 (undefined column)
+ * before the apply; any other error is an environment problem and throws,
+ * so a broken setup never silently skips every guard case. The filter on a
+ * user id no account has still makes Postgres validate the column, and no
+ * organisation's row is read.
+ */
+export async function has0099(): Promise<boolean> {
+  if (probe0099 !== null) return probe0099;
+  const { error } = await svc()
+    .from("v_course_attempt_summary")
+    .select("live_attempt_count")
+    .eq("user_id", "00000000-0000-0000-0000-000000000000")
+    .limit(1);
+  if (error && error.code !== "42703") throw new Error(`has0099 probe failed: ${error.code ?? ""} ${error.message}`);
+  probe0099 = !error;
+  return probe0099;
+}
+export const NEEDS_0099 = "needs 0099";
+
+/**
+ * A PostgREST client carrying the user's own session (anon key + password
+ * sign-in, the spec 50 pattern): what a learner or an admin can do with
+ * their JWT outside any route.
+ */
+export async function sessionClient(u: { email: string; password: string }): Promise<SupabaseClient> {
+  const c = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  const { error } = await c.auth.signInWithPassword({ email: u.email, password: u.password });
+  expect(error, "sign-in with the anon key").toBeNull();
+  return c;
+}
 
 export function sha256(bytes: Uint8Array | Buffer | string): string {
   return createHash("sha256").update(bytes).digest("hex");

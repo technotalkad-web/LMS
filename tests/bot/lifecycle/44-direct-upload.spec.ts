@@ -2,6 +2,14 @@
  * Direct browser-to-storage upload → validate → publish → learner playback
  * (streaming + range) → second version → rollback → abort cleanup.
  *
+ * ADR 0008 D1 (step 25): a version that will never be ready keeps its row
+ * as 'failed' (prefix emptied), so the next upload takes the next number
+ * under a new folder: abort (direct path), a multipart upload failing
+ * mid-way, and the Library hiding failed rows. The reaper's sweep has its
+ * own test, gated by REAPER_E2E=1 (the reaper also acts on other tenants:
+ * never set it against shared staging, so it skips itself there); the
+ * sweep's write is unit-tested in tests/unit/failed-uploads.test.ts.
+ *
  * Runs the real admin UI (file chooser, validation report, progress bar) on a
  * 161-file, 9 MB media package. Needs:
  *   - migration 0077 on the target database
@@ -9,7 +17,11 @@
  *     staging, or `node scripts/dev-s3.mjs` locally with
  *     STORAGE_DRIVER=r2 R2_ENDPOINT=http://localhost:9000 R2_BUCKET=lms-content
  *     R2_ACCESS_KEY_ID=S3RVER R2_SECRET_ACCESS_KEY=S3RVER on the app.
- * Set DIRECT_UPLOAD_E2E=1 to enable.
+ *     The runner lists version folders with the same storage adapter, so it
+ *     needs the app's storage env too (Supabase: the service key it already
+ *     has; R2: the R2_* variables).
+ * Set DIRECT_UPLOAD_E2E=1 to enable (EXPECTED_STORAGE_DRIVER=supabase when the
+ * app has no STORAGE_DRIVER).
  */
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 import fs from "node:fs";
@@ -17,6 +29,11 @@ import path from "node:path";
 import JSZip from "jszip";
 import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
 import { assignCourse, authedContext } from "./helpers";
+import { directUpload, uploadNew, zipFile } from "./p0-helpers";
+// Static imports: the runner's transform does not follow lib/storage's
+// dynamic import() of a .ts module.
+import { SupabaseStorageAdapter } from "../../../lib/storage/supabase";
+import { R2StorageAdapter } from "../../../lib/storage/r2";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 test.skip(!process.env.DIRECT_UPLOAD_E2E, "set DIRECT_UPLOAD_E2E=1 with an S3-compatible bucket configured on the app");
@@ -33,13 +50,43 @@ async function world() {
 async function versionsOf(courseId: string) {
   const { data } = await svc()
     .from("course_versions")
-    .select("id, package_id, version_number, upload_status, storage_driver, file_count, size_bytes, manifest_data")
+    .select("id, package_id, version_number, upload_status, storage_driver, storage_prefix, file_count, size_bytes, manifest_data")
     .eq("course_id", courseId)
     .order("version_number", { ascending: true });
   return (data ?? []) as Array<{
     id: string; package_id: string; version_number: number; upload_status: string; storage_driver: string;
-    file_count: number | null; size_bytes: number | null; manifest_data: { unitCount?: number | null };
+    storage_prefix: string; file_count: number | null; size_bytes: number | null; manifest_data: { unitCount?: number | null };
   }>;
+}
+
+/** Every object key under a version's folder (the app's own storage adapter for that row's driver). */
+async function keysUnder(v: { storage_driver: string; storage_prefix: string }): Promise<string[]> {
+  const storage = v.storage_driver === "r2" ? new R2StorageAdapter() : new SupabaseStorageAdapter();
+  return storage.list(v.storage_prefix.replace(/\/$/, ""));
+}
+
+/**
+ * xapi.zip plus `extra` small files and one entry whose deflate stream is
+ * corrupt: the manifest parses and the validator skips the unreadable file,
+ * so the multipart upload reserves the version and then fails mid-way
+ * (JSZip rejects the entry: "uncompressed data size mismatch").
+ */
+async function brokenXapiZip(extra = 20): Promise<Buffer> {
+  const date = new Date("2026-01-01T00:00:00Z");
+  const zip = await JSZip.loadAsync(fs.readFileSync(path.join(FIXTURES, "xapi.zip")));
+  for (let i = 0; i < extra; i++) zip.file(`assets/extra-${i}.txt`, `extra ${i}`, { date });
+  zip.file("assets/broken.txt", "x".repeat(200_000), { date, compression: "DEFLATE" });
+  const buf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  const name = Buffer.from("assets/broken.txt");
+  for (let i = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04])); i >= 0; i = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]), i + 4)) {
+    const nameLen = buf.readUInt16LE(i + 26);
+    const extraLen = buf.readUInt16LE(i + 28);
+    if (buf.subarray(i + 30, i + 30 + nameLen).equals(name)) {
+      buf[i + 30 + nameLen + extraLen] = 0x07; // BFINAL=1, BTYPE=11 (reserved): an invalid deflate block
+      return buf;
+    }
+  }
+  throw new Error("brokenXapiZip: entry not found");
 }
 
 async function currentVersionId(courseId: string) {
@@ -194,35 +241,47 @@ test("direct upload: 161-file package publishes only after finalise; learner str
   await adminCtx.close();
 });
 
-test("direct upload: an unfinished upload never becomes current; abort and the reaper clean it up", async ({ browser, baseURL }) => {
-  const w = await world();
-  const adminCtx = await authedContext(browser, baseURL!, w.admin.email, w.admin.password);
-  const req: APIRequestContext = adminCtx.request;
-
-  // Validate the small xAPI fixture the legacy way (full zip is fine for the validator).
-  const zipBuf = fs.readFileSync(path.join(FIXTURES, "xapi.zip"));
-  const v = await req.post("/api/courses/validate-package", {
-    multipart: { orgSlug: w.org.slug, file: { name: "xapi.zip", mimeType: "application/zip", buffer: zipBuf } },
-  });
-  expect(v.ok(), await v.text()).toBeTruthy();
-  const validationId = (await v.json()).validation_id as string;
-
+/** Init a direct upload of the small xAPI fixture (validate + init only); returns the init body. */
+async function initSmallUpload(req: APIRequestContext, orgSlug: string, zipBuf: Buffer, courseId?: string) {
   const zip = await JSZip.loadAsync(zipBuf);
   const files = await Promise.all(
     Object.entries(zip.files).filter(([, e]) => !e.dir).map(async ([p, e]) => ({ path: p, size: (await e.async("uint8array")).length }))
   );
+  const v = await req.post("/api/courses/validate-package", {
+    multipart: { orgSlug, ...(courseId ? { courseId } : {}), file: zipFile("xapi.zip", zipBuf) },
+  });
+  expect(v.ok(), await v.text()).toBeTruthy();
+  const validationId = (await v.json()).validation_id as string;
   const init = await req.post("/api/courses/upload/init", {
     data: {
-      orgSlug: w.org.slug,
+      orgSlug,
+      ...(courseId ? { courseId } : {}),
       validation_id: validationId,
       manifest: { fileName: "tincan.xml", xml: await zip.file("tincan.xml")!.async("string") },
       files,
     },
   });
   expect(init.ok(), await init.text()).toBeTruthy();
-  const j = (await init.json()) as { courseId: string; versionId: string; signBatch: number; fileCount: number };
+  return {
+    zip,
+    files,
+    validationId,
+    body: (await init.json()) as { courseId: string; versionId: string; versionNumber: number; storagePrefix: string; signBatch: number; fileCount: number },
+  };
+}
+
+test("direct upload: an unfinished upload never becomes current; abort keeps a failed row and the next upload moves on", async ({ browser, baseURL }) => {
+  const w = await world();
+  const adminCtx = await authedContext(browser, baseURL!, w.admin.email, w.admin.password);
+  const req: APIRequestContext = adminCtx.request;
+  const zipBuf = fs.readFileSync(path.join(FIXTURES, "xapi.zip"));
+
+  const first = await initSmallUpload(req, w.org.slug, zipBuf);
+  const { zip, files, validationId } = first;
+  const j = first.body;
   expect(j.fileCount).toBe(files.length);
   expect(j.signBatch).toBeGreaterThan(0);
+  expect(j.versionNumber).toBe(1);
 
   // Signed URLs come in batches; a batch larger than the driver's budget is refused.
   const tooMany = await req.post("/api/courses/upload/sign", {
@@ -264,29 +323,143 @@ test("direct upload: an unfinished upload never becomes current; abort and the r
   // …nor through the versioned route, although tincan.xml IS in storage: only
   // finished ('ready') uploads are servable (ALDS step 0, P1).
   expect((await learnerCtx.request.get(`/${w.org.slug}/courses/${j.courseId}/content/v/${j.versionId}/tincan.xml`)).status()).toBe(404);
-  await learnerCtx.close();
 
-  // Abort: row and files go away.
+  // The same package for another (new) course: v1, still uploading, holds
+  // its identity, so that validation is blocked (ADR 0004)…
+  const verdictElsewhere = async () => {
+    const r = await req.post("/api/courses/validate-package", { multipart: { orgSlug: w.org.slug, file: zipFile("xapi.zip", zipBuf) } });
+    return ((await r.json()) as { report?: { verdict?: string } }).report?.verdict;
+  };
+  expect(await verdictElsewhere()).toBe("blocked");
+
+  // --- Abort v1 (ADR 0008 D1): the row stays as 'failed', its files go.
+  let versions = await versionsOf(j.courseId);
+  expect(await keysUnder(versions[0]), "the manifest PUT landed").toHaveLength(1);
   const ab = await req.post("/api/courses/upload/abort", { data: { orgSlug: w.org.slug, versionId: j.versionId } });
   expect(ab.ok(), await ab.text()).toBeTruthy();
-  expect(await versionsOf(j.courseId)).toHaveLength(0);
-  expect((await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId } })).status()).toBe(404);
+  versions = await versionsOf(j.courseId);
+  expect(versions.map((v) => [v.version_number, v.upload_status, v.size_bytes])).toEqual([[1, "failed", 0]]);
+  expect(await keysUnder(versions[0]), "v1's folder is empty").toEqual([]);
+  // …but a failed row holds no content, so it is never a collision.
+  expect(await verdictElsewhere()).not.toBe("blocked");
+  // A failed row is not uploading: no more signing or finalising…
+  const finFailed = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId } });
+  expect(finFailed.status()).toBe(409);
+  expect((await finFailed.json()).error).toMatch(/failed, not uploading/);
+  expect((await req.post("/api/courses/upload/sign", { data: { orgSlug: w.org.slug, versionId: j.versionId, files: [{ path: "tincan.xml" }] } })).status()).toBe(409);
+  // …and aborting it again only empties the folder again (idempotent).
+  expect((await req.post("/api/courses/upload/abort", { data: { orgSlug: w.org.slug, versionId: j.versionId } })).ok()).toBeTruthy();
+  expect((await versionsOf(j.courseId)).map((v) => v.upload_status)).toEqual(["failed"]);
+  // Still nothing for the learner.
+  expect((await learnerCtx.request.get(`/${w.org.slug}/courses/${j.courseId}/content/v/${j.versionId}/tincan.xml`)).status()).toBe(404);
+  await learnerCtx.close();
 
-  // Reaper: an 'uploading' row older than 24 h is swept.
-  if (process.env.CRON_SECRET) {
-    const v2 = await req.post("/api/courses/validate-package", {
-      multipart: { orgSlug: w.org.slug, file: { name: "xapi.zip", mimeType: "application/zip", buffer: zipBuf } },
-    });
-    const init2 = await req.post("/api/courses/upload/init", {
-      data: { orgSlug: w.org.slug, courseId: j.courseId, validation_id: (await v2.json()).validation_id, manifest: { fileName: "tincan.xml", xml: await zip.file("tincan.xml")!.async("string") }, files },
-    });
-    expect(init2.ok(), await init2.text()).toBeTruthy();
-    const stale = (await init2.json()).versionId as string;
-    await svc().from("course_versions").update({ upload_started_at: new Date(Date.now() - 2 * 86_400_000).toISOString() }).eq("id", stale);
-    const reap = await req.post("/api/cron/reaper", { headers: { "x-cron-secret": process.env.CRON_SECRET } });
-    expect(reap.ok(), await reap.text()).toBeTruthy();
-    expect((await reap.json()).abandonedUploadsSwept).toBeGreaterThanOrEqual(1);
-    expect((await versionsOf(j.courseId)).find((x) => x.id === stale)).toBeUndefined();
-  }
+  // --- v2 takes the next number under a new folder; abort it mid-way too.
+  const second = (await initSmallUpload(req, w.org.slug, zipBuf, j.courseId)).body;
+  expect(second.versionNumber).toBe(2);
+  versions = await versionsOf(j.courseId);
+  const v2 = versions.find((v) => v.id === second.versionId)!;
+  expect(v2.package_id).toBe(versions[0].package_id);
+  expect(v2.storage_prefix).toBe(`courses/${j.courseId}/${v2.package_id}/v2/`);
+  expect(v2.storage_prefix).not.toBe(versions[0].storage_prefix);
+  const sign2 = await req.post("/api/courses/upload/sign", {
+    data: { orgSlug: w.org.slug, versionId: second.versionId, files: [{ path: "tincan.xml" }] },
+  });
+  expect(sign2.ok(), await sign2.text()).toBeTruthy();
+  const u2 = ((await sign2.json()) as { uploads: Array<{ url: string; headers: Record<string, string> }> }).uploads[0];
+  expect((await req.put(u2.url, { headers: u2.headers, data: await zip.file("tincan.xml")!.async("nodebuffer") })).ok()).toBeTruthy();
+  expect(await keysUnder(v2)).toHaveLength(1);
+  const ab2 = await req.post("/api/courses/upload/abort", { data: { orgSlug: w.org.slug, versionId: second.versionId } });
+  expect(ab2.ok(), await ab2.text()).toBeTruthy();
+  versions = await versionsOf(j.courseId);
+  expect(versions.map((v) => [v.version_number, v.upload_status])).toEqual([[1, "failed"], [2, "failed"]]);
+  expect(await keysUnder(v2), "v2's folder is empty").toEqual([]);
+
+  // --- The next full upload is v3 under its own folder, and becomes current.
+  const third = await directUpload(req, { orgSlug: w.org.slug, buffer: zipBuf, name: "xapi.zip", courseId: j.courseId });
+  expect(third.finalize?.status, JSON.stringify(third)).toBe(200);
+  versions = await versionsOf(j.courseId);
+  expect(versions.map((v) => [v.version_number, v.upload_status])).toEqual([[1, "failed"], [2, "failed"], [3, "ready"]]);
+  const v3 = versions[2];
+  expect(v3.id).toBe(third.versionId);
+  expect(v3.storage_prefix).toBe(`courses/${j.courseId}/${v3.package_id}/v3/`);
+  expect(new Set(versions.map((v) => v.storage_prefix)).size).toBe(3);
+  expect((await keysUnder(v3)).length).toBe(files.length);
+  expect(await currentVersionId(j.courseId)).toBe(v3.id);
+
+  // --- Library: failed rows are hidden behind "Show failed uploads"; shown,
+  // they offer no Discard, Make current or Restart.
+  const page = await adminCtx.newPage();
+  await page.goto(`/${w.org.slug}/library/${j.courseId}`);
+  const rows = page.getByTestId("version-row");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toHaveAttribute("data-version-id", v3.id);
+  const toggle = page.getByTestId("toggle-failed-uploads");
+  await expect(toggle).toHaveText("Show failed uploads (2)");
+  await toggle.click();
+  await page.waitForURL(/showFailed=1/);
+  await expect(rows).toHaveCount(3);
+  const failedRows = page.locator('[data-testid="version-row"][data-upload-status="failed"]');
+  await expect(failedRows).toHaveCount(2);
+  // Only the copy-id chips: no action on a failed row.
+  await expect(failedRows.getByRole("button", { name: /discard|make current|restart/i })).toHaveCount(0);
+  await expect(failedRows.getByRole("button", { name: /^copy /i })).toHaveCount(4);
+  await expect(failedRows.first()).toContainText("failed");
+  await expect(page.getByTestId("toggle-failed-uploads")).toHaveText("Hide failed uploads");
+  await page.close();
+  await adminCtx.close();
+});
+
+test("multipart upload: a failure mid-way keeps a failed row with an empty folder; the next upload moves on", async ({ browser, baseURL }) => {
+  const w = await world();
+  const adminCtx = await authedContext(browser, baseURL!, w.admin.email, w.admin.password);
+  const req = adminCtx.request;
+  const good = fs.readFileSync(path.join(FIXTURES, "xapi.zip"));
+
+  // v1 through the multipart API path (inline validation).
+  const r1 = await uploadNew(req, w.org.slug, "xapi.zip", good);
+  expect(r1.ok(), await r1.text()).toBeTruthy();
+  const v1 = (await r1.json()) as { courseId: string; versionId: string; versionNumber: number };
+  expect(v1.versionNumber).toBe(1);
+
+  // v2: the manifest parses, the version is reserved, then one entry cannot
+  // be read while the files are written → refused; the row stays 'failed'.
+  const r2 = await uploadNew(req, w.org.slug, "xapi-broken.zip", await brokenXapiZip(), { courseId: v1.courseId });
+  expect(r2.status(), await r2.text()).toBe(400);
+  let versions = await versionsOf(v1.courseId);
+  expect(versions.map((v) => [v.version_number, v.upload_status])).toEqual([[1, "ready"], [2, "failed"]]);
+  expect(versions[1].size_bytes).toBe(0);
+  expect(versions[1].storage_prefix).toBe(`courses/${v1.courseId}/${versions[1].package_id}/v2/`);
+  expect(await keysUnder(versions[1]), "nothing is left in v2's folder").toEqual([]);
+  expect(await currentVersionId(v1.courseId)).toBe(v1.versionId);
+
+  // v3: the next upload takes the next number under a new folder.
+  const r3 = await uploadNew(req, w.org.slug, "xapi.zip", good, { courseId: v1.courseId });
+  expect(r3.ok(), await r3.text()).toBeTruthy();
+  const v3 = (await r3.json()) as { versionId: string; versionNumber: number };
+  expect(v3.versionNumber).toBe(3);
+  versions = await versionsOf(v1.courseId);
+  expect(versions.map((v) => [v.version_number, v.upload_status])).toEqual([[1, "ready"], [2, "failed"], [3, "ready"]]);
+  expect(versions[2].storage_prefix).toBe(`courses/${v1.courseId}/${versions[2].package_id}/v3/`);
+  expect(await currentVersionId(v1.courseId)).toBe(v3.versionId);
+  await adminCtx.close();
+});
+
+// The reaper also reaps other tenants: this test calls it only with
+// REAPER_E2E=1 (never against shared staging; its write is unit-tested).
+test("reaper: an 'uploading' row older than 24 h is swept to 'failed', not deleted", async ({ browser, baseURL }) => {
+  test.skip(!process.env.REAPER_E2E || !process.env.CRON_SECRET, "set REAPER_E2E=1 (and CRON_SECRET) only on an isolated database: the reaper acts on every tenant");
+  const w = await world();
+  const adminCtx = await authedContext(browser, baseURL!, w.admin.email, w.admin.password);
+  const req = adminCtx.request;
+  const zipBuf = fs.readFileSync(path.join(FIXTURES, "xapi.zip"));
+  const stale = (await initSmallUpload(req, w.org.slug, zipBuf)).body;
+  await svc().from("course_versions").update({ upload_started_at: new Date(Date.now() - 2 * 86_400_000).toISOString() }).eq("id", stale.versionId);
+  const reap = await req.post("/api/cron/reaper", { headers: { "x-cron-secret": process.env.CRON_SECRET! } });
+  expect(reap.ok(), await reap.text()).toBeTruthy();
+  expect((await reap.json()).abandonedUploadsSwept).toBeGreaterThanOrEqual(1);
+  const row = (await versionsOf(stale.courseId)).find((x) => x.id === stale.versionId);
+  expect(row?.upload_status).toBe("failed");
+  expect(await keysUnder(row!)).toEqual([]);
   await adminCtx.close();
 });

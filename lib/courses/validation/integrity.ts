@@ -163,15 +163,28 @@ export async function checkIntegrity(
 
   const collisions = new Map<string, IntegrityCollision>();
   if (idForMatch || title) {
+    // ADR 0008 D1: a failed upload keeps its row (and its manifest identity)
+    // but holds no content, so it is never a collision. Before 0077 there is
+    // no upload_status column (and no failed row): the lookup runs without
+    // the filter.
+    let excludeFailed = true;
     for (let from = 0; ; from += 1000) {
-      let q = svc
-        .from("course_versions")
-        .select(`${VERSION_IDENTITY_SELECT}, courses!course_versions_course_id_fkey!inner(organization_id, title)`)
-        .eq("courses.organization_id", args.organizationId)
-        .order("id")
-        .range(from, from + 999);
-      if (args.courseId) q = q.neq("course_id", args.courseId);
-      const { data, error } = await q;
+      const page = (withStatusFilter: boolean) => {
+        let q = svc
+          .from("course_versions")
+          .select(`${VERSION_IDENTITY_SELECT}, courses!course_versions_course_id_fkey!inner(organization_id, title)`)
+          .eq("courses.organization_id", args.organizationId)
+          .order("id")
+          .range(from, from + 999);
+        if (args.courseId) q = q.neq("course_id", args.courseId);
+        if (withStatusFilter) q = q.neq("upload_status", "failed");
+        return q;
+      };
+      let { data, error } = await page(excludeFailed);
+      if (error && excludeFailed && /upload_status|schema cache/i.test(error.message)) {
+        excludeFailed = false;
+        ({ data, error } = await page(false));
+      }
       if (error) throw new Error(`integrity lookup failed: ${error.message}`);
       const rows = (data ?? []) as unknown as VersionIdentityRow[];
       for (const r of rows) {

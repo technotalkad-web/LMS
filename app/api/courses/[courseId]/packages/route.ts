@@ -245,7 +245,7 @@ export async function POST(
     );
   }
   await linkValidationToVersion({
-    supabase,
+    organizationId: org.id as string,
     validationId: gate.validationId,
     courseId,
     versionId: uploadResult.versionId,

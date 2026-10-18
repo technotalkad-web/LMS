@@ -118,7 +118,12 @@ the contract). `public.effective_attempt_policy(course_id)` /
 module; `public.v_course_attempt_scoring` and `v_course_attempt_summary`
 expose `official_score`, `first_score`, `best_score`, `scored_attempts`,
 `practice_attempts` per learner per module, and (since 0090) the official
-verdict as `official_status` / `official_attempt_id`. Extra-attempt grants are
+verdict as `official_status` / `official_attempt_id`. Since 0099
+`v_course_attempt_summary` also carries `live_attempt_count`,
+`latest_live_completion` and `latest_live_success`, computed over attempts
+whose status is not `abandoned` (ADR 0009 step 7), while `attempt_count`,
+`latest_completion` and `latest_success` keep counting reset attempts as
+history. Extra-attempt grants are
 applied both in the application layer (`lib/scoring/attempt-kind.ts` →
 `computeScoring(…, retakeIds)`) and in those SQL views (via
 `attempt_requests.used_attempt_id`), so the two agree.

@@ -7,6 +7,7 @@ import {
 } from "@/lib/courses/validation/validate-package";
 import { validateStoredVersion } from "@/lib/courses/validation/validate-stored";
 import { applyIntegrity, checkIntegrity, type IntegrityFindings } from "@/lib/courses/validation/integrity";
+import { isReadyVersion } from "@/lib/courses/default-rule";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 
 /**
@@ -29,7 +30,11 @@ import { auditLog } from "@/lib/auth/require-platform-owner";
  *         pending 'blocked' row so the upload gates accept it; the row stays
  *         pending and blocked until the upload consumes it. Audited.
  *
- * Admin-only. Phase 2 (Accept & Upload) happens on the real upload
+ * Admin-only. Every package_validations write here goes through the service
+ * client after requireAdmin, with the admin's organization_id (ADR 0008 C);
+ * reads stay on the caller's RLS session.
+ *
+ * Phase 2 (Accept & Upload) happens on the real upload
  * endpoints with `validation_id` + `acknowledge` — see
  * lib/courses/validation/gate.ts.
  */
@@ -162,17 +167,20 @@ export async function POST(request: NextRequest) {
       if (!course) {
         return NextResponse.json({ error: "Course not found" }, { status: 404 });
       }
-      let vq = auth.supabase
-        .from("course_versions")
-        .select("id, version_number, storage_prefix")
-        .eq("course_id", course.id);
+      // Without a course default: the newest FINISHED version. An unfinished
+      // or failed upload (ADR 0008 D1: failed rows stay, their folder empty)
+      // is never re-scanned. select("*") for 0077 deploy safety.
+      let vq = auth.supabase.from("course_versions").select("*").eq("course_id", course.id);
       vq = course.current_version_id
         ? vq.eq("id", course.current_version_id)
-        : vq.order("version_number", { ascending: false }).limit(1);
+        : vq.order("version_number", { ascending: false });
       const { data: verRows } = await vq;
-      const version = (verRows ?? [])[0] as
-        | { id: string; version_number: number; storage_prefix: string }
-        | undefined;
+      const version = ((verRows ?? []) as Array<{
+        id: string;
+        version_number: number;
+        storage_prefix: string;
+        upload_status?: string | null;
+      }>).find((v) => isReadyVersion(v.upload_status));
       if (!version?.storage_prefix) {
         return NextResponse.json(
           { error: "Course has no stored version to validate" },
@@ -182,8 +190,10 @@ export async function POST(request: NextRequest) {
 
       const report = await validateStoredVersion(version.storage_prefix);
       // Content is already live for learners, so the row records an audit
-      // (status accepted), not a pending gate decision.
-      const { data: inserted, error } = await auth.supabase
+      // (status accepted), not a pending gate decision. Written by the server
+      // after the admin check (ADR 0008 C: package_validations is written by
+      // service_role only); the organisation is the admin's own.
+      const { data: inserted, error } = await serviceClient()
         .from("package_validations")
         .insert({
           organization_id: auth.orgId,
@@ -224,7 +234,9 @@ export async function POST(request: NextRequest) {
     if ("error" in auth) {
       return NextResponse.json({ error: auth.error }, { status: auth.status });
     }
-    const { data: updated, error } = await auth.supabase
+    // Server write after the admin check (ADR 0008 C), scoped to the admin's
+    // organisation and to a still-pending row.
+    const { data: updated, error } = await serviceClient()
       .from("package_validations")
       .update({ status: "rejected" })
       .eq("id", body.validation_id)
@@ -305,7 +317,9 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  const { data: inserted, error } = await auth.supabase
+  // Server write after the admin check (ADR 0008 C); the organisation is the
+  // admin's own.
+  const { data: inserted, error } = await serviceClient()
     .from("package_validations")
     .insert({
       organization_id: auth.orgId,

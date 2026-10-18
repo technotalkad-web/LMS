@@ -82,6 +82,20 @@ export async function POST(request: NextRequest) {
   const zipBytes = Buffer.from(await file.arrayBuffer());
   const courseId =
     typeof courseIdRaw === "string" && courseIdRaw ? courseIdRaw : undefined;
+  // A given course must be this organisation's (as the packages and
+  // versions upload routes check): the gate writes it into the validation
+  // row with the service client.
+  if (courseId) {
+    const { data: ownCourse } = await supabase
+      .from("courses")
+      .select("id")
+      .eq("id", courseId)
+      .eq("organization_id", org.id)
+      .maybeSingle();
+    if (!ownCourse) {
+      return NextResponse.json({ error: "Course not found" }, { status: 404 });
+    }
+  }
 
   // Language mapping: every NEW course gets a labelled package (default
   // English) so the learner picker and reports always know what they hold.
@@ -213,7 +227,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: isVersionConflictError(err) ? 409 : 400 });
   }
   await linkValidationToVersion({
-    supabase,
+    organizationId: org.id as string,
     validationId: gate.validationId,
     courseId: result.courseId,
     versionId: result.versionId,

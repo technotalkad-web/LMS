@@ -10,7 +10,11 @@ import { useConfirm } from "@/components/ui/confirm";
  * "Make current" for a non-current, fully uploaded version: the rollback /
  * roll-forward control on the course page's version list.
  */
-/** Remove a version whose upload never finished (files + row). */
+/**
+ * Retire a version whose upload never finished: its files are deleted and
+ * the row stays as a failed upload, so its number is never reused (ADR 0008
+ * D1). Rendered for 'uploading' rows only.
+ */
 export function DiscardUploadButton({
   orgSlug,
   versionId,
@@ -28,7 +32,7 @@ export function DiscardUploadButton({
   async function discard() {
     const ok = await confirm({
       title: `Discard the unfinished upload v${versionNumber}?`,
-      message: "Its files are deleted and the version disappears from this list. Nothing learners see changes.",
+      message: `Its files are deleted and v${versionNumber} is kept as a failed upload (hidden from this list; the number is not reused). Nothing learners see changes.`,
       confirmText: "Discard",
       destructive: true,
     });

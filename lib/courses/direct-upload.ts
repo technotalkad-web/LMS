@@ -22,6 +22,7 @@ import {
   insertVersionRow,
   isVersionConflictError,
   manifestData,
+  markVersionFailed,
   nextVersionNumber,
   publishVersion,
   resolveTargetPackage,
@@ -47,7 +48,9 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
  *              'ready' and ONLY THEN makes the version current. An
  *              interrupted upload never reaches learners; the reaper sweeps
  *              abandoned ones.
- *   abort    → deletes the prefix + row of an 'uploading' version.
+ *   abort    → turns an 'uploading' version 'failed' and empties its prefix;
+ *              the row stays, so its number and folder are never reused
+ *              (ADR 0008 D1).
  */
 
 export const DIRECT_UPLOAD_LIMITS = {
@@ -265,7 +268,7 @@ export async function initDirectUpload(args: {
   // ---- 6. Consume the validation and link it; signing happens per batch
   //         through signUploadBatch(). ----
   await consumeValidationForDirectUpload(gateArgs, gate.validationId);
-  await linkValidationToVersion({ supabase, validationId: gate.validationId, courseId, versionId: version.id });
+  await linkValidationToVersion({ organizationId: org.id, validationId: gate.validationId, courseId, versionId: version.id });
 
   return {
     ok: true,
@@ -540,13 +543,18 @@ async function finalizeIntegrity(args: {
     const patch: Record<string, unknown> = blocked
       ? { report, verdict: "blocked", status: "rejected", course_id: null, course_version_id: null }
       : { report };
-    const { error } = await svc.from("package_validations").update(patch).eq("id", linked.id);
+    const { error } = await svc
+      .from("package_validations")
+      .update(patch)
+      .eq("id", linked.id)
+      .eq("organization_id", org.id);
     // Before 0098 'blocked' cannot be stored: keep the findings at least.
     if (error && blocked) {
       await svc
         .from("package_validations")
         .update({ report, status: "rejected", course_id: null, course_version_id: null })
-        .eq("id", linked.id);
+        .eq("id", linked.id)
+        .eq("organization_id", org.id);
     }
   }
 
@@ -557,10 +565,15 @@ async function finalizeIntegrity(args: {
 }
 
 /**
- * Remove an upload finalize refused, before it can become ready: its files,
- * its 'uploading' row and, when this upload created it, the course (nothing
- * current, no other version, and created by init right before this version
- * was reserved; an older empty course is left alone).
+ * Retire an upload finalize refused, before it can become ready (ADR 0008
+ * D1): its row turns 'failed' (kept, so its number and folder are never
+ * reused), then its files go; and, when this upload created it, the course
+ * goes too (nothing current, no version besides this failed one, and created
+ * by init right before this version was reserved; an older empty course is
+ * left alone). The course delete cascades the failed row: it holds no
+ * attempts, and the folder carried the course id, so it can never return.
+ * Nothing is deleted unless this call claimed the row: a row another
+ * request already finalised or retired is left to that request.
  */
 async function removeRefusedUpload(args: {
   version: VersionRow;
@@ -570,25 +583,38 @@ async function removeRefusedUpload(args: {
 }): Promise<void> {
   const { version, course, prefix, storage } = args;
   const svc = serviceClient();
+  const mark = await markVersionFailed(svc, version.id);
+  if (mark.error) console.warn("[direct-upload] refused finalize: could not mark the version failed:", mark.error);
+  // Not claimed: finalised, aborted or swept by another request (or a
+  // database error: the row stays 'uploading' and the reaper retires it).
+  if (!mark.claimed) return;
   try {
     await storage.deletePrefix(prefix.replace(/\/$/, ""));
   } catch (e) {
     console.warn("[direct-upload] refused finalize: prefix delete failed", e);
   }
-  await svc.from("course_versions").delete().eq("id", version.id).eq("upload_status", "uploading");
   if (!course.current_version_id) {
-    const [{ count }, { data: courseRow }] = await Promise.all([
-      svc.from("course_versions").select("id", { count: "exact", head: true }).eq("course_id", course.id),
+    const [{ count, error: countErr }, { data: courseRow }] = await Promise.all([
+      // Every version of the course except this failed one.
+      svc.from("course_versions").select("id", { count: "exact", head: true }).eq("course_id", course.id).neq("id", version.id),
       svc.from("courses").select("created_at").eq("id", course.id).maybeSingle(),
     ]);
     const createdAt = Date.parse((courseRow as { created_at?: string } | null)?.created_at ?? "");
     const startedAt = Date.parse(version.upload_started_at ?? "");
     const createdByThisUpload =
       Number.isFinite(createdAt) && Number.isFinite(startedAt) && startedAt - createdAt > -60_000 && startedAt - createdAt < 10 * 60_000;
-    if ((count ?? 0) === 0 && createdByThisUpload) await svc.from("courses").delete().eq("id", course.id);
+    // A failed count read keeps the course (count is null then).
+    if (!countErr && count === 0 && createdByThisUpload) await svc.from("courses").delete().eq("id", course.id);
   }
 }
 
+/**
+ * Abort (the uploader's own cleanup, or Discard on an 'uploading' row):
+ * the row turns 'failed' and stays (ADR 0008 D1), then the prefix is
+ * emptied. A 'failed' row is accepted too, so a second call only empties
+ * the prefix again (idempotent). A row a concurrent finalize made ready is
+ * refused and keeps its files.
+ */
 export async function abortDirectUpload(args: {
   supabase: SupabaseClient;
   org: { id: string };
@@ -597,22 +623,34 @@ export async function abortDirectUpload(args: {
   const loaded = await loadUploadingVersion(args.supabase, args.org.id, args.versionId, ["uploading", "failed"]);
   if (!loaded.ok) return loaded;
   const { version } = loaded;
+  const mark = await markVersionFailed(serviceClient(), version.id, ["uploading", "failed"]);
+  if (mark.error) return { ok: false, status: 500, error: `Could not abort the upload: ${mark.error}` };
+  if (!mark.claimed) return { ok: false, status: 409, error: "This version was finalised by another request." };
   try {
     const storage = await getStorageFor(version.storage_driver);
     await storage.deletePrefix(version.storage_prefix.replace(/\/$/, ""));
   } catch (e) {
     console.warn("[direct-upload] abort: prefix delete failed", e);
   }
-  await serviceClient().from("course_versions").delete().eq("id", version.id);
   return { ok: true };
 }
 
+type PrefixDeleter = { deletePrefix(prefix: string): Promise<void> };
+
 /**
- * Reaper hook: delete 'uploading' versions nobody finalised within the
- * abandonment window, files first. Returns how many were swept.
+ * Reaper hook: retire 'uploading' versions nobody finalised within the
+ * abandonment window (ADR 0008 D1): the row turns 'failed' and stays, then
+ * its files go. The claim is conditional on 'uploading', so a version
+ * finalised meanwhile keeps its files. Returns how many were swept.
+ * `opts.storageFor` exists for the unit test (a fake adapter); the reaper
+ * passes nothing.
  */
-export async function sweepAbandonedUploads(svc: SupabaseClient): Promise<{ swept: number; errors: string[] }> {
-  const cutoff = new Date(Date.now() - DIRECT_UPLOAD_LIMITS.abandonAfterMs).toISOString();
+export async function sweepAbandonedUploads(
+  svc: SupabaseClient,
+  opts: { storageFor?: (driver: string) => Promise<PrefixDeleter>; now?: number } = {}
+): Promise<{ swept: number; errors: string[] }> {
+  const storageFor = opts.storageFor ?? getStorageFor;
+  const cutoff = new Date((opts.now ?? Date.now()) - DIRECT_UPLOAD_LIMITS.abandonAfterMs).toISOString();
   const { data, error } = await svc
     .from("course_versions")
     .select("id, storage_prefix, storage_driver, upload_started_at")
@@ -625,8 +663,8 @@ export async function sweepAbandonedUploads(svc: SupabaseClient): Promise<{ swep
   for (const v of (data ?? []) as Array<{ id: string; storage_prefix: string; storage_driver: string }>) {
     try {
       // An 'uploading' version is never served, so it holds no attempts. If
-      // one does (a ready row set back to 'uploading' by hand), deleting it
-      // would cascade learner history away: leave it and report it.
+      // one does (a ready row set back to 'uploading' by hand), retiring it
+      // would delete the files those learners run: leave it and report it.
       const { count: attempts, error: attErr } = await svc
         .from("course_attempts")
         .select("id", { count: "exact", head: true })
@@ -636,10 +674,18 @@ export async function sweepAbandonedUploads(svc: SupabaseClient): Promise<{ swep
         errors.push(`${v.id}: skipped, ${attempts} attempt(s) on an 'uploading' version`);
         continue;
       }
-      const storage = await getStorageFor(v.storage_driver);
-      await storage.deletePrefix(v.storage_prefix.replace(/\/$/, ""));
-      await svc.from("course_versions").delete().eq("id", v.id).eq("upload_status", "uploading");
+      const mark = await markVersionFailed(svc, v.id);
+      if (mark.error) throw new Error(`could not mark failed: ${mark.error}`);
+      if (!mark.claimed) continue; // finalised or aborted since the scan
       swept++;
+      // The row is already 'failed' (never served, number kept). A failed
+      // delete is reported in the reaper's errors and is not retried by any
+      // later sweep (this scan reads 'uploading' rows only) or by the
+      // Library (no action on failed rows, ADR 0008 step 22): only an
+      // explicit POST /api/courses/upload/abort for this version removes
+      // those files.
+      const storage = await storageFor(v.storage_driver);
+      await storage.deletePrefix(v.storage_prefix.replace(/\/$/, ""));
     } catch (e) {
       errors.push(`${v.id}: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -743,8 +789,11 @@ type GateArgs = {
   expect: { type: string; launchUrl: string };
 };
 
+// package_validations is written by the server only (ADR 0008 C): the two
+// writes below use the service client, scoped to the admin's organisation;
+// the read in check() stays on the caller's RLS session (opts.supabase).
 async function consumeValidationForDirectUpload(opts: GateArgs, validationId: string): Promise<void> {
-  await opts.supabase
+  await serviceClient()
     .from("package_validations")
     .update({
       status: "accepted",
@@ -753,6 +802,7 @@ async function consumeValidationForDirectUpload(opts: GateArgs, validationId: st
       ...(opts.courseId ? { course_id: opts.courseId } : {}),
     })
     .eq("id", validationId)
+    .eq("organization_id", opts.organizationId)
     .eq("status", "pending");
 }
 
@@ -803,7 +853,11 @@ async function checkValidationForDirectUpload(
   }
   if (v.verdict !== "pass") {
     // Record the acknowledgement now; the status flips in consume().
-    await supabase.from("package_validations").update({ acknowledged_warnings: true }).eq("id", v.id);
+    await serviceClient()
+      .from("package_validations")
+      .update({ acknowledged_warnings: true })
+      .eq("id", v.id)
+      .eq("organization_id", opts.organizationId);
   }
   return { ok: true, validationId: v.id };
 }

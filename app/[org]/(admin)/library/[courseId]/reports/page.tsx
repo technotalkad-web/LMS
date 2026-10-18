@@ -13,9 +13,10 @@ import { loadEnrolledCourseStatus, userCourseKey } from "@/lib/scoring/status";
 // from the attempts with the official-status rule, through the same counter
 // as the Library course card (loadEnrolledCourseStatus), so the two pages always
 // agree and a learner whose only attempts were reset (abandoned, ADR 0004
-// step 11) reads as not started. mv_course_enrollment_status counts any
-// attempt as a start and is no longer read here (its fix waits for the next
-// migration window).
+// step 11) reads as not started. mv_course_enrollment_status is not read
+// here: before migration 0099 it counts any attempt as a start, and from
+// 0099 on it is status-aware (a reset-only learner is not started), but this
+// page keeps computing live (ADR 0009 Consequences).
 //
 // Reads from the materialized views shipped in migration 0031 (#175):
 //   - mv_course_performance        → §4.2 (Completion Rate / Passed / Failed / Avg Score / Avg Time / Rating)
