@@ -1,0 +1,223 @@
+{
+  "about": "Expected results of the v1.3.0 migration rehearsal (README.md). Every audit step compares the exact set of MISMATCH rows in its column, the Z90 summary, the named observed values and the probe groups. Synthetic data only.",
+  "pglite": "0.5.10",
+  "migrations": "supabase/migrations",
+  "audit": "ops/release-v1.3.0-audit.sql",
+  "mustNotAppear": ["p4ss", "token=abc", "never-printed", "key:secret", "user:p4ss"],
+  "scenarios": [
+    {
+      "name": "prod",
+      "title": "production's believed start (0001-0071 without 0032), audit, the sitting (0032 and 0072-0098, each pasted twice; 0098 refused until the shared prefix is repointed), audit, 0099 twice, refresh_report_views(), audit",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        {
+          "audit": {
+            "label": "before the sitting",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "D02"],
+            "z90": "2 / 46 / 50",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0070": "present", "B0071a": "present", "B0071b": "present",
+              "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only",
+              "D01": "6", "D02": "1", "D03": "2", "D03.00001": "2", "D04": "2",
+              "D05": "1", "D06": "1", "D07": "1", "D07.00001": "webhook host crm.example.com",
+              "D08": "1", "D08.00001": "statement_profile n/a (before 0078)",
+              "D09": "3", "D09.00001": "course default", "D09.00002": "other slot", "D09.00003": "other slot",
+              "D10": "0", "D11": "0", "Z01": "0072", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" },
+              { "name": "D04 listed courses", "match": "^D04\\.\\d{5}$", "count": 2 }
+            ],
+            "noteMatches": {
+              "D10": "qa-\\* rows skipped: 1 ",
+              "D11": "qa-\\* rows skipped \\([^)]*\\): 1\\."
+            }
+          }
+        },
+        {
+          "apply": {
+            "label": "the sitting",
+            "files": ["0032", "0072-0098"],
+            "times": 2,
+            "refuseFirst": {
+              "0098": {
+                "why": "by its own guard while a storage prefix is shared (D02 = 1)",
+                "code": "P0001",
+                "contains": "0098 refused: 1 storage_prefix value(s) are shared by more than one course_versions row",
+                "then": "repoint.sql"
+              }
+            }
+          }
+        },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 84,
+            "mismatch": ["A03"],
+            "z90": "40 / 1 / 5",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "absent", "C02": "present", "C03": "0", "C04": "0", "C05": "per-package only",
+              "D01": "6", "D02": "0", "D03": "2", "D04": "2", "D05": "1", "D06": "1", "D07": "1",
+              "D08": "1", "D08.00001": "statement_profile ambak-v1", "D09": "3",
+              "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0099",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "hotfix",
+      "title": "the out-of-band 0032 hotfix already applied (0001-0071 with 0032) and a course-level duplicate pair: C05 reads per-package only",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "files": 71 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        { "sql": "seed-hotfix.sql" },
+        {
+          "audit": {
+            "label": "before the sitting",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "D02"],
+            "z90": "2 / 43 / 47",
+            "observed": { "C01": "absent", "C02": "present", "C03": "1", "C04": "0", "C05": "per-package only", "Z01": "0072", "Z02": "none" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "below0071",
+      "title": "a database below 0071 (0001-0069): the baseline rows read absent and mismatch",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 69, "skip": [32], "files": 68 } },
+        { "sql": "seed.sql" },
+        {
+          "audit": {
+            "label": "before the sitting",
+            "column": "at_before",
+            "rows": 80,
+            "mismatch": ["A03", "B0070", "B0071a", "B0071b", "B0099d", "D02", "D09"],
+            "z90": "7 / 51 / 53",
+            "observed": { "B0070": "absent", "B0071a": "absent", "B0071b": "absent", "D07": "table absent", "D09": "table absent", "Z01": "0072", "Z02": "none" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "gap",
+      "title": "an out-of-order database (0072-0075 and 0077 applied, 0076 missing): Z01 reads 0076, Z02 reads 0077",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        { "apply": { "label": "out-of-order files", "files": ["0072-0075", "0077"], "times": 1 } },
+        {
+          "audit": {
+            "label": "with 0076 missing",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "B0073", "B0073b", "B0074", "B0075", "B0077", "D02", "Z02"],
+            "z90": "8 / 41 / 45",
+            "observed": { "B0072": "present", "B0076": "absent", "B0077": "present", "Z01": "0076", "Z02": "0077" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "asrole",
+      "title": "the audit run as authenticated with Supabase-like default grants: row-level security empties the D rows and A04 is the only mismatch",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        { "sql": "asrole-grants.sql" },
+        {
+          "audit": {
+            "label": "as authenticated",
+            "role": "authenticated",
+            "column": "at_before",
+            "rows": 76,
+            "mismatch": ["A04"],
+            "z90": "1 / 45 / 50",
+            "observed": { "A03": "0", "A04": "authenticated", "D01": "0", "D02": "0", "D03": "0", "D04": "0", "D05": "0", "D06": "0", "D07": "0", "D08": "0", "D09": "0", "D10": "0", "D11": "0" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "many",
+      "title": "1,003 courses: D04 lists every one (five-digit row numbers, no check id collision)",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        { "sql": "seed-many.sql" },
+        {
+          "audit": {
+            "label": "with 1,003 courses",
+            "column": "at_before",
+            "rows": 1085,
+            "mismatch": ["A03", "D02"],
+            "z90": "2 / 46 / 50",
+            "observed": { "D04": "2", "D04.01003": "no flag" },
+            "probes": [{ "name": "D04 listed courses", "match": "^D04\\.\\d{5}$", "count": 1003 }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "no-dashboard-fn",
+      "title": "a replay from the repository alone (no dashboard-made public.set_updated_at()) stops at 0049",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "base": { "through": 71, "skip": [32], "failAt": "0049", "code": "42883" } }
+      ]
+    }
+  ]
+}
