@@ -25,6 +25,13 @@ export const XAPI_NS = "https://ambak.com/xapi/" as const;
 export const E = `${XAPI_NS}ext/` as const;
 export const CMI5_SESSION_EXT = "https://w3id.org/xapi/cmi5/context/extensions/sessionid" as const;
 
+/**
+ * ALDS statement namespace for deterministic ids of id-less content statements
+ * (BLUEPRINT §5.3; ADR 0003 step 6, used by lib/lrs/statement-id.ts). Not the
+ * LMS-derived statement namespace of lib/lrs/uuid5.ts.
+ */
+export const ALDS_NS = "6b2c1f6e-9c2e-5c3a-8f0b-3c1a6d1e2a10" as const;
+
 /** cmi5 category activities (cmi5 §7.1.3, §9.6.2.1–9.6.2.2). */
 export const CMI5_CATEGORY = "https://w3id.org/xapi/cmi5/context/categories/cmi5" as const;
 export const CMI5_MOVEON_CATEGORY = "https://w3id.org/xapi/cmi5/context/categories/moveon" as const;

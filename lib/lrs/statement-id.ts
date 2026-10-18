@@ -1,3 +1,4 @@
+import { ALDS_NS as ALDS_NAMESPACE, EXT } from "../alds/types";
 import { uuid5 } from "./uuid5";
 
 /**
@@ -10,14 +11,15 @@ import { uuid5 } from "./uuid5";
  * object, so an exact retry hashes to the same id (one row) while statements
  * from separate launches or separate tries never collapse.
  *
- * Kept next to uuid5.ts until lib/alds exists (P3 moves both constants).
+ * Both constants now live in lib/alds/types.ts (moved in P3, as ADR 0003
+ * step 6 planned); re-exported here under their old names, values unchanged.
  */
 
 /** ALDS statement namespace (BLUEPRINT §5.3). Not LMS_STATEMENT_NAMESPACE. */
-export const ALDS_NS = "6b2c1f6e-9c2e-5c3a-8f0b-3c1a6d1e2a10";
+export const ALDS_NS: string = ALDS_NAMESPACE;
 
-/** Context extension carrying the question try number (BLUEPRINT §1). */
-export const ALDS_QUESTION_TRY_EXT = "https://ambak.com/xapi/ext/question/try";
+/** Context extension carrying the question try number (BLUEPRINT §1.3). */
+export const ALDS_QUESTION_TRY_EXT: string = EXT.questionTry;
 
 type StatementLike = {
   verb?: { id?: string } | null;
