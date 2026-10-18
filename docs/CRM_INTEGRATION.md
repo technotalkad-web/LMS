@@ -420,9 +420,11 @@ cache-refresh signal, the summary as truth.
 
 ## 6. Known limits
 
-- Completion webhooks fire from the SCORM path; **cmi5** course completions
-  don't fire them yet (no practical impact for Storyline/Rise content —
-  reconcile via `learner-summary` if you adopt cmi5).
+- Completion webhooks fire for official attempts on every runtime (SCORM,
+  cmi5 and xAPI) from release v1.3.0. A cmi5 or xAPI module counts as
+  completed only when it reports completion for the module itself, not for
+  one of its screens. Before v1.3.0, production fired them from the SCORM
+  path only; reconcile any earlier cmi5 completion via `learner-summary`.
 - Email changes are LMS-admin-only by design.
 - Webhook delivery is at-most-once; the summary endpoint is the source of
   truth.
