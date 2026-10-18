@@ -5,11 +5,13 @@ import { attemptAbandonedResponse } from "@/lib/attempts/abandon";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
 import {
+  commitRuntimeRefusal,
   deriveAttemptStatus,
   deriveCompletionStatus,
   deriveSuccessStatus,
   deriveScore,
   type CmiData,
+  type CommitRuntimeRefusal,
 } from "@/lib/scorm/types";
 import { notifyBackground } from "@/lib/notifications/send";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
@@ -34,6 +36,18 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  * beacon arriving after LMSFinish must not erase a completed attempt).
  * An abandoned attempt is terminal for good: 410 `{error:"attempt_abandoned"}`
  * and nothing is written (ALDS step 0, P4); an unknown attempt is 404.
+ *
+ * ADR 0010: this route writes only SCORM attempts (`course_versions.
+ * manifest_type = 'scorm12'`). A cmi5 or xAPI attempt is refused with 409
+ * `{error:"wrong_runtime", manifest_type}` before any derivation, and nothing
+ * is written: those attempts are written at runtime only by the token-bound
+ * xAPI statements and State routes. When the attempt or its version type
+ * cannot be read, the answer is 503 `{error:"attempt_unreadable"}` and
+ * nothing is written; this replaces the former write made without the read
+ * (on a 503 the runtime shows "error" and its next LMSCommit flushes the full
+ * CMI dictionary again).
+ * Order of answers: 401, 400 (invalid JSON), 503 (read error), 404, 410,
+ * 503 or 409 (runtime type), then derive and write.
  */
 export async function POST(
   request: NextRequest,
@@ -62,15 +76,17 @@ export async function POST(
   const { data: attempt, error: readErr } = await supabase
     .from("course_attempts")
     .select(
-      "*, course_versions(manifest_data)"
+      "*, course_versions(manifest_data, manifest_type)"
     )
     .eq("id", attemptId)
     .eq("user_id", user.id)
     .maybeSingle();
-  // A failed READ degrades as before (the write below still runs, and its
-  // status <> 'abandoned' condition still protects an abandoned attempt);
-  // only a clean "no such attempt for this user" is a 404.
-  if (readErr) console.error("[scorm/commit] attempt read failed:", readErr.message);
+  // ADR 0010 step 4 (i): a failed READ writes nothing. Without the row the
+  // route knows neither the attempt's runtime nor its status.
+  if (readErr) {
+    console.error("[scorm/commit] attempt read failed:", readErr.message);
+    return runtimeRefusalResponse(commitRuntimeRefusal(undefined)!);
+  }
 
   const a = attempt as
     | {
@@ -78,15 +94,28 @@ export async function POST(
         completion_status?: string;
         success_status?: string;
         completed_at?: string | null;
-        course_versions?: { manifest_data?: { masteryScore?: number | null } };
+        course_versions?: {
+          manifest_data?: { masteryScore?: number | null };
+          manifest_type?: string | null;
+        } | null;
       }
     | null;
-  if (!a && !readErr) {
+  // (ii) only a clean "no such attempt for this user" is a 404.
+  if (!a) {
     return NextResponse.json({ error: "attempt_not_found" }, { status: 404 });
   }
   // ALDS step 0 (P4): abandoned is terminal — a stale tab's commit or unload
   // beacon must never write to (and so revive) an abandoned attempt.
   if (a?.status === "abandoned") return attemptAbandonedResponse();
+  // (iii) ADR 0010: SCORM attempts only. 409 for a known non-SCORM type, 503
+  // when the version embed is missing or its type empty; nothing is written.
+  const refusal = commitRuntimeRefusal(a.course_versions?.manifest_type);
+  if (refusal) {
+    if (refusal.status === 503) {
+      console.error(`[scorm/commit] version type unreadable for attempt ${attemptId}`);
+    }
+    return runtimeRefusalResponse(refusal);
+  }
 
   const currentStatus = a?.status;
   const currentCompletion = a?.completion_status;
@@ -471,4 +500,13 @@ export async function POST(
     status,
     score,
   });
+}
+
+/**
+ * ADR 0010 refusal body: the error code, the attempt's manifest_type for a
+ * 409 (that string only, no ids) and a fixed message.
+ */
+function runtimeRefusalResponse(r: CommitRuntimeRefusal) {
+  const { status, ...body } = r;
+  return NextResponse.json(body, { status });
 }
