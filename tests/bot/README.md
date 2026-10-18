@@ -140,3 +140,29 @@ follow-up step and exit non-zero when `totals.critical > 0`.
   be crawled. Seed sample courses/paths/teams to widen coverage.
 - **Multi-tenant isolation** is covered precisely in `tests/e2e/security`; the
   bot adds a single-tenant RBAC probe. Keep both.
+
+---
+
+## Lifecycle suite (`tests/bot/lifecycle`)
+
+The lifecycle specs exercise real learner lifecycles against the **staging**
+database (a local `next dev` on port 3001 by hand, or the app built inside the
+runner by `lifecycle-nightly.yml`):
+
+```bash
+E2E_BASE_URL=http://localhost:3001 npx playwright test --config=playwright.lifecycle.config.ts tests/bot/lifecycle/55-attempt-row-guard.spec.ts
+bash scripts/lifecycle-nightly.sh     # what the nightly runs: build, start on :3100, the ALDS subset, counts only
+```
+
+- **Own data namespace** — specs seed through `tests/bot/lifecycle/data.ts`:
+  `lifecycle-*` org slugs and `@lifecycle.test` emails
+  (`tests/e2e/helpers/namespace.ts`). The e2e purge (`qa-*` /
+  `@example.test`), which pr-checks runs on every push and pull request,
+  never matches them, so a push no longer wipes a lifecycle run
+  (`tests/unit/test-data-namespace.test.ts`). Import seeding helpers from
+  `./data`, never from `../../e2e/helpers/supabase`.
+- **Kept 48 h, then cleaned** — there is no teardown; the global setup
+  (`setup.ts`) deletes lifecycle orgs (by cascade) and users older than 48 h
+  through the service role (`cleanup.ts`, bounded per run, counts only).
+- **Staging only** — the setup refuses any Supabase project but
+  `zeaclbapadosqqttexxh`, whatever `E2E_ALLOW_PROD` says.
