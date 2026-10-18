@@ -1,4 +1,10 @@
 import * as Sentry from "@sentry/nextjs";
+import {
+  scrubBreadcrumb,
+  scrubEvent,
+  scrubRecordingEvent,
+  scrubSpan,
+} from "./lib/security/telemetry-scrub";
 
 /**
  * Client-side Sentry init.
@@ -13,6 +19,13 @@ import * as Sentry from "@sentry/nextjs";
  * DSN is injected at build time via NEXT_PUBLIC_SENTRY_DSN (see
  * .github/workflows/deploy-*.yml). When the env var is missing
  * (e.g. local `next dev` without secrets), init is a no-op.
+ *
+ * Privacy: Session Replay keeps the SDK defaults (all text masked, all
+ * media blocked, inputs masked), so learner and admin names, emails and
+ * scores never reach Sentry. Every event, span, breadcrumb and replay
+ * custom event passes through lib/security/telemetry-scrub.ts, which
+ * replaces the /invitations/<token> segment and q= / email= / token=
+ * query values with "[Filtered]".
  */
 const dsn = process.env.NEXT_PUBLIC_SENTRY_DSN;
 if (dsn) {
@@ -42,11 +55,22 @@ if (dsn) {
       "ResizeObserver loop completed with undelivered notifications",
     ],
 
+    // Credential and search scrubbing (see the header comment).
+    beforeSend: (event) => scrubEvent(event),
+    beforeSendTransaction: (event) => scrubEvent(event),
+    beforeSendSpan: (span) => scrubSpan(span),
+    beforeBreadcrumb: (breadcrumb) => scrubBreadcrumb(breadcrumb),
+
     integrations: [
       Sentry.replayIntegration({
-        maskAllText: false,
-        blockAllMedia: false,
+        maskAllText: true,
+        blockAllMedia: true,
+        beforeAddRecordingEvent: (event) => scrubRecordingEvent(event),
       }),
     ],
   });
+
+  // Replay events (their page urls and request url) skip beforeSend and
+  // beforeSendTransaction; event processors run for them too.
+  Sentry.addEventProcessor((event) => (event.type === "replay_event" ? scrubEvent(event) : event));
 }
