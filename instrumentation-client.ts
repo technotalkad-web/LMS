@@ -21,14 +21,22 @@ import {
  * .github/workflows/deploy-*.yml). When the env var is missing
  * (e.g. local `next dev` without secrets), init is a no-op.
  *
- * Privacy: Session Replay keeps the SDK defaults (all text masked, all
- * media blocked, inputs masked), so learner and admin names, emails and
- * scores never reach Sentry. Every event, span, breadcrumb and replay
- * custom event passes through lib/security/telemetry-scrub.ts, which
- * replaces the /invitations/<token> segment, q= / email= / token= query
- * values and Supabase credentials in a query or fragment (access_token=,
- * refresh_token=, ...) with "[Filtered]". Error replays are not sampled
- * from a document that has shown a credential page (see below).
+ * Privacy:
+ *   - Session Replay masks all text, blocks all media and masks inputs (the
+ *     SDK defaults), and masks the aria-label, alt, title and placeholder
+ *     attributes, which admin pages fill with learner names and emails
+ *     (maskAttributes replaces the SDK's default list, so it names all four).
+ *   - Every event, span, breadcrumb and replay custom event passes through
+ *     lib/security/telemetry-scrub.ts, which replaces with "[Filtered]" the
+ *     /invitations/<token> segment, q= / email= / token= values, Supabase
+ *     credentials in a query or fragment (access_token=, refresh_token=,
+ *     ...) and the aria-label / title / alt values in UI breadcrumb
+ *     selectors (read from the live DOM, so replay masking never sees them).
+ *   - Error replays are not sampled from a document that has shown a
+ *     credential page (see below).
+ *   What is NOT covered: free text the app itself puts into an error
+ *   message, a console call or another attribute (for example an href or a
+ *   data-* value). Keep names, emails and scores out of those.
  */
 const dsn = process.env.NEXT_PUBLIC_SENTRY_DSN;
 if (dsn) {
@@ -79,6 +87,7 @@ if (dsn) {
       Sentry.replayIntegration({
         maskAllText: true,
         blockAllMedia: true,
+        maskAttributes: ["title", "placeholder", "aria-label", "alt"],
         beforeAddRecordingEvent: (event) => scrubRecordingEvent(event),
         beforeErrorSampling: () => !(credentialPageSeen || isCredentialUrl(window.location.href)),
       }),

@@ -1,8 +1,9 @@
 /**
  * Unit test for the browser telemetry scrubber (lib/security/telemetry-scrub.ts):
  * the invitation token, the q / email / token query values and the Supabase
- * credentials in a query or fragment never reach Sentry, and everything else
- * in a URL or event is left as it was.
+ * credentials in a query or fragment, and the aria-label / title / alt values
+ * in a UI breadcrumb's element selector never reach Sentry, and everything
+ * else in a URL, selector or event is left as it was.
  *
  * Run:  npx tsx tests/unit/telemetry-scrub.test.ts   (or npm run test:unit)
  */
@@ -12,6 +13,7 @@ import {
   scrubBreadcrumb,
   scrubEvent,
   scrubRecordingEvent,
+  scrubSelectorText,
   scrubSpan,
   scrubText,
 } from "../../lib/security/telemetry-scrub";
@@ -88,6 +90,18 @@ eq("search page with q= is not a credential page", isCredentialUrl("https://lms.
 eq("plain page", isCredentialUrl("https://lms.example.test/acme/learn"), false);
 eq("empty string", isCredentialUrl(""), false);
 
+console.log("\nscrubSelectorText");
+eq("title and aria-label across ancestors", scrubSelectorText('span[title="alice@corp.com"] > button[aria-label="Remove Alice Kumar"]'),
+  `span[title="${F}"] > button[aria-label="${F}"]`);
+eq("alt on an image", scrubSelectorText('div.card > img[alt="Photo of Alice"]'), `div.card > img[alt="${F}"]`);
+eq("type and name kept, text attributes filtered", scrubSelectorText('button#save.btn[aria-label="Change role for a@b.c"][type="button"][name="role"][title="Alice"]'),
+  `button#save.btn[aria-label="${F}"][type="button"][name="role"][title="${F}"]`);
+eq("value with a quote", scrubSelectorText('button[aria-label="Remove "Bob" now"] > svg'), `button[aria-label="${F}"] > svg`);
+eq("value with ] inside", scrubSelectorText('a[title="x] y"][type="z"]'), `a[title="${F}"][type="z"]`);
+eq("component name (no attributes) unchanged", scrubSelectorText("GroupsClient > MemberRow"), "GroupsClient > MemberRow");
+eq("plain selector unchanged", scrubSelectorText('div.flex > button.btn[type="submit"]'), 'div.flex > button.btn[type="submit"]');
+eq("data-* attribute with a similar name untouched", scrubSelectorText('div[data-title="x"]'), 'div[data-title="x"]');
+
 console.log("\nscrubBreadcrumb");
 eq("fetch breadcrumb data.url", scrubBreadcrumb({ category: "fetch", data: { method: "GET", url: "/api/users/search?q=jane", status_code: 200 } }),
   { category: "fetch", data: { method: "GET", url: `/api/users/search?q=${F}`, status_code: 200 } });
@@ -96,6 +110,12 @@ eq("navigation breadcrumb data.from/to", scrubBreadcrumb({ category: "navigation
 eq("console breadcrumb message and arguments", scrubBreadcrumb({ category: "console", message: `visit /invitations/${TOKEN}`, data: { arguments: [`/invitations/${TOKEN}`, 3] } }),
   { category: "console", message: `visit /invitations/${F}`, data: { arguments: [`/invitations/${F}`, 3] } });
 eq("breadcrumb without data or message", scrubBreadcrumb({ category: "ui.click" }), { category: "ui.click" });
+eq("ui.click breadcrumb: selector text attributes filtered", scrubBreadcrumb({ category: "ui.click", message: 'span[title="alice@corp.com"] > button[aria-label="Remove Alice Kumar"]' }),
+  { category: "ui.click", message: `span[title="${F}"] > button[aria-label="${F}"]` });
+eq("ui.input breadcrumb filtered too", scrubBreadcrumb({ category: "ui.input", message: 'input[aria-label="Search Alice"][type="text"]' }),
+  { category: "ui.input", message: `input[aria-label="${F}"][type="text"]` });
+eq("console breadcrumb message is not a selector: kept", scrubBreadcrumb({ category: "console", message: 'found [title="x"]' }),
+  { category: "console", message: 'found [title="x"]' });
 eq("navigation breadcrumb from a fragment with tokens", scrubBreadcrumb({ category: "navigation", data: { from: "/auth/finish?next=%2Fx#access_token=a.b.c&refresh_token=r", to: "/select-org" } }),
   { category: "navigation", data: { from: `/auth/finish?next=%2Fx#access_token=${F}&refresh_token=${F}`, to: "/select-org" } });
 {
@@ -151,6 +171,8 @@ eq("event with nothing to scrub is unchanged", scrubEvent({ message: "boom", req
   { message: "boom", request: { url: "https://lms.example.test/acme/learn" } });
 eq("error event on the implicit-flow landing page", scrubEvent({ request: { url: "https://lms.example.test/auth/finish?next=%2Fx#access_token=eyJ.a.b&refresh_token=r3f&token_type=bearer" } }),
   { request: { url: `https://lms.example.test/auth/finish?next=%2Fx#access_token=${F}&refresh_token=${F}&token_type=bearer` } });
+eq("error event: ui.click breadcrumb selector filtered", scrubEvent({ breadcrumbs: [{ category: "ui.click", message: 'td[title="alice@corp.com"]' }] }),
+  { breadcrumbs: [{ category: "ui.click", message: `td[title="${F}"]` }] });
 eq("empty event", scrubEvent({}), {});
 eq("non-string fields untouched", scrubEvent({ message: undefined, request: null, breadcrumbs: "x", spans: 3 } as object),
   { request: null, breadcrumbs: "x", spans: 3 });
@@ -162,6 +184,18 @@ eq("network span", scrubRecordingEvent({ type: 5, timestamp: 1, data: { tag: "pe
   { type: 5, timestamp: 1, data: { tag: "performanceSpan", payload: { op: "resource.fetch", description: `/api/users/search?q=${F}`, data: { method: "GET", statusCode: 200, request: { size: 0 } } } } });
 eq("breadcrumb frame", scrubRecordingEvent({ type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: { category: "navigation", data: { to: `/invitations/${TOKEN}` } } } }),
   { type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: { category: "navigation", data: { to: `/invitations/${F}` } } } });
+
+eq("replay click breadcrumb: message and node text attributes", scrubRecordingEvent({ type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: {
+  timestamp: 1, type: "default", category: "ui.click", message: 'div[title="alice@corp.com"] > button[aria-label="Remove Alice Kumar"]',
+  data: { nodeId: 7, node: { id: 7, tagName: "button", textContent: "******", attributes: { id: "rm", class: "btn", "aria-label": "Remove Alice Kumar", alt: "Alice", title: "***", role: "button", name: "rm", testId: "remove" } } } } } }),
+  { type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: {
+  timestamp: 1, type: "default", category: "ui.click", message: `div[title="${F}"] > button[aria-label="${F}"]`,
+  data: { nodeId: 7, node: { id: 7, tagName: "button", textContent: "******", attributes: { id: "rm", class: "btn", "aria-label": F, alt: F, title: F, role: "button", name: "rm", testId: "remove" } } } } } });
+eq("replay slow-click breadcrumb filtered", scrubRecordingEvent({ type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: { category: "ui.slowClickDetected", message: 'a[aria-label="Open Alice"]', data: { node: { attributes: { "aria-label": "Open Alice" } } } } } }),
+  { type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: { category: "ui.slowClickDetected", message: `a[aria-label="${F}"]`, data: { node: { attributes: { "aria-label": F } } } } } });
+eq("replay non-UI breadcrumb: no selector scrub", scrubRecordingEvent({ type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: { category: "console", message: 'x[title="y"]' } } }),
+  { type: 5, timestamp: 1, data: { tag: "breadcrumb", payload: { category: "console", message: 'x[title="y"]' } } });
+eq("recording event without data", scrubRecordingEvent({ type: 5, timestamp: 1 }), { type: 5, timestamp: 1 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
