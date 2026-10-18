@@ -9,9 +9,10 @@
  *     under app/, lib/ and components/ that calls .insert/.update/.upsert/
  *     .delete is listed below with its receiver, in file order; a new write
  *     site, a moved one or a receiver that is not a service client fails;
- *   - every `updateAttemptFailSoft(` call is listed the same way, and the two
+ *   - every `updateAttemptFailSoft(` call is listed the same way, and the
  *     functions that pass a parameter through (processStatement,
- *     updateProgressFromState) are checked at their call sites;
+ *     updateProgressFromState, forceRestartOlderVersions) are checked at
+ *     their call sites;
  *   - the sites ADR 0009 steps 2-4 moved carry their explicit filters, and
  *     every package_validations write names organization_id.
  *
@@ -200,9 +201,11 @@ const ATTEMPT_WRITES: Record<string, Site> = {
     what: "grant-retake reset, deactivated-slot close, journey tag, attempt insert",
   },
   "app/api/courses/[courseId]/language-preference/route.ts": { receivers: ["svc"], what: "language switch abandon" },
-  "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts": { receivers: ["svc"], what: "force-restart replace (multipart)" },
   "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts": { receivers: ["svc"], what: "per-version restart" },
-  "lib/courses/direct-upload.ts": { receivers: ["svc"], what: "force-restart replace (direct upload)" },
+  // ADR 0011 step 12: the force-restart writes of versions/route.ts (multipart)
+  // and lib/courses/direct-upload.ts (direct upload) moved here, one write
+  // for both paths; its client is the parameter, checked at both callers below.
+  "lib/attempts/force-restart.ts": { receivers: ["svc"], params: ["svc"], what: "forced restart (both replace paths)" },
   "lib/integrations/webhook.ts": { receivers: ["svc"], what: "webhook latch" },
   // updateAttemptFailSoft's own write: its client is the parameter, checked at every call below.
   "lib/courses/progress.ts": { receivers: ["svc"], params: ["svc"], what: "updateAttemptFailSoft" },
@@ -266,6 +269,28 @@ console.log("\ncourse_attempts: parameter pass-throughs receive a service client
     upCalls.map((c) => isServiceReceiver("app/api/xapi/activities/state/route.ts", "svc", c.at)),
     upCalls.map(() => true)
   );
+
+  // ADR 0011 step 12: forceRestartOlderVersions(svc, …) writes with its
+  // parameter; its two callers must pass the service client.
+  const fr = callsOf("forceRestartOlderVersions");
+  const MULTIPART = "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts";
+  const DIRECT = "lib/courses/direct-upload.ts";
+  eq("forceRestartOlderVersions is called from the two replace paths only", [...fr.keys()].sort(), [MULTIPART, DIRECT].sort());
+  const firstArgOf = (c: Call) => c.args.split(",")[0].trim();
+  const mpCalls = fr.get(MULTIPART) ?? [];
+  eq("multipart replace: one call, first argument svc", mpCalls.map(firstArgOf), ["svc"]);
+  eq(
+    "multipart replace: `svc` is the service client in scope at the call",
+    mpCalls.map((c) => isServiceReceiver(MULTIPART, "svc", c.at)),
+    mpCalls.map(() => true)
+  );
+  const duCalls = fr.get(DIRECT) ?? [];
+  eq("direct finalize: one call, first argument serviceClient()", duCalls.map(firstArgOf), ["serviceClient()"]);
+  eq(
+    "direct finalize: serviceClient() is the service-role one",
+    duCalls.map((c) => isServiceReceiver(DIRECT, "serviceClient()", c.at)),
+    duCalls.map(() => true)
+  );
   eq(
     "lib/xapi/auth serviceClient() uses the service-role key",
     /const serviceClient = \(\) => \{[^}]*SUPABASE_SERVICE_ROLE_KEY/.test(sources.get("lib/xapi/auth.ts") ?? "") &&
@@ -295,6 +320,13 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
   eq("SCORM commit: an abandoned attempt still answers 410",
     /if \(a\?\.status === "abandoned"\) return attemptAbandonedResponse\(\);/.test(commit) &&
     /if \(error\?\.abandoned\) return attemptAbandonedResponse\(\);/.test(commit), true);
+  // ADR 0011: the forced restart's update is id-bound and keeps today's conditions.
+  const fr = (attemptWrites.get("lib/attempts/force-restart.ts") ?? [])[0];
+  eq("forced restart: .update({ status: abandoned }) .in(id) .in(course_version_id) .eq(status, in_progress)", !!fr &&
+    /\.update\(\{ status: "abandoned" \}\)/.test(fr.stmt) &&
+    /\.in\("id", ids\)/.test(fr.stmt) &&
+    /\.in\("course_version_id", versionIds\)/.test(fr.stmt) &&
+    /\.eq\("status", "in_progress"\)/.test(fr.stmt), true);
   const progress = sources.get("lib/courses/progress.ts") ?? "";
   eq("updateAttemptFailSoft: .eq(id) .neq(status, abandoned) and the user_id filter",
     /\.eq\("id", attemptId\)\s*\.neq\("status", "abandoned"\)/.test(progress) &&

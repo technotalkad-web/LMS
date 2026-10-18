@@ -8,6 +8,14 @@
  *
  * No learner-facing choice/notice in either mode.
  *
+ * ADR 0011: a forced restart reports its reset apart from the publish, on
+ * both upload paths (multipart replace and direct finalize): the counts
+ * (`expected`, `restarted`, `resolved`) and a message, "No learners were in
+ * progress." only for a selection that read fine and found nobody. A failed
+ * reset is a 500 with `published: true`; it cannot be produced here without
+ * harming the database and is proven by tests/unit/force-restart.test.ts.
+ * Any non-2xx answer fails these tests (no skip).
+ *
  * Per-version restart (ADR 0008 decision A, step 17 part A): "Restart
  * learners on this version" closes the in-progress attempts of ONE version
  * only — never another version, a grant retake or a completed attempt —
@@ -25,11 +33,17 @@ import {
   svc,
 } from "../../e2e/helpers/supabase";
 import { authedContext, uploadCourse, assignCourse, launch } from "./helpers";
+import { directUpload } from "./p0-helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 const zipBuf = () => fs.readFileSync(path.join(FIXTURES, "scorm12.zip"));
 
-async function seed(browser: import("@playwright/test").Browser, baseURL: string) {
+async function seed(
+  browser: import("@playwright/test").Browser,
+  baseURL: string,
+  /** Overrides for the seeded v1 attempt (e.g. an already passed one). */
+  attempt: Record<string, unknown> = {}
+) {
   const org = await createOrg({ name: "QA VerMode Org" });
   const admin = await createAuthUser({
     profile: { first_name: "Ver", last_name: "Admin", must_change_password: false },
@@ -61,6 +75,7 @@ async function seed(browser: import("@playwright/test").Browser, baseURL: string
       completion_status: "in_progress",
       success_status: "unknown",
       cmi_data: { "cmi.core.lesson_location": "page-3" },
+      ...attempt,
     })
     .select("id")
     .single();
@@ -124,13 +139,17 @@ test("force_restart: old attempt abandoned, fresh attempt on the new version", a
     }
   );
   const body = await replace.text();
-  // force_restart needs the 'abandoned' status constraint (migration 0043/0042).
-  test.skip(
-    !replace.ok() && /restart failed|constraint/i.test(body),
-    "migration 0043 (abandoned status) not applied yet"
-  );
+  // ADR 0011 step 10: no skip; migration 0043 is on every environment and a
+  // non-ok answer (e.g. "…but resetting N learners failed…") fails the test.
   expect(replace.ok(), `replace → ${replace.status()}: ${body}`).toBeTruthy();
-  const v2 = JSON.parse(body).version_id as string;
+  const rep = JSON.parse(body);
+  const v2 = rep.version_id as string;
+  // ADR 0011 step 13: one selected, one reset, nobody resolved elsewhere.
+  expect(rep).toMatchObject({ ok: true, mode: "force_restart", expected: 1, restarted: 1, resolved: 0, message: "1 learner reset." });
+  expect(rep.version_number).toBe(2);
+  // Counts only: no attempt or user ids in the answer.
+  expect(body).not.toContain(s.attemptId);
+  expect(body).not.toContain(s.learner.id);
   await s.adminCtx.close();
 
   // Old attempt silently abandoned.
@@ -153,6 +172,107 @@ test("force_restart: old attempt abandoned, fresh attempt on the new version", a
     .eq("course_version_id", v2)
     .maybeSingle();
   expect(fresh?.status).toBe("in_progress");
+});
+
+const PASSED = {
+  status: "passed",
+  completion_status: "completed",
+  success_status: "passed",
+  score: 0.9,
+  completed_at: new Date().toISOString(),
+};
+
+test("force_restart with nobody in progress: 200, the genuine zero; the passed attempt is untouched (ADR 0011)", async ({
+  browser,
+  baseURL,
+}) => {
+  // Seeded already passed (not a second replace after a launch, which would
+  // find the fresh attempt on v2 and give expected: 1).
+  const s = await seed(browser, baseURL!, PASSED);
+  const before = await attemptRow(s.attemptId);
+  const replace = await s.adminCtx.request.post(
+    `/api/courses/${s.course.courseId}/packages/${s.pkgId}/versions`,
+    {
+      multipart: {
+        orgSlug: s.org.slug,
+        mode: "force_restart",
+        file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
+      },
+    }
+  );
+  const body = await replace.text();
+  expect(replace.status(), body).toBe(200);
+  expect(JSON.parse(body)).toMatchObject({
+    ok: true,
+    mode: "force_restart",
+    restarted: 0,
+    expected: 0,
+    resolved: 0,
+    message: "No learners were in progress.",
+  });
+  await s.adminCtx.close();
+  expect(await attemptRow(s.attemptId)).toEqual(before);
+});
+
+test("direct finalize force_restart: the in-progress attempt is reset and reported (ADR 0011)", async ({ browser, baseURL }) => {
+  const s = await seed(browser, baseURL!);
+  const r = await directUpload(s.adminCtx.request, {
+    orgSlug: s.org.slug,
+    buffer: zipBuf(),
+    name: "scorm12.zip",
+    courseId: s.course.courseId,
+    packageId: s.pkgId,
+    acknowledge: true,
+    mode: "force_restart",
+  });
+  expect(r.finalize?.status, JSON.stringify(r)).toBe(200);
+  const body = r.finalize!.body as { versionId?: string; restart?: Record<string, unknown> };
+  // toMatchObject: tokensExpired is informational (ADR 0011 step 3), so a
+  // transient token-table error must not fail a reset that worked.
+  expect(body.restart).toMatchObject({
+    status: "ok",
+    expected: 1,
+    restarted: 1,
+    resolved: 0,
+    unresolved: 0,
+    unresolved_version_ids: [],
+    message: "1 learner reset.",
+  });
+  const text = JSON.stringify(r.finalize!.body);
+  expect(text).not.toContain(s.attemptId);
+  expect(text).not.toContain(s.learner.id);
+  await s.adminCtx.close();
+  expect((await attemptRow(s.attemptId)).status).toBe("abandoned");
+  // The new version is the package's current version.
+  const { data: pkg } = await svc().from("course_packages").select("current_version_id").eq("id", s.pkgId).single();
+  expect((pkg as { current_version_id: string }).current_version_id).toBe(body.versionId);
+});
+
+test("direct finalize force_restart with nobody in progress: 200, the genuine zero (ADR 0011)", async ({ browser, baseURL }) => {
+  const s = await seed(browser, baseURL!, PASSED);
+  const before = await attemptRow(s.attemptId);
+  const r = await directUpload(s.adminCtx.request, {
+    orgSlug: s.org.slug,
+    buffer: zipBuf(),
+    name: "scorm12.zip",
+    courseId: s.course.courseId,
+    packageId: s.pkgId,
+    acknowledge: true,
+    mode: "force_restart",
+  });
+  expect(r.finalize?.status, JSON.stringify(r)).toBe(200);
+  expect((r.finalize!.body as { restart?: Record<string, unknown> }).restart).toEqual({
+    status: "ok",
+    expected: 0,
+    restarted: 0,
+    resolved: 0,
+    unresolved: 0,
+    unresolved_version_ids: [],
+    message: "No learners were in progress.",
+    tokensExpired: true,
+  });
+  await s.adminCtx.close();
+  expect(await attemptRow(s.attemptId)).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------

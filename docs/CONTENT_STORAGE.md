@@ -126,6 +126,10 @@ learners. `STORAGE_DRIVER` on the Worker decides where **new** uploads go.
   launch; attempts already in progress keep the version they started on. The
   action is audit-logged (`course.version.activated`) and reversible the same
   way. API: `POST /api/courses/{courseId}/packages/{packageId}/versions/{versionId}/activate`.
+  A replace with **Force restart** reports its reset separately from the
+  publish (ADR 0011): the new version is published either way, and a failed
+  reset (a 500 with `published: true`, the red banner in the Library) is
+  retried per version with **Restart learners on this version**.
 - **Roll back the app:** Cloudflare Workers → Deployments → rollback, as before.
 
 ## Deployment (staging, then production)

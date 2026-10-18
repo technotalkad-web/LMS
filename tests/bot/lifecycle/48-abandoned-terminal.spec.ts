@@ -309,7 +309,10 @@ test.describe.serial("ALDS P4 — abandoned is terminal", () => {
       }
     );
     expect(rep.ok(), `replace → ${rep.status()}: ${await rep.text()}`).toBeTruthy();
-    expect((await rep.json()).restarted).toBe(1);
+    const repBody = await rep.json();
+    expect(repBody.restarted).toBe(1);
+    // ADR 0011: the reset is checked, not assumed — one selected, one reset.
+    expect(repBody.expected).toBe(1);
     expect((await attempt(hiAttempt)).status).toBe("abandoned");
     expect((await tokensExpired(hiAttempt)).every(Boolean)).toBe(true);
 

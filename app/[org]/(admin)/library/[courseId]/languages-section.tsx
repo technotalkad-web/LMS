@@ -11,12 +11,14 @@ import {
   type ValidationResult,
 } from "../_components/validation-gate";
 import {
+  PublishedButRestartFailedError,
   directUpload,
   unzipPackage,
   validateUnzipped,
   type UnzippedPackage,
   type UploadProgress,
 } from "../_components/direct-upload";
+import type { ForceRestartOutcome } from "@/lib/attempts/force-restart";
 import { UploadProgressBar } from "../_components/upload-progress";
 
 export type LanguagePackage = {
@@ -41,6 +43,12 @@ export type LanguagePackage = {
  * other active language with a ready current version, and a warning when
  * no active language holds the default.
  *
+ * Replace with "Force restart" (ADR 0011 step 8): the reset is reported
+ * apart from the publish. A failed reset shows the red banner (the new
+ * version is published); a successful one a neutral `replace-result`
+ * banner with the count. Both survive the refresh that shows the new
+ * version in the Versions list.
+ *
  * Closes #158 Phase 1c (UI half).
  */
 export function LanguagesSection({
@@ -63,6 +71,7 @@ export function LanguagesSection({
   const [replaceFor, setReplaceFor] = useState<LanguagePackage | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const hasNullDefault = packages.some((p) => p.language === null);
   const slotLabel = (p: LanguagePackage) =>
@@ -190,6 +199,15 @@ export function LanguagesSection({
       {error && (
         <div className="border border-red-200 bg-red-50 text-red-900 rounded-xl px-4 py-2 text-sm mb-3">
           {error}
+        </div>
+      )}
+
+      {notice && (
+        <div
+          className="border border-line bg-canvas text-ink rounded-xl px-4 py-2 text-sm mb-3"
+          data-testid="replace-result"
+        >
+          {notice}
         </div>
       )}
 
@@ -345,9 +363,22 @@ export function LanguagesSection({
           courseId={courseId}
           pkg={replaceFor}
           onClose={() => setReplaceFor(null)}
-          onReplaced={() => {
+          onReplaced={(outcome) => {
             setReplaceFor(null);
+            // The new version is current either way: the Versions list must show it.
             router.refresh();
+            const r = outcome.restart;
+            if (!r) {
+              // Grandfather: no banner, and an earlier replace's banner goes.
+              setError(null);
+              setNotice(null);
+            } else if (r.status === "failed") {
+              setNotice(null);
+              setError(r.message);
+            } else {
+              setError(null);
+              setNotice(`Replaced. ${r.message}`);
+            }
           }}
         />
       )}
@@ -378,7 +409,7 @@ function ReplacePackageDialog({
   courseId: string;
   pkg: LanguagePackage;
   onClose: () => void;
-  onReplaced: () => void;
+  onReplaced: (outcome: { restart?: ForceRestartOutcome }) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState<"grandfather" | "force_restart">("grandfather");
@@ -420,22 +451,29 @@ function ReplacePackageDialog({
     if (!file || !unzippedPkg) return;
     setBusy(true);
     setError(null);
+    let restart: ForceRestartOutcome | undefined;
     try {
-      await directUpload({
+      const res = await directUpload({
         pkg: unzippedPkg,
         validationId: fields.validation_id,
         acknowledge: fields.acknowledge,
         target: { orgSlug, courseId, packageId: pkg.id, mode },
         onProgress: setProgress,
       });
+      restart = res.restart;
     } catch (err) {
       setBusy(false);
       setProgress(null);
+      if (err instanceof PublishedButRestartFailedError) {
+        // Published, reset failed: close, refresh, and say so on the page.
+        onReplaced({ restart: err.restart });
+        return;
+      }
       setError(err instanceof Error ? err.message : "Upload failed");
       return;
     }
     setBusy(false);
-    onReplaced();
+    onReplaced({ restart });
   }
 
   async function rejectPackage() {

@@ -19,8 +19,8 @@ const eq = (n: string, got: unknown, want: unknown) => {
 const root = path.resolve(__dirname, "../..");
 const SITES: Array<{ file: string; calls: number; what: string }> = [
   { file: "app/api/courses/[courseId]/language-preference/route.ts", calls: 1, what: "language switch" },
-  { file: "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts", calls: 1, what: "force-restart replace (multipart)" },
-  { file: "lib/courses/direct-upload.ts", calls: 1, what: "force-restart replace (direct upload)" },
+  // ADR 0011: both replace paths (multipart route, direct-upload finalize) call the one forced restart.
+  { file: "lib/attempts/force-restart.ts", calls: 1, what: "force-restart replace (both paths)" },
   { file: "app/[org]/(learner)/courses/[courseId]/launch/page.tsx", calls: 2, what: "grant-retake and deactivated-slot closes" },
   { file: "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts", calls: 1, what: "per-version restart" },
 ];
