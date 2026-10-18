@@ -2,9 +2,13 @@
  * Package Guardian: the static certification gate of ADR 0005 step 5, as
  * decided in the note of 2026-10-19 items (d)–(f).
  *
- * runPackageGuardian() runs after publishVersion() in both finalize paths
- * (lib/courses/upload.ts, lib/courses/direct-upload.ts) and from the
- * super_owner re-run route. It is WARN-ONLY: it never throws, never blocks
+ * runPackageGuardian() runs as the last step of every finalize path, after
+ * publishVersion(), the forced restart and the update notification: the
+ * three multipart routes that call lib/courses/upload.ts
+ * uploadCoursePackage (app/api/courses/upload, …/packages and
+ * …/packages/[packageId]/versions) and lib/courses/direct-upload.ts
+ * finalizeDirectUpload; and from the super_owner re-run route
+ * (canRerunCertification). It is WARN-ONLY: it never throws, never blocks
  * or fails an upload, and nothing reads the tier for grading, completion,
  * scores, the Report Card, CRM or journeys (D1). With ALDS_P4 off it returns
  * before any read; with 0100 absent it logs once and skips.
@@ -240,6 +244,19 @@ export function rootAldsManifestKey(keys: readonly string[], prefix: string, man
   const dir = launchKey ? launchKey.slice(0, launchKey.lastIndexOf("/")) : prefix.replace(/\/$/, "");
   const want = `${dir}/${ALDS_MANIFEST_NAME}`.toLowerCase();
   return keys.find((k) => k.toLowerCase() === want) ?? null;
+}
+
+/**
+ * Who may re-run the check (ADR 0005 note (f)): the certify route's
+ * permission predicate, on the caller's RAW organization_members.role as
+ * requireOrgAdminApi reads it. super_owner only: an admin, the legacy
+ * "owner" alias (which requireOrgAccess normalises to super_owner for
+ * pages) and an impersonation without a membership row are refused. The
+ * Library course page offers "Re-run check" through this same function on
+ * the same raw role, so the button shows only where the route answers.
+ */
+export function canRerunCertification(membershipRole: string | null | undefined): boolean {
+  return membershipRole === "super_owner";
 }
 
 // ---------------------------------------------------------------- the gate

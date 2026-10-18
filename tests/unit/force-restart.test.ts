@@ -645,7 +645,13 @@ function answers() {
     const uploadCatch = src.indexOf("} catch (e) {", src.indexOf("result = await uploadCoursePackage("));
     const link = src.indexOf("await linkValidationToVersion(");
     eq("multipart route: one call, after the upload's catch and the validation link", call > uploadCatch && call > link && src.indexOf("forceRestartOlderVersions(svc", call + 1) === -1, true);
-    eq("multipart route: no try/catch after the upload's catch", /\btry\s*\{/.test(src.slice(uploadCatch + 1)), false);
+    eq("multipart route: no try/catch between the upload's catch and the restart", /\btry\s*\{/.test(src.slice(uploadCatch + 1, call)), false);
+    // ADR 0005 note (e), additions of 2026-10-19: the only try after the
+    // upload's catch is the Package Guardian's warn-only one, opened after
+    // the restart call (so it can wrap nothing but the gate).
+    const tries = [...src.slice(uploadCatch + 1).matchAll(/\btry\s*\{/g)].map((m) => uploadCatch + 1 + (m.index ?? 0));
+    eq("multipart route: the one try after it is the gate's, after the restart, wrapping only the gate",
+      tries.length === 1 && tries[0] > call && /^try\s*\{\s*await runPackageGuardian\(/.test(src.slice(tries[0])), true);
   }
 }
 

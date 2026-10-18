@@ -3,7 +3,8 @@
  * ADR 0006 notes (a)–(f) of 2026-10-19; BLUEPRINT §1.2, §1.3, §4, §10.4):
  *
  *   1. lib/alds/launch.ts: the LMS AU id formula, preview roles, the
- *      registration kind, the served language, the LaunchData shape
+ *      registration kind (note (h): a relaunched grant retake keeps
+ *      grant_retake), the served language, the LaunchData shape
  *      (registration = attempt id, the seven contextTemplate extensions,
  *      attemptIndex 1, moveOn CompletedOrPassed), the two fail-soft writers
  *      and the exact LMS.LaunchData match.
@@ -113,11 +114,19 @@ async function main() {
   eq("data_analyst → preview, Browse", previewLaunch("data_analyst"), { isPreview: true, launchMode: "Browse" });
   eq("user → not preview, Normal", previewLaunch("user"), { isPreview: false, launchMode: "Normal" });
 
-  console.log("\nregistrationKindFor (ADR 0006 note (b))");
-  eq("grant consumed on this launch → grant_retake", registrationKindFor({ consumeGrantId: "g1", practiceLaunch: false }), "grant_retake");
-  eq("revision run → retake", registrationKindFor({ consumeGrantId: null, practiceLaunch: true }), "retake");
-  eq("otherwise → enrollment", registrationKindFor({ consumeGrantId: null, practiceLaunch: false }), "enrollment");
-  eq("a grant wins over practice (the page never sets both)", registrationKindFor({ consumeGrantId: "g1", practiceLaunch: true }), "grant_retake");
+  console.log("\nregistrationKindFor (ADR 0006 notes (b) and (h))");
+  eq("grant consumed on this launch → grant_retake", registrationKindFor({ consumeGrantId: "g1", practiceLaunch: false, attemptIsGrantRetake: false }), "grant_retake");
+  eq("revision run → retake", registrationKindFor({ consumeGrantId: null, practiceLaunch: true, attemptIsGrantRetake: false }), "retake");
+  eq("otherwise → enrollment", registrationKindFor({ consumeGrantId: null, practiceLaunch: false, attemptIsGrantRetake: false }), "enrollment");
+  eq("a grant wins over practice (the page never sets both)", registrationKindFor({ consumeGrantId: "g1", practiceLaunch: true, attemptIsGrantRetake: false }), "grant_retake");
+  // Note (h): the kind belongs to the registration (the attempt), so a
+  // relaunch of an in-progress grant retake (no grant consumed on it) keeps it.
+  eq("relaunch of an in-progress grant retake (no grant consumed) → grant_retake, not enrollment",
+    registrationKindFor({ consumeGrantId: null, practiceLaunch: false, attemptIsGrantRetake: true }), "grant_retake");
+  eq("the attempt's grant link wins over a practice verdict", registrationKindFor({ consumeGrantId: null, practiceLaunch: true, attemptIsGrantRetake: true }), "grant_retake");
+  eq("first launch and relaunch of one grant retake give the same kind",
+    registrationKindFor({ consumeGrantId: "g1", practiceLaunch: false, attemptIsGrantRetake: false }) ===
+      registrationKindFor({ consumeGrantId: null, practiceLaunch: false, attemptIsGrantRetake: true }), true);
 
   console.log("\nservedLanguageFor");
   eq("null (unlabeled legacy slot) → und", servedLanguageFor(null), "und");
@@ -504,6 +513,18 @@ async function main() {
     eq("the attempt insert's 0100 columns: ...(p4 ? { … } : {})", !!cond && ts.isConditionalExpression(cond) && isP4(cond.condition) &&
       ts.isObjectLiteralExpression(unparen(cond.whenFalse)) && (unparen(cond.whenFalse) as ts.ObjectLiteralExpression).properties.length === 0, true);
     eq("the LaunchData block is cmi5-only: if (p4 && !isXapi)", /if \(p4 && !isXapi\) \{/.test(src), true);
+    // Note (h): on a relaunch the kind comes from the attempt's grant link
+    // (attempt_requests.used_attempt_id via grantRetakeIdsFor, service
+    // client), read only under the flag and only when no grant is consumed.
+    const svcGrantReads = all.filter((n) => ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "grantRetakeIdsFor" &&
+      n.arguments.length === 3 && n.arguments[0].getText(sf) === "svc") as ts.CallExpression[];
+    eq("one service-client grantRetakeIdsFor(svc, user.id, c.id) read, gated by p4",
+      svcGrantReads.map((n) => [n.arguments.map((a) => a.getText(sf)).join(", "), gatedByP4(n)]), [["svc, user.id, c.id", true]]);
+    eq("…membership of THIS attempt, skipped when a grant is consumed on this launch",
+      /const attemptIsGrantRetake =\s*!consumeGrantId && \(await grantRetakeIdsFor\(svc, user\.id, c\.id\)\)\.has\(attemptId\);/.test(src), true);
+    eq("…read after the grant stamp (attempt_requests.used_attempt_id), so the first launch's row is linked too",
+      src.indexOf("used_attempt_id: attemptId") > 0 && src.indexOf("used_attempt_id: attemptId") < src.indexOf("const attemptIsGrantRetake ="), true);
+    eq("registrationKindFor receives it", /registrationKindFor\(\{ consumeGrantId, practiceLaunch, attemptIsGrantRetake \}\)/.test(src), true);
     eq("the attempt column stores the raw slot language (null when unlabeled), never the LaunchData und",
       [/served_language:\s*attemptServedLanguage\(servedPackage\?\.language\)/.test(src), /served_language:\s*servedLanguage\b/.test(src)], [true, false]);
     eq("LaunchData returnURL is a URL: the request origin + the fixed back target (cmi5 §10.2.6)",

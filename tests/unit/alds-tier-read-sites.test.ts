@@ -15,9 +15,14 @@
  *   (vi)  the grading code imports none of the tier modules, no client
  *         component imports the server flag or the gate, and the frozen rules
  *         tree imports none of the P4 modules;
- *   (vii) both finalize paths call the gate once, after publishVersion(),
- *         inside try/catch (an upload never fails for it); the direct path
- *         calls it last, after the forced restart and the update notice.
+ *   (vii) every finalize path calls the gate once, inside try/catch (an
+ *         upload never fails for it), as its last step: finalizeDirectUpload
+ *         and the three multipart routes that call uploadCoursePackage()
+ *         (the helper itself no longer does), after publication, the forced
+ *         restart and the update notice (note (e), additions of 2026-10-19);
+ *   (viii) the course page offers "Re-run check" through the certify route's
+ *         own predicate (canRerunCertification) on the same raw membership
+ *         role (note (f)).
  * The allowlists say where a name MAY appear; a listed file that does not
  * exist yet (another builder's) is not an error.
  *
@@ -208,28 +213,109 @@ console.log("\n(vi) imports: grading never imports the tier modules; the flag st
   eq("non-vacuous: the rules tree was scanned", rules.length > 5, true);
 }
 
-console.log("\n(vii) both finalize paths run the gate once, after publishVersion(), inside try/catch");
+console.log("\n(vii) every finalize path runs the gate once, as its last step before the return, inside try/catch");
 {
-  for (const [file, listed] of [["lib/courses/upload.ts", false], ["lib/courses/direct-upload.ts", true]] as const) {
-    const c = code(file);
-    const calls = [...c.matchAll(/runPackageGuardian\(/g)].map((m) => m.index ?? 0);
-    eq(`${file}: one call`, calls.length, 1);
-    const at = calls[0] ?? 0;
-    const before = c.slice(0, at);
-    eq(`${file}: after publishVersion(`, before.lastIndexOf("await publishVersion(") > before.lastIndexOf("export async function"), true);
-    const tryAt = before.lastIndexOf("try {");
-    eq(`${file}: inside a try block that catches`, tryAt > before.lastIndexOf("await publishVersion(") && /^[^]*?\}\s*catch\s*\(/.test(c.slice(at)), true);
-    eq(`${file}: listedKeys ${listed ? "reused" : "not passed"}`, /listedKeys:\s*keys/.test(statementFrom(c, at + "runPackageGuardian(".length)), listed);
-    eq(`${file}: the result is not used`, /=\s*await\s+runPackageGuardian\(/.test(c), false);
-    if (listed) {
-      // Note (e) addition of 2026-10-19: in finalizeDirectUpload the gate is
-      // last, so it can never delay or cost the ADR 0011 restart or the notice.
-      const pub = before.lastIndexOf("await publishVersion(");
-      eq(`${file}: after the forced restart and the update notification`,
-        before.lastIndexOf("forceRestartOlderVersions(") > pub && before.lastIndexOf("notifyCourseUpdate(") > pub, true);
-      eq(`${file}: nothing but the return after it`, /^[^]*?\}\s*catch\s*\([^)]*\)\s*\{[^{}]*\}\s*return\s*\{/.test(c.slice(at)), true);
+  // Note (e), additions of 2026-10-19: the gate runs at the end of each
+  // finalize path, after publication, the forced restart and the update
+  // notification, so it can never delay or cost the ADR 0011 restart or the
+  // notice. The multipart helper does not run it; each route that calls
+  // uploadCoursePackage() does, exactly as finalizeDirectUpload does.
+  eq("lib/courses/upload.ts (the multipart helper) does not call it", /runPackageGuardian\(/.test(code("lib/courses/upload.ts")), false);
+  eq("lib/courses/upload.ts does not import it", /@\/lib\/alds\/guardian/.test(code("lib/courses/upload.ts")), false);
+  const UPLOAD_ROUTE = "app/api/courses/upload/route.ts";
+  const PACKAGES_ROUTE = "app/api/courses/[courseId]/packages/route.ts";
+  const VERSIONS_ROUTE = "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts";
+  eq("the files that call uploadCoursePackage( are exactly the three multipart routes",
+    filesMatching(/\buploadCoursePackage\(/).filter((f) => f !== "lib/courses/upload.ts"), [UPLOAD_ROUTE, PACKAGES_ROUTE, VERSIONS_ROUTE].sort());
+
+  /** published: the call after which the version is public; after: the calls the gate must follow. */
+  const SITES: Array<{ file: string; published: string; after: string[]; listed: boolean }> = [
+    { file: "lib/courses/direct-upload.ts", published: "publishVersion", after: ["forceRestartOlderVersions", "notifyCourseUpdate"], listed: true },
+    { file: UPLOAD_ROUTE, published: "linkValidationToVersion", after: ["notifyCourseUpdate"], listed: false },
+    { file: PACKAGES_ROUTE, published: "linkValidationToVersion", after: [], listed: false },
+    { file: VERSIONS_ROUTE, published: "linkValidationToVersion", after: ["forceRestartOlderVersions"], listed: false },
+  ];
+  for (const site of SITES) {
+    const { file } = site;
+    const sf = ts.createSourceFile(file, raw.get(file) ?? "", ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const callsOf = (name: string, under: ts.Node = sf): ts.CallExpression[] => {
+      const out: ts.CallExpression[] = [];
+      const visit = (n: ts.Node) => {
+        if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === name) out.push(n);
+        ts.forEachChild(n, visit);
+      };
+      visit(under);
+      return out;
+    };
+    const gates = callsOf("runPackageGuardian");
+    eq(`${file}: one call`, gates.length, 1);
+    const call = gates[0];
+    if (!call) continue;
+    // `await runPackageGuardian(…)` is the only statement of a try block whose
+    // catch only warns; that try is a top-level statement of the function
+    // (never inside a branch), followed only by the function's return.
+    const stmt = call.parent?.parent;
+    const tryBlock = stmt?.parent;
+    const tryStmt = tryBlock?.parent;
+    const fnBody = tryStmt?.parent;
+    const fn = fnBody?.parent;
+    const shaped = !!stmt && ts.isAwaitExpression(call.parent) && ts.isExpressionStatement(stmt) &&
+      !!tryBlock && ts.isBlock(tryBlock) && tryBlock.statements.length === 1 &&
+      !!tryStmt && ts.isTryStatement(tryStmt) && tryStmt.tryBlock === tryBlock && !tryStmt.finallyBlock;
+    eq(`${file}: \`await runPackageGuardian(…)\` alone in a try block (the result is not used)`, shaped, true);
+    const catchBody = shaped ? (tryStmt as ts.TryStatement).catchClause?.block : undefined;
+    eq(`${file}: the catch only warns`, !!catchBody && catchBody.statements.length === 1 &&
+      /^console\.warn\("\[alds\] guardian failed",/.test(catchBody.statements[0].getText(sf)), true);
+    const isFn = !!fn && !!fnBody && ts.isBlock(fnBody) &&
+      (ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn) || ts.isArrowFunction(fn)) && fn.body === fnBody;
+    eq(`${file}: the try is a top-level statement of the function, never inside a branch`, isFn, true);
+    if (!isFn || !shaped) continue;
+    const body = fnBody as ts.Block;
+    const tryAt = (tryStmt as ts.TryStatement).getStart(sf);
+    const last = body.statements[body.statements.length - 1];
+    eq(`${file}: followed only by the function's return`,
+      body.statements.indexOf(tryStmt as ts.TryStatement) === body.statements.length - 2 && ts.isReturnStatement(last), true);
+    const pubCalls = callsOf(site.published, body);
+    eq(`${file}: after ${site.published}()`, pubCalls.length === 1 && pubCalls[0].getStart(sf) < tryAt, true);
+    for (const a of site.after) {
+      const xs = callsOf(a, body);
+      eq(`${file}: after ${a}()`, xs.length >= 1 && xs.every((x) => x.getStart(sf) < tryAt), true);
     }
+    // Every way out after publication passes the gate: the only return
+    // after it is the last statement (nested functions do not count).
+    const returns: ts.ReturnStatement[] = [];
+    const visitReturns = (n: ts.Node) => {
+      if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n)) return;
+      if (ts.isReturnStatement(n)) returns.push(n);
+      ts.forEachChild(n, visitReturns);
+    };
+    body.statements.forEach(visitReturns);
+    const pubAt = pubCalls[0]?.getStart(sf) ?? Infinity;
+    eq(`${file}: one exit after publication, after the gate`,
+      returns.filter((r) => r.getStart(sf) > pubAt).map((r) => r === last), [true]);
+    eq(`${file}: listedKeys ${site.listed ? "reused" : "not passed"}`, /listedKeys:\s*keys/.test(call.getText(sf)), site.listed);
+    eq(`${file}: trigger "upload"`, /trigger:\s*"upload"/.test(call.getText(sf)), true);
   }
+}
+
+console.log("\n(viii) \"Re-run check\" shows for exactly the roles the certify route accepts");
+{
+  const COURSE_PAGE = "app/[org]/(admin)/library/[courseId]/page.tsx";
+  const route = code(CERTIFY_ROUTE);
+  const page = code(COURSE_PAGE);
+  eq("canRerunCertification is defined only in lib/alds/guardian.ts", filesMatching(/function canRerunCertification\(/), ["lib/alds/guardian.ts"]);
+  eq("…and called only by the certify route and the course page",
+    filesMatching(/(?<!function\s)\bcanRerunCertification\(/), [COURSE_PAGE, CERTIFY_ROUTE].sort());
+  eq("the route answers 403 unless canRerunCertification(role), role from requireOrgAdminApi (the raw membership role)",
+    /if\s*\(!canRerunCertification\(role\)\)\s*\{\s*return NextResponse\.json\(\{\s*error:\s*"super_owner_required"\s*\},\s*\{\s*status:\s*403\s*\}\);/.test(route) &&
+      /const\s*\{[^}]*\brole\b[^}]*\}\s*=\s*auth;/.test(route) && /=\s*await requireOrgAdminApi\(/.test(route), true);
+  eq("the route compares no role literal itself", /\brole\s*[!=]==?\s*"/.test(route), false);
+  eq("the page feeds it the RAW organization_members.role of the signed-in user, read as requireOrgAdminApi reads it",
+    /\.from\("organization_members"\)\s*\.select\("role"\)\s*\.eq\("organization_id",\s*org\.id\)\s*\.eq\("user_id",\s*user\.id\)\s*\.maybeSingle\(\)/.test(page) &&
+      /rerunAllowed\s*=\s*canRerunCertification\(\(membership as [^)]*\)\?\.role\);/.test(page), true);
+  eq("the page reads it only with the flag on: if (showTiers) { … }", /if\s*\(showTiers\)\s*\{\s*const\s*\{\s*data:\s*membership\s*\}/.test(page), true);
+  eq("the button's predicate starts from it, never from the normalised role",
+    /const canRerun\s*=\s*rerunAllowed\s*&&/.test(page) && !/\brole\s*===?\s*"super_owner"/.test(page), true);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

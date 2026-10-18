@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 import { aldsP4Enabled } from "@/lib/alds/flag";
-import { runPackageGuardian } from "@/lib/alds/guardian";
+import { canRerunCertification, runPackageGuardian } from "@/lib/alds/guardian";
 
 /**
  *   POST /api/courses/[courseId]/packages/[packageId]/versions/[versionId]/certify
@@ -11,7 +11,8 @@ import { runPackageGuardian } from "@/lib/alds/guardian";
  * Re-run the Package Guardian static check on one stored version (ADR 0005
  * step 1 "Re-run", step 2 "super_owner may re-run … with an audited reason";
  * note (f) of 2026-10-19). super_owner only (an admin answers 403, the legacy
- * "owner" alias is not accepted), tenant-guarded like the activate route.
+ * "owner" alias is not accepted; canRerunCertification, which the Library
+ * course page uses for its button), tenant-guarded like the activate route.
  * The check is warn-only: it changes the version's analytics tier and
  * nothing else (no grading, completion or learner data; D1).
  *
@@ -33,7 +34,7 @@ export async function POST(
   const auth = await requireOrgAdminApi(body.orgSlug ?? request.nextUrl.searchParams.get("orgSlug"));
   if ("error" in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
   const { supabase, org, userId, role } = auth;
-  if (role !== "super_owner") {
+  if (!canRerunCertification(role)) {
     return NextResponse.json({ error: "super_owner_required" }, { status: 403 });
   }
 

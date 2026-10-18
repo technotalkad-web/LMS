@@ -31,6 +31,7 @@ import { IdChip } from "@/components/ui/id-chip";
 import { packageCode, versionCode } from "@/lib/reference-codes";
 import { isReadyVersion } from "@/lib/courses/default-rule";
 import { aldsP4Enabled } from "@/lib/alds/flag";
+import { canRerunCertification } from "@/lib/alds/guardian";
 import type { VersionTierColumns } from "@/lib/alds/rpc";
 import { TierBadge } from "@/components/alds/tier-badge";
 
@@ -80,7 +81,7 @@ export default async function AdminCourseDetailPage({
 }) {
   const { org: orgSlug, courseId } = await params;
   const showFailed = (await searchParams).showFailed === "1";
-  const { org, role } = await requireOrgAccess(orgSlug);
+  const { org, role, user } = await requireOrgAccess(orgSlug);
   if (!canManage(role)) {
     redirect(`/${orgSlug}/dashboard?denied=1`);
   }
@@ -114,6 +115,21 @@ export default async function AdminCourseDetailPage({
   // ALDS P4 (ADR 0005 note (g)): the analytics-tier badge per version, read
   // from the select("*") above; flag off or column absent → no badge.
   const showTiers = aldsP4Enabled();
+  // "Re-run check" shows on exactly the roles the certify route accepts:
+  // the same predicate (canRerunCertification) on the same input, the RAW
+  // membership role the route reads through requireOrgAdminApi (`role`
+  // above is normalised: the legacy "owner" and an impersonation read as
+  // super_owner, and the route refuses both). Read only with the flag on.
+  let rerunAllowed = false;
+  if (showTiers) {
+    const { data: membership } = await supabase
+      .from("organization_members")
+      .select("role")
+      .eq("organization_id", org.id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    rerunAllowed = canRerunCertification((membership as { role?: string | null } | null)?.role);
+  }
 
 
   // Language packages (#158 Phase 1c). Sorted by language code so the
@@ -742,7 +758,7 @@ export default async function AdminCourseDetailPage({
                   // on a version that is pending, uncertified or revoked.
                   const tier = showTiers ? v.analytics_tier : undefined;
                   const canRerun =
-                    role === "super_owner" &&
+                    rerunAllowed &&
                     !!v.package_id &&
                     isReady &&
                     (tier === "pending" || tier === "uncertified" || tier === "revoked");

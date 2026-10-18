@@ -8,7 +8,7 @@
  *
  *   - the pure pieces: packageDigest (vector), decideTier (every reason, in
  *     order), findAllowlistEntry, the shipped empty allowlist, key lookup,
- *     error scrubbing;
+ *     error scrubbing, who may re-run (canRerunCertification, note (f));
  *   - the flow: flag off → nothing read or written; no manifest → nothing
  *     written (and in the direct path not even a listing); a manifest with an
  *     engine outside the allowlist → uncertified engine_not_allowlisted;
@@ -278,6 +278,15 @@ async function main() {
     eq("no token survives", /abc123|eyJabc|zzz/.test(s), false);
     eq("one line", s.includes("\n"), false);
   }
+
+  /* ---------------- who may re-run ---------------- */
+  console.log("\ncanRerunCertification (note (f)): the certify route's predicate, on the RAW membership role");
+  eq("super_owner → allowed", g.canRerunCertification("super_owner"), true);
+  eq("the legacy owner alias → refused (pages normalise it to super_owner; the route does not)", g.canRerunCertification("owner"), false);
+  for (const r of ["admin", "data_analyst", "user", "member", "", "Super_Owner", " super_owner"]) {
+    eq(`${JSON.stringify(r)} → refused`, g.canRerunCertification(r), false);
+  }
+  eq("no membership row (e.g. an impersonation) → refused", [g.canRerunCertification(null), g.canRerunCertification(undefined)], [false, false]);
 
   /* ---------------- the flow ---------------- */
   const env = process.env as Record<string, string | undefined>;

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { isVersionConflictError, uploadCoursePackage } from "@/lib/courses/upload";
+import { runPackageGuardian } from "@/lib/alds/guardian";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
 import {
   enforcePackageValidation,
@@ -250,6 +251,15 @@ export async function POST(
     courseId,
     versionId: uploadResult.versionId,
   });
+
+  // ADR 0005 note (e), additions of 2026-10-19: the Package Guardian static
+  // gate, warn-only (flag ALDS_P4, default off), as the last step, as
+  // finalizeDirectUpload runs it; it never changes this answer.
+  try {
+    await runPackageGuardian({ versionId: uploadResult.versionId, organizationId: org.id, trigger: "upload" });
+  } catch (e) {
+    console.warn("[alds] guardian failed", e instanceof Error ? e.message : e);
+  }
 
   return NextResponse.json({
     package_id: newPackageId,

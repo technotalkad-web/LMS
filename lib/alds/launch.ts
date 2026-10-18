@@ -51,12 +51,19 @@ export function previewLaunch(role: OrgRole): { isPreview: boolean; launchMode: 
 }
 
 /**
- * registration/kind of this launch (ADR 0006 note (b)): grant_retake when a
- * grant is consumed on this launch, retake when it is a revision run, else
- * enrollment.
+ * registration/kind (ADR 0006 notes (b) and (h)): grant_retake when a grant
+ * is consumed on this launch or the attempt (= the registration) is a grant
+ * retake by its row's link (attempt_requests.used_attempt_id), so a relaunch
+ * of an in-progress grant retake keeps its kind; retake when it is a
+ * revision run, else enrollment.
  */
-export function registrationKindFor(i: { consumeGrantId: string | null; practiceLaunch: boolean }): RegistrationKind {
-  if (i.consumeGrantId) return "grant_retake";
+export function registrationKindFor(i: {
+  consumeGrantId: string | null;
+  practiceLaunch: boolean;
+  /** The launched attempt is a consumed grant's retake (grantRetakeIdsFor). */
+  attemptIsGrantRetake: boolean;
+}): RegistrationKind {
+  if (i.consumeGrantId || i.attemptIsGrantRetake) return "grant_retake";
   if (i.practiceLaunch) return "retake";
   return "enrollment";
 }

@@ -1113,13 +1113,20 @@ export default async function LaunchPage({
       } catch {
         courseUlid = null;
       }
+      // ADR 0006 note (h): a registration's kind never changes between its
+      // launches. A relaunch of an in-progress grant retake consumes no
+      // grant, so the kind comes from the attempt's own link to its grant
+      // (attempt_requests.used_attempt_id, stamped above on the first
+      // launch); fail-soft (a failed read is an empty set).
+      const attemptIsGrantRetake =
+        !consumeGrantId && (await grantRetakeIdsFor(svc, user.id, c.id)).has(attemptId);
       const launchData = buildLaunchData({
         attemptId,
         packageId: v.package_id,
         versionId: v.id,
         servedLanguage,
         launchMode: preview.launchMode,
-        registrationKind: registrationKindFor({ consumeGrantId, practiceLaunch }),
+        registrationKind: registrationKindFor({ consumeGrantId, practiceLaunch, attemptIsGrantRetake }),
         sessionId,
         publisherCourseId: v.manifest_data?.raw?.courseId ?? null,
         courseUlid,
