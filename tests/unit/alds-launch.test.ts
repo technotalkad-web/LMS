@@ -18,6 +18,8 @@
  *   4. Flag off = today's launch: a TypeScript-AST scan of launch/page.tsx
  *      proving every P4 call, column and value sits under a condition whose
  *      leftmost operand is `p4` (= aldsP4Enabled(), read once).
+ *   5. The revision seed (launch/page.tsx) copies the source attempt's State
+ *      documents except LMS.LaunchData, flag or not (ADR 0006 note (j)).
  *
  * Intentionally unconditional deltas (live in every deploy, flag or not;
  * none changes what a learner sees or how an attempt is graded):
@@ -26,7 +28,10 @@
  *   - process-statement's attempt read embeds `package_id`, and
  *     launchedActivityIds() appends the LMS AU id (only an engine launched
  *     with the flag on is ever given that id);
- *   - the State route's LMS.LaunchData 403 guard (no engine writes that id).
+ *   - the State route's LMS.LaunchData 403 guard (no engine writes that id);
+ *   - the revision seed's read excludes state_id LMS.LaunchData (note (j):
+ *     that document names the source attempt; where the flag was never on
+ *     none is stored, so the copy is exactly today's).
  *
  * No database, no network: a recording fake stands in for supabase-js, and
  * globalThis.fetch is stubbed for the route.
@@ -539,6 +544,21 @@ async function main() {
         const e = src.indexOf("// --- cmi5 / standalone xAPI (TinCan) path ---");
         return s > 0 && e > s && !/lesson_mode|p4|preview|servedLanguage/.test(src.slice(s, e));
       })(), true);
+
+    /* ---------------- 5. the revision seed never copies LMS.LaunchData ---------------- */
+    console.log("\nlaunch/page.tsx: the revision seed never copies LMS.LaunchData (unconditional, note (j))");
+    eq("the seed reads the source attempt's documents except LMS.LaunchData",
+      /\.from\("xapi_state"\)\s*\.select\("state_id, content, content_type"\)\s*\.eq\("attempt_id", revisionSource\.id\)\s*\.neq\("state_id", LMS_LAUNCH_DATA_STATE_ID\);/.test(src), true);
+    eq("…the constant is rpc.ts's (= \"LMS.LaunchData\", checked above)",
+      /^import \{ LMS_LAUNCH_DATA_STATE_ID \} from "@\/lib\/alds\/rpc";$/m.test(src), true);
+    eq("…and the seed upserts exactly the rows of that read onto the new attempt",
+      /const rows = \(states \?\? \[\]\) as Array<[^>]+>;\s*if \(rows\.length > 0\) \{\s*await seedSvc\s*\.from\("xapi_state"\)\s*\.upsert\(rows\.map\(\(r\) => \(\{ \.\.\.r, attempt_id: attemptId \}\)\), \{ onConflict: "attempt_id,state_id" \}\);/.test(src), true);
+    eq("the page names xapi_state only in the seed (one read, one upsert; LaunchData is writeLaunchData's)",
+      (src.match(/\.from\("xapi_state"\)/g) ?? []).length, 2);
+    const seedExclusions = all.filter((n) => ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&
+      n.expression.name.text === "neq" && n.arguments[1]?.getText(sf) === "LMS_LAUNCH_DATA_STATE_ID") as ts.CallExpression[];
+    eq("the exclusion is one call, not behind the flag (a source document may outlive ALDS_P4)",
+      seedExclusions.map((n) => gatedByP4(n)), [false]);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

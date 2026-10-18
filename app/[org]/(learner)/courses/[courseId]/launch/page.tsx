@@ -38,6 +38,7 @@ import {
   servedLanguageFor,
   writeLaunchData,
 } from "@/lib/alds/launch";
+import { LMS_LAUNCH_DATA_STATE_ID } from "@/lib/alds/rpc";
 
 type Course = {
   id: string;
@@ -848,7 +849,12 @@ export default async function LaunchPage({
     if (attemptId) {
       cmi = seedCmi;
       // cmi5 / xAPI revision: carry the package's State documents over so it
-      // resumes from the learner's latest saved progress.
+      // resumes from the learner's latest saved progress. Never the
+      // LMS-owned LMS.LaunchData (cmi5 §10.1, ADR 0006 note (j)): it names
+      // the SOURCE attempt (registration, session, launch mode), so a copy
+      // would hand this attempt another attempt's identity whenever the
+      // flag-on write below does not replace it. Unconditional: the flag may
+      // be off now and the source's document still stored.
       if (revisionSource && v.manifest_type !== "scorm12") {
         try {
           const seedSvc = createServiceClient(
@@ -859,7 +865,8 @@ export default async function LaunchPage({
           const { data: states } = await seedSvc
             .from("xapi_state")
             .select("state_id, content, content_type")
-            .eq("attempt_id", revisionSource.id);
+            .eq("attempt_id", revisionSource.id)
+            .neq("state_id", LMS_LAUNCH_DATA_STATE_ID);
           const rows = (states ?? []) as Array<{ state_id: string; content: unknown; content_type: string | null }>;
           if (rows.length > 0) {
             await seedSvc
