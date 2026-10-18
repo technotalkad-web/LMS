@@ -49,7 +49,7 @@ Deciders: owner; architect (Fable 5.1)
 
 | Risk | Protection |
 |---|---|
-| 26–28 hand-applied files on a no-PITR production (0032 guarded, 0072 or 0073 through 0098) | rehearsal on a scratch project restored from the dump; one sitting; `ops/release-v1.3.0-audit.sql` before and after |
+| 26–28 hand-applied files on a no-PITR production (0032 guarded, 0072 or 0073 through 0098) | rehearsal on a scratch project restored from the dump; one sitting; `ops/release-v1.3.0-audit.sql` before and after. Note (2026-10-18; decision 7, not an edit to this row): for v1.3.0 the rehearsal is the free local copy (the migration rehearsal harness and the encrypted-dump drill), not a scratch project; the data-dependent failures are left to the production audit's stop rules, and what the local copy cannot prove is in `docs/release/v1.3.0.md` §7.3 |
 | Tenant LRS consumers receive a changed payload | `raw` per enabled config unless told; release note |
 | CRM receives cmi5 completion webhooks for the first time | webhook count in the audit; CRM consumer sign-off item |
 | Learners: one official attempt by default | release note; existing attempts unchanged; `attempt_requests` flow exists |
