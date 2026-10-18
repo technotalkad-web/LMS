@@ -11,6 +11,8 @@
  *   (iii) forceRestartOlderVersions on the recording fake: the versions read
  *         excludes the new version; the update is conditional on id,
  *         course_version_id and status = 'in_progress', 150 ids at a time;
+ *         the selection pages by keyset, so a row leaving 'in_progress'
+ *         between pages skips no other row;
  *         an empty answer at R1, R2, R3 or the update is that step's
  *         failure; a failed read issues no update; `[]` is the genuine zero;
  *         token expiry and the LRS enqueue get exactly the reset ids; a
@@ -158,12 +160,15 @@ function attemptsWorld(
       if (hooked) return hooked;
       const vers = new Set(inList(q, "course_version_id"));
       const status = arg(q, "eq", "status")?.[1];
-      const [from, to] = (arg(q, "range") ?? [0, 999]) as [number, number];
+      const after = arg(q, "gt", "id")?.[1] as string | undefined;
+      const range = arg(q, "range") as [number, number] | undefined;
+      const limit = (arg(q, "limit")?.[0] ?? 1000) as number;
       const all = rows
-        .filter((r) => vers.has(r.course_version_id) && r.status === status)
+        .filter((r) => vers.has(r.course_version_id) && r.status === status && (after === undefined || r.id > after))
         .sort((a, b) => (a.id < b.id ? -1 : 1))
         .map((r) => ({ id: r.id, course_version_id: r.course_version_id }));
-      return { data: all.slice(from, to + 1) };
+      // Offsets are answered too, so the test can tell keyset from offset paging.
+      return { data: range ? all.slice(range[0], range[1] + 1) : all.slice(0, limit) };
     }
     if (q.table === "course_attempts" && sel(q) === "id, status, course_version_id") {
       const hooked = hooks.reread?.(q);
@@ -361,7 +366,7 @@ async function io() {
     eq("R1: course_versions select(id) eq(package_id)", [v.table, sel(v), arg(v, "eq", "package_id")], ["course_versions", "id", ["package_id", PKG]]);
     const r2 = queries.find((q) => q.table === "course_attempts" && sel(q) === "id, course_version_id")!;
     eq("R2: the versions read excludes the new version", inList(r2, "course_version_id"), [OLD1, OLD2]);
-    eq("R2: status = in_progress, ordered by id, paged at 1000", [arg(r2, "eq", "status"), arg(r2, "order"), arg(r2, "range")], [["status", "in_progress"], ["id"], [0, 999]]);
+    eq("R2: status = in_progress, ordered by id, first page of 1000 (no cursor, no offset)", [arg(r2, "eq", "status"), arg(r2, "order"), arg(r2, "limit"), has(r2, "gt"), has(r2, "range")], [["status", "in_progress"], ["id"], [1000], false, false]);
     eq("R2: no grant-retake exclusion (no attempt_requests read)", queries.some((q) => q.table === "attempt_requests"), false);
     const u = updatesOf(queries);
     eq("U: one update", u.length, 1);
@@ -433,11 +438,32 @@ async function io() {
     const { client, queries } = attemptsWorld(rows);
     const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
     const r2 = queries.filter((q) => sel(q) === "id, course_version_id");
-    eq("R2: two pages, range 0-999 then 1000-1999", r2.map((q) => arg(q, "range")), [[0, 999], [1000, 1999]]);
+    eq("R2: two keyset pages, the second after the first page's last id", r2.map((q) => [arg(q, "gt", "id") ?? null, arg(q, "limit"), has(q, "range")]), [
+      [null, [1000], false],
+      [["id", "a0999"], [1000], false],
+    ]);
     const u = updatesOf(queries);
     eq("U: chunks of 150 ids", u.map((q) => inList(q, "id").length), [150, 150, 150, 150, 150, 150, 105]);
     eq("U: every chunk conditional on status = in_progress", u.every((q) => JSON.stringify(arg(q, "eq", "status")) === JSON.stringify(["status", "in_progress"])), true);
     eq("1005 selected, 1005 restarted → ok", [r.status, r.expected, r.restarted], ["ok", 1005, 1005]);
+  }
+  {
+    // A first-page row leaves 'in_progress' between the two page reads. Offset
+    // paging would then start page 2 one row too late and never select a1000
+    // (expected 1004, a1000 left in progress, run ok); the keyset page cannot.
+    const rows: Row[] = ids(1005).map((id) => ({ id, course_version_id: OLD1, status: "in_progress" }));
+    let pages = 0;
+    const { client } = attemptsWorld(rows, {
+      selection: () => {
+        if (pages++ === 1) rows[0].status = "passed";
+        return undefined;
+      },
+    });
+    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    eq("a row leaving in_progress between pages: every row still in progress is selected", pick(r), {
+      status: "ok", expected: 1005, restarted: 1004, resolved: 1, unresolved: 0, unresolved_version_ids: [],
+    });
+    eq("…the row after the page boundary is reset, nothing left in progress", [rows[1000].status, rows.filter((x) => x.status === "in_progress").length], ["abandoned", 0]);
   }
   {
     // Update error on the second chunk: stop; the first chunk is kept.

@@ -43,7 +43,11 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 
-/** `.in()` lists stay at 150 ids and every read is paged at 1000 rows (the lib/db/chunked.ts house rules). */
+/**
+ * `.in()` lists stay at 150 ids and every read is paged at 1000 rows ordered
+ * by id (the lib/db/chunked.ts house rules); the selection pages by keyset,
+ * see readSelection.
+ */
 export const FORCE_RESTART_CHUNK = 150;
 export const FORCE_RESTART_PAGE = 1000;
 
@@ -262,21 +266,29 @@ async function readSelection(
   if (!ids.includes(newVersionId)) throw new StepError("versions", "new_version_missing");
   const older = [...new Set(ids.filter((id) => id !== newVersionId))].sort();
 
+  // Keyset pages (id > the last id seen), not offsets: an attempt that
+  // leaves 'in_progress' while the pages are read (a completion, another
+  // reset) would shift every later row one place back under offset paging
+  // and the next page would skip one: that learner is never selected, and
+  // the run would report ok. A cursor never skips a row that stays in
+  // progress while the pages are read.
   const byId = new Map<string, SelectedAttempt>();
   for (const part of chunks(older, FORCE_RESTART_CHUNK)) {
-    for (let from = 0; ; from += FORCE_RESTART_PAGE) {
-      const { data, error } = await svc
+    let after: string | null = null;
+    for (;;) {
+      let q = svc
         .from("course_attempts")
         .select("id, course_version_id")
         .in("course_version_id", part)
-        .eq("status", "in_progress")
-        .order("id")
-        .range(from, from + FORCE_RESTART_PAGE - 1);
+        .eq("status", "in_progress");
+      if (after !== null) q = q.gt("id", after);
+      const { data, error } = await q.order("id").limit(FORCE_RESTART_PAGE);
       if (error) throw new StepError("selection", codeOf(error));
       if (data == null) throw new StepError("selection", "empty_answer");
       const page = data as SelectedAttempt[];
       for (const r of page) byId.set(r.id, r);
       if (page.length < FORCE_RESTART_PAGE) break;
+      after = page[page.length - 1].id;
     }
   }
   return [...byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
