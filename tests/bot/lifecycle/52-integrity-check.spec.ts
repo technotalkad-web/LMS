@@ -22,11 +22,23 @@
  *     exports in different courses do not block each other
  *   - the same fixture through the multipart and the direct path → identical
  *     findings after finalize
+ *
+ * ADR 0008 step 21 (decision C: package_validations is written by the server
+ * only; section 1 of migration 0099):
+ *   - validate → upload on both paths still creates and links the rows, and
+ *     validate_existing still records its audit row (server writes; run now)
+ *   - a `user` session reads no validation row; the admin session reads its
+ *     organisation's (select policy; run now)
+ *   - an admin session's PostgREST PATCH of overridden_at / verdict / report
+ *     on a pending blocked row, an INSERT and a DELETE → refused, row
+ *     unchanged                                                (needs 0099)
+ *   - the super_owner override route still works: the override test below,
+ *     unchanged
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
 import { authedContext } from "./helpers";
-import { NEEDS_0098, cmi5Zip, directUpload, has0098, uploadNew, zipFile } from "./p0-helpers";
+import { NEEDS_0098, NEEDS_0099, cmi5Zip, directUpload, has0098, has0099, sessionClient, uploadNew, zipFile } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
 const X_ID = "urn:elearning-engine:qa-integrity-x";
@@ -57,6 +69,7 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
   const s: {
     org?: { id: string; slug: string };
     owner?: User;
+    admin?: User;
     ownerCtx?: BrowserContext;
     adminCtx?: BrowserContext;
     courseX?: string;
@@ -77,7 +90,7 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     await addMember({ organizationId: org.id, userId: owner.id, role: "super_owner" });
     const admin = await createAuthUser({ profile: { first_name: "Integ", last_name: "Admin", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
-    Object.assign(s, { org, owner });
+    Object.assign(s, { org, owner, admin });
     s.ownerCtx = await authedContext(browser, baseURL!, owner.email, owner.password);
     s.adminCtx = await authedContext(browser, baseURL!, admin.email, admin.password);
     const up = await uploadNew(s.adminCtx.request, org.slug, "x.zip", await cmi5Zip({ courseId: X_ID, title: X_TITLE }));
@@ -292,6 +305,85 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     for (const c of ctxs) await c.close();
   });
 
+  // ---- ADR 0008 C: the server's own writes still work (run before and after 0099) ----
+  test("ADR 0008 C: validate → upload on both paths creates and links the validation rows", async () => {
+    const areq = s.adminCtx!.request;
+    const row = async (id: string) =>
+      (await svc().from("package_validations").select("status, organization_id, course_id, course_version_id").eq("id", id).single()).data;
+
+    // Multipart: validate (pending row), then the upload accepts and links it.
+    const mpZip = await cmi5Zip({ courseId: "urn:elearning-engine:qa-integrity-link-mp", title: "QA Integrity Link Multipart" });
+    const v = await areq.post("/api/courses/validate-package", { multipart: { orgSlug: s.org!.slug, file: zipFile("link-mp.zip", mpZip) } });
+    expect(v.status(), await v.text()).toBe(200);
+    const mpId = (await v.json()).validation_id as string;
+    expect(await row(mpId)).toEqual({ status: "pending", organization_id: s.org!.id, course_id: null, course_version_id: null });
+    const up = await uploadNew(areq, s.org!.slug, "link-mp.zip", mpZip, { validation_id: mpId, acknowledge: "1" });
+    expect(up.status(), await up.text()).toBe(200);
+    const mpCourse = (await up.json()).courseId as string;
+    const { data: c } = await svc().from("courses").select("current_version_id").eq("id", mpCourse).single();
+    expect(await row(mpId)).toEqual({
+      status: "accepted",
+      organization_id: s.org!.id,
+      course_id: mpCourse,
+      course_version_id: (c as { current_version_id: string }).current_version_id,
+    });
+
+    // Direct: validate → init (consumes the row) → finalize (links it).
+    const dZip = await cmi5Zip({ courseId: "urn:elearning-engine:qa-integrity-link-direct", title: "QA Integrity Link Direct" });
+    const d = await directUpload(areq, { orgSlug: s.org!.slug, buffer: dZip, name: "link-direct.zip", acknowledge: true });
+    expect(d.finalize?.status, JSON.stringify(d.finalize?.body)).toBe(200);
+    const dId = d.validate!.body.validation_id as string;
+    const { data: dv } = await svc().from("course_versions").select("course_id").eq("id", d.versionId!).single();
+    expect(await row(dId)).toEqual({
+      status: "accepted",
+      organization_id: s.org!.id,
+      course_id: (dv as { course_id: string }).course_id,
+      course_version_id: d.versionId,
+    });
+  });
+
+  test("ADR 0008 C: validate_existing still records its audit row", async () => {
+    const r = await s.adminCtx!.request.post("/api/courses/validate-package", {
+      data: { action: "validate_existing", orgSlug: s.org!.slug, course_id: s.courseX },
+    });
+    expect(r.status(), await r.text()).toBe(200);
+    const id = (await r.json()).validation_id as string;
+    expect(typeof id).toBe("string");
+    const { data: c } = await svc().from("courses").select("current_version_id").eq("id", s.courseX!).single();
+    const current = (c as { current_version_id: string }).current_version_id;
+    const { data: v } = await svc()
+      .from("package_validations")
+      .select("status, organization_id, course_id, course_version_id, sha256, uploaded_by")
+      .eq("id", id)
+      .single();
+    expect(v).toEqual({
+      status: "accepted",
+      organization_id: s.org!.id,
+      course_id: s.courseX,
+      course_version_id: current,
+      sha256: `stored:${current}`,
+      uploaded_by: s.admin!.id,
+    });
+  });
+
+  test("ADR 0008 C: a user session reads no validation row; the admin session reads its organisation's", async () => {
+    const learner = await createAuthUser({ profile: { first_name: "Integ", last_name: "Learner", must_change_password: false } });
+    await addMember({ organizationId: s.org!.id, userId: learner.id, role: "user" });
+    const { count } = await svc()
+      .from("package_validations")
+      .select("id", { count: "exact", head: true })
+      .eq("organization_id", s.org!.id);
+    expect(count ?? 0, "the organisation has validation rows").toBeGreaterThan(0);
+    const userDb = await sessionClient(learner);
+    const { data: seen, error } = await userDb.from("package_validations").select("id").eq("organization_id", s.org!.id);
+    expect(error).toBeNull();
+    expect(seen, "a user reads nothing").toEqual([]);
+    const adminDb = await sessionClient(s.admin!);
+    const { data: adminSeen, error: adminErr } = await adminDb.from("package_validations").select("id").eq("organization_id", s.org!.id);
+    expect(adminErr).toBeNull();
+    expect((adminSeen ?? []).length, "the admin reads every row of the organisation").toBe(count);
+  });
+
   // ---- needs 0098: rows with verdict 'blocked' and the override columns ----
   test("a blocked row without an override is still refused (multipart re-POST; the direct gate is covered above)", async () => {
     test.skip(!(await has0098()), NEEDS_0098);
@@ -299,6 +391,45 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     const again = await uploadNew(s.adminCtx!.request, s.org!.slug, "c.zip", s.inlineZip!, { validation_id: s.inlineBlockedId! });
     expect(again.status(), await again.text()).toBe(409);
     expect((await again.json()).validation_id).toBe(s.inlineBlockedId);
+  });
+
+  test("ADR 0008 C: an admin session's PostgREST PATCH / INSERT / DELETE on package_validations is refused, row unchanged", async () => {
+    test.skip(!(await has0099()), NEEDS_0099);
+    // Its own pending blocked row (0099 requires 0098, so blocked rows store).
+    const v = await s.adminCtx!.request.post("/api/courses/validate-package", {
+      multipart: { orgSlug: s.org!.slug, file: zipFile("guard.zip", await cmi5Zip({ courseId: X_ID, title: "QA Integrity X guard" })) },
+    });
+    expect(v.status(), await v.text()).toBe(200);
+    const id = (await v.json()).validation_id as string;
+    const read = async () => (await svc().from("package_validations").select("*").eq("id", id).single()).data as Record<string, unknown>;
+    const orgCount = async () =>
+      (await svc().from("package_validations").select("id", { count: "exact", head: true }).eq("organization_id", s.org!.id)).count ?? 0;
+    const before = await read();
+    expect(before).toMatchObject({ status: "pending", verdict: "blocked", overridden_at: null });
+
+    const adminDb = await sessionClient(s.admin!);
+    const patches: Array<Record<string, unknown>> = [
+      { overridden_at: new Date().toISOString(), overridden_by: s.admin!.id, override_reason: "forged" },
+      { verdict: "pass" },
+      { report: { forged: true } },
+    ];
+    for (const patch of patches) {
+      const res = await adminDb.from("package_validations").update(patch).eq("id", id).select("id");
+      expect(Boolean(res.error) || (res.data ?? []).length === 0, `PATCH ${Object.keys(patch).join(", ")} refused`).toBe(true);
+      expect(await read(), "row unchanged").toEqual(before);
+    }
+
+    const countBefore = await orgCount();
+    const ins = await adminDb
+      .from("package_validations")
+      .insert({ organization_id: s.org!.id, sha256: "forged", verdict: "pass", report: {}, status: "accepted" })
+      .select("id");
+    expect(ins.error, "INSERT refused").toBeTruthy();
+    expect(await orgCount(), "no row created").toBe(countBefore);
+
+    const del = await adminDb.from("package_validations").delete().eq("id", id).select("id");
+    expect(Boolean(del.error) || (del.data ?? []).length === 0, "DELETE refused").toBe(true);
+    expect(await read(), "row still there, unchanged").toEqual(before);
   });
 
   test("super_owner override with a reason → upload goes through, accepted, audited, in the Attention Center", async () => {
