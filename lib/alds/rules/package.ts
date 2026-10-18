@@ -103,7 +103,8 @@ export function checkPackage(input: PackageInput): PackageResult {
   r.check("U1");
   let raw: unknown;
   try {
-    raw = JSON.parse(input.manifestText.replace(/^﻿/, ""));
+    const text = input.manifestText;
+    raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); // a leading BOM is tolerated
   } catch {
     r.add("U1", "manifest_unparseable", "alds-manifest.json is not valid JSON", { path: "alds-manifest.json" });
     return done(null);
