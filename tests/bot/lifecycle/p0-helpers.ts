@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { svc } from "../../e2e/helpers/supabase";
 
 export const FIXTURES = path.resolve(__dirname, "../fixtures");
@@ -46,6 +47,20 @@ export async function has0099(): Promise<boolean> {
   return probe0099;
 }
 export const NEEDS_0099 = "needs 0099";
+
+/**
+ * A PostgREST client carrying the user's own session (anon key + password
+ * sign-in, the spec 50 pattern): what a learner or an admin can do with
+ * their JWT outside any route.
+ */
+export async function sessionClient(u: { email: string; password: string }): Promise<SupabaseClient> {
+  const c = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  const { error } = await c.auth.signInWithPassword({ email: u.email, password: u.password });
+  expect(error, "sign-in with the anon key").toBeNull();
+  return c;
+}
 
 export function sha256(bytes: Uint8Array | Buffer | string): string {
   return createHash("sha256").update(bytes).digest("hex");

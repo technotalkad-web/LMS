@@ -51,7 +51,7 @@
  * Never push while this runs: pr-checks purges qa-* data on every push.
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
 import { assignCourse, authedContext } from "./helpers";
 import {
@@ -62,6 +62,7 @@ import {
   cmi5Zip,
   has0099,
   inProgressAttempt,
+  sessionClient,
   scormZip,
   uploadNew,
   zipFile,
@@ -79,15 +80,6 @@ const CMI5_TITLE = "QA Attempt Guard cmi5";
 async function branch(): Promise<Branch> {
   if (await has0099()) return "guard";
   return PROBE ? "probe" : "skip";
-}
-
-async function signedIn(u: User): Promise<SupabaseClient> {
-  const c = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-  const { error } = await c.auth.signInWithPassword({ email: u.email, password: u.password });
-  expect(error, "sign-in with the anon key").toBeNull();
-  return c;
 }
 
 /** Service-role re-read of one attempt (every column). */
@@ -205,8 +197,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     s.cmi5Attempt = await inProgressAttempt(learner.id, s.cmi5Version);
     expect(await rowsFor(learner.id, s.forgeVersion), "the forge target was never launched").toHaveLength(0);
 
-    s.learnerDb = await signedIn(learner);
-    s.adminDb = await signedIn(admin);
+    s.learnerDb = await sessionClient(learner);
+    s.adminDb = await sessionClient(admin);
   });
 
   test("(a) learner PATCH of own in-progress SCORM attempt to passed / completed / score 1", async () => {
