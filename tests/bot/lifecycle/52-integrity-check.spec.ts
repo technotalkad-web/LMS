@@ -30,7 +30,7 @@
  *   - a `user` session reads no validation row; the admin session reads its
  *     organisation's (select policy; run now)
  *   - reject (a server write since ADR 0008 step 18): pending → rejected; a
- *     second reject and another qa organisation's row → 404, that row
+ *     second reject and another test organisation's row → 404, that row
  *     unchanged (run now)
  *   - ADR 0008 D1: a refused finalize into a course that is kept leaves the
  *     version row 'failed' with size 0, the course and its current version
@@ -42,7 +42,7 @@
  *     unchanged
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { authedContext } from "./helpers";
 import { NEEDS_0098, NEEDS_0099, cmi5Zip, directUpload, has0098, has0099, sessionClient, uploadNew, zipFile } from "./p0-helpers";
 
@@ -407,10 +407,10 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     const again = await reject(id);
     expect(again.status(), "a second reject finds no pending row").toBe(404);
 
-    // Another qa organisation's pending row: this admin's reject is scoped to
+    // Another test organisation's pending row: this admin's reject is scoped to
     // their own organisation, so it matches nothing and the row stays.
     const other = await createOrg({ name: "QA Integrity Reject Other" });
-    expect(other.slug.startsWith("qa-")).toBeTruthy();
+    expect(isLifecycleSlug(other.slug)).toBeTruthy();
     const otherAdmin = await createAuthUser({ profile: { first_name: "Integ", last_name: "OtherAdmin", must_change_password: false } });
     await addMember({ organizationId: other.id, userId: otherAdmin.id, role: "admin" });
     const octx = await authedContext(browser, baseURL!, otherAdmin.email, otherAdmin.password);

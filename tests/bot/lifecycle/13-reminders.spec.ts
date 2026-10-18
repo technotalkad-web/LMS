@@ -8,7 +8,7 @@
  * Requires CRON_SECRET in .env.test.local matching the deployed app's env.
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { aliasFor, configureOrgSmtp, waitForEmail } from "./inbox";
 import { assignCourse, uploadCourse } from "./helpers";

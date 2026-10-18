@@ -17,7 +17,7 @@ import {
   createAuthUser,
   createOrg,
   svc,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import { authedContext } from "../lib/session";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");

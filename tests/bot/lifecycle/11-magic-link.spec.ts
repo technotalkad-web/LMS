@@ -13,7 +13,7 @@
  * config finding, not an app bug.
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, rand } from "./data";
 import { authedContext } from "../lib/session";
 import { aliasFor, configureOrgSmtp, waitForEmail } from "./inbox";
 

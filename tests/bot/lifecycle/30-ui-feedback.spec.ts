@@ -12,7 +12,7 @@ import {
   markPlatformOwner,
   rand,
   svc,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import { authedContext } from "../lib/session";
 
 test.describe.serial("UI Batch 3 — toast + confirm dialog", () => {

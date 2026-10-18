@@ -10,7 +10,7 @@ import {
   createAuthUser,
   createOrg,
   svc,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import { authedContext, uploadCourse } from "./helpers";
 
 test.describe.serial("Library folders — CRUD + guards", () => {

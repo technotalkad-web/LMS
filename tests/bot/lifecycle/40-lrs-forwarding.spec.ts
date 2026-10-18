@@ -12,7 +12,7 @@
  */
 import http from "node:http";
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
 import { authedContext } from "../lib/session";
 
 type Mock = { url: string; received: unknown[][]; setStatus: (n: number) => void; close: () => Promise<void> };

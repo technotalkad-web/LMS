@@ -16,7 +16,7 @@ import { test, expect, type APIRequestContext, type BrowserContext } from "@play
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { assignCourse, authedContext, uploadCourse } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");

@@ -7,7 +7,7 @@
  * fresh browser to confirm sign-in.
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { aliasFor, configureOrgSmtp, waitForEmail } from "./inbox";
 

@@ -12,14 +12,15 @@
  *                                                          (needs 0098)
  *   - update of storage_prefix or launch_url on a ready version →
  *     course_version_frozen; storage_driver stays writable  (needs 0098)
- *   - a qa-* org with learner attempts deleted through the service client
- *     by cascade succeeds (the CI purge path; meaningful once 0098's guard
- *     exists, harmless before)
+ *   - a test org with learner attempts deleted through the service client
+ *     by cascade succeeds (the path of the e2e purge of qa-* orgs and of the
+ *     48 h lifecycle cleanup of lifecycle-* orgs, ./cleanup.ts; meaningful
+ *     once 0098's guard exists, harmless before)
  *   - concurrent multipart uploads to one package → 409 for the losers, and
  *     every stored launch file is its own upload's bytes (reserve-first)
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
 import { NEEDS_0098, has0098, scormZip, sha256, uploadNew, zipFile } from "./p0-helpers";
 
@@ -161,9 +162,12 @@ test.describe.serial("ADR 0003 — record guard", () => {
     expect(after).toEqual(before);
   });
 
-  test("purge path: a qa-* org with learner attempts deletes by cascade through the service client", async ({ browser, baseURL }) => {
+  test("purge path: a test org with learner attempts deletes by cascade through the service client", async ({ browser, baseURL }) => {
+    // The e2e purge (qa-* orgs) and the lifecycle cleanup (lifecycle-* orgs,
+    // ./cleanup.ts) both delete this way; the 0098 exemption is the
+    // service_role claim, not the slug.
     const org = await createOrg({ name: "QA Guard Purge" });
-    expect(org.slug.startsWith("qa-")).toBeTruthy();
+    expect(isLifecycleSlug(org.slug)).toBeTruthy();
     const admin = await createAuthUser({ profile: { first_name: "Purge", last_name: "Admin", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
     const learner = await createAuthUser({ profile: { first_name: "Purge", last_name: "Learner", must_change_password: false } });

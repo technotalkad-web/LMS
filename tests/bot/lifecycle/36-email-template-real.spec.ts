@@ -10,7 +10,7 @@
  */
 import { test, expect } from "@playwright/test";
 import { createClient } from "@supabase/supabase-js";
-import { addMember, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import { addMember, createOrg, rand, svc } from "./data";
 import { aliasFor, waitForEmail } from "./inbox";
 
 function assertTokenHashLink(link: string | undefined, type: string) {
