@@ -19,10 +19,14 @@
 # whose bytes changed (the step-0 incident class: ledger entry).
 #
 # The repository is public, so its run logs and job summaries are public:
-# rclone writes only to a file on the runner (never to the log) and only
-# counts are printed. Object keys (course ids, package file names) are never
-# printed; to see the keys of a conflicting folder, list it privately (an
-# authenticated `rclone lsl` or the B2 dashboard).
+# rclone writes only to a file on the runner (never to the log). The log
+# prints only counts. The job summary prints counts and, for each version
+# folder with a conflict, that folder's prefix,
+# courses/<course id>/<package id>/v<n>/ (opaque ids, printed so the owner
+# can match the folder to its course_versions row), with a count. File names
+# inside a folder, and keys outside a version folder, are never printed; to
+# see them, list the folder privately (an authenticated `rclone lsl` or the
+# B2 dashboard).
 #
 # Flags (ADR 0008 step 23 and the decision-3 budget note: B2's free tier
 # caps Class B and Class C transactions at 2,500 a day each, so nothing may
@@ -194,7 +198,7 @@ jobs:
             echo ""
             echo "rclone exit code: ${rc}. Immutable conflicts (\"immutable file modified\"): ${n}. rclone ERROR lines: ${errors}."
             echo ""
-            echo "Object keys are never printed here (this repository is public); list a folder privately to see its keys."
+            echo "This repository is public: a conflicting object is shown only by its version folder (course id, package id, version number), never by file name; list the folder privately to see its keys."
             if [ "$n" -gt 0 ]; then
               echo ""
               echo "Each object counted below already exists in the backup with different content and was NOT overwritten."
