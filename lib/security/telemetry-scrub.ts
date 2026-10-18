@@ -10,7 +10,13 @@
  *   - the invitation token in /invitations/<token>: the token is the
  *     credential (app/invitations/[token]/page.tsx);
  *   - the values of the q, email and token query parameters (q= is the
- *     user search by name or email, app/api/users/search/route.ts).
+ *     user search by name or email, app/api/users/search/route.ts) and of
+ *     the Supabase credentials (token_hash, access_token, refresh_token,
+ *     provider_token, provider_refresh_token), in the query or in the
+ *     fragment: an implicit-flow sign-in link lands on
+ *     /auth/finish#access_token=...&refresh_token=...
+ *     (app/auth/finish/AuthCallbackFragment.tsx), and the SDK reads
+ *     location.href, fragment included.
  *
  * Each such value becomes "[Filtered]". The rest of the URL is kept, so an
  * event stays debuggable. Wired up in instrumentation-client.ts.
@@ -25,10 +31,17 @@ export const FILTERED = "[Filtered]";
 // it (": 500", ")") is kept.
 const INVITATION_TOKEN = /(\/invitations\/)(?!(?:accept|bulk)(?![\w.~%+=-]))[\w.~%+=-]+/gi;
 
-// A q, email or token query value: after ? or &, up to the next parameter
-// or the fragment. Other names that merely end in "token" (access_token=)
-// are not this parameter and are left alone.
-const SENSITIVE_QUERY = /([?&](?:q|email|token)=)[^&#\s"'<>]+/gi;
+// The value of a sensitive parameter in the query or the fragment: after ?,
+// & or #, up to the next parameter or the fragment. The name must match
+// whole, so names that merely contain one of these (token_type=, query=,
+// emails=) are left alone.
+const SENSITIVE_QUERY =
+  /([?&#](?:q|email|token|token_hash|access_token|refresh_token|provider_token|provider_refresh_token)=)[^&#\s"'<>]+/gi;
+
+// Pages whose own URL carries a credential: the implicit-flow sign-in
+// landing page and an invitation (a top-level page, not /api/invitations).
+const CREDENTIAL_PATH = /^\/(?:auth\/finish(?:[/?#]|$)|invitations\/[^/?#])/i;
+const CREDENTIAL_PARAM = /[?&#](?:token|token_hash|access_token|refresh_token|provider_token|provider_refresh_token)=[^&#]/i;
 
 type Loose = Record<string, unknown>;
 
@@ -36,9 +49,24 @@ function isObject(value: unknown): value is Loose {
   return typeof value === "object" && value !== null;
 }
 
-/** Returns `value` with every invitation token and q/email/token value replaced. */
+/** Returns `value` with every invitation token and sensitive parameter value replaced. */
 export function scrubText(value: string): string {
   return value.replace(INVITATION_TOKEN, `$1${FILTERED}`).replace(SENSITIVE_QUERY, `$1${FILTERED}`);
+}
+
+/**
+ * True when a page URL (absolute, or a path with its query and fragment)
+ * itself carries a credential: /auth/finish, /invitations/<token>, or a
+ * token / Supabase credential parameter in its query or fragment.
+ *
+ * Session Replay records location.href in the Meta event of every full
+ * snapshot, and no hook can scrub it (beforeAddRecordingEvent only receives
+ * custom events), so instrumentation-client.ts does not sample an error
+ * replay from a document that has shown such a page.
+ */
+export function isCredentialUrl(url: string): boolean {
+  const rest = url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i, "");
+  return CREDENTIAL_PATH.test(rest) || CREDENTIAL_PARAM.test(rest);
 }
 
 /**

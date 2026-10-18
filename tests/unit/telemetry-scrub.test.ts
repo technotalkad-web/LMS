@@ -1,12 +1,14 @@
 /**
  * Unit test for the browser telemetry scrubber (lib/security/telemetry-scrub.ts):
- * the invitation token and the q / email / token query values never reach
- * Sentry, and everything else in a URL or event is left as it was.
+ * the invitation token, the q / email / token query values and the Supabase
+ * credentials in a query or fragment never reach Sentry, and everything else
+ * in a URL or event is left as it was.
  *
  * Run:  npx tsx tests/unit/telemetry-scrub.test.ts   (or npm run test:unit)
  */
 import {
   FILTERED,
+  isCredentialUrl,
   scrubBreadcrumb,
   scrubEvent,
   scrubRecordingEvent,
@@ -49,7 +51,7 @@ for (const name of ["q", "email", "token"]) {
 }
 eq("user search URL", scrubText("https://lms.example.test/api/users/search?q=Jane+Doe"), `https://lms.example.test/api/users/search?q=${F}`);
 eq("upper-case name", scrubText("/api/x?EMAIL=a%40b.c"), `/api/x?EMAIL=${F}`);
-eq("access_token= is another name: untouched", scrubText("/cb?access_token=abc&x=1"), "/cb?access_token=abc&x=1");
+eq("q= in the fragment", scrubText("/acme/admin/users#q=jane"), `/acme/admin/users#q=${F}`);
 eq("query= is another name: untouched", scrubText("/api/x?query=abc"), "/api/x?query=abc");
 eq("emails= is another name: untouched", scrubText("/api/x?emails=abc"), "/api/x?emails=abc");
 eq("empty value left as is", scrubText("/api/x?q=&page=2"), "/api/x?q=&page=2");
@@ -57,6 +59,34 @@ eq("q= in a path, not a query: untouched", scrubText("/docs/q=1"), "/docs/q=1");
 eq("token and query together", scrubText(`/invitations/${TOKEN}?email=a%40b.c`), `/invitations/${F}?email=${F}`);
 eq("plain URL unchanged", scrubText("https://lms.example.test/acme/learn?page=2&sort=asc"), "https://lms.example.test/acme/learn?page=2&sort=asc");
 eq("empty string", scrubText(""), "");
+
+console.log("\nscrubText: Supabase credentials (query and fragment)");
+for (const name of ["token_hash", "access_token", "refresh_token", "provider_token", "provider_refresh_token"]) {
+  eq(`${name}= in the query`, scrubText(`/auth/callback?${name}=abc.def&type=magiclink`), `/auth/callback?${name}=${F}&type=magiclink`);
+  eq(`${name}= first in the fragment`, scrubText(`/auth/finish#${name}=abc.def&x=1`), `/auth/finish#${name}=${F}&x=1`);
+}
+eq("implicit-flow landing URL", scrubText(
+  "https://lms.example.test/auth/finish?next=%2Facme%2Fdashboard#access_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig-_x&expires_at=1760000000&expires_in=3600&refresh_token=r3fr35h-t0k3n&token_type=bearer&type=magiclink"),
+  `https://lms.example.test/auth/finish?next=%2Facme%2Fdashboard#access_token=${F}&expires_at=1760000000&expires_in=3600&refresh_token=${F}&token_type=bearer&type=magiclink`);
+eq("error fragment untouched", scrubText("/auth/finish#error=access_denied&error_code=otp_expired&error_description=Email+link+is+invalid"),
+  "/auth/finish#error=access_denied&error_code=otp_expired&error_description=Email+link+is+invalid");
+eq("token_type= is another name: untouched", scrubText("/cb#token_type=bearer"), "/cb#token_type=bearer");
+eq("a fragment that is not a parameter: untouched", scrubText("/docs#access"), "/docs#access");
+
+console.log("\nisCredentialUrl");
+eq("/auth/finish (path)", isCredentialUrl("/auth/finish"), true);
+eq("/auth/finish with next and fragment (full URL)", isCredentialUrl("https://lms.example.test/auth/finish?next=%2Fx#access_token=a&refresh_token=b"), true);
+eq("/auth/finishing is another page", isCredentialUrl("/auth/finishing"), false);
+eq("/invitations/<token>", isCredentialUrl(`https://lms.example.test/invitations/${TOKEN}`), true);
+eq("/Invitations/<token> (case)", isCredentialUrl(`/Invitations/${TOKEN}`), true);
+eq("/invitations alone", isCredentialUrl("/invitations"), false);
+eq("/api/invitations/<id> is not a page", isCredentialUrl(`/api/invitations/${TOKEN}`), false);
+eq("access_token in a fragment on another page", isCredentialUrl("https://lms.example.test/select-org#access_token=a"), true);
+eq("token_hash in a query", isCredentialUrl("/auth/callback?token_hash=abc&type=magiclink"), true);
+eq("empty token value", isCredentialUrl("/x?token=&a=1"), false);
+eq("search page with q= is not a credential page", isCredentialUrl("https://lms.example.test/acme/admin/users?q=jane"), false);
+eq("plain page", isCredentialUrl("https://lms.example.test/acme/learn"), false);
+eq("empty string", isCredentialUrl(""), false);
 
 console.log("\nscrubBreadcrumb");
 eq("fetch breadcrumb data.url", scrubBreadcrumb({ category: "fetch", data: { method: "GET", url: "/api/users/search?q=jane", status_code: 200 } }),
@@ -66,6 +96,8 @@ eq("navigation breadcrumb data.from/to", scrubBreadcrumb({ category: "navigation
 eq("console breadcrumb message and arguments", scrubBreadcrumb({ category: "console", message: `visit /invitations/${TOKEN}`, data: { arguments: [`/invitations/${TOKEN}`, 3] } }),
   { category: "console", message: `visit /invitations/${F}`, data: { arguments: [`/invitations/${F}`, 3] } });
 eq("breadcrumb without data or message", scrubBreadcrumb({ category: "ui.click" }), { category: "ui.click" });
+eq("navigation breadcrumb from a fragment with tokens", scrubBreadcrumb({ category: "navigation", data: { from: "/auth/finish?next=%2Fx#access_token=a.b.c&refresh_token=r", to: "/select-org" } }),
+  { category: "navigation", data: { from: `/auth/finish?next=%2Fx#access_token=${F}&refresh_token=${F}`, to: "/select-org" } });
 {
   // Console breadcrumbs carry the app's own console arguments: the scrubber
   // must not write into them (or into anything they reference).
@@ -117,6 +149,8 @@ eq("replay event urls", scrubEvent({ type: "replay_event", urls: [`https://lms.e
   { type: "replay_event", urls: [`https://lms.example.test/invitations/${F}`, "https://lms.example.test/acme/learn"] });
 eq("event with nothing to scrub is unchanged", scrubEvent({ message: "boom", request: { url: "https://lms.example.test/acme/learn" } }),
   { message: "boom", request: { url: "https://lms.example.test/acme/learn" } });
+eq("error event on the implicit-flow landing page", scrubEvent({ request: { url: "https://lms.example.test/auth/finish?next=%2Fx#access_token=eyJ.a.b&refresh_token=r3f&token_type=bearer" } }),
+  { request: { url: `https://lms.example.test/auth/finish?next=%2Fx#access_token=${F}&refresh_token=${F}&token_type=bearer` } });
 eq("empty event", scrubEvent({}), {});
 eq("non-string fields untouched", scrubEvent({ message: undefined, request: null, breadcrumbs: "x", spans: 3 } as object),
   { request: null, breadcrumbs: "x", spans: 3 });

@@ -1,5 +1,6 @@
 import * as Sentry from "@sentry/nextjs";
 import {
+  isCredentialUrl,
   scrubBreadcrumb,
   scrubEvent,
   scrubRecordingEvent,
@@ -24,11 +25,20 @@ import {
  * media blocked, inputs masked), so learner and admin names, emails and
  * scores never reach Sentry. Every event, span, breadcrumb and replay
  * custom event passes through lib/security/telemetry-scrub.ts, which
- * replaces the /invitations/<token> segment and q= / email= / token=
- * query values with "[Filtered]".
+ * replaces the /invitations/<token> segment, q= / email= / token= query
+ * values and Supabase credentials in a query or fragment (access_token=,
+ * refresh_token=, ...) with "[Filtered]". Error replays are not sampled
+ * from a document that has shown a credential page (see below).
  */
 const dsn = process.env.NEXT_PUBLIC_SENTRY_DSN;
 if (dsn) {
+  // Session Replay writes location.href into the Meta event of every full
+  // snapshot (one at page load, then one per checkout), and no hook can
+  // scrub it. A document that has shown a page whose URL carries a
+  // credential (/auth/finish#access_token=..., /invitations/<token>) never
+  // samples an error replay: its buffer may still hold that href.
+  let credentialPageSeen = isCredentialUrl(window.location.href);
+
   Sentry.init({
     dsn,
     environment: process.env.NEXT_PUBLIC_SENTRY_ENV ?? "staging",
@@ -59,13 +69,18 @@ if (dsn) {
     beforeSend: (event) => scrubEvent(event),
     beforeSendTransaction: (event) => scrubEvent(event),
     beforeSendSpan: (span) => scrubSpan(span),
-    beforeBreadcrumb: (breadcrumb) => scrubBreadcrumb(breadcrumb),
+    beforeBreadcrumb: (breadcrumb) => {
+      const to = breadcrumb.category === "navigation" ? breadcrumb.data?.to : undefined;
+      if (typeof to === "string" && isCredentialUrl(to)) credentialPageSeen = true;
+      return scrubBreadcrumb(breadcrumb);
+    },
 
     integrations: [
       Sentry.replayIntegration({
         maskAllText: true,
         blockAllMedia: true,
         beforeAddRecordingEvent: (event) => scrubRecordingEvent(event),
+        beforeErrorSampling: () => !(credentialPageSeen || isCredentialUrl(window.location.href)),
       }),
     ],
   });
