@@ -1,0 +1,16 @@
+{
+  "$comment": "ALDS rules bundle registry (ADR 0005 step 9). Append-only: written by `node scripts/build-alds-rules.mjs --register`; a manifest's rulesBundleHash is known (U5) when it is listed here. Never edit or remove an entry.",
+  "bundles": [
+    {
+      "n": 1,
+      "rulesBundleHash": "sha256:25269326922cf703b820d2577e6e83cd22a4ec5d0fb779fc7ae5426729425a46",
+      "file": "alds-rules-1.js",
+      "bytes": 62706,
+      "standardVersion": "2.0",
+      "esbuild": "0.25.4",
+      "target": "es2020",
+      "globalName": "AldsRules",
+      "registeredAt": "2026-10-18"
+    }
+  ]
+}
