@@ -112,7 +112,10 @@ export async function enforcePackageValidation(opts: {
         error: "Validation reported issues — confirm 'Accept & Upload' to acknowledge them.",
       };
     }
-    await serviceClient()
+    // Conditional on 'pending', as the reject and override writes are: a
+    // double submit, or a reject landing after the read above, consumes the
+    // row once and the other request is refused.
+    const { data: accepted, error: acceptErr } = await serviceClient()
       .from("package_validations")
       .update({
         status: "accepted",
@@ -122,7 +125,13 @@ export async function enforcePackageValidation(opts: {
         ...(courseId ? { course_id: courseId } : {}),
       })
       .eq("id", v.id)
-      .eq("organization_id", organizationId);
+      .eq("organization_id", organizationId)
+      .eq("status", "pending")
+      .select("id");
+    if (acceptErr) return { ok: false, status: 500, error: `Could not accept the validation: ${acceptErr.message}` };
+    if (!accepted || accepted.length === 0) {
+      return { ok: false, status: 400, error: "Validation not found or already used — re-validate the package." };
+    }
     return { ok: true, validationId: v.id };
   }
 
