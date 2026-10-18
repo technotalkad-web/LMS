@@ -2,6 +2,8 @@
 
 import JSZip from "jszip";
 import type { ValidationResult } from "./validation-gate";
+// Type only: the force-restart module never enters the client bundle.
+import type { ForceRestartOutcome } from "@/lib/attempts/force-restart";
 
 /**
  * Browser side of the direct-to-storage upload:
@@ -178,7 +180,39 @@ export type DirectUploadResult = {
   versionNumber: number;
   manifest: { title: string; type: string; launchUrl: string };
   fileCount: number;
+  /** Replace with mode force_restart only: the reset, reported apart from the publish (ADR 0011). */
+  restart?: ForceRestartOutcome;
 };
+
+/**
+ * Finalize published the version but its forced restart failed (the 500
+ * with `published: true`, ADR 0011 step 7): the version is live, so the
+ * upload is not aborted. `restart` is always a failed outcome, its message
+ * the text to show.
+ */
+export class PublishedButRestartFailedError extends Error {
+  readonly result: DirectUploadResult;
+  readonly restart: ForceRestartOutcome;
+  constructor(fin: DirectUploadResult & { error?: string }) {
+    const message =
+      fin.restart?.message ?? fin.error ?? "The new version is published, but the learners in progress could not be reset.";
+    super(message);
+    this.name = "PublishedButRestartFailedError";
+    this.result = fin;
+    this.restart =
+      fin.restart?.status === "failed"
+        ? fin.restart
+        : {
+            status: "failed",
+            expected: fin.restart?.expected ?? null,
+            restarted: fin.restart?.restarted ?? 0,
+            resolved: fin.restart?.resolved ?? 0,
+            unresolved: fin.restart?.unresolved ?? 0,
+            unresolved_version_ids: fin.restart?.unresolved_version_ids ?? null,
+            message,
+          };
+  }
+}
 
 type InitResponse = {
   courseId: string;
@@ -341,8 +375,11 @@ export async function directUpload(args: {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ orgSlug: target.orgSlug, versionId: init.versionId, notify_update: target.notifyUpdate === true, mode: target.mode ?? "grandfather" }),
   });
-  const fin = (await finRes.json().catch(() => ({}))) as DirectUploadResult & { error?: string };
+  const fin = (await finRes.json().catch(() => ({}))) as DirectUploadResult & { error?: string; published?: boolean };
   if (!finRes.ok) {
+    // Published, reset failed: the version is live; never abort it (the
+    // server refuses a ready row anyway) and never report "Publish failed".
+    if (fin.published === true) throw new PublishedButRestartFailedError(fin);
     if (finRes.status !== 409) await abort();
     throw new Error(fin.error ?? `Publish failed (HTTP ${finRes.status})`);
   }
