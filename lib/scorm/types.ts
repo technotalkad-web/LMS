@@ -79,6 +79,47 @@ export function deriveAttemptStatus(
   return "in_progress";
 }
 
+/**
+ * ADR 0010: the SCORM commit route writes only SCORM attempts. SCORM 2004 is
+ * not supported (docs/ARCHITECTURE.md §1), so "a SCORM attempt" is exactly a
+ * version whose `course_versions.manifest_type` is the string "scorm12".
+ * cmi5 and xAPI attempts are written at runtime only by the token-bound xAPI
+ * statements and State routes.
+ */
+export function isScormRuntime(manifestType: string | null | undefined): boolean {
+  return manifestType === "scorm12";
+}
+
+export type CommitRuntimeRefusal =
+  | { status: 409; error: "wrong_runtime"; manifest_type: string; message: string }
+  | { status: 503; error: "attempt_unreadable"; message: string };
+
+/**
+ * The commit route's runtime decision (ADR 0010 step 3; the route does the
+ * I/O). `null` = a SCORM attempt, derive and write as before. A known,
+ * non-SCORM type is refused with 409 and the type echoed; a type that could
+ * not be established (no version embed, an empty value) is 503: nothing may
+ * be written without knowing the attempt's runtime.
+ */
+export function commitRuntimeRefusal(
+  manifestType: string | null | undefined
+): CommitRuntimeRefusal | null {
+  if (isScormRuntime(manifestType)) return null;
+  if (typeof manifestType === "string" && manifestType !== "") {
+    return {
+      status: 409,
+      error: "wrong_runtime",
+      manifest_type: manifestType,
+      message: "This attempt is not a SCORM attempt; its progress is saved through its own runtime.",
+    };
+  }
+  return {
+    status: 503,
+    error: "attempt_unreadable",
+    message: "The attempt could not be read; nothing was saved. Try again.",
+  };
+}
+
 export function deriveScore(cmi: CmiData): number | null {
   const raw = cmi["cmi.core.score.raw"];
   if (raw === undefined || raw === "") return null;

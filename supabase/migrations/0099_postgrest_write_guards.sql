@@ -69,6 +69,17 @@
 --        join public.course_versions v on v.id = a.course_version_id
 --        join public.courses c on c.id = v.course_id
 --        where a.organization_id <> c.organization_id;
+--   3. Read-only, once (ADR 0010 step 7, owner decision 2): abandoned
+--      attempts that are completed or passed, the only rows that could make
+--      mv_path_enrollment_status count one learner as both completed and
+--      not started (section 3b's comment). Run it after the staging apply
+--      and after the production apply; expect 0 at both. Record each result
+--      under ADR 0010's acceptance note. A non-zero count is reported to the
+--      owner and goes to ops/INCIDENT_LEDGER.md with ids only; change
+--      nothing (ADR 0002 decision 4) until the owner's go.
+--        select count(*) from public.course_attempts
+--        where status = 'abandoned'
+--          and (completion_status = 'completed' or success_status = 'passed');
 
 begin;
 
