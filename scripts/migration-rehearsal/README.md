@@ -32,6 +32,7 @@ CI runs the same command: `.github/workflows/migration-rehearsal.yml`, on every 
 | `seed.sql`, `seed-0071.sql` | synthetic rows that make every data check read something (shared storage prefix, inactive package with a learner's and a staff member's in-progress attempt, wrong default, cmi5 completion after 20 s with only a screen-level statement, webhook and LRS endpoint with credentials in the URL, a `qa-*` organisation with an abandoned-but-completed, cross-organisation attempt) |
 | `seed-hotfix.sql`, `seed-many.sql`, `asrole-grants.sql` | extras for one scenario each |
 | `repoint.sql` | the repoint after 0098 refuses on the shared prefix |
+| `assert-0100.sql` | scenario `p4-0100`: what `0100_alds_core.sql` must have done (every object, once, and no `xapi_statements` foreign key or index yet, those come with 0101; the backfill; the guard on the tier and manifest columns and the writer, also as `service_role`; the refusals; the delete guards on `is_preview`; `anon` and `authenticated` locked out), in one transaction that ends in `rollback` |
 
 ## Scenarios and what each one proves
 
@@ -44,6 +45,7 @@ CI runs the same command: `.github/workflows/migration-rehearsal.yml`, on every 
 | `asrole` | the audit run as `authenticated` with Supabase-like default grants | row-level security makes every D row read 0 (`D02` reads `ok`, `A03` reads 0 although a `qa-*` organisation exists); `A04` is the only mismatch, which is why it is a stop rule |
 | `many` | 1,001 more courses | `D04.01003` listed, 1,003 `D04` rows, no check id collision |
 | `no-dashboard-fn` | the shim without `public.set_updated_at()` | the replay stops at `0049_security_advisor_hardening.sql` with `42883` (function does not exist) |
+| `p4-0100` | the `prod` scenario's steps through 0099 and its refresh; then 0100 (P4 alds core, ADR 0005 note (a) of 2026-10-19) pasted twice; `assert-0100.sql`; `refresh_report_views()`; audit | 0100 applies and re-applies without error; `assert-0100.sql` passes and rolls back; after 0100 only `B0100a`–`d` mismatch (they read `present`; every D row as after 0099 in `prod`), `Z90` = `49 / 10 / 4`; the six report views refresh without error |
 
 Every audit run is also checked to be read-only, in two ways:
 
@@ -52,7 +54,7 @@ Every audit run is also checked to be read-only, in two ways:
 
 The dynamic check sees only what changes on the synthetic rows: a call that happens to change nothing here (for example `refresh_report_views()`, whose views are empty on these rows and refresh concurrently) leaves no trace, and only the static check catches it. The grid is also searched for the seeded credentials (user, password, token, secret), which must never appear.
 
-Results on 2026-10-18 (branch `feat/p1-release-prep`, PGlite 0.5.10, Node 22 and Node 24): `RESULT: PASS: 229 checks, 0 failed` over the seven scenarios; the sitting's first pastes took 0.14–0.26 s in total, depending on the run and the machine, and 0099 under 0.05 s (toy data). The audit grids are identical, row for row, to those of the first replay, made the same day in a temporary folder before this harness existed (its logs are not kept in the repository), except `A01`, the run time.
+Results on 2026-10-18 (branch `feat/p1-release-prep`, PGlite 0.5.10, Node 22 and Node 24): `RESULT: PASS: 229 checks, 0 failed` over the seven scenarios; the sitting's first pastes took 0.14–0.26 s in total, depending on the run and the machine, and 0099 under 0.05 s (toy data). The audit grids are identical, row for row, to those of the first replay, made the same day in a temporary folder before this harness existed (its logs are not kept in the repository), except `A01`, the run time. On 2026-10-19 (branch `feat/p4-lms-side`, with the `p4-0100` scenario added): `RESULT: PASS: 370 checks, 0 failed` over the eight scenarios.
 
 ## Repository gap it found
 
@@ -66,4 +68,4 @@ A replay from the repository alone stops at `0049_security_advisor_hardening.sql
 
 ## When it fails
 
-Read the `FAIL` lines. A changed migration or audit file that changes a result on purpose needs `expectations.json` updated in the same change, with the reason in the commit message. A migration added after 0099 is not part of the v1.3.0 sitting and is not applied here.
+Read the `FAIL` lines. A changed migration or audit file that changes a result on purpose needs `expectations.json` updated in the same change, with the reason in the commit message. A migration added after 0099 is not part of the v1.3.0 sitting: it is rehearsed by its own scenario (0100 by `p4-0100`), never by the `prod` one.
