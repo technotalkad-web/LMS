@@ -10,7 +10,7 @@
  * deployed staging that has them). Uses real login + page navigation.
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { uploadCourse } from "./helpers";
 

@@ -10,7 +10,7 @@
 import { test, expect } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext, uploadCourse } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");

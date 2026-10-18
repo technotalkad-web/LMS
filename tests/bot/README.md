@@ -140,3 +140,49 @@ follow-up step and exit non-zero when `totals.critical > 0`.
   be crawled. Seed sample courses/paths/teams to widen coverage.
 - **Multi-tenant isolation** is covered precisely in `tests/e2e/security`; the
   bot adds a single-tenant RBAC probe. Keep both.
+
+---
+
+## Lifecycle suite (`tests/bot/lifecycle`)
+
+The lifecycle specs exercise real learner lifecycles against the **staging**
+database (a local `next dev` on port 3001 by hand, or the app built inside the
+runner by `lifecycle-nightly.yml`):
+
+```bash
+E2E_BASE_URL=http://localhost:3001 npx playwright test --config=playwright.lifecycle.config.ts tests/bot/lifecycle/55-attempt-row-guard.spec.ts
+bash scripts/lifecycle-nightly.sh     # what the nightly runs: build, start on :3100, the ALDS subset, counts only
+```
+
+Stop any `next dev` in the same checkout before running the script: it runs
+`next build`, which rewrites the `.next` folder the dev server uses.
+
+- **Own data namespace** — specs seed through `tests/bot/lifecycle/data.ts`:
+  `lifecycle-*` org slugs and `@lifecycle.test` emails
+  (`tests/e2e/helpers/namespace.ts`). The e2e purge (`qa-*` /
+  `@example.test`), which pr-checks runs on every push and pull request,
+  never matches them, so a push no longer wipes a lifecycle run
+  (`tests/unit/test-data-namespace.test.ts`, which also runs the purge on a
+  fake client). Import seeding helpers from `./data`, never from
+  `../../e2e/helpers/supabase`; the unit test fails on a tracked file that
+  does, and notes untracked ones.
+- **Kept 48 h, then cleaned** — there is no teardown; the global setup
+  (`setup.ts`) deletes lifecycle orgs (by cascade) and users older than 48 h
+  through the service role (`cleanup.ts`: generated slugs only, newest
+  first, bounded per run, counts only). In the nightly a refused delete, a
+  query error or a reached bound becomes a run warning; spec 50 checks the
+  cleanup's queries against the database with a dry run.
+- **Accepted staging debt** — the cleanup (like the e2e purge) deletes the
+  organisations' rows but not their package files in the staging storage
+  bucket. The fixture packages are a few KB each; deleting storage by
+  prefix from a test helper was judged riskier than the growth.
+- **Staging only** — the setup refuses any Supabase project but
+  `zeaclbapadosqqttexxh`, whatever `E2E_ALLOW_PROD` says. How ADR 0008 C,
+  ADR 0009 and ADR 0010 are verified on production after v1.3.0 is an open
+  owner decision (`docs/ARCHITECTURE.md` §8).
+- **Known local difference** — on a Windows laptop, `next build && next
+  start` fails spec 54 "Set as default from the Library" (the label keeps
+  the old language although the refresh response carries the new one; with
+  the response buffered it passes), while `next dev` and the deployed Cloud
+  Run build pass 12/12. The first Linux CI run of the nightly settles
+  whether the runner behaves like the laptop.

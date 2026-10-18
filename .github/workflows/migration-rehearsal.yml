@@ -1,0 +1,59 @@
+# Migration rehearsal — the v1.3.0 free local copy (docs/release/v1.3.0.md §7).
+#
+# Replays supabase/migrations on an embedded Postgres (PGlite 0.5.10) with a
+# small Supabase shim and synthetic rows only, runs ops/release-v1.3.0-audit.sql
+# before and after the sitting, and fails on any difference from
+# scripts/migration-rehearsal/expectations.json (README.md in that folder).
+#
+# Public repository: no secrets, no database connection, no staging or
+# production access, no artifacts. The log carries file names, check ids,
+# counts and pass/fail only. PGlite is installed into RUNNER_TEMP, never into
+# the checkout; package.json is not involved.
+name: Migration rehearsal
+
+on:
+  pull_request:
+    paths:
+      - "supabase/migrations/**"
+      - "ops/release-*.sql"
+      - "scripts/migration-rehearsal/**"
+      - ".github/workflows/migration-rehearsal.yml"
+  push:
+    paths:
+      - "supabase/migrations/**"
+      - "ops/release-*.sql"
+      - "scripts/migration-rehearsal/**"
+      - ".github/workflows/migration-rehearsal.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migration-rehearsal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rehearsal:
+    name: replay and audit (PGlite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install PGlite 0.5.10 into RUNNER_TEMP
+        working-directory: ${{ runner.temp }}
+        run: npm install --prefix "$RUNNER_TEMP/pglite" --no-audit --no-fund --no-package-lock --ignore-scripts @electric-sql/pglite@0.5.10
+
+      - name: Replay, sitting and audits
+        env:
+          PGLITE_DIR: ${{ runner.temp }}/pglite
+        run: node scripts/migration-rehearsal/run.mjs

@@ -27,7 +27,7 @@ import { test, expect, type APIRequestContext, type Page } from "@playwright/tes
 import fs from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
 import { directUpload, uploadNew, zipFile } from "./p0-helpers";
 // Static imports: the runner's transform does not follow lib/storage's

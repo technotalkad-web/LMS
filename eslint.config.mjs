@@ -15,6 +15,8 @@ const eslintConfig = [
     // Files/dirs we never want linted.
     // - .next, out, build, .open-next: build artifacts
     // - supabase/functions: Deno runtime, has its own toolchain
+    // - lib/alds/bundles: generated ALDS rules bundles (hashed, never edited;
+    //   scripts/build-alds-rules.mjs, ADR 0005 step 9)
     // - *.tmp / *.clean: dev scratch
     ignores: [
       ".next/**",
@@ -23,6 +25,7 @@ const eslintConfig = [
       ".open-next/**",
       "next-env.d.ts",
       "supabase/functions/**",
+      "lib/alds/bundles/**",
       "**/*.tmp",
       "**/*.clean",
       "**/*.new",

@@ -12,16 +12,20 @@
  *                                                          (needs 0098)
  *   - update of storage_prefix or launch_url on a ready version →
  *     course_version_frozen; storage_driver stays writable  (needs 0098)
- *   - a qa-* org with learner attempts deleted through the service client
- *     by cascade succeeds (the CI purge path; meaningful once 0098's guard
- *     exists, harmless before)
+ *   - a test org with learner attempts deleted through the service client
+ *     by cascade succeeds (the path of the e2e purge of qa-* orgs and of the
+ *     48 h lifecycle cleanup of lifecycle-* orgs, ./cleanup.ts; meaningful
+ *     once 0098's guard exists, harmless before)
+ *   - the lifecycle cleanup's real queries (dry run, clock moved 49 h on)
+ *     match a freshly seeded lifecycle org and user, and delete nothing
  *   - concurrent multipart uploads to one package → 409 for the losers, and
  *     every stored launch file is its own upload's bytes (reserve-first)
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
 import { NEEDS_0098, has0098, scormZip, sha256, uploadNew, zipFile } from "./p0-helpers";
+import { cleanupLifecycleData } from "./cleanup";
 
 type User = { id: string; email: string; password: string };
 
@@ -161,9 +165,12 @@ test.describe.serial("ADR 0003 — record guard", () => {
     expect(after).toEqual(before);
   });
 
-  test("purge path: a qa-* org with learner attempts deletes by cascade through the service client", async ({ browser, baseURL }) => {
+  test("purge path: a test org with learner attempts deletes by cascade through the service client", async ({ browser, baseURL }) => {
+    // The e2e purge (qa-* orgs) and the lifecycle cleanup (lifecycle-* orgs,
+    // ./cleanup.ts) both delete this way; the 0098 exemption is the
+    // service_role claim, not the slug.
     const org = await createOrg({ name: "QA Guard Purge" });
-    expect(org.slug.startsWith("qa-")).toBeTruthy();
+    expect(isLifecycleSlug(org.slug)).toBeTruthy();
     const admin = await createAuthUser({ profile: { first_name: "Purge", last_name: "Admin", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
     const learner = await createAuthUser({ profile: { first_name: "Purge", last_name: "Learner", must_change_password: false } });
@@ -188,6 +195,28 @@ test.describe.serial("ADR 0003 — record guard", () => {
     const { data: gone } = await svc().from("courses").select("id").eq("id", courseId).maybeSingle();
     expect(gone).toBeNull();
     if (!(await has0098())) test.info().annotations.push({ type: "note", description: `cascade passed; the exemption itself is only exercised once 0098 is applied (${NEEDS_0098})` });
+  });
+
+  test("lifecycle cleanup, dry run: its real queries match a fresh lifecycle org and user, and delete nothing", async () => {
+    // The 48 h cleanup (./cleanup.ts) runs in every lifecycle global setup;
+    // this checks its PostgREST select (like + lt + order + limit) and its
+    // paged auth listing against the database. Dry run with the clock moved
+    // 49 h on, so the rows just seeded count as expired: never a live delete
+    // with a shifted clock (it would delete this run's data).
+    const org = await createOrg({ name: "QA Cleanup Probe" });
+    const user = await createAuthUser({ profile: { first_name: "Cleanup", last_name: "Probe", must_change_password: false } });
+    const r = await cleanupLifecycleData({ dryRun: true, now: new Date(Date.now() + 49 * 3_600_000) });
+    expect(r.errors, "no query error").toEqual([]);
+    expect(r.orgs.matched, "expired lifecycle orgs").toBeGreaterThanOrEqual(1);
+    expect(r.users.matched, "expired lifecycle users").toBeGreaterThanOrEqual(1);
+    // Newest first, so the org just seeded is inside the per-run bound.
+    expect(r.ids.orgs.includes(org.id), "the seeded org is matched").toBeTruthy();
+    if (!r.capped.includes("users")) expect(r.ids.users.includes(user.id), "the seeded user is matched").toBeTruthy();
+    expect([r.orgs.deleted, r.users.deleted, r.otps.deleted], "a dry run deletes nothing").toEqual([0, 0, 0]);
+    const { data: still } = await svc().from("organizations").select("id").eq("id", org.id).maybeSingle();
+    expect(still, "the seeded org still exists").toBeTruthy();
+    const { data: u } = await svc().auth.admin.getUserById(user.id);
+    expect(u?.user?.id, "the seeded user still exists").toBe(user.id);
   });
 
   test("concurrent multipart uploads to one package: losers get 409, no upload overwrites another", async () => {

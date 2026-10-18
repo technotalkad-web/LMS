@@ -15,7 +15,7 @@
  *   3. SCORM regression: launch + commit unchanged (no xAPI params injected).
  */
 import { test, expect, type APIRequestContext } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import {
   assignCourse,
   attemptsFor,

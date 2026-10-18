@@ -5,17 +5,28 @@
  * actual app-under-test still goes through normal auth + RLS; we only
  * use the service role from inside test code, never from a page.
  *
- * Naming conventions (so teardown can find what to delete):
+ * Naming conventions (so teardown can find what to delete), the QA
+ * namespace of ./namespace.ts:
  *   - emails:  qa+<purpose>-<rand>@example.test
- *   - slugs:   qa-<rand>
+ *   - slugs:   qa-<purpose>-<rand>
  *   - org names: "QA Org <rand>"
+ * The lifecycle suite uses its own namespace (tests/bot/lifecycle/data.ts),
+ * which purgeAllTestData() never matches.
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { randomBytes, createHash } from "node:crypto";
+import {
+  QA_NAMESPACE,
+  isNamespaceEmail,
+  namespaceEmail,
+  namespaceSlug,
+  orgSlugLike,
+  otpEmailLike,
+} from "./namespace";
 
-export const TEST_EMAIL_DOMAIN = "example.test";
-export const TEST_PREFIX = "qa";
+export const TEST_EMAIL_DOMAIN = QA_NAMESPACE.emailDomain;
+export const TEST_PREFIX = QA_NAMESPACE.prefix;
 
 let _svc: SupabaseClient | null = null;
 export function svc(): SupabaseClient {
@@ -38,11 +49,11 @@ export function rand(n = 6): string {
 }
 
 export function testEmail(purpose: string): string {
-  return `${TEST_PREFIX}+${purpose}-${rand()}@${TEST_EMAIL_DOMAIN}`;
+  return namespaceEmail(QA_NAMESPACE, purpose, rand());
 }
 
 export function testSlug(purpose = "org"): string {
-  return `${TEST_PREFIX}-${purpose}-${rand()}`;
+  return namespaceSlug(QA_NAMESPACE, purpose, rand());
 }
 
 // ---------------------------------------------------------------------------
@@ -219,19 +230,22 @@ export async function seedOtp(email: string): Promise<string> {
 /**
  * Delete every row created by the E2E suite. Idempotent. Safe to run on
  * any environment because it only touches rows that match the qa-* /
- * @example.test naming convention.
+ * @example.test naming convention (QA_NAMESPACE). It never matches the
+ * lifecycle namespace (lifecycle-* / @lifecycle.test): a pr-checks run no
+ * longer wipes a lifecycle run's data (tests/unit/test-data-namespace.test.ts
+ * runs this function against a recording fake client).
  */
-export async function purgeAllTestData(): Promise<{
+export async function purgeAllTestData(client?: SupabaseClient): Promise<{
   users: number;
   orgs: number;
   otps: number;
 }> {
-  const s = svc();
+  const s = client ?? svc();
 
   // 1. Auth users with our test domain.
   const { data: list } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
   const testUsers =
-    list?.users?.filter((u) => u.email?.endsWith(`@${TEST_EMAIL_DOMAIN}`)) ?? [];
+    list?.users?.filter((u) => isNamespaceEmail(QA_NAMESPACE, u.email)) ?? [];
   for (const u of testUsers) {
     await s.auth.admin.deleteUser(u.id).catch(() => {});
   }
@@ -240,7 +254,7 @@ export async function purgeAllTestData(): Promise<{
   const { data: orgs } = await s
     .from("organizations")
     .select("id, slug")
-    .like("slug", `${TEST_PREFIX}-%`);
+    .like("slug", orgSlugLike(QA_NAMESPACE));
   const orgIds = (orgs ?? []).map((o) => o.id as string);
   if (orgIds.length > 0) {
     // Logged, not thrown: a refusal here (for example the 0098 delete guard,
@@ -257,7 +271,7 @@ export async function purgeAllTestData(): Promise<{
   const { count: otpCount } = await s
     .from("password_reset_otps")
     .delete({ count: "exact" })
-    .like("email", `${TEST_PREFIX}+%@${TEST_EMAIL_DOMAIN}`);
+    .like("email", otpEmailLike(QA_NAMESPACE));
 
   return {
     users: testUsers.length,
