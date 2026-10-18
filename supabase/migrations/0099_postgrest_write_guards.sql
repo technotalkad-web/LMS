@@ -43,12 +43,32 @@
 --      mv_path_enrollment_status count a reset-only learner as not started.
 --      (ADR 0009 steps 7-8, decision 3; the item ADR 0004 decision 9 deferred.)
 --
+-- Run order: 0, 3a, 3b, 1, 2. The sections keep the numbers ADR 0009 step 6
+-- gives them and their statements are unchanged; 1 and 2 run last so the
+-- exclusive locks their policy changes take on package_validations and
+-- course_attempts are held for milliseconds, not through the matview
+-- rebuilds of 3b. If the paste reports a lock timeout or a deadlock, nothing
+-- changed: paste it again. Staging: paste when no spec or CI e2e run is in
+-- progress. Production (after v1.3.0): paste at a minute clear of the
+-- crons' :03 / :07 quarter-hour offsets and of 03:30 UTC.
+--
 -- No row of any table is inserted, updated or deleted. Creates no table;
 -- the view and the two matviews are re-granted in this file
 -- (docs/MIGRATIONS.md, scripts/check-migration-grants.mjs).
 --
--- After the apply: `select public.refresh_report_views();` once (every entry
--- must show error = null), then read the two matviews once.
+-- After the apply:
+--   1. `select public.refresh_report_views();` once (every entry must show
+--      error = null), then read the two matviews once.
+--   2. Read-only, once: attempt rows whose organisation differs from their
+--      course's (forged through PostgREST before this file, e.g. the ADR 0009
+--      decision 4 probe's qa row). Expect only qa ids before the next CI
+--      purge and 0 rows after it; record any other row in
+--      ops/INCIDENT_LEDGER.md and change nothing (ADR 0002 decision 4).
+--        select a.id, a.organization_id, c.organization_id as course_org
+--        from public.course_attempts a
+--        join public.course_versions v on v.id = a.course_version_id
+--        join public.courses c on c.id = v.course_id
+--        where a.organization_id <> c.organization_id;
 
 begin;
 
@@ -85,42 +105,6 @@ begin
   end if;
 end
 $$;
-
--- ---------------------------------------------------------------------------
--- 1. package_validations: written by service_role only (ADR 0008 step 19)
--- ---------------------------------------------------------------------------
--- 0070's "for all" policy let any org admin's session insert, update and
--- delete rows through PostgREST (e.g. set overridden_at or verdict on a
--- blocked row). Every app write now goes through the service client after
--- the route's admin check; admins keep reading their organisation's rows.
-drop policy if exists "admins manage package validations" on public.package_validations;
-drop policy if exists "admins read package validations" on public.package_validations;
-create policy "admins read package validations" on public.package_validations
-  for select
-  using (public.is_org_admin(organization_id));
-
-revoke insert, update, delete on public.package_validations from anon, authenticated;
-grant select on public.package_validations to authenticated;
-grant select, insert, update, delete on public.package_validations to service_role;
-
--- ---------------------------------------------------------------------------
--- 2. course_attempts: written by service_role only (ADR 0009 step 6)
--- ---------------------------------------------------------------------------
--- The 0002 insert and update policies let a learner's session forge or edit
--- any column of their own attempts (status, scores, completion, an abandoned
--- row back to in_progress). The launch page, the SCORM commit and the xAPI
--- routes write through the service client with explicit id / user_id /
--- organization_id filters.
-drop policy if exists "members create own attempts" on public.course_attempts;
-drop policy if exists "members update own attempts" on public.course_attempts;
--- "members read own attempts" (0002 lines 161-164) is kept unchanged: learners
--- read their own rows, admins their organisation's. RLS stays enabled; with
--- no write policy left, a write would match nothing even if a privilege were
--- ever re-granted. The 0098 delete guards and journey_record_completion are
--- security definer and unaffected.
-revoke insert, update, delete on public.course_attempts from anon, authenticated;
-grant select on public.course_attempts to authenticated;
-grant select, insert, update, delete on public.course_attempts to service_role;
 
 -- ---------------------------------------------------------------------------
 -- 3a. v_course_attempt_summary: live (non-abandoned) attempt columns
@@ -228,7 +212,14 @@ revoke select on public.mv_course_enrollment_status from anon, authenticated;
 grant select on public.mv_course_enrollment_status to service_role;
 
 -- mv_path_enrollment_status (last defined in 0090): the 0090 body, with
--- any_attempt counting live attempts only; the pass_required branch is kept.
+-- any_attempt counting live attempts only; the pass_required branch is kept
+-- (ADR 0009 step 8 pins this body). Unlike the course summary above, the
+-- three counts are disjoint only while no completed attempt is ever
+-- abandoned: every abandon path in the app is conditional on
+-- status = 'in_progress', and a completed or passed attempt leaves
+-- in_progress. A learner whose only completing attempts were abandoned
+-- (a hand-run fix, or a row forged before this file) would count under both
+-- completed and not_started.
 drop materialized view if exists public.mv_path_enrollment_status;
 create materialized view public.mv_path_enrollment_status as
 with path_course_count as (
@@ -268,6 +259,42 @@ create unique index mv_path_enrollment_status_idx
   on public.mv_path_enrollment_status (path_id);
 revoke select on public.mv_path_enrollment_status from anon, authenticated;
 grant select on public.mv_path_enrollment_status to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 1. package_validations: written by service_role only (ADR 0008 step 19)
+-- ---------------------------------------------------------------------------
+-- 0070's "for all" policy let any org admin's session insert, update and
+-- delete rows through PostgREST (e.g. set overridden_at or verdict on a
+-- blocked row). Every app write now goes through the service client after
+-- the route's admin check; admins keep reading their organisation's rows.
+drop policy if exists "admins manage package validations" on public.package_validations;
+drop policy if exists "admins read package validations" on public.package_validations;
+create policy "admins read package validations" on public.package_validations
+  for select
+  using (public.is_org_admin(organization_id));
+
+revoke insert, update, delete on public.package_validations from anon, authenticated;
+grant select on public.package_validations to authenticated;
+grant select, insert, update, delete on public.package_validations to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 2. course_attempts: written by service_role only (ADR 0009 step 6)
+-- ---------------------------------------------------------------------------
+-- The 0002 insert and update policies let a learner's session forge or edit
+-- any column of their own attempts (status, scores, completion, an abandoned
+-- row back to in_progress). The launch page, the SCORM commit and the xAPI
+-- routes write through the service client with explicit id / user_id /
+-- organization_id filters.
+drop policy if exists "members create own attempts" on public.course_attempts;
+drop policy if exists "members update own attempts" on public.course_attempts;
+-- "members read own attempts" (0002 lines 161-164) is kept unchanged: learners
+-- read their own rows, admins their organisation's. RLS stays enabled; with
+-- no write policy left, a write would match nothing even if a privilege were
+-- ever re-granted. The 0098 delete guards and journey_record_completion are
+-- security definer and unaffected.
+revoke insert, update, delete on public.course_attempts from anon, authenticated;
+grant select on public.course_attempts to authenticated;
+grant select, insert, update, delete on public.course_attempts to service_role;
 
 notify pgrst, 'reload schema';
 
