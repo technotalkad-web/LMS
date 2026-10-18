@@ -37,11 +37,17 @@ let probe0099: boolean | null = null;
  * transaction as the policy drops, so one real select of that column settles
  * all of it (ADR 0009 step 12). Postgres answers 42703 (undefined column)
  * before the apply; any other error is an environment problem and throws,
- * so a broken setup never silently skips every guard case.
+ * so a broken setup never silently skips every guard case. The filter on a
+ * user id no account has still makes Postgres validate the column, and no
+ * organisation's row is read.
  */
 export async function has0099(): Promise<boolean> {
   if (probe0099 !== null) return probe0099;
-  const { error } = await svc().from("v_course_attempt_summary").select("live_attempt_count").limit(1);
+  const { error } = await svc()
+    .from("v_course_attempt_summary")
+    .select("live_attempt_count")
+    .eq("user_id", "00000000-0000-0000-0000-000000000000")
+    .limit(1);
   if (error && error.code !== "42703") throw new Error(`has0099 probe failed: ${error.code ?? ""} ${error.message}`);
   probe0099 = !error;
   return probe0099;

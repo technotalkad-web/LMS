@@ -26,27 +26,31 @@
  *       the attempt of (a) answers 200 and the row carries the committed
  *       status and score; the learner (and the admin) still read the
  *       learner's rows through PostgREST (select policy kept).
+ *   (j) the journey launches write their tag as the server (every run):
+ *       relaunching an untagged in-progress attempt through
+ *       ?journey=<enrollment>&day=1 tags it; a first launch through a
+ *       journey inserts the attempt with the tag (ADR 0009 steps 2-3; spec
+ *       02-journeys, which step 14 names, never launches through a journey).
+ *       Two extra SCORM courses, so no other case's attempt is tagged.
  *
  * Branches, decided by has0099() (a real select of
  * v_course_attempt_summary.live_attempt_count):
  *   - 0099 applied: (a)-(g) assert refusal.
- *   - before 0099, ATTEMPT_GUARD_PROBE=1: the staging probe of ADR 0009 step
- *     13 (owner decision 4: one run, staging test accounts only). The same
- *     calls run; (a)-(e) must succeed and change or create the row (the hole
- *     exists), (f) and (g) are refused today as well. Each outcome is recorded
- *     as a test annotation and a log line (case, HTTP status, row changed,
- *     ids only). Nothing is restored: every row written belongs to this run's
- *     qa-* organisations and goes with the next CI purge.
- *   - before 0099 without the variable: (a)-(g) and the revive skip
- *     ("needs 0099"); the seed, the force restart and (h) still run.
+ *   - before 0099: (a)-(g) and the revive skip ("needs 0099"); the seed, the
+ *     force restart, (h) and (j) still run.
+ *   - The staging probe of ADR 0009 step 13 (owner decision 4: one run,
+ *     staging test accounts only) ran once, at 2026-10-17T19:45:55Z with
+ *     ATTEMPT_GUARD_PROBE=1 at commit 63c1e28 (that commit holds the probe
+ *     branch); its results are recorded under ADR 0009 decision 4 and it is
+ *     not to be repeated. The branch is retired: ATTEMPT_GUARD_PROBE=1 on a
+ *     database without 0099 now fails the run instead of probing (after the
+ *     staging apply such a database is production).
  *
- * Binding (so a probe call that succeeds never invalidates a later case): the
- * SCORM attempt serves (a), (b), (f), (g) and the commit of (h), whose
- * assertions do not depend on what (a)/(b) left; the inserts of (c) target a
- * third course the learner never launches (a forged completion on the cmi5
- * course would turn (h)'s launch into a revision run); the revive of (e) runs
- * last, after (h)'s fresh launch (a revived old-version attempt would be
- * resumed by grandfather routing).
+ * Binding: the SCORM attempt serves (a), (b), (f), (g) and the commit of (h);
+ * the inserts of (c) target a third course the learner never launches (a
+ * forged completion on the cmi5 course would turn (h)'s launch into a
+ * revision run); the revive of (e) runs last, after (h)'s fresh launch (a
+ * revived old-version attempt would be resumed by grandfather routing).
  *
  * Never push while this runs: pr-checks purges qa-* data on every push.
  */
@@ -54,6 +58,7 @@ import { test, expect, type BrowserContext } from "@playwright/test";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
 import { assignCourse, authedContext } from "./helpers";
+import { todayStr } from "../../../lib/journey/journey";
 import {
   NEEDS_0099,
   VERB,
@@ -69,17 +74,22 @@ import {
 } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
-type Branch = "guard" | "probe" | "skip";
+type Branch = "guard" | "skip";
 type Row = Record<string, unknown>;
 
-const PROBE = process.env.ATTEMPT_GUARD_PROBE === "1";
+const PROBE_REQUESTED = process.env.ATTEMPT_GUARD_PROBE === "1";
 const CMI5_ID = "urn:elearning-engine:qa-attempt-guard";
 const CMI5_TITLE = "QA Attempt Guard cmi5";
 
 /** Which branch this run takes for the PostgREST write cases. */
 async function branch(): Promise<Branch> {
   if (await has0099()) return "guard";
-  return PROBE ? "probe" : "skip";
+  if (PROBE_REQUESTED) {
+    throw new Error(
+      "ATTEMPT_GUARD_PROBE=1 refused: the one approved probe (ADR 0009 decision 4) ran at 2026-10-17T19:45:55Z (commit 63c1e28) and is not to be repeated. Unset the variable."
+    );
+  }
+  return "skip";
 }
 
 /** Service-role re-read of one attempt (every column). */
@@ -201,6 +211,102 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     s.adminDb = await sessionClient(admin);
   });
 
+  test("(j) journey launches tag the attempt as the server: the resume tag and the tagged insert (every run)", async () => {
+    const areq = s.adminCtx!.request;
+    const lreq = s.learnerCtx!.request;
+    const db = svc();
+    const orgA = s.orgA!;
+    const learner = s.learner!;
+
+    // Two SCORM courses of their own, so no other case's attempt is tagged
+    // (a tag makes (h)'s commit credit a journey day). Assigned, so the
+    // launch never depends on the journey entitlement branch.
+    const courses: Record<"resume" | "fresh", { course: string; version: string }> = {} as never;
+    for (const key of ["resume", "fresh"] as const) {
+      const up = await uploadNew(areq, orgA.slug, `journey-${key}.zip`, await scormZip({ title: `QA Attempt Guard Journey ${key}` }));
+      expect(up.ok(), `upload journey ${key} → ${up.status()}: ${await up.text()}`).toBeTruthy();
+      const course = (await up.json()).courseId as string;
+      const { data: c } = await db.from("courses").select("current_version_id").eq("id", course).single();
+      courses[key] = { course, version: (c as { current_version_id: string }).current_version_id };
+      await assignCourse(areq, orgA.slug, course, learner.id);
+    }
+
+    // One program per course (0063 allows several per organisation), day 1 =
+    // that course, the enrollment starting today (org-local; no
+    // gamification_settings row → the default journey timezone).
+    // count_sundays: day 1 must be open on any weekday, Sundays included.
+    const start = todayStr();
+    const enrollments: Record<"resume" | "fresh", string> = {} as never;
+    for (const key of ["resume", "fresh"] as const) {
+      const { data: program, error: pErr } = await db
+        .from("journey_programs")
+        .insert({ organization_id: orgA.id, name: `QA Attempt Guard Journey ${key}`, days_total: 1, count_sundays: true })
+        .select("id")
+        .single();
+      expect(pErr, `program: ${pErr?.message}`).toBeNull();
+      const { data: jv, error: vErr } = await db
+        .from("journey_versions")
+        .insert({
+          program_id: program!.id,
+          organization_id: orgA.id,
+          version_number: 1,
+          name: `QA Attempt Guard Journey ${key}`,
+          days_total: 1,
+          count_sundays: true,
+          completion_title: "Yoddha",
+          days: [{ day: 1, course_id: courses[key].course, mission_title: `QA mission ${key}` }],
+        })
+        .select("id")
+        .single();
+      expect(vErr, `journey version: ${vErr?.message}`).toBeNull();
+      await db.from("journey_programs").update({ current_version_id: jv!.id }).eq("id", program!.id);
+      const { data: enr, error: eErr } = await db
+        .from("journey_enrollments")
+        .insert({ program_id: program!.id, version_id: jv!.id, organization_id: orgA.id, user_id: learner.id, start_date: start, status: "active" })
+        .select("id")
+        .single();
+      expect(eErr, `enrollment: ${eErr?.message}`).toBeNull();
+      enrollments[key] = (enr as { id: string }).id;
+    }
+
+    // (i) the resume tag: a plain launch leaves an untagged in-progress
+    // attempt; the journey launch of the same course tags it.
+    const plain = await lreq.get(`/${orgA.slug}/courses/${courses.resume.course}/launch`);
+    expect(plain.ok(), `plain launch → ${plain.status()}`).toBeTruthy();
+    const resumeAttempt = await inProgressAttempt(learner.id, courses.resume.version);
+    const untagged = await row(resumeAttempt);
+    expect(untagged).toMatchObject({ journey_enrollment_id: null, journey_day: null });
+    const viaJourney = await lreq.get(`/${orgA.slug}/courses/${courses.resume.course}/launch?journey=${enrollments.resume}&day=1`);
+    expect(viaJourney.ok(), `journey launch (resume) → ${viaJourney.status()}`).toBeTruthy();
+    expect(await inProgressAttempt(learner.id, courses.resume.version), "the same attempt is resumed").toBe(resumeAttempt);
+    const tagged = await row(resumeAttempt);
+    expect(tagged, "the resumed attempt carries the journey tag").toMatchObject({
+      journey_enrollment_id: enrollments.resume,
+      journey_day: 1,
+      user_id: learner.id,
+      organization_id: orgA.id,
+      status: "in_progress",
+    });
+
+    // (ii) the tagged insert: a first launch through the journey.
+    expect(await rowsFor(learner.id, courses.fresh.version), "never launched").toHaveLength(0);
+    const first = await lreq.get(`/${orgA.slug}/courses/${courses.fresh.course}/launch?journey=${enrollments.fresh}&day=1`);
+    expect(first.ok(), `journey launch (fresh) → ${first.status()}`).toBeTruthy();
+    const freshRows = await rowsFor(learner.id, courses.fresh.version);
+    expect(freshRows, "one attempt created by the launch").toHaveLength(1);
+    expect(freshRows[0], "the inserted attempt carries the journey tag").toMatchObject({
+      journey_enrollment_id: enrollments.fresh,
+      journey_day: 1,
+      user_id: learner.id,
+      organization_id: orgA.id,
+      status: "in_progress",
+    });
+    test.info().annotations.push({
+      type: "case j",
+      description: JSON.stringify({ resumeAttempt, insertAttempt: String(freshRows[0].id), enrollments, org: orgA.id }),
+    });
+  });
+
   test("(a) learner PATCH of own in-progress SCORM attempt to passed / completed / score 1", async () => {
     const b = await branch();
     test.skip(b === "skip", NEEDS_0099);
@@ -218,13 +324,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     const after = await row(s.scormAttempt!);
     const changed = !same(before, after);
     record({ case: "a", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed, ids: { attempt: s.scormAttempt! } });
-    if (b === "guard") {
-      expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
-      expect(after, "row unchanged").toEqual(before);
-    } else {
-      expect(changed, "probe: the learner's session rewrote the row").toBe(true);
-      expect(after).toMatchObject({ status: "passed", completion_status: "completed", success_status: "passed", score: 1, progress_pct: 100 });
-    }
+    expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
+    expect(after, "row unchanged").toEqual(before);
   });
 
   test("(b) learner PATCH of cmi_data alone on the same row", async () => {
@@ -236,13 +337,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     const after = await row(s.scormAttempt!);
     const changed = !same(before, after);
     record({ case: "b", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed, ids: { attempt: s.scormAttempt! } });
-    if (b === "guard") {
-      expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
-      expect(after, "row unchanged").toEqual(before);
-    } else {
-      expect(changed, "probe: cmi_data rewritten").toBe(true);
-      expect(after?.cmi_data).toEqual(cmi);
-    }
+    expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
+    expect(after, "row unchanged").toEqual(before);
   });
 
   test("(c) learner POST of a never-launched completed + passed row", async () => {
@@ -268,13 +364,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
       .select("id");
     const after = await rowsFor(s.learner!.id, s.forgeVersion!);
     record({ case: "c", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed: after.length !== before.length, ids: { version: s.forgeVersion!, org: s.orgA!.id, ...(after[0] ? { attempt: String(after[0].id) } : {}) } });
-    if (b === "guard") {
-      expect(res.error, "refused").toBeTruthy();
-      expect(after, "no row for this learner and version").toHaveLength(0);
-    } else {
-      expect(after, "probe: a forged completion exists").toHaveLength(1);
-      expect(after[0]).toMatchObject({ status: "passed", success_status: "passed", completion_status: "completed" });
-    }
+    expect(res.error, "refused").toBeTruthy();
+    expect(after, "no row for this learner and version").toHaveLength(0);
   });
 
   test("(d) learner POST naming the other organisation's version and the learner's own organisation", async () => {
@@ -293,13 +384,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
       .select("id");
     const after = await rowsFor(s.learner!.id, s.otherOrgVersion!);
     record({ case: "d", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed: after.length !== before.length, ids: { version: s.otherOrgVersion!, versionOrg: s.orgB!.id, rowOrg: s.orgA!.id, ...(after[0] ? { attempt: String(after[0].id) } : {}) } });
-    if (b === "guard") {
-      expect(res.error, "refused").toBeTruthy();
-      expect(after, "no row on the other organisation's version").toHaveLength(0);
-    } else {
-      expect(after, "probe: a cross-organisation row exists").toHaveLength(1);
-      expect(after[0]).toMatchObject({ organization_id: s.orgA!.id, course_version_id: s.otherOrgVersion! });
-    }
+    expect(res.error, "refused").toBeTruthy();
+    expect(after, "no row on the other organisation's version").toHaveLength(0);
   });
 
   test("(f) learner DELETE of the SCORM attempt → the row still exists", async () => {
@@ -309,8 +395,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     const res = await s.learnerDb!.from("course_attempts").delete().eq("id", s.scormAttempt!).select("id");
     const after = await row(s.scormAttempt!);
     record({ case: "f", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed: !same(before, after), ids: { attempt: s.scormAttempt! } });
-    // Refused in both branches: there is no delete policy today, and 0099's
-    // revoke keeps it so.
+    // Refused before 0099 as well (the probe saw 200 with 0 rows): there is
+    // no delete policy, and 0099's revoke keeps it so.
     expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
     expect(after, "row still exists, unchanged").toEqual(before);
   });
@@ -326,7 +412,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
       .select("id");
     const after = await row(s.scormAttempt!);
     record({ case: "g", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed: !same(before, after), ids: { attempt: s.scormAttempt!, actorRole: "admin" } });
-    // Refused in both branches: the 0002 update policy is user_id = auth.uid().
+    // Refused before 0099 as well (the probe saw 200 with 0 rows): the 0002
+    // update policy is user_id = auth.uid().
     expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
     expect(after, "row unchanged").toEqual(before);
   });
@@ -375,7 +462,7 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     expect(freshRow?.last_activity_at).toBeTruthy();
 
     // The SCORM commit through the route on the attempt of (a): 200 and the
-    // committed values land (independent of what a probe left on the row).
+    // committed values land.
     const commit = await lreq.post(`/api/scorm/${s.scormAttempt}/commit`, {
       data: { cmi: { "cmi.core.lesson_status": "passed", "cmi.core.score.raw": "95", "cmi.core.lesson_location": "end" }, finished: true },
     });
@@ -405,12 +492,7 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     const after = await row(s.cmi5Attempt!);
     const changed = !same(before, after);
     record({ case: "e", branch: b, http: res.status, code: res.error?.code ?? null, returned: res.data?.length ?? 0, changed, ids: { attempt: s.cmi5Attempt!, version: s.cmi5Version! } });
-    if (b === "guard") {
-      expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
-      expect(after, "still abandoned, unchanged").toEqual(before);
-    } else {
-      expect(changed, "probe: the learner's session revived the abandoned attempt").toBe(true);
-      expect(after?.status).toBe("in_progress");
-    }
+    expect(Boolean(res.error) || (res.data ?? []).length === 0, "refused").toBe(true);
+    expect(after, "still abandoned, unchanged").toEqual(before);
   });
 });
