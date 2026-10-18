@@ -49,7 +49,12 @@
             "files": ["0032", "0072-0098"],
             "times": 2,
             "refuseFirst": {
-              "0098": { "why": "while a storage prefix is shared (D02 = 1)", "contains": "storage_prefix", "then": "repoint.sql" }
+              "0098": {
+                "why": "by its own guard while a storage prefix is shared (D02 = 1)",
+                "code": "P0001",
+                "contains": "0098 refused: 1 storage_prefix value(s) are shared by more than one course_versions row",
+                "then": "repoint.sql"
+              }
             }
           }
         },

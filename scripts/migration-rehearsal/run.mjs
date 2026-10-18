@@ -190,8 +190,8 @@ async function stepApply(db, s) {
       const r = await applyMigration(db, f);
       allOk =
         check(
-          !r.ok && r.message.includes(refuse.contains),
-          `${f}: refused ${refuse.why} (expected a refusal naming "${refuse.contains}")${r.ok ? ": it APPLIED" : ""}`,
+          !r.ok && r.code === refuse.code && r.message.includes(refuse.contains),
+          `${f}: refused ${refuse.why} (expected ${refuse.code} "${refuse.contains}…")${r.ok ? ": it APPLIED" : ""}`,
         ) && allOk;
       if (!r.ok) info(`refusal: ${r.code} ${r.message}`);
       if (!(await runSqlFile(db, refuse.then))) return "stop";
@@ -225,24 +225,43 @@ async function stepRefresh(db, s) {
   return "next";
 }
 
-// what the audit must leave untouched: every relation, every table row
+// What the audit must leave untouched, in public/auth/storage: every relation
+// with its kind and storage file (relfilenode: a rewrite, truncate, reindex or
+// non-concurrent refresh changes it), every row of every table and
+// materialized view, every sequence's state, and the session's settings (a
+// set or set_config that outlives the paste). A call that leaves none of
+// these traces is the static check's job (lintAudit).
+const SNAP_SCHEMAS = "('public', 'auth', 'storage')";
 const SNAP_RELATIONS = `select coalesce(string_agg(x, ',' order by x), '') as s from (
-  select n.nspname || '.' || c.relname || ':' || c.relkind::text as x
+  select n.nspname || '.' || c.relname || ':' || c.relkind::text || ':' || c.relfilenode::text as x
   from pg_class c join pg_namespace n on n.oid = c.relnamespace
-  where n.nspname in ('public', 'auth', 'storage')) q`;
+  where n.nspname in ${SNAP_SCHEMAS}) q`;
+const SNAP_SETTINGS = `select coalesce(string_agg(name || '=' || setting, ',' order by name), '') as s
+  from pg_settings where source = 'session'`;
+const ident = (s) => `"${String(s).replace(/"/g, '""')}"`;
 async function snapshot(db) {
   const rel = (await db.query(SNAP_RELATIONS)).rows[0].s;
-  const tables = await db.query(`select table_schema, table_name from information_schema.tables
-    where table_schema in ('public', 'auth', 'storage') and table_type = 'BASE TABLE' order by 1, 2`);
+  const settings = (await db.query(SNAP_SETTINGS)).rows[0].s;
+  const rels = await db.query(`select n.nspname as sc, c.relname as t, c.relkind::text as k, c.relispopulated as pop
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname in ${SNAP_SCHEMAS} and c.relkind in ('r', 'm', 'S') order by 1, 2`);
   let data = "";
-  for (const { table_schema: sc, table_name: t } of tables.rows) {
+  const counts = { r: 0, m: 0, S: 0 };
+  for (const { sc, t, k, pop } of rels.rows) {
+    counts[k] += 1;
+    if (k === "m" && !pop) {
+      data += `${sc}.${t}=unpopulated;`;
+      continue;
+    }
     const r = await db.query(
-      `select count(*)::text || ':' || coalesce(md5(string_agg(to_jsonb(x)::text, '|' order by to_jsonb(x)::text)), '') as h
-       from "${sc}"."${t}" x`,
+      k === "S"
+        ? `select last_value::text || ':' || is_called::text as h from ${ident(sc)}.${ident(t)}`
+        : `select count(*)::text || ':' || coalesce(md5(string_agg(to_jsonb(x)::text, '|' order by to_jsonb(x)::text)), '') as h
+           from ${ident(sc)}.${ident(t)} x`,
     );
     data += `${sc}.${t}=${r.rows[0].h};`;
   }
-  return { rel, data, tables: tables.rows.length };
+  return { rel, settings, data, counts };
 }
 
 const AUDIT = fs.readFileSync(AUDIT_PATH, "utf8");
@@ -270,9 +289,20 @@ async function stepAudit(db, s, mustNotAppear) {
     if (s.role) await db.exec("reset role");
   }
   const snap1 = await snapshot(db);
+  const changed = [];
+  if (snap0.rel !== snap1.rel) changed.push("relations or their storage files");
+  if (snap0.settings !== snap1.settings) changed.push("session settings");
+  if (snap0.data !== snap1.data) {
+    const before = new Set(snap0.data.split(";"));
+    const names = snap1.data.split(";").filter((x) => x && !before.has(x)).map((x) => x.split("=")[0]);
+    changed.push(`rows of ${names.length ? names.join(" ") : "a relation"}`);
+  }
+  const { r, m, S } = snap0.counts;
   check(
-    snap0.rel === snap1.rel && snap0.data === snap1.data,
-    `${tag}${s.role ? ` (run as ${s.role})` : ""}: read-only (every relation in public/auth/storage and every row of its ${snap0.tables} tables unchanged)`,
+    changed.length === 0,
+    `${tag}${s.role ? ` (run as ${s.role})` : ""}: read-only (in public/auth/storage every relation and its storage file, ` +
+      `every row of ${r} tables and ${m} materialized views, ${S} sequence${S === 1 ? "" : "s"}, and the session settings unchanged)` +
+      `${changed.length ? `: CHANGED ${changed.join("; ")}` : ""}`,
   );
   if (VERBOSE) printGrid(rows);
 
@@ -334,29 +364,47 @@ async function stepAudit(db, s, mustNotAppear) {
 }
 
 // --- static check of the audit file -----------------------------------------------
+// every function the migrations and the shims create: the audit reads catalogs
+// and tables only, so a call to any of them, qualified or not, is flagged
+function projectFunctions() {
+  const sources = [...files.map((f) => path.join(MIG, f)), path.join(HERE, "shim.sql"), path.join(HERE, "shim-dashboard.sql")];
+  const re = /\bcreate\s+(?:or\s+replace\s+)?function\s+(?:"?\w+"?\s*\.\s*)?"?(\w+)"?\s*\(/gi;
+  const names = new Set();
+  for (const p of sources) for (const m of fs.readFileSync(p, "utf8").matchAll(re)) names.add(m[1].toLowerCase());
+  return names;
+}
+
 function lintAudit() {
-  // strip comments and string literals, so words inside notes are not matched
-  const code = AUDIT.replace(/\/\*[\s\S]*?\*\//g, "")
-    .split(/\r?\n/)
-    .map((l) => l.replace(/--.*$/, ""))
-    .join("\n")
-    .replace(/'(?:[^']|'')*'/g, "''")
-    .toLowerCase();
+  // One left-to-right pass drops comments and empties string literals (a quote
+  // inside a comment, or "--" inside a string, cannot shift what counts as
+  // code); quoted identifiers are kept as they are. The $audit$ body is code.
+  const code = AUDIT.replace(/\/\*[\s\S]*?\*\/|--[^\n]*|'(?:[^']|'')*'|"(?:[^"]|"")*"/g, (t) =>
+    t[0] === "'" ? "''" : t[0] === '"' ? t : " ",
+  ).toLowerCase();
   const allowed = [
     /^insert\s+into\s+pg_temp\.release_audit\b/,
     /^drop\s+table\s+if\s+exists\s+pg_temp\.release_audit\b/,
     /^create\s+temporary\s+table\s+release_audit\b/,
   ];
   const bad = [];
-  const re =
+  const writes =
     /\b(insert\s+into|update|delete\s+from|truncate|alter|grant|revoke|drop|create|copy|call|perform|execute|set\s+\w+|vacuum|refresh|lock|nextval|setval|pg_advisory\w*|dblink\w*|lo_\w+)\b[^;\n]{0,60}/g;
-  for (const m of code.matchAll(re)) {
+  for (const m of code.matchAll(writes)) {
     if (allowed.some((a) => a.test(m[0]))) continue;
     bad.push(m[0].replace(/\s+/g, " ").slice(0, 80));
   }
+  // calls with side effects that leave no row behind
+  const calls =
+    /\b(?:(?:public|auth|storage|extensions)\.\w+|set_config|pg_notify|pg_sleep\w*|pg_reload_conf|pg_terminate_backend|pg_cancel_backend|pg_stat_reset\w*|pg_switch_wal|pg_promote|pg_rotate_logfile|pg_create_\w+|pg_drop_\w+|pg_file_\w+)\s*\([^;\n]{0,60}/g;
+  for (const m of code.matchAll(calls)) bad.push(m[0].replace(/\s+/g, " ").slice(0, 80));
+  const fns = projectFunctions();
+  for (const m of code.matchAll(/(?<![.\w])(\w+)\s*\(/g)) {
+    if (fns.has(m[1])) bad.push(`${m[1]}( (a function the migrations or the shim create)`);
+  }
   check(
     bad.length === 0,
-    `${EXP.audit}: writes nothing but its temporary table (static check): ${bad.length ? bad.join(" || ") : "no other write"}`,
+    `${EXP.audit}: writes nothing but its temporary table and calls none of ${fns.size} project functions or the ` +
+      `listed side-effecting built-ins (static check): ${bad.length ? bad.join(" || ") : "no other write, no such call"}`,
   );
 }
 
