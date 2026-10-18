@@ -21,6 +21,8 @@ Rules for this file:
 | 2026-10-18 | staging | 7ff60dde | Corrects the 2026-10-15 entry | D5a done 2026-10-17: TEST LMS.zip uploaded as 5f836158 (v2) in the same Hindi package (grandfather); 5f836158 is the package's current version and the course default. | Partly closed: new learners get 5f836158; the 6 in-progress attempts stay on 7ff60dde until D5b |
 | 2026-10-18 | staging | 3b005ed1 | Corrects the 2026-10-16 entry | Package 104a6740 hidden from learners (D5a, 2026-10-17); 0 attempts. The package now carries language `pa` (Punjabi), set through the Library "Promote to" control between 2026-10-17 and 2026-10-18 (promotion is not audited); it stays hidden. | Closed |
 | 2026-10-18 | staging | 887d4aaf | Corrects the 2026-10-16 entry | Package 42d6ae90 hidden from learners (D5a, 2026-10-17); 0 attempts. | Closed |
+| 2026-10-19 | staging | 7ff60dde | Corrects the 2026-10-18 entry | D5b done 2026-10-18 (§5): its five in-progress learner and staff attempts reset; 5f836158 serves the corrected module. One staff grant retake (42ee946f) remains in progress on 7ff60dde by design. | Closed on staging (one staff grant retake left by design) |
+| 2026-10-19 | staging | d4f05fac | Corrects the 2026-10-15 entry | D5b done 2026-10-18 (§5): Gujarati package 1337fa47 hidden; its one in-progress learner attempt reset. | Closed on staging |
 
 ## 2. Versions repointed to their own folder (step 0)
 
@@ -83,6 +85,9 @@ D5b (later, only on the owner's explicit go against the re-read list of section 
 
 | Date | Env | Owner go | Action | Attempt / target |
 |---|---|---|---|---|
+| 2026-10-18 | staging | owner's standing direction of 2026-10-18 (staging is test data; ADR 0004 decision 2 note) | Per-version restart of 7ff60dde through the Library "Restart learners on this version" (owner's own admin session; dry-run preview 5 attempts, 1 grant retake excluded); audit `course.version.attempts_restarted` d32079f6 at 16:37:01 UTC, reason "D5b: Correct affected staging attempts from the wrong Hindi course version." | 7ff60dde: 1a6d679a learner, 6cec0b33 learner, 6efb5efc learner, 6da4af36 staff, b238c46c staff → abandoned. 42ee946f staff stays in progress by design (approved grant retake a6db5c02, excluded by ADR 0008 step 3) |
+| 2026-10-18 | staging | owner's standing direction of 2026-10-18 (staging is test data; ADR 0004 decision 2 note) | Deactivate the Gujarati package (Library, "Hidden from learners"); not the course default (5f836158) | Package 1337fa47 (current version d4f05fac) → inactive |
+| 2026-10-18 | staging | owner's standing direction of 2026-10-18 (staging is test data; ADR 0004 decision 2 note) | Per-version restart of d4f05fac (current version of the now-inactive package; ADR 0008 step 2) through the Library; audit d32079f6's sibling dee4783a at 17:30:41 UTC, reason "D5b: Correct the staging learner's attempt on the wrong Gujarati course version." | d4f05fac: 0a005088 learner → abandoned |
 
 Completions earned on a wrong slot during the grandfather window are recorded here, never rewritten:
 
