@@ -15,10 +15,16 @@
  *   - the sites ADR 0009 steps 2-4 moved carry their explicit filters, and
  *     every package_validations write names organization_id.
  *
+ * A receiver is resolved lexically with the TypeScript parser: the binding
+ * or parameter of that name in scope at the write (the enclosing functions'
+ * parameters and the bindings declared before it in the enclosing blocks),
+ * not the first binding of the name anywhere in the file.
+ *
  * Run:  npx tsx tests/unit/attempt-write-sites.test.ts   (or npm run test:unit)
  */
 import fs from "node:fs";
 import path from "node:path";
+import ts from "typescript";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -68,7 +74,7 @@ function receiverBefore(src: string, at: number): string {
   return (before.match(/([\w$.]+(?:\(\))?)$/) ?? [])[1] ?? "?";
 }
 
-type Write = { receiver: string; stmt: string; method: string };
+type Write = { receiver: string; stmt: string; method: string; at: number };
 function writesOn(table: string): Map<string, Write[]> {
   const re = new RegExp(`\\.from\\(\\s*["'\`]${table}["'\`]\\s*\\)`, "g");
   const out = new Map<string, Write[]>();
@@ -78,47 +84,112 @@ function writesOn(table: string): Map<string, Write[]> {
       const w = /\.(insert|update|upsert|delete)\(/.exec(stmt);
       if (!w) continue;
       const list = out.get(file) ?? [];
-      list.push({ receiver: receiverBefore(src, m.index ?? 0), stmt, method: w[1] });
+      list.push({ receiver: receiverBefore(src, m.index ?? 0), stmt, method: w[1], at: m.index ?? 0 });
       out.set(file, list);
     }
   }
   return out;
 }
 
-function callsOf(fn: string): Map<string, string[]> {
+type Call = { args: string; at: number };
+function callsOf(fn: string): Map<string, Call[]> {
   const re = new RegExp(`(?<!function\\s)\\b${fn}\\(`, "g");
-  const out = new Map<string, string[]>();
+  const out = new Map<string, Call[]>();
   for (const [file, src] of sources) {
     for (const m of src.matchAll(re)) {
       const args = statementFrom(src, (m.index ?? 0) + m[0].length);
       const list = out.get(file) ?? [];
-      list.push(args.replace(/\s+/g, " ").trim());
+      list.push({ args: args.replace(/\s+/g, " ").trim(), at: m.index ?? 0 });
       out.set(file, list);
     }
   }
   return out;
 }
 
+const asts = new Map<string, ts.SourceFile>();
+function ast(file: string): ts.SourceFile {
+  let sf = asts.get(file);
+  if (!sf) {
+    sf = ts.createSourceFile(file, sources.get(file) ?? "", ts.ScriptTarget.Latest, true, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+    asts.set(file, sf);
+  }
+  return sf;
+}
+function bindsName(name: ts.BindingName, id: string): boolean {
+  if (ts.isIdentifier(name)) return name.text === id;
+  return name.elements.some((e) => !ts.isOmittedExpression(e) && bindsName(e.name, id));
+}
+type Decl = { kind: "binding"; init: string } | { kind: "param" } | null;
 /**
- * A receiver is a service client in its file when the file binds it to
- * createServiceClient(...) / serviceClient(), and its serviceClient() is the
- * service-role one (local, or lib/xapi/auth's). `serviceClient()` itself is
- * checked the same way. Parameters are listed as such and checked at their
- * callers below.
+ * The declaration of `id` in scope at offset `at`: walking out from the
+ * innermost node, an enclosing function's parameter, or a `const`/`let`
+ * declared before `at` directly in an enclosing block (or the file).
  */
-function isServiceReceiver(file: string, receiver: string): boolean {
+function declarationAt(file: string, at: number, id: string): Decl {
+  const sf = ast(file);
+  const chain: ts.Node[] = [];
+  let node: ts.Node = sf;
+  for (;;) {
+    chain.push(node);
+    const child = node.getChildren(sf).find((c) => c.getStart(sf) <= at && at < c.getEnd());
+    if (!child) break;
+    node = child;
+  }
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const n = chain[i];
+    if (ts.isFunctionLike(n) && n.parameters.some((p) => bindsName(p.name, id))) return { kind: "param" };
+    const stmts = ts.isBlock(n) || ts.isSourceFile(n) || ts.isCaseClause(n) || ts.isDefaultClause(n) ? n.statements : null;
+    if (!stmts) continue;
+    let found: Decl = null;
+    for (const st of stmts) {
+      if (st.getStart(sf) >= at) break;
+      if (!ts.isVariableStatement(st)) continue;
+      for (const d of st.declarationList.declarations) {
+        if (bindsName(d.name, id)) found = { kind: "binding", init: d.initializer ? d.initializer.getText(sf) : "" };
+      }
+    }
+    if (found) {
+      // `const { supabase } = opts` with `opts` a parameter: a pass-through.
+      if (found.kind === "binding" && /^[A-Za-z_$][\w$]*$/.test(found.init) && !ts.isSourceFile(n)) {
+        const outer = declarationAt(file, stmtStartOf(n, at, sf), found.init);
+        if (outer?.kind === "param") return { kind: "param" };
+      }
+      return found;
+    }
+  }
+  return null;
+}
+/** An offset inside `block` before `at` (used to resolve a destructuring source). */
+function stmtStartOf(block: ts.Node, at: number, sf: ts.SourceFile): number {
+  const stmts = (block as ts.Block).statements ?? [];
+  const first = stmts.find((st) => st.getStart(sf) < at);
+  return first ? first.getStart(sf) : at;
+}
+const isParamAt = (file: string, at: number, id: string) => declarationAt(file, at, id)?.kind === "param";
+
+/**
+ * A receiver is a service client at offset `at` when the binding in scope
+ * there is createServiceClient(...) / serviceClient(), and the file's
+ * serviceClient() is the service-role one (local, or lib/xapi/auth's).
+ * `serviceClient()` itself is checked the same way. A parameter is never a
+ * service client here: pass-throughs are listed as such and checked at
+ * their callers below.
+ */
+function isServiceReceiver(file: string, receiver: string, at: number): boolean {
   const src = sources.get(file) ?? "";
   const localServiceFn =
     /function serviceClient\(\)[^{]*\{[^}]*SUPABASE_SERVICE_ROLE_KEY/.test(src) ||
     /import \{[^}]*\bserviceClient\b[^}]*\} from "@\/lib\/xapi\/auth"/.test(src);
   if (receiver === "serviceClient()") return localServiceFn;
-  const id = receiver.replace(/[.$]/g, (c) => `\\${c}`);
-  const bound = new RegExp(`\\b(?:const|let)\\s+${id}\\s*(?::[^=]+)?=\\s*(createServiceClient\\(|serviceClient\\(\\))`).exec(src);
-  if (!bound) return false;
-  if (bound[1] === "serviceClient()") return localServiceFn;
+  if (!/^[A-Za-z_$][\w$]*$/.test(receiver)) return false;
+  const decl = declarationAt(file, at, receiver);
+  if (!decl || decl.kind !== "binding") return false;
+  const init = decl.init.replace(/^await\s+/, "");
+  if (init === "serviceClient()") return localServiceFn;
   // createServiceClient must be supabase-js's, used with the service-role key.
-  return /import \{[^}]*createClient as createServiceClient[^}]*\} from "@supabase\/supabase-js"/.test(src) &&
-    /SUPABASE_SERVICE_ROLE_KEY/.test(src);
+  return init.startsWith("createServiceClient(") &&
+    /import \{[^}]*createClient as createServiceClient[^}]*\} from "@supabase\/supabase-js"/.test(src) &&
+    /SUPABASE_SERVICE_ROLE_KEY/.test(init);
 }
 
 // ---------------------------------------------------------------- course_attempts
@@ -147,24 +218,27 @@ const FAILSOFT_CALLS: Record<string, Site> = {
 console.log("\ncourse_attempts: every write site is a listed service-client write (ADR 0009 step 5)");
 const attemptWrites = writesOn("course_attempts");
 for (const [file, site] of Object.entries(ATTEMPT_WRITES)) {
-  const got = (attemptWrites.get(file) ?? []).map((w) => w.receiver);
-  eq(`${site.what}: receivers in file order`, got, site.receivers);
-  for (const r of new Set(site.receivers)) {
-    if (site.params?.includes(r)) continue;
-    eq(`${site.what}: \`${r}\` is a service client`, isServiceReceiver(file, r), true);
-  }
+  const writes = attemptWrites.get(file) ?? [];
+  eq(`${site.what}: receivers in file order`, writes.map((w) => w.receiver), site.receivers);
+  eq(
+    `${site.what}: each receiver is the service client in scope at its write`,
+    writes.map((w) => (site.params?.includes(w.receiver) ? isParamAt(file, w.at, w.receiver) : isServiceReceiver(file, w.receiver, w.at))),
+    writes.map(() => true)
+  );
 }
 const unlistedAttemptWrites = [...attemptWrites.keys()].filter((f) => !(f in ATTEMPT_WRITES));
 eq("no other file under app/, lib/, components/ writes course_attempts", unlistedAttemptWrites, []);
 
 const failSoft = callsOf("updateAttemptFailSoft");
 for (const [file, site] of Object.entries(FAILSOFT_CALLS)) {
-  const got = (failSoft.get(file) ?? []).map((a) => a.split(",")[0].trim());
-  eq(`updateAttemptFailSoft in ${site.what}: first arguments`, got, site.receivers);
-  for (const r of new Set(site.receivers)) {
-    if (site.params?.includes(r)) continue;
-    eq(`updateAttemptFailSoft in ${site.what}: \`${r}\` is a service client`, isServiceReceiver(file, r), true);
-  }
+  const calls = failSoft.get(file) ?? [];
+  const firstArg = (c: Call) => c.args.split(",")[0].trim();
+  eq(`updateAttemptFailSoft in ${site.what}: first arguments`, calls.map(firstArg), site.receivers);
+  eq(
+    `updateAttemptFailSoft in ${site.what}: each client is the service client (or the listed parameter) in scope`,
+    calls.map((c) => (site.params?.includes(firstArg(c)) ? isParamAt(file, c.at, firstArg(c)) : isServiceReceiver(file, firstArg(c), c.at))),
+    calls.map(() => true)
+  );
 }
 const unlistedFailSoft = [...failSoft.keys()].filter((f) => !(f in FAILSOFT_CALLS) && f !== "lib/courses/progress.ts");
 eq("no other file calls updateAttemptFailSoft", unlistedFailSoft, []);
@@ -174,16 +248,24 @@ console.log("\ncourse_attempts: parameter pass-throughs receive a service client
   const ps = callsOf("processStatement");
   const psFiles = [...ps.keys()].filter((f) => f !== "lib/xapi/process-statement.ts");
   eq("processStatement is called from the xAPI statements route only", psFiles, ["app/api/xapi/statements/route.ts"]);
-  const psArgs = ps.get("app/api/xapi/statements/route.ts") ?? [];
-  eq("processStatement receives supabase: svc", psArgs.length > 0 && psArgs.every((a) => /\bsupabase:\s*svc\b/.test(a)), true);
-  eq("statements route: `svc` is a service client", isServiceReceiver("app/api/xapi/statements/route.ts", "svc"), true);
+  const psCalls = ps.get("app/api/xapi/statements/route.ts") ?? [];
+  eq("processStatement receives supabase: svc", psCalls.length > 0 && psCalls.every((c) => /\bsupabase:\s*svc\b/.test(c.args)), true);
+  eq(
+    "statements route: `svc` is the service client in scope at every processStatement call",
+    psCalls.map((c) => isServiceReceiver("app/api/xapi/statements/route.ts", "svc", c.at)),
+    psCalls.map(() => true)
+  );
 
   const up = callsOf("updateProgressFromState");
   const upFiles = [...up.keys()].filter((f) => f !== "lib/courses/progress.ts");
   eq("updateProgressFromState is called from the xAPI state route only", upFiles, ["app/api/xapi/activities/state/route.ts"]);
-  const upArgs = up.get("app/api/xapi/activities/state/route.ts") ?? [];
-  eq("updateProgressFromState receives svc", upArgs.length > 0 && upArgs.every((a) => /^svc\b/.test(a)), true);
-  eq("state route: `svc` is a service client", isServiceReceiver("app/api/xapi/activities/state/route.ts", "svc"), true);
+  const upCalls = up.get("app/api/xapi/activities/state/route.ts") ?? [];
+  eq("updateProgressFromState receives svc", upCalls.length > 0 && upCalls.every((c) => /^svc\b/.test(c.args)), true);
+  eq(
+    "state route: `svc` is the service client in scope at every updateProgressFromState call",
+    upCalls.map((c) => isServiceReceiver("app/api/xapi/activities/state/route.ts", "svc", c.at)),
+    upCalls.map(() => true)
+  );
   eq(
     "lib/xapi/auth serviceClient() uses the service-role key",
     /const serviceClient = \(\) => \{[^}]*SUPABASE_SERVICE_ROLE_KEY/.test(sources.get("lib/xapi/auth.ts") ?? "") &&
@@ -240,9 +322,11 @@ const validationWrites = writesOn("package_validations");
 for (const [file, site] of Object.entries(VALIDATION_WRITES)) {
   const writes = validationWrites.get(file) ?? [];
   eq(`${site.what}: receivers in file order`, writes.map((w) => w.receiver), site.receivers);
-  for (const r of new Set(site.receivers)) {
-    eq(`${site.what}: \`${r}\` is a service client`, isServiceReceiver(file, r), true);
-  }
+  eq(
+    `${site.what}: each receiver is the service client in scope at its write`,
+    writes.map((w) => isServiceReceiver(file, w.receiver, w.at)),
+    writes.map(() => true)
+  );
   eq(
     `${site.what}: every write names organization_id`,
     writes.map((w) =>
