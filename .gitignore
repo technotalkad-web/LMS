@@ -45,6 +45,10 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+# load tests (tests/load) — seeded credentials + result exports
+/tests/load/.seed.json
+/tests/load/results/
+
 # playwright
 /playwright-report/
 /test-results/
@@ -56,3 +60,8 @@ next-env.d.ts
 /bot-playwright-report/
 /lifecycle-report/
 /lifecycle-playwright-report/
+
+# Local DB backups — may contain production PII. NEVER commit.
+prod_backup*.sql
+*_backup*.sql
+*.dump
