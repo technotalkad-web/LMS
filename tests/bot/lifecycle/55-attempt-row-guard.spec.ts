@@ -26,6 +26,12 @@
  *       the attempt of (a) answers 200 and the row carries the committed
  *       status and score; the learner (and the admin) still read the
  *       learner's rows through PostgREST (select policy kept).
+ *   (k) ADR 0010 step 6, the SCORM commit route writes only SCORM attempts
+ *       (every run, route-level, no 0099 dependency): a passing SCORM commit
+ *       (lesson_status passed, score.raw 100, finished) on the fresh cmi5
+ *       attempt of (h) and on the learner's xAPI attempt → 409
+ *       wrong_runtime with the type echoed, and the service-role re-read is
+ *       unchanged; the SCORM commit of (h) answered 200.
  *   (j) the journey launches write their tag as the server (every run):
  *       relaunching an untagged in-progress attempt through
  *       ?journey=<enrollment>&day=1 tags it; a first launch through a
@@ -37,7 +43,7 @@
  * v_course_attempt_summary.live_attempt_count):
  *   - 0099 applied: (a)-(g) assert refusal.
  *   - before 0099: (a)-(g) and the revive skip ("needs 0099"); the seed, the
- *     force restart, (h) and (j) still run.
+ *     force restart, (h), (k) and (j) still run.
  *   - The staging probe of ADR 0009 step 13 (owner decision 4: one run,
  *     staging test accounts only) ran once, at 2026-10-17T19:45:55Z with
  *     ATTEMPT_GUARD_PROBE=1 at commit 63c1e28 (local, before the branch was
@@ -50,15 +56,19 @@
  * Binding: the SCORM attempt serves (a), (b), (f), (g) and the commit of (h);
  * the inserts of (c) target a third course the learner never launches (a
  * forged completion on the cmi5 course would turn (h)'s launch into a
- * revision run); the revive of (e) runs last, after (h)'s fresh launch (a
- * revived old-version attempt would be resumed by grandfather routing).
+ * revision run); a fourth course (tests/bot/fixtures/xapi.zip) is launched
+ * so (k) has an xAPI attempt, and (k) targets the fresh cmi5 attempt (h)
+ * records (on the new version, not the abandoned one); (k) runs after (h)
+ * and before the revive; the revive of (e) runs last, after (h)'s fresh
+ * launch (a revived old-version attempt would be resumed by grandfather
+ * routing).
  *
  * Never push while this runs: pr-checks purges qa-* data on every push.
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
-import { assignCourse, authedContext } from "./helpers";
+import { assignCourse, authedContext, uploadCourse } from "./helpers";
 import { todayStr } from "../../../lib/journey/journey";
 import {
   NEEDS_0099,
@@ -139,6 +149,10 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     cmi5Version?: string;
     cmi5Attempt?: string;
     cmi5NewVersion?: string;
+    cmi5FreshAttempt?: string; // (h)'s fresh launch on the new version; (k)
+    xapiCourse?: string; // (k)
+    xapiVersion?: string;
+    xapiAttempt?: string;
     forgeVersion?: string; // (c): a course the learner never launches
     otherOrgVersion?: string; // (d)
   } = {};
@@ -149,7 +163,7 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     if (results.length) console.log(`[spec55] summary ${JSON.stringify(results)}`);
   });
 
-  test("seed: two qa orgs; a SCORM, a cmi5 and a forge-target course; the learner launches SCORM and cmi5", async ({ browser, baseURL }) => {
+  test("seed: two qa orgs; a SCORM, a cmi5, a forge-target and an xAPI course; the learner launches SCORM, cmi5 and xAPI", async ({ browser, baseURL }) => {
     const b = await branch();
     test.info().annotations.push({ type: "branch", description: b });
     console.log(`[spec55] branch=${b}`);
@@ -187,6 +201,11 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     const upK = await uploadNew(areq, orgA.slug, "forge.zip", await scormZip({ title: "QA Attempt Guard Forge Target" }));
     expect(upK.ok(), `upload forge target → ${upK.status()}: ${await upK.text()}`).toBeTruthy();
     const forgeCourse = (await upK.json()).courseId as string;
+    // (k): an xAPI (TinCan) course the learner launches, so an xAPI attempt exists.
+    const xapi = await uploadCourse(areq, orgA.slug, "xapi.zip");
+    expect(xapi.manifestType).toBe("xapi");
+    s.xapiCourse = xapi.courseId;
+    s.xapiVersion = xapi.versionId;
 
     const versionOf = async (courseId: string) =>
       ((await svc().from("courses").select("current_version_id").eq("id", courseId).single()).data as { current_version_id: string }).current_version_id;
@@ -198,14 +217,16 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
 
     await assignCourse(areq, orgA.slug, s.scormCourse, learner.id);
     await assignCourse(areq, orgA.slug, s.cmi5Course, learner.id);
+    await assignCourse(areq, orgA.slug, s.xapiCourse, learner.id);
 
     s.learnerCtx = await authedContext(browser, baseURL!, learner.email, learner.password);
-    for (const cid of [s.scormCourse, s.cmi5Course]) {
+    for (const cid of [s.scormCourse, s.cmi5Course, s.xapiCourse]) {
       const r = await s.learnerCtx.request.get(`/${orgA.slug}/courses/${cid}/launch`);
       expect(r.ok(), `launch ${cid} → ${r.status()}`).toBeTruthy();
     }
     s.scormAttempt = await inProgressAttempt(learner.id, s.scormVersion);
     s.cmi5Attempt = await inProgressAttempt(learner.id, s.cmi5Version);
+    s.xapiAttempt = await inProgressAttempt(learner.id, s.xapiVersion);
     expect(await rowsFor(learner.id, s.forgeVersion), "the forge target was never launched").toHaveLength(0);
 
     s.learnerDb = await sessionClient(learner);
@@ -444,6 +465,7 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     expect(r.ok(), `launch → ${r.status()}`).toBeTruthy();
     const fresh = await inProgressAttempt(s.learner!.id, s.cmi5NewVersion!);
     expect(fresh).not.toBe(s.cmi5Attempt);
+    s.cmi5FreshAttempt = fresh;
     // ... and a statement through /api/xapi/statements updates it (the xAPI
     // routes' service-client write).
     const auth = await authTokenFor(lreq, fresh);
@@ -482,6 +504,49 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     const { data: adm, error: admErr } = await s.adminDb!.from("course_attempts").select("id").eq("user_id", s.learner!.id);
     expect(admErr).toBeNull();
     expect(((adm ?? []) as Array<{ id: string }>).map((x) => x.id)).toEqual(expect.arrayContaining([s.scormAttempt, s.cmi5Attempt, fresh]));
+  });
+
+  test("(k) a SCORM commit on a cmi5 or xAPI attempt → 409 wrong_runtime, nothing written (every run)", async () => {
+    // Route-level (ADR 0010): no 0099 dependency, so no skip. The branch is
+    // read only for the outcome record.
+    const b = await branch();
+    const lreq = s.learnerCtx!.request;
+    const forged = { cmi: { "cmi.core.lesson_status": "passed", "cmi.core.score.raw": "100" }, finished: true };
+    const targets = [
+      // The fresh cmi5 attempt (h) recorded: on the new version, not the abandoned one.
+      { type: "cmi5", attempt: s.cmi5FreshAttempt!, version: s.cmi5NewVersion! },
+      { type: "xapi", attempt: s.xapiAttempt!, version: s.xapiVersion! },
+    ];
+    for (const t of targets) {
+      const before = await row(t.attempt);
+      expect(before, `${t.type} attempt exists`).toMatchObject({ course_version_id: t.version, user_id: s.learner!.id });
+      expect(before?.status, `${t.type} attempt is live`).not.toBe("abandoned");
+      const res = await lreq.post(`/api/scorm/${t.attempt}/commit`, { data: forged });
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      const after = await row(t.attempt);
+      // A route call returns no rows: `returned` is 0 by construction.
+      record({ case: `k-${t.type}`, branch: b, http: res.status(), code: body?.error ?? null, returned: 0, changed: !same(before, after), ids: { attempt: t.attempt, version: t.version } });
+      expect(res.status(), JSON.stringify(body)).toBe(409);
+      expect(body).toEqual({ error: "wrong_runtime", manifest_type: t.type, message: expect.any(String) });
+      expect(after, `${t.type} row unchanged`).toEqual(before);
+    }
+    // The xAPI attempt never received a statement: still the launch's row.
+    expect(await row(s.xapiAttempt!)).toMatchObject({
+      status: "in_progress",
+      completion_status: "in_progress",
+      success_status: "unknown",
+      score: null,
+      completed_at: null,
+      completion_webhook_at: null,
+    });
+    // The cmi5 attempt keeps what (h)'s AU "completed" statement left
+    // (completed, never passed, no score): the forged passed / 100 did not land.
+    expect(await row(s.cmi5FreshAttempt!)).toMatchObject({
+      status: "completed",
+      completion_status: "completed",
+      success_status: "unknown",
+      score: null,
+    });
   });
 
   test("(e, part 2) learner PATCH {status: 'in_progress'} on the abandoned cmi5 attempt", async () => {
