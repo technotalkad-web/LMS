@@ -18,6 +18,9 @@ Rules for this file:
 | 2026-10-16 | staging | 3b005ed1 | "The A.M.B.A.K. Framework" (7e1f624d), default-language slot | Stored bytes are Turning Escalations Level 1 SCORM; 0 attempts. Was that course's default version at 2026-10-16. | Open: D5a deactivates the package |
 | 2026-10-16 | staging | 887d4aaf | Same course, Hindi slot | Stored bytes are Turning Escalations Level 1 SCORM; 0 attempts. | Open: D5a deactivates the package |
 | 2026-10-15 | staging | 9dcdad9b | "The A.M.B.A.K. Framework", Marathi v1 (SCORM) | Original lost; one completed staff attempt. | Left as is; never re-activated (ADR 0004 step 15) |
+| 2026-10-18 | staging | 7ff60dde | Corrects the 2026-10-15 entry | D5a done 2026-10-17: TEST LMS.zip uploaded as 5f836158 (v2) in the same Hindi package (grandfather); 5f836158 is the package's current version and the course default. | Partly closed: new learners get 5f836158; the 6 in-progress attempts stay on 7ff60dde until D5b |
+| 2026-10-18 | staging | 3b005ed1 | Corrects the 2026-10-16 entry | Package 104a6740 hidden from learners (D5a, 2026-10-17); 0 attempts. The package now carries language `pa` (Punjabi), set through the Library "Promote to" control between 2026-10-17 and 2026-10-18 (promotion is not audited); it stays hidden. | Closed |
+| 2026-10-18 | staging | 887d4aaf | Corrects the 2026-10-16 entry | Package 42d6ae90 hidden from learners (D5a, 2026-10-17); 0 attempts. | Closed |
 
 ## 2. Versions repointed to their own folder (step 0)
 
@@ -33,6 +36,8 @@ Rules for this file:
 |---|---|---|---|---|---|
 | 2026-10-16 | staging | a5b3396a | d4f05fac (Gujarati slot) | Learners without a language preference get the Framework module | `publishVersion()` repoints `courses.current_version_id` on every upload and every "Make current" on any slot |
 | 2026-10-16 | staging | 7e1f624d | 3b005ed1 (default-language slot) | Learners without a language preference get Turning Escalations Level 1 | Same |
+| 2026-10-18 | staging | a5b3396a | 5f836158 (Hindi v2, the D5a corrected version) | Closed, corrects the 2026-10-16 entry: the D5a upload of 2026-10-17 moved the default under the old `publishVersion()`; verified read-only 2026-10-18 | Default rule fixed by ADR 0008 B (merged #183): uploads move the default only inside its own slot |
+| 2026-10-18 | staging | 7e1f624d | 2e404b48 (Marathi) | Closed, corrects the 2026-10-16 entry: owner clicked "Set as default" on the Marathi slot at 2026-10-18 05:04:16 UTC (audit `course.default_slot_set`, previous 3b005ed1); verified read-only; attempts on the course unchanged | Same |
 
 ## 4. Attempts on the wrong slots (read 2026-10-16, ADR 0004 step 12a)
 
@@ -69,10 +74,10 @@ D5a (now, zero restarts; owner-run through the admin UI; ADR 0004 step 13). One 
 
 | Date | Env | Action | Target | Result |
 |---|---|---|---|---|
-| | staging | Replace-package, `mode = grandfather`, TEST LMS.zip as a new version, update email unticked | Hindi package of a5b3396a (current version 7ff60dde) | |
-| | staging | Deactivate package (PATCH `is_active: false`) | Package holding 3b005ed1 | |
-| | staging | Deactivate package (PATCH `is_active: false`) | Package holding 887d4aaf | |
-| | staging | Make current | 2e404b48 (Framework, Marathi) | |
+| 2026-10-17 | staging | Replace-package, `mode = grandfather`, TEST LMS.zip as a new version, update email unticked | Hindi package of a5b3396a (current version 7ff60dde) | 5f836158 (v2) current and course default; 6 in-progress attempts stay on 7ff60dde; 0 abandoned. TEST LMS.zip shows the same resume failure as the version it replaces (engine issue, KIVO release A); not for production |
+| 2026-10-17 | staging | Deactivate package (PATCH `is_active: false`) | Package holding 3b005ed1 | 104a6740 hidden; 0 attempts; verified 2026-10-18 |
+| 2026-10-17 | staging | Deactivate package (PATCH `is_active: false`) | Package holding 887d4aaf | 42d6ae90 hidden; 0 attempts; verified 2026-10-18 |
+| 2026-10-18 | staging | Set as default (ADR 0008 step 16; replaces "Make current", which could not move a default between slots) | 2e404b48 (Framework, Marathi) | Course default 2e404b48 at 05:04:16 UTC, audit row written; verified read-only |
 
 D5b (later, only on the owner's explicit go against the re-read list of section 4; ADR 0004 step 14). Each closed attempt id goes here with the date and the go:
 
