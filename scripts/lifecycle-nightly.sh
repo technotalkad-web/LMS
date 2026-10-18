@@ -17,11 +17,18 @@
 #   LIFECYCLE_OUT               where the logs and the JSON report go
 #                               (default $RUNNER_TEMP/lifecycle-nightly)
 #
+# On a laptop: stop any `next dev` in this checkout first. The script runs
+# `next build`, which rewrites the .next folder a running dev server uses.
+#
 # Public-log rule (the repository is public): the build log, the server log,
 # the Playwright output and its JSON report stay in LIFECYCLE_OUT; they are
-# never printed or uploaded. Spec failure messages embed response bodies and
-# test emails. Only counts (scripts/lifecycle-summary.mjs) and the cleanup's
-# count line reach stdout. Reproduce a failure locally with this script.
+# never uploaded. Spec failure messages embed response bodies and test
+# emails, so the Playwright output is never printed: only counts
+# (scripts/lifecycle-summary.mjs) and the cleanup's count line reach stdout.
+# A build or server-start failure prints at most 40 matching lines of its
+# log with emails and tokens masked (compiler and Node errors name files of
+# this public repository, not data). Reproduce a failure locally with this
+# script.
 #
 # The data it creates is in the lifecycle namespace (lifecycle-* orgs,
 # @lifecycle.test users), which the e2e purge never matches; the lifecycle
@@ -36,6 +43,22 @@ STAGING_REF="zeaclbapadosqqttexxh"
 
 cd "$(dirname "$0")/.."
 mkdir -p "$OUT"
+
+# Masks emails, JWTs and Supabase API keys in a log excerpt (GitHub also
+# masks the secret values themselves).
+redact() {
+  sed -E \
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/<email>/g' \
+    -e 's/eyJ[A-Za-z0-9._-]{10,}/<jwt>/g' \
+    -e 's/sb_(secret|publishable)_[A-Za-z0-9_-]+/sb_\1_<masked>/g'
+}
+
+# At most 40 error lines of a log, masked: enough to see which file or
+# module broke without publishing the whole log.
+error_excerpt() {
+  { grep -E -A3 'Error|error TS|Failed|failed to|Module not found|Cannot find|EADDRINUSE|ERR_' "$1" 2>/dev/null || true; } \
+    | head -n 40 | redact
+}
 
 for v in NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY; do
   [[ -n "${!v:-}" ]] || { echo "lifecycle-nightly: $v is not set"; exit 2; }
@@ -70,7 +93,10 @@ export E2E_BASE_URL="$BASE"
 
 echo "lifecycle-nightly: building (log kept off the console)"
 if ! npm run build > "$OUT/build.log" 2>&1; then
-  echo "lifecycle-nightly: build failed; reproduce locally with this script"
+  echo "::error title=Lifecycle nightly::the app build failed"
+  echo "lifecycle-nightly: build failed; error lines of the build log (masked):"
+  error_excerpt "$OUT/build.log"
+  echo "lifecycle-nightly: reproduce locally with this script"
   exit 1
 fi
 
@@ -88,7 +114,9 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 if [[ "$up" != "1" ]]; then
-  echo "lifecycle-nightly: the app did not answer /login with 200 within 120 s"
+  echo "::error title=Lifecycle nightly::the app did not start"
+  echo "lifecycle-nightly: the app did not answer /login with 200 within 120 s (last status ${code:-none}); error lines of the server log (masked):"
+  error_excerpt "$OUT/server.log"
   exit 1
 fi
 
@@ -101,8 +129,21 @@ PLAYWRIGHT_JSON_OUTPUT_NAME="$OUT/results.json" \
 pw=$?
 set -e
 
-# The cleanup's own line carries counts and error codes only.
-grep -E '^\[lifecycle-cleanup\] ' "$OUT/playwright.log" || echo "lifecycle-nightly: no cleanup line (did the global setup run?)"
+# The cleanup's own line carries counts and error codes only. It does not
+# decide the exit code (the specs do), but anything short of a clean sweep
+# becomes a run annotation: a delete refused (the 0098 service-role
+# exemption stopped matching, a new foreign key), a query error, a per-run
+# bound reached, a thrown cleanup, or no line at all.
+cleanup_line="$(grep -E '^\[lifecycle-cleanup\] ' "$OUT/playwright.log" | head -n 1 || true)"
+if [[ -z "$cleanup_line" ]]; then
+  echo "::warning title=Lifecycle cleanup::no cleanup line (the global setup did not run)"
+else
+  echo "$cleanup_line"
+  if [[ "$cleanup_line" =~ failed=[1-9] || "$cleanup_line" == *"errors="* \
+     || "$cleanup_line" == *"capped="* || "$cleanup_line" == "[lifecycle-cleanup] failed:"* ]]; then
+    echo "::warning title=Lifecycle cleanup::the 48 h cleanup did not finish cleanly (see the cleanup line)"
+  fi
+fi
 
 summary=0
 node scripts/lifecycle-summary.mjs "$OUT/results.json" || summary=$?
