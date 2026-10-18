@@ -113,6 +113,9 @@ export default async function LaunchPage({
       )
       .eq("id", journeyParam)
       .eq("user_id", user.id)
+      // The enrollment is trusted only within this attempt's organisation:
+      // its id is written into the attempt by the server below.
+      .eq("organization_id", org.id)
       .maybeSingle();
     const enr = enrRow as {
       id: string;
@@ -474,6 +477,9 @@ export default async function LaunchPage({
     .from("course_versions")
     .select("id, manifest_type, launch_url, manifest_data")
     .eq("id", resolvedVersionId)
+    // Bound to this course: a pointer to another course's version redirects
+    // and is never written into an attempt.
+    .eq("course_id", c.id)
     .maybeSingle();
   if (!version) redirect(`/${orgSlug}/courses/${courseId}`);
   const v = version as Version;
@@ -693,7 +699,8 @@ export default async function LaunchPage({
   // the caller's RLS session; the two writes below (journey tag, insert) use
   // this service client with explicit id/user_id/organization_id. Membership
   // is already proven: the course was read under RLS ("members read org
-  // courses") with organization_id = org.id, and v is one of its versions.
+  // courses") with organization_id = org.id, v was read with
+  // course_id = c.id, and a journey context only from this organisation.
   const svcAttempt = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
@@ -716,7 +723,7 @@ export default async function LaunchPage({
     // Resuming an untagged in-progress attempt from the journey: tag it so
     // its completion credits the journey day (and stays XP-exempt).
     if (journeyCtx) {
-      await svcAttempt
+      const { error: tagErr } = await svcAttempt
         .from("course_attempts")
         .update({
           journey_enrollment_id: journeyCtx.enrollmentId,
@@ -725,6 +732,8 @@ export default async function LaunchPage({
         .eq("id", existing.id)
         .eq("user_id", user.id)
         .eq("organization_id", org.id);
+      // Fail-soft as before (the launch goes on); ids only in the log.
+      if (tagErr) console.warn(`[launch] journey tag failed on attempt ${existing.id}:`, tagErr.message);
     }
   } else {
     // ?lp=<pathId> threads through from the path detail page so reports
