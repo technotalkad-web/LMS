@@ -21,10 +21,23 @@ let probe: boolean | null = null;
  * package_validations come in the same file as the delete guard and the
  * freeze trigger, so one real select settles all of it (head/count probes
  * report missing columns as present).
+ *
+ * Fails closed like has0099(): only Postgres 42703 (undefined column) means
+ * "not applied"; any other error (network, 5xx, auth) throws. A probe that
+ * cached false on a transient error would skip the 0098 guard cases and
+ * quietly take the weaker branch of the `if (await has0098())` blocks in
+ * spec 52 for the rest of the worker, and the run would still be green.
+ * The filter on an id no row has still makes Postgres validate the columns,
+ * and no organisation's row is read.
  */
 export async function has0098(): Promise<boolean> {
   if (probe !== null) return probe;
-  const { error } = await svc().from("package_validations").select("override_reason, overridden_at").limit(1);
+  const { error } = await svc()
+    .from("package_validations")
+    .select("override_reason, overridden_at")
+    .eq("id", "00000000-0000-0000-0000-000000000000")
+    .limit(1);
+  if (error && error.code !== "42703") throw new Error(`has0098 probe failed: ${error.code ?? ""} ${error.message}`);
   probe = !error;
   return probe;
 }

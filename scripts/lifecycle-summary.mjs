@@ -11,6 +11,13 @@
  *
  * Exit 1 when a test failed, the report holds top-level errors (a global
  * setup that threw), or no test ran at all; 2 when the report is missing.
+ *
+ * Skips: a healthy run of the subset skips nothing (spec 51's server-log
+ * case gets LIFECYCLE_SERVER_LOG; the has0098/has0099 probes throw instead
+ * of skipping on an environment error). Any skip prints a GitHub
+ * `::warning::` annotation and a line in the job summary, so a run that
+ * passed with cases skipped is never mistaken for a full pass. Serial
+ * skips after a failure already fail the run through the failure.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -61,11 +68,19 @@ for (const n of names) {
 }
 
 const ok = total.failed === 0 && topErrors === 0 && ran > 0;
+const skippedFiles = names.filter((n) => perFile.get(n).skipped > 0);
+const skipNote =
+  total.skipped > 0
+    ? `${total.skipped} test(s) skipped in ${skippedFiles.join(", ")}; a healthy run skips none`
+    : "";
+// A GitHub workflow command: an annotation on the run, a plain line elsewhere.
+if (skipNote) console.log(`::warning title=Lifecycle nightly skipped tests::${skipNote}`);
 if (process.env.GITHUB_STEP_SUMMARY) {
   const lines = [
-    `## Lifecycle nightly ${ok ? "✅" : "❌"}`,
+    `## Lifecycle nightly ${ok ? (skipNote ? "⚠️" : "✅") : "❌"}`,
     "",
     headline,
+    ...(skipNote ? ["", `**Warning:** ${skipNote}.`] : []),
     "",
     "| spec file | passed | failed | flaky | skipped |",
     "|---|---:|---:|---:|---:|",
@@ -75,7 +90,9 @@ if (process.env.GITHUB_STEP_SUMMARY) {
     }),
     "",
     ok
-      ? "All specs passed against this commit, built and started in the runner, on the staging database."
+      ? skipNote
+        ? "No test failed, but some were skipped: the run does not cover the whole subset."
+        : "All specs passed against this commit, built and started in the runner, on the staging database."
       : "Failure details are not published (public repository). Reproduce with `bash scripts/lifecycle-nightly.sh` against staging.",
   ];
   fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
