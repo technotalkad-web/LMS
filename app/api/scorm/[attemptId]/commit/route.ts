@@ -43,9 +43,18 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  * is written: those attempts are written at runtime only by the token-bound
  * xAPI statements and State routes. When the attempt or its version type
  * cannot be read, the answer is 503 `{error:"attempt_unreadable"}` and
- * nothing is written; this replaces the former write made without the read
- * (on a 503 the runtime shows "error" and its next LMSCommit flushes the full
- * CMI dictionary again).
+ * nothing is written; this replaces the former write made without the read.
+ * What a 503 costs the runtime (scorm-runtime.tsx makes one fetch per save
+ * and shows "error" on any non-2xx, with no retry):
+ *   - a failed mid-course save is resent in full by the next LMSCommit;
+ *   - a failed final LMSFinish save is not resent: SCORM 1.2 content calls
+ *     nothing after LMSFinish, and the unload beacon sends finished=false and
+ *     does not fire on the in-app Exit link;
+ *   - a 503 from a missing version embed lasts as long as its cause: a
+ *     learner removed from the organisation mid-session still reads their
+ *     own attempt but no longer its version (RLS), so every later save of
+ *     that session is 503 until they are added back.
+ * A malformed (non-UUID) attempt id fails the read, so it is a 503 as well.
  * Order of answers: 401, 400 (invalid JSON), 503 (read error), 404, 410,
  * 503 or 409 (runtime type), then derive and write.
  */
