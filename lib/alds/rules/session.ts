@@ -33,7 +33,9 @@
  * ordering. The caller names them in `lmsStatementIds`; every other row is
  * treated as sent by content, including a content-sent LMS-only verb (which
  * checkStatement reports as S2 lms_verb_from_content). Rows without an id
- * cannot be named and count as content.
+ * cannot be named and count as content. A named row is skipped entirely,
+ * including R5: the LMS never records an AU verb (initialized, completed,
+ * passed, failed, terminated), so only LMS-defined-verb rows may be named.
  *
  * Statements with the same `id` are one statement (write-once storage, ADR
  * 0003): only the first copy is checked. Quiz-run summaries (S4) are not
