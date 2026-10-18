@@ -16,8 +16,13 @@
  *   ["set", path, value]  ["del", path]  ["push", path, value]  ["replace", value]
  *   ["each", arrayPath, field, value] (set a field on every element)
  *   packages only: ["rehash", ["manifest","questions",i]]  ["rehashAll"]
- * Expected findings: [rule, code] or [rule, code, {severity?, attribution?, index?}];
- * the (rule, code) multiset must match exactly.
+ * Expected findings: [rule, code] or [rule, code, {severity?, attribution?, index?, path?}];
+ * the (rule, code) multiset must match exactly, and each expected finding is
+ * matched one-to-one with a produced finding of the same severity (default
+ * "error") and attribution (default "package"), and the same index and path
+ * when the case pins them. The expected `ok` follows from the expected list
+ * (no expected error = ok), never from the produced findings; a case's own
+ * `ok` must agree with it.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -25,7 +30,7 @@ import { CMI5_SESSION_EXT, E, EXT_RESULT_UNANSWERED } from "../../../lib/alds/ty
 
 export interface CheckResultLike {
   ok: boolean;
-  findings: Array<{ rule: string; code: string; severity: string; attribution: string; index?: number }>;
+  findings: Array<{ rule: string; code: string; severity: string; attribution: string; index?: number; path?: string }>;
   checked: string[];
 }
 
@@ -37,7 +42,8 @@ export interface RulesApi {
   contentHash(entry: unknown): string;
 }
 
-type Expected = [string, string] | [string, string, { severity?: string; attribution?: string; index?: number }];
+type ExpectedProps = { severity?: string; attribution?: string; index?: number; path?: string };
+type Expected = [string, string] | [string, string, ExpectedProps];
 type PatchOp = unknown[];
 
 export interface GoldenCase {
@@ -217,25 +223,38 @@ function fail(msg: string): never {
   throw new Error(msg);
 }
 
+/** The ok value a case's expected findings imply: no expected finding of severity error. */
+export function expectedOk(c: Pick<GoldenCase, "expect">): boolean {
+  return !c.expect.some((e) => (e[2]?.severity ?? "error") === "error");
+}
+
 /** Compare a result with a case's expectations; returns problems (empty = pass). */
 export function verify(c: GoldenCase, res: CheckResultLike): string[] {
   const problems: string[] = [];
   const got = res.findings.map((f) => `${f.rule} ${f.code}`).sort();
   const want = c.expect.map((e) => `${e[0]} ${e[1]}`).sort();
   if (JSON.stringify(got) !== JSON.stringify(want)) problems.push(`findings ${JSON.stringify(got)} ≠ expected ${JSON.stringify(want)}`);
-  for (const e of c.expect) {
-    const props = e[2];
-    if (!props) continue;
-    const hit = res.findings.some(
-      (f) =>
+  // one-to-one: the most specific expectations (index/path pinned) pick first
+  const used = new Set<number>();
+  const order = c.expect
+    .map((e, i) => ({ e, i, pins: (e[2]?.index !== undefined ? 1 : 0) + (e[2]?.path !== undefined ? 1 : 0) }))
+    .sort((a, b) => b.pins - a.pins || a.i - b.i);
+  for (const { e } of order) {
+    const props: ExpectedProps = { severity: "error", attribution: "package", ...(e[2] ?? {}) };
+    const j = res.findings.findIndex(
+      (f, k) =>
+        !used.has(k) &&
         f.rule === e[0] && f.code === e[1] &&
-        (props.severity === undefined || f.severity === props.severity) &&
-        (props.attribution === undefined || f.attribution === props.attribution) &&
-        (props.index === undefined || f.index === props.index),
+        f.severity === props.severity &&
+        f.attribution === props.attribution &&
+        (props.index === undefined || f.index === props.index) &&
+        (props.path === undefined || f.path === props.path),
     );
-    if (!hit) problems.push(`no ${e[0]} ${e[1]} with ${JSON.stringify(props)}`);
+    if (j < 0) problems.push(`no ${e[0]} ${e[1]} with ${JSON.stringify(props)}`);
+    else used.add(j);
   }
-  const ok = c.expectOk ?? !res.findings.some((f) => f.severity === "error");
+  const ok = expectedOk(c);
+  if (c.expectOk !== undefined && c.expectOk !== ok) problems.push(`the case says ok = ${c.expectOk} but its expected findings give ok = ${ok}`);
   if (res.ok !== ok) problems.push(`ok = ${res.ok}, expected ${ok}`);
   if (c.expectChecked && JSON.stringify(res.checked) !== JSON.stringify(c.expectChecked)) {
     problems.push(`checked ${JSON.stringify(res.checked)} ≠ ${JSON.stringify(c.expectChecked)}`);
