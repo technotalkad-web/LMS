@@ -14,7 +14,7 @@ import {
   rand,
   svc,
   testEmail,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import { authedContext } from "../lib/session";
 
 test("change role learner → admin without nullifying email", async ({ browser, baseURL }) => {

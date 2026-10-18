@@ -15,7 +15,7 @@
 import http from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { lintStatement } from "../lib/xapi-lint";
 
 const NS = "https://ambak.com/xapi/";

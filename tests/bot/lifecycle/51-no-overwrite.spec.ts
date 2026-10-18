@@ -21,7 +21,7 @@ import fs from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
 import { VERB, XAPI_HEADERS, authTokenFor, cmi5Zip, inProgressAttempt, uploadNew } from "./p0-helpers";
 import { deterministicStatementId } from "../../../lib/lrs/statement-id";

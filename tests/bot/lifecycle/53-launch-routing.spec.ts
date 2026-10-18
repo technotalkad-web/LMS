@@ -16,7 +16,7 @@
  * 0004/6 is open.
  */
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
 import { attemptStatuses, cmi5Zip, getNoFollow, inProgressAttempt, scormZip, uploadNew, zipFile } from "./p0-helpers";
 

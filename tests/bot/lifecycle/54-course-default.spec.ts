@@ -19,7 +19,7 @@
  *   - the Attention Center lists the hidden default.
  */
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
 import { directUpload, scormZip, uploadNew, zipFile } from "./p0-helpers";
 

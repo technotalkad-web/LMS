@@ -9,7 +9,7 @@
  * question section, no narrowing.
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg } from "./data";
 import { authedContext, uploadCourse } from "./helpers";
 
 test("analytics ?content= is scoped to the org's own content", async ({ browser, baseURL }) => {

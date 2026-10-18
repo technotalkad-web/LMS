@@ -15,7 +15,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
 import { lintStatement } from "../lib/xapi-lint";
 import { uuid5 } from "../../../lib/lrs/uuid5";
 import { testConnection } from "../../../lib/lrs/forward";

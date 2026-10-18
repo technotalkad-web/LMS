@@ -3,7 +3,7 @@
  *
  * Every case calls PostgREST directly with a real user session (JWT from
  * signInWithPassword with the anon key, the spec 50 pattern) on rows of this
- * spec's own qa-* organisations, and every assertion is on a service-role
+ * spec's own lifecycle-* organisations, and every assertion is on a service-role
  * re-read of the row, never on the status code alone: a revoked privilege
  * answers 42501, a dropped policy with the privilege present answers 200 with
  * zero rows, and both count as refused.
@@ -63,11 +63,13 @@
  * launch (a revived old-version attempt would be resumed by grandfather
  * routing).
  *
- * Never push while this runs: pr-checks purges qa-* data on every push.
+ * The seeded orgs and users are in the lifecycle namespace (./data.ts):
+ * the e2e purge that pr-checks runs on every push (qa-* / @example.test)
+ * does not touch them. (The one approved probe above ran on qa-* data.)
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { addMember, createAuthUser, createOrg, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { assignCourse, authedContext, uploadCourse } from "./helpers";
 import { todayStr } from "../../../lib/journey/journey";
 import {
@@ -163,14 +165,14 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     if (results.length) console.log(`[spec55] summary ${JSON.stringify(results)}`);
   });
 
-  test("seed: two qa orgs; a SCORM, a cmi5, a forge-target and an xAPI course; the learner launches SCORM, cmi5 and xAPI", async ({ browser, baseURL }) => {
+  test("seed: two lifecycle orgs; a SCORM, a cmi5, a forge-target and an xAPI course; the learner launches SCORM, cmi5 and xAPI", async ({ browser, baseURL }) => {
     const b = await branch();
     test.info().annotations.push({ type: "branch", description: b });
     console.log(`[spec55] branch=${b}`);
 
     const orgA = await createOrg({ name: "QA Attempt Guard" });
     const orgB = await createOrg({ name: "QA Attempt Guard Other" });
-    expect(orgA.slug.startsWith("qa-") && orgB.slug.startsWith("qa-")).toBeTruthy();
+    expect(isLifecycleSlug(orgA.slug) && isLifecycleSlug(orgB.slug)).toBeTruthy();
     const admin = await createAuthUser({ profile: { first_name: "AGuard", last_name: "Admin", must_change_password: false } });
     await addMember({ organizationId: orgA.id, userId: admin.id, role: "admin" });
     const learner = await createAuthUser({ profile: { first_name: "AGuard", last_name: "Learner", must_change_password: false } });

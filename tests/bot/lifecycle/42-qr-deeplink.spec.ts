@@ -18,7 +18,7 @@ import {
   deleteAuthUser,
   rand,
   svc,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import { authedContext } from "../lib/session";
 
 const state: {

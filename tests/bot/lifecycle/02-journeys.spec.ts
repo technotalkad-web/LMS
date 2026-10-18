@@ -23,7 +23,7 @@ import {
   createAuthUser,
   createOrg,
   svc,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import {
   assignCourse,
   attemptsFor,

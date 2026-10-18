@@ -31,7 +31,7 @@ import {
   createAuthUser,
   createOrg,
   svc,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 import { authedContext, uploadCourse, assignCourse, launch } from "./helpers";
 import { directUpload } from "./p0-helpers";
 

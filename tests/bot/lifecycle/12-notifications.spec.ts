@@ -10,7 +10,7 @@
  * and need CRON_SECRET + course_reminder_settings — tracked separately.
  */
 import { test, expect } from "@playwright/test";
-import { addMember, createAuthUser, createOrg, rand, svc } from "../../e2e/helpers/supabase";
+import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { aliasFor, configureOrgSmtp, waitForEmail } from "./inbox";
 import { courseHandle, latestAttemptId, launch, scormCommit, uploadCourse } from "./helpers";

@@ -16,7 +16,7 @@ import {
   createOrg,
   svc,
   testEmail,
-} from "../../e2e/helpers/supabase";
+} from "./data";
 
 test("magic-link token_hash signs in from a fresh browser (no verifier)", async ({
   browser,
