@@ -4,7 +4,11 @@
  *
  * Compiles lib/alds/rules/index.ts with esbuild (the pinned devDependency) to
  * an IIFE that defines the global `AldsRules` (target es2020, no dynamic
- * import, no require, pure ASCII). Its `rulesBundleHash` is
+ * import, no require, pure ASCII). Whitespace is minified, which also drops
+ * every comment, so the hash depends on the code only: a comment or layout
+ * edit under lib/alds (lib/lrs imports lib/alds/types.ts) does not move it.
+ * Identifiers and syntax are not minified; a pretty-printer makes the bundle
+ * readable again. Its `rulesBundleHash` is
  *
  *   "sha256:" + sha256( the exact text, normalised to LF and UTF-8 without BOM )
  *
@@ -38,6 +42,8 @@ export const BUNDLES_DIR = path.join(ROOT, "lib", "alds", "bundles");
 export const REGISTRY_PATH = path.join(BUNDLES_DIR, "bundles.json");
 export const GLOBAL_NAME = "AldsRules";
 export const TARGET = "es2020";
+/** The bundle starts by defining the global as an IIFE (minified or not). */
+export const IIFE_RE = new RegExp(`^var ${GLOBAL_NAME} ?= ?[(][(][)] ?=> ?[{]`);
 /**
  * The TypeScript settings that shape the output, fixed here so the bundle does
  * not change when the app's tsconfig.json does (esbuild would otherwise read
@@ -56,10 +62,14 @@ export function bundleHash(text) {
   return `sha256:${createHash("sha256").update(normalizeBundleText(text), "utf8").digest("hex")}`;
 }
 
-/** Build in memory. Returns { text, hash, bytes } or throws. */
-export async function buildRulesBundle() {
+/**
+ * Build in memory. Returns { text, hash, bytes } or throws. `root` (default:
+ * the repository) is the directory that holds lib/alds; the bundle test
+ * builds from an edited copy to show that comment edits do not move the hash.
+ */
+export async function buildRulesBundle({ root = ROOT } = {}) {
   const result = await esbuild.build({
-    absWorkingDir: ROOT,
+    absWorkingDir: root,
     entryPoints: [ENTRY],
     bundle: true,
     format: "iife",
@@ -69,7 +79,9 @@ export async function buildRulesBundle() {
     charset: "ascii",
     legalComments: "none",
     sourcemap: false,
-    minify: false,
+    minifyWhitespace: true,
+    minifyIdentifiers: false,
+    minifySyntax: false,
     write: false,
     logLevel: "silent",
     tsconfigRaw: TSCONFIG_RAW,
@@ -80,8 +92,10 @@ export async function buildRulesBundle() {
   if (/[^\x00-\x7f]/.test(text)) problems.push("non-ASCII characters in the output");
   if (/\bimport\s*\(/.test(text)) problems.push("a dynamic import()");
   if (/\brequire\s*\(/.test(text)) problems.push("a require() call");
-  if (text.includes(ROOT) || text.includes(ROOT.replace(/\\/g, "/"))) problems.push("an absolute path");
-  if (!text.includes(`var ${GLOBAL_NAME} = (() => {`)) problems.push(`no ${GLOBAL_NAME} IIFE`);
+  for (const dir of new Set([ROOT, root])) {
+    if (text.includes(dir) || text.includes(dir.replace(/\\/g, "/"))) problems.push("an absolute path");
+  }
+  if (!IIFE_RE.test(text)) problems.push(`no ${GLOBAL_NAME} IIFE`);
   if (problems.length > 0) throw new Error(`rules bundle rejected: ${problems.join(", ")}`);
   return { text, hash: bundleHash(text), bytes: Buffer.byteLength(text, "utf8") };
 }

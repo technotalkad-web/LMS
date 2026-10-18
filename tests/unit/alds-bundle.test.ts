@@ -6,7 +6,8 @@
  *         BOM (CRLF and BOM variants hash the same; the hash = sha256 of the
  *         LF bytes);
  *   (iii) the bundle is an es2020 IIFE defining `AldsRules`: pure ASCII, no
- *         dynamic import, no require;
+ *         dynamic import, no require; comment and layout edits under lib/alds
+ *         (built from an edited copy) do not move the hash, a code edit does;
  *   (iv)  the registry (lib/alds/bundles/bundles.json) is consistent and its
  *         latest entry is exactly what the current source builds to: a change
  *         to lib/alds without `--register` fails here;
@@ -18,6 +19,7 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import vm from "node:vm";
@@ -31,7 +33,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 type BuildModule = {
-  buildRulesBundle(): Promise<{ text: string; hash: string; bytes: number }>;
+  buildRulesBundle(opts?: { root?: string }): Promise<{ text: string; hash: string; bytes: number }>;
   bundleHash(text: string): string;
   normalizeBundleText(text: string): string;
   readRegistry(): { bundles?: Array<{ n: number; rulesBundleHash: string; file: string; bytes: number }> };
@@ -62,8 +64,35 @@ async function main() {
   eq("pure ASCII", /[^\x00-\x7f]/.test(a.text), false);
   eq("no dynamic import()", /\bimport\s*\(/.test(a.text), false);
   eq("no require()", /\brequire\s*\(/.test(a.text), false);
-  eq(`defines the ${mod.GLOBAL_NAME} IIFE`, a.text.includes(`var ${mod.GLOBAL_NAME} = (() => {`), true);
+  eq(`defines the ${mod.GLOBAL_NAME} IIFE`, new RegExp(`^var ${mod.GLOBAL_NAME} ?= ?[(][(][)] ?=> ?[{]`).test(a.text), true);
   eq("byte count", a.bytes, Buffer.byteLength(a.text, "utf8"));
+
+  console.log("\n(ii-b) comment and layout edits under lib/alds do not move the hash; code edits do");
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "alds-rules-"));
+    try {
+      const src = path.resolve(__dirname, "..", "..", "lib", "alds");
+      fs.cpSync(src, path.join(tmp, "lib", "alds"), { recursive: true, filter: (p) => !p.includes(`${path.sep}bundles`) });
+      const edit = (rel: string, f: (t: string) => string) => {
+        const p = path.join(tmp, ...rel.split("/"));
+        const before = fs.readFileSync(p, "utf8");
+        const after = f(before);
+        if (after === before) throw new Error(`the edit of ${rel} changed nothing`);
+        fs.writeFileSync(p, after);
+      };
+      // a documentation edit to EXT (which lib/lrs imports), a new block comment, a CRLF file
+      edit("lib/alds/types.ts", (t) => t.replace("export const EXT = {", "// a documentation edit made for lib/lrs reasons\nexport const EXT = {\n  /* a block comment */").replace("// v1 key (LMS-supplied)", "// reworded"));
+      edit("lib/alds/rules/statement.ts", (t) => `/** a new header line */\n${t}`.split("\n").join("\r\n"));
+      edit("lib/alds/rules/session.ts", (t) => t.replace("// G3: order within the session", "// G3: the order of statements within one session (reworded)"));
+      const c = await mod.buildRulesBundle({ root: tmp });
+      eq("an edited copy (comments added and reworded, CRLF) builds to the same hash", c.hash, a.hash);
+      edit("lib/alds/rules/package.ts", (t) => t.replace("export const U4_SCRIPT_SHARE = 0.9;", "export const U4_SCRIPT_SHARE = 0.91;"));
+      const d = await mod.buildRulesBundle({ root: tmp });
+      eq("a one-token code edit in the copy moves the hash", d.hash === a.hash, false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
 
   console.log("\n(iv) registry");
   const registry = mod.readRegistry().bundles ?? [];

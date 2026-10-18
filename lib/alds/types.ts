@@ -288,8 +288,16 @@ export interface AldsCatalogueEntry {
   revision: number;
   contentHash: Sha256;
   prompt: string;                     // full text
-  options: Array<{ oid: string; label: string }>;   // empty for non-option kinds
-  correct: string[];                  // xAPI correctResponsesPattern entries
+  /**
+   * Empty for non-option kinds. PROPOSED (P3), an open decision: every
+   * component id of the xAPI definition is an option here with an oid o1..oN
+   * (choices, likert scale, matching source and target, performance steps);
+   * the semantic check requires the definition's component ids to equal this
+   * set (SEM option_set_mismatch) and U1 requires the oid form. §1.1/§1.4
+   * define oid per "option" only.
+   */
+  options: Array<{ oid: string; label: string }>;
+  correct: string[];                  // xAPI correctResponsesPattern entries (hashed in canonical form, content-hash.ts)
   scoring?: { points?: number; weighting?: number };
   authoringKind?: string;             // PROPOSED (P3): key of KEY_CLASS_BY_AUTHORING_KIND
 }
