@@ -447,7 +447,11 @@ test("multipart upload: a failure mid-way keeps a failed row with an empty folde
 
 // ADR 0011 step 13: the Library's Replace dialog reports the forced
 // restart apart from the publish. Nobody is in progress here, so the
-// banner is the genuine zero; the failure banner is unit-tested only.
+// banner is the genuine zero. The failure path is proven on the server and
+// in the browser client by tests/unit/force-restart.test.ts, which also
+// source-checks the dialog's wiring to the red banner; the failure banner
+// itself is never rendered by any test (no React rig, and a failed reset
+// cannot be produced against staging without harming it).
 test("Library Replace with force restart and nobody in progress: the replace-result banner, the new version listed", async ({ browser, baseURL }) => {
   const w = await world();
   const adminCtx = await authedContext(browser, baseURL!, w.admin.email, w.admin.password);
