@@ -45,6 +45,8 @@ Facts behind it (staging, read-only, at a89832f):
 1. Confirm the not-doing list in Decision 4 as binding scope. Recommended: yes. Decided (owner, 2026-10-16): yes. The abandon actions of ADR 0004 D5b run through app flows and are not the "attempt surgery" this list excludes.
 2. Confirm that the only Hinglish measure in P0 is the `display_name` relabel by L&D (no `hi-Latn` slot code). Recommended: yes; a `hi-Latn` code is added only if a script rule ever becomes gating, which ADR 0004 does not propose. Decided (owner, 2026-10-16): yes.
 
+Note (2026-10-18, on condition (a) of the Acceptance line above; the line is not rewritten): condition (a) was written when staging was believed to hold real learners; the owner's standing direction of 2026-10-18 reclassifies staging as test data and is, on staging, the go for D5b and for any staging reset development or verification needs, while condition (a) stands unchanged for production; the direction and its effect are recorded in full under ADR 0004 decision 2, note of 2026-10-18.
+
 ## References
 
 - `docs/ambak-learning-data-standard/BLUEPRINT.md` §0, §1.5, §2, §3, §5, §6, §8, §9, §10
