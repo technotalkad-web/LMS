@@ -1,6 +1,6 @@
 # 0010. The SCORM commit route writes only SCORM attempts
 
-Status: Proposed
+Status: Accepted (owner, 2026-10-18). Both decisions requested below were answered on the day the record was proposed; the owner's words are recorded under "Decisions requested from the owner", as ADR 0008 and 0009 do, not by rewriting this record. Code only, no migration; the code ships in its own build (the ADR 0008 C + D + ADR 0009 build was finished before this record). Decision 2's read-only count (step 7) runs after each 0099 apply, staging first and then production, and any non-zero result is reported to the owner before any change is made, in the owner's words: "report any issue found before making further changes".
 Date: 2026-10-18
 Deciders: owner; architect (Fable 5.1)
 
@@ -59,8 +59,8 @@ Verified on 2026-10-18 by reading the pushed branch `feat/adr-0008-part2-and-000
 
 ## Decisions requested from the owner
 
-1. Adopt the rule and steps 1–6, including the fail-closed 503 when the attempt or its version type cannot be read (step 4). Recommended: yes; it closes the only route-level path by which a cmi5 or xAPI attempt can be completed without statements, and it changes nothing for SCORM learners.
-2. The `mv_path_enrollment_status` overlap of ADR 0009 step 8: accept it as documented in 0099 section 3b's comment, with the read-only count of step 7 at its two moments (after the staging apply, after the production apply), and tighten the body in the next migration window only if either count is non-zero. Recommended: accept as documented; no server path abandons a completed attempt, no app code reads the matview, 0099 is not reopened, and two zero counts close the point.
+1. Adopt the rule and steps 1–6, including the fail-closed 503 when the attempt or its version type cannot be read (step 4). Recommended: yes; it closes the only route-level path by which a cmi5 or xAPI attempt can be completed without statements, and it changes nothing for SCORM learners. Decided (owner, 2026-10-18): yes, in the owner's words: "1. YES — The SCORM save route must reject non-SCORM attempts and must not save anything if the attempt type cannot be verified." Both halves of step 4 are accepted as written: the 409 for a known non-SCORM type and the 503 that writes nothing when the type cannot be established.
+2. The `mv_path_enrollment_status` overlap of ADR 0009 step 8: accept it as documented in 0099 section 3b's comment, with the read-only count of step 7 at its two moments (after the staging apply, after the production apply), and tighten the body in the next migration window only if either count is non-zero. Recommended: accept as documented; no server path abandons a completed attempt, no app code reads the matview, 0099 is not reopened, and two zero counts close the point. Decided (owner, 2026-10-18): yes, in the owner's words: "2. YES — Accept the documented database-summary limitation for now. After SQL 0099 is applied, run the read-only check and report any issue found before making further changes." Step 7 as written: the count runs after each 0099 apply, staging first and then production; each result is recorded under this note; a non-zero result is reported to the owner, with ids only in `ops/INCIDENT_LEDGER.md`, before any change is made anywhere, and the body is tightened only on the owner's go in the next migration window.
 
 ## References
 
