@@ -14,9 +14,11 @@
 #   up" but doesn't exercise login / invite / RBAC flows. This
 #   workflow does.
 #
-# On failure: GitHub emails repo admins automatically. Upload
-# Playwright report as an artifact (14-day retention) so you can
-# download + inspect without re-running.
+# On failure: GitHub emails repo admins automatically. No Playwright
+# report, trace, screenshot or video is uploaded: this repository is
+# public, so any signed-in GitHub user could download an artifact, and
+# traces hold the QA login, session cookies and staging tenant pages.
+# Reproduce a failure locally against staging instead.
 #
 # Manual dispatch: enabled via workflow_dispatch so you can fire
 # the full suite on demand without waiting for the next cron.
@@ -32,6 +34,10 @@ on:
 concurrency:
   group: nightly-e2e
   cancel-in-progress: false
+
+# Read-only token: the job only checks out and runs Playwright.
+permissions:
+  contents: read
 
 jobs:
   e2e:
@@ -51,6 +57,8 @@ jobs:
       E2E_BROWSER_MATRIX: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -60,13 +68,6 @@ jobs:
         run: npx playwright install --with-deps chromium firefox webkit
       - name: Run Playwright
         run: npx playwright test --reporter=list
-      - name: Upload report on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report-nightly-${{ github.run_id }}
-          path: playwright-report/
-          retention-days: 14
       - name: Run summary
         if: always()
         run: |
@@ -77,7 +78,7 @@ jobs:
           else
             echo "## Nightly e2e ❌" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Playwright reported failures. Download the artifact \`playwright-report-nightly-${{ github.run_id }}\` for the full HTML report." >> $GITHUB_STEP_SUMMARY
+            echo "Playwright reported failures; the failing specs are in the job log." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Common causes:" >> $GITHUB_STEP_SUMMARY
             echo "- Supabase Auth Site URL or Redirect URLs drifted (see docs/ops/supabase-auth-smtp.md Step 0)" >> $GITHUB_STEP_SUMMARY
