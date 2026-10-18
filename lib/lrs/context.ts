@@ -337,7 +337,13 @@ export async function loadAttemptContexts(
         language: str(pkg.language),
         manifestType: str(version.manifest_type),
         engineVersion: str(manifest.engineVersion),
-        launchedIds: launchedActivityIds({ id: versionId, manifest_data: manifest }, versionId),
+        // package_id adds the LMS-issued AU id (ADR 0006 note (d) of
+        // 2026-10-19), accepted in every deploy as process-statement.ts does;
+        // only SENDING it is flag-gated (ALDS_P4, launch page).
+        launchedIds: launchedActivityIds(
+          { id: versionId, manifest_data: manifest, package_id: str(version.package_id) },
+          versionId
+        ),
       },
       path: pathId
         ? {

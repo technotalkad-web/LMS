@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { bindXapi, serviceClient } from "@/lib/xapi/auth";
 import { attemptAbandonedResponse, isAttemptAbandonedError } from "@/lib/attempts/abandon";
 import { updateProgressFromState } from "@/lib/courses/progress";
+import { isLaunchDataStateId } from "@/lib/alds/launch";
 
 /**
  *   GET    /api/xapi/activities/state?stateId=...&activityId=...&agent=...
@@ -16,6 +17,11 @@ import { updateProgressFromState } from "@/lib/courses/progress";
  *
  * Auth: Bearer token from /api/xapi/fetch. An abandoned attempt answers 410
  * attempt_abandoned on every method (ALDS step 0, P4).
+ *
+ * `LMS.LaunchData` is LMS-owned (cmi5 §10.1; ADR 0006 step 16 and note (e)
+ * of 2026-10-19): the launch page writes it, the AU may only GET it. PUT,
+ * POST (an alias of PUT) and DELETE of that exact state id answer 403
+ * read_only_state before any write. Unconditional, not behind ALDS_P4.
  */
 export async function GET(request: Request) {
   const bound = await bindXapi(request);
@@ -58,6 +64,9 @@ export async function PUT(request: Request) {
   const stateId = searchParams.get("stateId");
   if (!stateId) {
     return NextResponse.json({ error: "Missing stateId" }, { status: 400 });
+  }
+  if (isLaunchDataStateId(stateId)) {
+    return NextResponse.json({ error: "read_only_state" }, { status: 403 });
   }
 
   const contentType = request.headers.get("content-type") ?? "application/json";
@@ -112,6 +121,9 @@ export async function DELETE(request: Request) {
   const stateId = searchParams.get("stateId");
   if (!stateId) {
     return NextResponse.json({ error: "Missing stateId" }, { status: 400 });
+  }
+  if (isLaunchDataStateId(stateId)) {
+    return NextResponse.json({ error: "read_only_state" }, { status: 403 });
   }
 
   const svc = serviceClient();

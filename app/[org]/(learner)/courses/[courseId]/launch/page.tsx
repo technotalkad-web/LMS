@@ -26,6 +26,18 @@ import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
 import { launchFallback } from "@/lib/courses/default-rule";
+import { aldsP4Enabled, isAldsSchemaMissing, logAldsSkip } from "@/lib/alds/flag";
+import {
+  attemptServedLanguage,
+  buildLaunchData,
+  lmsAuActivityId,
+  newSessionId,
+  previewLaunch,
+  recordLearningSession,
+  registrationKindFor,
+  servedLanguageFor,
+  writeLaunchData,
+} from "@/lib/alds/launch";
 
 type Course = {
   id: string;
@@ -39,7 +51,11 @@ type Version = {
   id: string;
   manifest_type: "scorm12" | "cmi5" | "xapi";
   launch_url: string;
-  manifest_data: { raw?: { courseId?: string; auId?: string; activityId?: string } };
+  manifest_data: {
+    raw?: { courseId?: string; auId?: string; activityId?: string };
+    masteryScore?: number | null;
+  };
+  package_id: string | null;
 };
 
 type PackageRow = {
@@ -475,7 +491,7 @@ export default async function LaunchPage({
 
   const { data: version } = await supabase
     .from("course_versions")
-    .select("id, manifest_type, launch_url, manifest_data")
+    .select("id, manifest_type, launch_url, manifest_data, package_id")
     .eq("id", resolvedVersionId)
     // Bound to this course: a pointer to another course's version redirects
     // and is never written into an attempt.
@@ -483,6 +499,19 @@ export default async function LaunchPage({
     .maybeSingle();
   if (!version) redirect(`/${orgSlug}/courses/${courseId}`);
   const v = version as Version;
+
+  // ALDS P4 launch contract (ADR 0006 §C, notes (a)–(c) of 2026-10-19),
+  // behind ALDS_P4 (default off). With the flag off nothing below that
+  // names `p4` runs and this launch is today's. Staff launches are previews
+  // (is_preview, launch_mode 'Browse'); the served language is the
+  // attempt's slot (by the version's package, which also covers a
+  // cross-slot resume): the attempt column stores null for the unlabeled
+  // legacy slot (as the 0100 backfill does), the LaunchData says "und".
+  // Never read by scoring (ADR 0005 D1).
+  const p4 = aldsP4Enabled();
+  const preview = previewLaunch(role);
+  const servedPackage = allPackages.find((p) => p.id === v.package_id);
+  const servedLanguage = servedLanguageFor(servedPackage?.language);
 
   // PREREQ LOCK: if this course is in a learning path the user is assigned
   // to, every earlier step in that path must be completed first — UNLESS
@@ -762,7 +791,7 @@ export default async function LaunchPage({
       if (prev["cmi.core.lesson_location"]) seedCmi["cmi.core.lesson_location"] = prev["cmi.core.lesson_location"];
       if (Object.keys(seedCmi).length > 0) seedCmi["cmi.core.entry"] = "resume";
     }
-    const { data: created, error: insErr } = await svcAttempt
+    let { data: created, error: insErr } = await svcAttempt
       .from("course_attempts")
       .insert({
         course_version_id: v.id,
@@ -780,9 +809,41 @@ export default async function LaunchPage({
               journey_day: journeyCtx.day,
             }
           : {}),
+        // The 0100 columns, only with ALDS_P4 on (ADR 0006 note (c)).
+        ...(p4
+          ? {
+              served_language: attemptServedLanguage(servedPackage?.language),
+              launch_mode: preview.launchMode,
+              is_preview: preview.isPreview,
+            }
+          : {}),
       })
       .select("id")
       .single();
+    // Flag on, 0100 absent on this database: retry once without the three
+    // 0100 columns, so a launch never fails for P4. The 0062 23505
+    // fallback below follows either insert as before.
+    if (p4 && !created && isAldsSchemaMissing(insErr)) {
+      logAldsSkip("launch_insert", "schema_missing", { versionId: v.id });
+      ({ data: created, error: insErr } = await svcAttempt
+        .from("course_attempts")
+        .insert({
+          course_version_id: v.id,
+          user_id: user.id,
+          organization_id: org.id,
+          status: "in_progress",
+          cmi_data: seedCmi,
+          learning_path_id: pathContextId,
+          ...(journeyCtx
+            ? {
+                journey_enrollment_id: journeyCtx.enrollmentId,
+                journey_day: journeyCtx.day,
+              }
+            : {}),
+        })
+        .select("id")
+        .single());
+    }
     attemptId = created?.id ?? null;
     if (attemptId) {
       cmi = seedCmi;
@@ -980,11 +1041,18 @@ export default async function LaunchPage({
       name: user.id,
     },
   });
+  // ADR 0006 step 17: with ALDS_P4 on, a cmi5 launch names the LMS-issued
+  // AU id (BLUEPRINT §1.2); launchedActivityIds() accepts it in every
+  // deploy and keeps the publisher ids. Flag off, a version without a
+  // package, or a tincan package: today's publisher-id chain.
+  const lmsAuId =
+    p4 && v.manifest_type === "cmi5" && v.package_id ? lmsAuActivityId(v.package_id) : null;
   const activityId =
-    v.manifest_data?.raw?.auId ??
-    v.manifest_data?.raw?.activityId ??
-    v.manifest_data?.raw?.courseId ??
-    `urn:uuid:${v.id}`;
+    lmsAuId ??
+    (v.manifest_data?.raw?.auId ??
+      v.manifest_data?.raw?.activityId ??
+      v.manifest_data?.raw?.courseId ??
+      `urn:uuid:${v.id}`);
 
   const isXapi = v.manifest_type === "xapi";
   const launchParams = isXapi
@@ -1015,6 +1083,65 @@ export default async function LaunchPage({
   const launchPath = v.launch_url.replace(/^\/+/, "");
   const sep = launchPath.includes("?") ? "&" : "?";
   const iframeSrc = `${contentBase}${launchPath}${sep}${launchParams}`;
+
+  // ADR 0006 step 16 (cmi5 §10.1), ALDS_P4 on, cmi5 only: write the
+  // LMS-owned LMS.LaunchData document before the runtime renders and record
+  // the session. Both fail soft: a failed write is logged with ids and the
+  // launch proceeds (a 2.0 engine then runs its flagged fallback,
+  // uncertified). The document carries ids and the slot language only. A
+  // version without a package (the legacy no-package path) has no package
+  // id for the template, so it gets no document; its session is recorded.
+  if (p4 && !isXapi) {
+    const sessionId = newSessionId();
+    if (v.package_id) {
+      // alds_manifest is a 0100 column: a separate, fail-soft read (any
+      // error, or 0100 absent, leaves the course family out of grouping).
+      let courseUlid: string | null = null;
+      try {
+        const { data: aldsRow, error: aldsErr } = await svc
+          .from("course_versions")
+          .select("alds_manifest")
+          .eq("id", v.id)
+          .maybeSingle();
+        if (!aldsErr) {
+          const manifest = (aldsRow as { alds_manifest?: unknown } | null)?.alds_manifest as
+            | { courseUlid?: unknown }
+            | null
+            | undefined;
+          courseUlid = typeof manifest?.courseUlid === "string" ? manifest.courseUlid : null;
+        }
+      } catch {
+        courseUlid = null;
+      }
+      const launchData = buildLaunchData({
+        attemptId,
+        packageId: v.package_id,
+        versionId: v.id,
+        servedLanguage,
+        launchMode: preview.launchMode,
+        registrationKind: registrationKindFor({ consumeGrantId, practiceLaunch }),
+        sessionId,
+        publisherCourseId: v.manifest_data?.raw?.courseId ?? null,
+        courseUlid,
+        masteryScore: typeof v.manifest_data?.masteryScore === "number" ? v.manifest_data.masteryScore : null,
+        // cmi5 §10.2.6: a URL, not a path (the fixed in-app back target).
+        returnURL: `${host}${backHref}`,
+      });
+      const { error: ldErr } = await writeLaunchData(svc, attemptId, launchData);
+      if (ldErr) console.warn("[alds] LaunchData write failed", { attemptId, code: ldErr.code });
+    } else {
+      logAldsSkip("launch_data", "no_package", { attemptId, versionId: v.id });
+    }
+    await recordLearningSession(svc, {
+      sessionId,
+      organizationId: org.id,
+      attemptId,
+      launchKind: "cmi5",
+      fetchToken: token.fetch_token,
+      activityId,
+      launchMode: preview.launchMode,
+    });
+  }
 
   return (
     <Cmi5Runtime
