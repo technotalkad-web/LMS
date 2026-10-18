@@ -2,8 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { isVersionConflictError, uploadCoursePackage } from "@/lib/courses/upload";
-import { expireLaunchTokens } from "@/lib/attempts/abandon";
-import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
+import {
+  forceRestartOlderVersions,
+  forceRestartReplaceAnswer,
+  forceRestartReport,
+} from "@/lib/attempts/force-restart";
 import {
   enforcePackageValidation,
   linkValidationToVersion,
@@ -29,11 +32,29 @@ import {
  *     This is the launcher's natural behavior — no action needed here.
  *   - 'force_restart': mark this package's old in-progress attempts 'abandoned'
  *     so the launcher starts each learner fresh on the new version (0% on next
- *     launch).
+ *     launch). lib/attempts/force-restart.ts, shared with the direct-upload
+ *     finalize (ADR 0011).
  *
  * Admin-only; tenant-guarded (course + package must belong to the caller's org).
  *
- * Returns: { version_id, version_number, mode, restarted? }
+ * The new version is published BEFORE the restart runs, and the restart is
+ * reported separately from it (ADR 0011): it is a success only when every
+ * selected in-progress attempt is, by the database's answers, no longer in
+ * progress, and "nobody was in progress" only when the selection read
+ * succeeded and found none.
+ *
+ * Returns:
+ *   grandfather:          200 { ok, version_id, version_number, mode, restarted: 0 }
+ *   force_restart, reset: 200 { ok, version_id, version_number, mode, restarted,
+ *                               expected, resolved, message, tokens_expired?: false }
+ *   force_restart, reset failed (the new version IS published and current):
+ *                         500 { error, published: true, version_id, version_number,
+ *                               mode, restart: "failed", expected, restarted,
+ *                               resolved, unresolved, unresolved_version_ids,
+ *                               retry } — `retry` is the per-version restart
+ *                               route (ADR 0008 A) to run for each entry of
+ *                               unresolved_version_ids ("Restart learners on
+ *                               this version" in the Library).
  */
 export async function POST(
   request: NextRequest,
@@ -156,47 +177,28 @@ export async function POST(
     versionId: result.versionId,
   });
 
-  // ---- Force-restart: silently abandon old in-progress attempts ----
-  // After this, the launcher finds no resumable attempt on the package's old
-  // versions, so each learner starts fresh on the new version. Grandfather mode
-  // skips this — the launcher keeps routing them to their retired version.
-  let restarted = 0;
-  if (mode === "force_restart") {
-    const { data: pkgVers } = await svc
-      .from("course_versions")
-      .select("id")
-      .eq("package_id", packageId);
-    const oldVerIds = ((pkgVers ?? []) as Array<{ id: string }>)
-      .map((r) => r.id)
-      .filter((id) => id !== result.versionId);
-    if (oldVerIds.length > 0) {
-      const { data: abRows, error: abErr } = await svc
-        .from("course_attempts")
-        .update({ status: "abandoned" })
-        .in("course_version_id", oldVerIds)
-        .eq("status", "in_progress")
-        .select("id");
-      if (abErr) {
-        return NextResponse.json(
-          { error: `New version uploaded, but restart failed: ${abErr.message}` },
-          { status: 500 }
-        );
-      }
-      const abIds = ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id);
-      restarted = abIds.length;
-      // ALDS step 0 (P4): an abandoned attempt's launch tokens die with it.
-      const tokErr = await expireLaunchTokens(svc, abIds);
-      if (tokErr) console.warn("[versions] token expiry failed:", tokErr.message);
-      // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
-      await enqueueAbandonedStatements(svc, abIds);
-    }
+  if (mode === "grandfather") {
+    return NextResponse.json({
+      ok: true,
+      version_id: result.versionId,
+      version_number: result.versionNumber,
+      mode,
+      restarted: 0,
+    });
   }
 
-  return NextResponse.json({
-    ok: true,
-    version_id: result.versionId,
-    version_number: result.versionNumber,
-    mode,
-    restarted,
+  // ---- Force-restart: silently abandon old in-progress attempts ----
+  // After this, the launcher finds no resumable attempt on the package's old
+  // versions, so each learner starts fresh on the new version. The outcome
+  // is a value (never a throw): the version above stays published whatever
+  // it says, and a failed reset answers 500 with published: true.
+  const run = await forceRestartOlderVersions(svc, { packageId, newVersionId: result.versionId });
+  const answer = forceRestartReplaceAnswer({
+    courseId,
+    packageId,
+    versionId: result.versionId,
+    versionNumber: result.versionNumber,
+    report: forceRestartReport(run),
   });
+  return NextResponse.json(answer.body, { status: answer.status });
 }

@@ -1,5 +1,5 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { activeStorageDriver, getStorageFor } from "@/lib/storage";
+import { activeStorageDriver, getStorageFor, type StorageAdapter } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import { parseManifestXml } from "./manifest/parse-xml";
@@ -29,8 +29,7 @@ import {
   storagePrefixFor,
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
-import { expireLaunchTokens } from "@/lib/attempts/abandon";
-import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
+import { forceRestartOlderVersions, forceRestartReport, type ForceRestartReport } from "@/lib/attempts/force-restart";
 
 /**
  * Direct browser-to-storage uploads.
@@ -50,7 +49,13 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
  *              abandoned ones.
  *   abort    → turns an 'uploading' version 'failed' and empties its prefix;
  *              the row stays, so its number and folder are never reused
- *              (ADR 0008 D1).
+ *              (ADR 0008 D1). A 'ready' version is refused before anything
+ *              is touched.
+ *
+ * With force_restart, finalize publishes first and then runs the shared
+ * forced restart (lib/attempts/force-restart.ts, ADR 0011); its outcome is
+ * returned as `restart` next to the published version and never turns a
+ * published version into a failed finalize.
  */
 
 export const DIRECT_UPLOAD_LIMITS = {
@@ -337,8 +342,34 @@ export type FinalizeResult =
       manifest: { title: string; type: string; launchUrl: string };
       fileCount: number;
       unitCount: number | null;
+      /**
+       * force_restart only (ADR 0011): the reset of the older versions'
+       * in-progress attempts, reported separately from the publish. `ok`
+       * above stays true (the version IS published); finalizeAnswer turns a
+       * failed restart into a 500 with `published: true`.
+       */
+      restart?: ForceRestartReport;
     }
   | { ok: false; status: number; error: string; retryable?: boolean };
+
+/**
+ * The finalize route's status and body (ADR 0011 step 6), pure so the unit
+ * test checks it: a refusal answers its status with `{ error, retryable }`;
+ * a published version whose forced restart failed answers 500 with
+ * `ok: false` (no client reading `body.ok` sees success), `published: true`,
+ * the version fields and the restart's message as `error`; anything else
+ * answers 200 with the result.
+ */
+export function finalizeAnswer(result: FinalizeResult): { status: number; body: Record<string, unknown> } {
+  if (!result.ok) return { status: result.status, body: { error: result.error, retryable: result.retryable ?? false } };
+  if (result.restart?.status === "failed") {
+    return {
+      status: 500,
+      body: { ...result, ok: false, published: true, error: result.restart.message, retryable: false },
+    };
+  }
+  return { status: 200, body: { ...result } };
+}
 
 export async function finalizeDirectUpload(args: {
   supabase: SupabaseClient;
@@ -354,7 +385,7 @@ export async function finalizeDirectUpload(args: {
   if (!loaded.ok) return loaded;
   const { version, course } = loaded;
 
-  const storage = await getStorageFor(version.storage_driver);
+  const storage = await storageFor(version.storage_driver);
   const prefix = version.storage_prefix;
 
   // The launch file is the one object that must exist; then the count.
@@ -415,8 +446,13 @@ export async function finalizeDirectUpload(args: {
   const hadCurrent = !!course.current_version_id;
   await publishVersion(supabase, { courseId: course.id, packageId: version.package_id, versionId: version.id });
 
+  // Published: from here on nothing marks this version failed or empties its
+  // prefix. The forced restart reports a value (it never throws), carried
+  // next to the published version (ADR 0011 step 6).
+  let restart: ForceRestartReport | undefined;
   if (args.restartMode === "force_restart") {
-    await abandonOldAttempts(version.package_id, version.id);
+    const run = await forceRestartOlderVersions(serviceClient(), { packageId: version.package_id, newVersionId: version.id });
+    restart = forceRestartReport(run);
   }
   if (args.notifyUpdate && hadCurrent) {
     await notifyCourseUpdate({ org, courseId: course.id });
@@ -435,6 +471,7 @@ export async function finalizeDirectUpload(args: {
     },
     fileCount: keys.length,
     unitCount,
+    ...(restart ? { restart } : {}),
   };
 }
 
@@ -455,7 +492,7 @@ async function finalizeIntegrity(args: {
 }): Promise<{ ok: true; findings: IntegrityFindings } | { ok: false; status: number; error: string; retryable?: boolean }> {
   const { org, version, course, keys, prefix, launchHtml } = args;
   const svc = serviceClient();
-  const storage = await getStorageFor(version.storage_driver);
+  const storage = await storageFor(version.storage_driver);
 
   // The STORED manifest (root first). Never the text the browser sent at
   // init: that is the client's claim, and the identity must come from the
@@ -612,8 +649,11 @@ async function removeRefusedUpload(args: {
  * Abort (the uploader's own cleanup, or Discard on an 'uploading' row):
  * the row turns 'failed' and stays (ADR 0008 D1), then the prefix is
  * emptied. A 'failed' row is accepted too, so a second call only empties
- * the prefix again (idempotent). A row a concurrent finalize made ready is
- * refused and keeps its files.
+ * the prefix again (idempotent). A 'ready' row is refused (409) before the
+ * row or storage is touched, and the claim below is conditional on
+ * 'uploading' or 'failed' too, so a row a concurrent finalize made ready
+ * keeps its files: a published version survives a stale tab's abort
+ * (ADR 0011).
  */
 export async function abortDirectUpload(args: {
   supabase: SupabaseClient;
@@ -627,7 +667,7 @@ export async function abortDirectUpload(args: {
   if (mark.error) return { ok: false, status: 500, error: `Could not abort the upload: ${mark.error}` };
   if (!mark.claimed) return { ok: false, status: 409, error: "This version was finalised by another request." };
   try {
-    const storage = await getStorageFor(version.storage_driver);
+    const storage = await storageFor(version.storage_driver);
     await storage.deletePrefix(version.storage_prefix.replace(/\/$/, ""));
   } catch (e) {
     console.warn("[direct-upload] abort: prefix delete failed", e);
@@ -696,32 +736,34 @@ export async function sweepAbandonedUploads(
 // ---------------------------------------------------------------------------
 
 /**
- * Force-restart: silently abandon in-progress attempts on the package's older
- * versions so the launcher starts every learner fresh on the new one.
- * Service-role: attempts belong to other users.
+ * Unit-test doubles (tests/unit/force-restart.test.ts): a fake service
+ * client and storage adapter for finalize and abort. Honoured only when
+ * NODE_ENV is "test", which Next never sets, so the app always gets the
+ * real service client and adapters.
  */
+const testDoubles: {
+  svc: SupabaseClient | null;
+  storageFor: ((driver: string) => Promise<StorageAdapter>) | null;
+} = { svc: null, storageFor: null };
+
+export function setDirectUploadTestDoubles(d: {
+  svc?: SupabaseClient | null;
+  storageFor?: ((driver: string) => Promise<StorageAdapter>) | null;
+}): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("setDirectUploadTestDoubles is for unit tests only");
+  if (d.svc !== undefined) testDoubles.svc = d.svc;
+  if (d.storageFor !== undefined) testDoubles.storageFor = d.storageFor;
+}
+
+/** Service role: rows other users own, and server-only writes. */
 function serviceClient() {
+  if (process.env.NODE_ENV === "test" && testDoubles.svc) return testDoubles.svc;
   return createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
 }
 
-async function abandonOldAttempts(packageId: string, newVersionId: string): Promise<number> {
-  const svc = serviceClient();
-  const { data: pkgVers } = await svc.from("course_versions").select("id").eq("package_id", packageId);
-  const oldIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id).filter((id) => id !== newVersionId);
-  if (oldIds.length === 0) return 0;
-  const { data: abRows } = await svc
-    .from("course_attempts")
-    .update({ status: "abandoned" })
-    .in("course_version_id", oldIds)
-    .eq("status", "in_progress")
-    .select("id");
-  const abIds = ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id);
-  // ALDS step 0 (P4): an abandoned attempt's launch tokens die with it.
-  const tokErr = await expireLaunchTokens(svc, abIds);
-  if (tokErr) console.warn("[direct-upload] token expiry failed:", tokErr.message);
-  // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
-  await enqueueAbandonedStatements(svc, abIds);
-  return abIds.length;
+function storageFor(driver: string): Promise<StorageAdapter> {
+  if (process.env.NODE_ENV === "test" && testDoubles.storageFor) return testDoubles.storageFor(driver);
+  return getStorageFor(driver);
 }
 
 type VersionRow = {
