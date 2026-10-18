@@ -22,9 +22,16 @@
 # caps Class B and Class C transactions at 2,500 a day each, so nothing may
 # cost one request per object or per folder against B2):
 #   --fast-list           one listing call per 1,000 objects, not one per folder
-#   --checksum            "modified" = size or MD5 differs, both read from the
-#                         listing (single-part ETag); default size+modtime would
-#                         HEAD every object on both sides to read X-Amz-Meta-Mtime
+#   --checksum            "modified" = size or MD5 differs. For a single-part
+#                         object the MD5 is its ETag, read from the listing; an
+#                         object with a multipart ETag (not an MD5) has no hash
+#                         there, and rclone may HEAD it (one B2 Class B call per
+#                         such object per night) for X-Amz-Meta-Md5chksum.
+#                         Default size+modtime would HEAD every object on both
+#                         sides to read X-Amz-Meta-Mtime. Check the Class B
+#                         count in B2's transaction report the day after the
+#                         first real copy: well inside 2,500/day, or switch to
+#                         --size-only.
 #   --min-age 1h          objects that arrived in the last hour wait for the next
 #                         night (an upload still in progress is never half-copied)
 #   --use-server-modtime  the age filter reads LastModified from the listing

@@ -7,8 +7,8 @@
  * under a new folder: abort (direct path), a multipart upload failing
  * mid-way, and the Library hiding failed rows. The reaper's sweep has its
  * own test, gated by REAPER_E2E=1 (the reaper also acts on other tenants:
- * never set it against shared staging); the sweep's write is unit-tested
- * in tests/unit/failed-uploads.test.ts. Run with `--grep-invert reaper`.
+ * never set it against shared staging, so it skips itself there); the
+ * sweep's write is unit-tested in tests/unit/failed-uploads.test.ts.
  *
  * Runs the real admin UI (file chooser, validation report, progress bar) on a
  * 161-file, 9 MB media package. Needs:
