@@ -445,6 +445,37 @@ test("multipart upload: a failure mid-way keeps a failed row with an empty folde
   await adminCtx.close();
 });
 
+// ADR 0011 step 13: the Library's Replace dialog reports the forced
+// restart apart from the publish. Nobody is in progress here, so the
+// banner is the genuine zero; the failure banner is unit-tested only.
+test("Library Replace with force restart and nobody in progress: the replace-result banner, the new version listed", async ({ browser, baseURL }) => {
+  const w = await world();
+  const adminCtx = await authedContext(browser, baseURL!, w.admin.email, w.admin.password);
+  const zipBuf = fs.readFileSync(path.join(FIXTURES, "xapi.zip"));
+  const first = await directUpload(adminCtx.request, { orgSlug: w.org.slug, buffer: zipBuf, name: "xapi.zip", acknowledge: true });
+  expect(first.finalize?.status, JSON.stringify(first)).toBe(200);
+  const courseId = first.finalize!.body.courseId as string;
+
+  const page = await adminCtx.newPage();
+  await page.goto(`/${w.org.slug}/library/${courseId}`, { timeout: 120_000 });
+  await page.getByRole("button", { name: "Replace content" }).click();
+  const dialog = page.locator("div.fixed").filter({ hasText: "Replace module content" });
+  await dialog.locator("input[type=file]").setInputFiles(path.join(FIXTURES, "xapi.zip"));
+  await dialog.getByRole("radio", { name: /Force restart on new version/ }).check();
+  await dialog.getByRole("button", { name: "Validate package" }).click();
+  await expect(dialog.getByRole("button", { name: /accept & upload/i })).toBeVisible({ timeout: 60_000 });
+  await dialog.getByRole("button", { name: /accept & upload/i }).click();
+  await expect(page.getByTestId("replace-result")).toHaveText("Replaced. No learners were in progress.", { timeout: 180_000 });
+
+  const versions = await versionsOf(courseId);
+  expect(versions.map((v) => [v.version_number, v.upload_status])).toEqual([[1, "ready"], [2, "ready"]]);
+  expect(await currentVersionId(courseId)).toBe(versions[1].id);
+  const row = page.locator(`[data-testid="version-row"][data-version-id="${versions[1].id}"]`);
+  await expect(row).toBeVisible({ timeout: 60_000 });
+  await expect(row).toContainText("current");
+  await adminCtx.close();
+});
+
 // The reaper also reaps other tenants: this test calls it only with
 // REAPER_E2E=1 (never against shared staging; its write is unit-tested).
 test("reaper: an 'uploading' row older than 24 h is swept to 'failed', not deleted", async ({ browser, baseURL }) => {

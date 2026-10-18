@@ -451,6 +451,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     expect(rep.ok(), `replace → ${rep.status()}: ${await rep.text()}`).toBeTruthy();
     const j = await rep.json();
     expect(j.restarted).toBe(1);
+    // ADR 0011: the reset is checked, not assumed — one selected, one reset.
+    expect(j.expected).toBe(1);
     s.cmi5NewVersion = j.version_id as string;
     expect(s.cmi5NewVersion).not.toBe(s.cmi5Version);
     expect((await row(s.cmi5Attempt!))?.status).toBe("abandoned");

@@ -140,6 +140,8 @@ export async function directUpload(
     filesFrom?: Buffer;
     /** Stop after init: the version stays 'uploading' (spec 54: a slot without a ready version). */
     initOnly?: boolean;
+    /** Replace-package semantics sent to finalize (ADR 0011 step 13); omitted = the route's default, grandfather. */
+    mode?: "grandfather" | "force_restart";
   }
 ): Promise<{
   validate: { status: number; body: Record<string, unknown> } | null;
@@ -192,7 +194,9 @@ export async function directUpload(
     const put = await req.put(u.url, { headers: u.headers, data: await source.file(u.path)!.async("nodebuffer") });
     expect(put.ok(), `PUT ${u.path} → ${put.status()}`).toBeTruthy();
   }
-  const fin = await req.post("/api/courses/upload/finalize", { data: { orgSlug: opts.orgSlug, versionId } });
+  const fin = await req.post("/api/courses/upload/finalize", {
+    data: { orgSlug: opts.orgSlug, versionId, ...(opts.mode ? { mode: opts.mode } : {}) },
+  });
   return {
     validate,
     init: { status: init.status(), body: initBody },
