@@ -241,6 +241,10 @@ A course's `version_id` is the current version of its default language
 (chosen by an admin with "Set as default"); uploading to or switching
 versions in any other language never changes it, and while the default
 language is hidden from learners the course is `"unavailable"`.
+`analytics_tier` (optional; present once the ALDS P4 build is enabled on
+the environment): the Package Guardian tier of that version —
+`unverified | pending | uncertified | certified | revoked`; informational,
+it never affects `status` or progress.
 
 **`GET|POST /api/integrations/progress`** — a page of learners, each with
 every course, learning path and journey they hold. Same status, score,
