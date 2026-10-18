@@ -264,6 +264,7 @@ declare
   n bigint;
   m bigint;
   txt text;
+  txt2 text;
 begin
   -- C03 duplicate (course_id, version_number) pairs
   begin
@@ -605,29 +606,42 @@ begin
   end;
 
   -- D09 current versions without any package_validations row (input to the
-  -- owner's validate_existing runs, ADR 0007 decision 6)
+  -- owner's validate_existing runs, ADR 0007 decision 6). The Library's
+  -- "Validate now" button (action validate_existing) scans the COURSE DEFAULT
+  -- version only, so the other slots are listed separately.
   begin
     if to_regclass('public.package_validations') is null then
       insert into pg_temp.release_audit values ('D09', 'data',
-        'current versions with no package_validations row (non-qa)', 'table absent',
-        'no error', 'no error', 'no error', 'package_validations is missing: production is below 0070 (see B0070).');
+        'current versions (one per slot) with no package_validations row (non-qa)', 'table absent',
+        'no error', 'no error', 'no error', 'package_validations is missing: production is below 0070 (see B0070): STOP.');
     else
-      select count(*), string_agg(x, ' | ' order by x) into n, txt from (
-        select 'course ' || p.course_id || ' slot ' || coalesce(p.language, 'default') || ' version ' || v.id as x
+      with cur as (
+        select p.course_id, coalesce(p.language, 'default') as lang, v.id as version_id,
+               (c.current_version_id = v.id) as is_default
         from public.course_packages p
         join public.course_versions v on v.id = p.current_version_id
         join public.courses c on c.id = p.course_id
         left join public.organizations o on o.id = c.organization_id
         where not coalesce(o.slug like 'qa-%', false)
-          and not exists (select 1 from public.package_validations pv where pv.course_version_id = v.id)) d;
+          and not exists (select 1 from public.package_validations pv where pv.course_version_id = v.id))
+      select count(*),
+             string_agg(case when is_default then 'course ' || course_id || ' (' || lang || ', version ' || version_id || ')' end,
+                        ' | ' order by course_id),
+             string_agg(case when not is_default then 'course ' || course_id || ' (' || lang || ', version ' || version_id || ')' end,
+                        ' | ' order by course_id, lang)
+        into n, txt, txt2
+      from cur;
       insert into pg_temp.release_audit values ('D09', 'data',
         'current versions (one per slot) with no package_validations row (non-qa)', n::text,
         'info', 'info', 'info',
-        'Each course listed gets one validate_existing run after the v1.3.0 deploy (ADR 0007 decision 6; Library -> course -> Validate). List: ' || coalesce(left(txt, 3000), 'none'));
+        'After the v1.3.0 deploy: course defaults are scanned with Library -> the course page -> "Validate now" (ADR 0007 decision 6): '
+          || coalesce(left(txt, 2500), 'none')
+          || '. Other slots (the button scans only the course default; no app path validates them today): '
+          || coalesce(left(txt2, 2500), 'none') || '.');
     end if;
   exception when others then
     insert into pg_temp.release_audit values ('D09', 'data',
-      'current versions with no package_validations row (non-qa)',
+      'current versions (one per slot) with no package_validations row (non-qa)',
       'ERROR ' || sqlstate || ': ' || sqlerrm, 'no error', 'no error', 'no error', 'Read the error; stop and ask.');
   end;
 
