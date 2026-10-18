@@ -54,9 +54,9 @@ async function main() {
   console.log("\n(ii) hash over LF / UTF-8 without BOM");
   eq("hash = sha256 of the LF text bytes", a.hash, `sha256:${createHash("sha256").update(Buffer.from(a.text, "utf8")).digest("hex")}`);
   eq("CRLF variant hashes the same", mod.bundleHash(a.text.replace(/\n/g, "\r\n")), a.hash);
-  eq("BOM-prefixed variant hashes the same", mod.bundleHash(`﻿${a.text}`), a.hash);
+  eq("BOM-prefixed variant hashes the same", mod.bundleHash(`\uFEFF${a.text}`), a.hash);
   eq("a one-character change does not", mod.bundleHash(`${a.text} `) === a.hash, false);
-  eq("normalizeBundleText strips the BOM and CR", mod.normalizeBundleText("﻿a\r\nb\rc\n"), "a\nb\nc\n");
+  eq("normalizeBundleText strips the BOM and CR", mod.normalizeBundleText("\uFEFFa\r\nb\rc\n"), "a\nb\nc\n");
 
   console.log("\n(iii) bundle shape");
   eq("pure ASCII", /[^\x00-\x7f]/.test(a.text), false);
