@@ -29,6 +29,12 @@
  *     validate_existing still records its audit row (server writes; run now)
  *   - a `user` session reads no validation row; the admin session reads its
  *     organisation's (select policy; run now)
+ *   - reject (a server write since ADR 0008 step 18): pending → rejected; a
+ *     second reject and another qa organisation's row → 404, that row
+ *     unchanged (run now)
+ *   - ADR 0008 D1: a refused finalize into a course that is kept leaves the
+ *     version row 'failed' with size 0, the course and its current version
+ *     unchanged, and the next upload takes the next number (run now)
  *   - an admin session's PostgREST PATCH of overridden_at / verdict / report
  *     on a pending blocked row, an INSERT and a DELETE → refused, row
  *     unchanged                                                (needs 0099)
@@ -382,6 +388,80 @@ test.describe.serial("ADR 0004 — content-integrity check", () => {
     const { data: adminSeen, error: adminErr } = await adminDb.from("package_validations").select("id").eq("organization_id", s.org!.id);
     expect(adminErr).toBeNull();
     expect((adminSeen ?? []).length, "the admin reads every row of the organisation").toBe(count);
+  });
+
+  test("ADR 0008 C: reject is a server write bound to the organisation and to a pending row", async ({ browser, baseURL }) => {
+    const areq = s.adminCtx!.request;
+    const rowOf = async (id: string) =>
+      (await svc().from("package_validations").select("status, organization_id").eq("id", id).single()).data as { status: string; organization_id: string };
+    const reject = (id: string) => areq.post("/api/courses/validate-package", { data: { action: "reject", orgSlug: s.org!.slug, validation_id: id } });
+    const zip = await cmi5Zip({ courseId: "urn:elearning-engine:qa-integrity-reject", title: "QA Integrity Reject" });
+
+    const v = await areq.post("/api/courses/validate-package", { multipart: { orgSlug: s.org!.slug, file: zipFile("reject.zip", zip) } });
+    expect(v.status(), await v.text()).toBe(200);
+    const id = (await v.json()).validation_id as string;
+    expect(await rowOf(id)).toEqual({ status: "pending", organization_id: s.org!.id });
+    const first = await reject(id);
+    expect(first.status(), await first.text()).toBe(200);
+    expect(await rowOf(id), "the row is rejected").toEqual({ status: "rejected", organization_id: s.org!.id });
+    const again = await reject(id);
+    expect(again.status(), "a second reject finds no pending row").toBe(404);
+
+    // Another qa organisation's pending row: this admin's reject is scoped to
+    // their own organisation, so it matches nothing and the row stays.
+    const other = await createOrg({ name: "QA Integrity Reject Other" });
+    expect(other.slug.startsWith("qa-")).toBeTruthy();
+    const otherAdmin = await createAuthUser({ profile: { first_name: "Integ", last_name: "OtherAdmin", must_change_password: false } });
+    await addMember({ organizationId: other.id, userId: otherAdmin.id, role: "admin" });
+    const octx = await authedContext(browser, baseURL!, otherAdmin.email, otherAdmin.password);
+    const ov = await octx.request.post("/api/courses/validate-package", { multipart: { orgSlug: other.slug, file: zipFile("reject-other.zip", zip) } });
+    expect(ov.status(), await ov.text()).toBe(200);
+    const otherId = (await ov.json()).validation_id as string;
+    await octx.close();
+    const cross = await reject(otherId);
+    expect(cross.status(), "another organisation's row is not found").toBe(404);
+    expect(await rowOf(otherId), "…and unchanged").toEqual({ status: "pending", organization_id: other.id });
+  });
+
+  test("ADR 0008 D1: a refused finalize into a kept course leaves its version 'failed' and the course as it was", async () => {
+    const areq = s.adminCtx!.request;
+    const Y_ID = "urn:elearning-engine:qa-integrity-kept";
+    const Y_TITLE = "QA Integrity Kept";
+    const up = await uploadNew(areq, s.org!.slug, "kept.zip", await cmi5Zip({ courseId: Y_ID, title: Y_TITLE }));
+    expect(up.status(), await up.text()).toBe(200);
+    const courseY = (await up.json()).courseId as string;
+    const courseRow = async () => (await svc().from("courses").select("id, current_version_id").eq("id", courseY).maybeSingle()).data;
+    const before = await courseRow();
+    expect(before?.current_version_id, "course Y has a current version").toBeTruthy();
+    const { data: pkg } = await svc().from("course_packages").select("id").eq("course_id", courseY).single();
+    const pkgY = (pkg as { id: string }).id;
+
+    // Validated bytes are Y's own; the stored bytes carry course X's id, so
+    // finalize refuses them (the collision is found on what was stored).
+    const clean = await cmi5Zip({ courseId: Y_ID, title: Y_TITLE, marker: "kept-v2" });
+    const wrong = await cmi5Zip({ courseId: X_ID, title: Y_TITLE, marker: "kept-v2" });
+    const r = await directUpload(areq, { orgSlug: s.org!.slug, buffer: clean, name: "kept-v2.zip", courseId: courseY, packageId: pkgY, filesFrom: wrong, acknowledge: true });
+    expect(r.init?.status, JSON.stringify(r.init?.body)).toBe(200);
+    expect(r.finalize?.status, JSON.stringify(r.finalize?.body)).toBe(409);
+    expect(String(r.finalize?.body.error)).toMatch(BLOCKED);
+    expect(r.finalize?.body.retryable).toBe(false);
+
+    const { data: refused } = await svc().from("course_versions").select("upload_status, size_bytes, version_number").eq("id", r.versionId!).maybeSingle();
+    expect(refused, "the refused version keeps its row, emptied").toMatchObject({ upload_status: "failed", size_bytes: 0 });
+    expect(await courseRow(), "the course is kept with its current version").toEqual(before);
+
+    // The number stays taken: the next upload into the slot moves on.
+    const next = await directUpload(areq, {
+      orgSlug: s.org!.slug,
+      buffer: await cmi5Zip({ courseId: Y_ID, title: Y_TITLE, marker: "kept-v3" }),
+      name: "kept-v3.zip",
+      courseId: courseY,
+      packageId: pkgY,
+      acknowledge: true,
+    });
+    expect(next.finalize?.status, JSON.stringify(next.finalize?.body)).toBe(200);
+    const { data: nv } = await svc().from("course_versions").select("version_number").eq("id", next.versionId!).single();
+    expect((nv as { version_number: number }).version_number).toBe((refused as { version_number: number }).version_number + 1);
   });
 
   // ---- needs 0098: rows with verdict 'blocked' and the override columns ----
