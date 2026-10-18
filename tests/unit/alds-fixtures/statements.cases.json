@@ -174,6 +174,11 @@
     { "name": "S4 boundary: question/run 0", "base": "run-summary", "patch": [["set", ["context", "extensions", "E:question/run"], 0]], "expect": [["S4", "run_missing", { "path": "context.extensions[E:question/run]" }]] },
     { "name": "S2 boundary: passed at exactly masteryScore", "base": "passed", "patch": [["set", ["result", "score", "scaled"], 0.8]], "expect": [] },
     { "name": "SEM a duplicated pattern entry is not the manifest key", "base": "answered-choice", "patch": [["set", ["object", "definition", "correctResponsesPattern"], ["o1", "o1"]]], "expect": [["SEM", "pattern_differs_from_manifest", { "path": "object.definition.correctResponsesPattern" }]] },
-    { "name": "S3 a language map key matches the question language case-insensitively", "base": "answered-choice", "patch": [["set", ["object", "definition", "name"], { "en-in": "Question 3" }]], "expect": [] }
+    { "name": "S3 a language map key matches the question language case-insensitively", "base": "answered-choice", "patch": [["set", ["object", "definition", "name"], { "en-in": "Question 3" }]], "expect": [] },
+
+    { "name": "S2 satisfied sent by content, even with the cmi5 category (LMS-only verb)", "base": "initialized", "patch": [["set", ["verb", "id"], "https://w3id.org/xapi/adl/verbs/satisfied"]], "expect": [["S2", "lms_verb_from_content", { "path": "verb.id" }]] },
+    { "name": "S2 launched sent by content (LMS-only verb)", "base": "progressed", "patch": [["set", ["verb", "id"], "http://adlnet.gov/expapi/verbs/launched"]], "expect": [["S2", "lms_verb_from_content", { "path": "verb.id" }]] },
+    { "name": "S2 abandoned sent by content (LMS-only verb)", "base": "terminated", "patch": [["set", ["verb", "id"], "https://w3id.org/xapi/adl/verbs/abandoned"]], "expect": [["S2", "lms_verb_from_content", { "path": "verb.id" }]] },
+    { "name": "S2 waived sent by content (LMS-only verb)", "base": "completed", "patch": [["set", ["verb", "id"], "https://w3id.org/xapi/adl/verbs/waived"]], "expect": [["S2", "lms_verb_from_content", { "path": "verb.id" }]] }
   ]
 }

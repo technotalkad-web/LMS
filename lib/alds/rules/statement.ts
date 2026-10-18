@@ -11,6 +11,11 @@
  *                 statement's package id with the §1.2 formula)
  * The result's `checked` lists the rules actually evaluated.
  *
+ * Every input is taken as sent by content (the AU). Rows the LMS records
+ * itself (cmi5 LMS-defined verbs) must not be passed here: a launched,
+ * abandoned, waived or satisfied statement is reported as S2
+ * lms_verb_from_content. checkSession takes the LMS rows' ids instead.
+ *
  * Decisions taken here (listed for the owner/architect, see the PR):
  *   - S3 is class-aware: `result.success` is required on `answered` unless the
  *     manifest classes the question `unscored` (ADR 0005 step 6 "success must
@@ -308,6 +313,10 @@ export function checkStatement(statement: unknown, ctx: StatementContext = {}): 
   } else if (cls === "answered" || cls === "other") {
     if (hasCmi5) r.add("S2", "cmi5_category_on_non_defined", "only cmi5-defined statements carry the cmi5 category", { path: "context.contextActivities.category" });
     if (hasMoveOn) r.add("S2", "moveon_category_on_non_defined", "only completed/passed/failed on the AU carry the moveOn category", { path: "context.contextActivities.category" });
+  } else if (cls === "lms-defined") {
+    // launched, abandoned, waived, satisfied: the LMS sends these, never the AU (cmi5 §9.3);
+    // S2's five AU verbs are the only cmi5-defined statements content may send
+    r.add("S2", "lms_verb_from_content", "launched/abandoned/waived/satisfied are sent by the LMS only, never by content", { path: "verb.id" });
   }
 
   // --- S6: Browse/Review launches ----------------------------------------------------

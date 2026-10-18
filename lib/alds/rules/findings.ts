@@ -8,7 +8,7 @@
  * |------|------------------------------------------|------------------|-------------|
  * | G1   | BLUEPRINT §5.2 G1 (actor/verb/object)     | checkStatement   | package     |
  * | S1   | §1.3 S1 contextTemplate as the base       | checkStatement   | lms         |
- * | S2   | §1.3 S2 cmi5-defined statements           | checkStatement   | package     |
+ * | S2   | §1.3 S2 cmi5-defined statements; no LMS-only verb from content | checkStatement | package |
  * | S3   | §1.3 S3 `answered` shape                  | checkStatement   | package     |
  * | S4   | §1.3 S4 quiz-run summary                  | checkStatement   | package     |
  * | S5   | §1.3 S5 text not truncated                | checkStatement   | package     |
@@ -21,15 +21,23 @@
  * | R3   | §7 R3 (qid, language) in the catalogue    | checkStatement   | package     |
  * | SEM  | ADR 0005 step 6 semantic check vs the key | checkStatement   | package     |
  * | POOL | ADR 0005 step 5 pools / drawn set         | both             | package     |
- * | G3   | §5.2 G3 order within a session            | checkSession     | package; `session_reinitialized` lms |
- * | R5   | §7 R5 once per registration               | checkSession     | package     |
+ * | G3   | §5.2 G3 order within a session; no failed after passed | checkSession | package (`session_reopened` is a warning, an open decision: session.ts) |
+ * | R5   | §7 R5 per-registration clause (≤ 1 completed, ≤ 1 passed) | checkSession | package |
  * | U1   | §2 U1 manifest parses, standardVersion    | checkPackage     | package     |
  * | U2   | §2 U2 publisherIds in the real XML        | checkPackage     | package     |
  * | U3   | §2 U3 contentHash recomputes              | checkPackage     | package     |
  * | U4   | §2 U4 language/script (informational)     | checkPackage     | package     |
  * | U5   | §2 U5 known rulesBundleHash               | checkPackage     | package     |
  * | U7   | §2 U7 exactly one AU                      | checkPackage     | package     |
- * | R4   | §7 R4 declared language vs the slot       | checkPackage     | package     |
+ * | R4   | §7 R4 first clause: declared language vs the slot | checkPackage | package |
+ *
+ * R4 and R5 reuse the ids of two §7 reconciliation invariants that
+ * docs/ARCHITECTURE.md §5 lists as cut or deferred with registrations and the
+ * gateway. Here each id names only the clause checked: R4 the manifest
+ * language against course_packages.language (by primary subtag, at upload);
+ * R5 at most one AU-level completed and one passed per registration (a clause
+ * §5.2 G3 states as well). "failed after passed" is G3 only. No reconciliation
+ * job is built by P3.
  *
  * Attribution follows ADR 0005 step 7: package-attributable findings count
  * toward a version's revoke threshold; LMS-attributable ones (S1/S7 template,

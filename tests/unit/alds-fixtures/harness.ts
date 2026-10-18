@@ -8,7 +8,9 @@
  *   base.json              valid documents: manifest, LaunchData, cmi5.xml,
  *                          one statement per kind (all pass)
  *   statements.cases.json  checkStatement cases: base + patch → expected findings
- *   sessions.cases.json    checkSession cases: a list of steps → expected findings
+ *   sessions.cases.json    checkSession cases: a list of steps → expected findings;
+ *                          a step {base, patch?, origin: "lms"} is a row the LMS
+ *                          recorded (its id goes to ctx.lmsStatementIds)
  *   packages.cases.json    checkPackage cases (mini-packages): patch → expected findings
  *
  * Patch ops (paths are arrays; "E:x" = the ALDS extension namespace + x,
@@ -119,6 +121,10 @@ export function applyPatch(root: unknown, ops: PatchOp[] = [], extra?: (op: Patc
   return doc;
 }
 
+function isObjStep(s: unknown): s is { base: string; patch?: PatchOp[]; origin?: string } {
+  return typeof s === "object" && s !== null && !Array.isArray(s);
+}
+
 /** A step "name" or "name#n": the base statement; #n gives it a fresh deterministic id. */
 function stepStatement(base: Base, step: unknown): unknown {
   const spec = typeof step === "string" ? { base: step } : (step as { base: string; patch?: PatchOp[] });
@@ -172,11 +178,15 @@ export function loadGolden(): { base: Base; cases: GoldenCase[] } {
     cases.push({
       kind: "session",
       name: c.name,
-      run: (api) =>
-        api.checkSession(
-          c.input !== undefined ? (clone(c.input) as unknown[]) : (c.steps ?? []).map((s) => stepStatement(base, s)),
-          c.context === "bare" ? {} : { launchData: clone(base.launchData) },
-        ),
+      run: (api) => {
+        const steps = c.steps ?? [];
+        const statements = c.input !== undefined ? (clone(c.input) as unknown[]) : steps.map((s) => stepStatement(base, s));
+        const lmsStatementIds =
+          c.input !== undefined ? [] : steps.flatMap((s, i) => (isObjStep(s) && s.origin === "lms" ? [String((statements[i] as { id?: unknown }).id)] : []));
+        const ctx: Record<string, unknown> = c.context === "bare" ? {} : { launchData: clone(base.launchData) };
+        if (lmsStatementIds.length > 0) ctx.lmsStatementIds = lmsStatementIds;
+        return api.checkSession(statements, ctx);
+      },
       expect: c.expect,
       expectOk: c.ok,
     });
