@@ -1,0 +1,1604 @@
+{
+  "$comment": "Golden base documents for the ALDS rules (ADR 0005 step 9). Every statement here passes checkStatement with { manifest, launchData }; the package passes checkPackage. Cases in alds-fixtures/*.cases.json patch these. Content hashes were computed with lib/alds/rules/content-hash.ts and are pinned: a change to the hash definition fails the U3 cases.",
+  "manifest": {
+    "standardVersion": "2.0",
+    "engineVersion": "2026.11.02.1",
+    "courseUlid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+    "courseTitle": "Home Loan Basics",
+    "courseVersion": "2.0.0",
+    "packageBuild": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+    "language": "en-IN",
+    "manifestType": "cmi5",
+    "publisherIds": {
+      "course": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms",
+      "au": [
+        "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1"
+      ]
+    },
+    "rulesBundleHash": "sha256:abababababababababababababababababababababababababababababababab",
+    "questions": [
+      {
+        "qid": "01JCQ000000000000000000001",
+        "slideId": "3",
+        "kind": "choice",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:51996fad43bfde3f11c7f6ca2d80713ac80a8bfc85ab679fad5bb4beba1fd608",
+        "prompt": "Which document confirms the customer's income?",
+        "options": [
+          {
+            "oid": "o1",
+            "label": "Salary slip"
+          },
+          {
+            "oid": "o2",
+            "label": "PAN card"
+          },
+          {
+            "oid": "o3",
+            "label": "Ration card"
+          }
+        ],
+        "correct": [
+          "o1"
+        ],
+        "authoringKind": "choice"
+      },
+      {
+        "qid": "01JCQ000000000000000000002",
+        "slideId": "4",
+        "kind": "true-false",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:83a49e6e8d7f6271272c918298ab8ad77d21c4a55a01d03088ea776446932473",
+        "prompt": "A co-applicant can be added after sanction.",
+        "options": [],
+        "correct": [
+          "false"
+        ],
+        "authoringKind": "true-false"
+      },
+      {
+        "qid": "01JCQ000000000000000000003",
+        "slideId": "5",
+        "kind": "choice",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:8130d17f6845ecf1c36319e197916bbd6937c84d7451cf61ed4734d8843ad8be",
+        "prompt": "Select all mandatory KYC documents.",
+        "options": [
+          {
+            "oid": "o1",
+            "label": "Aadhaar"
+          },
+          {
+            "oid": "o2",
+            "label": "PAN"
+          },
+          {
+            "oid": "o3",
+            "label": "Voter ID"
+          },
+          {
+            "oid": "o4",
+            "label": "Club membership"
+          }
+        ],
+        "correct": [
+          "o1[,]o2"
+        ],
+        "authoringKind": "multi-response"
+      },
+      {
+        "qid": "01JCQ000000000000000000004",
+        "slideId": "6",
+        "kind": "fill-in",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:9be477dcb3ce58c762564651cb815f0c621c3cbe337eeb2784b1676c5b546bb5",
+        "prompt": "EMI stands for Equated Monthly ____.",
+        "options": [],
+        "correct": [
+          "{case_matters=false}Instalment",
+          "{case_matters=false}Installment"
+        ],
+        "authoringKind": "fill-in"
+      },
+      {
+        "qid": "01JCQ000000000000000000005",
+        "slideId": "7",
+        "kind": "matching",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:eebe76a505cb3d5453164eb6f89add9269d4b71b36cd09b0bc27f4022ab932b2",
+        "prompt": "Match each term to its meaning.",
+        "options": [
+          {
+            "oid": "o1",
+            "label": "LTV"
+          },
+          {
+            "oid": "o2",
+            "label": "FOIR"
+          },
+          {
+            "oid": "o3",
+            "label": "Loan to value"
+          },
+          {
+            "oid": "o4",
+            "label": "Fixed obligations to income ratio"
+          }
+        ],
+        "correct": [
+          "o1[.]o3[,]o2[.]o4"
+        ],
+        "authoringKind": "drag-match"
+      },
+      {
+        "qid": "01JCQ000000000000000000006",
+        "slideId": "8",
+        "kind": "sequencing",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:6475ea9ba2ab45ab85273f9836699eff8a8eae5e2a9affb567558ff275ab221f",
+        "prompt": "Put the loan steps in order.",
+        "options": [
+          {
+            "oid": "o1",
+            "label": "Application"
+          },
+          {
+            "oid": "o2",
+            "label": "Sanction"
+          },
+          {
+            "oid": "o3",
+            "label": "Disbursal"
+          }
+        ],
+        "correct": [
+          "o1[,]o2[,]o3"
+        ],
+        "authoringKind": "sequencing"
+      },
+      {
+        "qid": "01JCQ000000000000000000007",
+        "slideId": "9",
+        "kind": "likert",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:ab9b37cb5720d4fc1a8fc65adeba8873ca64fc0ca8ec94e26c1e8399dbdc3f81",
+        "prompt": "How useful was this module?",
+        "options": [
+          {
+            "oid": "o1",
+            "label": "Not useful"
+          },
+          {
+            "oid": "o2",
+            "label": "Useful"
+          },
+          {
+            "oid": "o3",
+            "label": "Very useful"
+          }
+        ],
+        "correct": [],
+        "authoringKind": "feedback"
+      },
+      {
+        "qid": "01JCQ000000000000000000008",
+        "slideId": "10",
+        "kind": "other",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:31ee080e4c209373fe113fd794947f79582b938d3ec4c21d93d6af7974eee4d5",
+        "prompt": "Handle the customer's objection about the processing fee.",
+        "options": [],
+        "correct": [],
+        "authoringKind": "dialogue"
+      },
+      {
+        "qid": "01JCQ000000000000000000009",
+        "slideId": "11",
+        "kind": "other",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:167cbdc90b2ad84657ebeb88d42b3172f0f75c7a650d268d14f68a9556d3f689",
+        "prompt": "Find the signature box on the form.",
+        "options": [],
+        "correct": [],
+        "authoringKind": "hotspot"
+      },
+      {
+        "qid": "01JCQ000000000000000000010",
+        "slideId": "12",
+        "kind": "numeric",
+        "language": "en-IN",
+        "revision": 1,
+        "contentHash": "sha256:aea7542ea3d3f5153e24660233e6c96d1e3189ad6b351d479bb78836e1099e19",
+        "prompt": "What is the highest LTV, in percent, for a loan above 75 lakh?",
+        "options": [],
+        "correct": [
+          "75"
+        ]
+      }
+    ],
+    "quizzes": [
+      {
+        "quizId": "asmt1",
+        "slideId": "12",
+        "bankQids": [
+          "01JCQ000000000000000000001",
+          "01JCQ000000000000000000002",
+          "01JCQ000000000000000000003"
+        ],
+        "drawCount": 2,
+        "retakesAllowed": true,
+        "pools": [
+          {
+            "tags": [
+              "kyc"
+            ],
+            "draw": 2,
+            "candidateQids": [
+              "01JCQ000000000000000000001",
+              "01JCQ000000000000000000002",
+              "01JCQ000000000000000000003"
+            ]
+          }
+        ]
+      }
+    ],
+    "selfCheck": {
+      "reportHash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "engineDigest": "sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "kindsCovered": [
+        "choice",
+        "true-false",
+        "multi-response",
+        "fill-in",
+        "drag-match",
+        "sequencing",
+        "feedback",
+        "dialogue",
+        "hotspot"
+      ]
+    }
+  },
+  "launchData": {
+    "contextTemplate": {
+      "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+      "contextActivities": {
+        "grouping": [
+          {
+            "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+          },
+          {
+            "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+          }
+        ]
+      },
+      "extensions": {
+        "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+        "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+        "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+        "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+        "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+        "https://ambak.com/xapi/ext/content/language": "en-IN"
+      }
+    },
+    "launchMode": "Normal",
+    "masteryScore": 0.8,
+    "moveOn": "CompletedOrPassed",
+    "returnURL": "https://lms.example.test/ambak/courses/x"
+  },
+  "cmi5Xml": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<courseStructure xmlns=\"https://w3id.org/xapi/profiles/cmi5/v1/CourseStructure.xsd\" xmlns:alds=\"https://ambak.com/xapi/alds/2.0\">\n  <course id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms\">\n    <title><langstring lang=\"en-IN\">Home Loan Basics</langstring></title>\n    <description><langstring lang=\"en-IN\">Basics</langstring></description>\n    <alds:manifest href=\"alds-manifest.json\"/>\n  </course>\n  <!-- <au id=\"commented-out\"> is ignored -->\n  <au id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1\" moveOn=\"CompletedOrPassed\" masteryScore=\"0.8\">\n    <title><langstring lang=\"en-IN\">Home Loan Basics</langstring></title>\n    <description><langstring lang=\"en-IN\">Basics</langstring></description>\n    <url>index.html</url>\n  </au>\n</courseStructure>",
+  "knownBundleHashes": [
+    "sha256:abababababababababababababababababababababababababababababababab",
+    "sha256:0101010101010101010101010101010101010101010101010101010101010101"
+  ],
+  "slotLanguage": "en",
+  "statements": {
+    "initialized": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000001",
+      "timestamp": "2026-11-03T10:00:05.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/initialized",
+        "display": {
+          "en-US": "initialized"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/au/3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f/1"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ],
+          "category": [
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/cmi5"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN"
+        }
+      }
+    },
+    "answered-choice": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000002",
+      "timestamp": "2026-11-03T10:00:10.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000001/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 3"
+          },
+          "description": {
+            "en-IN": "Which document confirms the customer's income?"
+          },
+          "interactionType": "choice",
+          "correctResponsesPattern": [
+            "o1"
+          ],
+          "choices": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "Salary slip"
+              }
+            },
+            {
+              "id": "o2",
+              "description": {
+                "en-IN": "PAN card"
+              }
+            },
+            {
+              "id": "o3",
+              "description": {
+                "en-IN": "Ration card"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "response": "o1",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000001"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000001",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:51996fad43bfde3f11c7f6ca2d80713ac80a8bfc85ab679fad5bb4beba1fd608",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true,
+          "https://ambak.com/xapi/ext/question/display-order": [
+            "o3",
+            "o1",
+            "o2"
+          ],
+          "https://ambak.com/xapi/ext/question/run": 1
+        }
+      }
+    },
+    "answered-true-false": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000003",
+      "timestamp": "2026-11-03T10:00:15.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000002/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 4"
+          },
+          "description": {
+            "en-IN": "A co-applicant can be added after sanction."
+          },
+          "interactionType": "true-false",
+          "correctResponsesPattern": [
+            "false"
+          ]
+        }
+      },
+      "result": {
+        "response": "false",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000002"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000002",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:83a49e6e8d7f6271272c918298ab8ad77d21c4a55a01d03088ea776446932473",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true,
+          "https://ambak.com/xapi/ext/question/run": 1
+        }
+      }
+    },
+    "answered-multi": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000004",
+      "timestamp": "2026-11-03T10:00:20.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000003/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 5"
+          },
+          "description": {
+            "en-IN": "Select all mandatory KYC documents."
+          },
+          "interactionType": "choice",
+          "correctResponsesPattern": [
+            "o1[,]o2"
+          ],
+          "choices": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "Aadhaar"
+              }
+            },
+            {
+              "id": "o2",
+              "description": {
+                "en-IN": "PAN"
+              }
+            },
+            {
+              "id": "o3",
+              "description": {
+                "en-IN": "Voter ID"
+              }
+            },
+            {
+              "id": "o4",
+              "description": {
+                "en-IN": "Club membership"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "response": "o2[,]o1",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000003"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000003",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:8130d17f6845ecf1c36319e197916bbd6937c84d7451cf61ed4734d8843ad8be",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true,
+          "https://ambak.com/xapi/ext/question/display-order": [
+            "o4",
+            "o2",
+            "o1",
+            "o3"
+          ],
+          "https://ambak.com/xapi/ext/question/run": 1
+        }
+      }
+    },
+    "answered-fill-in": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000005",
+      "timestamp": "2026-11-03T10:00:25.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000004/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 6"
+          },
+          "description": {
+            "en-IN": "EMI stands for Equated Monthly ____."
+          },
+          "interactionType": "fill-in",
+          "correctResponsesPattern": [
+            "{case_matters=false}Instalment",
+            "{case_matters=false}Installment"
+          ]
+        }
+      },
+      "result": {
+        "response": "installment",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000004"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000004",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:9be477dcb3ce58c762564651cb815f0c621c3cbe337eeb2784b1676c5b546bb5",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true
+        }
+      }
+    },
+    "answered-matching": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000006",
+      "timestamp": "2026-11-03T10:00:30.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000005/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 7"
+          },
+          "description": {
+            "en-IN": "Match each term to its meaning."
+          },
+          "interactionType": "matching",
+          "correctResponsesPattern": [
+            "o1[.]o3[,]o2[.]o4"
+          ],
+          "source": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "LTV"
+              }
+            },
+            {
+              "id": "o2",
+              "description": {
+                "en-IN": "FOIR"
+              }
+            }
+          ],
+          "target": [
+            {
+              "id": "o3",
+              "description": {
+                "en-IN": "Loan to value"
+              }
+            },
+            {
+              "id": "o4",
+              "description": {
+                "en-IN": "Fixed obligations to income ratio"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "response": "o2[.]o4[,]o1[.]o3",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000005"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000005",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:eebe76a505cb3d5453164eb6f89add9269d4b71b36cd09b0bc27f4022ab932b2",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true
+        }
+      }
+    },
+    "answered-sequencing": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000007",
+      "timestamp": "2026-11-03T10:00:35.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000006/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 8"
+          },
+          "description": {
+            "en-IN": "Put the loan steps in order."
+          },
+          "interactionType": "sequencing",
+          "correctResponsesPattern": [
+            "o1[,]o2[,]o3"
+          ],
+          "choices": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "Application"
+              }
+            },
+            {
+              "id": "o2",
+              "description": {
+                "en-IN": "Sanction"
+              }
+            },
+            {
+              "id": "o3",
+              "description": {
+                "en-IN": "Disbursal"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "response": "o1[,]o2[,]o3",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000006"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000006",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:6475ea9ba2ab45ab85273f9836699eff8a8eae5e2a9affb567558ff275ab221f",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true,
+          "https://ambak.com/xapi/ext/question/display-order": [
+            "o2",
+            "o3",
+            "o1"
+          ]
+        }
+      }
+    },
+    "answered-likert-feedback": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000008",
+      "timestamp": "2026-11-03T10:00:40.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000007/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 9"
+          },
+          "description": {
+            "en-IN": "How useful was this module?"
+          },
+          "interactionType": "likert",
+          "scale": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "Not useful"
+              }
+            },
+            {
+              "id": "o2",
+              "description": {
+                "en-IN": "Useful"
+              }
+            },
+            {
+              "id": "o3",
+              "description": {
+                "en-IN": "Very useful"
+              }
+            }
+          ]
+        }
+      },
+      "result": {
+        "response": "o3",
+        "duration": "PT20S"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000007"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000007",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:ab9b37cb5720d4fc1a8fc65adeba8873ca64fc0ca8ec94e26c1e8399dbdc3f81",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true
+        }
+      }
+    },
+    "answered-dialogue": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000009",
+      "timestamp": "2026-11-03T10:00:45.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000008/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 10"
+          },
+          "description": {
+            "en-IN": "Handle the customer's objection about the processing fee."
+          },
+          "interactionType": "other"
+        }
+      },
+      "result": {
+        "response": "branch-b",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000008"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000008",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:31ee080e4c209373fe113fd794947f79582b938d3ec4c21d93d6af7974eee4d5",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true
+        }
+      }
+    },
+    "answered-hotspot": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-00000000000a",
+      "timestamp": "2026-11-03T10:00:50.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000009/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 11"
+          },
+          "description": {
+            "en-IN": "Find the signature box on the form."
+          },
+          "interactionType": "other"
+        }
+      },
+      "result": {
+        "response": "signature-box",
+        "duration": "PT20S"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000009"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000009",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:167cbdc90b2ad84657ebeb88d42b3172f0f75c7a650d268d14f68a9556d3f689",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true
+        }
+      }
+    },
+    "answered-numeric": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-00000000000b",
+      "timestamp": "2026-11-03T10:00:55.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/answered",
+        "display": {
+          "en-US": "answered"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000010/en-in",
+        "definition": {
+          "type": "http://adlnet.gov/expapi/activities/cmi.interaction",
+          "name": {
+            "en-IN": "Question 12"
+          },
+          "description": {
+            "en-IN": "What is the highest LTV, in percent, for a loan above 75 lakh?"
+          },
+          "interactionType": "numeric",
+          "correctResponsesPattern": [
+            "75"
+          ]
+        }
+      },
+      "result": {
+        "response": "75",
+        "duration": "PT20S",
+        "success": true
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/question/01JCQ000000000000000000010"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000010",
+          "https://ambak.com/xapi/ext/question/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/revision": 1,
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:aea7542ea3d3f5153e24660233e6c96d1e3189ad6b351d479bb78836e1099e19",
+          "https://ambak.com/xapi/ext/question/try": 1,
+          "https://ambak.com/xapi/ext/question/final": true
+        }
+      }
+    },
+    "run-summary": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-00000000000c",
+      "timestamp": "2026-11-03T10:01:00.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/passed",
+        "display": {
+          "en-US": "passed"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/quiz/asmt1/en-in"
+      },
+      "result": {
+        "success": true,
+        "score": {
+          "scaled": 1
+        },
+        "duration": "PT2M"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN",
+          "https://ambak.com/xapi/ext/question/run": 1,
+          "https://ambak.com/xapi/ext/question/drawn": [
+            "01JCQ000000000000000000001",
+            "01JCQ000000000000000000002"
+          ]
+        }
+      }
+    },
+    "progressed": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-00000000000d",
+      "timestamp": "2026-11-03T10:01:05.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/progressed",
+        "display": {
+          "en-US": "progressed"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/au/3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f/1"
+      },
+      "result": {
+        "extensions": {
+          "https://w3id.org/xapi/cmi5/result/extensions/progress": 60
+        }
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN"
+        }
+      }
+    },
+    "completed": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-00000000000e",
+      "timestamp": "2026-11-03T10:01:10.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/completed",
+        "display": {
+          "en-US": "completed"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/au/3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f/1"
+      },
+      "result": {
+        "completion": true,
+        "duration": "PT9M"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ],
+          "category": [
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/cmi5"
+            },
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/moveon"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN"
+        }
+      }
+    },
+    "passed": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-00000000000f",
+      "timestamp": "2026-11-03T10:01:15.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/passed",
+        "display": {
+          "en-US": "passed"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/au/3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f/1"
+      },
+      "result": {
+        "success": true,
+        "score": {
+          "scaled": 0.9
+        },
+        "duration": "PT9M5S"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ],
+          "category": [
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/cmi5"
+            },
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/moveon"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN"
+        }
+      }
+    },
+    "failed": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000010",
+      "timestamp": "2026-11-03T10:01:20.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/failed",
+        "display": {
+          "en-US": "failed"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/au/3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f/1"
+      },
+      "result": {
+        "success": false,
+        "score": {
+          "scaled": 0.5
+        },
+        "duration": "PT9M5S"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ],
+          "category": [
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/cmi5"
+            },
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/moveon"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN"
+        }
+      }
+    },
+    "terminated": {
+      "id": "0b0c0d0e-0f10-4a11-8b12-000000000011",
+      "timestamp": "2026-11-03T10:01:25.000+05:30",
+      "actor": {
+        "objectType": "Agent",
+        "account": {
+          "homePage": "https://lms.example.test",
+          "name": "2f3e4d5c-6b7a-4980-8a1b-2c3d4e5f6a7b"
+        }
+      },
+      "verb": {
+        "id": "http://adlnet.gov/expapi/verbs/terminated",
+        "display": {
+          "en-US": "terminated"
+        }
+      },
+      "object": {
+        "objectType": "Activity",
+        "id": "https://ambak.com/xapi/activities/au/3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f/1"
+      },
+      "result": {
+        "duration": "PT10M"
+      },
+      "context": {
+        "registration": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+        "contextActivities": {
+          "grouping": [
+            {
+              "id": "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&channel=lms"
+            },
+            {
+              "id": "https://ambak.com/xapi/activities/course/01JAH7Q4ZB8K3T6W2M9XRV5C1N"
+            }
+          ],
+          "category": [
+            {
+              "id": "https://w3id.org/xapi/cmi5/context/categories/cmi5"
+            }
+          ]
+        },
+        "extensions": {
+          "https://ambak.com/xapi/ext/profile-version": "2.0",
+          "https://ambak.com/xapi/ext/content/standard-version": "2.0",
+          "https://ambak.com/xapi/ext/content/engine-version": "2026.11.02.1",
+          "https://ambak.com/xapi/ext/content/course-ulid": "01JAH7Q4ZB8K3T6W2M9XRV5C1N",
+          "https://ambak.com/xapi/ext/content/course-version": "2.0.0",
+          "https://ambak.com/xapi/ext/content/package-build": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "https://w3id.org/xapi/cmi5/context/extensions/sessionid": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/attempt/id": "5b8c3d2e-9f1a-4b6c-8d7e-1a2b3c4d5e6f",
+          "https://ambak.com/xapi/ext/registration/kind": "enrollment",
+          "https://ambak.com/xapi/ext/registration/attempt-index": 1,
+          "https://ambak.com/xapi/ext/content/package-id": "3f6c2a8e-1b4d-4c7a-9e2f-5a8b7c6d4e3f",
+          "https://ambak.com/xapi/ext/content/version-id": "7d1e9b2c-4a6f-4e8d-b3c5-2f1a0e9d8c7b",
+          "https://ambak.com/xapi/ext/content/language": "en-IN"
+        }
+      }
+    }
+  }
+}
