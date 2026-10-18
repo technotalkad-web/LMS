@@ -200,7 +200,7 @@ export function checkPackage(input: PackageInput): PackageResult {
       );
     }
   });
-  if (r.findings.length > before) return done(null);
+  if (r.findings.slice(before).some((f) => f.severity === "error")) return done(null);
   const m = raw as unknown as AldsPackageManifest;
 
   // R10 on the manifest key: every correct entry parses for its kind

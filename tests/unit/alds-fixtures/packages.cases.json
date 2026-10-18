@@ -1,0 +1,67 @@
+{
+  "$comment": "checkPackage golden cases (ADR 0005 step 9): mini-packages built from base.json (manifest, cmi5.xml, known bundle hashes, slot language 'en') with patches; the manifest is serialised unless manifestText is set. ['rehash', ['manifest','questions',i]] / ['rehashAll'] recompute content hashes after an edit that must not trip U3.",
+  "cases": [
+    { "name": "the base package passes every package rule", "expect": [], "checked": ["R10", "POOL", "U1", "U2", "U3", "U4", "U5", "U7", "R4"] },
+    { "name": "no alds-manifest.json: a Level 1 package, nothing to check", "patch": [["set", ["manifestText"], null]], "expect": [], "checked": [] },
+
+    { "name": "U1 manifest is not JSON", "patch": [["set", ["manifestText"], "{\"standardVersion\": \"2.0\","]], "expect": [["U1", "manifest_unparseable"]] },
+    { "name": "U1 manifest is a JSON array", "patch": [["set", ["manifestText"], "[]"]], "expect": [["U1", "manifest_unparseable"]] },
+    { "name": "U1 standardVersion 1.0 is not supported", "patch": [["set", ["manifest", "standardVersion"], "1.0"]], "expect": [["U1", "standard_version_unsupported"]] },
+    { "name": "U1 courseUlid is not a ULID", "patch": [["set", ["manifest", "courseUlid"], "home-loan-basics"]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 publisherIds.au is not an array", "patch": [["set", ["manifest", "publisherIds", "au"], "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1"]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 an option id that is not an oid", "patch": [["set", ["manifest", "questions", 0, "options", 0, "oid"], "option_0"]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 a duplicate oid in one question", "patch": [["set", ["manifest", "questions", 0, "options", 1, "oid"], "o1"]], "expect": [["U1", "option_id_duplicate"]] },
+    { "name": "U1 the same (qid, language) twice", "patch": [["push", ["manifest", "questions"], { "qid": "01JCQ000000000000000000001", "slideId": "30", "kind": "choice", "language": "en-IN", "revision": 1, "contentHash": "sha256:51996fad43bfde3f11c7f6ca2d80713ac80a8bfc85ab679fad5bb4beba1fd608", "prompt": "Which document confirms the customer's income?", "options": [{ "oid": "o1", "label": "Salary slip" }, { "oid": "o2", "label": "PAN card" }, { "oid": "o3", "label": "Ration card" }], "correct": ["o1"] }]], "expect": [["U1", "duplicate_question"]] },
+    { "name": "U1 a kind outside the xAPI interaction types", "patch": [["set", ["manifest", "questions", 0, "kind"], "dropdown"]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 manifestType differs from the package type", "patch": [["set", ["manifestType"], "xapi"]], "expect": [["U1", "manifest_type_mismatch"]] },
+    { "name": "U1 an unknown authoringKind is a warning and the class falls back to the key", "patch": [["set", ["manifest", "questions", 0, "authoringKind"], "carousel"]], "expect": [["U1", "authoring_kind_unknown", { "severity": "warn" }]], "ok": true },
+    { "name": "U1 selfCheck with a malformed report hash", "patch": [["set", ["manifest", "selfCheck", "reportHash"], "abc"]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 selfCheck is optional", "patch": [["del", ["manifest", "selfCheck"]]], "expect": [] },
+    { "name": "U1 a pool that draws 0", "patch": [["set", ["manifest", "quizzes", 0, "pools", 0, "draw"], 0]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 a quizId with a slash (breaks the quiz-run IRI)", "patch": [["set", ["manifest", "quizzes", 0, "quizId"], "asmt/1"]], "expect": [["U1", "manifest_field_invalid"]] },
+    { "name": "U1 drawCount 0", "patch": [["set", ["manifest", "quizzes", 0, "drawCount"], 0]], "expect": [["U1", "manifest_field_invalid"]] },
+
+    { "name": "R10 a manifest key outside the grammar", "patch": [["set", ["manifest", "questions", 1, "correct"], ["yes"]], ["rehash", ["manifest", "questions", 1]]], "expect": [["R10", "pattern_grammar"]] },
+    { "name": "R10 a multi-select key in the old comma form", "patch": [["set", ["manifest", "questions", 2, "correct"], ["o1, o2"]], ["rehash", ["manifest", "questions", 2]]], "expect": [["R10", "pattern_grammar"]] },
+
+    { "name": "U2 publisherIds.course not in cmi5.xml", "patch": [["set", ["manifest", "publisherIds", "course"], "urn:elearning-engine:home-loan-basics"]], "expect": [["U2", "publisher_course_id_not_found"]] },
+    { "name": "U2 publisher AU id not in cmi5.xml", "patch": [["set", ["manifest", "publisherIds", "au"], ["urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/2"]]], "expect": [["U2", "publisher_au_id_not_found"]] },
+    { "name": "U2 the course id must match after XML entity decoding, not before", "patch": [["set", ["manifest", "publisherIds", "course"], "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms"]], "expect": [["U2", "publisher_course_id_not_found"]] },
+    { "name": "U2 cmi5.xml missing", "patch": [["del", ["cmi5Xml"]]], "expect": [["U2", "launch_manifest_missing"]] },
+    { "name": "U2/U7 an AU that only exists inside an XML comment", "patch": [["set", ["cmi5Xml"], "<courseStructure><course id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms\"></course><!-- <au id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1\"> --></courseStructure>"]], "expect": [["U2", "publisher_au_id_not_found"], ["U7", "multi_au_unsupported"]] },
+    { "name": "U2 an xAPI (TinCan) package", "patch": [["set", ["manifestType"], "xapi"], ["set", ["manifest", "manifestType"], "xapi"], ["del", ["cmi5Xml"]], ["set", ["tincanXml"], "<?xml version=\"1.0\"?><tincan xmlns=\"http://projecttincan.com/tincan.xsd\"><activities><activity id='urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms' type=\"http://adlnet.gov/expapi/activities/course\"><name>Home Loan Basics</name></activity><activity id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1\" type=\"http://adlnet.gov/expapi/activities/module\"><launch lang=\"en-IN\">index.html</launch></activity></activities></tincan>"]], "expect": [] },
+    { "name": "U2 an xAPI package without tincan.xml", "patch": [["set", ["manifestType"], "xapi"], ["set", ["manifest", "manifestType"], "xapi"], ["del", ["cmi5Xml"]]], "expect": [["U2", "launch_manifest_missing"]] },
+    { "name": "U2 a SCORM 1.2 package (identifiers in imsmanifest.xml)", "patch": [["set", ["manifestType"], "scorm12"], ["set", ["manifest", "manifestType"], "scorm12"], ["del", ["cmi5Xml"]], ["set", ["imsManifestXml"], "<manifest identifier=\"MANIFEST-1\" xmlns:adlcp=\"http://www.adlnet.org/xsd/adlcp_rootv1p2\"><organizations default=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms\"><organization identifier=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms\"><item identifier=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1\" identifierref=\"RES-1\"><title>Home Loan Basics</title></item></organization></organizations><resources><resource identifier=\"RES-1\" type=\"webcontent\" adlcp:scormtype=\"sco\" href=\"index.html\"/></resources></manifest>"]], "expect": [] },
+
+    { "name": "U3 a contentHash that does not recompute", "patch": [["set", ["manifest", "questions", 4, "contentHash"], "sha256:0000000000000000000000000000000000000000000000000000000000000000"]], "expect": [["U3", "content_hash_mismatch"]] },
+    { "name": "U3 a prompt edited after the hash was computed", "patch": [["set", ["manifest", "questions", 0, "prompt"], "Which document proves the customer's income?"]], "expect": [["U3", "content_hash_mismatch"]] },
+    { "name": "U3 a key edited after the hash was computed", "patch": [["set", ["manifest", "questions", 1, "correct"], ["true"]]], "expect": [["U3", "content_hash_mismatch"]] },
+    { "name": "U3 an edit with a recomputed hash passes", "patch": [["set", ["manifest", "questions", 0, "prompt"], "Which document proves the customer's income?"], ["rehash", ["manifest", "questions", 0]]], "expect": [] },
+    { "name": "U3 a whitespace-only edit keeps the hash", "patch": [["set", ["manifest", "questions", 0, "prompt"], "  Which document  confirms the customer's income?\n"]], "expect": [] },
+
+    { "name": "U4 a malformed language tag is informational", "patch": [["set", ["manifest", "language"], "en_IN"], ["set", ["slotLanguage"], null]], "expect": [["U4", "language_malformed", { "severity": "info" }]], "ok": true },
+    { "name": "U4 a tag not in canonical case is informational", "patch": [["set", ["manifest", "language"], "en-in"]], "expect": [["U4", "language_not_canonical", { "severity": "info" }]], "ok": true },
+    { "name": "U4 an unmapped language is informational", "patch": [["set", ["manifest", "language"], "sr"], ["each", ["manifest", "questions"], "language", "sr"], ["rehashAll"], ["set", ["slotLanguage"], "sr"]], "expect": [["U4", "language_unmapped", { "severity": "info" }]], "ok": true },
+    { "name": "U4 Hindi declared, prompts in Latin script: informational only (ADR 0004 step 6)", "patch": [["set", ["manifest", "language"], "hi"], ["each", ["manifest", "questions"], "language", "hi"], ["rehashAll"], ["set", ["slotLanguage"], "hi"]], "expect": [["U4", "script_mismatch", { "severity": "info" }]], "ok": true },
+    { "name": "U4 Hinglish declared as hi-Latn with Latin prompts passes", "patch": [["set", ["manifest", "language"], "hi-Latn"], ["each", ["manifest", "questions"], "language", "hi-Latn"], ["rehashAll"], ["set", ["slotLanguage"], "hi"]], "expect": [] },
+    { "name": "U4 9 of 10 prompts in the mapped script is enough (90 %)", "patch": [["set", ["manifest", "questions", 0, "prompt"], "ग्राहक की आय की पुष्टि कौन सा दस्तावेज़ करता है?"], ["rehash", ["manifest", "questions", 0]]], "expect": [] },
+    { "name": "U4 8 of 10 prompts in the mapped script is not", "patch": [["set", ["manifest", "questions", 0, "prompt"], "ग्राहक की आय की पुष्टि कौन सा दस्तावेज़ करता है?"], ["rehash", ["manifest", "questions", 0]], ["set", ["manifest", "questions", 1, "prompt"], "सैंक्शन के बाद सह-आवेदक जोड़ा जा सकता है।"], ["rehash", ["manifest", "questions", 1]]], "expect": [["U4", "script_mismatch", { "severity": "info" }]], "ok": true },
+
+    { "name": "U5 a rules bundle the registry does not know (stale editor)", "patch": [["set", ["manifest", "rulesBundleHash"], "sha256:1111111111111111111111111111111111111111111111111111111111111111"]], "expect": [["U5", "rules_bundle_unknown"]] },
+    { "name": "U5 not evaluated without the registry", "patch": [["del", ["knownBundleHashes"]]], "expect": [], "checked": ["R10", "POOL", "U1", "U2", "U3", "U4", "U7", "R4"] },
+
+    { "name": "U7 cmi5.xml with two AUs", "patch": [["set", ["cmi5Xml"], "<courseStructure><course id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms\"/><au id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1\"><url>a.html</url></au><au id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/2\"><url>b.html</url></au></courseStructure>"]], "expect": [["U7", "multi_au_unsupported"]] },
+    { "name": "U7 two AUs in the manifest and in cmi5.xml", "patch": [["set", ["manifest", "publisherIds", "au"], ["urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1", "urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/2"]], ["set", ["cmi5Xml"], "<cmi5:courseStructure xmlns:cmi5=\"https://w3id.org/xapi/profiles/cmi5/v1/CourseStructure.xsd\"><cmi5:course id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N?edition=1&amp;channel=lms\"/><cmi5:au id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/1\"/><cmi5:au id=\"urn:kivo:course:01JAH7Q4ZB8K3T6W2M9XRV5C1N/au/2\"/></cmi5:courseStructure>"]], "expect": [["U7", "multi_au_unsupported"], ["U7", "multi_au_unsupported"]] },
+
+    { "name": "R4 the declared language differs from the slot", "patch": [["set", ["slotLanguage"], "hi"]], "expect": [["R4", "declared_language_differs_from_slot"]] },
+    { "name": "R4 compares primary subtags (en-IN in an en-GB slot)", "patch": [["set", ["slotLanguage"], "en-GB"]], "expect": [] },
+    { "name": "R4 an unspecified slot language is skipped", "patch": [["set", ["slotLanguage"], null]], "expect": [], "checked": ["R10", "POOL", "U1", "U2", "U3", "U4", "U5", "U7"] },
+
+    { "name": "POOL drawCount larger than the bank", "patch": [["set", ["manifest", "quizzes", 0, "drawCount"], 4]], "expect": [["POOL", "pool_underdraw"], ["POOL", "pool_draw_mismatch"]] },
+    { "name": "POOL a pool that draws more than its candidates", "patch": [["set", ["manifest", "quizzes", 0, "pools", 0, "candidateQids"], ["01JCQ000000000000000000001"]]], "expect": [["POOL", "pool_underdraw"]] },
+    { "name": "POOL a pool candidate outside the bank", "patch": [["set", ["manifest", "quizzes", 0, "pools", 0, "candidateQids"], ["01JCQ000000000000000000001", "01JCQ000000000000000000002", "01JCQ000000000000000000004"]]], "expect": [["POOL", "pool_candidate_not_in_bank"]] },
+    { "name": "POOL a bank qid that is not in the catalogue", "patch": [["push", ["manifest", "quizzes", 0, "bankQids"], "01JCQ000000000000000000011"]], "expect": [["POOL", "bank_qid_not_in_catalogue"]] },
+    { "name": "POOL pools draw fewer than drawCount", "patch": [["set", ["manifest", "quizzes", 0, "pools", 0, "draw"], 1]], "expect": [["POOL", "pool_draw_mismatch"]] },
+    { "name": "POOL draw-all quiz without pools", "patch": [["del", ["manifest", "quizzes", 0, "pools"]], ["set", ["manifest", "quizzes", 0, "drawCount"], null]], "expect": [] }
+  ]
+}

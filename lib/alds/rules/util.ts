@@ -51,8 +51,12 @@ export const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
 export const SEMVER_RE = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 /** KIVO option id: "o" + 1..N (BLUEPRINT §1.1). */
 export const OID_RE = /^o[1-9][0-9]*$/;
-/** ISO 8601 date-time; group 1 is the offset (Z or ±hh[:]mm) when present. */
-const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/;
+/**
+ * ISO 8601 extended date-time as profiled by RFC 3339 (offset `Z` or `±hh:mm`;
+ * a basic-format `+hhmm` offset mixed into an extended date is rejected);
+ * group 1 is the offset when present.
+ */
+const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2}|[+-]\d{4})?$/;
 /** ISO 8601 duration (xAPI result.duration). */
 const DURATION_RE =
   /^P(?=\d|T\d)(?:\d+(?:\.\d+)?Y)?(?:\d+(?:\.\d+)?M)?(?:\d+(?:\.\d+)?W)?(?:\d+(?:\.\d+)?D)?(?:T(?=\d)(?:\d+(?:\.\d+)?H)?(?:\d+(?:\.\d+)?M)?(?:\d+(?:\.\d+)?S)?)?$/;
@@ -82,6 +86,7 @@ export function timestampState(v: unknown): "ok" | "missing_offset" | "invalid" 
   const m = TIMESTAMP_RE.exec(v);
   if (!m) return "invalid";
   if (!m[1]) return "missing_offset";
+  if (/^[+-]\d{4}$/.test(m[1])) return "invalid";
   return Number.isNaN(Date.parse(v)) ? "invalid" : "ok";
 }
 

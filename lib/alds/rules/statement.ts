@@ -258,7 +258,7 @@ export function checkStatement(statement: unknown, ctx: StatementContext = {}): 
   const sessionId = ext[CMI5_SESSION_EXT];
   if (!isNonEmptyStr(sessionId)) r.add("S7", "session_id_missing", "the cmi5 sessionid extension is missing", { ...lms, path: extPath(CMI5_SESSION_EXT) });
   if (tpl) {
-    if (registration !== undefined && registration !== tpl.registration) {
+    if (isUuid(registration) && registration !== tpl.registration) {
       r.add("S7", "registration_changed", "context.registration differs from the template", { ...lms, path: "context.registration" });
     }
     const tplSession = isObj(tpl.extensions) ? (tpl.extensions as Obj)[CMI5_SESSION_EXT] : undefined;
