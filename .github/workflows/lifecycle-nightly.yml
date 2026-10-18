@@ -1,0 +1,77 @@
+# Lifecycle nightly (ADR 0007 step 15): the ALDS lifecycle subset of
+# tests/bot/lifecycle, every night, against the staging database.
+#
+# Subset: 00, 32, 33, 34, 43, 47, 48, 49, 50-53 (ADR 0007 step 15), 54
+# (ADR 0008 step 17) and 55 (ADR 0009 step 12). The golden canary of
+# ADR 0005 step 12 joins when it exists (P4).
+#
+# Target: this commit, built and started INSIDE the runner on
+# http://localhost:3100, against the STAGING Supabase project, with the same
+# three STAGING_* secrets the pr-checks e2e job uses. No new secret, no
+# deployed staging URL: the run tests the code on the default branch rather
+# than whatever a staging deploy last pushed, it is not subject to the
+# Workers free-plan CPU cap, and spec 51's loopback webhook listener and its
+# server-log case work. (ADR 0007 decision 2 names Cloud Run staging with
+# continuous deploy, else the Workers staging with retries; this in-runner
+# target is the executor's proposal pending the owner's decision.)
+#
+# Data: the lifecycle namespace (lifecycle-* orgs, @lifecycle.test users),
+# which the e2e purge of pr-checks and nightly-e2e never matches, so a push
+# during this run no longer wipes it. The lifecycle global setup deletes
+# lifecycle data older than 48 h (tests/bot/lifecycle/cleanup.ts) and
+# refuses any Supabase project but staging.
+#
+# Public-log rule: the build log, server log, Playwright output and JSON
+# report stay in $RUNNER_TEMP; nothing is uploaded. The job prints counts
+# per spec file only (scripts/lifecycle-summary.mjs). Reproduce a failure
+# locally: bash scripts/lifecycle-nightly.sh (header there).
+name: Lifecycle nightly (staging)
+
+on:
+  schedule:
+    # 22:41 UTC = 04:11 IST. Clear of the 01:30-04:45 UTC block (ops digest,
+    # backup, ops-review, content-backup, crons, nightly-e2e 04:00) and of
+    # the busy minutes (*/5, */10, 3-59/15, 7-59/15).
+    - cron: "41 22 * * *"
+  workflow_dispatch:
+    inputs:
+      specs:
+        description: "Spec numbers to run, space-separated (blank = the nightly subset)"
+        required: false
+        default: ""
+
+concurrency:
+  group: lifecycle-nightly
+  cancel-in-progress: false
+
+# Read-only token: the job checks out, builds and runs Playwright.
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Lifecycle nightly (staging)
+    runs-on: ubuntu-latest
+    # Build about 5 min; the subset about 30-40 min serially (workers: 1).
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      # The staging secrets reach this step only.
+      - name: Build, start and run the lifecycle subset (counts only)
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+          NEXT_TELEMETRY_DISABLED: "1"
+          LIFECYCLE_PORT: "3100"
+          LIFECYCLE_SPECS: ${{ inputs.specs }}
+        run: bash scripts/lifecycle-nightly.sh
