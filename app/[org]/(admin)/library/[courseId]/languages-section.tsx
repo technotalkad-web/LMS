@@ -369,6 +369,8 @@ export function LanguagesSection({
             router.refresh();
             const r = outcome.restart;
             if (!r) {
+              // Grandfather: no banner, and an earlier replace's banner goes.
+              setError(null);
               setNotice(null);
             } else if (r.status === "failed") {
               setNotice(null);
