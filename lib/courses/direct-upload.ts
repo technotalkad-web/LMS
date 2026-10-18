@@ -30,6 +30,7 @@ import {
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
 import { forceRestartOlderVersions, forceRestartReport, type ForceRestartReport } from "@/lib/attempts/force-restart";
+import { runPackageGuardian } from "@/lib/alds/guardian";
 
 /**
  * Direct browser-to-storage uploads.
@@ -456,6 +457,17 @@ export async function finalizeDirectUpload(args: {
   }
   if (args.notifyUpdate && hadCurrent) {
     await notifyCourseUpdate({ org, courseId: course.id });
+  }
+
+  // ADR 0005 note (e) of 2026-10-19 (position: its addition of that date):
+  // the Package Guardian static gate, warn-only (flag ALDS_P4, default off),
+  // LAST, after the forced restart and the update notification, so a slow
+  // gate or a worker killed inside it can never cost the ADR 0011 restart or
+  // its report. It reuses this listing and never changes the FinalizeResult.
+  try {
+    await runPackageGuardian({ versionId: version.id, organizationId: org.id, trigger: "upload", listedKeys: keys });
+  } catch (e) {
+    console.warn("[alds] guardian failed", e instanceof Error ? e.message : e);
   }
 
   return {

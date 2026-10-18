@@ -7,6 +7,7 @@ import { createClient as createServiceClient, type SupabaseClient } from "@supab
 import type { ParsedManifest } from "./manifest/types";
 import { packageIdentity, type PackageIdentity } from "./validation/integrity";
 import { shouldMoveCourseDefault } from "./default-rule";
+import { runPackageGuardian } from "@/lib/alds/guardian";
 
 export interface UploadResult {
   courseId: string;
@@ -184,6 +185,13 @@ export async function uploadCoursePackage(opts: {
   // 6) Point the package at this version; the course default follows only
   //    for a new course or the default slot (ADR 0008 step 9).
   await publishVersion(supabase, { courseId, packageId, versionId: version.id });
+  // ADR 0005 note (e) of 2026-10-19: the Package Guardian static gate,
+  // warn-only (flag ALDS_P4, default off); it never changes this answer.
+  try {
+    await runPackageGuardian({ versionId: version.id, organizationId, trigger: "upload" });
+  } catch (e) {
+    console.warn("[alds] guardian failed", e instanceof Error ? e.message : e);
+  }
 
   return {
     courseId,
