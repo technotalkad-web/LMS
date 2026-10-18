@@ -108,6 +108,10 @@
     { "name": "U1 a dialogue on kind other relabelled choice: keyed without a key, untyped", "patch": [["set", ["manifest", "questions", 7, "authoringKind"], "choice"]], "expect": [["U1", "keyed_kind_without_key", { "path": "questions[7].authoringKind" }], ["U1", "keyed_kind_untyped", { "path": "questions[7].authoringKind" }]] },
     { "name": "U1 a keyed choice whose key was emptied", "patch": [["set", ["manifest", "questions", 0, "correct"], []], ["rehash", ["manifest", "questions", 0]]], "expect": [["U1", "keyed_kind_without_key", { "path": "questions[0].authoringKind" }]] },
     { "name": "U1 a key on an unkeyed label is allowed on kind other (nothing comparable)", "patch": [["set", ["manifest", "questions", 7, "correct"], ["accept-fee-waiver"]], ["rehash", ["manifest", "questions", 7]]], "expect": [] },
-    { "name": "U1 a relabelled question without its key is consistent (nothing left to compare)", "patch": [["set", ["manifest", "questions", 0, "authoringKind"], "image-id"], ["set", ["manifest", "questions", 0, "correct"], []], ["rehash", ["manifest", "questions", 0]]], "expect": [] }
+    { "name": "U1 a relabelled question without its key is consistent (nothing left to compare)", "patch": [["set", ["manifest", "questions", 0, "authoringKind"], "image-id"], ["set", ["manifest", "questions", 0, "correct"], []], ["rehash", ["manifest", "questions", 0]]], "expect": [] },
+
+    { "name": "U3 a multi-select key re-serialised in another order keeps its hash (same key for SEM and the hash)", "patch": [["set", ["manifest", "questions", 2, "correct"], ["o2[,]o1"]]], "expect": [] },
+    { "name": "U3 accepted fill-in variants listed in another order keep their hash", "patch": [["set", ["manifest", "questions", 3, "correct"], ["{case_matters=false}Installment", "{case_matters=false}Instalment"]]], "expect": [] },
+    { "name": "U3 a sequencing key in another order is a content change", "patch": [["set", ["manifest", "questions", 5, "correct"], ["o2[,]o1[,]o3"]]], "expect": [["U3", "content_hash_mismatch", { "path": "questions[5].contentHash" }]] }
   ]
 }

@@ -25,7 +25,7 @@ export { checkStatement, classifyStatement, keyClassOf, parseQuizRunIri, type St
 export { checkSession, type SessionContext } from "./session";
 export { checkPackage, decodeXmlEntities, xmlAttributeValues, U4_SCRIPT_SHARE, type PackageInput, type PackageResult } from "./package";
 export { canonicalContentJson, contentHash, type ContentHashInput } from "./content-hash";
-export { canonicalPatternKey, parseInteraction, responseMatches, type GrammarMode, type Parsed, type ParseResult } from "./grammar";
+export { canonicalPattern, canonicalPatternKey, canonicalPatternText, parseInteraction, responseMatches, type GrammarMode, type Parsed, type ParseResult } from "./grammar";
 export { detectScript, scriptForLanguage, type DetectedScript, type ScriptProfile } from "./script";
 export { sha256Hex, sha256HexOfString, utf8Encode } from "./sha256";
 export { canonicalBcp47, isBcp47, normalizeText } from "./util";

@@ -4,8 +4,10 @@
  *   (i)   sha256 / utf8Encode against node:crypto and Buffer (NIST vectors,
  *         block boundaries, 2,000 random Unicode strings incl. lone surrogates);
  *   (ii)  the canonical content hash (BLUEPRINT §1.1) against an independent
- *         implementation (node:crypto + generic sorted-key JSON) and pinned
- *         vectors, plus NFC / whitespace invariance;
+ *         implementation (node:crypto + generic sorted-key JSON, `correct`
+ *         sorted) and pinned vectors, plus NFC / whitespace invariance and the
+ *         key canonicalisation (canonicalPattern): a key SEM treats as the
+ *         same key hashes the same;
  *   (iii) the R10 grammar: every interaction type, both modes, valid and
  *         invalid; responseMatches and canonicalPatternKey semantics;
  *   (iv)  script and lexical detection, scriptForLanguage;
@@ -20,6 +22,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   canonicalContentJson,
+  canonicalPattern,
   canonicalPatternKey,
   contentHash,
   detectScript,
@@ -75,18 +78,25 @@ for (const n of [55, 56, 63, 64, 65, 119, 120, 1000]) eq(`${n} bytes = node:cryp
 
 console.log("\n(ii) canonical content hash");
 const base = JSON.parse(fs.readFileSync(path.join(__dirname, "alds-fixtures", "base.json"), "utf8")) as { manifest: { questions: AldsCatalogueEntry[] } };
-// Independent reference: generic deep key sort + JSON.stringify + node:crypto.
+// Independent reference: generic deep key sort + JSON.stringify + node:crypto, with the
+// `correct` entries sorted (valid for keys already written canonically, which every golden
+// manifest key is: asserted below; the key canonicalisation itself has its own vectors).
 const sortDeep = (v: unknown): unknown =>
   Array.isArray(v) ? v.map(sortDeep) : v && typeof v === "object"
     ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, sortDeep((v as Record<string, unknown>)[k])]))
     : typeof v === "string" ? v.normalize("NFC").replace(/\s+/g, " ").trim() : v;
 const refHash = (e: Pick<AldsCatalogueEntry, "qid" | "language" | "kind" | "prompt" | "options" | "correct">) =>
-  "sha256:" + nodeSha(JSON.stringify(sortDeep({ qid: e.qid, lang: e.language, kind: e.kind, prompt: e.prompt, options: e.options.map((o) => ({ oid: o.oid, label: o.label })), correct: e.correct })));
+  "sha256:" + nodeSha(JSON.stringify(sortDeep({ qid: e.qid, lang: e.language, kind: e.kind, prompt: e.prompt, options: e.options.map((o) => ({ oid: o.oid, label: o.label })), correct: e.correct.map((c) => c.normalize("NFC").replace(/\s+/g, " ").trim()).sort() })));
+eq(
+  "every golden manifest key entry is already in canonical form",
+  base.manifest.questions.flatMap((q) => q.correct.filter((c) => canonicalPattern(q.kind, c) !== c).map((c) => `${q.qid} ${c}`)),
+  [],
+);
 let refOk = 0;
 for (const q of base.manifest.questions) if (contentHash(q) === refHash(q) && q.contentHash === refHash(q)) refOk++;
 eq(`every golden manifest entry: contentHash = independent reference = pinned value (${base.manifest.questions.length})`, refOk, base.manifest.questions.length);
 eq("pinned vector q1 (choice)", base.manifest.questions[0].contentHash, "sha256:51996fad43bfde3f11c7f6ca2d80713ac80a8bfc85ab679fad5bb4beba1fd608");
-eq("pinned vector q4 (fill-in variants)", base.manifest.questions[3].contentHash, "sha256:9be477dcb3ce58c762564651cb815f0c621c3cbe337eeb2784b1676c5b546bb5");
+eq("pinned vector q4 (fill-in variants, sorted in the hash)", base.manifest.questions[3].contentHash, "sha256:7153bf4b9b59903aee02a0ed542c4e192355c0782e989f38c2c8abd8704a7561");
 const small = { qid: "01JCQ00000000000000000000Z", language: "hi", kind: "choice" as const, prompt: "  क्या   यह सही है? ", options: [{ oid: "o1", label: "हाँ" }, { oid: "o2", label: "नहीं" }], correct: ["o1"] };
 eq(
   "canonical JSON text: sorted keys, normalised strings, arrays in order",
@@ -99,6 +109,45 @@ eq("whitespace runs and tabs collapse", contentHash({ ...small, prompt: "a\t\n  
 eq("a wording change changes the hash", contentHash({ ...small, prompt: "क्या यह गलत है?" }) === contentHash(small), false);
 eq("an option reorder changes the hash (arrays keep order)", contentHash({ ...small, options: [small.options[1], small.options[0]] }) === contentHash(small), false);
 eq("a key change changes the hash", contentHash({ ...small, correct: ["o2"] }) === contentHash(small), false);
+// one definition of "same key": what SEM compares as equal hashes the same, and nothing else
+const sameHash = (kind: string, a: string[], b: string[]) =>
+  contentHash({ ...small, kind: kind as AldsCatalogueEntry["kind"], correct: a }) === contentHash({ ...small, kind: kind as AldsCatalogueEntry["kind"], correct: b });
+eq("hash: a multi-select key in another order is the same key", sameHash("choice", ["o2[,]o1"], ["o1[,]o2"]), true);
+eq("hash: a sequencing key in another order is not", sameHash("sequencing", ["o2[,]o1"], ["o1[,]o2"]), false);
+eq("hash: matching pairs in another order are the same key", sameHash("matching", ["o2[.]o4[,]o1[.]o3"], ["o1[.]o3[,]o2[.]o4"]), true);
+eq("hash: accepted fill-in variants in another order are the same key", sameHash("fill-in", ["{case_matters=false}b", "{case_matters=false}a"], ["{case_matters=false}a", "{case_matters=false}b"]), true);
+eq("hash: an explicit default flag is the same key", sameHash("fill-in", ["{case_matters=false}Paris"], ["Paris"]), true);
+eq("hash: case_matters=true is not", sameHash("fill-in", ["{case_matters=true}Paris"], ["Paris"]), false);
+eq("hash: unordered fill-in items in another order are the same key", sameHash("fill-in", ["{order_matters=false}b[,]a"], ["{case_matters=false}{order_matters=false}a[,]b"]), true);
+eq("hash: ordered fill-in items in another order are not", sameHash("fill-in", ["b[,]a"], ["a[,]b"]), false);
+eq("hash: unordered performance steps in another order are the same key", sameHash("performance", ["{order_matters=false}s2[.]3.0[:]5[,]s1[.]a"], ["{order_matters=false}s1[.]a[,]s2[.]3[:]5"]), true);
+eq("hash: ordered performance steps in another order are not", sameHash("performance", ["s2[.]b[,]s1[.]a"], ["s1[.]a[,]s2[.]b"]), false);
+eq("hash: numeric n and n[:]n are the same key", sameHash("numeric", ["75"], ["75[:]75"]), true);
+eq("hash: a duplicated key entry is not the same key", sameHash("choice", ["o1", "o1"], ["o1"]), false);
+eq("hash: a key outside the grammar is hashed as written", sameHash("choice", ["o2, o1"], ["o1, o2"]), false);
+type CanonRow = [kind: string, text: string, want: string];
+const canonRows: CanonRow[] = [
+  ["choice", "o3[,]o1[,]o2", "o1[,]o2[,]o3"],
+  ["sequencing", "o3[,]o1", "o3[,]o1"],
+  ["matching", "o2[.]o4[,]o1[.]o3", "o1[.]o3[,]o2[.]o4"],
+  ["true-false", "false", "false"],
+  ["likert", "o2", "o2"],
+  ["numeric", "75[:]75", "75"],
+  ["numeric", "70.0[:]", "70[:]"],
+  ["numeric", "[:]80", "[:]80"],
+  ["performance", "{order_matters=true}s1[.]a", "s1[.]a"],
+  ["performance", "{order_matters=false}s2[.]4[:]5[,]s1[.]a", "{order_matters=false}s1[.]a[,]s2[.]4[:]5"],
+  ["fill-in", "Paris", "{case_matters=false}Paris"],
+  ["fill-in", "{order_matters=false}{case_matters=true}b[,]{lang=en}a", "{case_matters=true}{order_matters=false}b[,]{lang=en}a"],
+  ["long-fill-in", "{case_matters=false}A  long   answer", "{case_matters=false}A long answer"],
+  ["other", "anything [,] at all", "anything [,] at all"],
+  ["choice", "o1, o2", "o1, o2"],
+];
+for (const [kind, text, want] of canonRows) {
+  const got = canonicalPattern(kind, text);
+  eq(`canonicalPattern ${kind} ${JSON.stringify(text)} → ${JSON.stringify(want)}`, got, want);
+  eq(`  … is idempotent and keeps the key`, [canonicalPattern(kind, got), parseInteraction(kind, got, "pattern").ok || !parseInteraction(kind, text, "pattern").ok], [got, true]);
+}
 eq("normalizeText", normalizeText("  a  b c  "), "a b c");
 
 console.log("\n(iii) R10 grammar");

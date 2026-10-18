@@ -12,6 +12,13 @@
  * Outcomes (ADR 0005 step 5, docs/ARCHITECTURE.md §5 §2 row): U1, U2, U3, U5,
  * U7, R4 and POOL failures are `error` (they make a version `uncertified`;
  * none blocks an upload); U4 is `info` only.
+ *
+ * `ok: true` means only that these manifest rules pass. It is not
+ * "certifiable": BLUEPRINT §2 lets a TinCan or SCORM package carry an
+ * alds-manifest.json (U2 then looks in tincan.xml or imsmanifest.xml), and
+ * those pass here, but ADR 0002 decision 2 and ADR 0005 step 1 certify KIVO
+ * cmi5 packages only. The P4 tier writer must also require manifestType
+ * cmi5 (and the P4 checks listed above) before it writes `certified`.
  */
 import {
   INTERACTION_KINDS,

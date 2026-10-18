@@ -319,35 +319,72 @@ export function responseMatches(response: Parsed, pattern: Parsed): boolean | nu
 }
 
 /**
- * A canonical key for a parsed pattern, so two pattern lists can be compared
- * as sets of equivalent patterns (choice/matching order-insensitive, sequencing
- * ordered, fill-in text normalised but case kept).
+ * The canonical text of a parsed pattern: one spelling per meaning, and a
+ * valid pattern of the same kind. Two patterns are the same key exactly when
+ * their canonical texts are equal; the semantic check (SEM) compares keys and
+ * contentHash hashes the canonical text, so both use this one definition.
+ *
+ *   choice                  ids sorted (a set)
+ *   sequencing              ids in order
+ *   matching                pairs sorted (a set)
+ *   performance             {order_matters=false} written only when false;
+ *                           steps sorted when order does not matter; a range
+ *                           answer written min[:]max with numbers as
+ *                           JavaScript prints them
+ *   numeric                 n when min = max, else min[:]max (open ends empty)
+ *   fill-in, long-fill-in   {case_matters=true|false} always, then
+ *                           {order_matters=false} only when false; items
+ *                           {lang=x}text with text normalised (NFC, single
+ *                           spaces, trimmed), sorted when order does not matter
+ *   true-false, likert      as parsed
+ *   other                   the raw text
  */
-export function canonicalPatternKey(p: Parsed): string {
-  const sep = "\u0001";
+export function canonicalPatternText(p: Parsed): string {
+  const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  const num = (n: number | null): string => (n === null ? "" : String(n));
   switch (p.type) {
     case "true-false":
-      return `tf${sep}${p.value}`;
+      return String(p.value);
     case "choice":
-      return `c${sep}${p.ids.slice().sort().join(sep)}`;
+      return p.ids.slice().sort(byCodeUnit).join(LIST);
     case "sequencing":
-      return `s${sep}${p.ids.join(sep)}`;
+      return p.ids.join(LIST);
     case "likert":
-      return `l${sep}${p.id}`;
+      return p.id;
     case "matching":
-      return `m${sep}${p.pairs.map((x) => `${x[0]}\u0000${x[1]}`).sort().join(sep)}`;
+      return p.pairs
+        .slice()
+        .sort((a, b) => byCodeUnit(a[0], b[0]) || byCodeUnit(a[1], b[1]))
+        .map(([src, tgt]) => `${src}${PAIR}${tgt}`)
+        .join(LIST);
     case "numeric":
-      return `n${sep}${p.range.min}${sep}${p.range.max}`;
+      return p.range.min !== null && p.range.min === p.range.max ? String(p.range.min) : `${num(p.range.min)}${RANGE}${num(p.range.max)}`;
     case "performance": {
-      const steps = p.steps.map((s) => (s.range ? `${s.step}\u0000${s.range.min}:${s.range.max}` : `${s.step}\u0000${s.answer}`));
-      return `p${sep}${p.orderMatters}${sep}${(p.orderMatters ? steps : steps.slice().sort()).join(sep)}`;
+      const steps = p.steps.map((s) => `${s.step}${PAIR}${s.range ? `${num(s.range.min)}${RANGE}${num(s.range.max)}` : s.answer}`);
+      return `${p.orderMatters ? "" : "{order_matters=false}"}${(p.orderMatters ? steps : steps.slice().sort(byCodeUnit)).join(LIST)}`;
     }
     case "fill-in":
     case "long-fill-in": {
-      const items = p.items.map((x) => `${x.lang ?? ""}\u0000${normalizeText(x.text)}`);
-      return `f${sep}${p.caseMatters}${sep}${p.orderMatters}${sep}${(p.orderMatters ? items : items.slice().sort()).join(sep)}`;
+      const items = p.items.map((x) => `${x.lang === null ? "" : `{lang=${x.lang}}`}${normalizeText(x.text)}`);
+      return `{case_matters=${p.caseMatters}}${p.orderMatters ? "" : "{order_matters=false}"}${(p.orderMatters ? items : items.slice().sort(byCodeUnit)).join(LIST)}`;
     }
     case "other":
-      return `o${sep}${p.raw}`;
+      return p.raw;
   }
+}
+
+/** The key SEM compares patterns by (patterns of one interactionType): their canonical text. */
+export function canonicalPatternKey(p: Parsed): string {
+  return canonicalPatternText(p);
+}
+
+/**
+ * The canonical text of a correct-response pattern given as text, for
+ * contentHash: the pattern parsed for `kind` and rewritten by
+ * canonicalPatternText; a pattern that does not parse is returned unchanged
+ * (R10 reports it).
+ */
+export function canonicalPattern(kind: string, text: string): string {
+  const parsed = parseInteraction(kind, text, "pattern");
+  return parsed.ok ? canonicalPatternText(parsed.value) : text;
 }

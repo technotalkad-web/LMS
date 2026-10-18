@@ -95,7 +95,7 @@
         "kind": "fill-in",
         "language": "en-IN",
         "revision": 1,
-        "contentHash": "sha256:9be477dcb3ce58c762564651cb815f0c621c3cbe337eeb2784b1676c5b546bb5",
+        "contentHash": "sha256:7153bf4b9b59903aee02a0ed542c4e192355c0782e989f38c2c8abd8704a7561",
         "prompt": "EMI stands for Equated Monthly ____.",
         "options": [],
         "correct": [
@@ -715,7 +715,7 @@
           "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000004",
           "https://ambak.com/xapi/ext/question/language": "en-IN",
           "https://ambak.com/xapi/ext/question/revision": 1,
-          "https://ambak.com/xapi/ext/question/content-hash": "sha256:9be477dcb3ce58c762564651cb815f0c621c3cbe337eeb2784b1676c5b546bb5",
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:7153bf4b9b59903aee02a0ed542c4e192355c0782e989f38c2c8abd8704a7561",
           "https://ambak.com/xapi/ext/question/try": 1,
           "https://ambak.com/xapi/ext/question/final": true
         }

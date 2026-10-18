@@ -444,7 +444,13 @@ function checkAnswered(r: Report, statement: Obj, object: Obj, ext: Obj, result:
     if (!ids.every(isNonEmptyStr)) r.add("S3", "component_id_invalid", `every ${list} entry needs an id`, { path });
     if (duplicates(componentIds[list]).length > 0) r.add("S3", "component_id_duplicate", `${list} ids must be unique`, { path });
     if (list === "choices" && !componentIds[list].every(isOid)) r.add("S3", "choice_id_not_oid", "choices[].id must be the option's oid (o1..oN)", { path });
-    arr.forEach((c, i) => checkLangMap(get(c, "description"), `${path}[${i}].description`));
+    // xAPI makes a component description optional; ALDS requires it (the option text in the
+    // question language, S3/S5), so a missing one is its own finding (severity: an open decision)
+    arr.forEach((c, i) => {
+      const d = get(c, "description");
+      if (d === undefined) r.add("S3", "component_description_missing", `${list}[${i}] needs a description (its text in the question language)`, { path: `${path}[${i}].description` });
+      else checkLangMap(d, `${path}[${i}].description`);
+    });
   }
   const allComponentIds = ([] as string[]).concat(...Object.keys(componentIds).map((k) => componentIds[k]));
 
