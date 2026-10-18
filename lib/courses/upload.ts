@@ -115,6 +115,8 @@ export async function uploadCoursePackage(opts: {
   //    reserved row turns 'failed' and its prefix is emptied (ADR 0008 D1:
   //    the number and folder stay taken; crashes: the reaper's
   //    sweepAbandonedUploads covers 'uploading' rows older than a day).
+  //    A row that is already 'ready' never loses its files
+  //    (failedUploadCleanup).
   const storage = await getStorage();
   try {
     // Tasks, not promises: at most 12 files are read and written at a time,
@@ -144,25 +146,39 @@ export async function uploadCoursePackage(opts: {
     // Before 0077 there is no upload_status column (and no 'failed'):
     // remove the row as before.
     const mark = await markVersionFailed(svc, version.id);
-    if (mark.error) {
-      if (/upload_status|schema cache/i.test(mark.error)) {
-        await svc.from("course_versions").delete().eq("id", version.id);
+    let rowDeleted = false;
+    let status: UploadRowStatus | null = null;
+    if (mark.error && /upload_status|schema cache/i.test(mark.error)) {
+      await svc.from("course_versions").delete().eq("id", version.id);
+      rowDeleted = true;
+    } else if (!mark.claimed) {
+      if (mark.error) console.warn("[upload] cleanup: could not mark the version failed:", mark.error);
+      // Not claimed: discarded meanwhile, gone, or made ready by the last
+      // statement of the try with only its answer lost. Look before
+      // deleting anything.
+      status = await uploadStatusOf(svc, version.id);
+    }
+    const plan = failedUploadCleanup({ claimed: mark.claimed, rowDeleted, status, createdCourse });
+    if (!plan.landed) {
+      // Every write of this request has settled (runPool), so emptying the
+      // folder now is final.
+      if (plan.emptyFolder) {
+        try {
+          await storage.deletePrefix(storagePrefix.replace(/\/$/, ""));
+        } catch (delErr) {
+          console.warn("[upload] cleanup: prefix delete failed", delErr);
+        }
       } else {
-        console.warn("[upload] cleanup: could not mark the version failed:", mark.error);
+        console.warn(`[upload] cleanup: version ${version.id} keeps its files (status ${status}); the reaper retires an 'uploading' row`);
       }
+      // A course created by THIS call goes, and its row with it (cascade;
+      // no attempts). The folder carried that course's id, so it can never
+      // come back either.
+      if (plan.deleteCourse) await svc.from("courses").delete().eq("id", courseId);
+      throw e;
     }
-    // Every write of this request has settled (runPool), so emptying the
-    // folder now is final.
-    try {
-      await storage.deletePrefix(storagePrefix.replace(/\/$/, ""));
-    } catch (delErr) {
-      console.warn("[upload] cleanup: prefix delete failed", delErr);
-    }
-    // A course created by THIS call goes, and its failed row with it
-    // (cascade; no attempts). The folder carried that course's id, so it
-    // can never come back either.
-    if (createdCourse) await svc.from("courses").delete().eq("id", courseId);
-    throw e;
+    // Every file landed and the row is 'ready': finish the upload.
+    console.warn(`[upload] version ${version.id} is ready although its confirmation failed; publishing it:`, e);
   }
 
   // 6) Point the package at this version; the course default follows only
@@ -475,6 +491,45 @@ export async function markVersionFailed(
     .select("id");
   if (error) return { claimed: false, error: error.message };
   return { claimed: ((data ?? []) as unknown[]).length > 0, error: null };
+}
+
+/** A reserved version's upload_status as re-read by the multipart error path. */
+export type UploadRowStatus = "ready" | "failed" | "uploading" | "missing" | "unknown";
+
+async function uploadStatusOf(svc: SupabaseClient, versionId: string): Promise<UploadRowStatus> {
+  const { data, error } = await svc.from("course_versions").select("upload_status").eq("id", versionId).maybeSingle();
+  if (error) return "unknown";
+  if (!data) return "missing";
+  const s = (data as { upload_status?: string | null }).upload_status;
+  return s === "ready" || s === "failed" || s === "uploading" ? s : "unknown";
+}
+
+/**
+ * What the multipart error path of uploadCoursePackage does once its
+ * claim (markVersionFailed) has run. The folder is emptied only when the
+ * row is known not to be a ready version:
+ *   - claimed by this call, or deleted (pre-0077)        → empty the folder
+ *   - not claimed, re-read 'failed' (Discard retired it
+ *     mid-upload; files written after that land here)
+ *     or the row is gone                                 → empty the folder
+ *   - not claimed, re-read 'ready': markVersionReady
+ *     committed and only its answer was lost; every file
+ *     landed                                             → keep it, publish
+ *   - not claimed, 'uploading' or unreadable             → keep the files
+ *     (the reaper retires an 'uploading' row after a day)
+ * A course created by this call goes together with its folder whenever the
+ * upload did not land (it holds no attempts: it was never published).
+ */
+export function failedUploadCleanup(input: {
+  claimed: boolean;
+  rowDeleted: boolean;
+  status: UploadRowStatus | null;
+  createdCourse: boolean;
+}): { landed: boolean; emptyFolder: boolean; deleteCourse: boolean } {
+  const { claimed, rowDeleted, status, createdCourse } = input;
+  if (!claimed && !rowDeleted && status === "ready") return { landed: true, emptyFolder: false, deleteCourse: false };
+  const knownNotReady = claimed || rowDeleted || status === "failed" || status === "missing";
+  return { landed: false, emptyFolder: knownNotReady || createdCourse, deleteCourse: createdCourse };
 }
 
 function serviceClient(): SupabaseClient {

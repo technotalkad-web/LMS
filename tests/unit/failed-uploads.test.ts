@@ -6,13 +6,15 @@
  *   - sweepAbandonedUploads (the reaper hook): an old 'uploading' row turns
  *     'failed' and its prefix is emptied; the row is never deleted; a row
  *     finalised meanwhile, or one holding attempts, keeps its files.
+ *   - failedUploadCleanup: the multipart error path empties a folder only
+ *     when its row is known not to be ready.
  * No DB and no storage: a recording fake stands in for the supabase-js query
  * builder and the storage adapter (the reaper route itself is never called;
  * lifecycle spec 44 covers it only behind REAPER_E2E=1).
  *
  * Run:  npx tsx tests/unit/failed-uploads.test.ts   (or npm run test:unit)
  */
-import { markVersionFailed } from "../../lib/courses/upload";
+import { failedUploadCleanup, markVersionFailed, type UploadRowStatus } from "../../lib/courses/upload";
 import { DIRECT_UPLOAD_LIMITS, sweepAbandonedUploads } from "../../lib/courses/direct-upload";
 
 let pass = 0, fail = 0;
@@ -202,6 +204,27 @@ async function main() {
       swept: 0,
       errors: ["scan failed"],
     });
+  }
+
+  /* ---------------- failedUploadCleanup (multipart error path) ---------------- */
+  console.log("\nfailedUploadCleanup (the multipart error path never empties a ready version)");
+  {
+    const plan = (claimed: boolean, rowDeleted: boolean, status: UploadRowStatus | null, createdCourse: boolean) =>
+      failedUploadCleanup({ claimed, rowDeleted, status, createdCourse });
+    const keep = { landed: false, emptyFolder: false, deleteCourse: false };
+    const empty = { landed: false, emptyFolder: true, deleteCourse: false };
+    const emptyAndCourse = { landed: false, emptyFolder: true, deleteCourse: true };
+    const landed = { landed: true, emptyFolder: false, deleteCourse: false };
+    eq("claimed by this call → empty the folder", plan(true, false, null, false), empty);
+    eq("claimed, course created by this call → folder and course go", plan(true, false, null, true), emptyAndCourse);
+    eq("pre-0077 row delete → empty the folder", plan(false, true, null, false), empty);
+    eq("re-read 'ready' (only the answer of the ready flip was lost) → keep and publish", plan(false, false, "ready", false), landed);
+    eq("re-read 'ready' on a course created by this call → kept too", plan(false, false, "ready", true), landed);
+    eq("re-read 'failed' (Discard mid-upload) → empty the folder", plan(false, false, "failed", false), empty);
+    eq("row gone → empty the folder", plan(false, false, "missing", false), empty);
+    eq("still 'uploading' (claim error) → files kept for the reaper", plan(false, false, "uploading", false), keep);
+    eq("unreadable → files kept", plan(false, false, "unknown", false), keep);
+    eq("unreadable, course created by this call → course and folder go together", plan(false, false, "unknown", true), emptyAndCourse);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

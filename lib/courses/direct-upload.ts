@@ -678,8 +678,12 @@ export async function sweepAbandonedUploads(
       if (mark.error) throw new Error(`could not mark failed: ${mark.error}`);
       if (!mark.claimed) continue; // finalised or aborted since the scan
       swept++;
-      // The row is already 'failed' (never served, number kept); a failed
-      // delete leaves files a later abort of this version can remove.
+      // The row is already 'failed' (never served, number kept). A failed
+      // delete is reported in the reaper's errors and is not retried by any
+      // later sweep (this scan reads 'uploading' rows only) or by the
+      // Library (no action on failed rows, ADR 0008 step 22): only an
+      // explicit POST /api/courses/upload/abort for this version removes
+      // those files.
       const storage = await storageFor(v.storage_driver);
       await storage.deletePrefix(v.storage_prefix.replace(/\/$/, ""));
     } catch (e) {
