@@ -232,14 +232,15 @@ export async function seedOtp(email: string): Promise<string> {
  * any environment because it only touches rows that match the qa-* /
  * @example.test naming convention (QA_NAMESPACE). It never matches the
  * lifecycle namespace (lifecycle-* / @lifecycle.test): a pr-checks run no
- * longer wipes a lifecycle run's data (tests/unit/test-data-namespace.test.ts).
+ * longer wipes a lifecycle run's data (tests/unit/test-data-namespace.test.ts
+ * runs this function against a recording fake client).
  */
-export async function purgeAllTestData(): Promise<{
+export async function purgeAllTestData(client?: SupabaseClient): Promise<{
   users: number;
   orgs: number;
   otps: number;
 }> {
-  const s = svc();
+  const s = client ?? svc();
 
   // 1. Auth users with our test domain.
   const { data: list } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });

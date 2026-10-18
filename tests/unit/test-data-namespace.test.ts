@@ -15,8 +15,18 @@
  * whole string).
  *
  * Run:  npx tsx tests/unit/test-data-namespace.test.ts   (or npm run test:unit)
- * (No DB: the deletes themselves are covered by lifecycle spec 50 "purge path".)
+ *
+ * No database. purgeAllTestData() and cleanupLifecycleData() themselves run
+ * against an in-memory fake client that applies the PostgREST filters they
+ * send (like, lt, eq, in, order, limit) to seeded rows, so the test checks
+ * what each one would delete, not only the patterns. A static case keeps
+ * every tracked lifecycle file on ./data for seeding. The real deletes are
+ * covered by lifecycle spec 50 ("purge path" and the cleanup dry run).
  */
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   LIFECYCLE_NAMESPACE,
   QA_NAMESPACE,
@@ -27,12 +37,16 @@ import {
   orgSlugLike,
   otpEmailLike,
 } from "../e2e/helpers/namespace";
-import { testEmail as qaEmail, testSlug as qaSlug } from "../e2e/helpers/supabase";
+import { purgeAllTestData, testEmail as qaEmail, testSlug as qaSlug } from "../e2e/helpers/supabase";
 import { isLifecycleSlug, testEmail as lcEmail, testSlug as lcSlug } from "../bot/lifecycle/data";
 import {
+  CLEANUP_MAX_ORGS,
   CLEANUP_MIN_AGE_HOURS,
   cleanupCutoff,
+  cleanupLifecycleData,
+  formatCleanup,
   isExpiredLifecycleUser,
+  isGeneratedLifecycleSlug,
   isStagingSupabaseUrl,
 } from "../bot/lifecycle/cleanup";
 
@@ -138,5 +152,232 @@ eq("another port", isStagingSupabaseUrl("https://zeaclbapadosqqttexxh.supabase.c
 eq("ref only in the path", isStagingSupabaseUrl("https://prod.example/zeaclbapadosqqttexxh.supabase.co"), false);
 eq("empty / missing / not a URL", [isStagingSupabaseUrl(""), isStagingSupabaseUrl(undefined), isStagingSupabaseUrl("zeaclbapadosqqttexxh")], [false, false, false]);
 
-console.log(`\n${pass} passed, ${fail} failed`);
-if (fail > 0) process.exit(1);
+console.log("\nthe cleanup deletes only generated lifecycle slugs");
+eq(`every generated lifecycle slug (${lcSlugs.length}) has the generated shape`, lcSlugs.filter((s) => !isGeneratedLifecycleSlug(s)), []);
+eq("hand-made lifecycle- slugs are not generated",
+  ["lifecycle-academy", "lifecycle-", "lifecycle--abcdef", "lifecycle-org-ABCDEF", "lifecycle-org-abc12", "lifecycle-org-abc1234", "lifecycle-org-abcdef-", "lifecycle-new-campus"].filter((s) => isGeneratedLifecycleSlug(s)),
+  []);
+eq("qa slugs and plain slugs are not generated lifecycle slugs", [...qaSlugs, ...realish].filter((s) => isGeneratedLifecycleSlug(s)), []);
+eq("a multi-word purpose is generated", isGeneratedLifecycleSlug("lifecycle-th-invite-0a1b2c"), true);
+
+// ---------------------------------------------------------------------------
+// In-memory fake of the supabase-js calls the purge and the cleanup make.
+// ---------------------------------------------------------------------------
+type Row = Record<string, unknown>;
+type Op = { table: string; kind: "select" | "delete"; filters: Array<[string, unknown[]]> };
+interface FakeOpts {
+  tables: Record<string, Row[]>;
+  users: Array<{ id: string; email: string; created_at: string }>;
+  failOrgDelete?: Set<string>;
+}
+function fakeClient(opts: FakeOpts) {
+  const ops: Op[] = [];
+  const likeCalls: Array<[string, string, string]> = [];
+  const match = (row: Row, [m, a]: [string, unknown[]]) => {
+    const v = row[a[0] as string];
+    switch (m) {
+      case "like": return typeof v === "string" && likeMatches(a[1] as string, v);
+      case "lt": return String(v) < String(a[1]);
+      case "eq": return v === a[1];
+      case "in": return (a[1] as unknown[]).includes(v);
+      default: return true;
+    }
+  };
+  const from = (table: string) => {
+    const op: Op = { table, kind: "select", filters: [] };
+    ops.push(op);
+    let order: { col: string; asc: boolean } | null = null;
+    let limit: number | null = null;
+    const b: Record<string, unknown> = {};
+    b.select = () => b;
+    b.delete = () => { op.kind = "delete"; return b; };
+    for (const m of ["like", "lt", "eq", "in"]) {
+      b[m] = (...a: unknown[]) => {
+        op.filters.push([m, a]);
+        if (m === "like") likeCalls.push([table, a[0] as string, a[1] as string]);
+        return b;
+      };
+    }
+    b.order = (col: string, o?: { ascending?: boolean }) => { order = { col, asc: o?.ascending !== false }; return b; };
+    b.limit = (n: number) => { limit = n; return b; };
+    b.then = (ok: (v: unknown) => unknown, ko?: (e: unknown) => unknown) => {
+      const rows = opts.tables[table] ?? [];
+      let hit = rows.filter((r) => op.filters.every((f) => match(r, f)));
+      if (op.kind === "delete") {
+        if (table === "organizations" && hit.some((r) => opts.failOrgDelete?.has(r.id as string))) {
+          return Promise.resolve({ data: null, error: { code: "P0001", message: "refused" }, count: null }).then(ok, ko);
+        }
+        opts.tables[table] = rows.filter((r) => !hit.includes(r));
+        return Promise.resolve({ data: null, error: null, count: hit.length }).then(ok, ko);
+      }
+      if (order) {
+        const { col, asc } = order;
+        hit = [...hit].sort((x, y) => (String(x[col]) < String(y[col]) ? -1 : 1) * (asc ? 1 : -1));
+      }
+      if (limit !== null) hit = hit.slice(0, limit);
+      return Promise.resolve({ data: hit, error: null, count: null }).then(ok, ko);
+    };
+    return b;
+  };
+  const auth = {
+    admin: {
+      listUsers: async ({ page, perPage }: { page: number; perPage: number }) => ({
+        data: { users: opts.users.slice((page - 1) * perPage, page * perPage) },
+        error: null,
+      }),
+      deleteUser: async (id: string) => {
+        opts.users = opts.users.filter((u) => u.id !== id);
+        return { data: null, error: null };
+      },
+    },
+  };
+  return { client: { from, auth } as unknown as SupabaseClient, ops, likeCalls, state: opts };
+}
+
+const NOW = new Date("2026-10-18T12:00:00.000Z");
+const hoursAgo = (h: number) => new Date(NOW.getTime() - h * 3_600_000).toISOString();
+function world() {
+  return {
+    tables: {
+      organizations: [
+        { id: "qa-1", slug: "qa-org-aaaaaa", created_at: hoursAgo(100) },
+        { id: "qa-2", slug: "qa-tenant-bbbbbb", created_at: hoursAgo(1) },
+        { id: "lc-old", slug: "lifecycle-org-cccccc", created_at: hoursAgo(49) },
+        { id: "lc-old2", slug: "lifecycle-th-invite-dddddd", created_at: hoursAgo(72) },
+        { id: "lc-new", slug: "lifecycle-org-eeeeee", created_at: hoursAgo(1) },
+        { id: "lc-hand", slug: "lifecycle-academy", created_at: hoursAgo(500) },
+        { id: "real", slug: "ambak", created_at: hoursAgo(5000) },
+      ] as Row[],
+      password_reset_otps: [
+        { id: "o1", email: "qa+u-111111@example.test", created_at: hoursAgo(100) },
+        { id: "o2", email: "lifecycle+u-222222@lifecycle.test", created_at: hoursAgo(100) },
+        { id: "o3", email: "lifecycle+u-333333@lifecycle.test", created_at: hoursAgo(1) },
+        { id: "o4", email: "jane@ambak.com", created_at: hoursAgo(100) },
+      ] as Row[],
+    },
+    users: [
+      { id: "u-qa", email: "qa+u-111111@example.test", created_at: hoursAgo(100) },
+      { id: "u-lc-old", email: "lifecycle+u-222222@lifecycle.test", created_at: hoursAgo(100) },
+      { id: "u-lc-new", email: "lifecycle+u-333333@lifecycle.test", created_at: hoursAgo(1) },
+      { id: "u-real", email: "jane@ambak.com", created_at: hoursAgo(5000) },
+    ],
+  };
+}
+const ids = (rows: Row[]) => rows.map((r) => r.id as string).sort();
+
+async function asyncCases() {
+  console.log("\npurgeAllTestData against the fake: qa data only, whatever its age");
+  {
+    const f = fakeClient(world());
+    const out = await purgeAllTestData(f.client);
+    eq("orgs left: lifecycle, hand-made and real ones", ids(f.state.tables.organizations), ["lc-hand", "lc-new", "lc-old", "lc-old2", "real"]);
+    eq("users left: lifecycle and real ones", f.state.users.map((u) => u.id).sort(), ["u-lc-new", "u-lc-old", "u-real"]);
+    eq("otps left: lifecycle and real ones", ids(f.state.tables.password_reset_otps), ["o2", "o3", "o4"]);
+    eq("the purge's like patterns are exactly the qa ones",
+      f.likeCalls.map(([t, c, p]) => `${t}.${c} ${p}`).sort(),
+      ["organizations.slug qa-%", "password_reset_otps.email qa+%@example.test"]);
+    eq("its counts", out, { users: 1, orgs: 2, otps: 1 });
+  }
+
+  console.log("\ncleanupLifecycleData against the fake");
+  const prevUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  try {
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://abcdefghijklmnopqrst.supabase.co";
+    {
+      const f = fakeClient(world());
+      let refused = false;
+      try { await cleanupLifecycleData({ now: NOW, client: f.client }); } catch { refused = true; }
+      eq("another project → refused before any call", [refused, f.ops.length], [true, 0]);
+    }
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://zeaclbapadosqqttexxh.supabase.co";
+    {
+      const f = fakeClient(world());
+      const r = await cleanupLifecycleData({ now: NOW, client: f.client, dryRun: true });
+      eq("dry run: matches the expired generated orgs and users", [r.ids.orgs.sort(), r.ids.users], [["lc-old", "lc-old2"], ["u-lc-old"]]);
+      eq("dry run: deletes nothing", [f.state.tables.organizations.length, f.state.users.length, f.state.tables.password_reset_otps.length, f.ops.filter((o) => o.kind === "delete").length], [7, 4, 4, 0]);
+      eq("dry run: the hand-made lifecycle- org is counted as kept", r.orgs.kept, 1);
+    }
+    {
+      const f = fakeClient(world());
+      const r = await cleanupLifecycleData({ now: NOW, client: f.client });
+      eq("orgs left: qa, new lifecycle, hand-made, real", ids(f.state.tables.organizations), ["lc-hand", "lc-new", "qa-1", "qa-2", "real"]);
+      eq("users left: qa, new lifecycle, real", f.state.users.map((u) => u.id).sort(), ["u-lc-new", "u-qa", "u-real"]);
+      eq("otps left: all but the expired lifecycle one", ids(f.state.tables.password_reset_otps), ["o1", "o3", "o4"]);
+      eq("counts", [r.orgs, r.users, r.otps, r.capped, r.errors],
+        [{ matched: 2, deleted: 2, failed: 0, kept: 1 }, { matched: 1, deleted: 1, failed: 0 }, { deleted: 1 }, [], []]);
+      eq("the cleanup's like patterns are exactly the lifecycle ones",
+        f.likeCalls.map(([t, c, p]) => `${t}.${c} ${p}`).sort(),
+        ["organizations.slug lifecycle-%", "password_reset_otps.email lifecycle+%@lifecycle.test"]);
+      const line = formatCleanup(r);
+      eq("the log line holds counts only (no id, slug or email)",
+        ["lc-old", "lifecycle-org", "u-lc-old", "@lifecycle.test", "@example.test"].filter((x) => line.includes(x)), []);
+    }
+    {
+      const w = world();
+      const f = fakeClient({ ...w, failOrgDelete: new Set(["lc-old2"]) });
+      const r = await cleanupLifecycleData({ now: NOW, client: f.client });
+      eq("a refused org delete is counted; the others still go", [r.orgs.deleted, r.orgs.failed, r.errors], [1, 1, ["orgs.delete:P0001"]]);
+      eq("…and shows in the log line", /failed=1 .*errors=orgs\.delete:P0001/.test(formatCleanup(r)), true);
+    }
+    {
+      // More expired orgs than one run may delete: the newest go first and
+      // the run says it was capped; an old stuck org cannot block them.
+      const many: Row[] = [];
+      for (let i = 0; i < CLEANUP_MAX_ORGS + 5; i++) {
+        many.push({ id: `m${String(i).padStart(3, "0")}`, slug: `lifecycle-org-${(0xa00000 + i).toString(16)}`, created_at: hoursAgo(49 + i) });
+      }
+      const f = fakeClient({ tables: { organizations: many, password_reset_otps: [] }, users: [], failOrgDelete: new Set(["m204"]) });
+      const r = await cleanupLifecycleData({ now: NOW, client: f.client });
+      eq("capped at the per-run bound", [r.orgs.matched, r.capped], [CLEANUP_MAX_ORGS, ["orgs"]]);
+      eq("newest expired first: the 5 oldest (incl. the stuck one) wait for the next run",
+        ids(f.state.tables.organizations), ["m200", "m201", "m202", "m203", "m204"]);
+      eq("…and the line says capped", /; capped=orgs/.test(formatCleanup(r)), true);
+    }
+  } finally {
+    if (prevUrl === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    else process.env.NEXT_PUBLIC_SUPABASE_URL = prevUrl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Static: tracked lifecycle files seed through ./data, never the e2e helper.
+// ---------------------------------------------------------------------------
+function staticCases() {
+  console.log("\ntracked lifecycle files take their seeding helpers from ./data");
+  const root = path.resolve(__dirname, "../..");
+  let tracked: string[];
+  try {
+    tracked = execFileSync("git", ["ls-files", "tests/bot/lifecycle"], { cwd: root, encoding: "utf8" })
+      .split(/\r?\n/)
+      .filter((f) => f.endsWith(".ts"));
+  } catch {
+    tracked = [];
+  }
+  eq("git lists the tracked lifecycle files", tracked.length > 20, true);
+  const all = fs.readdirSync(path.join(root, "tests/bot/lifecycle")).filter((f) => f.endsWith(".ts")).map((f) => `tests/bot/lifecycle/${f}`);
+  const SEEDERS = /\b(createOrg|createAuthUser|testEmail|testSlug)\b/;
+  const offends = (rel: string) => {
+    if (rel.endsWith("/data.ts")) return false; // the one binder
+    const src = fs.readFileSync(path.join(root, rel), "utf8");
+    const re = /import\s+(type\s+)?(\{[\s\S]*?\}|\*\s+as\s+\w+)\s+from\s+["'][./]*e2e\/helpers\/supabase["']/g;
+    for (const m of src.matchAll(re)) {
+      if (m[1]) continue; // type-only
+      if (m[2].startsWith("*") || SEEDERS.test(m[2])) return true;
+    }
+    return false;
+  };
+  eq("no tracked lifecycle file imports createOrg / createAuthUser / testEmail / testSlug (or the whole module) from e2e/helpers/supabase",
+    tracked.filter(offends), []);
+  const untracked = all.filter((f) => !tracked.includes(f) && offends(f));
+  if (untracked.length) {
+    console.log(`  note: ${untracked.length} untracked lifecycle file(s) still seed in the qa namespace (the e2e purge wipes their data); move them to ./data before committing: ${untracked.join(", ")}`);
+  }
+}
+
+staticCases();
+asyncCases()
+  .catch((e) => { fail++; console.log(`  ✗ async cases threw: ${(e as Error).message}`); })
+  .finally(() => {
+    console.log(`\n${pass} passed, ${fail} failed`);
+    if (fail > 0) process.exit(1);
+  });
