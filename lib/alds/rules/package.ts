@@ -204,6 +204,21 @@ export function checkPackage(input: PackageInput): PackageResult {
   if (r.findings.slice(before).some((f) => f.severity === "error")) return done(null);
   const m = raw as unknown as AldsPackageManifest;
 
+  // U1: an authoringKind's class agrees with the entry's key (ADR 0005 step 6),
+  // so a label cannot switch the SEM key comparison off (see KEY_CLASS_BY_AUTHORING_KIND)
+  m.questions.forEach((q, i) => {
+    const label = q.authoringKind;
+    if (!isStr(label) || !hasOwn(KEY_CLASS_BY_AUTHORING_KIND as Obj, label)) return;
+    const cls = KEY_CLASS_BY_AUTHORING_KIND[label];
+    const path = `questions[${i}].authoringKind`;
+    if (cls === "keyed") {
+      if (q.correct.length === 0) r.add("U1", "keyed_kind_without_key", `questions[${i}] is a ${label} (keyed) question without a key in correct`, { path });
+      if (q.kind === "other") r.add("U1", "keyed_kind_untyped", `questions[${i}] is a ${label} (keyed) question on interactionType other, which has no comparable key`, { path });
+    } else if (q.correct.length > 0 && q.kind !== "other") {
+      r.add("U1", "key_on_unkeyed_kind", `questions[${i}] is a ${label} (${cls}) question but carries a key on the typed kind ${q.kind}; a keyed question cannot be relabelled to skip the key comparison`, { path });
+    }
+  });
+
   // R10 on the manifest key: every correct entry parses for its kind
   r.check("R10");
   m.questions.forEach((q, i) => {

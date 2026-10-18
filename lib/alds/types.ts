@@ -202,9 +202,23 @@ export type AldsKeyClass = "keyed" | "scored-unkeyed" | "completion-only" | "uns
 
 /**
  * PROPOSED (P3): the authoring kind vocabulary (ADR 0005 step 6) mapped to its
- * class. The table lives in the reviewed rules, so a package cannot declare its
- * own class. A catalogue entry without `authoringKind` is `keyed` when it has a
- * key (`correct` not empty) and `scored-unkeyed` otherwise.
+ * class. The table lives in the reviewed rules. A catalogue entry without
+ * `authoringKind` is `keyed` when it has a key (`correct` not empty) and
+ * `scored-unkeyed` otherwise.
+ *
+ * A label alone cannot switch the key comparison off: checkPackage (U1)
+ * requires the entry to agree with the class its label names. A keyed label
+ * needs a key (`keyed_kind_without_key`) and a typed xAPI kind, not `other`
+ * (`keyed_kind_untyped`); any other label carries no key on a typed kind
+ * (`key_on_unkeyed_kind`). So relabelling a keyed question `game` or
+ * `hotspot` also has to drop its key, and then there is nothing to compare.
+ *
+ * OPEN DECISIONS (owner/architect, before KIVO builds the 2.0 export against
+ * this bundle): (1) a reviewed table of the xAPI kinds each authoring kind may
+ * use (what release A emits per kind; not built here, because it cannot be
+ * checked against the engine yet); (2) whether a typed kind with a non-empty
+ * key may ever be scored-unkeyed or completion-only. Until (2) is decided it
+ * may not (`key_on_unkeyed_kind`, error).
  */
 export const KEY_CLASS_BY_AUTHORING_KIND: Readonly<Record<string, AldsKeyClass>> = {
   choice: "keyed",
