@@ -16,6 +16,9 @@ import {
 } from "lucide-react";
 import { LibraryBrowser, type FolderLite, type CourseLite } from "./library-browser";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
+import { fetchByIds } from "@/lib/db/chunked";
+import { aldsP4Enabled } from "@/lib/alds/flag";
+import { isAnalyticsTier, type AnalyticsTier } from "@/lib/alds/tier";
 
 export default async function CoursesPage({
   params,
@@ -138,6 +141,35 @@ export default async function CoursesPage({
 
   // Human-readable codes (0079), fail-soft before the migration.
   const codes = await fetchReferenceCodes(supabase, "courses", courseIds);
+
+  // ALDS P4 (ADR 0005 note (g)): the analytics tier of each course's default
+  // version. Flag off → not read and not passed; any read error (0100 not
+  // applied, RLS) → no badge.
+  const tierByVersion = new Map<string, { tier: AnalyticsTier | null; reason: string | null }>();
+  const showTiers = aldsP4Enabled();
+  if (showTiers) {
+    const currentVersionIds = [...new Set(list.map((c) => c.current_version_id).filter((v): v is string => !!v))];
+    try {
+      const rows = await fetchByIds<{ id: string; analytics_tier: string | null; analytics_tier_reason: string | null }>(
+        supabase,
+        "course_versions",
+        "id, analytics_tier, analytics_tier_reason",
+        "id",
+        currentVersionIds
+      );
+      for (const r of rows) {
+        tierByVersion.set(r.id, { tier: isAnalyticsTier(r.analytics_tier) ? r.analytics_tier : null, reason: r.analytics_tier_reason });
+      }
+    } catch {
+      tierByVersion.clear();
+    }
+  }
+  // The two fields only when a tier was read for the course's default version.
+  const tierFieldsOf = (versionId: string | null): Pick<CourseLite, "analytics_tier" | "analytics_tier_reason"> => {
+    const t = versionId ? tierByVersion.get(versionId) : undefined;
+    return t?.tier ? { analytics_tier: t.tier, analytics_tier_reason: t.reason } : {};
+  };
+
   const courseList: CourseLite[] = list.map((c) => ({
     id: c.id,
     code: codes.get(c.id) ?? null,
@@ -153,6 +185,7 @@ export default async function CoursesPage({
     folder_id: folderByCourse.get(c.id) ?? null,
     enrolled: enrolledByCourse.get(c.id)?.size ?? 0,
     languages: languagesByCourse.get(c.id) ?? [],
+    ...tierFieldsOf(c.current_version_id),
   }));
 
   const totalCourses = list.length;

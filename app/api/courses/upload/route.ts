@@ -8,6 +8,7 @@ import {
 } from "@/lib/courses/validation/gate";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
+import { runPackageGuardian } from "@/lib/alds/guardian";
 
 /**
  * Course package upload endpoint.
@@ -256,6 +257,16 @@ export async function POST(request: NextRequest) {
   // existing course (i.e., learners already had the old version assigned).
   if (wantsNotify && courseId) {
     await notifyCourseUpdate({ org: org as { id: string; slug: string; name: string }, courseId });
+  }
+
+  // ADR 0005 note (e), additions of 2026-10-19: the Package Guardian static
+  // gate, warn-only (flag ALDS_P4, default off), LAST, after the update
+  // notification, as finalizeDirectUpload runs it; it never changes this
+  // answer.
+  try {
+    await runPackageGuardian({ versionId: result.versionId, organizationId: org.id, trigger: "upload" });
+  } catch (e) {
+    console.warn("[alds] guardian failed", e instanceof Error ? e.message : e);
   }
 
   return NextResponse.json(result);

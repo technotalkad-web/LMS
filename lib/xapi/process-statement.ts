@@ -9,6 +9,14 @@ import {
   type VersionLite,
 } from "@/lib/courses/progress";
 import { AttemptAbandonedError } from "@/lib/attempts/abandon";
+import { auActivityId } from "@/lib/alds/types";
+
+/**
+ * The attempt's version as the read below embeds it: VersionLite plus the
+ * package id, from which the LMS-issued AU id is derived (ADR 0006 note (d)
+ * of 2026-10-19). Local on purpose: lib/courses/progress.ts is not edited.
+ */
+type LaunchedVersion = VersionLite & { package_id?: string | null };
 
 /**
  * Inspect a single xAPI statement and update the bound attempt's
@@ -45,7 +53,7 @@ export async function processStatement(opts: {
   // keeps this deploy-safe across attempt-column migrations (0075).
   const { data: row, error: readErr } = await supabase
     .from("course_attempts")
-    .select("*, course_versions(id, manifest_data, launch_url, storage_prefix)")
+    .select("*, course_versions(id, manifest_data, launch_url, storage_prefix, package_id)")
     .eq("id", attemptId)
     .maybeSingle();
   // Distinguish a real query error from "no such attempt". On error we must NOT
@@ -72,7 +80,7 @@ export async function processStatement(opts: {
 
   const version = (Array.isArray(r.course_versions)
     ? r.course_versions[0]
-    : r.course_versions) as VersionLite | null;
+    : r.course_versions) as LaunchedVersion | null;
   const auIds = launchedActivityIds(version, r.course_version_id);
   const aboutAu = isAboutAu(statement, auIds);
 
@@ -203,15 +211,22 @@ export function normalizeActivityId(id: string | undefined | null): string {
  * page's `activityId` choice (manifest auId → courseId → urn:uuid:version)
  * and also accepts the manifest course id, which some tools use for their
  * cmi5-defined statements instead of the AU id.
+ *
+ * ADR 0006 step 17 / note (d) of 2026-10-19: when the version has a
+ * package, the LMS-issued AU id (BLUEPRINT §1.2) is accepted too, in every
+ * deploy and whatever ALDS_P4 says (only SENDING it is flag-gated, on the
+ * launch page). Additive: the publisher ids stay in the list.
  */
 export function launchedActivityIds(
-  version: { id?: string; manifest_data?: unknown } | null,
+  version: { id?: string; manifest_data?: unknown; package_id?: string | null } | null,
   versionId: string
 ): string[] {
   const raw =
     ((version?.manifest_data as { raw?: Record<string, unknown> } | undefined)?.raw ??
       {}) as Record<string, unknown>;
-  const ids = [raw.auId, raw.activityId, raw.courseId, `urn:uuid:${version?.id ?? versionId}`]
+  const lmsAuId =
+    typeof version?.package_id === "string" && version.package_id ? auActivityId(version.package_id) : null;
+  const ids = [raw.auId, raw.activityId, raw.courseId, `urn:uuid:${version?.id ?? versionId}`, lmsAuId]
     .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
     .map(normalizeActivityId);
   return [...new Set(ids)];

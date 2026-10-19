@@ -23,6 +23,8 @@ import { useConfirm } from "@/components/ui/confirm";
 import { QrCodeModal } from "../_components/qr-code-modal";
 import { thumbImgStyle } from "@/lib/ui/thumbnail";
 import { languageDisplay } from "@/lib/i18n/languages";
+import type { AnalyticsTier } from "@/lib/alds/tier";
+import { TierBadge } from "@/components/alds/tier-badge";
 
 export type FolderLite = { id: string; name: string; parent_id: string | null };
 export type CourseLite = {
@@ -42,6 +44,9 @@ export type CourseLite = {
   enrolled: number;
   /** Language packages on the course (#158); null = unlabeled legacy. */
   languages?: Array<{ language: string | null; is_active: boolean }>;
+  /** ALDS P4: the default version's analytics tier; absent when the flag is off or the read failed. */
+  analytics_tier?: AnalyticsTier | null;
+  analytics_tier_reason?: string | null;
 };
 
 function formatDuration(mins: number | null): string | null {
@@ -378,6 +383,9 @@ export function LibraryBrowser({
                         </span>
                         {!c.current_version_id && (
                           <span className="text-amber-700">no version</span>
+                        )}
+                        {c.analytics_tier && (
+                          <TierBadge tier={c.analytics_tier} reason={c.analytics_tier_reason} />
                         )}
                       </div>
                     </div>

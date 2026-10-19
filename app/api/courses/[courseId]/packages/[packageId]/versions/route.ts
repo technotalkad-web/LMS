@@ -7,6 +7,7 @@ import {
   forceRestartReplaceAnswer,
   forceRestartReport,
 } from "@/lib/attempts/force-restart";
+import { runPackageGuardian } from "@/lib/alds/guardian";
 import {
   enforcePackageValidation,
   linkValidationToVersion,
@@ -177,28 +178,44 @@ export async function POST(
     versionId: result.versionId,
   });
 
+  let answer: { status: 200 | 500; body: Record<string, unknown> };
   if (mode === "grandfather") {
-    return NextResponse.json({
-      ok: true,
-      version_id: result.versionId,
-      version_number: result.versionNumber,
-      mode,
-      restarted: 0,
+    answer = {
+      status: 200,
+      body: {
+        ok: true,
+        version_id: result.versionId,
+        version_number: result.versionNumber,
+        mode,
+        restarted: 0,
+      },
+    };
+  } else {
+    // ---- Force-restart: silently abandon old in-progress attempts ----
+    // After this, the launcher finds no resumable attempt on the package's old
+    // versions, so each learner starts fresh on the new version. The outcome
+    // is a value (never a throw): the version above stays published whatever
+    // it says, and a failed reset answers 500 with published: true.
+    const run = await forceRestartOlderVersions(svc, { packageId, newVersionId: result.versionId });
+    answer = forceRestartReplaceAnswer({
+      courseId,
+      packageId,
+      versionId: result.versionId,
+      versionNumber: result.versionNumber,
+      report: forceRestartReport(run),
     });
   }
 
-  // ---- Force-restart: silently abandon old in-progress attempts ----
-  // After this, the launcher finds no resumable attempt on the package's old
-  // versions, so each learner starts fresh on the new version. The outcome
-  // is a value (never a throw): the version above stays published whatever
-  // it says, and a failed reset answers 500 with published: true.
-  const run = await forceRestartOlderVersions(svc, { packageId, newVersionId: result.versionId });
-  const answer = forceRestartReplaceAnswer({
-    courseId,
-    packageId,
-    versionId: result.versionId,
-    versionNumber: result.versionNumber,
-    report: forceRestartReport(run),
-  });
+  // ADR 0005 note (e), additions of 2026-10-19: the Package Guardian static
+  // gate, warn-only (flag ALDS_P4, default off), LAST, after the forced
+  // restart, as finalizeDirectUpload runs it, so a slow gate or a worker
+  // killed inside it can never cost the ADR 0011 restart or its report. It
+  // never changes this answer.
+  try {
+    await runPackageGuardian({ versionId: result.versionId, organizationId: org.id, trigger: "upload" });
+  } catch (e) {
+    console.warn("[alds] guardian failed", e instanceof Error ? e.message : e);
+  }
+
   return NextResponse.json(answer.body, { status: answer.status });
 }

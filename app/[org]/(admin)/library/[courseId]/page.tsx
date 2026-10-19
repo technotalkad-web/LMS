@@ -20,13 +20,23 @@ import { ValidateExistingButton } from "./validate-existing-button";
 import { ScoringRulesCard } from "@/components/scoring/scoring-rules-card";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
 import { loadEnrolledCourseStatus } from "@/lib/scoring/status";
-import { ActivateVersionButton, DiscardUploadButton, RestartVersionButton } from "./version-actions";
+import {
+  ActivateVersionButton,
+  DiscardUploadButton,
+  RerunCertificationButton,
+  RestartVersionButton,
+} from "./version-actions";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { IdChip } from "@/components/ui/id-chip";
 import { packageCode, versionCode } from "@/lib/reference-codes";
 import { isReadyVersion } from "@/lib/courses/default-rule";
+import { aldsP4Enabled } from "@/lib/alds/flag";
+import { canRerunCertification } from "@/lib/alds/guardian";
+import type { VersionTierColumns } from "@/lib/alds/rpc";
+import { TierBadge } from "@/components/alds/tier-badge";
 
-type Version = {
+/** 0100 adds analytics_tier & co.; select("*") reads undefined before it (no badge). */
+type Version = VersionTierColumns & {
   id: string;
   package_id?: string | null;
   version_number: number;
@@ -71,7 +81,7 @@ export default async function AdminCourseDetailPage({
 }) {
   const { org: orgSlug, courseId } = await params;
   const showFailed = (await searchParams).showFailed === "1";
-  const { org, role } = await requireOrgAccess(orgSlug);
+  const { org, role, user } = await requireOrgAccess(orgSlug);
   if (!canManage(role)) {
     redirect(`/${orgSlug}/dashboard?denied=1`);
   }
@@ -102,7 +112,24 @@ export default async function AdminCourseDetailPage({
   // Failed uploads keep their row (ADR 0008 D1: the version number and folder
   // are never reused); the version list hides them unless asked.
   const failedCount = list.filter((v) => v.upload_status === "failed").length;
-
+  // ALDS P4 (ADR 0005 note (g)): the analytics-tier badge per version, read
+  // from the select("*") above; flag off or column absent → no badge.
+  const showTiers = aldsP4Enabled();
+  // "Re-run check" shows on exactly the roles the certify route accepts:
+  // the same predicate (canRerunCertification) on the same input, the RAW
+  // membership role the route reads through requireOrgAdminApi (`role`
+  // above is normalised: the legacy "owner" and an impersonation read as
+  // super_owner, and the route refuses both). Read only with the flag on.
+  let rerunAllowed = false;
+  if (showTiers) {
+    const { data: membership } = await supabase
+      .from("organization_members")
+      .select("role")
+      .eq("organization_id", org.id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    rerunAllowed = canRerunCertification((membership as { role?: string | null } | null)?.role);
+  }
 
 
   // Language packages (#158 Phase 1c). Sorted by language code so the
@@ -727,6 +754,14 @@ export default async function AdminCourseDetailPage({
                   const isReady = !v.upload_status || v.upload_status === "ready";
                   const canRestart =
                     !!v.package_id && isReady && (!isCurrent || pkgById.get(v.package_id)?.is_active === false);
+                  // ADR 0005 note (f): super_owner re-runs the static check
+                  // on a version that is pending, uncertified or revoked.
+                  const tier = showTiers ? v.analytics_tier : undefined;
+                  const canRerun =
+                    rerunAllowed &&
+                    !!v.package_id &&
+                    isReady &&
+                    (tier === "pending" || tier === "uncertified" || tier === "revoked");
                   return (
                     <li
                       key={v.id}
@@ -757,6 +792,14 @@ export default async function AdminCourseDetailPage({
                               course default
                             </span>
                           )}
+                          {tier && (
+                            <TierBadge
+                              tier={tier}
+                              reason={v.analytics_tier_reason}
+                              certificationId={v.certification_id}
+                              className="ml-2"
+                            />
+                          )}
                         </div>
                         <div className="text-xs text-muted break-all">
                           {v.manifest_type} - launch:{" "}
@@ -772,6 +815,15 @@ export default async function AdminCourseDetailPage({
                         </div>
                       </div>
                       <div className="text-xs text-muted shrink-0 flex items-center gap-2">
+                        {canRerun && v.package_id && (
+                          <RerunCertificationButton
+                            orgSlug={orgSlug}
+                            courseId={c.id}
+                            packageId={v.package_id}
+                            versionId={v.id}
+                            versionNumber={v.version_number}
+                          />
+                        )}
                         {canRestart && v.package_id && (
                           <RestartVersionButton
                             orgSlug={orgSlug}

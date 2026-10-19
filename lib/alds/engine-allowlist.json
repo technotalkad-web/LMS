@@ -1,0 +1,4 @@
+{
+  "$comment": "Certified KIVO engines (ADR 0005 step 4). An entry is added only by a reviewed pull request after the reference 2.0 export of the hosted editor exists; keyed by (engineDigest, rulesBundleHash). Empty = nothing can be certified. Entry shape: { \"engineDigest\": \"sha256:<64 hex>\", \"rulesBundleHash\": \"sha256:<64 hex>\" (a lib/alds/bundles/bundles.json hash), \"certifiedKinds\": string[] (questions[].authoringKind values the reference export proved), \"editorVersion\": string, \"registeredAt\": \"YYYY-MM-DD\", \"reference\": string (the reference export and the review that admitted it) }. Read by lib/alds/guardian.ts (loadEngineAllowlist, findAllowlistEntry).",
+  "engines": []
+}

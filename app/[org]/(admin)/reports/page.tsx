@@ -27,6 +27,9 @@ import {
   StatusPill,
 } from "@/components/admin";
 import { CsvButton } from "./_components/csv-button";
+import { fetchByIds } from "@/lib/db/chunked";
+import { aldsP4Enabled } from "@/lib/alds/flag";
+import { D1_SENTENCE, isAnalyticsTier, questionAnalyticsLabel, type AnalyticsTier } from "@/lib/alds/tier";
 
 type Course = {
   id: string;
@@ -73,6 +76,8 @@ type TeamLink = { team_id: string; user_id: string };
 interface CourseRow {
   course: Course;
   standard: string;
+  /** ALDS P4 "Question analytics" label; null = column not shown (flag off or tier unreadable). Display only (D1). */
+  questionAnalytics: string | null;
   /** Attempts that were not reset (ADR 0004 step 11). */
   attempts: number;
   /** Reset (abandoned) attempts, shown as "· N reset". */
@@ -151,6 +156,26 @@ export default async function ReportsPage({
         .in("course_id", courseIds)
     : { data: [] };
   const versions = (versionRows ?? []) as Version[];
+
+  // ALDS P4 (ADR 0005 step 11, note (g)): the "Question analytics" column,
+  // from a separate read of the analytics tier. Flag off or any read error
+  // (0100 not applied) → null and the column is not shown. Display only: no
+  // KPI, status or score below reads it (D1).
+  let tierByVersion: Map<string, AnalyticsTier | null> | null = null;
+  if (aldsP4Enabled() && courseIds.length > 0) {
+    try {
+      const tierRows = await fetchByIds<{ id: string; analytics_tier: string | null }>(
+        supabase,
+        "course_versions",
+        "id, analytics_tier",
+        "course_id",
+        courseIds
+      );
+      tierByVersion = new Map(tierRows.map((r) => [r.id, isAnalyticsTier(r.analytics_tier) ? r.analytics_tier : null]));
+    } catch {
+      tierByVersion = null;
+    }
+  }
 
   // Paginate the unbounded reads. Supabase caps a single response at 1000 rows,
   // which silently truncated every KPI once an org crossed ~1000 attempts /
@@ -341,6 +366,11 @@ export default async function ReportsPage({
     return {
       course: c,
       standard: currentVersion?.manifest_type ?? "-",
+      questionAnalytics: tierByVersion
+        ? currentVersion
+          ? questionAnalyticsLabel(tierByVersion.get(currentVersion.id), currentVersion.manifest_type)
+          : "-"
+        : null,
       attempts: myCounts.live,
       resetAttempts: myCounts.reset,
       learners: new Set(myLive.map((a) => a.user_id)).size,
@@ -712,6 +742,11 @@ export default async function ReportsPage({
                 <tr>
                   <th className="text-left px-4 py-2 font-medium">Course</th>
                   <th className="text-left px-4 py-2 font-medium">Std</th>
+                  {tierByVersion && (
+                    <th className="text-left px-4 py-2 font-medium" title={D1_SENTENCE} data-testid="question-analytics-header">
+                      Question analytics
+                    </th>
+                  )}
                   <th className="text-right px-4 py-2 font-medium">Attempts</th>
                   <th className="text-right px-4 py-2 font-medium">Learners</th>
                   <th className="text-right px-4 py-2 font-medium" title="Learners whose official attempt has a result">Completed</th>
@@ -737,6 +772,11 @@ export default async function ReportsPage({
                       </Link>
                     </td>
                     <td className="px-4 py-3 text-xs text-muted">{r.standard}</td>
+                    {tierByVersion && (
+                      <td className="px-4 py-3 text-xs text-muted whitespace-nowrap" data-testid="question-analytics">
+                        {r.questionAnalytics}
+                      </td>
+                    )}
                     <td className="px-4 py-3 text-right tabular-nums whitespace-nowrap">
                       {r.attempts}
                       <ResetSuffix n={r.resetAttempts} />
@@ -766,6 +806,11 @@ export default async function ReportsPage({
             </table>
             </div>
           </Card>
+        )}
+        {tierByVersion && rows.length > 0 && (
+          <p className="mt-2 text-xs text-muted" data-testid="question-analytics-d1">
+            Question analytics: certified KIVO cmi5 packages only. {D1_SENTENCE}
+          </p>
         )}
       </section>
 

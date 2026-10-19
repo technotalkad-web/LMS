@@ -197,8 +197,8 @@ function isServiceReceiver(file: string, receiver: string, at: number): boolean 
 type Site = { receivers: string[]; params?: string[]; what: string };
 const ATTEMPT_WRITES: Record<string, Site> = {
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
-    receivers: ["svcReset", "svcSlot", "svcAttempt", "svcAttempt"],
-    what: "grant-retake reset, deactivated-slot close, journey tag, attempt insert",
+    receivers: ["svcReset", "svcSlot", "svcAttempt", "svcAttempt", "svcAttempt"],
+    what: "grant-retake reset, deactivated-slot close, journey tag, attempt insert, attempt insert retry without the 0100 columns (ADR 0006 note (c) of 2026-10-19)",
   },
   "app/api/courses/[courseId]/language-preference/route.ts": { receivers: ["svc"], what: "language switch abandon" },
   "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts": { receivers: ["svc"], what: "per-version restart" },
@@ -312,6 +312,17 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
     /\buser_id: user\.id\b/.test(ins.stmt) &&
     /\borganization_id: org\.id\b/.test(ins.stmt) &&
     /\bcourse_version_id: v\.id\b/.test(ins.stmt), true);
+  // ADR 0006 note (c) of 2026-10-19: the retry without the 0100 columns is
+  // the same row (same user, organisation and version); only the first
+  // insert names the P4 columns.
+  const inserts = launch.filter((w) => w.receiver === "svcAttempt" && w.method === "insert");
+  eq("attempt insert + retry: both carry user_id, organization_id and course_version_id", inserts.length === 2 &&
+    inserts.every((w) =>
+      /\buser_id: user\.id\b/.test(w.stmt) &&
+      /\borganization_id: org\.id\b/.test(w.stmt) &&
+      /\bcourse_version_id: v\.id\b/.test(w.stmt)), true);
+  eq("attempt insert + retry: exactly one names is_preview (the first)",
+    inserts.map((w) => /\bis_preview:/.test(w.stmt)), [true, false]);
   const commit = sources.get("app/api/scorm/[attemptId]/commit/route.ts") ?? "";
   eq("SCORM commit: updateAttemptFailSoft(svc, attemptId, update, { userId: user.id })",
     /updateAttemptFailSoft\(svc, attemptId, update, \{ userId: user\.id \}\)/.test(commit), true);

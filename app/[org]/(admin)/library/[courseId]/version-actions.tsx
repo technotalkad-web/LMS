@@ -5,6 +5,7 @@ import { useEffect, useId, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle } from "lucide-react";
 import { useConfirm } from "@/components/ui/confirm";
+import { isAnalyticsTier, tierBadge } from "@/lib/alds/tier";
 
 /**
  * "Make current" for a non-current, fully uploaded version: the rollback /
@@ -303,6 +304,137 @@ export function RestartVersionButton({
               </div>
             </>
           )}
+        </RestartDialog>
+      )}
+    </span>
+  );
+}
+
+const RERUN_ERRORS: Record<string, string> = {
+  super_owner_required: "Only a super owner can re-run the check.",
+  p4_disabled: "The certification check is switched off on this environment.",
+  not_ready: "This version is not fully uploaded.",
+  no_manifest: "This package has no alds-manifest.json: there is nothing to certify.",
+  schema_missing: "The certification tables are not on this database yet.",
+  unavailable: "The check could not run. Nothing changed; try again.",
+};
+
+/**
+ * "Re-run check" (ADR 0005 note (f) of 2026-10-19): super_owner only, on a
+ * version whose analytics tier is pending, uncertified or revoked. A dialog
+ * asks for the reason (kept in the audit log), then the certify route runs
+ * the Package Guardian again and the page refreshes. The tier is
+ * informational: nothing learners see or are scored on changes.
+ */
+export function RerunCertificationButton({
+  orgSlug,
+  courseId,
+  packageId,
+  versionId,
+  versionNumber,
+}: {
+  orgSlug: string;
+  courseId: string;
+  packageId: string;
+  versionId: string;
+  versionNumber: number;
+}) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+
+  function close() {
+    if (busy) return;
+    setOpen(false);
+    setError(null);
+  }
+
+  async function rerun() {
+    if (!reason.trim()) return;
+    setBusy(true);
+    setError(null);
+    const res = await fetch(`/api/courses/${courseId}/packages/${packageId}/versions/${versionId}/certify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug, reason: reason.trim() }),
+    });
+    const j = (await res.json().catch(() => ({}))) as { error?: string; tier?: string; reason?: string | null };
+    setBusy(false);
+    if (!res.ok) {
+      setError((j.error && RERUN_ERRORS[j.error]) ?? j.error ?? `HTTP ${res.status}`);
+      return;
+    }
+    const label = tierBadge(isAnalyticsTier(j.tier) ? j.tier : null)?.label ?? j.tier ?? "done";
+    setOpen(false);
+    setResult(j.reason ? `${label}: ${j.reason}` : label);
+    router.refresh();
+  }
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      {error && !open && <span className="text-[11px] text-red-700">{error}</span>}
+      {result && (
+        <span className="text-[11px] text-muted max-w-[16rem] truncate" title={result} data-testid="rerun-result">
+          {result}
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={() => {
+          setReason("");
+          setError(null);
+          setResult(null);
+          setOpen(true);
+        }}
+        disabled={busy}
+        className="text-[11px] px-2 py-1 border border-line rounded hover:border-ink disabled:opacity-50"
+        title="Run the static certification check on this version's stored files again"
+        data-testid="rerun-certification"
+      >
+        {busy ? "Checking…" : "Re-run check"}
+      </button>
+      {open && (
+        <RestartDialog title={`Re-run the certification check on v${versionNumber}?`} onClose={close}>
+          <p className="mt-1 text-xs text-muted leading-relaxed">
+            The static check reads this version&apos;s stored files again and sets its analytics tier. Completion,
+            scores, the Report Card, CRM and journeys never depend on the tier, and learners are not affected.
+          </p>
+          <label className="block mt-4 text-xs font-medium text-ink" htmlFor={`rerun-reason-${versionId}`}>
+            Reason (required, kept in the audit log)
+          </label>
+          <textarea
+            id={`rerun-reason-${versionId}`}
+            autoFocus
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            maxLength={500}
+            rows={3}
+            disabled={busy}
+            className="mt-1 w-full rounded-lg border border-line bg-canvas px-3 py-2 text-sm"
+            placeholder="e.g. storage timed out during the upload check"
+          />
+          {error && <p className="mt-2 text-xs text-red-700">{error}</p>}
+          <div className="mt-6 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={close}
+              disabled={busy}
+              className="px-4 py-2 rounded-lg border border-line text-sm text-muted hover:text-ink hover:border-ink transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={rerun}
+              disabled={busy || !reason.trim()}
+              className="px-4 py-2 rounded-lg bg-ink text-canvas text-sm font-semibold hover:opacity-90 transition-opacity disabled:opacity-50"
+            >
+              {busy ? "Checking…" : "Re-run check"}
+            </button>
+          </div>
         </RestartDialog>
       )}
     </span>

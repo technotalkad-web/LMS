@@ -5,6 +5,8 @@ import { readParams, pick, list, bool, int, iso } from "@/lib/integrations/param
 import { parseVersionDays } from "@/lib/journey/journey";
 import { catalogAvailable } from "@/lib/courses/default-rule";
 import { fetchReferenceCodes, journeyVersionCode, versionCode } from "@/lib/reference-codes";
+import { aldsP4Enabled } from "@/lib/alds/flag";
+import { isAnalyticsTier, type AnalyticsTier } from "@/lib/alds/tier";
 
 /**
  * Catalogue — what the organisation can assign and launch (the UpsideLMS
@@ -41,6 +43,13 @@ type CatalogItem =
       version_id: string | null;
       /** Derived: MOD0015-V03, or MOD0015-HI-V02 when the course has several language packages. */
       version_code: string | null;
+      /**
+       * ALDS P4 (ADR 0005 decision 3, note (g)): the Package Guardian tier of
+       * `version_id`. Present only when ALDS_P4 is on and the column could be
+       * read; never null-faked, never an input to `status`, `has_content` or
+       * `version_id`.
+       */
+      analytics_tier?: AnalyticsTier;
       duration_minutes: number | null;
       status: "available" | "unavailable";
       is_active: boolean;
@@ -139,6 +148,25 @@ async function handle(request: Request) {
       versionOf.set(v.id, { version_number: v.version_number, package_id: v.package_id });
     }
   }
+  // ALDS P4 (ADR 0005 decision 3): the default version's analytics tier, a
+  // separate fail-soft read. Flag off → not read; any error (0100 not
+  // applied) → the map stays empty and no course carries the field.
+  const tierOf = new Map<string, AnalyticsTier>();
+  if (aldsP4Enabled()) {
+    for (let i = 0; i < verIds.length; i += 300) {
+      const { data, error } = await svc
+        .from("course_versions")
+        .select("id, analytics_tier")
+        .in("id", verIds.slice(i, i + 300));
+      if (error) {
+        tierOf.clear();
+        break;
+      }
+      for (const v of (data ?? []) as Array<{ id: string; analytics_tier: unknown }>) {
+        if (isAnalyticsTier(v.analytics_tier)) tierOf.set(v.id, v.analytics_tier);
+      }
+    }
+  }
   // Human-readable codes (0079): MOD0015 and the derived MOD0015-HI-V02; fail-soft before the migration.
   const courseCodes = await fetchReferenceCodes(svc, "courses", courses.map((c) => c.id));
   const packageLang = new Map<string, string | null>();
@@ -187,6 +215,7 @@ async function handle(request: Request) {
       if (changedBefore(c.updated_at)) continue;
       const ver = c.current_version_id ? versionOf.get(c.current_version_id) : undefined;
       const code = courseCodes.get(c.id) ?? null;
+      const tier = c.current_version_id ? tierOf.get(c.current_version_id) : undefined;
       items.push({
         type: "course",
         id: c.id,
@@ -198,6 +227,7 @@ async function handle(request: Request) {
         version_code: ver
           ? versionCode(code, ver.version_number, ver.package_id ? packageLang.get(ver.package_id) ?? null : null, (packagesOf.get(c.id) ?? 0) > 1)
           : null,
+        ...(tier ? { analytics_tier: tier } : {}),
         duration_minutes: c.duration_minutes,
         status: available ? "available" : "unavailable",
         is_active: c.is_active !== false,

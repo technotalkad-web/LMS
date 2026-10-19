@@ -184,6 +184,9 @@ export async function uploadCoursePackage(opts: {
   // 6) Point the package at this version; the course default follows only
   //    for a new course or the default slot (ADR 0008 step 9).
   await publishVersion(supabase, { courseId, packageId, versionId: version.id });
+  // The Package Guardian gate does not run here: every multipart route that
+  // calls this helper runs it as its own last step, after its forced restart
+  // and its update notification (ADR 0005 note (e), additions of 2026-10-19).
 
   return {
     courseId,
