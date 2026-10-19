@@ -1,6 +1,6 @@
 # 0013. Patch the bundled react-dom's lost ping at bundle time until Next ships the fix
 
-Status: Proposed (owner approval pending). Code only, no migration, no API or schema change. Ships with the next build on every environment.
+Status: Accepted (owner, 2026-10-19): Option A, React's upstream fix applied to the bundled react-dom at bundle time, with the fail-the-build safeguard of decision 2 kept; the owner's words are recorded under "Decisions requested from the owner", as ADR 0008–0011 do, not by rewriting this record. Code only, no migration, no API or schema change. Ships with the next build on every environment.
 Date: 2026-10-19
 Deciders: owner; executor (diagnosis and fix on branch `fix/course-default-header-refresh`)
 
@@ -32,3 +32,7 @@ Deciders: owner; executor (diagnosis and fix on branch `fix/course-default-heade
 - **Patch `node_modules` in a `postinstall` script (or patch-package).** Same change, but mutates installed files, needs the Dockerfile to copy the script before `npm ci`, and webpack's persistent cache treats `node_modules` as immutable per package version, so a cache built before the patch would keep serving the broken chunk.
 - **Page-level workaround** (a full page load after Set as default, or a watchdog that reloads). Fixes one call site, leaves every other refresh and navigation exposed, and loses client state; rejected.
 - **Change the spec** (reload before the assertion, a longer timeout, or asserting the client-only badge). Would hide a real admin-facing bug; rejected.
+
+## Decisions requested from the owner
+
+1. Which fix. A: apply React's upstream `pingSuspendedRoot` change to the bundled react-dom client builds at bundle time (decisions 1–4: the webpack loader `scripts/react-dom-ping-fix.cjs` registered in `next.config.ts`, the fail-loud rule with `tests/unit/react-dom-ping-fix.test.ts`, the exit condition, spec 54 unchanged). B: upgrade Next to 16.x, whose bundled react-dom carries the fix (the first alternative above). C: a full page load after Set as default only (the third alternative above). Recommended: A. Decided (owner, 2026-10-19): A, in the owner's words: "I approve Option A: apply the small React fix during the build, as recorded in ADR 0013. Please keep the safeguard that stops the build if a future Next.js upgrade changes the affected code." The safeguard the owner names is decision 2 as written, and it is kept: the loader throws, so `next build` and `next dev` fail naming the file and this record, whenever a matched react-dom file does not contain the broken form exactly once (zero or several matches), which is what a Next upgrade that changes the affected code produces. A file that already carries the upstream fix is passed through unchanged and does not stop the build; that case is caught by `tests/unit/react-dom-ping-fix.test.ts` in the `unit` job, whose installed-file check then fails with `already-fixed` instead of `patched` (decision 3, the exit condition). Neither check is removed or weakened while the loader exists. B remains the way to retire this record (decision 3); C stays rejected as recorded under Alternatives considered.
