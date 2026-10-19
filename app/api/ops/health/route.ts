@@ -27,14 +27,28 @@ export const dynamic = "force-dynamic";
 type CheckStatus = "ok" | "warn" | "fail" | "unknown";
 type Check = { status: CheckStatus; latency_ms?: number; detail?: unknown };
 
-/** Expected max minutes between runs before a job counts as stale. */
+/**
+ * Expected max minutes between runs before a job counts as stale.
+ *
+ * An entry is added only once its .github/workflows/cron.yml schedule fires
+ * and its route is live on production: a schedule fires on production as
+ * soon as it is on main, and an entry whose schedule is not firing pages the
+ * watchdog (docs/ARCHITECTURE.md §9, ADR 0007 step 7). So no
+ * "report-card-refresh" entry yet: its schedule line is removed before
+ * v1.3.0 and re-added after the deploy is verified; its entry ships in the
+ * next tag. tests/unit/cron-cadence.test.ts checks this list against
+ * cron.yml and the cron routes' heartbeat names.
+ */
 const CRON_CADENCE_MIN: Record<string, number> = {
   "lrs-forward": 30, //           */5 schedule; generous for GH cron jitter
+  "gamification-refresh": 90, //  7-59/15 schedule; 6x the interval, as lrs-forward
+  "journey-nudges": 6 * 60, //    hourly (since #155); 6x the interval, as lrs-forward
   billing: 26 * 60, //            daily 02:00 UTC
   reaper: 26 * 60, //             daily 03:00 UTC
   "refresh-report-views": 26 * 60, // daily 03:30 UTC
   reminders: 26 * 60, //          daily 06:00 UTC
   "rls-audit": 8 * 24 * 60, //    weekly (Mondays)
+  "gamification-monthly": 32 * 24 * 60, // monthly (1st, 00:30 UTC); longest month + 1 day
 };
 
 const OUTBOX_BACKLOG_WARN = 50; // overdue-but-undelivered statements
