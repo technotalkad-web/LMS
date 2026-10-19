@@ -5,11 +5,11 @@
 -- history: `git show 1375511:supabase/migrations/0073_attempt_scoring_rules.sql`).
 -- Why it is kept: the owner's read-only production audit of 2026-10-19 found
 -- 0072 and a 0073 already on production (B0073/B0073b present, Z01 = 0074),
--- most likely this copy, pasted by hand around v1.2.0. The only later change
--- to the file, #170 (5240d80, 2026-10-14), added the explicit Data API grants
--- (anon / authenticated / service_role on attempt_scoring_rules and the two
--- attempt views). The prod-asfound* scenarios replay this copy to model
--- production as found. Never paste this file anywhere.
+-- pasted by hand on an unrecorded date after 2026-09-23; which copy is unknown.
+-- The only later content, first on fix/migration-grants (8a50667, 2026-09-23),
+-- on main since #170 (5240d80, 2026-10-14), adds explicit Data API grants. The
+-- prod-asfound* scenarios replay this grant-less copy, the case in which the
+-- re-paste matters. Never paste this file anywhere.
 -- ---------------------------------------------------------------------------
 -- 0073: Admin-configurable attempt scoring rules (per course / learning
 -- path / journey) + scoring-window aware reports, leaderboard and XP.
