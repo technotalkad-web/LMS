@@ -155,6 +155,12 @@ NODE_ENV = "production"
 # crons on prod alone — never set this on staging, where heartbeats are stale
 # by design and the env would read permanently degraded.
 OPS_EXPECT_CRONS = "1"
+# ALDS_P4 is deliberately ABSENT here (P4 off on production; ADR 0005 note (h)).
+# Every production deploy prints wrangler's warning "The following vars exist at
+# the top level, but not on env.production.vars ... Please add these vars to
+# env.production.vars: - ALDS_P4". Expected: do NOT add it. It comes here only
+# after v1.4.0 and 0100_alds_core.sql are on production, in a later commit and
+# tag (docs/release/v1.3.0.md §5).
 # Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
 # RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 # White-label custom domains (see docs/INFRA_MIGRATION.md). Inert until set.

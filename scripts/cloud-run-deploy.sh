@@ -16,8 +16,10 @@
 #   ALDS_P4=on             switch the ALDS P4 flag on (ADR 0005 note (h)). Unset =
 #                          absent from the service: --set-env-vars replaces the
 #                          whole set, so a deploy without it switches P4 off.
-#                          Staging only, after 0100_alds_core.sql is applied there.
-#   ALLOW_PROD=1           required to point at the PRODUCTION Supabase project
+#                          Staging only, after 0100_alds_core.sql is applied there;
+#                          refused with the PRODUCTION project, even with ALLOW_PROD=1.
+#                          The owner's launcher exports it (docs/CLOUD_RUN_STAGING.md §3).
+#   ALLOW_PROD=1          required to point at the PRODUCTION Supabase project
 # Secrets must already exist in Secret Manager (runbook §2):
 #   lms-supabase-service-role-key, lms-cron-secret, lms-impersonation-secret
 set -euo pipefail
@@ -37,6 +39,13 @@ IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${SERVICE}:latest"
 # Safety: the trial must not touch production data.
 if [[ "$NEXT_PUBLIC_SUPABASE_URL" == *"alkfrcglmseksweqhwzq"* && "${ALLOW_PROD:-0}" != "1" ]]; then
   echo "✖ NEXT_PUBLIC_SUPABASE_URL points at the PRODUCTION Supabase project. Refusing (set ALLOW_PROD=1 to override)."
+  exit 1
+fi
+# ALDS_P4 is staging-only until v1.4.0 and 0100 are on production (ADR 0005
+# note (h)): never hand it to a service on the production project, whatever
+# ALLOW_PROD says.
+if [[ -n "${ALDS_P4:-}" && "$NEXT_PUBLIC_SUPABASE_URL" == *"alkfrcglmseksweqhwzq"* ]]; then
+  echo "✖ ALDS_P4 is set and NEXT_PUBLIC_SUPABASE_URL points at the PRODUCTION Supabase project. Refusing: ALDS_P4 is staging-only (unset it)."
   exit 1
 fi
 
