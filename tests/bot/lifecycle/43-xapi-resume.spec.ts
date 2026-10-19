@@ -102,6 +102,12 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
     const launchUrl = `/${w.org.slug}/courses/${course.courseId}/launch`;
 
     // --- Session 1: fresh start, advance 3 slides, exit.
+    // Each click below waits for the package's statement / State requests,
+    // and the DB polls read what they wrote. The nightly runs the app on a
+    // GitHub runner against the staging database in another region, where
+    // every request is ~4x the laptop time (2026-10-19: ~5.5 s per click
+    // step vs ~1.4 s), so these waits get 30 s. Only the finish below went
+    // past the 15 s default there; the others are headroom.
     await page.goto(launchUrl);
     const frame = page.frameLocator("iframe");
     const status = frame.locator("#status");
@@ -110,21 +116,21 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
 
     for (let n = 2; n <= 4; n++) {
       await frame.locator("#next").click();
-      await expect(status).toHaveText(`slide ${n} saved`);
+      await expect(status).toHaveText(`slide ${n} saved`, { timeout: 30_000 });
     }
     await frame.locator("#exit").click();
-    await expect(status).toHaveText("exited at slide 4");
+    await expect(status).toHaveText("exited at slide 4", { timeout: 30_000 });
 
     const attemptId = await latestAttemptId(course.versionId, w.learner.id);
     await expect
-      .poll(async () => (await stateRow(attemptId))?.current, { timeout: 15_000 })
+      .poll(async () => (await stateRow(attemptId))?.current, { timeout: 30_000 })
       .toBe(4);
     const saved = await stateRow(attemptId);
     expect(saved?.completed).toEqual([1, 2, 3]);
 
     // Exit ≠ complete. Progress reflects 3 of 5 slides.
     await expect
-      .poll(async () => (await attemptRow(attemptId)).progress_pct, { timeout: 15_000 })
+      .poll(async () => (await attemptRow(attemptId)).progress_pct, { timeout: 30_000 })
       .toBe(60);
     const afterExit = await attemptRow(attemptId);
     expect(afterExit.status).toBe("in_progress");
@@ -143,14 +149,17 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
 
     // Continue and finish.
     await frame.locator("#next").click();
-    await expect(status).toHaveText("slide 5 saved");
+    await expect(status).toHaveText("slide 5 saved", { timeout: 30_000 });
     await expect
-      .poll(async () => (await attemptRow(attemptId)).progress_pct, { timeout: 15_000 })
+      .poll(async () => (await attemptRow(attemptId)).progress_pct, { timeout: 30_000 })
       .toBe(80);
     await frame.locator("#pass").click();
-    await expect(status).toHaveText("passed + completed sent");
+    // Finish sends three statements one after another (passed, completed,
+    // terminated): ~3 s on a laptop, over the 15 s default on the nightly
+    // runner (2026-10-19), hence 60 s.
+    await expect(status).toHaveText("passed + completed sent", { timeout: 60_000 });
     await expect
-      .poll(async () => (await attemptRow(attemptId)).completion_status, { timeout: 15_000 })
+      .poll(async () => (await attemptRow(attemptId)).completion_status, { timeout: 30_000 })
       .toBe("completed");
     const done = await attemptRow(attemptId);
     expect(done.success_status).toBe("passed");

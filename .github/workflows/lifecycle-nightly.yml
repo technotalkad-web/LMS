@@ -11,9 +11,8 @@
 # deployed staging URL: the run tests the code on the default branch rather
 # than whatever a staging deploy last pushed, it is not subject to the
 # Workers free-plan CPU cap, and spec 51's loopback webhook listener and its
-# server-log case work. (ADR 0007 decision 2 names Cloud Run staging with
-# continuous deploy, else the Workers staging with retries; this in-runner
-# target is the executor's proposal pending the owner's decision.)
+# server-log case work. (ADR 0007 decision 2, note of 2026-10-18, records
+# this in-runner target in place of the Workers staging with retries.)
 #
 # Data: the lifecycle namespace (lifecycle-* orgs, @lifecycle.test users),
 # which the e2e purge of pr-checks and nightly-e2e never matches, so a push
@@ -23,8 +22,11 @@
 #
 # Public-log rule: the build log, server log, Playwright output and JSON
 # report stay in $RUNNER_TEMP; nothing is uploaded. The job prints counts
-# per spec file only (scripts/lifecycle-summary.mjs). Reproduce a failure
-# locally: bash scripts/lifecycle-nightly.sh (header there).
+# per spec file and, for each failing test, its title path and the
+# file:line:column of its first error; never an error message, test output
+# or attachment (scripts/lifecycle-summary.mjs; ADR 0007 decision 2, note of
+# 2026-10-19). Reproduce a failure locally: bash scripts/lifecycle-nightly.sh
+# (header there).
 name: Lifecycle nightly (staging)
 
 on:
@@ -66,7 +68,7 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
       # The staging secrets reach this step only.
-      - name: Build, start and run the lifecycle subset (counts only)
+      - name: Build, start and run the lifecycle subset (counts and failing-test locations)
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
