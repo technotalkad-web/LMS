@@ -2,8 +2,9 @@
 # Lifecycle nightly (ADR 0007 step 15; subset widened by ADR 0008 step 17 and
 # ADR 0009 step 12). Builds THIS checkout, starts it on a local port against
 # the STAGING Supabase project, runs the ALDS lifecycle subset against it and
-# prints counts only. Run by .github/workflows/lifecycle-nightly.yml; the
-# same command reproduces a nightly run on a laptop (Git Bash or Linux):
+# prints counts and failing-test locations only. Run by
+# .github/workflows/lifecycle-nightly.yml; the same command reproduces a
+# nightly run on a laptop (Git Bash or Linux):
 #
 #   NEXT_PUBLIC_SUPABASE_URL=… NEXT_PUBLIC_SUPABASE_ANON_KEY=… \
 #   SUPABASE_SERVICE_ROLE_KEY=… bash scripts/lifecycle-nightly.sh
@@ -23,8 +24,10 @@
 # Public-log rule (the repository is public): the build log, the server log,
 # the Playwright output and its JSON report stay in LIFECYCLE_OUT; they are
 # never uploaded. Spec failure messages embed response bodies and test
-# emails, so the Playwright output is never printed: only counts
-# (scripts/lifecycle-summary.mjs) and the cleanup's count line reach stdout.
+# emails, so the Playwright output is never printed: only the counts and,
+# for each failing test, its title path and the file:line:column of its
+# first error (scripts/lifecycle-summary.mjs; ADR 0007 decision 2, note of
+# 2026-10-19) and the cleanup's count line reach stdout.
 # A build or server-start failure prints at most 40 matching lines of its
 # log with emails and tokens masked (compiler and Node errors name files of
 # this public repository, not data). Reproduce a failure locally with this

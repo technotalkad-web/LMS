@@ -151,7 +151,7 @@ runner by `lifecycle-nightly.yml`):
 
 ```bash
 E2E_BASE_URL=http://localhost:3001 npx playwright test --config=playwright.lifecycle.config.ts tests/bot/lifecycle/55-attempt-row-guard.spec.ts
-bash scripts/lifecycle-nightly.sh     # what the nightly runs: build, start on :3100, the ALDS subset, counts only
+bash scripts/lifecycle-nightly.sh     # what the nightly runs: build, start on :3100, the ALDS subset, counts and failing-test locations only
 ```
 
 Stop any `next dev` in the same checkout before running the script: it runs
