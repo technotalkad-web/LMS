@@ -34,10 +34,14 @@ type Check = { status: CheckStatus; latency_ms?: number; detail?: unknown };
  * and its route is live on production: a schedule fires on production as
  * soon as it is on main, and an entry whose schedule is not firing pages the
  * watchdog (docs/ARCHITECTURE.md §9, ADR 0007 step 7). So no
- * "report-card-refresh" entry yet: its schedule line is removed before
- * v1.3.0 and re-added after the deploy is verified; its entry ships in the
- * next tag. tests/unit/cron-cadence.test.ts checks this list against
- * cron.yml and the cron routes' heartbeat names.
+ * "report-card-refresh" entry yet: its schedule line and case arm are
+ * removed before v1.3.0 and re-added after the deploy is verified; its entry
+ * ships in the next tag. tests/unit/cron-cadence.test.ts checks this list
+ * against cron.yml and the cron routes' heartbeat names.
+ *
+ * GitHub starts only a small share of scheduled runs (ADR 0007 Context), so
+ * the sub-daily entries read stale most of the time; ADR 0007 step 17 and
+ * decision 4 accept that until pg_cron replaces GitHub-driven schedules.
  */
 const CRON_CADENCE_MIN: Record<string, number> = {
   "lrs-forward": 30, //           */5 schedule; generous for GH cron jitter

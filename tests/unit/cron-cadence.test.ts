@@ -106,6 +106,8 @@ const scheduledJobs = arms.map((a) => a.job);
 console.log("\ncron.yml: schedule lines and case arms agree");
 eq("at least one schedule line", schedules.length > 0, true);
 eq("every schedule line has exactly one case arm", schedules.filter((s) => arms.filter((a) => a.expr === s).length !== 1), []);
+// Removing a job from cron.yml means removing its schedule line AND its case
+// arm in the same push (docs/release/v1.3.0.md §2.1 item 4).
 eq("every case arm has a schedule line", arms.filter((a) => !schedules.includes(a.expr)).map((a) => a.job), []);
 eq("no job has two case arms", scheduledJobs.filter((j, i) => scheduledJobs.indexOf(j) !== i), []);
 
