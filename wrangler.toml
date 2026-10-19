@@ -62,6 +62,15 @@ NEXT_PUBLIC_SENTRY_ENV = "staging"
 STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
+# ALDS P4 (ADR 0005 note (h), ADR 0006 note (a)): the Package Guardian gate,
+# the tier surfaces and the cmi5 launch contract. STAGING Worker only: this
+# top-level block is what `wrangler deploy` with no --env uses
+# (deploy-staging.yml). `vars` is NOT inherited by [env.production] (wrangler:
+# "This field is not automatically inherited from the top level environment");
+# production reads only [env.production.vars], where ALDS_P4 stays absent until
+# v1.4.0 and 0100 are on production, in a later commit and tag. Switched on
+# only after 0100_alds_core.sql was confirmed on the staging database.
+ALDS_P4 = "on"
 
 # ---- Auth email fallback (global Resend sender) -----------------------------
 # Auth emails (invite / magic-link) are minted via generateLink and sent via the
