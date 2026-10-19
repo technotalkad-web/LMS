@@ -96,4 +96,8 @@ Completions earned on a wrong slot during the grandfather window are recorded he
 
 ## 6. Production
 
-Nothing recorded yet. The P1 read-only audit (ADR 0007 step 2, ADR 0004 step 16) lists the production slots whose stored bytes disagree with their row, the wrong defaults and the inactive packages with in-progress attempts; each finding is entered here before any action.
+The P1 read-only audit (ADR 0007 step 2, ADR 0004 step 16) lists the production slots whose stored bytes disagree with their row, the wrong defaults and the inactive packages with in-progress attempts; each finding is entered here before any action.
+
+| Recorded | Env | Finding | Impact | Action / status |
+|---|---|---|---|---|
+| 2026-10-19 | production | Migration state differs from the release documents. The owner's read-only audit (16:06 UTC, `ops/release-v1.3.0-audit.sql`; CSV kept private) found 0072 and a 0073 applied (`B0072`, `B0073`, `B0073b` present; `Z01` `0074`; `Z02` `none`); the documents assumed 0071 (ADR 0007 Context, `docs/release/v1.3.0.md` §1). Source: most likely the September hand-apply around v1.2.0 (2026-09-17/18), with 0073 as it was at commit 1375511 (#114), before #170 (5240d80) added its explicit Data API grants. To be confirmed by the owner. No ids: the audit listed no rows. | None on data: production has no courses or attempts (every D row 0). | Sitting order adjusted (`docs/release/v1.3.0.md` §4.3): 0032, then 0072 and the current 0073 pasted again, then 0074–0098 (variant a; variant b, without the re-paste, is the fallback), both rehearsed from this state. Open: the owner confirms the source of 0072/0073. |
