@@ -17,6 +17,41 @@ the test suite automatically and you never deploy untested code again.
 
 The shape: **branch → PR → merge → auto-staging → tag → prod.**
 
+### Note 2026-10-20: the PR e2e job tests the PR's own code in the runner
+
+Owner decision of 2026-10-20 (Option A). The `e2e (playwright)` job of
+`pr-checks.yml` (same job name, so branch protection is unchanged) no longer
+targets the deployed Workers staging site. `scripts/e2e-in-runner.sh` builds
+the commit under test inside the GitHub runner, starts it with `next start` on
+`http://localhost:3100` and runs the same `tests/e2e` suite against it, with
+the same CI settings (retries 2, workers 2, `forbidOnly`).
+
+- **Why:** the Workers staging site is on Cloudflare's free plan; its CPU limit
+  fails requests at random with error 1102 (on 2026-10-20, 2 tests failed on
+  every attempt and 5 passed only on retry, none of them because of the code
+  under test). It also ran whatever staging last deployed, not the PR's code.
+- **Database:** still the STAGING Supabase project, through the same three
+  `STAGING_*` secrets. The script refuses any other project. The suite's
+  `qa-*` / `@example.test` purge is unchanged.
+- **App configuration:** the staging Worker's (`STORAGE_DRIVER=supabase`,
+  `SUPABASE_STORAGE_BUCKET=course-content`, `ALDS_P4=on`). The production
+  configuration (`ALDS_P4` absent) stays covered by `lifecycle-nightly.yml`.
+  `IMPERSONATION_SECRET` and `CRON_SECRET` are fresh random values per run,
+  masked in the log; no deployed secret is added to GitHub. The
+  `STAGING_NEXT_PUBLIC_SITE_URL` secret is no longer used by this job.
+- **Logs:** the build and server logs stay in `$RUNNER_TEMP` and are not
+  printed (a build or start failure prints at most 40 masked error lines);
+  the Playwright list output is printed as before; nothing is uploaded.
+- **Failures:** the job's exit code is Playwright's; no step continues on
+  error. Reproduce a run locally with the command in the script's header.
+- **Main pushes:** still skipped. The `pull_request` run already tested the
+  merge result, and another run at merge time would add a concurrent `qa-*`
+  purge of the shared staging data.
+- **Not changed:** `nightly-e2e.yml` still targets the deployed Workers
+  staging site, so 1102 errors may still turn it red.
+- **Cost:** about 5 more minutes per run (the build); the job timeout is 30
+  minutes.
+
 ---
 
 ## Step 1 — Create a Cloudflare API token
@@ -121,13 +156,14 @@ Click into the failed job → look at the log → fix locally → push again.
 
 - `typecheck` red → A `tsc` error. The log will point to the file + line.
 - `lint` red → An ESLint error. Same — log shows file + line + rule.
-- `e2e` red → A Playwright assertion failed. Download the
-  `playwright-report` artifact from the failed run (Actions UI → click into
-  the run → scroll to "Artifacts" at the bottom) → open `index.html` → see
-  exactly what assertion failed and a screenshot of the page at failure.
+- `e2e` red → A Playwright assertion failed, or the app did not build or
+  start in the runner (the log says which). Read the failing test in the
+  job log, then reproduce it locally with `bash scripts/e2e-in-runner.sh`
+  (header of that script).
 
-The artifact retention is 7 days. After that, you'll need to re-run to
-re-generate the report.
+Correction 2026-10-20: no `playwright-report` artifact is uploaded (the
+repository is public, and reports carry test emails and response bodies), so
+there is nothing to download from the run.
 
 ---
 

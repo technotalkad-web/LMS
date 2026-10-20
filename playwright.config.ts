@@ -96,8 +96,11 @@ export default defineConfig({
       : []),
   ],
 
-  // Boot a local Next dev server only if we're hitting localhost.
-  webServer: isLocal
+  // Boot a local Next dev server only if we're hitting localhost, unless the
+  // caller already started the app: E2E_EXTERNAL_SERVER=1 is set by
+  // scripts/e2e-in-runner.sh (the pr-checks e2e job), which builds and starts
+  // the app itself with its logs kept off the public job log.
+  webServer: isLocal && process.env.E2E_EXTERNAL_SERVER !== "1"
     ? {
         command: "npm run dev",
         url: baseURL,

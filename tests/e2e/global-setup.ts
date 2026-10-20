@@ -57,8 +57,10 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
     );
   }
 
-  // 4. Wait for the deployed worker to be STABLE, not just up. The suite
-  // targets the live staging worker, and a merge to main redeploys it —
+  // 4. Wait for the target to be STABLE, not just up. nightly-e2e targets
+  // the live staging worker (pr-checks, since 2026-10-20, a server started in
+  // the runner, where this check is harmless), and a merge to main redeploys
+  // the worker —
   // requests landing during the swap flake with slow/failed renders (the
   // login mount-gate timeout seen 2026-08-21 and again 2026-09-02). Require
   // two consecutive healthy /login responses a few seconds apart before
