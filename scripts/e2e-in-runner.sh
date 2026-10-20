@@ -8,10 +8,15 @@
 #   CI=1 NEXT_PUBLIC_SUPABASE_URL=… NEXT_PUBLIC_SUPABASE_ANON_KEY=… \
 #   SUPABASE_SERVICE_ROLE_KEY=… bash scripts/e2e-in-runner.sh [playwright args]
 #
-# On a laptop: stop any `next dev` in this checkout and move .env.local aside
-# first. `next build` rewrites the .next folder a running dev server uses, and
-# `next build`/`next start` read .env.local, whose extra secrets would make the
-# run differ from CI.
+# On a laptop: stop any `next dev` in this checkout and move .env.local and
+# .env.test.local aside first. `next build` rewrites the .next folder a running
+# dev server uses; `next build`/`next start` read .env.local, whose extra
+# secrets would make the run differ from CI (they cannot replace the three
+# Supabase values checked below: Next.js never overrides a variable that is
+# already set). .env.test.local is refused outright: playwright.config.ts loads
+# it with override: true, so the Playwright process (global setup, purge and
+# test helpers) would use whatever Supabase project it names instead of the
+# one this script checked. Neither file exists in CI (both are gitignored).
 #
 # Why not the deployed Workers staging site: on the Cloudflare free plan it
 # fails requests at random with error 1102 (CPU limit), which made the PR e2e
@@ -40,7 +45,8 @@
 # scripts/lifecycle-nightly.sh does. The Playwright list reporter prints to the
 # job log as the job did before this change.
 #
-# Exit code: Playwright's. A build or start failure exits 1; bad input exits 2.
+# Exit code: Playwright's. A build or start failure exits 1; bad input
+# (including a .env.test.local in the checkout) exits 2.
 set -euo pipefail
 
 PORT="${E2E_PORT:-3100}"
@@ -48,6 +54,15 @@ OUT="${E2E_OUT:-${RUNNER_TEMP:-$(mktemp -d)}/e2e-in-runner}"
 STAGING_REF="zeaclbapadosqqttexxh"
 
 cd "$(dirname "$0")/.."
+
+# playwright.config.ts loads .env.test.local with override: true, which would
+# send the Playwright side of the run to whatever Supabase project that file
+# names, past the staging check below. Refuse rather than run split-brained.
+if [[ -e .env.test.local ]]; then
+  echo "e2e-in-runner: refused, .env.test.local exists in this checkout; move it aside (playwright.config.ts would let it override the checked staging values)"
+  exit 2
+fi
+
 mkdir -p "$OUT"
 
 # Masks emails, JWTs and Supabase API keys in a log excerpt (GitHub also
