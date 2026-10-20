@@ -318,6 +318,332 @@
           }
         }
       ]
+    },
+    {
+      "name": "prod-asfound-a",
+      "title": "production as found on 2026-10-19 (0001-0071 without 0032, 0072, the 1375511 copy of 0073, no rows, as on production), audit (exactly the owner's production result); variant (a): 0032, 0072 and the current 0073 re-pasted, 0074-0098, each pasted twice; audit; the current 0073's explicit grants exist; 0099 twice, refresh_report_views(), audit, grants again",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "apply": { "label": "0072 (already on production)", "files": ["0072"], "times": 1 } },
+        { "sql": "fixtures/0073_attempt_scoring_rules.at-1375511.sql" },
+        {
+          "audit": {
+            "label": "before the sitting (production as found)",
+            "column": "at_before",
+            "rows": 76,
+            "mismatch": ["B0073", "B0073b"],
+            "z90": "2 / 41 / 46",
+            "observed": {
+              "A04": "postgres", "B0070": "present", "B0071a": "present", "B0071b": "present", "B0072": "present", "B0073": "present",
+              "B0073b": "present", "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only", "A03": "0",
+              "D01": "0", "D02": "0", "D03": "0", "D04": "0", "D05": "0", "D06": "0",
+              "D07": "0", "D08": "0", "D09": "0", "D10": "0", "D11": "0", "Z01": "0074",
+              "Z02": "none"
+            },
+            "probes": [
+              { "name": "0074-0098 presence probes (first and end-of-file)", "match": "^B00(7[4-9]|8[0-9]|9[0-8])[a-z]?$", "count": 37, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "the sitting, variant (a): 0032, 0072 and the current 0073 again, 0074-0098", "files": ["0032", "0072-0098"], "times": 2 } },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 76,
+            "mismatch": [],
+            "z90": "39 / 0 / 5",
+            "observed": {
+              "A04": "postgres", "B0072": "present", "B0073": "present", "B0073b": "present", "B0099a": "absent", "B0099b": "present",
+              "B0099c": "present", "B0099d": "present", "B0099e": "absent", "C01": "absent", "C02": "present", "C03": "0",
+              "C04": "0", "C05": "per-package only", "A03": "0", "D01": "0", "D02": "0", "D03": "0",
+              "D04": "0", "D05": "0", "D06": "0", "D07": "0", "D08": "0", "D09": "0",
+              "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants.sql" },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0099",
+            "column": "at_0099",
+            "rows": 76,
+            "mismatch": [],
+            "z90": "44 / 5 / 0",
+            "observed": {
+              "A04": "postgres", "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "A03": "0", "D01": "0", "D02": "0", "D03": "0", "D04": "0",
+              "D05": "0", "D06": "0", "D07": "0", "D08": "0", "D09": "0", "D10": "0",
+              "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants.sql" }
+      ]
+    },
+    {
+      "name": "prod-asfound-b",
+      "title": "production as found on 2026-10-19 (0001-0071 without 0032, 0072, the 1375511 copy of 0073, no rows, as on production), audit (exactly the owner's production result); variant (b): 0032, 0074-0098, each pasted twice; audit; only 0073's table grants absent (PGlite has no default privileges); 0099 twice, refresh_report_views(), audit, grants again",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "apply": { "label": "0072 (already on production)", "files": ["0072"], "times": 1 } },
+        { "sql": "fixtures/0073_attempt_scoring_rules.at-1375511.sql" },
+        {
+          "audit": {
+            "label": "before the sitting (production as found)",
+            "column": "at_before",
+            "rows": 76,
+            "mismatch": ["B0073", "B0073b"],
+            "z90": "2 / 41 / 46",
+            "observed": {
+              "A04": "postgres", "B0070": "present", "B0071a": "present", "B0071b": "present", "B0072": "present", "B0073": "present",
+              "B0073b": "present", "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only", "A03": "0",
+              "D01": "0", "D02": "0", "D03": "0", "D04": "0", "D05": "0", "D06": "0",
+              "D07": "0", "D08": "0", "D09": "0", "D10": "0", "D11": "0", "Z01": "0074",
+              "Z02": "none"
+            },
+            "probes": [
+              { "name": "0074-0098 presence probes (first and end-of-file)", "match": "^B00(7[4-9]|8[0-9]|9[0-8])[a-z]?$", "count": 37, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "the sitting, variant (b): 0032, 0074-0098", "files": ["0032", "0074-0098"], "times": 2 } },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 76,
+            "mismatch": [],
+            "z90": "39 / 0 / 5",
+            "observed": {
+              "A04": "postgres", "B0072": "present", "B0073": "present", "B0073b": "present", "B0099a": "absent", "B0099b": "present",
+              "B0099c": "present", "B0099d": "present", "B0099e": "absent", "C01": "absent", "C02": "present", "C03": "0",
+              "C04": "0", "C05": "per-package only", "A03": "0", "D01": "0", "D02": "0", "D03": "0",
+              "D04": "0", "D05": "0", "D06": "0", "D07": "0", "D08": "0", "D09": "0",
+              "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants-absent.sql" },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0099",
+            "column": "at_0099",
+            "rows": 76,
+            "mismatch": [],
+            "z90": "44 / 5 / 0",
+            "observed": {
+              "A04": "postgres", "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "A03": "0", "D01": "0", "D02": "0", "D03": "0", "D04": "0",
+              "D05": "0", "D06": "0", "D07": "0", "D08": "0", "D09": "0", "D10": "0",
+              "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants-absent.sql" }
+      ]
+    },
+    {
+      "name": "prod-asfound-a-seeded",
+      "title": "production as found on 2026-10-19 (0001-0071 without 0032, 0072, the 1375511 copy of 0073, the prod scenario's synthetic rows), audit; variant (a): 0032, 0072 and the current 0073 re-pasted, 0074-0098, each pasted twice (0098 refused until the shared prefix is repointed); audit; the current 0073's explicit grants exist; 0099 twice, refresh_report_views(), audit, grants again",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "apply": { "label": "0072 (already on production)", "files": ["0072"], "times": 1 } },
+        { "sql": "fixtures/0073_attempt_scoring_rules.at-1375511.sql" },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        {
+          "audit": {
+            "label": "before the sitting (production as found)",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "B0073", "B0073b", "D02"],
+            "z90": "4 / 43 / 47",
+            "observed": {
+              "A04": "postgres", "B0070": "present", "B0071a": "present", "B0071b": "present", "B0072": "present", "B0073": "present",
+              "B0073b": "present", "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only", "A03": "1",
+              "D02": "1", "Z01": "0074", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0074-0098 presence probes (first and end-of-file)", "match": "^B00(7[4-9]|8[0-9]|9[0-8])[a-z]?$", "count": 37, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        {
+          "apply": {
+            "label": "the sitting, variant (a): 0032, 0072 and the current 0073 again, 0074-0098",
+            "files": ["0032", "0072-0098"],
+            "times": 2,
+            "refuseFirst": {
+              "0098": {
+                "why": "by its own guard while a storage prefix is shared (D02 = 1)",
+                "code": "P0001",
+                "contains": "0098 refused: 1 storage_prefix value(s) are shared by more than one course_versions row",
+                "then": "repoint.sql"
+              }
+            }
+          }
+        },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 84,
+            "mismatch": ["A03"],
+            "z90": "40 / 1 / 5",
+            "observed": {
+              "A04": "postgres", "B0072": "present", "B0073": "present", "B0073b": "present", "B0099a": "absent", "B0099b": "present",
+              "B0099c": "present", "B0099d": "present", "B0099e": "absent", "C01": "absent", "C02": "present", "C03": "0",
+              "C04": "0", "C05": "per-package only", "A03": "1", "D02": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants.sql" },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0099",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A04": "postgres", "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "A03": "1", "D02": "0", "D10": "0", "D11": "0", "Z01": "none",
+              "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants.sql" }
+      ]
+    },
+    {
+      "name": "prod-asfound-b-seeded",
+      "title": "production as found on 2026-10-19 (0001-0071 without 0032, 0072, the 1375511 copy of 0073, the prod scenario's synthetic rows), audit; variant (b): 0032, 0074-0098, each pasted twice (0098 refused until the shared prefix is repointed); audit; only 0073's table grants absent (PGlite has no default privileges); 0099 twice, refresh_report_views(), audit, grants again",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "apply": { "label": "0072 (already on production)", "files": ["0072"], "times": 1 } },
+        { "sql": "fixtures/0073_attempt_scoring_rules.at-1375511.sql" },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        {
+          "audit": {
+            "label": "before the sitting (production as found)",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "B0073", "B0073b", "D02"],
+            "z90": "4 / 43 / 47",
+            "observed": {
+              "A04": "postgres", "B0070": "present", "B0071a": "present", "B0071b": "present", "B0072": "present", "B0073": "present",
+              "B0073b": "present", "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only", "A03": "1",
+              "D02": "1", "Z01": "0074", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0074-0098 presence probes (first and end-of-file)", "match": "^B00(7[4-9]|8[0-9]|9[0-8])[a-z]?$", "count": 37, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        {
+          "apply": {
+            "label": "the sitting, variant (b): 0032, 0074-0098",
+            "files": ["0032", "0074-0098"],
+            "times": 2,
+            "refuseFirst": {
+              "0098": {
+                "why": "by its own guard while a storage prefix is shared (D02 = 1)",
+                "code": "P0001",
+                "contains": "0098 refused: 1 storage_prefix value(s) are shared by more than one course_versions row",
+                "then": "repoint.sql"
+              }
+            }
+          }
+        },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 84,
+            "mismatch": ["A03"],
+            "z90": "40 / 1 / 5",
+            "observed": {
+              "A04": "postgres", "B0072": "present", "B0073": "present", "B0073b": "present", "B0099a": "absent", "B0099b": "present",
+              "B0099c": "present", "B0099d": "present", "B0099e": "absent", "C01": "absent", "C02": "present", "C03": "0",
+              "C04": "0", "C05": "per-package only", "A03": "1", "D02": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants-absent.sql" },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0099",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A04": "postgres", "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "A03": "1", "D02": "0", "D10": "0", "D11": "0", "Z01": "none",
+              "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "sql": "assert-0073-grants-absent.sql" }
+      ]
     }
   ]
 }
