@@ -7,10 +7,13 @@
  * component (no NEXT_PUBLIC_ prefix, so the value is never inlined into a
  * browser bundle).
  *
- * Default OFF. ALDS_P4 is absent from wrangler.toml and from the Cloud Run
- * environment on main; it is set per environment only after
- * 0100_alds_core.sql is confirmed there (staging first; production after
- * v1.4.0 and 0100, in a later tag). It gates the Package Guardian writes,
+ * Default OFF. It is set per environment only after 0100_alds_core.sql is
+ * confirmed there (staging first; production after v1.4.0 and 0100, in a
+ * later tag). Staging: `ALDS_P4 = "on"` in the top-level [vars] of
+ * wrangler.toml (the staging Worker; `vars` is not inherited by
+ * [env.production]) and on Cloud Run staging only when the deploy runs with
+ * ALDS_P4=on (scripts/cloud-run-deploy.sh). Production: absent from
+ * [env.production.vars]. It gates the Package Guardian writes,
  * the tier surfaces and the ADR 0006 §C launch contract.
  */
 export const ALDS_P4_ENV = "ALDS_P4" as const;

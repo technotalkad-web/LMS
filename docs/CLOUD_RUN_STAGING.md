@@ -126,6 +126,18 @@ Later deploys after code changes: `git pull` then the same command.
 `MIN_INSTANCES=1 ./scripts/cloud-run-deploy.sh` removes cold starts
 (roughly $8–15/month from credits) — leave it at 0 until real users arrive.
 
+ALDS P4 flag (2026-10-19; ADR 0005 note (h) and its addition of that date):
+`ALDS_P4=on ./scripts/cloud-run-deploy.sh` switches P4 on for this staging
+service, only after `0100_alds_core.sql` is confirmed on the staging
+database. `--set-env-vars` replaces the whole list on every deploy, so the
+"on" state lives in whatever runs the deploy: the owner's launcher (outside
+this repository; it deploys `origin/main` to staging only) carries
+`export ALDS_P4=on` from the P4 staging sitting on. A deploy without it, or
+a regenerated launcher that lacks the line, switches P4 off on Cloud Run
+while the Workers staging keeps it on (`wrangler.toml` top-level `[vars]`).
+The script refuses `ALDS_P4` when `NEXT_PUBLIC_SUPABASE_URL` is the
+production project, even with `ALLOW_PROD=1`.
+
 ## 4. Make sign-in work on the new URL (2 min)
 
 Supabase dashboard → **staging** project → Authentication → URL

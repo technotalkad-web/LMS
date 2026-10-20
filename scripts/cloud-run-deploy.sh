@@ -13,7 +13,13 @@
 #   NEXT_PUBLIC_SITE_URL   defaults to the service's deterministic Cloud Run URL
 #   REGION (asia-south1) SERVICE (my-lms-staging) MIN_INSTANCES (0) MAX_INSTANCES (3)
 #   RESEND_SECRET=1        also mount lms-resend-api-key
-#   ALLOW_PROD=1           required to point at the PRODUCTION Supabase project
+#   ALDS_P4=on             switch the ALDS P4 flag on (ADR 0005 note (h)). Unset =
+#                          absent from the service: --set-env-vars replaces the
+#                          whole set, so a deploy without it switches P4 off.
+#                          Staging only, after 0100_alds_core.sql is applied there;
+#                          refused with the PRODUCTION project, even with ALLOW_PROD=1.
+#                          The owner's launcher exports it (docs/CLOUD_RUN_STAGING.md §3).
+#   ALLOW_PROD=1          required to point at the PRODUCTION Supabase project
 # Secrets must already exist in Secret Manager (runbook §2):
 #   lms-supabase-service-role-key, lms-cron-secret, lms-impersonation-secret
 set -euo pipefail
@@ -33,6 +39,13 @@ IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${SERVICE}:latest"
 # Safety: the trial must not touch production data.
 if [[ "$NEXT_PUBLIC_SUPABASE_URL" == *"alkfrcglmseksweqhwzq"* && "${ALLOW_PROD:-0}" != "1" ]]; then
   echo "✖ NEXT_PUBLIC_SUPABASE_URL points at the PRODUCTION Supabase project. Refusing (set ALLOW_PROD=1 to override)."
+  exit 1
+fi
+# ALDS_P4 is staging-only until v1.4.0 and 0100 are on production (ADR 0005
+# note (h)): never hand it to a service on the production project, whatever
+# ALLOW_PROD says.
+if [[ -n "${ALDS_P4:-}" && "$NEXT_PUBLIC_SUPABASE_URL" == *"alkfrcglmseksweqhwzq"* ]]; then
+  echo "✖ ALDS_P4 is set and NEXT_PUBLIC_SUPABASE_URL points at the PRODUCTION Supabase project. Refusing: ALDS_P4 is staging-only (unset it)."
   exit 1
 fi
 
@@ -59,7 +72,7 @@ gcloud run deploy "${SERVICE}" \
   --concurrency 40 \
   --timeout 300 \
   --min-instances "${MIN_INSTANCES:-0}" --max-instances "${MAX_INSTANCES:-3}" \
-  --set-env-vars "NODE_ENV=production,NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL},NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY},NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL},NEXT_PUBLIC_SENTRY_ENV=${NEXT_PUBLIC_SENTRY_ENV:-staging-gcp},STORAGE_DRIVER=${STORAGE_DRIVER:-supabase},SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-course-content},OPS_EXPECT_CRONS=${OPS_EXPECT_CRONS:-0}" \
+  --set-env-vars "NODE_ENV=production,NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL},NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY},NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL},NEXT_PUBLIC_SENTRY_ENV=${NEXT_PUBLIC_SENTRY_ENV:-staging-gcp},STORAGE_DRIVER=${STORAGE_DRIVER:-supabase},SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-course-content},OPS_EXPECT_CRONS=${OPS_EXPECT_CRONS:-0}${ALDS_P4:+,ALDS_P4=${ALDS_P4}}" \
   --set-secrets "SUPABASE_SERVICE_ROLE_KEY=lms-supabase-service-role-key:latest,CRON_SECRET=lms-cron-secret:latest,IMPERSONATION_SECRET=lms-impersonation-secret:latest${RESEND_SECRET:+,RESEND_API_KEY=lms-resend-api-key:latest}"
 
 URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')"
