@@ -7,7 +7,10 @@
  * Run:  npx tsx tests/unit/scoring-status.test.ts
  * (No DB. Typechecked by `npm run typecheck`.)
  */
-import { DEFAULT_POLICY, hasLiveGrantedRetake } from "../../lib/scoring/policy";
+import fs from "node:fs";
+import path from "node:path";
+import { DEFAULT_POLICY, hasLiveGrantedRetake, latestResetRetake, normalizePolicy } from "../../lib/scoring/policy";
+import { classifyAttempt, GrantReadError, grantSnapshotFor } from "../../lib/scoring/attempt-kind";
 import {
   computeScoring,
   courseStatus,
@@ -166,5 +169,240 @@ console.log("\na granted retake blocks a new grant only while it is live (gap 5)
   eq("an in-progress attempt that is not the retake -> does not block", hasLiveGrantedRetake(row("in_progress"), new Set(["other"])), false);
 }
 
-console.log(`\n==== status: ${pass} passed, ${fail} failed ====`);
-process.exit(fail === 0 ? 0 : 1);
+/* ------------------------------------------------------------------ ADR 0014 */
+
+console.log("\na revision visit's row is never an attempt (ADR 0014 step 6)");
+{
+  const off = { ...at("a1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "completed", "passed", 0.9), status: "passed" };
+  const rev = { ...at("r1", "2026-10-02T09:00Z", null, "in_progress", "unknown", null), status: "in_progress", is_revision: true };
+  const revDone = { ...at("r2", "2026-10-03T09:00Z", "2026-10-03T09:30Z", "completed", "failed", 0.2), status: "failed", is_revision: true };
+  const pre0103 = { ...at("p1", "2026-10-04T09:00Z", null, "in_progress", "unknown", null), status: "in_progress" };
+  eq("excludeAbandoned drops a flagged row", excludeAbandoned([off, rev]).map((a) => a.id), ["a1"]);
+  eq("…and keeps an unflagged and a pre-0103 row (is_revision undefined)", excludeAbandoned([off, pre0103]).map((a) => a.id), ["a1", "p1"]);
+  eq("…its fast path tests both predicates (flagged only, nothing abandoned)", excludeAbandoned([rev]).length, 0);
+  eq("…drops abandoned and flagged together", excludeAbandoned([off, rev, { ...pre0103, status: "abandoned" }]).map((a) => a.id), ["a1"]);
+  eq("is_revision false is unflagged", excludeAbandoned([{ ...pre0103, is_revision: false }]).length, 1);
+  eq("attemptCounts: a flagged row is neither live nor reset", attemptCounts([off, rev, { ...rev, id: "r3", status: "abandoned" }]), { live: 1, reset: 0 });
+  const s = computeScoring([off, rev, revDone], P);
+  eq("computeScoring: a completed flagged row is not counted, scored or practice", [s.completedAttempts, s.scoredAttempts, s.practiceAttempts, s.officialAttempt?.id], [1, 1, 0, "a1"]);
+  eq("courseStatus: a learner with only a flagged in-progress row is not started", courseStatus(computeScoring([rev], P), [rev]), "not_started");
+}
+
+console.log("\nthe policy clamp (ADR 0014 steps 6 and 9, Q1)");
+{
+  const legacy = normalizePolicy({ max_scored_attempts: 3, official_basis: "best", official_attempt_number: 2, retain_first_attempt: false, after_limit: "block", source: "course", source_id: "c2" });
+  eq("a 3 / best / block rule normalises to the default (source kept)", legacy, { ...DEFAULT_POLICY, source: "course", source_id: "c2" });
+  eq("nth 2 → official_attempt_number null", normalizePolicy({ official_basis: "nth", official_attempt_number: 2 }).official_attempt_number, null);
+  eq("an empty row → the default", normalizePolicy({}), DEFAULT_POLICY);
+  eq("an unknown source → default", normalizePolicy({ source: "galaxy" }).source, "default");
+  const two = [
+    at("a1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "completed", "failed", 0.4),
+    at("a2", "2026-10-02T09:00Z", "2026-10-02T09:30Z", "completed", "passed", 0.9),
+  ];
+  const s = computeScoring(two, legacy);
+  eq("under the clamped legacy rule: one scored attempt, the first is official", [s.scoredAttempts, s.officialAttempt?.id, s.officialStatus], [1, "a1", "failed"]);
+  eq("blocked is always false; practiceMode === limitReached", [s.blocked, s.practiceMode, s.limitReached], [false, true, true]);
+  const none = computeScoring([], legacy);
+  eq("…also with no attempt", [none.blocked, none.practiceMode === none.limitReached], [false, true]);
+}
+
+console.log("\nlatestResetRetake: the course page's reset-retake notice (ADR 0014 step 8)");
+{
+  const g = new Set(["r1"]);
+  const first = { id: "a1", started_at: "2026-10-01T09:00Z", status: "failed", completion_status: "completed", success_status: "failed" };
+  const resetRetake = { id: "r1", started_at: "2026-10-05T09:00Z", status: "abandoned", completion_status: "in_progress", success_status: "unknown" };
+  const laterRevision = { id: "v1", started_at: "2026-10-06T09:00Z", status: "in_progress", completion_status: "in_progress", success_status: "unknown", is_revision: true };
+  eq("newest non-revision row is an abandoned retake → true", latestResetRetake([first, resetRetake], g), true);
+  eq("a newer flagged revision row does not hide it", latestResetRetake([first, resetRetake, laterRevision], g), true);
+  eq("a live retake → false", latestResetRetake([first, resetRetake, { ...resetRetake, id: "r2", started_at: "2026-10-07T09:00Z", status: "in_progress" }], new Set(["r1", "r2"])), false);
+  eq("the newest row is official (not a retake) → false", latestResetRetake([resetRetake, { ...first, id: "a9", started_at: "2026-10-08T09:00Z" }], g), false);
+  eq("an empty retakeIds → false", latestResetRetake([first, resetRetake], new Set()), false);
+  eq("the retake is in progress (not reset) → false", latestResetRetake([first, { ...resetRetake, status: "in_progress" }], g), false);
+  eq("no attempts → false", latestResetRetake([], g), false);
+}
+
+console.log("\nthe learner course page's two ADR 0014 notices (source check; no React rig)");
+{
+  const src = fs.readFileSync(path.resolve(__dirname, "../../app/[org]/(learner)/courses/[courseId]/page.tsx"), "utf8");
+  const notices = (() => {
+    const s = src.indexOf("{scoring.officialAttempt && (");
+    const e = src.indexOf("{/* Launch CTA */}");
+    return s > 0 && e > s ? src.slice(s, e) : "";
+  })();
+  const cta = src.slice(src.indexOf("{/* Launch CTA */}"));
+  eq("searchParams carries retry", /searchParams: Promise<\{ switch\?: string; retry\?: string \}>/.test(src) && /retry: retryParam/.test(src), true);
+  eq("the retry notice sits in the notices block, gated by ?retry", /\{retryParam && \([\s\S]*?Could not open the course\. Please try again\./.test(notices), true);
+  eq("the reset-retake notice text sits in the notices block, above the CTA row with the request button",
+    notices.includes("Your retake was reset when the module was updated. Request another attempt to continue.") &&
+      cta.includes("<RequestAttemptButton"), true);
+  eq("…gated by latestResetRetake(attempts, retakeIds), no pending request and no live grant",
+    /const showResetRetakeNotice =\s*latestResetRetake\(attempts, retakeIds\) && attemptRequestState !== "pending" && !hasUnusedGrant;/.test(src) &&
+      /\{showResetRetakeNotice && \(/.test(notices), true);
+  eq("canRequestAttempt is unchanged in PR 1a (still officialFailed-gated until step 11)",
+    /const canRequestAttempt =\s*!isAdmin &&\s*scoring\.limitReached &&\s*officialFailed &&/.test(src), true);
+  eq("the attempts read stays select(\"*\") (is_revision present on a 0103 database, undefined before)",
+    /\.from\("course_attempts"\)\s*\/\/[^\n]*\n\s*\.select\("\*"\)/.test(src), true);
+}
+
+/* ---------------- classifyAttempt against a recording fake ---------------- */
+
+type Op = { op: string; args: unknown[] };
+type Query = { table: string; ops: Op[] };
+function recordingClient(respond: (q: Query) => { data?: unknown; error?: unknown }) {
+  const queries: Query[] = [];
+  const client = {
+    from(table: string) {
+      const q: Query = { table, ops: [] };
+      queries.push(q);
+      const b: Record<string, unknown> = {};
+      for (const op of ["select", "eq", "neq", "in", "is", "not", "order", "limit"]) {
+        b[op] = (...args: unknown[]) => {
+          q.ops.push({ op, args });
+          return b;
+        };
+      }
+      const settle = () => Promise.resolve({ data: null, error: null, ...respond(q) });
+      b.maybeSingle = () => settle();
+      b.single = () => settle();
+      b.then = (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) => settle().then(res, rej);
+      return b;
+    },
+    rpc() {
+      return Promise.resolve({ data: [], error: null });
+    },
+  };
+  return { client: client as never, queries };
+}
+const selectOf = (q: Query) => String(q.ops.find((o) => o.op === "select")?.args[0] ?? "");
+const MISSING = { code: "42703", message: "column course_attempts.is_revision does not exist" };
+
+async function classifyCases() {
+  console.log("\nclassifyAttempt (ADR 0014 step 6)");
+  const attemptRow = (isRevision?: boolean) => ({
+    id: "x", user_id: "u1", organization_id: "o1", course_version_id: "v1",
+    course_versions: { course_id: "c1" },
+    ...(isRevision === undefined ? {} : { is_revision: isRevision }),
+  });
+  const run = async (target: string, rows: unknown[], opts: { flagged?: boolean; rejectColumn?: boolean } = {}) => {
+    const { client, queries } = recordingClient((q) => {
+      const sel = selectOf(q);
+      if (opts.rejectColumn && sel.includes("is_revision")) return { data: null, error: MISSING };
+      if (q.table === "course_attempts" && q.ops.some((o) => o.op === "maybeSingle" || (o.op === "eq" && o.args[0] === "id"))) {
+        return { data: { ...attemptRow(opts.rejectColumn ? undefined : opts.flagged ?? false), id: target } };
+      }
+      if (q.table === "course_versions") return { data: [{ id: "v1" }] };
+      if (q.table === "course_attempts") {
+        return { data: opts.rejectColumn ? (rows as Array<Record<string, unknown>>).map(({ is_revision: _drop, ...r }) => (void _drop, r)) : rows };
+      }
+      if (q.table === "attempt_requests") return { data: [] };
+      return { data: [] };
+    });
+    const kind = await classifyAttempt(client, target);
+    return { kind, queries };
+  };
+  const done = (id: string, started: string, completed: string, ss: string, extra: Record<string, unknown> = {}) => ({
+    id, score: 0.8, started_at: started, completed_at: completed, completion_status: "completed", success_status: ss, status: ss, ...extra,
+  });
+
+  {
+    const { kind, queries } = await run("a1", [done("a1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "passed", { is_revision: false })]);
+    const lists = queries.filter((q) => q.table === "course_attempts" && q.ops.some((o) => o.op === "in"));
+    const one = queries.find((q) => q.table === "course_attempts" && q.ops.some((o) => o.op === "eq" && o.args[0] === "id"));
+    eq("the attempts-list select names status and is_revision", lists.map((q) => /\bstatus\b/.test(selectOf(q)) && /\bis_revision\b/.test(selectOf(q))), [true]);
+    eq("the attempt select names is_revision", /\bis_revision\b/.test(one ? selectOf(one) : ""), true);
+    eq("the first completed attempt → official #1", [kind?.official, kind?.attemptNumber], [true, 1]);
+  }
+  {
+    const rows = [
+      done("a1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "passed", { is_revision: false }),
+      { id: "r1", score: null, started_at: "2026-10-02T09:00Z", completed_at: null, completion_status: "in_progress", success_status: "unknown", status: "in_progress", is_revision: true },
+    ];
+    const { kind } = await run("r1", rows, { flagged: true });
+    eq("a flagged row answers official: false", kind?.official, false);
+    const { kind: legacyDone } = await run("r2", [...rows, done("r2", "2026-10-03T09:00Z", "2026-10-03T09:30Z", "passed", { is_revision: true })], { flagged: true });
+    eq("…a completed flagged row too", legacyDone?.official, false);
+  }
+  {
+    // An abandoned-but-completed row (0099 count #3 expects none) no longer
+    // takes ordinal 1: the real official attempt is #1 again.
+    const rows = [
+      done("a0", "2026-09-30T09:00Z", "2026-09-30T09:30Z", "failed", { status: "abandoned", is_revision: false }),
+      done("a1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "passed", { is_revision: false }),
+    ];
+    const { kind } = await run("a1", rows);
+    eq("an abandoned-but-completed row leaves the ordinal", [kind?.attemptNumber, kind?.official], [1, true]);
+  }
+  {
+    const rows = [done("a1", "2026-10-01T09:00Z", "2026-10-01T09:30Z", "passed", { is_revision: false })];
+    const { kind, queries } = await run("a1", rows, { rejectColumn: true });
+    const selects = queries.filter((q) => q.table === "course_attempts").map(selectOf);
+    eq("a client rejecting is_revision → each select retried once without it", selects.map((s) => s.includes("is_revision")), [true, false, true, false]);
+    eq("…the narrower list select still names status", /\bstatus\b/.test(selects[3] ?? ""), true);
+    eq("…today's answer", [kind?.official, kind?.attemptNumber], [true, 1]);
+  }
+  {
+    const { client, queries } = recordingClient((q) =>
+      q.table === "course_attempts" ? { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } } : { data: [] }
+    );
+    const kind = await classifyAttempt(client, "a1");
+    eq("another error is never retried without the column (no row → null, as today)", [kind, queries.filter((q) => q.table === "course_attempts").length], [null, 1]);
+  }
+}
+
+async function snapshotCases() {
+  console.log("\ngrantSnapshotFor: one strict read of the approved grants (ADR 0014 step 3)");
+  const NOW = "2026-10-29T10:00:00.000Z";
+  const g = (id: string, over: Record<string, unknown> = {}) => ({
+    id, used_attempt_id: null, used_at: null, expires_at: null, created_at: "2026-10-01T00:00:00Z",
+    decided_by: "admin-1", decided_at: "2026-10-01T00:00:00Z", decision_note: null, reason: null, reissued_from: null, ...over,
+  });
+  const rows = [
+    g("used", { used_attempt_id: "r1", used_at: "2026-10-02T00:00:00Z", created_at: "2026-09-01T00:00:00Z" }),
+    g("lapsed", { expires_at: "2026-10-10T00:00:00Z", created_at: "2026-09-02T00:00:00Z" }),
+    g("newer", { created_at: "2026-10-05T00:00:00Z" }),
+    g("older", { created_at: "2026-10-03T00:00:00Z", expires_at: "2026-11-30T00:00:00Z" }),
+  ];
+  {
+    const { client, queries } = recordingClient(() => ({ data: rows }));
+    const snap = await grantSnapshotFor(client, "u1", "c1", NOW);
+    const q = queries[0];
+    eq("one read: attempt_requests, the user's approved grants on the course",
+      [queries.length, q.table, q.ops.filter((o) => o.op === "eq").map((o) => o.args)], [1, "attempt_requests", [["user_id", "u1"], ["course_id", "c1"], ["status", "approved"]]]);
+    eq("…the 0083 columns the history needs, and reissued_from", selectOf(q), "id, used_attempt_id, used_at, expires_at, created_at, decided_by, decided_at, decision_note, reason, reissued_from");
+    eq("retakeIds = the rows with used_attempt_id", [...snap.retakeIds], ["r1"]);
+    eq("unusedGrant = the OLDEST unused, unexpired grant (a lapsed one never counts)", snap.unusedGrant?.id, "older");
+    eq("rows kept for later consumers", snap.rows.length, 4);
+  }
+  {
+    const { client, queries } = recordingClient((q) =>
+      selectOf(q).includes("reissued_from") ? { data: null, error: { code: "42703", message: "column attempt_requests.reissued_from does not exist" } } : { data: rows.map(({ reissued_from: _r, ...x }) => (void _r, x)) }
+    );
+    const snap = await grantSnapshotFor(client, "u1", "c1", NOW);
+    eq("a database without 0103: re-read without reissued_from (never 'no grants')", [queries.map((q) => selectOf(q).includes("reissued_from")), [...snap.retakeIds], snap.unusedGrant?.id], [[true, false], ["r1"], "older"]);
+  }
+  {
+    const { client } = recordingClient(() => ({ data: null, error: { code: "42P01", message: 'relation "public.attempt_requests" does not exist' } }));
+    const snap = await grantSnapshotFor(client, "u1", "c1", NOW);
+    eq("a missing table (pre-0083) → no grants", [snap.retakeIds.size, snap.unusedGrant, snap.rows.length], [0, null, 0]);
+  }
+  for (const [what, answer] of [
+    ["a timeout", { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } }],
+    ["an answer with neither rows nor an error", { data: null, error: null }],
+  ] as Array<[string, { data: unknown; error: unknown }]>) {
+    const { client } = recordingClient(() => answer);
+    let thrown: unknown = null;
+    try { await grantSnapshotFor(client, "u1", "c1", NOW); } catch (e) { thrown = e; }
+    eq(`${what} → GrantReadError (the launch refuses)`, thrown instanceof GrantReadError, true);
+  }
+}
+
+classifyCases()
+  .then(snapshotCases)
+  .catch((e) => {
+    fail++;
+    console.log("  ✗ classifyAttempt / grantSnapshotFor cases threw:", e);
+  })
+  .finally(() => {
+    console.log(`\n==== status: ${pass} passed, ${fail} failed ====`);
+    process.exit(fail === 0 ? 0 : 1);
+  });

@@ -11,7 +11,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { languageDisplay } from "@/lib/i18n/languages";
-import { computeScoring } from "@/lib/scoring/policy";
+import { computeScoring, latestResetRetake } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { grantRetakeIdsFor, fetchPassRequired } from "@/lib/scoring/attempt-kind";
 import {
@@ -60,6 +60,8 @@ type Attempt = {
   completed_at: string | null;
   /** 0075 — undefined before the migration. */
   progress_pct?: number | null;
+  /** 0103 (ADR 0014): a revision visit's row; undefined before the migration (= false). */
+  is_revision?: boolean | null;
 };
 
 export default async function CourseDetailPage({
@@ -67,11 +69,14 @@ export default async function CourseDetailPage({
   searchParams,
 }: {
   params: Promise<{ org: string; courseId: string }>;
-  /** ?switch=<lang>: the launch page sent the learner here to confirm a language switch (ADR 0004 step 9). */
-  searchParams: Promise<{ switch?: string }>;
+  /**
+   * ?switch=<lang>: the launch page sent the learner here to confirm a language switch (ADR 0004 step 9).
+   * ?retry=1: the launch page refused this launch (ADR 0014 step 3: fail closed); the learner may retry.
+   */
+  searchParams: Promise<{ switch?: string; retry?: string }>;
 }) {
   const { org: orgSlug, courseId } = await params;
-  const { switch: switchParam } = await searchParams;
+  const { switch: switchParam, retry: retryParam } = await searchParams;
   const { org, user, role } = await requireOrgAccess(orgSlug);
   const isAdmin = canManage(role);
 
@@ -286,6 +291,14 @@ export default async function CourseDetailPage({
       !!pkgOfLatest && (pkgOfLatest.is_active === false || pkgOfLatest.current_version_id !== latestAttempt.course_version_id);
   }
 
+  // ADR 0014 step 8: the learner's newest non-revision attempt is a granted
+  // retake that a forced restart reset, and no granted retake is live. The
+  // notice sits above the request button and is hidden once a request is
+  // pending or a grant is live. retakeIds come from the fail-soft reader, so
+  // on a failed read the notice is absent, never wrong.
+  const showResetRetakeNotice =
+    latestResetRetake(attempts, retakeIds) && attemptRequestState !== "pending" && !hasUnusedGrant;
+
   const manifestDescription = current?.manifest_data?.description ?? "";
   const description = c.description || manifestDescription;
 
@@ -381,6 +394,18 @@ export default async function CourseDetailPage({
               </div>
             )}
 
+            {/* ADR 0014 step 3: the launch page refused this launch (a read it
+                could not make, or a launch kind the row disagreed with) and
+                wrote nothing; a retry decides again. */}
+            {retryParam && (
+              <p
+                className="text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2"
+                role="alert"
+                data-testid="launch-retry-notice"
+              >
+                Could not open the course. Please try again.
+              </p>
+            )}
             {hasUnusedGrant && (
               <p className="text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
                 You&apos;ve been granted another attempt. Launch the course to start
@@ -419,6 +444,14 @@ export default async function CourseDetailPage({
               <p className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
                 A previous attempt request was declined.
                 {requestRejectionNote ? <> Note: {requestRejectionNote}</> : null}
+              </p>
+            )}
+            {showResetRetakeNotice && (
+              <p
+                className="text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2"
+                data-testid="retake-reset-notice"
+              >
+                Your retake was reset when the module was updated. Request another attempt to continue.
               </p>
             )}
           </div>

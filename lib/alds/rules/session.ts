@@ -22,6 +22,23 @@
  *                                       behind the LMS; P5 decides by code whether it
  *                                       counts toward a revoke. The reopened session is
  *                                       then checked from scratch.
+ *     G3 outcome_twice_in_session (warn) a second of {passed, failed} at AU level in one
+ *                                       open session, either order (cmi5 §9.3 "More than
+ *                                       one of the set of {passed, failed} verbs MUST NOT
+ *                                       be used"). A warning on the session_reopened
+ *                                       precedent: a failed then a passed in one session
+ *                                       is a recorded engine departure (KIVO ADR 0008
+ *                                       D-2; KIVO ADR 0010), so an error would count the
+ *                                       owner's own decision against every such package
+ *                                       (ADR 0014 step 19); promoted by a later bundle.
+ *     G3 verb_duplicated_in_session     an AU-level failed repeated in one open session
+ *                                       under another statement id (cmi5 §9.3 "Verbs MUST
+ *                                       NOT be duplicated"): the one repeat no other code
+ *                                       reports (a second initialized is
+ *                                       initialized_twice, a second completed or passed
+ *                                       R5's, anything after terminated
+ *                                       statement_after_terminated; a same-id copy is one
+ *                                       statement).
  *   per registration (context.registration):
  *     R5 completed_twice / passed_twice  at most one AU-level completed and one passed
  *                                       (§7 R5's per-registration clause, which §5.2 G3
@@ -68,6 +85,8 @@ export function checkSession(statements: readonly unknown[], ctx: SessionContext
   const lmsIds = new Set(Array.isArray(ctx.lmsStatementIds) ? ctx.lmsStatementIds.filter(isStr) : []);
   const seenIds = new Set<string>();
   const sessions = new Map<string, SessionState>();
+  // AU-level outcomes ({passed, failed}) seen in each open session (ADR 0014 step 19).
+  const outcomes = new Map<string, { any: number; failed: number }>();
   const regs = new Map<string, { completed: number; passed: number; passedAt: number }>();
 
   statements.forEach((s, index) => {
@@ -95,6 +114,8 @@ export function checkSession(statements: readonly unknown[], ctx: SessionContext
           severity: "warn",
         });
       }
+      // A new or reopened session is checked from scratch.
+      if (state !== "open") outcomes.set(sessionKey, { any: 0, failed: 0 });
       sessions.set(sessionKey, "open");
     } else if (state === "before-init") {
       r.add("G3", "statement_before_initialized", "a statement before initialized in its session", { index });
@@ -102,6 +123,21 @@ export function checkSession(statements: readonly unknown[], ctx: SessionContext
       r.add("G3", "statement_after_terminated", "a statement after terminated in its session", { index });
     } else if (isAu && verbId === VERB.terminated) {
       sessions.set(sessionKey, "closed");
+    } else if (isAu && (verbId === VERB.passed || verbId === VERB.failed)) {
+      // cmi5 §9.3 within one session (ADR 0014 step 19).
+      const seen = outcomes.get(sessionKey) ?? { any: 0, failed: 0 };
+      if (seen.any > 0) {
+        r.add("G3", "outcome_twice_in_session", "a second AU-level passed or failed in one session (cmi5 §9.3); a recorded engine departure for failed then passed (KIVO ADR 0008 D-2)", {
+          index,
+          severity: "warn",
+        });
+      }
+      if (verbId === VERB.failed && seen.failed > 0) {
+        r.add("G3", "verb_duplicated_in_session", "an AU-level failed repeated in one session under another statement id (cmi5 §9.3)", { index });
+      }
+      seen.any++;
+      if (verbId === VERB.failed) seen.failed++;
+      outcomes.set(sessionKey, seen);
     }
 
     // once per registration (AU-level outcomes only)

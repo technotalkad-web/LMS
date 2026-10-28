@@ -173,6 +173,10 @@ export async function updateProgressFromState(
   if (!row) return null;
   const r = row as Record<string, unknown>;
   if (r.status === "abandoned") throw new AttemptAbandonedError(attemptId);
+  // ADR 0014 step 4: a revision visit's row records no progress (the State
+  // document itself is still stored by the State route). select("*"):
+  // undefined on a database without 0103.
+  if (r.is_revision === true) return null;
   if (r.completion_status === "completed") return 100;
   const update: Record<string, unknown> = {};
   let pct = p.pct;

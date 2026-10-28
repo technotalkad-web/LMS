@@ -12,6 +12,13 @@ export const LEARNING_SESSIONS_TABLE = "learning_sessions" as const;
 /** cmi5 §10.1: the LMS-owned State document; the AU may only GET it (ADR 0006 step 16). */
 export const LMS_LAUNCH_DATA_STATE_ID = "LMS.LaunchData" as const;
 
+/**
+ * ADR 0014 step 3: the LMS-owned official-result document a revision visit's
+ * registration gets (status, integer percent score, dates, ids; never a
+ * name). Like LMS.LaunchData, the AU may only GET it.
+ */
+export const LMS_OFFICIAL_RESULT_STATE_ID = "LMS.OfficialResult" as const;
+
 /** Named arguments of public.alds_set_version_tier(...); supabase-js rpc() passes them by name. */
 export interface SetVersionTierArgs {
   p_version_id: string;

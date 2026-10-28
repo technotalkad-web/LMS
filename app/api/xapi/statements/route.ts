@@ -6,8 +6,10 @@ import { attemptAbandonedResponse, isAttemptAbandonedError } from "@/lib/attempt
 import { processStatement } from "@/lib/xapi/process-statement";
 import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
+import { isCompletedAttempt } from "@/lib/scoring/policy";
 import { fireCompletionWebhookForAttempt } from "@/lib/integrations/webhook";
-import type { XapiStatement } from "@/lib/xapi/types";
+import { VERBS, type XapiStatement } from "@/lib/xapi/types";
+import { isUuid, registrationVerdict } from "@/lib/xapi/registration";
 
 /**
  *   POST /api/xapi/statements   (write one or more statements)
@@ -15,6 +17,17 @@ import type { XapiStatement } from "@/lib/xapi/types";
  *   PUT  /api/xapi/statements?statementId=<uuid>  (write a single statement)
  *
  * Auth: Authorization: Bearer <auth_token from /api/xapi/fetch>
+ *
+ * ADR 0014 (steps 4 and 5): the bound attempt row is read once, error-checked,
+ * before any insert (503 attempt_unreadable on an error or no row, so the
+ * AU's queue retries). Then, per statement, before the upsert:
+ *   R-3  a `context.registration` naming ANOTHER attempt of the same learner
+ *        on the same course is answered with its id and not stored,
+ *        processed or mirrored (log `registration_changed`, ids only);
+ *   R-5  on a revision visit's row (is_revision) only `initialized` and
+ *        `terminated` are stored; every other statement is answered with its
+ *        id and not stored (log `revision_ignored`). Nothing on such a row
+ *        moves XP, the streak, a journey day or the webhook (`officialRun`).
  */
 export async function POST(request: Request) {
   // P4: an abandoned attempt (or its expired token) → 410 before any write.
@@ -35,9 +48,35 @@ export async function POST(request: Request) {
   const svc = serviceClient();
   const ids: string[] = [];
 
+  // ADR 0014 step 4: the bound row, read once and error-checked BEFORE any
+  // insert. `isRevision` comes from the row, never from the token. A read
+  // error or no row → 503, so a revision visit's `answered` can never be
+  // stored because the flag was unreadable. select("*"): a key absent from
+  // the row means the column is absent (ADR 0015 step 3 reads its `before`
+  // from this same row).
+  const { data: boundRow, error: boundErr } = await svc
+    .from("course_attempts")
+    .select("*")
+    .eq("id", session.attemptId)
+    .maybeSingle();
+  if (boundErr || !boundRow) {
+    if (boundErr) console.warn("[xapi/statements] attempt read failed:", boundErr.message);
+    return NextResponse.json({ error: "attempt_unreadable" }, { status: 503 });
+  }
+  const row = boundRow as {
+    user_id: string;
+    course_version_id: string;
+    completion_status?: string | null;
+    success_status?: string | null;
+    is_revision?: boolean | null;
+  };
   // 0081: remember whether the attempt was already complete, so a completion
   // in this batch is reported exactly once (webhook) and only for OFFICIAL
-  // attempts (journey day, XP). Fail-soft: errors here never block statements.
+  // attempts (journey day, XP).
+  const wasComplete = isCompletedAttempt(row);
+  const isRevision = row.is_revision === true;
+
+  // After the batch: fail-soft, as before (errors here never block statements).
   const attemptStatus = async () => {
     const { data } = await svc
       .from("course_attempts")
@@ -47,7 +86,47 @@ export async function POST(request: Request) {
     const a = data as { completion_status?: string | null; success_status?: string | null } | null;
     return a?.completion_status === "completed" || a?.success_status === "passed";
   };
-  const wasComplete = await attemptStatus().catch(() => false);
+
+  // R-3 (ADR 0014 step 5): the learner's attempt ids on the bound attempt's
+  // course, read lazily, once per request, only when a statement names a
+  // registration other than the bound attempt. A failed read leaves the rule
+  // out for this request (today's path), logged with ids only.
+  let siblingIds: Set<string> | null = null;
+  const siblingAttemptIds = async (): Promise<Set<string>> => {
+    if (siblingIds) return siblingIds;
+    const out = new Set<string>();
+    try {
+      const { data: ver, error: verErr } = await svc
+        .from("course_versions")
+        .select("course_id")
+        .eq("id", row.course_version_id)
+        .maybeSingle();
+      const courseId = (ver as { course_id?: string } | null)?.course_id;
+      if (verErr || !courseId) throw new Error(verErr?.message ?? "no course");
+      const { data: vers, error: versErr } = await svc.from("course_versions").select("id").eq("course_id", courseId);
+      if (versErr || !vers) throw new Error(versErr?.message ?? "no versions");
+      const verIds = (vers as Array<{ id: string }>).map((v) => v.id);
+      if (verIds.length > 0) {
+        const { data: atts, error: attErr } = await svc
+          .from("course_attempts")
+          .select("id")
+          .eq("user_id", row.user_id)
+          .in("course_version_id", verIds);
+        if (attErr || !atts) throw new Error(attErr?.message ?? "no attempts");
+        for (const a of atts as Array<{ id: string }>) out.add(a.id);
+      }
+    } catch (e) {
+      console.warn(
+        JSON.stringify({
+          event: "registration_check_failed",
+          attempt_id: session.attemptId,
+          reason: e instanceof Error ? e.message : String(e),
+        })
+      );
+    }
+    siblingIds = out;
+    return out;
+  };
 
   // What reaches the tenant LRS mirror: the statements as stored. A resent id
   // with different content is left out (ADR 0003 step 5).
@@ -68,6 +147,42 @@ export async function POST(request: Request) {
     if (!statement.id) statement.id = deterministicStatementId(session.attemptId, received);
     if (!statement.timestamp) statement.timestamp = new Date().toISOString();
     const statementId = statement.id;
+
+    // (a) R-3, first: a registration naming a sibling attempt is answered
+    // and dropped, whether or not that attempt already stores the id.
+    const registration = (statement.context as { registration?: unknown } | undefined)?.registration;
+    if (isUuid(registration) && registration.toLowerCase() !== session.attemptId.toLowerCase()) {
+      const verdict = registrationVerdict({
+        registration,
+        attemptId: session.attemptId,
+        siblingAttemptIds: await siblingAttemptIds(),
+      });
+      if (verdict === "sibling") {
+        ids.push(statementId);
+        console.warn(
+          JSON.stringify({
+            event: "registration_changed",
+            attempt_id: session.attemptId,
+            statement_id: statementId,
+            named_attempt_id: registration,
+          })
+        );
+        continue;
+      }
+    }
+    // (b) R-5: a revision visit's row stores the session bookends only.
+    if (isRevision && statement.verb.id !== VERBS.initialized && statement.verb.id !== VERBS.terminated) {
+      ids.push(statementId);
+      console.warn(
+        JSON.stringify({
+          event: "revision_ignored",
+          attempt_id: session.attemptId,
+          statement_id: statementId,
+          verb: statement.verb.id,
+        })
+      );
+      continue;
+    }
 
     // ADR 0003 step 5: statements are write-once (ON CONFLICT DO NOTHING).
     // A resent id never changes the stored raw.
@@ -150,7 +265,10 @@ export async function POST(request: Request) {
       console.warn("[xapi/statements] attempt classification failed (treated as official):", e);
     }
   }
-  const officialRun = !nowComplete || !kind || kind.official;
+  // ADR 0014 step 4: a revision visit's row is never an official run, so
+  // neither RPC is called for it (gamification_record_activity moves the
+  // streak and last_active_day on every call) and no webhook fires.
+  const officialRun = !isRevision && (!nowComplete || !kind || kind.official);
 
   // Gamification engine: one fail-isolated RPC per request (idempotent —
   // dedupe keys make replays award-neutral). cmi5 parity with the SCORM

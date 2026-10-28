@@ -61,8 +61,10 @@ export function LaunchLanguagePicker({
     if (res.status === 409 && !restart) {
       const j = (await res.json().catch(() => ({}))) as {
         requires_confirm?: boolean;
+        requires_finish?: boolean;
         in_progress_attempts?: number;
         message?: string;
+        error?: string;
       };
       if (j.requires_confirm) {
         setConfirmFor({
@@ -75,6 +77,14 @@ export function LaunchLanguagePicker({
             j.message ??
             "Switching languages will reset your progress. Continue?",
         });
+        setPicking(null);
+        return;
+      }
+      // ADR 0014 step 18: an attempt that has taken an assessment cannot be
+      // reset by a switch. The body was read once above; show its message
+      // (never "HTTP 409") and stop.
+      if (j.requires_finish) {
+        setError(j.message ?? j.error ?? "");
         setPicking(null);
         return;
       }

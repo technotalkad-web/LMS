@@ -209,6 +209,30 @@ async function stepApply(db, s) {
   return allOk ? "next" : "stop";
 }
 
+// A word rule on a migration's raw text (ADR 0014 step 2: "nothing in the
+// file names ..."): comments and string literals included, case-insensitive,
+// one check per token. The file is read as it is, never stripped, so the
+// header's own prose and its pasted SQL are held to the same rule.
+function stepStatic(s) {
+  const [n] = expand([s.file]);
+  const f = byNum.get(n);
+  if (!f) {
+    check(false, `static: migration ${pad(n)} is missing`);
+    return "next";
+  }
+  const lines = fs.readFileSync(path.join(MIG, f), "utf8").toLowerCase().split(/\r?\n/);
+  for (const token of s.mustNotContain) {
+    const t = token.toLowerCase();
+    const hits = lines.flatMap((l, i) => (l.includes(t) ? [i + 1] : []));
+    check(
+      hits.length === 0,
+      `${f}: contains no "${token}" (raw text, comments included, case-insensitive)` +
+        `${hits.length ? `: FOUND on line${hits.length === 1 ? "" : "s"} ${hits.slice(0, 10).join(", ")}` : ""}`,
+    );
+  }
+  return "next";
+}
+
 async function stepRefresh(db, s) {
   try {
     const r = await db.query("select public.refresh_report_views() as r");
@@ -434,6 +458,7 @@ for (const sc of scenarios) {
       else if (kind === "apply") next = await stepApply(db, s);
       else if (kind === "audit") next = await stepAudit(db, s, EXP.mustNotAppear);
       else if (kind === "refresh") next = await stepRefresh(db, s);
+      else if (kind === "static") next = stepStatic(s);
       else setupError(`unknown step "${kind}" in scenario ${sc.name}`);
       if (next === "stop") {
         info(`${sc.name}: stopped here`);

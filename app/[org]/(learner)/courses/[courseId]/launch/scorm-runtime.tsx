@@ -25,7 +25,7 @@ export function ScormRuntime({
   backHref,
   backLabel = "Exit course",
   preloadUrls = [],
-  practice = false,
+  revision = false,
 }: {
   attemptId: string;
   initialCmi: CmiData;
@@ -36,8 +36,8 @@ export function ScormRuntime({
   backLabel?: string;
   /** Next module's content file(s) to warm in the background once this one is up. */
   preloadUrls?: string[];
-  /** Revision run: the official attempt is used; this launch never changes score or pass/fail. */
-  practice?: boolean;
+  /** A revision visit (ADR 0014): review only; this launch never changes the official result. */
+  revision?: boolean;
 }) {
   const cmiRef = useRef<CmiData>({ ...initialCmi });
   const initializedRef = useRef(false);
@@ -161,13 +161,13 @@ export function ScormRuntime({
             <span className="sm:hidden">Exit</span>
           </Link>
           <span className="serif text-lg sm:text-xl truncate">{courseTitle}</span>
-          {practice && (
+          {revision && (
             <span
               className="shrink-0 px-2 py-0.5 rounded-full border border-amber-300/60 bg-amber-400/15 text-amber-200 text-[11px] font-semibold uppercase tracking-wide"
-              title="Revision (practice): your official score and pass/fail do not change"
+              title="Revision visit: your official result does not change"
               data-testid="practice-badge"
             >
-              Revision · practice
+              Revision
             </span>
           )}
         </div>

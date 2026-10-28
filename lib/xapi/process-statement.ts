@@ -78,6 +78,20 @@ export async function processStatement(opts: {
   // statements route answers 410.
   if (r.status === "abandoned") throw new AttemptAbandonedError(attemptId);
 
+  // ADR 0014 step 4, rule R-5: a revision visit's row records nothing. It
+  // never derives completion, success, score, completed_at or progress;
+  // only last_activity_at is stamped (conditional on status <> 'abandoned',
+  // as every write here). `select("*")` above: undefined on a database
+  // without 0103, so the row derives as before.
+  if (r.is_revision === true) {
+    const revErr = await updateAttemptFailSoft(supabase, attemptId, { last_activity_at: new Date().toISOString() });
+    if (revErr?.abandoned) throw new AttemptAbandonedError(attemptId);
+    if (revErr) {
+      throw new Error(`processStatement: failed to update attempt ${attemptId}: ${revErr.message}`);
+    }
+    return null;
+  }
+
   const version = (Array.isArray(r.course_versions)
     ? r.course_versions[0]
     : r.course_versions) as LaunchedVersion | null;

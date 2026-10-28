@@ -16,10 +16,23 @@
  *      403 read_only_state before any write; other state ids and GET behave
  *      as before.
  *   4. Flag off = today's launch: a TypeScript-AST scan of launch/page.tsx
- *      proving every P4 call, column and value sits under a condition whose
- *      leftmost operand is `p4` (= aldsP4Enabled(), read once).
- *   5. The revision seed (launch/page.tsx) copies the source attempt's State
- *      documents except LMS.LaunchData, flag or not (ADR 0006 note (j)).
+ *      proving every P4 call and value sits under a condition whose
+ *      leftmost operand is `p4` (= aldsP4Enabled(), read once). ADR 0014:
+ *      the 0100 columns come from p4AttemptColumns(), a P4
+ *      call; the tracked values are the served language and `.launchMode`;
+ *      `launch.isPreview` is used ungated by design, only as the argument of
+ *      shouldRecordVisit(); the SCORM branch sets lesson_mode for a revision
+ *      visit's row only (a deliberate amendment of the old assertion).
+ *   5. The revision seed (launch/page.tsx, ADR 0014 step 3) copies the
+ *      OFFICIAL attempt's State documents except LMS.LaunchData and
+ *      LMS.OfficialResult, flag or not (ADR 0006 note (j)), decided by
+ *      seedPlan(); SCORM's cmi is rebuilt by a conditional update.
+ *   6. ADR 0014 step 3's wiring, by source (the page has no unit rig; the
+ *      decisions themselves are tests/unit/launch-kind.test.ts): the one
+ *      refusal path, no refusal inside a try, the strict grant read, the
+ *      narrower-select fallbacks, the cutover's `=== 1`, consume_grant with
+ *      no fallback writes and the same-request re-run, the token expiry
+ *      after `opened`, the P4 update, the closes, the visit record.
  *
  * Intentionally unconditional deltas (live in every deploy, flag or not;
  * none changes what a learner sees or how an attempt is graded):
@@ -45,16 +58,17 @@ import {
   attemptServedLanguage,
   buildLaunchData,
   isLaunchDataStateId,
+  launchModeFor,
   lmsAuActivityId,
   newSessionId,
-  previewLaunch,
+  p4AttemptColumns,
   recordLearningSession,
   registrationKindFor,
   servedLanguageFor,
   writeLaunchData,
 } from "../../lib/alds/launch";
 import { CMI5_SESSION_EXT, EXT, courseFamily, type AldsLaunchData } from "../../lib/alds/types";
-import { LMS_LAUNCH_DATA_STATE_ID } from "../../lib/alds/rpc";
+import { LMS_LAUNCH_DATA_STATE_ID, LMS_OFFICIAL_RESULT_STATE_ID } from "../../lib/alds/rpc";
 import { launchedActivityIds, normalizeActivityId, processStatement } from "../../lib/xapi/process-statement";
 
 let pass = 0, fail = 0;
@@ -113,25 +127,38 @@ async function main() {
     "https://ambak.com/xapi/activities/au/3f2b1c9e-0d4a-4e7b-9a51-2c8d6e0f1a23/1"
   );
 
-  console.log("\npreviewLaunch (ADR 0006 step 17, BLUEPRINT §10.4)");
-  eq("super_owner → preview, Browse", previewLaunch("super_owner"), { isPreview: true, launchMode: "Browse" });
-  eq("admin → preview, Browse", previewLaunch("admin"), { isPreview: true, launchMode: "Browse" });
-  eq("data_analyst → preview, Browse", previewLaunch("data_analyst"), { isPreview: true, launchMode: "Browse" });
-  eq("user → not preview, Normal", previewLaunch("user"), { isPreview: false, launchMode: "Normal" });
+  console.log("\nlaunchModeFor (ADR 0006 step 17, BLUEPRINT §10.4; ADR 0014 step 3: row-driven)");
+  for (const revision of [false, true]) {
+    eq(`super_owner (revision ${revision}) → preview, Browse`, launchModeFor({ role: "super_owner", revision }), { isPreview: true, launchMode: "Browse" });
+    eq(`admin (revision ${revision}) → preview, Browse`, launchModeFor({ role: "admin", revision }), { isPreview: true, launchMode: "Browse" });
+    eq(`data_analyst (revision ${revision}) → preview, Browse`, launchModeFor({ role: "data_analyst", revision }), { isPreview: true, launchMode: "Browse" });
+  }
+  eq("user on an official row → not preview, Normal", launchModeFor({ role: "user", revision: false }), { isPreview: false, launchMode: "Normal" });
+  eq("user on a revision visit's row → not preview, Review", launchModeFor({ role: "user", revision: true }), { isPreview: false, launchMode: "Review" });
 
-  console.log("\nregistrationKindFor (ADR 0006 notes (b) and (h))");
-  eq("grant consumed on this launch → grant_retake", registrationKindFor({ consumeGrantId: "g1", practiceLaunch: false, attemptIsGrantRetake: false }), "grant_retake");
-  eq("revision run → retake", registrationKindFor({ consumeGrantId: null, practiceLaunch: true, attemptIsGrantRetake: false }), "retake");
-  eq("otherwise → enrollment", registrationKindFor({ consumeGrantId: null, practiceLaunch: false, attemptIsGrantRetake: false }), "enrollment");
-  eq("a grant wins over practice (the page never sets both)", registrationKindFor({ consumeGrantId: "g1", practiceLaunch: true, attemptIsGrantRetake: false }), "grant_retake");
+  console.log("\np4AttemptColumns (the three 0100 columns of a launch's row)");
+  eq("user, official row, hi-Latn → the raw tag, Normal, not preview",
+    p4AttemptColumns({ role: "user", revision: false, language: "hi-Latn" }), { served_language: "hi-Latn", launch_mode: "Normal", is_preview: false });
+  eq("user, revision row → Review", p4AttemptColumns({ role: "user", revision: true, language: "en" }).launch_mode, "Review");
+  eq("the retake opened by consume_grant (revision false) → Normal", p4AttemptColumns({ role: "user", revision: false, language: "en" }).launch_mode, "Normal");
+  eq("admin → Browse, preview, whatever the row", [p4AttemptColumns({ role: "admin", revision: true, language: null }).launch_mode, p4AttemptColumns({ role: "admin", revision: true, language: null }).is_preview], ["Browse", true]);
+  eq("unlabeled legacy slot → null, never und", p4AttemptColumns({ role: "user", revision: false, language: null }).served_language, null);
+  eq("blank slot language → null", p4AttemptColumns({ role: "user", revision: false, language: "  " }).served_language, null);
+  eq("the three keys only", Object.keys(p4AttemptColumns({ role: "user", revision: false, language: "en" })).sort(), ["is_preview", "launch_mode", "served_language"]);
+
+  console.log("\nregistrationKindFor (ADR 0006 notes (b) and (h); ADR 0014 step 3)");
+  eq("grant consumed on this launch → grant_retake", registrationKindFor({ consumeGrantId: "g1", revision: false, attemptIsGrantRetake: false }), "grant_retake");
+  eq("a revision visit's row → retake", registrationKindFor({ consumeGrantId: null, revision: true, attemptIsGrantRetake: false }), "retake");
+  eq("otherwise → enrollment", registrationKindFor({ consumeGrantId: null, revision: false, attemptIsGrantRetake: false }), "enrollment");
+  eq("a grant wins over a revision flag (the page never sets both)", registrationKindFor({ consumeGrantId: "g1", revision: true, attemptIsGrantRetake: false }), "grant_retake");
   // Note (h): the kind belongs to the registration (the attempt), so a
   // relaunch of an in-progress grant retake (no grant consumed on it) keeps it.
   eq("relaunch of an in-progress grant retake (no grant consumed) → grant_retake, not enrollment",
-    registrationKindFor({ consumeGrantId: null, practiceLaunch: false, attemptIsGrantRetake: true }), "grant_retake");
-  eq("the attempt's grant link wins over a practice verdict", registrationKindFor({ consumeGrantId: null, practiceLaunch: true, attemptIsGrantRetake: true }), "grant_retake");
+    registrationKindFor({ consumeGrantId: null, revision: false, attemptIsGrantRetake: true }), "grant_retake");
+  eq("the attempt's grant link wins over a revision flag", registrationKindFor({ consumeGrantId: null, revision: true, attemptIsGrantRetake: true }), "grant_retake");
   eq("first launch and relaunch of one grant retake give the same kind",
-    registrationKindFor({ consumeGrantId: "g1", practiceLaunch: false, attemptIsGrantRetake: false }) ===
-      registrationKindFor({ consumeGrantId: null, practiceLaunch: false, attemptIsGrantRetake: true }), true);
+    registrationKindFor({ consumeGrantId: "g1", revision: false, attemptIsGrantRetake: false }) ===
+      registrationKindFor({ consumeGrantId: null, revision: false, attemptIsGrantRetake: true }), true);
 
   console.log("\nservedLanguageFor");
   eq("null (unlabeled legacy slot) → und", servedLanguageFor(null), "und");
@@ -239,9 +266,12 @@ async function main() {
     eq("returnURL null → absent", "returnURL" in buildLaunchData({ ...base, returnURL: null }), false);
   }
 
-  console.log("\nisLaunchDataStateId (exact, case-sensitive)");
+  console.log("\nisLaunchDataStateId (exact, case-sensitive; ADR 0014 step 4: both LMS-owned documents)");
   eq("the constant is LMS.LaunchData", LMS_LAUNCH_DATA_STATE_ID, "LMS.LaunchData");
+  eq("the official-result constant is LMS.OfficialResult", LMS_OFFICIAL_RESULT_STATE_ID, "LMS.OfficialResult");
   eq("LMS.LaunchData → true", isLaunchDataStateId("LMS.LaunchData"), true);
+  eq("LMS.OfficialResult → true", isLaunchDataStateId("LMS.OfficialResult"), true);
+  eq("lms.officialresult → false", isLaunchDataStateId("lms.officialresult"), false);
   eq("lms.launchdata → false", isLaunchDataStateId("lms.launchdata"), false);
   eq("LMS.LaunchData with a space → false", isLaunchDataStateId("LMS.LaunchData "), false);
   eq("null → false", isLaunchDataStateId(null), false);
@@ -372,6 +402,9 @@ async function main() {
     process.env.SUPABASE_SERVICE_ROLE_KEY = "stub-service-key";
     const realFetch = globalThis.fetch;
     let requests: Array<{ method: string; path: string }> = [];
+    // ADR 0014 step 4: the stub can also answer the State read with a
+    // database error (before this, it never returned one for GET).
+    let stateReadFails = false;
     const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
@@ -381,6 +414,8 @@ async function main() {
         return json([{ attempt_id: "a1", expires_at: "2999-01-01T00:00:00Z", course_attempts: { status: "in_progress" } }]);
       }
       if (url.pathname === "/rest/v1/xapi_state" && method === "GET") {
+        if (stateReadFails) return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
+        if (url.searchParams.get("state_id") === "eq.missing_doc") return json([]);
         return json([{ content: { contextTemplate: { registration: "a1" } }, content_type: "application/json" }]);
       }
       if (url.pathname === "/rest/v1/xapi_state") return new Response(null, { status: method === "POST" ? 201 : 204 });
@@ -419,6 +454,28 @@ async function main() {
       eq("PUT lms.launchdata (different case) → 204, the guard is exact", [lower.status, stateWrites()], [204, ["POST"]]);
       const got = await route.GET(req("GET", "LMS.LaunchData"));
       eq("GET LMS.LaunchData → 200 with the stored document (GET unchanged)", [got.status, await got.json()], [200, { contextTemplate: { registration: "a1" } }]);
+
+      // ADR 0014 step 4: LMS.OfficialResult is LMS-owned too; GET's 500.
+      for (const [name, handler, method, body] of cases) {
+        requests = [];
+        const res = await handler(req(method, "LMS.OfficialResult", body));
+        eq(`${name} LMS.OfficialResult → 403 read_only_state, no write`, [res.status, await res.json(), stateWrites()], [403, { error: "read_only_state" }, []]);
+      }
+      const gotOfficial = await route.GET(req("GET", "LMS.OfficialResult"));
+      eq("GET LMS.OfficialResult → 200, served to the AU", gotOfficial.status, 200);
+      const missing = await route.GET(req("GET", "missing_doc"));
+      eq("GET of a document that is not stored → 404 as before", missing.status, 404);
+      stateReadFails = true;
+      const realWarn = console.warn;
+      console.warn = () => {};
+      let failed: Response;
+      try {
+        failed = await route.GET(req("GET", "elearning_state_v1"));
+      } finally {
+        console.warn = realWarn;
+        stateReadFails = false;
+      }
+      eq("GET on a database error → 500 state_unreadable, never 404", [failed.status, await failed.json()], [500, { error: "state_unreadable" }]);
       // bindXapi logs a MISS on a missing header; keep the runner's output clean.
       const realError = console.error;
       console.error = () => {};
@@ -482,28 +539,41 @@ async function main() {
     eq("…bound to `const p4`", !!p4Decl && ts.isVariableDeclaration(p4Decl) && p4Decl.name.getText(sf) === "p4" &&
       (p4Decl.parent.flags & ts.NodeFlags.Const) !== 0, true);
 
-    const P4_CALLS = new Set(["lmsAuActivityId", "buildLaunchData", "writeLaunchData", "recordLearningSession", "newSessionId", "registrationKindFor", "isAldsSchemaMissing", "logAldsSkip", "attemptServedLanguage"]);
+    // ADR 0014 step 3: the three 0100 columns come from
+    // p4AttemptColumns() (lib/alds/launch.ts), a P4 call like the others; the
+    // P4 VALUES the page computes are the served language and the launch
+    // mode's `.launchMode`, and every use of them is gated. `launch.isPreview`
+    // is deliberately NOT a P4 value: it decides the revision visit record in
+    // every deploy, and its only uses are shouldRecordVisit's argument
+    // (checked below).
+    const P4_CALLS = new Set(["lmsAuActivityId", "buildLaunchData", "writeLaunchData", "recordLearningSession", "newSessionId", "registrationKindFor", "isAldsSchemaMissing", "logAldsSkip", "attemptServedLanguage", "p4AttemptColumns"]);
     const P4_COLUMNS = new Set(["served_language", "launch_mode", "is_preview"]);
     const sites: Array<{ what: string; node: ts.Node }> = [];
     for (const n of all) {
       if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && P4_CALLS.has(n.expression.text)) sites.push({ what: `${n.expression.text}()`, node: n });
       if (ts.isPropertyAssignment(n) && P4_COLUMNS.has(n.name.getText(sf))) sites.push({ what: `column ${n.name.getText(sf)}`, node: n });
       if (ts.isStringLiteral(n) && n.text === "alds_manifest") sites.push({ what: `select "alds_manifest"`, node: n });
-      // The two values computed for P4 are pure; every USE of them must be gated.
-      if (ts.isIdentifier(n) && (n.text === "preview" || n.text === "servedLanguage") &&
-        !(ts.isVariableDeclaration(n.parent) && n.parent.name === n)) {
+      if (ts.isIdentifier(n) && n.text === "servedLanguage" && !(ts.isVariableDeclaration(n.parent) && n.parent.name === n)) {
         sites.push({ what: `use of ${n.text}`, node: n });
       }
+      if (ts.isPropertyAccessExpression(n) && n.name.text === "launchMode") sites.push({ what: "use of .launchMode", node: n });
     }
     const kinds = [...new Set(sites.map((s) => s.what.replace(/^use of .*/, "use")))].sort();
-    eq("the scan finds every P4 call, column and value", kinds, [
-      "attemptServedLanguage()",
-      "buildLaunchData()", "column is_preview", "column launch_mode", "column served_language", "isAldsSchemaMissing()",
-      "lmsAuActivityId()", "logAldsSkip()", "newSessionId()", "recordLearningSession()", "registrationKindFor()",
-      `select "alds_manifest"`, "use", "writeLaunchData()",
+    eq("the scan finds every P4 call and value", kinds, [
+      "buildLaunchData()", "isAldsSchemaMissing()", "lmsAuActivityId()", "logAldsSkip()", "newSessionId()", "p4AttemptColumns()",
+      "recordLearningSession()", "registrationKindFor()", `select "alds_manifest"`, "use", "writeLaunchData()",
     ].sort());
     const ungated = sites.filter((s) => !gatedByP4(s.node)).map((s) => `${s.what} @${sf.getLineAndCharacterOfPosition(s.node.getStart(sf)).line + 1}`);
     eq("every one of them runs only when p4 is true", ungated, []);
+    eq("the page names no 0100 column itself (p4AttemptColumns does)", sites.filter((s) => s.what.startsWith("column ")).length, 0);
+    const previewUses = all.filter((n) => ts.isPropertyAccessExpression(n) && n.name.text === "isPreview") as ts.PropertyAccessExpression[];
+    eq("launch.isPreview: exactly the two shouldRecordVisit arguments, nothing else", previewUses.map((n) => {
+      const prop = n.parent;
+      const obj = prop?.parent;
+      const call = obj?.parent;
+      return !!prop && ts.isPropertyAssignment(prop) && prop.name.getText(sf) === "isPreview" && !!obj && ts.isObjectLiteralExpression(obj) &&
+        !!call && ts.isCallExpression(call) && call.expression.getText(sf) === "shouldRecordVisit" && n.expression.getText(sf) === "launch";
+    }), [true, true]);
 
     // The two value-level switches fall back to exactly today's value.
     const lmsAuDecl = all.find((n) => ts.isVariableDeclaration(n) && n.name.getText(sf) === "lmsAuId") as ts.VariableDeclaration | undefined;
@@ -512,53 +582,167 @@ async function main() {
       lmsAuInit.whenFalse.kind === ts.SyntaxKind.NullKeyword, true);
     eq("activityId = lmsAuId ?? today's publisher-id chain",
       /const activityId =\s*lmsAuId \?\?\s*\(v\.manifest_data\?\.raw\?\.auId \?\?\s*v\.manifest_data\?\.raw\?\.activityId \?\?\s*v\.manifest_data\?\.raw\?\.courseId \?\?\s*`urn:uuid:\$\{v\.id\}`\);/.test(src), true);
-    const columnSpread = sites.find((s) => s.what === "column is_preview")?.node;
-    let cond: ts.Node | undefined = columnSpread;
-    while (cond && !ts.isConditionalExpression(cond)) cond = cond.parent;
-    eq("the attempt insert's 0100 columns: ...(p4 ? { … } : {})", !!cond && ts.isConditionalExpression(cond) && isP4(cond.condition) &&
-      ts.isObjectLiteralExpression(unparen(cond.whenFalse)) && (unparen(cond.whenFalse) as ts.ObjectLiteralExpression).properties.length === 0, true);
+    const p4ColCalls = sites.filter((s) => s.what === "p4AttemptColumns()").map((s) => s.node as ts.CallExpression);
+    eq("p4AttemptColumns is called twice: the insert and the update after opened", p4ColCalls.length, 2);
+    const insertCall = p4ColCalls.find((n) => ts.isConditionalExpression(n.parent));
+    const updateCall = p4ColCalls.find((n) => ts.isCallExpression(n.parent) && n.parent.expression.getText(sf).endsWith(".update"));
+    const insertCond = insertCall?.parent;
+    eq("the attempt insert's 0100 columns: ...(p4 ? p4AttemptColumns(…) : {})", !!insertCond && ts.isConditionalExpression(insertCond) && isP4(insertCond.condition) &&
+      insertCond.whenTrue === insertCall && ts.isObjectLiteralExpression(unparen(insertCond.whenFalse)) &&
+      (unparen(insertCond.whenFalse) as ts.ObjectLiteralExpression).properties.length === 0 && ts.isSpreadAssignment(insertCond.parent.parent ?? insertCond.parent), true);
+    eq("…the insert's launch mode follows the row it inserts (revision: namedIsRevision)",
+      /p4AttemptColumns\(\{ role, revision: namedIsRevision, language: packageOfServed\(v\)\?\.language \}\)/.test(src), true);
+    eq("the 0100 columns store the raw slot language (null when unlabeled), never the LaunchData und",
+      [(src.match(/language: packageOfServed\(v\)\?\.language \}\)/g) ?? []).length, /language: servedLanguage\b/.test(src)], [2, false]);
     eq("the LaunchData block is cmi5-only: if (p4 && !isXapi)", /if \(p4 && !isXapi\) \{/.test(src), true);
-    // Note (h): on a relaunch the kind comes from the attempt's grant link
-    // (attempt_requests.used_attempt_id via grantRetakeIdsFor, service
-    // client), read only under the flag and only when no grant is consumed.
-    const svcGrantReads = all.filter((n) => ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "grantRetakeIdsFor" &&
-      n.arguments.length === 3 && n.arguments[0].getText(sf) === "svc") as ts.CallExpression[];
-    eq("one service-client grantRetakeIdsFor(svc, user.id, c.id) read, gated by p4",
-      svcGrantReads.map((n) => [n.arguments.map((a) => a.getText(sf)).join(", "), gatedByP4(n)]), [["svc, user.id, c.id", true]]);
-    eq("…membership of THIS attempt, skipped when a grant is consumed on this launch",
-      /const attemptIsGrantRetake =\s*!consumeGrantId && \(await grantRetakeIdsFor\(svc, user\.id, c\.id\)\)\.has\(attemptId\);/.test(src), true);
-    eq("…read after the grant stamp (attempt_requests.used_attempt_id), so the first launch's row is linked too",
-      src.indexOf("used_attempt_id: attemptId") > 0 && src.indexOf("used_attempt_id: attemptId") < src.indexOf("const attemptIsGrantRetake ="), true);
-    eq("registrationKindFor receives it", /registrationKindFor\(\{ consumeGrantId, practiceLaunch, attemptIsGrantRetake \}\)/.test(src), true);
-    eq("the attempt column stores the raw slot language (null when unlabeled), never the LaunchData und",
-      [/served_language:\s*attemptServedLanguage\(servedPackage\?\.language\)/.test(src), /served_language:\s*servedLanguage\b/.test(src)], [true, false]);
+    // Note (h), ADR 0014 step 3: the kind comes from the row and from this
+    // launch's strict grant snapshot; the fail-soft readers are gone.
+    eq("registrationKindFor: the grant opened on THIS launch, the row's flag, the snapshot's retake link",
+      /registrationKindFor\(\{\s*consumeGrantId: openedGrantId,\s*revision: rowIsRevision,\s*attemptIsGrantRetake: grants\.retakeIds\.has\(attemptId\),\s*\}\)/.test(src), true);
+    eq("the page calls neither fail-soft grant reader (grantRetakeIdsFor, unusedGrantFor)",
+      [/\bgrantRetakeIdsFor\(/.test(src), /\bunusedGrantFor\(/.test(src)], [false, false]);
+    eq("LaunchData and the learning session carry launch.launchMode",
+      (src.match(/launchMode: launch\.launchMode,/g) ?? []).length, 2);
     eq("LaunchData returnURL is a URL: the request origin + the fixed back target (cmi5 §10.2.6)",
       /returnURL:\s*`\$\{host\}\$\{backHref\}`/.test(src) && src.indexOf("const host =") < src.indexOf("returnURL:"), true);
     eq("the retry fires only with the flag on: if (p4 && !created && isAldsSchemaMissing(insErr))",
       /if \(p4 && !created && isAldsSchemaMissing\(insErr\)\) \{/.test(src), true);
-    eq("the 23505 fallback is unchanged and follows both inserts",
-      src.indexOf('if (!attemptId && insErr?.code === "23505")') > src.indexOf("isAldsSchemaMissing(insErr)"), true);
-    eq("SCORM keeps today's lesson mode (nothing P4 in the SCORM branch)",
+    eq("I-4: the retry re-sends is_revision when it was named (both inserts carry the same spread)",
+      (src.match(/\.\.\.\(namedIsRevision \? \{ is_revision: true \} : \{\}\),/g) ?? []).length, 2);
+    eq("I-4: a revision insert failing on a missing schema refuses, before the 23505 fallback",
+      /if \(!created && revisionInsertRefused\(insErr, namedIsRevision, namedP4\)\) refuse\("schema_missing"\);/.test(src) &&
+        src.indexOf("revisionInsertRefused(insErr") < src.indexOf('insErr?.code === "23505"'), true);
+    eq("the 23505 fallback follows both inserts and re-applies the kind rule on the raced row",
+      src.indexOf('insErr?.code === "23505"') > src.indexOf("isAldsSchemaMissing(insErr)") &&
+        /rowAction\(\{ candidate: ev\.candidate, limitReached, row: raced, retakeIds: grants\.retakeIds \}\)/.test(src), true);
+    eq("SCORM branch: nothing P4 (no p4, no served language, no .launchMode)",
       (() => {
         const s = src.indexOf("// --- SCORM 1.2 path ---");
         const e = src.indexOf("// --- cmi5 / standalone xAPI (TinCan) path ---");
-        return s > 0 && e > s && !/lesson_mode|p4|preview|servedLanguage/.test(src.slice(s, e));
+        const body = src.slice(s, e);
+        return s > 0 && e > s && !/\bp4\b|servedLanguage|\.launchMode/.test(body);
+      })(), true);
+    // Deliberate amendment (ADR 0014 step 3, SCORM runtime): lesson_mode is
+    // set in the SCORM branch for a revision visit's row only.
+    eq("SCORM branch: lesson_mode / credit only for a revision visit's row, before entry = resume",
+      (() => {
+        const s = src.indexOf("// --- SCORM 1.2 path ---");
+        const e = src.indexOf("// --- cmi5 / standalone xAPI (TinCan) path ---");
+        const body = src.slice(s, e);
+        return (body.match(/lesson_mode/g) ?? []).length === 1 &&
+          /if \(rowIsRevision\) \{[\s\S]*?cmi\["cmi\.core\.lesson_mode"\] = "review";\s*cmi\["cmi\.core\.credit"\] = "no-credit";\s*cmi\["cmi\.core\.entry"\] = "resume";\s*\}/.test(body) &&
+          body.indexOf('cmi["cmi.core.lesson_mode"]') < body.indexOf('cmi["cmi.core.student_id"]');
       })(), true);
 
-    /* ---------------- 5. the revision seed never copies LMS.LaunchData ---------------- */
-    console.log("\nlaunch/page.tsx: the revision seed never copies LMS.LaunchData (unconditional, note (j))");
-    eq("the seed reads the source attempt's documents except LMS.LaunchData",
-      /\.from\("xapi_state"\)\s*\.select\("state_id, content, content_type"\)\s*\.eq\("attempt_id", revisionSource\.id\)\s*\.neq\("state_id", LMS_LAUNCH_DATA_STATE_ID\);/.test(src), true);
-    eq("…the constant is rpc.ts's (= \"LMS.LaunchData\", checked above)",
-      /^import \{ LMS_LAUNCH_DATA_STATE_ID \} from "@\/lib\/alds\/rpc";$/m.test(src), true);
-    eq("…and the seed upserts exactly the rows of that read onto the new attempt",
-      /const rows = \(states \?\? \[\]\) as Array<[^>]+>;\s*if \(rows\.length > 0\) \{\s*await seedSvc\s*\.from\("xapi_state"\)\s*\.upsert\(rows\.map\(\(r\) => \(\{ \.\.\.r, attempt_id: attemptId \}\)\), \{ onConflict: "attempt_id,state_id" \}\);/.test(src), true);
-    eq("the page names xapi_state only in the seed (one read, one upsert; LaunchData is writeLaunchData's)",
-      (src.match(/\.from\("xapi_state"\)/g) ?? []).length, 2);
+    /* ---------------- 5. the revision seed (ADR 0014 step 3, K) ---------------- */
+    console.log("\nlaunch/page.tsx: the revision seed copies the OFFICIAL attempt's documents, never the LMS-owned ones");
+    eq("the seed reads the official attempt's documents except LMS.LaunchData and LMS.OfficialResult",
+      /\.from\("xapi_state"\)\s*\.select\("state_id, content, content_type"\)\s*\.eq\("attempt_id", official\.id\)\s*\.neq\("state_id", LMS_LAUNCH_DATA_STATE_ID\)\s*\.neq\("state_id", LMS_OFFICIAL_RESULT_STATE_ID\);/.test(src), true);
+    eq("…both constants are rpc.ts's",
+      /^import \{ LMS_LAUNCH_DATA_STATE_ID, LMS_OFFICIAL_RESULT_STATE_ID \} from "@\/lib\/alds\/rpc";$/m.test(src), true);
+    eq("…and the seed upserts exactly the rows of that read onto the revision row",
+      /const rows = \(states \?\? \[\]\) as Array<[^>]+>;\s*if \(rows\.length > 0\) \{\s*await svcAttempt\s*\.from\("xapi_state"\)\s*\.upsert\(rows\.map\(\(r\) => \(\{ \.\.\.r, attempt_id: attemptId \}\)\), \{ onConflict: "attempt_id,state_id" \}\);/.test(src), true);
+    eq("the page names xapi_state three times: the seed read, its upsert, the LMS.OfficialResult upsert (LaunchData is writeLaunchData's)",
+      (src.match(/\.from\("xapi_state"\)/g) ?? []).length, 3);
     const seedExclusions = all.filter((n) => ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&
       n.expression.name.text === "neq" && n.arguments[1]?.getText(sf) === "LMS_LAUNCH_DATA_STATE_ID") as ts.CallExpression[];
-    eq("the exclusion is one call, not behind the flag (a source document may outlive ALDS_P4)",
+    eq("the LMS.LaunchData exclusion is one call, not behind the flag (a source document may outlive ALDS_P4)",
       seedExclusions.map((n) => gatedByP4(n)), [false]);
+    eq("the seed is decided by seedPlan from the row's action (every revision launch, never first, retake or grant)",
+      /const seed = seedPlan\(\{ action: rowAct, flagResult, manifestType: v\.manifest_type \}\);/.test(src) &&
+        /if \(seed\.scorm\) \{/.test(src) && /if \(seed\.state && official\) \{/.test(src) && /if \(seed\.officialResult && ev\.scoring\) \{/.test(src), true);
+    eq("…its source is scoring.officialAttempt, never the latest completed row",
+      /const official = \(ev\.scoring\?\.officialAttempt \?\? null\) as MyAttempt \| null;/.test(src) && !/myCompleted|revisionSource/.test(src), true);
+    eq("SCORM: the served cmi is rebuilt from the official attempt, by an update conditional on the row's flag",
+      /cmi = buildRevisionCmi\(official\);\s*const \{ error: seedErr \} = await svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ cmi_data: cmi \}\)\s*\.eq\("id", attemptId\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("is_revision", true\)\s*\.eq\("status", "in_progress"\);/.test(src), true);
+    eq("LMS.OfficialResult: buildOfficialResult for the revision registration, not P4-gated",
+      /state_id: LMS_OFFICIAL_RESULT_STATE_ID,\s*content: buildOfficialResult\(/.test(src) &&
+        !gatedByP4(all.find((n) => ts.isIdentifier(n) && n.text === "buildOfficialResult" && ts.isCallExpression(n.parent))!), true);
+    eq("every insert writes an empty cmi_data (a grant retake and a first launch are never seeded)",
+      (src.match(/cmi_data: \{\},/g) ?? []).length, 2);
+
+    /* ---------------- 6. ADR 0014 step 3: the launch page's wiring ---------------- */
+    console.log("\nlaunch/page.tsx: fail closed, the kind rule, consume_grant, the token expiry, the visit record (ADR 0014 step 3)");
+    {
+      eq("every refusal goes through refuse(): one ?retry=1 in the page, inside it",
+        (src.match(/\?retry=1/g) ?? []).length === 1 &&
+          /const refuse: \(reason: string\) => never = \(reason\) => \{\s*console\.warn\(JSON\.stringify\(\{ event: "launch_refused", reason, course_id: c\.id, user_id: user\.id \}\)\);\s*redirect\(`\/\$\{orgSlug\}\/courses\/\$\{courseId\}\?retry=1`\);\s*\};/.test(src), true);
+      const refuseCalls = all.filter((n) => ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "refuse") as ts.CallExpression[];
+      const inTry = refuseCalls.filter((n) => {
+        let child: ts.Node = n;
+        for (let a = n.parent; a; child = a, a = a.parent) {
+          if (ts.isTryStatement(a) && child === a.tryBlock) return true;
+          if (ts.isFunctionLike(a)) break;
+        }
+        return false;
+      });
+      eq("no refusal sits inside a try block (redirect() throws)", [refuseCalls.length > 10, inTry.length], [true, 0]);
+      eq("the grants: one strict grantSnapshotFor(svcAttempt, user.id, c.id) read, a failure refuses",
+        (src.match(/grantSnapshotFor\(/g) ?? []).length === 1 && /grantSnapshotFor\(svcAttempt, user\.id, c\.id\)[\s\S]{0,260}\?\? refuse\("grant_read_failed"\)/.test(src), true);
+      eq("the attempts and versions reads refuse on error",
+        /if \(verErr\) refuse\("versions_read_failed"\);/.test(src) && /if \(myErr\) refuse\("attempts_read_failed"\);/.test(src), true);
+      eq("every new is_revision read has the narrower-select fallback (attempts, routing, grandfather, row)",
+        [
+          /readMy\(`\$\{MY_COLUMNS\}, is_revision`\)[\s\S]{0,40}if \(myErr && isMissingColumn\(myErr, "is_revision"\)\)/.test(src),
+          /readIp\(`\$\{IP_COLUMNS\}, is_revision`\)[\s\S]{0,40}if \(ipErr && isMissingColumn\(ipErr, "is_revision"\)\)/.test(src),
+          /if \(withFlagFilter\) q = q\.eq\("is_revision", false\);[\s\S]*?if \(gfErr && isMissingColumn\(gfErr, "is_revision"\)\) \(\{ data: ip, error: gfErr \} = await readGrandfather\(false\)\);/.test(src),
+          /read\(`\$\{ROW_COLUMNS\}, is_revision`\)[\s\S]{0,40}if \(rowErr && isMissingColumn\(rowErr, "is_revision"\)\)/.test(src),
+        ], [true, true, true, true]);
+      eq("the routing reads and the row lookup refuse on any other error",
+        (src.match(/refuse\("routing_read_failed"\)/g) ?? []).length >= 3 && /if \(rowErr\) refuse\("row_read_failed"\);/.test(src), true);
+      // The cutover rule: flag_revision_attempt proceeds only on exactly 1.
+      eq("one .rpc(\"flag_revision_attempt\"), and only a result of exactly 1 resumes",
+        (src.match(/\.rpc\("flag_revision_attempt"/g) ?? []).length === 1 &&
+          /\.rpc\("flag_revision_attempt", \{ p_attempt_id: existing\.id \}\);\s*if \(flagErr\) refuse\([^;]+\);\s*if \(flagged !== 1\) refuse\("flag_not_applied"\);/.test(src), true);
+      // consume_grant: one call, every argument by name, no fallback writes.
+      const cgAt = src.indexOf('.rpc("consume_grant"');
+      const rerunAt = src.indexOf("grants = await readGrants();", cgAt);
+      eq("one .rpc(\"consume_grant\") with its eight named arguments",
+        (src.match(/\.rpc\("consume_grant"/g) ?? []).length === 1 &&
+          /\.rpc\("consume_grant", \{\s*p_grant_id: grantId,\s*p_user_id: user\.id,\s*p_course_id: c\.id,\s*p_version_id: v\.id,\s*p_org_id: org\.id,\s*p_learning_path_id: pathContextId,\s*p_journey_enrollment_id: journeyCtx\?\.enrollmentId \?\? null,\s*p_journey_day: journeyCtx\?\.day \?\? null,\s*\}\);/.test(src), true);
+      eq("…no fallback insert, abandon or grant stamp on the grant path",
+        cgAt > 0 && rerunAt > cgAt && !/\.insert\(|status: "abandoned"/.test(src.slice(cgAt, rerunAt)) &&
+          !/\.from\("attempt_requests"\)\s*\.update\(/.test(src), true);
+      eq("…a raised error or a missing function refuses; the outcome goes through afterConsumeGrant",
+        /if \(cgErr\) refuse\(isSchemaMissing\(cgErr\) \? "schema_missing" : /.test(src) &&
+          /const next = afterConsumeGrant\(cg\?\.outcome\);\s*if \(next === "refuse"\) refuse\(/.test(src), true);
+      eq("…the rerun re-reads, re-evaluates without consuming and resolves again in this request",
+        /grants = await readGrants\(\);\s*ev = await evaluate\(grants, false\);\s*res = await resolveVersion\(ev\.candidate, grants\);\s*v = res\.v;\s*await closeAfterResolution\(res\);/.test(src) &&
+          !/redirect\([^)]*\/launch/.test(src), true);
+      // The token expiry after opened.
+      eq("after opened: expireLaunchTokens(…, tokenExpiryTargets(…)) for every non-revision attempt, then the LRS abandoned queue",
+        /const tokErr = await expireLaunchTokens\(\s*svcAttempt,\s*tokenExpiryTargets\(\{ attempts: ev\.my, abandonedIds, newAttemptId: retakeId \}\)\s*\);[\s\S]{0,200}await enqueueAbandonedStatements\(svcAttempt, abandonedIds\);/.test(src), true);
+      // The P4 update after opened (its values are unit-tested as p4AttemptColumns).
+      const p4Update = updateCall;
+      eq("the P4 update follows consume_grant, under p4, with revision: false",
+        !!p4Update && p4Update.getStart(sf) > cgAt && gatedByP4(p4Update) &&
+          /\.update\(p4AttemptColumns\(\{ role, revision: false, language: packageOfServed\(v\)\?\.language \}\)\)\s*\.eq\("id", retakeId\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("organization_id", org\.id\);/.test(src), true);
+      eq("…a missing 0100 is skipped with logAldsSkip, any other error logged, never a refusal",
+        /if \(p4Err\) \{\s*if \(isAldsSchemaMissing\(p4Err\)\) logAldsSkip\("grant_retake_columns", "schema_missing", \{ attemptId: retakeId \}\);\s*else console\.warn\([^;]+\);\s*\}/.test(src), true);
+      // The kind rule, the closes.
+      eq("the kind rule decides at the row: rowAction on the looked-up row",
+        /const decision = rowAction\(\{ candidate: ev\.candidate, limitReached, row: existing, retakeIds: grants\.retakeIds \}\);/.test(src), true);
+      eq("I-3: the insert names is_revision only for insert_revision and checks the invariant",
+        /const namedIsRevision = decision\.action === "insert_revision";\s*if \(namedIsRevision !== insertIsRevision\(limitReached, null\)\) refuse\("kind_mismatch"\);/.test(src), true);
+      eq("H: a first launch closes open flagged rows on the resolved version first (conditional, tokens, LRS)",
+        /if \(ev\.candidate === "first"\) \{\s*const \{ data: flRows, error: flErr \} = await svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.eq\("course_version_id", v\.id\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("is_revision", true\)/.test(src) &&
+          src.indexOf('if (ev.candidate === "first") {') < src.indexOf("const existing = await lookupRow(v.id);"), true);
+      eq("G: the stale-revision close is conditional on the flag, own rows, in progress",
+        /\.in\("id", r\.staleRevisionIds\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("is_revision", true\)/.test(src), true);
+      // The visit record.
+      eq("one .rpc(\"record_revision_visit\") with p_kind = the version's manifest_type",
+        (src.match(/\.rpc\("record_revision_visit"/g) ?? []).length === 1 && /p_kind: v\.manifest_type,/.test(src), true);
+      eq("…a plain insert when the function fails for another reason, revision_visit_failed when that fails",
+        /if \(isSchemaMissing\(visitErr\)\) \{[\s\S]*?return;\s*\}\s*const \{ error: plainErr \} = await svcAttempt\.from\("revision_visits"\)\.insert\(/.test(src) &&
+          /if \(plainErr\) console\.warn\(JSON\.stringify\(\{ event: "revision_visit_failed", attempt_id: visitAttemptId \}\)\);/.test(src), true);
+      const visitCalls = [...src.matchAll(/if \(shouldRecordVisit\(\{ isPreview: launch\.isPreview, rowIsRevision \}\)\) await recordRevisionVisit\(attemptId\);/g)].map((m) => m.index ?? 0);
+      const scormReturn = src.search(/return \(\s*<ScormRuntime/);
+      eq("…written twice, each guarded by shouldRecordVisit: SCORM before the runtime returns, cmi5/xAPI after the token is minted",
+        visitCalls.length === 2 && visitCalls[0] < scormReturn && visitCalls[1] > src.indexOf("if (!token) {"), true);
+      eq("the launch mode is row-driven: launchModeFor({ role, revision: rowIsRevision })",
+        /const launch = launchModeFor\(\{ role, revision: rowIsRevision \}\);/.test(src), true);
+      eq("both runtimes get revision={rowIsRevision}", (src.match(/revision=\{rowIsRevision\}/g) ?? []).length, 2);
+    }
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

@@ -14,7 +14,11 @@
  *     updateProgressFromState, forceRestartOlderVersions) are checked at
  *     their call sites;
  *   - the sites ADR 0009 steps 2-4 moved carry their explicit filters, and
- *     every package_validations write names organization_id.
+ *     every package_validations write names organization_id;
+ *   - ADR 0014 step 3: the launch page's new writes (the closes, the 0100
+ *     columns after consume_grant, the SCORM seed) carry theirs, and the two
+ *     0103 functions that write attempt rows (consume_grant,
+ *     flag_revision_attempt) are listed by hand with their receiver.
  *
  * A receiver is resolved lexically with the TypeScript parser: the binding
  * or parameter of that name in scope at the write (the enclosing functions'
@@ -196,9 +200,14 @@ function isServiceReceiver(file: string, receiver: string, at: number): boolean 
 // ---------------------------------------------------------------- course_attempts
 type Site = { receivers: string[]; params?: string[]; what: string };
 const ATTEMPT_WRITES: Record<string, Site> = {
+  // ADR 0014 step 3: one service client for every launch write; the
+  // grant-retake reset moved into consume_grant (listed by hand below).
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
-    receivers: ["svcReset", "svcSlot", "svcAttempt", "svcAttempt", "svcAttempt"],
-    what: "grant-retake reset, deactivated-slot close, journey tag, attempt insert, attempt insert retry without the 0100 columns (ADR 0006 note (c) of 2026-10-19)",
+    receivers: ["svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt"],
+    what:
+      "deactivated-slot close, stale-revision close, journey tag, the 0100 columns after consume_grant opened, " +
+      "flagged-row close of a first launch, attempt insert, attempt insert retry without the 0100 columns (ADR 0006 note (c) of 2026-10-19), " +
+      "the SCORM revision seed",
   },
   "app/api/courses/[courseId]/language-preference/route.ts": { receivers: ["svc"], what: "language switch abandon" },
   "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts": { receivers: ["svc"], what: "per-version restart" },
@@ -215,7 +224,8 @@ const FAILSOFT_CALLS: Record<string, Site> = {
   // updateProgressFromState(svc, …) passes its parameter on; its callers are checked below.
   "lib/courses/progress.ts": { receivers: ["svc"], params: ["svc"], what: "updateProgressFromState" },
   // processStatement({ supabase }) passes its parameter on; its caller is checked below.
-  "lib/xapi/process-statement.ts": { receivers: ["supabase"], params: ["supabase"], what: "processStatement" },
+  // ADR 0014 step 4 (R-5): the revision row's last_activity_at stamp, then the derivation's write.
+  "lib/xapi/process-statement.ts": { receivers: ["supabase", "supabase"], params: ["supabase"], what: "processStatement (R-5 stamp, derivation)" },
 };
 
 console.log("\ncourse_attempts: every write site is a listed service-client write (ADR 0009 step 5)");
@@ -299,10 +309,31 @@ console.log("\ncourse_attempts: parameter pass-throughs receive a service client
   );
 }
 
+// ADR 0014 step 3: the 0103 functions that write attempt rows are not
+// `.from("course_attempts")` chains, so they are listed here by hand:
+// consume_grant (the abandon, the retake insert, the grant stamp in one
+// transaction) and flag_revision_attempt (the cutover flag).
+console.log("\ncourse_attempts: the 0103 functions that write attempt rows, listed by hand (ADR 0014 step 3)");
+{
+  const LAUNCH = "app/[org]/(learner)/courses/[courseId]/launch/page.tsx";
+  for (const fn of ["consume_grant", "flag_revision_attempt"]) {
+    const re = new RegExp(`\\.rpc\\(\\s*["'\`]${fn}["'\`]`, "g");
+    const sites: Array<{ file: string; receiver: string; at: number }> = [];
+    for (const [file, src] of sources) {
+      for (const m of src.matchAll(re)) sites.push({ file, receiver: receiverBefore(src, m.index ?? 0), at: m.index ?? 0 });
+    }
+    eq(`${fn}: called from the launch page only, once`, sites.map((s) => s.file), [LAUNCH]);
+    eq(`${fn}: on svcAttempt, the service client in scope`,
+      sites.map((s) => [s.receiver, isServiceReceiver(s.file, s.receiver, s.at)]), [["svcAttempt", true]]);
+  }
+}
+
 console.log("\ncourse_attempts: the moved writes carry their explicit filters (ADR 0009 steps 2-4)");
 {
   const launch = attemptWrites.get("app/[org]/(learner)/courses/[courseId]/launch/page.tsx") ?? [];
-  const tag = launch.find((w) => w.receiver === "svcAttempt" && w.method === "update");
+  // ADR 0014 step 3: other svcAttempt updates precede the journey tag now
+  // (the closes, the P4 update after opened), so the tag is found by its row.
+  const tag = launch.find((w) => w.receiver === "svcAttempt" && w.method === "update" && /\.eq\("id", existing\.id\)/.test(w.stmt));
   const ins = launch.find((w) => w.receiver === "svcAttempt" && w.method === "insert");
   eq("journey tag: .eq(id) .eq(user_id) .eq(organization_id)", !!tag &&
     /\.eq\("id", existing\.id\)/.test(tag.stmt) &&
@@ -321,8 +352,28 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
       /\buser_id: user\.id\b/.test(w.stmt) &&
       /\borganization_id: org\.id\b/.test(w.stmt) &&
       /\bcourse_version_id: v\.id\b/.test(w.stmt)), true);
-  eq("attempt insert + retry: exactly one names is_preview (the first)",
-    inserts.map((w) => /\bis_preview:/.test(w.stmt)), [true, false]);
+  eq("attempt insert + retry: exactly one names the 0100 columns (the first, through p4AttemptColumns)",
+    inserts.map((w) => /\.\.\.\(p4 \? p4AttemptColumns\(/.test(w.stmt)), [true, false]);
+  // ADR 0014 step 3 (I-3, I-4): both name is_revision only when it was named.
+  eq("attempt insert + retry: both carry the same is_revision spread",
+    inserts.map((w) => /\.\.\.\(namedIsRevision \? \{ is_revision: true \} : \{\}\)/.test(w.stmt)), [true, true]);
+  // ADR 0014 step 3: the new writes on attempt rows and their filters.
+  const byStmt = (re: RegExp) => launch.filter((w) => re.test(w.stmt));
+  eq("deactivated-slot close: .in(id) .eq(user_id) .eq(status, in_progress)",
+    byStmt(/\.in\("id", closable\)/).map((w) => /\.eq\("user_id", user\.id\)/.test(w.stmt) && /\.eq\("status", "in_progress"\)/.test(w.stmt)), [true]);
+  eq("stale-revision close: own rows, in progress, flagged only",
+    byStmt(/\.in\("id", r\.staleRevisionIds\)/).map((w) =>
+      /\.eq\("user_id", user\.id\)/.test(w.stmt) && /\.eq\("status", "in_progress"\)/.test(w.stmt) && /\.eq\("is_revision", true\)/.test(w.stmt)), [true]);
+  eq("flagged-row close (a first launch): this version, own rows, in progress, flagged only",
+    byStmt(/\.eq\("course_version_id", v\.id\)/).filter((w) => w.method === "update").map((w) =>
+      /\.eq\("user_id", user\.id\)/.test(w.stmt) && /\.eq\("status", "in_progress"\)/.test(w.stmt) && /\.eq\("is_revision", true\)/.test(w.stmt)), [true]);
+  eq("the P4 update after opened: by the retake's id, user and organisation",
+    byStmt(/\.update\(p4AttemptColumns\(/).map((w) =>
+      /\.eq\("id", retakeId\)/.test(w.stmt) && /\.eq\("user_id", user\.id\)/.test(w.stmt) && /\.eq\("organization_id", org\.id\)/.test(w.stmt)), [true]);
+  eq("the SCORM seed update: by id and user, conditional on is_revision and in_progress",
+    byStmt(/\.update\(\{ cmi_data: cmi \}\)/).map((w) =>
+      /\.eq\("id", attemptId\)/.test(w.stmt) && /\.eq\("user_id", user\.id\)/.test(w.stmt) &&
+      /\.eq\("is_revision", true\)/.test(w.stmt) && /\.eq\("status", "in_progress"\)/.test(w.stmt)), [true]);
   const commit = sources.get("app/api/scorm/[attemptId]/commit/route.ts") ?? "";
   eq("SCORM commit: updateAttemptFailSoft(svc, attemptId, update, { userId: user.id })",
     /updateAttemptFailSoft\(svc, attemptId, update, \{ userId: user\.id \}\)/.test(commit), true);

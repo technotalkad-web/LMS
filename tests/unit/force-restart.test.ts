@@ -118,7 +118,7 @@ const inList = (q: Query, col: string) => (arg(q, "in", col)?.[1] ?? []) as stri
 
 /* ---------------- an in-memory course_attempts table ---------------- */
 
-type Row = { id: string; course_version_id: string; status: string };
+type Row = { id: string; course_version_id: string; status: string; is_revision?: boolean };
 const NEW = "v-new";
 const OLD1 = "v-old-1";
 const OLD2 = "v-old-2";
@@ -140,10 +140,17 @@ function attemptsWorld(
     beforeUpdate?: (n: number) => void;
     reread?: (q: Query) => Answer | undefined;
     tokens?: Answer;
+    /** ADR 0014 step 8: the grant-link read and the attempt_requests writes (default: no links). */
+    links?: (q: Query) => Answer | undefined;
+    requests?: (q: Query) => Answer | undefined;
+    /** Any other read (the 23505 path's attempts and pass_required). */
+    other?: (q: Query) => Answer | undefined;
   } = {}
 ) {
   let updates = 0;
   return fakeClient((q) => {
+    const other = hooks.other?.(q);
+    if (other) return other;
     if (q.table === "course_versions" && sel(q) === "id") {
       return hooks.versions ?? { data: [{ id: OLD1 }, { id: NEW }, { id: OLD2 }] };
     }
@@ -159,7 +166,7 @@ function attemptsWorld(
       for (const r of hit) r.status = "abandoned";
       return { data: hit.map((r) => ({ id: r.id })) };
     }
-    if (q.table === "course_attempts" && sel(q) === "id, course_version_id") {
+    if (q.table === "course_attempts" && isR2(q)) {
       const hooked = hooks.selection?.(q);
       if (hooked) return hooked;
       const vers = new Set(inList(q, "course_version_id"));
@@ -170,7 +177,7 @@ function attemptsWorld(
       const all = rows
         .filter((r) => vers.has(r.course_version_id) && r.status === status && (after === undefined || r.id > after))
         .sort((a, b) => (a.id < b.id ? -1 : 1))
-        .map((r) => ({ id: r.id, course_version_id: r.course_version_id }));
+        .map((r) => ({ id: r.id, course_version_id: r.course_version_id, ...(String(sel(q)).includes("is_revision") ? { is_revision: r.is_revision ?? false } : {}) }));
       // Offsets are answered too, so the test can tell keyset from offset paging.
       return { data: range ? all.slice(range[0], range[1] + 1) : all.slice(0, limit) };
     }
@@ -180,6 +187,10 @@ function attemptsWorld(
       const ids = new Set(inList(q, "id"));
       return { data: rows.filter((r) => ids.has(r.id)).map((r) => ({ ...r })) };
     }
+    if (q.table === "attempt_requests" && sel(q)?.toString().startsWith("id, user_id, course_id, used_attempt_id, expires_at") && !has(q, "update")) {
+      return hooks.links?.(q) ?? { data: [] };
+    }
+    if (q.table === "attempt_requests") return hooks.requests?.(q) ?? {};
     if (q.table === "cmi5_launch_tokens" && has(q, "update")) return hooks.tokens ?? { data: null };
     // enqueueAbandonedStatements' read: nothing to queue (stops before the LRS config).
     if (q.table === "course_attempts" && sel(q) === LRS_SELECT) return { data: [] };
@@ -188,6 +199,27 @@ function attemptsWorld(
 }
 const updatesOf = (qs: Query[]) => qs.filter((q) => q.table === "course_attempts" && has(q, "update"));
 const attemptQueries = (qs: Query[]) => qs.filter((q) => q.table === "course_attempts");
+/** R2, the selection read (ADR 0014 step 8: it names is_revision, dropped on a database without it). */
+const isR2 = (q: Query) => q.table === "course_attempts" && (sel(q) === "id, course_version_id" || sel(q) === "id, course_version_id, is_revision") && !has(q, "update");
+/** ADR 0014 step 8: what every forced restart now carries (the admin, the org, the course, the injected notifier). */
+type NotifyCall = { userId: string; approved: boolean; note: string | null | undefined; expiresAt: string | null | undefined; email: string };
+let notifyCalls: NotifyCall[] = [];
+const runArgs = () => ({
+  packageId: PKG,
+  newVersionId: NEW,
+  versionNumber: 3,
+  admin: { id: "admin-1" },
+  org: { id: "org1", name: "QA", slug: "qa" },
+  origin: "",
+  course: { id: "c1", title: "Turning Escalations" },
+  notify: {
+    decision: async (_svc: unknown, a: { learner: { id: string; email: string }; approved: boolean; note?: string | null; expiresAt?: string | null }) => {
+      notifyCalls.push({ userId: a.learner.id, approved: a.approved, note: a.note, expiresAt: a.expiresAt, email: a.learner.email });
+    },
+    emails: async (_svc: unknown, uids: Iterable<string>) => new Map([...uids].map((u) => [u, `${u}@example.test`] as [string, string])),
+  },
+});
+const ZERO_REGRANT = { reissued: 0, reissue_failed: 0, reissue_pending: 0, revision_closed: 0 };
 const ids = (n: number, prefix = "a") => Array.from({ length: n }, (_, i) => `${prefix}${String(i).padStart(4, "0")}`);
 
 /* ---------------- (i) classification ---------------- */
@@ -361,17 +393,20 @@ async function io() {
       { id: "a4", course_version_id: NEW, status: "in_progress" },
     ];
     const { client, queries } = attemptsWorld(rows);
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("success: ok, expected 2, restarted 2", pick(r), { status: "ok", expected: 2, restarted: 2, resolved: 0, unresolved: 0, unresolved_version_ids: [] });
     eq("success: message", r.message, "2 learners reset.");
     eq("success: restartedIds (internal only)", r.restartedIds, ["a1", "a2"]);
     eq("success: tokens expired", r.tokensExpired, true);
     const v = queries[0];
     eq("R1: course_versions select(id) eq(package_id)", [v.table, sel(v), arg(v, "eq", "package_id")], ["course_versions", "id", ["package_id", PKG]]);
-    const r2 = queries.find((q) => q.table === "course_attempts" && sel(q) === "id, course_version_id")!;
+    const r2 = queries.find((q) => q.table === "course_attempts" && isR2(q))!;
     eq("R2: the versions read excludes the new version", inList(r2, "course_version_id"), [OLD1, OLD2]);
     eq("R2: status = in_progress, ordered by id, first page of 1000 (no cursor, no offset)", [arg(r2, "eq", "status"), arg(r2, "order"), arg(r2, "limit"), has(r2, "gt"), has(r2, "range")], [["status", "in_progress"], ["id"], [1000], false, false]);
-    eq("R2: no grant-retake exclusion (no attempt_requests read)", queries.some((q) => q.table === "attempt_requests"), false);
+    // ADR 0014 step 8: the grant links are read as part of the selection,
+    // once per chunk, BEFORE the update; they exclude nothing.
+    const linkReads = queries.filter((q) => q.table === "attempt_requests");
+    eq("R2: no grant-retake exclusion; the grant links are read once, before the update", [linkReads.length, queries.indexOf(linkReads[0]) < queries.indexOf(updatesOf(queries)[0])], [1, true]);
     const u = updatesOf(queries);
     eq("U: one update", u.length, 1);
     eq("U: sets status abandoned only", arg(u[0], "update"), [{ status: "abandoned" }]);
@@ -390,23 +425,23 @@ async function io() {
   }
   {
     const { client, queries } = attemptsWorld([], { versions: { data: null, error: null } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("R1 { data: null, error: null } → failed, expected unknown", pick(r), { status: "failed", expected: null, restarted: 0, resolved: 0, unresolved: 0, unresolved_version_ids: null });
     eq("R1 empty answer → no attempts query at all (no update)", attemptQueries(queries).length, 0);
   }
   {
     const { client, queries } = attemptsWorld([], { versions: { error: { message: "timeout", code: "57014" } } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("R1 error → failed, no attempts query", [r.status, r.expected, attemptQueries(queries).length], ["failed", null, 0]);
   }
   {
     const { client, queries } = attemptsWorld([], { versions: { data: [{ id: OLD1 }, { id: OLD2 }] } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("R1 without the new version (wrong/truncated read) → failed, no attempts query", [r.status, r.expected, attemptQueries(queries).length], ["failed", null, 0]);
   }
   {
     const { client, queries } = attemptsWorld([], { versions: { data: [{ id: NEW }] } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("no older versions → genuine zero, nothing else queried", [pick(r), queries.length], [
       { status: "ok", expected: 0, restarted: 0, resolved: 0, unresolved: 0, unresolved_version_ids: [] }, 1,
     ]);
@@ -414,34 +449,34 @@ async function io() {
   {
     const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "passed" }];
     const { client, queries } = attemptsWorld(rows);
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("selection [] → genuine zero", [r.status, r.expected, r.restarted, r.message], ["ok", 0, 0, "No learners were in progress."]);
     eq("selection [] → no update, no token or LRS query", [updatesOf(queries).length, queries.some((q) => q.table === "cmi5_launch_tokens"), queries.some((q) => sel(q) === LRS_SELECT)], [0, false, false]);
   }
   {
     const { client, queries } = attemptsWorld([], { selection: () => ({ data: null, error: null }) });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("R2 { data: null, error: null } → failed, expected unknown, no update", [r.status, r.expected, updatesOf(queries).length], ["failed", null, 0]);
   }
   {
     const { client, queries } = attemptsWorld([], { selection: () => ({ error: { message: "boom", code: "XX000" } }) });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("R2 error → failed, no update", [r.status, r.expected, updatesOf(queries).length], ["failed", null, 0]);
   }
   {
     // 160 older versions → R2 in two chunks of version ids (150 + 10).
     const older = ids(160, "v");
     const { client, queries } = attemptsWorld([], { versions: { data: [{ id: NEW }, ...older.map((id) => ({ id }))] } });
-    await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
-    const r2 = queries.filter((q) => sel(q) === "id, course_version_id");
+    await forceRestartOlderVersions(client, runArgs());
+    const r2 = queries.filter((q) => isR2(q));
     eq("R2: version ids chunked at 150", r2.map((q) => inList(q, "course_version_id").length), [150, 10]);
   }
   {
     // 1005 in progress on one old version: R2 pages at 1000; U runs 7 chunks.
     const rows: Row[] = ids(1005).map((id) => ({ id, course_version_id: OLD1, status: "in_progress" }));
     const { client, queries } = attemptsWorld(rows);
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
-    const r2 = queries.filter((q) => sel(q) === "id, course_version_id");
+    const r = await forceRestartOlderVersions(client, runArgs());
+    const r2 = queries.filter((q) => isR2(q));
     eq("R2: two keyset pages, the second after the first page's last id", r2.map((q) => [arg(q, "gt", "id") ?? null, arg(q, "limit"), has(q, "range")]), [
       [null, [1000], false],
       [["id", "a0999"], [1000], false],
@@ -463,7 +498,7 @@ async function io() {
         return undefined;
       },
     });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("a row leaving in_progress between pages: every row still in progress is selected", pick(r), {
       status: "ok", expected: 1005, restarted: 1004, resolved: 1, unresolved: 0, unresolved_version_ids: [],
     });
@@ -474,7 +509,7 @@ async function io() {
     // the first chunk is kept and the third is never sent.
     const rows: Row[] = ids(301).map((id) => ({ id, course_version_id: OLD1, status: "in_progress" }));
     const { client, queries } = attemptsWorld(rows, { update: (_q, n) => (n === 1 ? { error: { message: "deadlock", code: "40P01" } } : undefined) });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("update error after one chunk → failed, restarted 150, unresolved 151", pick(r), {
       status: "failed", expected: 301, restarted: 150, resolved: 0, unresolved: 151, unresolved_version_ids: [OLD1],
     });
@@ -489,7 +524,7 @@ async function io() {
   {
     const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "in_progress" }];
     const { client } = attemptsWorld(rows, { update: () => ({ data: null, error: null }) });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("U { data: null, error: null } → update failure → failed", [r.status, r.restarted, r.unresolved], ["failed", 0, 1]);
   }
   {
@@ -503,7 +538,7 @@ async function io() {
         return { data: null, error: null };
       },
     });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("U applied but answers null → failed, restarted 0, resolved 1, unresolved 0", [r.status, r.restarted, r.resolved, r.unresolved], ["failed", 0, 1, 0]);
     eq("…no token expiry or LRS enqueue for it", [queries.some((q) => q.table === "cmi5_launch_tokens"), queries.some((q) => sel(q) === LRS_SELECT)], [false, false]);
   }
@@ -514,7 +549,7 @@ async function io() {
       { id: "a2", course_version_id: OLD2, status: "in_progress" },
     ];
     const { client } = attemptsWorld(rows, { beforeUpdate: () => { rows[1].status = "passed"; } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("a completion landing first wins: ok, restarted 1, resolved 1", pick(r), { status: "ok", expected: 2, restarted: 1, resolved: 1, unresolved: 0, unresolved_version_ids: [] });
     eq("…the completion is not overwritten", rows[1].status, "passed");
     eq("…message", r.message, "1 learner reset; 1 had already finished or been reset.");
@@ -531,7 +566,7 @@ async function io() {
         return inList(q, "id").includes("a1") ? { data: [{ id: "a1" }] } : undefined;
       },
     });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("a selected row still in progress after the run → failed", pick(r), { status: "failed", expected: 2, restarted: 1, resolved: 0, unresolved: 1, unresolved_version_ids: [OLD2] });
   }
   {
@@ -543,19 +578,19 @@ async function io() {
       update: () => ({ data: [{ id: "a1" }] }),
       reread: () => ({ data: null, error: null }),
     });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("R3 { data: null, error: null } → re-read failure → failed", [r.status, r.unresolved], ["failed", 1]);
   }
   {
     const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "in_progress" }];
     const { client } = attemptsWorld(rows, { update: () => ({ data: [{ id: "a1" }, { id: "zz" }] }) });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("an extra id from the update is counted, not an error", [r.status, r.expected, r.restarted], ["ok", 1, 2]);
   }
   {
     const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "in_progress" }];
     const { client } = attemptsWorld(rows, { tokens: { error: { message: "tokens down" } } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("token expiry failure → ok with tokensExpired false (informational)", [r.status, r.restarted, r.tokensExpired], ["ok", 1, false]);
   }
   {
@@ -564,7 +599,7 @@ async function io() {
     let threw = false;
     let r: Awaited<ReturnType<typeof forceRestartOlderVersions>> | null = null;
     try {
-      r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+      r = await forceRestartOlderVersions(client, runArgs());
     } catch {
       threw = true;
     }
@@ -574,7 +609,7 @@ async function io() {
     // A responder that rejects (the awaited builder throws) during the update.
     const rows: Row[] = [{ id: "a1", course_version_id: OLD1, status: "in_progress" }];
     const { client } = attemptsWorld(rows, { update: () => { throw new Error("socket hang up"); } });
-    const r = await forceRestartOlderVersions(client, { packageId: PKG, newVersionId: NEW });
+    const r = await forceRestartOlderVersions(client, runArgs());
     eq("a rejecting update → failed (update failure), not a throw", [r.status, r.expected, r.restarted, r.unresolved], ["failed", 1, 0, 1]);
   }
 }
@@ -584,7 +619,7 @@ async function io() {
 function answers() {
   console.log("\n(iv) the route answers (ADR 0011 steps 5–6)");
   const base = { courseId: "c1", packageId: PKG, versionId: NEW, versionNumber: 3 };
-  const okRun = { status: "ok" as const, expected: 2, restarted: 2, resolved: 0, unresolved: 0, unresolved_version_ids: [], message: "2 learners reset.", restartedIds: ["a1", "a2"], tokensExpired: true };
+  const okRun = { status: "ok" as const, expected: 2, restarted: 2, resolved: 0, unresolved: 0, unresolved_version_ids: [], ...ZERO_REGRANT, message: "2 learners reset.", restartedIds: ["a1", "a2"], tokensExpired: true };
   {
     const a = forceRestartReplaceAnswer({ ...base, report: forceRestartReport(okRun) });
     eq("multipart ok: 200, every existing field kept, expected/resolved/message added", a, {
@@ -596,7 +631,7 @@ function answers() {
     eq("multipart ok: tokens_expired: false only when the expiry failed", t.body.tokens_expired, false);
   }
   const failedRun = {
-    status: "failed" as const, expected: 4, restarted: 2, resolved: 1, unresolved: 1, unresolved_version_ids: [OLD2],
+    status: "failed" as const, expected: 4, restarted: 2, resolved: 1, unresolved: 1, unresolved_version_ids: [OLD2], ...ZERO_REGRANT,
     message: "The new version is published, but resetting 4 learners failed. Use 'Restart learners on this version' on the older version to retry. 2 were reset, 1 could not be.",
     restartedIds: ["a1", "a2"], tokensExpired: true,
   };
@@ -694,7 +729,7 @@ function finalizeWorld(restart: Responder) {
   return fakeClient((q) => {
     const s = sel(q);
     if (q.table === "course_versions" && s === "*") return { data: { ...VERSION_ROW } };
-    if (q.table === "courses" && s === "id, organization_id, current_version_id") return { data: { id: "c1", organization_id: "org1", current_version_id: OLD1 } };
+    if (q.table === "courses" && s === "id, organization_id, current_version_id, title") return { data: { id: "c1", organization_id: "org1", current_version_id: OLD1, title: "Turning Escalations" } };
     if (q.table === "course_versions" && typeof s === "string" && s.includes("courses!course_versions_course_id_fkey")) return { data: [] };
     if (q.table === "course_packages" && s === "id, current_version_id") return { data: { id: PKG, current_version_id: OLD1 } };
     if (q.table === "package_validations" && s === "*") return { data: null };
@@ -704,6 +739,7 @@ function finalizeWorld(restart: Responder) {
     if (q.table === "courses" && has(q, "update")) return { data: [{ id: "c1" }] };
     if (q.table === "course_versions" && s === "id") return restart(q);
     if (q.table === "course_attempts") return restart(q);
+    if (q.table === "attempt_requests") return restart(q);
     if (q.table === "cmi5_launch_tokens") return restart(q);
     if (q.table === "course_versions") return { data: [] }; // same-slot identity read
     return {};
@@ -723,7 +759,8 @@ async function ruleOne() {
     ["the restart's update fails", (q) => {
       if (q.table === "course_versions") return { data: [{ id: NEW }, { id: OLD1 }] };
       if (q.table === "course_attempts" && has(q, "update")) return { error: { message: "deadlock", code: "40P01" } };
-      if (q.table === "course_attempts" && sel(q) === "id, course_version_id") return { data: [{ id: "a1", course_version_id: OLD1 }] };
+      if (q.table === "course_attempts" && isR2(q)) return { data: [{ id: "a1", course_version_id: OLD1 }] };
+      if (q.table === "attempt_requests") return { data: [] };
       if (q.table === "course_attempts" && sel(q) === "id, status, course_version_id") return { data: [{ id: "a1", status: "in_progress", course_version_id: OLD1 }] };
       return {};
     }],
@@ -733,7 +770,7 @@ async function ruleOne() {
     const st = fakeStorage(files);
     setDirectUploadTestDoubles({ svc: client, storageFor: st.storageFor });
     const result = await finalizeDirectUpload({
-      supabase: client, org: { id: "org1", slug: "qa", name: "QA" }, userId: "u1", versionId: NEW, notifyUpdate: false, restartMode: "force_restart",
+      supabase: client, org: { id: "org1", slug: "qa", name: "QA" }, userId: "u1", origin: "", notify: runArgs().notify, versionId: NEW, notifyUpdate: false, restartMode: "force_restart",
     });
     eq(`${what}: finalize result ok (published)`, [result.ok, result.ok && result.versionId], [true, NEW]);
     eq(`${what}: restart reported failed`, result.ok && result.restart?.status, "failed");
@@ -752,11 +789,11 @@ async function ruleOne() {
     const st = fakeStorage(files);
     setDirectUploadTestDoubles({ svc: client, storageFor: st.storageFor });
     const result = await finalizeDirectUpload({
-      supabase: client, org: { id: "org1", slug: "qa", name: "QA" }, userId: "u1", versionId: NEW, notifyUpdate: false, restartMode: "force_restart",
+      supabase: client, org: { id: "org1", slug: "qa", name: "QA" }, userId: "u1", origin: "", notify: runArgs().notify, versionId: NEW, notifyUpdate: false, restartMode: "force_restart",
     });
     const a = finalizeAnswer(result);
     eq("control: nobody in progress → 200, restart ok, genuine zero", [a.status, (a.body.restart as { status: string; expected: number; message: string })], [200, {
-      status: "ok", expected: 0, restarted: 0, resolved: 0, unresolved: 0, unresolved_version_ids: [], message: "No learners were in progress.", tokensExpired: true,
+      status: "ok", expected: 0, restarted: 0, resolved: 0, unresolved: 0, unresolved_version_ids: [], ...ZERO_REGRANT, message: "No learners were in progress.", tokensExpired: true,
     }]);
   }
   {
@@ -764,7 +801,7 @@ async function ruleOne() {
     const st = fakeStorage(files);
     setDirectUploadTestDoubles({ svc: client, storageFor: st.storageFor });
     const result = await finalizeDirectUpload({
-      supabase: client, org: { id: "org1", slug: "qa", name: "QA" }, userId: "u1", versionId: NEW, notifyUpdate: false, restartMode: "grandfather",
+      supabase: client, org: { id: "org1", slug: "qa", name: "QA" }, userId: "u1", origin: "", notify: runArgs().notify, versionId: NEW, notifyUpdate: false, restartMode: "grandfather",
     });
     eq("grandfather: no restart field, no attempts query", [result.ok && "restart" in result, queries.some((q) => q.table === "course_attempts")], [false, false]);
   }
@@ -823,7 +860,7 @@ async function browser() {
   const buf = fs.readFileSync(path.join(root, "tests/bot/fixtures/scorm12.zip"));
   const pkg = await unzipPackage(new File([buf], "scorm12.zip", { type: "application/zip" }));
   const failedRestart: ForceRestartOutcome = {
-    status: "failed", expected: 1, restarted: 0, resolved: 0, unresolved: 1, unresolved_version_ids: [OLD1],
+    status: "failed", expected: 1, restarted: 0, resolved: 0, unresolved: 1, unresolved_version_ids: [OLD1], ...ZERO_REGRANT,
     message: "The new version is published, but resetting 1 learner failed. Use 'Restart learners on this version' on the older version to retry. 0 were reset, 1 could not be.",
   };
   const run = async (finalize: { status: number; body: Record<string, unknown> }) => {
@@ -912,6 +949,294 @@ function library() {
   eq("the notice renders as data-testid=replace-result", src.includes('data-testid="replace-result"'), true);
 }
 
+/* ---------------- (ix) ADR 0014 step 8: the forced restart re-grants ---------------- */
+
+const LINK_SELECT = "id, user_id, course_id, used_attempt_id, expires_at, override_confirmed, attempts_used";
+const linkRow = (over: Record<string, unknown> = {}) => ({
+  id: "g1", user_id: "u1", course_id: "c1", used_attempt_id: "a1", expires_at: "2026-11-01T00:00:00Z", override_confirmed: true, attempts_used: 1, ...over,
+});
+const inserts = (qs: Query[]) => qs.filter((q) => q.table === "attempt_requests" && has(q, "insert")).map((q) => arg(q, "insert")?.[0] as Record<string, unknown>);
+const requestUpdates = (qs: Query[]) => qs.filter((q) => q.table === "attempt_requests" && has(q, "update"));
+const DAY = 24 * 60 * 60 * 1000;
+const near = (iso: unknown, ms: number) => typeof iso === "string" && Math.abs(Date.parse(iso) - (Date.now() + ms)) < 60 * 1000;
+
+/** a1 = a granted retake (grant g1), a2 = an ordinary attempt, rv = a revision visit's row; all in progress on old versions. */
+const regrantRows = (): Row[] => [
+  { id: "a1", course_version_id: OLD1, status: "in_progress" },
+  { id: "a2", course_version_id: OLD1, status: "in_progress" },
+  { id: "rv", course_version_id: OLD2, status: "in_progress", is_revision: true },
+];
+
+/** The 23505 path's reads: the learner's attempts on the course, the strict snapshot, pass_required. */
+function pendingPath(o: { attempts?: Answer; passRequired?: Answer; snapshot?: Answer } = {}) {
+  return (q: Query): Answer | undefined => {
+    if (q.table === "course_attempts" && String(sel(q)).startsWith("id, status, completion_status")) {
+      return o.attempts ?? { data: [{ id: "a0", status: "failed", completion_status: "completed", success_status: "failed", score: 0.4, started_at: "2026-10-01T09:00:00Z", completed_at: "2026-10-01T09:30:00Z" }] };
+    }
+    if (q.table === "courses" && sel(q) === "pass_required") return o.passRequired ?? { data: { pass_required: false } };
+    if (q.table === "attempt_requests" && String(sel(q)).startsWith("id, used_attempt_id, used_at")) return o.snapshot ?? { data: [] };
+    return undefined;
+  };
+}
+
+async function regrant() {
+  console.log("\n(ix) ADR 0014 step 8: the grant links, the re-issue, the 23505 rule, rule (g), the notifier");
+  {
+    const rows = regrantRows();
+    notifyCalls = [];
+    const { client, queries } = attemptsWorld(rows, { links: () => ({ data: [linkRow()] }), requests: () => ({ data: null, error: null }) });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("a reset retake gets a re-issued grant: ok, restarted 3, reissued 1, revision visits closed 1",
+      [r.status, r.restarted, r.reissued, r.reissue_failed, r.reissue_pending, r.revision_closed], ["ok", 3, 1, 0, 0, 1]);
+    eq("…the message counts the revision visits closed", r.message, "3 learners reset. 1 revision visit closed.");
+    const link = queries.find((q) => q.table === "attempt_requests" && sel(q) === LINK_SELECT)!;
+    eq("the link read names override_confirmed and attempts_used, approved only, by the selected ids",
+      [!!link, arg(link, "eq", "status"), inList(link, "used_attempt_id")], [true, ["status", "approved"], ["a1", "a2", "rv"]]);
+    eq("…and runs BEFORE the update", queries.indexOf(link) < queries.indexOf(updatesOf(queries)[0]), true);
+    const ins = inserts(queries);
+    eq("one re-issue insert", ins.length, 1);
+    const row = ins[0] ?? {};
+    eq("…the grant.ts shape: org, course, user, approved, source restart, decided by the admin",
+      [row.organization_id, row.course_id, row.user_id, row.status, row.source, row.decided_by], ["org1", "c1", "u1", "approved", "restart", "admin-1"]);
+    eq("…the note names the new version", row.decision_note, "re-issued by forced restart of version 3");
+    eq("…reissued_from the superseded grant; override_confirmed and attempts_used copied", [row.reissued_from, row.override_confirmed, row.attempts_used], ["g1", true, 1]);
+    eq("…expires 30 days from now (DEFAULT_GRANT_EXPIRY_DAYS), never the original's remaining time", near(row.expires_at, 30 * DAY), true);
+    eq("…decided_at is now", near(row.decided_at, 0), true);
+    eq("the learner is notified once: approved, the note, the expiry, the resolved email",
+      notifyCalls.map((c) => [c.userId, c.approved, c.note, c.expiresAt === row.expires_at, c.email]), [["u1", true, "re-issued by forced restart of version 3", true, "u1@example.test"]]);
+    eq("no attempt or user id in the outcome's public fields", /"a[12]"|"rv"|"u1"|"g1"/.test(JSON.stringify(forceRestartReport(r))), false);
+  }
+  {
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow({ expires_at: null, override_confirmed: false })] }),
+      requests: () => ({ data: null, error: null }),
+    });
+    await forceRestartOlderVersions(client, runArgs());
+    const row = inserts(queries)[0] ?? {};
+    eq("a never-expiring grant re-issues as never-expiring; override_confirmed false copied", [row.expires_at, row.override_confirmed], [null, false]);
+  }
+  {
+    let n = 0;
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? (n++ === 0 ? { error: { code: "23514", message: "violates check constraint attempt_requests_source_check" } } : { data: null, error: null }) : undefined),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("23514 (an older source list) → the re-issue degrades source to bulk and succeeds", [inserts(queries).map((x) => x.source), r.reissued], [["restart", "bulk"], 1]);
+  }
+  {
+    let n = 0;
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? (n++ === 0 ? { error: { code: "PGRST204", message: "Could not find the 'attempts_used' column of 'attempt_requests' in the schema cache" } } : { data: null, error: null }) : undefined),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("a missing attempts_used on the insert → dropped, re-issued", [inserts(queries).map((x) => "attempts_used" in x), r.reissued], [[true, false], 1]);
+  }
+  {
+    const { client, queries } = attemptsWorld(regrantRows(), { links: () => ({ data: null, error: null }) });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("a null link answer is a selection failure: nothing reset (rule (a))", [r.status, r.expected, updatesOf(queries).length, inserts(queries).length], ["failed", null, 0, 0]);
+  }
+  {
+    const { client, queries } = attemptsWorld(regrantRows(), { links: () => ({ error: { code: "57014", message: "canceling statement due to statement timeout" } }) });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("a link read error resets nothing", [r.status, r.expected, updatesOf(queries).length], ["failed", null, 0]);
+  }
+  {
+    // A database without 0103: the link read falls back without
+    // override_confirmed; the restart still runs, every re-issue fails closed.
+    const rows = regrantRows().map((x) => ({ ...x, is_revision: undefined }));
+    notifyCalls = [];
+    const { client, queries } = attemptsWorld(rows, {
+      links: (q) => (String(sel(q)).includes("override_confirmed")
+        ? { error: { code: "42703", message: "column attempt_requests.override_confirmed does not exist" } }
+        : { data: [linkRow({ override_confirmed: undefined })] }),
+      selection: (q) => (String(sel(q)).includes("is_revision") ? { error: { code: "42703", message: "column course_attempts.is_revision does not exist" } } : undefined),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    const linkSelects = queries.filter((q) => q.table === "attempt_requests" && !has(q, "insert")).map((q) => sel(q));
+    eq("pre-0103: the link read retries without override_confirmed (attempts_used kept)",
+      linkSelects, [LINK_SELECT, "id, user_id, course_id, used_attempt_id, expires_at, attempts_used"]);
+    eq("…the selection retries without is_revision", queries.filter((q) => isR2(q)).map((q) => sel(q)), ["id, course_version_id, is_revision", "id, course_version_id"]);
+    eq("…the restart still resets everyone; the re-issue counts as failed and inserts nothing",
+      [r.restarted, r.reissue_failed, inserts(queries).length, notifyCalls.length], [3, 1, 0, 0]);
+    eq("…rule (g): failed, with the ADR's message (kept verbatim)", [r.status, r.message], ["failed",
+      "The new version of Turning Escalations is published and 3 learners were reset, but a retake could not be re-issued for 1 of them. They are listed on the course's Learners page as 'retake reset, no grant'; grant each one a retake from Attempt Requests: the bulk grant covers a learner whose official result is not passed; a learner who passed asks again from the course page, and you approve with the confirmation."]);
+  }
+  {
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: (q) => (String(sel(q)).includes("attempts_used") ? { error: { code: "42703", message: "column attempt_requests.attempts_used does not exist" } } : { data: [linkRow({ attempts_used: undefined })] }),
+      requests: () => ({ data: null, error: null }),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("pre-0085: the link read retries without attempts_used; the re-issue carries none", [r.reissued, "attempts_used" in (inserts(queries)[0] ?? {})], [1, false]);
+  }
+  {
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? { error: { code: "PGRST204", message: "Could not find the 'reissued_from' column of 'attempt_requests' in the schema cache" } } : undefined),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("an insert refused for a missing 0103 column fails closed (no retry without it)", [r.reissue_failed, inserts(queries).length, r.status], [1, 1, "failed"]);
+  }
+  // The 23505 rule: the learner has a pending request.
+  const dup = { error: { code: "23505", message: "duplicate key value violates unique constraint attempt_requests_one_open_idx" } };
+  {
+    notifyCalls = [];
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? dup : has(q, "update") ? { data: [{ id: "p1" }] } : undefined),
+      other: pendingPath(),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    const up = requestUpdates(queries)[0];
+    const fields = (arg(up, "update")?.[0] ?? {}) as Record<string, unknown>;
+    eq("23505, the official result does not stand (failed) → the pending request is approved instead", [r.status, r.reissued, r.reissue_pending, r.reissue_failed], ["ok", 1, 0, 0]);
+    eq("…exactly the ADR's fields (source and override_confirmed untouched)",
+      Object.keys(fields).sort(), ["decided_at", "decided_by", "decision_note", "expires_at", "reissued_from", "status"]);
+    eq("…approved by the admin, the same note and expiry, reissued_from the old grant",
+      [fields.status, fields.decided_by, fields.decision_note, near(fields.expires_at, 30 * DAY), fields.reissued_from], ["approved", "admin-1", "re-issued by forced restart of version 3", true, "g1"]);
+    eq("…only that learner's pending request on the course", [arg(up, "eq", "user_id"), arg(up, "eq", "course_id"), arg(up, "eq", "status")], [["user_id", "u1"], ["course_id", "c1"], ["status", "pending"]]);
+    eq("…the learner is notified", notifyCalls.map((c) => [c.userId, c.approved]), [["u1", true]]);
+  }
+  {
+    // The 23505 path's attempts read on a client that rejects is_revision:
+    // the narrower select, then the same decision.
+    const selects: string[] = [];
+    const failedRow = { id: "a0", status: "failed", completion_status: "completed", success_status: "failed", score: 0.4, started_at: "2026-10-01T09:00:00Z", completed_at: "2026-10-01T09:30:00Z" };
+    const { client } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? dup : has(q, "update") ? { data: [{ id: "p1" }] } : undefined),
+      other: (q) => {
+        if (q.table === "course_attempts" && String(sel(q)).startsWith("id, status, completion_status")) {
+          selects.push(String(sel(q)));
+          return String(sel(q)).includes("is_revision")
+            ? { error: { code: "42703", message: "column course_attempts.is_revision does not exist" } }
+            : { data: [failedRow] };
+        }
+        return pendingPath()(q);
+      },
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("23505 and a client rejecting is_revision: the attempts are re-read without it, the request approved",
+      [selects.map((x) => x.includes("is_revision")), r.reissued, r.reissue_failed], [[true, false], 1, 0]);
+  }
+  {
+    notifyCalls = [];
+    const passed = { data: [{ id: "a0", status: "passed", completion_status: "completed", success_status: "passed", score: 0.9, started_at: "2026-10-01T09:00:00Z", completed_at: "2026-10-01T09:30:00Z" }] };
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? dup : undefined),
+      other: pendingPath({ attempts: passed }),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("23505, the official result stands (passed) → the request stays pending: ok, reissue_pending 1, no update",
+      [r.status, r.reissue_pending, requestUpdates(queries).length, notifyCalls.length], ["ok", 1, 0, 0]);
+    eq("…the message names the confirmation in Attempt Requests", r.message, "3 learners reset. 1 revision visit closed. 1 pending request awaits the confirmation in Attempt Requests.");
+  }
+  {
+    const completed = { data: [{ id: "a0", status: "completed", completion_status: "completed", success_status: "unknown", score: null, started_at: "2026-10-01T09:00:00Z", completed_at: "2026-10-01T09:30:00Z" }] };
+    const stands = attemptsWorld(regrantRows(), { links: () => ({ data: [linkRow()] }), requests: (q) => (has(q, "insert") ? dup : undefined), other: pendingPath({ attempts: completed }) });
+    eq("…a completed result with pass_required false stands", (await forceRestartOlderVersions(stands.client, runArgs())).reissue_pending, 1);
+    const notDone = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? dup : has(q, "update") ? { data: [{ id: "p1" }] } : undefined),
+      other: pendingPath({ attempts: completed, passRequired: { data: { pass_required: true } } }),
+    });
+    eq("…but not when the course requires a pass (approved)", (await forceRestartOlderVersions(notDone.client, runArgs())).reissued, 1);
+  }
+  for (const [what, o] of [
+    ["the learner's attempts", { attempts: { error: { code: "57014", message: "timeout" } } }],
+    ["pass_required", { passRequired: { error: { code: "57014", message: "timeout" } } }],
+    ["the strict grant snapshot", { snapshot: { error: { code: "57014", message: "timeout" } } }],
+  ] as Array<[string, Parameters<typeof pendingPath>[0]]>) {
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? dup : undefined),
+      other: pendingPath(o),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq(`23505 and ${what} unreadable → counts as standing: not approved, a failure that names the queue`,
+      [r.status, r.reissue_failed, requestUpdates(queries).length, /Attempt Requests/.test(r.message) && /Turning Escalations/.test(r.message)], ["failed", 1, 0, true]);
+  }
+  {
+    const { client } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow()] }),
+      requests: (q) => (has(q, "insert") ? dup : has(q, "update") ? { data: [] } : undefined),
+      other: pendingPath(),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("23505, the approval matches zero rows → a failure (rule (g))", [r.status, r.reissue_failed], ["failed", 1]);
+  }
+  {
+    notifyCalls = [];
+    const { client, queries } = attemptsWorld(regrantRows(), { links: () => ({ data: [] }) });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("no reset retake → no insert, no notifier call", [r.reissued, inserts(queries).length, notifyCalls.length], [0, 0, 0]);
+  }
+  {
+    notifyCalls = [];
+    // The update resets a2 only (a1 completed first): a1's grant is NOT re-issued.
+    const rows = regrantRows();
+    const { client, queries } = attemptsWorld(rows, {
+      links: () => ({ data: [linkRow()] }),
+      beforeUpdate: () => { rows[0].status = "passed"; },
+      requests: () => ({ data: null, error: null }),
+    });
+    const r = await forceRestartOlderVersions(client, runArgs());
+    eq("only a retake this run actually reset is re-issued", [r.reissued, inserts(queries).length, r.resolved], [0, 0, 1]);
+  }
+  {
+    // A notifier that throws never changes the outcome.
+    const { client } = attemptsWorld(regrantRows(), { links: () => ({ data: [linkRow()] }), requests: () => ({ data: null, error: null }) });
+    const args = runArgs();
+    args.notify.decision = async () => { throw new Error("mail down"); };
+    const r = await forceRestartOlderVersions(client, args);
+    eq("a failing notifier → still ok, reissued 1", [r.status, r.reissued], ["ok", 1]);
+  }
+
+  console.log("\n(ix) rule (g) and the messages");
+  {
+    const base = { selected: sel4, restartedIds: ["a1", "a2", "a3", "a4"] };
+    const g = classifyForceRestart(facts({ ...base, reissueFailed: 2 }), "Course X");
+    eq("(g): everyone reset, 2 re-issues failed → failed, with the counts", [g.status, g.restarted, g.reissue_failed, g.unresolved], ["failed", 4, 2, 0]);
+    eq("(g): the message names the course and Attempt Requests", g.message.startsWith("The new version of Course X is published and 4 learners were reset, but a retake could not be re-issued for 2 of them."), true);
+    const both = classifyForceRestart(facts({ selected: sel4, restartedIds: ["a1"], reread: [], reissueFailed: 1 }), "Course X");
+    eq("(f) and (g) together: the reset failure first, then the re-issue sentence",
+      [both.status, both.message.startsWith("The new version is published, but resetting 4 learners failed."), both.message.includes("could not be re-issued for 1 of them")], ["failed", true, true]);
+    const pending = classifyForceRestart(facts({ ...base, reissuePending: 2 }));
+    eq("pending requests alone stay ok; the message adds the queue", [pending.status, pending.message], ["ok", "4 learners reset. 2 pending requests await the confirmation in Attempt Requests."]);
+    eq("no ADR 0014 fact → the ADR 0011 outcome, zero counts", [classifyForceRestart(facts({ ...base })).message, classifyForceRestart(facts({ ...base })).reissued], ["4 learners reset.", 0]);
+    const a = forceRestartReplaceAnswer({ courseId: "c1", packageId: PKG, versionId: NEW, versionNumber: 3, report: forceRestartReport({ ...g, restartedIds: [], tokensExpired: true }) });
+    eq("the multipart answer: 500 on (g), the re-issue count in the body", [a.status, a.body.reissue_failed, a.body.published], [500, 2, true]);
+  }
+
+  console.log("\n(ix) the callers and the import shape (source checks)");
+  {
+    const src = fs.readFileSync(path.join(root, "lib/attempts/force-restart.ts"), "utf8");
+    eq("force-restart.ts imports nothing from @/lib/attempts/requests, @/lib/notifications or @/lib/users",
+      /from "@\/lib\/attempts\/requests"|from "@\/lib\/notifications|from "@\/lib\/users/.test(src), false);
+    eq("…and no runtime Supabase import (types only)", /^import \{[^}]*\} from "@supabase\/supabase-js";$/m.test(src) && /^import type \{ SupabaseClient \} from "@supabase\/supabase-js";$/m.test(src), false);
+    eq("…the expiry is DEFAULT_GRANT_EXPIRY_DAYS from lib/attempts/constants", /import \{ DEFAULT_GRANT_EXPIRY_DAYS \} from "@\/lib\/attempts\/constants";/.test(src), true);
+    const mp = fs.readFileSync(path.join(root, "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts"), "utf8");
+    eq("multipart route: org id/name/slug, course id/title, the admin, the origin, the version number, the notifier",
+      /\.select\("id, name, slug"\)/.test(mp) && /\.select\("id, title"\)/.test(mp) &&
+        /forceRestartOlderVersions\(svc, \{\s*packageId,\s*newVersionId: result\.versionId,\s*versionNumber: result\.versionNumber,\s*admin: \{ id: caller\.id \},/.test(mp) &&
+        /origin: await originFromRequest\(\),/.test(mp) && /notify: \{ decision: notifyLearnerOfDecision, emails: resolveEmails \},/.test(mp), true);
+    const fin = fs.readFileSync(path.join(root, "app/api/courses/upload/finalize/route.ts"), "utf8");
+    eq("finalize route: passes the origin and the notifier", /origin: await originFromRequest\(\),/.test(fin) && /notify: \{ decision: notifyLearnerOfDecision, emails: resolveEmails \},/.test(fin), true);
+    const du = fs.readFileSync(path.join(root, "lib/courses/direct-upload.ts"), "utf8");
+    eq("finalizeDirectUpload: the version number, the admin, the org, the course title",
+      /versionNumber: version\.version_number,\s*admin: \{ id: args\.userId \},\s*org,\s*origin: args\.origin,\s*course: \{ id: course\.id, title: course\.title \?\? "this course" \},\s*notify: args\.notify,/.test(du) &&
+        /\.select\("id, organization_id, current_version_id, title"\)/.test(du), true);
+    const pv = fs.readFileSync(path.join(root, "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts"), "utf8");
+    eq("the per-version restart counts the revision visits it closes (is_revision with the fallback)",
+      /select\("id, user_id, organization_id, is_revision"\)/.test(pv) && /select\("id, user_id, organization_id"\)/.test(pv) &&
+        /revision_closed: restartedIds\.filter\(\(id\) => revisionRowIds\.has\(id\)\)\.length,/.test(pv), true);
+  }
+}
+
 async function main() {
   // The direct-upload test doubles are honoured only under NODE_ENV=test.
   (process.env as Record<string, string>).NODE_ENV = "test";
@@ -923,6 +1248,7 @@ async function main() {
   await ruleTwo();
   await browser();
   library();
+  await regrant();
   setDirectUploadTestDoubles({ svc: null, storageFor: null });
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail) process.exit(1);
