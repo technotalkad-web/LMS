@@ -17,7 +17,9 @@
  *      nothing; a sub-activity `passed` sets nothing on the attempt; R-3: a
  *      sibling registration is answered and dropped (one registration_changed
  *      line, ids only), an unknown one is stored as today, and R-3 runs
- *      before R-5.
+ *      before R-5; R-3's read of the learner's attempt ids failing → 503
+ *      before any insert when a statement names a foreign UUID registration
+ *      (the lead, 2026-10-29), and no read at all when none does.
  *
  * No database, no network.
  *
@@ -145,6 +147,7 @@ async function main() {
   let requests: Req[] = [];
   let row: Record<string, unknown> = attemptRow();
   let rowReadFails = false;
+  let siblingReadFails = false;
   const SIB = "22222222-2222-4222-8222-222222222222";
   const BOUND = "a1";
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -176,7 +179,9 @@ async function main() {
     if (p === "/rest/v1/lrs_forward_outbox") return json([], 201);
     if (url.host === "lrs.test") return json([]);
     if (p === "/rest/v1/course_versions") {
-      if (select === "course_id") return json([{ course_id: "c1" }]);
+      if (select === "course_id") {
+        return siblingReadFails ? json({ code: "57014", message: "canceling statement due to statement timeout" }, 500) : json([{ course_id: "c1" }]);
+      }
       return json([{ id: "v1" }]);
     }
     if (p === "/rest/v1/xapi_statements" && method === "POST") {
@@ -200,7 +205,8 @@ async function main() {
         headers: { authorization: `Bearer ${"b".repeat(64)}`, "content-type": "application/json" },
         body: JSON.stringify(statements),
       }));
-    const reset = (r: Record<string, unknown>) => { requests = []; logs = []; row = r; rowReadFails = false; };
+    const reset = (r: Record<string, unknown>) => { requests = []; logs = []; row = r; rowReadFails = false; siblingReadFails = false; };
+    const siblingReads = () => requests.filter((r) => r.path === "/rest/v1/course_versions" && r.select === "course_id").length;
     const stored = () => requests.filter((r) => r.path === "/rest/v1/xapi_statements" && r.method === "POST").map((r) => (JSON.parse(r.body) as { verb: string }).verb.split("/").pop());
     const rpcs = () => requests.filter((r) => r.path.startsWith("/rest/v1/rpc/")).map((r) => r.path.slice("/rest/v1/rpc/".length));
     const webhookLatch = () => requests.filter((r) => r.method === "PATCH" && r.body.includes("completion_webhook_at")).length;
@@ -280,6 +286,48 @@ async function main() {
       logs.filter((l) => l.includes('"revision_ignored"')).length,
       stored(),
     ], [2, 0, []]);
+    eq("…the learner's attempt ids are read once per request", siblingReads(), 1);
+
+    // R-3's read failing (the lead, 2026-10-29, after the review): a statement
+    // naming a UUID registration other than the bound attempt → 503 before
+    // any insert, like the bound-row read, so the AU's queue retries.
+    reset(attemptRow({ is_revision: false }));
+    siblingReadFails = true;
+    const rf = await post([stmt("passed", AU, { id: "40000000-0000-4000-8000-000000000001", context: { registration: SIB } })]);
+    eq("R-3's sibling read erroring, a sibling registration → 503 registration_unreadable", [rf.status, await rf.json()], [503, { error: "registration_unreadable" }]);
+    eq("…before any insert, derivation or RPC, no mirror", [stored(), derives(), rpcs(), requests.some((r) => r.path === "/rest/v1/lrs_forward_outbox")], [[], 0, [], false]);
+    eq("…one registration_check_failed line, ids and the reason only", logs.filter((l) => l.includes('"registration_check_failed"')).map((l) => Object.keys(JSON.parse(l)).sort()), [
+      ["attempt_id", "event", "reason"],
+    ]);
+
+    reset(attemptRow({ is_revision: false }));
+    siblingReadFails = true;
+    const mixed = await post([
+      stmt("initialized", AU, { id: "40000000-0000-4000-8000-000000000002" }),
+      stmt("passed", AU, { id: "40000000-0000-4000-8000-000000000003", context: { registration: SIB } }),
+    ]);
+    eq("…a batch whose SECOND statement names a sibling → 503 with the first not stored (the read precedes every insert)",
+      [mixed.status, stored(), derives()], [503, [], 0]);
+
+    reset(attemptRow({ is_revision: false }));
+    siblingReadFails = true;
+    const unk = await post([stmt("initialized", AU, { context: { registration: unknownReg } })]);
+    eq("…an unknown UUID registration → 503 too (a sibling cannot be told from it without the read)", [unk.status, stored()], [503, []]);
+
+    reset(attemptRow({ is_revision: true }));
+    siblingReadFails = true;
+    const flaggedRf = await post([stmt("initialized", AU, { context: { registration: SIB } })]);
+    eq("…on a flagged row a sibling-registered bookend → 503, not stored (R-3 still before R-5)", [flaggedRf.status, stored()], [503, []]);
+
+    reset(attemptRow({ is_revision: false }));
+    siblingReadFails = true;
+    const plainBatch = await post([
+      stmt("initialized", AU),
+      stmt("initialized", AU, { id: "40000000-0000-4000-8000-000000000004", context: { registration: "not-a-uuid" } }),
+      stmt("terminated", AU, { context: { registration: BOUND } }),
+    ]);
+    eq("…no foreign registration in the batch → no sibling read, 200, stored as today",
+      [plainBatch.status, siblingReads(), stored()], [200, 0, ["initialized", "initialized", "terminated"]]);
   } finally {
     globalThis.fetch = realFetch;
     console.warn = realWarn;

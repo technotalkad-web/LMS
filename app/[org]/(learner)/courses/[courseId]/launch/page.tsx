@@ -1108,19 +1108,27 @@ export default async function LaunchPage({
     // session, launch mode), and LMS.OfficialResult is written below.
     // Unconditional: the flag may be off now and the source's document still
     // stored. The guard is this request's own verdict (seedPlan: the row read,
-    // inserted or raced is flagged, or the cutover answered 1).
+    // inserted or raced is flagged, or the cutover answered 1). supabase-js
+    // returns its errors, so both calls destructure and log theirs (ids
+    // only, as the SCORM branch does); the launch goes on either way.
     try {
-      const { data: states } = await svcAttempt
+      const { data: states, error: stateReadErr } = await svcAttempt
         .from("xapi_state")
         .select("state_id, content, content_type")
         .eq("attempt_id", official.id)
         .neq("state_id", LMS_LAUNCH_DATA_STATE_ID)
         .neq("state_id", LMS_OFFICIAL_RESULT_STATE_ID);
-      const rows = (states ?? []) as Array<{ state_id: string; content: unknown; content_type: string | null }>;
+      if (stateReadErr) {
+        console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official.id, step: "state_read" }));
+      }
+      const rows = (stateReadErr ? [] : (states ?? [])) as Array<{ state_id: string; content: unknown; content_type: string | null }>;
       if (rows.length > 0) {
-        await svcAttempt
+        const { error: stateSeedErr } = await svcAttempt
           .from("xapi_state")
           .upsert(rows.map((r) => ({ ...r, attempt_id: attemptId })), { onConflict: "attempt_id,state_id" });
+        if (stateSeedErr) {
+          console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official.id, step: "state_upsert" }));
+        }
       }
     } catch (e) {
       console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official.id, reason: e instanceof Error ? e.message : String(e) }));

@@ -23,7 +23,9 @@ import { isUuid, registrationVerdict } from "@/lib/xapi/registration";
  * AU's queue retries). Then, per statement, before the upsert:
  *   R-3  a `context.registration` naming ANOTHER attempt of the same learner
  *        on the same course is answered with its id and not stored,
- *        processed or mirrored (log `registration_changed`, ids only);
+ *        processed or mirrored (log `registration_changed`, ids only); the
+ *        learner's attempt ids are read before any insert, and a failed read
+ *        answers 503 (registration_unreadable) like the bound-row read;
  *   R-5  on a revision visit's row (is_revision) only `initialized` and
  *        `terminated` are stored; every other statement is answered with its
  *        id and not stored (log `revision_ignored`). Nothing on such a row
@@ -88,12 +90,18 @@ export async function POST(request: Request) {
   };
 
   // R-3 (ADR 0014 step 5): the learner's attempt ids on the bound attempt's
-  // course, read lazily, once per request, only when a statement names a
-  // registration other than the bound attempt. A failed read leaves the rule
-  // out for this request (today's path), logged with ids only.
-  let siblingIds: Set<string> | null = null;
-  const siblingAttemptIds = async (): Promise<Set<string>> => {
-    if (siblingIds) return siblingIds;
+  // course, read once per request and BEFORE any insert, only when a
+  // statement of the batch names a UUID registration other than the bound
+  // attempt. A failed read answers 503, like the bound-row read, so the AU's
+  // queue retries: without the set a sibling cannot be told from an unknown
+  // registration, and storing the statement would be the write R-3 exists to
+  // stop. Logged with ids only.
+  const foreignRegistration = (s: unknown): string | null => {
+    const registration = (s as { context?: { registration?: unknown } } | null | undefined)?.context?.registration;
+    return isUuid(registration) && registration.toLowerCase() !== session.attemptId.toLowerCase() ? registration : null;
+  };
+  let siblingIds: ReadonlySet<string> = new Set<string>();
+  if (statements.some((s) => foreignRegistration(s) !== null)) {
     const out = new Set<string>();
     try {
       const { data: ver, error: verErr } = await svc
@@ -123,10 +131,10 @@ export async function POST(request: Request) {
           reason: e instanceof Error ? e.message : String(e),
         })
       );
+      return NextResponse.json({ error: "registration_unreadable" }, { status: 503 });
     }
     siblingIds = out;
-    return out;
-  };
+  }
 
   // What reaches the tenant LRS mirror: the statements as stored. A resent id
   // with different content is left out (ADR 0003 step 5).
@@ -150,12 +158,12 @@ export async function POST(request: Request) {
 
     // (a) R-3, first: a registration naming a sibling attempt is answered
     // and dropped, whether or not that attempt already stores the id.
-    const registration = (statement.context as { registration?: unknown } | undefined)?.registration;
-    if (isUuid(registration) && registration.toLowerCase() !== session.attemptId.toLowerCase()) {
+    const registration = foreignRegistration(statement);
+    if (registration !== null) {
       const verdict = registrationVerdict({
         registration,
         attemptId: session.attemptId,
-        siblingAttemptIds: await siblingAttemptIds(),
+        siblingAttemptIds: siblingIds,
       });
       if (verdict === "sibling") {
         ids.push(statementId);

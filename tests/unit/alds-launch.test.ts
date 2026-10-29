@@ -640,8 +640,33 @@ async function main() {
       /\.from\("xapi_state"\)\s*\.select\("state_id, content, content_type"\)\s*\.eq\("attempt_id", official\.id\)\s*\.neq\("state_id", LMS_LAUNCH_DATA_STATE_ID\)\s*\.neq\("state_id", LMS_OFFICIAL_RESULT_STATE_ID\);/.test(src), true);
     eq("…both constants are rpc.ts's",
       /^import \{ LMS_LAUNCH_DATA_STATE_ID, LMS_OFFICIAL_RESULT_STATE_ID \} from "@\/lib\/alds\/rpc";$/m.test(src), true);
-    eq("…and the seed upserts exactly the rows of that read onto the revision row",
-      /const rows = \(states \?\? \[\]\) as Array<[^>]+>;\s*if \(rows\.length > 0\) \{\s*await svcAttempt\s*\.from\("xapi_state"\)\s*\.upsert\(rows\.map\(\(r\) => \(\{ \.\.\.r, attempt_id: attemptId \}\)\), \{ onConflict: "attempt_id,state_id" \}\);/.test(src), true);
+    // Amended deliberately (the review's seed-error finding, the lead,
+    // 2026-10-29): the read and the upsert each destructure their error.
+    eq("…and the seed upserts exactly the rows of that read onto the revision row (none after a failed read)",
+      /const rows = \(stateReadErr \? \[\] : \(states \?\? \[\]\)\) as Array<[^>]+>;\s*if \(rows\.length > 0\) \{\s*const \{ error: stateSeedErr \} = await svcAttempt\s*\.from\("xapi_state"\)\s*\.upsert\(rows\.map\(\(r\) => \(\{ \.\.\.r, attempt_id: attemptId \}\)\), \{ onConflict: "attempt_id,state_id" \}\);/.test(src), true);
+    {
+      // AST, so a comment cannot satisfy it: inside `if (seed.state && official)`,
+      // the xapi_state read and its upsert each destructure `error`, and each
+      // error is logged as revision_seed_failed with both attempt ids.
+      const seedIf = all.find((n) => ts.isIfStatement(n) && n.expression.getText(sf) === "seed.state && official") as ts.IfStatement | undefined;
+      const inSeed: ts.Node[] = [];
+      if (seedIf) { const walk = (n: ts.Node) => { inSeed.push(n); ts.forEachChild(n, walk); }; walk(seedIf.thenStatement); }
+      const errBinding = (d: ts.VariableDeclaration): string | null => {
+        if (!ts.isObjectBindingPattern(d.name) || !d.initializer || !ts.isAwaitExpression(d.initializer)) return null;
+        if (!/^svcAttempt\s*\.from\("xapi_state"\)/.test(d.initializer.expression.getText(sf))) return null;
+        const el = d.name.elements.find((e) => (e.propertyName ?? e.name).getText(sf) === "error");
+        return el ? el.name.getText(sf) : null;
+      };
+      const decls = inSeed.filter((n): n is ts.VariableDeclaration => ts.isVariableDeclaration(n) && errBinding(n) !== null);
+      const kinds = decls.map((d) => (/\.upsert\(/.test(d.initializer!.getText(sf)) ? "upsert" : /\.select\(/.test(d.initializer!.getText(sf)) ? "read" : "other"));
+      eq("seed (cmi5/xAPI): the xapi_state read and its upsert each destructure their error", kinds, ["read", "upsert"]);
+      const logged = decls.map((d) => {
+        const name = errBinding(d)!;
+        return inSeed.some((n) => ts.isIfStatement(n) && ts.isIdentifier(n.expression) && n.expression.text === name &&
+          /console\.warn\(JSON\.stringify\(\{ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official\.id,/.test(n.thenStatement.getText(sf)));
+      });
+      eq("…each error is logged as revision_seed_failed with both attempt ids (ids only)", logged, [true, true]);
+    }
     eq("the page names xapi_state three times: the seed read, its upsert, the LMS.OfficialResult upsert (LaunchData is writeLaunchData's)",
       (src.match(/\.from\("xapi_state"\)/g) ?? []).length, 3);
     const seedExclusions = all.filter((n) => ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&

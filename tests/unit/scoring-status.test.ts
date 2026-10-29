@@ -323,6 +323,19 @@ async function classifyCases() {
     eq("…a completed flagged row too", legacyDone?.official, false);
   }
   {
+    // The `!isRevision` gate on its own (the review's low finding, the lead,
+    // 2026-10-29): with no other completed, non-abandoned attempt the window
+    // has a free slot (limitReached false, no ordinal), so only the gate
+    // keeps a flagged in-progress row from answering official: true.
+    const flagged = { id: "r1", score: null, started_at: "2026-10-02T09:00Z", completed_at: null, completion_status: "in_progress", success_status: "unknown", status: "in_progress", is_revision: true };
+    const { kind: alone } = await run("r1", [flagged], { flagged: true });
+    eq("the gate alone: a flagged in-progress row with no other attempt → official: false",
+      [alone?.official, alone?.attemptNumber, alone?.scoring.limitReached], [false, null, false]);
+    const { kind: f6 } = await run("r1", [done("a0", "2026-09-30T09:00Z", "2026-09-30T09:30Z", "passed", { status: "abandoned", is_revision: false }), flagged], { flagged: true });
+    eq("the gate alone: …whose only completed attempt is abandoned (the f6 shape) → official: false",
+      [f6?.official, f6?.attemptNumber, f6?.scoring.limitReached], [false, null, false]);
+  }
+  {
     // An abandoned-but-completed row (0099 count #3 expects none) no longer
     // takes ordinal 1: the real official attempt is #1 again.
     const rows = [
