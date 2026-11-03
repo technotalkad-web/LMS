@@ -47,6 +47,8 @@ Facts behind it (staging, read-only, at a89832f):
 
 Note (2026-10-18, on condition (a) of the Acceptance line above; the line is not rewritten): condition (a) was written when staging was believed to hold real learners; the owner's standing direction of 2026-10-18 reclassifies staging as test data and is, on staging, the go for D5b and for any staging reset development or verification needs, while condition (a) stands unchanged for production; the direction and its effect are recorded in full under ADR 0004 decision 2, note of 2026-10-18.
 
+Note (2026-10-21, ADR 0014; a pointer, not an edit): the cutover flag of ADR 0014 step 3 (`flag_revision_attempt`, a conditional update at launch on the learner's own in-progress row) and the stale-revision close of the same step (a conditional abandon of an `is_revision` row on a non-current version) are app flows under decision 1's note, not the attempt surgery decision 4 excludes; no row is rewritten or deleted. The Consequence "the LMS keeps `registration = attempt id`" is unchanged: a revision visit's registration is its own row's id, re-seeded from the official attempt at every launch (ADR 0014 step 3), and `Review` is now minted (ADR 0006 note (l)).
+
 ## References
 
 - `docs/ambak-learning-data-standard/BLUEPRINT.md` §0, §1.5, §2, §3, §5, §6, §8, §9, §10

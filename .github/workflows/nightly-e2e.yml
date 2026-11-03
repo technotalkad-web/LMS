@@ -42,7 +42,8 @@ permissions:
 jobs:
   e2e:
     name: Nightly e2e (staging)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest (now 26.04): Playwright 1.60 cannot install chromium on 26.04.
+    runs-on: ubuntu-24.04
     # Full browser matrix (chromium + firefox + webkit + two mobile
     # viewports) needs more headroom than the chromium-only PR job.
     timeout-minutes: 45
