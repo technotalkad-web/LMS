@@ -53,7 +53,8 @@ permissions:
 jobs:
   lifecycle:
     name: Lifecycle nightly (staging)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest (now 26.04): Playwright 1.60 cannot install chromium on 26.04.
+    runs-on: ubuntu-24.04
     # Build about 5 min; the subset about 30-40 min serially (workers: 1).
     timeout-minutes: 75
     steps:

@@ -71,7 +71,8 @@ jobs:
 
   e2e:
     name: e2e (playwright)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest (now 26.04): Playwright 1.60 cannot install chromium on 26.04.
+    runs-on: ubuntu-24.04
     # Build about 5 min, the suite about 5-10 min with CI retries.
     timeout-minutes: 30
     # Target (owner decision 2026-10-20, Option A): THIS commit, built and
