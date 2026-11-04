@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { fetchScoringRule, resolvePolicy } from "@/lib/scoring/resolve";
+import { DEFAULT_POLICY, isDefaultRule } from "@/lib/scoring/policy";
 import type { AfterLimit, OfficialBasis, RuleScope } from "@/lib/scoring/policy";
 
 /**
@@ -11,13 +12,20 @@ import type { AfterLimit, OfficialBasis, RuleScope } from "@/lib/scoring/policy"
  *              (effective is returned for scope=course: what actually applies
  *               after path/journey inheritance)
  *   POST   /api/scoring-rules   { orgSlug, scope, target_id, ...fields }
- *            → upsert; { ok, rule }
+ *            → upsert; { ok, rule }. ADR 0014 step 9 retired the window and
+ *              Block: any rule value other than the default (after_limit
+ *              "block" included) answers 400; an empty or default-valued
+ *              body upserts the default row as before.
  *   DELETE /api/scoring-rules   { orgSlug, scope, target_id }
  *            → remove the explicit rule (target inherits again); { ok }
  *
  * The target must belong to the caller's org (courses / learning_paths /
  * journey_programs are checked by id + organization_id).
  */
+
+/** The 400 text of a non-default rule (ADR 0014 step 9). */
+const FIXED_RULE_ERROR =
+  "Attempt rules are fixed by ADR 0014: one official attempt, then review-only revision visits; extra attempts by grant.";
 
 const SCOPES: RuleScope[] = ["course", "path", "journey"];
 const BASES: OfficialBasis[] = ["first", "best", "latest", "nth"];
@@ -114,7 +122,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Target not found" }, { status: 404 });
   }
 
-  const max = Math.round(Number(body.max_scored_attempts ?? 3));
+  // ADR 0014 step 9: the raw body, before any fill. Only the default rule
+  // may be stored, so the route is read-only in effect except DELETE.
+  if (!isDefaultRule(body)) {
+    return NextResponse.json({ error: FIXED_RULE_ERROR }, { status: 400 });
+  }
+
+  const max = Math.round(Number(body.max_scored_attempts ?? DEFAULT_POLICY.max_scored_attempts));
   if (!Number.isFinite(max) || max < 1 || max > 99) {
     return NextResponse.json(
       { error: "max_scored_attempts must be between 1 and 99" },

@@ -1,7 +1,13 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DEFAULT_POLICY, computeScoring, hasLiveGrantedRetake, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
-import { fetchGrantRetakeIdsForUsers, fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import {
+  fetchPassRequired,
+  grantSnapshotForUsers,
+  readPagedWithOptionalColumn,
+  type GrantSnapshot,
+  type PgError,
+} from "@/lib/scoring/attempt-kind";
 import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from "./requests";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
@@ -17,7 +23,14 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * Phase 1 exposed this to managers; since Phase 4a (decision 12) only an admin
  * calls it — from the Attempt Requests queue or from a manager's ticket
  * (`source: "ticket"`). Scope and role are the caller's responsibility.
+ *
+ * ADR 0014 step 11 (5): the reads fail closed. A failed versions, attempts,
+ * grants or open-request read reports every named learner `failed` ("could
+ * not read the learner's records") and inserts nothing; the expiry sweep
+ * stays fail-soft.
  */
+/** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
+const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
 export async function grantExtraAttempts(
   svc: SupabaseClient,
   args: {
@@ -37,30 +50,51 @@ export async function grantExtraAttempts(
   const course = await orgCourse(svc, args.orgId, args.courseId);
   if (!course) return { error: "Course not found", status: 404 };
 
-  const { data: verRows } = await svc.from("course_versions").select("id").eq("course_id", course.id);
-  const verIds = ((verRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+  const unreadable = (read: string) => {
+    console.warn(JSON.stringify({ event: "grant_records_unreadable", course_id: course.id, read }));
+    return {
+      results: ids.map((uid): PerLearnerResult => ({ userId: uid, status: "failed", reason: "could not read the learner's records" })),
+      courseTitle: course.title,
+    };
+  };
+
+  const { data: verRows, error: verErr } = await svc.from("course_versions").select("id").eq("course_id", course.id);
+  if (verErr || !verRows) return unreadable("versions");
+  const verIds = (verRows as Array<{ id: string }>).map((v) => v.id);
   type Att = ScorableAttempt & { user_id: string };
   const attempts: Att[] = [];
   if (verIds.length) {
-    for (let from = 0; ; from += 1000) {
-      const { data } = await svc
-        .from("course_attempts")
-        .select("id, user_id, status, score, started_at, completed_at, completion_status, success_status")
-        .eq("organization_id", args.orgId)
-        .in("user_id", ids)
-        .in("course_version_id", verIds)
-        .order("id")
-        .range(from, from + 999);
-      const page = (data ?? []) as Att[];
-      attempts.push(...page);
-      if (page.length < 1000) break;
-    }
+    // The rows carry `is_revision` (the narrower-select fallback,
+    // readPagedWithOptionalColumn: the first page decides the column list
+    // for the rest). Any failed page, or a page with neither rows nor an
+    // error, reports every learner failed.
+    const attemptsRead = await readPagedWithOptionalColumn<Att>(
+      "is_revision",
+      (cols, from, to) =>
+        svc
+          .from("course_attempts")
+          .select(cols)
+          .eq("organization_id", args.orgId)
+          .in("user_id", ids)
+          .in("course_version_id", verIds)
+          .order("id")
+          .range(from, to) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
+      ATTEMPT_COLUMNS,
+      { nullIsError: true }
+    );
+    if (attemptsRead.error) return unreadable("attempts");
+    attempts.push(...attemptsRead.data);
   }
   const byUser = new Map<string, Att[]>();
   for (const x of attempts) byUser.set(x.user_id, [...(byUser.get(x.user_id) ?? []), x]);
   const policy = (await resolvePolicy(svc, course.id).catch(() => DEFAULT_POLICY)) ?? DEFAULT_POLICY;
   const passRequired = (await fetchPassRequired(svc, [course.id])).has(course.id);
-  const retakes = await fetchGrantRetakeIdsForUsers(svc, args.orgId, ids);
+  let retakes: Map<string, GrantSnapshot>;
+  try {
+    retakes = await grantSnapshotForUsers(svc, args.orgId, [course.id], ids);
+  } catch {
+    return unreadable("grants");
+  }
 
   // A lapsed grant (approved, unused, expired) still occupies the one-open
   // slot; close it so a new grant can be made.
@@ -76,13 +110,14 @@ export async function grantExtraAttempts(
     .then(({ error }) => {
       if (error && (error as { code?: string }).code !== "23514") console.warn("[grant] expiry sweep:", error.message);
     });
-  const { data: openRows } = await svc
+  const { data: openRows, error: openErr } = await svc
     .from("attempt_requests")
     .select("user_id, status, used_at")
     .eq("course_id", course.id)
     .in("user_id", ids);
+  if (openErr || !openRows) return unreadable("open requests");
   const open = new Set<string>();
-  for (const r of (openRows ?? []) as Array<{ user_id: string; status: string; used_at: string | null }>) {
+  for (const r of openRows as Array<{ user_id: string; status: string; used_at: string | null }>) {
     if (r.status === "pending" || (r.status === "approved" && r.used_at === null)) open.add(r.user_id);
   }
 
@@ -93,7 +128,7 @@ export async function grantExtraAttempts(
   const people = await namesAndEmails(svc, ids);
   for (const uid of ids) {
     const mine = byUser.get(uid) ?? [];
-    const retakeIds = retakes.get(`${uid}:${course.id}`) ?? new Set<string>();
+    const retakeIds = retakes.get(`${uid}:${course.id}`)?.retakeIds ?? new Set<string>();
     const sc = computeScoring(mine, policy, retakeIds);
     const failed = sc.officialStatus === "failed" || (passRequired && sc.officialStatus !== null && sc.officialStatus !== "passed");
     if (!sc.officialAttempt || !failed) { results.push({ userId: uid, status: "skipped", reason: "has not failed this module" }); continue; }

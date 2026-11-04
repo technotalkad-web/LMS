@@ -51,6 +51,9 @@ export function L2View(p: L2ViewProps) {
   const inTeams = teams.reduce((n, t) => n + t.memberIds.filter((id) => byId.has(id)).length, 0);
   const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
   const pct = (v: number | null) => (v === null ? "—" : `${v}%`);
+  // ADR 0014:188: learners whose history could not be
+  // read are counted nowhere; no reassurance is shown while any is in scope.
+  const unreadableN = learners.filter((l) => l.historyUnavailable).length;
 
   return (
     <div data-dashboard-root="" className="max-w-6xl mx-auto space-y-6">
@@ -84,6 +87,7 @@ export function L2View(p: L2ViewProps) {
               </li>
             ))}
           </ul>
+          {group.unavailable > 0 && <p className="text-xs text-muted mt-2">{group.unavailable} not counted (history unavailable)</p>}
           <p className="text-[11px] text-muted mt-3">{plural(inTeams, "person", "people")} in {plural(teams.length, "team", "teams")}{p.ungrouped.length ? ` + ${plural(p.ungrouped.length, "other", "others")}` : ""}. Same four signals as every team card.</p>
         </Card>
 
@@ -113,6 +117,7 @@ export function L2View(p: L2ViewProps) {
                     <tr key={c.managerId} className="hover:bg-canvas/60">
                       <td className="px-5 py-2.5 font-medium">
                         <Link href={teamHref(c.managerId)} className="hover:underline">{c.isOwn ? "Your direct team" : `${c.managerName}'s team`}</Link>
+                        {c.unavailable > 0 && <span className="block text-[11px] text-muted font-normal">{c.unavailable} not counted</span>}
                       </td>
                       <td className="px-3 py-2.5 text-right"><Pill tone={c.score.tone}>{c.score.score ?? "—"}</Pill></td>
                       <td className="px-3 py-2.5 text-right tabular-nums">{c.size}</td>
@@ -143,7 +148,11 @@ export function L2View(p: L2ViewProps) {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card eyebrow="What needs your attention">
           {exceptions.length === 0 ? (
-            <p className="text-sm text-muted">Every team is on track.</p>
+            learners.some((l) => l.historyUnavailable) ? (
+              <p className="text-sm text-muted">History unavailable for {unreadableN} {unreadableN === 1 ? "learner" : "learners"}. Please reload.</p>
+            ) : (
+              <p className="text-sm text-muted">Every team is on track.</p>
+            )
           ) : (
             <div className="space-y-3">
               {exceptions.map((e) => (
@@ -168,7 +177,11 @@ export function L2View(p: L2ViewProps) {
         </Card>
         <Card eyebrow="Common struggles across teams">
           {common.length === 0 ? (
-            <p className="text-sm text-muted">No module or journey day is holding several teams back.</p>
+            learners.some((l) => l.historyUnavailable) ? (
+              <p className="text-sm text-muted">History unavailable for {unreadableN} {unreadableN === 1 ? "learner" : "learners"}. Please reload.</p>
+            ) : (
+              <p className="text-sm text-muted">No module or journey day is holding several teams back.</p>
+            )
           ) : (
             <ul className="space-y-2 text-sm">
               {common.map((s) => {

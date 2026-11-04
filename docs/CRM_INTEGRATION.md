@@ -126,9 +126,12 @@ Rules your sync can rely on:
     {
       "course_id": "…", "title": "Objection Handling",
       "status": "in_progress", "score": 82, "attempts": 2,
-      "official_score": 82, "first_score": 74, "best_score": 82,
-      "scored_attempts": 2, "practice_attempts": 0, "progress_pct": 45,
+      "official_score": 82, "first_score": 82, "best_score": 82,
+      "scored_attempts": 1, "practice_attempts": 0, "progress_pct": 45,
       "due_at": "2026-09-30T00:00:00+00:00", "overdue": false,
+      "completed_at": "2026-09-12T08:20:00.000Z",
+      "revision_visits": 3, "last_revision_at": "2026-09-14T09:05:00.000Z",
+      "official_retake": "in_progress", "previous_official_score": null, "previous_official_status": null,
       "target": "/ambak/courses/…/launch"
     }
   ],
@@ -143,15 +146,27 @@ Render these as native cards in your app. Statuses:
 `not_started | in_progress | completed | passed | failed`. Every item
 carries a ready-made `target` for Step 4.
 
-**Official vs revision (0081).** Status and score follow the learner's
-OFFICIAL attempt only (by default the first completed attempt; an admin can
-widen the window per module). `failed` means the official attempt was
-completed but not passed. Learners may revise a module as often as they
-like afterwards; those revision (practice) runs resume from their saved
-progress and are counted in `practice_attempts`, but they never change
-`status`, `score` or the completion webhook. A learning-path step counts as
-done on any official completion, or only on a pass when the module is
-configured "Pass required".
+**Official vs revision (ADR 0014).** Status and score follow the learner's
+OFFICIAL attempt only: one official attempt per learner and module, the
+first completed attempt, pass or fail. `failed` means the official attempt
+was completed but not passed. Learners may revisit a completed module as
+often as they like afterwards. A revision visit is review only (nothing can
+be answered, retaken or restarted): it never changes `status`, `score` or
+the completion webhook, and it is counted per course in `revision_visits`,
+with the time of the latest visit in `last_revision_at`. `attempts` and
+`last_access` (and `engagement.last_active` in learner-summary) exclude
+revision visits, so a revisit never makes a learner look active.
+`revision_visits` and `last_revision_at` read `null` when the visit count
+could not be read in full for that poll: retry on a later poll; a number is
+never guessed. `practice_attempts` is kept for compatibility: counts
+completed revision rows recorded before ADR 0014; 0 for all activity after
+it. A learning-path step counts as done on any official completion, or only
+on a pass when the module is configured "Pass required".
+
+An official course attempt left with assessment attempts remaining reads
+`status: in_progress`, `score: null`, `progress_pct` ≤ 99, and `overdue:
+true` after the due date, for as long as it lasts, and the feed cannot tell
+it from an attempt closed before Results except through the statement log.
 
 **Reset attempts (ADR 0004 step 11).** An attempt the LMS closed (the
 learner confirmed a language switch, an admin replaced the module with
@@ -166,15 +181,38 @@ only attempts were reset can show `attempts > 0` and a non-null
 `first_access` while `status` is `not_started`. Decide "started" from
 `status`, never from `attempts` or `first_access`.
 
-**Scores follow the LMS's attempt rules.** Admins configure, per module /
-learning path / journey, how many completed attempts are scored (default 1)
-and which one is the official score (default: the first attempt). When an
-admin grants an extra attempt, the newest completed granted retake becomes
-the official attempt (its score and pass/fail). `score` and `official_score`
-are that official value; `first_score` is retained for learning-gain
-analysis, `best_score` is the best inside the scored window, and
-`practice_attempts` counts revision attempts beyond the window — those never
-change any score or status. Show `official_score` on the employee's card.
+**Scores follow the LMS's attempt rules.** Every module has one official
+attempt; there is no per-module window of scored attempts (ADR 0014 retired
+it). An extra official attempt opens only when an admin grants one, and the
+newest completed granted retake then becomes the official attempt (its score
+and pass/fail), whether its result is higher or lower. `score` and
+`official_score` are that official value; `first_score` keeps the first
+official attempt's score for learning-gain analysis; `best_score` is the
+best of the scored attempts (the first official attempt and any granted
+retakes). Show `official_score` on the employee's card.
+
+**Granted retakes (ADR 0014).** While a granted retake runs, the course
+reads `status: in_progress`, `progress_pct` is the retake's progress,
+`score` stays the standing official result, and `official_retake` reads
+`in_progress`. `summary.completed` counts the course as not completed
+meanwhile, while `learning_paths[].steps_completed` and the path `status`
+keep the standing result until the retake completes. `completed_at` is the
+official attempt's: during a running retake the standing attempt's (and
+`overdue` stays false), after a completed retake the retake's.
+`official_retake` is `none`, `in_progress` or `completed`;
+`previous_official_score` and `previous_official_status` carry the result a
+completed retake replaced, and are null unless a granted retake completed.
+In learner-summary each course also carries `completed_at`, new with ADR
+0014, by the same rule.
+
+A `course_completed` with a higher `attempt_number` for the same learner and course is a granted extra official attempt, whose result replaces the earlier one whether it is higher or lower, so a `passed: false` can follow a `passed: true` (`attempt_number` and `official: true` on both).
+
+At most two `course_completed` messages are sent per official attempt: the first when it completes (cmi5/xAPI: with its result, or, when the course sent its completion without a result, after that session ends or 15 minutes later; SCORM 1.2: at the completing commit, with whatever is known then), and a second, always `passed: true` with the same `attempt_number`, only if the attempt becomes passed afterwards (a fail then a pass in the same sitting, or a pass that arrives after a message sent without a result), which replaces the first.
+
+**When the LMS cannot read its records.** If the LMS cannot read the grant
+records it needs to decide a learner's official result, `learner-summary`
+and `progress` answer `503` with `{ "error": "grants_unreadable" }`: retry;
+the feed never answers a guess.
 
 `progress_pct` is how far through the module the employee's open attempt is
 (0–99, from the package's own screen/state signals; 100 once complete; null
@@ -265,7 +303,9 @@ disagree.
 When any course or date filter is set, only learners with at least one
 attempt matching *all* of them are returned (Upside semantics). Reset
 (abandoned) attempts count for these filters, as they do for `attempts`,
-`first_access` and `last_access` (see "Reset attempts" above).
+`first_access` and `last_access` (see "Reset attempts" above). Revision
+visits never do (ADR 0014), and `completed_from` / `completed_to` compare
+the course's `completed_at`, the official attempt's.
 
 ```json
 {
@@ -279,6 +319,8 @@ attempt matching *all* of them are returned (Upside semantics). Reset
           "official_score": 92, "first_score": 74, "best_score": 92, "scored_attempts": 2, "practice_attempts": 0,
           "progress_pct": 100, "attempts": 2, "assigned_at": "…", "due_at": "…", "overdue": false,
           "first_access": "…", "last_access": "…", "completed_at": "2026-09-17T10:41:00.000Z",
+          "revision_visits": 1, "last_revision_at": "2026-09-20T07:15:00.000Z",
+          "official_retake": "completed", "previous_official_score": 74, "previous_official_status": "failed",
           "target": "/ambak/courses/…/launch" }
       ],
       "learning_paths": [
@@ -409,7 +451,9 @@ cache-refresh signal, the summary as truth.
 
 **Status codes:** `401` bad/revoked key · `403` admin account refused ·
 `404` no active LMS account for that employee_id · `400` validation
-(governance messages are admin-identical) · `402` user quota reached.
+(governance messages are admin-identical) · `402` user quota reached ·
+`503` `grants_unreadable` on `learner-summary` and `progress` (the records
+behind an official result could not be read; retry).
 `warnings: []` on success responses = applied with noted skips.
 
 ## 5. Security model

@@ -59,7 +59,25 @@ export default async function EmployeeReportPage({
   const hiddenCount = scoped.hiddenByUser.get(userId) ?? 0;
   const coverage = scoped.coverage;
   const activeJourney = l.journeys.find((j) => j.status === "active") ?? null;
-  const reasons = l.flags.filter((f) => f.kind !== "needs_support").map((f) => f.detail);
+  // ADR 0014:199: "Last revisit" beside the inactive flag (revisits move no
+  // engagement value, so a learner who only revisits turns inactive).
+  const reasons = l.flags
+    .filter((f) => f.kind !== "needs_support")
+    .map((f) => (f.kind === "inactive" && l.lastRevisitAt ? `${f.detail} · Last revisit: ${relativeDays(l.lastRevisitAt, nowMs)}` : f.detail));
+  // ADR 0014:188: the learner's grant read failed, so their lines carry no figure.
+  const unavailable = l.historyUnavailable === true;
+  const UNAVAILABLE_TEXT = "History unavailable. Please reload.";
+  // The result a granted retake replaces, then the retake's state (ADR 0014 step 7, as the admin Learners row).
+  const resultWord = (s: string) => (s === "passed" ? "Passed" : s === "failed" ? "Not passed" : "Completed");
+  const resultText = (s: string, score: number | null) => `${resultWord(s)}${score === null ? "" : ` ${score} %`}`;
+  const retakeText = (c: (typeof l.courses)[number]) =>
+    !c.previousOfficial
+      ? null
+      : c.retakeState === "in_progress"
+        ? `${resultText(c.previousOfficial.status, c.previousOfficial.score)} → retake in progress`
+        : c.retakeState === "completed"
+          ? `${resultText(c.previousOfficial.status, c.previousOfficial.score)} → ${resultText(c.status, c.officialScore)}`
+          : null;
 
   // Suggested actions (§5): one per exception the person actually has.
   const actions: ExceptionAction[] = [];
@@ -113,8 +131,8 @@ export default async function EmployeeReportPage({
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Kpi label="Completion" value={l.completionPct === null ? "—" : `${l.completionPct}%`} sub={`${l.completed} of ${l.assigned} assigned`} tone={l.completionPct === null ? undefined : l.completionPct >= 85 ? "ok" : l.completionPct >= 65 ? "warn" : "bad"} />
-        <Kpi label="Avg official score" value={l.avgScore === null ? "—" : String(l.avgScore)} sub={`${l.courses.filter((c) => c.status === "failed" || c.passRequiredUnmet).length} failed · ${l.courses.filter((c) => c.status === "passed").length} passed`} tone={l.avgScore === null ? undefined : l.avgScore >= 75 ? "ok" : l.avgScore >= 60 ? "warn" : "bad"} />
+        <Kpi label="Completion" value={l.completionPct === null ? "—" : `${l.completionPct}%`} sub={unavailable ? UNAVAILABLE_TEXT : `${l.completed} of ${l.assigned} assigned`} tone={l.completionPct === null ? undefined : l.completionPct >= 85 ? "ok" : l.completionPct >= 65 ? "warn" : "bad"} />
+        <Kpi label="Avg official score" value={l.avgScore === null ? "—" : String(l.avgScore)} sub={unavailable ? UNAVAILABLE_TEXT : `${l.courses.filter((c) => c.status === "failed" || c.passRequiredUnmet).length} failed · ${l.courses.filter((c) => c.status === "passed").length} passed`} tone={l.avgScore === null ? undefined : l.avgScore >= 75 ? "ok" : l.avgScore >= 60 ? "warn" : "bad"} />
         <Kpi label="Journey" value={activeJourney ? `${activeJourney.day}/${activeJourney.total}` : l.journeys[0]?.status === "completed" ? "Done" : "—"} sub={activeJourney ? (activeJourney.behind ? `${activeJourney.behind} days behind` : activeJourney.overdueDeadline ? "past deadline" : `on track · next: ${activeJourney.nextModule ?? "—"}`) : null} tone={activeJourney ? (activeJourney.onTrack ? "ok" : activeJourney.behind >= 3 ? "bad" : "warn") : undefined} />
         <Kpi label="Last active" value={relativeDays(l.lastActive, nowMs)} sub={l.lastActive ? fmtDate(l.lastActive) : "no learning activity yet"} tone={l.inactiveDays === null ? undefined : l.inactiveDays >= 14 ? "bad" : l.inactiveDays >= 7 ? "warn" : "ok"} />
       </div>
@@ -129,7 +147,12 @@ export default async function EmployeeReportPage({
         {openGrants.length > 0 && (
           <p className="text-xs text-muted mt-2">Already holds an unused extra attempt on {openGrants.map((c) => c.title).join(", ")}.</p>
         )}
-        {uniqueActions.length === 0 && <p className="text-xs text-muted mt-2">Nothing is flagged — nothing to chase right now.</p>}
+        {uniqueActions.length === 0 && (
+          <p className="text-xs text-muted mt-2">
+            {/* ADR 0014:188: no reassurance while the history is unreadable. */}
+            {l.historyUnavailable ? "History unavailable for 1 learner. Please reload." : "Nothing is flagged — nothing to chase right now."}
+          </p>
+        )}
       </Card>
 
       <section className="bg-paper border border-line rounded-2xl overflow-hidden">
@@ -152,12 +175,18 @@ export default async function EmployeeReportPage({
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
-              {l.courses.map((c) => (
+              {l.courses.map((c) => c.historyUnavailable ? (
+                // ADR 0014:188: the course title and the text only, no figure.
+                <tr key={c.courseId}>
+                  <td className="px-5 py-2.5 font-medium">{c.title}</td>
+                  <td colSpan={6} className="px-3 py-2.5 text-xs text-muted">{UNAVAILABLE_TEXT}</td>
+                </tr>
+              ) : (
                 <tr key={c.courseId}>
                   <td className="px-5 py-2.5 font-medium">{c.title}{c.passRequiredUnmet && c.status !== "failed" ? <span className="block text-[11px] text-red-700 font-normal">pass required · not passed</span> : null}</td>
                   <td className="px-3 py-2.5"><Pill tone={statusTone(c)}>{statusWord(c)}</Pill></td>
                   <td className="px-3 py-2.5 text-right tabular-nums">{c.status === "not_started" ? "—" : c.progressPct === null ? "In progress" : `${c.progressPct}%`}</td>
-                  <td className="px-3 py-2.5 text-right tabular-nums">{c.officialScore === null ? "—" : c.officialScore}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">{retakeText(c) ? <span className="text-xs whitespace-nowrap">{retakeText(c)}</span> : c.officialScore === null ? "—" : c.officialScore}</td>
                   <td className="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">
                     {c.attempts}
                     {(c.resetAttempts ?? 0) > 0 && (
@@ -201,9 +230,13 @@ export default async function EmployeeReportPage({
                 {l.paths.map((p) => (
                   <li key={p.pathId} className="flex flex-wrap items-baseline justify-between gap-2">
                     <span className="font-medium">{p.name}</span>
-                    <span className={`text-xs ${p.overdue ? "text-red-700 font-semibold" : "text-muted"}`}>
-                      {p.stepsDone}/{p.stepsTotal} steps{p.dueAt ? ` · due ${fmtDate(p.dueAt)}` : ""}{p.overdue ? " · overdue" : ""}
-                    </span>
+                    {p.historyUnavailable ? (
+                      <span className="text-xs text-muted">{UNAVAILABLE_TEXT}</span>
+                    ) : (
+                      <span className={`text-xs ${p.overdue ? "text-red-700 font-semibold" : "text-muted"}`}>
+                        {p.stepsDone}/{p.stepsTotal} steps{p.dueAt ? ` · due ${fmtDate(p.dueAt)}` : ""}{p.overdue ? " · overdue" : ""}
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>

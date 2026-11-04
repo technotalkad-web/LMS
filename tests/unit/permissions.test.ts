@@ -15,6 +15,8 @@ const eq = (n: string, got: unknown, want: unknown) => {
 
 console.log("\nrole helpers");
 eq("canManage: super_owner + admin only", ["super_owner", "admin", "data_analyst", "user"].map((r) => canManage(r as never)), [true, true, false, false]);
+// ADR 0014 step 17 (PR 1b): a Data Analyst never decides an attempt request; the routes gate on ADMIN_ROLES (tests/unit/attempt-requests.test.ts).
+eq("ADR 0014: canManage(\"data_analyst\") === false (no grant decisions)", canManage("data_analyst" as never), false);
 eq("canViewReports: super_owner + admin + data_analyst", ["super_owner", "admin", "data_analyst", "user"].map((r) => canViewReports(r as never)), [true, true, true, false]);
 eq("labels", ["super_owner", "admin", "data_analyst", "user"].map((r) => roleLabel(r as never)), ["Super Owner", "Administrator", "Data Analyst", "User"]);
 

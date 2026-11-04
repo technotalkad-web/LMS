@@ -4,7 +4,9 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { officialStatuses, statusOf } from "@/lib/scoring/status";
+import { officialStatuses, standingVerdictOf } from "@/lib/scoring/status";
+import { isRevisionAttempt } from "@/lib/scoring/policy";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 
 // =============================================================================
 // /[org]/learning-paths/[pathId]/reports — Path Reports surface.
@@ -52,6 +54,8 @@ type Attempt = {
   course_version_id: string;
   /** ADR 0004 step 11: an abandoned attempt never makes a step "started". */
   status: string | null;
+  /** ADR 0014 (0103): a revision visit's row never starts or dates a step. */
+  is_revision?: boolean | null;
   completion_status: string;
   success_status: string;
   score: number | null;
@@ -190,16 +194,23 @@ export default async function PathReportsPage({
   const assignedIdArr = Array.from(assignedUserIds);
 
   // ---- Path-context attempts only (the key separation from course-level reports) ----
+  // ADR 0014 step 12: both attempts selects name is_revision through the
+  // narrower-select fallback (a database without 0103 has no revision rows).
+  const PATH_ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id";
   const { data: attemptRows } =
     assignedIdArr.length && allVersionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select(
-            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id"
-          )
-          .eq("learning_path_id", pathId)
-          .in("user_id", assignedIdArr)
-          .in("course_version_id", allVersionIds)
+      ? await readWithOptionalColumn<unknown[]>(
+          "is_revision",
+          (columns) =>
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .eq("learning_path_id", pathId)
+              .in("user_id", assignedIdArr)
+              .in("course_version_id", allVersionIds),
+          PATH_ATTEMPT_COLUMNS
+        )
       : { data: [] };
   const attempts = (attemptRows ?? []) as Attempt[];
 
@@ -223,6 +234,8 @@ export default async function PathReportsPage({
   };
   const aggByUserCourse = new Map<string, CourseAgg>(); // key: `${uid}::${courseId}`
   for (const a of attempts) {
+    // ADR 0014 step 12: a revision row neither starts a learner nor dates the step.
+    if (isRevisionAttempt(a)) continue;
     const cid = versionToCourse.get(a.course_version_id);
     if (!cid) continue;
     const key = `${a.user_id}::${cid}`;
@@ -261,13 +274,20 @@ export default async function PathReportsPage({
   // path context or a direct launch), exactly as the course pages and the
   // path Learners tab do — the path-filtered set above stays for
   // touched / done / time.
+  const ALL_ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at";
   const { data: allAttemptRows } =
     assignedIdArr.length && allVersionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select("id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at")
-          .in("user_id", assignedIdArr)
-          .in("course_version_id", allVersionIds)
+      ? await readWithOptionalColumn<unknown[]>(
+          "is_revision",
+          (columns) =>
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .in("user_id", assignedIdArr)
+              .in("course_version_id", allVersionIds),
+          ALL_ATTEMPT_COLUMNS
+        )
       : { data: [] };
   const official = await officialStatuses(
     supabase,
@@ -277,9 +297,11 @@ export default async function PathReportsPage({
       return cid ? [{ ...a, course_id: cid }] : [];
     })
   );
+  // A per-step count is a roll-up, so it reads the STANDING verdict, never
+  // step 10's "in_progress" while a granted retake runs (ADR 0014:195).
   for (const [key, agg] of aggByUserCourse) {
     const [uid, cid] = key.split("::");
-    const verdict = statusOf(official, uid, cid);
+    const verdict = standingVerdictOf(official, uid, cid);
     agg.passed = verdict === "passed";
     agg.failed = verdict === "failed";
   }

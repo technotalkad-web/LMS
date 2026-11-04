@@ -281,7 +281,8 @@ test("direct finalize force_restart with nobody in progress: 200, the genuine ze
 
 type User = { id: string; email: string; password: string };
 const RESTART_ACTION = "course.version.attempts_restarted";
-const RESET = "Reset — module updated";
+// The learner course page's pill for an abandoned incomplete row (ADR 0014 step 7, PR 1b).
+const RESET = "Closed — not counted";
 
 async function seedAttempt(
   versionId: string,

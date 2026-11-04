@@ -9,6 +9,7 @@ import { courseDaysOf, todayStr, DEFAULT_JOURNEY_TZ } from "@/lib/journey/journe
 import { fetchScoringRule } from "@/lib/scoring/resolve";
 import { computeJourneyState, parseVersionDays } from "@/lib/journey/journey";
 import { courseProgress } from "@/lib/courses/progress-view";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 import {
   JourneyAdminClient,
   type ProgramRow,
@@ -208,14 +209,24 @@ export default async function JourneyAdminPage({
       const courseOfVer = new Map(vers.map((v) => [v.id, v.course_id]));
       const unitCountByVersion = new Map(vers.map((v) => [v.id, typeof v.unit_count === "number" ? v.unit_count : null]));
       const userIds = [...new Set(enrollments.filter((e) => missionByEnr.has(e.id)).map((e) => e.user_id))];
+      // ADR 0014 step 12: the select names is_revision through the
+      // narrower-select fallback, so a revision row never supplies the
+      // mission's progress. No retakeIds: the mission feeds a journey roll-up.
+      const ATTEMPT_COLUMNS =
+        "user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units";
       const { data: aRows } = vers.length && userIds.length
-        ? await svc
-            .from("course_attempts")
-            .select("user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units")
-            .in("user_id", userIds)
-            .in("course_version_id", vers.map((v) => v.id))
+        ? await readWithOptionalColumn<unknown[]>(
+            "is_revision",
+            (columns) =>
+              svc
+                .from("course_attempts")
+                .select(columns)
+                .in("user_id", userIds)
+                .in("course_version_id", vers.map((v) => v.id)),
+            ATTEMPT_COLUMNS
+          )
         : { data: [] };
-      type A = { user_id: string; course_version_id: string; status: string | null; completion_status: string; success_status: string; started_at: string | null; progress_pct?: number | null; units?: unknown };
+      type A = { user_id: string; course_version_id: string; status: string | null; is_revision?: boolean | null; completion_status: string; success_status: string; started_at: string | null; progress_pct?: number | null; units?: unknown };
       const byUserCourse = new Map<string, A[]>();
       for (const a of (aRows ?? []) as A[]) {
         const cid = courseOfVer.get(a.course_version_id);

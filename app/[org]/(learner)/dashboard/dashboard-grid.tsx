@@ -47,14 +47,12 @@ export type GridCard = {
   progressPct?: number | null;
   /** 0073 scoring window: scored attempts the learner still has (null = unknown). */
   scoredLeft?: number | null;
-  /** Window used up and the rule says further launches are practice only. */
+  /**
+   * The official attempt is used: further launches are review-only revision
+   * visits (ADR 0014). False while a granted retake runs (step 10). The
+   * block rule and the card's revision line are retired (steps 9 and 7).
+   */
   practiceMode?: boolean;
-  /** Window used up and the rule blocks further launches. */
-  blocked?: boolean;
-  /** Revision (practice) runs so far — informational, never change the official result. */
-  practiceCount?: number;
-  practiceBest?: number | null;
-  practicePassed?: boolean;
   thumbnail_url?: string | null;
   thumbnail_fit?: string | null;
   thumbnail_pos_x?: number | null;
@@ -405,31 +403,20 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
   // What a learner who did not pass can do next, under the current rule.
   // An open retry (progressPct known) resumes rather than restarts.
   const retryOpen = isFailed && typeof card.progressPct === "number";
-  const retryLabel = card.blocked
-    ? "No attempts left"
-    : retryOpen
-      ? card.practiceMode
-        ? "Resume revision"
-        : "Resume"
-      : card.practiceMode
-        ? "Revise (practice)"
-        : "Try again";
-  const attemptsLeftLine = card.blocked
-    ? "Official attempt used · ask your admin for another"
-    : retryOpen
-      ? `${card.practiceMode ? "Revision" : "Retry"} in progress · ${card.progressPct}% complete`
-      : card.practiceMode
-        ? "Official attempt used · revision only, never changes your score"
-        : typeof card.scoredLeft === "number"
-          ? `${card.scoredLeft} official attempt${card.scoredLeft === 1 ? "" : "s"} left`
-          : null;
-  // Revision runs are shown for information only; the official result above never moves.
-  const revisionLine =
-    (card.practiceCount ?? 0) > 0
-      ? `Revision: ${card.practicePassed ? "passed" : "not passed yet"}` +
-        (typeof card.practiceBest === "number" ? ` · best ${Math.round(card.practiceBest * 100)}%` : "") +
-        ` · ${card.practiceCount} run${card.practiceCount === 1 ? "" : "s"}`
-      : null;
+  const retryLabel = retryOpen
+    ? card.practiceMode
+      ? "Resume revision"
+      : "Resume"
+    : card.practiceMode
+      ? "Revise"
+      : "Try again";
+  const attemptsLeftLine = retryOpen
+    ? `${card.practiceMode ? "Revision" : "Retry"} in progress · ${card.progressPct}% complete`
+    : card.practiceMode
+      ? "Official attempt used · revision only, never changes your score"
+      : typeof card.scoredLeft === "number"
+        ? `${card.scoredLeft} official attempt${card.scoredLeft === 1 ? "" : "s"} left`
+        : null;
   // Unreleased content can't be overdue — the learner couldn't have started it.
   const overdue =
     !isCompleted &&
@@ -569,9 +556,6 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
               {attemptsLeftLine && (
                 <div className="text-[11px] text-muted mt-1.5 font-medium">{attemptsLeftLine}</div>
               )}
-              {revisionLine && (
-                <div className="text-[11px] text-muted mt-1 font-medium" data-testid="revision-line">{revisionLine}</div>
-              )}
             </div>
           ) : (
             <>
@@ -633,10 +617,10 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
           ) : (
             <Link
               href={`/${orgSlug}/courses/${card.course_id}${
-                isCompleted || (isFailed && card.blocked) ? "" : "/launch?back=dashboard"
+                isCompleted ? "" : "/launch?back=dashboard"
               }`}
               className={`w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                isCompleted || (isFailed && card.blocked)
+                isCompleted
                   ? "bg-canvas hover:bg-canvas/70 text-ink border border-line"
                   : overdue
                     ? "bg-red-600 hover:bg-red-700 text-white shadow-sm"
@@ -649,7 +633,7 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
                 </>
               ) : isFailed ? (
                 <>
-                  <RotateCcw className="w-4 h-4" /> {card.blocked ? "View details" : retryLabel}
+                  <RotateCcw className="w-4 h-4" /> {retryLabel}
                 </>
               ) : card.status === "in_progress" ? (
                 <>

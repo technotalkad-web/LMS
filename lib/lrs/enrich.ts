@@ -32,6 +32,8 @@ export type AttemptContext = {
   attemptNumber: number | null;
   startedAt: string | null;
   scored: boolean | null;
+  /** course_attempts.is_revision (0103): a revision visit's row (ADR 0014 step 7); false on a database without it. */
+  isRevision: boolean;
   scoringBasis: string | null;
   scoringMaxAttempts: number | null;
   org: { id: string; slug: string | null; name: string | null };
@@ -144,6 +146,10 @@ export function contextExtensions(ctx: AttemptContext, timestamp?: string): Obj 
   e[ext.attemptId] = ctx.attemptId;
   setIf(e, ext.attemptNumber, ctx.attemptNumber);
   if (typeof ctx.scored === "boolean") e[ext.attemptScored] = ctx.scored;
+  // ADR 0014 step 7 (ii): emitted only on a revision visit's row; its absence
+  // means "not a revision visit". `scored` is false on that row, so (i)
+  // attempt/scored = false is emitted explicitly just above.
+  if (ctx.isRevision) e[ext.attemptLaunchMode] = "Review";
   setIf(e, ext.scoringBasis, ctx.scoringBasis);
   setIf(e, ext.scoringMaxAttempts, ctx.scoringMaxAttempts);
   setIf(e, ext.attemptStartedAt, ctx.startedAt);

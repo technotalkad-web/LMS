@@ -1,8 +1,26 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { fetchAll, fetchByIds } from "@/lib/db/chunked";
-import { DEFAULT_POLICY, attemptCounts, computeScoring, courseStatus, excludeAbandoned, officialDone } from "@/lib/scoring/policy";
+import { chunk, fetchAll, fetchByIds } from "@/lib/db/chunked";
+import {
+  DEFAULT_POLICY,
+  attemptCounts,
+  computeScoring,
+  courseStatus,
+  excludeAbandoned,
+  isRevisionAttempt,
+  officialDone,
+} from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchGrantRetakeIdsForUsers, fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import {
+  GrantReadError,
+  fetchPassRequired,
+  grantSnapshotForUsers,
+  readPagedWithOptionalColumn,
+  type GrantSnapshot,
+  type OptionalColumnState,
+  type PgError,
+} from "@/lib/scoring/attempt-kind";
+import { officialHistory, officialRetakeState } from "@/lib/scoring/official-history";
+import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 import { courseProgress } from "@/lib/courses/progress-view";
 import {
   DEFAULT_JOURNEY_TZ,
@@ -77,6 +95,8 @@ type AttemptRow = {
   last_activity_at: string | null;
   progress_pct?: number | null;
   units?: unknown;
+  /** 0103 (ADR 0014): a revision visit's row; absent on a database without the column (= false). */
+  is_revision?: boolean | null;
 };
 type CourseAssign = {
   course_id: string;
@@ -121,8 +141,39 @@ const toScorable = (a: AttemptRow) => ({
   completion_status: a.completion_status,
   success_status: a.success_status,
   status: a.status ?? null,
+  is_revision: a.is_revision ?? null,
 });
 void fmtDay; void daysAgo;
+
+/** The attempts select; `is_revision` (0103) is added through the narrower-select fallback. */
+const ATTEMPT_COLUMNS =
+  "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units";
+
+/**
+ * The learners' attempts in the organisation (fetchByIds' chunks of 150 and
+ * pages of 1,000, ordered by id), with `is_revision` read through
+ * readPagedWithOptionalColumn (ADR 0014 steps 7 and 12). fetchByIds throws
+ * the error message alone, which cannot tell a missing column from another
+ * failure, so the pages are read here. The first page decides: once it
+ * answers, every later page and chunk reads the same column list (one
+ * `decided` for every chunk). Any other error throws, as fetchByIds does.
+ */
+async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: string[]): Promise<AttemptRow[]> {
+  const out: AttemptRow[] = [];
+  const decided: OptionalColumnState = { columns: null };
+  for (const part of chunk([...new Set(userIds.filter(Boolean))], 150)) {
+    const res = await readPagedWithOptionalColumn<unknown>(
+      "is_revision",
+      (cols, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
+        svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId).order("id").range(from, to),
+      ATTEMPT_COLUMNS,
+      { state: decided }
+    );
+    if (res.error) throw new Error(`course_attempts: ${res.error.message ?? ""}`);
+    out.push(...(res.data as AttemptRow[]));
+  }
+  return out;
+}
 
 export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightOptions): Promise<InsightsResult> {
   const { orgId, orgSlug } = opts;
@@ -215,11 +266,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   };
 
   /* ---- attempts + versions ---- */
-  const attempts = await fetchByIds<AttemptRow>(
-    svc, "course_attempts",
-    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
-    "user_id", userIds, (q) => q.eq("organization_id", orgId)
-  );
+  const attempts = await fetchAttemptRows(svc, orgId, userIds);
   const versionIds = [...new Set(attempts.map((a) => a.course_version_id))];
   const versionRows = versionIds.length
     ? await fetchByIds<{ id: string; course_id: string; unit_count: number | null }>(
@@ -389,11 +436,39 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   for (const m of assignedByUser.values()) for (const cid of m.keys()) allCourseIds.add(cid);
   for (const cid of courseOfVersion.values()) allCourseIds.add(cid);
   const courseIdList = [...allCourseIds];
-  const [policies, grants, passRequired] = await Promise.all([
+  // ADR 0014:188, strict: the grant links come from one strict bulk read,
+  // because with them missing the chain is wrong, not empty. A failed read
+  // never throws here (this also runs inside the 15-minute precompute,
+  // cache.ts): it is logged once and every learner of the call degrades to
+  // "History unavailable. Please reload." with no figure.
+  // Any throw from this one read degrades, not only GrantReadError, so a
+  // client-level failure cannot fail the page or the refresh either.
+  const readGrants = async (): Promise<Map<string, GrantSnapshot> | null> => {
+    try {
+      return await grantSnapshotForUsers(svc, orgId, null, userIds);
+    } catch (e) {
+      console.warn(JSON.stringify({ event: "report_card_grants_unreadable", org_id: orgId, code: e instanceof GrantReadError ? e.code : null }));
+      return null;
+    }
+  };
+  const [policies, snapshots, passRequired, visits] = await Promise.all([
     resolvePolicies(svc, courseIdList),
-    fetchGrantRetakeIdsForUsers(svc, orgId, userIds),
+    readGrants(),
     fetchPassRequired(svc, courseIdList),
+    // "Last revisit" beside the inactive flag (ADR 0014:199), fail-soft.
+    fetchRevisionVisitStats(svc, { orgId, userIds }),
   ]);
+  const historyUnavailable = snapshots === null;
+  // The reader pages oldest first, so a capped read lacks the newest visits:
+  // "Last revisit" is then absent, like a failed read, never an older date.
+  const lastRevisitByUser = new Map<string, string>();
+  if (!visits.failed && !visits.capped) {
+    for (const [k, s] of visits.byPair) {
+      const uid = k.slice(0, k.indexOf(":"));
+      const last = maxIso(lastRevisitByUser.get(uid) ?? null, s.last);
+      if (last) lastRevisitByUser.set(uid, last);
+    }
+  }
 
   /* ---- org benchmark (nightly matview; fail-soft) ---- */
   const benchmark = await loadBenchmark(svc, courseIdList);
@@ -431,9 +506,13 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
 
     // Engagement is about the PERSON, not the lens: last activity comes from
     // every attempt and every journey day they have, whatever content filter
-    // the manager is looking through.
+    // the manager is looking through. A revision visit's row moves no
+    // engagement value (ADR 0014 step 12), so it is skipped.
     let lastActive: string | null = null;
-    for (const a of my) lastActive = maxIso(lastActive, maxIso(a.last_activity_at, maxIso(a.completed_at, a.started_at)));
+    for (const a of my) {
+      if (isRevisionAttempt(a)) continue;
+      lastActive = maxIso(lastActive, maxIso(a.last_activity_at, maxIso(a.completed_at, a.started_at)));
+    }
     for (const j of journeysByUser.get(uid) ?? []) for (const d of j.dayCompletions) lastActive = maxIso(lastActive, d || null);
 
     const courses: CourseLine[] = [];
@@ -441,19 +520,70 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     for (const cid of courseIds) {
       const list = byCourse.get(cid) ?? [];
       const info = assignedMap.get(cid);
-      const scoring = computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY, grants.get(`${uid}:${cid}`) ?? new Set<string>());
-      const status = courseStatus(scoring, list.map(toScorable));
-      const progress = courseProgress(list, unitCountByVersion);
       // ADR 0004 step 11: a reset (abandoned) attempt never dates the course:
       // "opened Nd ago" / idle days come from the live attempts only, so a
       // relaunch after a reset is not flagged stuck from the dead attempt's
-      // start. Engagement (lastActive above) keeps every attempt.
+      // start. Engagement (lastActive above) keeps every attempt but a
+      // revision visit's. excludeAbandoned and attemptCounts drop revision
+      // rows too (ADR 0014 steps 6 and 12).
       const tally = attemptCounts(list);
       let startedAt: string | null = null, lastActivity: string | null = null;
       for (const a of excludeAbandoned(list)) {
         startedAt = minIso(startedAt, a.started_at);
         lastActivity = maxIso(lastActivity, maxIso(a.last_activity_at, maxIso(a.completed_at, a.started_at)));
       }
+      if (historyUnavailable) {
+        // ADR 0014:188: the row shows only "History unavailable. Please
+        // reload." No figure that needs the chain is computed; what needs
+        // no grant stays as computed.
+        stepDone.set(cid, false);
+        courses.push({
+          courseId: cid,
+          title: courseTitle.get(cid) ?? "Untitled course",
+          status: "unavailable",
+          officialScore: null,
+          attempts: tally.live,
+          resetAttempts: tally.reset,
+          progressPct: null,
+          assignedAt: info?.assignedAt ?? null,
+          dueAt: info?.due ?? null,
+          overdue: false,
+          startedAt,
+          lastActivity,
+          passedFirstTime: false,
+          passRequiredUnmet: false,
+          nudges: nudges.get(`${uid}:${cid}`) ?? 0,
+          openGrant: false,
+          limitReached: false,
+          completedAt: null,
+          done: false,
+          isAssigned: assignedMap.has(cid),
+          historyUnavailable: true,
+        });
+        continue;
+      }
+      const snapshot = snapshots?.get(`${uid}:${cid}`);
+      const retakeIds = snapshot?.retakeIds ?? new Set<string>();
+      const scorable = list.map(toScorable);
+      const scoring = computeScoring(scorable, policies.get(cid) ?? DEFAULT_POLICY, retakeIds);
+      // ADR 0014 step 10: "in_progress" while a granted retake runs.
+      const status = courseStatus(scoring, scorable);
+      // A per-course display: the retake's progress while it runs. The path
+      // steps below read officialDone, so a passed step stays done.
+      const progress = courseProgress(list, unitCountByVersion, { retakeIds });
+      // ADR 0014 step 7: the retake state and the result it replaces, from
+      // the one chain (officialHistory + officialRetakeState).
+      const history = officialHistory(scorable, snapshot?.rows ?? []);
+      const retake = officialRetakeState(history);
+      const replaced = retake.state === "in_progress" ? retake.current : retake.state === "completed" ? retake.previous : null;
+      // The "stuck" clock (derive.ts: "opened Nd ago" under the progress
+      // mark) of a granted retake starts when the retake opens, not at the
+      // first attempt: the line reads in
+      // progress and shows the retake's progress, so it is dated by the
+      // retake's own start.
+      const running = history.running;
+      const runningRow = running ? list.find((a) => a.id === running.attemptId) : undefined;
+      const openedAt = runningRow?.started_at ?? startedAt;
       const official = scoring.officialAttempt;
       // "Completed in period" is dated by the OFFICIAL attempt (decision 1),
       // never by a practice run's completion.
@@ -481,7 +611,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
         assignedAt: info?.assignedAt ?? null,
         dueAt: info?.due ?? null,
         overdue,
-        startedAt,
+        startedAt: openedAt,
         lastActivity,
         passedFirstTime,
         passRequiredUnmet,
@@ -491,6 +621,10 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
         completedAt: officialCompletedAt,
         done,
         isAssigned: assignedMap.has(cid),
+        retakeState: retake.state,
+        previousOfficial: replaced
+          ? { score: replaced.score === null ? null : Math.round(replaced.score * 100), status: replaced.status, completedAt: replaced.completedAt }
+          : null,
       });
     }
     courses.sort((a, b) => {
@@ -503,12 +637,18 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       if (lensPath && pid !== lensPath) continue;
       if (lensCourse || lensJourney) continue;
       const steps = coursesOfPath.get(pid) ?? [];
+      if (historyUnavailable) {
+        // stepDone needs the chain (a step completed through a retake would
+        // read incomplete and raise a false overdue): no step count, no overdue.
+        paths.push({ pathId: pid, name: pathName.get(pid) ?? "Learning path", stepsTotal: steps.length, stepsDone: 0, dueAt: info.due, overdue: false, historyUnavailable: true });
+        continue;
+      }
       const doneN = steps.filter((c) => stepDone.get(c) === true).length;
       paths.push({ pathId: pid, name: pathName.get(pid) ?? "Learning path", stepsTotal: steps.length, stepsDone: doneN, dueAt: info.due, overdue: !!info.due && info.due < nowIso && doneN < steps.length });
     }
 
     const journeys = myJourneys.map(({ dayCompletions, courseIds: _c, ...j }) => { void _c; return { ...j, daysInPeriod: dayCompletions.filter((d) => inPeriod(d)).length }; });
-    const derived = deriveLearner({ courses, paths, journeys, lastActive, periodDays, nowMs });
+    const derived = deriveLearner({ courses, paths, journeys, lastActive, periodDays, nowMs, historyUnavailable });
 
     return {
       userId: uid,
@@ -522,10 +662,12 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       department: m?.department ?? null,
       joined: m?.date_of_joining ?? null,
       lastActive,
+      lastRevisitAt: lastRevisitByUser.get(uid) ?? null,
       journeys,
       courses,
       paths,
       ...derived,
+      ...(historyUnavailable ? { historyUnavailable: true } : {}),
     };
   });
   };

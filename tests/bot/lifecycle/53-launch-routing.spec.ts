@@ -9,7 +9,8 @@
  *       attempt's version is launched (grandfather across slots)
  *   (3) progress on a DEACTIVATED slot → the course page offers Launch, not
  *       Resume; at the next launch the attempt is abandoned, tokens expired, the
- *       "Reset — module updated" pill shows, the launch continues
+ *       course page's "Closed — not counted" pill shows (ADR 0014 step 7), the
+ *       launch continues
  *   (4) a consumed grant retake is never abandoned or rerouted
  *
  * The per-version restart action (ADR 0004 step 14a) is not built: decision
@@ -174,7 +175,7 @@ test.describe.serial("ADR 0004 step 9 — launch routing across language slots",
 
     const page = await ctx.newPage();
     await page.goto(base);
-    await expect(page.getByText("Reset — module updated")).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText("Closed — not counted")).toBeVisible({ timeout: 15_000 });
     await page.close();
     await ctx.close();
   });

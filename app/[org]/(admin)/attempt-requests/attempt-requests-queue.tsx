@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import {
@@ -28,7 +29,8 @@ import {
 export type AttemptRequestRow = {
   id: string;
   status: "pending" | "approved" | "rejected" | "expired";
-  source: "request" | "bulk" | "manager" | "ticket";
+  /** "restart": re-issued by a forced restart (ADR 0014 step 8). */
+  source: "request" | "bulk" | "manager" | "ticket" | "restart";
   reason: string | null;
   decision_note: string | null;
   decided_at: string | null;
@@ -46,6 +48,18 @@ export type AttemptRequestRow = {
   current_status: string | null;
   /** Completed official attempts when the request was made (0085). */
   attempts_used: number;
+  /**
+   * The official result when the request was made (ADR 0014 step 7: the
+   * chain before created_at), shown on a decided row in place of the live
+   * status; null on a pending row and when there was none.
+   */
+  request_time_result: { score: number | null; status: string } | null;
+  /** The grant links could not be read for this render (ADR 0014:188). */
+  history_unavailable: boolean;
+  /** A pending row whose learner's official result stands: the confirmation box (ADR 0014 step 11 (4)). */
+  result_stands: boolean;
+  /** The retake a used grant opened (the link is built from orgSlug and course_id). */
+  opened_retake: { attempt_id: string; status: string | null; score: number | null } | null;
 };
 
 export type BulkCourse = { id: string; title: string; code: string | null };
@@ -60,6 +74,21 @@ const EXPIRY_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "90", label: "90 days" },
   { value: "never", label: "Never expires" },
 ];
+
+/**
+ * The routes' 503 codes, shown as plain sentences (ADR 0014 PR 1b):
+ * PATCH answers records_unreadable (a failed read before
+ * the decision) and schema_missing (override_confirmed is not on this
+ * database), BULK answers records_unreadable. Every other error the routes
+ * send is already a sentence and is shown as sent.
+ */
+const DECIDE_ERRORS: Record<string, string> = {
+  records_unreadable: "Could not read this learner's records. Nothing was approved. Please try again.",
+  schema_missing: "Could not record the override on this database. Nothing was approved. Please try again later.",
+};
+const BULK_ERRORS: Record<string, string> = {
+  records_unreadable: "Could not read the learners' records. Nothing was granted. Please try again.",
+};
 
 export function AttemptRequestsQueue({
   rows,
@@ -87,7 +116,7 @@ export function AttemptRequestsQueue({
 
   const filtered = filter === "all" ? rows : rows.filter((r) => r.status === filter);
 
-  async function decide(id: string, action: "approve" | "reject", note: string, expiry: string) {
+  async function decide(id: string, action: "approve" | "reject", note: string, expiry: string, overridePassed = false) {
     setBusyId(id);
     setError(null);
     const res = await fetch(`/api/attempt-requests/${id}?orgSlug=${encodeURIComponent(orgSlug)}`, {
@@ -97,12 +126,14 @@ export function AttemptRequestsQueue({
         action,
         note: note || undefined,
         expires_in_days: expiry === "never" ? null : Number(expiry),
+        // ADR 0014 step 11 (3): the ticked confirmation, sent with the reason.
+        ...(action === "approve" && overridePassed ? { override_passed: true } : {}),
       }),
     });
     setBusyId(null);
     if (!res.ok) {
       const j = (await res.json().catch(() => ({}))) as { error?: string };
-      setError(j.error ?? `HTTP ${res.status}`);
+      setError((j.error && DECIDE_ERRORS[j.error]) ?? j.error ?? `HTTP ${res.status}`);
       return;
     }
     router.refresh();
@@ -150,7 +181,7 @@ export function AttemptRequestsQueue({
       ) : (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
           {filtered.map((r) => (
-            <RequestCard key={r.id} row={r} busy={busyId === r.id} onDecide={decide} />
+            <RequestCard key={r.id} row={r} busy={busyId === r.id} onDecide={decide} orgSlug={orgSlug} />
           ))}
         </div>
       )}
@@ -191,18 +222,24 @@ function BulkGrantPanel({
       error?: string;
       granted?: number;
       skipped?: number;
+      skipped_live_retake?: number;
       failed_total?: number;
     };
     if (!res.ok) {
-      setErr(j.error ?? `HTTP ${res.status}`);
+      setErr((j.error && BULK_ERRORS[j.error]) ?? j.error ?? `HTTP ${res.status}`);
       return;
     }
-    if ((j.failed_total ?? 0) === 0) {
+    // ADR 0014 step 11 (5): a learner whose granted retake is live is skipped
+    // and is not in failed_total, so "nothing to grant" is said only when no
+    // learner was skipped for it either.
+    const liveRetake = j.skipped_live_retake ?? 0;
+    if ((j.failed_total ?? 0) === 0 && liveRetake === 0) {
       setMsg("No learners have failed this module's official attempt — nothing to grant.");
     } else {
       setMsg(
         `Granted ${j.granted ?? 0} extra attempt${j.granted === 1 ? "" : "s"}` +
           ((j.skipped ?? 0) > 0 ? ` · ${j.skipped} already had an open grant` : "") +
+          (liveRetake > 0 ? ` · ${liveRetake} had a granted retake in progress` : "") +
           `.`
       );
     }
@@ -218,8 +255,8 @@ function BulkGrantPanel({
         <div className="flex-1 min-w-0">
           <h3 className="serif text-lg leading-tight text-ink">Bulk grant</h3>
           <p className="text-xs text-muted mt-0.5">
-            Give one extra official attempt to every learner who used up their window on a module and didn&apos;t pass. Learners
-            who already have an open grant are skipped.
+            Give one extra official attempt to every learner who has an official result on a module and didn&apos;t pass. Learners
+            who already have an open grant are skipped. Learners with a granted retake in progress are skipped.
           </p>
           <div className="flex flex-wrap items-center gap-2 mt-3">
             <select
@@ -270,13 +307,23 @@ function RequestCard({
   row: r,
   busy,
   onDecide,
+  orgSlug,
 }: {
   row: AttemptRequestRow;
   busy: boolean;
-  onDecide: (id: string, action: "approve" | "reject", note: string, expiry: string) => void;
+  onDecide: (id: string, action: "approve" | "reject", note: string, expiry: string, overridePassed?: boolean) => void;
+  orgSlug: string;
 }) {
   const [note, setNote] = useState("");
   const [expiry, setExpiry] = useState("30");
+  const [confirmed, setConfirmed] = useState(false);
+  // ADR 0014 step 11 (4): a learner whose official result stands is granted
+  // another official attempt only with the ticked confirmation and a reason
+  // (3+ characters; the route checks 3-2000). While the history cannot be
+  // read the queue cannot tell, so Approve is disabled (the PATCH
+  // route's 409/503 stays the backstop).
+  const approveBlocked =
+    r.history_unavailable || (r.result_stands && (!confirmed || note.trim().length < 3));
 
   return (
     <article className="bg-paper border border-line rounded-xl p-4 flex flex-col gap-3">
@@ -287,7 +334,13 @@ function RequestCard({
             <StatusBadge row={r} />
             {r.source !== "request" && (
               <span className="text-[10px] uppercase tracking-wider font-semibold text-muted border border-line rounded-full px-2 py-0.5">
-                {r.source === "manager" ? "Manager grant" : r.source === "ticket" ? "Granted from a ticket" : "Bulk grant"}
+                {r.source === "manager"
+                  ? "Manager grant"
+                  : r.source === "ticket"
+                    ? "Granted from a ticket"
+                    : r.source === "restart"
+                      ? "Re-issued after a module update"
+                      : "Bulk grant"}
               </span>
             )}
             <CurrentScore row={r} />
@@ -317,11 +370,38 @@ function RequestCard({
 
       {r.status === "pending" ? (
         <div className="space-y-2 pt-1">
+          {r.history_unavailable ? (
+            <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              History unavailable. Please reload.
+            </p>
+          ) : r.result_stands ? (
+            <div className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 space-y-1.5">
+              <p>
+                {r.current_status === "passed"
+                  ? r.current_score !== null
+                    ? `This learner passed (${r.current_score} %).`
+                    : "This learner passed."
+                  : "This learner has completed this module."}{" "}
+                {"A granted retake replaces that result even if it is lower, and shows 'in progress' until finished."}
+              </p>
+              <label className="flex items-start gap-2 text-xs font-medium">
+                <input
+                  type="checkbox"
+                  checked={confirmed}
+                  onChange={(e) => setConfirmed(e.target.checked)}
+                  disabled={busy}
+                  className="mt-0.5"
+                />
+                <span>I confirm: grant another official attempt to a learner whose result stands</span>
+              </label>
+            </div>
+          ) : null}
           <textarea
             value={note}
             onChange={(e) => setNote(e.target.value)}
             rows={2}
-            placeholder="Optional note to the learner…"
+            maxLength={2000}
+            placeholder={r.result_stands ? "Reason (required for a learner who passed)" : "Optional note to the learner…"}
             className="w-full px-3 py-2 border border-line rounded-xl bg-canvas text-sm outline-none focus:border-ink focus:ring-2 focus:ring-ink/10"
           />
           <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -349,8 +429,8 @@ function RequestCard({
               </button>
               <button
                 type="button"
-                onClick={() => onDecide(r.id, "approve", note, expiry)}
-                disabled={busy}
+                onClick={() => onDecide(r.id, "approve", note, expiry, r.result_stands && confirmed)}
+                disabled={busy || approveBlocked}
                 className="inline-flex items-center gap-1 text-xs px-3 py-1.5 bg-emerald-600 text-white rounded-lg font-medium hover:bg-emerald-700 disabled:opacity-50"
               >
                 {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
@@ -360,18 +440,39 @@ function RequestCard({
           </div>
         </div>
       ) : (
-        <DecidedFooter row={r} />
+        <DecidedFooter row={r} orgSlug={orgSlug} />
       )}
     </article>
   );
 }
 
-function DecidedFooter({ row: r }: { row: AttemptRequestRow }) {
+const RETAKE_STATUS_LABEL: Record<string, string> = {
+  in_progress: "in progress",
+  passed: "passed",
+  failed: "failed",
+  completed: "completed",
+  reset: "reset by a module update",
+};
+
+function DecidedFooter({ row: r, orgSlug }: { row: AttemptRequestRow; orgSlug: string }) {
+  const opened = r.opened_retake;
   return (
     <div className="pt-2 border-t border-line text-xs text-muted space-y-1">
       {r.decision_note && (
         <div className="border border-line bg-canvas/50 rounded-lg p-2 text-ink whitespace-pre-wrap">
           {r.decision_note}
+        </div>
+      )}
+      {opened && (
+        <div>
+          <Link
+            href={`/${orgSlug}/courses/${r.course_id}/attempts/${opened.attempt_id}`}
+            className="text-indigo-700 hover:underline font-medium"
+          >
+            Opened retake
+            {opened.status ? `: ${RETAKE_STATUS_LABEL[opened.status] ?? opened.status}` : ""}
+            {opened.score !== null ? ` · ${opened.score}%` : ""}
+          </Link>
         </div>
       )}
       <div className="flex items-center gap-2 flex-wrap">
@@ -403,10 +504,32 @@ function StatusBadge({ row: r }: { row: AttemptRequestRow }) {
   return <StatusPill tone="success">Granted</StatusPill>;
 }
 
+/**
+ * The result pill. A pending row shows the learner's live official result;
+ * a decided row shows the result when the request was made (ADR 0014 step
+ * 7: never the live status, which moves on after a grant), or "History
+ * unavailable. Please reload." when the grant links could not be read.
+ */
 function CurrentScore({ row: r }: { row: AttemptRequestRow }) {
-  if (r.current_score === null && !r.current_status) return null;
-  const failed = r.current_status === "failed";
-  const passed = r.current_status === "passed";
+  let score: number | null;
+  let status: string | null;
+  if (r.status === "pending") {
+    score = r.current_score;
+    status = r.current_status;
+  } else {
+    if (r.history_unavailable) {
+      return (
+        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold border bg-amber-50 text-amber-800 border-amber-200">
+          History unavailable. Please reload.
+        </span>
+      );
+    }
+    score = r.request_time_result?.score ?? null;
+    status = r.request_time_result?.status ?? null;
+  }
+  if (score === null && !status) return null;
+  const failed = status === "failed";
+  const passed = status === "passed";
   const tone = passed
     ? "bg-emerald-50 text-emerald-700 border-emerald-200"
     : failed
@@ -414,8 +537,8 @@ function CurrentScore({ row: r }: { row: AttemptRequestRow }) {
       : "bg-slate-50 text-slate-700 border-slate-200";
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold border ${tone}`}>
-      {r.current_score !== null ? `${r.current_score}%` : "—"}
-      {r.current_status ? ` · ${r.current_status}` : ""}
+      {score !== null ? `${score}%` : "—"}
+      {status ? ` · ${status}` : ""}
     </span>
   );
 }
@@ -435,8 +558,9 @@ function ordinal(n: number): string {
 function AttemptContext({ row: r }: { row: AttemptRequestRow }) {
   const used = r.attempts_used ?? 0;
   const next = used + 1;
-  const outcome =
-    r.current_status === "passed" ? "passed" : r.current_status === "failed" ? "failed" : "not passed";
+  // A decided row's outcome is the request-time result (ADR 0014 step 7).
+  const status = r.status === "pending" ? r.current_status : r.request_time_result?.status ?? null;
+  const outcome = status === "passed" ? "passed" : status === "failed" ? "failed" : "not passed";
   return (
     <div className="text-sm font-medium text-indigo-900 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2 flex items-center gap-2">
       <RotateCcw className="w-4 h-4 text-indigo-600 shrink-0" />

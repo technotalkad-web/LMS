@@ -5,6 +5,7 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadEnrolledCourseStatus, userCourseKey } from "@/lib/scoring/status";
+import { fetchCourseRevisitSummary } from "@/lib/attempts/revision-visits";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
@@ -134,6 +135,18 @@ export default async function CourseReportsPage({
     rating_count: 0,
     refreshed_at: new Date(0).toISOString(),
   };
+
+  // ---- Revisits tile (ADR 0014 step 7) ----
+  // average_time_minutes above already excludes revisits: mv_course_performance
+  // reads v_course_attempt_summary, which 0103 restricts to non-revision rows.
+  // revision_visits is deny-all, so the service client; course-pinned. Absent
+  // on a database without 0103, "—" on a failed read, "N+" past the read cap.
+  const revisits = await fetchCourseRevisitSummary(svc, {
+    orgId: org.id,
+    courseId: c.id,
+    sinceIso: new Date(Date.now() - 30 * 86_400_000).toISOString(),
+  });
+  const plus = revisits.capped ? "+" : "";
 
   // ---- §4.3 — Per-question breakdown ----
   // Two matviews: one with correct/incorrect counts per question, one
@@ -304,6 +317,20 @@ export default async function CourseReportsPage({
                   }`
             }
           />
+          {!revisits.missing && (
+            <BigStat
+              label="Revisits"
+              value={revisits.failed ? "—" : `${revisits.total.toLocaleString()}${plus}`}
+              sub={
+                revisits.failed
+                  ? undefined
+                  : `${revisits.learners.toLocaleString()}${plus} ${
+                      revisits.learners === 1 ? "learner" : "learners"
+                    } who revisited · ${revisits.recent.toLocaleString()}${plus} in the last 30 days`
+              }
+              testId="revisits-tile"
+            />
+          )}
         </div>
       </section>
 

@@ -4,7 +4,10 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
-import { excludeAbandoned, officialStatuses, statusOf } from "@/lib/scoring/status";
+import { excludeAbandoned, officialStatuses, standingVerdictOf } from "@/lib/scoring/status";
+import { isRevisionAttempt } from "@/lib/scoring/policy";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { csvEscape } from "@/lib/util/csv";
 
 /**
  *   GET /api/learning-paths/{id}/learners/export?orgSlug=...
@@ -22,15 +25,6 @@ import { excludeAbandoned, officialStatuses, statusOf } from "@/lib/scoring/stat
 type ViaKind = "user" | "team" | "org";
 type Status = "not_started" | "in_progress" | "completed" | "passed" | "failed";
 import { courseProgress, pathProgress, type CourseProgressView } from "@/lib/courses/progress-view";
-
-function csvEscape(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  const s = String(value);
-  if (/[",\n\r]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
-}
 
 export async function GET(
   request: Request,
@@ -187,15 +181,22 @@ export async function GET(
   );
   const versionIds = versions.map((v) => v.id);
 
+  // ADR 0014 step 12: the select names is_revision through the narrower-select
+  // fallback, so the folds below drop revision rows (none before 0103).
+  const ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units";
   const { data: attemptRows } =
     enrolledUserIds.length && versionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select(
-            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
-          )
-          .in("user_id", enrolledUserIds)
-          .in("course_version_id", versionIds)
+      ? await readWithOptionalColumn<unknown[]>(
+          "is_revision",
+          (columns) =>
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .in("user_id", enrolledUserIds)
+              .in("course_version_id", versionIds),
+          ATTEMPT_COLUMNS
+        )
       : { data: [] };
   const attempts = (attemptRows ?? []) as Array<{
     id: string;
@@ -203,6 +204,8 @@ export async function GET(
     course_version_id: string;
     /** ADR 0004 step 11: abandoned attempts never make a learner "in progress". */
     status: string | null;
+    /** ADR 0014 (0103): a revision visit's row never starts, completes or dates a step. */
+    is_revision?: boolean | null;
     completion_status: string;
     success_status: string;
     score: number | null;
@@ -253,6 +256,8 @@ export async function GET(
     const myAttempts = attempts.filter((a) => a.user_id === uid);
     const doneCourseIds = new Set<string>();
     for (const a of myAttempts) {
+      // ADR 0014: a revision visit's row never completes a step.
+      if (isRevisionAttempt(a)) continue;
       const cid = courseByVersion.get(a.course_version_id);
       if (!cid) continue;
       if (
@@ -268,13 +273,17 @@ export async function GET(
 
     let status: Status;
     // ADR 0004 step 11: a learner whose only attempts were reset (abandoned)
-    // has not started.
-    if (coursesDone === 0 && !myAttempts.some((a) => a.status !== "abandoned")) {
+    // has not started; ADR 0014: nor one with only revision visits (the
+    // courseStatus rule).
+    if (coursesDone === 0 && excludeAbandoned(myAttempts).length === 0) {
       status = "not_started";
     } else if (coursesDone < coursesTotal) {
       status = "in_progress";
     } else {
-      const verdict = lastStepCourseId ? statusOf(official, uid, lastStepCourseId) : "completed";
+      // The path status is a roll-up, so it reads the final step's STANDING
+      // verdict, never step 10's "in_progress" while a granted retake runs
+      // (ADR 0014:195; the CRM path object does the same).
+      const verdict = lastStepCourseId ? standingVerdictOf(official, uid, lastStepCourseId) : "completed";
       status = verdict === "passed" ? "passed" : verdict === "failed" ? "failed" : "completed";
     }
     // ADR 0004 step 11: a reset (abandoned) attempt never dates last activity.
@@ -286,6 +295,8 @@ export async function GET(
         .pop() ?? "";
     const profile = profileByUser.get(uid);
     const via = Array.from(viaByUser.get(uid) ?? []).join("+");
+    // Per-step progress feeds pathProgress, a roll-up: no retakeIds, so a
+    // passed step stays done while a granted retake runs (ADR 0014:195).
     const byCourse = new Map<string, CourseProgressView>();
     for (const s of orderedSteps) {
       byCourse.set(

@@ -6,6 +6,11 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { courseProgress } from "@/lib/courses/progress-view";
 import { excludeAbandoned, officialStatuses, statusOf, userCourseKey } from "@/lib/scoring/status";
+import { GrantReadError, grantSnapshotForUsers, readWithOptionalColumn, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
+import { officialHistory, officialRetakeState, type OfficialRetakeState } from "@/lib/scoring/official-history";
+import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
+import { resolveEmails } from "@/lib/users/emails";
+import { csvEscape } from "@/lib/util/csv";
 
 /**
  * GET /api/courses/{courseId}/learners/export?orgSlug=...
@@ -27,15 +32,6 @@ import { excludeAbandoned, officialStatuses, statusOf, userCourseKey } from "@/l
 
 type ViaKind = "user" | "team" | "org";
 type Status = "not_started" | "in_progress" | "completed" | "passed" | "failed";
-
-function csvEscape(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  const s = String(value);
-  if (/[",\n\r]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
-}
 
 export async function GET(
   request: Request,
@@ -184,15 +180,23 @@ export async function GET(
   }
 
   // ---- attempts ----
+  // ADR 0014 step 7: the select names is_revision through the narrower-select
+  // fallback, so every count, date and progress below drops revision rows (a
+  // database without 0103 has none and reads every row as unflagged).
+  const ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units";
   const { data: attemptRows } =
     enrolledUserIds.length && versionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select(
-            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
-          )
-          .in("user_id", enrolledUserIds)
-          .in("course_version_id", versionIds)
+      ? await readWithOptionalColumn<unknown[]>(
+          "is_revision",
+          (columns) =>
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .in("user_id", enrolledUserIds)
+              .in("course_version_id", versionIds),
+          ATTEMPT_COLUMNS
+        )
       : { data: [] };
   const attempts = (attemptRows ?? []) as Array<{
     id: string;
@@ -202,12 +206,50 @@ export async function GET(
     units?: unknown;
     /** ADR 0004 step 11: courseStatus()/courseProgress() leave abandoned attempts out. */
     status: string | null;
+    /** ADR 0014 (0103): a revision visit's row is never an attempt. */
+    is_revision?: boolean | null;
     completion_status: string;
     success_status: string;
     score: number | null;
     started_at: string;
     completed_at: string | null;
   }>;
+
+  // ---- grant links: one strict bulk read (ADR 0014 step 7, strict reads) ----
+  // The CSV carries the official-result chain (Official retake, Previous
+  // official …, Granted …), which is wrong, not empty, with the links missing,
+  // so a failed read answers 503 and writes no file (ADR 0014:188). A missing
+  // relation is "no grants" inside grantSnapshotForUsers.
+  let snapshots: Map<string, GrantSnapshot>;
+  try {
+    snapshots = await grantSnapshotForUsers(svc, org.id, [courseId], enrolledUserIds);
+  } catch (e) {
+    if (!(e instanceof GrantReadError)) throw e;
+    console.warn("[learners-export] grant read failed:", e.code);
+    return NextResponse.json({ error: "history_unavailable" }, { status: 503 });
+  }
+  const noGrants: GrantSnapshot = { retakeIds: new Set<string>(), unusedGrant: null, rows: [] };
+  const snapshotOf = (uid: string) => snapshots.get(userCourseKey(uid, courseId)) ?? noGrants;
+  const retakeIdsByPair = new Map<string, ReadonlySet<string>>([...snapshots].map(([k, s]) => [k, s.retakeIds]));
+
+  // ---- revision visits (deny-all, service client; ADR 0014 step 7) ----
+  // A failed read leaves both visit cells empty; past the page cap the count
+  // is a floor, written "N+".
+  const visits = await fetchRevisionVisitStats(svc, { orgId: org.id, courseIds: [courseId], userIds: enrolledUserIds });
+
+  // ---- the chain per learner (officialHistory + officialRetakeState), and the deciders' emails ----
+  const retakeByUser = new Map<string, OfficialRetakeState>();
+  const deciderIds = new Set<string>();
+  for (const uid of enrolledUserIds) {
+    const history = officialHistory(
+      attempts.filter((a) => a.user_id === uid),
+      snapshotOf(uid).rows
+    );
+    const retake = officialRetakeState(history);
+    retakeByUser.set(uid, retake);
+    if (retake.grant?.decidedBy) deciderIds.add(retake.grant.decidedBy);
+  }
+  const deciderEmail = deciderIds.size > 0 ? await resolveEmails(svc, deciderIds) : new Map<string, string>();
 
   // ---- build CSV ----
   const header = [
@@ -222,16 +264,27 @@ export async function GET(
     "Official score (%)",
     "Attempts",
     "Last activity (ISO)",
+    "Revisits",
+    "Last revisit (ISO)",
+    "Official retake",
+    "Previous official score (%)",
+    "Previous official status",
+    "Granted by",
+    "Granted at (ISO)",
+    "Grant reason",
     "Enrolled via",
   ];
   const rows: string[][] = [header];
 
   // Decision 1 (Phase 0a): the CSV status is the OFFICIAL attempt's verdict,
-  // identical to the learners page — never the latest attempt.
+  // identical to the learners page — never the latest attempt. ADR 0014: the
+  // strict snapshot's retake ids replace the fail-soft grant read,
+  // and the status reads "in_progress" while a granted retake runs (step 10).
   const official = await officialStatuses(
     svc,
     org.id,
-    attempts.map((a) => ({ ...a, course_id: courseId }))
+    attempts.map((a) => ({ ...a, course_id: courseId })),
+    { grants: retakeIdsByPair }
   );
 
   for (const uid of enrolledUserIds) {
@@ -241,7 +294,8 @@ export async function GET(
     // of every attempt including practice runs.
     const bestScore = official.get(userCourseKey(uid, courseId))?.scoring.officialScore ?? null;
     // Same numbers as the learners page: attempts and last activity count the
-    // attempts that were not reset (ADR 0004 step 11).
+    // attempts that were not reset (ADR 0004 step 11) and are not revision
+    // visits (ADR 0014 step 7; the select carries the flag).
     const liveAttempts = excludeAbandoned(myAttempts);
     const lastTouched =
       liveAttempts
@@ -252,7 +306,16 @@ export async function GET(
     const profile = profileByUser.get(uid);
     const via = Array.from(viaByUser.get(uid) ?? []).join("+");
 
-    const progress = courseProgress(myAttempts, unitCountByVersion);
+    // ADR 0014 step 10: a per-course display, so a running granted retake is
+    // the source (its own progress, never 100 %).
+    const progress = courseProgress(myAttempts, unitCountByVersion, { retakeIds: snapshotOf(uid).retakeIds });
+    const visit = visits.failed ? null : visits.byPair.get(userCourseKey(uid, courseId)) ?? { count: 0, last: null };
+    // officialRetakeState is the one reader of the retake state and the
+    // previous result (ADR 0014 step 7); "Previous official …" is filled only
+    // once a granted retake completed.
+    const retake = retakeByUser.get(uid) ?? null;
+    const previous = retake?.state === "completed" ? retake.previous : null;
+    const grant = retake?.grant ?? null;
     rows.push([
       employeeIdByUser.get(uid) ?? "",
       emailByUser.get(uid) ?? uid.slice(0, 8),
@@ -265,6 +328,14 @@ export async function GET(
       bestScore !== null ? String(Math.round(bestScore * 100)) : "",
       String(liveAttempts.length),
       lastTouched,
+      visit ? `${visit.count}${visits.capped ? "+" : ""}` : "",
+      visit?.last ?? "",
+      retake ? (retake.state === "in_progress" ? "in progress" : retake.state) : "none",
+      previous && previous.score !== null ? String(Math.round(previous.score * 100)) : "",
+      previous ? previous.status : "",
+      grant ? (grant.decidedBy ? deciderEmail.get(grant.decidedBy) : undefined) ?? "a former administrator" : "",
+      grant?.decidedAt ?? "",
+      grant ? grant.decisionNote ?? grant.reason ?? "" : "",
       via,
     ]);
   }

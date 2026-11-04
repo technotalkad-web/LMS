@@ -88,7 +88,7 @@ Drift to close: production is 25–26 migrations and one month of code behind st
 | Migrations | `docs/MIGRATIONS.md` | — |
 | CRM / Yoddha integration | `docs/CRM_INTEGRATION.md` | ADR 0004 step 11 (abandoned attempts excluded from progress and learner-summary), ADR 0005 decision 3 (optional `analytics_tier` on the catalog endpoint), ADR 0007 (release notes; §6 "Known limits" says cmi5 completions fire no webhook, which v1.3.0 makes stale and the executor corrects in that release), ADR 0008 B (`version_id` = the default slot's current version; `available` also requires that slot to be active) |
 | Operations, backups, DR | `ops/RUNBOOK.md`, `docs/ops/backup-restore.md` | ADR 0003 (restore = pg_dump), ADR 0007 |
-| Scoring and official attempts | `docs/ATTEMPT_SCORING.md` | — |
+| Scoring and official attempts | `docs/ATTEMPT_SCORING.md` | ADR 0014 (one official attempt, review-only revision visits counted in `revision_visits`, extra official attempts by admin grant; supersedes the revision model of AS lines 17–21 and the activity rule of AS line 55) |
 | Cloud Run staging | `docs/CLOUD_RUN_STAGING.md` | ADR 0007 |
 
 Blueprint sections under the future-first profile (ADR 0002). In force since 2026-10-16 (ADR 0002–0007 accepted); where this map and the blueprint differ, this map governs.

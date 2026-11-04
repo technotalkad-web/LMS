@@ -12,7 +12,7 @@ import {
   type ScoringResult,
 } from "./policy";
 import { resolvePolicies } from "./resolve";
-import { fetchGrantRetakeIdsForUsers } from "./attempt-kind";
+import { fetchGrantRetakeIdsForUsers, readPagedWithOptionalColumn, type OptionalColumnState, type PgError } from "./attempt-kind";
 
 /**
  * THE learner course-status definitions (Phase 0a, product decision 1).
@@ -83,11 +83,18 @@ export function userCourseKey(userId: string, courseId: string): string {
  *
  * Works with the service-role client or an admin's RLS client (the policy
  * RPC is granted to authenticated; attempt_requests is admin-readable).
+ *
+ * `opts.grants` (ADR 0014 step 7, strict reads): the caller's own retake ids
+ * per `${user_id}:${course_id}`, from grantSnapshotForUsers, in place of the
+ * fail-soft read below (the course learners CSV, which renders the chain).
+ * Every other caller renders counts or a path status and keeps the
+ * fail-soft read.
  */
 export async function officialStatuses(
   client: AnyClient,
   orgId: string,
-  attempts: StatusAttempt[]
+  attempts: StatusAttempt[],
+  opts?: { grants?: Map<string, ReadonlySet<string>> }
 ): Promise<Map<string, UserCourseStatus>> {
   const byKey = new Map<string, StatusAttempt[]>();
   const courseIds = new Set<string>();
@@ -103,7 +110,7 @@ export async function officialStatuses(
   }
   const [policies, grants] = await Promise.all([
     resolvePolicies(client, [...courseIds]),
-    fetchGrantRetakeIdsForUsers(client, orgId, [...userIds]),
+    opts?.grants ?? fetchGrantRetakeIdsForUsers(client, orgId, [...userIds]),
   ]);
   const out = new Map<string, UserCourseStatus>();
   for (const [k, list] of byKey) {
@@ -117,6 +124,23 @@ export async function officialStatuses(
 /** Read one pair from a batch result; a pair with no attempts is "not_started". */
 export function statusOf(map: Map<string, UserCourseStatus>, userId: string, courseId: string): CourseStatus {
   return map.get(userCourseKey(userId, courseId))?.status ?? "not_started";
+}
+
+/**
+ * The STANDING official verdict of one pair (scoring.officialStatus), null
+ * when there is no official attempt. Unlike statusOf it never reads ADR 0014
+ * step 10's "in_progress" while a granted retake runs: the learning-path
+ * surfaces take a path status and per-step counts from it, because those
+ * are roll-ups and ADR 0014:195 keeps roll-ups on the standing result until
+ * the retake completes (the CRM path objects do the same through
+ * officialDone).
+ */
+export function standingVerdictOf(
+  map: Map<string, UserCourseStatus>,
+  userId: string,
+  courseId: string
+): "passed" | "failed" | "completed" | null {
+  return map.get(userCourseKey(userId, courseId))?.scoring.officialStatus ?? null;
 }
 
 export type StatusCounts = Record<CourseStatus, number>;
@@ -204,12 +228,12 @@ export async function loadEnrolledCourseStatus(
   const CHUNK = 150;
   type Row = Record<string, unknown>;
   // Pages one query; `build(from, to)` returns the ranged builder.
-  const paged = async (what: string, build: (from: number, to: number) => PromiseLike<{ data: unknown; error: { message: string } | null }>) => {
+  const paged = async (what: string, build: (from: number, to: number) => PromiseLike<{ data: unknown; error: PgError }>) => {
     const out: Row[] = [];
     for (let from = 0; ; from += PAGE) {
       const { data, error } = await build(from, from + PAGE - 1);
       if (error) {
-        console.warn(`[enrolled-status] ${what} read failed:`, error.message);
+        console.warn(`[enrolled-status] ${what} read failed:`, error.message ?? "");
         break;
       }
       const rows = (data ?? []) as Row[];
@@ -246,19 +270,27 @@ export async function loadEnrolledCourseStatus(
     else if (a.assignee_type === "org") for (const uid of orgMemberIds) enrolledUserIds.add(uid);
   }
 
+  // ADR 0014 step 7: the attempts select names is_revision through the
+  // narrower-select fallback, paged by readPagedWithOptionalColumn. The first
+  // page decides: once it answers, every later page and chunk reads the same
+  // column list (one `decided` for every chunk). As `paged` does, a failed
+  // page is logged and the chunk keeps the rows read so far.
+  const ATTEMPT_COLUMNS = "id, user_id, status, completion_status, success_status, score, started_at, completed_at";
+  const decided: OptionalColumnState = { columns: null };
   const attempts: StatusAttempt[] = [];
   if (enrolledUserIds.size > 0) {
     for (let i = 0; i < versionIds.length; i += CHUNK) {
       const part = versionIds.slice(i, i + CHUNK);
-      const rows = (await paged("attempts", (f, t) =>
-        client
-          .from("course_attempts")
-          .select("id, user_id, status, completion_status, success_status, score, started_at, completed_at")
-          .in("course_version_id", part)
-          .order("id")
-          .range(f, t)
-      )) as unknown as Array<ScorableAttempt & { user_id: string }>;
-      for (const a of rows) if (enrolledUserIds.has(a.user_id)) attempts.push({ ...a, course_id: courseId });
+      const res = await readPagedWithOptionalColumn<unknown>(
+        "is_revision",
+        (columns, f, t) => client.from("course_attempts").select(columns).in("course_version_id", part).order("id").range(f, t),
+        ATTEMPT_COLUMNS,
+        { pageSize: PAGE, state: decided }
+      );
+      if (res.error) console.warn("[enrolled-status] attempts read failed:", res.error.message ?? "");
+      for (const a of res.data as Array<ScorableAttempt & { user_id: string }>) {
+        if (enrolledUserIds.has(a.user_id)) attempts.push({ ...a, course_id: courseId });
+      }
     }
   }
   const officialByUser = await officialStatuses(client, orgId, attempts);

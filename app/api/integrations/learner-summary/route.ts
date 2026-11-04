@@ -10,12 +10,16 @@ import {
 import {
   DEFAULT_POLICY,
   computeScoring,
+  hasLiveGrantedRetake,
+  isRevisionAttempt,
   type ScorableAttempt,
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { courseStatus, officialDone } from "@/lib/scoring/policy";
-import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, grantSnapshotForUsers, GrantReadError, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
+import { officialHistory, officialRetakeState } from "@/lib/scoring/official-history";
+import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 
 /**
  * One call, everything the CRM needs to render an employee's learning card:
@@ -28,6 +32,13 @@ import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-ki
  * last activity). Entitlements expand user/org/team/group assignments through
  * the same resolvers the learner dashboard uses, so the CRM card and the LMS
  * always agree. Include `target` fields to feed straight into sso-link.
+ *
+ * ADR 0014: the per-course fields follow the bulk progress feed's rules
+ * (lib/integrations/progress.ts), so both endpoints agree: revision visits
+ * are never attempts and move no last-active value; a running granted
+ * retake reads in_progress; completed_at is the official attempt's; the
+ * revision-visit fields are null when they could not be read; a failed read
+ * of the grant links answers 503 { error: "grants_unreadable" }.
  */
 export async function GET(request: Request) {
   const auth = await authenticateApiKey(request);
@@ -157,6 +168,8 @@ export async function GET(request: Request) {
     progress_pct?: number | null;
     /** select("*"): 'abandoned' never counts as in progress or official (ADR 0004 step 11). */
     status?: string | null;
+    /** select("*"): a revision visit's row (0103, ADR 0014); undefined on a database without it. */
+    is_revision?: boolean | null;
   };
   const attempts = (atRows ?? []) as Att[];
   const verIds = [...new Set(attempts.map((a) => a.course_version_id))];
@@ -170,10 +183,27 @@ export async function GET(request: Request) {
   let lastActive: string | null = null;
   for (const a of attempts) {
     const cid = courseOfVer.get(a.course_version_id);
+    // ADR 0014 steps 7 and 12: a revision visit's row is never an attempt,
+    // never supplies progress and moves no last-active value.
+    const revision = isRevisionAttempt(a);
     const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
-    if (t && (!lastActive || t > lastActive)) lastActive = t;
+    if (!revision && t && (!lastActive || t > lastActive)) lastActive = t;
     if (!cid) continue;
     const row = byCourse.get(cid) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
+    byCourse.set(cid, row);
+    // Every row is scored with its flag: computeScoring and officialHistory
+    // drop a revision visit's row themselves (ADR 0014 step 6).
+    row.list.push({
+      id: a.id,
+      score: a.score,
+      started_at: a.started_at ?? "",
+      completed_at: a.completed_at,
+      completion_status: a.completion_status,
+      success_status: a.success_status,
+      status: a.status ?? null,
+      is_revision: a.is_revision ?? null,
+    });
+    if (revision) continue;
     row.attempts++;
     // ADR 0004 step 11: an abandoned attempt never supplies progress_pct and
     // never makes the course "in progress".
@@ -183,19 +213,9 @@ export async function GET(request: Request) {
       row.progressAt = a.started_at ?? "";
       row.progress = typeof a.progress_pct === "number" ? a.progress_pct : null;
     }
-    row.list.push({
-      id: a.id,
-      score: a.score,
-      started_at: a.started_at ?? "",
-      completed_at: a.completed_at,
-      completion_status: a.completion_status,
-      success_status: a.success_status,
-      status: a.status ?? null,
-    });
     if (a.success_status === "passed") row.status = "passed";
     else if (a.completion_status === "completed" && row.status !== "passed") row.status = "completed";
     else if (row.status === "not_started" && !abandoned) row.status = "in_progress";
-    byCourse.set(cid, row);
   }
   // 0073: scores follow each module's admin-configured attempt rules.
   const policies = await resolvePolicies(svc, [...byCourse.keys()]);
@@ -213,20 +233,43 @@ export async function GET(request: Request) {
   // Human-readable codes (0079), fail-soft before the migration.
   const courseCodes = await fetchReferenceCodes(svc, "courses", allCourseIds);
   const passRequired = await fetchPassRequired(svc, allCourseIds);
-  // 0083: consumed extra-attempt grants widen the scoring window so a granted
-  // retake is scored/official in the CRM feed too. Fail-soft (empty) pre-0083.
-  const extraByCourse = await fetchGrantRetakeIds(svc, uid, allCourseIds);
+  // 0083: approved grants per course (one read, keyed `${uid}:${cid}`): the
+  // retake ids widen the scoring window so a granted retake is scored/official
+  // in the CRM feed too, and the rows give the official-result chain (ADR 0014
+  // step 7). Strict (ADR 0014:188): a failed read answers 503, never a guess;
+  // a database without the table reads as no grants.
+  let grantsByCourse: Map<string, GrantSnapshot>;
+  try {
+    grantsByCourse = await grantSnapshotForUsers(svc, orgId, allCourseIds, [uid]);
+  } catch (e) {
+    if (!(e instanceof GrantReadError)) throw e;
+    console.warn(JSON.stringify({ event: "learner_summary_grants_unreadable", code: e.code }));
+    return NextResponse.json({ error: "grants_unreadable" }, { status: 503 });
+  }
+  // Revision-visit counts (ADR 0014 step 7): null for every course when the
+  // read failed or stopped at the page cap; 0 on a database without the table.
+  const visits = await fetchRevisionVisitStats(svc, { orgId, userIds: [uid] });
+  const visitsKnown = !visits.failed && !visits.capped;
   // 0081: which modules count as learning completed for path steps.
   const stepDone = new Map<string, boolean>();
   const courses = ((cRows ?? []) as Array<{ id: string; title: string }>).map((cr) => {
     const st = byCourse.get(cr.id) ?? { status: "not_started", attempts: 0, list: [], progress: null, progressAt: "" };
-    const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY, extraByCourse.get(cr.id) ?? []);
+    const key = `${uid}:${cr.id}`;
+    const grants = grantsByCourse.get(key);
+    const sc = computeScoring(st.list, policies.get(cr.id) ?? DEFAULT_POLICY, grants?.retakeIds ?? []);
     const due = dueByCourse.get(cr.id) ?? null;
     // 0081 revision rule: status and "done" follow the OFFICIAL attempt only.
     // A failed official attempt is learning completed ("failed"); revision
-    // runs never change it.
+    // runs never change it. ADR 0014 step 10: while a granted retake runs,
+    // status reads in_progress and progress_pct is the retake's; "done"
+    // keeps the standing result (overdue stays false, the path steps keep it).
     const status = courseStatus(sc, st.list);
     const done = sc.officialAttempt !== null;
+    const live = hasLiveGrantedRetake(st.list, sc.retakeIds);
+    // ADR 0014 step 7: the chain's retake state and the result it replaced.
+    const history = officialHistory(st.list, grants?.rows ?? []);
+    const retake = officialRetakeState(history);
+    const visit = visits.byPair.get(key);
     stepDone.set(cr.id, officialDone(sc, passRequired.has(cr.id)));
     return {
       course_id: cr.id,
@@ -240,12 +283,21 @@ export async function GET(request: Request) {
       best_score: pct(sc.bestScore),
       scored_attempts: sc.scoredAttempts,
       practice_attempts: sc.practiceAttempts,
-      // How far through the module the open attempt is (0–99); 100 when
-      // complete; null when the package gives no progress signal.
-      progress_pct: done ? 100 : st.progress,
+      // How far through the module the open attempt is (0–99; a running
+      // granted retake's); 100 when complete; null when the package gives no
+      // progress signal; never a revision visit's.
+      progress_pct: done && !live ? 100 : st.progress,
+      // Official attempts and granted retakes; never a revision visit.
       attempts: st.attempts,
       due_at: due,
       overdue: !!due && due < nowIso && !done,
+      // The official attempt's (the progress feed's rule).
+      completed_at: done ? sc.officialAttempt?.completed_at ?? null : null,
+      revision_visits: visitsKnown ? visit?.count ?? 0 : null,
+      last_revision_at: visitsKnown ? visit?.last ?? null : null,
+      official_retake: retake.state,
+      previous_official_score: retake.state === "completed" ? pct(retake.previous?.score ?? null) : null,
+      previous_official_status: retake.state === "completed" ? retake.previous?.status ?? null : null,
       // Feed straight into sso-link's `target`.
       target: `/${orgSlug}/courses/${cr.id}/launch`,
     };

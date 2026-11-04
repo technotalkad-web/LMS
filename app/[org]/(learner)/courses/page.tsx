@@ -5,7 +5,13 @@ import { createClient } from "@/lib/supabase/server";
 import { DashboardGrid, type GridCard } from "../dashboard/dashboard-grid";
 import { isReleased, laterOf } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
-import { DEFAULT_POLICY, computeScoring, courseStatus } from "@/lib/scoring/policy";
+import {
+  DEFAULT_POLICY,
+  computeScoring,
+  courseStatus,
+  hasLiveGrantedRetake,
+  isRevisionAttempt,
+} from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
 
@@ -74,6 +80,8 @@ type Attempt = {
   progress_pct?: number | null;
   /** ADR 0004 step 11: an abandoned (reset) attempt is never in progress. */
   status?: string | null;
+  /** 0103 (ADR 0014): a revision visit's row; undefined before the migration (= false). */
+  is_revision?: boolean | null;
 };
 
 export default async function CoursesIndexPage({
@@ -264,6 +272,9 @@ export default async function CoursesIndexPage({
   }
   // Official score under the course's rule (was: raw best of all attempts,
   // which ignored practice attempts and the first/best/latest setting).
+  // ADR 0014: no block rule (step 9) and no revision line (step 7); while a
+  // granted retake runs the card reads "in progress" (step 10), so it is not
+  // also labelled "revision only" (the same rule as the dashboard).
   function scoringForCourse(courseId: string) {
     const my = attempts.filter((a) => {
       const v = versionById.get(a.course_version_id);
@@ -274,8 +285,7 @@ export default async function CoursesIndexPage({
     return {
       scoring,
       scoredLeft: Math.max(0, policy.max_scored_attempts + scoring.extraAttempts - scoring.scoredAttempts),
-      practiceMode: scoring.practiceMode,
-      blocked: scoring.blocked,
+      practiceMode: scoring.practiceMode && !hasLiveGrantedRetake(my, scoring.retakeIds),
     };
   }
   function bestScoreForCourse(courseId: string): number | null {
@@ -283,10 +293,17 @@ export default async function CoursesIndexPage({
   }
   function cardExtras(courseId: string) {
     const s = scoringForCourse(courseId);
+    // The latest open row; a revision visit's row never supplies progress
+    // (ADR 0014 step 12).
     const open = attempts
       .filter((a) => {
         const v = versionById.get(a.course_version_id);
-        return v?.course_id === courseId && a.completion_status === "in_progress" && a.status !== "abandoned";
+        return (
+          v?.course_id === courseId &&
+          a.completion_status === "in_progress" &&
+          a.status !== "abandoned" &&
+          !isRevisionAttempt(a)
+        );
       })
       .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0] as
       | (Attempt & { progress_pct?: number | null })
@@ -294,10 +311,6 @@ export default async function CoursesIndexPage({
     return {
       scoredLeft: s.scoredLeft,
       practiceMode: s.practiceMode,
-      blocked: s.blocked,
-      practiceCount: s.scoring.practiceAttempts,
-      practiceBest: s.scoring.practiceBestScore,
-      practicePassed: s.scoring.practicePassed,
       progressPct: typeof open?.progress_pct === "number" ? open.progress_pct : null,
     };
   }

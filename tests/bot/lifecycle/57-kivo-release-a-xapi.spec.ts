@@ -344,7 +344,7 @@ test.describe.serial("KIVO Release A xAPI package on the LMS (staging)", () => {
     const src = await page.locator("iframe").first().getAttribute("src");
     expect(src, "launch page renders the course iframe").toBeTruthy();
     const qs = new URLSearchParams(src!.slice(src!.indexOf("?") + 1));
-    state.iframeParams = Object.fromEntries([...qs.entries()].map(([k, v]) => [k, k === "auth" ? v.slice(0, 10) + "…(redacted)" : v]));
+    state.iframeParams = Object.fromEntries([...qs.entries()].filter(([k]) => k !== "auth"));
     state.attemptId = qs.get("registration")!;
     console.log(`[57] attempt/registration=${state.attemptId} launch params: ${[...qs.keys()].join(", ")}`);
     expect(qs.get("activity_id")).toBe(state.activityId);

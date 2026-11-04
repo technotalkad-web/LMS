@@ -12,10 +12,18 @@ import {
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canViewReports } from "@/lib/auth/permissions";
-import { DEFAULT_POLICY, computeScoring, type ScoringResult } from "@/lib/scoring/policy";
+import {
+  DEFAULT_POLICY,
+  attemptCounts,
+  computeScoring,
+  hasLiveGrantedRetake,
+  isRevisionAttempt,
+  type ScoringResult,
+} from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { isOfficialFailed } from "@/lib/scoring/status";
-import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
+import { fetchGrantRetakeIdsForUsers, isMissingColumn, readWithOptionalColumn, type PgError } from "@/lib/scoring/attempt-kind";
+import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 import { contentFilterInOrg } from "@/lib/content/analytics-filter";
 import {
   courseProgress,
@@ -89,7 +97,10 @@ function chunk<T>(arr: T[], n: number): T[][] {
 
 /** .in() chunked at 150 + .range paged at 1000 — the PostgREST house rules.
  * `apply` is loosely typed on purpose: supabase-js builder generics explode
- * ("excessively deep") when threaded through helper signatures. */
+ * ("excessively deep") when threaded through helper signatures. A failed
+ * page reads as empty, as before; `onError` (optional) sees each error, and
+ * returning true stops the whole read (the narrower-select fallback of
+ * ADR 0014 step 7 decides on the first failed page). */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 async function fetchByIds<T>(
   svc: Svc,
@@ -97,14 +108,16 @@ async function fetchByIds<T>(
   select: string,
   col: string,
   ids: string[],
-  apply?: (q: any) => any
+  apply?: (q: any) => any,
+  onError?: (error: PgError) => boolean | void
 ): Promise<T[]> {
   const out: T[] = [];
   for (const part of chunk(ids, 150)) {
     for (let from = 0; ; from += 1000) {
       let q: any = svc.from(table).select(select).in(col, part).range(from, from + 999);
       if (apply) q = apply(q);
-      const { data } = await q;
+      const { data, error } = await q;
+      if (error && onError?.(error)) return out;
       const page = (data ?? []) as T[];
       out.push(...page);
       if (page.length < 1000) break;
@@ -140,6 +153,8 @@ type AttemptRow = {
   course_version_id: string;
   /** 'abandoned' never counts as in progress or official (ADR 0004 step 11). */
   status?: string | null;
+  /** ADR 0014 (0103): a revision visit's row is never an attempt and moves no last-active value. */
+  is_revision?: boolean | null;
   completion_status: "in_progress" | "completed" | null;
   success_status: "unknown" | "passed" | "failed" | null;
   score: number | null;
@@ -160,6 +175,8 @@ const toScorable = (a: AttemptRow) => ({
   completion_status: a.completion_status,
   success_status: a.success_status,
   status: a.status ?? null,
+  // ADR 0014 step 6: computeScoring drops flagged rows only if the mapper carries the flag.
+  is_revision: a.is_revision ?? null,
 });
 
 type CourseAssign = {
@@ -402,15 +419,35 @@ export default async function AnalyticsPage({
   }
 
   /* ---- learning data for the scope ---- */
-  const attempts = scopedIds.length
-    ? await fetchByIds<AttemptRow>(
-        svc,
-        "course_attempts",
-        "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units",
-        "user_id",
-        scopedIds,
-        (q) => q.eq("organization_id", org.id)
-      )
+  // ADR 0014 step 7: the explicit select names is_revision through the
+  // narrower-select fallback; a missing column (a database without 0103,
+  // where no row is flagged) stops the read at its first page and it is
+  // re-read without the column. Any other failed page reads as empty, as before.
+  const ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units";
+  const attempts: AttemptRow[] = scopedIds.length
+    ? (
+        await readWithOptionalColumn<AttemptRow[]>(
+          "is_revision",
+          async (columns) => {
+            let error: PgError = null;
+            const data = await fetchByIds<AttemptRow>(
+              svc,
+              "course_attempts",
+              columns,
+              "user_id",
+              scopedIds,
+              (q) => q.eq("organization_id", org.id),
+              (e) => {
+                error ??= e;
+                return isMissingColumn(e, "is_revision");
+              }
+            );
+            return { data, error };
+          },
+          ATTEMPT_COLUMNS
+        )
+      ).data ?? []
     : [];
   const versionIds = Array.from(new Set(attempts.map((a) => a.course_version_id)));
   const versionRows = versionIds.length
@@ -636,6 +673,8 @@ export default async function AnalyticsPage({
     const gam = gamByUser.get(uid);
     let lastActive: string | null = gam?.last_active_day ?? null;
     for (const a of my) {
+      // ADR 0014 step 12: a revision visit moves no last-active value.
+      if (isRevisionAttempt(a)) continue;
       const t = a.last_activity_at ?? a.completed_at ?? a.started_at;
       if (t && (!lastActive || t > lastActive)) lastActive = t;
     }
@@ -644,7 +683,8 @@ export default async function AnalyticsPage({
     // attempts alone: gamification's last_active_day is stamped on any
     // official-run commit, so it would keep a reset-only learner "started".
     // lastActive above keeps every attempt and the XP day for engagement.
-    const hasStarted = my.some((a) => a.status !== "abandoned");
+    // ADR 0014: a revision visit's row is not a start either.
+    const hasStarted = my.some((a) => a.status !== "abandoned" && !isRevisionAttempt(a));
 
     let overdue = 0;
     for (const [cid, due] of assignedMap) {
@@ -668,6 +708,8 @@ export default async function AnalyticsPage({
 
     const latestByCourse = new Map<string, AttemptRow>();
     for (const a of my) {
+      // ADR 0014 step 12: the latest row is never a revision visit's.
+      if (isRevisionAttempt(a)) continue;
       const cid = courseOfVersion.get(a.course_version_id);
       if (!cid) continue;
       const t = a.last_activity_at ?? a.completed_at ?? a.started_at ?? "";
@@ -718,15 +760,15 @@ export default async function AnalyticsPage({
     if (lensCourse) {
       const a = latestByCourse.get(lensCourse);
       const officialScore = scoringByCourse.get(lensCourse)?.officialScore ?? null;
-      lens = done.has(lensCourse)
+      // ADR 0014 step 10 on this admin cell: while a granted retake
+      // runs, the retake's progress, never "Completed · N %".
+      const lensRows = my.filter((x) => courseOfVersion.get(x.course_version_id) === lensCourse);
+      const lensRetakeIds = grants.get(`${uid}:${lensCourse}`) ?? new Set<string>();
+      const lensRetakeLive = hasLiveGrantedRetake(lensRows, lensRetakeIds);
+      lens = done.has(lensCourse) && !lensRetakeLive
         ? `Completed${officialScore != null ? ` · ${Math.round(officialScore * 100)}%` : ""}`
         : a
-          ? formatCourseProgress(
-              courseProgress(
-                my.filter((x) => courseOfVersion.get(x.course_version_id) === lensCourse),
-                unitCountByVersion
-              )
-            )
+          ? formatCourseProgress(courseProgress(lensRows, unitCountByVersion, { retakeIds: lensRetakeIds }))
           : assignedMap.has(lensCourse)
             ? "Not started"
             : "—";
@@ -757,8 +799,9 @@ export default async function AnalyticsPage({
       completed,
       pct: assigned > 0 ? Math.round((completed / assigned) * 100) : -1,
       avgScore,
-      // Attempts that were not reset (ADR 0004 step 11).
-      attempts: my.filter((a) => a.status !== "abandoned").length,
+      // Attempts that were not reset (ADR 0004 step 11), revision visits
+      // excluded (ADR 0014:186, "attempts excludes revision rows").
+      attempts: attemptCounts(my).live,
       xp: gam?.total_xp ?? 0,
       streak: gam?.current_streak_days ?? 0,
       lastActive,
@@ -774,6 +817,28 @@ export default async function AnalyticsPage({
       lens,
     };
   });
+
+  // ADR 0014:243: a learner who only revisits reads as inactive, with "Last
+  // revisit" beside the flag. One revision_visits read (deny-all: service
+  // client), bounded to the learners flagged "inactive Nd"; nothing is added
+  // on a failed read.
+  const INACTIVE_REASON = /^inactive \d+d$/;
+  const inactiveIds = stats.filter((s) => s.reasons.some((r) => INACTIVE_REASON.test(r))).map((s) => s.userId);
+  if (inactiveIds.length > 0) {
+    const visits = await fetchRevisionVisitStats(svc, { orgId: org.id, userIds: inactiveIds });
+    if (!visits.failed) {
+      const lastRevisit = new Map<string, string>();
+      for (const [key, v] of visits.byPair) {
+        const uid = key.slice(0, key.indexOf(":"));
+        const prev = lastRevisit.get(uid);
+        if (v.last && (!prev || Date.parse(v.last) > Date.parse(prev))) lastRevisit.set(uid, v.last);
+      }
+      for (const s of stats) {
+        const last = lastRevisit.get(s.userId);
+        if (last) s.reasons = s.reasons.map((r) => (INACTIVE_REASON.test(r) ? `${r} · last revisit ${last.slice(0, 10)}` : r));
+      }
+    }
+  }
 
   // Content lens narrows the population too: only learners for whom the
   // selected content is relevant (assigned/enrolled/attempted).
@@ -928,11 +993,14 @@ export default async function AnalyticsPage({
       const cid = courseOfVersion.get(a.course_version_id);
       if (!cid) continue;
       const row = perCourse.get(cid) ?? { attempts: 0, live: 0, best: null, last: null, status: "Not started", progress: emptyProgress };
-      row.attempts++;
+      // ADR 0014 step 7: a revision visit's row is never an attempt and
+      // never dates the course's last activity.
+      const revision = isRevisionAttempt(a);
+      if (!revision) row.attempts++;
       // ADR 0004 step 11: an abandoned (reset) attempt is never "in progress".
-      if (a.status !== "abandoned") row.live++;
+      if (!revision && a.status !== "abandoned") row.live++;
       attemptsOfCourse.set(cid, [...(attemptsOfCourse.get(cid) ?? []), a]);
-      const t = a.status !== "abandoned" ? a.last_activity_at ?? a.completed_at ?? a.started_at : null;
+      const t = !revision && a.status !== "abandoned" ? a.last_activity_at ?? a.completed_at ?? a.started_at : null;
       if (t && (!row.last || t > row.last)) row.last = t;
       perCourse.set(cid, row);
     }
@@ -940,26 +1008,34 @@ export default async function AnalyticsPage({
     for (const [cid, list] of attemptsOfCourse) {
       const row = perCourse.get(cid);
       if (row) {
-        row.best = computeScoring(
-          list.map(toScorable),
-          policies.get(cid) ?? DEFAULT_POLICY,
-          grants.get(`${list[0]?.user_id ?? ""}:${cid}`) ?? new Set<string>()
-        ).officialScore;
-        row.progress = courseProgress(list, unitCountByVersion);
+        const retakeIds = grants.get(`${list[0]?.user_id ?? ""}:${cid}`) ?? new Set<string>();
+        row.best = computeScoring(list.map(toScorable), policies.get(cid) ?? DEFAULT_POLICY, retakeIds).officialScore;
+        // This table's display only (ADR 0014 step 10): a running granted
+        // retake's own progress, never 100 %.
+        row.progress = courseProgress(list, unitCountByVersion, { retakeIds });
       }
     }
-    // Progress per course for path / journey roll-ups (0075).
+    // Progress per course for path / journey roll-ups (0075). Retake-unaware
+    // on purpose (no retakeIds): a passed step stays done in every roll-up
+    // while a granted retake runs (ADR 0014:195).
     const progressOf = (cid: string): CourseProgressView =>
-      perCourse.get(cid)?.progress ??
-      courseProgress(my.filter((x) => courseOfVersion.get(x.course_version_id) === cid), unitCountByVersion);
+      courseProgress(attemptsOfCourse.get(cid) ?? [], unitCountByVersion);
     for (const [cid, row] of perCourse) {
-      row.status = done.has(cid)
-        ? "Completed"
-        : row.live > 0
-          ? "In progress"
-          : "Not started";
-      void cid;
+      // ADR 0014 step 10: "In progress" while a granted retake runs,
+      // so the row never pairs "Completed" with the retake's progress.
+      const list = attemptsOfCourse.get(cid) ?? [];
+      const retakeLive = hasLiveGrantedRetake(list, grants.get(`${list[0]?.user_id ?? ""}:${cid}`) ?? new Set<string>());
+      row.status = retakeLive
+        ? "In progress"
+        : done.has(cid)
+          ? "Completed"
+          : row.live > 0
+            ? "In progress"
+            : "Not started";
     }
+    // Per-course revision visits for this one learner (ADR 0014 step 7;
+    // deny-all, service client; bounded by one user). "—" on a failed read.
+    const visits360 = await fetchRevisionVisitStats(svc, { orgId: org.id, userIds: [s.userId] });
     const courseRowsSorted = [...perCourse.entries()].sort((a, b) => {
       const order = (st: string) => (st === "In progress" ? 0 : st === "Not started" ? 1 : 2);
       return order(a[1].status) - order(b[1].status);
@@ -1053,6 +1129,7 @@ export default async function AnalyticsPage({
                   <th className="px-4 py-2">Progress</th>
                   <th className="px-4 py-2">Official score</th>
                   <th className="px-4 py-2">Attempts</th>
+                  <th className="px-4 py-2" title="Revision visits (review only, never an attempt): count · last revisit">Revisits</th>
                   <th className="px-4 py-2">Due</th>
                   <th className="px-4 py-2">Last activity</th>
                 </tr>
@@ -1060,7 +1137,10 @@ export default async function AnalyticsPage({
               <tbody>
                 {courseRowsSorted.map(([cid, r]) => {
                   const due = assignedMap.get(cid) ?? null;
-                  const isOver = !!due && due < nowIso && r.status !== "Completed";
+                  // The standing result is never overdue while a granted
+                  // retake runs (ADR 0014:195): `done`, not the row's status.
+                  const isOver = !!due && due < nowIso && !done.has(cid);
+                  const visit = visits360.failed ? null : visits360.byPair.get(`${s.userId}:${cid}`) ?? null;
                   return (
                     <tr key={cid} className="border-b border-line last:border-0">
                       <td className="px-5 py-2.5 font-medium">{courseTitle.get(cid) ?? cid.slice(0, 8)}</td>
@@ -1076,6 +1156,11 @@ export default async function AnalyticsPage({
                             {" "}· {r.attempts - r.live} reset
                           </span>
                         )}
+                      </td>
+                      <td className="px-4 py-2.5 tabular-nums whitespace-nowrap text-muted">
+                        {visit && visit.count > 0
+                          ? `${visit.count}${visits360.capped ? "+" : ""}${visit.last ? ` · ${fmtDate(visit.last)}` : ""}`
+                          : "—"}
                       </td>
                       <td className={`px-4 py-2.5 ${isOver ? "text-red-700 font-semibold" : "text-muted"}`}>
                         {due ? `${fmtDate(due)}${isOver ? " · overdue" : ""}` : "—"}

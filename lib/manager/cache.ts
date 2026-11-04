@@ -81,12 +81,19 @@ export async function readCachedInsights(
  * Recompute active members of an org for all four period windows and upsert
  * the rows, stalest people first, until `deadline` (ms epoch) — a large org
  * converges over consecutive runs. Returns counts for the cron's response.
+ *
+ * ADR 0014:188: a batch whose insights carry `historyUnavailable` (its grant
+ * read failed) is never upserted, so a transient failure cannot pin "History
+ * unavailable" in the cache for up to CACHE_MAX_AGE_MS. Its learners keep
+ * their previous row (a good read, at most one refresh old) and are counted
+ * in `skipped_unreadable` and in `pending`; once that row ages out they are
+ * computed live, and a reload recomputes.
  */
 export async function refreshOrgCache(
   svc: SupabaseClient,
   org: { id: string; slug: string },
   deadline = Number.POSITIVE_INFINITY
-): Promise<{ learners: number; batches: number; pending: number }> {
+): Promise<{ learners: number; batches: number; pending: number; skipped_unreadable: number }> {
   const members: Array<{ user_id: string }> = [];
   for (let from = 0; ; from += 1000) {
     const { data, error } = await svc
@@ -116,9 +123,15 @@ export async function refreshOrgCache(
   ids.sort((a, b) => (age.get(a) ?? "").localeCompare(age.get(b) ?? "") || a.localeCompare(b));
   let batches = 0;
   let done = 0;
+  let skippedUnreadable = 0;
   for (const part of chunk(ids, REFRESH_BATCH)) {
     if (Date.now() > deadline) break;
     const result = await computeLearnerInsights(svc, { orgId: org.id, orgSlug: org.slug, userIds: part, periodDays: 30, periods: PERIODS });
+    // One data load feeds every period window, so the 30-day learners carry the flag for all of them.
+    if (result.learners.some((l) => l.historyUnavailable === true)) {
+      skippedUnreadable += part.length;
+      continue;
+    }
     const computedAt = new Date().toISOString();
     const rows: Array<{ organization_id: string; user_id: string; period: string; computed_at: string; insight: LearnerInsight }> = [];
     for (const [key, learners] of result.byPeriod ?? []) {
@@ -142,7 +155,10 @@ export async function refreshOrgCache(
     const gone = [...new Set(((stale ?? []) as Array<{ user_id: string }>).map((r) => r.user_id))].filter((id) => !ids.includes(id));
     for (const part of chunk(gone, 150)) await svc.from("report_card_cache").delete().eq("organization_id", org.id).in("user_id", part);
   }
-  return { learners: done, batches, pending: ids.length - done };
+  if (skippedUnreadable > 0) {
+    console.warn(JSON.stringify({ event: "report_card_cache_skipped_unreadable", org_id: org.id, learners: skippedUnreadable }));
+  }
+  return { learners: done, batches, pending: ids.length - done, skipped_unreadable: skippedUnreadable };
 }
 
 /**

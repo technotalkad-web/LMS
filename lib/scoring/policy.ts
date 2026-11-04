@@ -106,6 +106,32 @@ export function normalizePolicy(raw: unknown): EffectivePolicy {
   };
 }
 
+/**
+ * ADR 0014 step 9: POST /api/scoring-rules refuses any rule
+ * value other than the default. Reads the RAW request body: each of the five
+ * rule fields is either absent (undefined or null, which the route's fills
+ * already read as the default) or equal to DEFAULT_POLICY's value; a numeric
+ * string counts as its number ("1" is 1). `after_limit: "block"` is never
+ * default. Pure, so the route's rule is unit-tested
+ * (tests/unit/scoring-rules-route.test.ts).
+ */
+export function isDefaultRule(body: unknown): boolean {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const absent = (v: unknown) => v === undefined || v === null;
+  const max = b.max_scored_attempts;
+  const maxOk =
+    absent(max) ||
+    (typeof max === "number" && max === DEFAULT_POLICY.max_scored_attempts) ||
+    (typeof max === "string" && max.trim() !== "" && Number(max) === DEFAULT_POLICY.max_scored_attempts);
+  return (
+    maxOk &&
+    (absent(b.official_basis) || b.official_basis === DEFAULT_POLICY.official_basis) &&
+    (absent(b.official_attempt_number) || b.official_attempt_number === DEFAULT_POLICY.official_attempt_number) &&
+    (absent(b.retain_first_attempt) || b.retain_first_attempt === DEFAULT_POLICY.retain_first_attempt) &&
+    (absent(b.after_limit) || b.after_limit === DEFAULT_POLICY.after_limit)
+  );
+}
+
 export type ScorableAttempt = {
   id: string;
   score: number | null;
@@ -251,6 +277,12 @@ export type ScoringResult = {
   extraAttempts: number;
   /** Ids of the attempts in the scored window (base window + completed grant retakes). */
   scoredWindowIds: Set<string>;
+  /**
+   * The grant-retake attempt ids this result was scored with (the `extra`
+   * argument as a set; empty for the legacy number form). courseStatus reads
+   * it for ADR 0014 step 10 (a live granted retake reads "in progress").
+   */
+  retakeIds: ReadonlySet<string>;
   /** Best score among practice (revision) attempts — informational only. */
   practiceBestScore: number | null;
   /** A revision attempt passed; never changes the official result. */
@@ -369,6 +401,7 @@ export function computeScoring(
     officialStatus,
     extraAttempts: extraCount,
     scoredWindowIds,
+    retakeIds,
     practiceBestScore: numeric(bestOf(practice)),
     practicePassed: practice.some((a) => a.success_status === "passed"),
     limitReached,
@@ -385,9 +418,18 @@ export type CourseStatus = "not_started" | "in_progress" | "completed" | "passed
  * revision (practice) pass never turns a failed module green, and a
  * failed official attempt is "failed" — learning completed, not passed.
  * No official attempt yet → in progress once any attempt exists.
+ *
+ * ADR 0014 step 10 (Q3, "show an official retake as in progress"): while a
+ * granted retake runs (hasLiveGrantedRetake over the rows scored, with the
+ * result's own retakeIds) the status reads "in_progress"; the standing
+ * result stays in scoring.officialStatus, which officialDone and the path
+ * and journey roll-ups keep reading until the retake completes.
  */
 export function courseStatus(scoring: ScoringResult, attempts: ScorableAttempt[]): CourseStatus {
-  if (scoring.officialAttempt) return scoring.officialStatus ?? "completed";
+  if (scoring.officialAttempt) {
+    if (hasLiveGrantedRetake(attempts, scoring.retakeIds)) return "in_progress";
+    return scoring.officialStatus ?? "completed";
+  }
   // ADR 0004 step 11: abandoned is never in progress.
   return excludeAbandoned(attempts).length === 0 ? "not_started" : "in_progress";
 }

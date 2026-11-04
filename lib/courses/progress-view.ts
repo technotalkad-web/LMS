@@ -9,12 +9,16 @@
  */
 
 export type ProgressAttemptRow = {
+  /** course_attempts.id: read only to match `retakeIds` (ADR 0014 step 10). */
+  id?: string | null;
   course_version_id: string;
   completion_status: string | null;
   success_status: string | null;
   started_at: string | null;
   /** course_attempts.status: abandoned attempts are skipped (ADR 0004 step 11). */
   status?: string | null;
+  /** course_attempts.is_revision (0103): a revision visit's row never supplies progress (ADR 0014 step 7). */
+  is_revision?: boolean | null;
   progress_pct?: number | null;
   /** cmi_data->cmi5->units (PostgREST JSON path select) or the full cmi_data. */
   units?: unknown;
@@ -46,23 +50,39 @@ function unitsOf(a: ProgressAttemptRow): Record<string, string> | null {
 /**
  * Progress of one learner on one course from their attempts on any of its
  * versions. `unitCountByVersion` maps version id → manifest unitCount.
+ *
+ * ADR 0014 step 10: with `opts.retakeIds` (the learner's grant-retake
+ * attempt ids on the course), a live granted retake (one of those ids, in
+ * progress, not done) is the source and the course is not done, so a
+ * per-course display shows the retake's progress, never 100 %. Only
+ * per-course display callers pass it: a call whose result feeds
+ * pathProgress or journeyProgress never does, so a passed step stays done
+ * in every roll-up while a retake runs (ADR 0014:195).
  */
 export function courseProgress(
   all: ProgressAttemptRow[],
-  unitCountByVersion?: Map<string, number | null>
+  unitCountByVersion?: Map<string, number | null>,
+  opts?: { retakeIds?: ReadonlySet<string> }
 ): CourseProgressView {
   // ADR 0004 step 11: an abandoned attempt is never in progress and never
   // supplies progress_pct; a learner whose only attempts were reset reads as
-  // not started.
-  const attempts = all.filter((a) => a.status !== "abandoned");
+  // not started. ADR 0014 step 7: a revision visit's row supplies nothing.
+  const attempts = all.filter((a) => a.status !== "abandoned" && a.is_revision !== true);
   if (attempts.length === 0) {
     return { pct: null, done: false, started: false, screensDone: null, screensTotal: null };
   }
-  const done = attempts.some(isDoneAttempt);
+  const newestFirst = (x: ProgressAttemptRow, y: ProgressAttemptRow) => ((x.started_at ?? "") < (y.started_at ?? "") ? 1 : -1);
+  const retakeIds = opts?.retakeIds;
+  const liveRetake = retakeIds?.size
+    ? attempts
+        .filter((a) => !!a.id && retakeIds.has(a.id) && a.status === "in_progress" && !isDoneAttempt(a))
+        .sort(newestFirst)[0]
+    : undefined;
+  const done = !liveRetake && attempts.some(isDoneAttempt);
   const open = attempts
     .filter((a) => !isDoneAttempt(a) && a.completion_status !== "completed")
-    .sort((x, y) => ((x.started_at ?? "") < (y.started_at ?? "") ? 1 : -1))[0];
-  const source = done ? null : open ?? null;
+    .sort(newestFirst)[0];
+  const source = liveRetake ?? (done ? null : open ?? null);
   let screensDone: number | null = null;
   let screensTotal: number | null = null;
   if (source) {

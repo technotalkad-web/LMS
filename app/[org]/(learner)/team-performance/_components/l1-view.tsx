@@ -53,6 +53,11 @@ export function L1View(p: L1ViewProps) {
   const struggles = buildStruggles(learners, benchmark);
   const summary = periodSummary(learners, period.days);
   const roster = [...learners].sort(compareWorstFirst).filter((l) => matchesStatusFilter(l, statusFilter));
+  // ADR 0014:188: learners whose history
+  // could not be read are counted nowhere, so no reassurance is shown while
+  // any is in scope, and the cards say how many were left out.
+  const readable = learners.filter((l) => !l.historyUnavailable);
+  const unreadableN = learners.length - readable.length;
   const contents = contentOptions(p.catalog);
   const current = { period: period.value, content: p.content, status: statusFilter };
   const team = learners.map((l) => ({ userId: l.userId, name: l.name }));
@@ -112,12 +117,17 @@ export function L1View(p: L1ViewProps) {
                   </li>
                 ))}
               </ul>
+              {score.unavailable > 0 && <p className="text-xs text-muted mt-2">{score.unavailable} not counted (history unavailable)</p>}
               <p className="text-[11px] text-muted mt-3">Weights 35 · 25 · 25 · 15. Status flags are always current; the period filter only changes the counts below.</p>
             </Card>
 
             <Card eyebrow="What needs your attention" className="lg:col-span-2">
               {exceptions.length === 0 ? (
-                <p className="text-sm text-muted">Nothing needs attention right now — everyone is on track.</p>
+                learners.some((l) => l.historyUnavailable) ? (
+                  <p className="text-sm text-muted">History unavailable for {unreadableN} {unreadableN === 1 ? "learner" : "learners"}. Please reload.</p>
+                ) : (
+                  <p className="text-sm text-muted">Nothing needs attention right now — everyone is on track.</p>
+                )
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {exceptions
@@ -193,7 +203,11 @@ export function L1View(p: L1ViewProps) {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <Card eyebrow="Where the team struggles">
               {struggles.length === 0 ? (
-                <p className="text-sm text-muted">No course or journey day is holding the team back right now.</p>
+                learners.some((l) => l.historyUnavailable) ? (
+                  <p className="text-sm text-muted">History unavailable for {unreadableN} {unreadableN === 1 ? "learner" : "learners"}. Please reload.</p>
+                ) : (
+                  <p className="text-sm text-muted">No course or journey day is holding the team back right now.</p>
+                )
               ) : (
                 <ul className="space-y-2 text-sm">
                   {struggles.map((s) => {
@@ -237,8 +251,9 @@ export function L1View(p: L1ViewProps) {
                 <li className="flex justify-between"><span>Courses completed</span><span className="tabular-nums font-medium">{summary.coursesCompleted}{summary.completionsDelta !== null ? <span className={`ml-2 text-xs ${summary.completionsDelta >= 0 ? "text-emerald-700" : "text-red-700"}`}>{summary.completionsDelta >= 0 ? "+" : ""}{summary.completionsDelta} vs previous</span> : null}</span></li>
                 <li className="flex justify-between"><span>Assessments passed first time</span><span className="tabular-nums font-medium">{summary.passedFirstTime}{period.days ? "" : ` / ${summary.assessmentsWithResult}`}</span></li>
                 <li className="flex justify-between"><span>Journey missions done</span><span className="tabular-nums font-medium">{summary.journeyMissions}</span></li>
-                <li className="flex justify-between"><span>Active this week</span><span className="tabular-nums font-medium">{learners.filter((l) => l.activeLast7d).length} / {learners.length}</span></li>
+                <li className="flex justify-between"><span>Active this week</span><span className="tabular-nums font-medium">{readable.filter((l) => l.activeLast7d).length} / {readable.length}</span></li>
               </ul>
+              {summary.unavailable > 0 && <p className="text-xs text-muted mt-2">{summary.unavailable} not counted (history unavailable)</p>}
               <p className="text-[11px] text-muted mt-3">As of {p.today} (organisation calendar).</p>
             </Card>
           </div>

@@ -35,7 +35,14 @@ import {
   pickActiveBackground,
   type DashboardBackground as DashboardBackgroundRow,
 } from "@/lib/theme/dashboard-background";
-import { DEFAULT_POLICY, computeScoring, courseStatus, officialDone } from "@/lib/scoring/policy";
+import {
+  DEFAULT_POLICY,
+  computeScoring,
+  courseStatus,
+  hasLiveGrantedRetake,
+  isRevisionAttempt,
+  officialDone,
+} from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
 
@@ -83,6 +90,8 @@ type Attempt = {
   progress_pct?: number | null;
   /** ADR 0004 step 11: an abandoned (reset) attempt is never in progress. */
   status?: string | null;
+  /** 0103 (ADR 0014): a revision visit's row; undefined before the migration (= false). */
+  is_revision?: boolean | null;
 };
 
 type PathStepView = {
@@ -742,10 +751,13 @@ export default async function DashboardPage({
     return scoringForCourse(courseId).scoring.officialScore;
   }
 
-  // Scoring window state for the card: how many scored attempts remain, and
-  // whether further launches are practice-only or blocked. Evaluated live
-  // against the CURRENT rule, so an admin changing the rule re-labels every
-  // card on the next load.
+  // Scoring state for the card: how many scored attempts remain, and whether
+  // further launches are review-only revision visits. ADR 0014 retired the
+  // window and the block rule (step 9) and the card's revision line (step
+  // 7). While a granted retake runs the card reads "in progress" through
+  // courseStatus (step 10), so it must not also say "revision only"
+  // (practiceMode false); the retake's open progress_pct then makes the
+  // label "Resume".
   function scoringForCourse(courseId: string) {
     const my = attempts.filter((a) => {
       const v = versionById.get(a.course_version_id);
@@ -756,18 +768,23 @@ export default async function DashboardPage({
     return {
       scoring,
       scoredLeft: Math.max(0, policy.max_scored_attempts + scoring.extraAttempts - scoring.scoredAttempts),
-      practiceMode: scoring.practiceMode,
-      blocked: scoring.blocked,
+      practiceMode: scoring.practiceMode && !hasLiveGrantedRetake(my, scoring.retakeIds),
     };
   }
 
   // Progress of the learner's most recent open attempt (0075); null when
-  // the package gives no progress signal.
+  // the package gives no progress signal. A revision visit's row never
+  // supplies it (ADR 0014 step 12: the "latest in-progress row" pick).
   function progressForCourse(courseId: string): number | null {
     const open = attempts
       .filter((a) => {
         const v = versionById.get(a.course_version_id);
-        return v?.course_id === courseId && a.completion_status === "in_progress" && a.status !== "abandoned";
+        return (
+          v?.course_id === courseId &&
+          a.completion_status === "in_progress" &&
+          a.status !== "abandoned" &&
+          !isRevisionAttempt(a)
+        );
       })
       .sort((x, y) => (x.started_at < y.started_at ? 1 : -1))[0];
     return typeof open?.progress_pct === "number" ? open.progress_pct : null;
@@ -778,10 +795,6 @@ export default async function DashboardPage({
     return {
       scoredLeft: s.scoredLeft,
       practiceMode: s.practiceMode,
-      blocked: s.blocked,
-      practiceCount: s.scoring.practiceAttempts,
-      practiceBest: s.scoring.practiceBestScore,
-      practicePassed: s.scoring.practicePassed,
     };
   }
 
@@ -857,11 +870,12 @@ export default async function DashboardPage({
   const pathCards: GridCard[] = paths.map((p) => {
     const total = p.steps.length;
     const done = p.steps.filter((s) => s.state === "completed").length;
+    // An open revision visit's row never starts a path (ADR 0014 steps 6 and 12).
     const started =
       done > 0 ||
       attempts.some(
         (a) =>
-          a.learning_path_id === p.id && a.completion_status !== "completed" && a.status !== "abandoned"
+          a.learning_path_id === p.id && a.completion_status !== "completed" && a.status !== "abandoned" && !isRevisionAttempt(a)
       );
     return {
       course_id: p.id,

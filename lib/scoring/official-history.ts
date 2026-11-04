@@ -13,7 +13,10 @@
  *   - a grant carrying `reissued_from` is followed (transitively) to the
  *     grant originally approved, which gives who, when and why;
  *   - a decided request's request-time result is the chain before the
- *     request's `created_at` (officialResultAt).
+ *     request's `created_at` (officialResultAt);
+ *   - a granted retake abandoned by a forced restart is listed apart, in
+ *     `reset` ("Granted retake, reset by a module update"), and
+ *     officialRetakeState reads the retake state and the previous result.
  *
  * Ordering key: (completed_at ?? started_at, started_at, id), the key of
  * computeScoring and of the 0090 view. The SQL restatement of the current
@@ -80,6 +83,15 @@ export type OfficialHistory = {
   entries: HistoryEntry[];
   /** The running granted retake, the chain's open end; null when none. */
   running: { attemptId: string; grant: HistoryGrantInfo | null } | null;
+  /**
+   * Granted retakes a forced restart abandoned (ADR 0014:185, "Granted
+   * retake, reset by a module update"): abandoned, non-revision rows that an
+   * approved grant links through `used_attempt_id`, in the ordering key's
+   * order, each with its own (superseded) grant's who, when and why. They
+   * are in neither `entries` nor `running`; the re-issued grant that
+   * followed carries `reissued_from` to the same original grant.
+   */
+  reset: Array<{ attemptId: string; startedAt: string; grant: HistoryGrantInfo }>;
 };
 
 function ts(iso: string | null | undefined): number {
@@ -156,12 +168,46 @@ export function officialHistory(attempts: HistoryAttempt[], grants: HistoryGrant
   const running = runningRow
     ? { attemptId: runningRow.id, grant: grantInfo(grantOfAttempt.get(runningRow.id)!, byId) }
     : null;
-  return { entries, running };
+
+  const reset = attempts
+    .filter((a) => a.status === "abandoned" && a.is_revision !== true && grantOfAttempt.has(a.id))
+    .sort(byKey)
+    .map((a) => ({ attemptId: a.id, startedAt: a.started_at, grant: grantInfo(grantOfAttempt.get(a.id)!, byId) }));
+  return { entries, running, reset };
 }
 
 /** The current official result: the newest entry; null before any official attempt. */
 export function currentOfficial(history: OfficialHistory): HistoryEntry | null {
   return history.entries[history.entries.length - 1] ?? null;
+}
+
+export type OfficialRetakeState = {
+  /** in_progress: a granted retake runs; completed: the current result is a retake; none otherwise. */
+  state: "none" | "in_progress" | "completed";
+  /** The current official result (the standing one while a retake runs). */
+  current: HistoryEntry | null;
+  /** The entry the current one superseded, when state is "completed"; else null. */
+  previous: HistoryEntry | null;
+  /** The running retake's grant, else the current retake's (its original through reissued_from); null for none. */
+  grant: HistoryGrantInfo | null;
+};
+
+/**
+ * The one reader of the chain's retake state and previous result (ADR 0014
+ * step 7: the learner block, the admin row and expander, the CSV's
+ * "Official retake" and "Previous official …" columns, the Report Card and
+ * the CRM's official_retake / previous_official_*), so every surface agrees.
+ * A reset retake leaves the state "none" unless another retake runs or
+ * completed (the CSV and the CRM carry no reset column).
+ */
+export function officialRetakeState(history: OfficialHistory): OfficialRetakeState {
+  const current = currentOfficial(history);
+  if (history.running) return { state: "in_progress", current, previous: null, grant: history.running.grant };
+  if (current && current.kind === "retake") {
+    const previous = history.entries.find((e) => e.supersededBy === current.attemptId) ?? null;
+    return { state: "completed", current, previous, grant: current.grant };
+  }
+  return { state: "none", current, previous: null, grant: null };
 }
 
 /**

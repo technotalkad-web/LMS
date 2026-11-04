@@ -86,7 +86,9 @@ export function applyCoverage(l: LearnerInsight, visible: Visible, periodDays: n
   const journeys = l.journeys.filter((j) => visible("journey", j.programId));
   const hidden = l.courses.length - courses.length + (l.paths.length - paths.length) + (l.journeys.length - journeys.length);
   if (hidden === 0) return { learner: l, hidden: 0 };
-  const d = deriveLearner({ courses, paths, journeys, lastActive: l.lastActive, periodDays, nowMs });
+  // ADR 0014:188: a learner whose grant read failed stays degraded (no
+  // figure from the remaining lines); the spread keeps the flag.
+  const d = deriveLearner({ courses, paths, journeys, lastActive: l.lastActive, periodDays, nowMs, historyUnavailable: l.historyUnavailable === true });
   return { learner: { ...l, courses, paths, journeys, ...d }, hidden };
 }
 

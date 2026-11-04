@@ -165,6 +165,13 @@ export async function sendReminders(
       if (!who?.email) { results.push({ userId: uid, status: "skipped", reason: "no email" }); continue; }
       const line = lineOf.get(uid);
       if (!line) { results.push({ userId: uid, status: "skipped", reason: "not assigned this course" }); continue; }
+      // ADR 0014:188: with the learner's grant read
+      // failed the line carries no status, so nothing is sent or recorded:
+      // they may already have passed.
+      if (line.historyUnavailable || line.status === "unavailable") {
+        results.push({ userId: uid, status: "skipped", reason: "records could not be read; try again" });
+        continue;
+      }
       if (line.status === "completed" || line.status === "passed" || line.status === "failed") {
         results.push({ userId: uid, status: "skipped", reason: "already completed" });
         continue;

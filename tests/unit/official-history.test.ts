@@ -11,6 +11,7 @@ import {
   currentOfficial,
   officialHistory,
   officialResultAt,
+  officialRetakeState,
   type HistoryAttempt,
   type HistoryGrant,
 } from "../../lib/scoring/official-history";
@@ -121,6 +122,66 @@ console.log("\nthe request-time result (a decided request: the chain before its 
   eq("between #1 and the retake → #1 (failed)", [officialResultAt(h, "2026-10-03T00:00:00Z")?.attemptId, officialResultAt(h, "2026-10-03T00:00:00Z")?.status], ["a1", "failed"]);
   eq("after the retake → the retake (passed)", officialResultAt(h, "2026-10-20T00:00:00Z")?.attemptId, "r1");
   eq("exactly at a completion → the previous entry (completed BEFORE T)", officialResultAt(h, "2026-10-05T09:30:00Z")?.attemptId, "a1");
+}
+
+console.log("\nofficialRetakeState: the one reader of the retake state and the previous result");
+{
+  const none = officialRetakeState(officialHistory([att("a1", 1, "passed")], []));
+  eq("none: no retake → state none, the current result, no previous, no grant",
+    [none.state, none.current?.attemptId, none.previous, none.grant], ["none", "a1", null, null]);
+  eq("…and before any official attempt", officialRetakeState(officialHistory([], [])), { state: "none", current: null, previous: null, grant: null });
+
+  const live = { ...att("r2", 9, "unknown"), completed_at: null, completion_status: "in_progress", success_status: "unknown", status: "in_progress" };
+  const running = officialRetakeState(officialHistory([att("a1", 1, "passed"), live], [grant("g2", "r2", 8)]));
+  eq("running: state in_progress; current = the standing result; no previous; the running retake's grant",
+    [running.state, running.current?.attemptId, running.previous, running.grant?.grantId], ["in_progress", "a1", null, "g2"]);
+
+  const done = officialRetakeState(officialHistory([att("a1", 1, "passed"), att("r1", 5, "failed")], [grant("g1", "r1", 3)]));
+  eq("completed: state completed; current = the retake; previous = the entry it superseded",
+    [done.state, done.current?.attemptId, done.current?.status, done.previous?.attemptId, done.previous?.status, done.previous?.score],
+    ["completed", "r1", "failed", "a1", "passed", 0.9]);
+  eq("…its grant", done.grant?.grantId, "g1");
+  const two = officialRetakeState(
+    officialHistory([att("a1", 1, "failed"), att("r1", 5, "passed"), att("r2", 8, "failed")], [grant("g1", "r1", 3), grant("g2", "r2", 6)])
+  );
+  eq("two retakes: previous is the entry the current superseded (the first retake), not official #1", [two.current?.attemptId, two.previous?.attemptId], ["r2", "r1"]);
+
+  const g1 = grant("g1", "r1", 3);
+  const g2 = grant("g2", "r2", 6, { reissued_from: "g1", decision_note: "re-issued by forced restart of version 2" });
+  const resetRow = { ...att("r1", 4, "unknown"), status: "abandoned", completed_at: null, completion_status: "in_progress" };
+  const reissued = officialRetakeState(officialHistory([att("a1", 1, "failed"), resetRow, att("r2", 7, "passed")], [g1, g2]));
+  eq("a re-issued grant's retake: the grant info is the original's through reissued_from",
+    [reissued.state, reissued.grant?.grantId, reissued.grant?.originalGrantId, reissued.grant?.decisionNote, reissued.grant?.reissuedAt],
+    ["completed", "g2", "g1", "note g1", "2026-10-06T08:30:00Z"]);
+}
+
+console.log("\nreset: a granted retake abandoned by a forced restart (ADR 0014:185)");
+{
+  const reset = { ...att("r1", 4, "unknown"), status: "abandoned", completed_at: null, completion_status: "in_progress", success_status: "unknown" };
+  const g1 = grant("g1", "r1", 3);
+  const h = officialHistory([att("a1", 1, "passed"), reset], [g1]);
+  eq("an abandoned grant-linked row is in reset, with the superseded grant's who, when and why", h.reset, [
+    {
+      attemptId: "r1",
+      startedAt: "2026-10-04T09:00:00Z",
+      grant: { grantId: "g1", originalGrantId: "g1", decidedBy: "admin-g1", decidedAt: "2026-10-03T08:30:00Z", decisionNote: "note g1", reason: "reason g1", reissuedAt: null },
+    },
+  ]);
+  eq("…and in neither entries nor running", [h.entries.map((e) => e.attemptId), h.running], [["a1"], null]);
+  eq("…the retake state stays none (no live or completed retake)", officialRetakeState(h).state, "none");
+  eq("an abandoned row no grant links appears nowhere", officialHistory([att("a1", 1, "passed"), { ...reset, id: "x1" }], [g1]).reset, []);
+  eq("an abandoned revision row appears nowhere", officialHistory([att("a1", 1, "passed"), { ...reset, is_revision: true }], [g1]).reset, []);
+  eq("a declined grant links nothing", officialHistory([att("a1", 1, "passed"), reset], [grant("g1", "r1", 3, { status: "rejected" })]).reset, []);
+
+  // A reset, then the re-issued grant and its completed retake.
+  const g2 = grant("g2", "r2", 6, { reissued_from: "g1", decision_note: "re-issued by forced restart of version 2" });
+  const h2 = officialHistory([att("a1", 1, "passed"), reset, att("r2", 8, "failed")], [g1, g2]);
+  eq("a reset followed by a re-issued grant and a completed retake → one reset, one retake entry",
+    [h2.reset.map((r) => r.attemptId), h2.entries.filter((e) => e.kind === "retake").map((e) => e.attemptId)], [["r1"], ["r2"]]);
+  eq("…the two are joined by originalGrantId", [h2.reset[0]?.grant.originalGrantId, h2.entries[1]?.grant?.originalGrantId], ["g1", "g1"]);
+  eq("…the retake state is completed, the pass is the previous result", [officialRetakeState(h2).state, officialRetakeState(h2).previous?.attemptId], ["completed", "a1"]);
+  const order = officialHistory([att("a1", 1, "passed"), { ...reset, id: "r3", started_at: "2026-10-09T09:00:00Z" }, reset], [g1, grant("g3", "r3", 8)]);
+  eq("several resets are listed in the ordering key's order", order.reset.map((r) => r.attemptId), ["r1", "r3"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

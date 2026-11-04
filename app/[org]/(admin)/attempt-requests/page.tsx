@@ -2,9 +2,17 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
+import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
+import {
+  fetchPassRequired,
+  grantSnapshotForUsers,
+  readPagedWithOptionalColumn,
+  type GrantSnapshot,
+  type PgError,
+} from "@/lib/scoring/attempt-kind";
+import { officialHistory, officialResultAt, type OfficialHistory } from "@/lib/scoring/official-history";
+import { resultStands } from "@/lib/attempts/request-decision";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { resolveEmails } from "@/lib/users/emails";
 import { AttemptRequestsQueue, type AttemptRequestRow, type BulkCourse } from "./attempt-requests-queue";
@@ -35,13 +43,16 @@ export default async function AttemptRequestsPage({
     user_id: string;
     course_id: string;
     status: "pending" | "approved" | "rejected" | "expired";
-    source: "request" | "bulk" | "manager" | "ticket";
+    /** "restart": re-issued by a forced restart (0103, ADR 0014 step 8). */
+    source: "request" | "bulk" | "manager" | "ticket" | "restart";
     reason: string | null;
     decision_note: string | null;
     decided_by: string | null;
     decided_at: string | null;
     expires_at: string | null;
     used_at: string | null;
+    /** The retake this grant opened (0083); null while unused. */
+    used_attempt_id?: string | null;
     created_at: string;
     /** 0085 — undefined before the migration. */
     attempts_used?: number | null;
@@ -81,13 +92,40 @@ export default async function AttemptRequestsPage({
     }
   }
 
-  // Current official score/status per (learner, course) across all versions.
-  const current = new Map<string, { score: number | null; status: string | null; used: number }>();
+  // Per (learner, course) across all versions: the live official score/status
+  // (pending rows), whether that result stands (the queue's confirmation box,
+  // ADR 0014 step 11 (4)), and the official-result chain (ADR 0014 step 7),
+  // from which a decided row reads its request-time result.
+  const pct = (v: number | null) => (v !== null ? Math.round(v * 100) : null);
+  type Current = {
+    score: number | null;
+    status: string | null;
+    used: number;
+    stands: boolean;
+    history: OfficialHistory | null;
+    byId: Map<string, ScorableAttempt>;
+  };
+  const current = new Map<string, Current>();
+  // The grant links are read strictly (ADR 0014:188): on a failed grant read,
+  // a failed versions read or a failed attempts page (below), every decided
+  // row reads "History unavailable" in place of its request-time result and
+  // the queue disables Approve (the PATCH route stays the backstop); after a
+  // failed grant read the live figures also use no retake ids for this render.
+  let historyUnavailable = false;
   if (courseIds.length && userIds.length) {
-    const { data: verRows } = await svc
+    const { data: verRows, error: verErr } = await svc
       .from("course_versions")
       .select("id, course_id")
       .in("course_id", courseIds);
+    // A failed versions read (or an answer with neither rows nor an error)
+    // leaves no attempts to read, so the chain would be empty, not unread:
+    // the history reads unavailable, as on a failed attempts page.
+    if (verErr || !verRows) {
+      historyUnavailable = true;
+      console.warn(
+        JSON.stringify({ event: "attempt_requests_versions_unreadable", org_id: org.id, code: verErr?.code ?? "error" })
+      );
+    }
     const verToCourse = new Map<string, string>();
     const verIds: string[] = [];
     for (const v of (verRows ?? []) as Array<{ id: string; course_id: string }>) {
@@ -96,48 +134,97 @@ export default async function AttemptRequestsPage({
     }
     const attByUserCourse = new Map<string, ScorableAttempt[]>();
     if (verIds.length) {
-      const PAGE = 1000;
-      for (let from = 0; ; from += PAGE) {
-        const { data, error } = await svc
-          .from("course_attempts")
-          .select("id, user_id, course_version_id, score, started_at, completed_at, completion_status, success_status")
-          .in("course_version_id", verIds)
-          .in("user_id", userIds)
-          .order("id")
-          .range(from, from + PAGE - 1);
-        if (error) break;
-        const page = (data ?? []) as Array<ScorableAttempt & { user_id: string; course_version_id: string }>;
-        for (const a of page) {
-          const cid = verToCourse.get(a.course_version_id);
-          if (!cid) continue;
-          const key = `${a.user_id}:${cid}`;
-          attByUserCourse.set(key, [...(attByUserCourse.get(key) ?? []), a]);
-        }
-        if (page.length < PAGE) break;
+      // The rows carry `status` and `is_revision` (the narrower-select
+      // fallback, readPagedWithOptionalColumn: the first page decides the
+      // column list for the rest), so an abandoned or a revision visit's row
+      // never counts. A page with neither rows nor an error is an error
+      // (nullIsError), never the end of the read.
+      const ATTEMPT_COLUMNS = "id, user_id, course_version_id, status, score, started_at, completed_at, completion_status, success_status";
+      type Row = ScorableAttempt & { user_id: string; course_version_id: string };
+      const attemptsRead = await readPagedWithOptionalColumn<Row>(
+        "is_revision",
+        (cols, from, to) =>
+          svc
+            .from("course_attempts")
+            .select(cols)
+            .in("course_version_id", verIds)
+            .in("user_id", userIds)
+            .order("id")
+            .range(from, to) as unknown as PromiseLike<{ data: Row[] | null; error: PgError }>,
+        ATTEMPT_COLUMNS,
+        { nullIsError: true }
+      );
+      // A failed attempts page leaves the lists partial, so the chain built
+      // from them could be wrong: the history reads unavailable, as on a
+      // failed grant read (ADR 0014:188).
+      if (attemptsRead.error) {
+        historyUnavailable = true;
+        console.warn(
+          JSON.stringify({ event: "attempt_requests_attempts_unreadable", org_id: org.id, code: attemptsRead.error.code ?? "error" })
+        );
+      }
+      for (const a of attemptsRead.data) {
+        const cid = verToCourse.get(a.course_version_id);
+        if (!cid) continue;
+        const key = `${a.user_id}:${cid}`;
+        attByUserCourse.set(key, [...(attByUserCourse.get(key) ?? []), a]);
       }
     }
     const policies = await resolvePolicies(svc, courseIds);
-    const retakeByUser = await fetchGrantRetakeIdsForUsers(svc, org.id, userIds);
+    const passRequired = await fetchPassRequired(svc, courseIds);
+    let snapshots = new Map<string, GrantSnapshot>();
+    try {
+      snapshots = await grantSnapshotForUsers(svc, org.id, courseIds, userIds);
+    } catch (e) {
+      historyUnavailable = true;
+      console.warn(
+        JSON.stringify({ event: "attempt_requests_grants_unreadable", org_id: org.id, code: (e as { code?: string })?.code ?? "error" })
+      );
+    }
     for (const r of raw) {
       const key = `${r.user_id}:${r.course_id}`;
       if (current.has(key)) continue;
       const list = attByUserCourse.get(key) ?? [];
-      const sc = computeScoring(list, policies.get(r.course_id)!, retakeByUser.get(key) ?? []);
+      const snap = snapshots.get(key);
+      const sc = computeScoring(list, policies.get(r.course_id)!, snap?.retakeIds ?? []);
       current.set(key, {
-        score: sc.officialScore !== null ? Math.round(sc.officialScore * 100) : null,
+        score: pct(sc.officialScore),
         status: sc.officialStatus,
         used: sc.scoredAttempts,
+        stands: !historyUnavailable && resultStands(sc, passRequired.has(r.course_id)),
+        history: historyUnavailable ? null : officialHistory(list, snap?.rows ?? []),
+        byId: new Map(list.map((a) => [a.id, a])),
       });
     }
   }
 
+  /** The retake a used grant opened, from its own row (ADR 0014 step 7: "Opened retake: <status, score>"). */
+  const openedRetake = (cur: Current | undefined, attemptId: string): AttemptRequestRow["opened_retake"] => {
+    const a = cur?.byId.get(attemptId);
+    if (!a) return { attempt_id: attemptId, status: null, score: null };
+    const status = isCompletedAttempt(a)
+      ? a.success_status === "passed"
+        ? "passed"
+        : a.success_status === "failed"
+          ? "failed"
+          : "completed"
+      : a.status === "abandoned"
+        ? "reset"
+        : "in_progress";
+    return { attempt_id: attemptId, status, score: isCompletedAttempt(a) ? pct(a.score) : null };
+  };
+
   const rows: AttemptRequestRow[] = raw.map((r) => {
     const key = `${r.user_id}:${r.course_id}`;
-    const cur = current.get(key) ?? { score: null, status: null, used: 0 };
+    const found = current.get(key);
+    const cur = found ?? { score: null, status: null, used: 0, stands: false, history: null };
     // Attempts used when the request was made: the stored value is the truth for
     // the history (live scoring moves on after a grant); fall back to live for
     // pending rows and any row written before 0085.
     const used = typeof r.attempts_used === "number" ? r.attempts_used : cur.used;
+    // A decided row shows the official result at request time (the chain
+    // before created_at), never the live status (ADR 0014 step 7).
+    const atRequest = r.status !== "pending" && cur.history ? officialResultAt(cur.history, r.created_at) : null;
     return {
       id: r.id,
       status: r.status,
@@ -158,6 +245,10 @@ export default async function AttemptRequestsPage({
       current_score: cur.score,
       current_status: cur.status,
       attempts_used: used,
+      request_time_result: atRequest ? { score: pct(atRequest.score), status: atRequest.status } : null,
+      history_unavailable: historyUnavailable,
+      result_stands: r.status === "pending" && cur.stands,
+      opened_retake: r.status === "approved" && r.used_attempt_id ? openedRetake(found, r.used_attempt_id) : null,
     };
   });
 

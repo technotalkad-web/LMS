@@ -6,14 +6,24 @@ import {
   PlayCircle,
   ChevronRight,
 } from "lucide-react";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { languageDisplay } from "@/lib/i18n/languages";
-import { computeScoring, latestResetRetake } from "@/lib/scoring/policy";
+import { computeScoring, hasLiveGrantedRetake, isRevisionAttempt, latestResetRetake } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
-import { grantRetakeIdsFor, fetchPassRequired } from "@/lib/scoring/attempt-kind";
+import { grantSnapshotFor, fetchPassRequired, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
+import {
+  officialHistory,
+  officialRetakeState,
+  type HistoryEntry,
+  type HistoryGrantInfo,
+} from "@/lib/scoring/official-history";
+import { requestDecision, resultStands } from "@/lib/attempts/request-decision";
+import { fetchMyRevisits } from "@/lib/attempts/revision-visits";
+import { courseProgress } from "@/lib/courses/progress-view";
 import {
   ChangeLanguageMenu,
   type ChangeLanguageOption,
@@ -185,14 +195,45 @@ export default async function CourseDetailPage({
   // 0073: which attempts count (scoring window / official basis / what
   // happens after the window). Fail-soft → platform default pre-migration.
   const policy = await resolvePolicy(supabase, c.id);
-  const retakeIds = await grantRetakeIdsFor(supabase, user.id, c.id);
+  // ADR 0014 step 7 (strict reads): one strict grant read, used two ways.
+  // On a failed read the history block and the row markers read "History
+  // unavailable. Please reload." (a record is never guessed), while the
+  // result card and the launch labels take empty retake ids for this one
+  // render (display only) and the step 8 notice stays absent. The learner's
+  // own attempt_requests rows are readable through RLS (0083).
+  let snapshot: GrantSnapshot | null = null;
+  let historyUnavailable = false;
+  try {
+    snapshot = await grantSnapshotFor(supabase, user.id, c.id);
+  } catch {
+    historyUnavailable = true;
+  }
+  const retakeIds: Set<string> = snapshot?.retakeIds ?? new Set<string>();
   const scoring = computeScoring(attempts, policy, retakeIds);
   const passRequired = (await fetchPassRequired(supabase, [c.id])).has(c.id);
+  // ADR 0014 step 10: a granted retake is running. courseStatus is not
+  // called on this page, so the step is applied here: the CTA resumes it,
+  // the "Revision" pill and the revisit notice are hidden, and the official
+  // score card keeps the standing result.
+  const liveRetake = hasLiveGrantedRetake(attempts, scoring.retakeIds);
+  // ADR 0014 step 7: the official-result chain (one definition for every
+  // surface) and its retake state.
+  const history = officialHistory(attempts, snapshot?.rows ?? []);
+  const retakeState = officialRetakeState(history);
+  // "Revisited N times": revision_visits is deny-all (0103), so this one read
+  // goes through the service client, scoped to the signed-in user's own id
+  // and this course. Nothing else on this page uses the service client.
+  const svc = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
+  const revisits = await fetchMyRevisits(svc, user.id, c.id);
 
   // 0083: this learner's extra-attempt request/grant state for the course. A
   // live (approved, unexpired, unused) grant unblocks the launch — the launch
-  // gate turns it into a fresh official retake — and suppresses the "limit
-  // reached"/practice messaging. Fail-soft (no state) on a pre-0083 database.
+  // gate turns it into a fresh official retake — and suppresses the
+  // revisit messaging. Fail-soft (no state) on a pre-0083 database.
   let attemptRequestState: "none" | "pending" | "granted" | "rejected" = "none";
   let grantExpiresAt: string | null = null;
   let requestRejectionNote: string | null = null;
@@ -229,26 +270,27 @@ export default async function CourseDetailPage({
     /* pre-0083 */
   }
 
-  // An in-progress attempt that is itself a consumed grant retake is an
-  // official run the learner must be able to resume — even under a block rule.
-  // status, not completion_status: an ABANDONED retake keeps
-  // completion_status 'in_progress' but is terminal (ALDS step 0, P4).
-  const hasInProgressOfficialRetake = attempts.some(
-    (a) => a.status === "in_progress" && retakeIds.has(a.id)
-  );
-  const launchBlocked =
-    scoring.blocked && !hasUnusedGrant && !hasInProgressOfficialRetake && !isAdmin;
-  // The learner may ask for another attempt when they've used up their official
-  // window and did not pass (a failed verdict, or a pass-required module they
-  // didn't pass) and have no open request/grant already.
-  const officialFailed =
-    scoring.officialStatus === "failed" ||
-    (passRequired && scoring.officialAttempt !== null && scoring.officialStatus !== "passed");
+  // ADR 0014 step 11 (1): the learner may ask for another official attempt
+  // once an official result exists and no granted retake is live (the rule
+  // POST /api/attempt-requests checks too: requestDecision), with no open
+  // request or grant already. A pass is not a refusal: the modal warns.
+  // With the history unavailable the page cannot tell whether a retake is
+  // live, so the button is hidden for this render (the route stays the
+  // backstop). ADR 0014 step 9 retired the block rule, so nothing refuses a
+  // launch here any more.
   const canRequestAttempt =
     !isAdmin &&
-    scoring.limitReached &&
-    officialFailed &&
+    !historyUnavailable &&
+    requestDecision({ scoring, attempts }) === "ok" &&
     (attemptRequestState === "none" || attemptRequestState === "rejected");
+  // The modal's warning when the official result stands (passed, or
+  // completed on a module without a pass mark).
+  const standingResult: { kind: "passed" | "completed"; scorePct: number | null } | null = resultStands(scoring, passRequired)
+    ? {
+        kind: scoring.officialStatus === "passed" ? "passed" : "completed",
+        scorePct: scoring.officialScore === null ? null : Math.round(scoring.officialScore * 100),
+      }
+    : null;
 
   // Sticky completion: a course that was ever completed/passed stays
   // "complete" even after the learner relaunches it (which opens a fresh
@@ -269,16 +311,20 @@ export default async function CourseDetailPage({
     const pkg = versionById.get(a.course_version_id)?.package_id ?? null;
     return pkg === null || activePackageIds.has(pkg);
   };
+  // A revision visit's row is never an attempt in progress (ADR 0014 step 7).
   const isInProgress =
     !isComplete &&
-    attempts.some((a) => a.status === "in_progress" && resumable(a));
+    attempts.some((a) => a.status === "in_progress" && !isRevisionAttempt(a) && resumable(a));
 
   // A one-line note when the learner's latest attempt was reset by an admin
   // action: its package was deactivated or its version is no longer that
   // language's current version (replaced with force-restart). A reset the
   // learner chose (language switch, granted retake) gets no note.
+  // The newest NON-REVISION row (the list is ordered started_at desc): a
+  // stale revision row the launch page closed is abandoned and newest, and
+  // would otherwise read as a reset (ADR 0014 step 7).
   let resetByAdmin = false;
-  const latestAttempt = attempts[0];
+  const latestAttempt = attempts.find((a) => !isRevisionAttempt(a));
   if (latestAttempt?.status === "abandoned") {
     const { data: allPkgRows } = await supabase
       .from("course_packages")
@@ -294,8 +340,8 @@ export default async function CourseDetailPage({
   // ADR 0014 step 8: the learner's newest non-revision attempt is a granted
   // retake that a forced restart reset, and no granted retake is live. The
   // notice sits above the request button and is hidden once a request is
-  // pending or a grant is live. retakeIds come from the fail-soft reader, so
-  // on a failed read the notice is absent, never wrong.
+  // pending or a grant is live. retakeIds are empty when the strict grant
+  // read failed, so the notice is then absent, never wrong.
   const showResetRetakeNotice =
     latestResetRetake(attempts, retakeIds) && attemptRequestState !== "pending" && !hasUnusedGrant;
 
@@ -306,6 +352,19 @@ export default async function CourseDetailPage({
   // see it (with a badge) so they can preview what they've hidden.
   const attemptsHidden = c.show_attempts_history === false;
   const showAttemptsSection = isAdmin || !attemptsHidden;
+
+  // ADR 0014 step 7: "My attempts" lists official attempts and granted
+  // retakes only (a revision visit is counted in the line under the header),
+  // each row carrying its place in the chain. The "Official result history"
+  // block reads the same chain; while a retake runs its first line carries
+  // the retake's progress (a per-course display, so courseProgress gets the
+  // retake ids).
+  const attemptRows = attempts.filter((a) => !isRevisionAttempt(a));
+  const markers = historyUnavailable ? new Map<string, string[]>() : attemptMarkers(history, retakeState.current);
+  const runningPct =
+    retakeState.state === "in_progress" ? courseProgress(attempts, undefined, { retakeIds: scoring.retakeIds }).pct : null;
+  const historyLines = historyUnavailable ? [] : officialHistoryLines(history, retakeState.current, runningPct);
+  const showHistoryBlock = historyUnavailable ? attemptRows.length > 0 : historyLines.length > 0;
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -394,6 +453,36 @@ export default async function CourseDetailPage({
               </div>
             )}
 
+            {/* ADR 0014 step 7: the official-result history, under the
+                official score and OUTSIDE the hideable attempts section.
+                Text, not links: the attempt page refuses a learner when the
+                attempts history is hidden. The grant line names "your
+                administrator", never a name or email. */}
+            {showHistoryBlock && (
+              <div
+                className="border border-line rounded-xl p-4 sm:p-5"
+                data-testid="official-result-history"
+              >
+                <div className="text-[11px] uppercase tracking-wide text-muted mb-2">
+                  Official result history
+                </div>
+                {historyUnavailable ? (
+                  <p className="text-sm text-muted">History unavailable. Please reload.</p>
+                ) : (
+                  <ul className="space-y-2 text-sm">
+                    {historyLines.map((line) => (
+                      <li key={line.key} data-testid="official-history-line">
+                        <div className={line.current ? "text-ink font-medium" : "text-muted"}>{line.text}</div>
+                        {line.grant && (
+                          <div className="text-xs text-muted mt-0.5">{grantLine(line.grant)}</div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
             {/* ADR 0014 step 3: the launch page refused this launch (a read it
                 could not make, or a launch kind the row disagreed with) and
                 wrote nothing; a retry decides again. */}
@@ -416,21 +505,13 @@ export default async function CourseDetailPage({
                 ) : null}
               </p>
             )}
-            {!hasUnusedGrant && scoring.practiceMode && (
+            {!hasUnusedGrant && !liveRetake && scoring.practiceMode && (
               <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
                 You&apos;ve completed this course. You can revisit it any time to
                 review — revisiting won&apos;t change your result.
               </p>
             )}
-            {!hasUnusedGrant && scoring.blocked && (
-              <p className="text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-                You&apos;ve used your attempt for this course.
-                {attemptRequestState === "pending"
-                  ? " Your request for another attempt is under review."
-                  : " Request another attempt below, or contact your administrator."}
-              </p>
-            )}
-            {attemptRequestState === "pending" && !scoring.blocked && (
+            {attemptRequestState === "pending" && (
               <p className="text-xs text-sky-900 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2">
                 Your request for another attempt is under review.
               </p>
@@ -469,46 +550,39 @@ export default async function CourseDetailPage({
                 <PlayCircle className="w-5 h-5" />
                 Not available right now
               </button>
-            ) : current && !launchBlocked ? (
+            ) : current ? (
               <Link
                 href={`/${orgSlug}/courses/${c.id}/launch`}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3.5 rounded-xl font-semibold transition shadow-sm"
               >
                 <PlayCircle className="w-5 h-5" />
-                {hasUnusedGrant
-                  ? "Start granted attempt"
-                  : isComplete
-                    ? "Relaunch course"
-                    : isInProgress
-                      ? "Resume course"
-                      : "Launch course"}
+                {liveRetake
+                  ? "Resume course"
+                  : hasUnusedGrant
+                    ? "Start granted attempt"
+                    : isComplete
+                      ? "Relaunch course"
+                      : isInProgress
+                        ? "Resume course"
+                        : "Launch course"}
               </Link>
-            ) : current ? (
-              <button
-                type="button"
-                disabled
-                className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-canvas text-muted border border-line px-7 py-3.5 rounded-xl font-semibold cursor-not-allowed"
-              >
-                <PlayCircle className="w-5 h-5" />
-                Attempt limit reached
-              </button>
             ) : (
               <div className="text-sm text-muted">
                 This course doesn&apos;t have a version yet.
               </div>
             )}
-            {current && !noActiveLanguage && !launchBlocked && hasUnusedGrant && (
+            {current && !noActiveLanguage && hasUnusedGrant && (
               <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-100 text-emerald-800 border border-emerald-200">
                 Official retake
               </span>
             )}
-            {current && !noActiveLanguage && !launchBlocked && !hasUnusedGrant && scoring.practiceMode && (
+            {current && !noActiveLanguage && !hasUnusedGrant && !liveRetake && scoring.practiceMode && (
               <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800 border border-amber-200">
-                Review only
+                Revision
               </span>
             )}
             {canRequestAttempt && (
-              <RequestAttemptButton orgSlug={orgSlug} courseId={c.id} />
+              <RequestAttemptButton orgSlug={orgSlug} courseId={c.id} standingResult={standingResult} />
             )}
             {/* Phase 3: Change language — auto-hides if <2 active packages */}
             <ChangeLanguageMenu
@@ -518,7 +592,7 @@ export default async function CourseDetailPage({
               currentLanguage={savedLanguage}
               initialSwitch={switchParam ?? null}
               inProgress={attempts
-                .filter((a) => a.status === "in_progress")
+                .filter((a) => a.status === "in_progress" && !isRevisionAttempt(a))
                 .map((a) => ({
                   language: packageLanguageOf.get(
                     versionById.get(a.course_version_id)?.package_id ?? ""
@@ -555,8 +629,20 @@ export default async function CourseDetailPage({
             Your history with this course. Click any row for the per-question
             breakdown.
           </p>
+          {/* ADR 0014 step 7: revision visits are counted, never listed. */}
+          {!revisits.failed && revisits.count > 0 && (
+            <p className="text-xs text-muted mt-1" data-testid="revisit-count">
+              {revisits.count === 1 ? "Revisited 1 time" : `Revisited ${revisits.count} times`}
+              {revisits.last && isoDate(revisits.last) ? ` · last on ${isoDate(revisits.last)}` : ""}
+            </p>
+          )}
+          {historyUnavailable && attemptRows.length > 0 && (
+            <p className="text-xs text-muted mt-1" data-testid="attempt-markers-unavailable">
+              History unavailable. Please reload.
+            </p>
+          )}
         </header>
-        {attempts.length === 0 ? (
+        {attemptRows.length === 0 ? (
           <div className="p-8 text-center text-muted text-sm">
             {noActiveLanguage ? (
               <>No attempts yet.</>
@@ -566,11 +652,12 @@ export default async function CourseDetailPage({
           </div>
         ) : (
           <ul className="divide-y divide-line">
-            {attempts.map((a, i) => (
+            {attemptRows.map((a, i) => (
               <AttemptRow
                 key={a.id}
                 attempt={a}
-                number={attempts.length - i}
+                number={attemptRows.length - i}
+                markers={markers.get(a.id) ?? []}
                 version={versionById.get(a.course_version_id)}
                 orgSlug={orgSlug}
                 courseId={c.id}
@@ -588,15 +675,106 @@ function pct(v: number | null): string {
   return v === null ? "—" : `${Math.round(v * 100)}%`;
 }
 
+/** YYYY-MM-DD (the attempt rows' date form); null for a missing or unreadable timestamp. */
+function isoDate(iso: string | null | undefined): string | null {
+  const t = iso ? Date.parse(iso) : Number.NaN;
+  return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : null;
+}
+
+function sortKey(iso: string | null | undefined): number {
+  const t = iso ? Date.parse(iso) : Number.NaN;
+  return Number.isFinite(t) ? t : 0;
+}
+
+/** "N %" in the ADR 0014 step 7 wording; null when the attempt has no score. */
+function scorePctText(score: number | null): string | null {
+  return score === null ? null : `${Math.round(score * 100)} %`;
+}
+
+const RESULT_WORD: Record<HistoryEntry["status"], string> = {
+  passed: "Passed",
+  failed: "Not passed",
+  completed: "Completed",
+};
+
+type HistoryLine = { key: string; text: string; current: boolean; grant: HistoryGrantInfo | null };
+
+/**
+ * The "Official result history" block's lines (ADR 0014 step 7), newest
+ * first: each chain entry ("<date> · N % · Passed · Official result", or
+ * "… · Replaced by a granted retake on <date>" once superseded), each reset
+ * retake in date order among them ("<date> · Granted retake, reset by a
+ * module update"), and, while a granted retake runs, a first line carrying
+ * its progress and the standing result. A retake's line carries its grant.
+ */
+function officialHistoryLines(
+  history: ReturnType<typeof officialHistory>,
+  current: HistoryEntry | null,
+  runningPct: number | null
+): HistoryLine[] {
+  const dated: Array<{ at: number; line: HistoryLine }> = [];
+  for (const e of history.entries) {
+    const by = e.supersededBy ? history.entries.find((x) => x.attemptId === e.supersededBy) ?? null : null;
+    const byDate = by ? isoDate(by.completedAt) : null;
+    const tail = e.supersededBy
+      ? `Replaced by a granted retake${byDate ? ` on ${byDate}` : ""}`
+      : "Official result";
+    const text = [isoDate(e.completedAt), scorePctText(e.score), RESULT_WORD[e.status], tail].filter(Boolean).join(" · ");
+    dated.push({ at: sortKey(e.completedAt), line: { key: e.attemptId, text, current: !e.supersededBy, grant: e.grant } });
+  }
+  for (const r of history.reset) {
+    const text = [isoDate(r.startedAt), "Granted retake, reset by a module update"].filter(Boolean).join(" · ");
+    dated.push({ at: sortKey(r.startedAt), line: { key: `reset-${r.attemptId}`, text, current: false, grant: r.grant } });
+  }
+  dated.sort((a, b) => b.at - a.at);
+  const lines = dated.map((d) => d.line);
+  if (history.running) {
+    const previous = current
+      ? [scorePctText(current.score), RESULT_WORD[current.status], isoDate(current.completedAt)].filter(Boolean).join(", ")
+      : "";
+    const text =
+      `Official retake in progress${runningPct === null ? "" : ` · ${runningPct} %`}` +
+      (previous ? ` — your previous result (${previous}) stays in your history until you finish` : "");
+    lines.unshift({ key: `running-${history.running.attemptId}`, text, current: true, grant: history.running.grant });
+  }
+  return lines;
+}
+
+/** "Granted by your administrator on <date>" with the admin's note, never a name or email (ADR 0014:230). */
+function grantLine(grant: HistoryGrantInfo): string {
+  const date = isoDate(grant.decidedAt);
+  const note = grant.decisionNote?.trim();
+  return `Granted by your administrator${date ? ` on ${date}` : ""}${note ? `: ${note}` : ""}`;
+}
+
+/**
+ * "My attempts" row markers (ADR 0014 step 7): the current official
+ * result, every superseded one, each granted retake with "in progress" or
+ * its result, and a retake a forced restart reset.
+ */
+function attemptMarkers(history: ReturnType<typeof officialHistory>, current: HistoryEntry | null): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const add = (id: string, label: string) => out.set(id, [...(out.get(id) ?? []), label]);
+  for (const e of history.entries) {
+    add(e.attemptId, current && e.attemptId === current.attemptId ? "Official result" : "Previous official result");
+    if (e.kind === "retake") add(e.attemptId, `Granted retake · ${RESULT_WORD[e.status]}`);
+  }
+  if (history.running) add(history.running.attemptId, "Granted retake · in progress");
+  for (const r of history.reset) add(r.attemptId, "Granted retake, reset by a module update");
+  return out;
+}
+
 function AttemptRow({
   attempt,
   number,
+  markers,
   version,
   orgSlug,
   courseId,
 }: {
   attempt: Attempt;
   number: number;
+  markers: string[];
   version: Version | undefined;
   orgSlug: string;
   courseId: string;
@@ -636,6 +814,15 @@ function AttemptRow({
               </span>
             )}
           <SuccessPill success={attempt.success_status} />
+          {markers.map((m) => (
+            <span
+              key={m}
+              data-testid="attempt-marker"
+              className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-indigo-50 text-indigo-800 border border-indigo-200 shrink-0"
+            >
+              {m}
+            </span>
+          ))}
           {version && (
             <span className="text-xs text-muted shrink-0">
               v{version.version_number}
@@ -659,15 +846,17 @@ function CompletionPill({
   completion: "in_progress" | "completed";
   status: Attempt["status"];
 }) {
-  // ADR 0004 step 10: an abandoned attempt is a neutral, terminal "reset",
-  // never "In progress".
+  // ADR 0004 step 10: an abandoned attempt is neutral and terminal, never
+  // "In progress". ADR 0014 step 7: the cause of a close is not stored, so
+  // the pill says what is true of every close (the forced-restart notice
+  // already names a module update).
   if (status === "abandoned" && completion !== "completed") {
     return (
       <span
-        title="This attempt was closed; its progress does not carry over"
+        title="This attempt was closed before it finished and does not count"
         className="px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wide bg-slate-100 text-slate-600 border border-slate-200"
       >
-        Reset — module updated
+        Closed — not counted
       </span>
     );
   }

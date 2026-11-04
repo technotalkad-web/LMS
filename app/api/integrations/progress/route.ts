@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { authenticateApiKey } from "@/lib/integrations/auth";
 import { readParams, pick, list, bool, int, iso, isUuid } from "@/lib/integrations/params";
 import { resolveIdsOrCodes } from "@/lib/reference-codes";
+import { GrantReadError } from "@/lib/scoring/attempt-kind";
 import {
   buildProgress,
   hasAttemptFilters,
@@ -39,6 +40,10 @@ import {
  * those rows are listed (Upside semantics); totals are counted after that
  * filtering, so total_records always matches what the pages hold. Pages
  * are ordered by employee number, then email.
+ *
+ * A failed read of the grant links answers 503 { error: "grants_unreadable" }
+ * (ADR 0014:188): the caller retries; the feed never answers a guess, so a
+ * status never flips between in_progress and passed across polls.
  */
 const BATCH = 100;
 
@@ -130,6 +135,10 @@ async function handle(request: Request) {
       progress,
     });
   } catch (e) {
+    if (e instanceof GrantReadError) {
+      console.warn(JSON.stringify({ event: "crm_progress_grants_unreadable", code: e.code }));
+      return NextResponse.json({ error: "grants_unreadable" }, { status: 503 });
+    }
     console.error("[integrations/progress] failed:", e);
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "Progress query failed" },

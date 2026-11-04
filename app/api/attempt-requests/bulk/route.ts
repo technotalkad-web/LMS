@@ -4,7 +4,14 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
-import { fetchPassRequired, fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
+import {
+  fetchPassRequired,
+  grantSnapshotForUsers,
+  readPagedWithOptionalColumn,
+  type GrantSnapshot,
+  type PgError,
+} from "@/lib/scoring/attempt-kind";
+import { bulkEligibility } from "@/lib/attempts/request-decision";
 import { resolveEmails } from "@/lib/users/emails";
 import {
   ADMIN_ROLES,
@@ -16,12 +23,19 @@ import {
  *   POST /api/attempt-requests/bulk?orgSlug=acme
  *   body: { courseId, expires_in_days? }
  *
- * Grant one extra official attempt to EVERY learner who has used up their
- * official window on this module and did not pass — no individual request
- * needed. Each grant is an approved `source='bulk'` row the learner's next
- * launch consumes. Learners who already hold an open request or an unused
- * grant are skipped (the partial unique index would reject a second one).
+ * Grant one extra official attempt to EVERY learner who has an official
+ * result on this module and did not pass — no individual request needed.
+ * Each grant is an approved `source='bulk'` row the learner's next launch
+ * consumes. Learners who already hold an open request or an unused grant are
+ * skipped (the partial unique index would reject a second one), and so are
+ * learners whose granted retake is still in progress (ADR 0014 step 11 (5),
+ * counted in `skipped_live_retake`). A learner who passed is never granted
+ * here: they ask from the course page and the admin approves with the
+ * confirmation. Every read is error-checked (the versions, the attempts, the
+ * grants, the open requests): any error answers 503 and nothing is inserted.
  */
+/** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
+const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
 function svc() {
   return createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -77,77 +91,101 @@ export async function POST(request: Request) {
     .maybeSingle();
   if (!course) return NextResponse.json({ error: "Course not found" }, { status: 404 });
 
+  // ADR 0014 step 11 (5): every read before the insert fails closed.
+  const unreadable = (read: string) => {
+    console.warn(JSON.stringify({ event: "bulk_grant_records_unreadable", course_id: course.id, read }));
+    return NextResponse.json({ error: "records_unreadable" }, { status: 503 });
+  };
+
   // All version ids of the module (scoring spans versions/languages).
-  const { data: verRows } = await s
+  const { data: verRows, error: verErr } = await s
     .from("course_versions")
     .select("id")
     .eq("course_id", course.id);
-  const verIds = ((verRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+  if (verErr || !verRows) return unreadable("versions");
+  const verIds = (verRows as Array<{ id: string }>).map((v) => v.id);
   if (verIds.length === 0) {
-    return NextResponse.json({ ok: true, granted: 0, skipped: 0, failed_total: 0 });
+    return NextResponse.json({ ok: true, granted: 0, skipped: 0, skipped_live_retake: 0, failed_total: 0 });
   }
 
-  // Every attempt on those versions, paginated, grouped by learner.
+  // Every attempt on those versions, paginated, grouped by learner. The rows
+  // carry `status` and `is_revision` (the narrower-select fallback,
+  // readPagedWithOptionalColumn: the first page decides the column list for
+  // the rest), so an abandoned or a revision visit's row never counts and a
+  // live retake is seen. Any failed page, or a page with neither rows nor an
+  // error, answers 503.
   type Att = ScorableAttempt & { user_id: string };
-  const attempts: Att[] = [];
-  const PAGE = 1000;
-  for (let from = 0; ; from += PAGE) {
-    const { data, error } = await s
-      .from("course_attempts")
-      .select("id, user_id, score, started_at, completed_at, completion_status, success_status")
-      .eq("organization_id", org.id)
-      .in("course_version_id", verIds)
-      .order("id")
-      .range(from, from + PAGE - 1);
-    if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-    const page = (data ?? []) as Att[];
-    attempts.push(...page);
-    if (page.length < PAGE) break;
-  }
+  const attemptsRead = await readPagedWithOptionalColumn<Att>(
+    "is_revision",
+    (cols, from, to) =>
+      s
+        .from("course_attempts")
+        .select(cols)
+        .eq("organization_id", org.id)
+        .in("course_version_id", verIds)
+        .order("id")
+        .range(from, to) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
+    ATTEMPT_COLUMNS,
+    { nullIsError: true }
+  );
+  if (attemptsRead.error) return unreadable("attempts");
+  const attempts = attemptsRead.data;
   const byUser = new Map<string, Att[]>();
   for (const a of attempts) byUser.set(a.user_id, [...(byUser.get(a.user_id) ?? []), a]);
   const userIds = [...byUser.keys()];
   if (userIds.length === 0) {
-    return NextResponse.json({ ok: true, granted: 0, skipped: 0, failed_total: 0 });
+    return NextResponse.json({ ok: true, granted: 0, skipped: 0, skipped_live_retake: 0, failed_total: 0 });
   }
 
   const policy = await resolvePolicy(s, course.id);
   const passRequired = (await fetchPassRequired(s, [course.id])).has(course.id);
-  const retakeByUser = await fetchGrantRetakeIdsForUsers(s, org.id, userIds);
+  let snapshots: Map<string, GrantSnapshot>;
+  try {
+    snapshots = await grantSnapshotForUsers(s, org.id, [course.id], userIds);
+  } catch {
+    return unreadable("grants");
+  }
 
   // "Failed" = the official attempt exists and did not pass (a failed verdict,
-  // or — on a pass-required module — anything short of a pass). Only learners
-  // whose window is used up are eligible (limitReached); otherwise they still
-  // have an official attempt free and need no grant.
+  // or — on a pass-required module — anything short of a pass), and no
+  // granted retake is live (bulkEligibility, the rule's one definition).
   const failedUserIds: string[] = [];
+  let skippedLiveRetake = 0;
   const usedByUser = new Map<string, number>(); // 0085: completed official attempts at grant time
   for (const uid of userIds) {
-    const sc = computeScoring(byUser.get(uid)!, policy, retakeByUser.get(`${uid}:${course.id}`) ?? []);
-    if (!sc.officialAttempt || !sc.limitReached) continue;
-    const failed = sc.officialStatus === "failed" || (passRequired && sc.officialStatus !== "passed");
-    if (failed) {
-      failedUserIds.push(uid);
-      usedByUser.set(uid, sc.scoredAttempts);
-    }
+    const list = byUser.get(uid)!;
+    const sc = computeScoring(list, policy, snapshots.get(`${uid}:${course.id}`)?.retakeIds ?? []);
+    const verdict = bulkEligibility({ scoring: sc, attempts: list, passRequired });
+    if (verdict === "retake_live") skippedLiveRetake++;
+    if (verdict !== "grant") continue;
+    failedUserIds.push(uid);
+    usedByUser.set(uid, sc.scoredAttempts);
   }
   if (failedUserIds.length === 0) {
-    return NextResponse.json({ ok: true, granted: 0, skipped: 0, failed_total: 0 });
+    return NextResponse.json({ ok: true, granted: 0, skipped: 0, skipped_live_retake: skippedLiveRetake, failed_total: 0 });
   }
 
   // Skip learners who already hold an OPEN row (pending, or approved+unused) —
   // the partial unique index enforces one-open-per-learner anyway.
-  const { data: openRows } = await s
+  const { data: openRows, error: openErr } = await s
     .from("attempt_requests")
     .select("user_id, status, used_at")
     .eq("course_id", course.id)
     .in("user_id", failedUserIds);
+  if (openErr || !openRows) return unreadable("open requests");
   const alreadyOpen = new Set<string>();
-  for (const r of (openRows ?? []) as Array<{ user_id: string; status: string; used_at: string | null }>) {
+  for (const r of openRows as Array<{ user_id: string; status: string; used_at: string | null }>) {
     if (r.status === "pending" || (r.status === "approved" && r.used_at === null)) alreadyOpen.add(r.user_id);
   }
   const grantTo = failedUserIds.filter((uid) => !alreadyOpen.has(uid));
   if (grantTo.length === 0) {
-    return NextResponse.json({ ok: true, granted: 0, skipped: failedUserIds.length, failed_total: failedUserIds.length });
+    return NextResponse.json({
+      ok: true,
+      granted: 0,
+      skipped: failedUserIds.length,
+      skipped_live_retake: skippedLiveRetake,
+      failed_total: failedUserIds.length,
+    });
   }
 
   const nowIso = new Date().toISOString();
@@ -204,6 +242,7 @@ export async function POST(request: Request) {
     ok: true,
     granted: grantedIds.length,
     skipped: failedUserIds.length - grantedIds.length,
+    skipped_live_retake: skippedLiveRetake,
     failed_total: failedUserIds.length,
   });
 }
