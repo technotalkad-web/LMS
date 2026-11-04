@@ -29,7 +29,8 @@
  *       Revisits column; the Course Reports tile; the CRM visit fields;
  *       attempts, last_access and engagement.last_active unchanged;
  *   (g) step 12: user_gamification's streak and last_active_day unchanged by
- *       the revisit; Analytics' "Last active" is the retake's date;
+ *       the revisit; Analytics' "Last active" KPI is the later of that day and
+ *       the retake's date;
  *   (h) POST /api/scoring-rules with after_limit "block" answers 400 with the
  *       ADR text; the module page shows the read-only note.
  *   (i) The tenant-LRS markers (attempt/launch-mode = Review, attempt/scored
@@ -313,8 +314,10 @@ test.describe.serial("ADR 0014 — the revision surfaces and step 11 (PR 1b)", (
     expect(sum.paths[0]?.steps_completed, "the CRM path object keeps the standing result").toBe(1);
     expect(prog.learning_paths[0]?.steps_completed).toBe(1);
 
-    const pl = await pageText(s.adminCtx!, `/${s.org!.slug}/learning-paths/${s.pathId}/learners`, /Surfaces/);
-    expect(pl.toLowerCase()).toContain("passed");
+    const plp = await s.adminCtx!.newPage();
+    await plp.goto(`/${s.org!.slug}/learning-paths/${s.pathId}/learners`, { timeout: 120_000 });
+    await expect(plp.locator("tbody tr", { hasText: s.a!.email })).toContainText("Passed", { timeout: 60_000 });
+    await plp.close();
     const px = await s.adminCtx!.request.get(`/api/learning-paths/${s.pathId}/learners/export?orgSlug=${encodeURIComponent(s.org!.slug)}`);
     expect(px.status()).toBe(200);
     const pxRows = csvRows(await px.text());
@@ -380,8 +383,8 @@ test.describe.serial("ADR 0014 — the revision surfaces and step 11 (PR 1b)", (
     // The drill-down's "Last active" KPI (YYYY-MM-DD). On a same-day run the revisit's date equals the
     // retake's, so the exclusion itself is the unit fixture's (tests/unit/engagement-readers.test.ts).
     const an = await pageText(s.adminCtx!, `/${s.org!.slug}/analytics?learner=${s.a!.id}`, /Last active/);
-    expect(an).toContain("Last active");
-    expect(an).toContain(retakeDay);
+    const kpi = an.match(/last active (\S+)/i)?.[1];
+    expect(kpi, "the KPI: the later of the XP day and the retake's day").toBe([(gam as { last_active_day: string | null } | null)?.last_active_day ?? "", retakeDay].sort().pop());
   });
 
   test("(h) the scoring-rules route refuses Block; the module page shows the read-only note", async () => {

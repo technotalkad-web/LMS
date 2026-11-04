@@ -77,8 +77,13 @@ gcloud run deploy "${SERVICE}" \
 
 URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')"
 echo "✓ ${SERVICE} is live at ${URL}"
-if [[ "${NEXT_PUBLIC_SITE_URL}" != "${URL}" ]]; then
+# status.url names one of the addresses the service answers on, so a site URL on
+# another of them is no mismatch. This annotation lists them all as a JSON array;
+# the quotes make it a whole-URL match. If it cannot be read, only status.url is
+# compared, which can warn falsely but cannot miss a real mismatch.
+URLS="$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format="value(metadata.annotations['run.googleapis.com/urls'])" || true)"
+if [[ "${NEXT_PUBLIC_SITE_URL}" != "${URL}" && "${URLS}" != *"\"${NEXT_PUBLIC_SITE_URL}\""* ]]; then
   echo "! The build was made for ${NEXT_PUBLIC_SITE_URL} but the service answers at ${URL}."
   echo "  Re-run with NEXT_PUBLIC_SITE_URL=${URL} so auth redirects and xAPI endpoints match."
 fi
-echo "  Next: add ${URL}/auth/callback and ${URL}/auth/finish to Supabase → Authentication → URL Configuration."
+echo "  Next: add ${NEXT_PUBLIC_SITE_URL}/auth/callback and ${NEXT_PUBLIC_SITE_URL}/auth/finish to Supabase → Authentication → URL Configuration."

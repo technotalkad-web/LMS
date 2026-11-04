@@ -16,6 +16,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { test, expect } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
+import { authedContext } from "../lib/session";
 import { lintStatement } from "../lib/xapi-lint";
 import { uuid5 } from "../../../lib/lrs/uuid5";
 import { testConnection } from "../../../lib/lrs/forward";
@@ -101,7 +102,7 @@ async function waitOutbox(orgId: string, ids: string[], status: string, ms = 250
   }, ms);
 }
 
-test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outage, dead-letter, auth failure, TLS proxy", async ({ baseURL }) => {
+test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outage, dead-letter, auth failure, TLS proxy", async ({ baseURL, browser }) => {
   test.skip(!process.env.E2E_BASE_URL?.includes("localhost") && !REMOTE, "needs a local dev server that can reach the local LRS (or LRS_E2E_REMOTE=1 with LRS_URL_FOR_LMS)");
   test.setTimeout(15 * 60_000);
   const db = svc();
@@ -393,6 +394,30 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       const rows = await waitOutbox(org.id, [tlsId], "sent");
       rec("S8 statement delivered through the TLS endpoint (proxy → LRS)", status === 200 && !!rows && (await lrsGet(tlsId)).status === 200, { endpoint: CADDY.replace(/\/\/[^/]+/, "//…"), status, row: rows?.[0]?.status ?? (await outboxRows(org.id, [tlsId]))[0]?.last_error });
       await db.from("tenant_lrs_config").update({ endpoint: LRS_FOR_LMS }).eq("organization_id", org.id);
+    });
+
+    // ---------- S9 a revision visit's markers on the wire --------------------
+    // ADR 0014 step 7, on a real LRS; tests/unit/lrs-revision-markers.test.ts holds the branches.
+    await test.step("S9 revision markers", async () => {
+      // What a learner's launch needs that the token-driven steps above do not: a slot version and an assignment.
+      await db.from("course_packages").update({ current_version_id: version!.id }).eq("id", pkg!.id);
+      await db.from("learning_path_assignments").insert({ organization_id: org.id, path_id: path!.id, assignee_type: "user", user_id: learner.id });
+      const learnerCtx = await authedContext(browser, baseURL!, learner.email, learner.password);
+      const launch = await learnerCtx.request.get(`/${org.slug}/courses/${course!.id}/launch`);
+      await learnerCtx.close();
+      const { data: flagged } = await db.from("course_attempts").select("id").eq("organization_id", org.id).eq("user_id", learner.id).eq("is_revision", true);
+      rec("S9a a revisit after the pass opens one flagged row", launch.ok() && flagged?.length === 1, { status: launch.status(), flagged: flagged?.length ?? null });
+      const revisitId = flagged?.[0]?.id as string | undefined;
+      if (!revisitId) return;
+      const launchedId = uuid5(`launched:${revisitId}`);
+      for (let i = 0; i < 14; i++) {
+        await drain(baseURL!);
+        if ((await outboxRows(org.id, [launchedId]))[0]?.status === "sent") break;
+      }
+      const revisit = (await lrsGet(launchedId)).body?.context.extensions;
+      rec("S9b the LRS holds the revisit's 'launched' with attempt/launch-mode Review, attempt/scored false and no attempt/number", revisit?.[`${NS}ext/attempt/launch-mode`] === "Review" && revisit?.[`${NS}ext/attempt/scored`] === false && !!revisit && !(`${NS}ext/attempt/number` in revisit), { launchMode: revisit?.[`${NS}ext/attempt/launch-mode`] ?? null, scored: revisit?.[`${NS}ext/attempt/scored`] ?? null, number: revisit?.[`${NS}ext/attempt/number`] ?? null });
+      const official = (await lrsGet(uuid5(`launched:${attempt!.id}`))).body?.context.extensions;
+      rec("S9c the official attempt's 'launched' carries no attempt/launch-mode", !!official && !(`${NS}ext/attempt/launch-mode` in official), { launchMode: official?.[`${NS}ext/attempt/launch-mode`] ?? null });
     });
   } finally {
     try { await supervisor("start"); } catch { /* ignore */ }

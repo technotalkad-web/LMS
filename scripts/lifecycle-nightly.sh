@@ -93,6 +93,11 @@ BASE="http://localhost:$PORT"
 export NEXT_TELEMETRY_DISABLED=1
 export NEXT_PUBLIC_SITE_URL="$BASE"
 export E2E_BASE_URL="$BASE"
+# As scripts/e2e-in-runner.sh sets it, because the staging database has 0100.
+# With the flag absent a staff launch stores is_preview false, 0100's delete
+# guards count that row as learner history, and spec 50's admin delete answers
+# 409: a pairing of flag and database that no deployment runs.
+export ALDS_P4="on"
 
 echo "lifecycle-nightly: building (log kept off the console)"
 if ! npm run build > "$OUT/build.log" 2>&1; then

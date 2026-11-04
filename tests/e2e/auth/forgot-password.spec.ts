@@ -1,3 +1,4 @@
+import type { Page } from "@playwright/test";
 import { test, expect } from "../helpers/fixtures";
 import { seedOtp, svc } from "../helpers/supabase";
 
@@ -17,6 +18,22 @@ import { seedOtp, svc } from "../helpers/supabase";
  *             submit "Save password"
  */
 
+/**
+ * A single fill in the moment between the page's load and React's hydration
+ * (about 100 ms on WebKit) never reaches React's state: the box shows the email
+ * and Send code stays disabled. So: clear, fill and look again until the button
+ * is enabled. A page that never hydrates still fails here.
+ */
+async function fillEmail(page: Page, email: string) {
+  const input = page.getByPlaceholder("you@company.com");
+  const send = page.getByRole("button", { name: /send code/i });
+  await expect(async () => {
+    await input.fill("");
+    await input.fill(email);
+    await expect(send).toBeEnabled({ timeout: 1_000 });
+  }).toPass({ timeout: 15_000 });
+}
+
 test.describe("/forgot-password", () => {
   test("happy path: email → OTP auto-verify → set password → auto-login", async ({
     page,
@@ -29,7 +46,7 @@ test.describe("/forgot-password", () => {
     // our own seed (seedOtp invalidates prior unused codes for this email).
     const emailInput = page.getByPlaceholder("you@company.com");
     await expect(emailInput).toBeVisible({ timeout: 15_000 });
-    await emailInput.fill(seededLearner.email);
+    await fillEmail(page, seededLearner.email);
     await page.getByRole("button", { name: /send code/i }).click();
 
     // Step 2: OTP. Seed *after* /request has written its row so our row wins.
@@ -70,7 +87,7 @@ test.describe("/forgot-password", () => {
     await seedOtp(seededLearner.email); // real code we won't use
 
     await page.goto("/forgot-password");
-    await page.getByPlaceholder("you@company.com").fill(seededLearner.email);
+    await fillEmail(page, seededLearner.email);
     await page.getByRole("button", { name: /send code/i }).click();
 
     const otpInput = page.getByPlaceholder("000000");

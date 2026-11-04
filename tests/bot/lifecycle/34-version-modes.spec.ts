@@ -270,6 +270,10 @@ test("direct finalize force_restart with nobody in progress: 200, the genuine ze
     unresolved_version_ids: [],
     message: "No learners were in progress.",
     tokensExpired: true,
+    reissued: 0,
+    reissue_failed: 0,
+    reissue_pending: 0,
+    revision_closed: 0,
   });
   await s.adminCtx.close();
   expect(await attemptRow(s.attemptId)).toEqual(before);
@@ -553,7 +557,7 @@ test.describe.serial("per-version restart (ADR 0008 A)", () => {
     const res = await s.adminCtx!.request.post(url(s.v1!), { data: { orgSlug: s.org!.slug, reason: `  ${reason} ` } });
     expect(res.status(), await res.text()).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ ...s.dry, dry_run: false, restarted: 2 });
+    expect(body).toEqual({ ...s.dry, dry_run: false, restarted: 2, revision_closed: 0 });
 
     expect((await attemptRow(s.att!.reset)).status).toBe("abandoned");
     expect((await attemptRow(s.att!.staff)).status).toBe("abandoned");
