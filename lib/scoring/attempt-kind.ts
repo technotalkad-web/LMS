@@ -200,7 +200,7 @@ export async function classifyAttempt(svc: AnyClient, attemptId: string): Promis
   if (!courseId) return null;
   const isRevision = a.is_revision === true;
 
-  const { data: verRows } = await svc.from("course_versions").select("id").eq("course_id", courseId);
+  const { data: verRows, error: verErr } = await svc.from("course_versions").select("id").eq("course_id", courseId);
   const verIds = ((verRows ?? []) as Array<{ id: string }>).map((v) => v.id);
   // `status` and `is_revision` (ADR 0014 step 6): computeScoring
   // drops abandoned and revision rows, so an abandoned-but-completed row no
@@ -216,6 +216,11 @@ export async function classifyAttempt(svc: AnyClient, attemptId: string): Promis
   if (rowsErr && isMissingColumn(rowsErr, "is_revision")) {
     ({ data: rows, error: rowsErr } = await listFor(KIND_LIST_COLUMNS));
   }
+  // A failed versions read is a failed list read (ADR 0015): the list above
+  // would have narrowed to this row's own version, and a row beyond the window
+  // through another version would read as number 1. So scoring runs on no rows:
+  // a non-revision row answers official with a null number.
+  if (verErr) rows = [];
   const attempts = (rows ?? []) as ScorableAttempt[];
   const policy = (await resolvePolicy(svc, courseId).catch(() => DEFAULT_POLICY)) ?? DEFAULT_POLICY;
   const retakeIds = await grantRetakeIdsFor(svc, a.user_id, courseId);

@@ -14,6 +14,10 @@
  *   Wire log: <KIVO_REALRUN_OUT>/wire.json, every /api/xapi/ request of every launch (method, path, stateId,
  *   registration, status, statement summaries, State document summaries; never a URL with its tokens).
  *   ENGINE_VERSION is read from the frame on every launch (evidence.json "launches").
+ *   KIVO_CLOUD_RUN_CRON_SECRET  the Cloud Run staging deployment's CRON_SECRET, required by the sweep POSTs of ADR 0015
+ *                          step 9 (the §3.4 case, CR (iii)). The runner sets it under this name: the lifecycle config
+ *                          loads the env files with override: true, so a shell CRON_SECRET would be replaced by theirs,
+ *                          which differs from Cloud Run's. Never logged.
  *   § numbers and ids such as S-1, S-16r2 and S-30 in the comments below cite KIVO's plans, also outside this
  *   repository.
  *
@@ -2033,9 +2037,94 @@ async function officialPass(browser: Browser, baseURL: string, last: string, run
   return { L, ctx, official, progressText, frame, results };
 }
 
-// =================================================================== A.1 extras: 12 (i), 12 (v), 13 and the §3.4 case (the kit's base zip)
+// =================================================================== ADR 0015 helpers (the sweep POST, the latch, crafted statements)
+// ADR 0015 step 9. Staging has no scheduled crons, so the specs POST the sweep by hand, on Cloud Run only: the Workers
+// staging's free plan could cut a run between a latch and its message, so a Workers host is refused. A lifecycle
+// organisation has no webhook URL, so the assertions are the latch and the ids in `webhook_sweep`; the route test proves
+// the payloads. The secret and the launch tokens never reach a log or the evidence: these calls use plain fetch, as
+// spec 46 does, because a Playwright request that fails in transport carries its call log, every request header with
+// it, into the error and the reports.
+const SWEEP_SECRET = process.env.KIVO_CLOUD_RUN_CRON_SECRET || "";
+function assertSweepTarget(baseURL: string) {
+  expect(new URL(baseURL).hostname.endsWith(".workers.dev"), "ADR 0015: the sweep is POSTed on Cloud Run staging, never on a Workers host").toBe(false);
+  expect(!!SWEEP_SECRET, "set KIVO_CLOUD_RUN_CRON_SECRET (the Cloud Run deployment's CRON_SECRET)").toBe(true);
+}
+async function postSweep(baseURL: string) {
+  assertSweepTarget(baseURL);
+  const res = await fetch(new URL("/api/cron/gamification-refresh", baseURL), { method: "POST", headers: { "x-cron-secret": SWEEP_SECRET }, signal: AbortSignal.timeout(120_000) });
+  const body = await res.json().catch(() => null);
+  return { status: res.status, sweep: (body?.webhook_sweep ?? null) as { scanned?: unknown; fired?: unknown; skipped?: unknown; unfired?: unknown; error?: unknown } | null };
+}
+/** One sweep ran (a select error would leave every list empty, and this check empty with them) and left the attempt out: not a candidate. */
+function checkSweepLeaves(step: string, sw: Awaited<ReturnType<typeof postSweep>>, attempt: string) {
+  const lists = [sw.sweep?.fired, sw.sweep?.skipped, sw.sweep?.unfired];
+  const ran = sw.status === 200 && typeof sw.sweep?.scanned === "number" && lists.every((l) => Array.isArray(l)) && !sw.sweep?.error;
+  check(step, "one sweep POST: 200, and webhook_sweep.fired (an id array) does not contain the attempt", ran && !lists.some((l) => (l as string[]).includes(attempt)), { status: sw.status, webhook_sweep: sw.sweep, attempt });
+}
+/** After an AU outcome: the latch set, at or after the stored outcome (extra 13's assertion), and the row's score, which is the message's, equal to the Results score. */
+async function checkLatchAtOutcome(step: string, attempt: string, verb: "passed" | "failed", resultsScore: number | null) {
+  const out = auVerb(await stmts(attempt), verb);
+  const row = await attemptRow(attempt);
+  const at: string | null = row?.completion_webhook_at ?? null;
+  check(step, `completion_webhook_at set, at or after the stored AU ${verb}`, out.length === 1 && !!at && Date.parse(at) >= Date.parse(out[0].stored), { completion_webhook_at: at, auOutcomeStored: out[0]?.stored ?? null, auOutcomes: out.length, status: row?.status, success_status: row?.success_status });
+  check(step, "the row's score equals the Results score", resultsScore !== null && Math.round(Number(row?.score) * 100) === resultsScore, { rowScore: row?.score, resultsTile: resultsScore });
+  return at;
+}
+/** "Set once": the same value after the tab closed (the engine's own `terminated` decides nothing on a latched row). */
+async function checkLatchUnchanged(step: string, attempt: string, at: string | null) {
+  const after: string | null = (await attemptRow(attempt))?.completion_webhook_at ?? null;
+  check(step, "completion_webhook_at set once (unchanged after the tab closed)", !!at && after === at, { before: at, after });
+}
+/** A crafted statement about the AU in the engine's own shape (its actor, object and context, so `context.registration` is the attempt). */
+const auStatement = (init: StmtRow, verb: string, result?: Record<string, unknown>) => ({
+  id: crypto.randomUUID(),
+  timestamp: new Date().toISOString(),
+  actor: init.raw.actor,
+  verb: { id: V(verb), display: { "en-US": verb } },
+  object: init.raw.object,
+  context: init.raw.context,
+  ...(result ? { result } : {}),
+});
+/**
+ * A new learner's official attempt for crafted statements: launched to the AU `initialized`, then the engine tab closed
+ * before any crafted POST, so engine statements never interleave with them. The engine's own `terminated` lands on an
+ * in-progress row and does nothing; the launch token outlives the close (24 hours). `post` uses that token, as test 6 does.
+ */
+async function craftedAttempt(browser: Browser, baseURL: string, last: string, run: string) {
+  const { L, ctx, page, a } = await crLaunch(browser, baseURL, last, run);
+  const init = (await stmts(a)).find((s) => verbOf(s) === V("initialized"));
+  expect(init, "the engine's initialized is stored").toBeTruthy();
+  await page.close();
+  const closed = await waitFor(() => stmts(a), (l) => l.some((s) => verbOf(s) === V("terminated")), 30_000, 2000);
+  await sleep(3000);
+  const row = await attemptRow(a);
+  check(last, "the engine tab closed before any crafted POST: its terminated stored, the row in progress, completion_webhook_at null", closed.some((s) => verbOf(s) === V("terminated")) && row?.status === "in_progress" && row?.completion_webhook_at === null, { statements: summarize(closed).slice(-4), status: row?.status, completion_webhook_at: row?.completion_webhook_at });
+  const { data: tok, error } = await svc().from("cmi5_launch_tokens").select("auth_token").eq("attempt_id", a).order("created_at", { ascending: false }).limit(1).single();
+  if (error) throw new Error(`cmi5_launch_tokens read: ${error.message}`);
+  const auth = `Bearer ${(tok as any).auth_token}`;
+  const post = async (body: unknown[]) => {
+    const res = await fetch(new URL("/api/xapi/statements", baseURL), { method: "POST", headers: { Authorization: auth, "Content-Type": "application/json", "X-Experience-API-Version": "1.0.3" }, body: JSON.stringify(body), signal: AbortSignal.timeout(120_000) });
+    return { status: res.status, text: (await res.text()).slice(0, 200) };
+  };
+  return { L, ctx, a, init: init!, post };
+}
+/** The CRM pull for a learner on this world's course. An API key is a Super Owner's to make, and the world's admin is an admin, so one is seeded for it. */
+async function pulledCourse(browser: Browser, baseURL: string, email: string) {
+  const owner = await createAuthUser({ profile: { first_name: "Kivo", last_name: "Owner", must_change_password: false } });
+  await addMember({ organizationId: S.org!.id, userId: owner.id, role: "super_owner" });
+  const octx = await authedContext(browser, baseURL, owner.email, owner.password);
+  const keyRes = await octx.request.post("/api/org/api-keys", { data: { orgSlug: S.org!.slug, name: "KIVO ADR 0015 extra 17" } });
+  expect(keyRes.ok(), `api key -> ${keyRes.status()}`).toBeTruthy();
+  const key = (await keyRes.json()).key as string;
+  const res = await fetch(new URL(`/api/integrations/learner-summary?email=${encodeURIComponent(email)}`, baseURL), { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(120_000) });
+  const body = await res.json().catch(() => null);
+  await octx.close();
+  return { status: res.status, course: (body?.courses ?? []).find((c: any) => c.course_id === S.courseId) ?? null };
+}
+
+// =================================================================== A.1 extras: 12 (i), 12 (v), 13, 17 and the §3.4 case (the kit's base zip)
 // Not serial: each test seeds (or reuses) the extras world and its own learner, so one test's failure skips none.
-test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v), 13, the §3.4 case)", () => {
+test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v), 13, 17, the §3.4 case)", () => {
   test.skip(!HAVE_KIT, "KIVO_RELEASE_A_KIT is not set (or the kit is incomplete); this run needs the package, which is not in the repository");
   test.skip(HAVE_KIT && VARIANT !== "base", onlyOn(["base"]));
 
@@ -2173,8 +2262,8 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
   });
 
   // §8, extra 13: "one POST with a two-element array in the request log and `completion_webhook_at` on the
-  // official attempt at or after the stored time of the AU `passed`." (The latch, lib/integrations/webhook.ts:59-66,
-  // is stamped before the webhook URL is looked up, so it is set in an organisation without a webhook.)
+  // official attempt at or after the stored time of the AU `passed`." (The latch, in lib/integrations/webhook.ts, is
+  // taken whether or not the organisation has a webhook URL, so it is set in an organisation without a webhook.)
   test("13. (extra) KE-8: one POST with a two-element array; completion_webhook_at at or after the stored AU passed", async ({ browser, baseURL }) => {
     test.setTimeout(12 * 60_000);
     await ensureWorld(browser, baseURL!, "A.1 extras");
@@ -2205,11 +2294,58 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
     await ctx.close();
   });
 
+  // ADR 0015 steps 4 and 9, ADR 0014 step 17 (extra 17): the re-fire, produced by crafted statements with the official
+  // attempt's own launch token, because the A.1 engine sends no fail then pass in one registration and this course has
+  // its assessment at Maximum attempts 1. The latch moving is the staging assertion; the route test proves the payload.
+  test("17. (extra) the re-fire: crafted completed + failed sets completion_webhook_at, a later passed moves it, a repeat of passed leaves it", async ({ browser, baseURL }) => {
+    test.setTimeout(10 * 60_000);
+    await ensureWorld(browser, baseURL!, "A.1 extras");
+    const { L, ctx, a, init, post } = await craftedAttempt(browser, baseURL!, "X17", "X17-launch1");
+    const r1 = await post([auStatement(init, "completed", { completion: true }), auStatement(init, "failed", { success: false, score: { scaled: 0.4 } })]);
+    const row1 = await attemptRow(a);
+    const t1: string | null = row1?.completion_webhook_at ?? null;
+    check("17", "one POST of AU completed + AU failed: the attempt failed, completion_webhook_at set (t1)", r1.status === 200 && row1?.status === "failed" && row1?.success_status === "failed" && !!t1, { post: r1, status: row1?.status, success_status: row1?.success_status, score: row1?.score, t1 });
+    const passed = auStatement(init, "passed", { success: true, score: { scaled: 0.9 } });
+    const r2 = await post([passed]);
+    const row2 = await attemptRow(a);
+    const t2: string | null = row2?.completion_webhook_at ?? null;
+    check("17", "a second POST of AU passed: completion_webhook_at strictly later than t1 (the compare-and-set moved it)", r2.status === 200 && row2?.success_status === "passed" && !!t1 && !!t2 && Date.parse(t2) > Date.parse(t1), { post: r2, success_status: row2?.success_status, score: row2?.score, t1, t2 });
+    const pull = await pulledCourse(browser, baseURL!, L.email);
+    check("17", "learner-summary: passed with 90", pull.status === 200 && pull.course?.status === "passed" && pull.course?.score === 90, { status: pull.status, courseStatus: pull.course?.status, score: pull.course?.score });
+    const r3 = await post([passed]);
+    const t3: string | null = (await attemptRow(a))?.completion_webhook_at ?? null;
+    check("17", "a third POST repeating the same passed: the latch unchanged", r3.status === 200 && !!t2 && t3 === t2, { post: r3, t2, t3 });
+    await ctx.close();
+  });
+
+  // ADR 0015 step 9, extra 17's result-less variant: the first message went out with no result, then the attempt became
+  // passed. The second `terminated` is what makes "set once" observable on the row.
+  test("17 (variant). (extra) the re-fire after a message sent without a result: a lone completed is held, terminated sets the latch once, a crafted passed moves it", async ({ browser, baseURL }) => {
+    test.setTimeout(10 * 60_000);
+    await ensureWorld(browser, baseURL!, "A.1 extras");
+    const { ctx, a, init, post } = await craftedAttempt(browser, baseURL!, "X17R", "X17R-launch1");
+    const r1 = await post([auStatement(init, "completed", { completion: true })]);
+    const row1 = await attemptRow(a);
+    check("17v", "a lone AU completed: the attempt complete and held, completion_webhook_at null", r1.status === 200 && row1?.completion_status === "completed" && row1?.completion_webhook_at === null, { post: r1, completion_status: row1?.completion_status, success_status: row1?.success_status, completion_webhook_at: row1?.completion_webhook_at });
+    const r2 = await post([auStatement(init, "terminated")]);
+    const t1: string | null = (await attemptRow(a))?.completion_webhook_at ?? null;
+    check("17v", "terminated in a later POST: completion_webhook_at set", r2.status === 200 && !!t1, { post: r2, t1 });
+    const r3 = await post([auStatement(init, "terminated")]);
+    const again: string | null = (await attemptRow(a))?.completion_webhook_at ?? null;
+    check("17v", "a second terminated: the latch set once (unchanged)", r3.status === 200 && !!t1 && again === t1, { post: r3, t1, again });
+    const r4 = await post([auStatement(init, "passed", { success: true, score: { scaled: 0.9 } })]);
+    const row4 = await attemptRow(a);
+    const t2: string | null = row4?.completion_webhook_at ?? null;
+    check("17v", "a crafted AU passed: the latch moved once more", r4.status === 200 && row4?.success_status === "passed" && !!t1 && !!t2 && Date.parse(t2) > Date.parse(t1), { post: r4, success_status: row4?.success_status, t1, t2 });
+    await ctx.close();
+  });
+
   // §8: "The §3.4 case: submit the assessment, close on the slide before Results, relaunch: the same official attempt
   // resumes, the assessment score is a sub-activity statement on it and the row has no result, no webhook until
   // Results, then one webhook with the score."
   test("3.4. (extra) the §3.4 case: assessment submitted, tab closed on the slide before Results, relaunch, no webhook until Results", async ({ browser, baseURL }) => {
     test.setTimeout(15 * 60_000);
+    assertSweepTarget(baseURL!);
     await ensureWorld(browser, baseURL!, "A.1 extras");
     const L = await newAssignedLearner(browser, baseURL!, "LearnerS");
     EV.ids.learnerS = { id: L.id, email: L.email };
@@ -2234,6 +2370,9 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
     const row1 = await attemptRow(s1);
     EV.ui["S-after-close"] = { shownAtClose, statements: summarize(sub).slice(-6), row: { status: row1?.status, completion_status: row1?.completion_status, success_status: row1?.success_status, score: row1?.score, completion_webhook_at: row1?.completion_webhook_at } };
     flush();
+    // ADR 0015 step 9: one sweep between the close and the relaunch, so no message comes from the 15-minute timer. No wait:
+    // the row is not complete, so it is not a candidate whatever its age.
+    checkSweepLeaves("3.4", await postSweep(baseURL!), s1);
 
     const { page: p2, fl: fl2 } = await openCourse(ctx, "S-launch2");
     const atts2 = await waitFor(() => attemptsOf(L.id), (l) => l.length > 0, 10_000);
@@ -2251,6 +2390,7 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
       afterClose: row1 && { status: row1.status, completion_status: row1.completion_status, success_status: row1.success_status, score: row1.score }, afterRelaunch: row2 && { status: row2.status, completion_status: row2.completion_status, success_status: row2.success_status, score: row2.score }, auOutcomesStored: auOutBefore,
     });
     check("3.4", "no webhook until Results (completion_webhook_at null after the close and on the relaunch)", !row1?.completion_webhook_at && !row2?.completion_webhook_at, { afterClose: row1?.completion_webhook_at ?? null, afterRelaunch: row2?.completion_webhook_at ?? null });
+    check("3.4", "past one sweep: completion_webhook_at still null on the relaunch", row2?.completion_webhook_at === null, { afterRelaunch: row2?.completion_webhook_at });
 
     // Results.
     await dismissModals(fl2, 1);
@@ -2262,7 +2402,7 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
     const row3 = await attemptRow(s1);
     check("3.4", "then one webhook with the score (completion_webhook_at set once at Results; the attempt carries the AU score)", pas.length === 1 && !!row3?.completion_webhook_at && Number(row3.score) === Math.round(pas[0].raw.result.score.scaled * 10000) / 10000 && row3.success_status === "passed", {
       completion_webhook_at: row3?.completion_webhook_at ?? null, score: row3?.score, auScaled: pas[0]?.raw?.result?.score?.scaled, success_status: row3?.success_status,
-      how: "the single-fire latch on completion_webhook_at (lib/integrations/webhook.ts:59-66); the webhook body itself is not observable (no webhook URL in a lifecycle organisation)",
+      how: "the single-fire latch on completion_webhook_at (lib/integrations/webhook.ts); the webhook body itself is not observable (no webhook URL in a lifecycle organisation)",
     });
     await p2.close();
     await sleep(3000);
@@ -2548,6 +2688,9 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     const verbsSeen = Object.entries(wire1.reduce((m: Record<string, number>, s) => ((m[`${s.verb}:${s.obj === S.auId ? "AU" : "sub"}`] = (m[`${s.verb}:${s.obj === S.auId ? "AU" : "sub"}`] ?? 0) + 1), m), {}));
     check("CR-i", "learner E fails attempt 1 and reaches Results: no AU statement leaves (0 AU completed/passed/failed on the wire and stored)", rf1.slide === resultsIdx() + 1 && auOut1.length === 0 && stored1.length === 0, { slide: rf1.slide, auOutcomeOnTheWire: auOut1, auOutcomeStored: summarize(stored1), verbsSeenSoFar: verbsSeen, queueAtTheSnapshot: qAtSnapshot1, wireRequestsAtTheSnapshot: wireOf("E-launch1").length });
     check("CR-i", "the Results line shows \"Not final yet\" with \"Go to <assessment>\" and \"Finish now\"", rf1.notFinal && rf1.gotoBtn === `Go to ${asmt.title}` && rf1.finishBtn === "Finish now", { notFinalLine: rf1.notFinalLine, goto: rf1.gotoBtn, finish: rf1.finishBtn, tile: rf1.scoreTile });
+    // ADR 0015 step 9 (extra 22): a failed attempt with attempts left is not complete, so nothing is held and nothing is sent.
+    const rowE1 = await attemptRow(a);
+    check("CR-i/22", "after the failed attempt 1: completion_webhook_at null with no AU outcome stored", rowE1?.completion_webhook_at === null && stored1.length === 0, { completion_webhook_at: rowE1?.completion_webhook_at, status: rowE1?.status, auOutcomesStored: stored1.length });
     readmeNote("E after attempt 1", "failed", rf1.scoreTile);
     // Jump, attempt 2 passes, Results.
     await fl.locator("#results-goto-btn").click();
@@ -2558,6 +2701,7 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     await sleep(8000);
     const rf2 = await resultsFacts(fl);
     await checkPair("CR-i", "E-launch1", a, "passed", rf2.scoreTile);
+    const latchE = await checkLatchAtOutcome("CR-i/22", a, "passed", rf2.scoreTile);
     readmeNote("E after attempt 2", "passed", rf2.scoreTile);
     await fl.locator("#prev-btn").click();
     await waitSlide(fl, ai + 1, 10_000).catch(() => {});
@@ -2567,6 +2711,7 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     EV.ui["E-results"] = { first: rf1, final: rf2 };
     await page.close();
     await sleep(3000);
+    await checkLatchUnchanged("CR-i/22", a, latchE);
     await ctx.close();
   });
 
@@ -2589,10 +2734,13 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     await sleep(8000);
     const rf2 = await resultsFacts(fl);
     await checkPair("CR-ii", "F-launch1", a, "failed", rf2.scoreTile);
+    // ADR 0015 step 9 (extra 23's latch assertion): one message, passed: false, with the second Results score.
+    const latchF = await checkLatchAtOutcome("CR-ii/23", a, "failed", rf2.scoreTile);
     readmeNote("F at the second Results", "failed", rf2.scoreTile);
     EV.ui["F-results"] = { first: rf1, second: rf2 };
     await page.close();
     await sleep(3000);
+    await checkLatchUnchanged("CR-ii/23", a, latchF);
     await ctx.close();
   });
 
@@ -2602,6 +2750,7 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
   // `…_cmi5_att2_never.zip` (the resume despite `never`)."
   crTest(["att2_ask", "att2_never"], "CR (iii). learner G fails once and closes (Exit, then a tab close): terminated and the state PUT only; relaunch resumes the same registration, one attempt left, no Welcome-back modal (att2_ask / att2_never zips)", async ({ browser, baseURL }) => {
     test.setTimeout(25 * 60_000);
+    assertSweepTarget(baseURL!);
     await ensureWorld(browser, baseURL!, `course-result ${VARIANT}`);
     const tag = VARIANT === "att2_ask" ? "the no-modal check" : "the resume despite never";
     const { L, ctx, page, fl, a } = await crLaunch(browser, baseURL!, "G", "G-launch1");
@@ -2699,7 +2848,11 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     await waitStateMoved(pre2);
     await sleep(4000);
     await closeChecks("tab close", "G-launch2", cut2, q2, pre2, closeAt2);
+    // ADR 0015 step 9 (extra 24): a learner who fails once and closes is not complete: never held, never swept.
+    checkSweepLeaves("CR-iii/24", await postSweep(baseURL!), a);
     const p3 = await resumeChecks("tab close", "G-launch3", 3);
+    const rowG = await attemptRow(a);
+    check("CR-iii/24", "across the relaunches and past one sweep: in progress, completion_webhook_at null", rowG?.status === "in_progress" && rowG?.completion_webhook_at === null, { status: rowG?.status, completion_webhook_at: rowG?.completion_webhook_at });
     await p3.page.close();
     await sleep(3000);
     await ctx.close();
@@ -2720,10 +2873,13 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     const rf = await resultsFacts(fl);
     check("CR-v", "a fail at attempt 1 on the attempts-1 zip: no \"Try again\" (on the assessment and at Results) and no \"Not final yet\" line", retryOnAsmt === 0 && rf.tryAgainButtons === 0 && !rf.notFinal && rf.gotoBtn === null && rf.finishBtn === null, { asmtRetryAfterTheFail: retryOnAsmt, resultsTryAgain: rf.tryAgainButtons, notFinal: rf.notFinal, goto: rf.gotoBtn, finish: rf.finishBtn });
     await checkPair("CR-v", "V1F-launch1", a, "failed", rf.scoreTile);
+    // ADR 0015 step 9 (extra 27, learner J of ADR 0014 step 17): final at once, one message with passed: false.
+    const latchV1F = await checkLatchAtOutcome("CR-v/27", a, "failed", rf.scoreTile);
     readmeNote("V1F", "failed", rf.scoreTile);
     EV.ui["V1F-results"] = rf;
     await page.close();
     await sleep(3000);
+    await checkLatchUnchanged("CR-v/27", a, latchV1F);
     await ctx.close();
   });
 
@@ -2738,10 +2894,13 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     await sleep(8000);
     const rf = await resultsFacts(fl);
     await checkPair("CR-v", "V1P-launch1", a, "passed", rf.scoreTile);
+    // ADR 0015 step 9 (extra 27, learner K of ADR 0014 step 17): one message with passed: true.
+    const latchV1P = await checkLatchAtOutcome("CR-v/27", a, "passed", rf.scoreTile);
     readmeNote("V1P", "passed", rf.scoreTile);
     EV.ui["V1P-results"] = rf;
     await page.close();
     await sleep(3000);
+    await checkLatchUnchanged("CR-v/27", a, latchV1P);
     await ctx.close();
   });
 
@@ -2761,10 +2920,13 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     await sleep(8000);
     const rf = await resultsFacts(fl);
     await checkPair("CR-vi", "H-launch1", a, "passed", rf.scoreTile);
+    // ADR 0015 step 9 (extra 28): one message with the Results score.
+    const latchH = await checkLatchAtOutcome("CR-vi/28", a, "passed", rf.scoreTile);
     readmeNote("H", "passed", rf.scoreTile);
     EV.ui["H-results"] = rf;
     await page.close();
     await sleep(3000);
+    await checkLatchUnchanged("CR-vi/28", a, latchH);
     await ctx.close();
   });
 
@@ -2782,10 +2944,13 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
     await sleep(8000);
     const rf = await resultsFacts(fl);
     await checkPair("CR-vi", "I-launch1", a, "failed", rf.scoreTile);
+    // ADR 0015 step 9 (extra 28): one message with passed: false.
+    const latchI = await checkLatchAtOutcome("CR-vi/28", a, "failed", rf.scoreTile);
     readmeNote("I", "failed", rf.scoreTile);
     EV.ui["I-results"] = rf;
     await page.close();
     await sleep(3000);
+    await checkLatchUnchanged("CR-vi/28", a, latchI);
     await ctx.close();
   });
 });

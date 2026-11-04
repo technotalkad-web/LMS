@@ -420,6 +420,38 @@ const expected = "sha256=" +
 if (expected !== req.headers["x-ambak-signature"]) return res.status(401).end();
 ```
 
+**When it fires (ADR 0015).** A scored cmi5 or xAPI module fires within
+seconds of the pass/fail. An unscored cmi5 module fires when the learner
+exits it, after the course sent `completed` without a pass/fail. An unscored
+plain-xAPI module fires from a 15-minute sweep, so up to about 30 minutes
+after completion, longer when the scheduler is delayed or when more
+completions are waiting than one sweep sends.
+
+For an unscored module the payload carries `score: null, passed: false`,
+where `passed: false` means "no pass mark", not "failed".
+
+At most two `course_completed` messages are sent per official attempt: the first when it completes (cmi5/xAPI: with its result, or, when the course sent its completion without a result, after that session ends or 15 minutes later; SCORM 1.2: at the completing commit, with whatever is known then), and a second, always `passed: true` with the same `attempt_number`, only if the attempt becomes passed afterwards (a fail then a pass in the same sitting, or a pass that arrives after a message sent without a result), which replaces the first.
+
+SCORM 1.2 modules have always followed this rule. Their second message's
+`completed_at` is the time it was sent, while a cmi5/xAPI message carries
+the attempt's completion time, and a SCORM message can very rarely arrive
+twice with identical values.
+
+`score` is the attempt's stored score at the time of sending: on cmi5/xAPI
+the highest module-level score received, on SCORM 1.2 the last committed
+one, and for a KIVO course the Results slide's score. A change of score
+without a change of pass/fail, a `failed` that arrives after a message sent
+without a result, a granted retake starting (shown by `learner-summary` as
+in progress), and the official result changing because the attempt rules
+were recomputed (ADR 0014 step 9) are never sent, so `learner-summary` and
+`progress` are authoritative for them.
+
+A message with `attempt_number: null` is reconciled through
+`learner-summary`: it is sent when the attempt could not be classified and
+was treated as official.
+
+A `course_completed` with a higher `attempt_number` for the same learner and course is a granted extra official attempt, whose result replaces the earlier one whether it is higher or lower, so a `passed: false` can follow a `passed: true` (`attempt_number` and `official: true` on both).
+
 Delivery is best-effort (5s timeout, one attempt) and never blocks the
 learner. Reconcile any gaps with `learner-summary` — treat the webhook as a
 cache-refresh signal, the summary as truth.
@@ -476,3 +508,16 @@ behind an official result could not be read; retry).
 - Email changes are LMS-admin-only by design.
 - Webhook delivery is at-most-once; the summary endpoint is the source of
   truth.
+- Unscored modules: the webhook comes later than the completion. An unscored
+  cmi5 module's webhook fires when the learner exits it; an unscored
+  plain-xAPI module's webhook fires from a 15-minute sweep, so up to about
+  30 minutes after completion, longer when the scheduler is delayed or when
+  more completions are waiting than one sweep sends (Step 5).
+- At most two messages per official attempt (Step 5): the second only when
+  the attempt becomes passed afterwards. Never pushed, so read them from
+  `learner-summary` or `progress`: a new score with the same pass/fail, a
+  `failed` after a message that carried no result, the start of a granted
+  retake, and an official result recomputed under the attempt rules.
+- Delivery stays best-effort (one try, 5 s) for each message, so
+  "at-most-once" above describes each message's delivery, not a limit of
+  one message per attempt.
