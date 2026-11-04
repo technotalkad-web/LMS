@@ -15,7 +15,7 @@ export const TONE_DOT: Record<Tone, string> = {
   bad: "bg-red-500",
   none: "bg-slate-300",
 };
-export const STATUS_TONE: Record<LearnerStatus, Tone> = { on_track: "ok", watch: "warn", needs_support: "bad" };
+export const STATUS_TONE: Record<LearnerStatus, Tone> = { on_track: "ok", watch: "warn", needs_support: "bad", unavailable: "none" };
 export const SEVERITY_TONE: Record<Severity, Tone> = { critical: "bad", high: "warn", normal: "warn" };
 
 export function Pill({ tone, children, className = "" }: { tone: Tone; children: ReactNode; className?: string }) {

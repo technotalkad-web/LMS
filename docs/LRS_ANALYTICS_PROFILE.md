@@ -1,4 +1,4 @@
-# Ambak xAPI Analytics Profile (v1.0.0)
+# Ambak xAPI Analytics Profile (v1.1.0)
 
 The contract for every statement the LMS sends to an external Learning
 Record Store (Veracity, Watershed, Learning Locker, SQL LRS …). It is what
@@ -79,8 +79,9 @@ Context extensions on every statement, when known:
 - `content/course-id`, `content/course-title`, `content/version-id`, `content/version-number`,
   `content/package-id`, `content/language`, `content/manifest-type`, `content/engine-version`
 - `attempt/id`, `attempt/number` (1 = first attempt on the course), `attempt/scored`
-  (counts under the course's scoring rule), `attempt/scoring-basis`, `attempt/scoring-max-attempts`,
-  `attempt/started-at`
+  (counts under the course's scoring rule; `false` on a revision visit; `true` on a granted
+  retake), `attempt/launch-mode` (`Review` on a revision visit's statements; absent otherwise;
+  ADR 0014), `attempt/scoring-basis`, `attempt/scoring-max-attempts`, `attempt/started-at`
 - `path/id`, `path/name`, `path/step`, `path/steps-total`
 - `journey/program-id`, `journey/name`, `journey/enrollment-id`, `journey/day`, `journey/days-total`
 - `org/id`, `org/slug`

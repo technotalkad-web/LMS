@@ -1,5 +1,7 @@
 "use client";
 
+import { csvEscape } from "@/lib/util/csv";
+
 export type CsvCell = string | number | null | undefined;
 
 export function CsvButton({
@@ -15,7 +17,7 @@ export function CsvButton({
 }) {
   function download() {
     const lines = [header, ...rows].map((row) =>
-      row.map((c) => escapeCell(c)).join(",")
+      row.map((c) => csvEscape(c)).join(",")
     );
     const csv = "﻿" + lines.join("\n") + "\n"; // BOM for Excel
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -38,11 +40,4 @@ export function CsvButton({
       {label}
     </button>
   );
-}
-
-function escapeCell(v: CsvCell): string {
-  if (v === null || v === undefined) return "";
-  const s = String(v);
-  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
 }

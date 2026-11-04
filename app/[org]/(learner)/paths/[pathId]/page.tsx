@@ -15,9 +15,9 @@ import { createClient } from "@/lib/supabase/server";
 import { isReleased } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
-import { DEFAULT_POLICY, computeScoring, officialDone } from "@/lib/scoring/policy";
+import { DEFAULT_POLICY, computeScoring, isRevisionAttempt, officialDone } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, fetchGrantRetakeIds, readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 
 type PathRow = {
   id: string;
@@ -192,15 +192,6 @@ export default async function LearningPathDetailPage({
   // ALL of the learner's attempts on these modules (any launch context): the
   // 0073 scoring window counts every completed attempt of a module, whichever
   // screen launched it. Path PROGRESS below still uses path-context only.
-  const { data: attemptRows } = versionIds.length
-    ? await supabase
-        .from("course_attempts")
-        .select(
-          "id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id"
-        )
-        .eq("user_id", user.id)
-        .in("course_version_id", versionIds)
-    : { data: [] };
   type Attempt = {
     id: string;
     course_version_id: string;
@@ -212,7 +203,25 @@ export default async function LearningPathDetailPage({
     started_at: string;
     completed_at: string | null;
     learning_path_id: string | null;
+    /** 0103 (ADR 0014): a revision visit's row; absent on a database without 0103 (= false). */
+    is_revision?: boolean | null;
   };
+  // ADR 0014 steps 7 and 12: the select names is_revision (the narrower-select
+  // fallback on a database without 0103), so computeScoring drops a revision
+  // visit's row; officialDone stays the step gate while a granted retake runs
+  // (ADR 0014 step 10).
+  const { data: attemptRows } = versionIds.length
+    ? await readWithOptionalColumn<unknown[]>(
+        "is_revision",
+        (columns) =>
+          supabase
+            .from("course_attempts")
+            .select(columns)
+            .eq("user_id", user.id)
+            .in("course_version_id", versionIds),
+        "id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id"
+      )
+    : { data: [] };
   const allAttempts = (attemptRows ?? []) as Attempt[];
   const attempts = allAttempts.filter((a) => a.learning_path_id === pathId);
   // Official score per module under its attempt scoring rule (0073), and
@@ -249,13 +258,16 @@ export default async function LearningPathDetailPage({
     if (!v) continue;
     pathAttemptsByCourse.set(v.course_id, [...(pathAttemptsByCourse.get(v.course_id) ?? []), a]);
   }
+  // A step is in progress on an open path-context row that is neither
+  // abandoned nor a revision visit's row: an open revision visit never marks
+  // a step "in progress" (ADR 0014 steps 6 and 12).
   const completedCourseIds = new Set<string>();
   const inProgressCourseIds = new Set<string>();
   for (const [cid, list] of pathAttemptsByCourse) {
     const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
     if (officialDone(s, passRequired.has(cid))) {
       completedCourseIds.add(cid);
-    } else if (list.some((a) => a.completion_status === "in_progress" && a.status !== "abandoned")) {
+    } else if (list.some((a) => a.completion_status === "in_progress" && a.status !== "abandoned" && !isRevisionAttempt(a))) {
       inProgressCourseIds.add(cid);
     }
   }

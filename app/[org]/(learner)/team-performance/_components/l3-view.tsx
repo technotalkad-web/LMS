@@ -82,6 +82,10 @@ export function L3View(p: L3ViewProps) {
     ...(p.options.branches.length ? [{ key: "branch", label: "Branch", value: p.filters.branch, options: [{ value: "", label: "All branches" }, ...p.options.branches.map((v) => ({ value: v, label: v }))] }] : []),
   ];
   const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  // ADR 0014:188: learners whose history could not be
+  // read are counted nowhere; no reassurance is shown while any is in scope.
+  const unreadableN = learners.filter((l) => l.historyUnavailable).length;
+  const notCountedNote = (n: number) => (n > 0 ? <span className="ml-1 text-[11px] text-muted">{n} not counted</span> : null);
 
   return (
     <div data-dashboard-root="" className="max-w-6xl mx-auto space-y-6">
@@ -119,6 +123,7 @@ export function L3View(p: L3ViewProps) {
               </li>
             ))}
           </ul>
+          {org.unavailable > 0 && <p className="text-xs text-muted mt-2">{org.unavailable} not counted (history unavailable)</p>}
           <p className="text-[11px] text-muted mt-3">
             {plural(learners.length, "person", "people")} in {plural(p.teams.length, "team", "teams")}.
             {p.computedAt ? ` Numbers as of ${p.computedAt.slice(11, 16)} UTC (refreshed every 15 minutes).` : " Computed live."}
@@ -129,7 +134,7 @@ export function L3View(p: L3ViewProps) {
             <ul className="space-y-1.5 text-sm">
               {top.map((c) => (
                 <li key={c.managerId} className="flex items-baseline justify-between gap-3">
-                  <Link href={teamHref(c.managerId)} className="hover:underline">{c.isOwn ? "Your direct team" : `${c.managerName}'s team`}</Link>
+                  <span><Link href={teamHref(c.managerId)} className="hover:underline">{c.isOwn ? "Your direct team" : `${c.managerName}'s team`}</Link>{notCountedNote(c.unavailable)}</span>
                   <Pill tone={c.score.tone}>{c.score.score}</Pill>
                 </li>
               ))}
@@ -137,11 +142,17 @@ export function L3View(p: L3ViewProps) {
           )}
         </Card>
         <Card eyebrow="Teams needing support">
-          {weak.length === 0 ? <p className="text-sm text-muted">Every scored team is in the green.</p> : (
+          {weak.length === 0 ? (
+            learners.some((l) => l.historyUnavailable) ? (
+              <p className="text-sm text-muted">History unavailable for {unreadableN} {unreadableN === 1 ? "learner" : "learners"}. Please reload.</p>
+            ) : (
+              <p className="text-sm text-muted">Every scored team is in the green.</p>
+            )
+          ) : (
             <ul className="space-y-1.5 text-sm">
               {weak.map((c) => (
                 <li key={c.managerId} className="flex items-baseline justify-between gap-3">
-                  <Link href={teamHref(c.managerId)} className="hover:underline">{c.isOwn ? "Your direct team" : `${c.managerName}'s team`}</Link>
+                  <span><Link href={teamHref(c.managerId)} className="hover:underline">{c.isOwn ? "Your direct team" : `${c.managerName}'s team`}</Link>{notCountedNote(c.unavailable)}</span>
                   <span className="text-xs text-muted">{c.failed ? `${c.failed} failed · ` : ""}{c.overdue ? `${c.overdue} overdue · ` : ""}<Pill tone={c.score.tone}>{c.score.score}</Pill></span>
                 </li>
               ))}
@@ -172,7 +183,10 @@ export function L3View(p: L3ViewProps) {
                   const journey = c.score.signals.find((s) => s.key === "journey")?.value ?? null;
                   return (
                     <tr key={c.managerId} className="hover:bg-canvas/60">
-                      <td className="px-5 py-2.5 font-medium"><Link href={groupHref(c.managerId)} className="hover:underline">{c.managerName}</Link></td>
+                      <td className="px-5 py-2.5 font-medium">
+                        <Link href={groupHref(c.managerId)} className="hover:underline">{c.managerName}</Link>
+                        {c.unavailable > 0 && <span className="block text-[11px] text-muted font-normal">{c.unavailable} not counted</span>}
+                      </td>
                       <td className="px-3 py-2.5 text-right"><Pill tone={c.score.tone}>{c.score.score ?? "—"}</Pill></td>
                       <td className="px-3 py-2.5 text-right tabular-nums">{c.size}</td>
                       <td className="px-3 py-2.5 text-right tabular-nums">{pct(journey)}</td>
@@ -189,7 +203,11 @@ export function L3View(p: L3ViewProps) {
 
         <Card eyebrow="Major learning gaps (across everyone under you)">
           {gaps.length === 0 ? (
-            <p className="text-sm text-muted">No module or journey day is holding the organisation back right now.</p>
+            learners.some((l) => l.historyUnavailable) ? (
+              <p className="text-sm text-muted">History unavailable for {unreadableN} {unreadableN === 1 ? "learner" : "learners"}. Please reload.</p>
+            ) : (
+              <p className="text-sm text-muted">No module or journey day is holding the organisation back right now.</p>
+            )
           ) : (
             <ul className="space-y-2.5 text-sm">
               {gaps.map((g) => (

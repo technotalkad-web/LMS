@@ -9,6 +9,7 @@ import { LearningPathsClient } from "./learning-paths-client";
 import { loadScopes, type ContentScopes } from "@/lib/content/scopes";
 import { fetchScoringRules } from "@/lib/scoring/resolve";
 import { courseProgress, pathProgress, type CourseProgressView } from "@/lib/courses/progress-view";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 
 export const dynamic = "force-dynamic";
 
@@ -205,14 +206,22 @@ export default async function LearningPathsPage({
     )
   );
 
+  // ADR 0014 step 12: the select names is_revision through the narrower-select
+  // fallback, so a revision row never supplies a step's progress. No
+  // retakeIds: the per-step progress feeds pathProgress, a roll-up.
+  const ATTEMPT_COLUMNS =
+    "user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units";
   const { data: attemptsAll } = enrolleeUserIds.length && allVerIds.length
-    ? await supabase
-        .from("course_attempts")
-        .select(
-          "user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units"
-        )
-        .in("user_id", enrolleeUserIds)
-        .in("course_version_id", allVerIds)
+    ? await readWithOptionalColumn<unknown[]>(
+        "is_revision",
+        (columns) =>
+          supabase
+            .from("course_attempts")
+            .select(columns)
+            .in("user_id", enrolleeUserIds)
+            .in("course_version_id", allVerIds),
+        ATTEMPT_COLUMNS
+      )
     : { data: [] };
 
   type PAttempt = {
@@ -220,6 +229,8 @@ export default async function LearningPathsPage({
     course_version_id: string;
     /** ADR 0004 step 11: courseProgress() leaves abandoned attempts out. */
     status: string | null;
+    /** ADR 0014 (0103): courseProgress() leaves revision rows out. */
+    is_revision?: boolean | null;
     completion_status: string;
     success_status: string;
     started_at: string | null;

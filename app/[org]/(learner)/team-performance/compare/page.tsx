@@ -139,7 +139,11 @@ export default async function CompareTeamsPage({
               </h2>
               <Pill tone={c.score.tone}>{c.score.score ?? "—"}</Pill>
             </div>
-            <p className="text-xs text-muted mt-0.5">{c.size} {c.size === 1 ? "person" : "people"} · {c.score.label}</p>
+            <p className="text-xs text-muted mt-0.5">
+              {c.size} {c.size === 1 ? "person" : "people"} · {c.score.label}
+              {/* ADR 0014:188: members whose history could not be read are out of the score. */}
+              {c.unavailable > 0 ? ` · ${c.unavailable} not counted` : ""}
+            </p>
             <ul className="mt-3 space-y-1.5 text-sm">
               {c.score.signals.map((s) => (
                 <li key={s.key} className="flex items-baseline justify-between gap-3">

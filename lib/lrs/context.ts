@@ -5,11 +5,16 @@
  *
  * Every lookup is fail-soft: a missing table, column or row narrows the
  * context (fewer extensions) but never throws, so the forwarding path stays
- * exactly as robust as it was before enrichment existed.
+ * exactly as robust as it was before enrichment existed. One exception
+ * (ADR 0014 step 7): the two attempt reads behind the revision markers and
+ * the ordinal fall back only on a missing `is_revision` column; any other
+ * error throws ContextReadError, because a forwarded statement is
+ * write-once and must not leave with a revision row read as unflagged.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { launchedActivityIds } from "@/lib/xapi/process-statement";
 import { resolvePolicies } from "@/lib/scoring/resolve";
+import { isMissingColumn, type PgError } from "@/lib/scoring/attempt-kind";
 import {
   fetchActiveMembers,
   resolveGroupMembers,
@@ -41,6 +46,73 @@ async function safe<T>(p: PromiseLike<any>): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * A read behind the LRS markers (ADR 0014 step 7) failed for a reason other
+ * than a missing `is_revision` column. Thrown, never swallowed:
+ * the sweep is cursor-paged, so a row skipped inside a
+ * processed chunk is never re-selected, whereas a thrown source error is
+ * caught by the sweep's orchestration, which leaves that source's cursor
+ * where it was and marks it not done, so the next run retries the chunk.
+ * The live callers catch it too (lib/lrs/abandoned.ts per slice, logged;
+ * lib/lrs/enqueue.ts forwards the statements raw, never with a false label).
+ */
+export class ContextReadError extends Error {
+  constructor(readonly read: "attempts" | "siblings") {
+    super(`attempt context read failed: ${read}`);
+    this.name = "ContextReadError";
+  }
+}
+
+/**
+ * One read with a three-way answer, for the reads that must not be
+ * fail-soft: `data`, `missing` (a missing-column error naming `column`, the
+ * narrower-select fallback's trigger, isMissingColumn) or `failed` (any
+ * other error, a thrown exception, or an answer with neither rows nor an
+ * error).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function readOrMissing<T>(p: PromiseLike<any>, column: string): Promise<{ data: T } | { missing: true } | { failed: true }> {
+  try {
+    const { data, error } = (await p) as { data: T | null; error: PgError };
+    if (error) return isMissingColumn(error, column) ? { missing: true } : { failed: true };
+    return data == null ? { failed: true } : { data };
+  } catch {
+    return { failed: true };
+  }
+}
+
+/**
+ * Every non-abandoned attempt of these users on these courses, for the
+ * attempt ordinal. ADR 0014 step 7: revision rows are excluded from the
+ * ordinal (a first tier filters `is_revision = false`); only a missing
+ * column falls back to today's select (no row is flagged on such a
+ * database); any other error throws ContextReadError, since an ordinal
+ * re-read with revision rows in it would stamp write-once statements with
+ * a wrong attempt/number.
+ */
+async function loadSiblings(svc: SupabaseClient, userIds: string[], courseIds: string[]): Promise<Row[] | null> {
+  const flagged = await readOrMissing<Row[]>(
+    svc
+      .from("course_attempts")
+      .select("id, user_id, started_at, status, is_revision, course_versions!inner(course_id)")
+      .in("user_id", userIds)
+      .in("course_versions.course_id", courseIds)
+      .neq("status", "abandoned")
+      .eq("is_revision", false),
+    "is_revision"
+  );
+  if ("data" in flagged) return flagged.data;
+  if ("failed" in flagged) throw new ContextReadError("siblings");
+  return safe<Row[]>(
+    svc
+      .from("course_attempts")
+      .select("id, user_id, started_at, status, course_versions!inner(course_id)")
+      .in("user_id", userIds)
+      .in("course_versions.course_id", courseIds)
+      .neq("status", "abandoned")
+  );
 }
 
 export type LearnerDims = AttemptContext["learner"];
@@ -188,7 +260,25 @@ export async function loadAttemptContexts(
   const ids = [...new Set(attemptIds.filter(Boolean))];
   if (!ids.length) return out;
 
+  // ADR 0014 step 7: a first tier names is_revision. Only a missing
+  // is_revision column (a database without 0103, where no row is flagged)
+  // falls back to today's two tiers, and the flag then reads false; any
+  // other error throws ContextReadError (the sweep retries the chunk).
+  const flagged = await readOrMissing<Row[]>(
+    svc
+      .from("course_attempts")
+      .select(
+        "id, user_id, organization_id, course_version_id, learning_path_id, journey_enrollment_id, journey_day, started_at, status, is_revision, " +
+          "course_versions!inner(id, course_id, version_number, manifest_type, package_id, manifest_data, courses!course_versions_course_id_fkey(id, title), " +
+          "course_packages!course_versions_package_id_fkey(id, language))"
+      )
+      .in("id", ids),
+    "is_revision"
+  );
+  if ("failed" in flagged) throw new ContextReadError("attempts");
+
   const attempts =
+    ("data" in flagged ? flagged.data : null) ??
     (await safe<Row[]>(
       svc
         .from("course_attempts")
@@ -223,7 +313,7 @@ export async function loadAttemptContexts(
   ];
   const userIds = [...new Set(attempts.map((a) => String(a.user_id)))];
 
-  const [learners, orgs, paths, pathCourses, enrollments, policies, siblings] = await Promise.all([
+  const [learners, orgs, paths, pathCourses, enrollments, policies, siblings, grantLinks] = await Promise.all([
     loadLearnerDims(svc, pairs, groupsByOrgUser),
     loadOrgs(svc, orgIds),
     pathIds.length ? safe<Row[]>(svc.from("learning_paths").select("id, name").in("id", pathIds)) : null,
@@ -239,16 +329,20 @@ export async function loadAttemptContexts(
         )
       : null,
     resolvePolicies(svc, courseIds).catch(() => new Map()),
-    // Every non-abandoned attempt of these users on these courses → ordinal.
+    // Every non-abandoned, non-revision attempt of these users on these courses → ordinal.
+    loadSiblings(svc, userIds, courseIds),
+    // ADR 0014 step 7: `scored` is grant-aware (a grant retake is scored).
+    // Fail-soft: the mirror is not a chain renderer (ADR 0014:188's strict
+    // rule is for the history surfaces).
     safe<Row[]>(
-      svc
-        .from("course_attempts")
-        .select("id, user_id, started_at, status, course_versions!inner(course_id)")
-        .in("user_id", userIds)
-        .in("course_versions.course_id", courseIds)
-        .neq("status", "abandoned")
+      svc.from("attempt_requests").select("used_attempt_id").eq("status", "approved").in("used_attempt_id", ids)
     ),
   ]);
+  const retakeIds = new Set<string>();
+  for (const g of grantLinks ?? []) {
+    const id = str(g.used_attempt_id);
+    if (id) retakeIds.add(id);
+  }
 
   const pathName = new Map<string, string | null>();
   for (const p of paths ?? []) pathName.set(String(p.id), str(p.name));
@@ -299,13 +393,22 @@ export async function loadAttemptContexts(
     const policy = policies.get(courseId);
     const attemptNumber = ordinal.get(attemptId) ?? null;
     const manifest = (version.manifest_data ?? {}) as Row;
+    const isRevision = a.is_revision === true;
 
     out.set(attemptId, {
       attemptId,
       attemptNumber,
       startedAt: str(a.started_at),
-      scored:
-        policy && attemptNumber !== null ? attemptNumber <= policy.max_scored_attempts : null,
+      // ADR 0014 step 7: false on a revision visit's row (explicitly, since
+      // the row has no ordinal), true on a grant retake whatever its ordinal.
+      scored: isRevision
+        ? false
+        : retakeIds.has(attemptId)
+          ? true
+          : policy && attemptNumber !== null
+            ? attemptNumber <= policy.max_scored_attempts
+            : null,
+      isRevision,
       scoringBasis: policy?.official_basis ?? null,
       scoringMaxAttempts: policy?.max_scored_attempts ?? null,
       org: orgs.get(orgId) ?? { id: orgId, slug: null, name: null },

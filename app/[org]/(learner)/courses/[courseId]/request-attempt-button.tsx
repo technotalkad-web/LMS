@@ -3,19 +3,36 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { RotateCcw, Loader2 } from "lucide-react";
+import { learnerWarningLead, REQUEST_MESSAGES } from "@/lib/attempts/request-decision";
 
 /**
  * "Request another attempt" on the learner course page (revision rule, Phase 2).
  * Opens a small modal for the learner's reason and POSTs to /api/attempt-requests.
  * The server enforces one open request per learner+course; a 409 is surfaced as
  * a friendly message. On success the page refreshes to the "under review" state.
+ *
+ * ADR 0014 step 11 (1): when the learner's official result stands (passed,
+ * or completed on a module without a pass mark), the modal opens with the
+ * warning that a granted attempt's result replaces it even if it is lower.
  */
+
+/**
+ * The route's 503 code, shown as a plain sentence (ADR 0014 PR 1b); every
+ * other error the route sends is already a sentence.
+ */
+const REQUEST_ERRORS: Record<string, string> = {
+  records_unreadable: "Could not read your records. Please try again.",
+};
+
 export function RequestAttemptButton({
   orgSlug,
   courseId,
+  standingResult = null,
 }: {
   orgSlug: string;
   courseId: string;
+  /** The standing official result the warning names; null when it does not stand (no warning). */
+  standingResult?: { kind: "passed" | "completed"; scorePct: number | null } | null;
 }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -39,7 +56,7 @@ export function RequestAttemptButton({
     setBusy(false);
     if (!res.ok) {
       const j = (await res.json().catch(() => ({}))) as { error?: string };
-      setError(j.error ?? `HTTP ${res.status}`);
+      setError((j.error && REQUEST_ERRORS[j.error]) ?? j.error ?? `HTTP ${res.status}`);
       return;
     }
     setOpen(false);
@@ -69,6 +86,15 @@ export function RequestAttemptButton({
         >
           <div className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4">
             <h3 className="serif text-2xl">Request another attempt</h3>
+            {standingResult && (
+              <div
+                className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 space-y-1"
+                data-testid="request-attempt-warning"
+              >
+                <p className="font-medium">{learnerWarningLead(standingResult)}</p>
+                <p>{REQUEST_MESSAGES.learner_warning}</p>
+              </div>
+            )}
             <p className="text-sm text-muted leading-relaxed">
               Tell your administrator why you&apos;d like another official attempt.
               If approved, relaunching the course will start a fresh attempt that

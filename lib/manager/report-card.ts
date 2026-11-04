@@ -106,9 +106,24 @@ export function statusOf(flags: ExceptionFlag[], risk: number): LearnerStatus {
   return "on_track";
 }
 
-/** Worst-first ordering for the roster. */
+/**
+ * ADR 0014:188: a learner whose
+ * grant read failed carries no figure, so every team fold below leaves them
+ * out, journeys and engagement included (one rule, no carve-out).
+ */
+const unreadable = (l: LearnerInsight) => l.historyUnavailable === true;
+const notCounted = (n: number) => `${n} not counted (history unavailable)`;
+
+/**
+ * Worst-first ordering for the roster. Learners whose history could not be
+ * read sort after every ranked learner, among themselves by name: their
+ * risk and flags are never compared (none is computed).
+ */
 export function compareWorstFirst(a: LearnerInsight, b: LearnerInsight): number {
-  const rank: Record<LearnerStatus, number> = { needs_support: 0, watch: 1, on_track: 2 };
+  const ua = unreadable(a) || a.status === "unavailable";
+  const ub = unreadable(b) || b.status === "unavailable";
+  if (ua || ub) return ua && ub ? a.name.localeCompare(b.name) : ua ? 1 : -1;
+  const rank: Record<LearnerStatus, number> = { needs_support: 0, watch: 1, on_track: 2, unavailable: 3 };
   return (
     rank[a.status] - rank[b.status] ||
     b.risk - a.risk ||
@@ -122,22 +137,30 @@ export function compareWorstFirst(a: LearnerInsight, b: LearnerInsight): number 
 // ---------------------------------------------------------------------------
 
 export function teamScore(learners: LearnerInsight[]): TeamScore {
-  const assigned = learners.reduce((s, l) => s + l.assigned, 0);
-  const completed = learners.reduce((s, l) => s + l.completed, 0);
+  // ADR 0014:188: learners whose history could not be read are
+  // out of every signal's denominator, and each note says how many.
+  const counted = learners.filter((l) => !unreadable(l));
+  const unavailable = learners.length - counted.length;
+  const withCount = (note: string | null): string | null =>
+    unavailable === 0 ? note : note ? `${note} · ${notCounted(unavailable)}` : notCounted(unavailable);
+
+  const assigned = counted.reduce((s, l) => s + l.assigned, 0);
+  const completed = counted.reduce((s, l) => s + l.completed, 0);
   const completion = pct(completed, assigned);
 
-  const scores = learners.map((l) => l.avgScore).filter((v): v is number => v !== null);
+  const scores = counted.map((l) => l.avgScore).filter((v): v is number => v !== null);
   const assessment = mean(scores);
-  const withResult = learners.reduce((s, l) => s + l.assessmentsWithResult, 0);
-  const firstTime = learners.reduce((s, l) => s + l.passedFirstTime, 0);
+  const withResult = counted.reduce((s, l) => s + l.assessmentsWithResult, 0);
+  const firstTime = counted.reduce((s, l) => s + l.passedFirstTime, 0);
 
-  const journeyLearners = learners.filter((l) => l.journeys.some((j) => j.status === "active"));
+  const journeyLearners = counted.filter((l) => l.journeys.some((j) => j.status === "active"));
   const onTrack = journeyLearners.filter((l) =>
     l.journeys.filter((j) => j.status === "active").every((j) => j.onTrack)
   ).length;
   const journey = pct(onTrack, journeyLearners.length);
 
-  const engagement = pct(learners.filter((l) => l.activeLast7d).length, learners.length);
+  const active = counted.filter((l) => l.activeLast7d).length;
+  const engagement = pct(active, counted.length);
 
   const signals: Signal[] = [
     {
@@ -146,7 +169,7 @@ export function teamScore(learners: LearnerInsight[]): TeamScore {
       value: completion,
       tone: toneFor(completion, THRESHOLDS.completion),
       display: completion === null ? "—" : `${completion}%`,
-      note: assigned ? `${completed} of ${assigned} assigned items done` : "Nothing assigned yet",
+      note: withCount(assigned ? `${completed} of ${assigned} assigned items done` : "Nothing assigned yet"),
       weight: WEIGHTS.completion,
     },
     {
@@ -155,7 +178,7 @@ export function teamScore(learners: LearnerInsight[]): TeamScore {
       value: assessment,
       tone: toneFor(assessment, THRESHOLDS.assessment),
       display: assessment === null ? "—" : `${assessment} avg`,
-      note: withResult ? `${firstTime} of ${withResult} passed first time` : "No assessments taken yet",
+      note: withCount(withResult ? `${firstTime} of ${withResult} passed first time` : "No assessments taken yet"),
       weight: WEIGHTS.assessment,
     },
     {
@@ -164,9 +187,11 @@ export function teamScore(learners: LearnerInsight[]): TeamScore {
       value: journey,
       tone: toneFor(journey, THRESHOLDS.journey),
       display: journey === null ? "—" : `${journey}% on track`,
-      note: journeyLearners.length
-        ? `${onTrack} of ${journeyLearners.length} journey learners on track`
-        : "No active journey in this team",
+      note: withCount(
+        journeyLearners.length
+          ? `${onTrack} of ${journeyLearners.length} journey learners on track`
+          : "No active journey in this team"
+      ),
       weight: WEIGHTS.journey,
     },
     {
@@ -175,7 +200,7 @@ export function teamScore(learners: LearnerInsight[]): TeamScore {
       value: engagement,
       tone: toneFor(engagement, THRESHOLDS.engagement),
       display: engagement === null ? "—" : `${engagement}% active`,
-      note: learners.length ? `${learners.filter((l) => l.activeLast7d).length} of ${learners.length} active this week` : null,
+      note: withCount(counted.length ? `${active} of ${counted.length} active this week` : null),
       weight: WEIGHTS.engagement,
     },
   ];
@@ -191,7 +216,7 @@ export function teamScore(learners: LearnerInsight[]): TeamScore {
   const score = wsum > 0 && hasLearningData ? Math.round(live.reduce((s, x) => s + x.value! * x.weight, 0) / wsum) : null;
   const tone = toneFor(score, THRESHOLDS.score);
   const label = score === null ? "No data yet" : tone === "ok" ? "Good" : tone === "warn" ? "Needs attention" : "Needs support";
-  return { score, tone, label, signals };
+  return { score, tone, label, signals, unavailable };
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +373,8 @@ export function buildStruggles(
   const enrolledByCourse = new Map<string, number>();
   const failedByCourse = new Map<string, number>();
   for (const l of learners) {
+    // ADR 0014:188: an unreadable learner is in no denominator and no row.
+    if (unreadable(l)) continue;
     for (const c of l.courses) {
       enrolledByCourse.set(c.courseId, (enrolledByCourse.get(c.courseId) ?? 0) + 1);
       if (c.status === "failed" || c.passRequiredUnmet) failedByCourse.set(c.courseId, (failedByCourse.get(c.courseId) ?? 0) + 1);
@@ -366,6 +393,7 @@ export function buildStruggles(
   // Journey days: pending missions among people behind.
   const byDay = new Map<string, Struggle>();
   for (const l of learners) {
+    if (unreadable(l)) continue;
     for (const j of l.journeys) {
       if (j.status !== "active" || j.behind <= 0 || !j.nextModule) continue;
       const id = `${j.programId}:${j.day}`;
@@ -394,16 +422,23 @@ export function buildStruggles(
 // "This period"
 // ---------------------------------------------------------------------------
 
+/**
+ * The period card's sums, over the readable learners only (ADR 0014:188;
+ * journey missions included, so the sums and the card's
+ * "N not counted (history unavailable)" line agree).
+ */
 export function periodSummary(learners: LearnerInsight[], days: number | null): PeriodSummary {
-  const coursesCompleted = learners.reduce((s, l) => s + l.completedInPeriod, 0);
-  const prev = learners.reduce((s, l) => s + l.completedInPrevPeriod, 0);
+  const counted = learners.filter((l) => !unreadable(l));
+  const coursesCompleted = counted.reduce((s, l) => s + l.completedInPeriod, 0);
+  const prev = counted.reduce((s, l) => s + l.completedInPrevPeriod, 0);
   return {
     days,
     coursesCompleted,
-    passedFirstTime: learners.reduce((s, l) => s + l.passedFirstTimeInPeriod, 0),
-    assessmentsWithResult: learners.reduce((s, l) => s + l.assessmentsWithResult, 0),
-    journeyMissions: learners.reduce((s, l) => s + l.journeyDaysInPeriod, 0),
+    passedFirstTime: counted.reduce((s, l) => s + l.passedFirstTimeInPeriod, 0),
+    assessmentsWithResult: counted.reduce((s, l) => s + l.assessmentsWithResult, 0),
+    journeyMissions: counted.reduce((s, l) => s + l.journeyDaysInPeriod, 0),
     completionsDelta: days === null ? null : coursesCompleted - prev,
+    unavailable: learners.length - counted.length,
   };
 }
 
@@ -436,12 +471,13 @@ export function teamCards(teams: TeamInput[], byId: Map<string, LearnerInsight>,
     }
     const topFailed = [...failedTally.values()].sort((a, b) => b.n - a.n || a.title.localeCompare(b.title))[0] ?? null;
     const summary = periodSummary(ls, periodDays);
+    const score = teamScore(ls);
     return {
       managerId: t.managerId,
       managerName: t.managerName,
       isOwn: t.isOwn,
       size: ls.length,
-      score: teamScore(ls),
+      score,
       failed: has("failed"),
       overdue: has("overdue"),
       behind: has("behind"),
@@ -452,6 +488,7 @@ export function teamCards(teams: TeamInput[], byId: Map<string, LearnerInsight>,
       topFailed,
       completionsDelta: summary.completionsDelta,
       flagged: ls.filter((l) => l.flags.length > 0).map((l) => ({ userId: l.userId, name: l.name })),
+      unavailable: score.unavailable,
     };
   });
   return cards.sort(compareTeamsWorstFirst);
@@ -555,7 +592,8 @@ export function buildCommonStruggles(teams: TeamInput[], byId: Map<string, Learn
   for (const t of teams) {
     for (const id of t.memberIds) {
       const l = byId.get(id);
-      if (!l) continue;
+      // ADR 0014:188: an unreadable learner adds no row (their journeys included).
+      if (!l || unreadable(l)) continue;
       for (const f of l.flags) {
         if (f.contentKind !== "course" || !f.contentId) continue;
         const row = f.kind === "failed" || f.kind === "stuck" || f.kind === "not_started" || f.kind === "overdue"
@@ -610,8 +648,10 @@ export function buildOrgGaps(
     rows.set(id, cur);
     return cur;
   };
-  // Denominators per course across the hierarchy.
+  // Denominators per course across the hierarchy. ADR 0014:188: an
+  // unreadable learner is in no denominator and no gap.
   for (const l of learners) {
+    if (unreadable(l)) continue;
     for (const c of l.courses) {
       const r = row(c.courseId, "course", c.title);
       r.withCourse++;
@@ -619,6 +659,7 @@ export function buildOrgGaps(
     }
   }
   for (const l of learners) {
+    if (unreadable(l)) continue;
     const g = groupOf(l);
     for (const f of l.flags) {
       if (!f.contentId) continue;

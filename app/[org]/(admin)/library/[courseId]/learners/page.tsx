@@ -6,7 +6,22 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "./learners-filters";
 import { attemptCounts, computeScoring, courseStatus, excludeAbandoned } from "@/lib/scoring/policy";
-import { fetchGrantRetakeIdsForUsers } from "@/lib/scoring/attempt-kind";
+import {
+  GrantReadError,
+  grantSnapshotForUsers,
+  readWithOptionalColumn,
+  type GrantSnapshot,
+} from "@/lib/scoring/attempt-kind";
+import {
+  officialHistory,
+  officialRetakeState,
+  type HistoryEntry,
+  type HistoryGrantInfo,
+  type OfficialHistory,
+  type OfficialRetakeState,
+} from "@/lib/scoring/official-history";
+import { fetchRevisionVisitStats, type RevisionVisitStats } from "@/lib/attempts/revision-visits";
+import { resolveEmails } from "@/lib/users/emails";
 import { courseProgress, formatCourseProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 
@@ -70,11 +85,18 @@ interface EnrichedLearner {
   attempts: number;
   /** Reset (abandoned) attempts, shown as "· N reset". */
   resetAttempts: number;
-  /** Revision (practice) runs beyond the scoring window — informational. */
-  revisions: number;
+  /**
+   * ADR 0014 step 8: an abandoned grant retake, no unexpired unused grant on
+   * the course and no other retake id that is a non-abandoned row: the reset
+   * count reads "· N reset (retake reset, no grant)".
+   */
+  resetNoGrant: boolean;
   lastTouched: string | null;
-  /** 0075 progress % + screens. */
+  /** 0075 progress % + screens; a running granted retake's own (ADR 0014 step 10). */
   progress: CourseProgressView;
+  /** ADR 0014 step 7: the official-result chain, and its retake state. */
+  history: OfficialHistory;
+  retake: OfficialRetakeState;
 }
 
 export default async function LearnersPage({
@@ -247,15 +269,23 @@ export default async function LearnersPage({
   }
 
   // ---- fetch attempts ----
+  // ADR 0014 step 7: the select names is_revision through the narrower-select
+  // fallback, so counts, dates, progress and the chain drop revision rows (a
+  // database without 0103 has none and reads every row as unflagged).
+  const ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units";
   const { data: attemptRows } =
     enrolledUserIds.length && versionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select(
-            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units"
-          )
-          .in("user_id", enrolledUserIds)
-          .in("course_version_id", versionIds)
+      ? await readWithOptionalColumn<unknown[]>(
+          "is_revision",
+          (columns) =>
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .in("user_id", enrolledUserIds)
+              .in("course_version_id", versionIds),
+          ATTEMPT_COLUMNS
+        )
       : { data: [] };
   type AttemptRow = {
     id: string;
@@ -265,6 +295,8 @@ export default async function LearnersPage({
     course_version_id: string;
     /** ADR 0004 step 11: courseStatus()/courseProgress() leave abandoned attempts out. */
     status: string | null;
+    /** ADR 0014 (0103): a revision visit's row is never an attempt. */
+    is_revision?: boolean | null;
     completion_status: string;
     success_status: string;
     score: number | null;
@@ -275,9 +307,21 @@ export default async function LearnersPage({
 
   // 0073: this course's attempt scoring rule (fail-soft → default).
   const scoringPolicy = await resolvePolicy(supabase, c.id);
-  // 0083: consumed extra-attempt grants widen the scoring window so a granted
-  // retake is scored/official here too. Keyed `${uid}:${courseId}`; fail-soft pre-0083.
-  const extraByUser = await fetchGrantRetakeIdsForUsers(svc, org.id, enrolledUserIds);
+  // 0083 / ADR 0014 step 7 (strict reads): the grant links behind the
+  // official-result chain, in one strict bulk read used two ways. On a failed
+  // read the result columns keep a one-render fallback (no retake ids) while
+  // the History cell reads "History unavailable. Please reload." (ADR
+  // 0014:188). A missing relation is "no grants" inside the reader.
+  let snapshots = new Map<string, GrantSnapshot>();
+  let historyUnavailable = false;
+  try {
+    snapshots = await grantSnapshotForUsers(svc, org.id, [c.id], enrolledUserIds);
+  } catch (e) {
+    if (!(e instanceof GrantReadError)) throw e;
+    console.warn("[learners] grant read failed:", e.code);
+    historyUnavailable = true;
+  }
+  const noGrants: GrantSnapshot = { retakeIds: new Set<string>(), unusedGrant: null, rows: [] };
 
   // ---- enrich one row per enrolled user ----
   const enriched: EnrichedLearner[] = enrolledUserIds.map((uid) => {
@@ -286,12 +330,28 @@ export default async function LearnersPage({
       .slice()
       .sort((a, b) => (b.started_at > a.started_at ? 1 : -1))[0];
     // 0081 revision rule: status and score follow the OFFICIAL attempt (inside
-    // the scoring window). A revision run neither changes the verdict nor the
-    // score; it is counted separately so admins can see the learner revised.
-    const scoring = computeScoring(myAttempts, scoringPolicy, extraByUser.get(`${uid}:${c.id}`) ?? []);
+    // the scoring window). ADR 0014: a revision visit neither changes the
+    // verdict nor the score, and is counted in the Revisits column only.
+    const snapshot = snapshots.get(`${uid}:${c.id}`) ?? noGrants;
+    const scoring = computeScoring(myAttempts, scoringPolicy, snapshot.retakeIds);
+    // ADR 0014 step 10: "in_progress" while a granted retake runs.
     const status: Status = latest ? courseStatus(scoring, myAttempts) : "not_started";
     const bestScore = scoring.officialScore;
-    const revisions = scoring.practiceAttempts;
+    const history = officialHistory(myAttempts, snapshot.rows);
+    const retake = officialRetakeState(history);
+    // ADR 0014:186, verbatim: "an abandoned grant retake whose learner holds no
+    // unexpired unused grant on the course and no other retake id that is a
+    // non-abandoned row is labelled 'retake reset, no grant'". Every clause
+    // reads the strict snapshot: its unusedGrant
+    // is the oldest approved grant with used_at null and expires_at null or
+    // in the future, so "holds no unexpired unused grant" is
+    // `snapshot.unusedGrant === null`. Only when the history was read: a
+    // failed read leaves the label absent, never wrong (ADR 0014:186).
+    const resetNoGrant =
+      !historyUnavailable &&
+      history.reset.length > 0 &&
+      snapshot.unusedGrant === null &&
+      !myAttempts.some((a) => snapshot.retakeIds.has(a.id) && a.status !== "abandoned");
     // ADR 0004 step 11: a reset (abandoned) attempt is counted apart and
     // never dates the learner's last activity on the course.
     const counts = attemptCounts(myAttempts);
@@ -313,9 +373,12 @@ export default async function LearnersPage({
       bestScore,
       attempts: counts.live,
       resetAttempts: counts.reset,
-      revisions,
+      resetNoGrant,
       lastTouched,
-      progress: courseProgress(myAttempts, unitCountByVersion),
+      // A per-course display: the running retake's progress (ADR 0014 step 10).
+      progress: courseProgress(myAttempts, unitCountByVersion, { retakeIds: snapshot.retakeIds }),
+      history,
+      retake,
     };
   });
 
@@ -388,6 +451,22 @@ export default async function LearnersPage({
   const safePage = Math.min(page, totalPages);
   const startIdx = (safePage - 1) * PAGE_SIZE;
   const slice = sorted.slice(startIdx, startIdx + PAGE_SIZE);
+
+  // ---- revision visits for this page's learners only (ADR 0014 step 7) ----
+  // revision_visits is deny-all: service client. Bounded by PAGE_SIZE.
+  const visits: RevisionVisitStats =
+    slice.length > 0
+      ? await fetchRevisionVisitStats(svc, { orgId: org.id, courseIds: [c.id], userIds: slice.map((r) => r.user_id) })
+      : { byPair: new Map(), capped: false, failed: false };
+  // The History cells' "Granted by <email>": the deciders on this page, one read.
+  const deciderIds = new Set<string>();
+  for (const r of slice) {
+    for (const e of r.history.entries) if (e.grant?.decidedBy) deciderIds.add(e.grant.decidedBy);
+    if (r.history.running?.grant?.decidedBy) deciderIds.add(r.history.running.grant.decidedBy);
+    for (const x of r.history.reset) if (x.grant.decidedBy) deciderIds.add(x.grant.decidedBy);
+  }
+  const deciderEmail = deciderIds.size > 0 ? await resolveEmails(svc, deciderIds) : new Map<string, string>();
+  const attemptHref = (attemptId: string) => `/${orgSlug}/courses/${c.id}/attempts/${attemptId}`;
 
   // ---- helpers to build URLs that preserve other params ----
   function hrefWith(updates: Record<string, string | number | null>) {
@@ -537,11 +616,15 @@ export default async function LearnersPage({
                   sortKey="attempts_desc"
                   align="right"
                 />
+                <th className="text-right px-4 py-2 font-medium" title="Revision visits (review only, never an attempt): count · last revisit">
+                  Revisits
+                </th>
                 <SortHeader
                   label="Last activity"
                   sortKey="last_desc"
                   align="right"
                 />
+                <th className="text-left px-4 py-2 font-medium">History</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
@@ -581,28 +664,39 @@ export default async function LearnersPage({
                     <td className="px-4 py-3 text-xs tabular-nums whitespace-nowrap">
                       {r.status === "not_started" ? "—" : formatCourseProgress(r.progress)}
                     </td>
-                    <td className="px-4 py-3 text-right text-xs tabular-nums">
-                      {r.bestScore !== null
-                        ? `${(r.bestScore * 100).toFixed(0)}%`
-                        : "—"}
+                    <td className="px-4 py-3 text-right text-xs tabular-nums whitespace-nowrap">
+                      {/* ADR 0014 step 7: the standing result and the retake's state. */}
+                      {r.retake.state === "in_progress" && r.retake.current
+                        ? `${resultLabel(r.retake.current)} → retake in progress`
+                        : r.retake.state === "completed" && r.retake.previous && r.retake.current
+                          ? `${resultLabel(r.retake.previous)} → ${resultLabel(r.retake.current)}`
+                          : r.bestScore !== null
+                            ? `${(r.bestScore * 100).toFixed(0)}%`
+                            : "—"}
                     </td>
                     <td className="px-4 py-3 text-right text-xs tabular-nums whitespace-nowrap">
                       {r.attempts}
-                      {r.revisions > 0 && (
-                        <span className="text-muted" title="Revision (practice) runs: never change the official result">
-                          {" "}· {r.revisions} revision{r.revisions === 1 ? "" : "s"}
-                        </span>
-                      )}
                       {r.resetAttempts > 0 && (
                         <span className="text-muted" title="Attempts reset by a module update or language switch: never in progress, never official">
-                          {" "}· {r.resetAttempts} reset
+                          {" "}· {r.resetAttempts} reset{r.resetNoGrant ? " (retake reset, no grant)" : ""}
                         </span>
                       )}
+                    </td>
+                    <td className="px-4 py-3 text-right text-xs tabular-nums text-muted whitespace-nowrap">
+                      {revisitsCell(visits, `${r.user_id}:${c.id}`)}
                     </td>
                     <td className="px-4 py-3 text-right text-xs text-muted whitespace-nowrap">
                       {r.lastTouched
                         ? new Date(r.lastTouched).toISOString().slice(0, 10)
                         : "—"}
+                    </td>
+                    <td className="px-4 py-3 text-xs align-top">
+                      <HistoryCell
+                        learner={r}
+                        unavailable={historyUnavailable}
+                        deciderEmail={deciderEmail}
+                        attemptHref={attemptHref}
+                      />
                     </td>
                   </tr>
                 );
@@ -682,5 +776,113 @@ function StatusPill({ status }: { status: Status }) {
     >
       {label[status]}
     </span>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// ADR 0014 step 7: the result cell's retake marker, the Revisits column and the
+// per-learner History expander (server-rendered <details>: no client
+// component, no route, no folder). Scores are 0..1.
+// -----------------------------------------------------------------------------
+
+function isoDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : "—";
+}
+
+const resultWord = (e: HistoryEntry) =>
+  e.status === "passed" ? "Passed" : e.status === "failed" ? "Not passed" : "Completed";
+
+/** "Passed 85 %", "Not passed 60 %", "Completed". */
+function resultLabel(e: HistoryEntry): string {
+  return e.score !== null ? `${resultWord(e)} ${Math.round(e.score * 100)} %` : resultWord(e);
+}
+
+/** "3 · 2026-10-28"; "N+" past the read cap; "—" when none or the read failed. */
+function revisitsCell(visits: RevisionVisitStats, key: string): string {
+  if (visits.failed) return "—";
+  const v = visits.byPair.get(key);
+  if (!v || v.count === 0) return "—";
+  return `${v.count}${visits.capped ? "+" : ""}${v.last ? ` · ${isoDate(v.last)}` : ""}`;
+}
+
+/**
+ * "Granted by <email> on <date>: <reason>", from the grant originally
+ * approved (followed through reissued_from), plus "re-issued on <date> after
+ * a module update" for a re-issue (ADR 0014:185).
+ */
+function grantLine(g: HistoryGrantInfo, deciderEmail: Map<string, string>): string {
+  const who = (g.decidedBy ? deciderEmail.get(g.decidedBy) : undefined) ?? "a former administrator";
+  const why = g.decisionNote ?? g.reason;
+  const reissued = g.reissuedAt ? ` · re-issued on ${isoDate(g.reissuedAt)} after a module update` : "";
+  return `Granted by ${who}${g.decidedAt ? ` on ${isoDate(g.decidedAt)}` : ""}${why ? `: ${why}` : ""}${reissued}`;
+}
+
+function HistoryCell({
+  learner,
+  unavailable,
+  deciderEmail,
+  attemptHref,
+}: {
+  learner: EnrichedLearner;
+  unavailable: boolean;
+  deciderEmail: Map<string, string>;
+  attemptHref: (attemptId: string) => string;
+}) {
+  // ADR 0014:188: with the grant links unread the chain would be wrong, not
+  // empty, so nothing but the text is shown.
+  if (unavailable) return <span className="text-amber-800">History unavailable. Please reload.</span>;
+  const { history } = learner;
+  type Line = { key: string; at: number; attemptId: string; text: string; grant: HistoryGrantInfo | null };
+  const lines: Line[] = [];
+  const entryById = new Map(history.entries.map((e) => [e.attemptId, e]));
+  for (const e of history.entries) {
+    const head = `${isoDate(e.completedAt)} · ${e.score !== null ? `${Math.round(e.score * 100)} % · ` : ""}${resultWord(e)}`;
+    const next = e.supersededBy ? entryById.get(e.supersededBy) : undefined;
+    lines.push({
+      key: e.attemptId,
+      at: Date.parse(e.completedAt),
+      attemptId: e.attemptId,
+      text: next ? `${head} · Replaced by a granted retake on ${isoDate(next.completedAt)}` : `${head} · Official result`,
+      grant: e.grant,
+    });
+  }
+  for (const x of history.reset) {
+    lines.push({
+      key: `reset:${x.attemptId}`,
+      at: Date.parse(x.startedAt),
+      attemptId: x.attemptId,
+      text: `${isoDate(x.startedAt)} · Granted retake, reset by a module update`,
+      grant: x.grant,
+    });
+  }
+  // Newest first; the running retake, the chain's open end, on top.
+  lines.sort((a, b) => (Number.isFinite(b.at) ? b.at : 0) - (Number.isFinite(a.at) ? a.at : 0));
+  if (history.running) {
+    const pct = learner.progress.pct;
+    lines.unshift({
+      key: `running:${history.running.attemptId}`,
+      at: Number.POSITIVE_INFINITY,
+      attemptId: history.running.attemptId,
+      text: `Official retake in progress${pct !== null ? ` · ${pct} %` : ""}`,
+      grant: history.running.grant,
+    });
+  }
+  if (lines.length === 0) return <span className="text-muted">—</span>;
+  return (
+    <details>
+      <summary className="cursor-pointer text-ink whitespace-nowrap">History</summary>
+      <ul className="mt-2 space-y-1.5 min-w-[18rem]">
+        {lines.map((l) => (
+          <li key={l.key}>
+            <Link href={attemptHref(l.attemptId)} className="text-ink hover:underline">
+              {l.text}
+            </Link>
+            {l.grant && <div className="text-muted">{grantLine(l.grant, deciderEmail)}</div>}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }

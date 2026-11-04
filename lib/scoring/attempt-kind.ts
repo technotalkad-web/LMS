@@ -15,9 +15,19 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
  *                         page and the forced restart decide from it, so a
  *                         failed read throws GrantReadError instead of
  *                         reading as "no grants".
+ *   grantSnapshotForUsers() — its bulk form for the surfaces that render the
+ *                         official-result chain (ADR 0014 steps 7, 8, 11):
+ *                         the same strict rule, keyed `${user_id}:${course_id}`.
+ *   fetchUnusedGrantsForUsers() — the unused approved grants of a page of
+ *                         learners, fail-soft (ADR 0014:186's named reader;
+ *                         the Learners page's "retake reset, no grant" label
+ *                         reads the strict snapshot instead).
  *   isSchemaMissing()   — a missing relation, column or function (a
  *                         database behind the code); isMissingColumn() is
- *                         the trigger of the narrower-select fallbacks.
+ *                         the trigger of the narrower-select fallbacks, and
+ *                         readWithOptionalColumn() writes that fallback once
+ *                         (readPagedWithOptionalColumn() its paged form, the
+ *                         first page deciding).
  *   fetchPassRequired() — which courses are configured "pass required"
  *                         (0081), fail-soft on a database that has not run
  *                         the migration yet.
@@ -29,7 +39,7 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = any;
 
-type PgError = { code?: string | null; message?: string | null } | null | undefined;
+export type PgError = { code?: string | null; message?: string | null } | null | undefined;
 
 /**
  * A PostgREST / supabase-js error meaning a relation, column or function is
@@ -67,6 +77,88 @@ export function isMissingColumn(error: PgError, column: string): boolean {
   if (code !== "42703" && code !== "PGRST204") return false;
   const msg = error.message ?? "";
   return msg === "" || msg.includes(column);
+}
+
+/**
+ * The narrower-select fallback, written once (ADR 0014 steps 7 and 12; every
+ * explicit select PR 1b widens goes through it): reads `${base}, ${column}`,
+ * and only when that answer is a missing-column error naming `column`
+ * (isMissingColumn) reads `base` once. Any other error is returned as it is
+ * and never retried without the column.
+ */
+export async function readWithOptionalColumn<T>(
+  column: string,
+  read: (columns: string) => PromiseLike<{ data: T | null; error: PgError }>,
+  base: string
+): Promise<{ data: T | null; error: PgError }> {
+  const first = await read(`${base}, ${column}`);
+  if (first.error && isMissingColumn(first.error, column)) return await read(base);
+  return first;
+}
+
+/**
+ * The column list a paged read decided (readPagedWithOptionalColumn): null
+ * until a page answers without an error. A chunked read passes one object to
+ * every chunk, so the first page that answers decides for all of them.
+ */
+export type OptionalColumnState = { columns: string | null };
+
+/** The error of a page that answered neither rows nor an error (opts.nullIsError). */
+const EMPTY_ANSWER = { code: "empty_answer", message: "an answer with neither rows nor an error" };
+
+/**
+ * The paged form of readWithOptionalColumn, written once:
+ * reads pages of `pageSize` rows (default 1,000, the PostgREST cap)
+ * through `read(columns, from, to)` until a short page.
+ *
+ * The first page decides. It is read through readWithOptionalColumn, so a
+ * missing-column error naming `column` re-reads it with `base`; the column
+ * list that answered it without an error is then used for every later page
+ * (and every later call sharing `opts.state`) and is never decided again. An
+ * error on any later page, a missing-column error included, is never retried
+ * with another column list: it ends the read and is returned with the rows
+ * read so far. Each caller keeps its own rule for that error (fail closed,
+ * throw, or count what was read).
+ *
+ * `opts.nullIsError` makes a page that answers neither rows nor an error an
+ * error (`empty_answer`), for the callers that fail closed on it; otherwise
+ * such a page reads as empty and ends the read. `opts.maxPages` is a safety
+ * ceiling on the pages read.
+ */
+export async function readPagedWithOptionalColumn<T>(
+  column: string,
+  read: (columns: string, from: number, to: number) => PromiseLike<{ data: T[] | null; error: PgError }>,
+  base: string,
+  opts: { pageSize?: number; maxPages?: number; nullIsError?: boolean; state?: OptionalColumnState } = {}
+): Promise<{ data: T[]; error: PgError }> {
+  const pageSize = opts.pageSize ?? 1000;
+  const state = opts.state ?? { columns: null };
+  const out: T[] = [];
+  for (let page = 0; opts.maxPages === undefined || page < opts.maxPages; page++) {
+    const from = page * pageSize;
+    const to = from + pageSize - 1;
+    let res: { data: T[] | null; error: PgError };
+    if (state.columns !== null) {
+      res = await read(state.columns, from, to);
+    } else {
+      let used = base;
+      res = await readWithOptionalColumn<T[]>(
+        column,
+        (columns) => {
+          used = columns;
+          return read(columns, from, to);
+        },
+        base
+      );
+      if (!res.error) state.columns = used;
+    }
+    if (res.error) return { data: out, error: res.error };
+    if (res.data == null && opts.nullIsError) return { data: out, error: EMPTY_ANSWER };
+    const rows = res.data ?? [];
+    out.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return { data: out, error: null };
 }
 
 export type AttemptKind = {
@@ -230,6 +322,77 @@ export function grantSnapshotOf(rows: GrantRow[], nowIso: string = new Date().to
   return { retakeIds, unusedGrant: live[0] ?? null, rows };
 }
 
+/** One approved grant of the bulk snapshot: the snapshot's columns plus the pair it belongs to. */
+export type GrantPairRow = GrantRow & { user_id: string; course_id: string };
+
+/** The `.in()` chunk of the bulk grant reads (the chunk of fetchGrantRetakeIdsForUsers). */
+const GRANT_CHUNK = 300;
+
+/**
+ * The bulk form of grantSnapshotFor (ADR 0014 step 3, "its bulk form
+ * grantSnapshotForUsers(svc, orgId, courseIds, userIds)"), for the surfaces
+ * that render the official-result chain (steps 7, 8 and 11): the approved
+ * grants of `userIds` in the organisation, `user_id` chunked by 300, and
+ * `course_id` filtered in the query when `courseIds` holds at most 300 ids
+ * (a longer list is filtered in memory; null means every course of the
+ * users, for the Report Card and the CRM feed). Each chunk is paged,
+ * `.order("id").range(from, from + 999)` until a short page:
+ * PostgREST cuts an answer at 1,000 rows without an error,
+ * and the order keeps the pages, and so a CRM status, stable between calls.
+ * The same strict rule and error order as grantSnapshotFor, through
+ * readPagedWithOptionalColumn: a missing `reissued_from` on the first page
+ * re-reads without it, and every later page and chunk reads without it; a
+ * missing relation (isSchemaMissing) before any page has answered is an
+ * empty map, "no grants" (pre-0083); any other error, an error on a later
+ * page (a schema-missing one included: the first page decides), or a page
+ * with neither rows nor an error throws GrantReadError, so a partial read
+ * never stands as the whole.
+ * Keyed `${user_id}:${course_id}`; a pair with no grant is absent (callers
+ * read it as an empty snapshot).
+ */
+export async function grantSnapshotForUsers(
+  svc: AnyClient,
+  orgId: string,
+  courseIds: string[] | null,
+  userIds: string[],
+  nowIso: string = new Date().toISOString()
+): Promise<Map<string, GrantSnapshot>> {
+  const out = new Map<string, GrantSnapshot>();
+  const users = [...new Set(userIds.filter(Boolean))];
+  const courses = courseIds === null ? null : [...new Set(courseIds.filter(Boolean))];
+  if (!orgId || users.length === 0 || (courses !== null && courses.length === 0)) return out;
+  const inQuery = courses !== null && courses.length <= GRANT_CHUNK ? courses : null;
+  const inMemory = courses !== null && courses.length > GRANT_CHUNK ? new Set(courses) : null;
+  const decided: OptionalColumnState = { columns: null };
+  const rows: GrantPairRow[] = [];
+  for (let i = 0; i < users.length; i += GRANT_CHUNK) {
+    const chunk = users.slice(i, i + GRANT_CHUNK);
+    const res = await readPagedWithOptionalColumn<GrantPairRow>(
+      "reissued_from",
+      (columns, from, to) => {
+        const q = svc.from("attempt_requests").select(columns).eq("organization_id", orgId).eq("status", "approved").in("user_id", chunk);
+        return (inQuery ? q.in("course_id", inQuery) : q).order("id").range(from, to);
+      },
+      `${GRANT_COLUMNS}, user_id, course_id`,
+      { state: decided, nullIsError: true }
+    );
+    if (res.error) {
+      // "No grants" only while no page has answered: once one has, the
+      // relation exists and any error is a failed read.
+      if (decided.columns === null && isSchemaMissing(res.error)) return new Map();
+      throw new GrantReadError(String(res.error.code ?? "") || "error");
+    }
+    for (const r of res.data) if (!inMemory || inMemory.has(r.course_id)) rows.push(r);
+  }
+  const byPair = new Map<string, GrantPairRow[]>();
+  for (const r of rows) {
+    const k = `${r.user_id}:${r.course_id}`;
+    (byPair.get(k) ?? byPair.set(k, []).get(k)!).push(r);
+  }
+  for (const [k, list] of byPair) out.set(k, grantSnapshotOf(list, nowIso));
+  return out;
+}
+
 /**
  * The grant-designated official RETAKE attempt ids a learner has consumed for a
  * course (Phase 2): approved grants whose retake has been started (used_at set,
@@ -315,6 +478,45 @@ export async function fetchGrantRetakeIdsForUsers(svc: AnyClient, orgId: string,
     }
   } catch {
     /* pre-0083 */
+  }
+  return out;
+}
+
+/** An approved grant not yet used (fetchUnusedGrantsForUsers); the caller tests `expires_at`. */
+export type UnusedGrant = { id: string; course_id: string; expires_at: string | null };
+
+/**
+ * The approved, unused grants of a page of learners (ADR 0014:186's named
+ * read): `id, user_id, course_id, expires_at` with `status = 'approved'` and
+ * `used_at is null`, `user_id` chunked by 300, keyed `${user_id}:${course_id}`.
+ * Fail-soft: an error or a thrown exception returns the pairs read so far,
+ * with no failure signal. A missing pair therefore cannot tell "no unused
+ * grant" from "not read", so the Learners page's "retake reset, no grant"
+ * label does not read this map: it reads the strict snapshot's
+ * `unusedGrant`, which is absent with
+ * the history when the read fails.
+ */
+export async function fetchUnusedGrantsForUsers(svc: AnyClient, orgId: string, userIds: string[]): Promise<Map<string, UnusedGrant[]>> {
+  const out = new Map<string, UnusedGrant[]>();
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (!orgId || ids.length === 0) return out;
+  try {
+    for (let i = 0; i < ids.length; i += GRANT_CHUNK) {
+      const { data, error } = await svc
+        .from("attempt_requests")
+        .select("id, user_id, course_id, expires_at")
+        .eq("organization_id", orgId)
+        .eq("status", "approved")
+        .is("used_at", null)
+        .in("user_id", ids.slice(i, i + GRANT_CHUNK));
+      if (error) return out;
+      for (const r of (data ?? []) as Array<UnusedGrant & { user_id: string }>) {
+        const k = `${r.user_id}:${r.course_id}`;
+        (out.get(k) ?? out.set(k, []).get(k)!).push({ id: r.id, course_id: r.course_id, expires_at: r.expires_at });
+      }
+    }
+  } catch {
+    /* the pairs read so far */
   }
   return out;
 }

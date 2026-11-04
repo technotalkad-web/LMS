@@ -5,7 +5,9 @@ import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { LearnersFilters } from "../../../library/[courseId]/learners/learners-filters";
-import { excludeAbandoned, officialStatuses, statusOf } from "@/lib/scoring/status";
+import { excludeAbandoned, officialStatuses, standingVerdictOf } from "@/lib/scoring/status";
+import { isRevisionAttempt } from "@/lib/scoring/policy";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 
 // =============================================================================
 // Dedicated enrolled-learners page for an admin viewing one learning path.
@@ -232,15 +234,22 @@ export default async function PathLearnersPage({
   const courseByVersion = new Map(versions.map((v) => [v.id, v.course_id]));
   const versionIds = versions.map((v) => v.id);
 
+  // ADR 0014 step 12: the select names is_revision through the narrower-select
+  // fallback, so the folds below drop revision rows (none before 0103).
+  const ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at";
   const { data: attemptRows } =
     enrolledUserIds.length && versionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select(
-            "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at"
-          )
-          .in("user_id", enrolledUserIds)
-          .in("course_version_id", versionIds)
+      ? await readWithOptionalColumn<unknown[]>(
+          "is_revision",
+          (columns) =>
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .in("user_id", enrolledUserIds)
+              .in("course_version_id", versionIds),
+          ATTEMPT_COLUMNS
+        )
       : { data: [] };
   type AttemptRow = {
     id: string;
@@ -248,6 +257,8 @@ export default async function PathLearnersPage({
     course_version_id: string;
     /** ADR 0004 step 11: abandoned attempts never make a learner "in progress". */
     status: string | null;
+    /** ADR 0014 (0103): a revision visit's row never starts, completes or dates a step. */
+    is_revision?: boolean | null;
     completion_status: string;
     success_status: string;
     score: number | null;
@@ -274,6 +285,8 @@ export default async function PathLearnersPage({
     // Which step courses has the user completed?
     const doneCourseIds = new Set<string>();
     for (const a of myAttempts) {
+      // ADR 0014: a revision visit's row never completes a step.
+      if (isRevisionAttempt(a)) continue;
       const cid = courseByVersion.get(a.course_version_id);
       if (!cid) continue;
       if (
@@ -289,14 +302,18 @@ export default async function PathLearnersPage({
 
     let status: Status;
     // ADR 0004 step 11: a learner whose only attempts were reset (abandoned)
-    // has not started.
-    if (coursesDone === 0 && !myAttempts.some((a) => a.status !== "abandoned")) {
+    // has not started; ADR 0014: nor one with only revision visits (the
+    // courseStatus rule).
+    if (coursesDone === 0 && excludeAbandoned(myAttempts).length === 0) {
       status = "not_started";
     } else if (coursesDone < coursesTotal) {
       status = "in_progress";
     } else {
       // All done — the FINAL step's OFFICIAL verdict, otherwise "completed".
-      const verdict = lastStepCourseId ? statusOf(official, uid, lastStepCourseId) : "completed";
+      // The path status is a roll-up, so it reads the STANDING verdict, never
+      // step 10's "in_progress" while a granted retake runs (ADR 0014:195; the
+      // CRM path object does the same).
+      const verdict = lastStepCourseId ? standingVerdictOf(official, uid, lastStepCourseId) : "completed";
       status = verdict === "passed" ? "passed" : verdict === "failed" ? "failed" : "completed";
     }
 

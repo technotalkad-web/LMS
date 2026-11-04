@@ -2790,6 +2790,125 @@ test.describe("KIVO Release A — cmi5 real-LMS run: course-result extras (attem
   });
 });
 
+// =================================================================== 56A extras after PR 1b: 16, 18 and 20 (the kit's base zip)
+// ADR 0014 step 17 (spec 56A): "16 (visit counts), 18 (step 10), … 20 (engagement)"; the addendum note of
+// 2026-10-29 groups them "after PR 1b: 16, 18 and 20". They run on the A.1 kit by hand, only after both staging
+// deployments carry PR 1b, never while another lifecycle run is in progress. The 0103 probe fails them,
+// never skips them, on a database without revision_visits. Not serial: each test seeds its own learner.
+async function requires0103For56A() {
+  const { error } = await svc().from("revision_visits").select("id").limit(1);
+  if (error) throw new Error(`0103 is not applied on this database (a real select of revision_visits failed: ${error.code ?? ""} ${error.message})`);
+}
+/** attemptsOf() names no 0103 column (56E runs before PR 1a); these extras read every column, the flag included. */
+async function attemptsWithFlag(userId: string): Promise<any[]> {
+  const { data, error } = await svc().from("course_attempts").select("*").eq("user_id", userId).eq("course_version_id", S.versionId!).order("started_at", { ascending: true });
+  if (error) throw new Error(`course_attempts read: ${error.message}`);
+  return data ?? [];
+}
+async function revisit(ctx: BrowserContext, learnerId: string, official: string, run: string) {
+  const before = (await attemptsWithFlag(learnerId)).length;
+  const v = await openCourse(ctx, run);
+  await waitFor(() => attemptsWithFlag(learnerId), (l) => l.length >= Math.max(before, 2), 20_000);
+  const rev = (await attemptsWithFlag(learnerId)).find((x) => x.id !== official && x.is_revision === true)?.id ?? null;
+  if (rev) await waitFor(() => stmts(rev), (l) => l.some((s) => verbOf(s) === V("initialized")), 30_000);
+  await sleep(3000);
+  await v.page.close();
+  await sleep(3000);
+  return rev;
+}
+async function bodyText(ctx: BrowserContext, url: string, waitFor: RegExp) {
+  const p = await ctx.newPage();
+  await p.goto(url, { timeout: 120_000 });
+  await p.getByText(waitFor).first().waitFor({ timeout: 60_000 }).catch(() => {});
+  const txt = norm(await p.locator("body").innerText().catch(() => ""));
+  await p.close();
+  return txt;
+}
+
+test.describe("KIVO Release A — cmi5 real-LMS run: 56A extras after PR 1b (16, 18, 20)", () => {
+  test.skip(!HAVE_KIT, "KIVO_RELEASE_A_KIT is not set (or the kit is incomplete); this run needs the package, which is not in the repository");
+  test.skip(HAVE_KIT && VARIANT !== "base", onlyOn(["base"]));
+  test.beforeAll(async () => {
+    await requires0103For56A();
+  });
+
+  test("16. (extra, after PR 1b) visit counts: two revision visits are counted and shown, never as attempts", async ({ browser, baseURL }) => {
+    test.setTimeout(20 * 60_000);
+    await ensureWorld(browser, baseURL!, "56A after PR 1b");
+    const o = await officialPass(browser, baseURL!, "V", "V-official");
+    await revisit(o.ctx, o.L.id, o.official, "V-visit1");
+    await revisit(o.ctx, o.L.id, o.official, "V-visit2");
+    const { data: visits } = await svc().from("revision_visits").select("id, attempt_id, launched_at").eq("user_id", o.L.id).eq("course_id", S.courseId!);
+    const rows = (visits ?? []) as Array<{ attempt_id: string; launched_at: string }>;
+    check("16", "revision_visits holds one row per visit (2)", rows.length === 2, rows);
+    const atts = await attemptsWithFlag(o.L.id);
+    check("16", "the visits' attempt rows are flagged; the official row is not", atts.filter((x) => x.is_revision === true).length >= 1 && atts.find((x) => x.id === o.official)?.is_revision !== true, atts.map((x) => ({ id: x.id, is_revision: x.is_revision, status: x.status })));
+    const course = await bodyText(o.ctx, `/${S.org!.slug}/courses/${S.courseId}`, /Official result history/);
+    check("16", "the course page says \"Revisited 2 times\"", course.includes("Revisited 2 times"), { around: course.slice(Math.max(0, course.indexOf("Revisited") - 60), course.indexOf("Revisited") + 80) });
+    check("16", "\"My attempts\" lists no revision row (one official row, numbered #1)", !/#2\b/.test(course.slice(course.indexOf("My attempts"))), { tail: course.slice(course.indexOf("My attempts"), course.indexOf("My attempts") + 300) });
+    const actx = await authedContext(browser, baseURL!, S.admin!.email, S.admin!.password);
+    const day = String(rows.map((r) => r.launched_at).sort().pop() ?? "").slice(0, 10);
+    const lp = await bodyText(actx, `/${S.org!.slug}/library/${S.courseId}/learners`, /Revisits/);
+    check("16", "the admin Learners page's Revisits column reads \"2 · <date of the last visit>\"", lp.includes(`2 · ${day}`), { day });
+    const rep = await actx.newPage();
+    await rep.goto(`/${S.org!.slug}/library/${S.courseId}/reports`, { timeout: 120_000 });
+    const tile = norm(await rep.getByTestId("revisits-tile").textContent({ timeout: 60_000 }).catch(() => null));
+    check("16", "the Course Reports tile counts the visits", /^\d+\+?$/.test(tile) && Number(tile.replace("+", "")) >= 2, { tile });
+    await rep.close();
+    await actx.close();
+    await o.ctx.close();
+  });
+
+  test("18. (extra, after PR 1b) step 10: a granted retake reads \"in progress\" while it runs; the standing pass stays in the history", async ({ browser, baseURL }) => {
+    test.setTimeout(20 * 60_000);
+    await ensureWorld(browser, baseURL!, "56A after PR 1b");
+    const o = await officialPass(browser, baseURL!, "P", "P-official");
+    const req = await o.ctx.request.post("/api/attempt-requests", { data: { orgSlug: S.org!.slug, courseId: S.courseId, reason: "56A extra 18: re-certification" } });
+    check("18", "a learner who passed may request another attempt (200)", req.status() === 200, { status: req.status(), body: (await req.text()).slice(0, 200) });
+    const { data: row } = await svc().from("attempt_requests").select("id").eq("user_id", o.L.id).eq("course_id", S.courseId!).eq("status", "pending").maybeSingle();
+    const actx = await authedContext(browser, baseURL!, S.admin!.email, S.admin!.password);
+    const ap = await actx.request.patch(`/api/attempt-requests/${(row as any)?.id}?orgSlug=${encodeURIComponent(S.org!.slug)}`, { data: { action: "approve", override_passed: true, note: "56A extra 18 approved" } });
+    check("18", "the admin approves with the override and a reason (200)", ap.status() === 200, { status: ap.status(), body: (await ap.text()).slice(0, 200) });
+    const { page } = await openCourse(o.ctx, "P-retake");
+    const atts = await waitFor(() => attemptsWithFlag(o.L.id), (l) => l.some((x) => x.id !== o.official && x.is_revision !== true), 20_000);
+    const retake = atts.find((x) => x.id !== o.official && x.is_revision !== true)?.id ?? null;
+    const { data: g } = await svc().from("attempt_requests").select("used_attempt_id, override_confirmed").eq("id", (row as any)?.id).single();
+    check("18", "consume_grant opened the official retake (the marker passes stands)", !!retake && (g as any)?.used_attempt_id === retake && (g as any)?.override_confirmed === true, { retake, grant: g });
+    if (retake) await waitFor(() => stmts(retake), (l) => l.some((s) => verbOf(s) === V("initialized")), 30_000);
+    await sleep(3000);
+    await page.close();
+    await sleep(3000);
+    const course = await bodyText(o.ctx, `/${S.org!.slug}/courses/${S.courseId}`, /Official result history/);
+    check("18", "the course page's history opens with \"Official retake in progress\" and keeps the standing pass", course.includes("Official retake in progress") && /your previous result \(\d+ %, Passed, /.test(course), { around: course.slice(Math.max(0, course.indexOf("Official result history")), course.indexOf("Official result history") + 300) });
+    check("18", "the CTA reads \"Resume course\" and no \"Revision\" pill shows while the retake runs", course.includes("Resume course"), {});
+    const lp = await bodyText(actx, `/${S.org!.slug}/library/${S.courseId}/learners`, /Revisits/);
+    check("18", "the admin Learners row reads \"Passed N % → retake in progress\"", /Passed \d+ % → retake in progress/.test(lp), {});
+    await actx.close();
+    await o.ctx.close();
+  });
+
+  test("20. (extra, after PR 1b) the engagement readers: a revisit moves no streak, XP, last-active or last-access value", async ({ browser, baseURL }) => {
+    test.setTimeout(20 * 60_000);
+    await ensureWorld(browser, baseURL!, "56A after PR 1b");
+    const o = await officialPass(browser, baseURL!, "E20", "E20-official");
+    const gam = async () => (await svc().from("user_gamification").select("current_streak_days, last_active_day, total_xp").eq("organization_id", S.org!.id).eq("user_id", o.L.id).maybeSingle()).data ?? null;
+    const xp = async () => ((await svc().from("xp_events").select("id").eq("user_id", o.L.id)).data ?? []).length;
+    const before = { gam: await gam(), xp: await xp() };
+    const rev = await revisit(o.ctx, o.L.id, o.official, "E20-visit");
+    check("20", "the revisit opened a flagged row", !!rev, { rev });
+    const after = { gam: await gam(), xp: await xp() };
+    check("20", "user_gamification (streak, last_active_day, total XP) unchanged by the revisit", JSON.stringify(after.gam) === JSON.stringify(before.gam), { before: before.gam, after: after.gam });
+    check("20", "no xp_events row added by the revisit", after.xp === before.xp, before.xp === after.xp ? {} : { before: before.xp, after: after.xp });
+    const off = (await attemptsWithFlag(o.L.id)).find((x) => x.id === o.official);
+    const offDay = String(off?.last_activity_at ?? off?.completed_at ?? off?.started_at ?? "").slice(0, 10);
+    const actx = await authedContext(browser, baseURL!, S.admin!.email, S.admin!.password);
+    const an = await bodyText(actx, `/${S.org!.slug}/analytics?learner=${o.L.id}`, /Last active/);
+    check("20", "Analytics' \"Last active\" is the official attempt's date (the revision row is skipped)", an.includes("Last active") && an.includes(offDay), { offDay });
+    await actx.close();
+    await o.ctx.close();
+  });
+});
+
 // =================================================================== the staging scan (§8)
 // §8: "The staging scan shows 0 cross-attempt duplicate ids and 0 mismatches in the new orgs." The orgs: the ones this
 // run recorded (evidence.json "orgs") plus KIVO_REALRUN_SCAN_ORGS; only lifecycle-* organisations are read.

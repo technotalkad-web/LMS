@@ -18,7 +18,10 @@
  */
 
 export const XAPI_NS = "https://ambak.com/xapi/";
-export const PROFILE_VERSION = "1.0.0";
+// 1.1.0 (ADR 0014 step 7): adds attempt/launch-mode (`Review` on a revision
+// visit's statements) and attempt/scored = false on them; an addition, so no
+// LRS history splits.
+export const PROFILE_VERSION = "1.1.0";
 /** Category context activity that tags every enriched statement. */
 export const PROFILE_ACTIVITY_ID = `${XAPI_NS}profile/v1`;
 /** The account homePage used only when a learner has no email. */
@@ -156,6 +159,8 @@ export const ext = {
   attemptId: `${E}attempt/id`,
   attemptNumber: `${E}attempt/number`,
   attemptScored: `${E}attempt/scored`,
+  /** `Review` on a revision visit's statements (ADR 0014 step 7); absent otherwise. Since 1.1.0. */
+  attemptLaunchMode: `${E}attempt/launch-mode`,
   scoringBasis: `${E}attempt/scoring-basis`,
   scoringMaxAttempts: `${E}attempt/scoring-max-attempts`,
   attemptStartedAt: `${E}attempt/started-at`,

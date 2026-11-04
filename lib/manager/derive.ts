@@ -24,6 +24,11 @@ export type DeriveInput = {
   lastActive: string | null;
   periodDays: number | null;
   nowMs: number;
+  /**
+   * The learner's grant read failed (ADR 0014:188):
+   * no figure is derived from the lines, which are text only.
+   */
+  historyUnavailable?: boolean;
 };
 
 export type Derived = {
@@ -65,6 +70,34 @@ export function deriveLearner(i: DeriveInput): Derived {
   }
   const journeyDaysInPeriod = journeys.reduce((n, j) => n + (j.daysInPeriod ?? 0), 0);
   const inactiveDays = daysAgo(lastActive, nowMs);
+  const activeLast7d = !!lastActive && lastActive >= activeCutoff;
+
+  // ADR 0014:188, read strictly: with the
+  // official-result chain unreadable, no completion, score, flag or status is
+  // computed from the lines (a partial flag list would itself be a status).
+  // What needs no grant stays: the assigned count, and the person-level
+  // engagement and journey figures, of which the renderers print only Last
+  // active for this learner.
+  if (i.historyUnavailable) {
+    return {
+      assigned,
+      completed: 0,
+      completionPct: null,
+      avgScore: null,
+      assessmentsWithResult: 0,
+      passedFirstTime: 0,
+      inactiveDays,
+      activeLast7d,
+      flags: [],
+      risk: 0,
+      status: "unavailable",
+      completedInPeriod: 0,
+      passedFirstTimeInPeriod: 0,
+      journeyDaysInPeriod,
+      completedInPrevPeriod: 0,
+    };
+  }
+
   const earliestAssigned = assignedCourses.reduce<string | null>((acc, c) => minIso(acc, c.assignedAt), null);
 
   /* ---- §3 exception rules ---- */
@@ -102,6 +135,8 @@ export function deriveLearner(i: DeriveInput): Derived {
         detail: j.overdueDeadline ? `${j.name} · past deadline` : `${j.behind} day${j.behind === 1 ? "" : "s"} behind · next: ${j.nextModule ?? `Day ${j.day}`}` });
     }
   }
+  // lastActive skips revision visits (ADR 0014 step 12, insights.ts), so a
+  // learner who only revisits turns inactive here.
   if (inactiveDays !== null && inactiveDays >= THRESHOLDS.inactiveDays) {
     flags.push({ kind: "inactive", severity: inactiveDays >= THRESHOLDS.inactiveHighDays ? "high" : "normal", contentId: null, contentKind: null, contentTitle: null, detail: `no activity for ${inactiveDays} days` });
   } else if (
@@ -131,7 +166,7 @@ export function deriveLearner(i: DeriveInput): Derived {
     assessmentsWithResult: withResult.length,
     passedFirstTime: courses.filter((c) => c.passedFirstTime).length,
     inactiveDays,
-    activeLast7d: !!lastActive && lastActive >= activeCutoff,
+    activeLast7d,
     flags,
     risk,
     status,

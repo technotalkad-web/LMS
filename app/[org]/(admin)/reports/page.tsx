@@ -3,6 +3,8 @@ import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { officialStatuses, countsByCourse, hasOfficialResult, EMPTY_STATUS_COUNTS, attemptCounts, excludeAbandoned } from "@/lib/scoring/status";
+import { isRevisionAttempt } from "@/lib/scoring/policy";
+import { readPagedWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 import { canViewReports } from "@/lib/auth/permissions";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
@@ -53,6 +55,8 @@ type Attempt = {
   course_version_id: string;
   /** ADR 0004 step 11: 'abandoned' attempts are never in progress. */
   status: string | null;
+  /** ADR 0014 (0103): a revision visit's row is never an attempt, a learner in progress or an activity date. */
+  is_revision?: boolean | null;
   completion_status: "in_progress" | "completed";
   success_status: "unknown" | "passed" | "failed";
   score: number | null;
@@ -199,15 +203,23 @@ export default async function ReportsPage({
     return all;
   };
 
-  const attempts = await fetchAll<Attempt>((f, t) =>
-    supabase
-      .from("course_attempts")
-      .select(
-        "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct"
-      )
-      .eq("organization_id", org.id)
-      .range(f, t)
+  // ADR 0014 step 7: the attempts select names is_revision through the
+  // narrower-select fallback (a database without 0103 has no revision rows),
+  // paged by readPagedWithOptionalColumn: the first page decides the column
+  // list for every later page. As fetchAll does, a failed page ends the read
+  // with the rows read so far, and 500 pages (500,000 rows) is the ceiling.
+  // The pages are taken in id order: range pages without an order are not
+  // guaranteed to be disjoint, and attempt rows are updated on every progress
+  // write, so a row could be counted twice or missed.
+  const ATTEMPT_COLUMNS =
+    "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct";
+  const { data: attemptRows } = await readPagedWithOptionalColumn<unknown>(
+    "is_revision",
+    (columns, f, t) => supabase.from("course_attempts").select(columns).eq("organization_id", org.id).order("id").range(f, t),
+    ATTEMPT_COLUMNS,
+    { maxPages: 500 }
   );
+  const attempts = attemptRows as Attempt[];
 
   const members = await fetchAll<Member>((f, t) =>
     supabase
@@ -327,9 +339,14 @@ export default async function ReportsPage({
     const completed = oc.completed + oc.passed + oc.failed;
     const passed = oc.passed;
     const failed = oc.failed;
-    // ADR 0004 step 11: an abandoned (reset) attempt is never in progress.
+    // ADR 0004 step 11: an abandoned (reset) attempt is never in progress;
+    // ADR 0014: nor is a revision visit's open row.
     const inProgress = myAttempts.filter(
-      (a) => a.completion_status !== "completed" && a.success_status !== "passed" && a.status !== "abandoned"
+      (a) =>
+        a.completion_status !== "completed" &&
+        a.success_status !== "passed" &&
+        a.status !== "abandoned" &&
+        !isRevisionAttempt(a)
     ).length;
     const myLive = excludeAbandoned(myAttempts);
     // A reset attempt can carry a mid-run score; it never counts (ADR 0004 step 11).
@@ -345,6 +362,7 @@ export default async function ReportsPage({
         a.completion_status !== "completed" &&
         a.success_status !== "passed" &&
         a.status !== "abandoned" &&
+        !isRevisionAttempt(a) &&
         typeof a.progress_pct === "number"
     );
     const avgProgress =
@@ -462,7 +480,9 @@ export default async function ReportsPage({
     courses: courses.length,
     coursesWithActivity: rows.filter((r) => r.attempts > 0).length,
     attempts: liveAttempts.length,
-    resetAttempts: attempts.length - liveAttempts.length,
+    // attemptCounts: the abandoned rows only. `attempts.length - liveAttempts.length`
+    // would also count revision rows (excluded from liveAttempts) as resets.
+    resetAttempts: attemptCounts(attempts).reset,
     learnersWithActivity: new Set(liveAttempts.map((a) => a.user_id)).size,
     totalUsers: members.length,
     // Learner×course results under the OFFICIAL rule (decision 1).
@@ -474,7 +494,11 @@ export default async function ReportsPage({
   const completionRate = officialPairs.length === 0 ? 0 : totals.completed / officialPairs.length;
   const passRate = totals.completed === 0 ? 0 : totals.passed / totals.completed;
 
-  const scoredAll = attempts.filter((a) => typeof a.score === "number");
+  // The Avg score KPI folds the rows that count for scoring (excludeAbandoned),
+  // as the per-course Avg score does: a revision visit is never scored
+  // (ADR 0014) and a reset attempt never counts (ADR 0004 step 11), so neither
+  // row's score enters it.
+  const scoredAll = liveAttempts.filter((a) => typeof a.score === "number");
   const avgScoreOverall =
     scoredAll.length === 0
       ? null
@@ -912,6 +936,11 @@ export default async function ReportsPage({
                   const detailHref = course
                     ? `/${orgSlug}/courses/${course.id}/attempts/${a.id}`
                     : null;
+                  // ADR 0014: a revision visit is never an attempt, never in
+                  // progress and never scored. The feed lists every launch,
+                  // which the ADR does not name, so the row stays, labelled
+                  // "Review visit" with no score.
+                  const revision = isRevisionAttempt(a);
                   return (
                     <tr key={a.id} className="hover:bg-canvas/50">
                       <td className="px-4 py-3 text-xs text-muted whitespace-nowrap">
@@ -952,10 +981,13 @@ export default async function ReportsPage({
                           completion={a.completion_status}
                           success={a.success_status}
                           status={a.status}
+                          revision={revision}
                         />
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
-                        {detailHref ? (
+                        {revision ? (
+                          "-"
+                        ) : detailHref ? (
                           <Link href={detailHref} className="hover:underline">
                             {a.score === null ? "-" : fmtPct(a.score)}
                           </Link>
@@ -982,11 +1014,17 @@ function ResultPill({
   completion,
   success,
   status,
+  revision,
 }: {
   completion: "in_progress" | "completed";
   success: "unknown" | "passed" | "failed";
   status: string | null;
+  /** A revision visit's row (ADR 0014): "Review visit", before any result. */
+  revision: boolean;
 }) {
+  if (revision) {
+    return <StatusPill tone="neutral">Review visit</StatusPill>;
+  }
   if (success === "passed") {
     return <StatusPill tone="success">Passed</StatusPill>;
   }

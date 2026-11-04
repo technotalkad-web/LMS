@@ -16,12 +16,17 @@ export type ExceptionKind =
 export type Severity = "critical" | "high" | "normal";
 export const SEVERITY_RANK: Record<Severity, number> = { critical: 0, high: 1, normal: 2 };
 
-/** The three words every status uses. */
-export type LearnerStatus = "on_track" | "watch" | "needs_support";
+/**
+ * The three words every status uses, plus "unavailable": the learner's
+ * official-result chain could not be read (a failed grant read, ADR 0014:188),
+ * so no status is computed from their lines.
+ */
+export type LearnerStatus = "on_track" | "watch" | "needs_support" | "unavailable";
 export const STATUS_LABEL: Record<LearnerStatus, string> = {
   on_track: "On track",
   watch: "Watch",
   needs_support: "Needs support",
+  unavailable: "History unavailable. Please reload.",
 };
 
 export type Tone = "ok" | "warn" | "bad" | "none";
@@ -59,7 +64,8 @@ export type JourneyInsight = {
 export type CourseLine = {
   courseId: string;
   title: string;
-  status: "not_started" | "in_progress" | "completed" | "passed" | "failed";
+  /** "unavailable": the grant read failed (ADR 0014:188); the row then carries no figure. */
+  status: "not_started" | "in_progress" | "completed" | "passed" | "failed" | "unavailable";
   /** Official score 0–100, null until an official result exists. */
   officialScore: number | null;
   /** Attempts that were not reset (abandoned attempts are counted in resetAttempts). */
@@ -89,6 +95,21 @@ export type CourseLine = {
   done: boolean;
   /** Reached by an assignment (not only attempted); what "assigned" counts. */
   isAssigned: boolean;
+  /**
+   * ADR 0014 step 7, from officialRetakeState: "in_progress" while a granted
+   * retake runs, "completed" when the current official result is a retake.
+   * Optional so a cached row written before PR 1b still renders.
+   */
+  retakeState?: "none" | "in_progress" | "completed";
+  /**
+   * The official result a granted retake replaces: while the retake runs,
+   * the standing result ("your previous result … stays in your history until
+   * you finish", ADR 0014:186); after it completes, the superseded one. Null
+   * otherwise. Score 0–100.
+   */
+  previousOfficial?: { score: number | null; status: "passed" | "failed" | "completed"; completedAt: string } | null;
+  /** The grant read failed (ADR 0014:188): the row shows "History unavailable. Please reload." and no figure. */
+  historyUnavailable?: boolean;
 };
 
 export type PathLine = {
@@ -98,6 +119,8 @@ export type PathLine = {
   stepsDone: number;
   dueAt: string | null;
   overdue: boolean;
+  /** The grant read failed: stepsDone and overdue are not computed and the path list prints the text. */
+  historyUnavailable?: boolean;
 };
 
 export type LearnerInsight = {
@@ -137,6 +160,14 @@ export type LearnerInsight = {
   passedFirstTimeInPeriod: number;
   journeyDaysInPeriod: number;
   completedInPrevPeriod: number;
+  /**
+   * ADR 0014:188: the grant read failed, so
+   * every course and path line is text only and no completion, score, flag
+   * or status is derived from them; the team folds leave this learner out.
+   */
+  historyUnavailable?: boolean;
+  /** The newest revision visit on any course (ADR 0014:199, "Last revisit" beside the inactive flag); null when none or unread. */
+  lastRevisitAt?: string | null;
 };
 
 export type Signal = {
@@ -157,6 +188,8 @@ export type TeamScore = {
   tone: Tone;
   label: string;
   signals: Signal[];
+  /** Learners left out of every signal because their history could not be read (ADR 0014:188). */
+  unavailable: number;
 };
 
 export type ExceptionGroup = {
@@ -215,6 +248,8 @@ export type PeriodSummary = {
   journeyMissions: number;
   /** completions this period minus the previous period of the same length. */
   completionsDelta: number | null;
+  /** Learners left out of every sum because their history could not be read (ADR 0014:188). */
+  unavailable: number;
 };
 
 export const PERIODS = [
@@ -262,6 +297,8 @@ export type TeamCard = {
   completionsDelta: number | null;
   /** People in the team with at least one exception (for a ticket raised about the team). */
   flagged: TicketPerson[];
+  /** Members whose history could not be read, left out of the score (= score.unavailable). */
+  unavailable: number;
 };
 
 /** A team that needs the L2's attention, with one suggested step. */

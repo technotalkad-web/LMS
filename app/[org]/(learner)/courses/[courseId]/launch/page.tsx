@@ -340,11 +340,8 @@ export default async function LaunchPage({
       consumeGrants,
       liveRetakeOnAnyVersion,
     });
-    // Unreachable under the policy clamp (`blocked` is always false); removed
-    // with the rest of the block rule by ADR 0014 step 9 in PR 1b.
-    if (scoring.blocked && candidate !== "grant" && !liveRetakeOnAnyVersion) {
-      redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
-    }
+    // ADR 0014 step 9: the block rule is retired, so no launch is refused
+    // for a used window (normalizePolicy clamps every rule to the default).
     return { my, scoring, candidate };
   };
   let grants = await readGrants();
