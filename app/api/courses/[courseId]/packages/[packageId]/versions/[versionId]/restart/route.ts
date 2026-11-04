@@ -115,15 +115,29 @@ export async function POST(
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
-  let inProgress: RestartAttempt[];
+  // ADR 0014 step 8: revision visits' rows stay in the selection (they must
+  // close so the next revisit opens on the current version) and are counted
+  // as "revision visits closed"; `is_revision` is dropped on a database
+  // without it (fetchAll throws "<table>: <message>", so the fallback keys on
+  // the column named in the message, never on any other error).
+  let inProgress: Array<RestartAttempt & { is_revision?: boolean | null }>;
   try {
-    inProgress = await fetchAll<RestartAttempt>(svc, "course_attempts", "id, user_id, organization_id", (q) =>
-      q.eq("course_version_id", versionId).eq("status", "in_progress")
-    );
+    const select = (columns: string) =>
+      fetchAll<RestartAttempt & { is_revision?: boolean | null }>(svc, "course_attempts", columns, (q) =>
+        q.eq("course_version_id", versionId).eq("status", "in_progress")
+      );
+    try {
+      inProgress = await select("id, user_id, organization_id, is_revision");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/is_revision/.test(msg) || !/does not exist|schema cache|could not find/i.test(msg)) throw e;
+      inProgress = await select("id, user_id, organization_id");
+    }
   } catch (e) {
     console.error("[restart] attempts read failed:", e instanceof Error ? e.message : e);
     return NextResponse.json({ error: "Could not read the attempts on this version." }, { status: 500 });
   }
+  const revisionRowIds = new Set(inProgress.filter((a) => a.is_revision === true).map((a) => a.id));
   const ids = inProgress.map((a) => a.id);
 
   // Grant retakes are excluded by attempt id (the launch page's shape). Fail
@@ -248,6 +262,8 @@ export async function POST(
       excluded_grant_retake_ids: plan.excludedGrantRetakeIds,
       by_role: byRoleClass(plan.selected.filter((a) => restartedSet.has(a.id)), staffKeys),
       restarted: restartedIds.length,
+      // ADR 0014 step 8: of those, revision visits' rows ("revision visits closed").
+      revision_closed: restartedIds.filter((id) => revisionRowIds.has(id)).length,
       ...(tokErr ? { tokens_expired: false } : {}),
       ...(audit.error ? { audit: false } : {}),
     },

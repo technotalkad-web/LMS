@@ -87,5 +87,28 @@ eq("attempt on a version outside the course map → ignored",
   decideSlotRouting({ ...base, source: "preference", chosenPackageId: "en", inProgress: [att("x", "other-v1", "2026-10-05")] }),
   { kind: "continue", abandon: [] });
 
+console.log("\nADR 0014 step 3: a revision visit's row (is_revision) is excluded from every rule");
+{
+  const rev = (id: string, version: string, activity: string): SlotAttempt => ({ ...att(id, version, activity), is_revision: true });
+  eq("a flagged in-progress row on the chosen slot does not give own-slot",
+    decideSlotRouting({ ...base, source: "preference", chosenPackageId: "en", inProgress: [rev("r", "en-v1", "2026-10-05")] }),
+    { kind: "continue", abandon: [] });
+  eq("…an unflagged one beside it still does",
+    decideSlotRouting({ ...base, source: "preference", chosenPackageId: "en", inProgress: [rev("r", "en-v1", "2026-10-05"), att("a", "en-v2", "2026-10-04")] }),
+    { kind: "own-slot", abandon: [] });
+  eq("a flagged row on another active slot neither confirms (explicit)…",
+    decideSlotRouting({ ...base, source: "explicit", chosenPackageId: "en", inProgress: [rev("r", "hi-v1", "2026-10-05")] }),
+    { kind: "continue", abandon: [] });
+  eq("…nor reroutes (preference)",
+    decideSlotRouting({ ...base, source: "preference", chosenPackageId: "en", inProgress: [rev("r", "hi-v1", "2026-10-05")] }),
+    { kind: "continue", abandon: [] });
+  eq("a flagged row on a deactivated slot is not abandoned here",
+    decideSlotRouting({ ...base, source: "single", chosenPackageId: "en", inProgress: [rev("r", "gu-v1", "2026-10-03")] }),
+    { kind: "continue", abandon: [] });
+  eq("is_revision false and a pre-0103 row (undefined) route as before",
+    decideSlotRouting({ ...base, source: "preference", chosenPackageId: "en", inProgress: [{ ...att("b", "hi-v1", "2026-10-05"), is_revision: false }] }),
+    { kind: "cross-slot", versionId: "hi-v1", packageId: "hi", attemptId: "b", abandon: [] });
+}
+
 console.log(`\n==== slot routing: ${pass} passed, ${fail} failed ====`);
 process.exit(fail === 0 ? 0 : 1);

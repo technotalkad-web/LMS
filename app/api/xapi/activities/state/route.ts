@@ -22,6 +22,10 @@ import { isLaunchDataStateId } from "@/lib/alds/launch";
  * of 2026-10-19): the launch page writes it, the AU may only GET it. PUT,
  * POST (an alias of PUT) and DELETE of that exact state id answer 403
  * read_only_state before any write. Unconditional, not behind ALDS_P4.
+ * ADR 0014 step 4: `LMS.OfficialResult` (the revision visit's official-result
+ * document) is guarded the same way, and GET answers 500 state_unreadable on
+ * a database error instead of 404: the engine reads a 404 as "nothing
+ * stored", which a failed read must never look like.
  */
 export async function GET(request: Request) {
   const bound = await bindXapi(request);
@@ -35,13 +39,17 @@ export async function GET(request: Request) {
   }
 
   const svc = serviceClient();
-  const { data } = await svc
+  const { data, error } = await svc
     .from("xapi_state")
     .select("content, content_type")
     .eq("attempt_id", session.attemptId)
     .eq("state_id", stateId)
     .maybeSingle();
 
+  if (error) {
+    console.warn("[xapi/state] state read failed:", error.message);
+    return NextResponse.json({ error: "state_unreadable" }, { status: 500 });
+  }
   if (!data) return new Response("Not Found", { status: 404 });
 
   const contentType = data.content_type || "application/json";

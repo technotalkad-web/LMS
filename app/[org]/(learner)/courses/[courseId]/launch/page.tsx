@@ -20,25 +20,39 @@ import {
 } from "@/lib/journey/journey";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
-import { computeScoring, isCompletedAttempt, type ScorableAttempt } from "@/lib/scoring/policy";
-import { grantRetakeIdsFor, unusedGrantFor } from "@/lib/scoring/attempt-kind";
+import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
+import { grantSnapshotFor, isMissingColumn, isSchemaMissing, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
 import { launchFallback } from "@/lib/courses/default-rule";
 import { aldsP4Enabled, isAldsSchemaMissing, logAldsSkip } from "@/lib/alds/flag";
 import {
-  attemptServedLanguage,
   buildLaunchData,
+  launchModeFor,
   lmsAuActivityId,
   newSessionId,
-  previewLaunch,
+  p4AttemptColumns,
   recordLearningSession,
   registrationKindFor,
   servedLanguageFor,
   writeLaunchData,
 } from "@/lib/alds/launch";
-import { LMS_LAUNCH_DATA_STATE_ID } from "@/lib/alds/rpc";
+import { LMS_LAUNCH_DATA_STATE_ID, LMS_OFFICIAL_RESULT_STATE_ID } from "@/lib/alds/rpc";
+import {
+  afterConsumeGrant,
+  candidateKind,
+  insertIsRevision,
+  revisionInsertRefused,
+  rowAction,
+  seedPlan,
+  shouldRecordVisit,
+  tokenExpiryTargets,
+  type CandidateKind,
+  type RowAction,
+  type RowDecision,
+} from "@/lib/attempts/launch-kind";
+import { buildOfficialResult, buildRevisionCmi } from "@/lib/attempts/revision-seed";
 
 type Course = {
   id: string;
@@ -247,85 +261,94 @@ export default async function LaunchPage({
     redirect(`/${orgSlug}/courses/${courseId}`);
   }
 
-  // 0073/0081 attempt rule, evaluated across ALL versions/languages of the
-  // course so a language switch or a new version can't reopen the window:
-  //   - window used + rule says "block"    → no further launches
-  //   - window used + rule says "practice" → this launch is a REVISION run:
-  //     it resumes from the latest saved progress (seeded below) and never
-  //     changes the official score or pass/fail.
-  // Admins preview freely.
+  // ADR 0009: attempt rows are written by the server only. The reads stay on
+  // the caller's RLS session; every write below goes through this ONE
+  // service client with explicit id/user_id/organization_id (ADR 0014 step
+  // 3 adds the strict grant read, the closes, consume_grant, the cutover
+  // flag, the seed and the visit record). Membership is already proven: the
+  // course was read under RLS ("members read org courses") with
+  // organization_id = org.id, every version is read with course_id = c.id,
+  // and a journey context only from this organisation.
+  const svcAttempt = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
+
+  // ADR 0014 step 3, fail closed: every read that feeds the launch verdict or
+  // the row choice refuses on error, and so does every disagreement between
+  // the launch kind and the row. One refusal for all of them: back to the
+  // course page with the retry notice, nothing written. redirect() throws, so
+  // no refusal may sit inside a try that would swallow it.
+  const refuse: (reason: string) => never = (reason) => {
+    console.warn(JSON.stringify({ event: "launch_refused", reason, course_id: c.id, user_id: user.id }));
+    redirect(`/${orgSlug}/courses/${courseId}?retry=1`);
+  };
+
+  // The learner's approved grants on this course, read in one strict select
+  // per decision (grantSnapshotFor): a failed read refuses; a database
+  // without attempt_requests has none.
+  const readGrants = async (): Promise<GrantSnapshot> =>
+    (await grantSnapshotFor(svcAttempt, user.id, c.id).catch((e: unknown) => {
+      console.warn("[launch] grant read failed:", e instanceof Error ? e.message : String(e));
+      return null;
+    })) ?? refuse("grant_read_failed");
+
+  // 0073/0081 attempt rule (ADR 0014: one official attempt, then review-only
+  // revision visits; extra official attempts only by a consumed grant),
+  // evaluated across ALL versions/languages of the course so a language
+  // switch or a new version can't reopen the window. It writes nothing, so a
+  // launch that ends on the language picker spends nothing. The candidate
+  // kind (lib/attempts/launch-kind.ts): `first` while the window has a free
+  // slot, `grant` when an unused grant is consumed on this launch, otherwise
+  // `at_row` (the row decides: a granted retake resumes, anything else is a
+  // revision visit). Admins preview freely.
   type MyAttempt = ScorableAttempt & { course_version_id: string; cmi_data: CmiData | null; status?: string };
-  let practiceLaunch = false;
-  // 0083: the grant we consume on THIS launch, stamped used once the fresh
-  // official retake attempt exists (below). null = normal launch.
-  let consumeGrantId: string | null = null;
-  let myCompleted: MyAttempt[] = [];
-  if (!canManage(role)) {
+  type Evaluation = { my: MyAttempt[]; scoring: ScoringResult | null; candidate: CandidateKind };
+  const MY_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, course_version_id, cmi_data, status";
+  const evaluate = async (grantsNow: GrantSnapshot, consumeGrants: boolean): Promise<Evaluation> => {
+    if (canManage(role)) return { my: [], scoring: null, candidate: "first" };
     const policy = await resolvePolicy(supabase, c.id);
-    const { data: verRows } = await supabase
+    const { data: verRows, error: verErr } = await supabase
       .from("course_versions")
       .select("id")
       .eq("course_id", c.id);
+    if (verErr) refuse("versions_read_failed");
     const vIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+    let my: MyAttempt[] = [];
     if (vIds.length > 0) {
-      const { data: myRows } = await supabase
-        .from("course_attempts")
-        .select("id, score, started_at, completed_at, completion_status, success_status, course_version_id, cmi_data, status")
-        .eq("user_id", user.id)
-        .in("course_version_id", vIds);
-      const my = (myRows ?? []) as MyAttempt[];
-      // Grants already consumed widen the official window (0083).
-      const retakeIds = await grantRetakeIdsFor(supabase, user.id, c.id);
-      const scoring = computeScoring(my, policy, retakeIds);
-      // Resuming an in-progress attempt that is itself a grant retake is an
-      // OFFICIAL run, never a revision — don't let the window verdict relabel it.
-      // `status`, not completion_status: an ABANDONED retake keeps
-      // completion_status 'in_progress' but is terminal (ALDS step 0, P4).
-      const resumingOfficialRetake = my.some(
-        (a) => a.status === "in_progress" && retakeIds.has(a.id)
-      );
-      if (scoring.limitReached && !resumingOfficialRetake) {
-        // The base official window is used up: this would be a revision run.
-        // If the learner holds an approved, unexpired, UNUSED grant, consume it
-        // so this launch is a fresh OFFICIAL retake instead. Any in-progress
-        // attempt is abandoned so the retake starts clean ("reset completed
-        // progress"); the first score and full history are retained for L&D.
-        const grant = await unusedGrantFor(supabase, user.id, c.id);
-        if (grant) {
-          consumeGrantId = grant.id;
-          const svcReset = createServiceClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY!,
-            { auth: { persistSession: false } }
-          );
-          const { data: resetRows } = await svcReset
-            .from("course_attempts")
-            .update({ status: "abandoned" })
-            .eq("user_id", user.id)
-            .in("course_version_id", vIds)
-            .eq("status", "in_progress")
-            .select("id");
-          // ALDS step 0 (P4): an abandoned attempt's launch tokens die with
-          // it, so an open tab of the old run can't keep writing.
-          const resetIds = ((resetRows ?? []) as Array<{ id: string }>).map((r) => r.id);
-          const tokErr = await expireLaunchTokens(svcReset, resetIds);
-          if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
-          // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
-          await enqueueAbandonedStatements(svcReset, resetIds);
-        }
-      }
-      // Refuse only when the window is used up and the rule blocks further
-      // launches — unless a grant is being consumed (fresh official retake) or
-      // we are resuming an in-progress official retake. Both must proceed.
-      if (scoring.blocked && !consumeGrantId && !resumingOfficialRetake) {
-        redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
-      }
-      practiceLaunch = scoring.practiceMode && !consumeGrantId && !resumingOfficialRetake;
-      myCompleted = my
-        .filter((a) => isCompletedAttempt(a))
-        .sort((a, b) => (a.completed_at ?? a.started_at) < (b.completed_at ?? b.started_at) ? 1 : -1);
+      // is_revision (0103) with the narrower-select fallback.
+      const readMy = (columns: string) =>
+        supabase
+          .from("course_attempts")
+          .select(columns)
+          .eq("user_id", user.id)
+          .in("course_version_id", vIds);
+      let { data: myRows, error: myErr } = await readMy(`${MY_COLUMNS}, is_revision`);
+      if (myErr && isMissingColumn(myErr, "is_revision")) ({ data: myRows, error: myErr } = await readMy(MY_COLUMNS));
+      if (myErr) refuse("attempts_read_failed");
+      my = (myRows ?? []) as unknown as MyAttempt[];
     }
-  }
+    // Consumed grants widen the official window (0083).
+    const scoring = computeScoring(my, policy, grantsNow.retakeIds);
+    // A granted retake in progress on ANY version only blocks consuming
+    // another grant; whether THIS launch resumes a retake is the row's call.
+    const liveRetakeOnAnyVersion = my.some((a) => a.status === "in_progress" && grantsNow.retakeIds.has(a.id));
+    const candidate = candidateKind({
+      limitReached: scoring.limitReached,
+      unusedGrantId: grantsNow.unusedGrant?.id ?? null,
+      consumeGrants,
+      liveRetakeOnAnyVersion,
+    });
+    // Unreachable under the policy clamp (`blocked` is always false); removed
+    // with the rest of the block rule by ADR 0014 step 9 in PR 1b.
+    if (scoring.blocked && candidate !== "grant" && !liveRetakeOnAnyVersion) {
+      redirect(`/${orgSlug}/courses/${courseId}?limit=1`);
+    }
+    return { my, scoring, candidate };
+  };
+  let grants = await readGrants();
+  let ev = await evaluate(grants, true);
 
   // ---------------------------------------------------------------
   // Multi-language resolution (Phase 2 + Phase 3 of #158)
@@ -403,116 +426,158 @@ export default async function LaunchPage({
     redirect(`/${orgSlug}/courses/${courseId}`);
   }
 
-  // OTHER-SLOT HANDLING (ADR 0004 step 9, lib/courses/slot-routing.ts): an
-  // in-progress attempt on ANOTHER language slot of this course. Own-slot
-  // resume wins; an explicit ?lang= goes back to the course page's language
-  // switch confirm (nothing abandoned); a preference / single-slot launch
-  // continues the other slot's attempt; only an attempt on a DEACTIVATED
-  // slot is closed (conditional on status = 'in_progress', tokens expired).
-  // Grant retakes are never touched. Skipped on the legacy no-package path.
-  let deactivatedSlotAttempts: string[] = [];
-  if (chosenPackageId) {
-    const [{ data: allPkgRows }, { data: courseVerRows }] = await Promise.all([
-      supabase.from("course_packages").select("id, is_active").eq("course_id", courseId),
-      supabase.from("course_versions").select("id, package_id").eq("course_id", courseId),
-    ]);
-    const packageOfVersion = new Map(
-      ((courseVerRows ?? []) as Array<{ id: string; package_id: string | null }>)
-        .filter((r) => !!r.package_id)
-        .map((r) => [r.id, r.package_id as string] as [string, string])
-    );
-    const allVersionIds = [...packageOfVersion.keys()];
-    const { data: ipRows } = allVersionIds.length
-      ? await supabase
-          .from("course_attempts")
-          .select("id, course_version_id, started_at, last_activity_at")
-          .eq("user_id", user.id)
-          .in("course_version_id", allVersionIds)
-          .eq("status", "in_progress")
-      : { data: [] };
-    const inProgress = (ipRows ?? []) as SlotAttempt[];
-    const decision = inProgress.length
-      ? decideSlotRouting({
-          source: slotSource,
-          chosenPackageId,
-          packageOfVersion,
-          activePackageIds: new Set(
-            ((allPkgRows ?? []) as Array<{ id: string; is_active: boolean }>).filter((p) => p.is_active).map((p) => p.id)
-          ),
-          inProgress,
-          retakeIds: await grantRetakeIdsFor(supabase, user.id, c.id),
-        })
-      : ({ kind: "continue", abandon: [] } as const);
+  const initialVersionId: string = resolvedVersionId;
+  const initialPackageId: string | null = chosenPackageId;
 
-    if (decision.kind === "confirm-switch") {
-      // (1) Back to the course page, which opens the existing confirm for
-      // this language (a confirmed switch resets the other slot's progress).
-      redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
-    }
-    // (3) is carried out below, only once every launch gate has passed: a
-    // launch that is then refused (no version, prerequisite lock, scheduled
-    // release) closes nothing.
-    deactivatedSlotAttempts = [...decision.abandon];
-    if (decision.kind === "cross-slot") {
-      // (2) Grandfather across slots: run the attempt the learner already has.
-      chosenPackageId = decision.packageId;
-      resolvedVersionId = decision.versionId;
-    }
-  }
+  // The version this launch runs (ADR 0014 step 3, Routing), resolved once
+  // per kind decision: the other-slot handling, the grandfather routing and
+  // the version read. A revision visit's rows are invisible to both routing
+  // steps, so a revisit resolves to the current version of the chosen slot;
+  // the same reads list the stale revision rows (flagged, in progress, on a
+  // non-current version of the chosen package), closed below. A `grant`
+  // launch ignores every open row: consume_grant closes them all, so its
+  // version is the chosen slot's current one.
+  type Resolution = { v: Version; deactivated: string[]; staleRevisionIds: string[] };
+  const IP_COLUMNS = "id, course_version_id, started_at, last_activity_at";
+  const resolveVersion = async (candidate: CandidateKind, grantsNow: GrantSnapshot): Promise<Resolution> => {
+    let versionId: string = initialVersionId;
+    let packageId: string | null = initialPackageId;
+    let deactivated: string[] = [];
+    let openRevisionRows: SlotAttempt[] = [];
+    const packageOfVersion = new Map<string, string>();
 
-  // GRANDFATHER ROUTING (silent module versioning):
-  // If the learner already has an in-progress attempt on ANY version of the
-  // chosen package — including a now-retired version that a newer one replaced —
-  // resume THAT version so their bookmark/suspend_data stays intact. New
-  // learners (no in-progress attempt) get the current version. "Force restart"
-  // replaces abandon old in-progress attempts at replace time, so none match
-  // here and the learner starts fresh on the new version. No learner-facing
-  // choice or notice either way.
-  if (chosenPackageId) {
-    const { data: pkgVers } = await supabase
-      .from("course_versions")
-      .select("id")
-      .eq("package_id", chosenPackageId);
-    const pkgVerIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id);
-    if (pkgVerIds.length > 0) {
-      const { data: ip } = await supabase
-        .from("course_attempts")
-        .select("course_version_id")
-        .eq("user_id", user.id)
-        .in("course_version_id", pkgVerIds)
-        .eq("status", "in_progress")
-        .order("started_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (ip?.course_version_id) {
-        resolvedVersionId = ip.course_version_id as string;
+    // OTHER-SLOT HANDLING (ADR 0004 step 9, lib/courses/slot-routing.ts): an
+    // in-progress attempt on ANOTHER language slot of this course. Own-slot
+    // resume wins; an explicit ?lang= goes back to the course page's language
+    // switch confirm (nothing abandoned); a preference / single-slot launch
+    // continues the other slot's attempt; only an attempt on a DEACTIVATED
+    // slot is closed (conditional on status = 'in_progress', tokens expired).
+    // Grant retakes are never touched. Skipped on the legacy no-package path.
+    if (candidate !== "grant" && packageId) {
+      const [{ data: allPkgRows, error: allPkgErr }, { data: courseVerRows, error: courseVerErr }] = await Promise.all([
+        supabase.from("course_packages").select("id, is_active").eq("course_id", courseId),
+        supabase.from("course_versions").select("id, package_id").eq("course_id", courseId),
+      ]);
+      if (allPkgErr || courseVerErr) refuse("routing_read_failed");
+      for (const r of (courseVerRows ?? []) as Array<{ id: string; package_id: string | null }>) {
+        if (r.package_id) packageOfVersion.set(r.id, r.package_id);
+      }
+      const allVersionIds = [...packageOfVersion.keys()];
+      let inProgress: SlotAttempt[] = [];
+      if (allVersionIds.length) {
+        const readIp = (columns: string) =>
+          supabase
+            .from("course_attempts")
+            .select(columns)
+            .eq("user_id", user.id)
+            .in("course_version_id", allVersionIds)
+            .eq("status", "in_progress");
+        let { data: ipRows, error: ipErr } = await readIp(`${IP_COLUMNS}, is_revision`);
+        if (ipErr && isMissingColumn(ipErr, "is_revision")) ({ data: ipRows, error: ipErr } = await readIp(IP_COLUMNS));
+        if (ipErr) refuse("routing_read_failed");
+        inProgress = (ipRows ?? []) as unknown as SlotAttempt[];
+      }
+      openRevisionRows = inProgress.filter((a) => a.is_revision === true);
+      const decision = inProgress.length
+        ? decideSlotRouting({
+            source: slotSource,
+            chosenPackageId: packageId,
+            packageOfVersion,
+            activePackageIds: new Set(
+              ((allPkgRows ?? []) as Array<{ id: string; is_active: boolean }>).filter((p) => p.is_active).map((p) => p.id)
+            ),
+            inProgress,
+            retakeIds: grantsNow.retakeIds,
+          })
+        : ({ kind: "continue", abandon: [] } as const);
+
+      if (decision.kind === "confirm-switch") {
+        // (1) Back to the course page, which opens the existing confirm for
+        // this language (a confirmed switch resets the other slot's progress).
+        redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
+      }
+      // (3) is carried out below, only once every launch gate has passed: a
+      // launch that is then refused (no version, prerequisite lock, scheduled
+      // release) closes nothing.
+      deactivated = [...decision.abandon];
+      if (decision.kind === "cross-slot") {
+        // (2) Grandfather across slots: run the attempt the learner already has.
+        packageId = decision.packageId;
+        versionId = decision.versionId;
       }
     }
-  }
 
-  const { data: version } = await supabase
-    .from("course_versions")
-    .select("id, manifest_type, launch_url, manifest_data, package_id")
-    .eq("id", resolvedVersionId)
-    // Bound to this course: a pointer to another course's version redirects
-    // and is never written into an attempt.
-    .eq("course_id", c.id)
-    .maybeSingle();
-  if (!version) redirect(`/${orgSlug}/courses/${courseId}`);
-  const v = version as Version;
+    // GRANDFATHER ROUTING (silent module versioning):
+    // If the learner already has an in-progress attempt on ANY version of the
+    // chosen package — including a now-retired version that a newer one replaced —
+    // resume THAT version so their bookmark/suspend_data stays intact. New
+    // learners (no in-progress attempt) get the current version. "Force restart"
+    // replaces abandon old in-progress attempts at replace time, so none match
+    // here and the learner starts fresh on the new version. No learner-facing
+    // choice or notice either way. A revision visit's row never routes
+    // (is_revision = false, with the filter dropped on a database without it).
+    if (candidate !== "grant" && packageId) {
+      const { data: pkgVers, error: pkgVersErr } = await supabase
+        .from("course_versions")
+        .select("id")
+        .eq("package_id", packageId);
+      if (pkgVersErr) refuse("routing_read_failed");
+      const pkgVerIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id);
+      if (pkgVerIds.length > 0) {
+        const readGrandfather = (withFlagFilter: boolean) => {
+          let q = supabase
+            .from("course_attempts")
+            .select("course_version_id")
+            .eq("user_id", user.id)
+            .in("course_version_id", pkgVerIds)
+            .eq("status", "in_progress");
+          if (withFlagFilter) q = q.eq("is_revision", false);
+          return q.order("started_at", { ascending: false }).limit(1).maybeSingle();
+        };
+        let { data: ip, error: gfErr } = await readGrandfather(true);
+        if (gfErr && isMissingColumn(gfErr, "is_revision")) ({ data: ip, error: gfErr } = await readGrandfather(false));
+        if (gfErr) refuse("routing_read_failed");
+        const ipVersion = (ip as { course_version_id?: string } | null)?.course_version_id;
+        if (ipVersion) versionId = ipVersion;
+      }
+    }
+
+    const { data: version } = await supabase
+      .from("course_versions")
+      .select("id, manifest_type, launch_url, manifest_data, package_id")
+      .eq("id", versionId)
+      // Bound to this course: a pointer to another course's version redirects
+      // and is never written into an attempt.
+      .eq("course_id", c.id)
+      .maybeSingle();
+    if (!version) redirect(`/${orgSlug}/courses/${courseId}`);
+    const resolved = version as Version;
+    const currentOfChosen = packageId ? (allPackages.find((p) => p.id === packageId)?.current_version_id ?? null) : null;
+    const staleRevisionIds = packageId
+      ? openRevisionRows
+          .filter(
+            (a) =>
+              packageOfVersion.get(a.course_version_id) === packageId &&
+              a.course_version_id !== currentOfChosen &&
+              a.course_version_id !== resolved.id
+          )
+          .map((a) => a.id)
+      : [];
+    return { v: resolved, deactivated, staleRevisionIds };
+  };
+  let res = await resolveVersion(ev.candidate, grants);
+  let v = res.v;
 
   // ALDS P4 launch contract (ADR 0006 §C, notes (a)–(c) of 2026-10-19),
   // behind ALDS_P4 (default off). With the flag off nothing below that
   // names `p4` runs and this launch is today's. Staff launches are previews
-  // (is_preview, launch_mode 'Browse'); the served language is the
-  // attempt's slot (by the version's package, which also covers a
-  // cross-slot resume): the attempt column stores null for the unlabeled
-  // legacy slot (as the 0100 backfill does), the LaunchData says "und".
-  // Never read by scoring (ADR 0005 D1).
+  // (is_preview, launch_mode 'Browse'); a revision visit's row is 'Review'
+  // (ADR 0014 step 3); the served language is the attempt's slot (by the
+  // version's package, which also covers a cross-slot resume): the attempt
+  // column stores null for the unlabeled legacy slot (as the 0100 backfill
+  // does), the LaunchData says "und". Never read by scoring (ADR 0005 D1).
   const p4 = aldsP4Enabled();
-  const preview = previewLaunch(role);
-  const servedPackage = allPackages.find((p) => p.id === v.package_id);
-  const servedLanguage = servedLanguageFor(servedPackage?.language);
+  const packageOfServed = (ver: Version) => allPackages.find((p) => p.id === ver.package_id);
 
   // PREREQ LOCK: if this course is in a learning path the user is assigned
   // to, every earlier step in that path must be completed first — UNLESS
@@ -676,83 +741,122 @@ export default async function LaunchPage({
     }
   }
 
-  if (deactivatedSlotAttempts.length > 0) {
-    // (3) The slot was deactivated by an admin: this attempt can never be
-    // resumed from the picker again. Conditional on in_progress, own rows
-    // only; fail-soft (a failed close leaves it in progress, as before).
-    const svcSlot = createServiceClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
-      { auth: { persistSession: false } }
-    );
-    // Abandoning is irreversible: re-check (4) with an error-checked read
-    // and close nothing if it cannot be read (grantRetakeIdsFor is
-    // fail-soft). A database without attempt_requests (pre-0083) has no grants.
-    const { data: grantRows, error: grantErr } = await svcSlot
-      .from("attempt_requests")
-      .select("used_attempt_id")
-      .in("used_attempt_id", deactivatedSlotAttempts)
-      .eq("status", "approved");
-    const grantMissing = (grantErr as { code?: string } | null)?.code === "42P01";
-    const closable =
-      grantErr && !grantMissing
-        ? []
-        : deactivatedSlotAttempts.filter(
-            (id) => !((grantRows ?? []) as Array<{ used_attempt_id: string | null }>).some((g) => g.used_attempt_id === id)
-          );
-    if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
-    if (closable.length > 0) {
-      const { data: abRows, error: abErr } = await svcSlot
+  // The closes of a resolution, run only once every launch gate has passed
+  // (a launch that is then refused closes nothing), conditional on
+  // status = 'in_progress' and the learner's own rows, fail-soft.
+  const closeAfterResolution = async (r: Resolution) => {
+    if (r.deactivated.length > 0) {
+      // (3) The slot was deactivated by an admin: this attempt can never be
+      // resumed from the picker again.
+      // Abandoning is irreversible: re-check (4) with an error-checked read
+      // and close nothing if it cannot be read. A database without
+      // attempt_requests (pre-0083) has no grants.
+      const { data: grantRows, error: grantErr } = await svcAttempt
+        .from("attempt_requests")
+        .select("used_attempt_id")
+        .in("used_attempt_id", r.deactivated)
+        .eq("status", "approved");
+      const grantMissing = (grantErr as { code?: string } | null)?.code === "42P01";
+      const closable =
+        grantErr && !grantMissing
+          ? []
+          : r.deactivated.filter(
+              (id) => !((grantRows ?? []) as Array<{ used_attempt_id: string | null }>).some((g) => g.used_attempt_id === id)
+            );
+      if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
+      if (closable.length > 0) {
+        const { data: abRows, error: abErr } = await svcAttempt
+          .from("course_attempts")
+          .update({ status: "abandoned" })
+          .in("id", closable)
+          .eq("user_id", user.id)
+          .eq("status", "in_progress")
+          .select("id");
+        if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
+        const closedIds = ((abRows ?? []) as Array<{ id: string }>).map((row) => row.id);
+        const tokErr = await expireLaunchTokens(svcAttempt, closedIds);
+        if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+        // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
+        await enqueueAbandonedStatements(svcAttempt, closedIds);
+      }
+    }
+    if (r.staleRevisionIds.length > 0) {
+      // ADR 0014 step 3 (Routing): a revision visit's row left in progress on
+      // a non-current version of the chosen package closes here, so the next
+      // revisit opens on the current version (revision rows only; nothing is
+      // lost, every revisit re-seeds from the official attempt).
+      const { data: stRows, error: stErr } = await svcAttempt
         .from("course_attempts")
         .update({ status: "abandoned" })
-        .in("id", closable)
+        .in("id", r.staleRevisionIds)
         .eq("user_id", user.id)
         .eq("status", "in_progress")
+        .eq("is_revision", true)
         .select("id");
-      if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
-      const closedIds = ((abRows ?? []) as Array<{ id: string }>).map((r) => r.id);
-      const tokErr = await expireLaunchTokens(svcSlot, closedIds);
+      if (stErr && !isMissingColumn(stErr, "is_revision")) console.warn("[launch] stale revision close failed:", stErr.message);
+      const staleIds = ((stRows ?? []) as Array<{ id: string }>).map((row) => row.id);
+      const tokErr = await expireLaunchTokens(svcAttempt, staleIds);
       if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
-      // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
-      await enqueueAbandonedStatements(svcSlot, closedIds);
+      await enqueueAbandonedStatements(svcAttempt, staleIds);
     }
-  }
+  };
+  await closeAfterResolution(res);
 
-  // Find or create the attempt. Resume by most recent ACTIVITY (not
-  // started_at): when historical duplicate attempts exist, the one the
-  // learner actually worked in is the one holding their bookmark — resuming
-  // the other one is exactly the "lost my place" bug (0062 also makes new
-  // duplicates impossible via a partial unique index).
-  let attemptId: string | null = null;
-  let cmi: CmiData = {};
-  // ADR 0009: attempt rows are written by the server only. The reads stay on
-  // the caller's RLS session; the two writes below (journey tag, insert) use
-  // this service client with explicit id/user_id/organization_id. Membership
-  // is already proven: the course was read under RLS ("members read org
-  // courses") with organization_id = org.id, v was read with
-  // course_id = c.id, and a journey context only from this organisation.
-  const svcAttempt = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-  const { data: existing } = await supabase
-    .from("course_attempts")
-    .select("id, cmi_data")
-    .eq("course_version_id", v.id)
-    .eq("user_id", user.id)
-    .eq("status", "in_progress")
-    .order("last_activity_at", { ascending: false, nullsFirst: false })
-    .order("started_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  // ?lp=<pathId> threads through from the path detail page so reports
+  // can slice attempts by which learning path they were launched from.
+  // We trust the param only if it points at a path the user is actually
+  // assigned to (or that's org_public) and that contains this course as
+  // a step — otherwise NULL so reports stay honest.
+  const pathContextId: string | null =
+    lpParam && stepInPaths.some((s) => s.path_id === lpParam) ? lpParam : null;
 
-  if (existing) {
-    attemptId = existing.id;
-    cmi = (existing.cmi_data ?? {}) as CmiData;
+  // The in-progress row on the resolved version: resume by most recent
+  // ACTIVITY (not started_at): when historical duplicate attempts exist, the
+  // one the learner actually worked in is the one holding their bookmark —
+  // resuming the other one is exactly the "lost my place" bug (0062 also
+  // makes new duplicates impossible via a partial unique index). The row's
+  // own flag decides the kind (is_revision, with the fallback); a failed
+  // read refuses.
+  type LaunchRowFull = { id: string; cmi_data: CmiData | null; is_revision?: boolean | null; status?: string };
+  const ROW_COLUMNS = "id, cmi_data, status";
+  const lookupRow = async (versionId: string): Promise<LaunchRowFull | null> => {
+    const read = (columns: string) =>
+      supabase
+        .from("course_attempts")
+        .select(columns)
+        .eq("course_version_id", versionId)
+        .eq("user_id", user.id)
+        .eq("status", "in_progress")
+        .order("last_activity_at", { ascending: false, nullsFirst: false })
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    let { data: found, error: rowErr } = await read(`${ROW_COLUMNS}, is_revision`);
+    if (rowErr && isMissingColumn(rowErr, "is_revision")) ({ data: found, error: rowErr } = await read(ROW_COLUMNS));
+    if (rowErr) refuse("row_read_failed");
+    return (found ?? null) as unknown as LaunchRowFull | null;
+  };
+
+  // Resuming a row the kind rule accepted (lib/attempts/launch-kind.ts
+  // rowAction): the cutover rule flags an unflagged row of a revision launch
+  // in place first, and only a result of exactly 1 resumes it.
+  type Taken = { attemptId: string; cmi: CmiData; isRevision: boolean; flagResult: number | null; action: RowAction };
+  const takeRow = async (decision: RowDecision, existing: LaunchRowFull, tagJourney: boolean): Promise<Taken> => {
+    if (decision.action === "refuse") refuse(decision.reason);
+    if (decision.action === "insert_first" || decision.action === "insert_revision") refuse("row_exists");
+    let flag: number | null = null;
+    if (decision.action === "flag_then_resume") {
+      // Cutover (ADR 0014 step 3): rows opened before 0103, or under a legacy
+      // multi-attempt rule. Any error, 0 rows (a retake, completed, or changed
+      // under us) or a missing function refuses; the retry decides again.
+      const { data: flagged, error: flagErr } = await svcAttempt.rpc("flag_revision_attempt", { p_attempt_id: existing.id });
+      if (flagErr) refuse(isSchemaMissing(flagErr) ? "schema_missing" : "flag_failed");
+      if (flagged !== 1) refuse("flag_not_applied");
+      flag = 1;
+    }
     // Resuming an untagged in-progress attempt from the journey: tag it so
     // its completion credits the journey day (and stays XP-exempt).
-    if (journeyCtx) {
+    if (tagJourney && journeyCtx) {
       const { error: tagErr } = await svcAttempt
         .from("course_attempts")
         .update({
@@ -765,161 +869,323 @@ export default async function LaunchPage({
       // Fail-soft as before (the launch goes on); ids only in the log.
       if (tagErr) console.warn(`[launch] journey tag failed on attempt ${existing.id}:`, tagErr.message);
     }
-  } else {
-    // ?lp=<pathId> threads through from the path detail page so reports
-    // can slice attempts by which learning path they were launched from.
-    // We trust the param only if it points at a path the user is actually
-    // assigned to (or that's org_public) and that contains this course as
-    // a step — otherwise NULL so reports stay honest.
-    let pathContextId: string | null = null;
-    if (lpParam) {
-      const stepMatch = stepInPaths.some((s) => s.path_id === lpParam);
-      if (stepMatch) pathContextId = lpParam;
+    return {
+      attemptId: existing.id,
+      cmi: (existing.cmi_data ?? {}) as CmiData,
+      isRevision: existing.is_revision === true || flag === 1,
+      flagResult: flag,
+      action: decision.action,
+    };
+  };
+
+  let attemptId: string | null = null;
+  let cmi: CmiData = {};
+  let rowIsRevision = false;
+  let rowAct: RowAction = "insert_first";
+  let flagResult: number | null = null;
+  // The grant consumed on THIS launch (consume_grant answered `opened`).
+  let openedGrantId: string | null = null;
+
+  // I-1, the grant path, ONE transaction (ADR 0014 step 3; 0103
+  // consume_grant): the grant row is locked, every open row of the learner
+  // on the course closed, the fresh unseeded retake inserted and the grant
+  // stamped, or nothing at all. There is no fallback to separate writes.
+  if (ev.candidate === "grant" && grants.unusedGrant) {
+    const grantId = grants.unusedGrant.id;
+    const { data: cgData, error: cgErr } = await svcAttempt.rpc("consume_grant", {
+      p_grant_id: grantId,
+      p_user_id: user.id,
+      p_course_id: c.id,
+      p_version_id: v.id,
+      p_org_id: org.id,
+      p_learning_path_id: pathContextId,
+      p_journey_enrollment_id: journeyCtx?.enrollmentId ?? null,
+      p_journey_day: journeyCtx?.day ?? null,
+    });
+    // A raised error (a 23505 race, the consistency check, a deadlock) or a
+    // missing function refuses, nothing written.
+    if (cgErr) refuse(isSchemaMissing(cgErr) ? "schema_missing" : `consume_grant_error_${cgErr.code ?? "unknown"}`);
+    const cg = (Array.isArray(cgData) ? cgData[0] : cgData) as
+      | { outcome?: string | null; attempt_id?: string | null; abandoned_ids?: string[] | null }
+      | null;
+    const next = afterConsumeGrant(cg?.outcome);
+    if (next === "refuse") refuse(`consume_grant_${String(cg?.outcome ?? "no_answer")}`);
+    if (next === "proceed") {
+      if (!cg?.attempt_id) refuse("consume_grant_no_attempt");
+      const retakeId = cg.attempt_id;
+      attemptId = retakeId;
+      openedGrantId = grantId;
+      const abandonedIds = cg.abandoned_ids ?? [];
+      // The tokens of every NON-revision attempt of the learner on the course
+      // die now, not only the abandoned ones: a "Try again" pass in
+      // attempt #1's still-open tab must not upgrade it after the retake
+      // opened. Fail-soft, as every token expiry.
+      const tokErr = await expireLaunchTokens(
+        svcAttempt,
+        tokenExpiryTargets({ attempts: ev.my, abandonedIds, newAttemptId: retakeId })
+      );
+      if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+      // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
+      await enqueueAbandonedStatements(svcAttempt, abandonedIds);
+      // The 0100 columns of the retake, only with ALDS_P4 on: one update,
+      // skipped on a database without 0100, never refusing (the grant is
+      // already spent and the retake open; scoring never reads them).
+      if (p4) {
+        const { error: p4Err } = await svcAttempt
+          .from("course_attempts")
+          .update(p4AttemptColumns({ role, revision: false, language: packageOfServed(v)?.language }))
+          .eq("id", retakeId)
+          .eq("user_id", user.id)
+          .eq("organization_id", org.id);
+        if (p4Err) {
+          if (isAldsSchemaMissing(p4Err)) logAldsSkip("grant_retake_columns", "schema_missing", { attemptId: retakeId });
+          else console.warn("[alds] retake columns update failed", { attemptId: retakeId, code: p4Err.code });
+        }
+      }
+    } else {
+      // used | stale | retake_live | stands: never an unrequested retake.
+      // Re-read the attempts and the grants and run the kind rule again in
+      // THIS request, without consuming (never a self-redirect); routing
+      // runs in full now (the grant resolution skipped it). The launch gates
+      // above do not depend on the version and are not repeated.
+      grants = await readGrants();
+      ev = await evaluate(grants, false);
+      res = await resolveVersion(ev.candidate, grants);
+      v = res.v;
+      await closeAfterResolution(res);
     }
-    // Revision run (0081): seed the new attempt from the latest completed
-    // attempt — this version first, otherwise the newest on any version —
-    // so the package resumes where the learner left off (completed slides,
-    // exercises and videos stay completed). SCORM: suspend_data + bookmark
-    // with entry=resume; cmi5/xAPI: the State documents are copied below.
-    // Whether it actually resumes is the package's own decision.
-    const revisionSource = practiceLaunch
-      ? (myCompleted.find((a) => a.course_version_id === v.id) ?? myCompleted[0] ?? null)
-      : null;
-    const seedCmi: CmiData = {};
-    if (revisionSource?.cmi_data) {
-      const prev = revisionSource.cmi_data as CmiData;
-      if (prev["cmi.suspend_data"]) seedCmi["cmi.suspend_data"] = prev["cmi.suspend_data"];
-      if (prev["cmi.core.lesson_location"]) seedCmi["cmi.core.lesson_location"] = prev["cmi.core.lesson_location"];
-      if (Object.keys(seedCmi).length > 0) seedCmi["cmi.core.entry"] = "resume";
+  }
+
+  if (!attemptId) {
+    const limitReached = ev.scoring?.limitReached ?? false;
+    // H: a `first` launch first closes any open flagged row on the resolved
+    // version (conditional on in_progress and is_revision; nothing is lost,
+    // the next revisit re-seeds), then looks up unflagged rows. Fail-soft: a
+    // row left open is refused by the kind rule below.
+    if (ev.candidate === "first") {
+      const { data: flRows, error: flErr } = await svcAttempt
+        .from("course_attempts")
+        .update({ status: "abandoned" })
+        .eq("course_version_id", v.id)
+        .eq("user_id", user.id)
+        .eq("status", "in_progress")
+        .eq("is_revision", true)
+        .select("id");
+      if (flErr && !isMissingColumn(flErr, "is_revision")) console.warn("[launch] flagged-row close failed:", flErr.message);
+      const flIds = ((flRows ?? []) as Array<{ id: string }>).map((row) => row.id);
+      if (flIds.length > 0) {
+        const tokErr = await expireLaunchTokens(svcAttempt, flIds);
+        if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+        await enqueueAbandonedStatements(svcAttempt, flIds);
+      }
     }
-    let { data: created, error: insErr } = await svcAttempt
-      .from("course_attempts")
-      .insert({
-        course_version_id: v.id,
-        user_id: user.id,
-        organization_id: org.id,
-        status: "in_progress",
-        cmi_data: seedCmi,
-        learning_path_id: pathContextId,
-        // Only name the 0058 columns when there IS journey context (which
-        // itself requires 0058) — naming them unconditionally would fail
-        // every launch on a database that hasn't run the migration yet.
-        ...(journeyCtx
-          ? {
-              journey_enrollment_id: journeyCtx.enrollmentId,
-              journey_day: journeyCtx.day,
-            }
-          : {}),
-        // The 0100 columns, only with ALDS_P4 on (ADR 0006 note (c)).
-        ...(p4
-          ? {
-              served_language: attemptServedLanguage(servedPackage?.language),
-              launch_mode: preview.launchMode,
-              is_preview: preview.isPreview,
-            }
-          : {}),
-      })
-      .select("id")
-      .single();
-    // Flag on, 0100 absent on this database: retry once without the three
-    // 0100 columns, so a launch never fails for P4. The 0062 23505
-    // fallback below follows either insert as before.
-    if (p4 && !created && isAldsSchemaMissing(insErr)) {
-      logAldsSkip("launch_insert", "schema_missing", { versionId: v.id });
-      ({ data: created, error: insErr } = await svcAttempt
+
+    // I-2: the kind rule at the row.
+    const existing = await lookupRow(v.id);
+    const decision = rowAction({ candidate: ev.candidate, limitReached, row: existing, retakeIds: grants.retakeIds });
+    let taken: Taken | null = null;
+    if (existing) {
+      taken = await takeRow(decision, existing, true);
+    } else if (decision.action === "insert_first" || decision.action === "insert_revision") {
+      // I-3, the insert invariant: a new row is official only for a free
+      // window slot; every other new row is a revision visit's, and only
+      // then is the column named (the journey-column pattern), so a first
+      // launch keeps working on a database without 0103.
+      const namedIsRevision = decision.action === "insert_revision";
+      if (namedIsRevision !== insertIsRevision(limitReached, null)) refuse("kind_mismatch");
+      let { data: created, error: insErr } = await svcAttempt
         .from("course_attempts")
         .insert({
           course_version_id: v.id,
           user_id: user.id,
           organization_id: org.id,
           status: "in_progress",
-          cmi_data: seedCmi,
+          cmi_data: {},
           learning_path_id: pathContextId,
+          // Only name the 0058 columns when there IS journey context (which
+          // itself requires 0058) — naming them unconditionally would fail
+          // every launch on a database that hasn't run the migration yet.
           ...(journeyCtx
             ? {
                 journey_enrollment_id: journeyCtx.enrollmentId,
                 journey_day: journeyCtx.day,
               }
             : {}),
+          ...(namedIsRevision ? { is_revision: true } : {}),
+          // The 0100 columns, only with ALDS_P4 on (ADR 0006 note (c)).
+          ...(p4 ? p4AttemptColumns({ role, revision: namedIsRevision, language: packageOfServed(v)?.language }) : {}),
         })
         .select("id")
-        .single());
-    }
-    attemptId = created?.id ?? null;
-    if (attemptId) {
-      cmi = seedCmi;
-      // cmi5 / xAPI revision: carry the package's State documents over so it
-      // resumes from the learner's latest saved progress. Never the
-      // LMS-owned LMS.LaunchData (cmi5 §10.1, ADR 0006 note (j)): it names
-      // the SOURCE attempt (registration, session, launch mode), so a copy
-      // would hand this attempt another attempt's identity whenever the
-      // flag-on write below does not replace it. Unconditional: the flag may
-      // be off now and the source's document still stored.
-      if (revisionSource && v.manifest_type !== "scorm12") {
-        try {
-          const seedSvc = createServiceClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY!,
-            { auth: { persistSession: false } }
-          );
-          const { data: states } = await seedSvc
-            .from("xapi_state")
-            .select("state_id, content, content_type")
-            .eq("attempt_id", revisionSource.id)
-            .neq("state_id", LMS_LAUNCH_DATA_STATE_ID);
-          const rows = (states ?? []) as Array<{ state_id: string; content: unknown; content_type: string | null }>;
-          if (rows.length > 0) {
-            await seedSvc
-              .from("xapi_state")
-              .upsert(rows.map((r) => ({ ...r, attempt_id: attemptId })), { onConflict: "attempt_id,state_id" });
-          }
-        } catch (e) {
-          console.warn("[launch] revision state seed failed (package starts fresh):", e);
-        }
+        .single();
+      let namedP4 = p4;
+      // I-4: flag on, 0100 absent on this database: retry once without the
+      // three 0100 columns (is_revision re-sent when it was named), so a
+      // launch never fails for P4. The 0062 23505 fallback below follows
+      // either insert as before.
+      if (p4 && !created && isAldsSchemaMissing(insErr)) {
+        logAldsSkip("launch_insert", "schema_missing", { versionId: v.id });
+        namedP4 = false;
+        ({ data: created, error: insErr } = await svcAttempt
+          .from("course_attempts")
+          .insert({
+            course_version_id: v.id,
+            user_id: user.id,
+            organization_id: org.id,
+            status: "in_progress",
+            cmi_data: {},
+            learning_path_id: pathContextId,
+            ...(journeyCtx
+              ? {
+                  journey_enrollment_id: journeyCtx.enrollmentId,
+                  journey_day: journeyCtx.day,
+                }
+              : {}),
+            ...(namedIsRevision ? { is_revision: true } : {}),
+          })
+          .select("id")
+          .single());
       }
-    }
-    // Unique-violation on 0062's one-in-progress index: a concurrent request
-    // (double click / router prefetch) created the attempt a moment ago —
-    // resume that one instead of failing the launch.
-    if (!attemptId && insErr?.code === "23505") {
-      const { data: raced } = await supabase
-        .from("course_attempts")
-        .select("id, cmi_data")
-        .eq("course_version_id", v.id)
-        .eq("user_id", user.id)
-        .eq("status", "in_progress")
-        .limit(1)
-        .maybeSingle();
-      if (raced) {
-        attemptId = raced.id;
-        cmi = (raced.cmi_data ?? {}) as CmiData;
+      // A revision insert failing on a missing schema: 0103 is not on this
+      // database. Refuse (logged schema_missing); never an unflagged
+      // revision row, never a retry without the column.
+      if (!created && revisionInsertRefused(insErr, namedIsRevision, namedP4)) refuse("schema_missing");
+      if (created) {
+        taken = { attemptId: created.id, cmi: {}, isRevision: namedIsRevision, flagResult: null, action: decision.action };
+      } else if (insErr?.code === "23505") {
+        // I-5: a concurrent request (double click / router prefetch) created
+        // the attempt a moment ago on 0062's one-in-progress index. Re-read
+        // it with its flag and apply the kind rule; any disagreement refuses.
+        const raced = await lookupRow(v.id);
+        if (!raced) refuse("raced_row_missing");
+        taken = await takeRow(
+          rowAction({ candidate: ev.candidate, limitReached, row: raced, retakeIds: grants.retakeIds }),
+          raced,
+          false
+        );
       }
+    } else {
+      refuse(decision.reason);
+    }
+    if (taken) {
+      attemptId = taken.attemptId;
+      cmi = taken.cmi;
+      rowIsRevision = taken.isRevision;
+      rowAct = taken.action;
+      flagResult = taken.flagResult;
     }
   }
   if (!attemptId) {
     return <div className="p-10 text-red-700">Failed to create attempt.</div>;
   }
 
-  // 0083: mark the consumed grant used, bound to the attempt it opened. The
-  // `used_at is null` guard makes it idempotent and single-use under a double
-  // launch; once stamped, grantRetakeIdsFor counts this attempt as the official
-  // retake so the next scoring pass supersedes the earlier official score.
-  if (consumeGrantId) {
-    try {
-      const svcGrant = createServiceClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY!,
-        { auth: { persistSession: false } }
-      );
-      await svcGrant
-        .from("attempt_requests")
-        .update({ used_at: new Date().toISOString(), used_attempt_id: attemptId })
-        .eq("id", consumeGrantId)
-        .is("used_at", null);
-    } catch (e) {
-      console.warn("[launch] grant stamp failed (retake still proceeds):", e);
+  // K: the seed, keyed on the row, on EVERY launch whose resolved row is a
+  // revision visit's (ADR 0014 step 3; lib/attempts/launch-kind.ts seedPlan),
+  // from the OFFICIAL attempt (scoring.officialAttempt, whatever version or
+  // language it is on), never on a first, retake or grant launch. What the
+  // learner sees is the official attempt's progress, answers and result.
+  // Failures are logged with ids and the launch goes on.
+  const seed = seedPlan({ action: rowAct, flagResult, manifestType: v.manifest_type });
+  const official = (ev.scoring?.officialAttempt ?? null) as MyAttempt | null;
+  if (seed.scorm) {
+    // SCORM: the served cmi and the row's cmi_data are rebuilt from the
+    // official attempt alone, by an update conditional on the row's flag.
+    cmi = buildRevisionCmi(official);
+    const { error: seedErr } = await svcAttempt
+      .from("course_attempts")
+      .update({ cmi_data: cmi })
+      .eq("id", attemptId)
+      .eq("user_id", user.id)
+      .eq("is_revision", true)
+      .eq("status", "in_progress");
+    if (seedErr) {
+      console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official?.id ?? null }));
     }
   }
+  if (seed.state && official) {
+    // cmi5 / xAPI: the official attempt's State documents overwrite the
+    // revision row's, never the two LMS-owned documents (cmi5 §10.1, ADR
+    // 0006 note (j)): LMS.LaunchData names the SOURCE attempt (registration,
+    // session, launch mode), and LMS.OfficialResult is written below.
+    // Unconditional: the flag may be off now and the source's document still
+    // stored. The guard is this request's own verdict (seedPlan: the row read,
+    // inserted or raced is flagged, or the cutover answered 1). supabase-js
+    // returns its errors, so both calls destructure and log theirs (ids
+    // only, as the SCORM branch does); the launch goes on either way.
+    try {
+      const { data: states, error: stateReadErr } = await svcAttempt
+        .from("xapi_state")
+        .select("state_id, content, content_type")
+        .eq("attempt_id", official.id)
+        .neq("state_id", LMS_LAUNCH_DATA_STATE_ID)
+        .neq("state_id", LMS_OFFICIAL_RESULT_STATE_ID);
+      if (stateReadErr) {
+        console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official.id, step: "state_read" }));
+      }
+      const rows = (stateReadErr ? [] : (states ?? [])) as Array<{ state_id: string; content: unknown; content_type: string | null }>;
+      if (rows.length > 0) {
+        const { error: stateSeedErr } = await svcAttempt
+          .from("xapi_state")
+          .upsert(rows.map((r) => ({ ...r, attempt_id: attemptId })), { onConflict: "attempt_id,state_id" });
+        if (stateSeedErr) {
+          console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official.id, step: "state_upsert" }));
+        }
+      }
+    } catch (e) {
+      console.warn(JSON.stringify({ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official.id, reason: e instanceof Error ? e.message : String(e) }));
+    }
+  }
+  if (seed.officialResult && ev.scoring) {
+    // LMS.OfficialResult (cmi5 and xAPI only): the official
+    // attempt's status, integer-percent score and dates, for the revision
+    // registration; not P4-gated. Ids, a status, a score and dates only.
+    const { error: orErr } = await svcAttempt.from("xapi_state").upsert(
+      {
+        attempt_id: attemptId,
+        state_id: LMS_OFFICIAL_RESULT_STATE_ID,
+        content: buildOfficialResult({ scoring: { ...ev.scoring, officialAttempt: official }, writtenAt: new Date().toISOString() }),
+        content_type: "application/json",
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "attempt_id,state_id" }
+    );
+    if (orErr) console.warn(JSON.stringify({ event: "official_result_write_failed", attempt_id: attemptId }));
+  }
+
+  // Row-driven decisions (ADR 0014 step 3): the launch mode follows the
+  // row's flag; staff and data_analyst launches are previews.
+  const launch = launchModeFor({ role, revision: rowIsRevision });
+  const servedLanguage = servedLanguageFor(packageOfServed(v)?.language);
+
+  // L: the revision visit record (ADR 0014 step 3), written once the launch
+  // is certain, only for a flagged row and never for a preview
+  // (shouldRecordVisit): through record_revision_visit (its 10 s dedupe), a
+  // plain insert when the function fails for another reason than a missing
+  // schema (one high rather than lost), a log line when that fails too.
+  const recordRevisionVisit = async (visitAttemptId: string): Promise<void> => {
+    const visit = {
+      p_org: org.id,
+      p_user: user.id,
+      p_course: c.id,
+      p_version: v.id,
+      p_attempt: visitAttemptId,
+      p_kind: v.manifest_type,
+    };
+    const { error: visitErr } = await svcAttempt.rpc("record_revision_visit", visit);
+    if (!visitErr) return;
+    if (isSchemaMissing(visitErr)) {
+      console.warn(JSON.stringify({ event: "revision_visit_skipped", reason: "schema_missing", attempt_id: visitAttemptId }));
+      return;
+    }
+    const { error: plainErr } = await svcAttempt.from("revision_visits").insert({
+      organization_id: visit.p_org,
+      user_id: visit.p_user,
+      course_id: visit.p_course,
+      course_version_id: visit.p_version,
+      attempt_id: visit.p_attempt,
+      launch_kind: visit.p_kind,
+    });
+    if (plainErr) console.warn(JSON.stringify({ event: "revision_visit_failed", attempt_id: visitAttemptId }));
+  };
 
   // ALDS step 0 (P1): every content URL names the ATTEMPT's version, so the
   // iframe runs the package this attempt was opened on (its language, or a
@@ -988,11 +1254,21 @@ export default async function LaunchPage({
 
   // --- SCORM 1.2 path ---
   if (v.manifest_type === "scorm12") {
+    if (rowIsRevision) {
+      // ADR 0014 step 3 (SCORM runtime): a revision visit's row runs in
+      // review / no-credit, set unconditionally before entry = resume (the
+      // SCO may overwrite any key at runtime; the commit route records
+      // nothing for this row either way).
+      cmi["cmi.core.lesson_mode"] = "review";
+      cmi["cmi.core.credit"] = "no-credit";
+      cmi["cmi.core.entry"] = "resume";
+    }
     if (!cmi["cmi.core.student_id"]) cmi["cmi.core.student_id"] = user.id;
     if (!cmi["cmi.core.student_name"]) {
       cmi["cmi.core.student_name"] = user.email ?? "Learner";
     }
     const launchSrc = contentBase + v.launch_url.replace(/^\/+/, "");
+    if (shouldRecordVisit({ isPreview: launch.isPreview, rowIsRevision })) await recordRevisionVisit(attemptId);
     return (
       <ScormRuntime
         attemptId={attemptId}
@@ -1002,7 +1278,7 @@ export default async function LaunchPage({
         backHref={backHref}
         backLabel={backLabel}
         preloadUrls={preloadUrls}
-        practice={practiceLaunch}
+        revision={rowIsRevision}
       />
     );
   }
@@ -1012,14 +1288,8 @@ export default async function LaunchPage({
   // the one-shot `fetch` handshake; a tincan.xml package gets it directly
   // on the launch URL as the standard `auth` parameter. Everything after
   // that (statements, State API resume, progress) is shared.
-  const svcUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const svcKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-  const svc = createServiceClient(svcUrl, svcKey, {
-    auth: { persistSession: false },
-  });
-
   const authToken = randomBytes(32).toString("hex");
-  const { data: token } = await svc
+  const { data: token } = await svcAttempt
     .from("cmi5_launch_tokens")
     .insert({
       auth_token: authToken,
@@ -1033,6 +1303,7 @@ export default async function LaunchPage({
       <div className="p-10 text-red-700">Failed to mint launch token.</div>
     );
   }
+  if (shouldRecordVisit({ isPreview: launch.isPreview, rowIsRevision })) await recordRevisionVisit(attemptId);
 
   // xAPI endpoint URL must point at the live host so the SCORM/cmi5
   // player (in the iframe) can POST progress back. The helper handles
@@ -1105,7 +1376,7 @@ export default async function LaunchPage({
       // error, or 0100 absent, leaves the course family out of grouping).
       let courseUlid: string | null = null;
       try {
-        const { data: aldsRow, error: aldsErr } = await svc
+        const { data: aldsRow, error: aldsErr } = await svcAttempt
           .from("course_versions")
           .select("alds_manifest")
           .eq("id", v.id)
@@ -1122,18 +1393,20 @@ export default async function LaunchPage({
       }
       // ADR 0006 note (h): a registration's kind never changes between its
       // launches. A relaunch of an in-progress grant retake consumes no
-      // grant, so the kind comes from the attempt's own link to its grant
-      // (attempt_requests.used_attempt_id, stamped above on the first
-      // launch); fail-soft (a failed read is an empty set).
-      const attemptIsGrantRetake =
-        !consumeGrantId && (await grantRetakeIdsFor(svc, user.id, c.id)).has(attemptId);
+      // grant, so the kind comes from the attempt's own link to its grant,
+      // from this launch's strict grant snapshot (ADR 0014 step 3); a
+      // revision visit's row stays `retake`.
       const launchData = buildLaunchData({
         attemptId,
         packageId: v.package_id,
         versionId: v.id,
         servedLanguage,
-        launchMode: preview.launchMode,
-        registrationKind: registrationKindFor({ consumeGrantId, practiceLaunch, attemptIsGrantRetake }),
+        launchMode: launch.launchMode,
+        registrationKind: registrationKindFor({
+          consumeGrantId: openedGrantId,
+          revision: rowIsRevision,
+          attemptIsGrantRetake: grants.retakeIds.has(attemptId),
+        }),
         sessionId,
         publisherCourseId: v.manifest_data?.raw?.courseId ?? null,
         courseUlid,
@@ -1141,19 +1414,19 @@ export default async function LaunchPage({
         // cmi5 §10.2.6: a URL, not a path (the fixed in-app back target).
         returnURL: `${host}${backHref}`,
       });
-      const { error: ldErr } = await writeLaunchData(svc, attemptId, launchData);
+      const { error: ldErr } = await writeLaunchData(svcAttempt, attemptId, launchData);
       if (ldErr) console.warn("[alds] LaunchData write failed", { attemptId, code: ldErr.code });
     } else {
       logAldsSkip("launch_data", "no_package", { attemptId, versionId: v.id });
     }
-    await recordLearningSession(svc, {
+    await recordLearningSession(svcAttempt, {
       sessionId,
       organizationId: org.id,
       attemptId,
       launchKind: "cmi5",
       fetchToken: token.fetch_token,
       activityId,
-      launchMode: preview.launchMode,
+      launchMode: launch.launchMode,
     });
   }
 
@@ -1165,7 +1438,7 @@ export default async function LaunchPage({
       backLabel={backLabel}
       standard={isXapi ? "xAPI" : "cmi5"}
       preloadUrls={preloadUrls}
-      practice={practiceLaunch}
+      revision={rowIsRevision}
     />
   );
 }

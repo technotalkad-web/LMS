@@ -21,7 +21,7 @@
  * | R3   | §7 R3 (qid, language) in the catalogue    | checkStatement   | package     |
  * | SEM  | ADR 0005 step 6 semantic check vs the key | checkStatement   | package     |
  * | POOL | ADR 0005 step 5 pools / drawn set         | both             | package     |
- * | G3   | §5.2 G3 order within a session; no failed after passed | checkSession | package (`session_reopened` is a warning, an open decision: session.ts) |
+ * | G3   | §5.2 G3 order within a session; no failed after passed; cmi5 §9.3 one of {passed, failed} and no duplicated verb per session (ADR 0014 step 19) | checkSession | package (`session_reopened` and `outcome_twice_in_session` are warnings: session.ts) |
  * | R5   | §7 R5 per-registration clause (≤ 1 completed, ≤ 1 passed) | checkSession | package |
  * | U1   | §2 U1 manifest parses, standardVersion    | checkPackage     | package     |
  * | U2   | §2 U2 publisherIds in the real XML        | checkPackage     | package     |

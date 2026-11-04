@@ -8,7 +8,10 @@
  *
  * Everything here runs only behind ALDS_P4 (lib/alds/flag.ts) except
  * isLaunchDataStateId(), which the State route's read-only guard uses
- * unconditionally (cmi5 §10.1: LMS.LaunchData is LMS-owned).
+ * unconditionally (cmi5 §10.1: LMS.LaunchData and, from ADR 0014,
+ * LMS.OfficialResult are LMS-owned), and launchModeFor(), whose isPreview
+ * the launch page also reads outside the flag to decide the revision visit
+ * record (ADR 0014 step 3: staff previews record no visit).
  *
  * Privacy: the LaunchData document carries ids and the slot language only,
  * never a name or an email.
@@ -30,7 +33,11 @@ import {
   type RegistrationKind,
 } from "@/lib/alds/types";
 import { isAldsSchemaMissing, logAldsSkip } from "@/lib/alds/flag";
-import { LEARNING_SESSIONS_TABLE, LMS_LAUNCH_DATA_STATE_ID } from "@/lib/alds/rpc";
+import {
+  LEARNING_SESSIONS_TABLE,
+  LMS_LAUNCH_DATA_STATE_ID,
+  LMS_OFFICIAL_RESULT_STATE_ID,
+} from "@/lib/alds/rpc";
 import { canManage } from "@/lib/auth/permissions";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 
@@ -40,31 +47,56 @@ export function lmsAuActivityId(packageId: string): string {
 }
 
 /**
- * Staff launches are previews (ADR 0006 step 17, BLUEPRINT §10.4): the same
- * roles as the 0100 backfill. Every launch from the launch page; there is no
- * learner-view exception.
+ * The launch mode, decided by the row (ADR 0014 step 3, "Row-driven
+ * decisions"; replaces previewLaunch): staff launches are previews (ADR
+ * 0006 step 17, BLUEPRINT §10.4: the same roles as the 0100 backfill),
+ * `Browse`; otherwise a revision visit's row (is_revision) is `Review`;
+ * else `Normal`. Every launch from the launch page; there is no
+ * learner-view exception. No grading code reads the mode: every gate reads
+ * is_revision.
  */
-export function previewLaunch(role: OrgRole): { isPreview: boolean; launchMode: LaunchMode } {
-  return canManage(role) || role === "data_analyst"
-    ? { isPreview: true, launchMode: "Browse" }
-    : { isPreview: false, launchMode: "Normal" };
+export function launchModeFor(i: { role: OrgRole; revision: boolean }): { isPreview: boolean; launchMode: LaunchMode } {
+  if (canManage(i.role) || i.role === "data_analyst") return { isPreview: true, launchMode: "Browse" };
+  return { isPreview: false, launchMode: i.revision ? "Review" : "Normal" };
+}
+
+/**
+ * The three 0100 columns of a launch's attempt row (ADR 0006 note (c); ADR
+ * 0014 step 3), for the launch page's insert and for its update after
+ * consume_grant opens a retake. Only with ALDS_P4 on: the page calls it
+ * under `p4`. The attempt column stores the raw slot language (null when
+ * unlabeled), never the LaunchData "und".
+ */
+export function p4AttemptColumns(i: { role: OrgRole; revision: boolean; language: string | null | undefined }): {
+  served_language: string | null;
+  launch_mode: LaunchMode;
+  is_preview: boolean;
+} {
+  const mode = launchModeFor({ role: i.role, revision: i.revision });
+  return {
+    served_language: attemptServedLanguage(i.language),
+    launch_mode: mode.launchMode,
+    is_preview: mode.isPreview,
+  };
 }
 
 /**
  * registration/kind (ADR 0006 notes (b) and (h)): grant_retake when a grant
  * is consumed on this launch or the attempt (= the registration) is a grant
  * retake by its row's link (attempt_requests.used_attempt_id), so a relaunch
- * of an in-progress grant retake keeps its kind; retake when it is a
- * revision run, else enrollment.
+ * of an in-progress grant retake keeps its kind; retake when the row is a
+ * revision visit's (ADR 0014 step 3: a flagged row stays `retake`), else
+ * enrollment.
  */
 export function registrationKindFor(i: {
   consumeGrantId: string | null;
-  practiceLaunch: boolean;
-  /** The launched attempt is a consumed grant's retake (grantRetakeIdsFor). */
+  /** The launched row is a revision visit's (course_attempts.is_revision). */
+  revision: boolean;
+  /** The launched attempt is a consumed grant's retake (the launch's grant snapshot). */
   attemptIsGrantRetake: boolean;
 }): RegistrationKind {
   if (i.consumeGrantId || i.attemptIsGrantRetake) return "grant_retake";
-  if (i.practiceLaunch) return "retake";
+  if (i.revision) return "retake";
   return "enrollment";
 }
 
@@ -188,9 +220,13 @@ export async function recordLearningSession(
   }
 }
 
-/** The State route's read-only guard: exact, case-sensitive (cmi5 §10.1). */
+/**
+ * The State route's read-only guard: exact, case-sensitive (cmi5 §10.1).
+ * It keeps its name; from ADR 0014 step 4 it covers both LMS-owned
+ * documents, LMS.LaunchData and LMS.OfficialResult. GET serves both.
+ */
 export function isLaunchDataStateId(stateId: string | null): boolean {
-  return stateId === LMS_LAUNCH_DATA_STATE_ID;
+  return stateId === LMS_LAUNCH_DATA_STATE_ID || stateId === LMS_OFFICIAL_RESULT_STATE_ID;
 }
 
 /** A fresh cmi5 session id, one per launch. */

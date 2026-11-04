@@ -209,6 +209,11 @@ export class PublishedButRestartFailedError extends Error {
             resolved: fin.restart?.resolved ?? 0,
             unresolved: fin.restart?.unresolved ?? 0,
             unresolved_version_ids: fin.restart?.unresolved_version_ids ?? null,
+            // ADR 0014 step 8: the re-grant counts (0 when the server sent none).
+            reissued: fin.restart?.reissued ?? 0,
+            reissue_failed: fin.restart?.reissue_failed ?? 0,
+            reissue_pending: fin.restart?.reissue_pending ?? 0,
+            revision_closed: fin.restart?.revision_closed ?? 0,
             message,
           };
   }

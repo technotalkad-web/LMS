@@ -7,6 +7,9 @@ import {
   forceRestartReplaceAnswer,
   forceRestartReport,
 } from "@/lib/attempts/force-restart";
+import { notifyLearnerOfDecision } from "@/lib/attempts/requests";
+import { resolveEmails } from "@/lib/users/emails";
+import { originFromRequest } from "@/lib/http/origin";
 import { runPackageGuardian } from "@/lib/alds/guardian";
 import {
   enforcePackageValidation,
@@ -83,9 +86,10 @@ export async function POST(
   } = await supabase.auth.getUser();
   if (!caller) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  // name and slug: a forced restart's re-issued grant emails the learner (ADR 0014 step 8).
   const { data: org } = await supabase
     .from("organizations")
-    .select("id")
+    .select("id, name, slug")
     .eq("slug", orgSlug)
     .maybeSingle();
   if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
@@ -104,7 +108,7 @@ export async function POST(
   // ---- Verify course is in this org ----
   const { data: course } = await supabase
     .from("courses")
-    .select("id")
+    .select("id, title")
     .eq("id", courseId)
     .eq("organization_id", org.id)
     .maybeSingle();
@@ -196,7 +200,18 @@ export async function POST(
     // versions, so each learner starts fresh on the new version. The outcome
     // is a value (never a throw): the version above stays published whatever
     // it says, and a failed reset answers 500 with published: true.
-    const run = await forceRestartOlderVersions(svc, { packageId, newVersionId: result.versionId });
+    // ADR 0014 step 8: the reset retakes' grants are re-issued in the same
+    // operation, by this admin, and the learners told.
+    const run = await forceRestartOlderVersions(svc, {
+      packageId,
+      newVersionId: result.versionId,
+      versionNumber: result.versionNumber,
+      admin: { id: caller.id },
+      org: { id: org.id, name: (org as { name?: string }).name ?? "", slug: (org as { slug?: string }).slug ?? orgSlug },
+      origin: await originFromRequest(),
+      course: { id: course.id, title: (course as { title?: string }).title ?? "this course" },
+      notify: { decision: notifyLearnerOfDecision, emails: resolveEmails },
+    });
     answer = forceRestartReplaceAnswer({
       courseId,
       packageId,

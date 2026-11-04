@@ -5,7 +5,9 @@
  * which attempts COUNT. A policy has a scoring window (the first N completed
  * attempts), an official-score basis inside that window, and what happens
  * after the window is used up (practice = unscored relaunches, block = no
- * more launches).
+ * more launches). ADR 0014 retires the window: normalizePolicy() clamps
+ * every rule to DEFAULT_POLICY, and a revision visit's row (is_revision)
+ * never counts.
  *
  * computeScoring() mirrors public.v_course_attempt_scoring byte-for-byte in
  * intent: completed attempts ordered by (completed_at ?? started_at,
@@ -81,23 +83,24 @@ export const OFFICIAL_BASIS_OPTIONS: Array<{
   },
 ];
 
+/**
+ * ADR 0014 steps 6 and 9 (Q1, "Retire the multi-attempt setting"): every
+ * rule is clamped to DEFAULT_POLICY, one official attempt and then
+ * review-only revision visits; extra official attempts only by grant. The
+ * SQL twin is 0103's effective_attempt_policy(). Only where the rule came
+ * from (`source`, `source_id`) is still read from the input; the stored
+ * values stay in attempt_scoring_rules untouched (no row is rewritten), so
+ * `blocked` is always false and `practiceMode === limitReached`.
+ */
 export function normalizePolicy(raw: unknown): EffectivePolicy {
   const r = (raw ?? {}) as Record<string, unknown>;
-  const max = Number(r.max_scored_attempts);
-  const basis = r.official_basis as OfficialBasis;
-  const nth = r.official_attempt_number;
-  const after = r.after_limit as AfterLimit;
   const source = r.source as EffectivePolicy["source"];
   return {
-    max_scored_attempts:
-      Number.isFinite(max) && max >= 1 ? Math.round(max) : DEFAULT_POLICY.max_scored_attempts,
-    official_basis: ["first", "best", "latest", "nth"].includes(basis)
-      ? basis
-      : DEFAULT_POLICY.official_basis,
-    official_attempt_number:
-      typeof nth === "number" && Number.isFinite(nth) && nth >= 1 ? Math.round(nth) : null,
-    retain_first_attempt: r.retain_first_attempt !== false,
-    after_limit: after === "block" ? "block" : "practice",
+    max_scored_attempts: DEFAULT_POLICY.max_scored_attempts,
+    official_basis: DEFAULT_POLICY.official_basis,
+    official_attempt_number: DEFAULT_POLICY.official_attempt_number,
+    retain_first_attempt: DEFAULT_POLICY.retain_first_attempt,
+    after_limit: DEFAULT_POLICY.after_limit,
     source: ["course", "path", "journey", "default"].includes(source) ? source : "default",
     source_id: typeof r.source_id === "string" ? r.source_id : null,
   };
@@ -112,6 +115,11 @@ export type ScorableAttempt = {
   success_status?: string | null;
   /** course_attempts.status; 'abandoned' attempts never count (see excludeAbandoned). */
   status?: string | null;
+  /**
+   * course_attempts.is_revision (0103, ADR 0014): a revision visit's row is
+   * never an attempt. Undefined on a database without 0103 (= false).
+   */
+  is_revision?: boolean | null;
 };
 
 /**
@@ -124,9 +132,23 @@ export function isAbandonedAttempt(a: object): boolean {
   return (a as { status?: unknown }).status === "abandoned";
 }
 
-/** The attempts that count for status, scoring and progress (ADR 0004 step 11). */
+/**
+ * ADR 0014 step 6: a revision visit's row (is_revision = true) never enters
+ * any attempt count, scoring window or status. Only `true` flags a row: a
+ * row read from a database without 0103, or by a select that does not name
+ * the column, reads as unflagged.
+ */
+export function isRevisionAttempt(a: object): boolean {
+  return (a as { is_revision?: unknown }).is_revision === true;
+}
+
+/**
+ * The attempts that count for status, scoring and progress: neither
+ * abandoned (ADR 0004 step 11) nor a revision visit's row (ADR 0014 step 6).
+ */
 export function excludeAbandoned<T extends object>(attempts: T[]): T[] {
-  return attempts.some(isAbandonedAttempt) ? attempts.filter((a) => !isAbandonedAttempt(a)) : attempts;
+  const drop = (a: T) => isAbandonedAttempt(a) || isRevisionAttempt(a);
+  return attempts.some(drop) ? attempts.filter((a) => !drop(a)) : attempts;
 }
 
 /**
@@ -144,14 +166,56 @@ export function hasLiveGrantedRetake(
 }
 
 /**
+ * Step 8 of ADR 0014: the learner course page's "Your retake was reset…"
+ * notice. True when the newest row by `started_at` among the learner's
+ * NON-REVISION rows on the course is an abandoned grant retake and no
+ * granted retake is live. Revision rows are skipped: after the reset the
+ * learner's next launch opens a revision row, which would otherwise hide
+ * the notice for good ("a revision visit is never an attempt"). The page
+ * hides it once a request is pending or a grant is live (its own inputs).
+ */
+export function latestResetRetake(
+  attempts: Array<{
+    id: string;
+    started_at?: string | null;
+    status?: string | null;
+    completion_status?: string | null;
+    success_status?: string | null;
+    is_revision?: boolean | null;
+  }>,
+  retakeIds: ReadonlySet<string>
+): boolean {
+  if (retakeIds.size === 0) return false;
+  let newest: (typeof attempts)[number] | undefined;
+  for (const a of attempts) {
+    if (isRevisionAttempt(a)) continue;
+    if (!newest) {
+      newest = a;
+      continue;
+    }
+    const ka = ts(a.started_at);
+    const kn = ts(newest.started_at);
+    if (ka > kn || (ka === kn && a.id > newest.id)) newest = a;
+  }
+  if (!newest || newest.status !== "abandoned" || !retakeIds.has(newest.id)) return false;
+  return !hasLiveGrantedRetake(attempts, retakeIds);
+}
+
+/**
  * Attempt counts for admin tables (ADR 0004 step 11): `live` = attempts that
  * were not reset, the number a table shows; `reset` = abandoned attempts,
- * shown as a small "· N reset" suffix when N > 0.
+ * shown as a small "· N reset" suffix when N > 0. A revision visit's row
+ * (ADR 0014 step 6) is neither.
  */
 export function attemptCounts(attempts: object[]): { live: number; reset: number } {
   let reset = 0;
-  for (const a of attempts) if (isAbandonedAttempt(a)) reset++;
-  return { live: attempts.length - reset, reset };
+  let live = 0;
+  for (const a of attempts) {
+    if (isRevisionAttempt(a)) continue;
+    if (isAbandonedAttempt(a)) reset++;
+    else live++;
+  }
+  return { live, reset };
 }
 
 /** House completion definition (matches the SQL everywhere). */
@@ -220,7 +284,8 @@ export function computeScoring(
   extra: number | Iterable<string> = 0
 ): ScoringResult {
   // Abandoned is never official (R6); it never completes either, so this
-  // only guards against a mislabelled row.
+  // only guards against a mislabelled row. A revision visit's row is never
+  // an attempt (ADR 0014 step 6; defensive: R-5 keeps it from completing).
   const completed = excludeAbandoned(attempts)
     .filter((a) => isCompletedAttempt(a))
     .sort((a, b) => {

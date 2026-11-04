@@ -4,6 +4,9 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
+import { isMissingColumn } from "@/lib/scoring/attempt-kind";
+import { finishCheckAttemptIds, languageSwitchDecision, resettableSwitchRows, type SwitchRow } from "@/lib/courses/slot-routing";
+import { VERBS } from "@/lib/xapi/types";
 
 /**
  * PUT /api/courses/{courseId}/language-preference
@@ -34,6 +37,18 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
  *  - Consumed grant retakes are never abandoned (ALDS Decision 9) and do
  *    not count towards requires_confirm; abandoning also expires the
  *    attempts\' cmi5/xAPI launch tokens (ALDS step 0, P4).
+ *  - ADR 0014 step 3: a revision visit\'s row (is_revision) is neither
+ *    counted nor abandoned (it stays open and is re-seeded at its next
+ *    revisit); the filter is dropped on a database without the column.
+ *  - ADR 0014 step 18: an official cmi5 attempt on the other language that
+ *    has already taken an assessment (a stored passed or failed statement)
+ *    is not resettable: 409 { requires_finish, error, message } and nothing
+ *    is written, not the preference either, whatever restart_if_in_progress
+ *    says. The check runs after the resettable set is known, before the
+ *    requires_confirm 409 and before the upsert. Its reads, and the two
+ *    selects it widens, answer 503 on an error and write nothing.
+ *  - The decision itself is lib/courses/slot-routing.ts
+ *    languageSwitchDecision() (unit-tested).
  *
  * Auth: any org member can call for their own preference (RLS handles
  * the per-user scope on course_language_preferences).
@@ -90,30 +105,47 @@ export async function PUT(
     { auth: { persistSession: false } }
   );
 
+  const unreadable = (what: string, message: string) => {
+    console.error(`[language-preference] ${what} read failed:`, message);
+    return NextResponse.json({ error: "Could not check your progress. Please try again." }, { status: 503 });
+  };
+
   // Find all versions of THIS course whose package is NOT the chosen language,
-  // then count this user's in-progress attempts on them.
-  const { data: thisCourseVersions } = await svc
+  // then count this user's in-progress attempts on them. manifest_type (ADR
+  // 0014 step 18) maps each attempt to its runtime; an error writes nothing.
+  const { data: thisCourseVersions, error: versionsErr } = await svc
     .from("course_versions")
-    .select("id, package_id")
+    .select("id, package_id, manifest_type")
     .eq("course_id", courseId);
-  const otherLangVerIds = ((thisCourseVersions ?? []) as Array<{ id: string; package_id: string }>)
-    .filter((v) => v.package_id !== targetPkg.id)
-    .map((v) => v.id);
+  if (versionsErr) return unreadable("versions", versionsErr.message);
+  const courseVersions = (thisCourseVersions ?? []) as Array<{ id: string; package_id: string; manifest_type: string | null }>;
+  const otherLangVerIds = courseVersions.filter((v) => v.package_id !== targetPkg.id).map((v) => v.id);
+  const manifestTypeOfVersion = new Map(courseVersions.map((v) => [v.id, v.manifest_type]));
 
   // A consumed grant retake (an extra OFFICIAL attempt an admin granted) is
   // never abandoned by a language switch (ALDS Decision 9): it stays
   // resumable in its own language, so it is neither counted as "progress you
-  // will lose" nor reset below.
-  let ipIds: string[] = [];
+  // will lose" nor reset below. A revision visit's row (ADR 0014 step 3)
+  // neither: `is_revision = false`, the filter dropped on a database without
+  // the column (where no row can be flagged).
+  let ipRowsRead: SwitchRow[] = [];
   if (otherLangVerIds.length > 0) {
-    const { data: ipRows } = await svc
-      .from("course_attempts")
-      .select("id")
-      .eq("user_id", user.id)
-      .in("course_version_id", otherLangVerIds)
-      .eq("status", "in_progress");
-    ipIds = ((ipRows ?? []) as Array<{ id: string }>).map((r) => r.id);
+    const readInProgress = (withFlagFilter: boolean) => {
+      let q = svc
+        .from("course_attempts")
+        .select("id, course_version_id")
+        .eq("user_id", user.id)
+        .in("course_version_id", otherLangVerIds)
+        .eq("status", "in_progress");
+      if (withFlagFilter) q = q.eq("is_revision", false);
+      return q;
+    };
+    let { data: ipRows, error: ipErr } = await readInProgress(true);
+    if (ipErr && isMissingColumn(ipErr, "is_revision")) ({ data: ipRows, error: ipErr } = await readInProgress(false));
+    if (ipErr) return unreadable("in-progress attempts", ipErr.message);
+    ipRowsRead = (ipRows ?? []) as SwitchRow[];
   }
+  const ipIds = ipRowsRead.map((r) => r.id);
 
   // Only when there is something to reset: fail CLOSED — abandoning is
   // irreversible, so if the grant lookup errors we refuse the switch rather
@@ -139,21 +171,50 @@ export async function PUT(
       if (r.used_attempt_id) retakeIds.add(r.used_attempt_id);
     }
   }
-  const resettableIds = ipIds.filter((id) => !retakeIds.has(id));
-  const keptRetakes = ipIds.length - resettableIds.length;
-  const inProgressCount = resettableIds.length;
+  // ADR 0014 step 18: an official cmi5 attempt that has taken an assessment
+  // (a stored passed or failed run summary: on an in-progress row only a
+  // sub-activity outcome can be one) is not resettable. One error-checked
+  // read, only when there is a cmi5 attempt to check; the route stores the
+  // full verb IRI, so the filter names VERBS.passed and VERBS.failed.
+  const finishCheckIds = finishCheckAttemptIds(resettableSwitchRows(ipRowsRead, retakeIds), manifestTypeOfVersion);
+  const assessedAttemptIds = new Set<string>();
+  if (finishCheckIds.length > 0) {
+    const { data: outcomeRows, error: outcomeErr } = await svc
+      .from("xapi_statements")
+      .select("attempt_id")
+      .in("attempt_id", finishCheckIds)
+      .in("verb", [VERBS.passed, VERBS.failed]);
+    if (outcomeErr) return unreadable("statements", outcomeErr.message);
+    for (const r of (outcomeRows ?? []) as Array<{ attempt_id: string }>) assessedAttemptIds.add(r.attempt_id);
+  }
 
-  if (inProgressCount > 0 && !body.restart_if_in_progress) {
+  // The answer (lib/courses/slot-routing.ts): requires_finish first, on both
+  // values of restart_if_in_progress, then today's confirm, then proceed.
+  const decision = languageSwitchDecision({
+    rows: ipRowsRead,
+    retakeIds,
+    assessedAttemptIds,
+    restartIfInProgress: Boolean(body.restart_if_in_progress),
+  });
+  if (decision.kind === "requires_finish") {
+    return NextResponse.json(
+      { requires_finish: true, error: decision.message, message: decision.message },
+      { status: 409 }
+    );
+  }
+  if (decision.kind === "requires_confirm") {
     return NextResponse.json(
       {
         requires_confirm: true,
-        in_progress_attempts: inProgressCount,
+        in_progress_attempts: decision.inProgressAttempts,
         message:
           "We will retain your chosen language when you continue the course. If you switch languages during the course, your progress will be reset.",
       },
       { status: 409 }
     );
   }
+  const resettableIds = decision.resettableIds;
+  const keptRetakes = decision.keptRetakes;
 
   // Upsert the preference (composite PK = user_id + course_id).
   const { error: upErr } = await svc.from("course_language_preferences").upsert(

@@ -13,6 +13,7 @@ import {
   type CmiData,
   type CommitRuntimeRefusal,
 } from "@/lib/scorm/types";
+import { commitDecision } from "@/lib/scorm/commit-decision";
 import { notifyBackground } from "@/lib/notifications/send";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
@@ -57,6 +58,12 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  * A malformed (non-UUID) attempt id fails the read, so it is a 503 as well.
  * Order of answers: 401, 400 (invalid JSON), 503 (read error), 404, 410,
  * 503 or 409 (runtime type), then derive and write.
+ *
+ * ADR 0014 step 4 (lib/scorm/commit-decision.ts): on a revision visit's row
+ * (is_revision) only `cmi_data` and `last_activity_at` are written and the
+ * commit ends after the write (410/400/200 as for any commit); on every
+ * other row `completed_at` is stamped at the change to complete and only
+ * then, so a mid-way LMSFinish no longer stamps it.
  */
 export async function POST(
   request: NextRequest,
@@ -103,6 +110,9 @@ export async function POST(
         completion_status?: string;
         success_status?: string;
         completed_at?: string | null;
+        score?: number | null;
+        /** 0103 (ADR 0014); undefined on a database without it. */
+        is_revision?: boolean | null;
         course_versions?: {
           manifest_data?: { masteryScore?: number | null };
           manifest_type?: string | null;
@@ -166,21 +176,38 @@ export async function POST(
         : derivedStatus;
 
   const score = deriveScore(cmi);
+  const nowIso = new Date().toISOString();
+  // ADR 0014 step 4 (lib/scorm/commit-decision.ts): R-5 on a revision
+  // visit's row, and the completed_at rule on every other row.
+  const decision = commitDecision({
+    current: { completion_status: currentCompletion, success_status: currentSuccess },
+    derived: { completion_status, success_status },
+    finished,
+    isRevision: a.is_revision,
+    alreadyCompletedAt,
+    now: nowIso,
+  });
 
-  const update: Record<string, unknown> = {
-    cmi_data: cmi,
-    status,
-    completion_status,
-    success_status,
-    // Activity signal for streaks/"most active" (gamification): started_at is
-    // only set at launch, so resumes would otherwise be invisible.
-    last_activity_at: new Date().toISOString(),
-  };
-  if (score !== null) update.score = score;
-  // 0075 progress: 100 on completion; otherwise SCORM 2004's
-  // cmi.progress_measure (0..1) when the package reports it. Plain SCORM 1.2
-  // has no progress signal — leave it null (UI shows status only).
-  {
+  // A revision visit's row records nothing: `cmi_data` (the SCO's own map,
+  // re-seeded from the official attempt at every launch) and the activity
+  // stamp only; no status, completion, success, score, progress or
+  // completed_at.
+  const update: Record<string, unknown> = decision.revisionOnly
+    ? { cmi_data: cmi, last_activity_at: nowIso }
+    : {
+        cmi_data: cmi,
+        status,
+        completion_status,
+        success_status,
+        // Activity signal for streaks/"most active" (gamification): started_at is
+        // only set at launch, so resumes would otherwise be invisible.
+        last_activity_at: nowIso,
+      };
+  if (!decision.revisionOnly) {
+    if (score !== null) update.score = score;
+    // 0075 progress: 100 on completion; otherwise SCORM 2004's
+    // cmi.progress_measure (0..1) when the package reports it. Plain SCORM 1.2
+    // has no progress signal — leave it null (UI shows status only).
     let pct: number | null = null;
     if (completion_status === "completed") pct = 100;
     else {
@@ -192,12 +219,9 @@ export async function POST(
       ? ((a as { progress_pct: number }).progress_pct)
       : null;
     if (pct !== null && (cur === null || pct > cur)) update.progress_pct = pct;
-  }
-  if (
-    !alreadyCompletedAt &&
-    (finished || derivedCompletion === "completed")
-  ) {
-    update.completed_at = new Date().toISOString();
+    // completed_at is stamped at the change to complete and only then (a
+    // mid-way LMSFinish no longer stamps it; no backfill).
+    if (decision.stampCompletedAt) update.completed_at = decision.completedAt;
   }
 
   // ADR 0009 step 4: the write goes through the service client; the
@@ -217,6 +241,19 @@ export async function POST(
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
 
+  // ADR 0014 step 4: a revision visit's commit ends here: no classification,
+  // no RPC, no milestone, no webhook, no email. The answer carries the row's
+  // values, which this commit did not change.
+  if (decision.revisionOnly) {
+    return NextResponse.json({
+      ok: true,
+      completion_status: currentCompletion ?? "in_progress",
+      success_status: currentSuccess ?? "unknown",
+      status: currentStatus ?? "in_progress",
+      score: a.score ?? null,
+    });
+  }
+
   // 0081 revision rule: once the attempt is complete, decide whether it is
   // the learner's OFFICIAL attempt (inside the scoring window) or a revision
   // run. Only official completions move journey days, XP and the CRM
@@ -230,7 +267,9 @@ export async function POST(
       console.warn("[scorm/commit] attempt classification failed (treated as official):", e);
     }
   }
-  const officialRun = !nowComplete || !kind || kind.official;
+  // A revision visit's row is never an official run (ADR 0014 step 4; it
+  // returned above, and the gate says so again).
+  const officialRun = a.is_revision !== true && (!nowComplete || !kind || kind.official);
 
   // Gamification engine: one fail-isolated RPC on EVERY commit (it self-detects
   // completion from the row just written, dedupes via unique keys, and updates

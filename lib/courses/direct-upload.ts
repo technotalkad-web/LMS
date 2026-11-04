@@ -29,7 +29,12 @@ import {
   storagePrefixFor,
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
-import { forceRestartOlderVersions, forceRestartReport, type ForceRestartReport } from "@/lib/attempts/force-restart";
+import {
+  forceRestartOlderVersions,
+  forceRestartReport,
+  type ForceRestartNotify,
+  type ForceRestartReport,
+} from "@/lib/attempts/force-restart";
 import { runPackageGuardian } from "@/lib/alds/guardian";
 
 /**
@@ -380,6 +385,10 @@ export async function finalizeDirectUpload(args: {
   notifyUpdate: boolean;
   /** Replace-package semantics (see packages/[id]/versions): grandfather keeps in-progress learners on their old version; force_restart abandons those attempts so everyone starts the new version. */
   restartMode?: "grandfather" | "force_restart";
+  /** ADR 0014 step 8: the request origin for the re-issued grants' emails ("" leaves the link out). */
+  origin: string;
+  /** ADR 0014 step 8: the learner notifier and email resolver the forced restart's re-issue uses (passed in by the route). */
+  notify: ForceRestartNotify;
 }): Promise<FinalizeResult> {
   const { supabase, org, versionId } = args;
   const loaded = await loadUploadingVersion(supabase, org.id, versionId);
@@ -452,7 +461,18 @@ export async function finalizeDirectUpload(args: {
   // next to the published version (ADR 0011 step 6).
   let restart: ForceRestartReport | undefined;
   if (args.restartMode === "force_restart") {
-    const run = await forceRestartOlderVersions(serviceClient(), { packageId: version.package_id, newVersionId: version.id });
+    // ADR 0014 step 8: the reset retakes' grants are re-issued in the same
+    // operation, by this admin, and the learners told.
+    const run = await forceRestartOlderVersions(serviceClient(), {
+      packageId: version.package_id,
+      newVersionId: version.id,
+      versionNumber: version.version_number,
+      admin: { id: args.userId },
+      org,
+      origin: args.origin,
+      course: { id: course.id, title: course.title ?? "this course" },
+      notify: args.notify,
+    });
     restart = forceRestartReport(run);
   }
   if (args.notifyUpdate && hadCurrent) {
@@ -799,7 +819,7 @@ async function loadUploadingVersion(
   versionId: string,
   allowed: string[] = ["uploading"]
 ): Promise<
-  | { ok: true; version: VersionRow; course: { id: string; current_version_id: string | null } }
+  | { ok: true; version: VersionRow; course: { id: string; current_version_id: string | null; title: string | null } }
   | { ok: false; status: number; error: string }
 > {
   const { data: v } = await supabase
@@ -809,9 +829,10 @@ async function loadUploadingVersion(
     .maybeSingle();
   const version = v as VersionRow | null;
   if (!version) return { ok: false, status: 404, error: "Version not found." };
+  // title: a forced restart's re-issue names the course (ADR 0014 step 8).
   const { data: c } = await supabase
     .from("courses")
-    .select("id, organization_id, current_version_id")
+    .select("id, organization_id, current_version_id, title")
     .eq("id", version.course_id)
     .eq("organization_id", orgId)
     .maybeSingle();
@@ -822,7 +843,7 @@ async function loadUploadingVersion(
   return {
     ok: true,
     version,
-    course: c as { id: string; current_version_id: string | null },
+    course: c as { id: string; current_version_id: string | null; title: string | null },
   };
 }
 

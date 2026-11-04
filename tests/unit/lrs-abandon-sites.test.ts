@@ -21,7 +21,10 @@ const SITES: Array<{ file: string; calls: number; what: string }> = [
   { file: "app/api/courses/[courseId]/language-preference/route.ts", calls: 1, what: "language switch" },
   // ADR 0011: both replace paths (multipart route, direct-upload finalize) call the one forced restart.
   { file: "lib/attempts/force-restart.ts", calls: 1, what: "force-restart replace (both paths)" },
-  { file: "app/[org]/(learner)/courses/[courseId]/launch/page.tsx", calls: 2, what: "grant-retake and deactivated-slot closes" },
+  // ADR 0014 step 3: the deactivated-slot close, the stale-revision
+  // close, the flagged-row close of a first launch, and the rows
+  // consume_grant abandoned once it answered `opened`.
+  { file: "app/[org]/(learner)/courses/[courseId]/launch/page.tsx", calls: 4, what: "deactivated-slot, stale-revision and flagged-row closes, consume_grant's abandoned rows" },
   { file: "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts", calls: 1, what: "per-version restart" },
 ];
 
