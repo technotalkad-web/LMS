@@ -42,13 +42,13 @@
     "lottie-web": "^5.13.0",
     "lucide-react": "^1.16.0",
     "mime-types": "^2.1.35",
-    "next": "~15.5.18",
+    "next": "~15.5.29",
     "qrcode": "^1.5.4",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.19.11",
+    "@opennextjs/cloudflare": "^1.20.16",
     "@playwright/test": "^1.49.0",
     "@tailwindcss/postcss": "^4",
     "@types/mailparser": "^3.4.6",
@@ -60,13 +60,13 @@
     "dotenv": "^16.4.5",
     "esbuild": "0.25.4",
     "eslint": "^9",
-    "eslint-config-next": "~15.5.18",
+    "eslint-config-next": "~15.5.29",
     "imapflow": "^1.4.3",
     "mailparser": "^3.9.12",
     "s3rver": "^3.7.1",
     "tailwindcss": "^4",
     "tsx": "4.23.15",
     "typescript": "^5",
-    "wrangler": "^4.86.0"
+    "wrangler": "^4.157.0"
   }
 }

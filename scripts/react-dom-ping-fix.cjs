@@ -5,7 +5,7 @@
  * files matched by REACT_DOM_CLIENT_FILE; node_modules is never modified.
  *
  * The bug (react-dom 19.2.0-canary-0bdb9206-20250818, bundled by Next
- * 15.5.18 … 15.5.28; stable react-dom 19.2.4 has it too): a transition such
+ * 15.5.18 … 15.5.29; stable react-dom 19.2.4 has it too): a transition such
  * as router.refresh() suspends on a streamed RSC chunk inside a Suspense
  * boundary that is already showing content. If that chunk finishes
  * streaming during React's one-task pause, React attaches its ping listener
