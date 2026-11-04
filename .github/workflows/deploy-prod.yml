@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   deploy:
-    # ubuntu-24.04, not ubuntu-latest (now 26.04): the OpenNext build failed on 26.04 (run 41696617825) with the code that built on 24.04.
+    # ubuntu-24.04, not ubuntu-latest (now 26.04): the same pin as the Playwright jobs.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: production
