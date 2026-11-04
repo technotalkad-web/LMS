@@ -29,6 +29,7 @@ export function parseCmi5Manifest(xml: string): ParsedManifest {
 
   const title = readLangString(course.title);
   const description = readLangString(course.description);
+  const lang = readLangAttr(course.title);
 
   // Find the first AU (Assignable Unit) — depth-first through <block> children.
   const firstAu = findFirstAu(cs);
@@ -57,6 +58,7 @@ export function parseCmi5Manifest(xml: string): ParsedManifest {
       auId: firstAu["@_id"],
       moveOn: firstAu["@_moveOn"],
       auTitle: readLangString(firstAu.title),
+      ...(lang ? { lang } : {}),
     },
   };
 }
@@ -75,6 +77,21 @@ function readLangString(node: unknown): string | undefined {
   }
   if (typeof ls === "string") return ls;
   return undefined;
+}
+
+/**
+ * ADR 0016 step 3: the language the first langstring of a title declares, as
+ * written. A bare string title declares none.
+ */
+function readLangAttr(node: unknown): string | undefined {
+  if (typeof node !== "object" || node === null) return undefined;
+  const ls = (node as Record<string, unknown>).langstring;
+  const first = Array.isArray(ls) ? ls[0] : undefined;
+  if (typeof first !== "object" || first === null) return undefined;
+  const lang = (first as Record<string, unknown>)["@_lang"];
+  if (typeof lang !== "string") return undefined;
+  const tag = lang.trim();
+  return tag.length > 0 ? tag : undefined;
 }
 
 function findFirstAu(node: Record<string, unknown>): Record<string, unknown> | null {

@@ -297,7 +297,7 @@ test.describe.serial("KIVO Release A xAPI package on the LMS (staging)", () => {
     const c = course as { current_version_id: string; title: string; is_active: boolean };
     state.versionId = c.current_version_id;
     const { data: ver } = await svc().from("course_versions").select("manifest_type, launch_url, manifest_data").eq("id", state.versionId).single();
-    const v = ver as { manifest_type: string; launch_url: string; manifest_data: { raw?: { activityId?: string; activityCount?: number } } };
+    const v = ver as { manifest_type: string; launch_url: string; manifest_data: { unitCount?: number | null; unitCountAlgo?: number; raw?: { activityId?: string; activityCount?: number } } };
     console.log(`[57] course=${state.courseId} version=${state.versionId} title="${c.title}" manifest_type=${v.manifest_type} launch_url=${v.launch_url} activityId=${v.manifest_data?.raw?.activityId} activityCount=${v.manifest_data?.raw?.activityCount}`);
     writeOut("lms-course.json", { course, version: ver, upload: JSON.parse(text) });
     const zr = zipRecord(ZIP); // A.1: which zip ran, recorded only
@@ -306,6 +306,9 @@ test.describe.serial("KIVO Release A xAPI package on the LMS (staging)", () => {
     expect(v.manifest_type).toBe("xapi");
     expect(v.launch_url).toBe("index_lms.html");
     expect(v.manifest_data?.raw?.activityId).toBe("urn:elearning-engine:kivo-release-a-scorm-test");
+    // ADR 0016 steps 1 and 2: the kit's launch file is minified, and the upload stores its count with the marker.
+    expect(v.manifest_data?.unitCount, "unitCount of the minified launch file").toBe(18);
+    expect(v.manifest_data?.unitCountAlgo, "the marker of the matcher that counted it").toBe(2);
     state.activityId = v.manifest_data!.raw!.activityId!;
     await ctx.close();
   });
@@ -370,7 +373,23 @@ test.describe.serial("KIVO Release A xAPI package on the LMS (staging)", () => {
     expect((boot2 as { cmi5: boolean }).cmi5).toBe(false);
     expect((boot2 as { registration: string }).registration).toBe(state.attemptId);
 
-    await drive(page, f);
+    await drive(page, f, {
+      // ADR 0016 step 17: about half way through, a partial progress. This alone does not prove the
+      // matcher (the AU's own `progressed` extension can give a partial value); the two count
+      // assertions after the upload do.
+      midway: async () => {
+        await f.waitForFunction(() => (0, eval)("xapiLmsQueue.length === 0 && !xapiLmsBusy"), undefined, { timeout: 180_000, polling: 500 });
+        const progress = async () => {
+          const { data, error } = await svc().from("course_attempts").select("progress_pct").eq("id", state.attemptId!).single();
+          expect(error).toBeNull();
+          return (data as { progress_pct: number | null }).progress_pct ?? 0;
+        };
+        await expect.poll(progress, { message: "progress_pct after about half the slides", timeout: 30_000 }).toBeGreaterThan(0);
+        const pct = await progress();
+        console.log(`[57] progress_pct after slide 9: ${pct}`);
+        expect(pct, "still in progress").toBeLessThan(100);
+      },
+    });
 
     // Drain the engine queue, then close the tab like a learner.
     await f.waitForFunction(() => (0, eval)("xapiLmsQueue.length === 0 && !xapiLmsBusy"), undefined, { timeout: 180_000, polling: 500 });
@@ -1030,8 +1049,9 @@ test.describe.serial("KIVO Release A.1 xAPI course result (extra iii): the attem
  *  A.1 extras: asmtTries = the bank picks of each assessment attempt taken before
  *  Results (default [BANK_PICK], one attempt, as before; a second entry clicks "Try again",
  *  #asmt-retry, and accepts its confirm); review false = stop at Results without the S-12
- *  Review → Results step. With neither option the drive is the same as before. */
-async function drive(page: Page, f: Frame, opts: { fastCloseMs?: number; asmtTries?: Record<string, number[]>[]; review?: boolean } = {}) {
+ *  Review → Results step. With neither option the drive is the same as before.
+ *  ADR 0016 step 17: midway = called once, after slide 9. */
+async function drive(page: Page, f: Frame, opts: { fastCloseMs?: number; asmtTries?: Record<string, number[]>[]; review?: boolean; midway?: () => Promise<void> } = {}) {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const ev = <T,>(code: string) => f.evaluate((c) => (0, eval)(c), code) as Promise<T>;
   const cur = () => ev<number>("STATE.current");
@@ -1075,6 +1095,7 @@ async function drive(page: Page, f: Frame, opts: { fastCloseMs?: number; asmtTri
   const cats = ["Fruit", "Vegetable", "Fruit", "Vegetable"];
   for (let i = 0; i < 4; i++) { await f.click(`.draggable[data-i="${i}"]`); await f.click(`.drop-zone[data-cat="${cats[i]}"]`); }
   await f.click("#dd-check"); await modalOk(); await next(); log(9, ["tap-to-place 4 items, Check (right)"]);
+  await opts.midway?.();
   await at(10);
   const ups: string[] = [];
   for (let k = 0; k < 4; k++) {

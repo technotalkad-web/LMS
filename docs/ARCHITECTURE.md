@@ -82,7 +82,7 @@ Drift to close: production is 25–26 migrations and one month of code behind st
 
 | Area | Authoritative document | Amended by |
 |---|---|---|
-| Learning data, packages, Guardian, question analytics | `docs/ambak-learning-data-standard/BLUEPRINT.md` (v2, 2026-10-13) | ADR 0002–0006 (section map below) |
+| Learning data, packages, Guardian, question analytics | `docs/ambak-learning-data-standard/BLUEPRINT.md` (v2, 2026-10-13) | ADR 0002–0006 (section map below), ADR 0016 (declared package language read at upload and suggested as the slot; readable question labels in the two report pages until P5; the unit count of minified packages) |
 | KIVO step-0 engine patch | `docs/ambak-learning-data-standard/KIVO-P2-P3.md` | ADR 0006 (folded into engine release A) |
 | Content storage and delivery | `docs/CONTENT_STORAGE.md` | ADR 0003 (backup source), ADR 0004, ADR 0008 D (accepted 2026-10-17: no reused version folders, `--min-age` and a conflict summary in `content-backup.yml`, `--fast-list` kept) |
 | Migrations | `docs/MIGRATIONS.md` | — |

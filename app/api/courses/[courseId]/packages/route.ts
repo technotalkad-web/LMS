@@ -194,6 +194,9 @@ export async function POST(
     validationId:
       typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
     acknowledge: form.get("acknowledge") === "1",
+    // ADR 0016 step 8: the declared-language row of an inline validation names
+    // the slot this route creates.
+    target: { chosen: language, newCourse: false, takenLanguages: [] },
   });
   if (!gate.ok) {
     // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id

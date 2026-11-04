@@ -1,4 +1,5 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { DeclaredLanguageTarget } from "@/lib/i18n/languages";
 import { sha256Hex, validatePackage } from "./validate-package";
 import {
   BLOCKED_UPLOAD_ERROR,
@@ -50,11 +51,17 @@ export async function enforcePackageValidation(opts: {
   acknowledge: boolean;
   /** ADR 0004 step 4: the language slot this upload replaces (same-slot warning); null for a new slot. */
   packageId?: string | null;
+  /**
+   * ADR 0016 step 8: what the declared-language row of an inline validation
+   * compares against. An absent target reads as a new course with nothing
+   * chosen.
+   */
+  target?: DeclaredLanguageTarget;
 }): Promise<
   | { ok: true; validationId: string | null }
   | { ok: false; status: number; error: string; validationId?: string | null }
 > {
-  const { supabase, organizationId, userId, courseId, zipBytes, fileName } = opts;
+  const { supabase, organizationId, userId, courseId, zipBytes, fileName, target } = opts;
 
   if (opts.validationId) {
     // select("*"): deploy-safe across 0098 (overridden_at).
@@ -140,7 +147,7 @@ export async function enforcePackageValidation(opts: {
   // package literally cannot open — and the content-integrity block.
   let report: Awaited<ReturnType<typeof validatePackage>>;
   try {
-    report = await validatePackage(zipBytes);
+    report = await validatePackage(zipBytes, { target });
   } catch {
     // Validator hiccup — never break uploads for it.
     return { ok: true, validationId: null };

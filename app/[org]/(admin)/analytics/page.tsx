@@ -25,6 +25,7 @@ import { isOfficialFailed } from "@/lib/scoring/status";
 import { fetchGrantRetakeIdsForUsers, isMissingColumn, readWithOptionalColumn, type PgError } from "@/lib/scoring/attempt-kind";
 import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 import { contentFilterInOrg } from "@/lib/content/analytics-filter";
+import { fetchInteractionLabels, mergeInteractionLabels, missingLabelIds } from "@/lib/interactions/labels";
 import {
   courseProgress,
   formatCourseProgress,
@@ -915,7 +916,22 @@ export default async function AnalyticsPage({
     for (const w of (wRows ?? []) as Array<{ interaction_id: string; response: string }>) {
       wrongBy.set(w.interaction_id, [...(wrongBy.get(w.interaction_id) ?? []), w.response]);
     }
-    questions = qs.map((q) => ({ ...q, topWrong: wrongBy.get(q.interaction_id) ?? [] }));
+    // ADR 0016 step 13: the matview labels a question from name->>'en-US' only,
+    // so a non-English course's rows arrive with a null label. Those are read
+    // from the course's answered statements; the id stays the renderer's fallback.
+    // The version ids are the whole course's, never the page's `versionIds`: that
+    // list holds only what the scoped learners attempted, and this breakdown is
+    // course-wide. A learner's 360 view never renders this list: both learnerParam
+    // branches below return first, so no read is spent on it there.
+    const missingLabels = missingLabelIds(qs);
+    let labels = new Map<string, string>();
+    if (missingLabels.length && !learnerParam) {
+      const { data: lensVersionRows } = await svc.from("course_versions").select("id").eq("course_id", lensCourse);
+      const lensVersionIds = ((lensVersionRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+      labels = await fetchInteractionLabels(svc, lensVersionIds, missingLabels);
+    }
+    const labelled = mergeInteractionLabels(qs, labels);
+    questions = labelled.map((q) => ({ ...q, topWrong: wrongBy.get(q.interaction_id) ?? [] }));
   }
 
   /* ---- filter options for the bar ---- */

@@ -1,7 +1,13 @@
 import { createHash } from "crypto";
 import JSZip from "jszip";
 import { parseManifestFromZip } from "../manifest/detect";
+import { declaredLanguageOf } from "../manifest/parse-xml";
 import type { ParsedManifest } from "../manifest/types";
+import {
+  declaredLanguageRowSlot,
+  primarySubtag,
+  type DeclaredLanguageTarget,
+} from "@/lib/i18n/languages";
 import {
   detectScript,
   packageIdentity,
@@ -47,6 +53,12 @@ export type PackageValidationReport = {
     source?: "upload" | "stored";
     /** ADR 0004 step 2: the course id + title the integrity lookup matches on. */
     identity?: PackageIdentity;
+    /**
+     * ADR 0016 step 4: the language the manifest declares, null when it declares
+     * none. The validator always writes it; optional so that reports stored
+     * before ADR 0016 still read as this type.
+     */
+    declaredLanguage?: string | null;
   };
   /** 'blocked' = cross-course collision (ADR 0004 step 3), set by applyIntegrity(). */
   verdict: "pass" | "warning" | "fail" | "unplayable" | "blocked";
@@ -325,8 +337,14 @@ async function readBundleDescriptor(zip: JSZip): Promise<BundleDescriptor | null
   }
 }
 
+/**
+ * `opts.target` describes the slot the package is going to, for the
+ * `declared-language` row (ADR 0016 step 8). An absent target reads as a new
+ * course with nothing chosen, so every caller that stores a report passes one.
+ */
 export async function validatePackage(
-  zipBytes: Uint8Array
+  zipBytes: Uint8Array,
+  opts?: { target?: DeclaredLanguageTarget }
 ): Promise<PackageValidationReport> {
   const checks: ValidationCheck[] = [];
   const push = (id: string, label: string, status: CheckStatus, detail: string) =>
@@ -369,12 +387,14 @@ export async function validatePackage(
         sizeBytes: packageBytes(),
         fileCount: 0,
         tool: null,
+        declaredLanguage: null,
       },
       verdict: "unplayable",
       checks,
     };
   }
 
+  const declared = declaredLanguageOf(manifest);
   const launchOk = launchFileExists(zip, manifest.launchUrl);
   push(
     "launch",
@@ -394,6 +414,7 @@ export async function validatePackage(
         sizeBytes: packageBytes(),
         fileCount,
         tool: null,
+        declaredLanguage: declared,
       },
       verdict: "unplayable",
       checks,
@@ -423,6 +444,31 @@ export async function validatePackage(
   // ADR 0004 step 6: script / language detection is informational only.
   const script = scriptCheck(detectScript(s.launchHtml));
   if (script) checks.push(script);
+  // ADR 0016 step 8: informational like the script row, never a block. The
+  // comparison is by primary subtag, the slot comparison of ADR 0005 step 5.
+  if (declared === null) {
+    push("declared-language", "Declared language", "pass", "The package declares no language.");
+  } else {
+    const { slot, source } = declaredLanguageRowSlot(
+      declared,
+      opts?.target ?? { chosen: null, newCourse: true, takenLanguages: [] }
+    );
+    if (primarySubtag(declared) === primarySubtag(slot)) {
+      push(
+        "declared-language",
+        "Declared language",
+        "pass",
+        `The package declares ${declared}; the ${source} language slot ${slot} matches.`
+      );
+    } else {
+      push(
+        "declared-language",
+        "Declared language",
+        "info",
+        `The package declares ${declared}; the chosen language slot is ${slot}.`
+      );
+    }
+  }
 
   const isCmi5 = manifest.type === "cmi5";
   const isXapi = manifest.type === "xapi";
@@ -725,6 +771,7 @@ export async function validatePackage(
       fileCount,
       tool: s.tool,
       identity: packageIdentity(manifest, s.launchHtml),
+      declaredLanguage: declared,
     },
     verdict,
     checks,

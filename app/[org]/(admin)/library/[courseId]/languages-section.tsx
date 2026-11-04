@@ -648,7 +648,7 @@ function AddLanguageDialog({
       return;
     }
     setPkg(unzipped);
-    const v = await validateUnzipped(unzipped, orgSlug, { courseId });
+    const v = await validateUnzipped(unzipped, orgSlug, { courseId, language });
     setBusy(false);
     if (!v.ok) {
       setError(v.error);

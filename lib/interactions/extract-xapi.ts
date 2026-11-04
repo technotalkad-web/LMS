@@ -55,7 +55,7 @@ export function extractInteractionsFromXapi(
   return out;
 }
 
-function readLang(node: unknown): string | undefined {
+export function readLang(node: unknown): string | undefined {
   if (!node || typeof node !== "object") return undefined;
   const m = node as Record<string, unknown>;
   for (const key of ["en-US", "en", "und"]) {

@@ -52,6 +52,14 @@ export function parseTincanManifest(xml: string): ParsedManifest {
   const title = readText(activity.name);
   const description = readText(activity.description);
 
+  // ADR 0016 step 3: the language the course activity declares, as written.
+  const nameNode = firstOf(activity.name);
+  const declared =
+    typeof nameNode === "object" && nameNode !== null
+      ? (nameNode as Record<string, unknown>)["@_lang"]
+      : undefined;
+  const lang = typeof declared === "string" ? declared.trim() : "";
+
   return {
     type: "xapi",
     title: title ?? "Untitled course",
@@ -64,6 +72,7 @@ export function parseTincanManifest(xml: string): ParsedManifest {
       // scoping) reads one field for both standards.
       courseId: activityId,
       activityCount: list.length,
+      ...(lang ? { lang } : {}),
     },
   };
 }

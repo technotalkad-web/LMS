@@ -1,5 +1,6 @@
 import JSZip from "jszip";
 import { getStorage } from "@/lib/storage";
+import type { DeclaredLanguageTarget } from "@/lib/i18n/languages";
 import {
   validatePackage,
   type PackageValidationReport,
@@ -20,7 +21,8 @@ const MAX_FETCH_BYTES = 60 * 1024 * 1024;
 const FETCH_CONCURRENCY = 6;
 
 export async function validateStoredVersion(
-  storagePrefix: string
+  storagePrefix: string,
+  opts?: { target?: DeclaredLanguageTarget }
 ): Promise<PackageValidationReport> {
   const storage = await getStorage();
   const prefix = storagePrefix.replace(/\/$/, "");
@@ -36,6 +38,7 @@ export async function validateStoredVersion(
         sizeBytes: 0,
         fileCount: 0,
         tool: null,
+        declaredLanguage: null,
       },
       verdict: "unplayable",
       checks: [
@@ -85,7 +88,7 @@ export async function validateStoredVersion(
   );
 
   const zipBytes = await zip.generateAsync({ type: "uint8array" });
-  const report = await validatePackage(zipBytes);
+  const report = await validatePackage(zipBytes, opts);
   // The rebuilt zip's size is meaningless — flag the report's provenance
   // instead so the UI can say "re-scanned from stored files".
   report.package.source = "stored";

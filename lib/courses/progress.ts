@@ -1,7 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getStorage } from "@/lib/storage";
 import { ATTEMPT_ABANDONED, AttemptAbandonedError } from "@/lib/attempts/abandon";
-import { countLearningUnits } from "./units";
+import { countLearningUnits, launchBodyAllowed, MAX_LAUNCH_READ_BYTES } from "./units";
 
 /**
  * Attempt progress % (0075) — server-side helpers shared by the cmi5
@@ -32,38 +32,77 @@ export function partialPct(done: number, total: number): number | null {
 }
 
 /**
+ * What a stored manifest_data asks of ensureUnitCount (ADR 0016 step 2): a
+ * number stands; a null with unitCountAlgo 2 is final; anything else (a null
+ * from the matcher before ADR 0016, or no key) is counted from the launch file.
+ */
+export function unitCountPlan(
+  md: Record<string, unknown>
+): { kind: "number"; value: number | null } | { kind: "final" } | { kind: "recount" } {
+  if (typeof md.unitCount === "number") {
+    return { kind: "number", value: md.unitCount > 0 ? md.unitCount : null };
+  }
+  if (md.unitCount === null && md.unitCountAlgo === 2) return { kind: "final" };
+  return { kind: "recount" };
+}
+
+/**
+ * The stored launch file's text, or null. This runs inside a learner's request,
+ * so storage is asked for the object's size before anything is fetched (ADR
+ * 0016 step 2): no object, or a size outside MAX_LAUNCH_READ_BYTES, answers
+ * null without the signed fetch. It reads through the active driver.
+ */
+async function readLaunchHtmlFromStorage(version: VersionLite): Promise<string | null> {
+  if (!version.storage_prefix || !version.launch_url) return null;
+  const storage = await getStorage();
+  const key =
+    version.storage_prefix.replace(/\/$/, "") +
+    "/" +
+    version.launch_url.replace(/^\/+/, "").split("?")[0].split("#")[0];
+  const head = await storage.head(key);
+  if (!head || !launchBodyAllowed(head.size, MAX_LAUNCH_READ_BYTES)) return null;
+  const url = await storage.getSignedDownloadUrl(key, 300);
+  const res = await fetch(url);
+  return res.ok ? await res.text() : null;
+}
+
+/**
  * The module's unit count. Cached in manifest_data.unitCount (number, or
- * null once we've looked and found nothing). Versions uploaded before 0075
- * are counted lazily from their stored launch file, once.
+ * null once we've looked and found nothing), with unitCountAlgo recording the
+ * matcher that looked. Versions uploaded before 0075 are counted lazily from
+ * their stored launch file. That happens once per matcher: a null written by
+ * the matcher before ADR 0016 (no unitCountAlgo) is recounted one more time and
+ * then marked (ADR 0016 step 2), on whichever of a learner's statement
+ * (lib/xapi/process-statement.ts) or State write (updateProgressFromState,
+ * below) arrives first.
+ *
+ * A failed read caches its null as it always has, now with the marker in the
+ * same update, so that one attempt is final for the version. `deps` is the unit
+ * test's seam.
  */
 export async function ensureUnitCount(
   svc: SupabaseClient,
-  version: VersionLite | null | undefined
+  version: VersionLite | null | undefined,
+  deps?: { readLaunchHtml?: (v: VersionLite) => Promise<string | null> }
 ): Promise<number | null> {
   if (!version?.id) return null;
   const md = ((version.manifest_data ?? {}) as Record<string, unknown>) ?? {};
-  if (typeof md.unitCount === "number") return md.unitCount > 0 ? md.unitCount : null;
-  if (md.unitCount === null) return null;
+  const plan = unitCountPlan(md);
+  if (plan.kind === "number") return plan.value;
+  if (plan.kind === "final") return null;
 
+  const readLaunchHtml = deps?.readLaunchHtml ?? readLaunchHtmlFromStorage;
   let count: number | null = null;
   try {
-    if (version.storage_prefix && version.launch_url) {
-      const storage = await getStorage();
-      const key =
-        version.storage_prefix.replace(/\/$/, "") +
-        "/" +
-        version.launch_url.replace(/^\/+/, "").split("?")[0].split("#")[0];
-      const url = await storage.getSignedDownloadUrl(key, 300);
-      const res = await fetch(url);
-      if (res.ok) count = countLearningUnits(await res.text());
-    }
+    const html = await readLaunchHtml(version);
+    if (html !== null) count = countLearningUnits(html);
   } catch {
     count = null;
   }
   try {
     await svc
       .from("course_versions")
-      .update({ manifest_data: { ...md, unitCount: count } })
+      .update({ manifest_data: { ...md, unitCount: count, unitCountAlgo: 2 } })
       .eq("id", version.id);
   } catch {
     /* cache miss is harmless — recounted next time */
