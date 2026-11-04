@@ -450,6 +450,15 @@ The lead's answers inside the accepted steps, as PR 1b applies them:
 - `PENDING_1B` of the note of 2026-10-29 is empty. Specs 34 and 53 now expect "Closed — not counted" on the learner course page. Spec 61 (`tests/bot/lifecycle/61-revision-surfaces.spec.ts`) and spec 56's extras 16, 18 and 20 (the group after PR 1b, on the A.1 kit, with a 0103 probe that fails, never skips) are written, and run once both staging deployments carry PR 1b. The tenant-LRS markers stay the unit test's, because spec 45's mock LRS runs against local development only.
 - The CRM live harnesses seed their test identity with the service key, mirroring the create route's writes, because the staging organisation's allowed email domains refuse the test domain; the rest of the lifecycle runs through the API.
 
+Note (2026-11-04; the 0103 staging sitting, after the paste; a record, not an edit): the owner pasted `supabase/migrations/0103_revision_visits.sql` into the staging database's SQL editor on 2026-11-04, after the read-only checks recorded above, and ran the after-checks A1–A6 from the file's header. Every result is as expected:
+
+- A1: `refresh_report_views()` gave six entries and `refresh_gamification_views()` two, every `error` null. The editor's result cell cut off the second function's last entry, so the lead read that entry from one more call of the same function through the service role.
+- A2: 390 `course_attempts` rows, all `is_revision` false. A3: 0 `revision_visits` rows.
+- A4: no row, so both views keep `security_invoker`. A5: no row, so the privilege matrix is as the rehearsal expects.
+- A6: every row reads 1 / first / null / true / practice. The owner read five courses; the lead then read all 62 courses and all five columns through the service role.
+
+The lead also confirmed through the REST interface that the three new functions and the new columns are in the schema cache, and that the anon key is refused on `revision_visits`. The totals moved between the two readings (attempts 346 to 390, courses 17 to 62) because test runs continued on staging. Production is untouched; 0103 reaches it only in its own owner sitting.
+
 ## Notes to add to accepted records
 
 Exact text of the dated notes the lead adds under the named records at acceptance (ADR 0001 decision 3: an accepted ADR is never edited; the decision lives in ADR 0014 and each note is a pointer). Each is appended under a "Notes" heading, or under the named decision where the record keeps notes there.
