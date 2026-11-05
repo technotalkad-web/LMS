@@ -33,8 +33,9 @@
 #
 # App configuration: the staging Worker's (wrangler.toml top-level [vars]):
 # STORAGE_DRIVER=supabase, SUPABASE_STORAGE_BUCKET=course-content and
-# ALDS_P4=on. The production configuration (ALDS_P4 absent) stays covered by
-# the scheduled lifecycle nightly, which builds without the flag.
+# ALDS_P4=on, which scripts/lifecycle-nightly.sh sets too. No scheduled job that
+# builds or tests the app runs with the flag absent (ADR 0005, note of
+# 2026-11-05).
 # IMPERSONATION_SECRET and CRON_SECRET are fresh random values for each run,
 # masked in the GitHub log before use; no deployed secret is used.
 #

@@ -83,10 +83,11 @@ jobs:
     # free-plan CPU limit failed requests at random with error 1102 (2 tests
     # red and 5 flaky on 2026-10-20), and which ran whatever staging last
     # deployed rather than the PR's code. The app runs with the staging
-    # Worker's configuration (ALDS_P4=on); the production configuration (flag
-    # absent) stays covered by lifecycle-nightly.yml. The build and server
-    # logs stay in $RUNNER_TEMP; nothing is uploaded. The job's exit code is
-    # Playwright's (retries 2, workers 2, forbidOnly under CI, as before).
+    # Worker's configuration (ALDS_P4=on), as scripts/lifecycle-nightly.sh does;
+    # no scheduled job that builds or tests the app runs with the flag absent.
+    # The build and server logs stay in $RUNNER_TEMP; nothing is uploaded. The
+    # job's exit code is Playwright's (retries 2, workers 2, forbidOnly under CI,
+    # as before).
     # nightly-e2e.yml still targets the deployed Workers staging.
     #
     # Skip on pushes to main: the pull_request run already tested the merge

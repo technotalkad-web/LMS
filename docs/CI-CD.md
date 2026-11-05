@@ -36,6 +36,9 @@ the same CI settings (retries 2, workers 2, `forbidOnly`).
 - **App configuration:** the staging Worker's (`STORAGE_DRIVER=supabase`,
   `SUPABASE_STORAGE_BUCKET=course-content`, `ALDS_P4=on`). The production
   configuration (`ALDS_P4` absent) stays covered by `lifecycle-nightly.yml`.
+  Note 2026-11-05: no longer. `scripts/lifecycle-nightly.sh` sets `ALDS_P4=on`
+  too (ADR 0005, note of that date), and no scheduled job that builds or tests
+  the app runs with the flag absent.
   `IMPERSONATION_SECRET` and `CRON_SECRET` are fresh random values per run,
   masked in the log; no deployed secret is added to GitHub. The
   `STAGING_NEXT_PUBLIC_SITE_URL` secret is no longer used by this job.

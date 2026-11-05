@@ -2903,7 +2903,9 @@ test.describe("KIVO Release A — cmi5 real-LMS run: 56A extras after PR 1b (16,
     const offDay = String(off?.last_activity_at ?? off?.completed_at ?? off?.started_at ?? "").slice(0, 10);
     const actx = await authedContext(browser, baseURL!, S.admin!.email, S.admin!.password);
     const an = await bodyText(actx, `/${S.org!.slug}/analytics?learner=${o.L.id}`, /Last active/);
-    check("20", "Analytics' \"Last active\" is the official attempt's date (the revision row is skipped)", an.includes("Last active") && an.includes(offDay), { offDay });
+    const kpi = an.match(/last active (\S+)/i)?.[1] ?? null;
+    const want = offDay.length === 10 ? [String(after.gam?.last_active_day ?? ""), offDay].sort().pop() : null;
+    check("20", "Analytics' \"Last active\" KPI is the later of the XP day and the official attempt's date (the exclusion is the unit fixture's)", want !== null && kpi === want, { offDay, kpi, want });
     await actx.close();
     await o.ctx.close();
   });
