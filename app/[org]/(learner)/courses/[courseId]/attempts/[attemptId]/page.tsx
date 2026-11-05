@@ -8,6 +8,15 @@ import { extractInteractionsFromCmi } from "@/lib/interactions/extract-cmi";
 import type { Interaction } from "@/lib/interactions/types";
 import type { CmiData } from "@/lib/scorm/types";
 import type { XapiStatement } from "@/lib/xapi/types";
+import { officialFailedAttemptId } from "@/lib/scoring/attempt-kind";
+import {
+  NOT_APPLIED_CHIP,
+  REMEDY_ADMIN_LINE,
+  attemptBlockModel,
+  ignoredPassStatementIds,
+  notAppliedNotice,
+  readIgnoredRecord,
+} from "@/lib/xapi/ignored-pass";
 
 type Attempt = {
   id: string;
@@ -21,6 +30,8 @@ type Attempt = {
   started_at: string;
   completed_at: string | null;
   cmi_data: CmiData;
+  /** 0104 (ADR 0017); undefined on a database without it. */
+  ignored_pass?: unknown;
 };
 
 type Version = {
@@ -46,11 +57,11 @@ export default async function AttemptDetailPage({
   const isAdmin = role === "super_owner" || role === "admin";
 
   const supabase = await createClient();
+  // select("*") for 0104 deploy safety (ignored_pass): this read already takes
+  // cmi_data, so the column is all it adds.
   const { data: attemptRow } = await supabase
     .from("course_attempts")
-    .select(
-      "id, user_id, organization_id, course_version_id, completion_status, success_status, status, score, started_at, completed_at, cmi_data"
-    )
+    .select("*")
     .eq("id", attemptId)
     .maybeSingle();
 
@@ -122,6 +133,16 @@ export default async function AttemptDetailPage({
   } else {
     learnerEmail = user.email ?? null;
   }
+
+  // ADR 0017 step 15: the guard's record, under its heading; the chip on each ignored pass.
+  const ignoredBlock = attemptBlockModel(a.ignored_pass);
+  const ignoredRecord = readIgnoredRecord(a.ignored_pass);
+  const ignoredPassIds = new Set(ignoredPassStatementIds(a.ignored_pass));
+  // The block's sentence names the official result, so it shows only on the official
+  // attempt, by the course page's own condition. A failed or empty read leaves it
+  // absent. Three subrequests, on a row with an ignored pass only.
+  const officialSentence =
+    ignoredBlock?.showNotice === true && (await officialFailedAttemptId(supabase, a.user_id, v.course_id)) === a.id;
 
   const correctCount = interactions.filter((i) => i.success === true).length;
   const wrongCount = interactions.filter((i) => i.success === false).length;
@@ -196,6 +217,37 @@ export default async function AttemptDetailPage({
         />
         <Stat label="Time on course" value={fmtDuration(durationMs)} />
       </div>
+
+      {ignoredBlock && (
+        <div className="border border-line rounded-lg bg-paper p-5 mb-8 text-sm" data-testid="ignored-pass-block">
+          <h2 className="serif text-xl mb-2" data-testid="ignored-pass-heading">
+            {ignoredBlock.heading}
+          </h2>
+          {officialSentence && ignoredRecord && (
+            <p className="mb-3" data-testid="ignored-pass-notice">
+              {notAppliedNotice(ignoredRecord.failed)}
+            </p>
+          )}
+          <div className="text-xs text-muted space-y-1">
+            <div>{ignoredBlock.engineLine}</div>
+            <div>{ignoredBlock.failedLine}</div>
+            {ignoredBlock.countLine && <div data-testid="ignored-pass-count">{ignoredBlock.countLine}</div>}
+          </div>
+          <ul className="mt-3 space-y-1 text-xs">
+            {ignoredBlock.entries.map((e) => (
+              <li key={e.key} data-testid="ignored-pass-entry">
+                <div>{e.line}</div>
+                {isAdmin && e.adminNote && <div className="text-[10px] text-muted">{e.adminNote}</div>}
+              </li>
+            ))}
+          </ul>
+          {isAdmin && ignoredBlock.showNotice && (
+            <p className="mt-3 text-xs text-muted" data-testid="ignored-pass-remedy">
+              {REMEDY_ADMIN_LINE}
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="flex items-baseline justify-between mb-3">
         <h2 className="serif text-2xl">Interactions</h2>
@@ -289,6 +341,14 @@ export default async function AttemptDetailPage({
                   <div className="min-w-0">
                     <div className="font-medium">
                       {(s.verb?.id ?? "").split("/").pop()}
+                      {s.id && ignoredPassIds.has(s.id) && (
+                        <span
+                          className="ml-2 px-2 py-0.5 rounded-full text-[10px] bg-red-100 text-red-800 border border-red-200"
+                          data-testid="ignored-pass-chip"
+                        >
+                          {NOT_APPLIED_CHIP}
+                        </span>
+                      )}
                     </div>
                     <pre className="text-[10px] whitespace-pre-wrap break-all bg-canvas p-2 rounded mt-1 max-h-40 overflow-auto">
                       {JSON.stringify(s, null, 2)}

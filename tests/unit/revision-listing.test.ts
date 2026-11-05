@@ -117,8 +117,11 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     ],
   },
   "lib/scoring/attempt-kind.ts": {
-    calls: ["computeScoring(attempts)"],
+    calls: ["computeScoring(attempts)", "computeScoring(attempts)"],
     feeds: [
+      // officialFailedAttemptId, the attempt page's read of ADR 0017 step 15.
+      ["the attempt page's read adds is_revision with the fallback", /readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",[\s\S]*?KIND_LIST_COLUMNS\s*\);\s*if \(attemptsErr/],
+      ["…and computeScoring gets those rows", /if \(attemptsErr \|\| !attempts\?\.length\) return null;[\s\S]*?computeScoring\(attempts, DEFAULT_POLICY, retakeIds\)/],
       ["KIND_LIST_COLUMNS names status", /const KIND_LIST_COLUMNS = "[^"]*\bstatus\b[^"]*";/],
       ["the read adds is_revision with the fallback", /listFor\(`\$\{KIND_LIST_COLUMNS\}, is_revision`\);\s*if \(rowsErr && isMissingColumn\(rowsErr, "is_revision"\)\)/],
       ["computeScoring gets those rows", /const attempts = \(rows \?\? \[\]\) as ScorableAttempt\[\];[\s\S]*?computeScoring\(attempts, policy, retakeIds\)/],

@@ -66,7 +66,7 @@ type Failure =
 
 // The exact select strings (supabase-js strips the spaces of the code's own). An
 // unmatched read answers [] and is collected, so a drift fails loudly.
-const AFTER_SELECT = "completion_status,success_status";
+const AFTER_SELECT = "completion_status,success_status,score,completed_at,course_version_id";
 const PAYLOAD_SELECT = "organization_id,user_id,score,success_status,completed_at,course_versions(course_id,courses!course_versions_course_id_fkey(title))";
 const SETTINGS_SELECT = "webhook_url,webhook_secret";
 const HELD_SELECT = "id,completed_at,course_versions!inner(manifest_type)";
@@ -87,7 +87,8 @@ const NO_LATCH_COLUMN = { code: "42703", message: "column course_attempts.comple
 const NO_LATCH_COLUMN_ON_WRITE = { code: "PGRST204", message: "Could not find the 'completion_webhook_at' column of 'course_attempts' in the schema cache" };
 const NO_OTHER_COLUMN = { code: "42703", message: "column course_attempts.some_other_column does not exist" };
 const NO_FLAG_COLUMN = { code: "42703", message: "column course_attempts.is_revision does not exist" };
-const VERSION_EMBED = { id: "v1", manifest_data: { raw: { auId: AU }, unitCount: 4 }, package_id: null };
+// engineVersion null: a third-party AU, so the fail-then-pass cases keep the one-time upgrade (ADR 0017 step 3).
+const VERSION_EMBED = { id: "v1", manifest_data: { raw: { auId: AU }, unitCount: 4, engineVersion: null }, package_id: null };
 const HOOK_SETTINGS: Row = { webhook_url: HOOK, webhook_secret: null };
 
 let requests: Req[] = [];
@@ -170,7 +171,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (select === AFTER_SELECT) {
       if (fails.has("afterThrow")) throw new TypeError("fetch failed");
       if (fails.has("after")) return json(PG_TIMEOUT, 500);
-      return json(row ? [{ completion_status: row.completion_status, success_status: row.success_status }] : []);
+      return json(row ? [{ completion_status: row.completion_status, success_status: row.success_status, score: row.score, completed_at: row.completed_at, course_version_id: row.course_version_id }] : []);
     }
     if (select === "organization_id") return json(row ? [{ organization_id: row.organization_id }] : []);
     if (select === PAYLOAD_SELECT) {
@@ -229,7 +230,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       return json(storedRaw.has(parsed.statement_id) ? [] : [{ statement_id: parsed.statement_id }], 201);
     }
     if (select === "raw") return json([{ raw: storedRaw.get(eqParam("statement_id")) }]);
+    if (select === "statement_id,raw") return json([]); // ADR 0017: the failing-statement lookup
   }
+  if (p === "/rest/v1/xapi_state" && method === "POST") return json([], 201); // ADR 0017 step 19
   if (p === "/rest/v1/course_versions") {
     if (select === "course_id") return json([{ course_id: "c1" }]);
     return fails.has("classifyVersions") ? json(PG_TIMEOUT, 500) : json([{ id: "v0" }, { id: "v1" }]);

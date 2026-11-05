@@ -1,7 +1,9 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { getStorage } from "@/lib/storage";
+import { getStorage, getStorageFor, type StorageAdapter } from "@/lib/storage";
 import { ATTEMPT_ABANDONED, AttemptAbandonedError } from "@/lib/attempts/abandon";
+import { isMissingColumn } from "@/lib/scoring/attempt-kind";
 import { countLearningUnits, launchBodyAllowed, MAX_LAUNCH_READ_BYTES } from "./units";
+import { engineVersionForManifest, type EngineReadError } from "./engine-version";
 
 /**
  * Attempt progress % (0075) — server-side helpers shared by the cmi5
@@ -19,6 +21,8 @@ export type VersionLite = {
   manifest_data?: unknown;
   launch_url?: string | null;
   storage_prefix?: string | null;
+  /** The 0077 column: the driver this version's files were written to. */
+  storage_driver?: string | null;
 };
 
 export function clampPct(n: number): number {
@@ -110,6 +114,153 @@ export async function ensureUnitCount(
   return count;
 }
 
+/** What a read of the stored launch file found, for the engine stamp (ADR 0017 step 5). */
+export type LaunchFileRead =
+  | { kind: "ok"; html: string }
+  | { kind: "no_object" }
+  | { kind: "too_large"; size: number }
+  | { kind: "failed"; error: EngineReadError; detail?: string };
+
+const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/**
+ * The stored launch file, for the engine stamp, as one of four outcomes: the
+ * stamp has to tell them apart, where readLaunchHtmlFromStorage's null means
+ * "looked, nothing" for the unit count. Same key, same size check and same cap
+ * as that reader. It reads through the version's own storage driver, so a
+ * version stored before a driver change still reads. No key to look at is no
+ * object at the key. A size is too large only when it is a number above the cap; 0
+ * or a non-number is a failed read, because the stores answer 0 for a size they do not
+ * know (ADR 0017's note of 2026-11-06), and it caches nothing. `storage` is the unit
+ * test's seam; `signal` lets the bound in ensureEngineVersion let go of the signed
+ * fetch, its body included.
+ */
+export async function readLaunchFileForStamp(
+  version: VersionLite,
+  storage?: Pick<StorageAdapter, "head" | "getSignedDownloadUrl">,
+  signal?: AbortSignal
+): Promise<LaunchFileRead> {
+  if (!version.storage_prefix || !version.launch_url) return { kind: "no_object" };
+  const adapter = storage ?? (await getStorageFor(version.storage_driver ?? null));
+  const key =
+    version.storage_prefix.replace(/\/$/, "") +
+    "/" +
+    version.launch_url.replace(/^\/+/, "").split("?")[0].split("#")[0];
+  const head = await adapter.head(key);
+  if (!head) return { kind: "no_object" };
+  if (!launchBodyAllowed(head.size, MAX_LAUNCH_READ_BYTES)) {
+    return Number.isFinite(head.size) && head.size > MAX_LAUNCH_READ_BYTES
+      ? { kind: "too_large", size: head.size }
+      : { kind: "failed", error: "bad_size", detail: `size ${String(head.size)}` };
+  }
+  const url = await adapter.getSignedDownloadUrl(key, 300);
+  try {
+    const res = await fetch(url, { signal });
+    if (!res.ok) return { kind: "failed", error: "fetch_failed", detail: `fetch ${res.status}` };
+    return { kind: "ok", html: await res.text() };
+  } catch (e) {
+    return { kind: "failed", error: "fetch_failed", detail: messageOf(e) };
+  }
+}
+
+/** The lazy read runs inside a learner's request: the webhook's own bound. */
+const ENGINE_READ_TIMEOUT_MS = 5000;
+
+/**
+ * The version's engine stamp (ADR 0017 step 5), cached in
+ * manifest_data.engineVersion: a stamp, the literal `unknown` (a KIVO build whose
+ * stamp is missing or does not parse), or null (read, and not a KIVO build). A
+ * version uploaded before the stamping is read the first time the guard needs it.
+ *
+ * Modelled on ensureUnitCount above, and it departs from it on purpose, because
+ * here a cached null would read as "not a KIVO build" and keep the one-time
+ * upgrade silently on what may be a new-engine version:
+ *   - a storage error, a failed fetch, a head with no usable size or no object at the
+ *     key caches NOTHING and answers `error`, which the verdict reads as unreadable,
+ *     and the next candidate reads again. `error` is always a class
+ *     (ENGINE_READ_ERRORS), because the guard writes it on the row; the store's raw
+ *     text stays in the engine_version_unreadable log line;
+ *   - a file over MAX_LAUNCH_READ_BYTES makes no signed fetch and caches the
+ *     engineVersionRead marker with the cap, never engineVersion: null, so a
+ *     later cap change reads it again;
+ *   - it reads through the version's own storage driver, where ensureUnitCount
+ *     reads through the active one;
+ *   - a read that has not answered after ENGINE_READ_TIMEOUT_MS is a failed read:
+ *     a stalled store must not hold the learner's request, and with it the
+ *     engine's queue or the SCORM commit chain. Nothing is cached, and the next
+ *     candidate reads again.
+ *
+ * `deps` is the unit test's seam. The three lazy writers of manifest_data may
+ * lose each other's key; each key is recomputed from the stored bytes next time.
+ */
+export async function ensureEngineVersion(
+  svc: SupabaseClient,
+  version: VersionLite | null | undefined,
+  deps?: { readLaunchFile?: (v: VersionLite, signal?: AbortSignal) => Promise<LaunchFileRead>; readTimeoutMs?: number }
+): Promise<{ stamp: string | null; cached: boolean; error?: EngineReadError }> {
+  const unreadable = (error: EngineReadError, detail?: string) => {
+    console.warn(JSON.stringify({ event: "engine_version_unreadable", version_id: version?.id ?? null, error, ...(detail ? { detail } : {}) }));
+    return { stamp: null, cached: false, error };
+  };
+  if (!version?.id) return unreadable("no_object");
+  const md = ((version.manifest_data ?? {}) as Record<string, unknown>) ?? {};
+  if (typeof md.engineVersion === "string" || md.engineVersion === null) {
+    return { stamp: md.engineVersion, cached: true };
+  }
+  const marker = md.engineVersionRead as { too_large?: unknown; cap?: unknown } | null | undefined;
+  if (marker?.too_large === true && marker.cap === MAX_LAUNCH_READ_BYTES) {
+    return { stamp: null, cached: true, error: "too_large" };
+  }
+
+  const readLaunchFile = deps?.readLaunchFile ?? ((v: VersionLite, signal?: AbortSignal) => readLaunchFileForStamp(v, undefined, signal));
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let read: LaunchFileRead;
+  try {
+    read = await Promise.race([
+      readLaunchFile(version, controller.signal),
+      new Promise<LaunchFileRead>((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve({ kind: "failed", error: "timeout" });
+        }, deps?.readTimeoutMs ?? ENGINE_READ_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (e) {
+    read = { kind: "failed", error: "storage_error", detail: messageOf(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (read.kind === "no_object") return unreadable("no_object");
+  if (read.kind === "failed") return unreadable(read.error, read.detail);
+
+  const stamp = read.kind === "ok" ? (engineVersionForManifest(read.html) ?? null) : null;
+  const patch =
+    read.kind === "ok"
+      ? { engineVersion: stamp }
+      : { engineVersionRead: { too_large: true, cap: MAX_LAUNCH_READ_BYTES } };
+  let cached = false;
+  try {
+    const { error } = await svc
+      .from("course_versions")
+      .update({ manifest_data: { ...md, ...patch } })
+      .eq("id", version.id);
+    cached = !error;
+  } catch {
+    /* a cache miss is harmless: read again next time */
+  }
+  if (cached) {
+    console.warn(
+      JSON.stringify({
+        event: "engine_version_cached",
+        version_id: version.id,
+        engine_version: read.kind === "ok" ? stamp : "too_large",
+      })
+    );
+  }
+  return read.kind === "ok" ? { stamp, cached } : { stamp: null, cached, error: "too_large" };
+}
+
 /**
  * Best-effort progress from a saved resume-state document. Understands the
  * common shapes: `{ completed: [ids] }` (KIVO engine), `{ completedSlides,
@@ -150,8 +301,14 @@ export function progressFromState(content: unknown): {
 }
 
 /**
- * Update an attempt, tolerating a database that hasn't run 0075 yet: if
- * the write fails because progress_pct doesn't exist, retry without it.
+ * Update an attempt, tolerating a database that hasn't run 0075 or 0104 yet: if
+ * the write fails because progress_pct or ignored_pass doesn't exist, retry
+ * without it. The error can name either column first, so the retries run in a
+ * bounded loop. Without ignored_pass the record is lost and logged, and nothing
+ * else changes: the guard reads success_status, so the hold never depends on 0104.
+ * Only a missing column drops the record (ADR 0017 step 12: 42703 or PGRST204
+ * naming it). Any other error is a real failure and stands: a transient outage's
+ * retry must not lose the record of a pass the engine will not send again.
  *
  * ALDS step 0 (P4): the write is conditional on `status <> 'abandoned'` —
  * an abandoned attempt is terminal and no content write may revive it. A
@@ -181,13 +338,27 @@ export async function updateAttemptFailSoft(
     const { data, error } = await q.select("id");
     return { error, rows: Array.isArray(data) ? data.length : 0 };
   };
-  let res = await run(update);
-  if (res.error && "progress_pct" in update && /progress_pct/i.test(res.error.message)) {
-    const rest = { ...update };
-    delete rest.progress_pct;
-    res = await run(rest);
+  const unrecorded = (reason: string) =>
+    console.warn(JSON.stringify({ event: "ignored_pass_unrecorded", attempt_id: attemptId, reason }));
+  let current = update;
+  let res = await run(current);
+  for (let retry = 0; retry < 2 && res.error; retry++) {
+    const rest = { ...current };
+    if ("progress_pct" in current && /progress_pct/i.test(res.error.message)) {
+      delete rest.progress_pct;
+    } else if ("ignored_pass" in current && isMissingColumn(res.error, "ignored_pass")) {
+      delete rest.ignored_pass;
+      unrecorded(res.error.message);
+    } else {
+      break;
+    }
+    current = rest;
+    res = await run(current);
   }
-  if (res.error) return { message: res.error.message };
+  if (res.error) {
+    if ("ignored_pass" in current) unrecorded(res.error.message);
+    return { message: res.error.message };
+  }
   if (res.rows === 0) return { message: ATTEMPT_ABANDONED, abandoned: true };
   return null;
 }

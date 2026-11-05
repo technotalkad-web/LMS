@@ -8,6 +8,7 @@ import { suggestLanguageSlot } from "@/lib/i18n/languages";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ParsedManifest } from "./manifest/types";
 import { packageIdentity, type PackageIdentity } from "./validation/integrity";
+import { engineVersionForManifest } from "./engine-version";
 import { shouldMoveCourseDefault } from "./default-rule";
 
 export interface UploadResult {
@@ -147,11 +148,13 @@ export async function uploadCoursePackage(opts: {
     const unitCount = await countUnitsInZip(zip, manifest.launchUrl);
     // ADR 0004 step 2: new versions persist the identity the integrity
     // lookup matches on (manifest ids + the launch file's KIVO activity id).
-    const identity = packageIdentity(manifest, await launchHtmlFromZip(zip, manifest.launchUrl));
+    const launchHtml = await launchHtmlFromZip(zip, manifest.launchUrl);
+    const identity = packageIdentity(manifest, launchHtml);
     await markVersionReady(svc, version.id, {
       // ADR 0016 step 2: the marker goes with the count, a null included:
-      // countUnitsInZip answers null only after looking.
-      manifest_data: manifestData(manifest, unitCount, identity, 2),
+      // countUnitsInZip answers null only after looking. ADR 0017 step 4: the
+      // engine stamp goes with them, its key absent when the file was not read.
+      manifest_data: manifestData(manifest, unitCount, identity, 2, engineVersionForManifest(launchHtml)),
       file_count: files.length,
     });
   } catch (e) {
@@ -222,7 +225,8 @@ export function manifestData(
   manifest: ParsedManifest,
   unitCount: number | null,
   identity?: PackageIdentity,
-  unitCountAlgo?: number
+  unitCountAlgo?: number,
+  engineVersion?: string | null
 ) {
   return {
     title: manifest.title,
@@ -232,6 +236,7 @@ export function manifestData(
     unitCount,
     ...(unitCountAlgo !== undefined ? { unitCountAlgo } : {}),
     ...(identity ? { identity } : {}),
+    ...(engineVersion !== undefined ? { engineVersion } : {}),
   };
 }
 

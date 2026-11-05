@@ -347,9 +347,9 @@ async function main() {
   {
     const upload = src("lib/courses/upload.ts");
     const direct = src("lib/courses/direct-upload.ts");
-    eq("multipart: the ready write carries the marker", upload.includes("manifest_data: manifestData(manifest, unitCount, identity, 2),"), true);
+    eq("multipart: the ready write carries the marker", upload.includes("manifest_data: manifestData(manifest, unitCount, identity, 2, engineVersionForManifest(launchHtml)),"), true);
     eq("multipart: the reserve insert carries no marker", upload.includes("manifest_data: manifestData(manifest, null),"), true);
-    eq("multipart: only one call passes the marker", (upload.match(/manifestData\([^)]*, 2\)/g) ?? []).length, 1);
+    eq("multipart: only one call passes the marker", (upload.match(/manifestData\([^)]*, 2, /g) ?? []).length, 1);
     eq("direct: the finalize write carries the marker",
       /const md = \{ \.\.\.\(version\.manifest_data \?\? \{\}\), unitCount, unitCountAlgo: 2, identity: integrity\.findings\.identity \};/.test(direct), true);
     eq("direct: the reserve insert carries no marker", direct.includes("manifest_data: manifestData(manifest, null, packageIdentity(manifest)),"), true);

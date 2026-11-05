@@ -518,6 +518,13 @@ behind an official result could not be read; retry).
   `learner-summary` or `progress`: a new score with the same pass/fail, a
   `failed` after a message that carried no result, the start of a granted
   retake, and an official result recomputed under the attempt rules.
+- New-engine courses: for statements whose `content/engine-version` is at or
+  above `2026.10.28`, the first AU-level `failed` of a registration is final
+  and a later `passed` in the same registration was not applied (ADR 0017), so
+  the analytics feed's last outcome is not the recorded one; read the result
+  from `learner-summary`. On packages from that engine, the second message
+  described in Step 5 therefore does not arise after a final `failed`, on plain
+  xAPI or on SCORM.
 - Delivery stays best-effort (one try, 5 s) for each message, so
   "at-most-once" above describes each message's delivery, not a limit of
   one message per attempt.

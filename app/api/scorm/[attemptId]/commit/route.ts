@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { updateAttemptFailSoft } from "@/lib/courses/progress";
+import { ensureEngineVersion, updateAttemptFailSoft } from "@/lib/courses/progress";
+import { outcomeFinalVerdict, type OutcomeFinalVerdict } from "@/lib/courses/engine-version";
 import { attemptAbandonedResponse } from "@/lib/attempts/abandon";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
@@ -14,6 +15,7 @@ import {
   type CommitRuntimeRefusal,
 } from "@/lib/scorm/types";
 import { commitDecision } from "@/lib/scorm/commit-decision";
+import { appliedCommitRecord, frozenCommit } from "@/lib/scorm/commit-decision";
 import { notifyBackground } from "@/lib/notifications/send";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
@@ -64,6 +66,15 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  * commit ends after the write (410/400/200 as for any commit); on every
  * other row `completed_at` is stamped at the change to complete and only
  * then, so a mid-way LMSFinish no longer stamps it.
+ *
+ * ADR 0017 step 9 (decision 3b, broad): on a row that is `failed`, the version's
+ * engine verdict is read before the decision. Under `final` the row freezes at the
+ * official fail: every later commit writes `last_activity_at` and, when it carries
+ * a pass or another score, the `ignored_pass` record, and nothing else, `cmi_data`
+ * included. The answer carries the row's values, so no webhook and no email fire;
+ * classification and both RPCs run as for any commit. Under any other verdict the
+ * one-time upgrade stays, logged, and on `unknown` or `unreadable` also recorded.
+ * The `is_revision` branch comes first.
  */
 export async function POST(
   request: NextRequest,
@@ -92,7 +103,7 @@ export async function POST(
   const { data: attempt, error: readErr } = await supabase
     .from("course_attempts")
     .select(
-      "*, course_versions(manifest_data, manifest_type)"
+      "*, course_versions(id, manifest_data, manifest_type, launch_url, storage_prefix, storage_driver)"
     )
     .eq("id", attemptId)
     .eq("user_id", user.id)
@@ -113,9 +124,16 @@ export async function POST(
         score?: number | null;
         /** 0103 (ADR 0014); undefined on a database without it. */
         is_revision?: boolean | null;
+        /** 0104 (ADR 0017); undefined on a database without it. */
+        ignored_pass?: unknown;
+        course_version_id?: string;
         course_versions?: {
+          id: string;
           manifest_data?: { masteryScore?: number | null };
           manifest_type?: string | null;
+          launch_url?: string | null;
+          storage_prefix?: string | null;
+          storage_driver?: string | null;
         } | null;
       }
     | null;
@@ -136,6 +154,15 @@ export async function POST(
     return runtimeRefusalResponse(refusal);
   }
 
+  // ADR 0009 step 4: the write goes through the service client; the
+  // user_id filter (mandatory here) keeps it to the caller's own attempt.
+  // ADR 0017 step 5: the engine verdict's lazy read writes manifest_data with it.
+  const svc = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
+
   const currentStatus = a?.status;
   const currentCompletion = a?.completion_status;
   const currentSuccess = a?.success_status;
@@ -151,7 +178,7 @@ export async function POST(
 
   // Never downgrade. Once an attempt is completed/passed/failed a later
   // beacon with finished=false must leave the terminal values alone.
-  const completion_status =
+  let completion_status: string | null | undefined =
     currentCompletion === "completed" && derivedCompletion === "in_progress"
       ? currentCompletion
       : derivedCompletion;
@@ -159,8 +186,9 @@ export async function POST(
   // Non-downgrade: a `passed` attempt is terminal — never let a later commit
   // (a stray unload beacon, a re-run SCO emitting `failed`, or an `unknown`
   // derivation) pull it back to failed/unknown. `failed` is held only against
-  // an `unknown` derivation — an actual later `passed` may still upgrade it.
-  const success_status =
+  // an `unknown` derivation — an actual later `passed` may still upgrade it,
+  // unless the engine verdict below freezes the row.
+  let success_status: string | null | undefined =
     currentSuccess === "passed"
       ? "passed"
       : currentSuccess === "failed" && derivedSuccess === "unknown"
@@ -168,17 +196,28 @@ export async function POST(
         : derivedSuccess;
 
   const terminal: Array<string | undefined> = ["passed", "failed", "completed", "abandoned"];
-  const status =
+  let status: string | null | undefined =
     currentStatus === "passed" && derivedStatus !== "passed"
       ? "passed"
       : terminal.includes(currentStatus) && derivedStatus === "in_progress"
         ? (currentStatus as typeof derivedStatus)
         : derivedStatus;
 
-  const score = deriveScore(cmi);
+  let score = deriveScore(cmi);
   const nowIso = new Date().toISOString();
+
+  // ADR 0017 steps 5 and 9: every commit on a failed row needs the verdict, the
+  // freeze covers commits that carry no pass too. Cached after the first read.
+  // A revision visit's row never reaches it: R-5 runs first.
+  let engineRead: Awaited<ReturnType<typeof ensureEngineVersion>> | null = null;
+  let verdict: OutcomeFinalVerdict | null = null;
+  if (currentSuccess === "failed" && a.is_revision !== true) {
+    engineRead = await ensureEngineVersion(svc, a.course_versions);
+    verdict = outcomeFinalVerdict({ stamp: engineRead.stamp, readError: engineRead.error });
+  }
+
   // ADR 0014 step 4 (lib/scorm/commit-decision.ts): R-5 on a revision
-  // visit's row, and the completed_at rule on every other row.
+  // visit's row, ADR 0017's freeze, and the completed_at rule on every other row.
   const decision = commitDecision({
     current: { completion_status: currentCompletion, success_status: currentSuccess },
     derived: { completion_status, success_status },
@@ -186,24 +225,84 @@ export async function POST(
     isRevision: a.is_revision,
     alreadyCompletedAt,
     now: nowIso,
+    outcomeFinal: verdict === "final",
   });
+
+  const courseVersionId = a.course_versions?.id ?? a.course_version_id ?? "";
+  const lessonStatus = cmi["cmi.core.lesson_status"];
+  const frozen = decision.frozen
+    ? frozenCommit({
+        derivedSuccess,
+        lessonStatus,
+        score,
+        row: a,
+        courseVersionId,
+        engineVersion: engineRead?.stamp ?? null,
+        now: nowIso,
+      })
+    : null;
+  if (frozen) {
+    // From here on the route reads the row's values, so nothing downstream sees
+    // a change: no justCompleted, no justPassed, and the echo is the row's.
+    ({ completion_status, success_status, status, score } = frozen.echo);
+    if (frozen.event) {
+      console.warn(
+        JSON.stringify({
+          attempt_id: attemptId,
+          statement_id: null,
+          runtime: "scorm12",
+          engine_version: engineRead?.stamp ?? null,
+          ...frozen.event,
+        })
+      );
+    }
+  }
 
   // A revision visit's row records nothing: `cmi_data` (the SCO's own map,
   // re-seeded from the official attempt at every launch) and the activity
   // stamp only; no status, completion, success, score, progress or
-  // completed_at.
-  const update: Record<string, unknown> = decision.revisionOnly
-    ? { cmi_data: cmi, last_activity_at: nowIso }
-    : {
-        cmi_data: cmi,
-        status,
-        completion_status,
-        success_status,
-        // Activity signal for streaks/"most active" (gamification): started_at is
-        // only set at launch, so resumes would otherwise be invisible.
-        last_activity_at: nowIso,
-      };
-  if (!decision.revisionOnly) {
+  // completed_at. A frozen row records less: see frozenCommit.
+  const update: Record<string, unknown> = frozen
+    ? frozen.update
+    : decision.revisionOnly
+      ? { cmi_data: cmi, last_activity_at: nowIso }
+      : {
+          cmi_data: cmi,
+          status,
+          completion_status,
+          success_status,
+          // Activity signal for streaks/"most active" (gamification): started_at is
+          // only set at launch, so resumes would otherwise be invisible.
+          last_activity_at: nowIso,
+        };
+  // ADR 0017 step 6: the one-time upgrade happens here, so it is logged, and it
+  // goes on the row when a stamp may exist and could not be read.
+  if (verdict && !frozen && currentSuccess === "failed" && success_status === "passed") {
+    console.warn(
+      JSON.stringify({
+        event: "pass_upgraded",
+        attempt_id: attemptId,
+        statement_id: null,
+        runtime: "scorm12",
+        engine_version: engineRead?.stamp ?? null,
+        reason: verdict,
+        ...(engineRead?.error ? { error: engineRead.error } : {}),
+      })
+    );
+    if (verdict === "unknown" || verdict === "unreadable") {
+      update.ignored_pass = appliedCommitRecord({
+        lessonStatus,
+        score,
+        row: a,
+        courseVersionId,
+        engineVersion: engineRead?.stamp ?? null,
+        reason: verdict,
+        error: engineRead?.error,
+        now: nowIso,
+      });
+    }
+  }
+  if (!decision.revisionOnly && !frozen) {
     if (score !== null) update.score = score;
     // 0075 progress: 100 on completion; otherwise SCORM 2004's
     // cmi.progress_measure (0..1) when the package reports it. Plain SCORM 1.2
@@ -224,13 +323,6 @@ export async function POST(
     if (decision.stampCompletedAt) update.completed_at = decision.completedAt;
   }
 
-  // ADR 0009 step 4: the write goes through the service client; the
-  // user_id filter (mandatory here) keeps it to the caller's own attempt.
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
   // Conditional on status <> 'abandoned' (P4): abandoned since the read
   // above (a language switch in another tab) → 410, nothing written.
   const error = await updateAttemptFailSoft(svc, attemptId, update, { userId: user.id });

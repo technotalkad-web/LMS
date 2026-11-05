@@ -30,6 +30,12 @@ import {
 } from "./change-language-menu";
 import { RequestAttemptButton } from "./request-attempt-button";
 import { isReadyVersion } from "@/lib/courses/default-rule";
+import {
+  NOTICE_NO_REQUEST_LINE,
+  ignoredPassCount,
+  notAppliedNotice,
+  readIgnoredRecord,
+} from "@/lib/xapi/ignored-pass";
 
 type Version = {
   id: string;
@@ -199,8 +205,9 @@ export default async function CourseDetailPage({
   // On a failed read the history block and the row markers read "History
   // unavailable. Please reload." (a record is never guessed), while the
   // result card and the launch labels take empty retake ids for this one
-  // render (display only) and the step 8 notice stays absent. The learner's
-  // own attempt_requests rows are readable through RLS (0083).
+  // render (display only), and the step 8 notice and ADR 0017's notice stay
+  // absent. The learner's own attempt_requests rows are readable through RLS
+  // (0083).
   let snapshot: GrantSnapshot | null = null;
   let historyUnavailable = false;
   try {
@@ -283,6 +290,21 @@ export default async function CourseDetailPage({
     !historyUnavailable &&
     requestDecision({ scoring, attempts }) === "ok" &&
     (attemptRequestState === "none" || attemptRequestState === "rejected");
+  // ADR 0017 step 16: the official attempt's record comes with select("*"). The
+  // notice reaches every learner, whether or not the attempts history is shown,
+  // and only when a pass was really ignored and the grant read was clean: it is a
+  // claim about the record, and without the retake ids an older row can read as
+  // official (ADR 0014 step 7: absent, never wrong).
+  const officialRecord = (scoring.officialAttempt as { ignored_pass?: unknown } | null)?.ignored_pass;
+  const notAppliedText =
+    !historyUnavailable && scoring.officialStatus === "failed" && ignoredPassCount(officialRecord) > 0
+      ? notAppliedNotice(
+          readIgnoredRecord(officialRecord)?.failed ?? {
+            score: scoring.officialScore,
+            at: scoring.officialAttempt?.completed_at,
+          }
+        )
+      : null;
   // The modal's warning when the official result stands (passed, or
   // completed on a module without a pass mark).
   const standingResult: { kind: "passed" | "completed"; scorePct: number | null } | null = resultStands(scoring, passRequired)
@@ -426,7 +448,7 @@ export default async function CourseDetailPage({
               shown — no scoring windows, attempt counts or rule internals. */}
           <div className="space-y-3">
             {scoring.officialAttempt && (
-              <div className="border border-line rounded-xl p-4 sm:p-5 bg-canvas/40 flex items-center justify-between gap-3">
+              <div className="border border-line rounded-xl p-4 sm:p-5 bg-canvas/40 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-[11px] uppercase tracking-wide text-muted">
                     Official score
@@ -450,6 +472,16 @@ export default async function CourseDetailPage({
                       ? "Not passed"
                       : "Completed"}
                 </span>
+                {notAppliedText && (
+                  <div className="w-full text-sm text-ink" data-testid="not-applied-notice">
+                    <p>{notAppliedText}</p>
+                    {!canRequestAttempt && (
+                      <p className="mt-1 text-xs text-muted" data-testid="not-applied-contact">
+                        {NOTICE_NO_REQUEST_LINE}
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 

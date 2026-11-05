@@ -3,6 +3,7 @@ import JSZip from "jszip";
 import { parseManifestFromZip } from "../manifest/detect";
 import { declaredLanguageOf } from "../manifest/parse-xml";
 import type { ParsedManifest } from "../manifest/types";
+import { extractEngineStamp, isKivoLaunch } from "../engine-version";
 import {
   declaredLanguageRowSlot,
   primarySubtag,
@@ -132,7 +133,7 @@ export function analyzeLaunchHtml(html: string | null): LaunchFindings {
     embeddedLrsSecret: false, courseLevelOutcome: false, terminatedOnExit: false,
   };
   if (!html) return none;
-  const kivo = /COURSE_CONFIG\b/.test(html) && /elearning-engine|KIVO|cmi5LaunchActive/.test(html);
+  const kivo = isKivoLaunch(html);
   const cmi5StateApi = /cmi5GetState\s*\(|activities\/state/.test(html);
   // The defect: state fetched in the handshake, but loadBookmark() only ever
   // runs behind `if (scormApi)` and never after the async fetch.
@@ -156,13 +157,7 @@ export function analyzeLaunchHtml(html: string | null): LaunchFindings {
   const stateGatedByCmi5 =
     cmi5StateApi &&
     /function\s+cmi5(?:Put|Get)State\s*\([^)]*\)\s*\{\s*if\s*\(\s*!\s*cmi5LaunchActive\s*\)\s*return/.test(html);
-  const engineVersion =
-    (/["']?engineVersion["']?\s*[:=]\s*["']([^"']+)["']/.exec(html) ?? [])[1] ??
-    (/<meta[^>]+name=["'](?:engine[-_]?version|kivo[-_]?version)["'][^>]+content=["']([^"']+)["']/i.exec(html) ?? [])[1] ??
-    (/<meta[^>]+content=["']([^"']+)["'][^>]+name=["'](?:engine[-_]?version|kivo[-_]?version)["']/i.exec(html) ?? [])[1] ??
-    (/data-(?:engine|kivo)-version=["']([^"']+)["']/i.exec(html) ?? [])[1] ??
-    (/<meta[^>]+name=["']generator["'][^>]+content=["'][^"']*?(\d{4}\.\d{2}\.\d{2}(?:\.\d+)?|\d+\.\d+\.\d+)[^"']*["']/i.exec(html) ?? [])[1] ??
-    null;
+  const engineVersion = extractEngineStamp(html);
   const resumePromptNever = /["']?resumePrompt["']?\s*:\s*["']never["']/.test(html);
   const basicBearerAuth = /xapiLmsAuth\s*=\s*['"]Basic ['"]\s*\+\s*token/.test(html);
   const embeddedLrsSecret = /["']lrsApi(Secret|Key)["']\s*:\s*["'][^"']{6,}["']/.test(html);

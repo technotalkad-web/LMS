@@ -34,6 +34,8 @@ export type AttemptContext = {
   scored: boolean | null;
   /** course_attempts.is_revision (0103): a revision visit's row (ADR 0014 step 7); false on a database without it. */
   isRevision: boolean;
+  /** Statement ids the new-engine guard did not apply (0104, ADR 0017 step 18); empty on a database without it. */
+  notAppliedIds: Set<string>;
   scoringBasis: string | null;
   scoringMaxAttempts: number | null;
   org: { id: string; slug: string | null; name: string | null };
@@ -341,6 +343,9 @@ export function enrichStatement(raw: XapiStatement, ctx: AttemptContext): XapiSt
   context.contextActivities = ca;
   const cext: Obj = isObj(context.extensions) ? context.extensions : {};
   Object.assign(cext, contextExtensions(ctx, timestamp), { [ext.origin]: "engine" });
+  // ADR 0017 step 18: emitted only when it applies. Without it the feed's last
+  // outcome for the registration (Passed) would contradict Ambak's row (Failed).
+  if (typeof s.id === "string" && ctx.notAppliedIds.has(s.id)) cext[ext.resultNotApplied] = true;
   context.extensions = cext;
   s.context = context;
 
