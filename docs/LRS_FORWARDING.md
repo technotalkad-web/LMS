@@ -195,8 +195,16 @@ returned to the AU or our own statement storage.
   `Content-Type: application/json`. Statements keep **their own ids** ⇒ the LRS
   dedups ⇒ **retries are idempotent**.
 - Response classification:
-  - `200/204` → **sent**
-  - `409` (already stored) → treat as **sent**
+  - `200` with any JSON list (an LRS sends statement ids), or any other `2xx` → **sent**
+  - `200` with anything else → **retryable**, as a `502` with the fixed `last_error`
+    "LRS answered 200 without a list of statement ids". xAPI answers a stored POST
+    with `200` and that list, and `fetch` follows a `301` or `302` as a GET, so a
+    sign-in page behind a gateway answers `200` too. An LRS that does not follow
+    xAPI here now fails visibly: its rows back off and dead-letter, even if it did
+    store them. A `307` that keeps the POST still delivers.
+  - `409` on a single statement (already stored) → treat as **sent**. A `409` on
+    more than one statement stored none of them, so the batch is split like any
+    other rejection until each statement has its own answer.
   - `400/401/403/422` → **permanent** (don't retry; surface in `last_error`)
   - `5xx` / timeout / network → **retryable** (backoff)
 
@@ -207,7 +215,25 @@ returned to the AU or our own statement storage.
   **group per org**, forward as a batch, then update `status` / `attempts` /
   `last_error` and set `next_attempt_at = now() + backoff(attempts)`
   (e.g. `min(2^attempts, 3600)s`).
-- **Dead-letter** after `attempts >= 8` → `status='dead'` (admin-visible).
+- **Dead-letter** after `attempts >= 36` → `status='dead'` (admin-visible).
+- A rejected batch is split by halving, at most 16 more posts per org per run.
+  A row that budget did not reach counts no attempt when the LRS accepted
+  something in that call: it stays due with a `last_error` that says so. When
+  every row of a batch conflicts, about 6 rows settle per run. If nothing was
+  accepted (an outage, a wrong key, or a run that reached only rows the LRS
+  refuses) the row counts a failed attempt and backs off.
+- A batch with a row that has already failed (`attempts > 0`) is posted in a new
+  random order, so the same rows do not lead it run after run. A first send keeps
+  its order.
+- A failed read of the org's config leaves its rows due for the next run. Rows are
+  dropped only when a config row says forwarding is off or has no endpoint.
+  `loadLrsConfig` returns null for a failed read and for no row, so rows of an org
+  whose config row was deleted by hand also stay; every org gets a row when it is
+  created (migration 0044). While that lasts, 200 or more such rows fill the due
+  read and other orgs wait behind them.
+- **Retry policy, changed 2026-11-05:** the three rules above on unreached rows,
+  order and failed reads, and the `200` rule in 6.2. `MAX_ATTEMPTS` (36) and the
+  backoff are unchanged.
 - Register in `.github/workflows/cron.yml`.
 
 ### 6.4 Recommended queue approach
@@ -233,7 +259,12 @@ forward-compatible and only worth adopting at high statement volume.
 `app/api/org/lrs/test/route.ts` (admin-only): performs `GET ${endpoint}/about`
 with the auth header + version — the canonical **side-effect-free** xAPI
 connectivity + auth probe (returns the LRS's supported versions). Mapping:
-- `200` → ✅ `ok` (persist `last_test_*`, show supported versions)
+- `200` with a `version` list → ✅ `ok` (persist `last_test_*`, show supported
+  versions)
+- `200` without one → `error`: a sign-in page behind a redirect answers `200` too,
+  so this does not pass on a gateway that redirects `/about`. One that leaves
+  `/about` open and redirects only the POST still tests `ok`, and its rows then
+  fail visibly on the first send.
 - `401/403` → `auth_failed` ("LRS rejected the key/secret")
 - DNS/timeout/network → `unreachable` ("couldn't reach the endpoint")
 
@@ -271,6 +302,12 @@ provided, never echoes it back).
   ingestion + reports are unaffected.
 - **Bad credentials (401/403):** permanent-fail fast; admin sees it on the next
   Test and via `last_error`; rows dead-letter rather than retry forever.
+- **Endpoint answers 200 without being an LRS:** rows back off and dead-letter
+  with the fixed `last_error` in 6.2, and Test shows `error`.
+- **Config read fails:** the drainer leaves the org's rows due. At ingest it writes
+  no outbox row. The sweep's `statements` source brings that row back for an
+  `ambak-v1` org; a `raw` org has no sweep, so its copy of that statement is not
+  sent.
 - **Dead-letter:** `status='dead'` rows are surfaced in the settings card
   (count) for admin attention; a future "replay" action can re-queue them.
 - **Logging:** drainer logs per-batch outcomes; ingestion logs are unchanged.
@@ -303,6 +340,7 @@ MOD   .github/workflows/cron.yml                      # schedule the drainer
 ## 13. Testing plan
 - **Unit:** response classification in `lib/lrs/forward.ts` (200/204/409/4xx/5xx →
   sent/permanent/retryable); backoff math; secret masking on config GET.
+  A `200` reads as sent only when it carries a JSON list (6.2).
 - **Live (lifecycle, matches existing style):** seed an org, point it at a
   **mock LRS** (a tiny test endpoint that records POSTs), enable forwarding,
   drive a real cmi5 attempt, and assert: (a) `xapi_statements` written (internal

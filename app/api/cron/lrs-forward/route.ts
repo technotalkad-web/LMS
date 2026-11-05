@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadLrsConfig } from "@/lib/lrs/config";
-import { forwardStatements } from "@/lib/lrs/forward";
+import { forwardStatements, idOf, shuffled } from "@/lib/lrs/forward";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { sweepAll, type OrgSweepResult } from "@/lib/lrs/sweep";
 
@@ -107,14 +107,25 @@ export async function POST(request: Request) {
   let sent = 0;
   let failed = 0;
   let dead = 0;
+  let unsettled = 0;
 
   for (const [orgId, orgRows] of byOrg) {
     const cfg = await loadLrsConfig(orgId);
-    if (!cfg?.enabled || !cfg.endpoint) {
+    // Null is a failed read, or no config row, and the two look alike. Neither says
+    // forwarding is off, so the rows stay due for the next run.
+    if (!cfg) continue;
+    if (!cfg.enabled || !cfg.endpoint) {
       // Forwarding turned off (or unconfigured) since enqueue — drop quietly.
       await db.from("lrs_forward_outbox").delete().in("id", orgRows.map((r) => r.id));
       continue;
     }
+
+    // The isolation walk starts at the head of the list. When every row it reaches
+    // fails, nothing was accepted and the rows it did not reach count an attempt
+    // unposted, so the same rows leading run after run would take the others to
+    // dead-letter with them. A batch with a row that has already failed therefore
+    // goes in a new order. A first send keeps its order.
+    const sendOrder = orgRows.some((r) => r.attempts > 0) ? shuffled(orgRows) : orgRows;
 
     const res = await forwardStatements(
       {
@@ -123,7 +134,7 @@ export async function POST(request: Request) {
         auth_secret: cfg.auth_secret,
         xapi_version: cfg.xapi_version,
       },
-      orgRows.map((r) => r.payload)
+      sendOrder.map((r) => r.payload)
     );
 
     // Settle every row on its own outcome (the batch's when it was not split),
@@ -131,17 +142,26 @@ export async function POST(request: Request) {
     // per row, because every update is a Worker subrequest and a failed batch of
     // 50 rows used to cost 50 of them.
     const okIds: string[] = [];
+    const unsettledIds: string[] = [];
     const groups = new Map<string, { ids: string[]; status: "failed" | "dead"; attempts: number; error: string }>();
     for (const r of orgRows) {
-      const o = res.results ? res.results[r.statement_id] : res;
-      if (!o || o.ok) {
+      // results is keyed by the id inside each payload, which can differ from
+      // statement_id: the sweep reads statement_id from a uuid column (lower
+      // case) and the payload keeps the id as the engine sent it. A row with no
+      // outcome is never counted as sent.
+      const o = res.results ? res.results[idOf(r.payload)] : res;
+      if (o?.ok) {
         okIds.push(r.id);
         continue;
       }
+      if (o?.unsettled) {
+        unsettledIds.push(r.id);
+        continue;
+      }
       const attempts = r.attempts + 1;
-      const isDead = o.permanent || attempts >= MAX_ATTEMPTS;
+      const isDead = o?.permanent || attempts >= MAX_ATTEMPTS;
       const key = `${isDead ? "dead" : "failed"}|${attempts}`;
-      const g = groups.get(key) ?? { ids: [], status: isDead ? "dead" : "failed", attempts, error: o.error ?? "forward failed" };
+      const g = groups.get(key) ?? { ids: [], status: isDead ? "dead" : "failed", attempts, error: o?.error ?? "forward failed" };
       g.ids.push(r.id);
       groups.set(key, g);
     }
@@ -151,6 +171,16 @@ export async function POST(request: Request) {
         .update({ status: "sent", sent_at: new Date().toISOString(), last_error: null })
         .in("id", okIds);
       sent += okIds.length;
+    }
+    if (unsettledIds.length) {
+      // Not reached in this run, and nothing against them: no attempt counted.
+      // next_attempt_at = now keeps them due and puts them behind rows already
+      // waiting, this org's or another's, as a failed row's backoff would.
+      await db
+        .from("lrs_forward_outbox")
+        .update({ last_error: "not reached in this run: isolation budget exhausted", next_attempt_at: new Date().toISOString() })
+        .in("id", unsettledIds);
+      unsettled += unsettledIds.length;
     }
     for (const g of groups.values()) {
       await db
@@ -168,7 +198,7 @@ export async function POST(request: Request) {
   }
 
   const sweepSummary = summarize(await runSweep());
-  const body = { ok: true, processed: rows.length, sent, failed, dead, sweep: sweepSummary };
+  const body = { ok: true, processed: rows.length, sent, failed, dead, unsettled, sweep: sweepSummary };
   await recordHeartbeat("lrs-forward", body);
   return NextResponse.json(body);
 }
