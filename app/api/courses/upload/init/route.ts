@@ -19,6 +19,10 @@ import { initDirectUpload, type DeclaredFile } from "@/lib/courses/direct-upload
  *   manifest: { fileName, xml },
  *   files: [{ path, size, contentType? }]
  * }
+ *
+ * A new course without a language takes the declared language's slot when the
+ * package declares a supported tag or subtag, else English (ADR 0016 step 7).
+ * initDirectUpload applies that default after its one parse of manifest.xml.
  */
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as null | {
@@ -43,11 +47,10 @@ export async function POST(request: NextRequest) {
   const { supabase, org, userId } = auth;
 
   const courseId = typeof body.courseId === "string" && body.courseId ? body.courseId : undefined;
-  let language = typeof body.language === "string" && body.language.trim() ? body.language.trim() : null;
+  const language = typeof body.language === "string" && body.language.trim() ? body.language.trim() : null;
   if (language && !isSupportedLanguage(language)) {
     return NextResponse.json({ error: `Unsupported language code "${language}"` }, { status: 400 });
   }
-  if (!courseId && !language) language = "en";
   const displayName =
     typeof body.display_name === "string" && body.display_name.trim()
       ? body.display_name.trim().slice(0, 80)

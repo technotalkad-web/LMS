@@ -2,9 +2,10 @@ import { createClient as createServiceClient, type SupabaseClient } from "@supab
 import { activeStorageDriver, getStorageFor, type StorageAdapter } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
 import { checkQuota } from "@/lib/billing/enforce-quota";
-import { parseManifestXml } from "./manifest/parse-xml";
+import { suggestLanguageSlot } from "@/lib/i18n/languages";
+import { declaredLanguageOf, parseManifestXml } from "./manifest/parse-xml";
 import type { ParsedManifest } from "./manifest/types";
-import { countLearningUnits } from "./units";
+import { countLearningUnits, MAX_LAUNCH_READ_BYTES } from "./units";
 import { linkValidationToVersion } from "./validation/gate";
 import {
   BLOCKED_UPLOAD_ERROR,
@@ -72,7 +73,7 @@ export const DIRECT_UPLOAD_LIMITS = {
   /** 'uploading' versions older than this are swept by the reaper. */
   abandonAfterMs: 24 * 60 * 60 * 1000,
   /** Launch files bigger than this are not read for the unit count. */
-  maxLaunchReadBytes: 16 * 1024 * 1024,
+  maxLaunchReadBytes: MAX_LAUNCH_READ_BYTES,
   /**
    * Signed URLs per /sign request. Supabase Storage needs one network call
    * per signature, so stay under a free-plan Worker's 50 subrequests; R2
@@ -205,6 +206,12 @@ export async function initDirectUpload(args: {
   }
 
   // ---- 5. Rows: course, package, version (uploading, not current) ----
+  // ADR 0016 step 7: a new course without a language takes the declared
+  // language's slot, else English; an explicit language always wins.
+  const language =
+    !args.courseId && args.language == null
+      ? (suggestLanguageSlot(declaredLanguageOf(manifest)) ?? "en")
+      : args.language;
   let courseId: string;
   let packageId: string;
   try {
@@ -214,7 +221,7 @@ export async function initDirectUpload(args: {
     packageId = await resolveTargetPackage(supabase, {
       courseId,
       packageId: args.packageId,
-      language: args.language,
+      language,
       displayName: args.displayName,
       existingCourse: !!args.courseId,
     });
@@ -443,7 +450,10 @@ export async function finalizeDirectUpload(args: {
 
   // Service role: course_versions rows are written by the server, not by
   // admin RLS policies (an RLS-filtered UPDATE would silently touch 0 rows).
-  const md = { ...(version.manifest_data ?? {}), unitCount, identity: integrity.findings.identity };
+  // ADR 0016 step 2: the marker goes with whatever count finalize stores, so a
+  // launch file over the read cap stays null and final, and is never fetched by
+  // the lazy path.
+  const md = { ...(version.manifest_data ?? {}), unitCount, unitCountAlgo: 2, identity: integrity.findings.identity };
   const { data: updated, error: updErr } = await serviceClient()
     .from("course_versions")
     .update({ upload_status: "ready", manifest_data: md, file_count: keys.length })

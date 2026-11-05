@@ -11,6 +11,13 @@
  *   interactions (contract type, response, key, success, definition text keyed ONLY by the
  *   package language), the run summary, and what the learner sees.
  *
+ * ADR 0016 step 17 adds, in the same serial run: the `declared-language` row through validate-only
+ * calls before and after the API upload; the slot and the null display name of that upload; the
+ * question labels on the two report pages, also with more than 500 `answered` rows across 26 more
+ * learners (27 attempts, 594 rows; only the hi-Latn run proves the label read, because en-US labels
+ * come from the matview); and, for hi-Latn only and behind DIRECT_UPLOAD_E2E=1, the upload dialog in a second
+ * organisation, where the same zip becomes two slots of one course.
+ *
  * Packages are never committed (the LMS repo is public and a KIVO build contains the
  * engine): paths come from the environment and the spec skips without them.
  *   KIVO_RELEASE_A_XAPI_ZIP    the xAPI zip built by the fixed editor
@@ -22,7 +29,7 @@
  * the staging Supabase ref itself before any database call.
  * S-12, S4 and X-1 in the comments below are ids from KIVO's plans, which are outside this repository.
  */
-import { test, expect, type Frame, type Page } from "@playwright/test";
+import { test, expect, type BrowserContext, type Frame, type Page } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -114,6 +121,89 @@ const PLAN: Record<string, { sfx: string; type: string; response: string; key?: 
 };
 const BANK_PICK: Record<string, number[]> = { mcq1: [0], mcq2: [1], multi1: [0, 2], multi2: [0], tf1: [0], tf2: [1], dd1: [0], dd2: [1] };
 
+const HINGLISH = LANG === "hi-Latn";
+// ADR 0016 step 5, written out so the spec does not read its answer from the code it checks.
+const SUGGESTED_SLOT = HINGLISH ? "hi" : "en";
+const VERB_ANSWERED = "http://adlnet.gov/expapi/verbs/answered";
+const VERB_RESPONDED = "http://adlnet.gov/expapi/verbs/responded";
+
+// ADR 0016 step 8: the `declared-language` row of a validation report, every wording in one place.
+type DeclaredRow = { status: string; detail: string };
+const declaredRow = {
+  defaultMatches: (slot: string): DeclaredRow => ({ status: "pass", detail: `The package declares ${LANG}; the default language slot ${slot} matches.` }),
+  chosenMatches: (slot: string): DeclaredRow => ({ status: "pass", detail: `The package declares ${LANG}; the chosen language slot ${slot} matches.` }),
+  differs: (slot: string): DeclaredRow => ({ status: "info", detail: `The package declares ${LANG}; the chosen language slot is ${slot}.` }),
+};
+type StoredReport = { package: { declaredLanguage?: string | null }; checks: { id: string; status: string; detail: string }[] };
+type StoredValidation = { status: string; verdict: string; report: StoredReport };
+
+function declaredRowOf(report: StoredReport): DeclaredRow {
+  const check = report.checks.find((c) => c.id === "declared-language");
+  expect(check, "the report has a declared-language row").toBeTruthy();
+  return { status: check!.status, detail: check!.detail };
+}
+
+/** A POST on a signed-in session. Plain fetch on purpose: Playwright's request context prints a
+ *  request's headers, the session cookie among them, when the transport fails. */
+async function sessionPost(ctx: BrowserContext, baseURL: string, pathname: string, body: FormData | string, headers: Record<string, string> = {}) {
+  const cookie = (await ctx.cookies(baseURL)).map((c) => `${c.name}=${c.value}`).join("; ");
+  return fetch(new URL(pathname, baseURL), { method: "POST", headers: { ...headers, Cookie: cookie }, body, signal: AbortSignal.timeout(120_000) });
+}
+
+/** POST /api/courses/validate-package, then the row it stored, read by its id. The pending row is
+ *  test data and stays. */
+async function validateOnly(ctx: BrowserContext, baseURL: string, fields: { courseId?: string; language?: string }): Promise<DeclaredRow> {
+  const form = new FormData();
+  form.set("orgSlug", state.org!.slug);
+  for (const [k, v] of Object.entries(fields)) form.set(k, v);
+  form.set("file", new Blob([new Uint8Array(fs.readFileSync(ZIP))], { type: "application/zip" }), path.basename(ZIP));
+  const res = await sessionPost(ctx, baseURL, "/api/courses/validate-package", form);
+  const text = await res.text();
+  expect(res.status, `validate ${JSON.stringify(fields)} → ${res.status}: ${text.slice(0, 300)}`).toBe(200);
+  const { data, error } = await svc().from("package_validations").select("status, verdict, report").eq("id", (JSON.parse(text) as { validation_id: string }).validation_id).single();
+  expect(error).toBeNull();
+  const row = data as StoredValidation;
+  expect(row.status, "a validate-only row stays pending").toBe("pending");
+  expect(["blocked", "unplayable"], `the verdict lets the row stand: ${row.verdict}`).not.toContain(row.verdict);
+  expect(row.report.package.declaredLanguage, "report.package.declaredLanguage").toBe(LANG);
+  return declaredRowOf(row.report);
+}
+
+type StatementRow = { verb: string; stored: string; raw: Stmt };
+const nameOf = (r: StatementRow) => r.raw.object.definition?.name?.[LANG] ?? "";
+
+/** The learner's stored statements of one verb. */
+async function statementsOfRun(verbId: string): Promise<StatementRow[]> {
+  const { data, error } = await svc().from("xapi_statements").select("verb, stored, raw").eq("attempt_id", state.attemptId!).eq("verb", verbId).order("stored", { ascending: true });
+  expect(error).toBeNull();
+  return (data ?? []) as StatementRow[];
+}
+
+/** The nightly cron's own call. The function answers per view, with a per-view error. */
+async function refreshReportViews() {
+  const { data, error } = await svc().rpc("refresh_report_views");
+  expect(error?.message ?? null, "refresh_report_views").toBeNull();
+  const view = ((data ?? []) as { view: string; error: string | null }[]).find((v) => v.view === "mv_course_interaction_breakdown");
+  expect(view, "the breakdown is among the refreshed views").toBeTruthy();
+  expect(view!.error, "the breakdown refreshed").toBeNull();
+}
+
+async function breakdownRows() {
+  const { data, error } = await svc().from("mv_course_interaction_breakdown").select("interaction_id, interaction_label, total_responses, distinct_learners").eq("course_id", state.courseId!);
+  expect(error).toBeNull();
+  return (data ?? []) as { interaction_id: string; interaction_label: string | null; total_responses: number; distinct_learners: number }[];
+}
+
+/** The course reports page shows each question's text. The renderer prints the id in a <code>
+ *  beneath a label only when the row has a label, so a row showing the bare id fails here. */
+async function expectQuestionLabels(page: Page, answered: StatementRow[]) {
+  await page.goto(`/${state.org!.slug}/library/${state.courseId}/reports`);
+  for (const r of answered) {
+    const row = page.locator("tbody tr").filter({ has: page.locator(`code:text-is("${r.raw.object.id}")`) });
+    await expect(row, `the row of ${r.raw.object.id}`).toContainText(nameOf(r), { timeout: 60_000 });
+  }
+}
+
 test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)`, () => {
   test.skip(!ZIP || !fs.existsSync(ZIP) || !TINCAN || !fs.existsSync(TINCAN) || !EXPECTED || !fs.existsSync(EXPECTED), "set KIVO_RELEASE_A_XAPI_ZIP, KIVO_RELEASE_A_TINCAN and KIVO_RELEASE_A_KIT");
 
@@ -145,6 +235,17 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     writeOut("lms-seed.json", { org, admin: { id: admin.id, email: admin.email }, learner: { id: learner.id, email: learner.email } });
   });
 
+  test("validate-only before the upload: the declared-language row names the default slot", async ({ browser, baseURL }) => {
+    // ADR 0016 step 8, no courseId and no language. No course in the organisation holds this
+    // package yet, so no collision block (ADR 0004 step 3).
+    const ctx = await authedContext(browser, baseURL!, state.admin!.email, state.admin!.password);
+    const row = await validateOnly(ctx, baseURL!, {});
+    console.log(`[58 ${LANG}] validate-only, no course: ${row.status}`);
+    writeOut("lms-validate-before.json", row);
+    expect(row).toEqual(declaredRow.defaultMatches(SUGGESTED_SLOT));
+    await ctx.close();
+  });
+
   test("admin uploads the xAPI zip: manifest_type xapi, title from tincan.xml, one activity", async ({ browser, baseURL }) => {
     const ctx = await authedContext(browser, baseURL!, state.admin!.email, state.admin!.password);
     // The zip's path and sha256 go into the course record (lms-course.json), hashed from
@@ -161,8 +262,8 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     const { data: course } = await svc().from("courses").select("id, title, description, current_version_id, is_active").eq("id", state.courseId).single();
     const c = course as { current_version_id: string; title: string; is_active: boolean };
     state.versionId = c.current_version_id;
-    const { data: ver } = await svc().from("course_versions").select("manifest_type, launch_url, manifest_data").eq("id", state.versionId).single();
-    const v = ver as { manifest_type: string; launch_url: string; manifest_data: { title?: string; raw?: { activityId?: string; activityCount?: number; activityType?: string } } };
+    const { data: ver } = await svc().from("course_versions").select("package_id, manifest_type, launch_url, manifest_data").eq("id", state.versionId).single();
+    const v = ver as { package_id: string; manifest_type: string; launch_url: string; manifest_data: { title?: string; raw?: { activityId?: string; activityCount?: number; activityType?: string; lang?: string } } };
     console.log(`[58 ${LANG}] course=${state.courseId} version=${state.versionId} title="${c.title}" manifest_type=${v.manifest_type} launch_url=${v.launch_url} activityId=${v.manifest_data?.raw?.activityId} activityCount=${v.manifest_data?.raw?.activityCount}`);
     writeOut("lms-course.json", { zip, course, version: ver, upload: JSON.parse(text) });
     expect(v.manifest_type).toBe("xapi");
@@ -170,7 +271,31 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     expect(c.title, `course title parsed from the ${LANG} tincan.xml`).toBe(COURSE_TITLE);
     expect(v.manifest_data?.raw?.activityId).toBe(ACTIVITY_ID);
     expect(v.manifest_data?.raw?.activityCount, "tincan.xml declares only the course activity").toBe(1);
+    // ADR 0016 steps 3 and 7: the declared language is kept, and with no `language` sent it picks the
+    // slot of the new course. The API path never prefills the label (the owner's answer of 2026-10-28).
+    expect(v.manifest_data?.raw?.lang, "manifest_data.raw.lang").toBe(LANG);
+    const { data: pkg, error: pkgErr } = await svc().from("course_packages").select("language, display_name").eq("id", v.package_id).single();
+    expect(pkgErr).toBeNull();
+    expect(pkg, "the route's default slot, display_name null").toEqual({ language: SUGGESTED_SLOT, display_name: null });
     state.activityId = v.manifest_data!.raw!.activityId!;
+    await ctx.close();
+  });
+
+  test("validate-only on the uploaded course: the declared-language row for each slot", async ({ browser, baseURL }) => {
+    // ADR 0016 step 8. courseId excludes the course's own package from the collision lookup (ADR 0004
+    // step 2); without it the same package answers `blocked`.
+    const ctx = await authedContext(browser, baseURL!, state.admin!.email, state.admin!.password);
+    const courseId = state.courseId!;
+    const hi = await validateOnly(ctx, baseURL!, { courseId, language: "hi" });
+    const en = await validateOnly(ctx, baseURL!, { courseId, language: "en" });
+    // No slot named: the suggestion when the course does not hold it, else `en`. This course holds
+    // the suggestion, so the row compares against `en`.
+    const none = await validateOnly(ctx, baseURL!, { courseId });
+    console.log(`[58 ${LANG}] validate-only on the course: hi ${hi.status}, en ${en.status}, none ${none.status}`);
+    writeOut("lms-validate-after.json", { hi, en, none });
+    expect(hi).toEqual(HINGLISH ? declaredRow.chosenMatches("hi") : declaredRow.differs("hi"));
+    expect(en).toEqual(HINGLISH ? declaredRow.differs("en") : declaredRow.chosenMatches("en"));
+    expect(none).toEqual(HINGLISH ? declaredRow.differs("en") : declaredRow.defaultMatches("en"));
     await ctx.close();
   });
 
@@ -407,6 +532,188 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     expect(cardText).toContain(`${res.score}%`);
     expect(cardText).toContain(res.passed ? "Passed" : "Not passed");
     await ctx.close();
+  });
+
+  test("the two report pages show the question text", async ({ browser, baseURL }) => {
+    // ADR 0016 steps 11 to 13. The label is the statement's definition.name; a few questions have a
+    // short name there (`Matching`) and the full stem only in the description.
+    test.setTimeout(5 * 60_000);
+    const answered = await statementsOfRun(VERB_ANSWERED);
+    const responded = await statementsOfRun(VERB_RESPONDED);
+    expect(answered.length, "the run's answered statements").toBe(22);
+    expect(responded.length, "the run's feedback statements").toBe(5);
+    expect([...answered, ...responded].filter((r) => !nameOf(r)).map((r) => r.raw.object.id), `every name is keyed ${LANG}`).toEqual([]);
+
+    await refreshReportViews();
+    const mv = await breakdownRows();
+    console.log(`[58 ${LANG}] breakdown rows ${mv.length}, labelled ${mv.filter((m) => m.interaction_label !== null).length}`);
+    expect(mv.length, "one row per answered question: feedback stays out").toBe(answered.length);
+    // The matview is unchanged: it labels en-US names only, so a Hinglish course holds null here.
+    expect(mv.filter((m) => m.interaction_label !== null).length, "labels the matview itself holds").toBe(HINGLISH ? 0 : answered.length);
+
+    const ctx = await authedContext(browser, baseURL!, state.admin!.email, state.admin!.password);
+    const page = await ctx.newPage();
+    await expectQuestionLabels(page, answered);
+    await expect(page.getByText("KIVO D-7 test: multi-response. Which of these are fruits?", { exact: true })).toBeVisible();
+    for (const r of responded) await expect(page.getByText(nameOf(r), { exact: true }), "feedback stays out of the question analytics").toHaveCount(0);
+
+    // The lens reads the ten lowest correct rates, so it is asked for this run's wrong answers: a
+    // question answered right can fall outside the ten.
+    const wrong = answered.filter((r) => r.raw.result?.success === false);
+    expect(wrong.length, "this run's wrong answers, all among the lens's ten rows").toBe(7);
+    await page.goto(`/${state.org!.slug}/analytics?content=course:${state.courseId}`);
+    await expect(page.getByRole("heading", { name: /Hardest questions/ })).toBeVisible({ timeout: 60_000 });
+    for (const r of wrong) await expect(page.getByRole("cell", { name: nameOf(r), exact: true }), `the lens's row of ${r.raw.object.id}`).toBeVisible();
+    await ctx.close();
+  });
+
+  test("more than 500 answered rows across many learners: every question keeps its label", async ({ browser, baseURL }) => {
+    // ADR 0016 steps 13 and 17: many learners and few questions, the case a capped read would lose.
+    // For en-US the matview already holds the labels and no label read runs: only hi-Latn proves the read.
+    test.setTimeout(15 * 60_000);
+    const org = state.org!;
+    // The sweep reads statements per organisation with an enabled LRS. With no enabled LRS here, no
+    // copy is ever forwarded. Every organisation has a config row (0044's trigger).
+    const { data: lrs, error: lrsErr } = await svc().from("tenant_lrs_config").select("enabled").eq("organization_id", org.id);
+    expect(lrsErr).toBeNull();
+    expect((lrs ?? []).filter((c) => c.enabled), "the fixture's organisation has no enabled tenant LRS").toEqual([]);
+
+    const answered = await statementsOfRun(VERB_ANSWERED);
+    const { data: att, error: attErr } = await svc().from("course_attempts").select("course_version_id, status, completion_status, success_status, score, started_at, completed_at").eq("id", state.attemptId!).single();
+    expect(attErr).toBeNull();
+    const attemptIds = [state.attemptId!];
+    // Twenty questions' copies sort before the real run and fill the first read, so the other two ids
+    // are in a later read only: one capped read would lose them.
+    const lastTwo = new Set(answered.slice(-2).map((r) => r.raw.object.id));
+    const backdated = new Date(Date.parse(answered[0].stored) - 3_600_000).toISOString();
+    for (let i = 0; i < 26; i++) {
+      const u = await createAuthUser({ profile: { first_name: "Kivo", last_name: `Copy ${i + 1}`, must_change_password: false } });
+      await addMember({ organizationId: org.id, userId: u.id, role: "member" });
+      const { data: a, error: aErr } = await svc().from("course_attempts").insert({ ...(att as Record<string, unknown>), user_id: u.id, organization_id: org.id }).select("id").single();
+      expect(aErr).toBeNull();
+      const attemptId = (a as { id: string }).id;
+      attemptIds.push(attemptId);
+      // Test data: raw.actor still names the first learner. The breakdown and the label read key on
+      // the attempt, never on the actor.
+      const copies = answered.map((r) => {
+        const id = crypto.randomUUID();
+        return { attempt_id: attemptId, statement_id: id, verb: r.verb, stored: lastTwo.has(r.raw.object.id) ? new Date().toISOString() : backdated, raw: { ...r.raw, id, context: { ...r.raw.context, registration: attemptId } } };
+      });
+      const { error: sErr } = await svc().from("xapi_statements").insert(copies);
+      expect(sErr).toBeNull();
+    }
+    const { count, error: cErr } = await svc().from("xapi_statements").select("id", { count: "exact", head: true }).in("attempt_id", attemptIds).eq("verb", VERB_ANSWERED);
+    expect(cErr).toBeNull();
+    console.log(`[58 ${LANG}] answered rows ${count} over ${attemptIds.length} attempts`);
+    expect(count, "every copy is stored").toBe(attemptIds.length * answered.length);
+    expect(count!, "more than 500 answered rows").toBeGreaterThan(500);
+    const { data: firstRead } = await svc().from("xapi_statements").select("iid:raw->object->>id").in("attempt_id", attemptIds).eq("verb", VERB_ANSWERED).order("stored").order("id").limit(500);
+    expect(new Set((firstRead ?? []).map((r) => r.iid)).size, "the first read holds a subset of the ids").toBe(answered.length - 2);
+
+    await refreshReportViews();
+    const mv = await breakdownRows();
+    expect(mv.length, "the same questions").toBe(answered.length);
+    expect(mv.filter((m) => Number(m.distinct_learners) !== attemptIds.length).map((m) => m.interaction_id), "every question counts every learner").toEqual([]);
+
+    const ctx = await authedContext(browser, baseURL!, state.admin!.email, state.admin!.password);
+    const page = await ctx.newPage();
+    await expectQuestionLabels(page, answered);
+    await ctx.close();
+  });
+
+  test("the upload dialog suggests the slot and the label, and the admin confirms", async ({ browser, baseURL }) => {
+    // ADR 0016 steps 6, 8 and 9. The cross-course collision block is per organisation (ADR 0004 step 3),
+    // so the same zip may be uploaded again in a second one.
+    test.skip(!HINGLISH, "the dialog path is the Hinglish package's");
+    // The dialog uploads from the browser to storage, the path spec 44 gates.
+    test.skip(!process.env.DIRECT_UPLOAD_E2E, "set DIRECT_UPLOAD_E2E=1 with an S3-compatible bucket configured on the app");
+    test.setTimeout(10 * 60_000);
+    const org = await createOrg({ name: "QA KIVO Release A dialog" });
+    const admin = await createAuthUser({ profile: { first_name: "Kivo", last_name: "Dialog Admin", must_change_password: false } });
+    await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
+    const learner = await createAuthUser({ profile: { first_name: "Kivo", last_name: "Dialog Learner", must_change_password: false } });
+    await addMember({ organizationId: org.id, userId: learner.id, role: "member" });
+
+    const adminCtx = await authedContext(browser, baseURL!, admin.email, admin.password);
+    const page = await adminCtx.newPage();
+    const validate = page.getByRole("button", { name: "Validate package" });
+    const accept = page.getByRole("button", { name: "Accept & Upload" });
+    const displayLabel = page.getByPlaceholder("Display label (optional)");
+    const published = page.getByText(/^(Uploaded|New version published)$/);
+
+    // A new course: the slot preselected, the label prefilled, both shown before anything is written.
+    await page.goto(`/${org.slug}/library/upload`);
+    await page.setInputFiles("#file", ZIP);
+    await validate.click();
+    await expect(accept).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText("Language slot", { exact: true })).toBeVisible();
+    await expect(page.locator("#package-language")).toHaveValue("hi");
+    await expect(displayLabel).toHaveValue("Hinglish");
+    await expect(page.getByText(/Suggested from the package's declared language .?hi-Latn.?\. Change it if that is not right\./)).toBeVisible();
+    await accept.click();
+    await expect(published).toBeVisible({ timeout: 180_000 });
+    const { data: courseRow, error: courseErr } = await svc().from("courses").select("id").eq("organization_id", org.id).single();
+    expect(courseErr).toBeNull();
+    const courseId = (courseRow as { id: string }).id;
+    console.log(`[58 ${LANG}] dialog: org ${org.id} course ${courseId}`);
+
+    // ADR 0016 step 9: the label where display_name is the label, the code where it is not.
+    await page.goto(`/${org.slug}/library`);
+    await expect(page.locator('span[title="Hindi"]'), "the Library list chip keeps the code").toHaveText("hi", { timeout: 30_000 });
+    await page.goto(`/${org.slug}/library/${courseId}`);
+    await expect(page.locator("span", { hasText: /^Hinglish\s*hi$/ }).first(), "the course page names the slot by its display name").toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("cell", { name: "Hinglish", exact: true }), "the languages table's display-name column").toBeVisible();
+
+    // The same zip as a new language of that course: `hi` is taken, so the select stays at `en`. The
+    // label's rule does not depend on the slot; this admin clears it.
+    await page.getByRole("link", { name: "Upload new version" }).click();
+    await expect(page.getByRole("heading", { name: "Upload new version" })).toBeVisible({ timeout: 30_000 });
+    // Enabled once the package list has arrived, so the validation describes the target the upload takes.
+    await expect(validate).toBeEnabled({ timeout: 30_000 });
+    await page.locator("#target-package").selectOption({ value: "" });
+    await page.setInputFiles("#file", ZIP);
+    await validate.click();
+    await expect(accept).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText("New language slot", { exact: true })).toBeVisible();
+    await expect(page.locator("#new-language")).toHaveValue("en");
+    await expect(displayLabel).toHaveValue("Hinglish");
+    await displayLabel.fill("");
+    await accept.click();
+    await expect(published).toBeVisible({ timeout: 180_000 });
+
+    const { data: pkgRows, error: pkgErr } = await svc().from("course_packages").select("language, display_name, current_version_id").eq("course_id", courseId).order("language", { ascending: true });
+    expect(pkgErr).toBeNull();
+    const pkgs = pkgRows as { language: string; display_name: string | null; current_version_id: string }[];
+    expect(pkgs.map(({ language, display_name }) => ({ language, display_name })), "two slots of one course").toEqual([{ language: "en", display_name: null }, { language: "hi", display_name: "Hinglish" }]);
+
+    // The row each upload stored: never a block, and on the second upload it says the slots differ.
+    const storedRow = async (versionId: string) => {
+      const { data, error } = await svc().from("package_validations").select("status, verdict, report").eq("organization_id", org.id).eq("course_version_id", versionId).order("created_at", { ascending: false }).limit(1).single();
+      expect(error).toBeNull();
+      const row = data as StoredValidation;
+      expect(row.status, "Accept & Upload consumed the row").toBe("accepted");
+      return declaredRowOf(row.report);
+    };
+    expect(await storedRow(pkgs[1].current_version_id), "the new course's stored row").toEqual(declaredRow.defaultMatches("hi"));
+    expect(await storedRow(pkgs[0].current_version_id), "the add-as-new-language upload's stored row").toEqual(declaredRow.differs("en"));
+
+    const assign = await sessionPost(adminCtx, baseURL!, "/api/assignments", JSON.stringify({ orgSlug: org.slug, courseId, userIds: [learner.id] }), { "Content-Type": "application/json" });
+    expect(assign.status, `assign → ${assign.status}`).toBeLessThan(300);
+    await adminCtx.close();
+
+    // The learner's picker: the display name large, "English name · code" in small print.
+    const learnerCtx = await authedContext(browser, baseURL!, learner.email, learner.password);
+    const picker = await learnerCtx.newPage();
+    await picker.goto(`/${org.slug}/courses/${courseId}/launch`);
+    const hinglishCard = picker.getByRole("button", { name: /^Hinglish/ });
+    const englishCard = picker.getByRole("button", { name: /^English/ });
+    await expect(hinglishCard).toBeVisible({ timeout: 30_000 });
+    await expect(hinglishCard.locator("div").nth(0)).toHaveText("Hinglish");
+    await expect(hinglishCard.locator("div").nth(1)).toHaveText("Hindi · hi");
+    await expect(englishCard.locator("div").nth(0)).toHaveText("English");
+    await expect(englishCard.locator("div").nth(1)).toHaveText("English · en");
+    writeOut("lms-dialog.json", { org: org.id, course: courseId, packages: pkgs });
+    await learnerCtx.close();
   });
 });
 

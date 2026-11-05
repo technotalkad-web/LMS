@@ -21,9 +21,11 @@ import { runPackageGuardian } from "@/lib/alds/guardian";
  *     notify_update?: "1" | "0"   (when truthy + courseId given, fires asset_update
  *                                  email to every currently-assigned learner)
  *     language?: "en" | "hi" | …  (package language from SUPPORTED_LANGUAGES;
- *                                  new courses default to "en"; on an existing
- *                                  course it targets/creates that language's
- *                                  package)
+ *                                  a new course without one takes the declared
+ *                                  language's slot when the package declares a
+ *                                  supported tag or subtag, else English (ADR
+ *                                  0016 step 7); on an existing course it
+ *                                  targets/creates that language's package)
  *     display_name?: string        (optional label for a NEW language package)
  *     packageId?: "..."            (existing course: the exact package this
  *                                  zip replaces; wins over language)
@@ -98,10 +100,13 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // Language mapping: every NEW course gets a labelled package (default
-  // English) so the learner picker and reports always know what they hold.
+  // Language mapping: every NEW course gets a labelled package: the declared
+  // language's slot when the package declares a supported tag or subtag, else
+  // English (ADR 0016 step 7), so the learner picker and reports always know
+  // what they hold. uploadCoursePackage applies that default after its one
+  // parse of the zip; here `language` stays null when the caller sent none.
   const languageRaw = form.get("language");
-  let language =
+  const language =
     typeof languageRaw === "string" && languageRaw.trim() ? languageRaw.trim() : null;
   if (language && !isSupportedLanguage(language)) {
     return NextResponse.json(
@@ -109,7 +114,6 @@ export async function POST(request: NextRequest) {
       { status: 400 }
     );
   }
-  if (!courseId && !language) language = "en";
   const displayNameRaw = form.get("display_name");
   const displayName =
     typeof displayNameRaw === "string" && displayNameRaw.trim()
@@ -118,6 +122,7 @@ export async function POST(request: NextRequest) {
   const packageIdRaw = form.get("packageId");
   let packageId =
     typeof packageIdRaw === "string" && packageIdRaw.trim() ? packageIdRaw.trim() : undefined;
+  let packageLanguage: string | null = null;
   if (packageId) {
     if (!courseId) {
       return NextResponse.json(
@@ -127,7 +132,7 @@ export async function POST(request: NextRequest) {
     }
     const { data: pkg } = await supabase
       .from("course_packages")
-      .select("id, course_id")
+      .select("id, course_id, language")
       .eq("id", packageId)
       .eq("course_id", courseId)
       .maybeSingle();
@@ -138,6 +143,7 @@ export async function POST(request: NextRequest) {
       );
     }
     packageId = (pkg as { id: string }).id;
+    packageLanguage = (pkg as { language: string | null }).language;
   }
 
   // Only check quota when creating a NEW course (versions don't consume).
@@ -174,6 +180,8 @@ export async function POST(request: NextRequest) {
   // ADR 0004 step 4: the existing slot this upload lands in (read-only,
   // mirrors resolveTargetPackage) for the same-slot warning.
   let slotId: string | null = packageId ?? null;
+  let slotLanguage: string | null = packageLanguage;
+  let takenLanguages: string[] = [];
   if (!slotId && courseId) {
     const { data: pkgs } = await supabase
       .from("course_packages")
@@ -184,6 +192,8 @@ export async function POST(request: NextRequest) {
       ? rows.find((r) => r.language === language)
       : rows.find((r) => r.language === null) ?? (rows.length === 1 ? rows[0] : undefined);
     slotId = slot?.id ?? null;
+    slotLanguage = slot?.language ?? null;
+    takenLanguages = rows.map((r) => r.language).filter((l): l is string => !!l);
   }
 
   // Pre-Upload Package Validation gate (0070): phase-2 acceptance of a
@@ -200,6 +210,14 @@ export async function POST(request: NextRequest) {
       typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
     acknowledge: form.get("acknowledge") === "1",
     packageId: slotId,
+    // ADR 0016 step 8: what the declared-language row of an inline validation
+    // compares against, from the reads above. A named package wins over a sent
+    // language, as in the validate route: the row names where the bytes go.
+    target: {
+      chosen: packageId ? packageLanguage : language ?? slotLanguage,
+      newCourse: !courseId,
+      takenLanguages,
+    },
   });
   if (!gate.ok) {
     // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id

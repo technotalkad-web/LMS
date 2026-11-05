@@ -146,8 +146,10 @@ export async function validateUnzipped(
    * ADR 0004 step 2: the upload target. courseId = the course the package is
    * going into (its own versions are not a collision); packageId = the
    * language slot it replaces (same-slot warning). Omit both for a new course.
+   * ADR 0016 step 8: language = the slot chosen for a new package, which the
+   * declared-language row compares against; omit it when nobody chose one.
    */
-  target?: { courseId?: string | null; packageId?: string | null }
+  target?: { courseId?: string | null; packageId?: string | null; language?: string | null }
 ): Promise<{ ok: true; result: ValidationResult } | { ok: false; error: string }> {
   const bundle = await buildValidationBundle(pkg);
   const fd = new FormData();
@@ -155,6 +157,7 @@ export async function validateUnzipped(
   fd.set("orgSlug", orgSlug);
   if (target?.courseId) fd.set("courseId", target.courseId);
   if (target?.courseId && target.packageId) fd.set("packageId", target.packageId);
+  if (target?.language) fd.set("language", target.language);
   const res = await fetch("/api/courses/validate-package", { method: "POST", body: fd });
   const j = (await res.json().catch(() => ({}))) as ValidationResult & { error?: string };
   if (!res.ok || !j.validation_id) return { ok: false, error: j.error ?? "Validation failed" };

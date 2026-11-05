@@ -12,6 +12,13 @@
  *
  * Codes follow ISO 639-1 (two-letter) where one exists, falling back to
  * BCP-47 region-tagged where ambiguity matters (e.g. zh-Hans vs zh-Hant).
+ *
+ * The suggestion functions at the end (ADR 0016 steps 5 and 8) read the language
+ * a package declares. The suggestion is advisory: an admin confirms it, and an
+ * explicit language always wins. The slot codes are unchanged, and there is no
+ * `hi-Latn` code (ADR 0016 step 10): `hi-Latn` is a value a package may declare,
+ * compared with a slot by primary subtag. For an existing course with no chosen
+ * slot, declaredLanguageRowSlot applies the upload dialog's own rule.
  */
 
 export type LanguageCode = (typeof SUPPORTED_LANGUAGES)[number]["code"];
@@ -66,4 +73,62 @@ export function languageDisplay(
   const info = CODE_TO_INFO.get(code as LanguageCode);
   if (!info) return code;
   return prefer === "native" ? info.native : info.english;
+}
+
+/**
+ * The part of a language tag before the first `-`, lower-cased. Defined here
+ * and not imported from lib/alds: client components import this file, which
+ * stays free of lib/alds.
+ */
+export function primarySubtag(tag: string): string {
+  return tag.split("-")[0].toLowerCase();
+}
+
+/**
+ * The slot a declared language suggests (ADR 0016 step 5): the tag itself when
+ * it is a supported code, else its primary subtag when that is, else null.
+ */
+export function suggestLanguageSlot(declared: string | null | undefined): LanguageCode | null {
+  if (!declared) return null;
+  const tag = declared.trim();
+  if (isSupportedLanguage(tag)) return tag;
+  const primary = primarySubtag(tag);
+  return isSupportedLanguage(primary) ? primary : null;
+}
+
+/** The display name a declared language suggests (ADR 0016 step 5). */
+export function suggestDisplayName(declared: string | null | undefined): string | null {
+  return declared?.toLowerCase() === "hi-latn" ? "Hinglish" : null;
+}
+
+/**
+ * What a validation knows of the slot a package is going to. `chosen`: an
+ * explicit language, or the language of the package being replaced.
+ * `newCourse`: no course was named. `takenLanguages`: the course's labelled
+ * package languages, nulls excluded.
+ */
+export type DeclaredLanguageTarget = {
+  chosen: string | null;
+  newCourse: boolean;
+  takenLanguages: readonly string[];
+};
+
+/**
+ * The slot the `declared-language` validator row compares against (ADR 0016
+ * step 8): (i) the chosen slot when one was chosen; (ii) on a new course, the
+ * slot the upload's default takes; (iii) on an existing course, the slot an
+ * untouched upload dialog stands at, which is the suggestion when the course
+ * does not hold it and `en` otherwise.
+ */
+export function declaredLanguageRowSlot(
+  declared: string | null | undefined,
+  target: DeclaredLanguageTarget
+): { slot: string; source: "chosen" | "default" } {
+  if (typeof target.chosen === "string") return { slot: target.chosen, source: "chosen" };
+  const suggested = suggestLanguageSlot(declared);
+  if (target.newCourse) return { slot: suggested ?? "en", source: "default" };
+  if (suggested !== null && !target.takenLanguages.includes(suggested)) {
+    return { slot: suggested, source: "default" };
+  }
+  return { slot: "en", source: "default" };
 }

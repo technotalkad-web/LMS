@@ -11,6 +11,7 @@
  *     xAPI structural lint strict LRSs apply
  *   - with migration 0078: the sweeper derives LMS events (launched, XP …)
  *     and the "raw" profile forwards verbatim
+ *   - ADR 0016 step 17: a forwarded `responded` statement carries the display
  */
 import http from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -126,7 +127,7 @@ test("LRS analytics profile: enriched copy, raw internal, lint-clean delivery, d
       extensions: { "https://w3id.org/xapi/cmi5/context/extensions/sessionid": randomUUID() },
       contextActivities: { category: [{ id: "https://w3id.org/xapi/cmi5/context/categories/cmi5" }] },
     };
-    const ids = [randomUUID(), randomUUID(), randomUUID()];
+    const ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
     const res = await fetch(`${baseURL}/api/xapi/statements`, {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-experience-api-version": "1.0.3" },
@@ -134,6 +135,7 @@ test("LRS analytics profile: enriched copy, raw internal, lint-clean delivery, d
         { id: ids[0], actor, verb: { id: "http://adlnet.gov/expapi/verbs/experienced" }, object: { id: `${auId}/3`, definition: { name: { "en-US": "Slide three" } } }, context: ctx, timestamp: new Date().toISOString() },
         { id: ids[1], actor, verb: { id: "http://adlnet.gov/expapi/verbs/answered" }, object: { id: `${auId}/3_q_k1`, definition: { interactionType: "choice", correctResponsesPattern: ["b"], choices: [{ id: "a", description: { "en-US": "A" } }, { id: "b", description: { "en-US": "B" } }] } }, result: { success: false, response: "a" }, context: ctx, timestamp: new Date().toISOString() },
         { id: ids[2], actor, verb: { id: "http://adlnet.gov/expapi/verbs/failed" }, object: { id: auId }, result: { score: { scaled: 0.4, raw: 4, max: 10, min: 0 }, success: false, completion: true, duration: "PT9M" }, context: ctx, timestamp: new Date().toISOString() },
+        { id: ids[3], actor, verb: { id: "http://adlnet.gov/expapi/verbs/responded" }, object: { id: `${auId}/16_q1`, definition: { interactionType: "likert" } }, result: { response: "likert_3" }, context: ctx, timestamp: new Date().toISOString() },
       ]),
     });
     expect(res.status, "our LRS accepts the statements").toBe(200);
@@ -150,7 +152,7 @@ test("LRS analytics profile: enriched copy, raw internal, lint-clean delivery, d
     // Outbox: enriched copy.
     await new Promise((r) => setTimeout(r, 1500));
     const { data: outbox } = await db.from("lrs_forward_outbox").select("statement_id, payload, status").eq("organization_id", org.id);
-    expect(outbox!.length).toBe(3);
+    expect(outbox!.length).toBe(4);
     type Stmt = { actor: Record<string, unknown>; object: { id: string; definition?: Record<string, unknown> }; result?: Record<string, unknown>; context: { registration?: string; language?: string; extensions: Record<string, unknown>; contextActivities: { parent?: Array<{ id: string }>; grouping?: Array<{ id: string }>; category?: Array<{ id: string }> } } };
     const ans = outbox!.find((r) => r.statement_id === ids[1])!.payload as Stmt;
     expect(ans.actor.mbox).toBe(`mailto:${learner.email.toLowerCase()}`);
@@ -173,10 +175,12 @@ test("LRS analytics profile: enriched copy, raw internal, lint-clean delivery, d
     const fail = outbox!.find((r) => r.statement_id === ids[2])!.payload as Stmt;
     expect(fail.object.id).toBe(`${NS}activities/course/${course!.id}`);
     expect(fail.result?.score).toMatchObject({ scaled: 0.4, raw: 4, max: 10 });
+    const feedback = outbox!.find((r) => r.statement_id === ids[3])!.payload as { verb: { display?: Record<string, string> } };
+    expect(feedback.verb.display).toEqual({ "en-US": "responded" });
     for (const row of outbox!) expect(lintStatement(row.payload), `lint ${row.statement_id}`).toEqual([]);
 
     // Delivery: mock holds the enriched copy under the same ids.
-    if (mock.received.length < 3) await drain(baseURL!);
+    if (mock.received.length < 4) await drain(baseURL!);
     for (const id of ids) {
       const got = mock.received.find((s) => s.id === id) as Stmt | undefined;
       expect(got, `mock received ${id}`).toBeTruthy();

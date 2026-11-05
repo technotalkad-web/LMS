@@ -60,6 +60,7 @@ engine version are extensions, never part of the id.
 | --- | --- | --- |
 | `adlnet…/launched` | LMS (derived) | an attempt started (SCORM, cmi5 and xAPI alike) |
 | `adlnet…/initialized`, `experienced`, `progressed`, `answered`, `completed`, `passed`, `failed`, `terminated` | engine (enriched) / SCORM translation | as today |
+| `adlnet…/responded` | engine (enriched) | a feedback or survey item answered; no `result.success`, no key (KIVO Release A, D-7 (b)) |
 | `w3id…/adl/verbs/abandoned` | LMS | attempt abandoned (force-restart, dedupe) |
 | `adlnet…/completed` on a path step / journey day | LMS | step / day done |
 | `w3id…/adl/verbs/satisfied` on a path / journey | LMS | learning path or journey fully completed |

@@ -4,7 +4,12 @@ import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { ThumbnailPicker } from "../../_components/thumbnail-picker";
-import { SUPPORTED_LANGUAGES, languageDisplay } from "@/lib/i18n/languages";
+import {
+  SUPPORTED_LANGUAGES,
+  languageDisplay,
+  suggestDisplayName,
+  suggestLanguageSlot,
+} from "@/lib/i18n/languages";
 import {
   ValidationReportPanel,
   rejectValidation,
@@ -49,37 +54,69 @@ export default function CourseUploadPage() {
     posY: number;
   }>({ fit: "cover", posX: 50, posY: 50 });
 
-  // Language mapping. New course: the package's language (default English)
-  // + optional label. New version: which existing language package this zip
-  // replaces, or "add as a new language" to create another variant.
+  // Language mapping. New course: the package's language (English until the
+  // report arrives, then the slot its declared language suggests, ADR 0016
+  // step 6) + optional label. New version: which existing language package this
+  // zip replaces, or "add as a new language" to create another variant.
   const [language, setLanguage] = useState<string>("en");
   const [displayName, setDisplayName] = useState("");
+  // The admin changed a language select, since the last reset (ADR 0016 step 6).
+  const [languageTouched, setLanguageTouched] = useState(false);
+  // The declared language behind a suggestion this dialog applied, for the hint.
+  const [suggestedFrom, setSuggestedFrom] = useState<string | null>(null);
   const [packages, setPackages] = useState<PackageRow[] | null>(null);
   // "" = new language (uses the language select); otherwise a package id.
   const [targetPackageId, setTargetPackageId] = useState<string>("");
+  // "Upload another" reads the list again: the last upload may have created a slot.
+  const [packagesRead, setPackagesRead] = useState(0);
   useEffect(() => {
     if (!targetCourseId) return;
     let cancelled = false;
     (async () => {
       const res = await fetch(
         `/api/courses/${targetCourseId}/packages?orgSlug=${encodeURIComponent(orgSlug)}`
-      );
-      const j = (await res.json().catch(() => ({}))) as { packages?: PackageRow[] };
+      ).catch(() => null);
+      const j = (res ? await res.json().catch(() => ({})) : {}) as { packages?: PackageRow[] };
       if (cancelled) return;
-      const rows = res.ok && Array.isArray(j.packages) ? j.packages : [];
-      setPackages(rows);
+      const read = res?.ok && Array.isArray(j.packages) ? j.packages : null;
+      // A failed first read leaves an empty list; a failed re-read keeps the one the page has.
+      setPackages((prev) => read ?? (packagesRead === 0 ? [] : prev));
+      const rows = read ?? [];
       // Default to the unlabeled legacy package if there is one, else the
-      // first (usually only) language package.
+      // first (usually only) language package. Only the first read sets it: a
+      // re-read leaves the target where the admin put it.
       const def = rows.find((r) => r.language === null) ?? rows[0];
-      if (def) setTargetPackageId(def.id);
+      if (def && packagesRead === 0) setTargetPackageId(def.id);
     })();
     return () => {
       cancelled = true;
     };
-  }, [targetCourseId, orgSlug]);
+  }, [targetCourseId, orgSlug, packagesRead]);
   const existingLanguages = new Set(
     (packages ?? []).map((p) => p.language).filter((l): l is string => !!l)
   );
+
+  function changeLanguage(code: string) {
+    setLanguageTouched(true);
+    setLanguage(code);
+  }
+
+  // The dialog stands where it started for the next package: what it wrote
+  // itself goes, and a label the admin typed stays.
+  function resetLanguageChoice() {
+    setLanguage("en");
+    if (displayName === suggestDisplayName(suggestedFrom)) setDisplayName("");
+    setSuggestedFrom(null);
+    setLanguageTouched(false);
+  }
+
+  // A cancelled or failed accept: what the dialog wrote goes, so the next package
+  // gets its own suggestion, and a slot or label the admin chose stays for the retry.
+  function clearOwnSuggestion() {
+    if (!languageTouched) setLanguage("en");
+    if (displayName === suggestDisplayName(suggestedFrom)) setDisplayName("");
+    setSuggestedFrom(null);
+  }
 
   // Phase 1: validate the package and show the quality report.
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -111,11 +148,30 @@ export default function CourseUploadPage() {
     const v = await validateUnzipped(pkg, orgSlug, {
       courseId: targetCourseId,
       packageId: targetCourseId && targetPackageId ? targetPackageId : null,
+      // An untouched select sends no slot: the route applies this dialog's own
+      // rule, so the stored row and the select agree (ADR 0016 step 8).
+      language: languageControlsApply && languageTouched ? language : null,
     });
     if (!v.ok) {
       setState({ kind: "error", message: v.error });
       return;
     }
+    // ADR 0016 step 6: preselect and prefill from the declared language. A slot
+    // the package list showed as held when this validation started is never preselected.
+    // Nothing is written until Accept & Upload, and the admin may change both in the report phase.
+    const declared = v.result.report.package.declaredLanguage ?? null;
+    const slot = suggestLanguageSlot(declared);
+    const name = suggestDisplayName(declared);
+    let applied = false;
+    if (languageControlsApply && slot && !languageTouched && !(isNewVersion && existingLanguages.has(slot))) {
+      setLanguage(slot);
+      applied = true;
+    }
+    if (languageControlsApply && name && displayName.trim() === "") {
+      setDisplayName(name);
+      applied = true;
+    }
+    setSuggestedFrom(applied ? declared : null);
     setState({ kind: "report", file, pkg, result: v.result, uploading: false });
   }
 
@@ -124,6 +180,7 @@ export default function CourseUploadPage() {
   // has arrived.
   async function acceptAndUpload(fields: { validation_id: string; acknowledge: boolean }) {
     if (state.kind !== "report") return;
+    if (slotTaken) return;
     const { file, pkg } = state;
     setState({ ...state, uploading: true });
     const controller = new AbortController();
@@ -158,6 +215,7 @@ export default function CourseUploadPage() {
           : language,
       });
     } catch (err) {
+      clearOwnSuggestion();
       const cancelled = (err as { name?: string })?.name === "AbortError";
       setState({
         kind: "error",
@@ -171,10 +229,17 @@ export default function CourseUploadPage() {
   async function rejectPackage() {
     if (state.kind !== "report") return;
     await rejectValidation(state.result.validation_id, orgSlug);
+    resetLanguageChoice();
     setState({ kind: "idle" });
   }
 
   const isNewVersion = !!targetCourseId;
+  // The language controls decide a slot only for a new package. Before an
+  // existing course's package list answers, its taken slots are not known.
+  const languageControlsApply = !isNewVersion || (targetPackageId === "" && packages !== null);
+  // A new language on a slot the dialog's package list shows as held would land as a
+  // new version of that package, so Accept stays off until the select moves. Reject stays usable.
+  const slotTaken = isNewVersion && languageControlsApply && existingLanguages.has(language);
 
   return (
     <div className="max-w-2xl">
@@ -210,14 +275,51 @@ export default function CourseUploadPage() {
       {state.kind === "uploading" ? (
         <UploadProgressBar progress={state.progress} fileName={state.filename} onCancel={aborter ? () => aborter.abort() : undefined} />
       ) : state.kind === "report" ? (
-        <ValidationReportPanel
-          fileName={state.file.name}
-          result={state.result}
-          busy={state.uploading}
-          onAccept={acceptAndUpload}
-          onReject={rejectPackage}
-          orgSlug={orgSlug}
-        />
+        <>
+          {languageControlsApply && (
+            <div className="border border-line rounded-lg bg-paper p-8 mb-6">
+              <label className="block text-sm font-medium mb-2" htmlFor={isNewVersion ? "new-language" : "package-language"}>
+                {isNewVersion ? "New language slot" : "Language slot"}
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <LanguageSelect
+                  id={isNewVersion ? "new-language" : "package-language"}
+                  value={language}
+                  onChange={changeLanguage}
+                  disabledCodes={isNewVersion ? existingLanguages : undefined}
+                  disabled={state.uploading}
+                />
+                <DisplayLabelInput value={displayName} onChange={setDisplayName} disabled={state.uploading} />
+              </div>
+              {suggestedFrom && language === suggestLanguageSlot(suggestedFrom) ? (
+                <p className="text-xs text-muted mt-2">
+                  Suggested from the package&apos;s declared language <code>{suggestedFrom}</code>. Change it
+                  if that is not right.
+                </p>
+              ) : suggestedFrom && displayName === suggestDisplayName(suggestedFrom) ? (
+                <p className="text-xs text-muted mt-2">
+                  The label is suggested from the package&apos;s declared language <code>{suggestedFrom}</code>; the
+                  slot is not, so check it.
+                </p>
+              ) : null}
+              {slotTaken && (
+                <p className="text-sm text-red-700 mt-2">
+                  This course already has a package in that language. Choose a language it does not hold, or reject
+                  this report and choose that package as the one to replace.
+                </p>
+              )}
+            </div>
+          )}
+          <ValidationReportPanel
+            fileName={state.file.name}
+            result={state.result}
+            busy={state.uploading}
+            acceptDisabled={slotTaken}
+            onAccept={acceptAndUpload}
+            onReject={rejectPackage}
+            orgSlug={orgSlug}
+          />
+        </>
       ) : state.kind === "success" ? (
         <div className="border border-line rounded-lg bg-paper p-8">
           <h2 className="serif text-3xl mb-2">
@@ -258,7 +360,11 @@ export default function CourseUploadPage() {
             </button>
             <button
               type="button"
-              onClick={() => setState({ kind: "idle" })}
+              onClick={() => {
+                resetLanguageChoice();
+                setPackagesRead((n) => n + 1);
+                setState({ kind: "idle" });
+              }}
               className="px-4 py-2 border border-line rounded-lg font-medium hover:border-ink text-sm"
             >
               Upload another
@@ -298,7 +404,7 @@ export default function CourseUploadPage() {
                 id="target-package"
                 value={targetPackageId}
                 onChange={(e) => setTargetPackageId(e.target.value)}
-                disabled={packages === null}
+                disabled={packages === null || state.kind === "validating"}
                 className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
               >
                 {(packages ?? []).map((p) => (
@@ -311,18 +417,13 @@ export default function CourseUploadPage() {
               {targetPackageId === "" && (
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <LanguageSelect
+                    id="new-language"
                     value={language}
-                    onChange={setLanguage}
+                    onChange={changeLanguage}
                     disabledCodes={existingLanguages}
+                    disabled={state.kind === "validating"}
                   />
-                  <input
-                    type="text"
-                    value={displayName}
-                    onChange={(e) => setDisplayName(e.target.value)}
-                    maxLength={80}
-                    placeholder="Display label (optional)"
-                    className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
-                  />
+                  <DisplayLabelInput value={displayName} onChange={setDisplayName} disabled={state.kind === "validating"} />
                 </div>
               )}
               <p className="text-xs text-muted mt-2">
@@ -337,15 +438,8 @@ export default function CourseUploadPage() {
                 Package language
               </label>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <LanguageSelect id="package-language" value={language} onChange={setLanguage} />
-                <input
-                  type="text"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  maxLength={80}
-                  placeholder="Display label (optional)"
-                  className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
-                />
+                <LanguageSelect id="package-language" value={language} onChange={changeLanguage} disabled={state.kind === "validating"} />
+                <DisplayLabelInput value={displayName} onChange={setDisplayName} disabled={state.kind === "validating"} />
               </div>
               <p className="text-xs text-muted mt-2">
                 The language of the content inside this zip. Other languages
@@ -397,7 +491,7 @@ export default function CourseUploadPage() {
 
           <button
             type="submit"
-            disabled={state.kind === "validating"}
+            disabled={state.kind === "validating" || (isNewVersion && packages === null)}
             className="w-full px-4 py-3 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
           >
             {state.kind === "validating"
@@ -438,18 +532,21 @@ function LanguageSelect({
   value,
   onChange,
   disabledCodes,
+  disabled,
 }: {
   id?: string;
   value: string;
   onChange: (code: string) => void;
   /** Languages the course already has (can't be added twice). */
   disabledCodes?: Set<string>;
+  disabled?: boolean;
 }) {
   return (
     <select
       id={id}
       value={value}
       onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
       className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
     >
       {SUPPORTED_LANGUAGES.map((l) => {
@@ -461,5 +558,27 @@ function LanguageSelect({
         );
       })}
     </select>
+  );
+}
+
+function DisplayLabelInput({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  onChange: (label: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <input
+      type="text"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
+      maxLength={80}
+      placeholder="Display label (optional)"
+      className="w-full px-3 py-2 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink"
+    />
   );
 }

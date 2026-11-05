@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadEnrolledCourseStatus, userCourseKey } from "@/lib/scoring/status";
 import { fetchCourseRevisitSummary } from "@/lib/attempts/revision-visits";
+import { fetchInteractionLabels, mergeInteractionLabels, missingLabelIds } from "@/lib/interactions/labels";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
@@ -182,7 +183,15 @@ export default async function CourseReportsPage({
     response: string;
     freq: number;
   };
-  const interactions = (interactionRows ?? []) as InteractionRow[];
+  // ADR 0016 step 13: the matview labels a question from name->>'en-US' only,
+  // so a non-English course's rows arrive with a null label. Those are read
+  // from the course's answered statements; the id stays the renderer's fallback.
+  const breakdown = (interactionRows ?? []) as InteractionRow[];
+  const missingLabels = missingLabelIds(breakdown);
+  const labels = missingLabels.length
+    ? await fetchInteractionLabels(svc, versionIds, missingLabels)
+    : new Map<string, string>();
+  const interactions = mergeInteractionLabels(breakdown, labels);
   const topWrongByInteraction = new Map<string, WrongRow[]>();
   for (const w of (topWrongRows ?? []) as WrongRow[]) {
     const list = topWrongByInteraction.get(w.interaction_id) ?? [];

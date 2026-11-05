@@ -19,8 +19,8 @@
 
 export const XAPI_NS = "https://ambak.com/xapi/";
 // 1.1.0 (ADR 0014 step 7): adds attempt/launch-mode (`Review` on a revision
-// visit's statements) and attempt/scored = false on them; an addition, so no
-// LRS history splits.
+// visit's statements) and attempt/scored = false on them. ADR 0016 step 14 lists
+// the `responded` verb under the same version. Additions, so no LRS history splits.
 export const PROFILE_VERSION = "1.1.0";
 /** Category context activity that tags every enriched statement. */
 export const PROFILE_ACTIVITY_ID = `${XAPI_NS}profile/v1`;
@@ -75,6 +75,8 @@ export const verb = {
   initialized: "http://adlnet.gov/expapi/verbs/initialized",
   experienced: "http://adlnet.gov/expapi/verbs/experienced",
   answered: "http://adlnet.gov/expapi/verbs/answered",
+  // A feedback or survey item answered: no result.success, no key (ADR 0016 step 14).
+  responded: "http://adlnet.gov/expapi/verbs/responded",
   progressed: "http://adlnet.gov/expapi/verbs/progressed",
   completed: "http://adlnet.gov/expapi/verbs/completed",
   passed: "http://adlnet.gov/expapi/verbs/passed",
@@ -95,6 +97,7 @@ export const verbDisplay: Record<string, string> = {
   [verb.initialized]: "initialized",
   [verb.experienced]: "experienced",
   [verb.answered]: "answered",
+  [verb.responded]: "responded",
   [verb.progressed]: "progressed",
   [verb.completed]: "completed",
   [verb.passed]: "passed",

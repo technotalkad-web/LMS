@@ -30,6 +30,8 @@ export type ValidationReport = {
     sizeBytes: number;
     fileCount: number;
     tool: string | null;
+    /** ADR 0016 step 4: the language the package declares. Stored reports older than it have no key. */
+    declaredLanguage?: string | null;
   };
   /** 'blocked' = the module already belongs to another course in the org (ADR 0004 step 3). */
   verdict: "pass" | "warning" | "fail" | "unplayable" | "blocked";
@@ -124,6 +126,7 @@ export function ValidationReportPanel({
   fileName,
   result,
   busy,
+  acceptDisabled = false,
   onAccept,
   onReject,
   orgSlug,
@@ -131,6 +134,8 @@ export function ValidationReportPanel({
   fileName: string;
   result: ValidationResult;
   busy: boolean;
+  /** Holds Accept off while Reject stays usable. Off unless a caller sets it. */
+  acceptDisabled?: boolean;
   /** Called with the form fields to append to the real upload. */
   onAccept: (fields: { validation_id: string; acknowledge: boolean }) => void;
   onReject: () => void;
@@ -266,7 +271,7 @@ export function ValidationReportPanel({
         ) : (
           <button
             type="button"
-            disabled={busy || (needsAck && !acked)}
+            disabled={busy || acceptDisabled || (needsAck && !acked)}
             onClick={() =>
               onAccept({
                 validation_id: result.validation_id,

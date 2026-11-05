@@ -49,6 +49,8 @@ Note (2026-10-18, on condition (a) of the Acceptance line above; the line is not
 
 Note (2026-10-21, ADR 0014; a pointer, not an edit): the cutover flag of ADR 0014 step 3 (`flag_revision_attempt`, a conditional update at launch on the learner's own in-progress row) and the stale-revision close of the same step (a conditional abandon of an `is_revision` row on a non-current version) are app flows under decision 1's note, not the attempt surgery decision 4 excludes; no row is rewritten or deleted. The Consequence "the LMS keeps `registration = attempt id`" is unchanged: a revision visit's registration is its own row's id, re-seeded from the official attempt at every launch (ADR 0014 step 3), and `Review` is now minted (ADR 0006 note (l)).
 
+Note (2026-10-21, ADR 0016 step 9): the decision stands, no `hi-Latn` slot code; ADR 0016 adds code that reads the package's declared language at upload, suggests the `hi` slot for `hi-Latn` and prefills `display_name = 'Hinglish'` for the admin to confirm, which goes beyond the wording 'an L&D action, not code' of decision 6 while keeping the relabel an L&D confirmation.
+
 ## References
 
 - `docs/ambak-learning-data-standard/BLUEPRINT.md` §0, §1.5, §2, §3, §5, §6, §8, §9, §10

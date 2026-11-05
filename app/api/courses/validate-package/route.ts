@@ -9,16 +9,19 @@ import { validateStoredVersion } from "@/lib/courses/validation/validate-stored"
 import { applyIntegrity, checkIntegrity, type IntegrityFindings } from "@/lib/courses/validation/integrity";
 import { isReadyVersion } from "@/lib/courses/default-rule";
 import { auditLog } from "@/lib/auth/require-platform-owner";
+import { isSupportedLanguage } from "@/lib/i18n/languages";
 
 /**
  * Pre-Upload Package Validation — phase 1 of the quality gate.
  *
  *   POST /api/courses/validate-package
- *     multipart/form-data { file, orgSlug, courseId?, packageId? }
+ *     multipart/form-data { file, orgSlug, courseId?, packageId?, language? }
  *       → runs the static validator and the org-scoped content-integrity
  *         lookup (ADR 0004 step 2: courseId = the course being uploaded into,
  *         excluded from the lookup; packageId = the language slot being
- *         replaced, for the same-slot warning), stores a 'pending'
+ *         replaced, for the same-slot warning; ADR 0016 step 8: language = the
+ *         slot chosen for a new package, which the declared-language row
+ *         compares against, 400 when unsupported), stores a 'pending'
  *         package_validations row (verdict 'blocked' on a cross-course
  *         collision), returns { validation_id, report }.
  *     application/json { action: "reject", orgSlug, validation_id }
@@ -179,6 +182,7 @@ export async function POST(request: NextRequest) {
         id: string;
         version_number: number;
         storage_prefix: string;
+        package_id: string;
         upload_status?: string | null;
       }>).find((v) => isReadyVersion(v.upload_status));
       if (!version?.storage_prefix) {
@@ -188,7 +192,20 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const report = await validateStoredVersion(version.storage_prefix);
+      // ADR 0016 step 8: the declared-language row compares against the language
+      // of the package this version sits in. When that is not known (a failed
+      // read, or a legacy unlabelled package) the course's languages give the
+      // upload dialog's rule; informational, never a block.
+      const { data: packageRow } = await auth.supabase
+        .from("course_packages")
+        .select("language")
+        .eq("id", version.package_id)
+        .maybeSingle();
+      const chosen = (packageRow as { language: string | null } | null)?.language ?? null;
+      const takenLanguages = chosen === null ? await readCourseLanguages(auth.supabase, course.id) : [];
+      const report = await validateStoredVersion(version.storage_prefix, {
+        target: { chosen, newCourse: false, takenLanguages },
+      });
       // Content is already live for learners, so the row records an audit
       // (status accepted), not a pending gate decision. Written by the server
       // after the admin check (ADR 0008 C: package_validations is written by
@@ -274,8 +291,15 @@ export async function POST(request: NextRequest) {
   };
   const courseId = field("courseId");
   const packageId = field("packageId");
+  const languageField = field("language");
   if (packageId && !courseId) {
     return NextResponse.json({ error: "packageId requires courseId" }, { status: 400 });
+  }
+  if (languageField && !isSupportedLanguage(languageField)) {
+    return NextResponse.json(
+      { error: `Unsupported language code "${languageField}"` },
+      { status: 400 }
+    );
   }
   if (courseId) {
     const { data: c } = await auth.supabase
@@ -286,18 +310,27 @@ export async function POST(request: NextRequest) {
       .maybeSingle();
     if (!c) return NextResponse.json({ error: "Course not found" }, { status: 404 });
   }
+  let packageLanguage: string | null = null;
   if (packageId) {
     const { data: p } = await auth.supabase
       .from("course_packages")
-      .select("id")
+      .select("id, language")
       .eq("id", packageId)
       .eq("course_id", courseId!)
       .maybeSingle();
     if (!p) return NextResponse.json({ error: "Package not found on this course" }, { status: 404 });
+    packageLanguage = (p as { language: string | null }).language;
   }
 
   const zipBytes = new Uint8Array(await file.arrayBuffer());
-  let report = await validatePackage(zipBytes);
+  // ADR 0016 step 8: what the declared-language row compares against. The
+  // replaced package's language or the chosen slot; with neither, on an
+  // existing course, the course's languages give the upload dialog's rule.
+  const chosen = packageId ? packageLanguage : languageField;
+  const takenLanguages = courseId && chosen === null ? await readCourseLanguages(auth.supabase, courseId) : [];
+  let report = await validatePackage(zipBytes, {
+    target: { chosen, newCourse: !courseId, takenLanguages },
+  });
   if (report.verdict !== "unplayable" && report.package.identity) {
     try {
       const findings = await checkIntegrity(serviceClient(), {
@@ -368,6 +401,28 @@ function serviceClient() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+}
+
+/**
+ * The course's labelled package languages, for the declared-language row (ADR
+ * 0016 step 8). Fail-soft: a failed read gives an empty list, which is also what
+ * the upload dialog holds when its own package list fails to load.
+ */
+async function readCourseLanguages(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  courseId: string
+): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("course_packages")
+    .select("language")
+    .eq("course_id", courseId);
+  if (error) {
+    console.warn(JSON.stringify({ event: "course_languages_read_failed", course_id: courseId }));
+    return [];
+  }
+  return ((data ?? []) as Array<{ language: string | null }>)
+    .map((r) => r.language)
+    .filter((l): l is string => !!l);
 }
 
 async function requireAdmin(orgSlug: string): Promise<

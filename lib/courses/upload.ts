@@ -1,8 +1,10 @@
 import { lookup as lookupMime } from "mime-types";
 import { parseManifestFromZip } from "./manifest/detect";
+import { declaredLanguageOf } from "./manifest/parse-xml";
 import { countUnitsInZip } from "./units";
 import { activeStorageDriver, getStorage } from "@/lib/storage";
 import { sanitizeStorageKey } from "@/lib/storage/keys";
+import { suggestLanguageSlot } from "@/lib/i18n/languages";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { ParsedManifest } from "./manifest/types";
 import { packageIdentity, type PackageIdentity } from "./validation/integrity";
@@ -29,9 +31,10 @@ export interface UploadResult {
  * Multi-language note (#158): course_versions.package_id is NOT NULL since
  * migration 0030. Callers that have already created the target course_packages
  * row pass `packageId` directly. Callers that don't (legacy single-language
- * upload path, brand-new course creation) get the NULL-language default
- * package auto-resolved / auto-created so the insert always has a valid
- * package_id. Version numbers sequence per-package, not per-course, so that
+ * upload path on an existing course) get the NULL-language default package
+ * auto-resolved / auto-created so the insert always has a valid package_id;
+ * a brand-new course gets a labelled package (see `language` below). Version
+ * numbers sequence per-package, not per-course, so that
  * uploading v3 of the English variant doesn't make Hindi skip from v1 to v4.
  *
  * Reserve-first (ADR 0003 step 8a): the version row is inserted as
@@ -48,7 +51,10 @@ export async function uploadCoursePackage(opts: {
   /**
    * Language of the package (ISO 639-1 / BCP-47 from SUPPORTED_LANGUAGES).
    * Resolves (or creates) the course's package for that language when no
-   * packageId is given. Omitted = legacy NULL-language default package.
+   * packageId is given. Omitted on a new course: the declared language's slot
+   * when the package declares a supported tag or subtag, else English (ADR 0016
+   * step 7). Omitted on an existing course = legacy NULL-language default
+   * package, so the default never applies to the callers that pass courseId.
    */
   language?: string | null;
   displayName?: string | null;
@@ -64,11 +70,17 @@ export async function uploadCoursePackage(opts: {
     opts.courseId ??
     (await createCourseFromManifest(supabase, { organizationId, uploaderId, manifest }));
 
-  // 3) Resolve the target package + next version number.
+  // 3) Resolve the target package + next version number. ADR 0016 step 7: a new
+  //    course without a language takes the declared language's slot, else
+  //    English; an explicit language always wins.
+  const language =
+    !opts.courseId && opts.language == null
+      ? (suggestLanguageSlot(declaredLanguageOf(manifest)) ?? "en")
+      : opts.language;
   const packageId = await resolveTargetPackage(supabase, {
     courseId,
     packageId: opts.packageId,
-    language: opts.language,
+    language,
     displayName: opts.displayName,
     existingCourse: !!opts.courseId,
   });
@@ -137,7 +149,9 @@ export async function uploadCoursePackage(opts: {
     // lookup matches on (manifest ids + the launch file's KIVO activity id).
     const identity = packageIdentity(manifest, await launchHtmlFromZip(zip, manifest.launchUrl));
     await markVersionReady(svc, version.id, {
-      manifest_data: manifestData(manifest, unitCount, identity),
+      // ADR 0016 step 2: the marker goes with the count, a null included:
+      // countUnitsInZip answers null only after looking.
+      manifest_data: manifestData(manifest, unitCount, identity, 2),
       file_count: files.length,
     });
   } catch (e) {
@@ -207,7 +221,8 @@ export function storagePrefixFor(courseId: string, packageId: string, versionNum
 export function manifestData(
   manifest: ParsedManifest,
   unitCount: number | null,
-  identity?: PackageIdentity
+  identity?: PackageIdentity,
+  unitCountAlgo?: number
 ) {
   return {
     title: manifest.title,
@@ -215,6 +230,7 @@ export function manifestData(
     masteryScore: manifest.masteryScore ?? null,
     raw: manifest.raw,
     unitCount,
+    ...(unitCountAlgo !== undefined ? { unitCountAlgo } : {}),
     ...(identity ? { identity } : {}),
   };
 }
@@ -285,7 +301,8 @@ export async function createCourseFromManifest(
  * Resolve the course_packages row a new version belongs to. If the caller
  * passed one, use it directly (the multi-language POST /packages route does
  * this). Otherwise reuse/create the package for `language`, else the
- * NULL-language default package (created for brand-new courses). Migration
+ * NULL-language default package (the legacy path on an existing course; a
+ * brand-new course always arrives with a language, ADR 0016 step 7). Migration
  * 0030 enforces course_versions.package_id NOT NULL, so this MUST resolve
  * before the version insert.
  */

@@ -28,6 +28,16 @@ export function parseManifestXml(fileName: string, xml: string): ParsedManifest 
 }
 
 /**
+ * The language a package declares (ADR 0016 step 3): `raw.lang` as the cmi5 and
+ * TinCan parsers keep it, null when absent. One reader, so that every caller
+ * reads the key the same way. The SCORM parser keeps no such key.
+ */
+export function declaredLanguageOf(manifest: ParsedManifest): string | null {
+  const lang = manifest.raw.lang;
+  return typeof lang === "string" && lang.length > 0 ? lang : null;
+}
+
+/**
  * Pick the manifest file a package should be parsed with, from its file
  * list. Root-level first, then any depth; cmi5 wins over SCORM over TinCan,
  * matching parseManifestFromZip.

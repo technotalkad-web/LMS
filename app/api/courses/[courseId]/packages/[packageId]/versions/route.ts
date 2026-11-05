@@ -123,7 +123,7 @@ export async function POST(
   // ---- Verify the package belongs to this course ----
   const { data: pkg } = await svc
     .from("course_packages")
-    .select("id, course_id")
+    .select("id, course_id, language")
     .eq("id", packageId)
     .eq("course_id", courseId)
     .maybeSingle();
@@ -147,6 +147,14 @@ export async function POST(
       typeof validationIdRaw === "string" && validationIdRaw ? validationIdRaw : null,
     acknowledge: form.get("acknowledge") === "1",
     packageId,
+    // ADR 0016 step 8: the declared-language row of an inline validation names
+    // the package the bytes go to. A legacy unlabelled package has no language
+    // to name, so the rule for no chosen slot applies.
+    target: {
+      chosen: (pkg as { language: string | null }).language,
+      newCourse: false,
+      takenLanguages: [],
+    },
   });
   if (!gate.ok) {
     // A 'blocked' package (ADR 0004 step 3) answers 409 with the validation_id
