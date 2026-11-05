@@ -166,8 +166,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      RCLONE_VERSION: v1.68.2
-      RCLONE_SHA256: 0e6fa18051e67fc600d803a2dcb10ddedb092247fc6eee61be97f64ec080a13c
+      # Never named RCLONE_*: rclone reads every flag from an RCLONE_<FLAG> variable, before
+      # any command runs, so a pin under that prefix can stop every rclone call in this job.
+      # Only the remotes' RCLONE_CONFIG_<remote>_<key> names carry that prefix.
+      PINNED_RCLONE_VERSION: v1.68.2
+      PINNED_RCLONE_SHA256: 0e6fa18051e67fc600d803a2dcb10ddedb092247fc6eee61be97f64ec080a13c
     steps:
       - name: Check secrets
         env:
@@ -319,12 +322,12 @@ jobs:
       - name: Install rclone (pinned release, sha256-verified)
         run: |
           set -euo pipefail
-          zip="rclone-${RCLONE_VERSION}-linux-amd64.zip"
-          curl -fsSL -o "$RUNNER_TEMP/$zip" "https://downloads.rclone.org/${RCLONE_VERSION}/$zip"
-          echo "${RCLONE_SHA256}  $RUNNER_TEMP/$zip" | sha256sum -c -
+          zip="rclone-${PINNED_RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$zip" "https://downloads.rclone.org/${PINNED_RCLONE_VERSION}/$zip"
+          echo "${PINNED_RCLONE_SHA256}  $RUNNER_TEMP/$zip" | sha256sum -c -
           unzip -q -o "$RUNNER_TEMP/$zip" -d "$RUNNER_TEMP"
           mkdir -p "$RUNNER_TEMP/bin"
-          install -m 0755 "$RUNNER_TEMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" "$RUNNER_TEMP/bin/rclone"
+          install -m 0755 "$RUNNER_TEMP/rclone-${PINNED_RCLONE_VERSION}-linux-amd64/rclone" "$RUNNER_TEMP/bin/rclone"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/rclone" version
 
