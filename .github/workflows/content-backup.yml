@@ -22,11 +22,15 @@
 # rclone writes only to a file on the runner (never to the log). The log
 # prints only counts. The job summary prints counts and, for each version
 # folder with a conflict, that folder's prefix,
-# courses/<course id>/<package id>/v<n>/ (opaque ids, printed so the owner
-# can match the folder to its course_versions row), with a count. File names
-# inside a folder, and keys outside a version folder, are never printed; to
-# see them, list the folder privately (an authenticated `rclone lsl` or the
-# B2 dashboard).
+# courses/<course id>/<package id>/v<n>/ (opaque uuids, printed so the owner
+# can match the folder to its course_versions row), or the test folder
+# courses/backup-drill/test/v1/, with a count. File names inside a folder, and
+# any other key, are never printed; to see them, list the folder privately (an
+# authenticated `rclone lsl` or the B2 dashboard). Both also carry, for a failure that is not a conflict, the
+# number of log lines per error class: an allowlist of fixed labels (HTTP
+# status, S3 API error name, Content-MD5, no such host, timeout, connection
+# refused, plus how many lines fit none of them), never a raw line, so nothing
+# read from the log can reach the output.
 #
 # Flags (ADR 0008 step 23 and the decision-3 budget note: B2's free tier
 # caps Class B and Class C transactions at 2,500 a day each, so nothing may
@@ -47,6 +51,13 @@
 #   --use-server-modtime  the age filter reads LastModified from the listing
 #                         instead of a HEAD per object (the filter also runs on
 #                         the destination listing)
+#   --s3-no-head          no HEAD after each object uploaded: one Class B call per
+#                         object, and one package may hold 5,000 files. rclone then
+#                         trusts the upload's 200. Size and, for a single-part
+#                         object, MD5 are compared the next night. An object uploaded
+#                         in parts is compared by size and the MD5 rclone stored from
+#                         the source, so only a drill naming its folder compares its
+#                         bytes.
 # Because the destination's LastModified is its copy time, a REAL copy
 # started within an hour of another real copy sees the objects the first
 # one wrote as absent and writes them again (a second locked version, no
@@ -59,21 +70,69 @@
 # instead, the hashes are not comparable: replace --checksum with
 # --size-only (ADR 0008 step 23).
 #
-# Required secrets (the job fails with a message naming any that are missing):
+# Restore drill: run the workflow by hand with restore_drill = true. The copy
+# does not run. Read-only on both sides: its only rclone commands are lsf and
+# check, which have no write path, and one copy whose destination is a folder
+# on the runner. It lists the whole bucket and the whole backup and fails on an
+# object missing from the backup or differing by size. Objects under an hour
+# old are not due yet, the copy's own --min-age rule, so they are counted and do
+# not fail it; an object only on the backup is counted too, because the copy
+# never deletes. Then it downloads one version folder from B2 to the runner and
+# compares it byte for byte with the live folder (rclone check --download), and
+# fails on any object that is missing or differs. It is a byte-level check of a
+# download, not a restored course: nothing is written back to the live bucket, no
+# course is launched from the restored files, and no database row is read. The
+# folder is drill_prefix, or failing that the one with most objects within the
+# budget below among folders whose listings agree. Empty bucket and backup: it
+# says so, passes, and says nothing was proven. Objects due and no folder that
+# could be compared: it fails. It prints counts and that one opaque folder prefix.
+# Budget against B2: one Class B call per object downloaded (a GET; an object
+# whose ETag is not an MD5, one uploaded in parts, adds a HEAD), so the job's own
+# choice stops at 500 objects and 1 GiB, and one Class C call per 1,000 objects
+# listed. A folder named in drill_prefix is the operator's choice and has no
+# ceiling: it spends the same Class B budget as the nightly copy. Only the one
+# folder is compared byte for byte; the others are compared by size.
+# File versions: the job's key can hide a file by name (writeFiles allows it). A
+# hidden file looks missing to lsf and check; its version remains, locked, and the
+# next night's copy writes the file again from the source.
+#
+# Preflight, on every run, before rclone is fetched, read-only, with the key the
+# copy uses: b2_authorize_account (v4), then b2_list_buckets with the bucket's name,
+# two more calls a run. The job fails, copying nothing, if the key holds
+# bypassGovernance, deleteFiles, deleteBuckets, writeBuckets, writeBucketRetentions,
+# writeFileRetentions, writeBucketLifecycleRules, writeKeys, deleteKeys or
+# shareFiles; lacks writeFiles, listFiles or readFiles; is not limited to exactly
+# the content bucket; has a name prefix; if the S3 endpoint is not
+# https://s3.<B2_REGION>.backblazeb2.com; or if the bucket's lock cannot be read, is
+# off, or has another default retention. Change EXPECT_RETENTION_MODE and
+# EXPECT_RETENTION_DAYS with the bucket's default retention. It prints one fixed
+# pass or fail line per check, and a status or an exit code, both numbers: never a
+# key, a token, an account id, a bucket name, a URL or an error body. Credentials
+# go to curl on stdin, and the token stays in that step's shell.
+#
+# Required secrets (the job fails with a message naming any that are missing).
+# Seven to set for this job:
 #   SUPABASE_S3_ENDPOINT           https://<project-ref>.storage.supabase.co/storage/v1/s3
 #   SUPABASE_S3_REGION             the production project's region, e.g. ap-south-1
 #   SUPABASE_S3_ACCESS_KEY_ID      production project → Storage → S3 access keys
 #   SUPABASE_S3_SECRET_ACCESS_KEY  (owner action: generate the key pair there)
 #   B2_CONTENT_BUCKET              the dedicated, Object-Locked content bucket
-#   B2_KEY_ID, B2_APPLICATION_KEY, B2_REGION   B2 account access (as backup.yml)
-# Optional: B2_CONTENT_KEY_ID + B2_CONTENT_APPLICATION_KEY, when the existing
-# B2 key is restricted to the dump bucket; they replace B2_KEY_ID /
-# B2_APPLICATION_KEY for this job.
+#   B2_CONTENT_KEY_ID              the job's own key, limited to that bucket
+#   B2_CONTENT_APPLICATION_KEY     (the preflight fails without it, see below)
+# And one backup.yml already uses:
+#   B2_REGION                      the region of the account's buckets
+# The job's key holds listBuckets, readBuckets, readBucketRetentions, listFiles,
+# readFiles, readFileRetentions and writeFiles. It is made through the API because
+# the console's Read and Write holds bypassGovernance, deleteFiles and more. The two
+# content names replace B2_KEY_ID and B2_APPLICATION_KEY for this job; without them
+# the job falls back to that key, and the preflight refuses it.
 #
-# Hardening: the secrets reach only the two steps that need them (the check
-# and the copy), the token has read-only scope, and rclone is a pinned
-# release verified against a pinned sha256 (taken from the vendor's
-# SHA256SUMS), never an install script piped into a root shell.
+# Hardening: the secrets reach only the steps that need them (the check, the
+# preflight, and whichever of the copy or the drill runs), the GitHub token has
+# read-only scope, drill_prefix is read from the event file because GitHub prints a
+# step's env in the public log, and is validated before any use, and rclone is a
+# pinned release verified against a pinned sha256 (taken from
+# the vendor's SHA256SUMS), never an install script piped into a root shell.
 name: Nightly content backup (Supabase Storage → B2)
 
 on:
@@ -85,6 +144,15 @@ on:
         description: "Rehearsal: rclone copy --dry-run with the nightly flags (nothing is copied; conflicts are still reported)"
         type: boolean
         default: false
+      restore_drill:
+        description: "Restore drill, read-only on both sides: compare the listings, then download one version folder from B2 and compare it byte for byte with the live folder. The copy does not run, so dry_run has no effect."
+        type: boolean
+        default: false
+      drill_prefix:
+        description: "Restore drill only, optional: the version folder to download, courses/<course id>/<package id>/v<n>/ or courses/backup-drill/test/v1/. Empty: the job chooses one. Ignored unless restore_drill is on."
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: content-backup
@@ -126,6 +194,128 @@ jobs:
             *) echo "::error title=content-backup misconfigured::SUPABASE_S3_ENDPOINT must look like https://<project-ref>.storage.supabase.co/storage/v1/s3"; exit 1 ;;
           esac
 
+      - name: Preflight the B2 key and the bucket's lock (read-only)
+        env:
+          # Change these two with the bucket's default retention.
+          EXPECT_RETENTION_MODE: governance
+          EXPECT_RETENTION_DAYS: "90"
+          B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
+          B2_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
+          B2_REGION: ${{ secrets.B2_REGION }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          failed=0
+          result() {
+            echo "$1"
+            echo "- $1" >> "$GITHUB_STEP_SUMMARY"
+            case "$1" in FAIL:*) failed=$((failed + 1)) ;; esac
+          }
+          finish() {
+            if [ "$failed" -ne 0 ]; then
+              echo "::error title=content-backup preflight failed::${failed} check(s) failed: the key or the bucket's lock is not what the header of .github/workflows/content-backup.yml asks for. Nothing was copied."
+              exit 1
+            fi
+          }
+          echo "Preflight of the B2 key and the bucket's lock. Each line states what must hold. Nothing read from Backblaze is printed."
+          { echo "## Preflight of the B2 key and the bucket's lock"; echo ""; echo "Each line states what must hold. Nothing read from Backblaze is printed."; echo ""; } >> "$GITHUB_STEP_SUMMARY"
+
+          # Options and credentials go to curl on stdin, never in its arguments. Its stderr is dropped because
+          # it names the address. An answer stays in a variable, never in a file, and all that is printed from
+          # a call is a status or an exit code, both numbers. The token stays in this shell: no later step has it.
+          quote() { local b='\' q='"' v="$1"; v="${v//"$b"/"$b$b"}"; printf '"%s"' "${v//"$q"/"$b$q"}"; }
+          answer=""
+          call() { # <name of the call> <curl config>: answer = the body of a 200, or a FAIL line and non-zero.
+            local out status rc=0
+            out="$(printf '%s\n' "$2" | curl --disable --config - --silent --connect-timeout 10 --max-time 30 --write-out '\n%{http_code}' 2>/dev/null)" || rc=$?
+            if [ "$rc" -ne 0 ]; then result "FAIL: $1: no answer (curl exit code ${rc})."; return 1; fi
+            status="${out##*$'\n'}"
+            answer="${out%$'\n'*}"
+            case "$status" in
+              200) return 0 ;;
+              [0-9][0-9][0-9]) result "FAIL: $1: HTTP ${status}."; return 1 ;;
+              *) result "FAIL: $1: no answer."; return 1 ;;
+            esac
+          }
+          # Each check is one fixed line from these jq programs: "PASS: " or "FAIL: " and what must hold. Nothing in
+          # an answer can reach the output. A jq that fails prints nothing here, and that is a failure below.
+          verdict='def verdict($ok; $what): (if $ok then "PASS: " else "FAIL: " end) + $what + ".";'
+
+          if ! [[ "${B2_KEY_ID}${B2_APPLICATION_KEY}" =~ ^[!-~]+$ ]]; then
+            result "FAIL: the key id and application key hold only printable characters."
+            finish
+          fi
+          config="$(printf 'url = "%s"\nuser = %s' "https://api.backblazeb2.com/b2api/v4/b2_authorize_account" "$(quote "${B2_KEY_ID}:${B2_APPLICATION_KEY}")")"
+          call "sign-in" "$config" || finish
+          auth="$answer"
+          token="" account="" api_url="" bucket_id=""
+          { IFS= read -r token; IFS= read -r account; IFS= read -r api_url; IFS= read -r bucket_id; } < <(printf '%s' "$auth" | jq -r '
+            [.authorizationToken, .accountId, .apiInfo.storageApi.apiUrl,
+             (.apiInfo.storageApi.allowed.buckets | if type == "array" and length == 1 then .[0].id else null end)]
+            | map(if type == "string" then . else "" end) | .[]
+          ' 2>/dev/null) || true
+          if ! [[ "$token" =~ ^[!-~]+$ && "$account" =~ ^[!-~]+$ ]]; then
+            result "FAIL: sign-in: the answer could not be read."
+            finish
+          fi
+          echo "::add-mask::${token}"
+          echo "::add-mask::${account}"
+          result "PASS: sign-in."
+
+          verdicts="$(printf '%s' "$auth" | jq -r --arg bucket "$B2_CONTENT_BUCKET" --arg s3 "https://s3.${B2_REGION}.backblazeb2.com" "$verdict"'
+            .apiInfo.storageApi as $api
+            | ($api.allowed.capabilities | if type == "array" then . else [] end) as $caps
+            | ($api.allowed.buckets | if type == "array" then . else [] end) as $buckets
+            | (("bypassGovernance", "deleteFiles", "deleteBuckets", "writeBuckets", "writeBucketRetentions", "writeFileRetentions", "writeBucketLifecycleRules", "writeKeys", "deleteKeys", "shareFiles") as $c
+                | verdict($caps | index($c) | not; "the key does not hold " + $c)),
+              (("writeFiles", "listFiles", "readFiles") as $c
+                | verdict($caps | index($c) != null; "the key holds " + $c)),
+              verdict(($buckets | length) == 1 and ($buckets[0].name // $bucket) == $bucket; "the key is limited to exactly one bucket, the content bucket"),
+              verdict(($api.allowed.namePrefix // "") == ""; "the key has no name prefix"),
+              verdict($api.s3ApiUrl == $s3; "the S3 endpoint is the one for B2_REGION")
+          ' 2>/dev/null)" || verdicts=""
+          if [ -z "$verdicts" ]; then
+            result "FAIL: sign-in: the answer could not be read."
+            finish
+          fi
+          while IFS= read -r line; do result "$line"; done <<< "$verdicts"
+
+          # The token goes only to Backblaze, over TLS. The address comes from the answer, so it is read first.
+          if [[ "$api_url" =~ ^https://[a-z0-9-]+\.backblazeb2\.com$ ]]; then
+            result "PASS: the API address in the answer is Backblaze's, over https."
+          else
+            result "FAIL: the API address in the answer is Backblaze's, over https."
+            finish
+          fi
+          body="$(jq -cn --arg account "$account" --arg bucket "$B2_CONTENT_BUCKET" '{accountId: $account, bucketName: $bucket}')"
+          config="$(printf 'url = "%s/b2api/v4/b2_list_buckets"\nheader = %s\nheader = "Content-Type: application/json"\ndata-binary = %s' "$api_url" "$(quote "Authorization: ${token}")" "$(quote "$body")")"
+          call "b2_list_buckets" "$config" || finish
+
+          verdicts="$(printf '%s' "$answer" | jq -r --arg bucket "$B2_CONTENT_BUCKET" --arg id "$bucket_id" --arg mode "$EXPECT_RETENTION_MODE" --arg days "$EXPECT_RETENTION_DAYS" "$verdict"'
+            (.buckets | if type == "array" then . else [] end) as $all
+            | ($all | map(select(.bucketName == $bucket))) as $named
+            | ($named[0].fileLockConfiguration // {}) as $lock
+            | ($lock.value.defaultRetention // {}) as $default
+            | verdict(($all | length) == 1 and ($named | length) == 1 and $id != "" and $named[0].bucketId == $id; "the listing holds one bucket, the content bucket, and it is the one the key is limited to"),
+              if $lock.isClientAuthorizedToRead == true then
+                verdict(true; "the key can read the lock settings"),
+                verdict($lock.value.isFileLockEnabled == true; "Object Lock is on"),
+                verdict($default.mode == $mode and $default.period.duration == ($days | tonumber) and $default.period.unit == "days"; "the default retention is " + $mode + ", " + $days + " days")
+              else
+                verdict(false; "the key can read the lock settings")
+              end
+          ' 2>/dev/null)" || verdicts=""
+          if [ -z "$verdicts" ]; then
+            result "FAIL: b2_list_buckets: the answer could not be read."
+            finish
+          fi
+          while IFS= read -r line; do result "$line"; done <<< "$verdicts"
+
+          finish
+          echo "Preflight passed."
+          { echo ""; echo "Preflight passed."; echo ""; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install rclone (pinned release, sha256-verified)
         run: |
           set -euo pipefail
@@ -138,7 +328,50 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/rclone" version
 
+      - name: Write the public-safe error counter
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/rclone-error-classes.sh" <<'COUNTER'
+          # rclone_error_classes <log>: "label=count" for each class with a line
+          # in the log, or "none". The output is only these fixed labels and
+          # integers: nothing read from the log is printed, so it cannot carry
+          # an object key. A key holding the same words could only raise a count.
+          rclone_error_classes() {
+            local log="$1" out="" n code name known=0
+            add() { if [ "$2" -gt 0 ]; then out="${out:+$out }$1=$2"; fi; }
+            for code in 400 401 403 404 405 408 409 411 412 416 429 500 501 502 503 504; do
+              n=$(grep -cE "StatusCode: ${code}([^0-9]|\$)" "$log" || true)
+              known=$((known + n))
+              add "http_${code}" "$n"
+            done
+            n=$(grep -cE 'StatusCode: [1-9][0-9][0-9]([^0-9]|$)' "$log" || true)
+            add "http_other" "$((n - known))"
+            known=0
+            for name in AccessDenied AccountProblem AllAccessDisabled AuthorizationHeaderMalformed BadDigest BadRequest EntityTooLarge EntityTooSmall ExpiredToken Forbidden InternalError InvalidAccessKeyId InvalidArgument InvalidBucketName InvalidDigest InvalidObjectState InvalidPart InvalidRequest InvalidToken MethodNotAllowed MissingContentLength NoSuchBucket NoSuchKey NoSuchUpload NotFound NotImplemented PermanentRedirect PreconditionFailed RequestTimeTooSkewed RequestTimeout ServiceUnavailable SignatureDoesNotMatch SlowDown TooManyRequests Unauthorized XAmzContentSHA256Mismatch; do
+              n=$(grep -cF "api error ${name}:" "$log" || true)
+              known=$((known + n))
+              add "$name" "$n"
+            done
+            n=$(grep -cE 'api error [^ ]+:' "$log" || true)
+            add "api_error_other" "$((n - known))"
+            add "content_md5" "$(grep -ciF 'content-md5' "$log" || true)"
+            # A 404 on a listing reaches the log as rclone's own wording: usually a wrong bucket name.
+            add "directory_not_found" "$(grep -cF 'directory not found' "$log" || true)"
+            add "no_such_host" "$(grep -cF 'no such host' "$log" || true)"
+            add "timeout" "$(grep -cE 'i/o timeout|timeout awaiting response headers|TLS handshake timeout|deadline exceeded|Client\.Timeout' "$log" || true)"
+            add "connection_refused" "$(grep -cE 'connection refused|actively refused' "$log" || true)"
+            # The lines a failure is reported on that fit no class and are no conflict or report of
+            # a comparison: without this an unknown failure would read as "none".
+            n=$({ grep -E ' ERROR |CRITICAL: |NOTICE: Failed to' "$log" || true; } \
+              | { grep -viE 'StatusCode: [1-9]|api error |content-md5|directory not found|no such host|i/o timeout|timeout awaiting response headers|TLS handshake timeout|deadline exceeded|Client\.Timeout|connection refused|actively refused|immutable file modified|Timestamp mismatch between immutable objects|Can.t retry any of the errors|file not in |files differ|differences found' || true; } \
+              | wc -l | tr -d ' ')
+            add "unclassified" "$n"
+            echo "${out:-none}"
+          }
+          COUNTER
+
       - name: Copy Supabase Storage → B2 (copy, never sync)
+        if: ${{ !inputs.restore_drill }}
         env:
           # Scheduled runs have no inputs: always a real copy.
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
@@ -155,6 +388,7 @@ jobs:
           RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
           RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
           RCLONE_CONFIG_B2_ENDPOINT: https://s3.${{ secrets.B2_REGION }}.backblazeb2.com
+          RCLONE_CONFIG_B2_REGION: ${{ secrets.B2_REGION }}
         run: |
           set -euo pipefail
           dest="b2:${B2_CONTENT_BUCKET}/content/prod/supabase/course-content"
@@ -166,7 +400,7 @@ jobs:
           # are explained in the header (transaction budget).
           flags=(
             --immutable --checksum --min-age 1h --use-server-modtime --fast-list
-            --s3-no-check-bucket
+            --s3-no-check-bucket --s3-no-head
             --transfers 16 --checkers 32 --stats-one-line --stats 30s
           )
           mode="copy"
@@ -192,11 +426,17 @@ jobs:
             | sort -u > "$conflicts"
           n=$(wc -l < "$conflicts" | tr -d ' ')
           errors=$(grep -c ' ERROR ' "$log" || true)
+          # Fixed labels and counts only; see the step that writes this file.
+          . "$RUNNER_TEMP/rclone-error-classes.sh"
+          classes=$(rclone_error_classes "$log")
           echo "Content backup (${mode}): rclone exit code ${rc}; immutable conflicts ${n}; rclone ERROR lines ${errors}. Object keys are not printed (public log)."
+          echo "Log lines per error class: ${classes}."
           {
             echo "## Content backup: ${mode}"
             echo ""
             echo "rclone exit code: ${rc}. Immutable conflicts (\"immutable file modified\"): ${n}. rclone ERROR lines: ${errors}."
+            echo ""
+            echo "Log lines per error class: ${classes}."
             echo ""
             echo "This repository is public: a conflicting object is shown only by its version folder (course id, package id, version number), never by file name; list the folder privately to see its keys."
             if [ "$n" -gt 0 ]; then
@@ -207,10 +447,11 @@ jobs:
               echo ""
               echo "| Version folder | Conflicting objects |"
               echo "|---|---|"
-              # Only the version-folder prefix of a key is printed; a key outside
-              # a courses/<course>/<package>/v<n>/ folder is counted as (other),
-              # never printed.
+              # Only the version-folder prefix of a key is printed, and only when its
+              # ids are uuids or it is the test folder; any other key is counted as
+              # (other), never printed.
               awk '{ if (match($0, /^courses\/[^\/]+\/[^\/]+\/v[0-9]+\//)) print substr($0, 1, RLENGTH); else print "(other)" }' "$conflicts" \
+                | sed -E '/^courses\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/v[0-9]+|backup-drill\/test\/v1)\/$/!s/.*/(other)/' \
                 | sort | uniq -c \
                 | sed -E 's#^ *([0-9]+) (.*)$#| `\2` | \1 |#'
             fi
@@ -224,4 +465,158 @@ jobs:
           fi
 
           echo "Objects in the B2 content copy:"
-          rclone size "$dest" --fast-list
+          rclone size "$dest" --fast-list 2>> "$log"
+
+      - name: Restore drill (read-only on both sides)
+        if: ${{ inputs.restore_drill }}
+        env:
+          B2_CONTENT_BUCKET: ${{ secrets.B2_CONTENT_BUCKET }}
+          RCLONE_CONFIG_SUPA_TYPE: s3
+          RCLONE_CONFIG_SUPA_PROVIDER: Other
+          RCLONE_CONFIG_SUPA_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          RCLONE_CONFIG_SUPA_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          RCLONE_CONFIG_SUPA_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_SUPA_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_SUPA_FORCE_PATH_STYLE: "true"
+          RCLONE_CONFIG_B2_TYPE: s3
+          RCLONE_CONFIG_B2_PROVIDER: Other
+          RCLONE_CONFIG_B2_ACCESS_KEY_ID: ${{ secrets.B2_CONTENT_KEY_ID || secrets.B2_KEY_ID }}
+          RCLONE_CONFIG_B2_SECRET_ACCESS_KEY: ${{ secrets.B2_CONTENT_APPLICATION_KEY || secrets.B2_APPLICATION_KEY }}
+          RCLONE_CONFIG_B2_ENDPOINT: https://s3.${{ secrets.B2_REGION }}.backblazeb2.com
+          RCLONE_CONFIG_B2_REGION: ${{ secrets.B2_REGION }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          say() { echo "$1"; { echo "$1"; echo ""; } >> "$GITHUB_STEP_SUMMARY"; }
+          stop() { say "Restore drill FAILED: $1"; echo "::error title=restore drill failed::$1"; exit 1; }
+          { echo "## Restore drill (read-only on both sides)"; echo ""; } >> "$GITHUB_STEP_SUMMARY"
+
+          # From the event file, not env: GitHub prints a step's env in the public log.
+          DRILL_PREFIX="$(jq -r '.inputs.drill_prefix // ""' "$GITHUB_EVENT_PATH")"
+          # The input, before any use. A rejected value is never printed: it can hold anything.
+          id='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+          shape="courses/(${id}/${id}/v[1-9][0-9]*|backup-drill/test/v1)/"
+          if [ -n "${DRILL_PREFIX:-}" ] && ! [[ "$DRILL_PREFIX" =~ ^${shape}$ ]]; then
+            stop "drill_prefix is not courses/<course id>/<package id>/v<n>/ with lower-case uuids and the final slash, or courses/backup-drill/test/v1/. Its value is not printed. Nothing was read."
+          fi
+
+          # rclone writes only to files on the runner, never to the log: its
+          # output names object keys. See the header for the budget.
+          work="$RUNNER_TEMP/restore-drill"
+          mkdir -p "$work"
+          log="$work/rclone.log"
+          source_root="supa:course-content"
+          backup_root="b2:${B2_CONTENT_BUCKET}/content/prod/supabase/course-content"
+          max_objects=500
+          max_bytes=1073741824
+          . "$RUNNER_TEMP/rclone-error-classes.sh"
+
+          # An existing but empty prefix lists as nothing with exit 0; exit 3, a bucket that does not exist, stops here.
+          listing=(lsf -R --files-only --fast-list --use-server-modtime --format sp --separator $'\t')
+          read_listing() {
+            local out="$1" rc=0
+            shift
+            rclone "${listing[@]}" "$@" > "$out" 2>> "$log" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              stop "a listing failed (rclone exit code ${rc}). Log lines per error class: $(rclone_error_classes "$log")."
+            fi
+          }
+          read_listing "$work/source.tsv" "$source_root"
+          # The copy's own rule on the source only: on the backup the same filter
+          # would hide an object copied in the last hour and read as missing.
+          read_listing "$work/source-due.tsv" --min-age 1h "$source_root"
+          read_listing "$work/backup.tsv" "$backup_root"
+
+          # Every line is "size<TAB>key". Writes each folder with no disagreement and nothing
+          # under an hour old to folders.txt as "objects bytes prefix", and prints the counts.
+          : > "$work/folders.txt"
+          read -r n_source n_backup n_waiting n_missing n_differ n_only <<< "$(awk -v folders="$work/folders.txt" '
+            function parse() { i = index($0, "\t"); size = substr($0, 1, i - 1) + 0; key = substr($0, i + 1) }
+            function folder(k) { return match(k, /^courses\/[^\/]+\/[^\/]+\/v[0-9]+\//) ? substr(k, 1, RLENGTH) : "" }
+            FILENAME == ARGV[1] { parse(); on_backup[key] = size; backup++; next }
+            FILENAME == ARGV[2] { parse(); due[key] = 1; next }
+            {
+              parse(); live++; f = folder(key)
+              objects[f]++; bytes[f] += size
+              if (!(key in due)) blocked[f] = 1
+              if (key in on_backup) {
+                both[key] = 1
+                if (on_backup[key] != size) { differ++; blocked[f] = 1 }
+              } else if (key in due) { missing++; blocked[f] = 1 }
+              else waiting++
+            }
+            END {
+              for (k in on_backup) if (!(k in both)) { only++; blocked[folder(k)] = 1 }
+              for (f in objects) if (f != "" && !(f in blocked)) printf "%d %.0f %s\n", objects[f], bytes[f], f > folders
+              printf "%d %d %d %d %d %d\n", live, backup, waiting, missing, differ, only
+            }
+          ' "$work/backup.tsv" "$work/source-due.tsv" "$work/source.tsv")"
+
+          # An awk that failed leaves these empty, which must never read as a clean bucket.
+          case "$n_only" in ''|*[!0-9]*) stop "the listing comparison did not run." ;; esac
+
+          say "Listing comparison: live objects ${n_source}; backup objects ${n_backup}; missing on the backup ${n_missing}; differing by size ${n_differ}; under an hour old and not copied yet ${n_waiting}; only on the backup ${n_only} (the copy never deletes, so these do not fail the drill)."
+          failed=0
+          if [ "$n_missing" != 0 ] || [ "$n_differ" != 0 ]; then failed=1; fi
+
+          if [ "$n_source" -eq 0 ] && [ "$n_backup" -gt 0 ]; then
+            stop "the live bucket is empty but the backup holds ${n_backup} objects: a wrong secret, a lost bucket, or test files just removed from the live bucket on purpose, whose copies stay. Nothing was compared."
+          fi
+          if [ "$n_source" -eq 0 ] && [ -z "${DRILL_PREFIX:-}" ]; then
+            say "The live bucket and the backup are both empty. Nothing was proven: run the drill again after a course is uploaded and copied."
+            exit 0
+          fi
+
+          count_under() { awk -v p="$1" 'index(substr($0, index($0, "\t") + 1), p) == 1 { n++ } END { print n + 0 }' "$2"; }
+          chosen=""
+          n_folder=0
+          if [ -n "${DRILL_PREFIX:-}" ]; then
+            n_folder=$(count_under "$DRILL_PREFIX" "$work/backup.tsv")
+            in_live=$(count_under "$DRILL_PREFIX" "$work/source.tsv")
+            in_due=$(count_under "$DRILL_PREFIX" "$work/source-due.tsv")
+            if [ "$n_folder" -eq 0 ]; then stop "the folder \`${DRILL_PREFIX}\` is not on the backup."; fi
+            if [ "$in_live" -eq 0 ]; then stop "the folder \`${DRILL_PREFIX}\` is not in the live bucket, so there is nothing to compare it with."; fi
+            if [ "$in_due" -ne "$in_live" ]; then stop "the folder \`${DRILL_PREFIX}\` holds objects under an hour old, which may not be copied yet. Run the drill an hour later."; fi
+            chosen="$DRILL_PREFIX"
+            n_expected="$in_live"
+          else
+            { grep -E "^[0-9]+ [0-9]+ ${shape}\$" "$work/folders.txt" || true; } > "$work/eligible.txt"
+            read -r n_folder _bytes chosen <<< "$(awk -v maxo="$max_objects" -v maxb="$max_bytes" '
+              $1 + 0 <= maxo + 0 && $2 + 0 <= maxb + 0 && ($1 + 0 > best + 0 || ($1 + 0 == best + 0 && $3 < name)) { best = $1; bytes = $2; name = $3 }
+              END { if (name != "") print best, bytes, name }
+            ' "$work/eligible.txt")"
+            if [ -z "$chosen" ] && [ -s "$work/eligible.txt" ]; then
+              stop "every comparable folder is over the job's own budget (${max_objects} objects, ${max_bytes} bytes). Name one in drill_prefix to download it deliberately."
+            fi
+          fi
+
+          if [ -z "$chosen" ]; then
+            say "No version folder could be compared: no courses/<course id>/<package id>/v<n>/ folder has matching listings and every object over an hour old. Nothing was proven about restoring a file."
+            if [ "$failed" -ne 0 ]; then stop "objects are missing from the backup or differ by size (counts above)."; fi
+            if [ -s "$work/source-due.tsv" ]; then stop "the live bucket holds objects that are due, and none could be compared byte for byte."; fi
+            exit 0
+          fi
+
+          # The real download: B2 to a folder on the runner, then those files against the live prefix, byte for byte.
+          echo "Downloading \`${chosen}\`: ${n_folder} objects by the listing, one B2 Class B call each."
+          restored="$work/restored"
+          mkdir -p "$restored"
+          : > "$work/combined.txt"
+          down_rc=0
+          rclone copy "${backup_root}/${chosen}" "$restored" --fast-list --use-server-modtime --transfers 8 --checkers 8 >> "$log" 2>&1 || down_rc=$?
+          compare_rc=0
+          rclone check "${source_root}/${chosen}" "$restored" --download --one-way --fast-list --checkers 8 --combined "$work/combined.txt" >> "$log" 2>&1 || compare_rc=$?
+          read -r n_disk bytes_disk <<< "$(find "$restored" -type f -printf '%s\n' | awk '{ n++; b += $1 } END { printf "%d %.0f\n", n, b }')"
+          rm -rf "$restored"
+          # In combined.txt: "=" identical, "+" only live, "*" differs, "!" an error. One way, so it does not list
+          # an object only on the backup: that is what is left of the download, and the copy never deletes.
+          read -r n_same n_live_only n_changed n_read_errors <<< "$(awk '{ c[substr($0, 1, 1)]++ } END { printf "%d %d %d %d\n", c["="], c["+"], c["*"], c["!"] }' "$work/combined.txt")"
+
+          say "Byte comparison of \`${chosen}\`: downloaded from B2 to the runner ${n_disk} objects, ${bytes_disk} bytes; byte-identical to the live folder ${n_same}; differing ${n_changed}; only live ${n_live_only}; only on the backup $((n_disk - n_same - n_changed)) (not a failure, the copy never deletes); read errors ${n_read_errors}. rclone exit codes: download ${down_rc}, comparison ${compare_rc}."
+          # String comparisons, so that an empty value fails here instead of reading as clean.
+          if [ "$down_rc" != 0 ] || [ "$compare_rc" != 0 ] || [ "$n_same" != "${n_expected:-$n_folder}" ] || [ "$n_changed" != 0 ] || [ "$n_live_only" != 0 ] || [ "$n_read_errors" != 0 ]; then
+            say "Log lines per error class: $(rclone_error_classes "$log")."
+            stop "the folder did not come back byte for byte (counts above)."
+          fi
+          if [ "$failed" -ne 0 ]; then stop "the folder came back, but objects are missing from the backup or differ by size (counts above)."; fi
+          say "Restore drill passed: every object due is on the backup at its size, and one version folder came back from B2 byte for byte. Other folders were compared by size only. No course was launched from the restored files."
