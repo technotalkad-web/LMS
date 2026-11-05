@@ -114,12 +114,53 @@ learners. `STORAGE_DRIVER` on the Worker decides where **new** uploads go.
   never change; nothing is deleted from the copy when it disappears from the
   source. The secrets it needs are listed in the workflow header; it fails
   with a message naming any that are missing. The R2 source returns only when
-  `STORAGE_DRIVER` flips to `r2` (step 7).
+  `STORAGE_DRIVER` flips to `r2` (step 7). Its own key
+  (`B2_CONTENT_KEY_ID`, `B2_CONTENT_APPLICATION_KEY`) is made through the API,
+  because the console's Read and Write holds `bypassGovernance`. On every run,
+  before rclone is fetched, a preflight step signs in with that key and fails the
+  job, copying nothing, if the key holds a right it must not have, lacks one it
+  needs, or reaches more than this bucket, or if the bucket's lock is off or not
+  the retention named in the step's env. It prints one fixed pass or fail line per
+  check. Change that env with the bucket. The repository is public, so a failed
+  run shows no log line: its log and summary give the number of lines per error
+  class (HTTP status, S3 API error name, Content-MD5, no such host, timeout,
+  connection refused), and to read the lines themselves, re-run the same copy
+  privately.
 - **Restore a version's files:** copy
   `content/prod/supabase/course-content/courses/{course}/{package}/v{n}/` from
   the B2 content bucket back to the live bucket with `rclone copy` (or
   `aws s3 cp --recursive`); no database change is needed because the row
-  still points at that prefix.
+  still points at that prefix. A file that looks missing from the copy may be
+  hidden, not gone: the job's key can hide a file by name, a hidden file looks
+  missing to `rclone lsf` and `rclone check`, and its version remains, locked.
+  See it with rclone's `--s3-versions` or in the B2 dashboard.
+- **Prove a download (the drill):** run **Nightly content backup** by hand with
+  `restore_drill` on. For a first setup: `dry_run`, then a real copy, then this.
+  The copy does not run, and nothing is written to the live bucket or the
+  backup. It is a byte-level check of a download, not a restored course: no
+  course is launched from the restored files and no database row is read. A
+  real restore still needs the copy back above and a launch of that version.
+  - It lists the whole live bucket and the whole backup, and fails on an object
+    missing from the backup or differing by size. An object under an hour old
+    is not due yet (the copy's `--min-age`), so it is counted and does not fail
+    the drill; an object only on the backup is counted too, because the copy
+    never deletes.
+  - It then downloads one version folder from B2 to the runner and compares it
+    byte for byte with the live folder, and fails on any object that is missing
+    or differs. Only that folder is proven byte for byte; the others are
+    compared by size.
+  - It picks the folder with most objects among those whose listings agree, up
+    to 500 objects and 1 GiB. To choose, give `drill_prefix`,
+    `courses/{course}/{package}/v{n}/` or the test folder
+    `courses/backup-drill/test/v1/`; anything else is refused before any read.
+    Each object downloaded costs one B2 Class B call out of the free tier's
+    2,500 a day (two for an object uploaded in parts), and a folder you name has
+    no ceiling.
+  - Its log and summary show counts and that folder's prefix, nothing else. If
+    the live bucket and the backup are both empty it passes and says nothing
+    was proven. If only the live bucket is empty it fails, which it also does
+    just after test files are removed from it on purpose. If objects are due and
+    no folder could be compared, it fails.
 - **Roll a course back to an earlier version:** Library → course → Versions →
   **Make current** on any fully uploaded version. This repoints the language
   package (and the course) at that version; learners get it on their next

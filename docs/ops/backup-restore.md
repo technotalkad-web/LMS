@@ -114,6 +114,12 @@ Plain `pg_dump` backups are **daily snapshots**, not point-in-time. If you need 
 
 ---
 
+## Scenario 4 — Course files
+
+These dumps do not hold course files. They have their own nightly copy, a restore procedure, and a read-only drill that proves a download from B2 byte for byte: `docs/CONTENT_STORAGE.md`, "Backup and rollback".
+
+---
+
 ## Operational notes
 
 - **The workflow uses `pg_dump --format=plain`.** Sufficient for normal restore. If you'd prefer parallel restore for very large dumps, switch to `--format=directory --jobs=4` and use `pg_restore` instead. The plaintext format is more portable and human-inspectable for ad-hoc fixes.
