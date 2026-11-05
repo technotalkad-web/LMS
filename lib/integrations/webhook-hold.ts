@@ -163,7 +163,7 @@ export const WEBHOOK_HOLD_MINUTES = 15;
 export const WEBHOOK_HOLD_ATTENTION_HOURS = 24;
 
 /** ADR 0015 step 5: the start of the sweep's and the provider's window (see the header). */
-export const WEBHOOK_HOLD_SWEEP_FROM = "2026-11-04T00:00:00.000Z";
+export const WEBHOOK_HOLD_SWEEP_FROM = "2026-11-05T00:00:00.000Z";
 
 /**
  * Subrequests one Workers request may make on production's Workers plan,
