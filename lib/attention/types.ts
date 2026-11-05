@@ -129,6 +129,16 @@ export const ATTENTION_PROVIDERS: AttentionProviderMeta[] = [
     defaultPriority: "high",
     configurablePriority: true,
   },
+  {
+    // ADR 0015 step 6: official cmi5/xAPI completions whose CRM webhook is
+    // still held after 24 hours (the sweep starved or broken).
+    type: "held-webhooks",
+    label: "Completion webhooks held",
+    description: "cmi5/xAPI completions whose CRM webhook has not fired after 24 hours.",
+    defaultEnabled: true,
+    defaultPriority: "high",
+    configurablePriority: true,
+  },
 ];
 
 export type AttentionTypeConfig = { enabled: boolean; priority: AttentionPriority };

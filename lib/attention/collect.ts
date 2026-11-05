@@ -6,6 +6,8 @@
  */
 import { resolveEmails } from "@/lib/users/emails";
 import { defaultSlotFinding, isReadyVersion } from "@/lib/courses/default-rule";
+import { heldWebhookItem, heldWebhookSummary } from "@/lib/integrations/webhook-hold";
+import { classifyAttempt } from "@/lib/scoring/attempt-kind";
 import {
   ATTENTION_PROVIDERS,
   PRIORITY_RANK,
@@ -404,6 +406,23 @@ async function defaultSlotItems(svc: AnyClient, orgId: string, orgSlug: string, 
   return items.slice(0, 200);
 }
 
+/**
+ * ADR 0015 step 6: official cmi5/xAPI completions whose CRM webhook has not
+ * fired after 24 hours, as one item with the count. The selection, the summary
+ * and the item live in webhook-hold.ts, which the sweep shares; no opts, so its
+ * page size and scan cap apply. Fail-soft: any error, a database without 0082
+ * included, yields no items.
+ */
+async function heldWebhookItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
+  try {
+    const { count, oldestCompletedAt } = await heldWebhookSummary(svc, orgId, { classify: classifyAttempt });
+    const item = heldWebhookItem({ count, oldestCompletedAt, orgSlug, priority });
+    return item ? [item] : [];
+  } catch {
+    return [];
+  }
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 export async function collectAttention(args: {
@@ -440,6 +459,7 @@ export async function collectAttention(args: {
     else if (p.type === "integrity-override") jobs.push(run(integrityOverrideItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "unpublished-versions") jobs.push(run(unpublishedVersionItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "default-slot") jobs.push(run(defaultSlotItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "held-webhooks") jobs.push(run(heldWebhookItems(svc, orgId, orgSlug, c.priority)));
   }
   let items = (await Promise.all(jobs)).flat();
 

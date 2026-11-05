@@ -24,6 +24,10 @@
  *   KIVO_57_REVISIT=1 (+ KIVO_RELEASE_A_XAPI_ZIP)  official run, then a revisit → "(revisit)"
  *   KIVO_RELEASE_A_XAPI_ATT2_ZIP      the kit's …_xapi_en-US_att2.zip      → "(extra i)", "(extra ii, …)"
  *   KIVO_RELEASE_A_XAPI_ATT1_ZIP      the kit's …_xapi_en-US_att1.zip      → "(extra iii)"
+ *   KIVO_CLOUD_RUN_CRON_SECRET        the Cloud Run staging deployment's CRON_SECRET, required by "(unscored)" for the sweep POSTs
+ *                                     of ADR 0015 step 9. The runner sets it under this name: the lifecycle config loads the env
+ *                                     files with override: true, so a shell CRON_SECRET would be replaced by theirs, which
+ *                                     differs from Cloud Run's. Never logged.
  * STAGING only: the lifecycle global setup refuses other projects, and this spec
  * asserts the staging Supabase ref itself before any database call.
  */
@@ -34,6 +38,7 @@ import path from "node:path";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { VERB, XAPI_HEADERS } from "./p0-helpers";
+import { WEBHOOK_HOLD_MINUTES } from "../../../lib/integrations/webhook-hold";
 
 const ZIP = process.env.KIVO_RELEASE_A_XAPI_ZIP ?? "";
 const KIT = process.env.KIVO_RELEASE_A_KIT ?? "";
@@ -603,17 +608,52 @@ async function runToResults(browser: Browser, baseURL: string, zip: string, labe
   return { w, ctx, L, res, asm, atResults };
 }
 
+// ---------- ADR 0015 step 9: the sweep POST and the latch ----------
+// Staging has no scheduled crons, so the spec POSTs the sweep by hand, on Cloud Run only: the Workers staging's free
+// plan could cut a run between a latch and its message, so a Workers host is refused. The secret and the launch token
+// never reach a log or the evidence: these calls use plain fetch, as spec 46 does, because a Playwright request that
+// fails in transport carries its call log, every request header with it, into the error and the reports.
+const SWEEP_SECRET = process.env.KIVO_CLOUD_RUN_CRON_SECRET ?? "";
+// Past the 15 minutes by this much, so a difference between this machine's clock and the server's cannot leave the row
+// inside them. Kept small: the sweep's selection is newest first, and rows that age past this one come before it.
+const SWEEP_WAIT_MARGIN_MS = 45_000;
+type WebhookSweep = { scanned?: number; fired?: string[]; skipped?: string[]; unfired?: string[]; error?: string };
+function assertSweepTarget(baseURL: string) {
+  expect(new URL(baseURL).hostname.endsWith(".workers.dev"), "ADR 0015: the sweep is POSTed on Cloud Run staging, never on a Workers host").toBe(false);
+  expect(!!SWEEP_SECRET, "set KIVO_CLOUD_RUN_CRON_SECRET (the Cloud Run deployment's CRON_SECRET)").toBe(true);
+}
+async function postSweep(baseURL: string) {
+  assertSweepTarget(baseURL);
+  const res = await fetch(new URL("/api/cron/gamification-refresh", baseURL), { method: "POST", headers: { "x-cron-secret": SWEEP_SECRET }, signal: AbortSignal.timeout(120_000) });
+  const body = (await res.json().catch(() => null)) as { webhook_sweep?: WebhookSweep } | null;
+  return { status: res.status, sweep: body?.webhook_sweep ?? null };
+}
+/** The columns ADR 0015's assertions read; attemptOf names only what every run needs. */
+async function latchOf(attemptId: string) {
+  const { data, error } = await svc().from("course_attempts").select("completion_webhook_at, completed_at, success_status").eq("id", attemptId).single();
+  expect(error).toBeNull();
+  return data as { completion_webhook_at: string | null; completed_at: string | null; success_status: string };
+}
+
 /**
  * §8, spec 57: "an unscored variant (`--unscored` in the `-fixed` builder): `completion_status
  * completed`, `progress_pct 100`". The zip is that builder's --unscored build (every
  * slide weight 0, no counted assessment). Run alone: --grep "\(unscored\)".
+ *
+ * ADR 0015 step 9 extends it: the course sends `completed` with no pass/fail, so the completion is
+ * held, with no message, until the sweep this spec POSTs after the real 15 minutes (completed_at is
+ * never rewritten on the row); the sweep fires it once; then a crafted course-level `passed` moves
+ * the latch once more (the re-fire after a message sent without a result). The learner's context is
+ * closed before the wait, and the POSTs need neither its session nor the admin's. The webhook body
+ * is not observable here (no webhook URL); the route test proves the payloads.
  */
 test.describe.serial("KIVO Release A.1 xAPI: the unscored variant (unscored)", () => {
   test.skip(!UNSCORED_ZIP || !fs.existsSync(UNSCORED_ZIP), "set KIVO_RELEASE_A_XAPI_UNSCORED_ZIP (the -fixed builder's --unscored zip)");
   test.beforeAll(assertStagingTarget);
 
-  test("unscored: seed, upload, assign, drive to Results, close the tab, read the attempt", async ({ browser, baseURL }) => {
-    test.setTimeout(15 * 60_000);
+  test("unscored: seed, upload, assign, drive to Results, close the tab, read the attempt; ADR 0015: held, swept after 15 minutes, re-fired", async ({ browser, baseURL }) => {
+    test.setTimeout(45 * 60_000); // the drive, then the real 15 minutes and the POSTs
+    assertSweepTarget(baseURL!);
     const ev: Record<string, unknown> = {};
     const save = () => writeOut("x-unscored.json", ev);
     const w = await seedWorld(browser, baseURL!, UNSCORED_ZIP, "unscored");
@@ -648,6 +688,71 @@ test.describe.serial("KIVO Release A.1 xAPI: the unscored variant (unscored)", (
     // §8, spec 57: "an unscored variant (`--unscored` in the `-fixed` builder): `completion_status completed`, `progress_pct 100`".
     expect(att?.completion_status, "unscored: completion_status completed").toBe("completed");
     expect(att?.progress_pct, "unscored: progress_pct 100").toBe(100);
+
+    // ADR 0015 step 9. Rule (c) of step 2 reads a course-level completed, passed or failed that carries a boolean
+    // result.success: one stored here fired in that request, and this case would prove the wrong path.
+    const carried = course.filter((s) => ["completed", "passed", "failed"].includes(verbOf(s)) && typeof s.result?.success === "boolean");
+    expect(carried.map(stmtBrief), "precondition: no stored course-level completed carries a boolean result.success, or rule (c) would have fired in that request").toEqual([]);
+    const held = await latchOf(L.attemptId);
+    ev.adr0015Held = held;
+    save();
+    expect(held.completion_webhook_at, "the completion is held: completion_webhook_at null").toBeNull();
+
+    // The real 15 minutes, counted from the row's completed_at.
+    const wakeAt = Date.parse(held.completed_at ?? "") + WEBHOOK_HOLD_MINUTES * 60_000 + SWEEP_WAIT_MARGIN_MS;
+    expect(Number.isFinite(wakeAt), "the row carries its completed_at").toBe(true);
+    console.log(`[57 unscored] ADR 0015: waiting ${Math.round((wakeAt - Date.now()) / 1000)} s, until ${WEBHOOK_HOLD_MINUTES} minutes after completed_at`);
+    await sleepMs(Math.max(0, wakeAt - Date.now()));
+    expect((await latchOf(L.attemptId)).completion_webhook_at, "still null when the 15 minutes end: only the sweep releases it").toBeNull();
+
+    // The sweep fires it, once.
+    const sweep1 = await postSweep(baseURL!);
+    ev.adr0015Sweep1 = sweep1;
+    save();
+    expect(sweep1.status, "the first sweep POST").toBe(200);
+    expect(sweep1.sweep?.error, "the first sweep reports no error").toBeUndefined();
+    expect(sweep1.sweep?.fired, "webhook_sweep.fired carries the attempt").toContain(L.attemptId);
+    const t1 = (await latchOf(L.attemptId)).completion_webhook_at;
+    ev.adr0015LatchAfterSweep = t1;
+    save();
+    expect(t1, "the sweep set completion_webhook_at").toBeTruthy();
+    const sweep2 = await postSweep(baseURL!);
+    ev.adr0015Sweep2 = sweep2;
+    save();
+    expect(sweep2.status, "the second sweep POST").toBe(200);
+    expect(sweep2.sweep?.error, "the second sweep reports no error").toBeUndefined();
+    expect(Array.isArray(sweep2.sweep?.fired), "webhook_sweep.fired is an id array").toBe(true);
+    expect(sweep2.sweep?.fired, "the second sweep does not fire the attempt again").not.toContain(L.attemptId);
+    expect((await latchOf(L.attemptId)).completion_webhook_at, "the latch set once: unchanged by the second sweep").toBe(t1);
+
+    // The re-fire after a message sent without a result: a crafted course-level passed, in the course's own shape, with
+    // the attempt's launch token (it outlives the close, 24 hours).
+    const sent = course.find((s) => verbOf(s) === "completed");
+    expect(sent, "the course-level completed the course sent").toBeTruthy();
+    const { data: tok, error: tokErr } = await svc().from("cmi5_launch_tokens").select("auth_token").eq("attempt_id", L.attemptId).order("created_at", { ascending: false }).limit(1).single();
+    expect(tokErr, "the attempt's launch token").toBeNull();
+    const crafted: Stmt = {
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      actor: sent!.actor,
+      verb: { id: "http://adlnet.gov/expapi/verbs/passed", display: { "en-US": "passed" } },
+      object: sent!.object,
+      result: { completion: true, success: true },
+      context: { ...sent!.context, registration: L.attemptId },
+    };
+    const res = await fetch(new URL("/api/xapi/statements", baseURL!), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${(tok as { auth_token: string }).auth_token}`, "Content-Type": "application/json", "X-Experience-API-Version": "1.0.3" },
+      body: JSON.stringify([crafted]),
+      signal: AbortSignal.timeout(120_000),
+    });
+    const answer = await res.text();
+    expect(res.status, `the crafted course-level passed: ${answer.slice(0, 200)}`).toBe(200);
+    const moved = await latchOf(L.attemptId);
+    ev.adr0015AfterRefire = moved;
+    save();
+    expect(moved.success_status, "the crafted passed is stored on the row").toBe("passed");
+    expect(Date.parse(moved.completion_webhook_at ?? ""), "the latch moved once more").toBeGreaterThan(Date.parse(t1!));
   });
 });
 

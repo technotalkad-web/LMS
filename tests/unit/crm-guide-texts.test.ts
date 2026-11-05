@@ -33,7 +33,7 @@ const TEXT_B =
   "A `course_completed` with a higher `attempt_number` for the same learner and course is a granted extra official attempt, whose result replaces the earlier one whether it is higher or lower, so a `passed: false` can follow a `passed: true` (`attempt_number` and `official: true` on both).";
 
 /** The occurrences of each text in the guide at this pull request. */
-const EXPECTED_COUNT = 1;
+const EXPECTED_COUNT = 2;
 
 const normalise = (s: string) => s.replace(/\s+/g, " ");
 const guide = normalise(fs.readFileSync(path.resolve(__dirname, "../../docs/CRM_INTEGRATION.md"), "utf8"));

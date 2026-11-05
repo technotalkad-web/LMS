@@ -8,6 +8,7 @@ import { mirrorToExternalLrs } from "@/lib/lrs/enqueue";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
 import { isCompletedAttempt } from "@/lib/scoring/policy";
 import { fireCompletionWebhookForAttempt } from "@/lib/integrations/webhook";
+import { decideCompletionWebhook, normalizeSuccess } from "@/lib/integrations/webhook-hold";
 import { VERBS, type XapiStatement } from "@/lib/xapi/types";
 import { isUuid, registrationVerdict } from "@/lib/xapi/registration";
 
@@ -30,6 +31,10 @@ import { isUuid, registrationVerdict } from "@/lib/xapi/registration";
  *        `terminated` are stored; every other statement is answered with its
  *        id and not stored (log `revision_ignored`). Nothing on such a row
  *        moves XP, the streak, a journey day or the webhook (`officialRun`).
+ *
+ * ADR 0015 step 3: an AU completion without a result is held (log `webhook_held`)
+ * until its pass/fail, a `terminated` or the cron sweep releases it; an attempt that
+ * becomes passed after a not-passed message re-fires once (log `webhook_refired`). Ids only.
  */
 export async function POST(request: Request) {
   // P4: an abandoned attempt (or its expired token) → 410 before any write.
@@ -70,23 +75,32 @@ export async function POST(request: Request) {
     course_version_id: string;
     completion_status?: string | null;
     success_status?: string | null;
+    completion_webhook_at?: string | null;
     is_revision?: boolean | null;
   };
-  // 0081: remember whether the attempt was already complete, so a completion
-  // in this batch is reported exactly once (webhook) and only for OFFICIAL
-  // attempts (journey day, XP).
-  const wasComplete = isCompletedAttempt(row);
+  // ADR 0015 step 3: the row before the batch, for the webhook decision below.
+  // `webhookAt` is null on a 0082 database when not latched and undefined when
+  // the column is absent (the key is missing from a select("*") row), the
+  // distinction the decision's `terminated` branch relies on.
+  const before = {
+    complete: isCompletedAttempt(row),
+    successStatus: normalizeSuccess(row.success_status),
+    webhookAt: row.completion_webhook_at,
+  };
   const isRevision = row.is_revision === true;
 
   // After the batch: fail-soft, as before (errors here never block statements).
-  const attemptStatus = async () => {
+  const afterStatus = async () => {
     const { data } = await svc
       .from("course_attempts")
       .select("completion_status, success_status")
       .eq("id", session.attemptId)
       .maybeSingle();
     const a = data as { completion_status?: string | null; success_status?: string | null } | null;
-    return a?.completion_status === "completed" || a?.success_status === "passed";
+    return {
+      complete: a?.completion_status === "completed" || a?.success_status === "passed",
+      successStatus: normalizeSuccess(a?.success_status),
+    };
   };
 
   // R-3 (ADR 0014 step 5): the learner's attempt ids on the bound attempt's
@@ -139,6 +153,11 @@ export async function POST(request: Request) {
   // What reaches the tenant LRS mirror: the statements as stored. A resent id
   // with different content is left out (ADR 0003 step 5).
   const mirror: XapiStatement[] = [];
+
+  // ADR 0015 step 3: two flags over the statements this batch processed. One
+  // dropped by R-3 or R-5, or ignored as a conflicting resend, sets neither.
+  let terminated = false;
+  let completingStatementCarriedSuccess = false;
 
   for (const received of statements) {
     // The deterministic id below is derived from verb.id, so the 400 comes first.
@@ -256,6 +275,14 @@ export async function POST(request: Request) {
         throw e;
       }
       mirror.push(toProcess);
+      const verbId = toProcess.verb?.id;
+      if (verbId === VERBS.terminated) terminated = true;
+      if (
+        (verbId === VERBS.completed || verbId === VERBS.passed || verbId === VERBS.failed) &&
+        typeof toProcess.result?.success === "boolean"
+      ) {
+        completingStatementCarriedSuccess = true;
+      }
     }
 
     ids.push(statementId);
@@ -264,7 +291,8 @@ export async function POST(request: Request) {
   // 0081 revision rule: once complete, only an OFFICIAL attempt (inside the
   // scoring window) moves journey days, XP and the CRM webhook; a revision
   // run changes nothing but its own row.
-  const nowComplete = await attemptStatus().catch(() => false);
+  const after = await afterStatus().catch(() => ({ complete: false, successStatus: null }));
+  const nowComplete = after.complete;
   let kind: Awaited<ReturnType<typeof classifyAttempt>> = null;
   if (nowComplete) {
     try {
@@ -294,10 +322,21 @@ export async function POST(request: Request) {
       console.warn("[xapi/statements] gamification failed:", e);
     }
   }
-  // CRM completion webhook: first transition to complete, official attempts only
-  // (cmi5 / xAPI parity with the SCORM commit path).
-  if (nowComplete && !wasComplete && officialRun) {
+  // CRM completion webhook, official attempts only (ADR 0015 steps 3 and 4).
+  // The boolean the fire function answers is the sweep's, and is ignored here.
+  const decision = decideCompletionWebhook({
+    official: officialRun,
+    before,
+    after,
+    batch: { completingStatementCarriedSuccess, terminated },
+  });
+  if (decision === "fire") {
     await fireCompletionWebhookForAttempt(session.attemptId, kind?.attemptNumber ?? null);
+  } else if (decision === "refire" && typeof before.webhookAt === "string") {
+    console.warn(JSON.stringify({ event: "webhook_refired", attempt_id: session.attemptId }));
+    await fireCompletionWebhookForAttempt(session.attemptId, kind?.attemptNumber ?? null, { refireFrom: before.webhookAt });
+  } else if (decision === "hold") {
+    console.warn(JSON.stringify({ event: "webhook_held", attempt_id: session.attemptId }));
   }
 
   // Fan-out: mirror these statements to the org's external LRS if configured.
