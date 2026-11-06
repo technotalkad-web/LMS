@@ -15,6 +15,8 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
  *                         page and the forced restart decide from it, so a
  *                         failed read throws GrantReadError instead of
  *                         reading as "no grants".
+ *   officialFailedAttemptId() — which attempt holds the learner's official Not
+ *                         passed on a course, read strictly, for the attempt page.
  *   grantSnapshotForUsers() — its bulk form for the surfaces that render the
  *                         official-result chain (ADR 0014 steps 7, 8, 11):
  *                         the same strict rule, keyed `${user_id}:${course_id}`.
@@ -309,6 +311,41 @@ export async function grantSnapshotFor(
   }
   if (res.data == null) throw new GrantReadError("empty_answer");
   return grantSnapshotOf(res.data as GrantRow[], nowIso);
+}
+
+/**
+ * The attempt that holds the learner's official Not passed on a course, by the course
+ * page's own condition (ADR 0017's note of 2026-11-06): computeScoring over the
+ * learner's attempts on the course and the retake ids of the strict grant read, and
+ * `officialStatus === "failed"`. The attempt page shows the sentence that names the
+ * official result only on that attempt, so a row a granted retake replaced does not
+ * tell the learner their result is Not passed. A failed or empty read answers null
+ * (ADR 0014 step 7), except a grant read grantSnapshotFor takes for a missing schema:
+ * a PGRST002 or PGRST205 answer reads as no grants, as it does on the course page, so
+ * for that render the sentence can show on a row a retake replaced.
+ *
+ * Three reads on `client`, with the caller's RLS. No policy read: normalizePolicy
+ * clamps every rule to DEFAULT_POLICY (ADR 0014 step 9), so the course page's
+ * resolvePolicy can only answer that, and a failed read of it would go unseen. The
+ * attempts read names its columns, so it does not pull each row's cmi_data.
+ */
+export async function officialFailedAttemptId(client: AnyClient, userId: string, courseId: string): Promise<string | null> {
+  try {
+    const { data: versions, error: versionsErr } = await client.from("course_versions").select("id").eq("course_id", courseId);
+    const versionIds = ((versions ?? []) as Array<{ id: string }>).map((v) => v.id);
+    if (versionsErr || versionIds.length === 0) return null;
+    const { data: attempts, error: attemptsErr } = await readWithOptionalColumn<ScorableAttempt[]>(
+      "is_revision",
+      (columns) => client.from("course_attempts").select(columns).eq("user_id", userId).in("course_version_id", versionIds),
+      KIND_LIST_COLUMNS
+    );
+    if (attemptsErr || !attempts?.length) return null;
+    const { retakeIds } = await grantSnapshotFor(client, userId, courseId);
+    const scoring = computeScoring(attempts, DEFAULT_POLICY, retakeIds);
+    return scoring.officialStatus === "failed" ? (scoring.officialAttempt?.id ?? null) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

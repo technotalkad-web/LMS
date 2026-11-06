@@ -2294,10 +2294,10 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
     await ctx.close();
   });
 
-  // ADR 0015 steps 4 and 9, ADR 0014 step 17 (extra 17): the re-fire, produced by crafted statements with the official
-  // attempt's own launch token, because the A.1 engine sends no fail then pass in one registration and this course has
-  // its assessment at Maximum attempts 1. The latch moving is the staging assertion; the route test proves the payload.
-  test("17. (extra) the re-fire: crafted completed + failed sets completion_webhook_at, a later passed moves it, a repeat of passed leaves it", async ({ browser, baseURL }) => {
+  // ADR 0017, on ADR 0014 step 17's crafted pattern (extra 17): this kit's stamp reads final, so a pass after a final fail
+  // is held and ADR 0015's second message does not arise. Spec 62 row 8a keeps the fail-then-pass re-fire, on a kit below
+  // the floor; the result-less re-fire below still runs on this kit.
+  test("17. (extra) a final fail holds: crafted completed + failed sets completion_webhook_at, a later passed and its repeat move nothing", async ({ browser, baseURL }) => {
     test.setTimeout(10 * 60_000);
     await ensureWorld(browser, baseURL!, "A.1 extras");
     const { L, ctx, a, init, post } = await craftedAttempt(browser, baseURL!, "X17", "X17-launch1");
@@ -2309,12 +2309,13 @@ test.describe("KIVO Release A — cmi5 real-LMS run: A.1 extras (12 (i), 12 (v),
     const r2 = await post([passed]);
     const row2 = await attemptRow(a);
     const t2: string | null = row2?.completion_webhook_at ?? null;
-    check("17", "a second POST of AU passed: completion_webhook_at strictly later than t1 (the compare-and-set moved it)", r2.status === 200 && row2?.success_status === "passed" && !!t1 && !!t2 && Date.parse(t2) > Date.parse(t1), { post: r2, success_status: row2?.success_status, score: row2?.score, t1, t2 });
+    check("17", "a second POST of AU passed: answered 200 and held: failed, 0.4, the latch unchanged", r2.status === 200 && row2?.success_status === "failed" && Number(row2?.score) === 0.4 && !!t1 && t2 === t1, { post: r2, success_status: row2?.success_status, score: row2?.score, t1, t2 });
     const pull = await pulledCourse(browser, baseURL!, L.email);
-    check("17", "learner-summary: passed with 90", pull.status === 200 && pull.course?.status === "passed" && pull.course?.score === 90, { status: pull.status, courseStatus: pull.course?.status, score: pull.course?.score });
+    check("17", "learner-summary: failed with 40", pull.status === 200 && pull.course?.status === "failed" && pull.course?.score === 40, { status: pull.status, courseStatus: pull.course?.status, score: pull.course?.score });
     const r3 = await post([passed]);
-    const t3: string | null = (await attemptRow(a))?.completion_webhook_at ?? null;
-    check("17", "a third POST repeating the same passed: the latch unchanged", r3.status === 200 && !!t2 && t3 === t2, { post: r3, t2, t3 });
+    const row3 = await attemptRow(a);
+    const t3: string | null = row3?.completion_webhook_at ?? null;
+    check("17", "a third POST repeating the same passed: still failed, 0.4, the latch unchanged", r3.status === 200 && row3?.success_status === "failed" && Number(row3?.score) === 0.4 && !!t2 && t3 === t2, { post: r3, success_status: row3?.success_status, score: row3?.score, t2, t3 });
     await ctx.close();
   });
 

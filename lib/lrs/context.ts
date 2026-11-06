@@ -5,14 +5,17 @@
  *
  * Every lookup is fail-soft: a missing table, column or row narrows the
  * context (fewer extensions) but never throws, so the forwarding path stays
- * exactly as robust as it was before enrichment existed. One exception
- * (ADR 0014 step 7): the two attempt reads behind the revision markers and
- * the ordinal fall back only on a missing `is_revision` column; any other
- * error throws ContextReadError, because a forwarded statement is
- * write-once and must not leave with a revision row read as unflagged.
+ * exactly as robust as it was before enrichment existed. Two exceptions:
+ * the two attempt reads behind the revision markers and the ordinal fall back
+ * only on a missing `is_revision` column (ADR 0014 step 7), and the read behind
+ * the not-applied marker only on a missing `ignored_pass` column (ADR 0017 step
+ * 18). Any other error throws ContextReadError, because a forwarded statement
+ * is write-once and must not leave with a revision row read as unflagged, or an
+ * ignored pass read as applied.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { launchedActivityIds } from "@/lib/xapi/process-statement";
+import { notAppliedStatementIds } from "@/lib/xapi/ignored-pass";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { isMissingColumn, type PgError } from "@/lib/scoring/attempt-kind";
 import {
@@ -49,8 +52,9 @@ async function safe<T>(p: PromiseLike<any>): Promise<T | null> {
 }
 
 /**
- * A read behind the LRS markers (ADR 0014 step 7) failed for a reason other
- * than a missing `is_revision` column. Thrown, never swallowed:
+ * A read behind the LRS markers (ADR 0014 step 7, ADR 0017 step 18) failed for a
+ * reason other than a missing `is_revision` or `ignored_pass` column. Thrown,
+ * never swallowed:
  * the sweep is cursor-paged, so a row skipped inside a
  * processed chunk is never re-selected, whereas a thrown source error is
  * caught by the sweep's orchestration, which leaves that source's cursor
@@ -59,7 +63,7 @@ async function safe<T>(p: PromiseLike<any>): Promise<T | null> {
  * lib/lrs/enqueue.ts forwards the statements raw, never with a false label).
  */
 export class ContextReadError extends Error {
-  constructor(readonly read: "attempts" | "siblings") {
+  constructor(readonly read: "attempts" | "siblings" | "ignored_pass") {
     super(`attempt context read failed: ${read}`);
     this.name = "ContextReadError";
   }
@@ -313,7 +317,7 @@ export async function loadAttemptContexts(
   ];
   const userIds = [...new Set(attempts.map((a) => String(a.user_id)))];
 
-  const [learners, orgs, paths, pathCourses, enrollments, policies, siblings, grantLinks] = await Promise.all([
+  const [learners, orgs, paths, pathCourses, enrollments, policies, siblings, grantLinks, ignored] = await Promise.all([
     loadLearnerDims(svc, pairs, groupsByOrgUser),
     loadOrgs(svc, orgIds),
     pathIds.length ? safe<Row[]>(svc.from("learning_paths").select("id, name").in("id", pathIds)) : null,
@@ -337,7 +341,20 @@ export async function loadAttemptContexts(
     safe<Row[]>(
       svc.from("attempt_requests").select("used_attempt_id").eq("status", "approved").in("used_attempt_id", ids)
     ),
+    // ADR 0017 step 18: a separate read, so a database without 0104 costs the
+    // marker and nothing else. Only a missing column falls back (nothing is
+    // marked); any other error throws below, so an ignored pass never leaves
+    // enriched and unmarked.
+    readOrMissing<Row[]>(
+      svc.from("course_attempts").select("id, ignored_pass").in("id", ids).not("ignored_pass", "is", null),
+      "ignored_pass"
+    ),
   ]);
+  if ("failed" in ignored) throw new ContextReadError("ignored_pass");
+  const notAppliedByAttempt = new Map<string, Set<string>>();
+  if ("data" in ignored) {
+    for (const r of ignored.data) notAppliedByAttempt.set(String(r.id), new Set(notAppliedStatementIds(r.ignored_pass)));
+  }
   const retakeIds = new Set<string>();
   for (const g of grantLinks ?? []) {
     const id = str(g.used_attempt_id);
@@ -409,6 +426,7 @@ export async function loadAttemptContexts(
             ? attemptNumber <= policy.max_scored_attempts
             : null,
       isRevision,
+      notAppliedIds: notAppliedByAttempt.get(attemptId) ?? new Set<string>(),
       scoringBasis: policy?.official_basis ?? null,
       scoringMaxAttempts: policy?.max_scored_attempts ?? null,
       org: orgs.get(orgId) ?? { id: orgId, slug: null, name: null },

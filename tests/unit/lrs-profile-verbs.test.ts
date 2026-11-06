@@ -50,6 +50,7 @@ const ctx: AttemptContext = {
   startedAt: "2026-10-21T10:00:00.000Z",
   scored: true,
   isRevision: false,
+  notAppliedIds: new Set<string>(),
   scoringBasis: null,
   scoringMaxAttempts: null,
   org: { id: "99999999-8888-4777-8666-555555555555", slug: "profile-verbs", name: null },

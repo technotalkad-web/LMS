@@ -88,6 +88,18 @@ then on (a pass can become a fail, a score can change).
   changes the assessment materially, an additional official attempt opens
   only by an admin's grant (below): every module resolves to one official
   attempt (ADR 0014 step 9).
+- A final Failed from the new engine never becomes Passed in the same enrolment
+  (ADR 0017). On a course version whose launch file reads as the released KIVO
+  A.1 engine or later (the stamp at or above `2026.10.28`, verdict `final`), once
+  the attempt's `success_status` is `failed`, no later result changes its status
+  or score, on cmi5, plain xAPI or SCORM 1.2. The result is received and answered
+  as usual, recorded as not applied in `course_attempts.ignored_pass` (migration
+  0104, never a grading input), and nothing keyed on a pass fires; on SCORM the
+  saved data freezes at the official fail too. Any other verdict keeps the
+  one-time upgrade from `failed` to `passed`, logged: `older` and `non_kivo` as
+  designed, `unknown` (a KIVO build whose stamp does not parse) and `unreadable`
+  (the stored launch file could not be read) also noted on the attempt. An admin's
+  grant still opens a new attempt, which is unaffected.
 
 ## Requesting another attempt (extra-attempt grants — migration 0083)
 

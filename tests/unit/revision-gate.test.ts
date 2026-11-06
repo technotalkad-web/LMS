@@ -64,7 +64,8 @@ function fakeClient(respond: (q: Query) => { data?: unknown; error?: unknown }) 
 const updatesOf = (qs: Query[]) => qs.filter((q) => q.ops.some((o) => o.op === "update")).map((q) => q.ops.find((o) => o.op === "update")!.args[0] as Record<string, unknown>);
 
 const AU = "https://publisher.example/au/1";
-const versionEmbed = { id: "v1", manifest_data: { raw: { auId: AU }, unitCount: 4 }, package_id: null };
+// engineVersion null: a third-party AU, so these cases keep the one-time upgrade (ADR 0017 step 3).
+const versionEmbed = { id: "v1", manifest_data: { raw: { auId: AU }, unitCount: 4, engineVersion: null }, package_id: null };
 const attemptRow = (extra: Record<string, unknown> = {}) => ({
   id: "a1", user_id: "u1", status: "in_progress", completion_status: "in_progress", success_status: "unknown",
   completed_at: null, score: null, course_version_id: "v1", cmi_data: {}, progress_pct: null, course_versions: versionEmbed, ...extra,
@@ -167,7 +168,7 @@ async function main() {
         return rowReadFails ? json({ code: "57014", message: "canceling statement due to statement timeout" }, 500) : json([row]);
       }
       if (select.startsWith("*,course_versions(")) return json([{ ...row, course_versions: versionEmbed }]);
-      if (select === "completion_status,success_status") return json([{ completion_status: row.completion_status, success_status: row.success_status }]);
+      if (select === "completion_status,success_status,score,completed_at,course_version_id") return json([{ completion_status: row.completion_status, success_status: row.success_status, score: row.score, completed_at: row.completed_at, course_version_id: row.course_version_id }]);
       if (select === "id") return json([{ id: BOUND }, { id: SIB }]);
       if (select === "organization_id") return json([{ organization_id: "o1" }]); // the mirror's org lookup
       return json([]);

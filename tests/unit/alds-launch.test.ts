@@ -384,7 +384,7 @@ async function main() {
       return { delta: delta as Record<string, unknown> | null, warns, select: read?.ops.find((o) => o.op === "select")?.args[0] };
     };
     const a = await run(PKG, LMS_AU);
-    eq("the attempt read embeds package_id", a.select, "*, course_versions(id, manifest_data, launch_url, storage_prefix, package_id)");
+    eq("the attempt read embeds package_id", a.select, "*, course_versions(id, manifest_data, manifest_type, launch_url, storage_prefix, storage_driver, package_id)");
     eq("completed on the LMS AU id + package_id → completed", [a.delta?.completion_status, a.delta?.status, a.delta?.progress_pct], ["completed", "completed", 100]);
     const b = await run(undefined, LMS_AU);
     eq("completed on the LMS AU id, no package_id → ignored as a sub-activity", [b.delta?.completion_status, b.delta?.status], [undefined, undefined]);
@@ -638,6 +638,14 @@ async function main() {
     console.log("\nlaunch/page.tsx: the revision seed copies the OFFICIAL attempt's documents, never the LMS-owned ones");
     eq("the seed reads the official attempt's documents except LMS.LaunchData and LMS.OfficialResult",
       /\.from\("xapi_state"\)\s*\.select\("state_id, content, content_type"\)\s*\.eq\("attempt_id", official\.id\)\s*\.neq\("state_id", LMS_LAUNCH_DATA_STATE_ID\)\s*\.neq\("state_id", LMS_OFFICIAL_RESULT_STATE_ID\);/.test(src), true);
+    {
+      // ADR 0017 step 19: the official attempt holds LMS.OfficialResult too, so this exclusion is load-bearing.
+      const statements = fs.readFileSync(path.resolve(__dirname, "../../app/api/xapi/statements/route.ts"), "utf8");
+      eq("the official attempt holds LMS.OfficialResult: the statements route upserts it for its own registration",
+        /\.from\("xapi_state"\)\.upsert\(\s*\{\s*attempt_id: session\.attemptId,\s*state_id: LMS_OFFICIAL_RESULT_STATE_ID,/.test(statements), true);
+      eq("…so the seed does not copy it, and the revision registration's own document is the launch page's",
+        /seed\.officialResult && ev\.scoring/.test(src) && /attempt_id: attemptId,\s*state_id: LMS_OFFICIAL_RESULT_STATE_ID,/.test(src), true);
+    }
     eq("…both constants are rpc.ts's",
       /^import \{ LMS_LAUNCH_DATA_STATE_ID, LMS_OFFICIAL_RESULT_STATE_ID \} from "@\/lib\/alds\/rpc";$/m.test(src), true);
     // Amended deliberately (the review's seed-error finding, the lead,

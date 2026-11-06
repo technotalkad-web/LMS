@@ -11,6 +11,8 @@ import { fireCompletionWebhookForAttempt } from "@/lib/integrations/webhook";
 import { decideCompletionWebhook, normalizeSuccess } from "@/lib/integrations/webhook-hold";
 import { VERBS, type XapiStatement } from "@/lib/xapi/types";
 import { isUuid, registrationVerdict } from "@/lib/xapi/registration";
+import { LMS_OFFICIAL_RESULT_STATE_ID } from "@/lib/alds/rpc";
+import { buildOfficialResult } from "@/lib/attempts/revision-seed";
 
 /**
  *   POST /api/xapi/statements   (write one or more statements)
@@ -35,6 +37,10 @@ import { isUuid, registrationVerdict } from "@/lib/xapi/registration";
  * ADR 0015 step 3: an AU completion without a result is held (log `webhook_held`)
  * until its pass/fail, a `terminated` or the cron sweep releases it; an attempt that
  * becomes passed after a not-passed message re-fires once (log `webhook_refired`). Ids only.
+ *
+ * ADR 0017 step 19: when a request changes an official attempt's success_status or
+ * score, LMS.OfficialResult is upserted for its own registration, last and fail-soft
+ * (log `official_result_write_failed`). A result the guard held changes neither.
  */
 export async function POST(request: Request) {
   // P4: an abandoned attempt (or its expired token) → 410 before any write.
@@ -75,6 +81,7 @@ export async function POST(request: Request) {
     course_version_id: string;
     completion_status?: string | null;
     success_status?: string | null;
+    score?: number | null;
     completion_webhook_at?: string | null;
     is_revision?: boolean | null;
   };
@@ -86,6 +93,7 @@ export async function POST(request: Request) {
     complete: isCompletedAttempt(row),
     successStatus: normalizeSuccess(row.success_status),
     webhookAt: row.completion_webhook_at,
+    score: row.score ?? null,
   };
   const isRevision = row.is_revision === true;
 
@@ -93,13 +101,20 @@ export async function POST(request: Request) {
   const afterStatus = async () => {
     const { data } = await svc
       .from("course_attempts")
-      .select("completion_status, success_status")
+      .select("completion_status, success_status, score, completed_at, course_version_id")
       .eq("id", session.attemptId)
       .maybeSingle();
-    const a = data as { completion_status?: string | null; success_status?: string | null } | null;
+    const a = data as {
+      completion_status?: string | null;
+      success_status?: string | null;
+      score?: number | null;
+      completed_at?: string | null;
+      course_version_id?: string | null;
+    } | null;
     return {
       complete: a?.completion_status === "completed" || a?.success_status === "passed",
       successStatus: normalizeSuccess(a?.success_status),
+      row: a,
     };
   };
 
@@ -291,7 +306,7 @@ export async function POST(request: Request) {
   // 0081 revision rule: once complete, only an OFFICIAL attempt (inside the
   // scoring window) moves journey days, XP and the CRM webhook; a revision
   // run changes nothing but its own row.
-  const after = await afterStatus().catch(() => ({ complete: false, successStatus: null }));
+  const after = await afterStatus().catch(() => ({ complete: false, successStatus: null, row: null }));
   const nowComplete = after.complete;
   let kind: Awaited<ReturnType<typeof classifyAttempt>> = null;
   if (nowComplete) {
@@ -342,6 +357,46 @@ export async function POST(request: Request) {
   // Fan-out: mirror these statements to the org's external LRS if configured.
   // Fail-isolated + non-blocking — never affects this response or our own copy.
   await mirrorToExternalLrs(session.attemptId, mirror);
+
+  // ADR 0017 step 19: the result note on the official registration, the lock
+  // source of the next engine release's pre-claim read; the A.1 engine reads it
+  // only in revision mode. Last, so an inert document can never take the last
+  // subrequest before the message or the outbox row. The row read above says
+  // whether anything moved; a failed read writes nothing.
+  if (
+    officialRun &&
+    after.row &&
+    (after.successStatus !== before.successStatus || (after.row.score ?? null) !== before.score)
+  ) {
+    const failed = () => console.warn(JSON.stringify({ event: "official_result_write_failed", attempt_id: session.attemptId }));
+    try {
+      const writtenAt = new Date().toISOString();
+      const { error: orErr } = await svc.from("xapi_state").upsert(
+        {
+          attempt_id: session.attemptId,
+          state_id: LMS_OFFICIAL_RESULT_STATE_ID,
+          content: buildOfficialResult({
+            scoring: {
+              officialStatus: after.successStatus ?? (after.complete ? "completed" : null),
+              officialScore: after.row.score ?? null,
+              officialAttempt: {
+                id: session.attemptId,
+                completed_at: after.row.completed_at ?? null,
+                course_version_id: after.row.course_version_id ?? null,
+              },
+            },
+            writtenAt,
+          }),
+          content_type: "application/json",
+          updated_at: writtenAt,
+        },
+        { onConflict: "attempt_id,state_id" }
+      );
+      if (orErr) failed();
+    } catch {
+      failed();
+    }
+  }
 
   return NextResponse.json(ids, { status: 200 });
 }

@@ -32,6 +32,7 @@ import { CsvButton } from "./_components/csv-button";
 import { fetchByIds } from "@/lib/db/chunked";
 import { aldsP4Enabled } from "@/lib/alds/flag";
 import { D1_SENTENCE, isAnalyticsTier, questionAnalyticsLabel, type AnalyticsTier } from "@/lib/alds/tier";
+import { NOT_APPLIED_CSV_HEADER, NOT_APPLIED_REPORT_LIMIT, NOT_APPLIED_SECTION_TITLE, notAppliedReportRows } from "@/lib/xapi/ignored-pass";
 
 type Course = {
   id: string;
@@ -213,13 +214,37 @@ export default async function ReportsPage({
   // write, so a row could be counted twice or missed.
   const ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct";
-  const { data: attemptRows } = await readPagedWithOptionalColumn<unknown>(
+  const { data: attemptRows, error: attemptsErr } = await readPagedWithOptionalColumn<unknown>(
     "is_revision",
     (columns, f, t) => supabase.from("course_attempts").select(columns).eq("organization_id", org.id).order("id").range(f, t),
     ATTEMPT_COLUMNS,
     { maxPages: 500 }
   );
   const attempts = attemptRows as Attempt[];
+
+  // ADR 0017 step 14: every attempt whose new-engine guard held a pass, however
+  // old: a separate, light read, because the attempts read above never names the
+  // column and fetchAll discards errors. The ceiling is expected never to bind; a
+  // full page is logged. Before 0104 the read answers `{ error }`, and the
+  // section, its card and the marker are not rendered at all. The same when the
+  // attempts read ended early: the rows are joined to it, and the section's empty
+  // state says every such attempt is listed.
+  const { data: ignoredRows, error: ignoredErr } = await supabase
+    .from("course_attempts")
+    .select("id, ignored_pass")
+    .eq("organization_id", org.id)
+    .eq("success_status", "failed")
+    .not("ignored_pass", "is", null)
+    .order("ignored_pass->>last_at", { ascending: false })
+    .limit(NOT_APPLIED_REPORT_LIMIT);
+  if ((ignoredRows ?? []).length >= NOT_APPLIED_REPORT_LIMIT) {
+    console.warn(JSON.stringify({ event: "ignored_pass_reports_truncated", organization_id: org.id }));
+  }
+  const notAppliedRows =
+    ignoredErr || attemptsErr
+      ? null
+      : notAppliedReportRows((ignoredRows ?? []) as Array<{ id: string; ignored_pass: unknown }>, attempts);
+  const notAppliedAttemptIds = new Set((notAppliedRows ?? []).map((r) => r.attempt.id));
 
   const members = await fetchAll<Member>((f, t) =>
     supabase
@@ -523,6 +548,19 @@ export default async function ReportsPage({
     new Date(r.due_at).toISOString().slice(0, 10),
     r.daysOverdue,
   ]);
+  const notAppliedCsvRows = (notAppliedRows ?? []).map((r) => {
+    const v = versionById.get(r.attempt.course_version_id);
+    const course = v ? courseById.get(v.course_id) : null;
+    return [
+      emailByUser.get(r.attempt.user_id) ?? r.attempt.user_id.slice(0, 8),
+      course?.title ?? "",
+      "Failed",
+      r.attempt.score === null ? "" : fmtPct(r.attempt.score),
+      r.ignoredPasses,
+      r.lastAt ?? "",
+      r.attempt.id,
+    ];
+  });
   const teamCsvRows = teamSummaries.map((t) => [
     t.team_name,
     t.members,
@@ -565,6 +603,17 @@ export default async function ReportsPage({
       href: `#at-risk`,
       badge: `${atRisk.length}`,
     },
+    ...(notAppliedRows
+      ? [
+          {
+            title: NOT_APPLIED_SECTION_TITLE,
+            description: "Passes received after a final fail on the same attempt and not applied.",
+            icon: <AlertTriangle className="w-5 h-5" />,
+            href: `#not-applied`,
+            badge: `${notAppliedRows.length}`,
+          },
+        ]
+      : []),
     {
       title: "Recent attempts",
       description: "Live feed of the latest course launches and results.",
@@ -728,6 +777,90 @@ export default async function ReportsPage({
           </Card>
         )}
       </section>
+
+      {notAppliedRows && (
+        <section id="not-applied" className="mb-10 scroll-mt-6" data-testid="not-applied-section">
+          <div className="flex items-baseline justify-between mb-3">
+            <h2 className="serif text-xl text-ink">{NOT_APPLIED_SECTION_TITLE}</h2>
+            <CsvButton
+              filename="passed-results-not-applied.csv"
+              header={NOT_APPLIED_CSV_HEADER}
+              rows={notAppliedCsvRows}
+            />
+          </div>
+          {notAppliedRows.length === 0 ? (
+            <Card className="p-0">
+              <EmptyState
+                icon={<CheckCircle2 className="w-5 h-5" />}
+                title="No passed result was held back"
+                description="Every attempt that holds an ignored pass is listed here, however old it is."
+              />
+            </Card>
+          ) : (
+            <Card className="overflow-x-auto">
+              <div className="max-h-[70vh] overflow-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-canvas text-xs uppercase tracking-wide text-muted sticky top-0 z-10">
+                  <tr>
+                    <th className="text-left px-4 py-2 font-medium">Learner</th>
+                    <th className="text-left px-4 py-2 font-medium">Course</th>
+                    <th className="text-left px-4 py-2 font-medium">Recorded result</th>
+                    <th className="text-right px-4 py-2 font-medium">Score</th>
+                    <th className="text-right px-4 py-2 font-medium">Ignored passes</th>
+                    <th className="text-right px-4 py-2 font-medium">Last ignored</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-line">
+                  {notAppliedRows.slice(0, 50).map((r) => {
+                    const v = versionById.get(r.attempt.course_version_id);
+                    const course = v ? courseById.get(v.course_id) : null;
+                    return (
+                      <tr key={r.attempt.id} className="hover:bg-canvas/50" data-testid="not-applied-row">
+                        <td className="px-4 py-3 text-xs">
+                          {emailByUser.get(r.attempt.user_id) ?? r.attempt.user_id.slice(0, 8)}
+                        </td>
+                        <td className="px-4 py-3">
+                          {course ? (
+                            <Link
+                              href={`/${orgSlug}/courses/${course.id}/attempts/${r.attempt.id}`}
+                              className="hover:underline"
+                            >
+                              {course.title}
+                            </Link>
+                          ) : (
+                            "-"
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-xs">
+                          <ResultPill
+                            completion={r.attempt.completion_status}
+                            success={r.attempt.success_status}
+                            status={r.attempt.status}
+                            revision={false}
+                          />
+                        </td>
+                        <td className="px-4 py-3 text-right tabular-nums">
+                          {r.attempt.score === null ? "-" : fmtPct(r.attempt.score)}
+                        </td>
+                        <td className="px-4 py-3 text-right tabular-nums">{r.ignoredPasses}</td>
+                        <td className="px-4 py-3 text-right text-xs text-muted whitespace-nowrap">
+                          {r.lastAt ? new Date(r.lastAt).toISOString().slice(0, 10) : "-"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              </div>
+              {notAppliedRows.length > 50 && (
+                <div className="px-4 py-2 text-xs text-muted text-center bg-canvas border-t border-line">
+                  Showing 50 of {notAppliedRows.length}. Use CSV download for the full list.
+                </div>
+              )}
+            </Card>
+          )}
+        </section>
+      )}
 
       <section id="per-course" className="mb-10 scroll-mt-6">
         <div className="flex items-baseline justify-between mb-3">
@@ -983,6 +1116,14 @@ export default async function ReportsPage({
                           status={a.status}
                           revision={revision}
                         />
+                        {notAppliedAttemptIds.has(a.id) && (
+                          <span
+                            className="ml-2 text-[10px] uppercase tracking-wide text-red-700"
+                            data-testid="not-applied-marker"
+                          >
+                            Not applied
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-right tabular-nums">
                         {revision ? (

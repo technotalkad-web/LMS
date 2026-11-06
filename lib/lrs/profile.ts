@@ -20,7 +20,8 @@
 export const XAPI_NS = "https://ambak.com/xapi/";
 // 1.1.0 (ADR 0014 step 7): adds attempt/launch-mode (`Review` on a revision
 // visit's statements) and attempt/scored = false on them. ADR 0016 step 14 lists
-// the `responded` verb under the same version. Additions, so no LRS history splits.
+// the `responded` verb and ADR 0017 step 18 the statement/result-not-applied
+// extension under the same version. Additions, so no LRS history splits.
 export const PROFILE_VERSION = "1.1.0";
 /** Category context activity that tags every enriched statement. */
 export const PROFILE_ACTIVITY_ID = `${XAPI_NS}profile/v1`;
@@ -162,6 +163,11 @@ export const ext = {
   attemptId: `${E}attempt/id`,
   attemptNumber: `${E}attempt/number`,
   attemptScored: `${E}attempt/scored`,
+  /**
+   * `true` on a statement Ambak received after the attempt's final fail on a
+   * new-engine version and did not apply (ADR 0017 step 18); absent otherwise.
+   */
+  resultNotApplied: `${E}statement/result-not-applied`,
   /** `Review` on a revision visit's statements (ADR 0014 step 7); absent otherwise. Since 1.1.0. */
   attemptLaunchMode: `${E}attempt/launch-mode`,
   scoringBasis: `${E}attempt/scoring-basis`,

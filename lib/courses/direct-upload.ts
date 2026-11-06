@@ -7,6 +7,7 @@ import { declaredLanguageOf, parseManifestXml } from "./manifest/parse-xml";
 import type { ParsedManifest } from "./manifest/types";
 import { countLearningUnits, MAX_LAUNCH_READ_BYTES } from "./units";
 import { linkValidationToVersion } from "./validation/gate";
+import { engineVersionForManifest } from "./engine-version";
 import {
   BLOCKED_UPLOAD_ERROR,
   applyIntegrity,
@@ -454,9 +455,16 @@ export async function finalizeDirectUpload(args: {
   // launch file over the read cap stays null and final, and is never fetched by
   // the lazy path.
   const md = { ...(version.manifest_data ?? {}), unitCount, unitCountAlgo: 2, identity: integrity.findings.identity };
+  // ADR 0017 step 4: the engine stamp under the same read, its key absent when
+  // the file was not read, so the lazy read retries it.
+  const engineVersion = engineVersionForManifest(launchHtml);
   const { data: updated, error: updErr } = await serviceClient()
     .from("course_versions")
-    .update({ upload_status: "ready", manifest_data: md, file_count: keys.length })
+    .update({
+      upload_status: "ready",
+      manifest_data: engineVersion === undefined ? md : { ...md, engineVersion },
+      file_count: keys.length,
+    })
     .eq("id", version.id)
     .eq("upload_status", "uploading")
     .select("id");

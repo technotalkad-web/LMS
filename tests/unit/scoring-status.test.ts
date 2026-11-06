@@ -458,8 +458,8 @@ console.log("\nthe six paged attempts reads use readPagedWithOptionalColumn, eac
   const SITES: Record<string, Array<[string, RegExp]>> = {
     [ORG_REPORTS_FILE]: [
       ["the call: by organisation, in id order, paged by range, at most 500 pages (fetchAll's 500,000-row ceiling)",
-        /const \{ data: attemptRows \} = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) => supabase\.from\("course_attempts"\)\.select\(columns\)\.eq\("organization_id", org\.id\)\.order\("id"\)\.range\(f, t\),\s*ATTEMPT_COLUMNS,\s*\{ maxPages: 500 \}\s*\);/],
-      ["the error rule: the rows read so far, as fetchAll (the error is not read)", /const attempts = attemptRows as Attempt\[\];/],
+        /const \{ data: attemptRows, error: attemptsErr \} = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) => supabase\.from\("course_attempts"\)\.select\(columns\)\.eq\("organization_id", org\.id\)\.order\("id"\)\.range\(f, t\),\s*ATTEMPT_COLUMNS,\s*\{ maxPages: 500 \}\s*\);/],
+      ["the error rule: the rows read so far, as fetchAll; only the section that states completeness reads the error (ADR 0017 step 14)", /const attempts = attemptRows as Attempt\[\];[\s\S]*?const notAppliedRows =\s*ignoredErr \|\| attemptsErr\s*\? null/],
     ],
     "lib/scoring/status.ts": [
       ["the call: by version chunk, in id order, one decision for every chunk",

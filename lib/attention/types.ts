@@ -139,6 +139,15 @@ export const ATTENTION_PROVIDERS: AttentionProviderMeta[] = [
     defaultPriority: "high",
     configurablePriority: true,
   },
+  {
+    // ADR 0017 step 13: a pass the new-engine guard held, with the attempt to review.
+    type: "ignored-pass",
+    label: "Passed result not applied",
+    description: "A pass received after a final fail on the same attempt was not applied (new-engine rule).",
+    defaultEnabled: true,
+    defaultPriority: "high",
+    configurablePriority: true,
+  },
 ];
 
 export type AttentionTypeConfig = { enabled: boolean; priority: AttentionPriority };

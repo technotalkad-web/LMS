@@ -8,6 +8,7 @@ import { resolveEmails } from "@/lib/users/emails";
 import { defaultSlotFinding, isReadyVersion } from "@/lib/courses/default-rule";
 import { heldWebhookItem, heldWebhookSummary } from "@/lib/integrations/webhook-hold";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
+import { NOT_APPLIED_TITLE, attentionContextLine, ignoredPassCount, readIgnoredRecord } from "@/lib/xapi/ignored-pass";
 import {
   ATTENTION_PROVIDERS,
   PRIORITY_RANK,
@@ -423,6 +424,59 @@ async function heldWebhookItems(svc: AnyClient, orgId: string, orgSlug: string, 
   }
 }
 
+/**
+ * ADR 0017 step 13: attempts whose new-engine guard held a pass, one item per
+ * attempt. `occurredAt` is the record's last_at, so a later ignored pass brings a
+ * marked-read item back and a repeat of the same SCORM dictionary does not.
+ * Fail-soft: supabase-js answers `{ error }` on a database without 0104 and does
+ * not throw, so the fetcher checks it and answers no items.
+ */
+async function ignoredPassItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
+  const { data, error } = await svc
+    .from("course_attempts")
+    .select("id, user_id, course_version_id, score, completed_at, ignored_pass, course_versions(course_id)")
+    .eq("organization_id", orgId)
+    .not("ignored_pass", "is", null)
+    .eq("success_status", "failed")
+    .order("ignored_pass->>last_at", { ascending: false })
+    .limit(200);
+  if (error) return [];
+  const courseIdOf = (r: { course_versions: { course_id: string } | Array<{ course_id: string }> | null }) =>
+    (Array.isArray(r.course_versions) ? r.course_versions[0] : r.course_versions)?.course_id ?? null;
+  const rows = ((data ?? []) as Array<{
+    id: string;
+    user_id: string;
+    ignored_pass: unknown;
+    course_versions: { course_id: string } | Array<{ course_id: string }> | null;
+  }>).filter((r) => ignoredPassCount(r.ignored_pass) > 0);
+  if (!rows.length) return [];
+  const [emails, names, titles] = await Promise.all([
+    resolveEmails(svc, rows.map((r) => r.user_id)),
+    resolveNames(svc, rows.map((r) => r.user_id)),
+    courseTitles(svc, rows.map((r) => courseIdOf(r)).filter((x): x is string => !!x)),
+  ]);
+  const items: AttentionItem[] = [];
+  for (const r of rows) {
+    const record = readIgnoredRecord(r.ignored_pass);
+    if (!record?.last_at) continue;
+    const courseId = courseIdOf(r);
+    items.push({
+      key: `ignored-pass:${r.id}`,
+      type: "ignored-pass",
+      priority,
+      title: NOT_APPLIED_TITLE,
+      who: names.get(r.user_id) ?? emails.get(r.user_id) ?? r.user_id.slice(0, 8),
+      context: attentionContextLine(record, courseId ? titles.get(courseId) : null),
+      occurredAt: record.last_at,
+      actionLabel: "Review the attempt",
+      href: courseId ? `/${orgSlug}/courses/${courseId}/attempts/${r.id}` : `/${orgSlug}/reports#not-applied`,
+      inline: null,
+      dismissible: true,
+    });
+  }
+  return items;
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 export async function collectAttention(args: {
@@ -460,6 +514,7 @@ export async function collectAttention(args: {
     else if (p.type === "unpublished-versions") jobs.push(run(unpublishedVersionItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "default-slot") jobs.push(run(defaultSlotItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "held-webhooks") jobs.push(run(heldWebhookItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "ignored-pass") jobs.push(run(ignoredPassItems(svc, orgId, orgSlug, c.priority)));
   }
   let items = (await Promise.all(jobs)).flat();
 

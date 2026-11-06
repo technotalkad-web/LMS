@@ -3,20 +3,29 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   CMI5_PROGRESS_EXT,
   clampPct,
+  ensureEngineVersion,
   ensureUnitCount,
   partialPct,
   updateAttemptFailSoft,
   type VersionLite,
 } from "@/lib/courses/progress";
 import { AttemptAbandonedError } from "@/lib/attempts/abandon";
-import { auActivityId } from "@/lib/alds/types";
+import { CMI5_SESSION_EXT, auActivityId } from "@/lib/alds/types";
+import { OUTCOME_FINAL_FLOOR, outcomeFinalVerdict } from "@/lib/courses/engine-version";
+import {
+  mergeIgnoredResult,
+  newIgnoredRecord,
+  readIgnoredRecord,
+  type IgnoredEntry,
+  type IgnoredRecord,
+} from "./ignored-pass";
 
 /**
  * The attempt's version as the read below embeds it: VersionLite plus the
  * package id, from which the LMS-issued AU id is derived (ADR 0006 note (d)
  * of 2026-10-19). Local on purpose: lib/courses/progress.ts is not edited.
  */
-type LaunchedVersion = VersionLite & { package_id?: string | null };
+type LaunchedVersion = VersionLite & { package_id?: string | null; manifest_type?: string | null };
 
 /**
  * Inspect a single xAPI statement and update the bound attempt's
@@ -53,7 +62,7 @@ export async function processStatement(opts: {
   // keeps this deploy-safe across attempt-column migrations (0075).
   const { data: row, error: readErr } = await supabase
     .from("course_attempts")
-    .select("*, course_versions(id, manifest_data, launch_url, storage_prefix, package_id)")
+    .select("*, course_versions(id, manifest_data, manifest_type, launch_url, storage_prefix, storage_driver, package_id)")
     .eq("id", attemptId)
     .maybeSingle();
   // Distinguish a real query error from "no such attempt". On error we must NOT
@@ -98,7 +107,19 @@ export async function processStatement(opts: {
   const auIds = launchedActivityIds(version, r.course_version_id);
   const aboutAu = isAboutAu(statement, auIds);
 
+  const scaled = statement.result?.score?.scaled;
+  const roundedScore = typeof scaled === "number" && !Number.isNaN(scaled) ? Math.round(scaled * 10000) / 10000 : null;
+
+  // ADR 0017 step 8: a final fail from the new engine never becomes passed in
+  // this row. The guard is keyed on the row (step 7) and answers whether this
+  // statement's result is held, and what to write on the row's record.
+  const guard =
+    aboutAu && r.success_status === "failed"
+      ? await newEngineGuard({ statement, verbId, roundedScore, row: r, version, attemptId, auIds, supabase })
+      : NOT_HELD;
+
   const update: Record<string, unknown> = {};
+  if (guard.record) update.ignored_pass = guard.record;
   const outcomeVerbs: string[] = [VERBS.completed, VERBS.passed, VERBS.failed];
   const isOutcome = outcomeVerbs.includes(verbId);
 
@@ -118,7 +139,9 @@ export async function processStatement(opts: {
   }
 
   // Success side — AU-level outcomes only.
-  if (aboutAu && verbId === VERBS.passed && r.success_status !== "passed") {
+  if (guard.held) {
+    // Held: success_status, score and status stay as the final fail left them.
+  } else if (aboutAu && verbId === VERBS.passed && r.success_status !== "passed") {
     update.success_status = "passed";
   } else if (
     aboutAu &&
@@ -130,11 +153,9 @@ export async function processStatement(opts: {
 
   // Score: result.score.scaled is 0..1 in cmi5. Only the AU's own result
   // counts — a per-question scaled score must not become the module score.
-  const scaled = statement.result?.score?.scaled;
-  if (aboutAu && typeof scaled === "number" && !Number.isNaN(scaled)) {
-    const rounded = Math.round(scaled * 10000) / 10000;
-    if (r.score === null || r.score === undefined || rounded > r.score) {
-      update.score = rounded;
+  if (!guard.held && aboutAu && roundedScore !== null) {
+    if (r.score === null || r.score === undefined || roundedScore > r.score) {
+      update.score = roundedScore;
     }
   }
 
@@ -213,6 +234,169 @@ export async function processStatement(opts: {
     );
   }
   return update;
+}
+
+const NOT_HELD: { held: boolean; record: IgnoredRecord | null } = { held: false, record: null };
+
+function sessionIdOf(statement: XapiStatement): string | undefined {
+  const extensions = statement.context?.extensions as Record<string, unknown> | undefined;
+  const id = extensions?.[CMI5_SESSION_EXT];
+  return typeof id === "string" && id ? id : undefined;
+}
+
+/**
+ * A string of the received statement the record may keep. Postgres refuses a NUL in
+ * jsonb, so a hand-made value would fail the record's write and the POST on every
+ * resend, where the row's update without the record carries no such string.
+ */
+function withoutNul(s: unknown): string | undefined {
+  return typeof s === "string" && s && !s.includes("\u0000") ? s : undefined;
+}
+
+/** The attempt's first stored AU-level `failed`, or null. A failed read is treated as not found: fail-soft. */
+async function findFailingStatement(supabase: SupabaseClient, attemptId: string, auIds: string[]) {
+  try {
+    const { data, error } = await supabase
+      .from("xapi_statements")
+      .select("statement_id, raw")
+      .eq("attempt_id", attemptId)
+      .eq("verb", VERBS.failed)
+      .order("stored", { ascending: true })
+      // Up to 20 rows, because assessment run summaries also carry `failed` about a sub-activity.
+      .limit(20);
+    if (error) return null;
+    for (const stored of (data ?? []) as Array<{ statement_id: string; raw: XapiStatement }>) {
+      if (isAboutAu(stored.raw, auIds)) {
+        const sessionId = sessionIdOf(stored.raw);
+        return {
+          statement_id: stored.statement_id,
+          ...(stored.raw.timestamp ? { timestamp: stored.raw.timestamp } : {}),
+          ...(sessionId ? { session_id: sessionId } : {}),
+        };
+      }
+    }
+  } catch {
+    /* fail-soft: the record carries no ids */
+  }
+  return null;
+}
+
+/**
+ * ADR 0017 steps 6, 8 and 12, on an AU-level statement about a `failed` row. A
+ * statement is held when it is a `passed` or carries a score other than the row's.
+ * Only a `final` verdict holds. A statement carrying the failing statement's id
+ * with another score is held and records nothing: step 1 says the score does not
+ * move, and step 8 (ii) says it gets no entry, because the engine re-sends the
+ * failing pair with the same ids after a network error and that retry must raise
+ * no item. When its score is above the row's it logs one line of ids, a trace of a
+ * hand-made statement or of the double fault; a genuine retry carries the row's own
+ * score or one below it and stays silent. Every other verdict keeps today's one-time
+ * upgrade; when a `passed` is upgraded it is logged, and the two verdicts under which
+ * a stamp may exist and could not be read also go on the row. The failing-statement
+ * lookup runs only on a held result, or on an upgrade that writes an applied entry.
+ */
+async function newEngineGuard(i: {
+  statement: XapiStatement;
+  verbId: string;
+  roundedScore: number | null;
+  row: { score: number | null; completed_at: string | null; course_version_id: string; ignored_pass?: unknown };
+  version: LaunchedVersion | null;
+  attemptId: string;
+  auIds: string[];
+  supabase: SupabaseClient;
+}): Promise<{ held: boolean; record: IgnoredRecord | null }> {
+  const { statement, verbId, roundedScore, row, version, attemptId, auIds, supabase } = i;
+  const isPass = verbId === VERBS.passed;
+  if (!isPass && (roundedScore === null || roundedScore === row.score)) return NOT_HELD;
+
+  const read = await ensureEngineVersion(supabase, version);
+  const verdict = outcomeFinalVerdict({ stamp: read.stamp, readError: read.error });
+  const runtime = version?.manifest_type === "xapi" ? "xapi" : "cmi5";
+  const statementId = statement.id ?? null;
+
+  if (verdict !== "final" && !isPass) return NOT_HELD;
+  if (verdict !== "final") {
+    console.warn(
+      JSON.stringify({
+        event: "pass_upgraded",
+        attempt_id: attemptId,
+        statement_id: statementId,
+        runtime,
+        engine_version: read.stamp,
+        reason: verdict,
+        ...(read.error ? { error: read.error } : {}),
+      })
+    );
+    if (verdict !== "unknown" && verdict !== "unreadable") return NOT_HELD;
+  }
+
+  const failing = await findFailingStatement(supabase, attemptId, auIds);
+  if (!isPass && failing && failing.statement_id === statement.id) {
+    if (typeof row.score !== "number" || roundedScore! > row.score) {
+      console.warn(
+        JSON.stringify({
+          event: "result_ignored",
+          attempt_id: attemptId,
+          statement_id: statementId,
+          runtime,
+          engine_version: read.stamp,
+          failing_id: true,
+        })
+      );
+    }
+    return { held: true, record: null };
+  }
+
+  const sessionId = withoutNul(sessionIdOf(statement));
+  const timestamp = withoutNul(statement.timestamp);
+  const shortVerb = verbId.split("/").pop() ?? verbId;
+  const entry: IgnoredEntry = {
+    // A foreign verb that merely ends in "passed" is not an ignored pass.
+    verb: isPass || shortVerb !== "passed" ? shortVerb : verbId,
+    received_at: new Date().toISOString(),
+    score: roundedScore,
+    ...(timestamp ? { timestamp } : {}),
+    ...(sessionId ? { session_id: sessionId } : {}),
+    same_session: runtime === "cmi5" && sessionId && failing?.session_id ? sessionId === failing.session_id : null,
+  };
+  const existing =
+    readIgnoredRecord(row.ignored_pass) ??
+    newIgnoredRecord({
+      runtime,
+      course_version_id: row.course_version_id,
+      engine_version: read.stamp,
+      floor: OUTCOME_FINAL_FLOOR,
+      failed: { at: row.completed_at, score: row.score, ...(failing ?? {}) },
+    });
+
+  if (verdict !== "final") {
+    // The upgrade applied because the engine version could not be read. Never
+    // counted, and with no statement id: the statement was applied.
+    const { record, changed } = mergeIgnoredResult(existing, {
+      ...entry,
+      verb: "passed",
+      applied: true,
+      reason: verdict === "unknown" ? "unknown" : "unreadable",
+      ...(read.error ? { error: read.error } : {}),
+    });
+    return { held: false, record: changed ? record : null };
+  }
+
+  const { record, changed, capped } = mergeIgnoredResult(existing, { ...entry, ...(statement.id ? { statement_id: statement.id } : {}) });
+  if (changed || capped) {
+    console.warn(
+      JSON.stringify({
+        event: isPass ? "pass_ignored" : "result_ignored",
+        attempt_id: attemptId,
+        statement_id: statementId,
+        runtime,
+        engine_version: read.stamp,
+        ...(isPass ? {} : { verb: entry.verb }),
+        ...(capped ? { capped } : {}),
+      })
+    );
+  }
+  return { held: true, record: changed ? record : null };
 }
 
 /** Normalized activity id: trim, drop trailing slashes, case-insensitive. */

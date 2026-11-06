@@ -79,10 +79,19 @@ Context extensions on every statement, when known:
   `learner/tenure-days` (at the statement's timestamp), `learner/teams` [], `learner/groups` []
 - `content/course-id`, `content/course-title`, `content/version-id`, `content/version-number`,
   `content/package-id`, `content/language`, `content/manifest-type`, `content/engine-version`
+  (populated for KIVO packages from the build that carries ADR 0017: the launch file's stamp, or
+  `unknown` for a KIVO build with no parseable stamp; a non-KIVO package carries nothing)
 - `attempt/id`, `attempt/number` (1 = first attempt on the course), `attempt/scored`
   (counts under the course's scoring rule; `false` on a revision visit; `true` on a granted
   retake), `attempt/launch-mode` (`Review` on a revision visit's statements; absent otherwise;
   ADR 0014), `attempt/scoring-basis`, `attempt/scoring-max-attempts`, `attempt/started-at`
+- `statement/result-not-applied` (`true`, absent otherwise; ADR 0017): Ambak received this result
+  after the attempt's final fail on a new-engine version and did not apply it; the attempt's
+  recorded result is the CRM `learner-summary`'s. For statements whose `content/engine-version` is
+  at or above `2026.10.28`, the first AU-level `failed` of a registration is final and a later
+  `passed` in the same registration was not applied. The `raw` profile carries no extension, so a
+  `raw` consumer cannot tell these statements apart; it reads the recorded result from
+  `learner-summary`.
 - `path/id`, `path/name`, `path/step`, `path/steps-total`
 - `journey/program-id`, `journey/name`, `journey/enrollment-id`, `journey/day`, `journey/days-total`
 - `org/id`, `org/slug`
