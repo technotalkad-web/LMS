@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
@@ -60,10 +61,7 @@ export default async function TeamsPage({
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 200 });
-    for (const u of data?.users ?? []) {
-      if (u.email && allUserIds.includes(u.id)) emailByUser.set(u.id, u.email);
-    }
+    for (const [id, email] of await resolveEmails(svc, allUserIds)) emailByUser.set(id, email);
   }
 
   const teamMembers: TeamMember[] = teamMemberLinks.map((m) => ({

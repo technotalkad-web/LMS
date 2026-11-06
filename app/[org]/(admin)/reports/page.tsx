@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import Link from "next/link";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { redirect } from "next/navigation";
@@ -292,10 +293,7 @@ export default async function ReportsPage({
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 1500 });
-    for (const u of data?.users ?? []) {
-      if (u.email && userIdSet.has(u.id)) emailByUser.set(u.id, u.email);
-    }
+    for (const [id, email] of await resolveEmails(svc, userIdSet)) emailByUser.set(id, email);
   }
 
   // 0083: extra official attempts granted (approved requests + bulk grants).

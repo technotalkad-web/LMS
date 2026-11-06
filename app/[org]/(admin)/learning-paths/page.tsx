@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import { redirect } from "next/navigation";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
@@ -262,7 +263,7 @@ export default async function LearningPathsPage({
     }
   }
 
-  // Resolve enrollee emails (re-use the listUsers we run for assignments below).
+  // Resolve enrollee emails (re-use the lookup we run for assignments below).
 
   // Course picker options (all courses in this org)
   const { data: courseRows } = await supabase
@@ -310,19 +311,7 @@ export default async function LearningPathsPage({
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    // Every page, as [pathId]/learners/page.tsx does: one capped page leaves out
-    // this org's members on a project with more accounts, and the learner picker
-    // then shows id fragments. Stops once every id on this page is resolved.
-    let pageNum = 1;
-    while (emailByUser.size < userIds.size && pageNum <= 50) {
-      const { data } = await svc.auth.admin.listUsers({ page: pageNum, perPage: 1000 });
-      const users = data?.users ?? [];
-      for (const u of users) {
-        if (u.email && userIds.has(u.id)) emailByUser.set(u.id, u.email);
-      }
-      if (users.length < 1000) break;
-      pageNum += 1;
-    }
+    for (const [id, email] of await resolveEmails(svc, userIds)) emailByUser.set(id, email);
   }
   const memberOptions: MemberOption[] = (memberRows ?? []).map((m) => ({
     user_id: m.user_id,

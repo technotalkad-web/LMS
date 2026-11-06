@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
@@ -349,16 +350,7 @@ export default async function AdminCourseDetailPage({
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    // perPage bumped to 1500 (was 500) — at 500, large orgs would silently
-    // miss recently-created users in the combobox candidate list. Their
-    // membership row exists, but their email never gets mapped, so the
-    // combobox renders them as a UUID prefix and search doesn't match.
-    // 1500 covers single-tenant orgs up to ~Fortune-500 size; switch to
-    // multi-page accumulation if a tenant ever exceeds that.
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 1500 });
-    for (const u of data?.users ?? []) {
-      if (u.email && allUserIds.has(u.id)) emailByUser.set(u.id, u.email);
-    }
+    for (const [id, email] of await resolveEmails(svc, allUserIds)) emailByUser.set(id, email);
     const userIdList = Array.from(allUserIds);
     const { data: profileRows } = await svc
       .from("profiles")

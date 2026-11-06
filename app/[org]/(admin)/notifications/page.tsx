@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
@@ -65,10 +66,7 @@ export default async function NotificationsPage({
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 1500 });
-    for (const u of data?.users ?? []) {
-      if (u.email && memberIds.includes(u.id)) emailById.set(u.id, u.email);
-    }
+    for (const [id, email] of await resolveEmails(svc, memberIds)) emailById.set(id, email);
   }
   const users: RecipientUser[] = memberIds.map((id) => ({
     user_id: id,
