@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { Activity } from "lucide-react";
 
@@ -25,13 +26,7 @@ export default async function AuditLogPage() {
   );
   const emailById = new Map<string, string>();
   if (actorIds.length > 0) {
-    const { data: listed } = await svc.auth.admin.listUsers({
-      page: 1,
-      perPage: 1500,
-    });
-    for (const u of listed?.users ?? []) {
-      if (u.email && actorIds.includes(u.id)) emailById.set(u.id, u.email);
-    }
+    for (const [id, email] of await resolveEmails(svc, actorIds)) emailById.set(id, email);
   }
 
   return (

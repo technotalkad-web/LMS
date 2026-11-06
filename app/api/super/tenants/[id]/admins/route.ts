@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import { NextResponse } from "next/server";
 import { randomBytes } from "node:crypto";
 import { createClient } from "@/lib/supabase/server";
@@ -69,11 +70,7 @@ export async function GET(
     (m) => ADMIN_ROLES.has(m.role)
   );
 
-  const { data: listed } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  const emailById = new Map<string, string>();
-  for (const u of listed?.users ?? []) {
-    if (u.email) emailById.set(u.id, u.email);
-  }
+  const emailById = await resolveEmails(s, rows.map((r) => r.user_id));
 
   return NextResponse.json({
     admins: rows.map((r) => ({

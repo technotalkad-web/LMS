@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
@@ -91,11 +92,7 @@ export default async function TenantDetailPage({
   const adminRows = ((members ?? []) as Array<{ user_id: string; role: string }>).filter(
     (m) => ADMIN_ROLES.has(m.role)
   );
-  const { data: listed } = await svc.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  const emailById = new Map<string, string>();
-  for (const u of listed?.users ?? []) {
-    if (u.email) emailById.set(u.id, u.email);
-  }
+  const emailById = await resolveEmails(svc, adminRows.map((r) => r.user_id));
   const admins = adminRows.map((r) => ({
     user_id: r.user_id,
     role: r.role,

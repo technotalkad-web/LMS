@@ -1,3 +1,4 @@
+import { resolveEmails } from "@/lib/users/emails";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { ShieldAlert } from "lucide-react";
 
@@ -20,12 +21,8 @@ export default async function SuperAdminsPage() {
 
   const emailById = new Map<string, string>();
   if (owners.length > 0) {
-    const { data: listed } = await svc.auth.admin.listUsers({
-      page: 1,
-      perPage: 200,
-    });
-    for (const u of listed?.users ?? []) {
-      if (u.email) emailById.set(u.id, u.email);
+    for (const [id, email] of await resolveEmails(svc, owners.map((o) => o.user_id))) {
+      emailById.set(id, email);
     }
   }
 
