@@ -7,6 +7,12 @@
  *     drill; no run block holds an expression; drill_prefix is read from the event
  *     file and sits in no step's env, because GitHub prints a step's env in the
  *     public log; the drill's rclone commands cannot write to a remote;
+ *   - the env: rclone reads every flag from an RCLONE_<FLAG> variable before any
+ *     command runs, so no such variable reaches a step, from the workflow, the job
+ *     or the step, unless it is a remote's RCLONE_CONFIG_<remote>_<key>. The fake
+ *     rclone here refuses one as the real one does, and the run blocks get the
+ *     job's env, as on the runner;
+ *   - the install step, with a fake download: the pins reach each command;
  *   - the copy step, fed a log whose keys hold markers: 0 markers in stdout and
  *     the summary, and exact counts for each error class;
  *   - the drill step on canned listings: what fails it, what passes it, and a
@@ -75,6 +81,23 @@ const counter = step("Write the public-safe");
 // Not step(): a missing step fails its own assertion and each case below, one by one.
 const preflight: Step = steps.find((x) => x.name.startsWith("Preflight")) ?? { name: "Preflight", cond: null, env: {}, run: "" };
 const unquoted = (v: string | undefined) => (v ?? "").replace(/^"|"$/g, "");
+const install = step("Install rclone");
+// What reaches a step is the workflow's env, the job's and its own. readSteps reads only its own.
+const envAt = (indent: number): Record<string, string> => {
+  const lines = yml.split("\n");
+  const at = lines.indexOf(`${" ".repeat(indent)}env:`);
+  const found: Record<string, string> = {};
+  if (at < 0) return found;
+  for (const line of lines.slice(at + 1)) {
+    if (line.trim() === "" || line.trim().startsWith("#")) continue;
+    if (line.search(/\S/) <= indent) break;
+    const entry = line.match(/^\s*["']?([A-Za-z0-9_]+)["']?\s*:\s*(.*)$/);
+    if (entry) found[entry[1]] = entry[2];
+  }
+  return found;
+};
+const workflowEnv = envAt(0);
+const jobEnv = envAt(4);
 
 console.log("the workflow text");
 eq("step order: the preflight runs before rclone is fetched", steps.map((s) => s.name.split(" ")[0]), ["Check", "Preflight", "Install", "Write", "Copy", "Restore"]);
@@ -95,6 +118,23 @@ eq("the drill's remotes are the copy's",
   Object.fromEntries(Object.entries(copy.env).filter(([k]) => k !== "DRY_RUN")));
 eq("the copy signs for B2_REGION", copy.env.RCLONE_CONFIG_B2_REGION, "${{ secrets.B2_REGION }}");
 eq("the drill signs for B2_REGION", drill.env.RCLONE_CONFIG_B2_REGION, "${{ secrets.B2_REGION }}");
+
+console.log("\nno variable that rclone would read as a flag reaches any step");
+// A remote this job uses and a key. Bare RCLONE_CONFIG is the --config flag.
+const REMOTE_CONFIG = /^RCLONE_CONFIG_(SUPA|B2)_[A-Z][A-Z0-9_]*$/;
+const notConfig = (names: string[]) => names.filter((n) => n.startsWith("RCLONE_") && !REMOTE_CONFIG.test(n));
+eq("none in the workflow's env", notConfig(Object.keys(workflowEnv)), []);
+eq("none in the job's env", notConfig(Object.keys(jobEnv)), []);
+for (const s of steps) {
+  eq(`none reaches this step: ${s.name.split(" ")[0]}`, notConfig(Object.keys({ ...workflowEnv, ...jobEnv, ...s.env })), []);
+}
+// However it would be set: a flow-style env, a quoted name, export, GITHUB_ENV, a prefix on a command.
+const code = yml.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
+eq("none anywhere in the file but its comments", notConfig([...new Set(code.match(/(?<![A-Za-z0-9_])RCLONE_[A-Za-z0-9_]*/g) ?? [])]), []);
+eq("the version is pinned", /^v\d+\.\d+\.\d+$/.test(jobEnv.PINNED_RCLONE_VERSION ?? ""), true);
+eq("the sha256 is pinned", /^[0-9a-f]{64}$/.test(jobEnv.PINNED_RCLONE_SHA256 ?? ""), true);
+eq("the install step reads those two names and no other", install.run.match(/\$\{[A-Z0-9_]+\}/g), ["${PINNED_RCLONE_VERSION}", "${PINNED_RCLONE_VERSION}", "${PINNED_RCLONE_SHA256}", "${PINNED_RCLONE_VERSION}"]);
+eq("the zip is checked against the sha256", install.run.includes('echo "${PINNED_RCLONE_SHA256}  $RUNNER_TEMP/$zip" | sha256sum -c -'), true);
 
 console.log("\nthe nightly keeps its flags");
 eq("copy, never sync", copy.run.includes('rclone copy "supa:course-content" "$dest" "${flags[@]}" > "$log" 2>&1'), true);
@@ -164,6 +204,10 @@ if (!hasBash) {
   // A log file, when FAKE_LOG is set, stands for a failed copy: it goes to the step's own log.
   fs.writeFileSync(`${bin}/rclone`, `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$FAKE_DIR/calls.txt"
+# As the real one does, before any command: a variable named for a flag is read as that flag.
+for v in "\${!RCLONE_@}"; do
+  case "$v" in RCLONE_CONFIG_*) ;; *) echo "CRITICAL: Invalid value when setting a flag from environment variable $v" >&2; exit 1 ;; esac
+done
 if [ -n "\${FAKE_LOG:-}" ]; then cat "$FAKE_LOG"; exit 1; fi
 case "$1" in
   lsf)
@@ -217,6 +261,7 @@ esac
         GITHUB_EVENT_PATH: `${dir}/event.json`,
         FAKE_DIR: dir,
         B2_CONTENT_BUCKET: "bucket",
+        ...jobEnv,
         ...env,
       },
     });
@@ -231,6 +276,35 @@ esac
 
   const FOLDER = "courses/11111111-2222-4333-8444-555555555555/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/v2/";
   const OTHER = "courses/11111111-2222-4333-8444-555555555555/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/v1/";
+
+  console.log("\nthe install step, with the job's env and a fake download");
+  {
+    const dir = sandbox();
+    const fakes = `${dir}/install-bin`;
+    fs.mkdirSync(fakes);
+    const calls = "$FAKE_DIR/install-calls.txt";
+    fs.writeFileSync(`${fakes}/curl`, `#!/usr/bin/env bash\nprintf 'curl %s\\n' "$*" >> "${calls}"\n`, { mode: 0o755 });
+    fs.writeFileSync(`${fakes}/sha256sum`, `#!/usr/bin/env bash\nprintf 'sha256sum %s: ' "$*" >> "${calls}"\ncat >> "${calls}"\n`, { mode: 0o755 });
+    fs.writeFileSync(`${fakes}/unzip`, `#!/usr/bin/env bash\nprintf 'unzip %s\\n' "$*" >> "${calls}"\n`, { mode: 0o755 });
+    fs.writeFileSync(`${fakes}/install`, `#!/usr/bin/env bash\nprintf 'install %s\\n' "$*" >> "${calls}"\ncp "${bin}/rclone" "\${@: -1}"\n`, { mode: 0o755 });
+    const r = runBlock(dir, install, {
+      GITHUB_PATH: `${dir}/github-path`,
+      PATH: `${path.resolve(fakes)}${path.delimiter}${path.resolve(bin)}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+    const pin = jobEnv.PINNED_RCLONE_VERSION;
+    const zip = `rclone-${pin}-linux-amd64.zip`;
+    const read = (f: string) => (fs.existsSync(`${dir}/${f}`) ? fs.readFileSync(`${dir}/${f}`, "utf8") : "");
+    eq("it passes", r.status, 0);
+    eq("no variable stops rclone", /CRITICAL/.test(r.stdout + r.stderr), false);
+    eq("the pins reach each command", read("install-calls.txt").split("\n").filter(Boolean), [
+      `curl -fsSL -o ${dir}/tmp/${zip} https://downloads.rclone.org/${pin}/${zip}`,
+      `sha256sum -c -: ${jobEnv.PINNED_RCLONE_SHA256}  ${dir}/tmp/${zip}`,
+      `unzip -q -o ${dir}/tmp/${zip} -d ${dir}/tmp`,
+      `install -m 0755 ${dir}/tmp/rclone-${pin}-linux-amd64/rclone ${dir}/tmp/bin/rclone`,
+    ]);
+    eq("its last line runs rclone version", read("calls.txt"), "version\n");
+    eq("later steps find rclone on the path", read("github-path"), `${dir}/tmp/bin\n`);
+  }
 
   console.log("\nthe copy step, fed a log whose keys hold markers (the shapes of rclone v1.68.2)");
   {
