@@ -310,9 +310,18 @@ export default async function LearningPathsPage({
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    const { data } = await svc.auth.admin.listUsers({ page: 1, perPage: 200 });
-    for (const u of data?.users ?? []) {
-      if (u.email && userIds.has(u.id)) emailByUser.set(u.id, u.email);
+    // Every page, as [pathId]/learners/page.tsx does: one capped page leaves out
+    // this org's members on a project with more accounts, and the learner picker
+    // then shows id fragments. Stops once every id on this page is resolved.
+    let pageNum = 1;
+    while (emailByUser.size < userIds.size && pageNum <= 50) {
+      const { data } = await svc.auth.admin.listUsers({ page: pageNum, perPage: 1000 });
+      const users = data?.users ?? [];
+      for (const u of users) {
+        if (u.email && userIds.has(u.id)) emailByUser.set(u.id, u.email);
+      }
+      if (users.length < 1000) break;
+      pageNum += 1;
     }
   }
   const memberOptions: MemberOption[] = (memberRows ?? []).map((m) => ({
