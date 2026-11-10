@@ -459,6 +459,8 @@ Note (2026-11-04; the 0103 staging sitting, after the paste; a record, not an ed
 
 The lead also confirmed through the REST interface that the three new functions and the new columns are in the schema cache, and that the anon key is refused on `revision_visits`. The totals moved between the two readings (attempts 346 to 390, courses 17 to 62) because test runs continued on staging. Production is untouched; 0103 reaches it only in its own owner sitting.
 
+Note (2026-11-10, ADR 0021; a pointer, not an edit): Feedback statements on a granted retake are counted by ADR 0021 as the learner's newest answer; the earlier answer stays in the CSV with Counted = no.
+
 ## Notes to add to accepted records
 
 Exact text of the dated notes the lead adds under the named records at acceptance (ADR 0001 decision 3: an accepted ADR is never edited; the decision lives in ADR 0014 and each note is a pointer). Each is appended under a "Notes" heading, or under the named decision where the record keeps notes there.
