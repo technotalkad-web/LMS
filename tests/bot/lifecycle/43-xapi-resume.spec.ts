@@ -112,7 +112,7 @@ test.describe("xAPI (tincan.xml) save / exit / relaunch / resume", () => {
     const frame = page.frameLocator("iframe");
     const status = frame.locator("#status");
     await expect(status).toHaveText(/fresh start at slide 1/, { timeout: 30_000 });
-    await expect(page.getByText("xAPI", { exact: true })).toBeVisible(); // runtime badge
+    await expect(page.getByTestId("launch-bar")).toBeVisible(); // runtime bar
 
     for (let n = 2; n <= 4; n++) {
       await frame.locator("#next").click();

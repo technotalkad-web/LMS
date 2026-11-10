@@ -334,7 +334,7 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     page.on("pageerror", (e) => pageErrors.push(String(e.message || e)));
 
     await page.goto(`/${state.org!.slug}/courses/${state.courseId}/launch`);
-    await expect(page.getByText("xAPI", { exact: true })).toBeVisible({ timeout: 30_000 }); // runtime badge
+    await expect(page.getByTestId("launch-bar")).toBeVisible({ timeout: 30_000 }); // runtime bar
     const src = await page.locator("iframe").first().getAttribute("src");
     expect(src, "launch page renders the course iframe").toBeTruthy();
     const qs = new URLSearchParams(src!.slice(src!.indexOf("?") + 1));

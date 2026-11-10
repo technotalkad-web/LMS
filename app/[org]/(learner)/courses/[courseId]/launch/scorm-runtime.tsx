@@ -1,8 +1,8 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { CmiData } from "@/lib/scorm/types";
+import { LaunchBar } from "./launch-bar";
 import { ModuleFrameLoader, useModuleFrame, useNextModulePreload } from "./module-frame";
 
 /**
@@ -26,6 +26,8 @@ export function ScormRuntime({
   backLabel = "Exit course",
   preloadUrls = [],
   revision = false,
+  showTitle = true,
+  continueHref = null,
 }: {
   attemptId: string;
   initialCmi: CmiData;
@@ -38,6 +40,10 @@ export function ScormRuntime({
   preloadUrls?: string[];
   /** A revision visit (ADR 0014): review only; this launch never changes the official result. */
   revision?: boolean;
+  /** The course title in the bar (ADR 0019 step 8): false for a KIVO build, which shows its own. */
+  showTitle?: boolean;
+  /** The continue address on a Learning Path launch (ADR 0019 step 8); null hides Continue. */
+  continueHref?: string | null;
 }) {
   const cmiRef = useRef<CmiData>({ ...initialCmi });
   const initializedRef = useRef(false);
@@ -147,32 +153,16 @@ export function ScormRuntime({
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-ink">
-      <header className="flex items-center justify-between px-4 sm:px-5 py-2.5 bg-ink text-canvas border-b border-canvas/10">
-        <div className="flex items-center gap-3 sm:gap-4 min-w-0">
-          <Link
-            href={backHref}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-canvas/20 hover:border-canvas/50 hover:bg-canvas/10 text-sm font-medium transition-colors shrink-0"
-            title={`Exit course — ${backLabel.toLowerCase()}`}
-          >
-            <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden>
-              <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 010 1.06L9.06 10l3.73 3.71a.75.75 0 11-1.06 1.06l-4.25-4.24a.75.75 0 010-1.06l4.25-4.24a.75.75 0 011.06 0z" clipRule="evenodd" />
-            </svg>
-            <span className="hidden sm:inline">{backLabel}</span>
-            <span className="sm:hidden">Exit</span>
-          </Link>
-          <span className="serif text-lg sm:text-xl truncate">{courseTitle}</span>
-          {revision && (
-            <span
-              className="shrink-0 px-2 py-0.5 rounded-full border border-amber-300/60 bg-amber-400/15 text-amber-200 text-[11px] font-semibold uppercase tracking-wide"
-              title="Revision visit: your official result does not change"
-              data-testid="practice-badge"
-            >
-              Revision
-            </span>
-          )}
-        </div>
+      <LaunchBar
+        backHref={backHref}
+        backLabel={backLabel}
+        title={courseTitle}
+        showTitle={showTitle}
+        revision={revision}
+        continueHref={continueHref}
+      >
         <SyncBadge status={status} />
-      </header>
+      </LaunchBar>
       <div className="relative flex-1 min-h-0 bg-white">
         <iframe
           ref={frame.ref}
