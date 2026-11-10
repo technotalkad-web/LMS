@@ -7,14 +7,23 @@
  * component (no NEXT_PUBLIC_ prefix, so the value is never inlined into a
  * browser bundle).
  *
- * Default OFF. It is set per environment only after 0100_alds_core.sql is
- * confirmed there (staging first; production after v1.4.0 and 0100, in a
- * later tag). Staging: `ALDS_P4 = "on"` in the top-level [vars] of
- * wrangler.toml (the staging Worker; `vars` is not inherited by
- * [env.production]) and on Cloud Run staging only when the deploy runs with
- * ALDS_P4=on (scripts/cloud-run-deploy.sh). Production: absent from
- * [env.production.vars]. It gates the Package Guardian writes,
- * the tier surfaces and the ADR 0006 §C launch contract.
+ * Default OFF. Staging: set after 0100_alds_core.sql was confirmed there,
+ * `ALDS_P4 = "on"` in the top-level [vars] of wrangler.toml (the staging
+ * Worker; `vars` is not inherited by [env.production]) and on Cloud Run
+ * staging only when the deploy runs with ALDS_P4=on
+ * (scripts/cloud-run-deploy.sh). Production: `ALDS_P4 = "on"` in
+ * [env.production.vars] from the v1.4.0 tag, deployed BEFORE 0100 is pasted
+ * there (0103 and 0104 first, then the tag, then 0100;
+ * docs/release/v1.4.0.md). That order is safe because the flag on with 0100
+ * absent is fail-soft (isAldsSchemaMissing below: every P4 read or write of
+ * a 0100 object skips; the parts of the cmi5 launch contract that need no
+ * 0100 object, the LMS-issued AU id and the LMS.LaunchData document, run as
+ * on staging), while 0100 present with the flag absent is not: a staff
+ * launch is stored with is_preview false, 0100's delete guards count it as
+ * learner history, and an admin's course delete answers 409 (spec 50,
+ * observed on staging).
+ * It gates the Package Guardian writes, the tier surfaces and the ADR 0006
+ * §C launch contract.
  */
 export const ALDS_P4_ENV = "ALDS_P4" as const;
 
