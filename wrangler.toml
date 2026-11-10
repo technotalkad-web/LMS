@@ -63,12 +63,12 @@ STORAGE_DRIVER = "supabase"
 SUPABASE_STORAGE_BUCKET = "course-content"
 NODE_ENV = "production"
 # ALDS P4 (ADR 0005 note (h), ADR 0006 note (a)): the Package Guardian gate,
-# the tier surfaces and the cmi5 launch contract. STAGING Worker only: this
-# top-level block is what `wrangler deploy` with no --env uses
+# the tier surfaces and the cmi5 launch contract. This line is the STAGING
+# Worker's: this top-level block is what `wrangler deploy` with no --env uses
 # (deploy-staging.yml). `vars` is NOT inherited by [env.production] (wrangler:
 # "This field is not automatically inherited from the top level environment");
-# production reads only [env.production.vars], where ALDS_P4 stays absent until
-# v1.4.0 and 0100 are on production, in a later commit and tag. Switched on
+# production reads only [env.production.vars], which carries its own ALDS_P4
+# line from v1.4.0 (see there, and docs/release/v1.4.0.md). Switched on here
 # only after 0100_alds_core.sql was confirmed on the staging database.
 ALDS_P4 = "on"
 
@@ -155,12 +155,21 @@ NODE_ENV = "production"
 # crons on prod alone — never set this on staging, where heartbeats are stale
 # by design and the env would read permanently degraded.
 OPS_EXPECT_CRONS = "1"
-# ALDS_P4 is deliberately ABSENT here (P4 off on production; ADR 0005 note (h)).
-# Every production deploy prints wrangler's warning "The following vars exist at
-# the top level, but not on env.production.vars ... Please add these vars to
-# env.production.vars: - ALDS_P4". Expected: do NOT add it. It comes here only
-# after v1.4.0 and 0100_alds_core.sql are on production, in a later commit and
-# tag (docs/release/v1.3.0.md §5).
+# ALDS P4 on production from v1.4.0 (ADR 0005 note (h); docs/release/v1.4.0.md).
+# The sitting's order: 0103 and 0104 are pasted while v1.3.0 still runs, then
+# the v1.4.0 tag deploys this line, then 0100_alds_core.sql is pasted. The flag
+# goes BEFORE 0100 because that pairing is fail-soft: with 0100 absent, every
+# P4 read or write of a 0100 object skips (lib/alds/flag.ts,
+# isAldsSchemaMissing); the parts of the cmi5 launch contract that need no
+# 0100 object (the LMS-issued AU id, the LMS.LaunchData document) run as on
+# staging. The reverse pairing is not: with 0100 present and the
+# flag absent, a staff launch is stored with is_preview false, 0100's delete
+# guards count it as learner history, and an admin's course delete answers 409
+# (spec 50, observed on staging with the flag absent). Removing this line while
+# 0100 is on the production database brings that pairing back. With the line
+# here, wrangler's warning that ALDS_P4 exists at the top level but not in
+# env.production.vars no longer appears on production deploys.
+ALDS_P4 = "on"
 # Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
 # RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 # White-label custom domains (see docs/INFRA_MIGRATION.md). Inert until set.
