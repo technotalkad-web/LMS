@@ -12,6 +12,11 @@
  *     or the step, unless it is a remote's RCLONE_CONFIG_<remote>_<key>. The fake
  *     rclone here refuses one as the real one does, and the run blocks get the
  *     job's env, as on the runner;
+ *   - the copy's flags: every object goes up in parts, because a locked bucket refuses
+ *     an upload with no Content-MD5 and rclone sends it on a single PUT only when the
+ *     source gives an MD5; the comparison is by size, with no HEAD per object, and
+ *     nothing blinds it; no MD5 is stored on the object; one pass a run, because the
+ *     lock keeps every version an extra pass would write;
  *   - the install step, with a fake download: the pins reach each command;
  *   - the copy step, fed a log whose keys hold markers: 0 markers in stdout and
  *     the summary, and exact counts for each error class;
@@ -138,11 +143,29 @@ eq("the zip is checked against the sha256", install.run.includes('echo "${PINNED
 
 console.log("\nthe nightly keeps its flags");
 eq("copy, never sync", copy.run.includes('rclone copy "supa:course-content" "$dest" "${flags[@]}" > "$log" 2>&1'), true);
-eq("the comparison and age flags", copy.run.includes("--immutable --checksum --min-age 1h --use-server-modtime --fast-list"), true);
+eq("the comparison and age flags", copy.run.includes("--immutable --size-only --min-age 1h --use-server-modtime --fast-list"), true);
 eq("the destination", copy.run.includes('dest="b2:${B2_CONTENT_BUCKET}/content/prod/supabase/course-content"'), true);
 eq("the dry run's flag", copy.run.includes("flags+=(--dry-run)"), true);
 eq("no sync anywhere in a command", /^\s*rclone sync\b/m.test(yml), false);
-eq("no HEAD per object uploaded", /--s3-no-check-bucket --s3-no-head$/m.test(copy.run), true);
+eq("no HEAD per object uploaded", /--s3-no-check-bucket --s3-no-head --s3-upload-cutoff 0$/m.test(copy.run), true);
+// The flags as bash reads them: the array's words, with a commented-out line gone, not anywhere in the text.
+const flagWords = ((copy.run.match(/^flags=\(\n([\s\S]*?)^\)$/m) ?? [])[1] ?? "").split("\n").map((l) => l.replace(/(^|\s)#.*$/, "")).join(" ").split(/\s+/).filter(Boolean);
+const flagValue = (name: string) => (flagWords.includes(name) ? flagWords[flagWords.indexOf(name) + 1] : undefined);
+eq("every object goes up in parts, so every upload carries Content-MD5: the cutoff is 0", flagValue("--s3-upload-cutoff"), "0");
+eq("the cutoff is given once", flagWords.filter((w) => w.startsWith("--s3-upload-cutoff")).length, 1);
+eq("every run takes those flags: the dry run's branch adds only --dry-run", copy.run.match(/flags\+=\(.*\)/g), ["flags+=(--dry-run)"]);
+eq("the comparison is by size: a HEAD per object on both sides would compare no more", flagWords.includes("--size-only"), true);
+eq("--checksum is not in the flags", flagWords.includes("--checksum"), false);
+eq("no flag that turns multipart off or skips rclone's own check after a copy", flagWords.filter((w) => /^--(ignore-checksum|s3-use-multipart-uploads)/.test(w)), []);
+eq("no MD5 stored on the object: a 32-hex ETag that is not the MD5 would break every download. Each part keeps its Content-MD5", flagWords.includes("--s3-disable-checksum"), true);
+// On rclone v1.68.2: --ignore-size, --ignore-existing, --update and --compare-dest hide a changed size with exit 0, and
+// --copy-dest implies --compare-dest. --ignore-times makes every object a conflict. --no-check-dest is refused beside
+// --immutable, so no run would copy anything.
+eq("no flag that blinds the comparison or breaks it", flagWords.filter((w) => /^(--(ignore-size|ignore-existing|ignore-times|update|no-check-dest|compare-dest|copy-dest)\b|-I$|-u$)/.test(w)), []);
+eq("one pass a run: the lock keeps every version an extra pass would write", flagValue("--retries"), "1");
+eq("the new flags stand together, in the array every run takes", /--s3-disable-checksum --retries 1$/m.test(copy.run), true);
+eq("--retries is given once, and no --retries-sleep", flagWords.filter((w) => w.startsWith("--retries")).length, 1);
+eq("--low-level-retries stays at its default: a transient HTTP error is still retried", flagWords.filter((w) => w.startsWith("--low-level-retries")), []);
 eq("rclone size writes its errors to the file, not the public log", copy.run.includes('rclone size "$dest" --fast-list 2>> "$log"'), true);
 
 console.log("\nthe drill cannot write to a remote");
@@ -186,6 +209,20 @@ const header = headerLines.replace(/\n#\s*/g, " ");
 eq("says the key is made by API, and why", /made through the API because the console's Read and Write holds bypassGovernance/.test(header), true);
 eq("says to change the expected mode and days with the bucket", /change EXPECT_RETENTION_MODE and EXPECT_RETENTION_DAYS with the bucket/i.test(header), true);
 eq("says --s3-no-head's cost and what still compares", /--s3-no-head/.test(header) && /compared the next night/.test(header), true);
+eq("says why every object goes up in parts", /--s3-upload-cutoff 0\s+every object goes up in parts/.test(header) && /refuses an upload to an Object Lock bucket with no Content-MD5/.test(header), true);
+eq("says what the next night compares", /a change that keeps the size is no conflict, on the live side or the backup, and only a drill naming that folder finds it/.test(header), true);
+eq("says what a stored MD5 would break", /--s3-disable-checksum\s+no MD5 stored on the object/.test(header) && /refuse every download of that object as corrupted, though the bytes are right/.test(header), true);
+eq("says the parts still carry Content-MD5", /Each part still carries its Content-MD5/.test(header), true);
+eq("says what storing no MD5 costs", /a restored object is checked by the drill and not by a stored MD5/.test(header), true);
+eq("says why one pass a run", /--retries 1\s+one pass a run/.test(header) && /the lock keeps each extra version for the retention period/.test(header), true);
+eq("says a transient HTTP error is still retried", /--low-level-retries stays at its default, so a transient HTTP error is still retried/.test(header), true);
+eq("says what one pass a run costs", /a failed object waits for the next night's run/.test(header), true);
+eq("claims no SHA-256 on a part: over https a part goes unsigned", /SHA-256/.test(headerLines), false);
+eq("says a dry run proves sizes and not bytes", /listings give the same sizes\. It says nothing about the bytes/.test(header), true);
+eq("says a zero-byte object is never skipped in silence", /zero-byte object is one empty part/.test(header) && /never skipped in silence/.test(header), true);
+eq("says the drill's budget per object", /two Class B calls per object downloaded/.test(header), true);
+eq("the drill's own line says the same", drill.run.includes("two B2 Class B calls each."), true);
+eq("no comment still explains --checksum as the flag in use", /^#\s+--checksum\s/m.test(headerLines), false);
 eq("says a drill is no restored course", /no course is launched from the restored files/.test(header), true);
 eq("says a hidden file looks missing and its version remains", /hidden file looks missing/.test(header) && /version remains/.test(header), true);
 
@@ -320,7 +357,7 @@ esac
       `${stamp} ERROR : ${FOLDER}MARKER-e.html: Source and destination exist but do not match: immutable file modified`,
       `${stamp} ERROR : loose/MARKER-f.html: a failure no class knows MARKER-text`,
       `${stamp} ERROR : ${FOLDER}MARKER-g.html: Failed to copy: operation error S3: PutObject, https response error StatusCode: 418, RequestID: , HostID: , api error MARKER-name: MARKER-message`,
-      `${stamp} ERROR : Attempt 1/3 failed with 8 errors and: immutable file modified`,
+      `${stamp} ERROR : Attempt 1/1 failed with 8 errors and: immutable file modified`,
       `${stamp} ERROR : Can't retry any of the errors - not attempting retries`,
       `${stamp} NOTICE: Failed to copy: MARKER-fatal`,
       `${stamp} ERROR : ${FOLDER}MARKER-h.html: file not in Local file system at /tmp/MARKER-dir`,
@@ -386,7 +423,20 @@ esac
     eq("a clean copy passes", r.status, 0);
     eq("the totals still print", r.stdout.includes("Total objects: 3"), true);
     eq("rclone's own notice stays out of the public log", /MARKER/.test(r.stdout + r.stderr), false);
-    eq("the real copy skips the HEAD per object", /^copy supa:course-content .*--s3-no-head/m.test(fs.readFileSync(`${dir}/calls.txt`, "utf8")), true);
+    const called = fs.readFileSync(`${dir}/calls.txt`, "utf8");
+    eq("the real copy skips the HEAD per object", /^copy supa:course-content .*--s3-no-head/m.test(called), true);
+    eq("the real copy sends every object in parts", /^copy supa:course-content .*--s3-upload-cutoff 0 /m.test(called), true);
+    eq("the real copy compares by size", /^copy supa:course-content .*--size-only /m.test(called), true);
+    eq("the real copy stores no MD5", /^copy supa:course-content .*--s3-disable-checksum /m.test(called), true);
+    eq("the real copy makes one pass", /^copy supa:course-content .*--retries 1 /m.test(called), true);
+    eq("the real copy is no dry run", /^copy supa:course-content .*--dry-run/m.test(called), false);
+  }
+  {
+    const dir = prepared();
+    const r = runBlock(dir, copy, { DRY_RUN: "true" });
+    const called = fs.readFileSync(`${dir}/calls.txt`, "utf8");
+    eq("a dry run passes", r.status, 0);
+    eq("a dry run has the same flags as the real copy", /^copy supa:course-content .*--size-only .*--s3-upload-cutoff 0 --s3-disable-checksum --retries 1 .*--dry-run$/m.test(called), true);
   }
   {
     const dir = prepared();

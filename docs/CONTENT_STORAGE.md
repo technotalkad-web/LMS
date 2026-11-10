@@ -112,7 +112,16 @@ learners. `STORAGE_DRIVER` on the Worker decides where **new** uploads go.
   Object-Locked B2 content bucket (`B2_CONTENT_BUCKET`), not the dump bucket.
   `--immutable` never overwrites an existing object, because version folders
   never change; nothing is deleted from the copy when it disappears from the
-  source. The secrets it needs are listed in the workflow header; it fails
+  source. Every object goes up in parts (`--s3-upload-cutoff 0`), because B2
+  refuses an upload to an Object Lock bucket with no Content-MD5, and rclone
+  sends that header on a single upload only when the source gives an MD5, which
+  this source did not on the first real copy. The next night compares sizes
+  only, from the two listings (`--size-only`): a change that keeps the size is
+  no conflict, on the live side or the copy, and only the drill, naming that
+  folder, finds it. A zero-byte object goes up as one empty part; if B2 refuses
+  it the job fails and counts that error's class, and the object is never
+  skipped in silence.
+  The secrets it needs are listed in the workflow header; it fails
   with a message naming any that are missing. The R2 source returns only when
   `STORAGE_DRIVER` flips to `r2` (step 7). Its own key
   (`B2_CONTENT_KEY_ID`, `B2_CONTENT_APPLICATION_KEY`) is made through the API,
@@ -153,9 +162,9 @@ learners. `STORAGE_DRIVER` on the Worker decides where **new** uploads go.
     to 500 objects and 1 GiB. To choose, give `drill_prefix`,
     `courses/{course}/{package}/v{n}/` or the test folder
     `courses/backup-drill/test/v1/`; anything else is refused before any read.
-    Each object downloaded costs one B2 Class B call out of the free tier's
-    2,500 a day (two for an object uploaded in parts), and a folder you name has
-    no ceiling.
+    Each object downloaded costs two B2 Class B calls out of the free tier's
+    2,500 a day (a GET and a HEAD, because every object is uploaded in parts),
+    and a folder you name has no ceiling.
   - Its log and summary show counts and that folder's prefix, nothing else. If
     the live bucket and the backup are both empty it passes and says nothing
     was proven. If only the live bucket is empty it fails, which it also does
