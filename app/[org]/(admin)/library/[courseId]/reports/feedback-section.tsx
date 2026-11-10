@@ -149,11 +149,11 @@ export default async function FeedbackSection({
       >
         <input type="hidden" name="orgSlug" value={orgSlug} />
         <label className="flex flex-col text-[11px] text-muted">
-          From (received on or after)
+          From (received on or after, UTC)
           <input type="date" name="from" className="mt-1 border border-line rounded-md px-2 py-1 text-sm text-ink bg-paper" />
         </label>
         <label className="flex flex-col text-[11px] text-muted">
-          To (inclusive)
+          To (inclusive, UTC)
           <input type="date" name="to" className="mt-1 border border-line rounded-md px-2 py-1 text-sm text-ink bg-paper" />
         </label>
         <button

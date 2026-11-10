@@ -339,12 +339,13 @@ export function feedbackCsvHeader(): string[] {
  * One CSV row in the header's column order, raw cells: the route escapes
  * every cell (csvEscape) in its one join expression. Responded at is the
  * engine's timestamp, Stored at when the LMS received the statement. An item
- * left blank has an empty Response and the label "No answer"; a comment's
- * label is empty.
+ * left blank (no response) has an empty Response and the label "No answer",
+ * the summary's rule (ADR 0021 C.5): a row that carries a response is labelled
+ * by it even when the unanswered extension is set. A comment's label is empty.
  */
 export function feedbackCsvRow(row: FeedbackResponseRow): string[] {
   const kind = questionKind(row.interaction_type, row.scale);
-  const blank = row.response === null || row.unanswered;
+  const blank = row.response === null;
   const label = blank
     ? "No answer"
     : kind === "comment"
@@ -374,7 +375,8 @@ export function feedbackCsvRow(row: FeedbackResponseRow): string[] {
  * The CSV's optional date range (ADR 0021 E.4): an empty value is absent (a
  * blank date input is sent as `from=`); a present value must parse; a
  * date-only `to` (YYYY-MM-DD) is inclusive, so its bound is the next day.
- * Both bounds apply to `stored`. `from`/`to` echo the values as sent (null
+ * A date-only value is a UTC day (Date.parse reads YYYY-MM-DD as UTC
+ * midnight); the form's labels say so. Both bounds apply to `stored`. `from`/`to` echo the values as sent (null
  * when absent) for the audit row.
  */
 export function exportRange(

@@ -255,6 +255,8 @@ async function main() {
     eq("a comment stays raw (=SUM(1) is escaped by the route), empty label, Counted no", [comment[9], comment[10], comment[11]], ["=SUM(1)+1 clear", "", "no"]);
     const blank = feedbackCsvRow({ ...row, response: null, unanswered: true });
     eq("an item left blank: empty response, label No answer", [blank[9], blank[10]], ["", "No answer"]);
+    const marked = feedbackCsvRow({ ...row, response: "likert_2", unanswered: true });
+    eq("a response with the unanswered extension is labelled by the response, as the summary buckets it", [marked[9], marked[10]], ["likert_2", "Disagree"]);
     const bare = feedbackCsvRow({ ...row, responded_at: null, employee_id: null, slot_language: null, first_name: null, last_name: null, question: null, question_name: { "en-US": "Slide" }, interaction_type: null });
     eq("absent values are empty cells; the name stands in for the question", [bare[0], bare[2], bare[4], bare[5], bare[6], bare[8], bare[13]], ["", "", "", "", "Slide", "", ""]);
     eq("a yes/no label", feedbackCsvRow({ ...row, interaction_type: "choice", scale: null, choices: YES_NO, response: "no" })[10], "Not really");
