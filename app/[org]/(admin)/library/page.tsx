@@ -1,6 +1,9 @@
 import Link from "next/link";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { canViewReports } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { ENROLMENTS_VIEW } from "@/lib/scoring/status";
 import {
   AdminPageHeader,
   KpiStrip,
@@ -16,7 +19,7 @@ import {
 } from "lucide-react";
 import { LibraryBrowser, type FolderLite, type CourseLite } from "./library-browser";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
-import { fetchByIds } from "@/lib/db/chunked";
+import { chunk, fetchByIds } from "@/lib/db/chunked";
 import { aldsP4Enabled } from "@/lib/alds/flag";
 import { isAnalyticsTier, type AnalyticsTier } from "@/lib/alds/tier";
 
@@ -89,54 +92,43 @@ export default async function CoursesPage({
     }
   }
 
-  type AssignmentLite = {
-    course_id: string;
-    assignee_type: "user" | "team" | "org";
-    user_id: string | null;
-    team_id: string | null;
-  };
-
-  const [
-    { data: assignmentRows },
-    { data: teamMemberRows },
-    { data: orgMemberRows },
-  ] = await Promise.all([
-    courseIds.length
-      ? supabase
-          .from("course_assignments")
-          .select("course_id, assignee_type, user_id, team_id")
-          .in("course_id", courseIds)
-      : Promise.resolve({ data: [] as AssignmentLite[] }),
-    supabase.from("team_members").select("team_id, user_id"),
-    supabase
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", org.id),
-  ]);
-
-  const teamUsers = new Map<string, string[]>();
-  for (const r of (teamMemberRows ?? []) as Array<{
-    team_id: string;
-    user_id: string;
-  }>) {
-    const arr = teamUsers.get(r.team_id) ?? [];
-    arr.push(r.user_id);
-    teamUsers.set(r.team_id, arr);
-  }
-  const orgMemberIds = ((orgMemberRows ?? []) as Array<{ user_id: string }>).map(
-    (m) => m.user_id
-  );
-
+  // Enrolled per course: the one SQL definition (ENROLMENTS_VIEW, 0105,
+  // ADR 0020), so the card's N equals the course page, its Reports tab and
+  // the learners table. Read with the SERVICE ROLE after canViewReports: the
+  // admin layout admits data_analyst, whose session reads an incomplete set
+  // through the invoker view (Custom Group membership admits admins only),
+  // and the read is pinned to the course ids this org's session read above.
+  // Chunked at 150 ids, paged at 1000 rows over a total order. Fail-soft: a
+  // failed page is logged and the counts keep what was read.
   const enrolledByCourse = new Map<string, Set<string>>();
-  for (const a of (assignmentRows ?? []) as AssignmentLite[]) {
-    const set = enrolledByCourse.get(a.course_id) ?? new Set<string>();
-    if (a.assignee_type === "user" && a.user_id) set.add(a.user_id);
-    else if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUsers.get(a.team_id) ?? []) set.add(uid);
-    } else if (a.assignee_type === "org") {
-      for (const uid of orgMemberIds) set.add(uid);
+  if (canViewReports(role) && courseIds.length > 0) {
+    const svc = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    for (const part of chunk(courseIds, 150)) {
+      for (let from = 0; ; from += 1000) {
+        const { data, error } = await svc
+          .from(ENROLMENTS_VIEW)
+          .select("course_id, user_id")
+          .in("course_id", part)
+          .order("course_id")
+          .order("user_id")
+          .range(from, from + 999);
+        if (error) {
+          console.warn("[library] enrolments read failed:", error.message ?? "");
+          break;
+        }
+        const rows = (data ?? []) as Array<{ course_id: string; user_id: string }>;
+        for (const r of rows) {
+          const set = enrolledByCourse.get(r.course_id) ?? new Set<string>();
+          set.add(r.user_id);
+          enrolledByCourse.set(r.course_id, set);
+        }
+        if (rows.length < 1000) break;
+      }
     }
-    enrolledByCourse.set(a.course_id, set);
   }
 
   // Human-readable codes (0079), fail-soft before the migration.

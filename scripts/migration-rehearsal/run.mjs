@@ -129,10 +129,16 @@ async function applyMigration(db, f) {
   }
 }
 
+// A notice an assertion file raises on purpose (its text starts "assert-NNNN:",
+// e.g. a time it prints and does not assert) is shown; every other notice is not.
+const printAssertNotice = (n) => {
+  if (/^assert-\d{4}:/.test(String(n?.message ?? ""))) info(String(n.message));
+};
+
 async function runSqlFile(db, name) {
   const sql = fs.readFileSync(path.join(HERE, name), "utf8");
   try {
-    await db.exec(sql);
+    await db.exec(sql, { onNotice: printAssertNotice });
     return check(true, `${name} applied`);
   } catch (e) {
     return check(false, `${name} failed: ${e?.code ?? ""} ${String(e?.message ?? e).split("\n")[0]}`);

@@ -168,7 +168,8 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
   },
   "app/[org]/(admin)/library/[courseId]/learners/page.tsx": {
     calls: ["attemptCounts(myAttempts)", "computeScoring(myAttempts)", "officialHistory(myAttempts)", "officialRetakeState(history)"],
-    feeds: columnsFeeds(),
+    // ADR 0020: the enrolled set in chunks of 150, one decision for every chunk.
+    feeds: [...columnsFeeds(), pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\)/)],
   },
   "app/[org]/(admin)/reports/page.tsx": {
     calls: ["attemptCounts(attempts)", "attemptCounts(myAttempts)", "attemptCounts(teamAttempts)"],
@@ -203,7 +204,8 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
   },
   "app/api/courses/[courseId]/learners/export/route.ts": {
     calls: ["officialHistory(attempts.filter)", "officialRetakeState(history)"],
-    feeds: columnsFeeds(),
+    // ADR 0020: the enrolled set in chunks of 150, one decision for every chunk.
+    feeds: [...columnsFeeds(), pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\)/)],
   },
   "app/api/integrations/learner-summary/route.ts": {
     calls: ["computeScoring(st.list)", "hasLiveGrantedRetake(st.list)", "officialHistory(st.list)", "officialRetakeState(history)"],
@@ -267,20 +269,22 @@ console.log("\n(i) every scoring helper's call site reads status and is_revision
   eq("every caller is in SCOPED: PENDING_1B is empty (PR 1b)", outside, PENDING_1B);
   eq("PENDING_1B is the empty list", PENDING_1B, []);
   eq("non-vacuous: the scan finds the listed callers", callers.filter((f) => f in SCOPED).length >= 20, true);
-  // The paged fallback's callers are listed too (the six paged
+  // The paged fallback's callers are listed too (the eight paged
   // attempts reads and attempt-kind.ts's paged grant reader), each in SCOPED
   // with its pagedFeed, so a new paged read cannot slip in unlisted.
   const PAGED_CALLERS = [
     "app/[org]/(admin)/attempt-requests/page.tsx",
+    "app/[org]/(admin)/library/[courseId]/learners/page.tsx",
     "app/[org]/(admin)/reports/page.tsx",
     "app/api/attempt-requests/bulk/route.ts",
+    "app/api/courses/[courseId]/learners/export/route.ts",
     "lib/attempts/grant.ts",
     "lib/manager/insights.ts",
     "lib/scoring/attempt-kind.ts",
     "lib/scoring/status.ts",
   ];
   const paged = [...sources.entries()].filter(([, s]) => /(?<!function\s)\breadPagedWithOptionalColumn</.test(s)).map(([f]) => f).sort();
-  eq("every readPagedWithOptionalColumn caller is listed: the six paged attempts reads and the paged grant reader", paged, [...PAGED_CALLERS].sort());
+  eq("every readPagedWithOptionalColumn caller is listed: the eight paged attempts reads and the paged grant reader", paged, [...PAGED_CALLERS].sort());
   eq("…each is in SCOPED", PAGED_CALLERS.every((f) => f in SCOPED), true);
 }
 

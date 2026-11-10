@@ -13,7 +13,7 @@ import { useEffect, useState, useTransition } from "react";
  * Keys we own:
  *   q       — free-text search (matches name / email / employee_id)
  *   status  — "all" | "not_started" | "in_progress" | "completed" | "passed" | "failed"
- *   via     — "any" | "user" | "team" | "org"
+ *   via     — "any" | "user" | "team" | "org" | "group" | "path"
  *   page    — we reset to 1 whenever any filter changes
  *
  * (sort + page are owned by the page itself; this component only emits
@@ -113,6 +113,8 @@ export function LearnersFilters({
           <option value="user">Direct assignment</option>
           <option value="team">Via team</option>
           <option value="org">Org-wide</option>
+          <option value="group">Via Custom Group</option>
+          <option value="path">Via Learning Path</option>
         </select>
       </div>
 

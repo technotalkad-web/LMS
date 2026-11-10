@@ -9,9 +9,12 @@ import { attemptCounts, computeScoring, courseStatus, excludeAbandoned } from "@
 import {
   GrantReadError,
   grantSnapshotForUsers,
-  readWithOptionalColumn,
+  readPagedWithOptionalColumn,
   type GrantSnapshot,
+  type OptionalColumnState,
+  type PgError,
 } from "@/lib/scoring/attempt-kind";
+import { chunk, fetchByIds } from "@/lib/db/chunked";
 import {
   officialHistory,
   officialRetakeState,
@@ -24,6 +27,8 @@ import { fetchRevisionVisitStats, type RevisionVisitStats } from "@/lib/attempts
 import { resolveEmails } from "@/lib/users/emails";
 import { courseProgress, formatCourseProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { resolvePolicy } from "@/lib/scoring/resolve";
+import { ENROLMENTS_VIEW } from "@/lib/scoring/status";
+import { isReleased } from "@/lib/learner/release";
 
 // =============================================================================
 // Dedicated enrolled-learners page for an admin viewing one course.
@@ -43,9 +48,15 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
 //     - browser back/forward Just Works
 //     - the page can render without client JS for the basic flow
 //
+//   Who is listed: exactly the enrolment view's set for the course
+//   (v_course_enrollments_expanded, migration 0105, ADR 0020), the same
+//   set the Library card and the Reports tab count. "via" says how each
+//   learner is reached: the released direct rows (user, team, org-wide,
+//   Custom Group), else "path" (a released step of an active Learning Path).
+//
 //   For 10k users today: we still fetch the full enrolled set in memory
 //   on each request (because computing "via" requires joining assignments
-//   + team_members + org members), then filter + paginate in memory. At
+//   + team_members + org members + group members), then filter + paginate in memory. At
 //   ~10k users that's ~1MB of payload and sub-100ms compute — acceptable
 //   for an admin page hit infrequently. For 100k+ users we'd want a
 //   materialized view (course_id, user_id, last_status, last_score) kept
@@ -70,7 +81,8 @@ type Status =
   | "passed"
   | "failed";
 
-type ViaKind = "user" | "team" | "org";
+/** How a learner is reached: a released direct row of a kind, else a Learning Path (ADR 0020). */
+type ViaKind = "user" | "team" | "org" | "group" | "path";
 
 interface EnrichedLearner {
   user_id: string;
@@ -158,52 +170,144 @@ export default async function LearnersPage({
     ])
   );
 
-  // ---- fetch assignments + work out who's enrolled and how ----
-  const { data: assignmentRows } = await supabase
-    .from("course_assignments")
-    .select("assignee_type, user_id, team_id")
-    .eq("course_id", c.id);
-  const assignments = (assignmentRows ?? []) as Array<{
+  // ---- who's enrolled: the enrolment view (0105, ADR 0020) ----
+  // The one SQL definition the Library card and the Reports tab count, read
+  // with this admin session (the view is security_invoker and Custom Group
+  // membership admits admins only). Paged over user_id, unique per course.
+  const enrolledSet = new Set<string>();
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from(ENROLMENTS_VIEW)
+      .select("user_id")
+      .eq("course_id", c.id)
+      .order("user_id")
+      .range(from, from + 999);
+    if (error) {
+      console.warn("[learners] enrolments read failed:", error.message ?? "");
+      break;
+    }
+    const viewRows = (data ?? []) as Array<{ user_id: string }>;
+    for (const r of viewRows) enrolledSet.add(r.user_id);
+    if (viewRows.length < 1000) break;
+  }
+
+  // ---- how each is reached: the released direct rows ----
+  // Every direct-row read below is paged at the PostgREST row cap, as the
+  // view read is: the "path" label is given to an enrolled learner no
+  // released direct row reaches, so a truncated read would mislabel the
+  // learners past the cap (an org-wide row over 1,000 members, say).
+  const assignmentRows: Array<{
     assignee_type: ViaKind;
     user_id: string | null;
     team_id: string | null;
-  }>;
+    group_id: string | null;
+    release_at: string | null;
+  }> = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from("course_assignments")
+      .select("assignee_type, user_id, team_id, group_id, release_at")
+      .eq("course_id", c.id)
+      .order("id")
+      .range(from, from + 999);
+    if (error) {
+      console.warn("[learners] assignments read failed:", error.message ?? "");
+      break;
+    }
+    const assignmentPage = (data ?? []) as typeof assignmentRows;
+    assignmentRows.push(...assignmentPage);
+    if (assignmentPage.length < 1000) break;
+  }
+  const assignments = assignmentRows.filter((a) => isReleased(a.release_at));
 
   // Org members (always need this for org-wide assignments + employee_id lookup)
-  const { data: memberRows } = await supabase
-    .from("organization_members")
-    .select("user_id, employee_id")
-    .eq("organization_id", org.id);
-  const orgMembers = (memberRows ?? []) as Array<{
-    user_id: string;
-    employee_id: string | null;
-  }>;
+  const orgMembers: Array<{ user_id: string; employee_id: string | null }> = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from("organization_members")
+      .select("user_id, employee_id")
+      .eq("organization_id", org.id)
+      .order("user_id")
+      .range(from, from + 999);
+    if (error) {
+      console.warn("[learners] members read failed:", error.message ?? "");
+      break;
+    }
+    const memberPage = (data ?? []) as typeof orgMembers;
+    orgMembers.push(...memberPage);
+    if (memberPage.length < 1000) break;
+  }
   const employeeIdByUser = new Map<string, string | null>();
   for (const m of orgMembers) employeeIdByUser.set(m.user_id, m.employee_id);
 
   // Team members for any assigned teams.
-  const assignedTeamIds = assignments
-    .filter((a) => a.assignee_type === "team" && a.team_id)
-    .map((a) => a.team_id as string);
+  const assignedTeamIds = [
+    ...new Set(assignments.filter((a) => a.assignee_type === "team" && a.team_id).map((a) => a.team_id as string)),
+  ];
   const teamUserIds = new Map<string, Set<string>>();
-  if (assignedTeamIds.length > 0) {
-    const { data: teamMemberRows } = await supabase
-      .from("team_members")
-      .select("team_id, user_id")
-      .in("team_id", assignedTeamIds);
-    for (const r of (teamMemberRows ?? []) as Array<{
-      team_id: string;
-      user_id: string;
-    }>) {
-      const s = teamUserIds.get(r.team_id) ?? new Set<string>();
-      s.add(r.user_id);
-      teamUserIds.set(r.team_id, s);
+  for (let i = 0; i < assignedTeamIds.length; i += 150) {
+    const part = assignedTeamIds.slice(i, i + 150);
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await supabase
+        .from("team_members")
+        .select("team_id, user_id")
+        .in("team_id", part)
+        .order("team_id")
+        .order("user_id")
+        .range(from, from + 999);
+      if (error) {
+        console.warn("[learners] team members read failed:", error.message ?? "");
+        break;
+      }
+      const teamRows = (data ?? []) as Array<{ team_id: string; user_id: string }>;
+      for (const r of teamRows) {
+        const s = teamUserIds.get(r.team_id) ?? new Set<string>();
+        s.add(r.user_id);
+        teamUserIds.set(r.team_id, s);
+      }
+      if (teamRows.length < 1000) break;
     }
   }
 
-  // Build viaByUser → who's enrolled, via what mechanism(s).
+  // Custom Group members for any assigned group, through the SQL twin of
+  // the group resolver (v_group_members_expanded, 0105). Before 0105 the
+  // relation is missing: the read fails soft and no learner reads "group"
+  // (the 0031 view then counts no group learner either).
+  const assignedGroupIds = [
+    ...new Set(assignments.filter((a) => a.assignee_type === "group" && a.group_id).map((a) => a.group_id as string)),
+  ];
+  const groupUserIds = new Map<string, Set<string>>();
+  for (let i = 0; i < assignedGroupIds.length; i += 150) {
+    const part = assignedGroupIds.slice(i, i + 150);
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await supabase
+        .from("v_group_members_expanded")
+        .select("group_id, user_id")
+        .in("group_id", part)
+        .order("group_id")
+        .order("user_id")
+        .range(from, from + 999);
+      if (error) {
+        console.warn("[learners] group members read failed:", error.message ?? "");
+        break;
+      }
+      const groupRows = (data ?? []) as Array<{ group_id: string; user_id: string }>;
+      for (const r of groupRows) {
+        const s = groupUserIds.get(r.group_id) ?? new Set<string>();
+        s.add(r.user_id);
+        groupUserIds.set(r.group_id, s);
+      }
+      if (groupRows.length < 1000) break;
+    }
+  }
+
+  // Build viaByUser → how each enrolled learner is reached. Only the view's
+  // set is listed, whatever the direct rows say (a held-back learner, or a
+  // future release, is not enrolled); a learner no released direct row
+  // reaches is enrolled through a Learning Path.
   const viaByUser = new Map<string, Set<ViaKind>>();
   function addVia(uid: string, v: ViaKind) {
+    if (!enrolledSet.has(uid)) return;
     const s = viaByUser.get(uid) ?? new Set<ViaKind>();
     s.add(v);
     viaByUser.set(uid, s);
@@ -214,9 +318,12 @@ export default async function LearnersPage({
       for (const uid of teamUserIds.get(a.team_id) ?? []) addVia(uid, "team");
     } else if (a.assignee_type === "org") {
       for (const m of orgMembers) addVia(m.user_id, "org");
+    } else if (a.assignee_type === "group" && a.group_id) {
+      for (const uid of groupUserIds.get(a.group_id) ?? []) addVia(uid, "group");
     }
   }
-  const enrolledUserIds = Array.from(viaByUser.keys());
+  for (const uid of enrolledSet) if (!viaByUser.has(uid)) addVia(uid, "path");
+  const enrolledUserIds = Array.from(enrolledSet);
 
   // ---- resolve names + emails (service role for cross-table reads) ----
   const svc = createServiceClient(
@@ -252,19 +359,22 @@ export default async function LearnersPage({
     }
     void fetched;
 
-    const { data: profileRows } = await svc
-      .from("profiles")
-      .select("id, first_name, last_name")
-      .in("id", enrolledUserIds);
-    for (const p of (profileRows ?? []) as Array<{
-      id: string;
-      first_name: string | null;
-      last_name: string | null;
-    }>) {
-      profileByUser.set(p.id, {
-        first_name: p.first_name,
-        last_name: p.last_name,
-      });
+    // The house rule (lib/db/chunked.ts): chunks of 150 ids, pages of 1,000
+    // in id order. A failed read leaves the names empty (the email shows).
+    try {
+      const profileRows = await fetchByIds<{
+        id: string;
+        first_name: string | null;
+        last_name: string | null;
+      }>(svc, "profiles", "id, first_name, last_name", "id", enrolledUserIds);
+      for (const p of profileRows) {
+        profileByUser.set(p.id, {
+          first_name: p.first_name,
+          last_name: p.last_name,
+        });
+      }
+    } catch (e) {
+      console.warn("[learners] profiles read failed:", e instanceof Error ? e.message : "");
     }
   }
 
@@ -272,21 +382,35 @@ export default async function LearnersPage({
   // ADR 0014 step 7: the select names is_revision through the narrower-select
   // fallback, so counts, dates, progress and the chain drop revision rows (a
   // database without 0103 has none and reads every row as unflagged).
+  // The house rule (lib/db/chunked.ts): the enrolled ids in chunks of 150,
+  // each read in pages of 1,000 in id order, through
+  // readPagedWithOptionalColumn (fetchByIds cannot tell a missing column from
+  // another error). The first page decides the column list for every chunk
+  // (one `decided`). A failed page is logged and the rows read so far are
+  // kept, as the reads above do.
   const ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units";
-  const { data: attemptRows } =
-    enrolledUserIds.length && versionIds.length
-      ? await readWithOptionalColumn<unknown[]>(
-          "is_revision",
-          (columns) =>
-            supabase
-              .from("course_attempts")
-              .select(columns)
-              .in("user_id", enrolledUserIds)
-              .in("course_version_id", versionIds),
-          ATTEMPT_COLUMNS
-        )
-      : { data: [] };
+  const attemptRows: unknown[] = [];
+  if (enrolledUserIds.length && versionIds.length) {
+    const decided: OptionalColumnState = { columns: null };
+    for (const part of chunk(enrolledUserIds, 150)) {
+      const res = await readPagedWithOptionalColumn<unknown>(
+        "is_revision",
+        (columns, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
+          supabase
+            .from("course_attempts")
+            .select(columns)
+            .in("user_id", part)
+            .in("course_version_id", versionIds)
+            .order("id")
+            .range(from, to),
+        ATTEMPT_COLUMNS,
+        { state: decided }
+      );
+      if (res.error) console.warn("[learners] attempts read failed:", res.error.message ?? "");
+      attemptRows.push(...res.data);
+    }
+  }
   type AttemptRow = {
     id: string;
     user_id: string;
@@ -303,7 +427,7 @@ export default async function LearnersPage({
     started_at: string;
     completed_at: string | null;
   };
-  const attempts = (attemptRows ?? []) as AttemptRow[];
+  const attempts = attemptRows as AttemptRow[];
 
   // 0073: this course's attempt scoring rule (fail-soft → default).
   const scoringPolicy = await resolvePolicy(supabase, c.id);
@@ -654,7 +778,11 @@ export default async function LearnersPage({
                             ? "Direct"
                             : v === "team"
                               ? "Team"
-                              : "Org-wide"
+                              : v === "org"
+                                ? "Org-wide"
+                                : v === "group"
+                                  ? "Group"
+                                  : "Path"
                         )
                         .join(" · ")}
                     </td>
