@@ -417,6 +417,24 @@ export function digestVectors(): {
     // (f) no normalisation of any kind
     { name: "(f) every LF as CRLF", html: p0.split("\n").join("\r\n"), expect: "different" },
     { name: "(f) one trailing space", html: `${p0} `, expect: "different" },
+    // (i) the removed ranges must be inert: nothing in them is hashed, so markup there would run
+    // under the digest of the clean page. Range 1 must be one HTML comment; range 2 must hold
+    // neither </script in any letter case nor <!--.
+    { name: "(i) a script in place of the licence comment", html: pageOf({ licence: "\n<script>alert(1)</script>\n" }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) a script after the licence comment", html: pageOf({ licence: `${licenceBody("Home Loan Basics")}<script>alert(1)</script>\n` }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) a licence comment closed early by --> in its text", html: pageOf({ licence: licenceBody("x --> <script>alert(1)</script> <!-- y") }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) a licence comment closed early by --!>", html: pageOf({ licence: licenceBody("x --!> <script>alert(1)</script> y") }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) a licence comment closed at once (<!-->)", html: pageOf({ licence: "\n<!--><script>alert(1)</script>-->\n" }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) a licence comment closed at once (<!--->)", html: pageOf({ licence: "\n<!---><script>alert(1)</script>-->\n" }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) an empty licence body (not the writer's comment)", html: pageOf({ licence: "" }), expect: reason(`the licence body between ${D_BEGIN} and ${D_END} is not one HTML comment`) },
+    { name: "(i) the config closed by </SCRIPT> and a script after it", html: pageOf({ config: `${D_CONFIG}\n</SCRIPT><script>alert(1)` }), expect: reason(`the config body after ${D_OPEN} holds </script`) },
+    { name: "(i) the config closed by </script > and a script after it", html: pageOf({ config: `${D_CONFIG}\n</script ><script>alert(1)` }), expect: reason(`the config body after ${D_OPEN} holds </script`) },
+    { name: "(i) the config closed by </script/> and a script after it", html: pageOf({ config: `${D_CONFIG}\n</script/><script>alert(1)` }), expect: reason(`the config body after ${D_OPEN} holds </script`) },
+    { name: "(i) the config closed by </script and a line feed, and a script after it", html: pageOf({ config: `${D_CONFIG}\n</script\n><script>alert(1)` }), expect: reason(`the config body after ${D_OPEN} holds </script`) },
+    { name: "(i) <!--<script> in the config (the block would run past its closing tag)", html: pageOf({ config: '{"a":"<!--<script>"}' }), expect: reason(`the config body after ${D_OPEN} holds <!--`) },
+    { name: "(i) a bare <!-- in the config (the writer escapes every <)", html: pageOf({ config: '{"a":"<!-- x"}' }), expect: reason(`the config body after ${D_OPEN} holds <!--`) },
+    { name: "(i) the anchor checks come first: two config tags and a script in the licence", html: pageOf({ licence: "\n<script>alert(1)</script>\n", lock: `${D_OPEN}\n{}\n${D_CLOSE}\n${D_LOCK}` }), expect: reason(`${D_OPEN} found 2 times`) },
+    { name: "(i) a licence comment with CRLF line ends is still one comment: the same digest", html: pageOf({ licence: "\r\n<!--\r\nHome Loan Basics\r\n-->\r\n" }), expect: "same" },
   ];
   return { p0, p0Input, escapedPage, devanagariHeadPage, vectors };
 }

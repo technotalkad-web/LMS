@@ -31,7 +31,13 @@
  * Oid lists: a list that is missing, whose length differs in either
  * direction from the string list it runs beside, or that holds an entry not
  * of the form o1..oN gives null (the editor's export refuses the same
- * project on any length difference).
+ * project on any length difference). So does an oid that appears twice
+ * among the oids a slide's key reads (all its lists together: options;
+ * choices; cards with the two swipe targets; every pair's src and tgt; items
+ * with categories; steps): the response would carry the same oid for two
+ * different answers, so the key would accept an answer the grader rejects.
+ * The editor mints one oid per thing, and U1 option_id_duplicate refuses the
+ * same duplicate in the manifest's options (the union of those lists).
  */
 import { isInt, isObj, isOid, isStr, type Obj } from "./util";
 
@@ -51,6 +57,16 @@ function oidList(v: unknown, n: number): string[] | null {
   return v as string[];
 }
 
+/** True when no oid appears twice (the oids one key reads, all lists together). */
+function allDistinct(oids: readonly string[]): boolean {
+  const seen = new Set<string>();
+  for (const o of oids) {
+    if (seen.has(o)) return false;
+    seen.add(o);
+  }
+  return true;
+}
+
 /** An integer index in [0, n). */
 function isIndex(v: unknown, n: number): v is number {
   return isInt(v, 0) && v < n;
@@ -60,7 +76,7 @@ function isIndex(v: unknown, n: number): v is number {
 function singleChoiceKey(options: unknown, optionOids: unknown, correctAnswer: unknown): Key {
   const n = lengthOf(options);
   const ids = oidList(optionOids, n);
-  if (!ids || !isIndex(correctAnswer, n)) return null;
+  if (!ids || !allDistinct(ids) || !isIndex(correctAnswer, n)) return null;
   return [ids[correctAnswer]];
 }
 
@@ -68,7 +84,7 @@ function singleChoiceKey(options: unknown, optionOids: unknown, correctAnswer: u
 function multiChoiceKey(options: unknown, optionOids: unknown, correct: unknown): Key {
   const n = lengthOf(options);
   const ids = oidList(optionOids, n);
-  if (!ids || !Array.isArray(correct) || correct.length === 0) return null;
+  if (!ids || !allDistinct(ids) || !Array.isArray(correct) || correct.length === 0) return null;
   if (!correct.every((i) => isIndex(i, n))) return null;
   const sorted = (correct as number[]).slice().sort((a, b) => a - b);
   for (let k = 1; k < sorted.length; k++) if (sorted[k] === sorted[k - 1]) return null; // o1[,]o1: R10 duplicate_id
@@ -83,7 +99,7 @@ function multiChoiceKey(options: unknown, optionOids: unknown, correct: unknown)
 function scenarioKey(slide: Obj): Key {
   const choices = Array.isArray(slide.choices) ? slide.choices : [];
   const ids = oidList(slide.choiceOids, choices.length);
-  if (!ids) return null;
+  if (!ids || !allDistinct(ids)) return null;
   let best = -1;
   for (let i = 0; i < choices.length; i++) {
     const c = choices[i];
@@ -113,6 +129,7 @@ function swipeKey(slide: Obj): Key {
   const ids = oidList(slide.cardOids, cards.length);
   const targets = slide.swipeTargetOids;
   if (!ids || !isObj(targets) || !isOid(targets.left) || !isOid(targets.right)) return null;
+  if (!allDistinct(ids.concat([targets.left, targets.right]))) return null;
   const parts: string[] = [];
   for (let i = 0; i < cards.length; i++) {
     const c = cards[i];
@@ -129,10 +146,13 @@ function pairsKey(slide: Obj): Key {
   const pairOids = slide.pairOids;
   if (n === 0 || !Array.isArray(pairOids) || pairOids.length !== n) return null;
   const parts: string[] = [];
+  const oids: string[] = [];
   for (const p of pairOids) {
     if (!isObj(p) || !isOid(p.src) || !isOid(p.tgt)) return null;
+    oids.push(p.src, p.tgt);
     parts.push(p.src + PAIR_DELIM + p.tgt);
   }
+  if (!allDistinct(oids)) return null;
   return [parts.join(ITEM_DELIM)];
 }
 
@@ -146,7 +166,7 @@ function dragDropKey(slide: Obj): Key {
   const categories = Array.isArray(slide.categories) ? slide.categories : [];
   const itemIds = oidList(slide.itemOids, items.length);
   const categoryIds = oidList(slide.categoryOids, categories.length);
-  if (items.length === 0 || !itemIds || !categoryIds) return null;
+  if (items.length === 0 || !itemIds || !categoryIds || !allDistinct(itemIds.concat(categoryIds))) return null;
   const keys: unknown[] = [];
   for (let j = 0; j < categories.length; j++) {
     const cat = categories[j];
@@ -178,7 +198,7 @@ function sequencingKey(slide: Obj): Key {
   else list = null;
   if (!list || list.length === 0) return null;
   const ids = oidList(slide.stepOids, list.length);
-  return ids ? [ids.join(ITEM_DELIM)] : null;
+  return ids && allDistinct(ids) ? [ids.join(ITEM_DELIM)] : null;
 }
 
 // --- fill-blanks ---------------------------------------------------------------
@@ -236,12 +256,26 @@ export function fillBlanksVariants(slide: unknown): string[][] | null {
  * a blank or an accepted entry that normalises to "" makes the grader accept
  * an empty answer the patterns do not hold, and an accepted entry that is not
  * a string is stringified by the builder but stops the grader.
+ *
+ * Also true when an accepted text (`lists`, as the patterns hold it) would be
+ * read as fill-in pattern syntax rather than as text (the R10 grammar): a
+ * text holding the item delimiter [,] splits into two items, so an answer
+ * spread over two blanks matches the key while the grader fails both blanks;
+ * a text starting {lang= is read as a language tag and dropped from the
+ * text; a text of the first blank starting {case_matters= or {order_matters=
+ * is read as a pattern flag (only the first item can reach the flags).
  */
-function fillBlanksGraderDiffers(slide: Obj): boolean {
+function fillBlanksGraderDiffers(slide: Obj, lists: readonly string[][]): boolean {
   const blanks = blanksOf(slide.template);
   for (let i = 0; i < blanks.length; i++) {
     if (fillNorm(blanks[i]) === "") return true;
     if (acceptedAt(slide.acceptedAnswers, i).some((v) => !isStr(v) || fillNorm(v) === "")) return true;
+  }
+  for (let i = 0; i < lists.length; i++) {
+    for (const t of lists[i]) {
+      if (t.indexOf(ITEM_DELIM) >= 0 || t.indexOf("{lang=") === 0) return true;
+      if (i === 0 && (t.indexOf("{case_matters=") === 0 || t.indexOf("{order_matters=") === 0)) return true;
+    }
   }
   return false;
 }
@@ -254,7 +288,7 @@ function fillBlanksGraderDiffers(slide: Obj): boolean {
  */
 function fillBlanksKey(slide: Obj): Key {
   const lists = fillBlanksVariants(slide);
-  if (!lists || lists.some((l) => l.length === 0) || fillBlanksGraderDiffers(slide)) return null;
+  if (!lists || lists.some((l) => l.length === 0) || fillBlanksGraderDiffers(slide, lists)) return null;
   let combos: Array<string | null> = [null];
   for (const list of lists) {
     const next: string[] = [];
@@ -305,7 +339,8 @@ export function keyFromSlide(slide: unknown): string[] | null {
  * dropdown, multi or truefalse). mcq and dropdown: the option at the single
  * correct index. multi: as multi-response. truefalse: "true" or "false" from
  * the label of the single correct option ("true" / "false" after trim and
- * lower case, else index 0 means true); its optionOids are not read. A
+ * lower case, else index 0 means true), only when the options are exactly two
+ * that read as one true and one false; its optionOids are not read. A
  * question that is not an object, of another type, or whose correct list does
  * not fit the type is null.
  */
@@ -323,9 +358,17 @@ export function keyFromBankQuestion(q: unknown): string[] | null {
     const options = Array.isArray(q.options) ? q.options : [];
     const idx = correct[0];
     if (!isIndex(idx, options.length)) return null;
-    const label = String(options[idx] || "").trim().toLowerCase();
-    const value = label === "true" ? true : label === "false" ? false : idx === 0;
-    return [value ? "true" : "false"];
+    // The engine's tfValue: the option label "true" / "false" after trim and lower
+    // case, else index 0 means true. The response carries tfValue of the picked
+    // option and gradeAll compares indices, so the two agree only when the options
+    // are exactly two that read as one true and one false (True/True, False/Yes or a
+    // third option would let a wrong pick send the right value).
+    const tfValue = (i: number): boolean => {
+      const label = String(options[i] || "").trim().toLowerCase();
+      return label === "true" ? true : label === "false" ? false : i === 0;
+    };
+    if (options.length !== 2 || tfValue(0) === tfValue(1)) return null;
+    return [tfValue(idx) ? "true" : "false"];
   }
   return singleChoiceKey(q.options, q.optionOids, correct[0]);
 }

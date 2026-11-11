@@ -18,7 +18,8 @@
  * input with this bundle's sha256HexOfString (`engineDigest`); the Guardian
  * hashes the same input, as UTF-8, with the Web Crypto API (crypto.subtle).
  *
- * Pure: indexOf and slice only; no regular expression, no normalisation.
+ * Pure: indexOf and slice only (plus a lower-cased copy of the config body,
+ * searched and never hashed); no regular expression, no normalisation.
  */
 import { sha256HexOfString } from "./sha256";
 
@@ -51,6 +52,36 @@ function countOf(text: string, needle: string): number {
   return n;
 }
 
+/** HTML whitespace only (tab, line feed, form feed, carriage return, space); "" counts. */
+function isHtmlSpace(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    if (" \t\n\f\r".indexOf(text.charAt(i)) < 0) return false;
+  }
+  return true;
+}
+
+/**
+ * True when range 1 is exactly one HTML comment with only whitespace around it,
+ * so nothing in it can be markup or script: an opener `<!--`, a body with no
+ * `--` (no `-->`, `--!>` or nested opener can end it early) that does not start
+ * with `>` or `->` (an abrupt close), and the last `-->`. The 2.0 writer's
+ * licence (newline, `<!--`, the lines with every `--` cut, `-->`, newline)
+ * always is; a `<script>` put in its place never is.
+ */
+function isOneComment(range: string): boolean {
+  const open = range.indexOf("<!--");
+  const close = range.lastIndexOf("-->");
+  if (open < 0 || close < open + 4) return false;
+  const body = range.slice(open + 4, close);
+  return (
+    isHtmlSpace(range.slice(0, open)) &&
+    isHtmlSpace(range.slice(close + 3)) &&
+    body.indexOf("--") < 0 &&
+    body.indexOf(">") !== 0 &&
+    body.indexOf("->") !== 0
+  );
+}
+
 /**
  * v1, frozen. The page with two ranges removed and nothing inserted:
  *   range 1, every character strictly after the licence begin anchor and
@@ -62,6 +93,16 @@ function countOf(text: string, needle: string): number {
  * once; the end anchor must follow the begin anchor; a `</script>` must follow
  * the opening tag; range 1 must end before range 2 begins. Otherwise no
  * digest, with the reason (the first failure in that order).
+ *
+ * The removed ranges must also be inert, because nothing in them is hashed:
+ * range 1 must be one HTML comment (isOneComment), and range 2 must hold
+ * neither `</script` in any letter case (a browser ends the block at
+ * `</SCRIPT>`, `</script >` or `</script/>` as well) nor `<!--` (which, with a
+ * `<script` after it, lets the block run past the `</script>` this function
+ * stops at). The 2.0 writer meets both: its licence is one comment and it
+ * writes every `<` of the course JSON as `<`. A page that fails them was
+ * not made by the writer and has no digest; these two checks come after the
+ * anchor checks, so every anchor failure keeps its reason.
  */
 export function engineDigestInput(html: string): EngineDigestInputResult {
   const B = ENGINE_DIGEST_ANCHORS.licenceBegin;
@@ -80,6 +121,12 @@ export function engineDigestInput(html: string): EngineDigestInputResult {
   const iS = html.indexOf(S, iC + C.length);
   if (iS < 0) return { ok: false, reason: `no digest: no ${S} after ${C}` };
   if (iE + E.length > iC) return { ok: false, reason: `no digest: ${C} precedes ${E}` };
+  if (!isOneComment(html.slice(iB + B.length, iE))) {
+    return { ok: false, reason: `no digest: the licence body between ${B} and ${E} is not one HTML comment` };
+  }
+  const config = html.slice(iC + C.length, iS);
+  if (config.toLowerCase().indexOf("</script") >= 0) return { ok: false, reason: `no digest: the config body after ${C} holds </script` };
+  if (config.indexOf("<!--") >= 0) return { ok: false, reason: `no digest: the config body after ${C} holds <!--` };
   return { ok: true, input: html.slice(0, iB + B.length) + html.slice(iE, iC + C.length) + html.slice(iS) };
 }
 
