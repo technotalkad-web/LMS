@@ -240,6 +240,11 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     calls: ["computeScoring(list)"],
     feeds: [...columnsFeeds(), pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,600}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ pageSize: PAGE, state: decided \}\s*\)/)],
   },
+  // ADR 0019: the continue address scores the learner's own attempts on the course it waits on.
+  "app/[org]/(learner)/continue/page.tsx": {
+    calls: ["computeScoring(attempts)"],
+    feeds: columnsFeeds(),
+  },
   // The learning-path surfaces: no helper call; their selects carry the flag.
   "app/[org]/(admin)/learning-paths/[pathId]/learners/page.tsx": { calls: [], feeds: columnsFeeds() },
   "app/[org]/(admin)/learning-paths/[pathId]/reports/page.tsx": {

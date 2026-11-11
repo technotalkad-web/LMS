@@ -7,6 +7,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadEnrolledCourseStatus, userCourseKey } from "@/lib/scoring/status";
 import { fetchCourseRevisitSummary } from "@/lib/attempts/revision-visits";
 import { fetchInteractionLabels, mergeInteractionLabels, missingLabelIds } from "@/lib/interactions/labels";
+import FeedbackSection from "./feedback-section";
 
 // =============================================================================
 // /[org]/library/[courseId]/reports — full reports surface for a single course.
@@ -36,6 +37,10 @@ import { fetchInteractionLabels, mergeInteractionLabels, missingLabelIds } from 
 // on this page when shipped.
 //
 // CSV export is deferred to #182.
+//
+// Learner feedback (ADR 0021) is live: feedback-section.tsx, after the
+// per-question breakdown, administrators only, read from migration 0106's
+// service-role objects; its CSV is /api/courses/{courseId}/feedback/export.
 //
 // Closes #177. RFC: docs/roadmap/analytics-and-reporting.md §5 Phase 2b.
 // =============================================================================
@@ -107,9 +112,14 @@ export default async function CourseReportsPage({
   // the view needs an admin session), so the two pages always agree.
   const { data: versionRows } = await supabase
     .from("course_versions")
-    .select("id")
+    .select("id, package_id")
     .eq("course_id", c.id);
   const versionIds = ((versionRows ?? []) as Array<{ id: string }>).map((v) => v.id);
+  // Language slots with a version: the Learner feedback section labels each
+  // question with its slot language when there is more than one (ADR 0021 B.4).
+  const slotCount = new Set(
+    ((versionRows ?? []) as Array<{ package_id: string | null }>).map((v) => v.package_id).filter(Boolean)
+  ).size;
   const { enrolledUserIds, officialByUser, summary: enr } = await loadEnrolledCourseStatus(
     supabase,
     org.id,
@@ -243,8 +253,8 @@ export default async function CourseReportsPage({
           </div>
         </div>
         <p className="text-xs text-muted mt-1">
-          Enrollment &amp; status is live · performance and question numbers
-          refresh nightly at 03:30 UTC ·{" "}
+          Enrollment &amp; status is live · learner feedback is live ·
+          performance and question numbers refresh nightly at 03:30 UTC ·{" "}
           <span title={lastRefreshed}>last refreshed {refreshedAgo}</span>
         </p>
       </div>
@@ -451,7 +461,21 @@ export default async function CourseReportsPage({
           near-equal distractors — worth a click into the data when the top
           pick looks small.
         </p>
+        <p className="text-xs text-muted mt-1" data-testid="breakdown-population-note">
+          This breakdown counts every attempt, staff previews and resets
+          included.
+        </p>
       </section>
+
+      {/* Learner feedback (ADR 0021): administrators only, live */}
+      <FeedbackSection
+        orgSlug={orgSlug}
+        orgId={org.id}
+        courseId={c.id}
+        courseTitle={c.title}
+        role={role}
+        slotCount={slotCount}
+      />
     </div>
   );
 }

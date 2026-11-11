@@ -22,6 +22,7 @@ import {
   engineVersionForManifest,
   extractEngineStamp,
   isKivoLaunch,
+  isKivoStamped,
   outcomeFinalVerdict,
   parseEngineVersion,
 } from "../../lib/courses/engine-version";
@@ -119,6 +120,14 @@ function stampAndVerdicts() {
   eq("an older one is below", compareEngineVersion("2026.10.20", "2026.10.28") < 0, true);
   eq("a string that does not parse sorts below one that does", [compareEngineVersion("unknown", "2026.10.28") < 0, compareEngineVersion("2026.10.28", "unknown") > 0], [true, true]);
   eq("two that do not parse compare equal", compareEngineVersion("unknown", "sketch-g2"), 0);
+
+  console.log("\nisKivoStamped: the cached stamp only (ADR 0019 step 8)");
+  eq("a parseable stamp reads as a KIVO build", isKivoStamped({ engineVersion: "2026.10.28" }), true);
+  eq("the literal `unknown` reads as a KIVO build", isKivoStamped({ engineVersion: "unknown" }), true);
+  eq("null (read, not a KIVO build) reads false", isKivoStamped({ engineVersion: null }), false);
+  eq("an absent key (never read) reads false", isKivoStamped({ masteryScore: 0.8 }), false);
+  eq("no manifest_data at all reads false", [isKivoStamped(null), isKivoStamped(undefined), isKivoStamped("2026.10.28")], [false, false, false]);
+  eq("a non-string stamp reads false", isKivoStamped({ engineVersion: 20261028 }), false);
 
   console.log("\nthe pinned floor");
   eq("OUTCOME_FINAL_FLOOR is the literal 2026.10.28", OUTCOME_FINAL_FLOOR, "2026.10.28");
