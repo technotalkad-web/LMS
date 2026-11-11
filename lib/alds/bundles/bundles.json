@@ -22,6 +22,17 @@
       "target": "es2020",
       "globalName": "AldsRules",
       "registeredAt": "2026-10-28"
+    },
+    {
+      "n": 3,
+      "rulesBundleHash": "sha256:3a51c33232ba213ab921196bef23fc11a1a941c3b7b0304214861c30b9444ebe",
+      "file": "alds-rules-3.js",
+      "bytes": 74375,
+      "standardVersion": "2.0",
+      "esbuild": "0.25.4",
+      "target": "es2020",
+      "globalName": "AldsRules",
+      "registeredAt": "2026-11-11"
     }
   ]
 }
