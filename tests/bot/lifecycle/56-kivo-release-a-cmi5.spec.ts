@@ -576,8 +576,8 @@ function badgeTierFor(scorePct: number | null): { min: number; name: string } | 
 // answers shown with no badge card and no certificate (the S-16r2 shape, asserted here)." And: "assert the
 // observed labelled figure and the absence of lock icons on official slides, and no State PUT on a revision launch"
 // (the PUT check runs after the close, checkNoStatePut).
-// That was staging before ADR 0014 PR 1a. Since 1a the launch page upserts `LMS.OfficialResult` for the revision
-// registration on every revision launch (ADR 0014 step 3: "{status: scoring.officialStatus, score:
+// That was staging before ADR 0014 PR 1a; ADR 0014 step 3 supersedes it. Since 1a the launch page upserts
+// `LMS.OfficialResult` for the revision registration on every revision launch (ADR 0014 step 3: "{status: scoring.officialStatus, score:
 // scoring.officialScore === null ? null : Math.round(scoring.officialScore * 100), completed_at, ...}"; "the engine
 // reads the document's `score` as the Results percentage (`getBadgeTier`, whose tiers start at 80, and the
 // \"Recorded result: N %\" headline: KIVO ADR 0010 Decision 2 item 8 (f))") and the State route serves it on GET
@@ -589,57 +589,79 @@ function badgeTierFor(scorePct: number | null): { min: number; name: string } | 
 //     (offDoc.status === 'completed' ? 'Completed' : 'Not passed')) + (date ? ' · ' + months[d.getMonth()] + ' ' +
 //     d.getDate() + ', ' + d.getFullYear() : '');`
 //   10587-10588 `} else if (rev) { headline = (notScored ? 'Not scored' : score + ' %') + ' · from the answers shown
-//     here; your recorded result is on your course page'; }` (the S-16r2 shape, still asserted when no document is served)
+//     here; your recorded result is on your course page'; }` (the S-16r2 shape: the engine's fallback without the
+//     document. On this LMS every revision launch writes the document, so a missing one means the write in the
+//     launch page or the State GET broke, and the checks below fail; no caller in this spec asserts S-16r2 any more)
 //   10444 `const tier = passed ? getBadgeTier(score) : null;` 10496 `if (passed && tier) {` a `.badge-tier-card` naming the
 //     tier; 10540 `if (passed && t.showCertificate && slide.certificateImage && slide.certificateImage.imageData)` a second
 //     `.badge-tier-card` holding `#certificate-preview`; 10420 `showCertificate: slide.showCertificate === true` (default off).
 // So with the document served and a passed official result the revisit shows the badge card for the recorded score
-// (ADR 0014 step 3 above; "A failed seed or document write ... (the engine then shows no badge or certificate ...)").
-async function checkRevisitResults(step: string, run: string, fl: FrameLocator, officialScorePct: number | null, official: string | null) {
+// (ADR 0014 step 3 above; "A failed seed or document write is logged and the launch goes on" says what the product
+// does when the write fails, not that this test passes then).
+// Every expected value comes from the official attempt's row, never from the document, and nothing is skipped when
+// a value is missing: a missing row, score, date or document field fails the check that needs it.
+//   status, lib/scoring/policy.ts officialStatus: `officialAttempt.success_status === "passed" ? "passed" :
+//     officialAttempt.success_status === "failed" ? "failed" : "completed"`;
+//   score, lib/attempts/revision-seed.ts buildOfficialResult: `Math.round(s.officialScore * 100)` (the row's 0..1 score);
+//   completed_at, course_version_id, attempt_id: the official attempt's own.
+type OfficialResultDoc = { status: string | null; score: number | null; completed_at: string | null; attempt_id: string | null; course_version_id: string | null };
+async function checkRevisitResults(step: string, run: string, fl: FrameLocator, officialScorePct: number | null, official: string, revision: string | null) {
   // 11774: the engine reads the document once in revision mode and re-renders Results when the read resolves.
   const ff = await waitFor(() => frameEval(fl, FRAME_FACTS), (f) => f?.officialResult !== "reading", 15_000, 500);
   await settleWire();
   const ofrGets = wireOf(run).filter((w) => w.method === "GET" && w.stateId === "LMS.OfficialResult");
-  const ofr = ofrGets.map((w) => w.status);
-  const served = (ofrGets.find((w) => w.status === 200 && !!w.body && typeof w.body === "object" && "status" in (w.body as object))?.body ?? null) as
-    | { status: string | null; score: number | null; completed_at: string | null; attempt_id: string | null; course_version_id: string | null }
-    | null;
+  const ofr = ofrGets.map((w) => ({ status: w.status, reg: w.reg, body: w.body }));
+  // The GET of this revision launch: the revision registration, 200, a JSON document (docSummary of an object).
+  const servedGet = ofrGets.find((w) => w.status === 200 && !!revision && w.reg === revision && !!w.body && typeof w.body === "object") ?? null;
+  const served = (servedGet?.body ?? null) as OfficialResultDoc | null;
+  check(step, "LMS.OfficialResult served on this revision launch (a GET for the revision registration returned 200 with a document) and its attempt_id is the official attempt", !!revision && revision !== official && !!served && served.attempt_id === official, {
+    officialResultGets: ofr, revision, official, servedAttemptId: served?.attempt_id ?? null, engineRead: ff?.officialResult ?? null,
+  });
+
+  // The official attempt's record, as the LMS derives the document from it.
+  const off = await attemptRow(official);
+  const offStatus: string | null = !off ? null : off.success_status === "passed" ? "passed" : off.success_status === "failed" ? "failed" : "completed";
+  const offScoreRaw = off?.score;
+  const offScore = offScoreRaw !== null && offScoreRaw !== undefined && Number.isFinite(Number(offScoreRaw)) ? Math.round(Number(offScoreRaw) * 100) : null;
+  const offCompletedAt: string | null = off?.completed_at ?? null;
+  const offVersion: string | null = off?.course_version_id ?? null;
+  const officialRow = off ? { success_status: off.success_status ?? null, score: off.score ?? null, completed_at: offCompletedAt, course_version_id: offVersion } : null;
+  const sameInstant = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && Number.isFinite(Date.parse(a)) && Date.parse(a) === Date.parse(b);
+  check(step, "LMS.OfficialResult is the official attempt's record: status, score, completed_at and course_version_id each present and equal to the official row's (status both ways), score also = the official run's statement score", !!served && !!off &&
+    offStatus !== null && served.status === offStatus &&
+    offScore !== null && typeof served.score === "number" && served.score === offScore && typeof officialScorePct === "number" && served.score === officialScorePct &&
+    sameInstant(served.completed_at, offCompletedAt) &&
+    !!offVersion && served.course_version_id === offVersion &&
+    served.attempt_id === official, {
+    served, officialRow, expected: { status: offStatus, score: offScore, completed_at: offCompletedAt, course_version_id: offVersion, attempt_id: official }, officialScorePct,
+  });
+
+  // The headline the engine renders for that record (10582-10586), from the official row.
   const resultsSlideNo = (S.course?.slides ?? []).findIndex((s: any) => s.type === "results") + 1;
   let rf = await resultsFacts(fl);
-  if (served) {
-    for (const t0 = Date.now(); !rf.recordedHeadline && Date.now() - t0 < 15_000; ) {
-      await sleep(500);
-      rf = await resultsFacts(fl);
-    }
-    const off = official ? await attemptRow(official) : null;
-    const sameInstant = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && Date.parse(a) === Date.parse(b);
-    const docIsTheRecord =
-      (!official || served.attempt_id === official) &&
-      (officialScorePct === null || served.score === officialScorePct) &&
-      (!off || (sameInstant(served.completed_at, off.completed_at) && (off.success_status !== "passed" || served.status === "passed")));
-    // The date as the engine formats it, in the frame (the browser's own time zone).
-    const shownDate = served.completed_at
-      ? await frameEval(fl, `(() => { const d = new Date(${JSON.stringify(served.completed_at)}); const m = ['January','February','March','April','May','June','July','August','September','October','November','December']; return isNaN(d.getTime()) ? null : m[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear(); })()`)
-      : null;
-    const word = served.status === "passed" ? "Passed" : served.status === "completed" ? "Completed" : "Not passed";
-    const expected = `Recorded result: ${served.score} % · ${word}${typeof shownDate === "string" ? ` · ${shownDate}` : ""}`;
-    check(step, "Results (LMS.OfficialResult served): the headline is the recorded result (\"Recorded result: N % · Passed|Completed|Not passed · <Month D, YYYY>\"), N, status and date = the official attempt's", rf.slide === resultsSlideNo && ff?.officialResult === "found" && docIsTheRecord && rf.recordedHeadline === expected, {
-      slide: rf.slide, headline: rf.recordedHeadline, expected, engineRead: ff?.officialResult ?? null, served, official, officialScorePct, officialRow: off ? { success_status: off.success_status, score: off.score, completed_at: off.completed_at } : null, officialResultGets: ofr, text: rf.text.slice(0, 300),
-    });
-    const passed = served.status === "passed";
-    const tier = passed ? badgeTierFor(served.score) : null;
-    const rs = (S.course?.slides ?? []).find((s: any) => s.type === "results");
-    const cert = passed && rs?.showCertificate === true && !!rs?.certificateImage?.imageData;
-    const want = { badgeCards: (tier ? 1 : 0) + (cert ? 1 : 0), certificate: cert ? 1 : 0, tier: tier?.name ?? null };
-    check(step, "Results (LMS.OfficialResult served): the badge card and certificate the engine's Results code gives the recorded result (the getBadgeTier(score) card when passed; a certificate only with showCertificate and an image)", rf.badgeCards === want.badgeCards && rf.certificate === want.certificate && (want.tier === null || rf.badgeTierNames.includes(want.tier)), {
-      want, badgeCards: rf.badgeCards, certificate: rf.certificate, badgeTierNames: rf.badgeTierNames, servedStatus: served.status, servedScore: served.score, showCertificate: rs?.showCertificate ?? null,
-    });
-  } else {
-    check(step, "Results (S-16r2 shape): the labelled figure from the answers shown (\"N % · from the answers shown here; your recorded result is on your course page\"), N = the official run's recorded score", rf.slide === resultsSlideNo && !!rf.labelledHeadline && rf.labelledFigure !== null && (officialScorePct === null || rf.labelledFigure === officialScorePct), {
-      slide: rf.slide, headline: rf.labelledHeadline, figure: rf.labelledFigure, officialScorePct, officialResultGets: ofr, engineRead: ff?.officialResult ?? null, text: rf.text.slice(0, 300),
-    });
-    check(step, "Results (S-16r2 shape): no badge card and no certificate", rf.badgeCards === 0 && rf.certificate === 0, { badgeCards: rf.badgeCards, certificate: rf.certificate });
+  for (const t0 = Date.now(); !rf.recordedHeadline && Date.now() - t0 < 15_000; ) {
+    await sleep(500);
+    rf = await resultsFacts(fl);
   }
+  // The date as the engine formats it, in the frame (the browser's own time zone).
+  const shownDate = offCompletedAt
+    ? await frameEval(fl, `(() => { const d = new Date(${JSON.stringify(offCompletedAt)}); const m = ['January','February','March','April','May','June','July','August','September','October','November','December']; return isNaN(d.getTime()) ? null : m[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear(); })()`)
+    : null;
+  const word = offStatus === "passed" ? "Passed" : offStatus === "completed" ? "Completed" : offStatus === "failed" ? "Not passed" : null;
+  const expected = offScore !== null && word !== null && typeof shownDate === "string" ? `Recorded result: ${offScore} % · ${word} · ${shownDate}` : null;
+  check(step, "Results: the headline is the official attempt's recorded result (\"Recorded result: N % · Passed|Completed|Not passed · <Month D, YYYY>\"; the word follows the official status: passed Passed, completed Completed, failed Not passed)", rf.slide === resultsSlideNo && ff?.officialResult === "found" && expected !== null && rf.recordedHeadline === expected, {
+    slide: rf.slide, resultsSlideNo, headline: rf.recordedHeadline, expected, engineRead: ff?.officialResult ?? null, labelledHeadline: rf.labelledHeadline, officialRow, text: rf.text.slice(0, 300),
+  });
+
+  // The reward cards renderResults gives that record (10444, 10496, 10540, 10420), from the official row.
+  const passed = offStatus === "passed";
+  const tier = passed ? badgeTierFor(offScore) : null;
+  const rs = (S.course?.slides ?? []).find((s: any) => s.type === "results");
+  const cert = passed && rs?.showCertificate === true && !!rs?.certificateImage?.imageData;
+  const want = { badgeCards: (tier ? 1 : 0) + (cert ? 1 : 0), certificate: cert ? 1 : 0, tier: tier?.name ?? null };
+  check(step, "Results: the badge card and certificate the engine's Results code gives the official record (the getBadgeTier(score) card when passed; a certificate only with showCertificate and an image)", offStatus !== null && offScore !== null && rf.badgeCards === want.badgeCards && rf.certificate === want.certificate && (want.tier === null || rf.badgeTierNames.includes(want.tier)), {
+    want, badgeCards: rf.badgeCards, certificate: rf.certificate, badgeTierNames: rf.badgeTierNames, officialStatus: offStatus, officialScore: offScore, showCertificate: rs?.showCertificate ?? null,
+  });
   const dom = await domFacts(fl);
   check(step, "no lock icons on the official slides (0 .nav-item.locked)", dom.navLocked === 0, { navItemLocked: dom.navLocked });
   return rf;
@@ -1498,7 +1520,7 @@ test.describe.serial("KIVO Release A — cmi5 real-LMS run (Ambak University sta
     if (S.a1Revision) await checkRevisitStep5("5", "A-launch3", fl, S.a1!, S.a1Revision, modals);
     else check("5", "step 5 additions: a revision registration to read (none was opened)", false, { attempts: atts.map((x) => ({ id: x.id, status: x.status })) });
     const offPassed = auVerb(await stmts(S.a1!), "passed")[0];
-    await checkRevisitResults("5", "A-launch3", fl, typeof offPassed?.raw?.result?.score?.scaled === "number" ? Math.round(offPassed.raw.result.score.scaled * 100) : null, S.a1!);
+    await checkRevisitResults("5", "A-launch3", fl, typeof offPassed?.raw?.result?.score?.scaled === "number" ? Math.round(offPassed.raw.result.score.scaled * 100) : null, S.a1!, S.a1Revision ?? null);
     if (OUT) await page.screenshot({ path: path.join(OUT, "learnerA-relaunch-after-pass.png") }).catch(() => {});
     await page.close();
     await sleep(3000);
@@ -2068,10 +2090,10 @@ test.describe.serial("KIVO Release A — cmi5 real-LMS run: extras (lost outcome
     check("11", "wire: no statement sent in the revision carries the official registration or a re-sent official id", !!rev && badWire.length === 0, { revisionStatementsSent: revWire.length, offenders: badWire.slice(0, 10), verbsSent: revWire.map((s) => s.verb) });
     const mism = await regMismatchOf([d1, rev].filter(Boolean) as string[]);
     check("11", "verify.cjs regMismatch [] (every statement of each of D's attempts carries that attempt as its registration)", mism.length === 0, { regMismatch: mism.slice(0, 10) });
-    // A.1 (§8): the revisit's Results: the S-16r2 shape without LMS.OfficialResult (before PR 1a), the recorded
-    // result once the LMS serves the document (since PR 1a); checkRevisitResults follows the engine's branch.
+    // A.1 (§8): the revisit's Results. Since ADR 0014 PR 1a the LMS writes LMS.OfficialResult on every revision
+    // launch, so checkRevisitResults requires the document and the recorded result (the S-16r2 shape is gone).
     const dPassScore = typeof passD[0]?.raw?.result?.score?.scaled === "number" ? Math.round(passD[0].raw.result.score.scaled * 100) : null;
-    await checkRevisitResults("11", "D-launch2", p2.fl, dPassScore, d1);
+    await checkRevisitResults("11", "D-launch2", p2.fl, dPassScore, d1, rev);
     await p2.page.close();
     await sleep(4000);
     await checkNoStatePut("11", "D-launch2");
@@ -2540,8 +2562,8 @@ async function reviewLockVisit(step: string, run: string, ctx: BrowserContext, F
   };
 
   // Results, where the seeded bookmark resumes (substitution 1).
-  const rf = await checkRevisitResults(step, run, fl, F.offScorePct, F.official);
-  summary.results = { headline: rf.recordedHeadline ?? rf.labelledHeadline, badgeCards: rf.badgeCards, certificate: rf.certificate };
+  const rf = await checkRevisitResults(step, run, fl, F.offScorePct, F.official, rev);
+  summary.results = { headline: rf.recordedHeadline, labelledHeadline: rf.labelledHeadline, badgeCards: rf.badgeCards, certificate: rf.certificate };
   const d0 = await noteStartOver("Results");
   check(step, "the progress figure equals the official attempt's", pctOf(d0.progressText) !== null && pctOf(d0.progressText) === pctOf(F.officialProgressText), { revisit: d0.progressText, officialBeforeExit: F.officialProgressText });
   summary.progress = pctOf(d0.progressText);
