@@ -1,6 +1,6 @@
 # 0022. The Package Guardian for KIVO 2.0 exports: the engine digest and its recomputation, the trusted-engine row and its registrar, the config and identity-stability checks, the badge wording, and what is deferred past the P4 exit
 
-Status: Proposed (2026-11-11). Written as the first LMS step of the P4 part-2 plan (its step L10): the owner accepts it before L1 (rules bundle 3) opens. Nothing here is built, applied or deployed by this record; no migration, no table, no column, no grant.
+Status: Accepted by the owner on 2026-11-11, in the owner's words: "Accept ADR 0022." Written as the first LMS step of the P4 part-2 plan (its step L10); with the acceptance, L1 (rules bundle 3) opens. Nothing here is built, applied or deployed by this record; no migration, no table, no column, no grant.
 Date: 2026-11-11
 Deciders: owner (acceptance); architect (Fable 5.1)
 
@@ -133,7 +133,7 @@ Deciders: owner (acceptance); architect (Fable 5.1)
 
 ## Decisions requested from the owner
 
-1. Accept this record (sections A to I) so that L1 opens. Recommended: yes. Of its content, D1, D2, D7 and D12 are already the owner's answers of 2026-11-06; the identity-stability check (D item 10), the row shape and registrar (C), the bundle-3 contents (E), the decision order (B item 6, D item 11), the badge wording as the recommended D15 text (F), the spec numbers (G) and the deferrals (H) are new with this record.
+1. Accept this record (sections A to I) so that L1 opens. Recommended: yes. Answered on 2026-11-11: "Accept ADR 0022." Of its content, D1, D2, D7 and D12 are already the owner's answers of 2026-11-06; the identity-stability check (D item 10), the row shape and registrar (C), the bundle-3 contents (E), the decision order (B item 6, D item 11), the badge wording as the recommended D15 text (F), the spec numbers (G) and the deferrals (H) are new with this record.
 2. Nothing else is asked now. Open, each at the point named: D3, D4, D5 (the file-based list, a new slide on the hosted editor before it is fully proven, who approves a row: at the first row); D15 (Certified on production before P5: at the first row); D6 (where the 2.0 menu entry shows: at the editor upload, before the owner uploads); D10 (the golden course and where its zip lives: before KIVO's real-platform run K11a); D14 (Workers Paid or Cloud Run only: after L8, before 2.0 reaches production); D9 (App Simulation: after the first certified plain course); D8a (the language-edition command: later). The SCORM 2004 test waiver question is asked at the editor upload. O-1 (a staff launch whose `LMS.LaunchData` cannot be read runs as Normal and can complete and score; hold completion and score on `is_preview` attempts of 2.0 versions, or accept and record the residual) is a grading rule: the architect consults the advisor and puts it to the owner as its own question beside the data-analyst step; it is recorded under ADR 0006 step 17 and is not decided here.
 
 ## Verification
