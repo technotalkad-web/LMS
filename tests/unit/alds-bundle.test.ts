@@ -13,8 +13,8 @@
  *         to lib/alds without `--register` fails here;
  *   (v)   the bundle runs in a bare vm context (no Node, DOM, console or
  *         TextEncoder) and gives the same result as the TypeScript module on
- *         every golden case and every engine-digest page (bundle 3, ADR
- *         0022 section E).
+ *         every golden case, every engine-digest page and every key case
+ *         (bundle 3, ADR 0022 section E).
  *
  * Run:  npx tsx tests/unit/alds-bundle.test.ts   (or npm run test:unit)
  */
@@ -25,7 +25,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 import * as rules from "../../lib/alds/rules";
-import { digestVectors, loadGolden, verify, type RulesApi } from "./alds-fixtures/harness";
+import { digestVectors, loadGolden, loadKeyCases, verify, type RulesApi } from "./alds-fixtures/harness";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -118,7 +118,7 @@ async function main() {
   const bundle = vm.runInContext(mod.GLOBAL_NAME, sandbox) as Record<string, unknown>;
   const surface = [
     "checkStatement", "checkSession", "checkPackage", "contentHash", "parseInteraction", "responseMatches", "detectScript",
-    "engineDigestInput", "engineDigestInputByAlgo", "engineDigest",
+    "engineDigestInput", "engineDigestInputByAlgo", "engineDigest", "keyFromSlide", "keyFromBankQuestion", "fillBlanksVariants",
   ];
   eq("exposes the documented functions", surface.filter((k) => typeof bundle[k] !== "function"), []);
   eq("ALDS_VERSION", bundle.ALDS_VERSION, "2.0");
@@ -161,6 +161,22 @@ async function main() {
     algos.filter((a) => JSON.stringify(bundleDigest.engineDigestInputByAlgo(a, dv.p0)) !== JSON.stringify(rules.engineDigestInputByAlgo(a, dv.p0))).map(String),
     [],
   );
+
+  // The answer keys (ADR 0022 item 14): the editor's export and the gate run the same function
+  const keyCases = loadKeyCases();
+  const keyDiffs: string[] = [];
+  let keySame = 0, keyMet = 0;
+  for (const c of keyCases) {
+    const fromTs = c.run(tsApi);
+    const fromBundle = c.run(bundleApi);
+    if (JSON.stringify(fromBundle) === JSON.stringify(fromTs)) keySame++;
+    else keyDiffs.push(c.name);
+    if (JSON.stringify(fromBundle) === JSON.stringify(c.expect)) keyMet++;
+    else keyDiffs.push(`${c.name} (expectation)`);
+  }
+  eq(`${keyCases.length} key cases: bundle result = module result`, keySame, keyCases.length);
+  eq(`${keyCases.length} key cases: bundle meets every expectation`, keyMet, keyCases.length);
+  eq("key cases that differ", keyDiffs, []);
 
   console.log(`\nrulesBundleHash ${a.hash} (${a.bytes} bytes)`);
   console.log(`${pass} passed, ${fail} failed`);

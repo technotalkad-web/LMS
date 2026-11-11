@@ -12,6 +12,8 @@
  *                          a step {base, patch?, origin: "lms"} is a row the LMS
  *                          recorded (its id goes to ctx.lmsStatementIds)
  *   packages.cases.json    checkPackage cases (mini-packages): patch → expected findings
+ *   keys.cases.json        keyFromSlide / keyFromBankQuestion cases: a slide or a bank
+ *                          question → the expected key (string[], [] or null); loadKeyCases()
  * digestVectors() builds the engine-digest pages (ADR 0022 A) in code: small synthetic
  * pages in the KIVO 2.0 layout, never engine bytes.
  *
@@ -45,6 +47,8 @@ export interface RulesApi {
   checkSession(statements: unknown[], ctx?: unknown): CheckResultLike;
   checkPackage(input: unknown): CheckResultLike;
   contentHash(entry: unknown): string;
+  keyFromSlide(slide: unknown): string[] | null;
+  keyFromBankQuestion(q: unknown): string[] | null;
   engineDigestInput(html: string): { ok: true; input: string } | { ok: false; reason: string };
 }
 
@@ -280,6 +284,25 @@ export function verify(c: GoldenCase, res: CheckResultLike): string[] {
     problems.push(`checked ${JSON.stringify(res.checked)} ≠ ${JSON.stringify(c.expectChecked)}`);
   }
   return problems;
+}
+
+// --- keyFromSlide / keyFromBankQuestion cases (keys.cases.json) ----------------------------
+
+export interface KeyCase {
+  name: string;
+  slide?: unknown;
+  bank?: unknown;
+  expect: string[] | null;
+  /** keyFromSlide(slide) for a "slide" case, keyFromBankQuestion(bank) for a "bank" case. */
+  run(api: Pick<RulesApi, "keyFromSlide" | "keyFromBankQuestion">): string[] | null;
+}
+
+export function loadKeyCases(): KeyCase[] {
+  const file = read("keys.cases.json") as { cases: Array<{ name: string; slide?: unknown; bank?: unknown; expect: string[] | null }> };
+  return file.cases.map((c) => ({
+    ...c,
+    run: (api) => ("slide" in c ? api.keyFromSlide(clone(c.slide)) : api.keyFromBankQuestion(clone(c.bank))),
+  }));
 }
 
 // --- engine digest vectors (ADR 0022 A item 1) ------------------------------------------------

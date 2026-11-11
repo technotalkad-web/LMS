@@ -19,6 +19,8 @@
  * Bundle 3 (ADR 0022 section E):
  *   engineDigestInput(html) / engineDigestInputByAlgo(algo, html) / engineDigest(html)
  *       the engine digest of a KIVO 2.0 launch page (section A, v1)
+ *   keyFromSlide(slide) / keyFromBankQuestion(q) / fillBlanksVariants(slide)
+ *       the oid-form key of a KIVO slide or bank question (item 14)
  *   LABELS_BY_AUTHORING_KIND (item 12), EXT.launchContract (item 15)
  *
  * Pure: no imports outside lib/alds, no DOM or Node APIs, no I/O, no clock,
@@ -33,6 +35,7 @@ export { canonicalPattern, canonicalPatternKey, canonicalPatternText, parseInter
 export { detectScript, scriptForLanguage, type DetectedScript, type ScriptProfile } from "./script";
 export { sha256Hex, sha256HexOfString, utf8Encode } from "./sha256";
 export { ENGINE_DIGEST_ANCHORS, ENGINE_DIGEST_ALGO_V1, engineDigestInput, engineDigestInputByAlgo, engineDigest, type EngineDigestInputResult } from "./engine-digest";
+export { keyFromSlide, keyFromBankQuestion, fillBlanksVariants } from "./key-from-slide";
 export { canonicalBcp47, isBcp47, normalizeText } from "./util";
 export {
   ALDS_VERSION,

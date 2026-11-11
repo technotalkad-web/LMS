@@ -32,7 +32,10 @@ import {
   engineDigestInput,
   engineDigestInputByAlgo,
   EXT,
+  fillBlanksVariants,
   KEY_CLASS_BY_AUTHORING_KIND,
+  keyFromBankQuestion,
+  keyFromSlide,
   LABELS_BY_AUTHORING_KIND,
   LAUNCH_CONTRACT_FALLBACKS,
   normalizeText,
@@ -45,7 +48,7 @@ import {
   type Parsed,
 } from "../../lib/alds/rules";
 import { INTERACTION_KINDS, type AldsCatalogueEntry } from "../../lib/alds/types";
-import { digestVectors } from "./alds-fixtures/harness";
+import { digestVectors, loadKeyCases } from "./alds-fixtures/harness";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -365,6 +368,41 @@ console.log("\n(vi) the engine digest (ADR 0022 A; synthetic pages, never engine
   }
   const devIn = engineDigestInput(dv.devanagariHeadPage);
   eq("(h) the Devanagari-head input is not ASCII (the UTF-8 vector is real)", devIn.ok && /[^\x00-\x7f]/.test(devIn.input), true);
+}
+
+console.log("\n(vii) keyFromSlide / keyFromBankQuestion (ADR 0022 item 14; tests/unit/alds-fixtures/keys.cases.json)");
+{
+  const keyCases = loadKeyCases();
+  const api = { keyFromSlide, keyFromBankQuestion };
+  for (const c of keyCases) eq(c.name, c.run(api), c.expect);
+  // every row of the table has a positive case (one per keyed label) and a null case
+  for (let row = 1; row <= 14; row++) {
+    const mine = keyCases.filter((c) => c.name.startsWith(`row ${row} `));
+    eq(`row ${row}: a positive case and a null case`, [mine.some((c) => Array.isArray(c.expect) && c.expect.length > 0), mine.some((c) => c.expect === null)], [true, true]);
+  }
+  const keyedTypes = ["quiz", "timed-quiz", "scenario", "confidence", "multi-response", "true-false", "swipe-decision", "matching", "drag-match", "drag-drop", "sequencing", "fill-blanks"];
+  eq(
+    "a keyed slide type never gives [] (it gives a key or null)",
+    keyCases.filter((c) => "slide" in c && typeof (c.slide as { type?: unknown } | null)?.type === "string" && keyedTypes.includes((c.slide as { type: string }).type) && Array.isArray(c.expect) && c.expect.length === 0).map((c) => c.name),
+    [],
+  );
+  eq("every key case's slide or bank value passes through unchanged (no mutation)", keyCases.every((c) => {
+    const before = JSON.stringify("slide" in c ? c.slide : c.bank);
+    c.run(api);
+    return JSON.stringify("slide" in c ? c.slide : c.bank) === before;
+  }), true);
+  // fillBlanksVariants: the per-blank lists, uncapped (ADR 0022 D item 7 counts their product)
+  const fill = (template: string, acceptedAnswers?: unknown) => ({ type: "fill-blanks", template, acceptedAnswers });
+  eq("fillBlanksVariants: two blanks", fillBlanksVariants(fill("[[a]] and [[b]]", [["A2"], ["B2"]])), [["a", "A2"], ["b", "B2"]]);
+  eq("fillBlanksVariants: normalised, de-duplicated by lower case, the first spelling kept", fillBlanksVariants(fill("[[Equated  Monthly]]", [[" equated monthly ", "EMI", "emi"]])), [["Equated Monthly", "EMI"]]);
+  const five = (p: string) => [`${p}2`, `${p}3`, `${p}4`, `${p}5`];
+  const lists4 = fillBlanksVariants(fill("[[a1]] [[b1]] [[c1]] [[d1]]", [five("a"), five("b"), five("c"), five("d")])) ?? [];
+  eq("fillBlanksVariants: four blanks of five variants, uncapped (625 combinations)", [lists4.map((l) => l.length), lists4.reduce((n, l) => n * l.length, 1)], [[5, 5, 5, 5], 625]);
+  eq("fillBlanksVariants: … while keyFromSlide caps the key at 64 patterns", (keyFromSlide(fill("[[a1]] [[b1]] [[c1]] [[d1]]", [five("a"), five("b"), five("c"), five("d")])) ?? []).length, 64);
+  eq("fillBlanksVariants: an empty list stays visible (the key is null)", fillBlanksVariants(fill("[[ ]] and [[b]]")), [[], ["b"]]);
+  eq("fillBlanksVariants: no blank → null", fillBlanksVariants(fill("No blanks here.")), null);
+  eq("fillBlanksVariants: not a fill-blanks slide → null", fillBlanksVariants({ type: "quiz", template: "[[a]]" }), null);
+  eq("fillBlanksVariants: not an object → null", fillBlanksVariants("[[a]]"), null);
 }
 
 console.log("\n(viii) the label table (ADR 0022 item 12) and EXT.launchContract (item 15)");
