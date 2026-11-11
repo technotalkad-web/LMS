@@ -77,6 +77,22 @@ export function verdictPending(scoring: ScoringResult, passRequired: boolean): b
   return passRequired && scoring.officialStatus === "completed";
 }
 
+/**
+ * The one conclude test (ADR 0019, note of 2026-11-11): the module's official
+ * result is stored and, on a pass-required course, its verdict is too. Three
+ * callers read it over the same strict reads, so the bar and the continue
+ * address never disagree:
+ *   - the continue address (app/[org]/(learner)/continue/page.tsx) ends its
+ *     wait on it;
+ *   - the launch page (courses/[courseId]/launch/page.tsx) renders Continue
+ *     ready from the first paint when it is already true;
+ *   - the status route (app/api/attempts/[attemptId]/result-stored) answers
+ *     `{stored}` with it, which the bar polls while it waits.
+ */
+export function officialResultStored(scoring: ScoringResult, attempts: ScorableAttempt[], passRequired: boolean): boolean {
+  return resultStored(scoring, attempts) && !verdictPending(scoring, passRequired);
+}
+
 export type ContinueInput = {
   orgSlug: string;
   pathId: string;

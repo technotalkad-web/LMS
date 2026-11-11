@@ -28,6 +28,8 @@ export function ScormRuntime({
   revision = false,
   showTitle = true,
   continueHref = null,
+  continueReady = false,
+  continueStatusHref = null,
 }: {
   attemptId: string;
   initialCmi: CmiData;
@@ -44,6 +46,14 @@ export function ScormRuntime({
   showTitle?: boolean;
   /** The continue address on a Learning Path launch (ADR 0019 step 8); null hides Continue. */
   continueHref?: string | null;
+  /**
+   * Continue starts active (ADR 0019, note of 2026-11-11): the official result
+   * is already stored, or the launch is a preview. False, the safe default,
+   * keeps it waiting until the status route answers stored.
+   */
+  continueReady?: boolean;
+  /** The status route the bar checks after a terminal commit; null off a path launch. */
+  continueStatusHref?: string | null;
 }) {
   const cmiRef = useRef<CmiData>({ ...initialCmi });
   const initializedRef = useRef(false);
@@ -53,6 +63,13 @@ export function ScormRuntime({
     "idle"
   );
   const [lastError, setLastError] = useState("0");
+  // ADR 0019, note of 2026-11-11: the parent owns the API, so the bar does not
+  // poll; a commit the server answered with a terminal status bumps this and
+  // the bar runs one status check. The bar turns ready only on the route's
+  // `{ stored: true }`, never on this commit's answer: the server's own
+  // derivation decides, and a `completed` without a verdict on a
+  // pass_required course keeps waiting, as on the continue address.
+  const [continueRecheck, setContinueRecheck] = useState(0);
   // Serialize commits: packages often call LMSCommit then LMSFinish back to
   // back (both fire-and-forget). Overlapping requests would each read the
   // attempt as "not yet complete" and could double-fire the completion
@@ -70,6 +87,8 @@ export function ScormRuntime({
           body: JSON.stringify({ cmi: cmiRef.current, finished }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = (await res.json().catch(() => null)) as { status?: string } | null;
+        if (body && ["completed", "passed", "failed"].includes(String(body.status))) setContinueRecheck((n) => n + 1);
         setStatus("saved");
         window.setTimeout(() => setStatus("idle"), 1500);
         return true;
@@ -160,6 +179,10 @@ export function ScormRuntime({
         showTitle={showTitle}
         revision={revision}
         continueHref={continueHref}
+        continueReady={continueReady}
+        continueStatusHref={continueStatusHref}
+        continuePoll={false}
+        continueRecheck={continueRecheck}
       >
         <SyncBadge status={status} />
       </LaunchBar>

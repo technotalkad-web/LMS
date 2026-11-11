@@ -54,6 +54,7 @@ import {
 } from "@/lib/attempts/launch-kind";
 import { buildOfficialResult, buildRevisionCmi } from "@/lib/attempts/revision-seed";
 import { isKivoStamped } from "@/lib/courses/engine-version";
+import { officialResultStored } from "@/lib/learner/continue";
 
 type Course = {
   id: string;
@@ -61,6 +62,7 @@ type Course = {
   current_version_id: string | null;
   title: string;
   is_active?: boolean;
+  pass_required?: boolean | null;
 };
 
 type Version = {
@@ -110,7 +112,7 @@ export default async function LaunchPage({
   const supabase = await createClient();
   const { data: course } = await supabase
     .from("courses")
-    .select("id, organization_id, current_version_id, title, is_active")
+    .select("id, organization_id, current_version_id, title, is_active, pass_required")
     .eq("id", courseId)
     .eq("organization_id", org.id)
     .maybeSingle();
@@ -122,6 +124,9 @@ export default async function LaunchPage({
     redirect(`/${orgSlug}/dashboard`);
   }
   const c = course as Course;
+  // The bar's Continue state (ADR 0019, note of 2026-11-11): the continue
+  // address's own reading of the course's setting.
+  const passRequired = c.pass_required === true;
 
   // ---- Yoddha journey context (?journey=<enrollmentId>&day=<n>) ----
   // Runs BEFORE the generic entitlement gate: a locked journey day must
@@ -1216,6 +1221,24 @@ export default async function LaunchPage({
       ? `/${orgSlug}/continue?lp=${encodeURIComponent(pathContextId)}&from=${encodeURIComponent(courseId)}`
       : null;
   const showTitle = !isKivoStamped(v.manifest_data);
+  // ADR 0019, note of 2026-11-11: Continue waits until the module's official
+  // result is stored. Ready at once for a preview (the roles the continue
+  // address moves on without a wait) or when the page's own scoring of the
+  // learner's attempts on the course already reads stored, through the
+  // continue address's own test (a revision visit, a relaunch after a
+  // result). Waiting on a first launch (its new row is not in ev.my, and no
+  // official attempt exists yet), on a resumed granted retake (courseStatus
+  // reads in_progress), on a pass_required course whose verdict is pending,
+  // and on the launch that has just opened a granted retake (openedGrantId):
+  // ev was read before consume_grant inserted the retake, so ev.my still
+  // reads the earlier result as stored.
+  const continueReady =
+    continueHref !== null &&
+    (launch.isPreview ||
+      (openedGrantId === null && ev.scoring !== null && officialResultStored(ev.scoring, ev.my, passRequired)));
+  // The status the bar polls while it waits (a learner-owned GET, the caller's session).
+  const continueStatusHref =
+    continueHref !== null ? `/api/attempts/${encodeURIComponent(attemptId)}/result-stored` : null;
 
   // Background preload of the NEXT module (journey: next day with a course;
   // learning path: next step). Only its content launch file is warmed — the
@@ -1291,6 +1314,8 @@ export default async function LaunchPage({
         revision={rowIsRevision}
         showTitle={showTitle}
         continueHref={continueHref}
+        continueReady={continueReady}
+        continueStatusHref={continueStatusHref}
       />
     );
   }
@@ -1452,6 +1477,8 @@ export default async function LaunchPage({
       revision={rowIsRevision}
       showTitle={showTitle}
       continueHref={continueHref}
+      continueReady={continueReady}
+      continueStatusHref={continueStatusHref}
     />
   );
 }
