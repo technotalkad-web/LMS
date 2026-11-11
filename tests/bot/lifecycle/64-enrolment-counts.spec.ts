@@ -52,7 +52,8 @@
  * A separate block, "staging note", records one real path-taught course's
  * Reports §4.1 and §4.2 counts for the staging note (counts only): run it with
  * ENROLMENT_NOTE_COURSE=<course id> before the paste and after the first
- * refresh; it skips without the variable and needs no 0105.
+ * refresh; without the variable it is not registered at all (no skip in the
+ * nightly), and it needs no 0105.
  *
  * Needs 0105 on the database: the probe FAILS the fixture block without it.
  * By hand on staging after the paste, never while another lifecycle run is in
@@ -460,10 +461,11 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
   });
 });
 
-test.describe("ADR 0020 staging note: one path-taught course before the paste and after the first refresh", () => {
+// Registered only when ENROLMENT_NOTE_COURSE is set (a by-hand staging read): the nightly subset runs this file
+// without it, and a skipped test there turns every night amber (scripts/lifecycle-summary.mjs).
+if (process.env.ENROLMENT_NOTE_COURSE) test.describe("ADR 0020 staging note: one path-taught course before the paste and after the first refresh", () => {
   test("counts only: the live view and the two course matviews for ENROLMENT_NOTE_COURSE", async () => {
     const courseId = process.env.ENROLMENT_NOTE_COURSE ?? "";
-    test.skip(!courseId, "set ENROLMENT_NOTE_COURSE to a real staging course taught through a path");
     const { count } = await svc().from("v_course_enrollments_expanded").select("user_id", { count: "exact", head: true }).eq("course_id", courseId);
     const { data: st } = await svc().from("mv_course_enrollment_status").select("total_enrolled, completed, in_progress, not_started, refreshed_at").eq("course_id", courseId).maybeSingle();
     const { data: perf } = await svc().from("mv_course_performance").select("total_enrolled, total_completed, total_passed, total_failed, refreshed_at").eq("course_id", courseId).maybeSingle();
