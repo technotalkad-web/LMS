@@ -62,7 +62,8 @@
  */
 import { test, expect, type APIResponse, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
-import { authedContext, latestAttemptId, scormCommit, uploadCourse, type CourseHandle } from "./helpers";
+import { authedContext, courseHandle, latestAttemptId, scormCommit, type CourseHandle } from "./helpers";
+import { scormZip, uploadNew } from "./p0-helpers";
 import { resolveManyGroups } from "../../../lib/org/groups";
 
 type User = { id: string; email: string; password: string };
@@ -208,8 +209,14 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
       { group_id: s.groups.get(5), organization_id: org.id, user_id: u(14).id },
     ]);
 
+    // Six distinct packages: the upload guard (lib/courses/validation/integrity.ts) blocks a module that
+    // already belongs to another course of the organisation, so one fixture cannot be uploaded six times.
+    const tag = rand(6);
     for (let n = 1; n <= 6; n++) {
-      const course = await uploadCourse(s.adminCtx.request, org.slug, "scorm12.zip");
+      const zip = await scormZip({ title: `Enrolment C${n}`, marker: `enrolment-${tag}-c${n}` });
+      const res = await uploadNew(s.adminCtx.request, org.slug, `enrolment-c${n}.zip`, zip);
+      expect(res.ok(), `C${n} upload → ${res.status()}: ${await res.text()}`).toBeTruthy();
+      const course = await courseHandle((await res.json()).courseId as string);
       await svc().from("courses").update({ title: `Enrolment C${n}` }).eq("id", course.courseId);
       s.courses.set(n, course);
     }
