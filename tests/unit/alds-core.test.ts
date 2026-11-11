@@ -26,6 +26,10 @@ import {
   canonicalPatternKey,
   contentHash,
   detectScript,
+  EXT,
+  KEY_CLASS_BY_AUTHORING_KIND,
+  LABELS_BY_AUTHORING_KIND,
+  LAUNCH_CONTRACT_FALLBACKS,
   normalizeText,
   parseInteraction,
   responseMatches,
@@ -35,7 +39,7 @@ import {
   utf8Encode,
   type Parsed,
 } from "../../lib/alds/rules";
-import type { AldsCatalogueEntry } from "../../lib/alds/types";
+import { INTERACTION_KINDS, type AldsCatalogueEntry } from "../../lib/alds/types";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -300,6 +304,42 @@ console.log("\n(v) purity of lib/alds (types.ts + rules/)");
     for (const [re, what] of banned) if (re.test(src)) problems.push(`${rel}: uses ${what}`);
   }
   eq(`${files.length} files: imports stay inside lib/alds; no Node/DOM API, clock or randomness`, problems, []);
+}
+
+console.log("\n(viii) the label table (ADR 0022 item 12) and EXT.launchContract (item 15)");
+{
+  // The (label, class) pairs bundles 1 and 2 held as a literal table; written here as data so
+  // the derivation of KEY_CLASS_BY_AUTHORING_KIND from LABELS_BY_AUTHORING_KIND cannot move a class.
+  const classesBefore: Array<[string, string]> = [
+    ["choice", "keyed"], ["true-false", "keyed"], ["multi-response", "keyed"], ["sequencing", "keyed"],
+    ["matching", "keyed"], ["drag-match", "keyed"], ["drag-drop", "keyed"], ["fill-in", "keyed"],
+    ["confidence", "keyed"], ["swipe", "keyed"], ["dialogue", "scored-unkeyed"], ["game", "scored-unkeyed"],
+    ["image-id", "scored-unkeyed"], ["hotspot", "completion-only"], ["interactive-timeline", "completion-only"],
+    ["feedback", "unscored"], ["slider", "unscored"], ["dial", "unscored"],
+  ];
+  // ADR 0022 item 12, row by row.
+  const table: Array<[string, string, string[]]> = [
+    ["choice", "keyed", ["choice"]], ["confidence", "keyed", ["choice"]], ["multi-response", "keyed", ["choice"]],
+    ["true-false", "keyed", ["true-false"]],
+    ["swipe", "keyed", ["matching"]], ["matching", "keyed", ["matching"]], ["drag-match", "keyed", ["matching"]], ["drag-drop", "keyed", ["matching"]],
+    ["sequencing", "keyed", ["sequencing"]], ["fill-in", "keyed", ["fill-in"]],
+    ["dialogue", "scored-unkeyed", ["performance"]], ["game", "scored-unkeyed", ["other"]], ["image-id", "scored-unkeyed", ["choice"]],
+    ["hotspot", "completion-only", ["choice"]], ["interactive-timeline", "completion-only", ["choice"]],
+    ["feedback", "unscored", ["likert", "choice", "long-fill-in"]], ["slider", "unscored", []], ["dial", "unscored", []],
+  ];
+  const labels = Object.keys(LABELS_BY_AUTHORING_KIND);
+  const byLabel = (a: [string, ...unknown[]], b: [string, ...unknown[]]) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  eq("18 labels", labels.length, 18);
+  eq("LABELS_BY_AUTHORING_KIND and KEY_CLASS_BY_AUTHORING_KIND have the same keys", labels.slice().sort(), Object.keys(KEY_CLASS_BY_AUTHORING_KIND).sort());
+  eq("KEY_CLASS_BY_AUTHORING_KIND[label] = LABELS_BY_AUTHORING_KIND[label].class for every label", labels.filter((l) => KEY_CLASS_BY_AUTHORING_KIND[l] !== LABELS_BY_AUTHORING_KIND[l].class), []);
+  eq("the 18 (label, class) pairs are the ones bundles 1 and 2 held", Object.keys(KEY_CLASS_BY_AUTHORING_KIND).map((l): [string, string] => [l, KEY_CLASS_BY_AUTHORING_KIND[l]]).sort(byLabel), classesBefore.slice().sort(byLabel));
+  eq("every row equals ADR 0022 item 12's table", labels.map((l): [string, string, string[]] => [l, LABELS_BY_AUTHORING_KIND[l].class, Array.from(LABELS_BY_AUTHORING_KIND[l].xapiKinds)]).sort(byLabel), table.slice().sort(byLabel));
+  eq("every xapiKinds entry is an xAPI interaction type", labels.flatMap((l) => LABELS_BY_AUTHORING_KIND[l].xapiKinds.filter((k) => !INTERACTION_KINDS.includes(k)).map((k) => `${l}: ${k}`)), []);
+  const keyed = labels.filter((l) => LABELS_BY_AUTHORING_KIND[l].class === "keyed");
+  eq("exactly ten labels are keyed", keyed.length, 10);
+  eq("each keyed label allows exactly one xAPI kind", keyed.filter((l) => LABELS_BY_AUTHORING_KIND[l].xapiKinds.length !== 1), []);
+  eq("EXT.launchContract", EXT.launchContract, "https://ambak.com/xapi/ext/content/launch-contract");
+  eq("LAUNCH_CONTRACT_FALLBACKS", Array.from(LAUNCH_CONTRACT_FALLBACKS), ["launchdata_missing", "launchdata_unreadable"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

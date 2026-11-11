@@ -82,6 +82,7 @@ export const EXT = {
   questionTry: `${E}question/try`,
   questionFinal: `${E}question/final`,
   questionDrawn: `${E}question/drawn`,
+  launchContract: `${E}content/launch-contract`,  // informational; written by the 2.0 engine in ADR 0006 step 13's flagged fallback; no rule reads it in P4 (ADR 0022 item 15)
 } as const;
 
 /**
@@ -94,6 +95,14 @@ export const EXT = {
 export const EXT_RESULT_UNANSWERED = `${E}question/unanswered` as const;
 export const UNANSWERED_REASONS = ["timeout", "unanswered"] as const;
 export type UnansweredReason = (typeof UNANSWERED_REASONS)[number];
+
+/**
+ * The values of EXT.launchContract (ADR 0022 item 15): the 2.0 engine runs in
+ * ADR 0006 step 13's flagged fallback when LMS.LaunchData is missing or
+ * unreadable, and says which on every statement. Informational: no rule reads
+ * it in P4 (P5 may filter on it).
+ */
+export const LAUNCH_CONTRACT_FALLBACKS = ["launchdata_missing", "launchdata_unreadable"] as const;
 
 export type Ulid = string;          // ^[0-7][0-9A-HJKMNP-TV-Z]{25}$
 export type Bcp47 = string;         // canonical case, e.g. "hi-Latn"
@@ -200,11 +209,48 @@ export const SCRIPT_FOR_LANGUAGE: Readonly<Record<string, AldsScript>> = {
  */
 export type AldsKeyClass = "keyed" | "scored-unkeyed" | "completion-only" | "unscored";
 
+/** One row of LABELS_BY_AUTHORING_KIND: the label's class and the xAPI kinds it may use. */
+export interface AldsLabelRow {
+  class: AldsKeyClass;
+  xapiKinds: readonly InteractionKind[];
+}
+
+/**
+ * The reviewed label table (ADR 0022 item 12; the table ADR 0005 note (d)
+ * deferred to P4): each authoring kind (the label KIVO writes into
+ * `questions[].authoringKind`) with its class and the xAPI interaction types
+ * it may use. U1 `authoring_kind_type_mismatch` refuses a `kind` outside
+ * `xapiKinds`. Fifteen rows are the G2 engine's label tables (its
+ * ALDS_LABEL_BY_TYPE and ALDS_BANK_LABEL) joined with each adapter's
+ * interactionType; `feedback`, `slider` and `dial` come from ADR 0022 item 12
+ * (`slider` and `dial` are never in `questions[]`, so they allow no kind).
+ */
+export const LABELS_BY_AUTHORING_KIND: Readonly<Record<string, AldsLabelRow>> = {
+  choice: { class: "keyed", xapiKinds: ["choice"] },
+  confidence: { class: "keyed", xapiKinds: ["choice"] },
+  "multi-response": { class: "keyed", xapiKinds: ["choice"] },
+  "true-false": { class: "keyed", xapiKinds: ["true-false"] },
+  swipe: { class: "keyed", xapiKinds: ["matching"] },
+  matching: { class: "keyed", xapiKinds: ["matching"] },
+  "drag-match": { class: "keyed", xapiKinds: ["matching"] },
+  "drag-drop": { class: "keyed", xapiKinds: ["matching"] },
+  sequencing: { class: "keyed", xapiKinds: ["sequencing"] },
+  "fill-in": { class: "keyed", xapiKinds: ["fill-in"] },
+  dialogue: { class: "scored-unkeyed", xapiKinds: ["performance"] },
+  game: { class: "scored-unkeyed", xapiKinds: ["other"] },
+  "image-id": { class: "scored-unkeyed", xapiKinds: ["choice"] },
+  hotspot: { class: "completion-only", xapiKinds: ["choice"] },
+  "interactive-timeline": { class: "completion-only", xapiKinds: ["choice"] },
+  feedback: { class: "unscored", xapiKinds: ["likert", "choice", "long-fill-in"] },
+  slider: { class: "unscored", xapiKinds: [] },
+  dial: { class: "unscored", xapiKinds: [] },
+};
+
 /**
  * PROPOSED (P3): the authoring kind vocabulary (ADR 0005 step 6) mapped to its
- * class. The table lives in the reviewed rules. A catalogue entry without
- * `authoringKind` is `keyed` when it has a key (`correct` not empty) and
- * `scored-unkeyed` otherwise.
+ * class. Derived from LABELS_BY_AUTHORING_KIND (bundle 3), so the two cannot
+ * drift. A catalogue entry without `authoringKind` is `keyed` when it has a
+ * key (`correct` not empty) and `scored-unkeyed` otherwise.
  *
  * A label alone cannot switch the key comparison off: checkPackage (U1)
  * requires the entry to agree with the class its label names. A keyed label
@@ -213,33 +259,19 @@ export type AldsKeyClass = "keyed" | "scored-unkeyed" | "completion-only" | "uns
  * (`key_on_unkeyed_kind`). So relabelling a keyed question `game` or
  * `hotspot` also has to drop its key, and then there is nothing to compare.
  *
- * OPEN DECISIONS (owner/architect, before KIVO builds the 2.0 export against
- * this bundle): (1) a reviewed table of the xAPI kinds each authoring kind may
- * use (what release A emits per kind; not built here, because it cannot be
- * checked against the engine yet); (2) whether a typed kind with a non-empty
- * key may ever be scored-unkeyed or completion-only. Until (2) is decided it
- * may not (`key_on_unkeyed_kind`, error).
+ * The two decisions this comment once left open: (1) the reviewed table of
+ * the xAPI kinds each authoring kind may use is answered by
+ * LABELS_BY_AUTHORING_KIND (ADR 0022 item 12); (2) a typed kind with a
+ * non-empty key may still not be scored-unkeyed or completion-only
+ * (`key_on_unkeyed_kind`, error).
  */
-export const KEY_CLASS_BY_AUTHORING_KIND: Readonly<Record<string, AldsKeyClass>> = {
-  choice: "keyed",
-  "true-false": "keyed",
-  "multi-response": "keyed",
-  sequencing: "keyed",
-  matching: "keyed",
-  "drag-match": "keyed",
-  "drag-drop": "keyed",
-  "fill-in": "keyed",
-  confidence: "keyed",
-  swipe: "keyed",
-  dialogue: "scored-unkeyed",
-  game: "scored-unkeyed",
-  "image-id": "scored-unkeyed",
-  hotspot: "completion-only",
-  "interactive-timeline": "completion-only",
-  feedback: "unscored",
-  slider: "unscored",
-  dial: "unscored",
-};
+export const KEY_CLASS_BY_AUTHORING_KIND: Readonly<Record<string, AldsKeyClass>> = (() => {
+  const out: Record<string, AldsKeyClass> = {};
+  for (const label in LABELS_BY_AUTHORING_KIND) {
+    if (Object.prototype.hasOwnProperty.call(LABELS_BY_AUTHORING_KIND, label)) out[label] = LABELS_BY_AUTHORING_KIND[label].class;
+  }
+  return out;
+})();
 
 /** PROPOSED (P3), ADR 0006 step 11: a question pool of an assessment. */
 export interface AldsPool {
@@ -252,6 +284,7 @@ export interface AldsPool {
 export interface AldsSelfCheck {
   reportHash: Sha256;
   engineDigest: Sha256;
+  engineDigestAlgo?: string;    // ADR 0022 A item 2: absent = "v1" (rules/engine-digest.ts); any other unknown value gives no digest
   kindsCovered: string[];       // authoring kinds the self-check exercised
 }
 
@@ -276,6 +309,7 @@ export interface AldsPackageManifest {
     pools?: AldsPool[];              // PROPOSED (P3)
   }>;
   selfCheck?: AldsSelfCheck;         // PROPOSED (P3)
+  slideKinds?: string[];             // ADR 0022 item 12: the KIVO slide types in the config (distinct; presence checked by the gate, not U1)
 }
 
 export interface AldsCatalogueEntry {

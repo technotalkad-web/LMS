@@ -34,6 +34,8 @@ export {
   EXT,
   EXT_RESULT_UNANSWERED,
   KEY_CLASS_BY_AUTHORING_KIND,
+  LABELS_BY_AUTHORING_KIND,
+  LAUNCH_CONTRACT_FALLBACKS,
   SCRIPT_FOR_LANGUAGE,
   UNANSWERED_REASONS,
   auActivityId,
@@ -42,4 +44,5 @@ export {
   questionFamily,
   questionObject,
   quizRun,
+  type AldsLabelRow,
 } from "../types";
