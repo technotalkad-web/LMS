@@ -100,7 +100,7 @@ function isOneComment(range: string): boolean {
  * `</SCRIPT>`, `</script >` or `</script/>` as well) nor `<!--` (which, with a
  * `<script` after it, lets the block run past the `</script>` this function
  * stops at). The 2.0 writer meets both: its licence is one comment and it
- * writes every `<` of the course JSON as `<`. A page that fails them was
+ * writes every `<` of the course JSON as `\u003c`. A page that fails them was
  * not made by the writer and has no digest; these two checks come after the
  * anchor checks, so every anchor failure keeps its reason.
  */
