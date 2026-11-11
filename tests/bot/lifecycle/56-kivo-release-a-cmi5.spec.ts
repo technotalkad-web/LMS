@@ -275,6 +275,8 @@ function docSummary(stateId: string | null, doc: any): unknown {
     const kindKey = Object.keys(ext).find((k) => /(^|\/)registration\/kind$/.test(k));
     return { launchMode: doc.launchMode ?? null, registrationKind: kindKey ? ext[kindKey] : null, registration: doc.contextTemplate?.registration ?? null, moveOn: doc.moveOn ?? null };
   }
+  // ADR 0014 step 3 (lib/attempts/revision-seed.ts buildOfficialResult): ids, a status, a score and dates only.
+  if (stateId === "LMS.OfficialResult") return { status: doc.status ?? null, score: doc.score ?? null, completed_at: doc.completed_at ?? null, attempt_id: doc.attempt_id ?? null, course_version_id: doc.course_version_id ?? null };
   return { keys: Object.keys(doc).slice(0, 12) };
 }
 function wireOf(run: string): Wire[] {
@@ -450,12 +452,16 @@ async function resultsFacts(fl: FrameLocator, waitMs = 30_000) {
     await sleep(500);
   }
   const labelled = /(\d+|Not scored)( %)? · from the answers shown here; your recorded result is on your course page/.exec(txt);
+  // A revision visit's headline when the engine read LMS.OfficialResult (engine.a1.html 10585-10586).
+  const recorded = /Recorded result: \S+ % · (?:Passed|Completed|Not passed)(?: · [A-Z][a-z]+ \d{1,2}, \d{4})?/.exec(txt);
   return {
     slide: await slideNo(fl),
     text: txt.slice(0, 700),
     scoreTile: ((m) => (m ? +m[1] : null))(/(\d+)%\s*Score/.exec(txt)),
     labelledHeadline: labelled ? labelled[0] : null,
     labelledFigure: labelled && /^\d+$/.test(labelled[1]) ? +labelled[1] : null,
+    recordedHeadline: recorded ? recorded[0] : null,
+    badgeTierNames: (await fl.locator("#slide-container .badge-tier-card .badge-tier-name").allTextContents().catch(() => [] as string[])).map((t) => norm(t)),
     passedHeading: /Passed!/.test(txt),
     notPassedHeading: /Not passed yet/.test(txt),
     notFinal: /Not final yet/.test(txt),
@@ -514,6 +520,10 @@ async function checkOfficialRun(step: string, official: string) {
 // count equal to the official's; 0 `answered`/`responded` in the revision; progress restored; no Resume click; the
 // LaunchData read exercised (the wire log shows the GET and the `Normal` value); detection by the heuristic (the
 // seeded bookmark carries the official `reg`). Nothing Ambak-side is asserted."
+// The last two were written for the LMS before ADR 0014 PR 1a (2d4df18, 2026-11-04), which mints `Review` for a
+// revision visit's LaunchData (ADR 0014 step 3, "Row-driven decisions": "`Browse` for staff and `data_analyst`,
+// else `Review` for a flagged row, else `Normal` ... `registration/kind` stays `retake` for a flagged row"). They
+// now assert that contract: the GET shows `Review` and `retake`, and the engine detects the visit by it.
 async function checkRevisitStep5(step: string, run: string, fl: FrameLocator, official: string, revision: string, modals: string[]) {
   await settleWire();
   const ff = await frameEval(fl, FRAME_FACTS);
@@ -533,25 +543,103 @@ async function checkRevisitStep5(step: string, run: string, fl: FrameLocator, of
   check(step, "progress restored (the revision's progress figure = the official bookmark's completed slides)", pctOf(dom.progressText) !== null && pctOf(dom.progressText) === offPct, { revisionProgressText: dom.progressText, officialBookmarkPct: offPct, officialCompleted: Array.isArray(offBm?.completed) ? offBm.completed.length : null, slides: nSlides, officialOnScreenBeforeExit: S.officialA?.progressText ?? null });
   const resumeSeen = modals.filter((m) => /welcome back|resume|start over/i.test(m));
   check(step, "no Resume click (no Welcome-back / Resume prompt shown; the test clicks none)", resumeSeen.length === 0, { modalsSeen: modals });
+  // lib/alds/launch.ts launchModeFor: `return { isPreview: false, launchMode: i.revision ? "Review" : "Normal" };`
+  // and registrationKindFor: `if (i.revision) return "retake";` (no grant is consumed on this launch). The
+  // document names the revision attempt as its registration (registration = attempt id).
   const ldGets = wireOf(run).filter((w) => w.method === "GET" && w.stateId === "LMS.LaunchData");
-  check(step, "the LaunchData read exercised (the wire log shows the GET and the Normal value)", ldGets.length >= 1 && ldGets.some((w) => w.status === 200 && (w.body as any)?.launchMode === "Normal"), { gets: ldGets.map((w) => ({ status: w.status, reg: w.reg, body: w.body })) });
+  check(step, "the LaunchData read exercised (the wire log shows the GET: launchMode Review, registration/kind retake, the revision registration)", ldGets.length >= 1 && ldGets.some((w) => w.status === 200 && (w.body as any)?.launchMode === "Review" && (w.body as any)?.registrationKind === "retake" && (w.body as any)?.registration === revision), { gets: ldGets.map((w) => ({ status: w.status, reg: w.reg, body: w.body })), revision });
+  // engine.a1.html 11582: `cmi5RevisionMode = (cmi5LaunchData && cmi5LaunchData.launchMode === 'Review') ||
+  // (foreignReg && !cmi5LaunchDataSaysOfficial);` LaunchData `Review` alone puts the engine in its revision mode;
+  // the foreign-bookmark heuristic is only the fallback when LaunchData does not say `Review`. The seed itself is
+  // unchanged: the LMS re-seeds the revision row's State documents from the official attempt on every revision
+  // launch (ADR 0014 step 3), so the seeded bookmark still carries the official reg.
   const bmGet = wireOf(run).find((w) => w.method === "GET" && w.stateId === "elearning_state_v1" && w.status === 200);
-  check(step, "detection by the heuristic (the seeded bookmark carries the official reg; LaunchData Normal; the engine in its revision mode)", seeded?.reg === official && official !== revision && ff?.revisionMode === true && ff?.launchDataMode !== "Review" && (!bmGet || (bmGet.body as any)?.reg === official), {
+  check(step, "detection by LaunchData Review (the engine read launchMode Review and is in its revision mode; the seeded bookmark carries the official reg)", ff?.revisionMode === true && ff?.launchDataMode === "Review" && seeded?.reg === official && official !== revision && (!bmGet || (bmGet.body as any)?.reg === official), {
     seededBookmarkReg: seeded?.reg ?? null, official, revision, frameRevisionMode: ff?.revisionMode, frameLaunchDataMode: ff?.launchDataMode, bookmarkGetOnTheWire: bmGet ? bmGet.body : "not seen",
   });
   return { ff, dom, offBm, seeded };
+}
+// getBadgeTier, engine.a1.html 8926-8934: `const tiers = COURSE_CONFIG.settings.badgeTiers || [{ min: 95, name:
+// 'E2E Yoddha' ... }, { min: 90, name: 'E2E Strategist' ... }, { min: 80, name: 'E2E Specialist' ... }];` then the
+// highest `min` the score reaches, else null.
+const ENGINE_DEFAULT_BADGE_TIERS = [
+  { min: 95, name: "E2E Yoddha" },
+  { min: 90, name: "E2E Strategist" },
+  { min: 80, name: "E2E Specialist" },
+];
+function badgeTierFor(scorePct: number | null): { min: number; name: string } | null {
+  if (typeof scorePct !== "number") return null;
+  const tiers = ((S.course?.settings?.badgeTiers as Array<{ min: number; name: string }> | undefined) ?? ENGINE_DEFAULT_BADGE_TIERS).slice();
+  return tiers.sort((a, b) => b.min - a.min).find((t) => scorePct >= t.min) ?? null;
 }
 // §8: "A revisit on staging as it is has no `LMS.OfficialResult`, so Results shows the labelled figure from the
 // answers shown with no badge card and no certificate (the S-16r2 shape, asserted here)." And: "assert the
 // observed labelled figure and the absence of lock icons on official slides, and no State PUT on a revision launch"
 // (the PUT check runs after the close, checkNoStatePut).
-async function checkS16r2(step: string, run: string, fl: FrameLocator, officialScorePct: number | null) {
-  const rf = await resultsFacts(fl);
-  const ofr = wireOf(run).filter((w) => w.method === "GET" && w.stateId === "LMS.OfficialResult").map((w) => w.status);
-  check(step, "Results (S-16r2 shape): the labelled figure from the answers shown (\"N % · from the answers shown here; your recorded result is on your course page\"), N = the official run's recorded score", rf.slide === (S.course?.slides ?? []).findIndex((s: any) => s.type === "results") + 1 && !!rf.labelledHeadline && rf.labelledFigure !== null && (officialScorePct === null || rf.labelledFigure === officialScorePct), {
-    slide: rf.slide, headline: rf.labelledHeadline, figure: rf.labelledFigure, officialScorePct, officialResultGets: ofr, text: rf.text.slice(0, 300),
-  });
-  check(step, "Results (S-16r2 shape): no badge card and no certificate", rf.badgeCards === 0 && rf.certificate === 0, { badgeCards: rf.badgeCards, certificate: rf.certificate });
+// That was staging before ADR 0014 PR 1a. Since 1a the launch page upserts `LMS.OfficialResult` for the revision
+// registration on every revision launch (ADR 0014 step 3: "{status: scoring.officialStatus, score:
+// scoring.officialScore === null ? null : Math.round(scoring.officialScore * 100), completed_at, ...}"; "the engine
+// reads the document's `score` as the Results percentage (`getBadgeTier`, whose tiers start at 80, and the
+// \"Recorded result: N %\" headline: KIVO ADR 0010 Decision 2 item 8 (f))") and the State route serves it on GET
+// (the 56-run1 wire log on 00041-kvm: GET LMS.OfficialResult 200). So the expected Results follow the engine's own
+// branch on that document (engine.a1.html renderResults):
+//   10372 `const offDoc = (rev && cmi5OfficialResult && cmi5OfficialResult.status === 'found' && ...) ? cmi5OfficialResult.doc : null;`
+//   10374 `if (offDoc) { passed = offDoc.status === 'passed'; score = offDoc.score; }` / 10375 `else passed = false;`
+//   10582-10586 `} else if (rev && offDoc) { ... headline = 'Recorded result: ' + score + ' % · ' + (passed ? 'Passed' :
+//     (offDoc.status === 'completed' ? 'Completed' : 'Not passed')) + (date ? ' · ' + months[d.getMonth()] + ' ' +
+//     d.getDate() + ', ' + d.getFullYear() : '');`
+//   10587-10588 `} else if (rev) { headline = (notScored ? 'Not scored' : score + ' %') + ' · from the answers shown
+//     here; your recorded result is on your course page'; }` (the S-16r2 shape, still asserted when no document is served)
+//   10444 `const tier = passed ? getBadgeTier(score) : null;` 10496 `if (passed && tier) {` a `.badge-tier-card` naming the
+//     tier; 10540 `if (passed && t.showCertificate && slide.certificateImage && slide.certificateImage.imageData)` a second
+//     `.badge-tier-card` holding `#certificate-preview`; 10420 `showCertificate: slide.showCertificate === true` (default off).
+// So with the document served and a passed official result the revisit shows the badge card for the recorded score
+// (ADR 0014 step 3 above; "A failed seed or document write ... (the engine then shows no badge or certificate ...)").
+async function checkRevisitResults(step: string, run: string, fl: FrameLocator, officialScorePct: number | null, official: string | null) {
+  // 11774: the engine reads the document once in revision mode and re-renders Results when the read resolves.
+  const ff = await waitFor(() => frameEval(fl, FRAME_FACTS), (f) => f?.officialResult !== "reading", 15_000, 500);
+  await settleWire();
+  const ofrGets = wireOf(run).filter((w) => w.method === "GET" && w.stateId === "LMS.OfficialResult");
+  const ofr = ofrGets.map((w) => w.status);
+  const served = (ofrGets.find((w) => w.status === 200 && !!w.body && typeof w.body === "object" && "status" in (w.body as object))?.body ?? null) as
+    | { status: string | null; score: number | null; completed_at: string | null; attempt_id: string | null; course_version_id: string | null }
+    | null;
+  const resultsSlideNo = (S.course?.slides ?? []).findIndex((s: any) => s.type === "results") + 1;
+  let rf = await resultsFacts(fl);
+  if (served) {
+    for (const t0 = Date.now(); !rf.recordedHeadline && Date.now() - t0 < 15_000; ) {
+      await sleep(500);
+      rf = await resultsFacts(fl);
+    }
+    const off = official ? await attemptRow(official) : null;
+    const sameInstant = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && Date.parse(a) === Date.parse(b);
+    const docIsTheRecord =
+      (!official || served.attempt_id === official) &&
+      (officialScorePct === null || served.score === officialScorePct) &&
+      (!off || (sameInstant(served.completed_at, off.completed_at) && (off.success_status !== "passed" || served.status === "passed")));
+    // The date as the engine formats it, in the frame (the browser's own time zone).
+    const shownDate = served.completed_at
+      ? await frameEval(fl, `(() => { const d = new Date(${JSON.stringify(served.completed_at)}); const m = ['January','February','March','April','May','June','July','August','September','October','November','December']; return isNaN(d.getTime()) ? null : m[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear(); })()`)
+      : null;
+    const word = served.status === "passed" ? "Passed" : served.status === "completed" ? "Completed" : "Not passed";
+    const expected = `Recorded result: ${served.score} % · ${word}${typeof shownDate === "string" ? ` · ${shownDate}` : ""}`;
+    check(step, "Results (LMS.OfficialResult served): the headline is the recorded result (\"Recorded result: N % · Passed|Completed|Not passed · <Month D, YYYY>\"), N, status and date = the official attempt's", rf.slide === resultsSlideNo && ff?.officialResult === "found" && docIsTheRecord && rf.recordedHeadline === expected, {
+      slide: rf.slide, headline: rf.recordedHeadline, expected, engineRead: ff?.officialResult ?? null, served, official, officialScorePct, officialRow: off ? { success_status: off.success_status, score: off.score, completed_at: off.completed_at } : null, officialResultGets: ofr, text: rf.text.slice(0, 300),
+    });
+    const passed = served.status === "passed";
+    const tier = passed ? badgeTierFor(served.score) : null;
+    const rs = (S.course?.slides ?? []).find((s: any) => s.type === "results");
+    const cert = passed && rs?.showCertificate === true && !!rs?.certificateImage?.imageData;
+    const want = { badgeCards: (tier ? 1 : 0) + (cert ? 1 : 0), certificate: cert ? 1 : 0, tier: tier?.name ?? null };
+    check(step, "Results (LMS.OfficialResult served): the badge card and certificate the engine's Results code gives the recorded result (the getBadgeTier(score) card when passed; a certificate only with showCertificate and an image)", rf.badgeCards === want.badgeCards && rf.certificate === want.certificate && (want.tier === null || rf.badgeTierNames.includes(want.tier)), {
+      want, badgeCards: rf.badgeCards, certificate: rf.certificate, badgeTierNames: rf.badgeTierNames, servedStatus: served.status, servedScore: served.score, showCertificate: rs?.showCertificate ?? null,
+    });
+  } else {
+    check(step, "Results (S-16r2 shape): the labelled figure from the answers shown (\"N % · from the answers shown here; your recorded result is on your course page\"), N = the official run's recorded score", rf.slide === resultsSlideNo && !!rf.labelledHeadline && rf.labelledFigure !== null && (officialScorePct === null || rf.labelledFigure === officialScorePct), {
+      slide: rf.slide, headline: rf.labelledHeadline, figure: rf.labelledFigure, officialScorePct, officialResultGets: ofr, engineRead: ff?.officialResult ?? null, text: rf.text.slice(0, 300),
+    });
+    check(step, "Results (S-16r2 shape): no badge card and no certificate", rf.badgeCards === 0 && rf.certificate === 0, { badgeCards: rf.badgeCards, certificate: rf.certificate });
+  }
   const dom = await domFacts(fl);
   check(step, "no lock icons on the official slides (0 .nav-item.locked)", dom.navLocked === 0, { navItemLocked: dom.navLocked });
   return rf;
@@ -1410,7 +1498,7 @@ test.describe.serial("KIVO Release A — cmi5 real-LMS run (Ambak University sta
     if (S.a1Revision) await checkRevisitStep5("5", "A-launch3", fl, S.a1!, S.a1Revision, modals);
     else check("5", "step 5 additions: a revision registration to read (none was opened)", false, { attempts: atts.map((x) => ({ id: x.id, status: x.status })) });
     const offPassed = auVerb(await stmts(S.a1!), "passed")[0];
-    await checkS16r2("5", "A-launch3", fl, typeof offPassed?.raw?.result?.score?.scaled === "number" ? Math.round(offPassed.raw.result.score.scaled * 100) : null);
+    await checkRevisitResults("5", "A-launch3", fl, typeof offPassed?.raw?.result?.score?.scaled === "number" ? Math.round(offPassed.raw.result.score.scaled * 100) : null, S.a1!);
     if (OUT) await page.screenshot({ path: path.join(OUT, "learnerA-relaunch-after-pass.png") }).catch(() => {});
     await page.close();
     await sleep(3000);
@@ -1980,9 +2068,10 @@ test.describe.serial("KIVO Release A — cmi5 real-LMS run: extras (lost outcome
     check("11", "wire: no statement sent in the revision carries the official registration or a re-sent official id", !!rev && badWire.length === 0, { revisionStatementsSent: revWire.length, offenders: badWire.slice(0, 10), verbsSent: revWire.map((s) => s.verb) });
     const mism = await regMismatchOf([d1, rev].filter(Boolean) as string[]);
     check("11", "verify.cjs regMismatch [] (every statement of each of D's attempts carries that attempt as its registration)", mism.length === 0, { regMismatch: mism.slice(0, 10) });
-    // A.1 (§8): the revisit's Results in the S-16r2 shape (no LMS.OfficialResult before PR 1a).
+    // A.1 (§8): the revisit's Results: the S-16r2 shape without LMS.OfficialResult (before PR 1a), the recorded
+    // result once the LMS serves the document (since PR 1a); checkRevisitResults follows the engine's branch.
     const dPassScore = typeof passD[0]?.raw?.result?.score?.scaled === "number" ? Math.round(passD[0].raw.result.score.scaled * 100) : null;
-    await checkS16r2("11", "D-launch2", p2.fl, dPassScore);
+    await checkRevisitResults("11", "D-launch2", p2.fl, dPassScore, d1);
     await p2.page.close();
     await sleep(4000);
     await checkNoStatePut("11", "D-launch2");
@@ -2451,8 +2540,8 @@ async function reviewLockVisit(step: string, run: string, ctx: BrowserContext, F
   };
 
   // Results, where the seeded bookmark resumes (substitution 1).
-  const rf = await checkS16r2(step, run, fl, F.offScorePct);
-  summary.results = { headline: rf.labelledHeadline, badgeCards: rf.badgeCards, certificate: rf.certificate };
+  const rf = await checkRevisitResults(step, run, fl, F.offScorePct, F.official);
+  summary.results = { headline: rf.recordedHeadline ?? rf.labelledHeadline, badgeCards: rf.badgeCards, certificate: rf.certificate };
   const d0 = await noteStartOver("Results");
   check(step, "the progress figure equals the official attempt's", pctOf(d0.progressText) !== null && pctOf(d0.progressText) === pctOf(F.officialProgressText), { revisit: d0.progressText, officialBeforeExit: F.officialProgressText });
   summary.progress = pctOf(d0.progressText);

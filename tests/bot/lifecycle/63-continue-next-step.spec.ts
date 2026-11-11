@@ -511,22 +511,25 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const title = bar.getByText(LONG_TITLE);
     // The status region is always there and empty unless a waiting button was tapped.
     await expect(page.getByTestId("continue-waiting-message")).toHaveText("");
+    // boundingBox() reports sub-pixel layout (a min-h-10 control measured 39.999998569488525 at 1280 on
+    // staging 00041-kvm), so every pixel bound below allows half a pixel either way.
+    const SUBPX = 0.5;
     for (const width of [320, 390, 1280, 640, 768]) {
       await page.setViewportSize({ width, height: 640 });
       for (const l of [bar, exit, badge, next]) await expect(l, `visible at ${width}`).toBeVisible({ timeout: 60_000 });
       const boxes = await Promise.all([exit, badge, next].map((l) => l.boundingBox()));
       const [e, b, n] = boxes as Box[];
       expect([overlap(e, b), overlap(b, n), overlap(e, n)], `no overlap at ${width}: ${JSON.stringify(boxes)}`).toEqual([false, false, false]);
-      for (const box of boxes as Box[]) expect(box.x + box.width, `inside the viewport at ${width}`).toBeLessThanOrEqual(width);
+      for (const box of boxes as Box[]) expect(box.x + box.width, `inside the viewport at ${width}`).toBeLessThanOrEqual(width + SUBPX);
       // The owner's thinner bar (ADR 0019, note of 2026-11-11): about 41 px
       // below sm (36 px controls), about 49 px from sm (40 px controls).
       const barH = ((await bar.boundingBox()) as Box).height;
       if (width < 640) {
-        expect(barH, `the bar's height at ${width}`).toBeLessThanOrEqual(42);
-        expect(n.height, `Continue's height at ${width}`).toBeLessThanOrEqual(37);
+        expect(barH, `the bar's height at ${width}`).toBeLessThanOrEqual(42 + SUBPX);
+        expect(n.height, `Continue's height at ${width}`).toBeLessThanOrEqual(37 + SUBPX);
       } else {
-        expect(barH, `the bar's height at ${width}`).toBeGreaterThanOrEqual(48);
-        expect(n.height, `Continue's height at ${width}`).toBeGreaterThanOrEqual(40);
+        expect(barH, `the bar's height at ${width}`).toBeGreaterThanOrEqual(48 - SUBPX);
+        expect(n.height, `Continue's height at ${width}`).toBeGreaterThanOrEqual(40 - SUBPX);
       }
       if (width < 640) {
         await expect(title, `title hidden below sm at ${width}`).toBeHidden();
