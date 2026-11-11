@@ -145,6 +145,8 @@ Note (2026-10-21, ADR 0016 steps 11–13): until this step's matview change land
 
 Note (2026-11-05; a pointer, not an edit to the addition to note (h)): that addition says the lifecycle nightly builds without `ALDS_P4` and stays P4 off. From this date `scripts/lifecycle-nightly.sh` sets `ALDS_P4=on`, as `scripts/e2e-in-runner.sh` does. 0100 has been on the staging database since 2026-10-20, and there a flag-off build stores a staff launch with `is_preview` false, which 0100's delete guards count as learner history, so spec 50's admin delete of a course holding only the admin's attempt answers 409. No deployment runs that pairing: staging has 0100 and the flag, production has neither. No scheduled job that builds or tests the app now runs with the flag absent. The owner approved this change on 2026-11-05.
 
+Note (2026-11-10, ADR 0021; a pointer, not an edit): The Learner Feedback section groups by interaction id per course (ADR 0021 B.4); P5's question catalogue is the planned cross-slot grouping.
+
 ## References
 
 - `docs/ambak-learning-data-standard/BLUEPRINT.md` Conventions paragraph, §1.4, §2, §3.2 (0098 as written), §5.4 (`guardian_findings`, `guardian_runs`), §6.1–6.4, §7, §9 steps 3–6, §10.4

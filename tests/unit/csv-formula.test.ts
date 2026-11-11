@@ -67,12 +67,14 @@ console.log("\n(i) csvEscape (lib/util/csv.ts)");
 const CSV = "app/api/courses/[courseId]/learners/export/route.ts";
 const PX = "app/api/learning-paths/[id]/learners/export/route.ts";
 const BUTTON = "app/[org]/(admin)/reports/_components/csv-button.tsx";
+const FEEDBACK = "app/api/courses/[courseId]/feedback/export/route.ts";
 
 /** Each writer and the one expression that turns its rows into CSV text. */
 const WRITERS: Array<[string, string]> = [
   [CSV, 'ordered.map((r) => r.map(csvEscape).join(",")).join("\\r\\n")'],
   [PX, 'ordered.map((r) => r.map(csvEscape).join(",")).join("\\r\\n")'],
   [BUTTON, 'row.map((c) => csvEscape(c)).join(",")'],
+  [FEEDBACK, 'rows.map((r) => r.map(csvEscape).join(",")).join("\\r\\n")'],
 ];
 
 console.log("\n(ii) every CSV writer goes through csvEscape and keeps no local copy");

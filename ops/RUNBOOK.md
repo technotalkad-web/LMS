@@ -197,7 +197,7 @@ committing secrets.
 - DR truth: code = git tags; schema = `supabase/migrations/*` (canonical, idempotent);
   data = Supabase backups. Restore order: project → migrations replay → tag deploy.
 - Weekly review verifies: latest backup exists and is recent (dashboard check).
-- Course files: nightly copy to an Object-Locked B2 bucket. To prove a download from it byte for byte, run **Nightly content backup** by hand with `restore_drill` (`docs/CONTENT_STORAGE.md`, "Backup and rollback").
+- Course files: nightly copy to an Object-Locked B2 bucket. It compares sizes only, so a change that keeps the size shows only in a drill naming that folder. To prove a download from it byte for byte, run **Nightly content backup** by hand with `restore_drill` (`docs/CONTENT_STORAGE.md`, "Backup and rollback").
 
 ## 9. Scale readiness — 25,000 users (pre-launch gate)
 
