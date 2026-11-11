@@ -36,6 +36,10 @@
  * choices; cards with the two swipe targets; every pair's src and tgt; items
  * with categories; steps): the response would carry the same oid for two
  * different answers, so the key would accept an answer the grader rejects.
+ * Some of these are wider than the grader needs (a card oid equal to a swipe
+ * target, a pair's src equal to any tgt, an item oid equal to a category oid:
+ * the grader would still agree); they fail closed because the editor never
+ * writes them.
  * The editor mints one oid per thing, and U1 option_id_duplicate refuses the
  * same duplicate in the manifest's options (the union of those lists).
  */
@@ -361,8 +365,9 @@ export function keyFromBankQuestion(q: unknown): string[] | null {
     // The engine's tfValue: the option label "true" / "false" after trim and lower
     // case, else index 0 means true. The response carries tfValue of the picked
     // option and gradeAll compares indices, so the two agree only when the options
-    // are exactly two that read as one true and one false (True/True, False/Yes or a
-    // third option would let a wrong pick send the right value).
+    // are exactly two that read as one true and one false (True/True or False/Yes
+    // would let a wrong pick send the right value; one option or a third option is
+    // refused as well, wider than needed, because the editor never writes it).
     const tfValue = (i: number): boolean => {
       const label = String(options[i] || "").trim().toLowerCase();
       return label === "true" ? true : label === "false" ? false : i === 0;
