@@ -524,13 +524,12 @@ test.describe.serial("ADR 0022 G item 18: the Package Guardian's write path with
     expect(insErr, insErr?.message).toBeNull();
     const certifiedRun = (ins as { id: string }).id;
 
-    const set = await rpc("certified", null, null, certifiedRun);
-    expect(set.error, set.error?.message).toBeNull();
-    expect((set.data as Row).certified_at).toBeTruthy();
-    expect((set.data as Row).certification_id).toBe(certifiedRun);
-
     let reverted: Awaited<ReturnType<typeof rpc>> | null = null;
     try {
+      const set = await rpc("certified", null, null, certifiedRun);
+      expect(set.error, set.error?.message).toBeNull();
+      expect((set.data as Row).certified_at).toBeTruthy();
+      expect((set.data as Row).certification_id).toBe(certifiedRun);
       const v = await versionRow(s.a2!);
       expect(v.analytics_tier).toBe("certified");
       expect(v.certified_at).toBeTruthy();
