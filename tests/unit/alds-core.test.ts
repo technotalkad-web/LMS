@@ -13,7 +13,13 @@
  *   (iv)  script and lexical detection, scriptForLanguage;
  *   (v)   purity: lib/alds/types.ts and lib/alds/rules/*.ts import nothing
  *         outside lib/alds and use no Node/DOM API, clock or randomness
- *         (the bundle test also runs the built IIFE in a bare vm context).
+ *         (the bundle test also runs the built IIFE in a bare vm context);
+ *   (vi)  the engine digest (ADR 0022 A): synthetic pages built in
+ *         alds-fixtures/harness.ts digestVectors(), never engine bytes;
+ *   (vii) keyFromSlide / keyFromBankQuestion on alds-fixtures/keys.cases.json,
+ *         and fillBlanksVariants (ADR 0022 item 14);
+ *   (viii) the label table LABELS_BY_AUTHORING_KIND (item 12) and
+ *         EXT.launchContract (item 15).
  *
  * Run:  npx tsx tests/unit/alds-core.test.ts   (or npm run test:unit)
  */
@@ -26,6 +32,18 @@ import {
   canonicalPatternKey,
   contentHash,
   detectScript,
+  ENGINE_DIGEST_ALGO_V1,
+  ENGINE_DIGEST_ANCHORS,
+  engineDigest,
+  engineDigestInput,
+  engineDigestInputByAlgo,
+  EXT,
+  fillBlanksVariants,
+  KEY_CLASS_BY_AUTHORING_KIND,
+  keyFromBankQuestion,
+  keyFromSlide,
+  LABELS_BY_AUTHORING_KIND,
+  LAUNCH_CONTRACT_FALLBACKS,
   normalizeText,
   parseInteraction,
   responseMatches,
@@ -35,7 +53,8 @@ import {
   utf8Encode,
   type Parsed,
 } from "../../lib/alds/rules";
-import type { AldsCatalogueEntry } from "../../lib/alds/types";
+import { INTERACTION_KINDS, type AldsCatalogueEntry } from "../../lib/alds/types";
+import { digestVectors, loadKeyCases } from "./alds-fixtures/harness";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -300,6 +319,132 @@ console.log("\n(v) purity of lib/alds (types.ts + rules/)");
     for (const [re, what] of banned) if (re.test(src)) problems.push(`${rel}: uses ${what}`);
   }
   eq(`${files.length} files: imports stay inside lib/alds; no Node/DOM API, clock or randomness`, problems, []);
+}
+
+console.log("\n(vi) the engine digest (ADR 0022 A; synthetic pages, never engine bytes)");
+{
+  // The digest of the synthetic base page P0 (tests/unit/alds-fixtures/harness.ts digestVectors),
+  // pinned once: every later vector compares with it.
+  const DIGEST_P0 = "sha256:5281924a889799be766696b1f76c07c4978bf516c9e219a427e814b3c2e73640";
+  const dv = digestVectors();
+  eq("ENGINE_DIGEST_ANCHORS are the strings the 2.0 writer emits (KIVO names record §1)", ENGINE_DIGEST_ANCHORS, {
+    licenceBegin: "<!-- KIVO-LICENCE-BEGIN -->",
+    licenceEnd: "<!-- KIVO-LICENCE-END -->",
+    configOpen: '<script type="application/json" id="kivo-course-config" data-kivo="COURSE_CONFIG">',
+    scriptClose: "</script>",
+  });
+  const in0 = engineDigestInput(dv.p0);
+  const input0 = in0.ok ? in0.input : "";
+  eq("(a) P0 gives a digest input", in0.ok, true);
+  eq("(a) the input is P0 without the licence body and the config body (written out in the harness)", input0, dv.p0Input);
+  eq("(a) the licence anchors stay, adjacent", input0.includes("-->\n<!-- KIVO-LICENCE-BEGIN --><!-- KIVO-LICENCE-END -->\n<html "), true);
+  eq("(a) the config tag and its closing tag stay, adjacent", input0.includes('data-kivo="COURSE_CONFIG"></script>\n<script data-kivo="domain-lock">'), true);
+  eq("(a) nothing is inserted: the input is shorter than P0 by exactly the two ranges", dv.p0.length - input0.length, dv.p0.length - dv.p0Input.length);
+  eq("(a) the digest of P0 is pinned", engineDigest(dv.p0), { ok: true, digest: DIGEST_P0 });
+  // (c) the escaping trap: the page must hold backslash-u003c (two backslashes in this source)
+  // and no extra real closing tag, or the "same digest" below would prove nothing
+  eq("(c) the escaped page holds the six characters \\u003c before /script", dv.escapedPage.indexOf("\\u003c/script") >= 0, true);
+  eq("(c) the escaped page holds no closing tag P0 does not", dv.escapedPage.split("</script>").length, dv.p0.split("</script>").length);
+  for (const v of dv.vectors) {
+    const got = engineDigest(v.html);
+    if (v.expect === "same") eq(`${v.name}: the same digest`, got, { ok: true, digest: DIGEST_P0 });
+    else if (v.expect === "different") eq(`${v.name}: a digest, different`, got.ok && got.digest !== DIGEST_P0, true);
+    else {
+      eq(`${v.name}: no digest, with the reason`, engineDigestInput(v.html), v.expect);
+      eq(`  … and engineDigest reports the same`, got, v.expect);
+    }
+  }
+  // (g) the method is selected by selfCheck.engineDigestAlgo; absent reads as v1
+  eq("(g) engineDigestInputByAlgo(\"v1\", P0) = engineDigestInput(P0)", engineDigestInputByAlgo("v1", dv.p0), in0);
+  eq("(g) engineDigestInputByAlgo(undefined, P0) = engineDigestInput(P0) (the field absent)", engineDigestInputByAlgo(undefined, dv.p0), in0);
+  eq("(g) ENGINE_DIGEST_ALGO_V1", ENGINE_DIGEST_ALGO_V1, "v1");
+  eq("(g) an unknown algorithm gives no digest", engineDigestInputByAlgo("v2", dv.p0), { ok: false, reason: 'no digest: unknown engineDigestAlgo "v2"' });
+  eq("(g) null is unknown", engineDigestInputByAlgo(null, dv.p0), { ok: false, reason: "no digest: unknown engineDigestAlgo null" });
+  eq("(g) the empty string is unknown", engineDigestInputByAlgo("", dv.p0), { ok: false, reason: 'no digest: unknown engineDigestAlgo ""' });
+  eq("(g) the algorithm is matched exactly (V1)", engineDigestInputByAlgo("V1", dv.p0).ok, false);
+  // (h) the bundle's SHA-256 over the UTF-8 bytes = node:crypto's (L2's guardian test proves crypto.subtle equals it)
+  const devanagariLicence = dv.vectors.find((v) => v.name === "(b) a Devanagari title in the licence")?.html ?? "";
+  for (const [name, page] of [["P0", dv.p0], ["the Devanagari licence variant", devanagariLicence], ["a Devanagari title inside the digest", dv.devanagariHeadPage]] as const) {
+    const r = engineDigestInput(page);
+    const input = r.ok ? r.input : "";
+    const hex = createHash("sha256").update(Buffer.from(input, "utf8")).digest("hex");
+    eq(`(h) ${name}: sha256HexOfString(input) = node:crypto over Buffer.from(input, "utf8")`, [r.ok, sha256HexOfString(input)], [true, hex]);
+    eq(`(h) ${name}: engineDigest = "sha256:" + that hex`, engineDigest(page), { ok: true, digest: `sha256:${hex}` });
+    eq(`(h) ${name}: the whole page hashes the same both ways`, sha256HexOfString(page), nodeSha(Buffer.from(page, "utf8")));
+  }
+  const devIn = engineDigestInput(dv.devanagariHeadPage);
+  eq("(h) the Devanagari-head input is not ASCII (the UTF-8 vector is real)", devIn.ok && /[^\x00-\x7f]/.test(devIn.input), true);
+}
+
+console.log("\n(vii) keyFromSlide / keyFromBankQuestion (ADR 0022 item 14; tests/unit/alds-fixtures/keys.cases.json)");
+{
+  const keyCases = loadKeyCases();
+  const api = { keyFromSlide, keyFromBankQuestion };
+  for (const c of keyCases) eq(c.name, c.run(api), c.expect);
+  // every row of the table has a positive case (one per keyed label) and a null case
+  for (let row = 1; row <= 14; row++) {
+    const mine = keyCases.filter((c) => c.name.startsWith(`row ${row} `));
+    eq(`row ${row}: a positive case and a null case`, [mine.some((c) => Array.isArray(c.expect) && c.expect.length > 0), mine.some((c) => c.expect === null)], [true, true]);
+  }
+  const keyedTypes = ["quiz", "timed-quiz", "scenario", "confidence", "multi-response", "true-false", "swipe-decision", "matching", "drag-match", "drag-drop", "sequencing", "fill-blanks"];
+  eq(
+    "a keyed slide type never gives [] (it gives a key or null)",
+    keyCases.filter((c) => "slide" in c && typeof (c.slide as { type?: unknown } | null)?.type === "string" && keyedTypes.includes((c.slide as { type: string }).type) && Array.isArray(c.expect) && c.expect.length === 0).map((c) => c.name),
+    [],
+  );
+  eq("every key case's slide or bank value passes through unchanged (no mutation)", keyCases.every((c) => {
+    const before = JSON.stringify("slide" in c ? c.slide : c.bank);
+    c.run(api);
+    return JSON.stringify("slide" in c ? c.slide : c.bank) === before;
+  }), true);
+  // fillBlanksVariants: the per-blank lists, uncapped (ADR 0022 D item 7 counts their product)
+  const fill = (template: string, acceptedAnswers?: unknown) => ({ type: "fill-blanks", template, acceptedAnswers });
+  eq("fillBlanksVariants: two blanks", fillBlanksVariants(fill("[[a]] and [[b]]", [["A2"], ["B2"]])), [["a", "A2"], ["b", "B2"]]);
+  eq("fillBlanksVariants: normalised, de-duplicated by lower case, the first spelling kept", fillBlanksVariants(fill("[[Equated  Monthly]]", [[" equated monthly ", "EMI", "emi"]])), [["Equated Monthly", "EMI"]]);
+  const five = (p: string) => [`${p}2`, `${p}3`, `${p}4`, `${p}5`];
+  const lists4 = fillBlanksVariants(fill("[[a1]] [[b1]] [[c1]] [[d1]]", [five("a"), five("b"), five("c"), five("d")])) ?? [];
+  eq("fillBlanksVariants: four blanks of five variants, uncapped (625 combinations)", [lists4.map((l) => l.length), lists4.reduce((n, l) => n * l.length, 1)], [[5, 5, 5, 5], 625]);
+  eq("fillBlanksVariants: … while keyFromSlide caps the key at 64 patterns", (keyFromSlide(fill("[[a1]] [[b1]] [[c1]] [[d1]]", [five("a"), five("b"), five("c"), five("d")])) ?? []).length, 64);
+  eq("fillBlanksVariants: an empty list stays visible (the key is null)", fillBlanksVariants(fill("[[ ]] and [[b]]")), [[], ["b"]]);
+  eq("fillBlanksVariants: no blank → null", fillBlanksVariants(fill("No blanks here.")), null);
+  eq("fillBlanksVariants: not a fill-blanks slide → null", fillBlanksVariants({ type: "quiz", template: "[[a]]" }), null);
+  eq("fillBlanksVariants: not an object → null", fillBlanksVariants("[[a]]"), null);
+}
+
+console.log("\n(viii) the label table (ADR 0022 item 12) and EXT.launchContract (item 15)");
+{
+  // The (label, class) pairs bundles 1 and 2 held as a literal table; written here as data so
+  // the derivation of KEY_CLASS_BY_AUTHORING_KIND from LABELS_BY_AUTHORING_KIND cannot move a class.
+  const classesBefore: Array<[string, string]> = [
+    ["choice", "keyed"], ["true-false", "keyed"], ["multi-response", "keyed"], ["sequencing", "keyed"],
+    ["matching", "keyed"], ["drag-match", "keyed"], ["drag-drop", "keyed"], ["fill-in", "keyed"],
+    ["confidence", "keyed"], ["swipe", "keyed"], ["dialogue", "scored-unkeyed"], ["game", "scored-unkeyed"],
+    ["image-id", "scored-unkeyed"], ["hotspot", "completion-only"], ["interactive-timeline", "completion-only"],
+    ["feedback", "unscored"], ["slider", "unscored"], ["dial", "unscored"],
+  ];
+  // ADR 0022 item 12, row by row.
+  const table: Array<[string, string, string[]]> = [
+    ["choice", "keyed", ["choice"]], ["confidence", "keyed", ["choice"]], ["multi-response", "keyed", ["choice"]],
+    ["true-false", "keyed", ["true-false"]],
+    ["swipe", "keyed", ["matching"]], ["matching", "keyed", ["matching"]], ["drag-match", "keyed", ["matching"]], ["drag-drop", "keyed", ["matching"]],
+    ["sequencing", "keyed", ["sequencing"]], ["fill-in", "keyed", ["fill-in"]],
+    ["dialogue", "scored-unkeyed", ["performance"]], ["game", "scored-unkeyed", ["other"]], ["image-id", "scored-unkeyed", ["choice"]],
+    ["hotspot", "completion-only", ["choice"]], ["interactive-timeline", "completion-only", ["choice"]],
+    ["feedback", "unscored", ["likert", "choice", "long-fill-in"]], ["slider", "unscored", []], ["dial", "unscored", []],
+  ];
+  const labels = Object.keys(LABELS_BY_AUTHORING_KIND);
+  const byLabel = (a: [string, ...unknown[]], b: [string, ...unknown[]]) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  eq("18 labels", labels.length, 18);
+  eq("LABELS_BY_AUTHORING_KIND and KEY_CLASS_BY_AUTHORING_KIND have the same keys", labels.slice().sort(), Object.keys(KEY_CLASS_BY_AUTHORING_KIND).sort());
+  eq("KEY_CLASS_BY_AUTHORING_KIND[label] = LABELS_BY_AUTHORING_KIND[label].class for every label", labels.filter((l) => KEY_CLASS_BY_AUTHORING_KIND[l] !== LABELS_BY_AUTHORING_KIND[l].class), []);
+  eq("the 18 (label, class) pairs are the ones bundles 1 and 2 held", Object.keys(KEY_CLASS_BY_AUTHORING_KIND).map((l): [string, string] => [l, KEY_CLASS_BY_AUTHORING_KIND[l]]).sort(byLabel), classesBefore.slice().sort(byLabel));
+  eq("every row equals ADR 0022 item 12's table", labels.map((l): [string, string, string[]] => [l, LABELS_BY_AUTHORING_KIND[l].class, Array.from(LABELS_BY_AUTHORING_KIND[l].xapiKinds)]).sort(byLabel), table.slice().sort(byLabel));
+  eq("every xapiKinds entry is an xAPI interaction type", labels.flatMap((l) => LABELS_BY_AUTHORING_KIND[l].xapiKinds.filter((k) => !INTERACTION_KINDS.includes(k)).map((k) => `${l}: ${k}`)), []);
+  const keyed = labels.filter((l) => LABELS_BY_AUTHORING_KIND[l].class === "keyed");
+  eq("exactly ten labels are keyed", keyed.length, 10);
+  eq("each keyed label allows exactly one xAPI kind", keyed.filter((l) => LABELS_BY_AUTHORING_KIND[l].xapiKinds.length !== 1), []);
+  eq("EXT.launchContract", EXT.launchContract, "https://ambak.com/xapi/ext/content/launch-contract");
+  eq("LAUNCH_CONTRACT_FALLBACKS", Array.from(LAUNCH_CONTRACT_FALLBACKS), ["launchdata_missing", "launchdata_unreadable"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
