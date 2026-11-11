@@ -16,6 +16,10 @@
  *       addition to the two entry points of step 8, for the mini-package
  *       fixtures and the P4 static check)
  * Helpers: contentHash, parseInteraction, responseMatches, detectScript.
+ * Bundle 3 (ADR 0022 section E):
+ *   engineDigestInput(html) / engineDigestInputByAlgo(algo, html) / engineDigest(html)
+ *       the engine digest of a KIVO 2.0 launch page (section A, v1)
+ *   LABELS_BY_AUTHORING_KIND (item 12), EXT.launchContract (item 15)
  *
  * Pure: no imports outside lib/alds, no DOM or Node APIs, no I/O, no clock,
  * no randomness; the same input always gives the same result.
@@ -28,6 +32,7 @@ export { canonicalContentJson, contentHash, type ContentHashInput } from "./cont
 export { canonicalPattern, canonicalPatternKey, canonicalPatternText, parseInteraction, responseMatches, type GrammarMode, type Parsed, type ParseResult } from "./grammar";
 export { detectScript, scriptForLanguage, type DetectedScript, type ScriptProfile } from "./script";
 export { sha256Hex, sha256HexOfString, utf8Encode } from "./sha256";
+export { ENGINE_DIGEST_ANCHORS, ENGINE_DIGEST_ALGO_V1, engineDigestInput, engineDigestInputByAlgo, engineDigest, type EngineDigestInputResult } from "./engine-digest";
 export { canonicalBcp47, isBcp47, normalizeText } from "./util";
 export {
   ALDS_VERSION,

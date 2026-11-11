@@ -13,7 +13,8 @@
  *         to lib/alds without `--register` fails here;
  *   (v)   the bundle runs in a bare vm context (no Node, DOM, console or
  *         TextEncoder) and gives the same result as the TypeScript module on
- *         every golden case.
+ *         every golden case and every engine-digest page (bundle 3, ADR
+ *         0022 section E).
  *
  * Run:  npx tsx tests/unit/alds-bundle.test.ts   (or npm run test:unit)
  */
@@ -24,7 +25,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 import * as rules from "../../lib/alds/rules";
-import { loadGolden, verify, type RulesApi } from "./alds-fixtures/harness";
+import { digestVectors, loadGolden, verify, type RulesApi } from "./alds-fixtures/harness";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -115,7 +116,10 @@ async function main() {
   eq("the context has no Node/DOM globals", Array.from(globals as string[]), ["undefined", "undefined", "undefined", "undefined", "undefined", "undefined"]);
   vm.runInContext(a.text, sandbox, { filename: "alds-rules.js" });
   const bundle = vm.runInContext(mod.GLOBAL_NAME, sandbox) as Record<string, unknown>;
-  const surface = ["checkStatement", "checkSession", "checkPackage", "contentHash", "parseInteraction", "responseMatches", "detectScript"];
+  const surface = [
+    "checkStatement", "checkSession", "checkPackage", "contentHash", "parseInteraction", "responseMatches", "detectScript",
+    "engineDigestInput", "engineDigestInputByAlgo", "engineDigest",
+  ];
   eq("exposes the documented functions", surface.filter((k) => typeof bundle[k] !== "function"), []);
   eq("ALDS_VERSION", bundle.ALDS_VERSION, "2.0");
   const sample = { qid: "01JCQ000000000000000000001", language: "en-IN", kind: "choice", prompt: "x", options: [], correct: [] };
@@ -137,6 +141,26 @@ async function main() {
   eq(`${cases.length} golden cases: bundle result = module result`, same, cases.length);
   eq(`${cases.length} golden cases: bundle meets every expectation`, verified, cases.length);
   eq("cases that differ", diffs, []);
+
+  // The engine digest (ADR 0022 A item 2: one implementation for the editor and the Guardian)
+  const dv = digestVectors();
+  const pages: Array<[string, string]> = [["P0", dv.p0], ["the escaped page", dv.escapedPage], ["the Devanagari-head page", dv.devanagariHeadPage], ...dv.vectors.map((v): [string, string] => [v.name, v.html])];
+  const bundleDigest = bundle as unknown as {
+    engineDigestInput(html: string): unknown;
+    engineDigestInputByAlgo(algo: unknown, html: string): unknown;
+    engineDigest(html: string): unknown;
+  };
+  const digestDiffs = pages.filter(([, html]) =>
+    JSON.stringify(bundleDigest.engineDigestInput(html)) !== JSON.stringify(rules.engineDigestInput(html)) ||
+    JSON.stringify(bundleDigest.engineDigest(html)) !== JSON.stringify(rules.engineDigest(html)),
+  ).map(([name]) => name);
+  eq(`${pages.length} digest pages: bundle engineDigestInput and engineDigest = module`, digestDiffs, []);
+  const algos: unknown[] = ["v1", undefined, "v2", null, "", 1];
+  eq(
+    `engineDigestInputByAlgo for ${algos.length} algorithm values: bundle = module`,
+    algos.filter((a) => JSON.stringify(bundleDigest.engineDigestInputByAlgo(a, dv.p0)) !== JSON.stringify(rules.engineDigestInputByAlgo(a, dv.p0))).map(String),
+    [],
+  );
 
   console.log(`\nrulesBundleHash ${a.hash} (${a.bytes} bytes)`);
   console.log(`${pass} passed, ${fail} failed`);

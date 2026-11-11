@@ -12,6 +12,8 @@
  *                          a step {base, patch?, origin: "lms"} is a row the LMS
  *                          recorded (its id goes to ctx.lmsStatementIds)
  *   packages.cases.json    checkPackage cases (mini-packages): patch → expected findings
+ * digestVectors() builds the engine-digest pages (ADR 0022 A) in code: small synthetic
+ * pages in the KIVO 2.0 layout, never engine bytes.
  *
  * Patch ops (paths are arrays; "E:x" = the ALDS extension namespace + x,
  * "SESSION" = the cmi5 sessionid key, "UNANSWERED" = the unanswered marker key):
@@ -43,6 +45,7 @@ export interface RulesApi {
   checkSession(statements: unknown[], ctx?: unknown): CheckResultLike;
   checkPackage(input: unknown): CheckResultLike;
   contentHash(entry: unknown): string;
+  engineDigestInput(html: string): { ok: true; input: string } | { ok: false; reason: string };
 }
 
 type ExpectedProps = { severity?: string; attribution?: string; index?: number; path?: string };
@@ -277,4 +280,120 @@ export function verify(c: GoldenCase, res: CheckResultLike): string[] {
     problems.push(`checked ${JSON.stringify(res.checked)} ≠ ${JSON.stringify(c.expectChecked)}`);
   }
   return problems;
+}
+
+// --- engine digest vectors (ADR 0022 A item 1) ------------------------------------------------
+//
+// A small synthetic page in the KIVO 2.0 launch-file layout (the KIVO names record §1), never
+// engine bytes. The anchors are written here as literals, not imported from the rules, so the
+// hand-written expected input of vector (a) also checks ENGINE_DIGEST_ANCHORS.
+
+const D_BEGIN = "<!-- KIVO-LICENCE-BEGIN -->";
+const D_END = "<!-- KIVO-LICENCE-END -->";
+const D_OPEN = '<script type="application/json" id="kivo-course-config" data-kivo="COURSE_CONFIG">';
+const D_CLOSE = "</script>";
+/** The engine's top comment (it names COURSE_CONFIG), then the newline before the begin anchor. */
+const D_TOP = "<!DOCTYPE html>\n<!--\n  KIVO engine 2026.11.11, a synthetic test page. The course data is read from the COURSE_CONFIG block.\n-->\n";
+/** Range 1 as the 2.0 writer lays it out: newline, the comment wrapper, the licence lines, newline. */
+const licenceBody = (title: string, built = "2026-11-11T00:00:00.000Z") =>
+  `\n<!--\n${title}\nAuthor: Course Author\nBuilt:  ${built}\nEngine: 2026.11.11\nengineVersion: 2026.11.11\n\nThis course is licensed for internal training only.\n-->\n`;
+const headOf = (body = "<body>", title = "Home Loan Basics") =>
+  `\n<html lang="en" data-engine="KIVO" data-engine-version="2026.11.11">\n<head>\n<meta charset="utf-8">\n<title>${title}</title>\n<style>body{margin:0;font-family:sans-serif}</style>\n</head>\n${body}\n<div id="app"></div>\n`;
+const D_CONFIG = '{"settings":{"lang":"en","aldsStandardVersion":"2.0"},"slides":[]}';
+const D_LOCK = '<script data-kivo="domain-lock">/* lock */</script>';
+const D_ENGINE =
+  "<script>\nconst COURSE_CONFIG = JSON.parse(document.getElementById('kivo-course-config').textContent);\n/* engine 1 */\n</script>\n" +
+  "<script>\n/* engine 2 */\n</script>\n<script>\n/* engine 3 */\n</script>\n";
+const D_VENDOR = '<script src="vendor/lottie_light.min.js"></script>\n';
+const D_TAIL = "</body></html>\n";
+
+interface PageParts { top: string; licence: string; head: string; config: string; lock: string; engine: string; vendor: string; tail: string }
+const P0_PARTS: PageParts = { top: D_TOP, licence: licenceBody("Home Loan Basics"), head: headOf(), config: D_CONFIG, lock: D_LOCK, engine: D_ENGINE, vendor: D_VENDOR, tail: D_TAIL };
+/** After the config block's closing tag: newline, the lock block, newline, the engine blocks, the vendor block, the end. */
+const restOf = (p: PageParts) => `\n${p.lock}\n${p.engine}${p.vendor}${p.tail}`;
+const pageOf = (over: Partial<PageParts> = {}) => {
+  const p = { ...P0_PARTS, ...over };
+  return p.top + D_BEGIN + p.licence + D_END + p.head + D_OPEN + `\n${p.config}\n` + D_CLOSE + restOf(p);
+};
+
+export type DigestExpect = "same" | "different" | { ok: false; reason: string };
+export interface DigestVector {
+  name: string;
+  html: string;
+  /** "same" / "different": engineDigest(html) equals / differs from the digest of P0; else the exact engineDigestInput failure. */
+  expect: DigestExpect;
+}
+
+export function digestVectors(): {
+  /** The base page P0. */
+  p0: string;
+  /** engineDigestInput(P0).input, written out: P0 without the licence body and the config body. */
+  p0Input: string;
+  /** The page whose config body holds the closing tag escaped as the 2.0 writer spells it. */
+  escapedPage: string;
+  /** P0 with a Devanagari title inside the digest (the head), for the UTF-8 vector (h). */
+  devanagariHeadPage: string;
+  vectors: DigestVector[];
+} {
+  const p0 = pageOf();
+  const p0Input = D_TOP + D_BEGIN + D_END + headOf() + D_OPEN + D_CLOSE + restOf(P0_PARTS);
+  // The writer turns every "<" of the course JSON into the six characters \u003c (two backslashes
+  // here: one backslash would put a real closing tag into the page and end range 2 early).
+  const escapedPage = pageOf({ config: '{"settings":{"lang":"en"},"slides":[{"id":1,"type":"text","body":"\\u003c/script>\\u003c!-- not a comment -->"}]}' });
+  const devanagariHeadPage = pageOf({ head: headOf("<body>", "होम लोन की बुनियादी बातें") });
+  const reason = (r: string) => ({ ok: false as const, reason: `no digest: ${r}` });
+  const vectors: DigestVector[] = [
+    // (b) the licence body is outside the digest
+    { name: "(b) another course title in the licence", html: pageOf({ licence: licenceBody("Car Loan Basics") }), expect: "same" },
+    { name: "(b) another Built: time in the licence", html: pageOf({ licence: licenceBody("Home Loan Basics", "2026-12-01T09:30:00.000Z") }), expect: "same" },
+    { name: "(b) a Devanagari title in the licence", html: pageOf({ licence: licenceBody("होम लोन की बुनियादी बातें") }), expect: "same" },
+    // (c) the config body is outside the digest
+    {
+      name: "(c) another course in the config, pretty-printed over many lines",
+      html: pageOf({ config: JSON.stringify({ settings: { lang: "hi", aldsStandardVersion: "2.0", courseUlid: "01JAH7Q4ZB8K3T6W2M9XRV5C1N" }, slides: [{ id: 1, type: "quiz", question: "Which document?" }, { id: 2, type: "true-false", statement: "A co-applicant can be added." }] }, null, 2) }),
+      expect: "same",
+    },
+    { name: "(c) a config body holding a literal <", html: pageOf({ config: '{"a":"<b>"}' }), expect: "same" },
+    { name: "(c) a config body holding a literal -->", html: pageOf({ config: '{"a":"x --> y"}' }), expect: "same" },
+    { name: "(c) a config body holding the closing tag escaped as the writer spells it", html: escapedPage, expect: "same" },
+    // (d) everything else is inside it
+    { name: "(d) the vendor block edited", html: pageOf({ vendor: '<script src="vendor/lottie.min.js"></script>\n' }), expect: "different" },
+    { name: "(d) a script added before </body>", html: pageOf({ tail: "<script>alert(1)</script>\n</body></html>\n" }), expect: "different" },
+    { name: "(d) a body onload handler", html: pageOf({ head: headOf('<body onload="x()">') }), expect: "different" },
+    { name: "(d) an engine block changed by one character", html: pageOf({ engine: D_ENGINE.replace("/* engine 1 */", "/* engine I */") }), expect: "different" },
+    { name: "(d) the domain-lock block edited", html: pageOf({ lock: '<script data-kivo="domain-lock">/* lock off */</script>' }), expect: "different" },
+    { name: "(d) the engine's top comment edited", html: pageOf({ top: D_TOP.replace("synthetic", "edited") }), expect: "different" },
+    { name: "(d) a Devanagari title in the head", html: devanagariHeadPage, expect: "different" },
+    // (e) anchor counts and order: no digest, with the reason
+    { name: "(e) two config opening tags", html: pageOf({ lock: `${D_OPEN}\n{}\n${D_CLOSE}\n${D_LOCK}` }), expect: reason(`${D_OPEN} found 2 times`) },
+    { name: "(e) the licence begin anchor removed", html: p0.replace(D_BEGIN, ""), expect: reason(`${D_BEGIN} found 0 times`) },
+    { name: "(e) the licence end anchor duplicated", html: p0.replace(D_END, `${D_END}\n${D_END}`), expect: reason(`${D_END} found 2 times`) },
+    {
+      name: "(e) the end anchor moved before the begin anchor",
+      html: D_TOP + D_END + P0_PARTS.licence + D_BEGIN + headOf() + D_OPEN + `\n${D_CONFIG}\n` + D_CLOSE + restOf(P0_PARTS),
+      expect: reason(`${D_END} precedes ${D_BEGIN}`),
+    },
+    {
+      name: "(e) the config block moved above the licence",
+      html: D_TOP + D_OPEN + `\n${D_CONFIG}\n` + D_CLOSE + "\n" + D_BEGIN + P0_PARTS.licence + D_END + headOf() + restOf(P0_PARTS).slice(1),
+      expect: reason(`${D_OPEN} precedes ${D_END}`),
+    },
+    {
+      name: "(e) no closing tag anywhere after the config opening tag (P0 cut after the config body)",
+      html: D_TOP + D_BEGIN + P0_PARTS.licence + D_END + headOf() + D_OPEN + `\n${D_CONFIG}\n`,
+      expect: reason(`no ${D_CLOSE} after ${D_OPEN}`),
+    },
+    // The first </script> after the tag ends range 2 (ADR 0022 A item 1): with only the config block's
+    // own closing tag removed, the lock block's ends it, the lock block is swallowed, and the digest
+    // moves. Pinned this way so nobody "fixes" it; the 2.0 writer always closes the block.
+    {
+      name: "(e) only the config block's own closing tag removed: ok, a different digest",
+      html: D_TOP + D_BEGIN + P0_PARTS.licence + D_END + headOf() + D_OPEN + `\n${D_CONFIG}\n` + restOf(P0_PARTS),
+      expect: "different",
+    },
+    // (f) no normalisation of any kind
+    { name: "(f) every LF as CRLF", html: p0.split("\n").join("\r\n"), expect: "different" },
+    { name: "(f) one trailing space", html: `${p0} `, expect: "different" },
+  ];
+  return { p0, p0Input, escapedPage, devanagariHeadPage, vectors };
 }

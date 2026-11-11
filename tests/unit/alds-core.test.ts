@@ -26,6 +26,11 @@ import {
   canonicalPatternKey,
   contentHash,
   detectScript,
+  ENGINE_DIGEST_ALGO_V1,
+  ENGINE_DIGEST_ANCHORS,
+  engineDigest,
+  engineDigestInput,
+  engineDigestInputByAlgo,
   EXT,
   KEY_CLASS_BY_AUTHORING_KIND,
   LABELS_BY_AUTHORING_KIND,
@@ -40,6 +45,7 @@ import {
   type Parsed,
 } from "../../lib/alds/rules";
 import { INTERACTION_KINDS, type AldsCatalogueEntry } from "../../lib/alds/types";
+import { digestVectors } from "./alds-fixtures/harness";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -304,6 +310,61 @@ console.log("\n(v) purity of lib/alds (types.ts + rules/)");
     for (const [re, what] of banned) if (re.test(src)) problems.push(`${rel}: uses ${what}`);
   }
   eq(`${files.length} files: imports stay inside lib/alds; no Node/DOM API, clock or randomness`, problems, []);
+}
+
+console.log("\n(vi) the engine digest (ADR 0022 A; synthetic pages, never engine bytes)");
+{
+  // The digest of the synthetic base page P0 (tests/unit/alds-fixtures/harness.ts digestVectors),
+  // pinned once: every later vector compares with it.
+  const DIGEST_P0 = "sha256:5281924a889799be766696b1f76c07c4978bf516c9e219a427e814b3c2e73640";
+  const dv = digestVectors();
+  eq("ENGINE_DIGEST_ANCHORS are the strings the 2.0 writer emits (KIVO names record §1)", ENGINE_DIGEST_ANCHORS, {
+    licenceBegin: "<!-- KIVO-LICENCE-BEGIN -->",
+    licenceEnd: "<!-- KIVO-LICENCE-END -->",
+    configOpen: '<script type="application/json" id="kivo-course-config" data-kivo="COURSE_CONFIG">',
+    scriptClose: "</script>",
+  });
+  const in0 = engineDigestInput(dv.p0);
+  const input0 = in0.ok ? in0.input : "";
+  eq("(a) P0 gives a digest input", in0.ok, true);
+  eq("(a) the input is P0 without the licence body and the config body (written out in the harness)", input0, dv.p0Input);
+  eq("(a) the licence anchors stay, adjacent", input0.includes("-->\n<!-- KIVO-LICENCE-BEGIN --><!-- KIVO-LICENCE-END -->\n<html "), true);
+  eq("(a) the config tag and its closing tag stay, adjacent", input0.includes('data-kivo="COURSE_CONFIG"></script>\n<script data-kivo="domain-lock">'), true);
+  eq("(a) nothing is inserted: the input is shorter than P0 by exactly the two ranges", dv.p0.length - input0.length, dv.p0.length - dv.p0Input.length);
+  eq("(a) the digest of P0 is pinned", engineDigest(dv.p0), { ok: true, digest: DIGEST_P0 });
+  // (c) the escaping trap: the page must hold backslash-u003c (two backslashes in this source)
+  // and no extra real closing tag, or the "same digest" below would prove nothing
+  eq("(c) the escaped page holds the six characters \\u003c before /script", dv.escapedPage.indexOf("\\u003c/script") >= 0, true);
+  eq("(c) the escaped page holds no closing tag P0 does not", dv.escapedPage.split("</script>").length, dv.p0.split("</script>").length);
+  for (const v of dv.vectors) {
+    const got = engineDigest(v.html);
+    if (v.expect === "same") eq(`${v.name}: the same digest`, got, { ok: true, digest: DIGEST_P0 });
+    else if (v.expect === "different") eq(`${v.name}: a digest, different`, got.ok && got.digest !== DIGEST_P0, true);
+    else {
+      eq(`${v.name}: no digest, with the reason`, engineDigestInput(v.html), v.expect);
+      eq(`  … and engineDigest reports the same`, got, v.expect);
+    }
+  }
+  // (g) the method is selected by selfCheck.engineDigestAlgo; absent reads as v1
+  eq("(g) engineDigestInputByAlgo(\"v1\", P0) = engineDigestInput(P0)", engineDigestInputByAlgo("v1", dv.p0), in0);
+  eq("(g) engineDigestInputByAlgo(undefined, P0) = engineDigestInput(P0) (the field absent)", engineDigestInputByAlgo(undefined, dv.p0), in0);
+  eq("(g) ENGINE_DIGEST_ALGO_V1", ENGINE_DIGEST_ALGO_V1, "v1");
+  eq("(g) an unknown algorithm gives no digest", engineDigestInputByAlgo("v2", dv.p0), { ok: false, reason: 'no digest: unknown engineDigestAlgo "v2"' });
+  eq("(g) null is unknown", engineDigestInputByAlgo(null, dv.p0), { ok: false, reason: "no digest: unknown engineDigestAlgo null" });
+  eq("(g) the empty string is unknown", engineDigestInputByAlgo("", dv.p0), { ok: false, reason: 'no digest: unknown engineDigestAlgo ""' });
+  eq("(g) the algorithm is matched exactly (V1)", engineDigestInputByAlgo("V1", dv.p0).ok, false);
+  // (h) the bundle's SHA-256 over the UTF-8 bytes = node:crypto's (L2's guardian test proves crypto.subtle equals it)
+  const devanagariLicence = dv.vectors.find((v) => v.name === "(b) a Devanagari title in the licence")?.html ?? "";
+  for (const [name, page] of [["P0", dv.p0], ["the Devanagari licence variant", devanagariLicence], ["a Devanagari title inside the digest", dv.devanagariHeadPage]] as const) {
+    const r = engineDigestInput(page);
+    const input = r.ok ? r.input : "";
+    const hex = createHash("sha256").update(Buffer.from(input, "utf8")).digest("hex");
+    eq(`(h) ${name}: sha256HexOfString(input) = node:crypto over Buffer.from(input, "utf8")`, [r.ok, sha256HexOfString(input)], [true, hex]);
+    eq(`(h) ${name}: engineDigest = "sha256:" + that hex`, engineDigest(page), { ok: true, digest: `sha256:${hex}` });
+    eq(`(h) ${name}: the whole page hashes the same both ways`, sha256HexOfString(page), nodeSha(Buffer.from(page, "utf8")));
+  }
+  const devIn = engineDigestInput(dv.devanagariHeadPage);
+  eq("(h) the Devanagari-head input is not ASCII (the UTF-8 vector is real)", devIn.ok && /[^\x00-\x7f]/.test(devIn.input), true);
 }
 
 console.log("\n(viii) the label table (ADR 0022 item 12) and EXT.launchContract (item 15)");
