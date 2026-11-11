@@ -32,9 +32,9 @@
  * every learner page carries /{org}/dashboard links.
  *
  * By hand on staging (npm run test:lifecycle), after both staging deployments
- * carry the branch, never while another lifecycle run is in progress. Not in
- * the nightly subset until one green run (ADR 0019 decision 7). Data stays in
- * the lifecycle-* namespace.
+ * carry the branch, never while another lifecycle run is in progress. In the
+ * nightly subset since its first green staging run, 2026-11-11 (ADR 0019
+ * decision 7). Data stays in the lifecycle-* namespace.
  */
 import { test, expect, type APIRequestContext, type BrowserContext, type Page } from "@playwright/test";
 import { randomUUID } from "node:crypto";
