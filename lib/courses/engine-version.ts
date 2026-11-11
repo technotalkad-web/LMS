@@ -80,6 +80,18 @@ export function engineVersionForManifest(html: string | null): string | null | u
 }
 
 /**
+ * Is this version a KIVO build, by its cached stamp only (ADR 0019 step 8)? True
+ * when manifest_data.engineVersion is a string (a stamp, or the literal
+ * `unknown`); false for null (read, not a KIVO build) and for an absent key (never
+ * read). It never reads the launch file: a version uploaded before the stamping
+ * reads false until the guard's lazy read or a re-upload stamps it.
+ */
+export function isKivoStamped(manifestData: unknown): boolean {
+  if (typeof manifestData !== "object" || manifestData === null) return false;
+  return typeof (manifestData as { engineVersion?: unknown }).engineVersion === "string";
+}
+
+/**
  * What a failed read of the launch file is called (ADR 0017 steps 5 and 6). The row's
  * record and the logs' `error` keep one of these and never the store's own text: a
  * learner can read their row through the Data API, and that text can carry the

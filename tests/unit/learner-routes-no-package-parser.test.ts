@@ -22,6 +22,7 @@ const ROOTS = [
   "app/api/xapi/activities/state/route.ts",
   "app/api/scorm/[attemptId]/commit/route.ts",
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx",
+  "app/[org]/(learner)/continue/page.tsx",
   "app/api/courses/[courseId]/language-preference/route.ts",
   "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts",
   "app/api/cron/lrs-forward/route.ts",

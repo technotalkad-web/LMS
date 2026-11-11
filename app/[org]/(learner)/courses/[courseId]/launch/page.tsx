@@ -53,6 +53,7 @@ import {
   type RowDecision,
 } from "@/lib/attempts/launch-kind";
 import { buildOfficialResult, buildRevisionCmi } from "@/lib/attempts/revision-seed";
+import { isKivoStamped } from "@/lib/courses/engine-version";
 
 type Course = {
   id: string;
@@ -69,6 +70,8 @@ type Version = {
   manifest_data: {
     raw?: { courseId?: string; auId?: string; activityId?: string };
     masteryScore?: number | null;
+    /** ADR 0017's cached engine stamp: a string for a KIVO build, null for another, absent when unread. */
+    engineVersion?: string | null;
   };
   package_id: string | null;
 };
@@ -1204,6 +1207,16 @@ export default async function LaunchPage({
     back: backParam || null,
   });
 
+  // ADR 0019 step 8: the bar's Continue goes to the continue address only on a
+  // Learning Path launch this course really is a step of (pathContextId), and
+  // never on a journey launch. The title stays in the bar unless the version's
+  // cached engine stamp says it is a KIVO build, which shows its own title.
+  const continueHref =
+    pathContextId && !journeyParam
+      ? `/${orgSlug}/continue?lp=${encodeURIComponent(pathContextId)}&from=${encodeURIComponent(courseId)}`
+      : null;
+  const showTitle = !isKivoStamped(v.manifest_data);
+
   // Background preload of the NEXT module (journey: next day with a course;
   // learning path: next step). Only its content launch file is warmed — the
   // runtime fetches it after this module is up and the browser is idle, so
@@ -1276,6 +1289,8 @@ export default async function LaunchPage({
         backLabel={backLabel}
         preloadUrls={preloadUrls}
         revision={rowIsRevision}
+        showTitle={showTitle}
+        continueHref={continueHref}
       />
     );
   }
@@ -1433,9 +1448,10 @@ export default async function LaunchPage({
       courseTitle={c.title}
       backHref={backHref}
       backLabel={backLabel}
-      standard={isXapi ? "xAPI" : "cmi5"}
       preloadUrls={preloadUrls}
       revision={rowIsRevision}
+      showTitle={showTitle}
+      continueHref={continueHref}
     />
   );
 }

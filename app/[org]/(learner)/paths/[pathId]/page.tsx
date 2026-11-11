@@ -9,6 +9,7 @@ import {
   Lock,
   List as ListIcon,
   Award,
+  AlertTriangle,
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
@@ -61,10 +62,17 @@ type StepView = {
 
 export default async function LearningPathDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string; pathId: string }>;
+  searchParams: Promise<{ saving?: string; failed?: string; end?: string }>;
 }) {
   const { org: orgSlug, pathId } = await params;
+  // ADR 0019 step 9: where the continue address ended, one banner at most
+  // (failed, then saving, then end).
+  const sp = await searchParams;
+  const continueBanner: "failed" | "saving" | "end" | null =
+    sp.failed === "1" ? "failed" : sp.saving === "1" ? "saving" : sp.end === "1" ? "end" : null;
   const { user, org } = await requireOrgAccess(orgSlug);
   const supabase = await createClient();
 
@@ -323,6 +331,42 @@ export default async function LearningPathDetailPage({
       >
         <ArrowLeft className="w-4 h-4" /> Back to dashboard
       </Link>
+
+      {continueBanner === "failed" && (
+        <div
+          data-testid="continue-failed-banner"
+          className="border border-amber-200 bg-amber-50 text-amber-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2"
+        >
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>
+            This module needs a pass to complete this step. You can ask for another attempt from the course page.
+          </span>
+        </div>
+      )}
+      {continueBanner === "saving" && (
+        <div
+          data-testid="continue-saving-banner"
+          className="border border-line bg-paper text-ink rounded-xl px-4 py-3 text-sm flex items-start gap-2"
+        >
+          <Clock className="w-4 h-4 mt-0.5 shrink-0 text-muted" />
+          <span>
+            Your result for the last module is not recorded yet. If you finished it, it can take a moment:{" "}
+            <Link href={`/${orgSlug}/paths/${pathId}`} className="underline font-medium">
+              open this path again
+            </Link>
+            . If not, open the module again to finish it.
+          </span>
+        </div>
+      )}
+      {continueBanner === "end" && (
+        <div
+          data-testid="continue-end-banner"
+          className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2"
+        >
+          <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>That was the last step of this path.</span>
+        </div>
+      )}
 
       <div className="bg-paper border border-line rounded-2xl overflow-hidden shadow-sm">
         {/* Hero */}
