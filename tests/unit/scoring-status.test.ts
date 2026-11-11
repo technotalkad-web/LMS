@@ -33,6 +33,7 @@ import {
   isAbandonedAttempt,
   attemptCounts,
   enrolledStatusSummary,
+  ENROLMENTS_VIEW,
   loadEnrolledCourseStatus,
   officialDone,
   officialStatuses,
@@ -452,7 +453,7 @@ console.log("\n\"retake reset, no grant\" reads the strict snapshot, never the f
     grantSnapshotOf([resetGrant, g("g3", { expires_at: "2026-10-30T00:00:00Z" })], NOW).unusedGrant, null);
 }
 
-console.log("\nthe six paged attempts reads use readPagedWithOptionalColumn, each keeping its own error rule");
+console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, each keeping its own error rule");
 {
   /** Per site: its call (the fallback over ATTEMPT_COLUMNS, the select taking the decided list) and its error rule, unchanged. */
   const SITES: Record<string, Array<[string, RegExp]>> = {
@@ -487,6 +488,21 @@ console.log("\nthe six paged attempts reads use readPagedWithOptionalColumn, eac
         /readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*svc\s*\.from\("course_attempts"\)\s*\.select\(cols\)\s*\.eq\("organization_id", args\.orgId\)\s*\.in\("user_id", ids\)\s*\.in\("course_version_id", verIds\)\s*\.order\("id"\)\s*\.range\(from, to\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
       ["the error rule: every learner failed, nothing inserted", /if \(attemptsRead\.error\) return unreadable\("attempts"\);/],
     ],
+    // ADR 0020 (the lead's ruling of 2026-11-11): the enrolled set in chunks
+    // of 150 (lib/db/chunked.ts), each paged in id order, never one .in()
+    // over the whole set.
+    [LP_FILE]: [
+      ["the call: the enrolled ids by chunk of 150 on the course's versions, in id order, one decision for every chunk",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*for \(const part of chunk\(enrolledUserIds, 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, from, to\)[^=]*=>\s*supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.in\("user_id", part\)\s*\.in\("course_version_id", versionIds\)\s*\.order\("id"\)\s*\.range\(from, to\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
+      ["the error rule: logged, the rows read so far kept (as the page's other reads)",
+        /if \(res\.error\) console\.warn\("\[learners\] attempts read failed:", res\.error\.message \?\? ""\);\s*attemptRows\.push\(\.\.\.res\.data\);/],
+    ],
+    "app/api/courses/[courseId]/learners/export/route.ts": [
+      ["the call: the enrolled ids by chunk of 150 on the course's versions, in id order, one decision for every chunk",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*for \(const part of chunk\(enrolledUserIds, 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, from, to\)[^=]*=>\s*supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.in\("user_id", part\)\s*\.in\("course_version_id", versionIds\)\s*\.order\("id"\)\s*\.range\(from, to\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
+      ["the error rule: logged, the rows read so far kept (as the page's rule and the CSV's other reads)",
+        /if \(res\.error\) console\.warn\("\[learners-export\] attempts read failed:", res\.error\.message \?\? ""\);\s*attemptRows\.push\(\.\.\.res\.data\);/],
+    ],
   };
   for (const [file, checks] of Object.entries(SITES)) {
     const src = codeOf(file);
@@ -494,7 +510,7 @@ console.log("\nthe six paged attempts reads use readPagedWithOptionalColumn, eac
     for (const [what, re] of checks) eq(`${file}: ${what}`, re.test(src), true);
     eq(`${file}: no local copy of the first-page closure (the helper is the one implementation)`, /= used;|= usedColumns;|attemptColumns|\bcolumns = used\b/.test(src), false);
   }
-  // The inventory: every caller under app/ and lib/ is one of the six, and
+  // The inventory: every caller under app/ and lib/ is one of the eight, and
   // grantSnapshotForUsers (the strict grant read) in the helper's own file.
   const callers: string[] = [];
   const walk = (dir: string) => {
@@ -507,7 +523,7 @@ console.log("\nthe six paged attempts reads use readPagedWithOptionalColumn, eac
   };
   walk("app");
   walk("lib");
-  eq("every readPagedWithOptionalColumn caller is listed (the six, and attempt-kind.ts's grant snapshot)",
+  eq("every readPagedWithOptionalColumn caller is listed (the eight, and attempt-kind.ts's grant snapshot)",
     callers.sort(), [...Object.keys(SITES), "lib/scoring/attempt-kind.ts"].sort());
 }
 
@@ -977,7 +993,7 @@ async function statusCases() {
     const page1 = Array.from({ length: 1000 }, (_, i) => att(i));
     const page2 = [att(1000)];
     const { client, queries } = recordingClient((q) => {
-      if (q.table === "course_assignments") return { data: [{ id: "x", assignee_type: "user", user_id: "u1", team_id: null }] };
+      if (q.table === "v_course_enrollments_expanded") return { data: [{ user_id: "u1" }] };
       if (q.table === "course_attempts") {
         if (selectOf(q).includes("is_revision")) return { data: null, error: MISSING };
         return { data: (q.ops.find((o) => o.op === "range")?.args[0] ?? 0) === 0 ? page1 : page2 };
@@ -991,12 +1007,14 @@ async function statusCases() {
   }
   {
     const { client, queries } = recordingClient((q) => {
-      if (q.table === "course_assignments") return { data: [{ id: "x", assignee_type: "user", user_id: "u1", team_id: null }, { id: "y", assignee_type: "user", user_id: "u2", team_id: null }] };
+      if (q.table === "v_course_enrollments_expanded") return { data: [{ user_id: "u1" }, { user_id: "u2" }] };
       if (q.table === "course_attempts") {
         return {
           data: [
             { id: "a1", user_id: "u1", status: "passed", completion_status: "completed", success_status: "passed", score: 0.9, started_at: "2026-10-01T09:00Z", completed_at: "2026-10-01T09:30Z", is_revision: false },
             { id: "v1", user_id: "u2", status: "in_progress", completion_status: "in_progress", success_status: "unknown", score: null, started_at: "2026-10-02T09:00Z", completed_at: null, is_revision: true },
+            // a learner the view does not return: their attempt is not counted
+            { id: "o1", user_id: "u9", status: "passed", completion_status: "completed", success_status: "passed", score: 0.8, started_at: "2026-10-02T09:00Z", completed_at: "2026-10-02T09:30Z", is_revision: false },
           ],
         };
       }
@@ -1006,6 +1024,49 @@ async function statusCases() {
     eq("a database with 0103: one select naming is_revision; a learner with only a flagged row is not started",
       [queries.filter((q) => q.table === "course_attempts").map((q) => selectOf(q).includes("is_revision")), r.summary],
       [[true], { total: 2, completed: 1, failed: 0, inProgress: 0, notStarted: 1 }]);
+    eq("…an attempt of a learner the view does not return is not counted", [...r.enrolledUserIds].sort(), ["u1", "u2"]);
+  }
+
+  console.log("\nloadEnrolledCourseStatus: the enrolled set is the view's (ADR 0020 step 5)");
+  {
+    const { client, queries } = recordingClient((q) => (q.table === "v_course_enrollments_expanded" ? { data: [{ user_id: "u1" }] } : { data: [] }));
+    await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+    const view = queries.filter((q) => q.table === ENROLMENTS_VIEW);
+    eq("ENROLMENTS_VIEW names the view", ENROLMENTS_VIEW, "v_course_enrollments_expanded");
+    eq("one read of the view: select user_id, eq course_id, order user_id, range 0-999",
+      view.map((q) => q.ops.map((o) => [o.op, ...o.args])),
+      [[["select", "user_id"], ["eq", "course_id", "c1"], ["order", "user_id"], ["range", 0, 999]]]);
+    eq("no assignment, team or member table is read for the enrolled set",
+      queries.some((q) => ["course_assignments", "team_members", "organization_members", "learning_path_assignments", "org_groups"].includes(q.table)), false);
+  }
+  {
+    const ids = Array.from({ length: 1001 }, (_, i) => `u${String(i).padStart(4, "0")}`);
+    const { client, queries } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") {
+        const [from, to] = (q.ops.find((o) => o.op === "range")?.args ?? [0, 999]) as [number, number];
+        return { data: ids.slice(from, to + 1).map((user_id) => ({ user_id })) };
+      }
+      return { data: [] };
+    });
+    const r = await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+    eq("1,001 enrolled learners over two pages: ranges 0-999 and 1000-1999, every learner counted",
+      [queries.filter((q) => q.table === ENROLMENTS_VIEW).map((q) => q.ops.find((o) => o.op === "range")?.args), r.summary.total, r.summary.notStarted],
+      [[[0, 999], [1000, 1999]], 1001, 1001]);
+  }
+  {
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+    try {
+      const { client, queries } = recordingClient((q) =>
+        q.table === "v_course_enrollments_expanded" ? { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } } : { data: [] });
+      const r = await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+      eq("a failed view read: fail-soft, the summary counts what was read (0), no attempts read",
+        [r.summary.total, queries.some((q) => q.table === "course_attempts")], [0, false]);
+      eq("…and the warning is logged", warned.some((w) => w.startsWith("[enrolled-status] enrolments read failed:") && w.includes("statement timeout")), true);
+    } finally {
+      console.warn = warn;
+    }
   }
 }
 

@@ -16,10 +16,15 @@ import FeedbackSection from "./feedback-section";
 // from the attempts with the official-status rule, through the same counter
 // as the Library course card (loadEnrolledCourseStatus), so the two pages always
 // agree and a learner whose only attempts were reset (abandoned, ADR 0004
-// step 11) reads as not started. mv_course_enrollment_status is not read
-// here: before migration 0099 it counts any attempt as a start, and from
-// 0099 on it is status-aware (a reset-only learner is not started), but this
-// page keeps computing live (ADR 0009 Consequences).
+// step 11) reads as not started. Enrolled = every released assignment that
+// reaches the learner, direct (user, team, org-wide, Custom Group) or a
+// released step of an active Learning Path, minus the learners a path still
+// holds back: the one SQL definition, v_course_enrollments_expanded
+// (migration 0105, ADR 0020), which the two course report matviews read too.
+// mv_course_enrollment_status is not read here: before migration 0099 it
+// counts any attempt as a start, and from 0099 on it is status-aware (a
+// reset-only learner is not started), but this page keeps computing live
+// (ADR 0009 Consequences).
 //
 // Reads from the materialized views shipped in migration 0031 (#175):
 //   - mv_course_performance        → §4.2 (Completion Rate / Passed / Failed / Avg Score / Avg Time / Rating)
@@ -98,11 +103,13 @@ export default async function CourseReportsPage({
   );
 
   // ---- §4.1 Enrollment & status (live) ----
-  // Enrolled = direct, team and org-wide assignments; status = each
-  // learner's OFFICIAL attempt (courseStatus: abandoned attempts never count
-  // as a start). One loader with the Library course card (paged, chunked,
-  // caller's client as the card; the page is admin-gated above), so the two
-  // pages always agree.
+  // Enrolled = the enrolment view (0105, ADR 0020): released direct, team,
+  // org-wide and Custom Group assignments and released steps of active
+  // Learning Paths, minus the learners a path still holds back; status =
+  // each learner's OFFICIAL attempt (courseStatus: abandoned attempts never
+  // count as a start). One loader with the Library course card (paged,
+  // chunked, caller's client as the card; the page is admin-gated above, and
+  // the view needs an admin session), so the two pages always agree.
   const { data: versionRows } = await supabase
     .from("course_versions")
     .select("id, package_id")

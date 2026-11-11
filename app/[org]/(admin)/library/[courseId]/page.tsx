@@ -397,10 +397,13 @@ export default async function AdminCourseDetailPage({
   // ----- Enrolled summary -----
   // Totals (total / completed / failed / in progress / not started) from each
   // learner's OFFICIAL attempt (decision 1), through the one loader the
-  // course Reports tab uses, so the two pages always agree: assignments
-  // expanded and attempts read completely (paged, chunked), a learner whose
-  // only attempts were reset reads as not started. The per-learner table
-  // lives at /[org]/library/[courseId]/learners.
+  // course Reports tab uses, so the two pages always agree: the enrolled set
+  // from the enrolment view (0105, ADR 0020: released direct, team,
+  // org-wide and Custom Group assignments and released steps of active
+  // Learning Paths, minus the learners a path still holds back; read with
+  // this admin session) and attempts read completely (paged, chunked), a
+  // learner whose only attempts were reset reads as not started. The
+  // per-learner table lives at /[org]/library/[courseId]/learners.
   const { summary: enrSummary } = await loadEnrolledCourseStatus(
     supabase,
     org.id,

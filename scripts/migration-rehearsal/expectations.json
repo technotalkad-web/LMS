@@ -1488,6 +1488,321 @@
       ]
     },
     {
+      "name": "0100-0103-0104-then-0105",
+      "title": "ADR 0020 on both environments' state: the 0103-0104-then-0100 scenario whole (0099, 0103, 0104 and 0100), then 0105 pasted twice, its word rule, seed-0105.sql and assert-0105.sql (one transaction, rolled back), refresh, audit: identical to 0103-0104-then-0100 at its end",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        {
+          "audit": {
+            "label": "before the sitting",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "D02"],
+            "z90": "2 / 46 / 50",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0070": "present", "B0071a": "present", "B0071b": "present",
+              "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only",
+              "D01": "6", "D02": "1", "D03": "2", "D03.00001": "2", "D04": "2",
+              "D05": "1", "D06": "1", "D07": "1", "D07.00001": "webhook host crm.example.com",
+              "D08": "1", "D08.00001": "statement_profile n/a (before 0078)",
+              "D09": "3", "D09.00001": "course default", "D09.00002": "other slot", "D09.00003": "other slot",
+              "D10": "0", "D11": "0", "Z01": "0072", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" },
+              { "name": "D04 listed courses", "match": "^D04\\.\\d{5}$", "count": 2 }
+            ],
+            "noteMatches": {
+              "D10": "qa-\\* rows skipped: 1 ",
+              "D11": "qa-\\* rows skipped \\([^)]*\\): 1\\."
+            }
+          }
+        },
+        {
+          "apply": {
+            "label": "the sitting",
+            "files": ["0032", "0072-0098"],
+            "times": 2,
+            "refuseFirst": {
+              "0098": {
+                "why": "by its own guard while a storage prefix is shared (D02 = 1)",
+                "code": "P0001",
+                "contains": "0098 refused: 1 storage_prefix value(s) are shared by more than one course_versions row",
+                "then": "repoint.sql"
+              }
+            }
+          }
+        },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 84,
+            "mismatch": ["A03"],
+            "z90": "40 / 1 / 5",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "absent", "C02": "present", "C03": "0", "C04": "0", "C05": "per-package only",
+              "D01": "6", "D02": "0", "D03": "2", "D04": "2", "D05": "1", "D06": "1", "D07": "1",
+              "D08": "1", "D08.00001": "statement_profile ambak-v1", "D09": "3",
+              "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        { "apply": { "label": "0103 (ADR 0014; production at 0099, no 0100)", "files": ["0103"], "times": 2 } },
+        { "static": { "file": "0103", "mustNotContain": ["served_language", "launch_mode", "is_preview", "learning_sessions", "alds_", "ALDS_P4", "0100_alds_core.sql"] } },
+        { "sql": "assert-0103.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0103",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0104 (ADR 0017; a database at 0103, no 0100)", "files": ["0104"], "times": 2 } },
+        { "static": { "file": "0104", "mustNotContain": ["is_revision", "revision_visits", "flag_revision_attempt", "record_revision_visit", "consume_grant", "served_language", "launch_mode", "is_preview", "learning_sessions", "alds_", "ALDS_P4", "0100_alds_core.sql", "0103_revision_visits.sql"] } },
+        { "sql": "assert-0104.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0104",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0100 after 0103 and 0104 (production's sitting order)", "files": ["0100"], "times": 2 } },
+        { "sql": "assert-0100.sql" },
+        { "sql": "assert-0103.sql" },
+        { "sql": "assert-0104.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0100",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": ["B0100a", "B0100b", "B0100c", "B0100d"],
+            "z90": "49 / 10 / 4",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "B0100a": "present", "B0100b": "present", "B0100c": "present", "B0100d": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "present" }
+            ]
+          }
+        },
+        { "apply": { "label": "0105 (ADR 0020; a database at 0100, 0103 and 0104)", "files": ["0105"], "times": 2 } },
+        { "static": { "file": "0105", "mustNotContain": ["alds_", "is_preview", "learning_sessions", "is_revision", "ignored_pass", "course_feedback"] } },
+        { "sql": "seed-0105.sql" },
+        { "sql": "assert-0105.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0105",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": ["B0100a", "B0100b", "B0100c", "B0100d"],
+            "z90": "49 / 10 / 4",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "B0100a": "present", "B0100b": "present", "B0100c": "present", "B0100d": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "present" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "0105-at-0104-no-0100",
+      "title": "ADR 0020 without 0100: the 0103-then-0104 scenario whole, then 0105 pasted twice, its word rule, seed-0105.sql and assert-0105.sql (one transaction, rolled back), refresh, audit: identical to 0103-then-0104 at its end; proves the file's independence from 0100",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "seed.sql" },
+        { "sql": "seed-0071.sql" },
+        {
+          "audit": {
+            "label": "before the sitting",
+            "column": "at_before",
+            "rows": 84,
+            "mismatch": ["A03", "D02"],
+            "z90": "2 / 46 / 50",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0070": "present", "B0071a": "present", "B0071b": "present",
+              "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "present", "C02": "absent", "C03": "0", "C04": "0", "C05": "legacy only",
+              "D01": "6", "D02": "1", "D03": "2", "D03.00001": "2", "D04": "2",
+              "D05": "1", "D06": "1", "D07": "1", "D07.00001": "webhook host crm.example.com",
+              "D08": "1", "D08.00001": "statement_profile n/a (before 0078)",
+              "D09": "3", "D09.00001": "course default", "D09.00002": "other slot", "D09.00003": "other slot",
+              "D10": "0", "D11": "0", "Z01": "0072", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "absent" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" },
+              { "name": "D04 listed courses", "match": "^D04\\.\\d{5}$", "count": 2 }
+            ],
+            "noteMatches": {
+              "D10": "qa-\\* rows skipped: 1 ",
+              "D11": "qa-\\* rows skipped \\([^)]*\\): 1\\."
+            }
+          }
+        },
+        {
+          "apply": {
+            "label": "the sitting",
+            "files": ["0032", "0072-0098"],
+            "times": 2,
+            "refuseFirst": {
+              "0098": {
+                "why": "by its own guard while a storage prefix is shared (D02 = 1)",
+                "code": "P0001",
+                "contains": "0098 refused: 1 storage_prefix value(s) are shared by more than one course_versions row",
+                "then": "repoint.sql"
+              }
+            }
+          }
+        },
+        {
+          "audit": {
+            "label": "after the sitting",
+            "column": "at_after",
+            "rows": 84,
+            "mismatch": ["A03"],
+            "z90": "40 / 1 / 5",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "absent", "B0099b": "present", "B0099c": "present", "B0099d": "present", "B0099e": "absent",
+              "C01": "absent", "C02": "present", "C03": "0", "C04": "0", "C05": "per-package only",
+              "D01": "6", "D02": "0", "D03": "2", "D04": "2", "D05": "1", "D06": "1", "D07": "1",
+              "D08": "1", "D08.00001": "statement_profile ambak-v1", "D09": "3",
+              "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0099 (after v1.3.0 is live)", "files": ["0099"], "times": 2 } },
+        { "refresh": { "views": 6 } },
+        { "apply": { "label": "0103 (ADR 0014; production at 0099, no 0100)", "files": ["0103"], "times": 2 } },
+        { "static": { "file": "0103", "mustNotContain": ["served_language", "launch_mode", "is_preview", "learning_sessions", "alds_", "ALDS_P4", "0100_alds_core.sql"] } },
+        { "sql": "assert-0103.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0103",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0104 (ADR 0017; a database at 0103, no 0100)", "files": ["0104"], "times": 2 } },
+        { "static": { "file": "0104", "mustNotContain": ["is_revision", "revision_visits", "flag_revision_attempt", "record_revision_visit", "consume_grant", "served_language", "launch_mode", "is_preview", "learning_sessions", "alds_", "ALDS_P4", "0100_alds_core.sql", "0103_revision_visits.sql"] } },
+        { "sql": "assert-0104.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0104",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        },
+        { "apply": { "label": "0105 (ADR 0020; a database at 0103 and 0104, no 0100)", "files": ["0105"], "times": 2 } },
+        { "static": { "file": "0105", "mustNotContain": ["alds_", "is_preview", "learning_sessions", "is_revision", "ignored_pass", "course_feedback"] } },
+        { "sql": "seed-0105.sql" },
+        { "sql": "assert-0105.sql" },
+        { "refresh": { "views": 6 } },
+        {
+          "audit": {
+            "label": "after 0105",
+            "column": "at_0099",
+            "rows": 84,
+            "mismatch": [],
+            "z90": "45 / 6 / 0",
+            "observed": {
+              "A03": "1", "A04": "postgres",
+              "B0099a": "present", "B0099b": "absent", "B0099c": "absent", "B0099d": "absent", "B0099e": "present",
+              "C05": "per-package only", "D02": "0", "D10": "0", "D11": "0", "Z01": "none", "Z02": "none"
+            },
+            "probes": [
+              { "name": "0072-0098 presence probes (first and end-of-file)", "match": "^B00(7[2-9]|8[0-9]|9[0-8])[a-z]?$", "count": 40, "observed": "present" },
+              { "name": "planned 0100 probes", "match": "^B0100[a-z]$", "count": 4, "observed": "absent" }
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "0103-0104-0100-then-0106",
       "title": "production's order (ADR 0021): the 0103-0104-then-0100 scenario whole, then 0106 pasted twice, assert-0106.sql, assert-0100.sql, assert-0103.sql and assert-0104.sql again (0106 leaves them intact), refresh, audit: identical to the parent at its end (0106 adds no probe)",
       "steps": [

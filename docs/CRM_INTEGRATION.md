@@ -528,3 +528,13 @@ behind an official result could not be read; retry).
 - Delivery stays best-effort (one try, 5 s) for each message, so
   "at-most-once" above describes each message's delivery, not a limit of
   one message per attempt.
+- Assigned, not openable today: the course lists of `learner-summary` and
+  `progress` show every step of an assigned learning path whether or not the
+  step's scheduled release date has passed, and a course that another path
+  still holds back (an unreleased step of a path the learner is assigned to,
+  or of an organisation-wide public path) is listed. The LMS's own course
+  reports count, from migration 0105 (ADR 0020), only what the learner can
+  open: a path step from its release date, and not while a path holds the
+  course back. The two can therefore differ for a course on a path with an
+  unreleased step. This is intended (ADR 0020, decision 2): the feed's
+  contract is unchanged, and a change to it would be its own note here.

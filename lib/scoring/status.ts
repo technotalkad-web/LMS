@@ -208,15 +208,39 @@ export function enrolledStatusSummary(
 }
 
 /**
+ * The one SQL definition of "enrolled on a course" (migration 0105, ADR 0020):
+ * every released assignment that reaches the learner, direct (user, team,
+ * org-wide, Custom Group) or a released step of an active Learning Path they
+ * are assigned to, minus the learners a path still holds back (the launch
+ * page's gate). Distinct (course_id, user_id). The course report matviews
+ * read the same view, so the pages and the matviews cannot drift.
+ *
+ * Read it with an admin session or the service role only: the view is
+ * security_invoker and Custom Group membership (org_groups,
+ * org_group_members) admits admins only, so a data_analyst or learner
+ * session reads an incomplete set. A new admin reader of enrolment reads this
+ * view, never a fresh expansion (ADR 0020, "Binding on later work").
+ */
+export const ENROLMENTS_VIEW = "v_course_enrollments_expanded";
+
+/**
  * The enrolled learners of one course and their official statuses, read the
  * SAME way for the Library course card and the course Reports tab, so the
- * two pages always agree (gap 3). Enrolled = direct, team and org-wide
- * assignments (custom-group assignments are not expanded, as before). Every
- * read is paged at the PostgREST row cap and every `.in()` list is chunked,
- * so a large org-wide course is counted completely; attempts are read by the
- * course's versions and narrowed to the enrolled learners in memory.
+ * two pages always agree (gap 3). Enrolled = every released assignment that
+ * reaches the learner, direct (user, team, org-wide, Custom Group) or a
+ * released step of an active Learning Path, minus the learners a path still
+ * holds back, from the one SQL definition the report matviews use
+ * (`ENROLMENTS_VIEW`, 0105, ADR 0020). Before 0105 is applied the view is the
+ * 0031 one (user, team and org-wide rows), which is exactly the expansion
+ * this loader made in TypeScript before. Every read is paged at the
+ * PostgREST row cap and every `.in()` list is chunked, so a large org-wide
+ * course is counted completely; attempts are read by the course's versions
+ * and narrowed to the enrolled learners in memory.
  * Fail-soft: a failed read is logged and the summary counts what was read.
- * Works with an admin's RLS client (the pages are admin-gated).
+ * The caller's client must be an admin session or the service role: a
+ * data_analyst session reads an incomplete set through the invoker view
+ * (Custom Group membership admits admins only). Both callers pass the
+ * admin's RLS client behind canManage.
  */
 export async function loadEnrolledCourseStatus(
   client: AnyClient,
@@ -243,32 +267,12 @@ export async function loadEnrolledCourseStatus(
     return out;
   };
 
-  const assignments = (await paged("assignments", (f, t) =>
-    client.from("course_assignments").select("id, assignee_type, user_id, team_id").eq("course_id", courseId).order("id").range(f, t)
-  )) as Array<{ assignee_type: string; user_id: string | null; team_id: string | null }>;
-
-  const teamIds = [...new Set(assignments.filter((a) => a.assignee_type === "team" && a.team_id).map((a) => a.team_id as string))];
-  const teamUsers = new Map<string, Set<string>>();
-  for (let i = 0; i < teamIds.length; i += CHUNK) {
-    const part = teamIds.slice(i, i + CHUNK);
-    const rows = (await paged("team members", (f, t) =>
-      client.from("team_members").select("team_id, user_id").in("team_id", part).order("team_id").order("user_id").range(f, t)
-    )) as Array<{ team_id: string; user_id: string }>;
-    for (const r of rows) (teamUsers.get(r.team_id) ?? teamUsers.set(r.team_id, new Set()).get(r.team_id)!).add(r.user_id);
-  }
-
-  const orgMemberIds = assignments.some((a) => a.assignee_type === "org")
-    ? ((await paged("org members", (f, t) =>
-        client.from("organization_members").select("user_id").eq("organization_id", orgId).order("user_id").range(f, t)
-      )) as Array<{ user_id: string }>).map((r) => r.user_id)
-    : [];
-
-  const enrolledUserIds = new Set<string>();
-  for (const a of assignments) {
-    if (a.assignee_type === "user" && a.user_id) enrolledUserIds.add(a.user_id);
-    else if (a.assignee_type === "team" && a.team_id) for (const uid of teamUsers.get(a.team_id) ?? []) enrolledUserIds.add(uid);
-    else if (a.assignee_type === "org") for (const uid of orgMemberIds) enrolledUserIds.add(uid);
-  }
+  // One paged read of the view (ADR 0020 step 5). It has no id; user_id is
+  // unique per course, so ordering by it keeps the pages disjoint and stable.
+  const enrolmentRows = (await paged("enrolments", (f, t) =>
+    client.from(ENROLMENTS_VIEW).select("user_id").eq("course_id", courseId).order("user_id").range(f, t)
+  )) as Array<{ user_id: string }>;
+  const enrolledUserIds = new Set(enrolmentRows.map((r) => r.user_id));
 
   // ADR 0014 step 7: the attempts select names is_revision through the
   // narrower-select fallback, paged by readPagedWithOptionalColumn. The first

@@ -95,11 +95,16 @@ function callArgs(src: string, fn: string): string[][] {
   for (const m of src.matchAll(re)) out.push(items(src, (m.index ?? 0) + m[0].length - 1));
   return out;
 }
-/** The narrower-select fallback around one course_attempts select, keyed on a columns constant naming `status`. */
+/**
+ * The narrower-select fallback around one course_attempts select, keyed on a
+ * columns constant naming `status`: readWithOptionalColumn, or its paged form
+ * readPagedWithOptionalColumn (the closure then takes `from, to` and the
+ * options follow the constant; ADR 0020's chunked reads of the enrolled set).
+ */
 function fallbackSelect(src: string, constant: string): boolean {
   const decl = new RegExp(`const ${constant} =\\s*"[^"]*\\bstatus\\b[^"]*";`).test(src);
   const read = new RegExp(
-    `readWithOptionalColumn<[^>]*>\\(\\s*"is_revision",\\s*\\(columns\\) =>\\s*[\\s\\S]{0,40}?\\.from\\("course_attempts"\\)\\s*\\.select\\(columns\\)[\\s\\S]{0,400}?,\\s*${constant}\\s*\\)`
+    `read(?:Paged)?WithOptionalColumn<[^>]*>\\(\\s*"is_revision",\\s*\\(columns(?:, from, to)?\\)[^=]*?=>\\s*[\\s\\S]{0,40}?\\.from\\("course_attempts"\\)\\s*\\.select\\(columns\\)[\\s\\S]{0,400}?,\\s*${constant}\\s*[,)]`
   ).test(src);
   return decl && read;
 }
