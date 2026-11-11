@@ -11,8 +11,7 @@ import {
   continueTarget,
   isUuid,
   nextStepAfter,
-  resultStored,
-  verdictPending,
+  officialResultStored,
 } from "@/lib/learner/continue";
 
 /**
@@ -149,7 +148,7 @@ export default async function ContinuePage({
     if (rowsErr) readError();
     const attempts = (rows ?? []) as ScorableAttempt[];
     const scoring = computeScoring(attempts, policy, retakeIds);
-    if (resultStored(scoring, attempts) && !verdictPending(scoring, passRequired)) {
+    if (officialResultStored(scoring, attempts, passRequired)) {
       stored = true;
       done = officialDone(scoring, passRequired);
       break;

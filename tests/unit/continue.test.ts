@@ -8,6 +8,13 @@
  * itself cannot run in a unit test; its wiring is checked by the source scans
  * in tests/unit/launch-bar-copy.test.ts.
  *
+ * ADR 0019, note of 2026-11-11 (Continue waits for the stored result):
+ * officialResultStored, the one conclude test the continue address, the
+ * launch page and the status route share, over every row mix and equal to
+ * resultStored && !verdictPending on each; and lib/learner/continue-state.ts,
+ * the bar's constants and pure decisions (continueState, shouldPoll over its
+ * sixteen inputs, parseStoredAnswer).
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/continue.test.ts   (or npm run test:unit)
@@ -18,10 +25,20 @@ import {
   continueTarget,
   isUuid,
   nextStepAfter,
+  officialResultStored,
   resultStored,
   verdictPending,
   type ContinueInput,
 } from "../../lib/learner/continue";
+import {
+  CONTINUE_CHECK_DEBOUNCE_MS,
+  CONTINUE_MESSAGE_MS,
+  CONTINUE_STATUS_POLL_MS,
+  CONTINUE_WAITING_MESSAGE,
+  continueState,
+  parseStoredAnswer,
+  shouldPoll,
+} from "../../lib/learner/continue-state";
 import { computeScoring, DEFAULT_POLICY, officialDone, type ScorableAttempt } from "../../lib/scoring/policy";
 import { launchModeFor } from "../../lib/alds/launch";
 
@@ -160,6 +177,91 @@ eq("refused: empty, undefined, an array, a short id, a path, a uuid with a suffi
   isUuid(""), isUuid(undefined), isUuid(["0f8fad5b-d9cb-469f-a165-70867728950e"]), isUuid("0f8fad5b"),
   isUuid("../dashboard"), isUuid("0f8fad5b-d9cb-469f-a165-70867728950e&x=1"),
 ], [false, false, false, false, false, false]);
+
+console.log("\nofficialResultStored: the one conclude test (ADR 0019, note of 2026-11-11)");
+{
+  const row = (id: string, o: Partial<ScorableAttempt> = {}): ScorableAttempt => ({
+    id,
+    score: null,
+    started_at: "2026-11-10T09:00:00Z",
+    completed_at: null,
+    completion_status: "in_progress",
+    success_status: "unknown",
+    status: "in_progress",
+    ...o,
+  });
+  const done = (id: string, success: string, score: number | null, at = "2026-11-10T09:30:00Z", o: Partial<ScorableAttempt> = {}) =>
+    row(id, { completion_status: "completed", success_status: success, score, completed_at: at, status: "completed", ...o });
+  const ors = (rows: ScorableAttempt[], passRequired: boolean, retakes: string[] = []) =>
+    officialResultStored(computeScoring(rows, DEFAULT_POLICY, retakes), rows, passRequired);
+
+  eq("in progress → false", ors([row("a")], false), false);
+  eq("completed, not pass_required → true", ors([done("a", "unknown", null)], false), true);
+  eq("completed without a verdict, pass_required → false", ors([done("a", "unknown", null)], true), false);
+  eq("passed, pass_required → true", ors([done("a", "passed", 0.9)], true), true);
+  eq("failed, pass_required → true (stored, not done)", ors([done("a", "failed", 0.4)], true), true);
+  eq("abandoned only → false", ors([row("a", { status: "abandoned" }), done("b", "passed", 0.9, undefined, { status: "abandoned" })], false), false);
+  eq("a revision row only → false", ors([done("r", "passed", 1, undefined, { is_revision: true })], false), false);
+  eq("a revision row beside a complete official attempt → true", ors([done("a", "passed", 0.9), row("r", { is_revision: true, started_at: "2026-11-10T10:00:00Z" })], true), true);
+  eq("a live granted retake beside a completed first attempt → false", ors([done("a", "failed", 0.4), row("g", { started_at: "2026-11-10T11:00:00Z" })], false, ["g"]), false);
+  eq("…the same on a pass_required course → false", ors([done("a", "failed", 0.4), row("g", { started_at: "2026-11-10T11:00:00Z" })], true, ["g"]), false);
+
+  // Every mix, both settings: the one function equals the continue page's former two-call test.
+  const MIXES: Array<[string, ScorableAttempt[], string[]]> = [
+    ["none", [], []],
+    ["in progress", [row("a")], []],
+    ["completed", [done("a", "unknown", null)], []],
+    ["passed", [done("a", "passed", 0.9)], []],
+    ["failed", [done("a", "failed", 0.4)], []],
+    ["abandoned", [row("a", { status: "abandoned" })], []],
+    ["revision only", [done("r", "passed", 1, undefined, { is_revision: true })], []],
+    ["revision beside official", [done("a", "passed", 0.9), row("r", { is_revision: true, started_at: "2026-11-10T10:00:00Z" })], []],
+    ["live retake", [done("a", "failed", 0.4), row("g", { started_at: "2026-11-10T11:00:00Z" })], ["g"]],
+    ["completed retake without a verdict", [done("a", "failed", 0.4), done("g", "unknown", null, "2026-11-10T11:30:00Z")], ["g"]],
+    ["passed retake", [done("a", "failed", 0.4), done("g", "passed", 0.8, "2026-11-10T11:30:00Z")], ["g"]],
+  ];
+  const same = MIXES.flatMap(([name, rows, retakes]) =>
+    [false, true].map((pr) => {
+      const sc = computeScoring(rows, DEFAULT_POLICY, retakes);
+      return officialResultStored(sc, rows, pr) === (resultStored(sc, rows) && !verdictPending(sc, pr)) ? null : `${name}/${pr}`;
+    })
+  ).filter((x) => x !== null);
+  eq("equals resultStored(...) && !verdictPending(...) on every mix, both pass_required settings", same, []);
+}
+
+console.log("\nlib/learner/continue-state.ts: the bar's constants and decisions");
+eq("the poll interval is 25 s; the message 3 s; the debounce 2 s", [CONTINUE_STATUS_POLL_MS, CONTINUE_MESSAGE_MS, CONTINUE_CHECK_DEBOUNCE_MS], [25_000, 3_000, 2_000]);
+eq("the waiting message", CONTINUE_WAITING_MESSAGE, "Finish this module to continue");
+eq("continueState: false → waiting, true → ready", [continueState(false), continueState(true)], ["waiting", "ready"]);
+{
+  const rows: string[] = [];
+  for (const hasStatusHref of [false, true])
+    for (const ready of [false, true])
+      for (const visible of [false, true])
+        for (const poll of [false, true]) {
+          const got = shouldPoll({ hasStatusHref, ready, visible, poll });
+          const want = hasStatusHref && !ready && visible && poll;
+          if (got !== want) rows.push(JSON.stringify({ hasStatusHref, ready, visible, poll, got }));
+        }
+  eq("shouldPoll over its sixteen inputs: only a status address, waiting, visible and a polling runtime", rows, []);
+  eq("…the one true case", shouldPoll({ hasStatusHref: true, ready: false, visible: true, poll: true }), true);
+  eq("…never once ready, never hidden, never for SCORM, never off a path launch", [
+    shouldPoll({ hasStatusHref: true, ready: true, visible: true, poll: true }),
+    shouldPoll({ hasStatusHref: true, ready: false, visible: false, poll: true }),
+    shouldPoll({ hasStatusHref: true, ready: false, visible: true, poll: false }),
+    shouldPoll({ hasStatusHref: false, ready: false, visible: true, poll: true }),
+  ], [false, false, false, false]);
+}
+eq("parseStoredAnswer: 200 {stored:true} → true; 200 {stored:false} → false", [parseStoredAnswer(200, { stored: true }), parseStoredAnswer(200, { stored: false })], [true, false]);
+eq("…200 {} → null; 200 \"<html>\" → null (a followed redirect); 200 null → null; 200 [] → null; a string stored → null", [
+  parseStoredAnswer(200, {}),
+  parseStoredAnswer(200, "<html>"),
+  parseStoredAnswer(200, null),
+  parseStoredAnswer(200, []),
+  parseStoredAnswer(200, { stored: "true" }),
+], [null, null, null, null, null]);
+eq("…302, 401, 404 and 503 → null, whatever the body", [302, 401, 404, 503].map((s) => parseStoredAnswer(s, { stored: true })), [null, null, null, null]);
+eq("…0 (a signed-out check's unfollowed redirect, redirect: \"manual\") → null", parseStoredAnswer(0, null), null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

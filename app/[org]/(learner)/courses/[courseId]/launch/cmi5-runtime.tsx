@@ -25,6 +25,8 @@ export function Cmi5Runtime({
   revision = false,
   showTitle = true,
   continueHref = null,
+  continueReady = false,
+  continueStatusHref = null,
 }: {
   iframeSrc: string;
   courseTitle: string;
@@ -39,11 +41,21 @@ export function Cmi5Runtime({
   showTitle?: boolean;
   /** The continue address on a Learning Path launch (ADR 0019 step 8); null hides Continue. */
   continueHref?: string | null;
+  /**
+   * Continue starts active (ADR 0019, note of 2026-11-11): the official result
+   * is already stored, or the launch is a preview. False, the safe default,
+   * keeps it waiting until the status route answers stored.
+   */
+  continueReady?: boolean;
+  /** The status route the bar polls while Continue waits; null off a path launch. */
+  continueStatusHref?: string | null;
 }) {
   const frame = useModuleFrame();
   useNextModulePreload(preloadUrls, frame.loaded);
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-ink">
+      {/* cmi5 and xAPI content posts its statements itself, so the parent has
+          no completion signal of its own: the bar polls the status route. */}
       <LaunchBar
         backHref={backHref}
         backLabel={backLabel}
@@ -51,6 +63,9 @@ export function Cmi5Runtime({
         showTitle={showTitle}
         revision={revision}
         continueHref={continueHref}
+        continueReady={continueReady}
+        continueStatusHref={continueStatusHref}
+        continuePoll={true}
       />
       <div className="relative flex-1 min-h-0 bg-white">
         <iframe
