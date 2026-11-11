@@ -123,7 +123,7 @@ Notes (2026-11-11, ADR 0022 Proposed; records, not edits to steps 7, 12, 13, 14,
 
 (s) Step 20's baseline digest of `ambak_level_up` was not found where looked, and `ambak_level_up` is not a KIVO export; the golden fixture and canary package of step 20 and ADR 0005 step 12 are replaced by the real course the owner names (D10, open; ADR 0005's note (e) of this date). Release A's regression baseline is KIVO's own A14 byte compare of its fixture F1.
 
-(t) §C's production condition is met: 0100 was pasted on production on 2026-11-10 after v1.4.0 deployed with `ALDS_P4` in `[env.production.vars]` (`docs/release/v1.4.0.md`; ADR 0005's note (h) of this date). The reason `launch_contract_missing` of decision 4 stays unreachable while one flag gates both the gate and the contract (note (a) of 2026-10-19). P4's exit stays open: nothing is certified on any environment.
+(t) §C's production condition (0100 confirmed on the environment before the flag) is superseded by `docs/release/v1.4.0.md` §3, which reversed that order: 0100 was pasted on production on 2026-11-10 after v1.4.0 deployed with `ALDS_P4` in `[env.production.vars]` (`docs/release/v1.4.0.md`; ADR 0005's note (h) of this date). The reason `launch_contract_missing` of decision 4 stays unreachable while one flag gates both the gate and the contract (note (a) of 2026-10-19). P4's exit stays open: nothing is certified on any environment.
 
 ## References
 
