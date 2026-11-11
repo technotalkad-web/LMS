@@ -26,7 +26,7 @@
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext, uploadCourse } from "./helpers";
+import { assignCourse, authedContext, grantDecidedAfter, uploadCourse } from "./helpers";
 import { authTokenFor, cmi5Zip, directUpload, getNoFollow, VERB, XAPI_HEADERS } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
@@ -115,7 +115,7 @@ test.describe.serial("ADR 0014 — the grant flow and the fail-closed launch (PR
   test("an approved grant opens the official retake through consume_grant; #1's token answers 401", async () => {
     const { data: g, error } = await svc()
       .from("attempt_requests")
-      .insert({ organization_id: s.org!.id, course_id: s.courseId!, user_id: s.l1!.id, status: "approved", source: "bulk", decided_by: s.admin!.id, decided_at: new Date().toISOString() })
+      .insert({ organization_id: s.org!.id, course_id: s.courseId!, user_id: s.l1!.id, status: "approved", source: "bulk", decided_by: s.admin!.id, decided_at: await grantDecidedAfter(s.a1!) })
       .select("id")
       .single();
     expect(error).toBeNull();
@@ -193,7 +193,7 @@ test.describe.serial("ADR 0014 — the grant flow and the fail-closed launch (PR
       await finishOfficial(ctx.request, l2, a2.id, "passed");
       const { data: g } = await svc()
         .from("attempt_requests")
-        .insert({ organization_id: s.org!.id, course_id: s.courseId!, user_id: l2.id, status: "approved", source: "bulk", decided_by: s.admin!.id, decided_at: new Date().toISOString() })
+        .insert({ organization_id: s.org!.id, course_id: s.courseId!, user_id: l2.id, status: "approved", source: "bulk", decided_by: s.admin!.id, decided_at: await grantDecidedAfter(a2.id) })
         .select("id")
         .single();
       const launch = await ctx.request.get(`/${s.org!.slug}/courses/${s.courseId}/launch`);

@@ -46,7 +46,7 @@
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
-import { assignCourse, authedContext, uploadCourse } from "./helpers";
+import { assignCourse, authedContext, grantDecidedAfter, uploadCourse } from "./helpers";
 import { authTokenFor, VERB, XAPI_HEADERS } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
@@ -265,7 +265,7 @@ test.describe.serial("ADR 0014 — the revision surfaces and step 11 (PR 1b)", (
     await finish(s.bCtx!.request, s.b!, b1.id, "failed", 0.4);
     const { error } = await svc().from("attempt_requests").insert({
       organization_id: s.org!.id, course_id: s.courseId!, user_id: s.b!.id, status: "approved", source: "bulk",
-      decided_by: s.admin!.id, decided_at: new Date().toISOString(),
+      decided_by: s.admin!.id, decided_at: await grantDecidedAfter(b1.id),
     });
     expect(error, error?.message).toBeNull();
     await launchCourse(s.bCtx!, s.org!.slug, s.courseId!);
