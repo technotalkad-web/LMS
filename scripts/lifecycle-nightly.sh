@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Lifecycle nightly (ADR 0007 step 15; subset widened by ADR 0008 step 17 and
-# ADR 0009 step 12). Builds THIS checkout, starts it on a local port against
+# Lifecycle nightly (ADR 0007 step 15; subset widened by ADR 0008 step 17,
+# ADR 0009 step 12, ADR 0019 decision 7, ADR 0020 step 10 and ADR 0021 F.5).
+# Builds THIS checkout, starts it on a local port against
 # the STAGING Supabase project, runs the ALDS lifecycle subset against it and
 # prints counts and failing-test locations only. Run by
 # .github/workflows/lifecycle-nightly.yml; the same command reproduces a
@@ -38,7 +39,7 @@
 # global setup deletes it after 48 h (tests/bot/lifecycle/cleanup.ts).
 set -euo pipefail
 
-DEFAULT_SPECS="00 32 33 34 43 47 48 49 50 51 52 53 54 55"
+DEFAULT_SPECS="00 32 33 34 43 47 48 49 50 51 52 53 54 55 63 64 65"
 PORT="${LIFECYCLE_PORT:-3100}"
 SPECS="${LIFECYCLE_SPECS:-$DEFAULT_SPECS}"
 OUT="${LIFECYCLE_OUT:-${RUNNER_TEMP:-$(mktemp -d)}/lifecycle-nightly}"

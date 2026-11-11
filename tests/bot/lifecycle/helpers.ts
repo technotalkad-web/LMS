@@ -183,3 +183,17 @@ export async function cmi5Pass(
 /** Re-export so specs import from one place. */
 export { authedContext };
 export type { Browser };
+
+/**
+ * A grant's `decided_at` one second after the attempt's server-stamped `completed_at`. 0103's consume_grant
+ * treats a grant decided before the official attempt completed as stale (step 6), and the product stamps both
+ * times on the server; a spec that stamps `decided_at` from this machine's clock fails whenever the clock runs
+ * behind by more than the gap between the two writes (staging runs of specs 60 and 61, 2026-11-05 and 2026-11-11).
+ */
+export async function grantDecidedAfter(attemptId: string): Promise<string> {
+  const { data, error } = await svc().from("course_attempts").select("completed_at").eq("id", attemptId).single();
+  expect(error, `attempt ${attemptId}: ${error?.message}`).toBeNull();
+  const completedAt = (data as { completed_at: string | null } | null)?.completed_at;
+  if (!completedAt) throw new Error(`attempt ${attemptId} has no completed_at`);
+  return new Date(Date.parse(completedAt) + 1000).toISOString();
+}

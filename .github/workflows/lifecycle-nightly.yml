@@ -2,8 +2,10 @@
 # tests/bot/lifecycle, every night, against the staging database.
 #
 # Subset: 00, 32, 33, 34, 43, 47, 48, 49, 50-53 (ADR 0007 step 15), 54
-# (ADR 0008 step 17) and 55 (ADR 0009 step 12). The golden canary of
-# ADR 0005 step 12 joins when it exists (P4).
+# (ADR 0008 step 17), 55 (ADR 0009 step 12), 63 (ADR 0019 decision 7),
+# 64 (ADR 0020 step 10) and 65 (ADR 0021 F.5), each added after a green
+# run on staging. The golden canary of ADR 0005 step 12 joins when it
+# exists (P4).
 #
 # Target: this commit, built and started INSIDE the runner on
 # http://localhost:3100, against the STAGING Supabase project, with the same
@@ -55,7 +57,7 @@ jobs:
     name: Lifecycle nightly (staging)
     # ubuntu-24.04, not ubuntu-latest (now 26.04): Playwright 1.60 cannot install chromium on 26.04.
     runs-on: ubuntu-24.04
-    # Build about 5 min; the subset about 30-40 min serially (workers: 1).
+    # Build about 5 min; the subset about 40-50 min serially (workers: 1).
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
