@@ -22,14 +22,15 @@
  *
  * ADR 0019, note of 2026-11-11 (Continue waits for the stored result):
  *   - the bar renders Continue in two states, `data-state="waiting"` (no
- *     href, aria-disabled, role="link", a lock icon, a tap that checks and
- *     shows the waiting message in an aria-live status) and
+ *     href, aria-disabled, role="link", a lock icon, a tap that checks,
+ *     never navigates and shows the waiting message in an aria-live status)
+ *     and
  *     `data-state="ready"` (today's <a href>); the poll follows shouldPoll
  *     and the tab's visibility; the bar is thinner below sm;
  *   - both runtimes pass continueReady, continueStatusHref and continuePoll
  *     (true for cmi5, false for SCORM); the SCORM runtime bumps
  *     continueRecheck only after a commit the server answered ok with a
- *     terminal status;
+ *     terminal status that differs from the last one checked;
  *   - the launch page computes continueReady through officialResultStored
  *     (never on the launch that has just opened a granted retake) and
  *     continueStatusHref from attemptId, for both runtimes;
@@ -104,10 +105,12 @@ eq("the cmi5 runtime polls (continuePoll={true}); the SCORM runtime does not (co
     count(src, "continueRecheck={continueRecheck}"),
     code(CMI5).includes("continueRecheck"),
   ], [true, 1, false]);
-  eq("…bumped once, only after if (!res.ok) throw and only on a terminal status in the server's answer", [
+  eq("…bumped once, only after if (!res.ok) throw, only on a terminal status in the server's answer, and only when it differs from the last one checked", [
     count(src, "setContinueRecheck("),
-    /if \(!res\.ok\) throw new Error\(`HTTP \$\{res\.status\}`\);\s*const body = \(await res\.json\(\)\.catch\(\(\) => null\)\) as \{ status\?: string \} \| null;\s*if \(body && \["completed", "passed", "failed"\]\.includes\(String\(body\.status\)\)\) setContinueRecheck\(\(n\) => n \+ 1\);\s*setStatus\("saved"\);/.test(src),
-  ], [1, true]);
+    /const lastCheckedStatus = useRef<string \| null>\(null\);/.test(src),
+    /if \(!res\.ok\) throw new Error\(`HTTP \$\{res\.status\}`\);\s*const body = \(await res\.json\(\)\.catch\(\(\) => null\)\) as \{ status\?: string \} \| null;\s*const answered = body \? String\(body\.status\) : "";\s*if \(\["completed", "passed", "failed"\]\.includes\(answered\) && answered !== lastCheckedStatus\.current\) \{\s*lastCheckedStatus\.current = answered;\s*setContinueRecheck\(\(n\) => n \+ 1\);\s*\}\s*setStatus\("saved"\);/.test(src),
+    count(src, "lastCheckedStatus.current = "),
+  ], [1, true, true, 1]);
 }
 
 console.log("\nthe bar (step 6)");
@@ -160,9 +163,9 @@ console.log("\nthe bar (step 6)");
     /from "@\/lib\/scoring\//.test(src),
     /from "@\/lib\/learner\/continue";/.test(src),
   ], [false, false, false]);
-  eq("the check: one fetch of the status address, no-store, same-origin, aborted on unmount, parsed by parseStoredAnswer", [
+  eq("the check: one fetch of the status address, no-store, same-origin, the middleware's redirect not followed, aborted on unmount, parsed by parseStoredAnswer", [
     count(src, "fetch("),
-    /fetch\(statusHref, \{\s*cache: "no-store",\s*credentials: "same-origin",\s*signal: lifetime\.current\?\.signal,\s*\}\)/.test(src),
+    /fetch\(statusHref, \{\s*cache: "no-store",\s*credentials: "same-origin",\s*redirect: "manual",\s*signal: lifetime\.current\?\.signal,\s*\}\)/.test(src),
     /parseStoredAnswer\(res\.status, await res\.json\(\)\.catch\(\(\) => null\)\)/.test(src),
     /return \(\) => ac\.abort\(\);/.test(src),
   ], [1, true, true, true]);
@@ -186,11 +189,11 @@ console.log("\nthe bar (step 6)");
   ], [true, true, true, true, true, true]);
   eq("the recheck: a change of continueRecheck runs one forced check, none on mount", /useEffect\(\(\) => \{\s*if \(!recheck\) return;\s*void check\(true\);\s*\}, \[recheck, check\]\);/.test(src), true);
   eq("the hook runs whatever continueHref is; its status address is null off a path launch", /const \{ ready, check \} = useContinueReady\(\{\s*statusHref: continueHref \? continueStatusHref : null,\s*initialReady: continueReady,\s*poll: continuePoll,\s*recheck: continueRecheck,\s*\}\);/.test(src), true);
-  eq("the tap: preventDefault, one check; stored → a full navigation to the continue address; otherwise the message for CONTINUE_MESSAGE_MS", [
-    /const onTap = async \([^)]*\) => \{\s*e\.preventDefault\(\);\s*const answer = await check\(\);\s*if \(answer === true\) \{\s*if \(continueHref\) window\.location\.assign\(continueHref\);\s*return;\s*\}\s*setMessage\(CONTINUE_WAITING_MESSAGE\);/.test(src),
-    count(src, "window.location.assign("),
+  eq("the tap: preventDefault, one check; stored → nothing more (the hook turned it ready; a tap never navigates); otherwise the message for CONTINUE_MESSAGE_MS", [
+    /const onTap = async \([^)]*\) => \{\s*e\.preventDefault\(\);\s*const answer = await check\(\);\s*if \(answer === true\) return;\s*setMessage\(CONTINUE_WAITING_MESSAGE\);/.test(src),
+    count(src, "location.assign(") + count(src, "location.href") + count(src, "location.replace(") + count(src, "router.push("),
     /window\.setTimeout\(\(\) => \{\s*messageTimer\.current = null;\s*setMessage\(""\);\s*\}, CONTINUE_MESSAGE_MS\)/.test(src),
-  ], [true, 1, true]);
+  ], [true, 0, true]);
   const status = src.match(/\{continueHref && \(\s*<p\s+role="status"\s+aria-live="polite"\s+data-testid="continue-waiting-message"\s+className=\{message \? "([^"]*)" : "sr-only"\}\s*>\s*\{message\}\s*<\/p>\s*\)\}\s*<\/header>/);
   eq("the status region: role=status, aria-live=polite, its test id, under continueHref, the header's last child", !!status, true);
   eq("…out of the grid's flow in both states (absolute when shown; sr-only is absolute), so the bar's height never changes", (status?.[1] ?? "").split(/\s+/).includes("absolute"), true);

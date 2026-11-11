@@ -29,8 +29,10 @@ import {
  * - Continue shows only on a Learning Path launch (`continueHref`). It waits
  *   until the module's official result is stored (ADR 0019, note of
  *   2026-11-11): muted, `aria-disabled`, a lock icon and no `href`, so a tap
- *   before hydration cannot navigate; a tap shows "Finish this module to
- *   continue" and runs one status check. Once the result is stored it is
+ *   before hydration cannot navigate; a tap runs one status check and never
+ *   navigates: when the check finds the result stored the button turns
+ *   ready, otherwise it shows "Finish this module to continue". Once the
+ *   result is stored it is
  *   today's plain `<a>` to the continue address: a full navigation, so the
  *   continue route (which waits and redirects) is never prefetched, and the
  *   module document unloads as on a tab close. The launch page renders it
@@ -93,12 +95,11 @@ export function LaunchBar({
   const onTap = async (e: MouseEvent<HTMLAnchorElement> | KeyboardEvent<HTMLAnchorElement>) => {
     e.preventDefault();
     const answer = await check();
-    if (answer === true) {
-      // The learner tapped to continue and the result is stored: go now (a
-      // full navigation to the same address the ready button links to).
-      if (continueHref) window.location.assign(continueHref);
-      return;
-    }
+    // Stored: the hook has turned the button ready, and the learner taps it
+    // again. A tap on the waiting button never navigates (ADR 0019, note of
+    // 2026-11-11; going on at once is the plan's decision 3, not built until
+    // the owner answers it).
+    if (answer === true) return;
     setMessage(CONTINUE_WAITING_MESSAGE);
     if (messageTimer.current !== null) window.clearTimeout(messageTimer.current);
     messageTimer.current = window.setTimeout(() => {
@@ -231,9 +232,13 @@ function useContinueReady({
       lastAt.current = Date.now();
       const run = (async (): Promise<boolean | null> => {
         try {
+          // redirect: "manual": a signed-out tab gets the middleware's 302 as
+          // an opaque answer (status 0, read as unknown) instead of following
+          // it into a server-rendered login page on every poll.
           const res = await fetch(statusHref, {
             cache: "no-store",
             credentials: "same-origin",
+            redirect: "manual",
             signal: lifetime.current?.signal,
           });
           const answer = parseStoredAnswer(res.status, await res.json().catch(() => null));

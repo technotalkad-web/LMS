@@ -21,9 +21,11 @@
  *   (e2) a failed result on step 1 (not pass_required): moves on to step 2;
  *   (k)  the live state on a cmi5 launch (ADR 0019, note of 2026-11-11): C's
  *        step 2 waits; once its pass is stored the status route answers
- *        stored and a tap goes on to step 3's launch; a relaunch of step 2 (a
- *        revision visit) is ready on first render; the route refuses another
- *        learner's attempt, a bad id and a signed-out call, and writes nothing;
+ *        stored, the bar's own poll (no tap) turns Continue ready within one
+ *        interval, and a tap on the ready button goes on to step 3's launch; a
+ *        relaunch of step 2 (a revision visit) is ready on first render; the
+ *        route refuses another learner's attempt, a bad id and a signed-out
+ *        call, and writes nothing;
  *   (f)  the SCORM runtime: Continue waits on step 3 and turns ready after the
  *        parent's own passed commit through window.API, then the end banner
  *        and the celebration;
@@ -381,13 +383,19 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     expect(r1.headers()["cache-control"] ?? "").toContain("no-store");
     expect(await r1.json()).toEqual({ stored: true });
 
-    // A tap: the bar's own check finds the result stored and goes on at once
-    // (a full navigation to the continue address, then step 3's launch).
-    // Retried until hydration has attached the handler.
-    await expect(async () => {
-      if (new URL(page.url()).pathname.endsWith(`/courses/${s.c2}/launch`)) await next.click({ force: true, timeout: 5_000 });
-      await page.waitForURL((u) => u.pathname === `/${slug()}/courses/${s.c3}/launch` && u.searchParams.get("lp") === s.pathId, { timeout: 30_000 });
-    }).toPass({ timeout: 90_000 });
+    // The poll, untouched: the bar asks the status route every 25 s while the
+    // tab is visible (its interval started at hydration, before the finish),
+    // so it turns ready within one interval plus a round trip, with no tap.
+    // bringToFront keeps the page visible (if it was not, the check on return
+    // to the tab answers first; either way the bar's own check, not a tap).
+    await page.bringToFront();
+    await expect(next).toHaveAttribute("data-state", "ready", { timeout: 40_000 });
+    await expect(next).toHaveAttribute("href", continueUrl(s.c2!));
+    await expect(next).not.toHaveAttribute("aria-disabled", "true");
+    // A tap on the ready button: a full navigation to the continue address,
+    // then step 3's launch.
+    await next.click();
+    await page.waitForURL((u) => u.pathname === `/${slug()}/courses/${s.c3}/launch` && u.searchParams.get("lp") === s.pathId, { timeout: 60_000 });
 
     // A relaunch of step 2 is a revision visit: ready on first render, no poll needed.
     const html = await getOk(s.cCtx!, launchUrl(s.c2!));

@@ -45,8 +45,9 @@ export function shouldPoll(i: { hasStatusHref: boolean; ready: boolean; visible:
 /**
  * The status route's answer: true or false only for a 200 whose body is an
  * object with a boolean `stored`; null (unknown, keep waiting) for anything
- * else: a signed-out poll that followed the middleware's redirect into an
- * HTML page, 401, 404, 503, or a body that did not parse.
+ * else: a signed-out check, whose middleware redirect the bar does not follow
+ * (`redirect: "manual"`, so status 0), 401, 404, 503, or a body that did not
+ * parse.
  */
 export function parseStoredAnswer(status: number, body: unknown): boolean | null {
   if (status !== 200) return null;

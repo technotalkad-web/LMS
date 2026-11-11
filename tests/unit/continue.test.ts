@@ -261,6 +261,7 @@ eq("…200 {} → null; 200 \"<html>\" → null (a followed redirect); 200 null 
   parseStoredAnswer(200, { stored: "true" }),
 ], [null, null, null, null, null]);
 eq("…302, 401, 404 and 503 → null, whatever the body", [302, 401, 404, 503].map((s) => parseStoredAnswer(s, { stored: true })), [null, null, null, null]);
+eq("…0 (a signed-out check's unfollowed redirect, redirect: \"manual\") → null", parseStoredAnswer(0, null), null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

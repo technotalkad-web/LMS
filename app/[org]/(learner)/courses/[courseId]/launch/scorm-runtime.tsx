@@ -69,7 +69,12 @@ export function ScormRuntime({
   // `{ stored: true }`, never on this commit's answer: the server's own
   // derivation decides, and a `completed` without a verdict on a
   // pass_required course keeps waiting, as on the continue address.
+  // Only a terminal status that differs from the last one checked bumps it:
+  // a package that keeps committing `completed` on a pass_required course
+  // would otherwise add one status request to every commit. A check lost to
+  // the network then waits for a status change or a tap on the button.
   const [continueRecheck, setContinueRecheck] = useState(0);
+  const lastCheckedStatus = useRef<string | null>(null);
   // Serialize commits: packages often call LMSCommit then LMSFinish back to
   // back (both fire-and-forget). Overlapping requests would each read the
   // attempt as "not yet complete" and could double-fire the completion
@@ -88,7 +93,11 @@ export function ScormRuntime({
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = (await res.json().catch(() => null)) as { status?: string } | null;
-        if (body && ["completed", "passed", "failed"].includes(String(body.status))) setContinueRecheck((n) => n + 1);
+        const answered = body ? String(body.status) : "";
+        if (["completed", "passed", "failed"].includes(answered) && answered !== lastCheckedStatus.current) {
+          lastCheckedStatus.current = answered;
+          setContinueRecheck((n) => n + 1);
+        }
         setStatus("saved");
         window.setTimeout(() => setStatus("idle"), 1500);
         return true;
