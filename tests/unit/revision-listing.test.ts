@@ -245,6 +245,11 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     calls: ["computeScoring(attempts)"],
     feeds: columnsFeeds(),
   },
+  // ADR 0019, note of 2026-11-11: the bar's status route scores the same reads as the continue address.
+  "app/api/attempts/[attemptId]/result-stored/route.ts": {
+    calls: ["computeScoring(attempts)"],
+    feeds: columnsFeeds(),
+  },
   // The learning-path surfaces: no helper call; their selects carry the flag.
   "app/[org]/(admin)/learning-paths/[pathId]/learners/page.tsx": { calls: [], feeds: columnsFeeds() },
   "app/[org]/(admin)/learning-paths/[pathId]/reports/page.tsx": {

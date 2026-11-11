@@ -3,10 +3,12 @@
  * address (/{org}/continue?lp=<path>&from=<course>), on a strict three-step
  * Learning Path (steps 1 and 2 cmi5, step 3 SCORM 1.2; step 2 pass_required).
  *
- *   (a)  the bar: a path launch carries continue-next to the continue address
- *        and the launch-bar test id, no practice-badge on a first visit, the
- *        title of a package that is not a KIVO build; a Library launch has no
- *        continue-next;
+ *   (a)  the bar: a path launch with the official attempt in progress shows
+ *        continue-next waiting (no href, aria-disabled; a tap shows "Finish
+ *        this module to continue" and stays on the page; the status route
+ *        answers { stored: false }), the launch-bar test id, no practice-badge
+ *        on a first visit, the title of a package that is not a KIVO build; a
+ *        Library launch has no continue-next;
  *   (b)  Continue before the result: the address waits at least 6 s, shows
  *        "Saving your result", ends on the path page's saving banner, and
  *        changes no row;
@@ -17,14 +19,28 @@
  *   (e)  a failed result on the pass_required step 2: the failed banner, never
  *        step 3's launch, step 2 still current;
  *   (e2) a failed result on step 1 (not pass_required): moves on to step 2;
- *   (f)  the SCORM runtime: Continue on step 3, a passed commit, the end
- *        banner and the celebration;
- *   (g)  a revision visit: Continue moves on at once; the badge and Continue
- *        show together;
+ *   (k)  the live state on a cmi5 launch (ADR 0019, note of 2026-11-11): C's
+ *        step 2 waits; once its pass is stored the status route answers
+ *        stored and a tap goes on to step 3's launch; a relaunch of step 2 (a
+ *        revision visit) is ready on first render; the route refuses another
+ *        learner's attempt, a bad id and a signed-out call, and writes nothing;
+ *   (f)  the SCORM runtime: Continue waits on step 3 and turns ready after the
+ *        parent's own passed commit through window.API, then the end banner
+ *        and the celebration;
+ *   (g)  a revision visit: Continue is ready (href to the continue address)
+ *        and moves on at once; the badge and Continue show together;
  *   (h)  refusals: from not a step, lp not a uuid, another organisation's path;
  *   (i)  staff: an admin's Continue skips the wait and writes no row;
  *   (j)  widths and a 120-character title: Exit, Revision Mode and Continue
- *        visible and never overlapping at 320, 390, 640, 768 and 1280 px.
+ *        visible and never overlapping at 320, 390, 640, 768 and 1280 px; the
+ *        bar about 41 px high below sm and 49 px from sm.
+ *
+ * Hydration: launchPage() returns once the server-rendered bar is visible,
+ * before React has attached the waiting button's tap handler or the SCORM
+ * runtime has installed window.API, so a tap is retried inside toPass() and
+ * every window.API drive waits for the API first. The waiting button carries
+ * aria-disabled on role="link", which Playwright reads as disabled, so a tap
+ * is a forced click.
  *
  * Every redirect is asserted with redirectedExactly(): a 3xx Location ending
  * with the target, or Next's redirect marker naming it in the 200 body once
@@ -39,7 +55,7 @@
 import { test, expect, type APIRequestContext, type BrowserContext, type Page } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
-import { assignCourse, authedContext, courseHandle, scormCommit } from "./helpers";
+import { assignCourse, authedContext, courseHandle } from "./helpers";
 import { authTokenFor, cmi5Zip, scormZip, uploadNew, VERB, XAPI_HEADERS } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
@@ -50,6 +66,10 @@ const LONG_TITLE = `QA Continue Step One ${"with a deliberately long module titl
 const PROMPT_MS = 4_000;
 const WAIT_MS = 6_000;
 const BANNERS = ["continue-saving-banner", "continue-failed-banner", "continue-end-banner"];
+/** The waiting button's message (lib/learner/continue-state.ts CONTINUE_WAITING_MESSAGE). */
+const WAITING_MESSAGE = "Finish this module to continue";
+/** The bar's status route for one attempt (ADR 0019, note of 2026-11-11). */
+const statusUrl = (attemptId: string) => `/api/attempts/${attemptId}/result-stored`;
 
 /** spec 61's statement(), copied (spec 61 stays unchanged). */
 function statement(learner: User, verb: string, registration: string, extra: Record<string, unknown> = {}) {
@@ -241,19 +261,38 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     s.previewCtx = await authedContext(browser, baseURL!, previewer.email, previewer.password);
   });
 
-  test("(a) the bar: Continue to the continue address on a path launch, none on a Library launch", async () => {
+  test("(a) the bar: Continue waits on a path launch while the official attempt is in progress, none on a Library launch", async () => {
     const page = await launchPage(s.aCtx!, launchUrl(s.c1!));
-    expect(await page.getByTestId("continue-next").getAttribute("href")).toBe(`/${slug()}/continue?lp=${s.pathId}&from=${s.c1}`);
+    const next = page.getByTestId("continue-next");
+    await expect(next).toHaveAttribute("data-state", "waiting");
+    await expect(next).toHaveAttribute("aria-disabled", "true");
+    expect(await next.getAttribute("href"), "no href while waiting: inert before hydration").toBeNull();
+    const msg = page.getByTestId("continue-waiting-message");
+    await expect(msg).toHaveCount(1);
+    await expect(msg).toHaveText("");
     const html = await page.content();
     expect(html).toContain('data-testid="launch-bar"');
     expect(html).not.toContain("practice-badge");
     // The synthetic cmi5 package is not a KIVO build: its title shows from sm.
     await expect(page.getByTestId("launch-bar").getByText(LONG_TITLE)).toBeVisible();
+    // A tap checks the status and shows the message; retried until hydration
+    // has attached the handler. It never navigates.
+    const at = page.url();
+    await expect(async () => {
+      await next.click({ force: true, timeout: 5_000 });
+      await expect(msg).toHaveText(WAITING_MESSAGE, { timeout: 2_500 });
+    }).toPass({ timeout: 30_000 });
+    expect(page.url(), "a tap on the waiting button stays on the launch").toBe(at);
+    await expect(next).toHaveAttribute("data-state", "waiting");
     await page.close();
     const rows = await attemptsOn(s.a!.id, s.v1!);
     expect(rows.length, "one attempt on step 1").toBe(1);
     expect(rows[0].learning_path_id, "the launch carries the path").toBe(s.pathId);
     s.a1 = rows[0].id;
+    const st = await s.aCtx!.request.get(statusUrl(s.a1));
+    expect(st.status(), await st.text()).toBe(200);
+    expect(st.headers()["cache-control"] ?? "").toContain("no-store");
+    expect(await st.json()).toEqual({ stored: false });
 
     const lib = await getOk(s.aCtx!, launchUrl(s.c4!, false));
     expect(lib).toContain('data-testid="launch-bar"');
@@ -320,17 +359,91 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     expect(rows[0].learning_path_id).toBe(s.pathId);
   });
 
-  test("(f) the SCORM runtime: Continue on step 3, a passed commit, the end banner and the celebration", async () => {
+  test("(k) the live state on a cmi5 launch: waiting until stored, then on; the status route's answers and refusals", async ({ browser, baseURL }) => {
+    // C's step 2 row from (e2): in progress, on the pass_required course.
+    const [c2Row] = await attemptsOn(s.c!.id, s.v2!);
+    expect(c2Row.status, "C's step 2 is in progress").toBe("in_progress");
+    const creq = s.cCtx!.request;
+
+    const page = await launchPage(s.cCtx!, launchUrl(s.c2!));
+    const next = page.getByTestId("continue-next");
+    await expect(next).toHaveAttribute("data-state", "waiting");
+    expect(await next.getAttribute("href")).toBeNull();
+    const r0 = await creq.get(statusUrl(c2Row.id));
+    expect(r0.status(), await r0.text()).toBe(200);
+    expect(await r0.json()).toEqual({ stored: false });
+
+    await finish(creq, s.c!, c2Row.id, "passed", 0.9);
+    const stored = (await attemptsOn(s.c!.id, s.v2!)).find((x) => x.id === c2Row.id)!;
+    expect(stored.success_status).toBe("passed");
+    const r1 = await creq.get(statusUrl(c2Row.id));
+    expect(r1.status(), await r1.text()).toBe(200);
+    expect(r1.headers()["cache-control"] ?? "").toContain("no-store");
+    expect(await r1.json()).toEqual({ stored: true });
+
+    // A tap: the bar's own check finds the result stored and goes on at once
+    // (a full navigation to the continue address, then step 3's launch).
+    // Retried until hydration has attached the handler.
+    await expect(async () => {
+      if (new URL(page.url()).pathname.endsWith(`/courses/${s.c2}/launch`)) await next.click({ force: true, timeout: 5_000 });
+      await page.waitForURL((u) => u.pathname === `/${slug()}/courses/${s.c3}/launch` && u.searchParams.get("lp") === s.pathId, { timeout: 30_000 });
+    }).toPass({ timeout: 90_000 });
+
+    // A relaunch of step 2 is a revision visit: ready on first render, no poll needed.
+    const html = await getOk(s.cCtx!, launchUrl(s.c2!));
+    expect(html).toContain('data-testid="continue-next" data-state="ready"');
+    expect(html).not.toContain('data-state="waiting"');
+    await page.close();
+
+    // Refusals: another learner's attempt and a bad id are 404; a signed-out
+    // call is redirected to the login page by the middleware.
+    const foreign = await s.aCtx!.request.get(statusUrl(c2Row.id));
+    expect(foreign.status(), "another learner's attempt").toBe(404);
+    const bad = await creq.get(statusUrl("not-a-uuid"));
+    expect(bad.status(), "not a uuid").toBe(404);
+    const anon = await browser.newContext({ baseURL });
+    try {
+      const out = await anon.request.get(statusUrl(c2Row.id), { maxRedirects: 0 });
+      expect(out.status(), "signed out: a redirect").toBeGreaterThanOrEqual(300);
+      expect(out.status(), "signed out: a redirect").toBeLessThan(400);
+      expect(out.headers()["location"] ?? "").toContain("/login");
+    } finally {
+      await anon.close();
+    }
+
+    // The route wrote nothing: the official row is as the statements left it.
+    const after = (await attemptsOn(s.c!.id, s.v2!)).find((x) => x.id === c2Row.id)!;
+    expect(after).toEqual(stored);
+  });
+
+  test("(f) the SCORM runtime: Continue waits on step 3, turns ready after the parent's own passed commit, the end banner and the celebration", async () => {
     const breq = s.bCtx!.request;
     await getOk(s.bCtx!, launchUrl(s.c1!));
     await finish(breq, s.b!, (await attemptsOn(s.b!.id, s.v1!))[0].id, "passed", 0.9);
     await getOk(s.bCtx!, launchUrl(s.c2!));
     await finish(breq, s.b!, (await attemptsOn(s.b!.id, s.v2!))[0].id, "passed", 0.9);
-    const html = await getOk(s.bCtx!, launchUrl(s.c3!));
-    expect(html).toContain('data-testid="continue-next"');
+    const page = await launchPage(s.bCtx!, launchUrl(s.c3!));
+    const next = page.getByTestId("continue-next");
+    await expect(next).toHaveAttribute("data-state", "waiting");
     const [b3] = await attemptsOn(s.b!.id, s.v3!);
     expect(b3.learning_path_id).toBe(s.pathId);
-    await scormCommit(breq, b3.id, { "cmi.core.lesson_status": "passed", "cmi.core.score.raw": "90" }, true);
+    // The parent's own window.API (installed at hydration; the content never
+    // loads here): its LMSFinish commit is answered with a terminal status,
+    // and the bar's one status check turns Continue ready.
+    type ScormApi = { LMSInitialize(p: string): string; LMSSetValue(k: string, v: string): string; LMSFinish(p: string): string };
+    await page.waitForFunction(() => !!(window as unknown as { API?: unknown }).API, null, { timeout: 30_000 });
+    await page.evaluate(() => {
+      const api = (window as unknown as { API: ScormApi }).API;
+      api.LMSInitialize("");
+      api.LMSSetValue("cmi.core.lesson_status", "passed");
+      api.LMSSetValue("cmi.core.score.raw", "90");
+      api.LMSFinish("");
+    });
+    await expect(next).toHaveAttribute("data-state", "ready", { timeout: 10_000 });
+    await expect(next).toHaveAttribute("href", continueUrl(s.c3!));
+    const [b3After] = await attemptsOn(s.b!.id, s.v3!);
+    expect(b3After.success_status).toBe("passed");
+    await page.close();
     const r = await noFollow(breq, continueUrl(s.c3!));
     expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
     expect(redirectedExactly(r, pathUrl("?end=1")), describe(r)).toBe(true);
@@ -339,13 +452,21 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     expect(path).toContain("You finished this path");
   });
 
-  test("(g) a revision visit: Continue moves on at once; Revision Mode and Continue show together", async () => {
+  test("(g) a revision visit: Continue is ready and moves on at once; Revision Mode and Continue show together", async () => {
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
     expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
-    const html = await getOk(s.aCtx!, launchUrl(s.c1!));
+    const page = await launchPage(s.aCtx!, launchUrl(s.c1!));
+    const html = await page.content();
     expect(html).toContain('data-testid="practice-badge"');
     expect(html).toContain('data-testid="continue-next"');
+    const next = page.getByTestId("continue-next");
+    await expect(next).toHaveAttribute("data-state", "ready");
+    await expect(next).toHaveAttribute("href", continueUrl(s.c1!));
+    await page.close();
+    const st = await s.aCtx!.request.get(statusUrl(s.a1!));
+    expect(st.status(), await st.text()).toBe(200);
+    expect(await st.json()).toEqual({ stored: true });
   });
 
   test("(h) refusals: from not a step, lp not a uuid, another organisation's path", async () => {
@@ -369,7 +490,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     expect((data ?? []).length, "the continue address wrote no attempt").toBe(0);
   });
 
-  test("(j) widths and the 120-character title: Exit, Revision Mode and Continue visible and apart", async () => {
+  test("(j) widths and the 120-character title: Exit, Revision Mode and Continue visible and apart; a thinner bar below sm", async () => {
     const page = await s.aCtx!.newPage();
     await page.setViewportSize({ width: 320, height: 640 });
     await page.route(/\/content\//, (r) => r.abort());
@@ -380,6 +501,8 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const badge = page.getByTestId("practice-badge");
     const next = page.getByTestId("continue-next");
     const title = bar.getByText(LONG_TITLE);
+    // The status region is always there and empty unless a waiting button was tapped.
+    await expect(page.getByTestId("continue-waiting-message")).toHaveText("");
     for (const width of [320, 390, 1280, 640, 768]) {
       await page.setViewportSize({ width, height: 640 });
       for (const l of [bar, exit, badge, next]) await expect(l, `visible at ${width}`).toBeVisible({ timeout: 60_000 });
@@ -387,6 +510,16 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       const [e, b, n] = boxes as Box[];
       expect([overlap(e, b), overlap(b, n), overlap(e, n)], `no overlap at ${width}: ${JSON.stringify(boxes)}`).toEqual([false, false, false]);
       for (const box of boxes as Box[]) expect(box.x + box.width, `inside the viewport at ${width}`).toBeLessThanOrEqual(width);
+      // The owner's thinner bar (ADR 0019, note of 2026-11-11): about 41 px
+      // below sm (36 px controls), about 49 px from sm (40 px controls).
+      const barH = ((await bar.boundingBox()) as Box).height;
+      if (width < 640) {
+        expect(barH, `the bar's height at ${width}`).toBeLessThanOrEqual(42);
+        expect(n.height, `Continue's height at ${width}`).toBeLessThanOrEqual(37);
+      } else {
+        expect(barH, `the bar's height at ${width}`).toBeGreaterThanOrEqual(48);
+        expect(n.height, `Continue's height at ${width}`).toBeGreaterThanOrEqual(40);
+      }
       if (width < 640) {
         await expect(title, `title hidden below sm at ${width}`).toBeHidden();
       } else {

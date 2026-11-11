@@ -21,7 +21,8 @@
  *      the 0100 columns come from p4AttemptColumns(), a P4
  *      call; the tracked values are the served language and `.launchMode`;
  *      `launch.isPreview` is used ungated by design, only as the argument of
- *      shouldRecordVisit(); the SCORM branch sets lesson_mode for a revision
+ *      shouldRecordVisit() and as one operand of continueReady (ADR 0019,
+ *      note of 2026-11-11); the SCORM branch sets lesson_mode for a revision
  *      visit's row only (a deliberate amendment of the old assertion).
  *   5. The revision seed (launch/page.tsx, ADR 0014 step 3) copies the
  *      OFFICIAL attempt's State documents except LMS.LaunchData and
@@ -544,8 +545,10 @@ async function main() {
     // P4 VALUES the page computes are the served language and the launch
     // mode's `.launchMode`, and every use of them is gated. `launch.isPreview`
     // is deliberately NOT a P4 value: it decides the revision visit record in
-    // every deploy, and its only uses are shouldRecordVisit's argument
-    // (checked below).
+    // every deploy, and its only uses are shouldRecordVisit's argument and,
+    // since ADR 0019's note of 2026-11-11, one operand of `continueReady` (a
+    // preview's Continue starts active, the roles the continue address moves
+    // on without a wait) (checked below).
     const P4_CALLS = new Set(["lmsAuActivityId", "buildLaunchData", "writeLaunchData", "recordLearningSession", "newSessionId", "registrationKindFor", "isAldsSchemaMissing", "logAldsSkip", "attemptServedLanguage", "p4AttemptColumns"]);
     const P4_COLUMNS = new Set(["served_language", "launch_mode", "is_preview"]);
     const sites: Array<{ what: string; node: ts.Node }> = [];
@@ -567,13 +570,19 @@ async function main() {
     eq("every one of them runs only when p4 is true", ungated, []);
     eq("the page names no 0100 column itself (p4AttemptColumns does)", sites.filter((s) => s.what.startsWith("column ")).length, 0);
     const previewUses = all.filter((n) => ts.isPropertyAccessExpression(n) && n.name.text === "isPreview") as ts.PropertyAccessExpression[];
-    eq("launch.isPreview: exactly the two shouldRecordVisit arguments, nothing else", previewUses.map((n) => {
+    const declaredIn = (n: ts.Node): string | null => {
+      for (let p: ts.Node | undefined = n.parent; p; p = p.parent) if (ts.isVariableDeclaration(p)) return p.name.getText(sf);
+      return null;
+    };
+    eq("launch.isPreview: exactly the two shouldRecordVisit arguments and one operand of continueReady (ADR 0019, note of 2026-11-11), nothing else", previewUses.map((n) => {
       const prop = n.parent;
       const obj = prop?.parent;
       const call = obj?.parent;
-      return !!prop && ts.isPropertyAssignment(prop) && prop.name.getText(sf) === "isPreview" && !!obj && ts.isObjectLiteralExpression(obj) &&
-        !!call && ts.isCallExpression(call) && call.expression.getText(sf) === "shouldRecordVisit" && n.expression.getText(sf) === "launch";
-    }), [true, true]);
+      if (n.expression.getText(sf) !== "launch") return "other";
+      if (!!prop && ts.isPropertyAssignment(prop) && prop.name.getText(sf) === "isPreview" && !!obj && ts.isObjectLiteralExpression(obj) &&
+        !!call && ts.isCallExpression(call) && call.expression.getText(sf) === "shouldRecordVisit") return "shouldRecordVisit";
+      return declaredIn(n) === "continueReady" && ts.isBinaryExpression(n.parent) && n.parent.operatorToken.kind === ts.SyntaxKind.BarBarToken ? "continueReady" : "other";
+    }).sort(), ["continueReady", "shouldRecordVisit", "shouldRecordVisit"]);
 
     // The two value-level switches fall back to exactly today's value.
     const lmsAuDecl = all.find((n) => ts.isVariableDeclaration(n) && n.name.getText(sf) === "lmsAuId") as ts.VariableDeclaration | undefined;
