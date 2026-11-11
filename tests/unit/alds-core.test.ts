@@ -13,7 +13,13 @@
  *   (iv)  script and lexical detection, scriptForLanguage;
  *   (v)   purity: lib/alds/types.ts and lib/alds/rules/*.ts import nothing
  *         outside lib/alds and use no Node/DOM API, clock or randomness
- *         (the bundle test also runs the built IIFE in a bare vm context).
+ *         (the bundle test also runs the built IIFE in a bare vm context);
+ *   (vi)  the engine digest (ADR 0022 A): synthetic pages built in
+ *         alds-fixtures/harness.ts digestVectors(), never engine bytes;
+ *   (vii) keyFromSlide / keyFromBankQuestion on alds-fixtures/keys.cases.json,
+ *         and fillBlanksVariants (ADR 0022 item 14);
+ *   (viii) the label table LABELS_BY_AUTHORING_KIND (item 12) and
+ *         EXT.launchContract (item 15).
  *
  * Run:  npx tsx tests/unit/alds-core.test.ts   (or npm run test:unit)
  */

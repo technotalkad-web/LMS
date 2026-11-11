@@ -6,8 +6,9 @@
  * a checker; the LMS gate (P4) and the editor's export validation share it.
  *
  * Not here (P4, they need stored bytes or the certified allowlist): engine
- * digest, package digest, the certified kinds/settings set, the self-check
- * report consistency, the cross-course collision.
+ * digest (the function is rules/engine-digest.ts; the gate recomputes it from
+ * the stored launch file), package digest, the certified kinds/settings set,
+ * the self-check report consistency, the cross-course collision.
  *
  * Outcomes (ADR 0005 step 5, docs/ARCHITECTURE.md §5 §2 row): U1, U2, U3, U5,
  * U7, R4 and POOL failures are `error` (they make a version `uncertified`;
@@ -23,6 +24,7 @@
 import {
   INTERACTION_KINDS,
   KEY_CLASS_BY_AUTHORING_KIND,
+  LABELS_BY_AUTHORING_KIND,
   type AldsCatalogueEntry,
   type AldsPackageManifest,
 } from "../types";
@@ -146,12 +148,21 @@ export function checkPackage(input: PackageInput): PackageResult {
   field("questions", questions !== null, "an array");
   const quizzes = Array.isArray(raw.quizzes) ? raw.quizzes : null;
   field("quizzes", quizzes !== null, "an array");
+  // slideKinds (bundle 3, ADR 0022 item 12): optional here; its absence is the gate's
+  // config_not_certified (ADR 0022 D item 5), not a U1 finding
+  if (raw.slideKinds !== undefined) {
+    const sk = raw.slideKinds;
+    field("slideKinds", Array.isArray(sk) && sk.every(isNonEmptyStr) && duplicates(sk as string[]).length === 0, "an array of distinct non-empty slide type names");
+  }
   if (raw.selfCheck !== undefined) {
     const sc = raw.selfCheck;
+    // engineDigestAlgo: absent or a non-empty string; an unknown method is the gate's
+    // engine_digest_mismatch (ADR 0022 B item 6), not a U1 finding
     field(
       "selfCheck",
-      isObj(sc) && isSha256(sc.reportHash) && isSha256(sc.engineDigest) && Array.isArray(sc.kindsCovered) && sc.kindsCovered.every(isStr),
-      "{ reportHash, engineDigest, kindsCovered[] }",
+      isObj(sc) && isSha256(sc.reportHash) && isSha256(sc.engineDigest) && Array.isArray(sc.kindsCovered) && sc.kindsCovered.every(isStr) &&
+        (sc.engineDigestAlgo === undefined || isNonEmptyStr(sc.engineDigestAlgo)),
+      "{ reportHash, engineDigest, kindsCovered[], engineDigestAlgo? }",
     );
   }
   if (raw.manifestType !== undefined && raw.manifestType !== input.manifestType) {
@@ -212,12 +223,17 @@ export function checkPackage(input: PackageInput): PackageResult {
   const m = raw as unknown as AldsPackageManifest;
 
   // U1: an authoringKind's class agrees with the entry's key (ADR 0005 step 6),
-  // so a label cannot switch the SEM key comparison off (see KEY_CLASS_BY_AUTHORING_KIND)
+  // so a label cannot switch the SEM key comparison off (see KEY_CLASS_BY_AUTHORING_KIND),
+  // and its kind is one the label may use (ADR 0022 item 13, LABELS_BY_AUTHORING_KIND)
   m.questions.forEach((q, i) => {
     const label = q.authoringKind;
     if (!isStr(label) || !hasOwn(KEY_CLASS_BY_AUTHORING_KIND as Obj, label)) return;
     const cls = KEY_CLASS_BY_AUTHORING_KIND[label];
     const path = `questions[${i}].authoringKind`;
+    const row = LABELS_BY_AUTHORING_KIND[label];
+    if (!(row.xapiKinds as readonly string[]).includes(q.kind)) {
+      r.add("U1", "authoring_kind_type_mismatch", `questions[${i}] is a ${label} question on interactionType ${q.kind}; ${label} may use ${row.xapiKinds.length > 0 ? row.xapiKinds.join(", ") : "no interaction type (it is never listed in questions[])"}`, { path: `questions[${i}].kind` });
+    }
     if (cls === "keyed") {
       if (q.correct.length === 0) r.add("U1", "keyed_kind_without_key", `questions[${i}] is a ${label} (keyed) question without a key in correct`, { path });
       if (q.kind === "other") r.add("U1", "keyed_kind_untyped", `questions[${i}] is a ${label} (keyed) question on interactionType other, which has no comparable key`, { path });

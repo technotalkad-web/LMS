@@ -190,24 +190,42 @@
       {
         "qid": "01JCQ000000000000000000008",
         "slideId": "10",
-        "kind": "other",
+        "kind": "performance",
         "language": "en-IN",
         "revision": 1,
-        "contentHash": "sha256:31ee080e4c209373fe113fd794947f79582b938d3ec4c21d93d6af7974eee4d5",
+        "contentHash": "sha256:86cd9f15b4f5ba9f21f9904fff09e1c75f29a1b81179474b8d978d0597f2322e",
         "prompt": "Handle the customer's objection about the processing fee.",
-        "options": [],
+        "options": [
+          {
+            "oid": "o1",
+            "label": "This processing fee is far too high for me."
+          },
+          {
+            "oid": "o4",
+            "label": "Can the bank waive part of the fee?"
+          }
+        ],
         "correct": [],
         "authoringKind": "dialogue"
       },
       {
         "qid": "01JCQ000000000000000000009",
         "slideId": "11",
-        "kind": "other",
+        "kind": "choice",
         "language": "en-IN",
         "revision": 1,
-        "contentHash": "sha256:167cbdc90b2ad84657ebeb88d42b3172f0f75c7a650d268d14f68a9556d3f689",
+        "contentHash": "sha256:8478b68b35ae91ef3fe73c03fb8cbe5ae78beb88c6e33809532e9f880d834005",
         "prompt": "Find the signature box on the form.",
-        "options": [],
+        "options": [
+          {
+            "oid": "o1",
+            "label": "Signature box"
+          },
+          {
+            "oid": "o2",
+            "label": "Date box"
+          }
+        ],
         "correct": [],
         "authoringKind": "hotspot"
       },
@@ -1045,11 +1063,25 @@
           "description": {
             "en-IN": "Handle the customer's objection about the processing fee."
           },
-          "interactionType": "other"
+          "interactionType": "performance",
+          "steps": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "This processing fee is far too high for me."
+              }
+            },
+            {
+              "id": "o4",
+              "description": {
+                "en-IN": "Can the bank waive part of the fee?"
+              }
+            }
+          ]
         }
       },
       "result": {
-        "response": "branch-b",
+        "response": "o1[.]o2[,]o4[.]o5",
         "duration": "PT20S",
         "success": true
       },
@@ -1085,7 +1117,7 @@
           "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000008",
           "https://ambak.com/xapi/ext/question/language": "en-IN",
           "https://ambak.com/xapi/ext/question/revision": 1,
-          "https://ambak.com/xapi/ext/question/content-hash": "sha256:31ee080e4c209373fe113fd794947f79582b938d3ec4c21d93d6af7974eee4d5",
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:86cd9f15b4f5ba9f21f9904fff09e1c75f29a1b81179474b8d978d0597f2322e",
           "https://ambak.com/xapi/ext/question/try": 1,
           "https://ambak.com/xapi/ext/question/final": true
         }
@@ -1118,11 +1150,25 @@
           "description": {
             "en-IN": "Find the signature box on the form."
           },
-          "interactionType": "other"
+          "interactionType": "choice",
+          "choices": [
+            {
+              "id": "o1",
+              "description": {
+                "en-IN": "Signature box"
+              }
+            },
+            {
+              "id": "o2",
+              "description": {
+                "en-IN": "Date box"
+              }
+            }
+          ]
         }
       },
       "result": {
-        "response": "signature-box",
+        "response": "o1[,]o2",
         "duration": "PT20S"
       },
       "context": {
@@ -1157,9 +1203,13 @@
           "https://ambak.com/xapi/ext/question/qid": "01JCQ000000000000000000009",
           "https://ambak.com/xapi/ext/question/language": "en-IN",
           "https://ambak.com/xapi/ext/question/revision": 1,
-          "https://ambak.com/xapi/ext/question/content-hash": "sha256:167cbdc90b2ad84657ebeb88d42b3172f0f75c7a650d268d14f68a9556d3f689",
+          "https://ambak.com/xapi/ext/question/content-hash": "sha256:8478b68b35ae91ef3fe73c03fb8cbe5ae78beb88c6e33809532e9f880d834005",
           "https://ambak.com/xapi/ext/question/try": 1,
-          "https://ambak.com/xapi/ext/question/final": true
+          "https://ambak.com/xapi/ext/question/final": true,
+          "https://ambak.com/xapi/ext/question/display-order": [
+            "o1",
+            "o2"
+          ]
         }
       }
     },
