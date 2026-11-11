@@ -17,11 +17,13 @@
  *            alds_set_version_tier, seen on every surface and then reverted; nothing else
  *            moved (no attempt, no statement, the write-once columns, two courses).
  *
- * The spec never skips: a target without 0100, with ALDS_P4 off or with a build
- * older than this checkout's rules bundle fails with a message that says which.
+ * The spec never skips: a target without 0100, with ALDS_P4 off, whose gate skipped
+ * (a failed listing, read or run-row insert) or with a build older than this
+ * checkout's rules bundle fails with a message that says which.
  * It targets Cloud Run staging or an in-runner build (scripts/lifecycle-nightly.sh),
  * never the Workers staging, whose free plan cannot finish a Guardian run (ADR 0022
- * item 20). STAGING only (the lifecycle global setup refuses other projects); its
+ * item 20): the seed refuses a *.workers.dev host before anything is written.
+ * STAGING only (the lifecycle global setup refuses other projects); its
  * organisation is lifecycle-* test data. Nothing here is graded or assigned.
  */
 import { test, expect, type APIRequestContext, type BrowserContext, type Page } from "@playwright/test";
@@ -77,9 +79,19 @@ const C_IDS = { courseUlid: "01JAH7Q4ZB8K3T6W2M9XRV5C3N", title: "Home Loan Basi
 const RERUN_REASON = "spec 66 re-run";
 const CERTIFIED_CASE_REASON = "spec 66: service-role certified case, not a certification (no engine row exists)";
 
+/**
+ * No run row and tier unverified: the gate returned before its run row. The seed already proved 0100 on this
+ * database, so the causes left are the ones guardian.ts can return or throw there; the target's server log names
+ * which (logAldsSkip writes `[alds] guardian skipped: <why>`, the upload paths `[alds] guardian failed`).
+ */
+const NO_RUN_ROW =
+  "the gate wrote no run row: ALDS_P4 off on the target (flag_off), or the gate skipped (unavailable: listing_failed, " +
+  "version_unreadable, course_unreadable or certification_insert_failed; no_manifest: the root alds-manifest.json was not " +
+  "found; not_ready; not_found) or threw; the target's log line `[alds] guardian skipped: <why>` or `[alds] guardian failed` says which";
+
 const EXPECTED_GATE =
   "uncertified with engine_not_allowlisted expected; U5:rules_bundle_unknown means the deployed build does not carry rules bundle " +
-  `${LATEST.n} (redeploy Cloud Run at main >= 8a440ef); no run row and tier unverified means ALDS_P4 is off or 0100 is missing on the target`;
+  `${LATEST.n} (redeploy Cloud Run at main >= 8a440ef); no run row and tier unverified means ${NO_RUN_ROW}`;
 
 /** 0100 on the target: real selects of its columns and its table (the filter on a nil id reads no organisation's row). */
 async function requires0100(): Promise<void> {
@@ -154,7 +166,7 @@ async function gateDiagnosis(versionId: string): Promise<string> {
   const last = runs[runs.length - 1];
   if (!last) {
     return v.analytics_tier === "unverified"
-      ? `the gate did not run: ALDS_P4 off or 0100 missing on the target. ${EXPECTED_GATE}`
+      ? `${NO_RUN_ROW}. Expected: uncertified with engine_not_allowlisted`
       : `no run row while the tier reads ${v.analytics_tier}. ${EXPECTED_GATE}`;
   }
   if (last.reason_code === "U5:rules_bundle_unknown") {
@@ -191,6 +203,11 @@ const versionBadge = (page: Page, versionId: string) =>
   page.locator(`li[data-testid="version-row"][data-version-id="${versionId}"] [data-testid="analytics-tier"]`);
 const versionRerun = (page: Page, versionId: string) =>
   page.locator(`li[data-testid="version-row"][data-version-id="${versionId}"] [data-testid="rerun-certification"]`);
+/** A course's row in the Reports course table (the one with the Question analytics column); other tables link courses too. */
+const reportsCourseRow = (page: Page, orgSlug: string, courseId: string) =>
+  page
+    .locator("table", { has: page.getByTestId("question-analytics-header") })
+    .locator("tr", { has: page.locator(`a[href="/${orgSlug}/library/${courseId}"]`) });
 
 test.describe.serial("ADR 0022 G item 18: the Package Guardian's write path with a fixture manifest", () => {
   const s: {
@@ -289,6 +306,10 @@ test.describe.serial("ADR 0022 G item 18: the Package Guardian's write path with
   };
 
   test("seed: 0100 on the target, the stub's contract, then an organisation with a super owner (API key) and an admin", async ({ browser, baseURL }) => {
+    expect(
+      new URL(baseURL!).hostname.endsWith(".workers.dev"),
+      "ADR 0022 item 20: spec 66 targets Cloud Run staging or an in-runner build, never a Workers host (its free plan cannot finish a Guardian run)"
+    ).toBe(false);
     await requires0100();
 
     // The builder's contract, pinned before anything is written to the target.
@@ -430,7 +451,7 @@ test.describe.serial("ADR 0022 G item 18: the Package Guardian's write path with
 
   test("6. Reports: course A's question analytics read Unverified, with the D1 sentence", async () => {
     await withPage(s.adminCtx!, `/${slug()}/reports`, async (page) => {
-      const row = page.locator("tr", { has: page.locator(`a[href="/${slug()}/library/${s.courseA}"]`) });
+      const row = reportsCourseRow(page, slug(), s.courseA!);
       await expect(row.locator('[data-testid="question-analytics"]')).toHaveText("Unverified");
       await expect(page.getByTestId("question-analytics-d1")).toContainText(D1_SENTENCE);
     });
@@ -542,13 +563,15 @@ test.describe.serial("ADR 0022 G item 18: the Package Guardian's write path with
         await expect(page.locator(`a[href="/${slug()}/library/${s.courseA}"] [data-testid="analytics-tier"]`)).toHaveAttribute("data-tier", "certified");
       });
       await withPage(s.adminCtx!, `/${slug()}/reports`, async (page) => {
-        const row = page.locator("tr", { has: page.locator(`a[href="/${slug()}/library/${s.courseA}"]`) });
+        const row = reportsCourseRow(page, slug(), s.courseA!);
         await expect(row.locator('[data-testid="question-analytics"]')).toHaveText("Certified");
       });
       const a = (await catalog(request, s.apiKey!)).find((c) => c.id === s.courseA);
       expect(a?.analytics_tier).toBe("certified");
     } finally {
-      // No lifecycle version stays Certified: back to the gate's result of item 8.
+      // No lifecycle version stays Certified: back to the gate's result of item 8. A killed worker runs no
+      // finally (nor afterAll): A-v2 then stays Certified in this lifecycle-* org, which holds no attempt and is
+      // visible to no other org, until the global setup's 48 h cleanup deletes the org and its rows by cascade.
       reverted = await rpc("uncertified", "engine_not_allowlisted", s.rerun!.reason, s.rerun!.id);
     }
     expect(reverted?.error ?? null, reverted?.error?.message).toBeNull();
