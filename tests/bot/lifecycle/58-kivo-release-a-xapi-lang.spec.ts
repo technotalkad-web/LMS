@@ -195,7 +195,9 @@ async function breakdownRows() {
 }
 
 /** The course reports page shows each question's text. The renderer prints the id in a <code>
- *  beneath a label only when the row has a label, so a row showing the bare id fails here. */
+ *  beneath a label only when the row has a label, so a row showing the bare id fails here.
+ *  Since ADR 0021 the Learner feedback section's bucket tables add `tbody tr` rows to the page too;
+ *  none of them holds a <code> with a question id, so the filter below still finds only breakdown rows. */
 async function expectQuestionLabels(page: Page, answered: StatementRow[]) {
   await page.goto(`/${state.org!.slug}/library/${state.courseId}/reports`);
   for (const r of answered) {
@@ -555,7 +557,24 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     const page = await ctx.newPage();
     await expectQuestionLabels(page, answered);
     await expect(page.getByText("KIVO D-7 test: multi-response. Which of these are fruits?", { exact: true })).toBeVisible();
-    for (const r of responded) await expect(page.getByText(nameOf(r), { exact: true }), "feedback stays out of the question analytics").toHaveCount(0);
+    // Since PR 231 (ADR 0021) the same page carries a Learner feedback section that shows each feedback
+    // question's text by design (feedback-section.tsx: <section data-testid="feedback-section">, one
+    // data-testid="feedback-question" card per question, its title = description ?? name ?? id,
+    // lib/interactions/feedback.ts groupQuestions). So the absence check is scoped to the question
+    // analytics, the "Per-question breakdown" section of reports/page.tsx (no test id; found by its h2).
+    const breakdown = page.locator("section", { has: page.getByRole("heading", { level: 2, name: "Per-question breakdown", exact: true }) });
+    await expect(breakdown, "the Per-question breakdown section").toHaveCount(1);
+    for (const r of responded) await expect(breakdown.getByText(nameOf(r), { exact: true }), "feedback stays out of the question analytics").toHaveCount(0);
+    // And it shows in the Learner feedback section: this run's learner is a `member` (seeded above), so the
+    // attempt is no staff preview, no revision visit and not reset, an eligible attempt under ADR 0021
+    // (Terminology, "Eligible attempt"; Decision B item 2). nameOf() reads definition.name; the section titles a card with the description, and
+    // the kit's feedback questions carry the same text in both (evidence lms-sent.json, en-US and hi-Latn).
+    const feedback = page.getByTestId("feedback-section");
+    for (const r of responded) {
+      const card = feedback.getByTestId("feedback-question").filter({ has: page.locator(`code:text-is("${r.raw.object.id}")`) });
+      await expect(card, `the Learner feedback card of ${r.raw.object.id}`).toHaveCount(1);
+      await expect(card.getByText(nameOf(r), { exact: true }), `the Learner feedback section shows ${r.raw.object.id}'s question`).toBeVisible();
+    }
 
     // The lens reads the ten lowest correct rates, so it is asked for this run's wrong answers: a
     // question answered right can fall outside the ten.
