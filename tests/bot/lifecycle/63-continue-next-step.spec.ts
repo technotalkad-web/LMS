@@ -27,15 +27,19 @@
  *        route refuses another learner's attempt, a bad id and a signed-out
  *        call, and writes nothing;
  *   (f)  the SCORM runtime: Continue waits on step 3 and turns ready after the
- *        parent's own passed commit through window.API, then the end banner
- *        and the celebration;
+ *        parent's own passed commit through window.API (the commit gets 60 s;
+ *        the bar's one status check follows its answer within 3 s, none
+ *        before), then the end banner and the celebration;
  *   (g)  a revision visit: Continue is ready (href to the continue address)
  *        and moves on at once; the badge and Continue show together;
  *   (h)  refusals: from not a step, lp not a uuid, another organisation's path;
  *   (i)  staff: an admin's Continue skips the wait and writes no row;
  *   (j)  widths and a 120-character title: Exit, Revision Mode and Continue
  *        visible and never overlapping at 320, 390, 640, 768 and 1280 px; the
- *        bar about 41 px high below sm and 49 px from sm.
+ *        bar about 41 px high below sm and 49 px from sm;
+ *   (b2) a result stored during the wait: the address reads it (each read
+ *        fresh, not Next's memoized first answer) and moves on to step 2
+ *        before the bound (last in the file).
  *
  * Hydration: launchPage() returns once the server-rendered bar is visible,
  * before React has attached the waiting button's tap handler or the SCORM
@@ -64,9 +68,27 @@ type User = { id: string; email: string; password: string };
 const AU = "https://qa.bot/cmi5/au1";
 /** Step 1's title, exactly 120 characters (case (j)). */
 const LONG_TITLE = `QA Continue Step One ${"with a deliberately long module title ".repeat(4)}`.slice(0, 120);
-/** "About 2 s" in the record: asserted as well under the 6 s wait. */
-const PROMPT_MS = 4_000;
+/** The continue address's wait (CONTINUE_WAIT_MS): with no stored result it answers after at least this. */
 const WAIT_MS = 6_000;
+/**
+ * "Moves on at once" ("about 2 s" in the record) is asserted against the
+ * waits this run measured, not a fixed figure: a prompt answer beats the
+ * shortest of them ((b), then the lower of (b) and (d)) by at least a
+ * quarter of WAIT_MS. A wait runs to its WAIT_MS deadline after the same
+ * reads before it, so a wait and a prompt answer are about 6 s apart in any
+ * environment while both move with the database latency; the 1.5 s gap
+ * still fails an answer that ran to or near the deadline, and leaves about
+ * 4.5 s for slow round trips. A fixed 4 s came first; Cloud Run staging met
+ * it, but at a GitHub runner's latency (local runs with 270 ms added to
+ * every database call, 2026-11-12) a prompt answer takes 2.5 to 4.2 s and a
+ * wait 9.5 to 10.2 s, and the nightly runner crossed 4 s. Half of WAIT_MS
+ * came next; one answer took 6.3 s, 0.36 s inside it, in a run without
+ * per-read timing, and the timed runs did not reproduce it, so its cause is
+ * not known.
+ */
+const PROMPT_GAP_MS = WAIT_MS / 4;
+/** Never tighter than the first version's fixed bound; a wait still takes over WAIT_MS. */
+const PROMPT_FLOOR_MS = 4_000;
 const BANNERS = ["continue-saving-banner", "continue-failed-banner", "continue-end-banner"];
 /** The waiting button's message (lib/learner/continue-state.ts CONTINUE_WAITING_MESSAGE). */
 const WAITING_MESSAGE = "Finish this module to continue";
@@ -165,11 +187,19 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     pathId?: string;
     otherPathId?: string;
     a1?: string;
+    /** The shortest wait measured so far ((b), then the lower of (b) and (d)): expectPrompt's reference. */
+    waitMs?: number;
   } = {};
   const slug = () => s.org!.slug;
   const launchUrl = (courseId: string, lp = true) => `/${slug()}/courses/${courseId}/launch${lp ? `?lp=${s.pathId}` : ""}`;
   const continueUrl = (from: string, lp = s.pathId!) => `/${slug()}/continue?lp=${lp}&from=${from}`;
   const pathUrl = (q = "") => `/${slug()}/paths/${s.pathId}${q}`;
+  /** A prompt answer of the continue address (PROMPT_GAP_MS). */
+  const expectPrompt = (r: NoFollow) => {
+    expect(s.waitMs, "(b) measured a wait").toBeDefined();
+    const bound = Math.max(PROMPT_FLOOR_MS, s.waitMs! - PROMPT_GAP_MS);
+    expect(r.ms, `${describe(r)}; prompt bound ${bound} ms`).toBeLessThan(bound);
+  };
 
   /** A browser page on a launch whose module content never loads, so no fixture spends the attempt's fetch token. */
   async function launchPage(ctx: BrowserContext, url: string): Promise<Page> {
@@ -305,6 +335,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const before = (await attemptsOn(s.a!.id, s.v1!))[0];
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
     expect(r.ms, describe(r)).toBeGreaterThanOrEqual(WAIT_MS);
+    s.waitMs = r.ms;
     expect(r.body, "the loading screen streamed first").toContain("continue-saving");
     expect(redirectedExactly(r, pathUrl("?saving=1")), describe(r)).toBe(true);
     const after = await attemptsOn(s.a!.id, s.v1!);
@@ -318,7 +349,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
   test("(c) a stored pass moves on at once to step 2, whose new row carries the path", async () => {
     await finish(s.aCtx!.request, s.a!, s.a1!, "passed", 0.9);
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     await getOk(s.aCtx!, launchUrl(s.c2!));
     const rows = await attemptsOn(s.a!.id, s.v2!);
@@ -329,6 +360,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
   test("(d) step 2 in progress: the saving banner; the strict lock still refuses step 3", async () => {
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c2!));
     expect(r.ms, describe(r)).toBeGreaterThanOrEqual(WAIT_MS);
+    s.waitMs = Math.min(s.waitMs ?? r.ms, r.ms);
     expect(redirectedExactly(r, pathUrl("?saving=1")), describe(r)).toBe(true);
     const lock = await noFollow(s.aCtx!.request, launchUrl(s.c3!));
     expect(redirectedExactly(lock, `/${slug()}/dashboard?locked=${s.c3}`), describe(lock)).toBe(true);
@@ -338,7 +370,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const [a2] = await attemptsOn(s.a!.id, s.v2!);
     await finish(s.aCtx!.request, s.a!, a2.id, "failed", 0.4);
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c2!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, pathUrl("?failed=1")), describe(r)).toBe(true);
     expect((await attemptsOn(s.a!.id, s.v3!)).length, "no attempt on step 3").toBe(0);
     const html = await getOk(s.aCtx!, pathUrl("?failed=1"));
@@ -353,7 +385,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const [c1Row] = await attemptsOn(s.c!.id, s.v1!);
     await finish(s.cCtx!.request, s.c!, c1Row.id, "failed", 0.4);
     const r = await noFollow(s.cCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     await getOk(s.cCtx!, launchUrl(s.c2!));
     const rows = await attemptsOn(s.c!.id, s.v2!);
@@ -438,22 +470,50 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     // The parent's own window.API (installed at hydration; the content never
     // loads here): its LMSFinish commit is answered with a terminal status,
     // and the bar's one status check turns Continue ready.
+    // Timing. The commit answers only after it classifies the attempt and
+    // awaits its side effects: the XP and journey RPCs (the journey one does
+    // nothing here), the CRM webhook lookup, the course email, the
+    // path-completion scan and, because step 3 closes the path, the path
+    // email. On Cloud Run staging 0.9 s from the commit to the path email
+    // (2026-11-11); from a GitHub runner to the staging database 8.2 s in
+    // both lifecycle-nightly runs of 2026-11-12, and the commit's answer took
+    // 9.8 s in a local run with 270 ms added to every database call. A single
+    // 10 s budget timed out with the row already passed. So the commit gets
+    // 60 s and Continue 10 s after its answer; and the status checks are
+    // recorded from after the page loaded: none before the commit's answer
+    // (1 s slack, the answer's time is read after its response event) and the
+    // first within 3 s after it. A SCORM bar that polled every 25 s instead
+    // of rechecking after the commit meets that only by chance.
+    const statusAt: number[] = [];
+    page.on("request", (q) => {
+      if (q.url().includes(statusUrl(b3.id))) statusAt.push(Date.now());
+    });
     type ScormApi = { LMSInitialize(p: string): string; LMSSetValue(k: string, v: string): string; LMSFinish(p: string): string };
     await page.waitForFunction(() => !!(window as unknown as { API?: unknown }).API, null, { timeout: 30_000 });
-    await page.evaluate(() => {
-      const api = (window as unknown as { API: ScormApi }).API;
-      api.LMSInitialize("");
-      api.LMSSetValue("cmi.core.lesson_status", "passed");
-      api.LMSSetValue("cmi.core.score.raw", "90");
-      api.LMSFinish("");
-    });
+    const [commit] = await Promise.all([
+      page.waitForResponse((r) => r.request().method() === "POST" && r.url().includes(`/api/scorm/${b3.id}/commit`), {
+        timeout: 60_000,
+      }),
+      page.evaluate(() => {
+        const api = (window as unknown as { API: ScormApi }).API;
+        api.LMSInitialize("");
+        api.LMSSetValue("cmi.core.lesson_status", "passed");
+        api.LMSSetValue("cmi.core.score.raw", "90");
+        api.LMSFinish("");
+      }),
+    ]);
+    const answeredAt = Date.now();
+    expect(commit.status(), "the LMSFinish commit").toBe(200);
     await expect(next).toHaveAttribute("data-state", "ready", { timeout: 10_000 });
+    expect(statusAt.length, "the bar ran a status check").toBeGreaterThan(0);
+    expect(statusAt[0], "no status check before the commit answered").toBeGreaterThanOrEqual(answeredAt - 1_000);
+    expect(statusAt[0], "the check followed the commit's answer").toBeLessThanOrEqual(answeredAt + 3_000);
     await expect(next).toHaveAttribute("href", continueUrl(s.c3!));
     const [b3After] = await attemptsOn(s.b!.id, s.v3!);
     expect(b3After.success_status).toBe("passed");
     await page.close();
     const r = await noFollow(breq, continueUrl(s.c3!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, pathUrl("?end=1")), describe(r)).toBe(true);
     const path = await getOk(s.bCtx!, pathUrl("?end=1"));
     expect(path).toContain('data-testid="continue-end-banner"');
@@ -462,7 +522,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
 
   test("(g) a revision visit: Continue is ready and moves on at once; Revision Mode and Continue show together", async () => {
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     const page = await launchPage(s.aCtx!, launchUrl(s.c1!));
     const html = await page.content();
@@ -491,7 +551,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
 
   test("(i) staff: an admin's Continue skips the wait and writes no row", async () => {
     const r = await noFollow(s.previewCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     const { data, error } = await svc().from("course_attempts").select("id").eq("user_id", s.previewer!.id);
     expect(error).toBeNull();
@@ -540,5 +600,44 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       }
     }
     await page.close();
+  });
+
+  test("(b2) a result stored during the wait: Continue moves on to step 2 before the bound", async ({ browser, baseURL }) => {
+    // Last in the file: a red here skips no other case. A learner of its
+    // own, so no other case's rows change. The result lands through the
+    // service role mid-wait (as spec 46 stores one): the case is about the
+    // address's reads, and a statements round trip from a runner can outlast
+    // the 6 s wait. The shortest measured wait minus WAIT_MS is the time
+    // before the wait's first read plus its last read and the answer's
+    // overhead; 1.5 s past that puts the store about 1.5 to 2.5 s into the
+    // wait, after the first read and some 4 s before the deadline, at Cloud
+    // Run and at runner latency, so without fresh reads this case fails.
+    const d = await createAuthUser({ profile: { first_name: "Continue", last_name: "D", must_change_password: false } });
+    await addMember({ organizationId: s.org!.id, userId: d.id, role: "member" });
+    const { error: ae } = await svc().from("learning_path_assignments").insert({ organization_id: s.org!.id, path_id: s.pathId, assignee_type: "user", user_id: d.id });
+    expect(ae, `path assignment D: ${ae?.message}`).toBeNull();
+    const dCtx = await authedContext(browser, baseURL!, d.email, d.password);
+    try {
+      await getOk(dCtx, launchUrl(s.c1!));
+      const [d1] = await attemptsOn(d.id, s.v1!);
+      expect(d1.status).toBe("in_progress");
+      const storeAt = s.waitMs! - WAIT_MS + 1_500;
+      const t0 = Date.now();
+      const pending = noFollow(dCtx.request, continueUrl(s.c1!));
+      pending.catch(() => {}); // awaited below; no unhandled rejection if the store fails first
+      await new Promise((res) => setTimeout(res, storeAt));
+      const { error: ue } = await svc()
+        .from("course_attempts")
+        .update({ completion_status: "completed", success_status: "passed", status: "passed", score: 0.9, completed_at: new Date().toISOString() })
+        .eq("id", d1.id);
+      expect(ue, `store: ${ue?.message}`).toBeNull();
+      const storedAt = Date.now() - t0;
+      const r = await pending;
+      expect(redirectedExactly(r, launchUrl(s.c2!)), `${describe(r)}; stored at ${storedAt} ms`).toBe(true);
+      expect(r.ms, "it waited: no answer before the store was sent").toBeGreaterThanOrEqual(storeAt);
+      expect(r.ms, "before the bound").toBeLessThan(s.waitMs!);
+    } finally {
+      await dCtx.close();
+    }
   });
 });

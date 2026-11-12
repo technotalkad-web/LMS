@@ -1,6 +1,7 @@
 /**
  * ADR 0004 step 17 — launch-time handling of in-progress attempts on another
- * language slot (step 9), one case per rule:
+ * language slot (step 9), one case per rule, and (5) concurrent first launches
+ * on one slot (ADR 0014 step 3, I-5):
  *
  *   (0) own-slot resume wins
  *   (1) explicit ?lang= with progress on another active slot → the course
@@ -12,6 +13,7 @@
  *       course page's "Closed — not counted" pill shows (ADR 0014 step 7), the
  *       launch continues
  *   (4) a consumed grant retake is never abandoned or rerouted
+ *   (5) concurrent first launches (I-5): each opens the course, one row
  *
  * The per-version restart action (ADR 0004 step 14a) is not built: decision
  * 0004/6 is open.
@@ -76,7 +78,7 @@ test.describe.serial("ADR 0004 step 9 — launch routing across language slots",
   const learnerCtx = (browser: import("@playwright/test").Browser, baseURL: string, key: string) =>
     authedContext(browser, baseURL, s.learners[key].email, s.learners[key].password);
 
-  test("seed: bilingual cmi5 and SCORM courses, five learners", async ({ browser, baseURL }) => {
+  test("seed: bilingual cmi5 and SCORM courses, four learners", async ({ browser, baseURL }) => {
     const org = await createOrg({ name: "QA Launch Routing" });
     const admin = await createAuthUser({ profile: { first_name: "Route", last_name: "Admin", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
@@ -216,5 +218,32 @@ test.describe.serial("ADR 0004 step 9 — launch routing across language slots",
     const { data: after } = await svc().from("course_attempts").select("status").eq("id", retakeId).single();
     expect((after as { status: string }).status, "the grant retake stays in progress").toBe("in_progress");
     await ctx.close();
+  });
+
+  test("(5) concurrent first launches (I-5): every one opens the course, one in-progress row", async ({ browser, baseURL }) => {
+    // A double click or a router prefetch: requests that all read "no row"
+    // race to insert on 0062's one-in-progress index, and the losers re-read
+    // the winner's row (I-5). That re-read carries its own abort signal; a
+    // memoized one returned the first "no row" answer, and the loser ended
+    // on the course page's retry notice. The race needs requests that overlap
+    // between the read and the insert: reliable at a runner's latency (2 of 4
+    // retry notices per round without the fix, 270 ms added per database
+    // call), not guaranteed where calls take a few milliseconds.
+    const u = await createAuthUser({ profile: { first_name: "Route", last_name: "race", must_change_password: false } });
+    await addMember({ organizationId: s.org!.id, userId: u.id, role: "member" });
+    await assignCourse(s.adminCtx!.request, s.org!.slug, s.cmi5!.courseId, u.id);
+    const ctx = await authedContext(browser, baseURL!, u.email, u.password);
+    try {
+      const url = `/${s.org!.slug}/courses/${s.cmi5!.courseId}/launch?lang=en`;
+      const answers = await Promise.all(Array.from({ length: 4 }, () => getNoFollow(ctx.request, url)));
+      for (const [i, a] of answers.entries()) {
+        expect(a.redirectedTo("?retry=1"), `launch ${i + 1}: no retry notice`).toBe(false);
+        expect(a.status, `launch ${i + 1}`).toBe(200);
+        expect(a.body, `launch ${i + 1}: the module frame`).toContain(`/content/v/${s.cmi5!.enVersion}/`);
+      }
+      expect(await attemptStatuses(u.id, s.cmi5!.enVersion)).toEqual(["in_progress"]);
+    } finally {
+      await ctx.close();
+    }
   });
 });
