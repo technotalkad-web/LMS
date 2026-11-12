@@ -438,8 +438,23 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     // The parent's own window.API (installed at hydration; the content never
     // loads here): its LMSFinish commit is answered with a terminal status,
     // and the bar's one status check turns Continue ready.
+    // Two budgets. The commit answers only after it classifies the attempt and
+    // awaits its side effects: the XP and journey RPCs (the journey one does
+    // nothing here), the CRM webhook lookup, the course email, the
+    // path-completion scan and, because step 3 closes the path, the path
+    // email. About 1 s on Cloud Run staging; about 8 s from a GitHub runner to
+    // the staging database (both lifecycle-nightly runs of 2026-11-12, UTC:
+    // commit at 06:19:02.1 and 06:39:01.6, path email logged at 06:19:10.3
+    // and 06:39:09.8), so a single 10 s budget timed out with the row already
+    // passed. The commit gets 60 s; the bar's one status check after its
+    // answer (about 7 sequential reads) gets 10 s, below the 25 s poll
+    // interval, so a SCORM launch that polled instead would still fail here.
     type ScormApi = { LMSInitialize(p: string): string; LMSSetValue(k: string, v: string): string; LMSFinish(p: string): string };
     await page.waitForFunction(() => !!(window as unknown as { API?: unknown }).API, null, { timeout: 30_000 });
+    const commitAnswered = page.waitForResponse(
+      (r) => r.request().method() === "POST" && r.url().includes(`/api/scorm/${b3.id}/commit`),
+      { timeout: 60_000 }
+    );
     await page.evaluate(() => {
       const api = (window as unknown as { API: ScormApi }).API;
       api.LMSInitialize("");
@@ -447,6 +462,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       api.LMSSetValue("cmi.core.score.raw", "90");
       api.LMSFinish("");
     });
+    expect((await commitAnswered).status(), "the LMSFinish commit").toBe(200);
     await expect(next).toHaveAttribute("data-state", "ready", { timeout: 10_000 });
     await expect(next).toHaveAttribute("href", continueUrl(s.c3!));
     const [b3After] = await attemptsOn(s.b!.id, s.v3!);
