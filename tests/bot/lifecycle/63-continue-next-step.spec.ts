@@ -64,9 +64,19 @@ type User = { id: string; email: string; password: string };
 const AU = "https://qa.bot/cmi5/au1";
 /** Step 1's title, exactly 120 characters (case (j)). */
 const LONG_TITLE = `QA Continue Step One ${"with a deliberately long module title ".repeat(4)}`.slice(0, 120);
-/** "About 2 s" in the record: asserted as well under the 6 s wait. */
-const PROMPT_MS = 4_000;
+/** The continue address's wait (CONTINUE_WAIT_MS): with no stored result it answers after at least this. */
 const WAIT_MS = 6_000;
+/**
+ * "Moves on at once" ("about 2 s" in the record) is asserted against the wait
+ * this run measured in (b), not a fixed figure: a prompt answer beats that
+ * wait by at least half of WAIT_MS. A wait sleeps the full WAIT_MS on top of
+ * the same reads, so the real gap is at least 6 s in any environment, while
+ * both figures move with the database latency. A fixed 4 s came first; Cloud
+ * Run staging met it, but at a GitHub runner's latency a prompt answer takes
+ * about 3.5 s and a wait about 9.7 s (a local run with 270 ms added to every
+ * database call, 2026-11-12), and the nightly runner crossed 4 s.
+ */
+const PROMPT_GAP_MS = WAIT_MS / 2;
 const BANNERS = ["continue-saving-banner", "continue-failed-banner", "continue-end-banner"];
 /** The waiting button's message (lib/learner/continue-state.ts CONTINUE_WAITING_MESSAGE). */
 const WAITING_MESSAGE = "Finish this module to continue";
@@ -165,11 +175,19 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     pathId?: string;
     otherPathId?: string;
     a1?: string;
+    /** (b)'s measured wait, the reference of expectPrompt. */
+    waitMs?: number;
   } = {};
   const slug = () => s.org!.slug;
   const launchUrl = (courseId: string, lp = true) => `/${slug()}/courses/${courseId}/launch${lp ? `?lp=${s.pathId}` : ""}`;
   const continueUrl = (from: string, lp = s.pathId!) => `/${slug()}/continue?lp=${lp}&from=${from}`;
   const pathUrl = (q = "") => `/${slug()}/paths/${s.pathId}${q}`;
+  /** A prompt answer of the continue address (PROMPT_GAP_MS). */
+  const expectPrompt = (r: NoFollow) => {
+    expect(s.waitMs, "(b) measured the wait").toBeDefined();
+    const bound = s.waitMs! - PROMPT_GAP_MS;
+    expect(r.ms, `${describe(r)}; prompt bound ${bound} ms`).toBeLessThan(bound);
+  };
 
   /** A browser page on a launch whose module content never loads, so no fixture spends the attempt's fetch token. */
   async function launchPage(ctx: BrowserContext, url: string): Promise<Page> {
@@ -305,6 +323,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const before = (await attemptsOn(s.a!.id, s.v1!))[0];
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
     expect(r.ms, describe(r)).toBeGreaterThanOrEqual(WAIT_MS);
+    s.waitMs = r.ms;
     expect(r.body, "the loading screen streamed first").toContain("continue-saving");
     expect(redirectedExactly(r, pathUrl("?saving=1")), describe(r)).toBe(true);
     const after = await attemptsOn(s.a!.id, s.v1!);
@@ -318,7 +337,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
   test("(c) a stored pass moves on at once to step 2, whose new row carries the path", async () => {
     await finish(s.aCtx!.request, s.a!, s.a1!, "passed", 0.9);
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     await getOk(s.aCtx!, launchUrl(s.c2!));
     const rows = await attemptsOn(s.a!.id, s.v2!);
@@ -338,7 +357,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const [a2] = await attemptsOn(s.a!.id, s.v2!);
     await finish(s.aCtx!.request, s.a!, a2.id, "failed", 0.4);
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c2!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, pathUrl("?failed=1")), describe(r)).toBe(true);
     expect((await attemptsOn(s.a!.id, s.v3!)).length, "no attempt on step 3").toBe(0);
     const html = await getOk(s.aCtx!, pathUrl("?failed=1"));
@@ -353,7 +372,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const [c1Row] = await attemptsOn(s.c!.id, s.v1!);
     await finish(s.cCtx!.request, s.c!, c1Row.id, "failed", 0.4);
     const r = await noFollow(s.cCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     await getOk(s.cCtx!, launchUrl(s.c2!));
     const rows = await attemptsOn(s.c!.id, s.v2!);
@@ -469,7 +488,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     expect(b3After.success_status).toBe("passed");
     await page.close();
     const r = await noFollow(breq, continueUrl(s.c3!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, pathUrl("?end=1")), describe(r)).toBe(true);
     const path = await getOk(s.bCtx!, pathUrl("?end=1"));
     expect(path).toContain('data-testid="continue-end-banner"');
@@ -478,7 +497,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
 
   test("(g) a revision visit: Continue is ready and moves on at once; Revision Mode and Continue show together", async () => {
     const r = await noFollow(s.aCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     const page = await launchPage(s.aCtx!, launchUrl(s.c1!));
     const html = await page.content();
@@ -507,7 +526,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
 
   test("(i) staff: an admin's Continue skips the wait and writes no row", async () => {
     const r = await noFollow(s.previewCtx!.request, continueUrl(s.c1!));
-    expect(r.ms, describe(r)).toBeLessThan(PROMPT_MS);
+    expectPrompt(r);
     expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
     const { data, error } = await svc().from("course_attempts").select("id").eq("user_id", s.previewer!.id);
     expect(error).toBeNull();
