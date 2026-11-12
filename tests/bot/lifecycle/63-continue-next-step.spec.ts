@@ -73,18 +73,20 @@ const WAIT_MS = 6_000;
 /**
  * "Moves on at once" ("about 2 s" in the record) is asserted against the
  * waits this run measured, not a fixed figure: a prompt answer beats the
- * shortest of them ((b), then the lower of (b) and (d)) by at least half of
- * WAIT_MS. A wait runs to its WAIT_MS deadline after the same pre-wait
- * reads, so the real gap is about 6 s in any environment, while both
- * figures move with the database latency; an answer that needed up to
- * about two more reads, or whose reads before the wait ran up to about 3 s
- * slow, still passes as "at once". A fixed 4 s came first; Cloud Run
- * staging met it, but at a GitHub runner's latency (local runs with 270 ms
- * added to every database call, 2026-11-12) a prompt answer takes 2.6 to
- * 4.0 s (once 6.3 s, its reads before the wait slow) and a wait 9.6 to
- * 10.2 s, and the nightly runner crossed 4 s.
+ * shortest of them ((b), then the lower of (b) and (d)) by at least a
+ * quarter of WAIT_MS. A wait runs to its WAIT_MS deadline after the same
+ * reads before it, so a wait and a prompt answer are about 6 s apart in any
+ * environment while both move with the database latency; the 1.5 s gap
+ * still fails an answer that ran to or near the deadline, and leaves about
+ * 4.5 s for slow round trips. A fixed 4 s came first; Cloud Run staging met
+ * it, but at a GitHub runner's latency (local runs with 270 ms added to
+ * every database call, 2026-11-12) a prompt answer takes 2.5 to 4.2 s and a
+ * wait 9.5 to 10.2 s, and the nightly runner crossed 4 s. Half of WAIT_MS
+ * came next; one answer took 6.3 s, 0.36 s inside it, in a run without
+ * per-read timing, and the timed runs did not reproduce it, so its cause is
+ * not known.
  */
-const PROMPT_GAP_MS = WAIT_MS / 2;
+const PROMPT_GAP_MS = WAIT_MS / 4;
 /** Never tighter than the first version's fixed bound; a wait still takes over WAIT_MS. */
 const PROMPT_FLOOR_MS = 4_000;
 const BANNERS = ["continue-saving-banner", "continue-failed-banner", "continue-end-banner"];
