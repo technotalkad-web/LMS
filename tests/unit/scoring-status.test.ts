@@ -567,7 +567,7 @@ function recordingClient(respond: (q: Query) => { data?: unknown; error?: unknow
       const q: Query = { table, ops: [] };
       queries.push(q);
       const b: Record<string, unknown> = {};
-      for (const op of ["select", "eq", "neq", "in", "is", "not", "order", "limit", "range"]) {
+      for (const op of ["select", "eq", "neq", "in", "is", "not", "order", "limit", "range", "abortSignal"]) {
         b[op] = (...args: unknown[]) => {
           q.ops.push({ op, args });
           return b;

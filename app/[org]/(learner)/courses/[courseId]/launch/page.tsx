@@ -325,13 +325,17 @@ export default async function LaunchPage({
     const vIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
     let my: MyAttempt[] = [];
     if (vIds.length > 0) {
-      // is_revision (0103) with the narrower-select fallback.
+      // is_revision (0103) with the narrower-select fallback. Its own abort
+      // signal: Next memoizes identical GET fetches within one render, and
+      // evaluate runs again after consume_grant, when a concurrent launch may
+      // have closed rows and opened its retake.
       const readMy = (columns: string) =>
         supabase
           .from("course_attempts")
           .select(columns)
           .eq("user_id", user.id)
-          .in("course_version_id", vIds);
+          .in("course_version_id", vIds)
+          .abortSignal(new AbortController().signal);
       let { data: myRows, error: myErr } = await readMy(`${MY_COLUMNS}, is_revision`);
       if (myErr && isMissingColumn(myErr, "is_revision")) ({ data: myRows, error: myErr } = await readMy(MY_COLUMNS));
       if (myErr) refuse("attempts_read_failed");
@@ -824,6 +828,9 @@ export default async function LaunchPage({
   // read refuses.
   type LaunchRowFull = { id: string; cmi_data: CmiData | null; is_revision?: boolean | null; status?: string };
   const ROW_COLUMNS = "id, cmi_data, status";
+  // Each read has its own abort signal: Next memoizes identical GET fetches
+  // within one render, and I-5 below re-reads after a concurrent request's
+  // insert; without it the re-read returned the first "no row" answer.
   const lookupRow = async (versionId: string): Promise<LaunchRowFull | null> => {
     const read = (columns: string) =>
       supabase
@@ -835,6 +842,7 @@ export default async function LaunchPage({
         .order("last_activity_at", { ascending: false, nullsFirst: false })
         .order("started_at", { ascending: false })
         .limit(1)
+        .abortSignal(new AbortController().signal)
         .maybeSingle();
     let { data: found, error: rowErr } = await read(`${ROW_COLUMNS}, is_revision`);
     if (rowErr && isMissingColumn(rowErr, "is_revision")) ({ data: found, error: rowErr } = await read(ROW_COLUMNS));

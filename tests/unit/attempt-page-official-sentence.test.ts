@@ -260,7 +260,7 @@ async function main() {
         return {
           from(table: string) {
             const b: Record<string, unknown> = {};
-            for (const op of ["select", "eq", "in"]) b[op] = () => b;
+            for (const op of ["select", "eq", "in", "abortSignal"]) b[op] = () => b;
             b.then = (res: (v: unknown) => unknown) => Promise.resolve(answers[table]).then(res);
             return b;
           },

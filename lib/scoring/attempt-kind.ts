@@ -296,13 +296,18 @@ export async function grantSnapshotFor(
   courseId: string,
   nowIso: string = new Date().toISOString()
 ): Promise<GrantSnapshot> {
+  // Its own abort signal: Next memoizes identical GET fetches within one
+  // server render, and the launch page reads the grants again after
+  // consume_grant, when a concurrent launch may have used the grant. A
+  // signal opts the read out of that cache (no effect in a route handler).
   const read = (columns: string) =>
     svc
       .from("attempt_requests")
       .select(columns)
       .eq("user_id", userId)
       .eq("course_id", courseId)
-      .eq("status", "approved");
+      .eq("status", "approved")
+      .abortSignal(new AbortController().signal);
   let res: { data: unknown; error: PgError } = await read(`${GRANT_COLUMNS}, reissued_from`);
   if (res.error && isMissingColumn(res.error, "reissued_from")) res = await read(GRANT_COLUMNS);
   if (res.error) {
