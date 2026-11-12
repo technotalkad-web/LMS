@@ -20,8 +20,9 @@ import {
  * Continue button links here with `?lp=<path>&from=<course>`.
  *
  * It reads only, on the caller's RLS session, and writes nothing: the result
- * is written by the statements and commit routes as today. It waits, at most
- * CONTINUE_WAIT_MS, for the module's official result to be stored (on a
+ * is written by the statements and commit routes as today. It waits (seven
+ * reads, CONTINUE_WAIT_MS of sleep in all) for the module's official result
+ * to be stored (on a
  * pass_required course, with its pass or fail: verdictPending), then moves
  * the learner on only when that result completes the step under the course's
  * pass_required setting. The launch page keeps its own gates (release dates,

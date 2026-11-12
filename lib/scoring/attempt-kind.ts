@@ -299,7 +299,9 @@ export async function grantSnapshotFor(
   // Its own abort signal: Next memoizes identical GET fetches within one
   // server render, and the launch page reads the grants again after
   // consume_grant, when a concurrent launch may have used the grant. A
-  // signal opts the read out of that cache (no effect in a route handler).
+  // signal opts the read out of that cache. Elsewhere it costs nothing: the
+  // course and attempt pages read the grants once per render, and route
+  // handlers have no such cache.
   const read = (columns: string) =>
     svc
       .from("attempt_requests")
