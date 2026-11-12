@@ -14,10 +14,10 @@
  */
 import { courseStatus, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
 
-/** The route's sleep while it waits for a stored result (ADR 0019 decision 2); at the bound the request also spends its seven reads. */
+/** The longest the route waits for a stored result (ADR 0019 decision 2): a deadline from its first read. */
 export const CONTINUE_WAIT_MS = 6000;
 
-/** One read of the learner's attempts per interval: seven reads, CONTINUE_POLL_MS of sleep apart. */
+/** One read of the learner's attempts per interval, at most seven; slow reads shorten the sleeps, never extend the deadline. */
 export const CONTINUE_POLL_MS = 1000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

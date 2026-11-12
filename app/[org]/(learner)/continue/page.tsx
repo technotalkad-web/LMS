@@ -20,9 +20,9 @@ import {
  * Continue button links here with `?lp=<path>&from=<course>`.
  *
  * It reads only, on the caller's RLS session, and writes nothing: the result
- * is written by the statements and commit routes as today. It waits (seven
- * reads, CONTINUE_WAIT_MS of sleep in all) for the module's official result
- * to be stored (on a
+ * is written by the statements and commit routes as today. It waits, at most
+ * CONTINUE_WAIT_MS from its first read (a deadline, one read a second), for
+ * the module's official result to be stored (on a
  * pass_required course, with its pass or fail: verdictPending), then moves
  * the learner on only when that result completes the step under the course's
  * pass_required setting. The launch page keeps its own gates (release dates,
@@ -128,7 +128,10 @@ export default async function ContinuePage({
   const policy = await resolvePolicy(supabase, fromCourseId);
 
   // The wait: one read of the learner's attempts on this course per
-  // CONTINUE_POLL_MS, for at most CONTINUE_WAIT_MS. The sleep costs no CPU.
+  // CONTINUE_POLL_MS, until a deadline CONTINUE_WAIT_MS after the first read
+  // starts (decision 2: 6 s total), at most seven reads; the last one starts
+  // at the deadline at the latest, so slow reads shorten the sleeps rather
+  // than stretch the wait. The sleep costs no CPU.
   // It ends only on a stored result whose verdict is not pending: on a
   // pass_required course a completed row without its pass or fail keeps it
   // going, and at the bound the learner lands on the saving banner.
@@ -137,6 +140,7 @@ export default async function ContinuePage({
   // returned the first read's rows, so a result stored during the wait was
   // never seen (spec 63 (b2)). A signal opts the request out of that cache.
   const maxReads = Math.floor(CONTINUE_WAIT_MS / CONTINUE_POLL_MS) + 1;
+  const deadline = Date.now() + CONTINUE_WAIT_MS;
   let stored = false;
   let done = false;
   for (let read = 0; read < maxReads; read++) {
@@ -159,7 +163,9 @@ export default async function ContinuePage({
       done = officialDone(scoring, passRequired);
       break;
     }
-    if (read < maxReads - 1) await new Promise((r) => setTimeout(r, CONTINUE_POLL_MS));
+    const left = deadline - Date.now();
+    if (read === maxReads - 1 || left <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(CONTINUE_POLL_MS, left)));
   }
 
   if (!stored) log("continue_timeout");

@@ -74,10 +74,10 @@ const WAIT_MS = 6_000;
  * "Moves on at once" ("about 2 s" in the record) is asserted against the
  * waits this run measured, not a fixed figure: a prompt answer beats the
  * shortest of them ((b), then the lower of (b) and (d)) by at least half of
- * WAIT_MS. A wait sleeps the full WAIT_MS on top of the same reads plus six
- * more reads of the attempts, so the real gap is over 6 s in any
- * environment, while both figures move with the database latency; up to
- * about three of the six one-second sleeps still pass as "at once". A fixed
+ * WAIT_MS. A wait runs to its WAIT_MS deadline after the same pre-wait
+ * reads, so the real gap is about 6 s in any environment, while both
+ * figures move with the database latency; up to about three of the
+ * one-second sleeps still pass as "at once". A fixed
  * 4 s came first; Cloud Run staging met it, but at a GitHub runner's latency
  * (local runs with 270 ms added to every database call, 2026-11-12) a
  * prompt answer takes 3.5 to 4.4 s and a wait about 12 s, and the nightly
@@ -605,10 +605,10 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     // service role mid-wait (as spec 46 stores one): the case is about the
     // address's reads, and a statements round trip from a runner can outlast
     // the 6 s wait. The shortest measured wait minus WAIT_MS is the time
-    // before the first read of the attempts, seven of those reads and the
-    // answer's overhead; 1.5 s past that puts the store between the first
-    // read and the last with about 2 s or more on either side, at Cloud Run
-    // and at runner latency, so without fresh reads this case fails.
+    // before the wait's first read plus its last read and the answer's
+    // overhead; 1.5 s past that puts the store about 1.5 to 2 s into the
+    // wait, after the first read and some 4 s before the deadline, at Cloud
+    // Run and at runner latency, so without fresh reads this case fails.
     const d = await createAuthUser({ profile: { first_name: "Continue", last_name: "D", must_change_password: false } });
     await addMember({ organizationId: s.org!.id, userId: d.id, role: "member" });
     const { error: ae } = await svc().from("learning_path_assignments").insert({ organization_id: s.org!.id, path_id: s.pathId, assignee_type: "user", user_id: d.id });
