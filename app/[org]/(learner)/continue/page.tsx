@@ -131,6 +131,10 @@ export default async function ContinuePage({
   // It ends only on a stored result whose verdict is not pending: on a
   // pass_required course a completed row without its pass or fail keeps it
   // going, and at the bound the learner lands on the saving banner.
+  // Every read carries its own abort signal: Next memoizes identical GET
+  // fetches within one server render, and without a signal reads 2 to 7
+  // returned the first read's rows, so a result stored during the wait was
+  // never seen (spec 63 (b2)). A signal opts the request out of that cache.
   const maxReads = Math.floor(CONTINUE_WAIT_MS / CONTINUE_POLL_MS) + 1;
   let stored = false;
   let done = false;
@@ -142,7 +146,8 @@ export default async function ContinuePage({
           .from("course_attempts")
           .select(columns)
           .eq("user_id", user.id)
-          .in("course_version_id", versionIds),
+          .in("course_version_id", versionIds)
+          .abortSignal(new AbortController().signal),
       ATTEMPT_COLUMNS
     );
     if (rowsErr) readError();
