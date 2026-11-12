@@ -175,3 +175,7 @@ Note (2026-11-11, later; ADR 0022 section E built, pull request 237; a pointer, 
 - `app/[org]/(admin)/analytics/page.tsx`, `app/[org]/(admin)/reports/page.tsx`, `app/[org]/(admin)/library/page.tsx`, `lib/attention/collect.ts`
 - `app/api/integrations/catalog/route.ts`, `docs/CRM_INTEGRATION.md`
 - ADR 0003 (migration numbering, unit job), ADR 0004 (D2), ADR 0006 (engine digest, self-check), ADR 0007 (scheduler, lifecycle nightly)
+
+## Notes
+
+Note 2026-11-12 (ADR 0024, Proposed): this record's own D1 (not ADR 0024's D1) says completion and scoring never read `is_preview` or `launch_mode`. That left a preview attempt able to become a learner's official result, which the owner's staging test of 2026-11-11 showed. Under ADR 0024 a preview is its own attempt context (`context_kind = 'preview'`, tied to `is_preview` by a database check), and the one official rule in SQL and TypeScript excludes it, so scoring reads the preview flag for this one purpose. The rest of D1 is unchanged: no scoring, journey, manager, CRM or integration path reads a tier, the manifest or a 2.0 field, and `launch_mode` is still not read by scoring. The guard `tests/unit/alds-tier-read-sites.test.ts` is amended for `is_preview` and `context_kind` in the build. The change takes effect when ADR 0024 is accepted. See ADR 0024 sections A and B (steps 5, 9).
