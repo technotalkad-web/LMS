@@ -76,12 +76,13 @@ const WAIT_MS = 6_000;
  * shortest of them ((b), then the lower of (b) and (d)) by at least half of
  * WAIT_MS. A wait runs to its WAIT_MS deadline after the same pre-wait
  * reads, so the real gap is about 6 s in any environment, while both
- * figures move with the database latency; up to about three of the
- * one-second sleeps still pass as "at once". A fixed
- * 4 s came first; Cloud Run staging met it, but at a GitHub runner's latency
- * (local runs with 270 ms added to every database call, 2026-11-12) a
- * prompt answer takes 3.5 to 4.4 s and a wait about 12 s, and the nightly
- * runner crossed 4 s.
+ * figures move with the database latency; an answer that needed up to
+ * about two more reads, or whose reads before the wait ran up to about 3 s
+ * slow, still passes as "at once". A fixed 4 s came first; Cloud Run
+ * staging met it, but at a GitHub runner's latency (local runs with 270 ms
+ * added to every database call, 2026-11-12) a prompt answer takes 2.6 to
+ * 4.0 s (once 6.3 s, its reads before the wait slow) and a wait 9.6 to
+ * 10.2 s, and the nightly runner crossed 4 s.
  */
 const PROMPT_GAP_MS = WAIT_MS / 2;
 /** Never tighter than the first version's fixed bound; a wait still takes over WAIT_MS. */
@@ -606,7 +607,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     // address's reads, and a statements round trip from a runner can outlast
     // the 6 s wait. The shortest measured wait minus WAIT_MS is the time
     // before the wait's first read plus its last read and the answer's
-    // overhead; 1.5 s past that puts the store about 1.5 to 2 s into the
+    // overhead; 1.5 s past that puts the store about 1.5 to 2.5 s into the
     // wait, after the first read and some 4 s before the deadline, at Cloud
     // Run and at runner latency, so without fresh reads this case fails.
     const d = await createAuthUser({ profile: { first_name: "Continue", last_name: "D", must_change_password: false } });
