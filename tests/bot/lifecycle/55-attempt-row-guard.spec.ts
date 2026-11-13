@@ -268,6 +268,13 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
         .select("id")
         .single();
       expect(pErr, `program: ${pErr?.message}`).toBeNull();
+      // The draft day row before the version (ADR 0024 step 64): 0107's Q8
+      // before-check and its paste-window trigger find day 1 by (program,
+      // day number), so the day gets its identity.
+      const { error: dErr } = await db
+        .from("journey_days")
+        .insert({ program_id: program!.id, organization_id: orgA.id, day_number: 1, course_id: courses[key].course, mission_title: `QA mission ${key}` });
+      expect(dErr, `journey day: ${dErr?.message}`).toBeNull();
       const { data: jv, error: vErr } = await db
         .from("journey_versions")
         .insert({

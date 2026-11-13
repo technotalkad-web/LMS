@@ -125,11 +125,18 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
   const { data: path } = await db.from("learning_paths").insert({ organization_id: org.id, name: "QA Path", slug: `qa-path-${rand()}` }).select("id").single();
   await db.from("learning_path_courses").insert({ path_id: path!.id, course_id: course!.id, step_number: 1 });
   const { data: program } = await db.from("journey_programs").insert({ organization_id: org.id, name: "QA Journey", days_total: 30 }).select("id").single();
-  const { data: jversion } = await db.from("journey_versions").insert({ program_id: program!.id, organization_id: org.id, version_number: 1, name: "QA Journey", days_total: 30, count_sundays: false, completion_title: "Yoddha", days: [] }).select("id").single();
+  // ADR 0024 step 64: day 3 (the day the attempt and the progress row use) has
+  // a draft row before the version and is in the version's days, so 0107's Q8
+  // before-check and its paste-window trigger give it a day identity.
+  const { error: dayErr } = await db.from("journey_days").insert({ program_id: program!.id, organization_id: org.id, day_number: 3, course_id: course!.id, mission_title: "QA mission" });
+  expect(dayErr, `journey day insert: ${dayErr?.message}`).toBeNull();
+  const { data: jversion } = await db.from("journey_versions").insert({ program_id: program!.id, organization_id: org.id, version_number: 1, name: "QA Journey", days_total: 30, count_sundays: false, completion_title: "Yoddha", days: [{ day: 3, course_id: course!.id, mission_title: "QA mission" }] }).select("id").single();
   await db.from("journey_programs").update({ current_version_id: jversion!.id }).eq("id", program!.id);
   const { data: enrollment } = await db.from("journey_enrollments").insert({ program_id: program!.id, version_id: jversion!.id, organization_id: org.id, user_id: learner.id, start_date: new Date().toISOString().slice(0, 10), status: "active" }).select("id").single();
 
-  const { data: attempt, error: attErr } = await db.from("course_attempts").insert({ course_version_id: version!.id, user_id: learner.id, organization_id: org.id, status: "in_progress", completion_status: "in_progress", success_status: "unknown", learning_path_id: path!.id, journey_enrollment_id: enrollment!.id, journey_day: 3 }).select("id").single();
+  // One tag per attempt (ADR 0024; 0107's Q2 refuses a row with both): this
+  // one is the journey's; the SCORM attempt below carries the path tag.
+  const { data: attempt, error: attErr } = await db.from("course_attempts").insert({ course_version_id: version!.id, user_id: learner.id, organization_id: org.id, status: "in_progress", completion_status: "in_progress", success_status: "unknown", journey_enrollment_id: enrollment!.id, journey_day: 3 }).select("id").single();
   expect(attErr, `attempt insert: ${attErr?.message}`).toBeNull();
   const token = randomBytes(32).toString("hex");
   await db.from("cmi5_launch_tokens").insert({ auth_token: token, attempt_id: attempt!.id });
@@ -181,7 +188,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
         rec("S2d enriched object id (stable course/question)", ans.object.id === `${NS}activities/course/${course!.id}/question/3_q_k1`, ans.object.id);
         rec("S2e actor is mbox email only", ans.actor.mbox === `mailto:${learner.email.toLowerCase()}` && !ans.actor.account, ans.actor);
         rec("S2f segment E2E, team, employee id, tenure present", E[`${NS}ext/learner/segment`] === "E2E" && (E[`${NS}ext/learner/teams`] as string[] | undefined)?.includes("West Sales QA") === true && E[`${NS}ext/learner/employee-id`] === "QA-EMP-46" && typeof E[`${NS}ext/learner/tenure-days`] === "number", { segment: E[`${NS}ext/learner/segment`], teams: E[`${NS}ext/learner/teams`], emp: E[`${NS}ext/learner/employee-id`], tenure: E[`${NS}ext/learner/tenure-days`] });
-        rec("S2g grouping carries course, path+step, journey+day, org", [`${NS}activities/course/${course!.id}`, `${NS}activities/path/${path!.id}`, `${NS}activities/path/${path!.id}/step/1`, `${NS}activities/journey/${program!.id}`, `${NS}activities/journey/${program!.id}/day/3`, `${NS}activities/org/${org.id}`].every((g) => grouping.includes(g)), grouping);
+        rec("S2g grouping carries course, journey+day, org", [`${NS}activities/course/${course!.id}`, `${NS}activities/journey/${program!.id}`, `${NS}activities/journey/${program!.id}/day/3`, `${NS}activities/org/${org.id}`].every((g) => grouping.includes(g)), grouping);
         rec("S2h parent = slide 3; cmi5 category + profile category kept; registration = attempt", ans.context.contextActivities.parent?.[0]?.id === `${NS}activities/course/${course!.id}/slide/3` && (ans.context.contextActivities.category ?? []).some((c) => c.id.includes("cmi5")) && (ans.context.contextActivities.category ?? []).some((c) => c.id === `${NS}profile/v1`) && ans.context.registration === attempt!.id, { parent: ans.context.contextActivities.parent, category: ans.context.contextActivities.category });
         rec("S2i result preserved (success=false, response=a, duration)", ans.result?.success === false && ans.result?.response === "a" && ans.result?.duration === "PT23S", ans.result);
         const lint = Object.values(got).filter(Boolean).flatMap((s) => lintStatement(s));
@@ -214,7 +221,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
     // SCORM 1.2 attempt (finished) for the translation source.
     const sversion = await ins("scorm course_version", db.from("course_versions").insert({ course_id: course!.id, version_number: 2, manifest_type: "scorm12", launch_url: "index_lms.html", storage_prefix: `courses/${course!.id}/v2/`, manifest_data: { raw: { activityId: `${auId}-scorm` }, unitCount: 8 }, package_id: pkg!.id }).select("id").single());
     const sattempt = sversion
-      ? await ins("scorm course_attempt", db.from("course_attempts").insert({ course_version_id: sversion.id, user_id: learner.id, organization_id: org.id, status: "passed", completion_status: "completed", success_status: "passed", score: 0.8, completed_at: new Date().toISOString(), cmi_data: { "cmi.core.score.raw": 8, "cmi.core.score.max": 10, "cmi.core.score.min": 0, "cmi.core.total_time": "0000:12:30.00", "cmi.core.lesson_status": "passed", "cmi.interactions.0.id": "q1", "cmi.interactions.0.type": "choice", "cmi.interactions.0.student_response": "b", "cmi.interactions.0.correct_responses.0.pattern": "b", "cmi.interactions.0.result": "correct", "cmi.interactions.0.latency": "0000:00:20.00", "cmi.interactions.1.id": "q2", "cmi.interactions.1.type": "true-false", "cmi.interactions.1.student_response": "f", "cmi.interactions.1.correct_responses.0.pattern": "t", "cmi.interactions.1.result": "wrong" } }).select("id").single())
+      ? await ins("scorm course_attempt", db.from("course_attempts").insert({ course_version_id: sversion.id, user_id: learner.id, organization_id: org.id, learning_path_id: path!.id, status: "passed", completion_status: "completed", success_status: "passed", score: 0.8, completed_at: new Date().toISOString(), cmi_data: { "cmi.core.score.raw": 8, "cmi.core.score.max": 10, "cmi.core.score.min": 0, "cmi.core.total_time": "0000:12:30.00", "cmi.core.lesson_status": "passed", "cmi.interactions.0.id": "q1", "cmi.interactions.0.type": "choice", "cmi.interactions.0.student_response": "b", "cmi.interactions.0.correct_responses.0.pattern": "b", "cmi.interactions.0.result": "correct", "cmi.interactions.0.latency": "0000:00:20.00", "cmi.interactions.1.id": "q2", "cmi.interactions.1.type": "true-false", "cmi.interactions.1.student_response": "f", "cmi.interactions.1.correct_responses.0.pattern": "t", "cmi.interactions.1.result": "wrong" } }).select("id").single())
       : null;
     rec("Fixtures for LMS-derived events seeded (journey day, journey completion, rating, XP, badge, SCORM attempt)", Object.keys(fixtureErrors).length === 0, Object.keys(fixtureErrors).length ? fixtureErrors : "all seeded");
 
@@ -222,12 +229,13 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
     await test.step("S3 drainer and sweeper", async () => {
       const expected: Record<string, string> = {
         launched: uuid5(`launched:${attempt!.id}`),
-        "path step completed": uuid5(`path-step:${attempt!.id}`),
-        "path satisfied": uuid5(`path-satisfied:${path!.id}:${learner.id}`),
         ...(progress ? { "journey day completed": uuid5(`journey-day:${progress.id}`) } : {}),
         ...(fixtureErrors["journey_enrollments.completed"] ? {} : { "journey satisfied": uuid5(`journey-satisfied:${enrollment!.id}`) }),
         ...(sattempt
           ? {
+              // The path step and the path's satisfaction come from the path-tagged SCORM attempt.
+              "path step completed": uuid5(`path-step:${sattempt.id}`),
+              "path satisfied": uuid5(`path-satisfied:${path!.id}:${learner.id}`),
               "scorm completed": uuid5(`scorm:${sattempt.id}:completed`),
               "scorm passed": uuid5(`scorm:${sattempt.id}:passed`),
               "scorm answered q1": uuid5(`scorm:${sattempt.id}:answered:0`),

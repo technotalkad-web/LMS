@@ -5,7 +5,8 @@
  *
  *   - course DELETE with learner attempts → 409 (route count, decision 3)
  *   - an attempt by a user since removed from the org still blocks
- *   - staff-only attempts do not block (decision 3's definition)
+ *   - staff-only attempts do not block (decision 3's definition); from
+ *     0107 on, the admin's by-role row blocks (ADR 0024 decision L2)
  *   - delete of a course_versions row with learner attempts through an
  *     admin session → learner_history_exists, for a current member's attempt
  *     and for a removed member's attempt (no membership = learner)
@@ -31,7 +32,7 @@
 import { test, expect, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
-import { NEEDS_0098, has0098, scormZip, sessionClient, sha256, uploadNew, zipFile } from "./p0-helpers";
+import { NEEDS_0098, has0098, has0107, scormZip, sessionClient, sha256, uploadNew, zipFile } from "./p0-helpers";
 import { cleanupLifecycleData } from "./cleanup";
 
 type User = { id: string; email: string; password: string };
@@ -113,6 +114,16 @@ test.describe.serial("ADR 0003 — record guard", () => {
       .in("course_version_id", ((cVersions ?? []) as Array<{ id: string }>).map((v) => v.id));
     expect(((cAttempts ?? []) as Array<{ user_id: string }>).map((a) => a.user_id), "course C holds exactly the admin's attempt").toEqual([s.admin!.id]);
     const res = await s.adminCtx!.request.delete(`/api/courses/${s.courseC}`);
+    if (await has0107()) {
+      // ADR 0024 step 62 (decision L2, conflicts row 15): with 0107 the
+      // admin's row reads legacy_role, a by-role row that is never deleted.
+      // The route's own count still leaves staff out, the recreated delete
+      // guard refuses, and the route answers 409; course C stays.
+      expect(res.status(), await res.text()).toBe(409);
+      const { data: still } = await svc().from("courses").select("id").eq("id", s.courseC!).maybeSingle();
+      expect(still, "course C still exists").toBeTruthy();
+      return;
+    }
     expect(res.status(), await res.text()).toBe(200);
     const { data } = await svc().from("courses").select("id").eq("id", s.courseC!).maybeSingle();
     expect(data).toBeNull();
