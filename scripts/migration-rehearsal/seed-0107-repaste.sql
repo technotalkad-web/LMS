@@ -24,6 +24,13 @@
 --       individual and counts one firing in context_derive_log (2a), which
 --       the second paste must keep (its row is created once). It is
 --       abandoned, so it holds no open-row slot and no completion.
+--   r7 to r10  one row in each table of section 3 (creation order item 3):
+--       a path completion, a step fact (build note O1-g (5): "a second
+--       paste of 0107 leaves the rows as they are"), a sent completion
+--       claim and a Preview deletion record. The second paste re-creates
+--       their policies and their append-only triggers and must leave every
+--       value as written. They name a path of their own, PR (no step, no
+--       attempt), so no reader of the later sections meets them.
 -- r1 to r3 name context_kind, as the new code does, so they fire nothing.
 
 insert into public.course_attempts
@@ -68,3 +75,28 @@ values
 insert into public.org_api_keys (id, organization_id, name, key_prefix, key_hash, created_by) values
   ('00000000-0000-0000-0000-000107120005', '00000000-0000-0000-0000-00000000000a', 'CRM key after the paste (0107)', 'ambk_0107cd',
    'seed-0107-key-hash-2', '00000000-0000-0000-0000-0000000000a2');
+
+-- r7 to r10: PR, then one row in each table of section 3 (learner B; S is
+-- the admin who confirmed the deletion)
+insert into public.learning_paths (id, organization_id, name, slug, is_active, visibility) values
+  ('00000000-0000-0000-0000-000107120101', '00000000-0000-0000-0000-00000000000a', 'PR after the paste (0107)',
+   'pr-0107', true, 'private');
+insert into public.learning_path_completions (id, organization_id, path_id, user_id, completed_at, path_score, steps) values
+  ('00000000-0000-0000-0000-000107120007', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107120101',
+   '00000000-0000-0000-0000-000107010003', '2026-11-13 09:00:00+00', 0.75,
+   '[{"step": 1, "course_id": "00000000-0000-0000-0000-0000000000c1", "attempt_id": "00000000-0000-0000-0000-000107070008", "score": 0.75}]');
+insert into public.learning_path_step_completions (id, organization_id, path_id, course_id, user_id, attempt_id,
+                                                   rule_pass_required, done_at) values
+  ('00000000-0000-0000-0000-000107120008', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107120101',
+   '00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-000107010003', '00000000-0000-0000-0000-000107070008',
+   false, '2026-11-13 08:59:00+00');
+insert into public.completion_notices (id, organization_id, user_id, product_kind, instance_id, attempt_id, event_type,
+                                       origin, claimed_at, sent_at) values
+  ('00000000-0000-0000-0000-000107120009', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107010003',
+   'path', '00000000-0000-0000-0000-000107120101', '00000000-0000-0000-0000-000107070008', 'path_completed', 'learner',
+   '2026-11-13 09:00:00+00', '2026-11-13 09:00:05+00');
+insert into public.preview_purge_log (id, organization_id, ran_at, reason, actor_user_id, scope, counts, attempt_ids,
+                                      run_ids, excluded) values
+  ('00000000-0000-0000-0000-000107120010', '00000000-0000-0000-0000-00000000000a', '2026-11-13 09:10:00+00', 'manual',
+   '00000000-0000-0000-0000-000107010006', '{"course_ids": ["00000000-0000-0000-0000-0000000000c2"]}',
+   '{"course_attempts": 0, "total": 0}', '{}', '{}', '[]');

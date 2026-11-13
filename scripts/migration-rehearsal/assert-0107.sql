@@ -7,10 +7,12 @@
 -- creation order item 2 whole: the columns, their run-once backfills, the
 -- generated columns, the CHECKs, preview_runs, context_derive_log, the
 -- immutability and derive triggers, the two attempt foreign keys, the key
--- swaps and the indexes) and section 6's paste-window day_ids trigger on
--- journey_versions: checks (0) to (6) for section 1, (7) to (10) for the
--- rest; the rows (7) to (10) write have ids whose last group starts
--- 00010713. The checks of the later sections come with them. The whole file
+-- swaps and the indexes), section 3 (creation order item 3: the four new
+-- tables) and section 6's paste-window day_ids trigger on journey_versions:
+-- checks (0) to (6) for section 1, (7) to (10) for section 2 and 6a, (11)
+-- and (12) for section 3; the rows (7) to (10) write have ids whose last
+-- group starts 00010713, those of (12) 00010714. The checks of the later
+-- sections come with them. The whole file
 -- is one transaction that ends in ROLLBACK, so nothing it writes reaches the
 -- next step. Every check raises 'assert-0107: (n) …' on failure; the runner
 -- then reports the file as failed and stops the scenario.
@@ -26,7 +28,7 @@
 -- anon and authenticated usage on public and select on every table before
 -- the paste (the project defaults), and authenticated insert, update and
 -- delete on org_api_keys; the shim sets no default privileges, so preview_runs
--- holds exactly what 0107 grants.
+-- and the four tables of section 3 hold exactly what 0107 grants.
 begin;
 
 -- ---------------------------------------------------------------------------
@@ -803,8 +805,9 @@ $$;
 --     functions (security definer only for the derive trigger, the pinned
 --     search_path, execute for service_role only); the indexes exactly as
 --     defined, with the three replaced keys gone. With the five of (2), these
---     are twelve of step 7's seventeen foreign-key indexes; the other five
---     come with the tables of creation order item 3.
+--     are twelve of the twenty foreign-key indexes (step 7's seventeen and
+--     the three of build note O1-a); the other eight come with the tables of
+--     section 3 and are checked in (11).
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -1443,6 +1446,759 @@ begin
      is distinct from 'slot_backfill' then
     raise exception 'assert-0107: (10) an org admin''s publish reads day_ids % (expected days 1 and 2 mapped, slot_backfill)',
       (select day_ids from public.journey_versions where id = '00000000-0000-0000-0000-000107132009');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (11) section 3, the objects (creation order item 3; steps 14, 15 and 79;
+--      build note O1-a and O1-b): the four tables' columns exactly; their
+--      foreign keys (on delete; none on learning_path_step_completions.
+--      attempt_id or preview_purge_log.actor_user_id); their primary keys,
+--      unique keys and checks; row-level security with the select policy
+--      (own rows or is_org_admin) or the no-access policy; the privilege
+--      matrix (has_table_privilege per privilege, note N3); the three
+--      append-only triggers and their functions, and no trigger on
+--      completion_notices; the indexes exactly as defined; and the twenty
+--      foreign-key indexes of step 7 as build note O1-a counts them (seven in
+--      (7), five in (2), eight here), each leading with its column, with
+--      every foreign key of the four tables led by an index.
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  bad  text[] := '{}';
+  r    record;
+  g    record;
+  got  text;
+  tbls constant text[] := array['learning_path_completions', 'learning_path_step_completions',
+                                'completion_notices', 'preview_purge_log'];
+begin
+  -- the columns, exactly
+  for r in
+    select * from (values
+      ('learning_path_completions',
+       'id uuid not null default gen_random_uuid(), organization_id uuid not null, path_id uuid not null, '
+       || 'user_id uuid not null, completed_at timestamp with time zone not null default now(), '
+       || 'path_score numeric, steps jsonb not null default ''[]''::jsonb'),
+      ('learning_path_step_completions',
+       'id uuid not null default gen_random_uuid(), organization_id uuid not null, path_id uuid not null, '
+       || 'course_id uuid not null, user_id uuid not null, attempt_id uuid, rule_pass_required boolean not null, '
+       || 'done_at timestamp with time zone not null default now()'),
+      ('completion_notices',
+       'id uuid not null default gen_random_uuid(), organization_id uuid not null, user_id uuid not null, '
+       || 'product_kind text not null, instance_id uuid not null, attempt_id uuid, event_type text not null, '
+       || 'origin text not null default ''learner''::text, claimed_at timestamp with time zone not null default now(), '
+       || 'sent_at timestamp with time zone'),
+      ('preview_purge_log',
+       'id uuid not null default gen_random_uuid(), organization_id uuid not null, '
+       || 'ran_at timestamp with time zone not null default now(), reason text not null, actor_user_id uuid not null, '
+       || 'scope jsonb, counts jsonb not null, attempt_ids uuid[], run_ids uuid[], excluded jsonb')
+    ) as t(tbl, cols)
+  loop
+    select string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
+                      || case when a.attnotnull then ' not null' else '' end
+                      || coalesce(' default ' || pg_get_expr(d.adbin, d.adrelid), ''), ', ' order by a.attnum)
+      into got
+      from pg_attribute a
+      left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+     where a.attrelid = to_regclass('public.' || r.tbl) and a.attnum > 0 and not a.attisdropped;
+    if got is distinct from r.cols then
+      bad := bad || format('%s has columns (%s)', r.tbl, coalesce(got, 'none: the table is missing'));
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (11) %', array_to_string(bad, '; ');
+  end if;
+
+  -- the foreign keys: on delete, not deferrable, and no other
+  for r in
+    select * from (values
+      ('learning_path_completions',      'organization_id', 'public.organizations',   'c'),
+      ('learning_path_completions',      'path_id',         'public.learning_paths',  'a'),
+      ('learning_path_completions',      'user_id',         'auth.users',             'c'),
+      ('learning_path_step_completions', 'organization_id', 'public.organizations',   'c'),
+      ('learning_path_step_completions', 'path_id',         'public.learning_paths',  'a'),
+      ('learning_path_step_completions', 'course_id',       'public.courses',         'c'),
+      ('learning_path_step_completions', 'user_id',         'auth.users',             'c'),
+      ('completion_notices',             'organization_id', 'public.organizations',   'c'),
+      ('completion_notices',             'user_id',         'auth.users',             'c'),
+      ('completion_notices',             'attempt_id',      'public.course_attempts', 'n'),
+      ('preview_purge_log',              'organization_id', 'public.organizations',   'c')
+    ) as t(tbl, col, parent, deltype)
+  loop
+    select k.confdeltype::text as deltype, k.condeferrable, k.confrelid, count(*) over () as n
+      into g
+      from pg_constraint k
+      join pg_attribute a on a.attrelid = k.conrelid and a.attnum = any (k.conkey)
+     where k.contype = 'f' and k.conrelid = ('public.' || r.tbl)::regclass and a.attname = r.col;
+    if not found then
+      bad := bad || format('no foreign key on %s.%s', r.tbl, r.col);
+    elsif g.n <> 1 or g.deltype <> r.deltype or g.condeferrable or g.confrelid <> r.parent::regclass then
+      bad := bad || format('%s.%s: %s key(s), to %s, on delete %s, deferrable %s (expected one, to %s, on delete %s)',
+                           r.tbl, r.col, g.n, g.confrelid::regclass, g.deltype, g.condeferrable, r.parent, r.deltype);
+    end if;
+  end loop;
+  for r in
+    select * from (values
+      ('learning_path_completions', 3), ('learning_path_step_completions', 4),
+      ('completion_notices', 3), ('preview_purge_log', 1)
+    ) as t(tbl, n)
+  loop
+    if (select count(*) from pg_constraint where conrelid = ('public.' || r.tbl)::regclass and contype = 'f') <> r.n then
+      bad := bad || format('%s does not have exactly its %s foreign key(s)', r.tbl, r.n);
+    end if;
+  end loop;
+
+  -- primary keys, unique keys and checks (validated), and no other
+  for r in
+    select * from (values
+      ('learning_path_completions',      'learning_path_completions_pkey',      'PRIMARY KEY (id)'),
+      ('learning_path_completions',      'learning_path_completions_path_id_user_id_key', 'UNIQUE (path_id, user_id)'),
+      ('learning_path_step_completions', 'learning_path_step_completions_pkey', 'PRIMARY KEY (id)'),
+      ('learning_path_step_completions', 'learning_path_step_completions_path_id_user_id_course_id_key',
+       'UNIQUE (path_id, user_id, course_id)'),
+      ('completion_notices',             'completion_notices_pkey',             'PRIMARY KEY (id)'),
+      ('completion_notices',             'completion_notices_user_id_product_kind_instance_id_key',
+       'UNIQUE (user_id, product_kind, instance_id)'),
+      ('completion_notices',             'completion_notices_product_kind_check', null),
+      ('completion_notices',             'completion_notices_origin_check',       null),
+      ('preview_purge_log',              'preview_purge_log_pkey',              'PRIMARY KEY (id)'),
+      ('preview_purge_log',              'preview_purge_log_reason_check',      null)
+    ) as t(tbl, name, def)
+  loop
+    got := (select pg_get_constraintdef(oid) from pg_constraint
+             where conrelid = ('public.' || r.tbl)::regclass and conname = r.name and convalidated);
+    if got is null or got is distinct from coalesce(r.def, got) then
+      bad := bad || format('constraint %s on %s reads %s', r.name, r.tbl, coalesce(got, 'missing or not validated'));
+    end if;
+  end loop;
+  for r in
+    select * from (values
+      ('learning_path_completions', 2), ('learning_path_step_completions', 2),
+      ('completion_notices', 4), ('preview_purge_log', 2)
+    ) as t(tbl, n)
+  loop
+    if (select count(*) from pg_constraint
+         where conrelid = ('public.' || r.tbl)::regclass and contype in ('p', 'u', 'c')) <> r.n then
+      bad := bad || format('%s does not have exactly its %s primary, unique and check constraints', r.tbl, r.n);
+    end if;
+  end loop;
+
+  -- row-level security and exactly one policy each
+  for r in
+    select * from (values
+      ('learning_path_completions',      'learners and admins read path completions', 'r'),
+      ('learning_path_step_completions', 'learners and admins read step completions', 'r'),
+      ('completion_notices',             'no direct access to completion_notices',     '*'),
+      ('preview_purge_log',              'no direct access to preview_purge_log',      '*')
+    ) as t(tbl, pol, cmd)
+  loop
+    if not (select relrowsecurity from pg_class where oid = ('public.' || r.tbl)::regclass) then
+      bad := bad || format('%s has row-level security off', r.tbl);
+    end if;
+    select p.polname::text as polname, p.polcmd::text as cmd, p.polpermissive, p.polroles,
+           pg_get_expr(p.polqual, p.polrelid) as qual, pg_get_expr(p.polwithcheck, p.polrelid) as wc,
+           count(*) over () as n
+      into g
+      from pg_policy p
+     where p.polrelid = ('public.' || r.tbl)::regclass;
+    if not found then
+      bad := bad || format('%s has no policy', r.tbl);
+    elsif g.n <> 1 or g.polname <> r.pol or g.cmd <> r.cmd or not g.polpermissive or g.polroles <> array[0::oid]
+          or (r.cmd = 'r' and (g.qual not like '%(user_id = auth.uid())%' or g.qual not like '% OR %'
+                               or g.qual not like '%is_org_admin(organization_id)%' or g.wc is not null))
+          or (r.cmd = '*' and (g.qual <> 'false' or g.wc <> 'false')) then
+      bad := bad || format('%s: %s policy(ies); %s for %s using %s with check %s', r.tbl, g.n, g.polname, g.cmd,
+                           coalesce(g.qual, 'null'), coalesce(g.wc, 'null'));
+    end if;
+  end loop;
+
+  -- the privilege matrix, per privilege (note N3: no raw ACL text, no MAINTAIN)
+  for r in
+    select * from (values
+      ('learning_path_completions',      'anon',          ''),
+      ('learning_path_completions',      'authenticated', 'select'),
+      ('learning_path_completions',      'service_role',  'select'),
+      ('learning_path_step_completions', 'anon',          ''),
+      ('learning_path_step_completions', 'authenticated', 'select'),
+      ('learning_path_step_completions', 'service_role',  'select'),
+      ('completion_notices',             'anon',          ''),
+      ('completion_notices',             'authenticated', ''),
+      ('completion_notices',             'service_role',  'select,update'),
+      ('preview_purge_log',              'anon',          ''),
+      ('preview_purge_log',              'authenticated', ''),
+      ('preview_purge_log',              'service_role',  'select')
+    ) as t(tbl, role_name, granted)
+  loop
+    for g in
+      select x.priv from unnest(array['select', 'insert', 'update', 'delete', 'truncate', 'references', 'trigger']) as x(priv)
+    loop
+      if has_table_privilege(r.role_name, 'public.' || r.tbl, g.priv)
+         <> (g.priv = any (string_to_array(r.granted, ','))) then
+        bad := bad || format('%s %s on %s: %s (expected %s)', r.role_name, g.priv, r.tbl,
+                             not (g.priv = any (string_to_array(r.granted, ','))),
+                             g.priv = any (string_to_array(r.granted, ',')));
+      end if;
+    end loop;
+  end loop;
+
+  -- the append-only triggers (tgtype 27 = row, before, delete, update) and
+  -- their functions; no trigger on completion_notices
+  for r in
+    select * from (values
+      ('learning_path_completions',      'learning_path_completions_no_mutation',      'learning_path_completions_append_only'),
+      ('learning_path_step_completions', 'learning_path_step_completions_no_mutation', 'learning_path_step_completions_append_only'),
+      ('preview_purge_log',              'preview_purge_log_no_mutation',              'preview_purge_log_append_only')
+    ) as t(tbl, tg, fn)
+  loop
+    select t.tgname::text as tgname, t.tgtype::int as tgtype, t.tgenabled::text as enabled, p.proname::text as fn,
+           pg_get_triggerdef(t.oid) as def, count(*) over () as n
+      into g
+      from pg_trigger t
+      join pg_proc p on p.oid = t.tgfoid
+     where t.tgrelid = ('public.' || r.tbl)::regclass and not t.tgisinternal;
+    if not found then
+      bad := bad || format('%s has no trigger', r.tbl);
+    elsif g.n <> 1 or g.tgname <> r.tg or g.tgtype <> 27 or g.enabled <> 'O' or g.fn <> r.fn or g.def like '%WHEN%' then
+      bad := bad || format('%s: %s trigger(s); %s (type %s, enabled %s)', r.tbl, g.n, g.def, g.tgtype, g.enabled);
+    end if;
+    select p.prosecdef, p.proconfig, l.lanname::text as lang, p.prorettype::regtype::text as rettype
+      into g
+      from pg_proc p
+      join pg_language l on l.oid = p.prolang
+     where p.oid = to_regprocedure('public.' || r.fn || '()');
+    if not found then
+      bad := bad || format('public.%s() is missing', r.fn);
+    elsif g.prosecdef or g.proconfig is distinct from array['search_path=pg_catalog, public']
+          or g.lang <> 'plpgsql' or g.rettype <> 'trigger' then
+      bad := bad || format('public.%s(): security definer %s, proconfig %s, %s, returns %s', r.fn, g.prosecdef,
+                           coalesce(g.proconfig::text, 'null'), g.lang, g.rettype);
+    elsif has_function_privilege('anon', 'public.' || r.fn || '()', 'execute')
+          or has_function_privilege('authenticated', 'public.' || r.fn || '()', 'execute')
+          or not has_function_privilege('service_role', 'public.' || r.fn || '()', 'execute') then
+      bad := bad || format('public.%s(): execute is not service_role only', r.fn);
+    end if;
+  end loop;
+  if exists (select 1 from pg_trigger where tgrelid = 'public.completion_notices'::regclass and not tgisinternal) then
+    bad := bad || 'completion_notices has a trigger (it is not append-only: the routes stamp sent_at)'::text;
+  end if;
+
+  -- the indexes of section 3, exactly as defined, and no other
+  for r in
+    select * from (values
+      ('learning_path_completions_organization_idx',
+       'CREATE INDEX learning_path_completions_organization_idx ON public.learning_path_completions USING btree (organization_id)'),
+      ('learning_path_completions_user_idx',
+       'CREATE INDEX learning_path_completions_user_idx ON public.learning_path_completions USING btree (user_id)'),
+      ('learning_path_completions_path_id_user_id_key',
+       'CREATE UNIQUE INDEX learning_path_completions_path_id_user_id_key ON public.learning_path_completions USING btree (path_id, user_id)'),
+      ('learning_path_step_completions_organization_idx',
+       'CREATE INDEX learning_path_step_completions_organization_idx ON public.learning_path_step_completions USING btree (organization_id)'),
+      ('learning_path_step_completions_user_idx',
+       'CREATE INDEX learning_path_step_completions_user_idx ON public.learning_path_step_completions USING btree (user_id)'),
+      ('learning_path_step_completions_course_idx',
+       'CREATE INDEX learning_path_step_completions_course_idx ON public.learning_path_step_completions USING btree (course_id)'),
+      ('learning_path_step_completions_path_id_user_id_course_id_key',
+       'CREATE UNIQUE INDEX learning_path_step_completions_path_id_user_id_course_id_key ON public.learning_path_step_completions USING btree (path_id, user_id, course_id)'),
+      ('completion_notices_organization_idx',
+       'CREATE INDEX completion_notices_organization_idx ON public.completion_notices USING btree (organization_id)'),
+      ('completion_notices_attempt_idx',
+       'CREATE INDEX completion_notices_attempt_idx ON public.completion_notices USING btree (attempt_id) WHERE (attempt_id IS NOT NULL)'),
+      ('completion_notices_user_id_product_kind_instance_id_key',
+       'CREATE UNIQUE INDEX completion_notices_user_id_product_kind_instance_id_key ON public.completion_notices USING btree (user_id, product_kind, instance_id)'),
+      ('preview_purge_log_organization_idx',
+       'CREATE INDEX preview_purge_log_organization_idx ON public.preview_purge_log USING btree (organization_id)')
+    ) as t(idx, def)
+  loop
+    got := (select pg_get_indexdef(c.oid)
+              from pg_class c
+              join pg_namespace s on s.oid = c.relnamespace
+             where s.nspname = 'public' and c.relname = r.idx and c.relkind = 'i');
+    if got is distinct from r.def then
+      bad := bad || format('index %s reads %s', r.idx, coalesce(got, 'missing'));
+    end if;
+  end loop;
+  if (select count(*) from pg_index where indrelid = any (array(select ('public.' || x)::regclass from unnest(tbls) as x)))
+     <> 15 then
+    bad := bad || ('the four tables of section 3 do not have exactly their fifteen indexes '
+                   || '(four primary keys, three unique keys, eight foreign-key indexes)')::text;
+  end if;
+
+  -- the twenty foreign-key indexes of step 7 (build note O1-a), each
+  -- leading with its column
+  for r in
+    select * from (values
+      ('course_attempts',                'course_attempts_journey_version_idx',             'journey_version_id'),
+      ('course_attempts',                'course_attempts_preview_run_idx',                 'preview_run_id'),
+      ('course_attempts',                'course_attempts_journey_day_idx',                 'journey_day_id'),
+      ('attempt_requests',               'attempt_requests_journey_day_idx',                'journey_day_id'),
+      ('attempt_requests',               'attempt_requests_learning_path_idx',              'learning_path_id'),
+      ('attempt_requests',               'attempt_requests_journey_enrollment_idx',         'journey_enrollment_id'),
+      ('journey_day_progress',           'journey_day_progress_day_idx',                    'day_id'),
+      ('preview_runs',                   'preview_runs_organization_idx',                   'organization_id'),
+      ('preview_runs',                   'preview_runs_user_idx',                           'user_id'),
+      ('preview_runs',                   'preview_runs_learning_path_idx',                  'learning_path_id'),
+      ('preview_runs',                   'preview_runs_journey_program_idx',                'journey_program_id'),
+      ('preview_runs',                   'preview_runs_journey_version_idx',                'journey_version_id'),
+      ('learning_path_completions',      'learning_path_completions_organization_idx',      'organization_id'),
+      ('learning_path_completions',      'learning_path_completions_user_idx',              'user_id'),
+      ('learning_path_step_completions', 'learning_path_step_completions_organization_idx', 'organization_id'),
+      ('learning_path_step_completions', 'learning_path_step_completions_user_idx',         'user_id'),
+      ('learning_path_step_completions', 'learning_path_step_completions_course_idx',       'course_id'),
+      ('completion_notices',             'completion_notices_organization_idx',             'organization_id'),
+      ('completion_notices',             'completion_notices_attempt_idx',                  'attempt_id'),
+      ('preview_purge_log',              'preview_purge_log_organization_idx',              'organization_id')
+    ) as t(tbl, idx, col)
+  loop
+    if not exists (
+      select 1 from pg_index i
+      join pg_class c on c.oid = i.indexrelid
+      join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
+      where i.indrelid = ('public.' || r.tbl)::regclass and c.relname = r.idx and a.attname = r.col
+    ) then
+      bad := bad || format('foreign-key index %s on %s leading with %s is missing', r.idx, r.tbl, r.col);
+    end if;
+  end loop;
+  -- step 7's rule on the new tables: every foreign-key column leads an index
+  -- (path_id and completion_notices.user_id by their unique keys)
+  for r in
+    select k.conrelid::regclass::text as tbl, a.attname::text as col
+    from pg_constraint k
+    join pg_attribute a on a.attrelid = k.conrelid and a.attnum = k.conkey[1]
+    where k.contype = 'f'
+      and k.conrelid = any (array(select ('public.' || x)::regclass from unnest(tbls) as x))
+  loop
+    if not exists (
+      select 1 from pg_index i
+      join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
+      where i.indrelid = r.tbl::regclass and a.attname = r.col
+    ) then
+      bad := bad || format('the foreign-key column %s.%s leads no index', r.tbl, r.col);
+    end if;
+  end loop;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (11) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (12) section 3 at work, on rows whose ids' last group starts 00010714.
+--      Keys (each delete in a subtransaction that checks every deferred key
+--      and is then undone, as in (9)): the organisation cascade over a row of
+--      each table; the user cascade over a learner's completion, step fact
+--      and claim; a lone delete of a path that only a completion, or only a
+--      step fact, names raises 23503 on that table's path key (build note
+--      O1-g (10)), and a path nothing names deletes (control); the course
+--      cascade over a path attempt and its step fact for the service role
+--      (O1-g (9)), and the same delete on another session refused by the
+--      delete guard with the fact in place (control); an attempt delete sets
+--      a claim's attempt_id null. Then, as postgres (the owner, whom the
+--      security definer writers run as): the defaults; an update or a delete
+--      of each append-only table raises P0001 with a message no schema probe
+--      matches, while a claim's sent_at stamp passes (control); each unique
+--      key raises 23505 on a second row, and the writers' form, insert ... on
+--      conflict do nothing, inserts nothing; a claim of another product for
+--      the same learner passes; the checks and the not-null columns refuse.
+-- ---------------------------------------------------------------------------
+create function pg_temp.probe_0107(p_stmt text, p_claims text, p_probe text,
+                                   out state text, out con text, out msg text, out probe text)
+language plpgsql as $$
+begin
+  begin
+    if p_claims is not null then
+      perform set_config('request.jwt.claims', p_claims, true);
+    end if;
+    execute p_stmt;
+    set constraints all immediate;
+    if p_probe is not null then
+      execute p_probe into probe;
+    end if;
+    raise exception using errcode = 'R0107', message = 'assert-0107: undo';
+  exception when others then
+    get stacked diagnostics state = returned_sqlstate, con = constraint_name, msg = message_text;
+  end;
+  if state = 'R0107' then
+    state := 'ok';
+    con := null;
+    msg := null;
+  end if;
+end
+$$;
+
+select set_config('request.jwt.claims', '', true);
+
+do $$
+declare
+  bad   text[] := '{}';
+  r     record;
+  t     record;
+  a     record;
+  probe constant text := 'schema cache|does not exist|could not find the';
+  org   constant uuid := '00000000-0000-0000-0000-00000000000a';
+  u_i   constant uuid := '00000000-0000-0000-0000-000107010001';
+  u_p   constant uuid := '00000000-0000-0000-0000-000107010002';
+  u_s   constant uuid := '00000000-0000-0000-0000-000107010006';
+  c1    constant uuid := '00000000-0000-0000-0000-0000000000c1';
+  p1    constant uuid := '00000000-0000-0000-0000-000107050001';
+  px    constant uuid := '00000000-0000-0000-0000-000107141001';
+  py    constant uuid := '00000000-0000-0000-0000-000107141002';
+  pz    constant uuid := '00000000-0000-0000-0000-000107141003';
+  pw    constant uuid := '00000000-0000-0000-0000-000107141004';
+  cx    constant uuid := '00000000-0000-0000-0000-000107141101';
+  ax    constant uuid := '00000000-0000-0000-0000-000107141201';
+  rows4 constant text :=
+    'select format(''%s/%s/%s/%s'', '
+    || '(select count(*) from public.learning_path_completions where id::text like ''%-00010714200_''), '
+    || '(select count(*) from public.learning_path_step_completions where id::text like ''%-00010714200_''), '
+    || '(select count(*) from public.completion_notices where id::text like ''%-00010714200_''), '
+    || '(select count(*) from public.preview_purge_log where id::text like ''%-00010714200_''))';
+begin
+  -- paths PX (a completion of I only), PY (a step fact of I only), PZ (step
+  -- CX, a path attempt of I and its step fact) and PW (nothing); course CX
+  insert into public.learning_paths (id, organization_id, name, slug, is_active, visibility) values
+    (px, org, 'PX (0107 assert)', 'px-0107', true, 'private'),
+    (py, org, 'PY (0107 assert)', 'py-0107', true, 'private'),
+    (pz, org, 'PZ (0107 assert)', 'pz-0107', true, 'private'),
+    (pw, org, 'PW (0107 assert)', 'pw-0107', true, 'private');
+  insert into public.courses (id, organization_id, title, slug) values
+    (cx, org, 'CX (0107 assert)', 'cx-0107');
+  insert into public.course_packages (id, course_id, language, is_active) values
+    ('00000000-0000-0000-0000-000107141102', cx, null, true);
+  insert into public.course_versions (id, course_id, package_id, version_number, manifest_type, launch_url,
+                                      storage_prefix, manifest_data) values
+    ('00000000-0000-0000-0000-000107141103', cx, '00000000-0000-0000-0000-000107141102', 1, 'scorm12', 'index.html',
+     'courses/cx-0107/v1/', '{"title":"CX (0107 assert)"}');
+  insert into public.learning_path_courses (path_id, course_id, step_number) values (pz, cx, 1);
+  insert into public.course_attempts (id, course_version_id, user_id, organization_id, status, completion_status,
+                                      success_status, started_at, completed_at, context_kind, is_preview,
+                                      learning_path_id) values
+    (ax, '00000000-0000-0000-0000-000107141103', u_i, org, 'completed', 'completed', 'unknown',
+     now() - interval '1 hour', now() - interval '30 minutes', 'path', false, pz);
+
+  -- the rows: P's completion of P1, its step fact on C1 and its claim; I's
+  -- completion of PX and step facts on PY and PZ; one purge record
+  insert into public.learning_path_completions (id, organization_id, path_id, user_id, path_score) values
+    ('00000000-0000-0000-0000-000107142001', org, p1, u_p, 0.8),
+    ('00000000-0000-0000-0000-000107142005', org, px, u_i, null);
+  insert into public.learning_path_step_completions (id, organization_id, path_id, course_id, user_id, attempt_id,
+                                                     rule_pass_required) values
+    ('00000000-0000-0000-0000-000107142002', org, p1, c1, u_p, '00000000-0000-0000-0000-000107070004', false),
+    ('00000000-0000-0000-0000-000107142006', org, py, c1, u_i, null, true),
+    ('00000000-0000-0000-0000-000107142007', org, pz, cx, u_i, ax, false);
+  insert into public.completion_notices (id, organization_id, user_id, product_kind, instance_id, attempt_id,
+                                         event_type) values
+    ('00000000-0000-0000-0000-000107142003', org, u_p, 'path', p1, '00000000-0000-0000-0000-000107070004',
+     'path_completed');
+  insert into public.preview_purge_log (id, organization_id, reason, actor_user_id, scope, counts) values
+    ('00000000-0000-0000-0000-000107142004', org, 'manual', u_s, '{"course_ids": []}', '{"total": 0}');
+
+  -- the defaults
+  select * into a from public.learning_path_completions where id = '00000000-0000-0000-0000-000107142001';
+  if a.steps is distinct from '[]'::jsonb or a.completed_at is distinct from now() then
+    bad := bad || format('a completion inserted without steps or completed_at reads %s, %s (expected [], now)',
+                         a.steps, a.completed_at);
+  end if;
+  select * into a from public.learning_path_step_completions where id = '00000000-0000-0000-0000-000107142002';
+  if a.done_at is distinct from now() then
+    bad := bad || format('a step fact inserted without done_at reads %s (expected now)', a.done_at);
+  end if;
+  select * into a from public.completion_notices where id = '00000000-0000-0000-0000-000107142003';
+  if a.origin is distinct from 'learner' or a.claimed_at is distinct from now() or a.sent_at is not null then
+    bad := bad || format('a claim inserted without origin reads %s, claimed %s, sent %s (expected learner, now, null)',
+                         a.origin, a.claimed_at, coalesce(a.sent_at::text, 'null'));
+  end if;
+  if (select ran_at from public.preview_purge_log where id = '00000000-0000-0000-0000-000107142004')
+     is distinct from now() then
+    bad := bad || 'a purge record inserted without ran_at does not read now'::text;
+  end if;
+
+  -- the keys
+  for r in
+    select * from (values
+      ('the organisation cascade over a row of each table',
+       'delete from public.organizations where id = ''00000000-0000-0000-0000-00000000000a''',
+       '{"role": "service_role"}', rows4, 'ok', '0/0/0/0'),
+      ('the user cascade of P over its completion, step fact and claim (the purge record stays)',
+       'delete from auth.users where id = ''00000000-0000-0000-0000-000107010002''',
+       '{"role": "service_role"}', rows4, 'ok', '1/2/0/1'),
+      ('a lone delete of PX, which only a completion names',
+       'delete from public.learning_paths where id = ''00000000-0000-0000-0000-000107141001''',
+       null, null, '23503 learning_path_completions_path_id_fkey', null),
+      ('a lone delete of PY, which only a step fact names',
+       'delete from public.learning_paths where id = ''00000000-0000-0000-0000-000107141002''',
+       null, null, '23503 learning_path_step_completions_path_id_fkey', null),
+      ('a delete of PW, which nothing names (control)',
+       'delete from public.learning_paths where id = ''00000000-0000-0000-0000-000107141004''',
+       null, 'select count(*)::text from public.learning_paths where id = ''00000000-0000-0000-0000-000107141004''',
+       'ok', '0'),
+      ('the course cascade over CX''s path attempt and its step fact, for the service role (O1-g (9))',
+       'delete from public.courses where id = ''00000000-0000-0000-0000-000107141101''',
+       '{"role": "service_role"}',
+       'select format(''%s/%s'', (select count(*) from public.course_attempts '
+       || 'where id = ''00000000-0000-0000-0000-000107141201''), (select count(*) '
+       || 'from public.learning_path_step_completions where id = ''00000000-0000-0000-0000-000107142007''))',
+       'ok', '0/0'),
+      ('the same course delete on a session that is not the service role (control)',
+       'delete from public.courses where id = ''00000000-0000-0000-0000-000107141101''',
+       '{"role": "authenticated"}', null, 'P0001 learner_history_exists', null),
+      ('an attempt delete sets the claim''s attempt_id null',
+       'delete from public.course_attempts where id = ''00000000-0000-0000-0000-000107070004''',
+       null,
+       'select coalesce(attempt_id::text, ''null'') from public.completion_notices '
+       || 'where id = ''00000000-0000-0000-0000-000107142003''',
+       'ok', 'null')
+    ) as v(what, stmt, claims, probe_sql, expected, expected_probe)
+  loop
+    select * into t from pg_temp.probe_0107(r.stmt, r.claims, r.probe_sql);
+    if t.state || coalesce(' ' || nullif(t.con, ''), coalesce(' ' || case when t.state = 'P0001' then t.msg end, ''))
+       <> r.expected
+       or t.probe is distinct from r.expected_probe then
+      bad := bad || format('%s: %s %s %s, probe %s (expected %s, probe %s)', r.what, t.state, coalesce(t.con, ''),
+                           coalesce(t.msg, ''), coalesce(t.probe, 'null'), r.expected, coalesce(r.expected_probe, 'null'));
+    end if;
+  end loop;
+  if (select count(*) from public.learning_path_step_completions where id = '00000000-0000-0000-0000-000107142007') <> 1
+     or (select count(*) from public.course_attempts where id = ax) <> 1
+     or (select count(*) from public.learning_paths where id in (px, py, pz, pw)) <> 4
+     or not exists (select 1 from public.organizations where id = org)
+     or (select attempt_id from public.completion_notices where id = '00000000-0000-0000-0000-000107142003')
+        is distinct from '00000000-0000-0000-0000-000107070004'::uuid then
+    bad := bad || 'a delete of (12) was not undone, or the refused course delete took the step fact'::text;
+  end if;
+
+  -- as postgres: append-only, the control, the unique keys and the checks
+  for r in
+    select * from (values
+      ('an update of a completion',
+       'update public.learning_path_completions set path_score = 1 where id = ''00000000-0000-0000-0000-000107142001''',
+       'P0001'),
+      ('a delete of a completion',
+       'delete from public.learning_path_completions where id = ''00000000-0000-0000-0000-000107142001''', 'P0001'),
+      ('an update of a step fact',
+       'update public.learning_path_step_completions set rule_pass_required = true '
+       || 'where id = ''00000000-0000-0000-0000-000107142002''', 'P0001'),
+      ('a delete of a step fact',
+       'delete from public.learning_path_step_completions where id = ''00000000-0000-0000-0000-000107142002''', 'P0001'),
+      ('an update of a purge record',
+       'update public.preview_purge_log set reason = ''product_delete'' where id = ''00000000-0000-0000-0000-000107142004''',
+       'P0001'),
+      ('a delete of a purge record',
+       'delete from public.preview_purge_log where id = ''00000000-0000-0000-0000-000107142004''', 'P0001'),
+      ('the sent_at stamp on a claim (control: not append-only)',
+       'update public.completion_notices set sent_at = now() where id = ''00000000-0000-0000-0000-000107142003''',
+       'ok 1'),
+      ('a second completion of P1 by P',
+       'insert into public.learning_path_completions (organization_id, path_id, user_id) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107050001'', '
+       || '''00000000-0000-0000-0000-000107010002'')',
+       '23505 learning_path_completions_path_id_user_id_key'),
+      ('the same completion, on conflict do nothing (the writer''s form)',
+       'insert into public.learning_path_completions (organization_id, path_id, user_id) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107050001'', '
+       || '''00000000-0000-0000-0000-000107010002'') on conflict (path_id, user_id) do nothing',
+       'ok 0'),
+      ('a second step fact of P on (P1, C1)',
+       'insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, '
+       || 'rule_pass_required) values (''00000000-0000-0000-0000-00000000000a'', '
+       || '''00000000-0000-0000-0000-000107050001'', ''00000000-0000-0000-0000-0000000000c1'', '
+       || '''00000000-0000-0000-0000-000107010002'', true)',
+       '23505 learning_path_step_completions_path_id_user_id_course_id_key'),
+      ('the same step fact, on conflict do nothing (the writer''s form)',
+       'insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, '
+       || 'rule_pass_required) values (''00000000-0000-0000-0000-00000000000a'', '
+       || '''00000000-0000-0000-0000-000107050001'', ''00000000-0000-0000-0000-0000000000c1'', '
+       || '''00000000-0000-0000-0000-000107010002'', true) on conflict (path_id, user_id, course_id) do nothing',
+       'ok 0'),
+      ('a step fact without its rule',
+       'insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107050001'', '
+       || '''00000000-0000-0000-0000-0000000000c2'', ''00000000-0000-0000-0000-000107010002'')',
+       '23502'),
+      ('a second path claim of P on P1',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, event_type) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''path'', '
+       || '''00000000-0000-0000-0000-000107050001'', ''path_completed'')',
+       '23505 completion_notices_user_id_product_kind_instance_id_key'),
+      ('the same claim, on conflict do nothing (the writers'' form)',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, event_type) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''path'', '
+       || '''00000000-0000-0000-0000-000107050001'', ''path_completed'') '
+       || 'on conflict (user_id, product_kind, instance_id) do nothing',
+       'ok 0'),
+      ('an Individual claim of P on C1 beside the path claim',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, event_type) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''individual'', '
+       || '''00000000-0000-0000-0000-0000000000c1'', ''course_completed'')',
+       'ok 1'),
+      ('a claim of the kind preview',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, event_type) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''preview'', '
+       || '''00000000-0000-0000-0000-0000000000c2'', ''course_completed'')',
+       '23514 completion_notices_product_kind_check'),
+      ('a claim of origin admin',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, event_type, origin) '
+       || 'values (''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''individual'', '
+       || '''00000000-0000-0000-0000-0000000000c2'', ''course_completed'', ''admin'')',
+       '23514 completion_notices_origin_check'),
+      ('a claim with no instance',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, event_type) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''individual'', '
+       || '''course_completed'')',
+       '23502'),
+      ('a claim with no event type',
+       'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''individual'', '
+       || '''00000000-0000-0000-0000-0000000000c2'')',
+       '23502'),
+      ('a purge record of reason scheduled',
+       'insert into public.preview_purge_log (organization_id, reason, actor_user_id, counts) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''scheduled'', ''00000000-0000-0000-0000-000107010006'', ''{}'')',
+       '23514 preview_purge_log_reason_check'),
+      ('a purge record with no actor',
+       'insert into public.preview_purge_log (organization_id, reason, counts) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''manual'', ''{}'')',
+       '23502'),
+      ('a purge record with no counts',
+       'insert into public.preview_purge_log (organization_id, reason, actor_user_id) values '
+       || '(''00000000-0000-0000-0000-00000000000a'', ''manual'', ''00000000-0000-0000-0000-000107010006'')',
+       '23502')
+    ) as v(what, stmt, expected)
+  loop
+    select * into t from pg_temp.try_0107(r.stmt);
+    if (case when t.state = 'ok' then 'ok ' || t.n
+             when r.expected like '% %' then t.state || coalesce(' ' || nullif(t.con, ''), '')
+             else t.state end) <> r.expected then
+      bad := bad || format('%s: %s %s %s (expected %s)', r.what, t.state, coalesce(t.con, ''),
+                           coalesce(t.msg, coalesce(t.n::text, '')), r.expected);
+    elsif t.state = 'P0001' and t.msg ~* probe then
+      bad := bad || format('%s: the message "%s" matches a schema probe', r.what, t.msg);
+    end if;
+  end loop;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (12) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- (12), as the API roles: a learner reads only their own completion and step
+-- fact, an admin of the organisation reads every one of its rows, a member of
+-- another organisation reads none (real reads through the policies; the
+-- learner's own rows are the control that the select is granted); every
+-- write of a learner's session, and every read of the two service-only
+-- tables and of preview_runs (after-check A23), raises 42501; anon reads
+-- none of the four, nor preview_runs (42501), with the control that it
+-- reads a table it holds select on. The statements name the
+-- learner's id, never auth.uid(): the shim gives the API roles no usage on
+-- schema auth, so a call there would raise 42501 from the schema and hide
+-- the table privilege under test.
+create temporary table r0107_s3 (who text, what text, got text, expected text);
+grant select, insert on pg_temp.r0107_s3 to authenticated, anon;
+grant execute on function pg_temp.as_owner_state(text) to anon;
+
+select set_config('request.jwt.claims',
+  '{"sub": "00000000-0000-0000-0000-000107010002", "role": "authenticated"}', true);
+set local role authenticated;
+insert into pg_temp.r0107_s3
+select 'P, a learner', s.what, pg_temp.as_owner_state(s.stmt), s.expected
+from (values
+  ('reads the completions of (12)',
+   'select 1 from public.learning_path_completions where id::text like ''%-00010714200_''', 'no error, 1 row(s)'),
+  ('reads the step facts of (12)',
+   'select 1 from public.learning_path_step_completions where id::text like ''%-00010714200_''', 'no error, 1 row(s)'),
+  ('reads another learner''s row',
+   'select 1 from public.learning_path_step_completions where user_id <> ''00000000-0000-0000-0000-000107010002''', 'no error, 0 row(s)'),
+  ('reads completion_notices', 'select 1 from public.completion_notices', '42501'),
+  ('reads preview_purge_log', 'select 1 from public.preview_purge_log', '42501'),
+  ('reads preview_runs (1d; after-check A23)', 'select 1 from public.preview_runs', '42501'),
+  ('inserts a completion',
+   'insert into public.learning_path_completions (organization_id, path_id, user_id) values '
+   || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107141004'', ''00000000-0000-0000-0000-000107010002'')', '42501'),
+  ('updates their completion',
+   'update public.learning_path_completions set path_score = 1 where id = ''00000000-0000-0000-0000-000107142001''',
+   '42501'),
+  ('deletes their completion',
+   'delete from public.learning_path_completions where id = ''00000000-0000-0000-0000-000107142001''', '42501'),
+  ('inserts a step fact',
+   'insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, rule_pass_required) '
+   || 'values (''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107141004'', '
+   || '''00000000-0000-0000-0000-0000000000c1'', ''00000000-0000-0000-0000-000107010002'', false)', '42501'),
+  ('updates their step fact',
+   'update public.learning_path_step_completions set rule_pass_required = true '
+   || 'where id = ''00000000-0000-0000-0000-000107142002''', '42501'),
+  ('deletes their step fact',
+   'delete from public.learning_path_step_completions where id = ''00000000-0000-0000-0000-000107142002''', '42501'),
+  ('inserts a claim',
+   'insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, event_type) values '
+   || '(''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-000107010002'', ''individual'', '
+   || '''00000000-0000-0000-0000-0000000000c2'', ''course_completed'')', '42501'),
+  ('stamps a claim', 'update public.completion_notices set sent_at = now()', '42501'),
+  ('inserts a purge record',
+   'insert into public.preview_purge_log (organization_id, reason, actor_user_id, counts) values '
+   || '(''00000000-0000-0000-0000-00000000000a'', ''manual'', ''00000000-0000-0000-0000-000107010002'', ''{}'')', '42501')
+) as s(what, stmt, expected);
+reset role;
+
+select set_config('request.jwt.claims',
+  '{"sub": "00000000-0000-0000-0000-000107010006", "role": "authenticated"}', true);
+set local role authenticated;
+insert into pg_temp.r0107_s3
+select 'S, an admin of Org A', s.what, pg_temp.as_owner_state(s.stmt), s.expected
+from (values
+  ('reads the completions of (12)',
+   'select 1 from public.learning_path_completions where id::text like ''%-00010714200_''', 'no error, 2 row(s)'),
+  ('reads the step facts of (12)',
+   'select 1 from public.learning_path_step_completions where id::text like ''%-00010714200_''', 'no error, 3 row(s)'),
+  ('reads completion_notices', 'select 1 from public.completion_notices', '42501'),
+  ('reads preview_purge_log', 'select 1 from public.preview_purge_log', '42501')
+) as s(what, stmt, expected);
+reset role;
+
+select set_config('request.jwt.claims',
+  '{"sub": "00000000-0000-0000-0000-0000000000a3", "role": "authenticated"}', true);
+set local role authenticated;
+insert into pg_temp.r0107_s3
+select 'a member of QA Org', s.what, pg_temp.as_owner_state(s.stmt), s.expected
+from (values
+  ('reads the completions of (12)',
+   'select 1 from public.learning_path_completions where id::text like ''%-00010714200_''', 'no error, 0 row(s)'),
+  ('reads the step facts of (12)',
+   'select 1 from public.learning_path_step_completions where id::text like ''%-00010714200_''', 'no error, 0 row(s)')
+) as s(what, stmt, expected);
+reset role;
+
+select set_config('request.jwt.claims', '{"role": "anon"}', true);
+set local role anon;
+insert into pg_temp.r0107_s3
+select 'anon', s.what, pg_temp.as_owner_state(s.stmt), s.expected
+from (values
+  ('reads learning_path_completions', 'select 1 from public.learning_path_completions', '42501'),
+  ('reads learning_path_step_completions', 'select 1 from public.learning_path_step_completions', '42501'),
+  ('reads completion_notices', 'select 1 from public.completion_notices', '42501'),
+  ('reads preview_purge_log', 'select 1 from public.preview_purge_log', '42501'),
+  ('reads preview_runs (1d; after-check A23)', 'select 1 from public.preview_runs', '42501'),
+  ('reads a table it holds select on (control)', 'select 1 from public.courses where false', 'no error, 0 row(s)')
+) as s(what, stmt, expected);
+reset role;
+select set_config('request.jwt.claims', '', true);
+
+do $$
+declare
+  bad text[] := '{}';
+  r   record;
+begin
+  if (select count(*) from pg_temp.r0107_s3) <> 27 then
+    bad := bad || format('%s of the 27 role cases ran', (select count(*) from pg_temp.r0107_s3));
+  end if;
+  for r in select * from pg_temp.r0107_s3 loop
+    if r.got <> r.expected then
+      bad := bad || format('as %s, %s: %s (expected %s)', r.who, r.what, r.got, r.expected);
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (12) %', array_to_string(bad, '; ');
   end if;
 end
 $$;

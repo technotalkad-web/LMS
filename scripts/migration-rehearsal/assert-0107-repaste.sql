@@ -3,7 +3,8 @@
 -- SECOND paste of 0107: the rows seed-0107-repaste.sql wrote between the two
 -- pastes are exactly as written (ADR 0024 steps 4 and 63: every backfill runs
 -- once, inside the DO block that adds its column, so a re-paste never
--- touches a value the new code wrote). One transaction that ends in
+-- touches a value the new code wrote; and the tables of section 3 are
+-- created once, so a re-paste keeps their rows). One transaction that ends in
 -- ROLLBACK; every check raises 'assert-0107: (R…) …' on failure.
 begin;
 
@@ -95,8 +96,9 @@ begin
   if (select count(*) from pg_trigger
        where not tgisinternal
          and tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
-                        'journey_versions_derive_day_ids')) <> 3 then
-    bad := bad || 'the three triggers of 0107 are not present exactly once each'::text;
+                        'journey_versions_derive_day_ids', 'learning_path_completions_no_mutation',
+                        'learning_path_step_completions_no_mutation', 'preview_purge_log_no_mutation')) <> 6 then
+    bad := bad || 'the six triggers of 0107 are not present exactly once each'::text;
   end if;
   if (select count(*) from pg_constraint
        where conrelid = 'public.course_attempts'::regclass and contype = 'f'
@@ -106,6 +108,45 @@ begin
                   and confrelid in ('public.learning_paths'::regclass, 'public.journey_enrollments'::regclass)
                   and confdeltype <> 'a') then
     bad := bad || 'the two attempt keys to learning_paths and journey_enrollments are not one each, on delete no action'::text;
+  end if;
+
+  -- (R8) r7 to r10, the rows of section 3: exactly as written; and the one
+  -- policy of each of the four tables, once
+  if (select (organization_id, path_id, user_id, completed_at, path_score, steps)
+        from public.learning_path_completions where id = '00000000-0000-0000-0000-000107120007')
+     is distinct from ('00000000-0000-0000-0000-00000000000a'::uuid, '00000000-0000-0000-0000-000107120101'::uuid,
+                       '00000000-0000-0000-0000-000107010003'::uuid, '2026-11-13 09:00:00+00'::timestamptz, 0.75::numeric,
+                       ('[{"step": 1, "course_id": "00000000-0000-0000-0000-0000000000c1", '
+                        || '"attempt_id": "00000000-0000-0000-0000-000107070008", "score": 0.75}]')::jsonb) then
+    bad := bad || 'r7, the path completion, is missing or changed'::text;
+  end if;
+  if (select (organization_id, path_id, course_id, user_id, attempt_id, rule_pass_required, done_at)
+        from public.learning_path_step_completions where id = '00000000-0000-0000-0000-000107120008')
+     is distinct from ('00000000-0000-0000-0000-00000000000a'::uuid, '00000000-0000-0000-0000-000107120101'::uuid,
+                       '00000000-0000-0000-0000-0000000000c1'::uuid, '00000000-0000-0000-0000-000107010003'::uuid,
+                       '00000000-0000-0000-0000-000107070008'::uuid, false, '2026-11-13 08:59:00+00'::timestamptz) then
+    bad := bad || 'r8, the step fact, is missing or changed'::text;
+  end if;
+  if (select (organization_id, user_id, product_kind, instance_id, attempt_id, event_type, origin, claimed_at, sent_at)
+        from public.completion_notices where id = '00000000-0000-0000-0000-000107120009')
+     is distinct from ('00000000-0000-0000-0000-00000000000a'::uuid, '00000000-0000-0000-0000-000107010003'::uuid,
+                       'path'::text, '00000000-0000-0000-0000-000107120101'::uuid,
+                       '00000000-0000-0000-0000-000107070008'::uuid, 'path_completed'::text, 'learner'::text,
+                       '2026-11-13 09:00:00+00'::timestamptz, '2026-11-13 09:00:05+00'::timestamptz) then
+    bad := bad || 'r9, the sent completion claim, is missing or changed'::text;
+  end if;
+  if (select (organization_id, ran_at, reason, actor_user_id, scope, counts, attempt_ids, run_ids, excluded)
+        from public.preview_purge_log where id = '00000000-0000-0000-0000-000107120010')
+     is distinct from ('00000000-0000-0000-0000-00000000000a'::uuid, '2026-11-13 09:10:00+00'::timestamptz,
+                       'manual'::text, '00000000-0000-0000-0000-000107010006'::uuid,
+                       '{"course_ids": ["00000000-0000-0000-0000-0000000000c2"]}'::jsonb,
+                       '{"course_attempts": 0, "total": 0}'::jsonb, '{}'::uuid[], '{}'::uuid[], '[]'::jsonb) then
+    bad := bad || 'r10, the Preview deletion record, is missing or changed'::text;
+  end if;
+  if (select count(*) from pg_policy
+       where polrelid in ('public.learning_path_completions'::regclass, 'public.learning_path_step_completions'::regclass,
+                          'public.completion_notices'::regclass, 'public.preview_purge_log'::regclass)) <> 4 then
+    bad := bad || 'the four tables of section 3 do not hold one policy each'::text;
   end if;
 
   if cardinality(bad) > 0 then

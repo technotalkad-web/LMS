@@ -13,9 +13,12 @@
 -- new columns, their run-once backfills, the generated columns, the CHECKs,
 -- preview_runs, context_derive_log, the immutability and derive triggers,
 -- the two attempt foreign keys re-created on delete no action, the open-row,
--- open-request and journey_day_progress key swaps and the indexes), and of
--- item 6 only the paste-window day_ids trigger on journey_versions (section
--- 6). Not built yet: items 3 to 5, the rest of item 6 and item 7. On this
+-- open-request and journey_day_progress key swaps and the indexes), section
+-- 3, which is item 3 whole (learning_path_completions,
+-- learning_path_step_completions, completion_notices and preview_purge_log,
+-- created empty), and of item 6 only the paste-window day_ids trigger on
+-- journey_versions (section 6). Not built yet: items 4 and 5, the rest of
+-- item 6 and item 7; nothing writes the four new tables yet. On this
 -- build the old bodies still run and some now fail: the 0089
 -- journey_record_completion names the dropped credit key as its conflict
 -- target (42P10) and its untagged branch re-tags an attempt (refused by the
@@ -122,7 +125,8 @@
 -- credits Q7 counts so (1s). Existing org_api_keys rows read contract_version
 -- 1 from the column default (1t); every other new column takes its default.
 -- The one row of context_derive_log, a new table (2a), is created on the
--- first paste. A later paste writes no row. The temporary table of section 0b
+-- first paste; the four tables of section 3 are created empty. A later
+-- paste writes no row. The temporary table of section 0b
 -- is the session's own and is dropped at commit.
 --
 -- Locks: ACCESS EXCLUSIVE until commit on course_attempts, attempt_requests,
@@ -132,7 +136,7 @@
 -- org_api_keys, org_integration_settings and notification_templates; SHARE
 -- ROW EXCLUSIVE until commit on the parents of the foreign keys this file
 -- adds or re-creates that are not in that list, learning_paths,
--- organizations and auth.users (writes to them wait, reads do not). The two
+-- organizations, auth.users and courses (writes to them wait, reads do not). The two
 -- stored generated columns of course_attempts and the one of attempt_requests
 -- rewrite those tables on the first paste (a rewrite per added generated
 -- column; a later paste skips them). lock_timeout 5 s: if a lock is not
@@ -141,7 +145,9 @@
 -- PREREQUISITES (the DO block of section 0a refuses to run without them; for
 -- every object this file replaces it accepts the earlier state and its own,
 -- so the second paste passes):
---   0002  course_versions.manifest_type (the pre_0107 marker of section 1)
+--   0002  course_versions.manifest_type (the pre_0107 marker of section 1);
+--         courses (the step facts' course key, section 3); is_org_admin(uuid)
+--         (the select policies of section 3; latest body 0056)
 --   0003  course_attempts.completion_status, success_status
 --   0005  course_assignments
 --   0008  learning_path_courses.step_number
@@ -286,6 +292,7 @@ begin
   for r in
     select * from (values
       ('public.organizations',                    '0001'),
+      ('public.courses',                          '0002'),
       ('public.course_attempts',                  '0002'),
       ('public.course_assignments',               '0005'),
       ('public.learning_paths',                   '0008'),
@@ -375,6 +382,7 @@ begin
 
   for r in
     select * from (values
+      ('public.is_org_admin(uuid)',                                            '0002'),
       ('public.effective_attempt_policy(uuid)',                                '0081'),
       ('public.gamification_record_activity(uuid)',                            '0058'),
       ('public.gamification_record_activity_core(uuid)',                       '0084'),
@@ -1863,9 +1871,10 @@ $$;
 -- 2h. Foreign-key indexes (step 7's rule, after 0100:473-480): every
 -- foreign-key column this file adds leads an index, so a delete of its
 -- parent row (a program's cascade, a purged test run, an organisation's or a
--- user's cascade) never scans the child table. Of the seventeen, these are
--- the seven on the changed tables; five are on preview_runs (1d), and the
--- other five come with the new tables of creation order item 3. Partial
+-- user's cascade) never scans the child table. Of the twenty (step 7's
+-- seventeen and the three of learning_path_step_completions, build note
+-- O1-a), these are the seven on the changed tables; five are on preview_runs
+-- (1d), and the other eight come with the new tables of section 3. Partial
 -- where the column is nullable, plain on journey_day_progress.day_id, which
 -- is not null.
 create index if not exists course_attempts_journey_version_idx
@@ -1889,11 +1898,302 @@ create index if not exists xp_events_org_ctx_created_idx
   on public.xp_events (organization_id, context_key, created_at desc);
 
 -- ---------------------------------------------------------------------------
+-- 3. The new tables (ADR 0024 section B, creation order item 3; steps 14, 15
+--    and 79; build note O1-a, O1-b and O1-f)
+-- ---------------------------------------------------------------------------
+-- In the record's order: learning_path_completions, learning_path_step_completions
+-- (build note O1-f places it here, after learning_path_completions and before
+-- completion_notices), completion_notices, preview_purge_log. preview_runs
+-- (1d) and context_derive_log (2a) are item 2's. Each table is created empty
+-- (no backfill: note N22 for learning_path_completions, note O1-h (1) for the
+-- step facts), with its row-level security, its policy, its grants and its
+-- foreign-key indexes in this section; each append-only table's trigger
+-- function is created before its trigger. The views and functions that read
+-- and write these tables come in sections 4 to 6.
+--
+-- Grants. Each revoke names service_role as well as public, anon and
+-- authenticated (the 0103 form, as for preview_runs and context_derive_log),
+-- so that on a project whose default privileges give service_role all, the
+-- table holds exactly what the record grants: no API role is granted insert
+-- on any of the four, and no delete. The rows are inserted only by this
+-- file's security definer functions (the writer of step 12, the journey
+-- completion of step 13 and the purge of step 81), as the tables' owner.
+--
+-- Append-only (learning_path_completions, learning_path_step_completions,
+-- preview_purge_log): the xp_events form (0053:134-146). A direct update or
+-- delete, for every role including the owner, raises; the organisation, user
+-- and (for the step facts) course cascades arrive through the referential
+-- trigger, at trigger depth 2, and pass. Each trigger function is plpgsql,
+-- security invoker (it reads only its own row), with the pinned search_path
+-- and execute for service_role only; its refusal is SQLSTATE P0001 with a
+-- fixed short message (the form of note N7).
+
+-- 3a. learning_path_completions (step 14): one row per (path, learner) when
+-- every step of the path is done for the learner in path:P, inserted on
+-- conflict do nothing by the writer of step 12, which reads done from
+-- v_path_step_status. Never undone: a step added later, a rule tightened
+-- later or a failed retake leaves it as it is (section L). steps holds the
+-- step, course, attempt id and score of each step at completion: ids and
+-- scores only.
+create or replace function public.learning_path_completions_append_only()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  if pg_trigger_depth() > 1 then
+    return case tg_op when 'DELETE' then old else new end;
+  end if;
+  raise exception 'learning_path_completions is append-only: a path completion is never changed or removed (ADR 0024)'
+    using errcode = 'P0001';
+end
+$$;
+
+revoke execute on function public.learning_path_completions_append_only() from public, anon, authenticated;
+grant execute on function public.learning_path_completions_append_only() to service_role;
+
+create table if not exists public.learning_path_completions (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations(id) on delete cascade,
+  path_id         uuid not null references public.learning_paths(id) on delete no action,
+  user_id         uuid not null references auth.users(id) on delete cascade,
+  completed_at    timestamptz not null default now(),
+  path_score      numeric,
+  steps           jsonb not null default '[]'::jsonb,
+  constraint learning_path_completions_path_id_user_id_key unique (path_id, user_id)
+);
+
+-- Foreign-key indexes (step 7's rule): path_id is led by the unique key.
+create index if not exists learning_path_completions_organization_idx
+  on public.learning_path_completions (organization_id);
+create index if not exists learning_path_completions_user_idx
+  on public.learning_path_completions (user_id);
+
+comment on table public.learning_path_completions is
+  'One row per (path, learner): the path was completed in path:P (ADR 0024 step 14). Inserted only by the completion writer; append-only, never undone.';
+comment on column public.learning_path_completions.path_score is
+  'The path score at completion: the average of the steps'' latest official scores; null when no step is scored.';
+comment on column public.learning_path_completions.steps is
+  'Each step at completion: step, course, attempt id and score (ids and scores only).';
+
+drop trigger if exists learning_path_completions_no_mutation on public.learning_path_completions;
+create trigger learning_path_completions_no_mutation
+  before update or delete on public.learning_path_completions
+  for each row execute function public.learning_path_completions_append_only();
+
+alter table public.learning_path_completions enable row level security;
+-- A learner reads their own rows; an admin reads the organisation's. No
+-- insert, update or delete policy. authenticated needs the select:
+-- v_path_progress is security_invoker and reads this table.
+drop policy if exists "learners and admins read path completions" on public.learning_path_completions;
+create policy "learners and admins read path completions" on public.learning_path_completions
+  for select using (user_id = auth.uid() or public.is_org_admin(organization_id));
+
+revoke all on public.learning_path_completions from public, anon, authenticated, service_role;
+grant select on public.learning_path_completions to authenticated, service_role;
+
+-- 3b. learning_path_step_completions (build note O1-a and O1-b; the owner's
+-- O1 answer of 2026-11-13, option (ii)): one row per (path, learner, course)
+-- says this step was done, written by the writer of step 12 the first time
+-- the step satisfies the rule in force at that moment (on conflict do
+-- nothing). A step once done stays done even if an admin later makes it
+-- pass-required: v_path_step_status reads passed_ever = passed_by_rule or a
+-- row here. attempt_id is an id only (the step's official attempt at the
+-- write; no foreign key, because a set null action would be an update of an
+-- append-only row); rule_pass_required is the step's resolved rule at the
+-- write. No key to learning_path_courses, on purpose: its keys cascade, and
+-- a step removed and added again finds its fact. The course key cascades:
+-- a course with learner attempts is deleted only where the delete guards let
+-- it through (the service role, the organisation's cascade), and its attempts
+-- leave with it. The path key refuses, as the attempts' own path key does.
+-- Built without the second writer at rule changes (question O3, open).
+create or replace function public.learning_path_step_completions_append_only()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  if pg_trigger_depth() > 1 then
+    return case tg_op when 'DELETE' then old else new end;
+  end if;
+  raise exception 'learning_path_step_completions is append-only: a done path step is never changed or removed (ADR 0024)'
+    using errcode = 'P0001';
+end
+$$;
+
+revoke execute on function public.learning_path_step_completions_append_only() from public, anon, authenticated;
+grant execute on function public.learning_path_step_completions_append_only() to service_role;
+
+create table if not exists public.learning_path_step_completions (
+  id                 uuid primary key default gen_random_uuid(),
+  organization_id    uuid not null references public.organizations(id) on delete cascade,
+  path_id            uuid not null references public.learning_paths(id) on delete no action,
+  course_id          uuid not null references public.courses(id) on delete cascade,
+  user_id            uuid not null references auth.users(id) on delete cascade,
+  attempt_id         uuid,
+  rule_pass_required boolean not null,
+  done_at            timestamptz not null default now(),
+  constraint learning_path_step_completions_path_id_user_id_course_id_key unique (path_id, user_id, course_id)
+);
+
+-- Foreign-key indexes (step 7's rule): path_id is led by the unique key.
+create index if not exists learning_path_step_completions_organization_idx
+  on public.learning_path_step_completions (organization_id);
+create index if not exists learning_path_step_completions_user_idx
+  on public.learning_path_step_completions (user_id);
+create index if not exists learning_path_step_completions_course_idx
+  on public.learning_path_step_completions (course_id);
+
+comment on table public.learning_path_step_completions is
+  'One row per (path, learner, course): the path step was done under the rule in force when the writer recorded it (ADR 0024 build note O1). Inserted only by the completion writer; append-only.';
+comment on column public.learning_path_step_completions.attempt_id is
+  'The step''s official attempt when the fact was written: an id only, no foreign key.';
+comment on column public.learning_path_step_completions.rule_pass_required is
+  'The step''s resolved pass rule when the fact was written.';
+
+drop trigger if exists learning_path_step_completions_no_mutation on public.learning_path_step_completions;
+create trigger learning_path_step_completions_no_mutation
+  before update or delete on public.learning_path_step_completions
+  for each row execute function public.learning_path_step_completions_append_only();
+
+alter table public.learning_path_step_completions enable row level security;
+-- The form of learning_path_completions: a learner's own rows or an admin's
+-- organisation; no insert, update or delete policy. v_path_step_status is
+-- security_invoker and reads this table, so authenticated needs the select.
+drop policy if exists "learners and admins read step completions" on public.learning_path_step_completions;
+create policy "learners and admins read step completions" on public.learning_path_step_completions
+  for select using (user_id = auth.uid() or public.is_org_admin(organization_id));
+
+revoke all on public.learning_path_step_completions from public, anon, authenticated, service_role;
+grant select on public.learning_path_step_completions to authenticated, service_role;
+
+-- 3c. completion_notices (step 15; decision D16): the latch that sends each
+-- completion message once. The writer of step 12 and the journey completion
+-- of step 13 claim by insert ... on conflict do nothing and return a notice
+-- only when the insert happened; the routes stamp sent_at on that id. One
+-- claim per (learner, product, instance): the course, the path or the
+-- journey enrolment. Every key column is not null, because a null in the key
+-- would never conflict. origin says who made the claim: the writer on a
+-- learner's own completion, or an admin's publish to all enrolled learners.
+create table if not exists public.completion_notices (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations(id) on delete cascade,
+  user_id         uuid not null references auth.users(id) on delete cascade,
+  product_kind    text not null
+                    constraint completion_notices_product_kind_check
+                    check (product_kind in ('individual', 'path', 'journey')),
+  instance_id     uuid not null,
+  attempt_id      uuid references public.course_attempts(id) on delete set null,
+  event_type      text not null,
+  origin          text not null default 'learner'
+                    constraint completion_notices_origin_check
+                    check (origin in ('learner', 'publish')),
+  claimed_at      timestamptz not null default now(),
+  sent_at         timestamptz,
+  constraint completion_notices_user_id_product_kind_instance_id_key unique (user_id, product_kind, instance_id)
+);
+
+-- Foreign-key indexes (step 7's rule): user_id is led by the unique key;
+-- attempt_id is partial, because every purge and cascade of an attempt sets
+-- it null.
+create index if not exists completion_notices_organization_idx
+  on public.completion_notices (organization_id);
+create index if not exists completion_notices_attempt_idx
+  on public.completion_notices (attempt_id) where attempt_id is not null;
+
+comment on table public.completion_notices is
+  'One claim per (learner, product, instance) for the completion message (ADR 0024 step 15): claimed by the completion writer or the journey publish, stamped sent_at by the route that sends it. Service role only.';
+comment on column public.completion_notices.instance_id is
+  'The course (individual), the path (path) or the journey enrolment (journey).';
+comment on column public.completion_notices.origin is
+  'learner = claimed by the completion writer on the learner''s own completion; publish = claimed by an admin''s publish to all enrolled learners.';
+
+alter table public.completion_notices enable row level security;
+drop policy if exists "no direct access to completion_notices" on public.completion_notices;
+create policy "no direct access to completion_notices" on public.completion_notices
+  for all
+  using (false)
+  with check (false);
+
+revoke all on public.completion_notices from public, anon, authenticated, service_role;
+grant select, update on public.completion_notices to service_role;
+
+-- 3d. preview_purge_log (step 79; the owner's audit record of every Preview
+-- deletion): who, when, how many. Inserted only by purge_preview_data (step
+-- 81), which is started by a named person; there is no scheduled run.
+-- actor_user_id is the signed-in admin who confirmed the deletion, with no
+-- foreign key, so the row outlives the account. attempt_ids and run_ids are
+-- the deleted ids, so an admin can repeat a deletion by hand after a restore
+-- (step 97); excluded lists the attempts the call refused to delete, each
+-- with the table that points at it. Ids and counts only: no score, no name,
+-- no email. Append-only, in the form of learning_path_completions.
+create or replace function public.preview_purge_log_append_only()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  if pg_trigger_depth() > 1 then
+    return case tg_op when 'DELETE' then old else new end;
+  end if;
+  raise exception 'preview_purge_log is append-only: a Preview deletion record is never changed or removed (ADR 0024)'
+    using errcode = 'P0001';
+end
+$$;
+
+revoke execute on function public.preview_purge_log_append_only() from public, anon, authenticated;
+grant execute on function public.preview_purge_log_append_only() to service_role;
+
+create table if not exists public.preview_purge_log (
+  id              uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations(id) on delete cascade,
+  ran_at          timestamptz not null default now(),
+  reason          text not null
+                    constraint preview_purge_log_reason_check
+                    check (reason in ('manual', 'product_delete')),
+  actor_user_id   uuid not null,
+  scope           jsonb,
+  counts          jsonb not null,
+  attempt_ids     uuid[],
+  run_ids         uuid[],
+  excluded        jsonb
+);
+
+-- Foreign-key index (step 7's rule).
+create index if not exists preview_purge_log_organization_idx
+  on public.preview_purge_log (organization_id);
+
+comment on table public.preview_purge_log is
+  'One row per Preview deletion (ADR 0024 steps 79 and 81): who (actor_user_id), when (ran_at), why (reason) and how many (counts), with the deleted ids. Inserted only by purge_preview_data; append-only. Service role only.';
+comment on column public.preview_purge_log.actor_user_id is
+  'The signed-in admin who confirmed the deletion; an id only, no foreign key, so the record outlives the account.';
+comment on column public.preview_purge_log.counts is
+  'How many rows the deletion removed: one number per table, the cascaded tables included, and their total.';
+comment on column public.preview_purge_log.excluded is
+  'The attempts the call refused to delete, each with the table that points at it (ADR 0024 step 81).';
+
+drop trigger if exists preview_purge_log_no_mutation on public.preview_purge_log;
+create trigger preview_purge_log_no_mutation
+  before update or delete on public.preview_purge_log
+  for each row execute function public.preview_purge_log_append_only();
+
+alter table public.preview_purge_log enable row level security;
+drop policy if exists "no direct access to preview_purge_log" on public.preview_purge_log;
+create policy "no direct access to preview_purge_log" on public.preview_purge_log
+  for all
+  using (false)
+  with check (false);
+
+revoke all on public.preview_purge_log from public, anon, authenticated, service_role;
+grant select on public.preview_purge_log to service_role;
+
+-- ---------------------------------------------------------------------------
 -- 6. The plpgsql functions (ADR 0024 section B, creation order item 6)
 -- ---------------------------------------------------------------------------
 -- In any order among themselves: a plpgsql body is parsed when it is created
 -- and resolves its objects when it first runs. Sections 3 to 5 (creation
--- order items 3 to 5) come before this one. This build holds one function of
+-- order items 3 to 5) come before this one; this build holds section 3, and
+-- sections 4 and 5 come with a later build. This build holds one function of
 -- the item, the paste-window trigger function on journey_versions, followed
 -- by its trigger.
 
