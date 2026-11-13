@@ -69,6 +69,45 @@ begin
     bad := bad || 'the default of org_api_keys.contract_version is not 2 after the second paste'::text;
   end if;
 
+  -- (R6) the untagged insert between the pastes: labelled by the derive
+  -- trigger, and its one firing still counted after the second paste (the
+  -- log row is created once; a re-paste does not reset it)
+  select * into a from public.course_attempts where id = '00000000-0000-0000-0000-000107120006';
+  if not found then
+    bad := bad || 'r6 is missing'::text;
+  elsif a.context_kind <> 'individual' or a.context_key <> 'individual' or a.preview_kind is not null
+        or a.journey_day_id is not null then
+    bad := bad || format('r6 reads %s / %s / %s (expected individual / individual / null)',
+                         a.context_kind, a.context_key, coalesce(a.preview_kind, 'null'));
+  end if;
+  if (select fired_count from public.context_derive_log) is distinct from 1
+     or (select last_fired_at from public.context_derive_log) is null
+     or (select count(*) from public.context_derive_log) <> 1 then
+    bad := bad || format('context_derive_log reads %s row(s), fired_count %s, last_fired_at %s '
+                         || '(expected one row, 1, set: r6 fired the derive trigger once)',
+                         (select count(*) from public.context_derive_log),
+                         coalesce((select fired_count::text from public.context_derive_log), 'none'),
+                         coalesce((select last_fired_at::text from public.context_derive_log), 'null'));
+  end if;
+
+  -- (R7) the second paste re-created each trigger once, and left each
+  -- attempt key on delete no action, once
+  if (select count(*) from pg_trigger
+       where not tgisinternal
+         and tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
+                        'journey_versions_derive_day_ids')) <> 3 then
+    bad := bad || 'the three triggers of 0107 are not present exactly once each'::text;
+  end if;
+  if (select count(*) from pg_constraint
+       where conrelid = 'public.course_attempts'::regclass and contype = 'f'
+         and confrelid in ('public.learning_paths'::regclass, 'public.journey_enrollments'::regclass)) <> 2
+     or exists (select 1 from pg_constraint
+                where conrelid = 'public.course_attempts'::regclass and contype = 'f'
+                  and confrelid in ('public.learning_paths'::regclass, 'public.journey_enrollments'::regclass)
+                  and confdeltype <> 'a') then
+    bad := bad || 'the two attempt keys to learning_paths and journey_enrollments are not one each, on delete no action'::text;
+  end if;
+
   if cardinality(bad) > 0 then
     raise exception 'assert-0107: (R) %', array_to_string(bad, '; ');
   end if;

@@ -3,13 +3,17 @@
 -- first paste and again after the second), "0107-refused-q8" and
 -- "0107-refused-q2" (after the two pastes that follow the repair): what
 -- 0107_learning_contexts.sql must have done, on the rows of seed-0107.sql.
--- This build covers section 1 of the file (ADR 0024 section B, creation
--- order item 2: the columns, their run-once backfills, the generated columns,
--- the CHECKs and preview_runs); the checks of the later sections come with
--- them. The whole file is one transaction that ends in ROLLBACK, so nothing
--- it writes reaches the next step. Every check raises 'assert-0107: (n) …'
--- on failure; the runner then reports the file as failed and stops the
--- scenario.
+-- This build covers sections 1 and 2 of the file (ADR 0024 section B,
+-- creation order item 2 whole: the columns, their run-once backfills, the
+-- generated columns, the CHECKs, preview_runs, context_derive_log, the
+-- immutability and derive triggers, the two attempt foreign keys, the key
+-- swaps and the indexes) and section 6's paste-window day_ids trigger on
+-- journey_versions: checks (0) to (6) for section 1, (7) to (10) for the
+-- rest; the rows (7) to (10) write have ids whose last group starts
+-- 00010713. The checks of the later sections come with them. The whole file
+-- is one transaction that ends in ROLLBACK, so nothing it writes reaches the
+-- next step. Every check raises 'assert-0107: (n) …' on failure; the runner
+-- then reports the file as failed and stops the scenario.
 --
 -- The checks of (3) and (4) are first-paste facts (ADR 0024 step 19: "the
 -- after-checks that count backfilled rows apply to the first paste only").
@@ -126,6 +130,9 @@ begin
       ('course_attempts',      'journey_day_id',        'journey_days',        'a', false),
       ('course_attempts',      'journey_version_id',    'journey_versions',    'a', false),
       ('course_attempts',      'preview_run_id',        'preview_runs',        'a', false),
+      -- re-created on delete no action (2d; set null before 0107)
+      ('course_attempts',      'learning_path_id',      'learning_paths',      'a', false),
+      ('course_attempts',      'journey_enrollment_id', 'journey_enrollments', 'a', false),
       ('attempt_requests',     'learning_path_id',      'learning_paths',      'a', false),
       ('attempt_requests',     'journey_enrollment_id', 'journey_enrollments', 'a', false),
       ('attempt_requests',     'journey_day_id',        'journey_days',        'a', false),
@@ -565,6 +572,7 @@ declare
     || '''00000000-0000-0000-0000-00000000000a'', ''completed'', ''completed'', ''unknown'', ';
   p1  constant text := '''00000000-0000-0000-0000-000107050001''';
   ej  constant text := '''00000000-0000-0000-0000-000107063001''';
+  es  constant text := '''00000000-0000-0000-0000-000107063002''';
   d1  constant text := '''00000000-0000-0000-0000-000107061001''';
   v1  constant text := '''00000000-0000-0000-0000-000107062001''';
 begin
@@ -597,10 +605,15 @@ begin
        'a journey_run preview without a run or a day'),
       (ins || '''other'', false, null, null, null, null, null, null, null)', '23514',
        'an unknown context_kind'),
-      (ins || 'null, false, null, null, null, null, null, null, null)', '23502',
-       'a null context_kind'),
-      -- admitted: an old tagged preview (legacy_role keeps its tags) and a course preview
-      (ins || '''preview'', true, ''legacy_role'', ' || p1 || ', ' || ej || ', 2, null, null, null)', 'no error',
+      -- a null context_kind is labelled by the paste-window derive trigger
+      -- (section 2c; checks (8)); 0108 drops it and restores the not-null
+      -- refusal
+      (ins || 'null, false, null, null, null, null, null, null, null)', 'no error',
+       'a null context_kind (labelled by the derive trigger)'),
+      -- admitted: an old tagged preview (legacy_role keeps its tags) and a course preview;
+      -- the tag names ES, not J's EJ, so the user cascade of J in (9) meets no
+      -- other row that names J's enrolment (such a row blocks it, step 6)
+      (ins || '''preview'', true, ''legacy_role'', ' || p1 || ', ' || es || ', 2, null, null, null)', 'no error',
        'a legacy_role row keeping both old tags'),
       (ins || '''preview'', true, ''course'', null, null, null, null, null, null)', 'no error',
        'a course preview'),
@@ -779,6 +792,657 @@ begin
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0107: (6) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (7) section 2 and 6a, the objects: context_derive_log (its one row, RLS
+--     with a no-access policy, service_role select, insert and update only);
+--     the three triggers (timing, when clause, function) and their
+--     functions (security definer only for the derive trigger, the pinned
+--     search_path, execute for service_role only); the indexes exactly as
+--     defined, with the three replaced keys gone. With the five of (2), these
+--     are twelve of step 7's seventeen foreign-key indexes; the other five
+--     come with the tables of creation order item 3.
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  bad text[] := '{}';
+  r   record;
+  g   record;
+  got text;
+begin
+  select string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
+                    || case when a.attnotnull then ' not null' else '' end
+                    || coalesce(' default ' || pg_get_expr(d.adbin, d.adrelid), ''), ', ' order by a.attnum)
+    into got
+    from pg_attribute a
+    left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+   where a.attrelid = 'public.context_derive_log'::regclass and a.attnum > 0 and not a.attisdropped;
+  if got is distinct from
+     'id boolean not null default true, last_fired_at timestamp with time zone, fired_count bigint not null default 0' then
+    bad := bad || format('context_derive_log has columns (%s)', coalesce(got, 'none'));
+  end if;
+  if not exists (select 1 from pg_constraint
+                 where conrelid = 'public.context_derive_log'::regclass and contype = 'p')
+     or not exists (select 1 from pg_constraint
+                    where conrelid = 'public.context_derive_log'::regclass and contype = 'c'
+                      and pg_get_constraintdef(oid) = 'CHECK (id)') then
+    bad := bad || 'context_derive_log lacks its primary key or its check (id)'::text;
+  end if;
+  if (select count(*) from public.context_derive_log) <> 1
+     or not exists (select 1 from public.context_derive_log where id and fired_count >= 0) then
+    bad := bad || 'context_derive_log does not hold exactly its one row'::text;
+  end if;
+  if not (select relrowsecurity from pg_class where oid = 'public.context_derive_log'::regclass)
+     or not exists (
+       select 1 from pg_policy
+       where polrelid = 'public.context_derive_log'::regclass
+         and polname = 'no direct access to context_derive_log'
+         and pg_get_expr(polqual, polrelid) = 'false'
+         and pg_get_expr(polwithcheck, polrelid) = 'false') then
+    bad := bad || 'context_derive_log lacks row-level security or its no-access policy'::text;
+  end if;
+  for r in
+    select * from (values
+      ('anon', 'select', false), ('anon', 'insert', false), ('anon', 'update', false), ('anon', 'delete', false),
+      ('authenticated', 'select', false), ('authenticated', 'insert', false),
+      ('authenticated', 'update', false), ('authenticated', 'delete', false),
+      ('service_role', 'select', true), ('service_role', 'insert', true),
+      ('service_role', 'update', true), ('service_role', 'delete', false),
+      ('service_role', 'truncate', false)
+    ) as t(role_name, priv, expected)
+  loop
+    if has_table_privilege(r.role_name, 'public.context_derive_log', r.priv) <> r.expected then
+      bad := bad || format('%s %s on context_derive_log: %s (expected %s)', r.role_name, r.priv,
+                           not r.expected, r.expected);
+    end if;
+  end loop;
+
+  -- the triggers: tgtype 19 = row, before, update; 7 = row, before, insert
+  for r in
+    select * from (values
+      ('course_attempts',  'course_attempts_context_immutable', 19, null::text),
+      ('course_attempts',  'course_attempts_context_derive',     7, '%WHEN ((new.context_kind IS NULL))%'),
+      ('journey_versions', 'journey_versions_derive_day_ids',    7, '%WHEN ((new.day_ids IS NULL))%')
+    ) as t(tbl, tg, tgtype, when_like)
+  loop
+    select t.tgtype::int as tgtype, t.tgenabled::text as enabled, p.proname::text as fn,
+           pg_get_triggerdef(t.oid) as def, count(*) over () as n
+      into g
+      from pg_trigger t
+      join pg_proc p on p.oid = t.tgfoid
+     where t.tgrelid = ('public.' || r.tbl)::regclass and t.tgname = r.tg and not t.tgisinternal;
+    if not found then
+      bad := bad || format('trigger %s on %s is missing', r.tg, r.tbl);
+    elsif g.n <> 1 or g.tgtype <> r.tgtype or g.enabled <> 'O' or g.fn <> r.tg
+          or (r.when_like is null and g.def like '%WHEN%')
+          or (r.when_like is not null and g.def not like r.when_like) then
+      bad := bad || format('trigger %s reads: %s (type %s, enabled %s)', r.tg, g.def, g.tgtype, g.enabled);
+    end if;
+  end loop;
+  if (select count(*) from pg_trigger
+       where tgrelid = 'public.course_attempts'::regclass and not tgisinternal) <> 2 then
+    bad := bad || 'course_attempts does not have exactly its two triggers'::text;
+  end if;
+
+  -- the three functions
+  for r in
+    select * from (values
+      ('public.course_attempts_context_immutable()', false),
+      ('public.course_attempts_context_derive()',    true),
+      ('public.journey_versions_derive_day_ids()',   false)
+    ) as t(fn, secdef)
+  loop
+    select p.prosecdef, p.proconfig, l.lanname::text as lang, p.prorettype::regtype::text as rettype
+      into g
+      from pg_proc p
+      join pg_language l on l.oid = p.prolang
+     where p.oid = to_regprocedure(r.fn);
+    if not found then
+      bad := bad || format('%s is missing', r.fn);
+    elsif g.prosecdef <> r.secdef or g.proconfig is distinct from array['search_path=pg_catalog, public']
+          or g.lang <> 'plpgsql' or g.rettype <> 'trigger' then
+      bad := bad || format('%s: security definer %s, proconfig %s, %s, returns %s', r.fn, g.prosecdef,
+                           coalesce(g.proconfig::text, 'null'), g.lang, g.rettype);
+    elsif has_function_privilege('anon', r.fn, 'execute')
+          or has_function_privilege('authenticated', r.fn, 'execute')
+          or not has_function_privilege('service_role', r.fn, 'execute') then
+      bad := bad || format('%s: execute is not service_role only', r.fn);
+    end if;
+  end loop;
+
+  -- the indexes, exactly as defined
+  for r in
+    select * from (values
+      ('course_attempts_one_in_progress_ctx_idx',
+       'CREATE UNIQUE INDEX course_attempts_one_in_progress_ctx_idx ON public.course_attempts USING btree (user_id, course_version_id, context_key) WHERE (status = ''in_progress''::text)'),
+      ('course_attempts_user_version_ctx_idx',
+       'CREATE INDEX course_attempts_user_version_ctx_idx ON public.course_attempts USING btree (user_id, course_version_id, context_key)'),
+      ('course_attempts_org_kind_completed_idx',
+       'CREATE INDEX course_attempts_org_kind_completed_idx ON public.course_attempts USING btree (organization_id, context_kind, completed_at)'),
+      ('course_attempts_ctx_user_idx',
+       'CREATE INDEX course_attempts_ctx_user_idx ON public.course_attempts USING btree (context_key, user_id) WHERE (context_kind <> ''individual''::text)'),
+      ('attempt_requests_one_open_ctx_idx',
+       'CREATE UNIQUE INDEX attempt_requests_one_open_ctx_idx ON public.attempt_requests USING btree (user_id, course_id, context_key) WHERE ((status = ''pending''::text) OR ((status = ''approved''::text) AND (used_at IS NULL)))'),
+      ('journey_day_progress_enrollment_id_day_id_key',
+       'CREATE UNIQUE INDEX journey_day_progress_enrollment_id_day_id_key ON public.journey_day_progress USING btree (enrollment_id, day_id)'),
+      ('course_attempts_journey_version_idx',
+       'CREATE INDEX course_attempts_journey_version_idx ON public.course_attempts USING btree (journey_version_id) WHERE (journey_version_id IS NOT NULL)'),
+      ('course_attempts_preview_run_idx',
+       'CREATE INDEX course_attempts_preview_run_idx ON public.course_attempts USING btree (preview_run_id) WHERE (preview_run_id IS NOT NULL)'),
+      ('course_attempts_journey_day_idx',
+       'CREATE INDEX course_attempts_journey_day_idx ON public.course_attempts USING btree (journey_day_id) WHERE (journey_day_id IS NOT NULL)'),
+      ('attempt_requests_journey_day_idx',
+       'CREATE INDEX attempt_requests_journey_day_idx ON public.attempt_requests USING btree (journey_day_id) WHERE (journey_day_id IS NOT NULL)'),
+      ('attempt_requests_learning_path_idx',
+       'CREATE INDEX attempt_requests_learning_path_idx ON public.attempt_requests USING btree (learning_path_id) WHERE (learning_path_id IS NOT NULL)'),
+      ('attempt_requests_journey_enrollment_idx',
+       'CREATE INDEX attempt_requests_journey_enrollment_idx ON public.attempt_requests USING btree (journey_enrollment_id) WHERE (journey_enrollment_id IS NOT NULL)'),
+      ('journey_day_progress_day_idx',
+       'CREATE INDEX journey_day_progress_day_idx ON public.journey_day_progress USING btree (day_id)'),
+      ('xp_events_org_ctx_created_idx',
+       'CREATE INDEX xp_events_org_ctx_created_idx ON public.xp_events USING btree (organization_id, context_key, created_at DESC)')
+    ) as t(idx, def)
+  loop
+    got := (select pg_get_indexdef(c.oid)
+              from pg_class c
+              join pg_namespace s on s.oid = c.relnamespace
+             where s.nspname = 'public' and c.relname = r.idx and c.relkind = 'i');
+    if got is distinct from r.def then
+      bad := bad || format('index %s reads %s', r.idx, coalesce(got, 'missing'));
+    end if;
+  end loop;
+  if not exists (select 1 from pg_constraint
+                 where conrelid = 'public.journey_day_progress'::regclass
+                   and conname = 'journey_day_progress_enrollment_id_day_id_key' and contype = 'u') then
+    bad := bad || 'unique (enrollment_id, day_id) on journey_day_progress is not a constraint'::text;
+  end if;
+
+  -- the three replaced keys are gone
+  if to_regclass('public.course_attempts_one_in_progress_idx') is not null then
+    bad := bad || 'the 0062 index course_attempts_one_in_progress_idx is still present'::text;
+  end if;
+  if to_regclass('public.attempt_requests_one_open_idx') is not null then
+    bad := bad || 'the 0083 index attempt_requests_one_open_idx is still present'::text;
+  end if;
+  if exists (
+    select 1 from pg_index i
+    where i.indrelid = 'public.journey_day_progress'::regclass and i.indisunique
+      and (select array_agg(a.attname::text order by a.attname::text)
+             from pg_attribute a where a.attrelid = i.indrelid and a.attnum = any (i.indkey))
+          = array['day_number', 'enrollment_id']
+  ) then
+    bad := bad || 'unique (enrollment_id, day_number) of 0058 is still present on journey_day_progress'::text;
+  end if;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (7) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (8) the two attempt triggers at work. The derive trigger: every branch
+--     (individual, path, journey with its day id read from the pinned
+--     version and the path tag nulled, a given day id kept, preview as
+--     legacy_role with its old tags), its two refusals, no firing for an
+--     insert that names context_kind, and the count in context_derive_log (a
+--     delta: the log may already hold firings, seed-0107-repaste.sql). The
+--     immutability trigger: each of its nine columns refused for the service
+--     role and for postgres, the resume re-tag and the analyst's
+--     grant-retake update refused, and the controls (another column, the
+--     same values). Every refusal is P0001 with a message neither schema
+--     probe of the launch matches (note N7).
+-- ---------------------------------------------------------------------------
+create function pg_temp.try_0107(p_stmt text, out state text, out con text, out msg text, out n bigint)
+language plpgsql as $$
+begin
+  state := 'ok';
+  begin
+    execute p_stmt;
+    get diagnostics n = row_count;
+  exception when others then
+    get stacked diagnostics state = returned_sqlstate, con = constraint_name, msg = message_text;
+  end;
+end
+$$;
+grant execute on function pg_temp.try_0107(text) to service_role, authenticated;
+
+do $$
+declare
+  bad   text[] := '{}';
+  r     record;
+  t     record;
+  a     record;
+  n0    bigint;
+  n1    bigint;
+  fired timestamptz;
+  probe constant text := 'schema cache|does not exist|could not find the';
+  org   constant uuid := '00000000-0000-0000-0000-00000000000a';
+  e1    constant uuid := '00000000-0000-0000-0000-0000000000e1';
+  e3    constant uuid := '00000000-0000-0000-0000-0000000000e3';
+  u_p   constant uuid := '00000000-0000-0000-0000-000107010002';
+  u_j   constant uuid := '00000000-0000-0000-0000-000107010004';
+  u_o   constant uuid := '00000000-0000-0000-0000-000107010005';
+  u_s   constant uuid := '00000000-0000-0000-0000-000107010006';
+  p1    constant uuid := '00000000-0000-0000-0000-000107050001';
+  ej    constant uuid := '00000000-0000-0000-0000-000107063001';
+  es    constant uuid := '00000000-0000-0000-0000-000107063002';
+  d3    constant uuid := '00000000-0000-0000-0000-000107061003';
+  d4    constant uuid := '00000000-0000-0000-0000-000107061004';
+begin
+  select fired_count into n0 from public.context_derive_log;
+
+  for r in
+    select * from (values
+      -- id, what, version, learner, context_kind named, is_preview, path, enrolment, day, day id given;
+      -- then the expected state and, for a row written, context_kind, key, preview_kind, path, enrolment, day, day id
+      ('130001', 'a tagless insert', e3, u_o, null::text, false, null::uuid, null::uuid, null::int, null::uuid,
+       'ok', 'individual', 'individual', null::text, null::uuid, null::uuid, null::int, null::uuid),
+      ('130002', 'a path insert', e1, u_p, null, false, p1, null, null, null,
+       'ok', 'path', 'path:' || p1, null, p1, null, null, null),
+      ('130003', 'a journey insert that also carries a path tag', e1, u_j, null, false, p1, ej, 3, null,
+       'ok', 'journey', 'journey:' || ej || ':' || d3, null, null, ej, 3, d3),
+      -- S's own enrolment ES: a by-role row with an old enrolment tag blocks
+      -- that enrolment's delete (step 6), so it never names another learner's
+      ('130004', 'a preview by role with both old tags', e1, u_s, null, true, p1, es, 2, null,
+       'ok', 'preview', 'preview', 'legacy_role', p1, es, 2, null),
+      ('130005', 'a journey day the pinned version does not hold', e1, u_j, null, false, null, ej, 5, null,
+       'P0001', null, null, null, null, null, null, null),
+      ('130006', 'a journey tag with no day', e1, u_j, null, false, null, ej, null, null,
+       'P0001', null, null, null, null, null, null, null),
+      ('130007', 'a journey insert that gives its day id', e3, u_j, null, false, null, ej, 2, d4,
+       'ok', 'journey', 'journey:' || ej || ':' || d4, null, null, ej, 2, d4),
+      ('130008', 'an insert that names context_kind (no firing)', e1, u_o, 'individual', false, null, null, null, null,
+       'ok', 'individual', 'individual', null, null, null, null, null)
+    ) as v(id, what, version_id, learner, kind_in, preview, path, enr, day, day_id_in,
+           expected, kind, ckey, pkind, path_out, enr_out, day_out, day_id)
+  loop
+    select * into t from pg_temp.try_0107(format(
+      'insert into public.course_attempts (id, course_version_id, user_id, organization_id, status, '
+      || 'completion_status, success_status, context_kind, is_preview, learning_path_id, journey_enrollment_id, '
+      || 'journey_day, journey_day_id) values (%L, %L, %L, %L, ''completed'', ''completed'', ''unknown'', '
+      || '%L, %L, %L, %L, %L, %L)',
+      '00000000-0000-0000-0000-000107' || r.id, r.version_id, r.learner, org,
+      r.kind_in, r.preview, r.path, r.enr, r.day, r.day_id_in));
+    if t.state <> r.expected then
+      bad := bad || format('derive, %s: %s %s (expected %s)', r.what, t.state, coalesce(t.msg, ''), r.expected);
+    elsif t.state = 'P0001' and t.msg ~* probe then
+      bad := bad || format('derive, %s: the message "%s" matches a schema probe (note N7)', r.what, t.msg);
+    elsif t.state = 'ok' then
+      select * into a from public.course_attempts where id = ('00000000-0000-0000-0000-000107' || r.id)::uuid;
+      if a.context_kind <> r.kind or a.context_key is distinct from r.ckey or a.preview_kind is distinct from r.pkind
+         or a.learning_path_id is distinct from r.path_out or a.journey_enrollment_id is distinct from r.enr_out
+         or a.journey_day is distinct from r.day_out or a.journey_day_id is distinct from r.day_id
+         or a.journey_version_id is not null or a.preview_run_id is not null then
+        bad := bad || format('derive, %s: reads %s / %s / %s / path %s / enrolment %s / day %s / day id %s',
+                             r.what, a.context_kind, a.context_key, coalesce(a.preview_kind, 'null'),
+                             coalesce(a.learning_path_id::text, 'null'), coalesce(a.journey_enrollment_id::text, 'null'),
+                             coalesce(a.journey_day::text, 'null'), coalesce(a.journey_day_id::text, 'null'));
+      end if;
+    end if;
+  end loop;
+
+  select fired_count, last_fired_at into n1, fired from public.context_derive_log;
+  if n1 <> n0 + 5 or fired is distinct from now() then
+    bad := bad || format('context_derive_log reads %s firings since the start of (8) and last fired at %s '
+                         || '(expected 5, now)', n1 - n0, coalesce(fired::text, 'null'));
+  end if;
+
+  -- immutability, as postgres (the table owner is not exempt)
+  for r in
+    select * from (values
+      ('context_kind on an individual row', 'update public.course_attempts set context_kind = ''path'', '
+         || 'learning_path_id = ''00000000-0000-0000-0000-000107050001'' where id = ''00000000-0000-0000-0000-000107070001'''),
+      ('journey_day_id nulled on a journey row', 'update public.course_attempts set journey_day_id = null '
+         || 'where id = ''00000000-0000-0000-0000-000107070011''')
+    ) as v(what, stmt)
+  loop
+    select * into t from pg_temp.try_0107(r.stmt);
+    if t.state <> 'P0001' or t.msg ~* probe then
+      bad := bad || format('immutability as postgres, %s: %s %s (expected P0001)', r.what, t.state, coalesce(t.msg, ''));
+    end if;
+  end loop;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (8) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- immutability for the service role (decision D6): the shim grants it
+-- nothing, so this transaction grants what the service client holds on
+-- Supabase; the controls show the refusals come from the trigger
+grant usage on schema public to service_role;
+grant select, update on public.course_attempts to service_role;
+select set_config('request.jwt.claims', '{"role": "service_role"}', true);
+set local role service_role;
+create temporary table r0107_svc as
+select s.what, s.expected, t.state, t.msg, t.n
+from (values
+  ('context_kind',          'set context_kind = ''individual''',                                         'P0001'),
+  ('learning_path_id',      'set learning_path_id = ''00000000-0000-0000-0000-000107050002''',           'P0001'),
+  ('journey_enrollment_id', 'set journey_enrollment_id = ''00000000-0000-0000-0000-000107063001''',      'P0001'),
+  ('journey_day',           'set journey_day = 1',                                                       'P0001'),
+  ('journey_day_id',        'set journey_day_id = ''00000000-0000-0000-0000-000107061001''',             'P0001'),
+  ('journey_version_id',    'set journey_version_id = ''00000000-0000-0000-0000-000107062001''',         'P0001'),
+  ('is_preview',            'set is_preview = true',                                                     'P0001'),
+  ('preview_kind',          'set preview_kind = ''course''',                                             'P0001'),
+  ('preview_run_id',        'set preview_run_id = ''00000000-0000-0000-0000-000107999998''',             'P0001'),
+  ('another column (control)', 'set last_activity_at = now()',                                           'ok 1'),
+  ('the same values (control)',
+   'set context_kind = context_kind, learning_path_id = learning_path_id, '
+   || 'journey_enrollment_id = journey_enrollment_id, journey_day = journey_day, journey_day_id = journey_day_id, '
+   || 'journey_version_id = journey_version_id, is_preview = is_preview, preview_kind = preview_kind, '
+   || 'preview_run_id = preview_run_id',                                                                 'ok 1')
+) as s(what, stmt, expected)
+cross join lateral pg_temp.try_0107(
+  'update public.course_attempts ' || s.stmt || ' where id = ''00000000-0000-0000-0000-000107070005''') as t
+union all
+select s.what, s.expected, t.state, t.msg, t.n
+from (values
+  -- the launch page's resume re-tag on I's untagged open row
+  ('the resume re-tag',
+   'update public.course_attempts set journey_enrollment_id = ''00000000-0000-0000-0000-000107063001'', journey_day = 2 '
+   || 'where id = ''00000000-0000-0000-0000-000107070002''', 'P0001'),
+  -- the grant-retake update on B's live retake: an analyst writes is_preview, a learner false over false
+  ('the grant-retake update writing is_preview',
+   'update public.course_attempts set served_language = ''en'', launch_mode = ''Normal'', is_preview = true '
+   || 'where id = ''00000000-0000-0000-0000-000107070010''', 'P0001'),
+  ('the grant-retake update writing false over false (control)',
+   'update public.course_attempts set served_language = ''en'', launch_mode = ''Normal'', is_preview = false '
+   || 'where id = ''00000000-0000-0000-0000-000107070010''', 'ok 1')
+) as s(what, stmt, expected)
+cross join lateral pg_temp.try_0107(s.stmt) as t;
+reset role;
+
+do $$
+declare
+  bad text[] := '{}';
+  r   record;
+begin
+  if (select count(*) from pg_temp.r0107_svc) <> 14 then
+    bad := bad || 'the service-role cases did not all run'::text;
+  end if;
+  for r in select * from pg_temp.r0107_svc loop
+    if (case when r.state = 'ok' then 'ok ' || r.n else r.state end) <> r.expected then
+      bad := bad || format('as service_role, %s: %s %s (expected %s)', r.what, r.state,
+                           coalesce(r.msg, coalesce(r.n::text, '')), r.expected);
+    elsif r.state = 'P0001' and r.msg ~* 'schema cache|does not exist|could not find the' then
+      bad := bad || format('as service_role, %s: the message "%s" matches a schema probe (note N7)', r.what, r.msg);
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (8) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (9) the keys at work. The two attempt keys refuse a lone delete of a path
+--     or an enrolment that an attempt names (23503 on the attempt's key),
+--     while the organisation and user cascades delete paths, enrolments,
+--     attempts of both kinds, credits and grants (paste-window note 5); a
+--     program with a credit and no learner attempt deletes (note N1), and a
+--     lone delete of its credited day is refused at the deferred check.
+--     Each delete runs in a subtransaction that checks every deferred key
+--     at once and is then undone. The new unique keys: three open rows of
+--     one version in three contexts, a preview beside a real attempt, two
+--     open requests in two contexts, two credits of one number on two days;
+--     a second row in one context, and a course preview beside an open
+--     legacy_role row (note N4), raise 23505 on the new key.
+-- ---------------------------------------------------------------------------
+create function pg_temp.at_commit_0107(p_stmt text, p_claims text, out state text, out con text)
+language plpgsql as $$
+begin
+  begin
+    if p_claims is not null then
+      perform set_config('request.jwt.claims', p_claims, true);
+    end if;
+    execute p_stmt;
+    set constraints all immediate;
+    raise exception using errcode = 'R0107', message = 'assert-0107: undo';
+  exception when others then
+    get stacked diagnostics state = returned_sqlstate, con = constraint_name;
+  end;
+  if state = 'R0107' then
+    state := 'ok';
+    con := null;
+  end if;
+end
+$$;
+
+do $$
+declare
+  bad  text[] := '{}';
+  r    record;
+  t    record;
+  org  constant uuid := '00000000-0000-0000-0000-00000000000a';
+  jx   constant uuid := '00000000-0000-0000-0000-000107131001';
+  dx   constant uuid := '00000000-0000-0000-0000-000107131101';
+  ins  constant text :=
+    'insert into public.course_attempts (course_version_id, user_id, organization_id, status, completion_status, '
+    || 'success_status, context_kind, is_preview, preview_kind, learning_path_id, journey_enrollment_id, journey_day, '
+    || 'journey_day_id) values (''00000000-0000-0000-0000-0000000000e1'', ';
+  req  constant text :=
+    'insert into public.attempt_requests (organization_id, course_id, user_id, status, used_at, context_kind, '
+    || 'learning_path_id) values (''00000000-0000-0000-0000-00000000000a'', ''00000000-0000-0000-0000-0000000000c2'', '
+    || '''00000000-0000-0000-0000-000107010002'', ';
+  cred constant text :=
+    'insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id, course_id) '
+    || 'values (''00000000-0000-0000-0000-000107063001'', ''00000000-0000-0000-0000-00000000000a'', '
+    || '''00000000-0000-0000-0000-000107010004'', ';
+begin
+  -- N1's program: a day, a version (its day_ids from the trigger of 6a), an
+  -- enrolment of I and one credit that no attempt backs
+  insert into public.journey_programs (id, organization_id, name, days_total) values
+    (jx, org, 'Credit only (0107 assert)', 1);
+  insert into public.journey_days (id, program_id, organization_id, day_number, course_id) values
+    (dx, jx, org, 1, '00000000-0000-0000-0000-0000000000c1');
+  insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total,
+                                       count_sundays, completion_title, days) values
+    ('00000000-0000-0000-0000-000107131201', jx, org, 1, 'Credit only (0107 assert)', 1, false, 'Yoddha',
+     '[{"day": 1, "course_id": "00000000-0000-0000-0000-0000000000c1", "mission_title": null}]');
+  insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status) values
+    ('00000000-0000-0000-0000-000107131301', jx, '00000000-0000-0000-0000-000107131201', org,
+     '00000000-0000-0000-0000-000107010001', current_date - 1, 'active');
+  insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id, course_id,
+                                           attempt_id, credit_kind) values
+    ('00000000-0000-0000-0000-000107131301', org, '00000000-0000-0000-0000-000107010001', 1, dx,
+     '00000000-0000-0000-0000-0000000000c1', null, 'legacy_cross_context');
+
+  for r in
+    select * from (values
+      ('a lone delete of P2, which O''s open path row names',
+       'delete from public.learning_paths where id = ''00000000-0000-0000-0000-000107050002''', null::text,
+       '23503 course_attempts_learning_path_id_fkey'),
+      ('a lone delete of J''s enrolment EJ, which J''s journey rows name',
+       'delete from public.journey_enrollments where id = ''00000000-0000-0000-0000-000107063001''', null,
+       '23503 course_attempts_journey_enrollment_id_fkey'),
+      ('a delete of a program with a credit and no learner attempt (N1)',
+       'delete from public.journey_programs where id = ''00000000-0000-0000-0000-000107131001''', null,
+       'ok'),
+      ('a lone delete of that program''s credited day (N1 control)',
+       'delete from public.journey_days where id = ''00000000-0000-0000-0000-000107131101''', null,
+       '23503 journey_day_progress_day_id_fkey'),
+      ('the organisation cascade over path and journey attempts, credits and grants',
+       'delete from public.organizations where id = ''00000000-0000-0000-0000-00000000000a''',
+       '{"role": "service_role"}', 'ok'),
+      ('the user cascade of J (journey attempts, enrolment, credits)',
+       'delete from auth.users where id = ''00000000-0000-0000-0000-000107010004''', '{"role": "service_role"}', 'ok'),
+      ('the user cascade of P (path attempts, assignments, a grant)',
+       'delete from auth.users where id = ''00000000-0000-0000-0000-000107010002''', '{"role": "service_role"}', 'ok')
+    ) as v(what, stmt, claims, expected)
+  loop
+    select * into t from pg_temp.at_commit_0107(r.stmt, r.claims);
+    if t.state || coalesce(' ' || nullif(t.con, ''), '') <> r.expected then
+      bad := bad || format('%s: %s %s (expected %s)', r.what, t.state, coalesce(t.con, ''), r.expected);
+    end if;
+  end loop;
+  if not exists (select 1 from public.journey_programs where id = jx)
+     or not exists (select 1 from public.organizations where id = org) then
+    bad := bad || 'a delete of (9) was not undone'::text;
+  end if;
+
+  for r in
+    select * from (values
+      -- B on e1 holds an open Individual row (070010)
+      ('B: an open path row beside the open Individual row',
+       ins || '''00000000-0000-0000-0000-000107010003'', ''00000000-0000-0000-0000-00000000000a'', ''in_progress'', '
+           || '''in_progress'', ''unknown'', ''path'', false, null, ''00000000-0000-0000-0000-000107050001'', null, null, null)',
+       'ok'),
+      ('B: an open journey row, a third context on the same version',
+       ins || '''00000000-0000-0000-0000-000107010003'', ''00000000-0000-0000-0000-00000000000a'', ''in_progress'', '
+           || '''in_progress'', ''unknown'', ''journey'', false, null, null, ''00000000-0000-0000-0000-000107063003'', 1, '
+           || '''00000000-0000-0000-0000-000107061001'')',
+       'ok'),
+      ('B: a second open Individual row',
+       ins || '''00000000-0000-0000-0000-000107010003'', ''00000000-0000-0000-0000-00000000000a'', ''in_progress'', '
+           || '''in_progress'', ''unknown'', ''individual'', false, null, null, null, null, null)',
+       '23505 course_attempts_one_in_progress_ctx_idx'),
+      ('B: a second open path row in P1',
+       ins || '''00000000-0000-0000-0000-000107010003'', ''00000000-0000-0000-0000-00000000000a'', ''in_progress'', '
+           || '''in_progress'', ''unknown'', ''path'', false, null, ''00000000-0000-0000-0000-000107050001'', null, null, null)',
+       '23505 course_attempts_one_in_progress_ctx_idx'),
+      -- S on e1 holds an open legacy_role row (070014)
+      ('S: an open Individual row beside the open preview',
+       ins || '''00000000-0000-0000-0000-000107010006'', ''00000000-0000-0000-0000-00000000000a'', ''in_progress'', '
+           || '''in_progress'', ''unknown'', ''individual'', false, null, null, null, null, null)',
+       'ok'),
+      ('S: an open course preview beside the open legacy_role row (N4)',
+       ins || '''00000000-0000-0000-0000-000107010006'', ''00000000-0000-0000-0000-00000000000a'', ''in_progress'', '
+           || '''in_progress'', ''unknown'', ''preview'', true, ''course'', null, null, null, null)',
+       '23505 course_attempts_one_in_progress_ctx_idx'),
+      -- P holds a pending Individual request on C2 (080003)
+      ('P: a pending path request beside the pending Individual one',
+       req || '''pending'', null, ''path'', ''00000000-0000-0000-0000-000107050001'')', 'ok'),
+      ('P: a second pending Individual request',
+       req || '''pending'', null, ''individual'', null)', '23505 attempt_requests_one_open_ctx_idx'),
+      ('P: an approved, used Individual request (not open)',
+       req || '''approved'', now(), ''individual'', null)', 'ok'),
+      -- EJ holds a credit on day 1 (d1)
+      ('EJ: a credit numbered 1 on another day (d3)',
+       cred || '1, ''00000000-0000-0000-0000-000107061003'', ''00000000-0000-0000-0000-0000000000c1'')', 'ok'),
+      ('EJ: a second credit on d1 under another number',
+       cred || '3, ''00000000-0000-0000-0000-000107061001'', ''00000000-0000-0000-0000-0000000000c1'')',
+       '23505 journey_day_progress_enrollment_id_day_id_key')
+    ) as v(what, stmt, expected)
+  loop
+    select * into t from pg_temp.try_0107(r.stmt);
+    if t.state || coalesce(' ' || nullif(t.con, ''), '') <> r.expected then
+      bad := bad || format('%s: %s %s %s (expected %s)', r.what, t.state, coalesce(t.con, ''),
+                           coalesce(t.msg, ''), r.expected);
+    end if;
+  end loop;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (9) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (10) the day_ids trigger at work (6a, note N6): it fills day_ids from
+--      journey_days by (program, day number) when the insert gives none,
+--      marked slot_backfill, for the service role and for an org admin's
+--      session (security invoker under the journey_days policy); it keeps a
+--      given map; a version with no days gets {}; a day without a
+--      journey_days row (a missing number, a removed day, a day that is not
+--      a number) refuses the insert with P0001 and a message neither schema
+--      probe matches (note N7)
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  bad   text[] := '{}';
+  r     record;
+  t     record;
+  got   record;
+  jp    constant uuid := '00000000-0000-0000-0000-000107060001';
+  d1    constant text := '00000000-0000-0000-0000-000107061001';
+  d2    constant text := '00000000-0000-0000-0000-000107061002';
+  d3    constant text := '00000000-0000-0000-0000-000107061003';
+  d4    constant text := '00000000-0000-0000-0000-000107061004';
+  ins   constant text :=
+    'insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, '
+    || 'count_sundays, completion_title, days, day_ids, day_ids_source) values (';
+begin
+  -- day 5 of the program is removed (it keeps its row, without a number)
+  update public.journey_days set removed_at = coalesce(removed_at, now()), day_number = null
+   where id = '00000000-0000-0000-0000-000107061005';
+
+  for r in
+    select * from (values
+      ('132003', 'a version of days 1, 2 and 4', jp, 3, '[{"day": 1}, {"day": 2}, {"day": 4}]', null::text, null::text,
+       'ok', jsonb_build_object('1', d1, '2', d2, '4', d4), 'slot_backfill'),
+      ('132004', 'a version that gives its day_ids', jp, 4, '[{"day": 1}]', '{"1": "' || d3 || '"}', 'editor',
+       'ok', jsonb_build_object('1', d3), 'editor'),
+      ('132005', 'a version with a day that has no journey_days row', jp, 5, '[{"day": 1}, {"day": 6}]', null, null,
+       'P0001', null::jsonb, null),
+      ('132006', 'a version with a removed day', jp, 6, '[{"day": 5}]', null, null,
+       'P0001', null, null),
+      ('132007', 'a version with a day that is not a number', jp, 7, '[{"day": "x"}]', null, null,
+       'P0001', null, null),
+      ('132008', 'a version with no days', '00000000-0000-0000-0000-000107060002'::uuid, 2, '[]', null, null,
+       'ok', '{}'::jsonb, 'slot_backfill')
+    ) as v(id, what, program_id, version_number, days, day_ids, source, expected, want, want_source)
+  loop
+    select * into t from pg_temp.try_0107(ins || format(
+      '%L, %L, ''00000000-0000-0000-0000-00000000000a'', %s, ''Journey (0107 assert)'', 5, false, ''Yoddha'', '
+      || '%L::jsonb, %L::jsonb, %L)',
+      '00000000-0000-0000-0000-000107' || r.id, r.program_id, r.version_number, r.days, r.day_ids, r.source));
+    if t.state <> r.expected then
+      bad := bad || format('%s: %s %s (expected %s)', r.what, t.state, coalesce(t.msg, ''), r.expected);
+    elsif t.state = 'P0001' and t.msg ~* 'schema cache|does not exist|could not find the' then
+      bad := bad || format('%s: the message "%s" matches a schema probe (note N7)', r.what, t.msg);
+    elsif t.state = 'ok' then
+      select day_ids, day_ids_source into got from public.journey_versions
+       where id = ('00000000-0000-0000-0000-000107' || r.id)::uuid;
+      if got.day_ids is distinct from r.want or got.day_ids_source is distinct from r.want_source then
+        bad := bad || format('%s: day_ids %s, source %s (expected %s, %s)', r.what, got.day_ids,
+                             coalesce(got.day_ids_source, 'null'), r.want, r.want_source);
+      end if;
+    end if;
+  end loop;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (10) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- the old publish: an org admin's session (S, admin of Org A) inserts a
+-- version through the 0058 insert policy; the shim grants authenticated no
+-- insert, so this transaction grants it, as the project defaults do
+grant insert on public.journey_versions to authenticated;
+select set_config('request.jwt.claims',
+  '{"sub": "00000000-0000-0000-0000-000107010006", "role": "authenticated"}', true);
+set local role authenticated;
+create temporary table r0107_admin_publish as
+select t.state, t.msg, t.n
+from pg_temp.try_0107(
+  'insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, '
+  || 'count_sundays, completion_title, days) values (''00000000-0000-0000-0000-000107132009'', '
+  || '''00000000-0000-0000-0000-000107060001'', ''00000000-0000-0000-0000-00000000000a'', 9, ''Journey (0107 assert)'', '
+  || '2, false, ''Yoddha'', ''[{"day": 1}, {"day": 2}]'')') as t;
+reset role;
+
+do $$
+declare
+  r record;
+begin
+  select * into r from pg_temp.r0107_admin_publish;
+  if r.state <> 'ok' or r.n <> 1 then
+    raise exception 'assert-0107: (10) an org admin''s publish: % % (expected ok, 1 row)', r.state, coalesce(r.msg, '');
+  end if;
+  if (select day_ids from public.journey_versions where id = '00000000-0000-0000-0000-000107132009')
+     is distinct from jsonb_build_object('1', '00000000-0000-0000-0000-000107061001',
+                                         '2', '00000000-0000-0000-0000-000107061002')
+     or (select day_ids_source from public.journey_versions where id = '00000000-0000-0000-0000-000107132009')
+     is distinct from 'slot_backfill' then
+    raise exception 'assert-0107: (10) an org admin''s publish reads day_ids % (expected days 1 and 2 mapped, slot_backfill)',
+      (select day_ids from public.journey_versions where id = '00000000-0000-0000-0000-000107132009');
   end if;
 end
 $$;

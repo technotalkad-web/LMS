@@ -19,8 +19,12 @@
 --   r5  an API key created after the first paste, which takes the column
 --       default 2 (the run-once block, 1t, would leave it alone; only the
 --       keys from before the first paste read 1)
--- Until the derive trigger exists in 0107, every attempt insert names
--- context_kind, as the new code does.
+--   r6  an attempt inserted by the code before phase 2, which names no
+--       context_kind: the paste-window derive trigger (2c) labels it
+--       individual and counts one firing in context_derive_log (2a), which
+--       the second paste must keep (its row is created once). It is
+--       abandoned, so it holds no open-row slot and no completion.
+-- r1 to r3 name context_kind, as the new code does, so they fire nothing.
 
 insert into public.course_attempts
   (id, course_version_id, user_id, organization_id, status, completion_status, success_status, score,
@@ -52,6 +56,13 @@ values
   ('00000000-0000-0000-0000-000107120004', '00000000-0000-0000-0000-000107063003', '00000000-0000-0000-0000-00000000000a',
    '00000000-0000-0000-0000-000107010003', 4, '00000000-0000-0000-0000-000107061004', '00000000-0000-0000-0000-000107040001',
    null, now() - interval '5 minutes', 'self');
+
+-- r6: O, an untagged insert of the code before phase 2 (no context_kind)
+insert into public.course_attempts
+  (id, course_version_id, user_id, organization_id, status, completion_status, success_status, started_at)
+values
+  ('00000000-0000-0000-0000-000107120006', '00000000-0000-0000-0000-0000000000e3', '00000000-0000-0000-0000-000107010005',
+   '00000000-0000-0000-0000-00000000000a', 'abandoned', 'in_progress', 'unknown', now() - interval '2 hours');
 
 -- r5: a key of Org A created after the first paste, naming no contract_version
 insert into public.org_api_keys (id, organization_id, name, key_prefix, key_hash, created_by) values

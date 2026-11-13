@@ -8,17 +8,20 @@
 -- CLI is linked to production).
 --
 -- BUILD STATE (this paragraph is removed when the file is complete): this
--- build holds section 0 (the prerequisites and the before-checks) and
--- section 1, the first part of ADR 0024 section B's creation order item 2:
--- the new columns, their run-once backfills, the generated columns, the
--- CHECKs and the table preview_runs. Not built yet: the rest of item 2
--- (context_derive_log, the two trigger functions and their triggers, the two
--- attempt foreign keys re-created on delete no action, and the indexes with
--- the open-row, open-request and journey_day_progress key swaps), then items
--- 3 to 7. On this build the old functions still write as before 0107 and
--- would now fail (an attempt insert needs context_kind, a credit needs
--- day_id). Do not paste a build of this file that still carries this
--- paragraph.
+-- build holds section 0 (the prerequisites and the before-checks), sections
+-- 1 and 2, which are ADR 0024 section B's creation order item 2 whole (the
+-- new columns, their run-once backfills, the generated columns, the CHECKs,
+-- preview_runs, context_derive_log, the immutability and derive triggers,
+-- the two attempt foreign keys re-created on delete no action, the open-row,
+-- open-request and journey_day_progress key swaps and the indexes), and of
+-- item 6 only the paste-window day_ids trigger on journey_versions (section
+-- 6). Not built yet: items 3 to 5, the rest of item 6 and item 7. On this
+-- build the old bodies still run and some now fail: the 0089
+-- journey_record_completion names the dropped credit key as its conflict
+-- target (42P10) and its untagged branch re-tags an attempt (refused by the
+-- immutability trigger); the old consume_grant inserts a retake that the
+-- derive trigger labels. Do not paste a build of this file that still
+-- carries this paragraph.
 --
 -- ORDER (ADR 0024 steps 73 and 74):
 --   Staging: after pull request 1 (this file, 0108, the rehearsal, the pure
@@ -118,14 +121,18 @@
 -- on every credit (1q) and credit_kind = 'legacy_cross_context' on the
 -- credits Q7 counts so (1s). Existing org_api_keys rows read contract_version
 -- 1 from the column default (1t); every other new column takes its default.
--- A later paste writes no row. The temporary table of section 0b is the
--- session's own and is dropped at commit.
+-- The one row of context_derive_log, a new table (2a), is created on the
+-- first paste. A later paste writes no row. The temporary table of section 0b
+-- is the session's own and is dropped at commit.
 --
 -- Locks: ACCESS EXCLUSIVE until commit on course_attempts, attempt_requests,
 -- revision_visits, xp_events, journey_days, journey_versions,
 -- journey_day_progress, journey_enrollments, journey_programs,
 -- course_assignments, learning_path_assignments, learning_path_courses,
--- org_api_keys, org_integration_settings and notification_templates. The two
+-- org_api_keys, org_integration_settings and notification_templates; SHARE
+-- ROW EXCLUSIVE until commit on the parents of the foreign keys this file
+-- adds or re-creates that are not in that list, learning_paths,
+-- organizations and auth.users (writes to them wait, reads do not). The two
 -- stored generated columns of course_attempts and the one of attempt_requests
 -- rewrite those tables on the first paste (a rewrite per added generated
 -- column; a later paste skips them). lock_timeout 5 s: if a lock is not
@@ -1557,6 +1564,404 @@ alter table public.notification_templates
       'journey_escalation',
       'journey_completion'
     ));
+
+-- ---------------------------------------------------------------------------
+-- 2. The paste-window log, the two attempt triggers, the two attempt foreign
+--    keys and the indexes (ADR 0024 section B, the end of creation order
+--    item 2; steps 7, 8 and 91; notes N1, N5 and N7)
+-- ---------------------------------------------------------------------------
+-- After every backfill of section 1: the immutability trigger would refuse
+-- the context_kind backfill itself, and no row this file writes may reach
+-- the derive trigger.
+--
+-- Errors (note N7). The two triggers here and the day_ids trigger of section
+-- 6 raise SQLSTATE P0001 with a fixed short message. No message uses a
+-- phrase that the old launch code's schema probes match (isAldsSchemaMissing
+-- in lib/alds/flag.ts and isSchemaMissing in lib/scoring/attempt-kind.ts;
+-- note N7 lists them), and no error carries a code they match (42703, 42P01,
+-- 42883, PGRST20x): a match would make the old launch retry its insert
+-- without the ALDS_P4 columns, or log a refusal as a missing schema, and
+-- hide it. tests/unit/context-trigger-errors.test.ts reads each message from
+-- this file and feeds it to both probes.
+
+-- 2a. context_derive_log (step 7): one row, the evidence of the paste window.
+-- The derive trigger (2c) counts every insert that named no context_kind
+-- (old launch code on a staging deployment, or an old fixture); 0108 refuses
+-- to run while the last firing is less than 24 hours old, and drops the
+-- table. A time and a count, nothing about a learner. The row is created
+-- once; a later paste leaves it as it is.
+create table if not exists public.context_derive_log (
+  id            boolean primary key default true check (id),
+  last_fired_at timestamptz,
+  fired_count   bigint not null default 0
+);
+
+comment on table public.context_derive_log is
+  'One row: when the paste-window derive trigger on course_attempts last fired, and how many times (ADR 0024 step 7). 0108 reads it before it runs and drops it.';
+
+alter table public.context_derive_log enable row level security;
+drop policy if exists "no direct access to context_derive_log" on public.context_derive_log;
+create policy "no direct access to context_derive_log" on public.context_derive_log
+  for all
+  using (false)
+  with check (false);
+
+-- service_role is named in the revoke (the 0103 form), so a project's default
+-- privileges cannot leave it a delete the record does not grant.
+revoke all on public.context_derive_log from public, anon, authenticated, service_role;
+grant select, insert, update on public.context_derive_log to service_role;
+
+insert into public.context_derive_log (id) values (true)
+on conflict (id) do nothing;
+
+-- 2b. course_attempts_context_immutable (step 7, decision D6): the context of
+-- an attempt is fixed at insert, for every role, the service role included.
+-- There is no trigger-depth exemption: every foreign key on these columns is
+-- on delete no action (1e, 1f, 2d), so no referential action updates one.
+-- Before update only: a delete is not stopped (the purge of step 81 and the
+-- organisation, user and version cascades). It refuses three writes of the
+-- code before phase 2, each on purpose: the launch page's resume re-tag, the
+-- untagged-credit re-tag of the 0089 journey_record_completion (its new body
+-- in this file has none) and the grant-retake update that writes is_preview
+-- for a data_analyst. A write of the same values passes. Security invoker:
+-- it reads only the old and the new row.
+create or replace function public.course_attempts_context_immutable()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+begin
+  if (new.context_kind, new.learning_path_id, new.journey_enrollment_id, new.journey_day,
+      new.journey_day_id, new.journey_version_id, new.is_preview, new.preview_kind,
+      new.preview_run_id)
+     is distinct from
+     (old.context_kind, old.learning_path_id, old.journey_enrollment_id, old.journey_day,
+      old.journey_day_id, old.journey_version_id, old.is_preview, old.preview_kind,
+      old.preview_run_id) then
+    raise exception 'course_attempts: the context of an attempt is fixed when the attempt is created (ADR 0024)'
+      using errcode = 'P0001',
+            detail = 'context_kind, learning_path_id, journey_enrollment_id, journey_day, journey_day_id, '
+                     || 'journey_version_id, is_preview, preview_kind and preview_run_id never change after insert.';
+  end if;
+  return new;
+end
+$$;
+
+revoke execute on function public.course_attempts_context_immutable() from public, anon, authenticated;
+grant execute on function public.course_attempts_context_immutable() to service_role;
+
+drop trigger if exists course_attempts_context_immutable on public.course_attempts;
+create trigger course_attempts_context_immutable
+  before update on public.course_attempts
+  for each row execute function public.course_attempts_context_immutable();
+
+-- 2c. course_attempts_context_derive (step 7): for the paste window only;
+-- 0108 drops it, its function and context_derive_log. The code before phase
+-- 2 inserts attempts that name no context_kind; this trigger labels them by
+-- the rule section 1 used on the rows before the paste: preview if
+-- is_preview, with preview_kind legacy_role (that code flags previews by
+-- role), the old tags kept and no day id; else journey if the journey tag
+-- is set, nulling a path tag that arrives with it (a choice made at insert,
+-- not a rewrite), with journey_day_id read from the enrolment's pinned
+-- version (journey_versions.day_ids of journey_day, step 91), and a refusal
+-- when there is none, because the shape check needs the id and a day
+-- identity is never invented; else path; else individual. A journey_day_id
+-- given with the row is kept. journey_version_id stays null, the legal
+-- "pinned version only" value (step 5). The trigger's when clause lets only
+-- a row with a null context_kind reach it, so an insert by the new code never
+-- fires it and never counts as a firing. Each firing is counted in
+-- context_derive_log, which the launching session cannot write: security
+-- definer.
+create or replace function public.course_attempts_context_derive()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_day_id uuid;
+begin
+  if new.context_kind is not null then
+    return new;
+  end if;
+
+  if new.is_preview then
+    new.context_kind := 'preview';
+    new.preview_kind := 'legacy_role';
+  elsif new.journey_enrollment_id is not null then
+    new.context_kind := 'journey';
+    new.learning_path_id := null;
+    if new.journey_day_id is null then
+      select (jv.day_ids ->> new.journey_day::text)::uuid
+        into v_day_id
+        from public.journey_enrollments e
+        join public.journey_versions jv on jv.id = e.version_id
+       where e.id = new.journey_enrollment_id;
+      if v_day_id is null then
+        raise exception 'course_attempts: this journey day has no day identity in the enrolment''s pinned version (ADR 0024)'
+          using errcode = 'P0001',
+                detail = format('journey_enrollment_id %s, journey_day %s',
+                                new.journey_enrollment_id, coalesce(new.journey_day::text, 'null'));
+      end if;
+      new.journey_day_id := v_day_id;
+    end if;
+  elsif new.learning_path_id is not null then
+    new.context_kind := 'path';
+  else
+    new.context_kind := 'individual';
+  end if;
+
+  insert into public.context_derive_log as l (id, last_fired_at, fired_count)
+  values (true, now(), 1)
+  on conflict (id) do update
+    set last_fired_at = excluded.last_fired_at,
+        fired_count   = l.fired_count + 1;
+  return new;
+end
+$$;
+
+revoke execute on function public.course_attempts_context_derive() from public, anon, authenticated;
+grant execute on function public.course_attempts_context_derive() to service_role;
+
+drop trigger if exists course_attempts_context_derive on public.course_attempts;
+create trigger course_attempts_context_derive
+  before insert on public.course_attempts
+  for each row
+  when (new.context_kind is null)
+  execute function public.course_attempts_context_derive();
+
+-- 2d. The two attempt foreign keys, re-created on delete no action (step 7;
+-- set null today, 0034 and 0058). no action is checked at the end of the
+-- statement, so the organisation and user cascades still delete attempts
+-- together with their path or enrolment, while a lone delete of a path or of
+-- an enrolment that an attempt names fails with 23503 (the path is archived
+-- instead). Each key is found by its column and its parent, as section 0a
+-- reads it; a key that does not read no action is dropped and re-created
+-- under its own name, and a key that already reads no action (a later paste)
+-- is left alone. Adding the key checks every row against its parent once.
+do $$
+declare
+  r      record;
+  k      record;
+  v_name text;
+begin
+  for r in
+    select * from (values
+      ('learning_path_id',      'public.learning_paths'),
+      ('journey_enrollment_id', 'public.journey_enrollments')
+    ) as t(col, parent)
+  loop
+    v_name := null;
+    for k in
+      select c.conname
+      from pg_constraint c
+      join pg_attribute a on a.attrelid = c.conrelid and a.attnum = any (c.conkey)
+      where c.contype = 'f'
+        and c.conrelid = 'public.course_attempts'::regclass
+        and c.confrelid = r.parent::regclass
+        and a.attname = r.col
+        and c.confdeltype <> 'a'
+    loop
+      v_name := coalesce(v_name, k.conname);
+      execute format('alter table public.course_attempts drop constraint %I', k.conname);
+    end loop;
+    if not exists (
+      select 1 from pg_constraint c
+      join pg_attribute a on a.attrelid = c.conrelid and a.attnum = any (c.conkey)
+      where c.contype = 'f'
+        and c.conrelid = 'public.course_attempts'::regclass
+        and c.confrelid = r.parent::regclass
+        and a.attname = r.col
+    ) then
+      execute format(
+        'alter table public.course_attempts add constraint %I foreign key (%I) references %s(id) on delete no action',
+        coalesce(v_name, 'course_attempts_' || r.col || '_fkey'), r.col, r.parent);
+    end if;
+  end loop;
+end
+$$;
+
+-- 2e. The open-row key per context (step 7). One open attempt per (learner,
+-- version, context) in place of one per (learner, version) (0062:52-54), so
+-- three open rows of one version can coexist in three contexts. The version
+-- stays in the key, so language-slot routing keeps working. An open
+-- legacy_role row and a new course preview of the same version share the
+-- key 'preview', so a Preview launch closes that row before it inserts (note
+-- N4). The new key is created before the old one is dropped. 0062, and 0103,
+-- which refuses to run without the 0062 index, are never pasted again
+-- (header).
+create unique index if not exists course_attempts_one_in_progress_ctx_idx
+  on public.course_attempts (user_id, course_version_id, context_key)
+  where status = 'in_progress';
+drop index if exists public.course_attempts_one_in_progress_idx;
+
+-- The context readers (step 7): attempts per learner, version and context;
+-- per organisation, context kind and completion time; and per context and
+-- learner outside the Individual context.
+create index if not exists course_attempts_user_version_ctx_idx
+  on public.course_attempts (user_id, course_version_id, context_key);
+create index if not exists course_attempts_org_kind_completed_idx
+  on public.course_attempts (organization_id, context_kind, completed_at);
+create index if not exists course_attempts_ctx_user_idx
+  on public.course_attempts (context_key, user_id)
+  where context_kind <> 'individual';
+
+-- 2f. The open-request key per context (step 8). At most one open request
+-- (pending, or an approved grant not yet used: the 0083 predicate, unchanged)
+-- per (learner, course, context), in place of one per (learner, course)
+-- (0083:45-47). The new key is created before the old one is dropped. 0083 is
+-- never pasted again (header).
+create unique index if not exists attempt_requests_one_open_ctx_idx
+  on public.attempt_requests (user_id, course_id, context_key)
+  where status = 'pending' or (status = 'approved' and used_at is null);
+drop index if exists public.attempt_requests_one_open_idx;
+
+-- 2g. The credit key by day identity (step 91): unique (enrollment_id, day_id)
+-- in place of unique (enrollment_id, day_number) (0058:173), because after a
+-- move two credits of one enrolment can carry the same number at credit time.
+-- The new key is created before the old one is dropped; the old one is found
+-- by its columns, as a constraint or as a bare unique index. The 0089
+-- journey_record_completion still names the old key as its conflict target,
+-- which raises 42P10 once the key is gone: this file recreates that function
+-- (creation order item 6, note N5), and no statement of the file calls it
+-- before then. Every statement on journey_day_progress after its deferred key
+-- (1s) is DDL: a row write would queue a deferred check, and the next alter
+-- of the table in this transaction would fail with 55006.
+do $$
+declare
+  k record;
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.journey_day_progress'::regclass
+      and conname = 'journey_day_progress_enrollment_id_day_id_key'
+  ) then
+    alter table public.journey_day_progress
+      add constraint journey_day_progress_enrollment_id_day_id_key unique (enrollment_id, day_id);
+  end if;
+  for k in
+    select ic.relname as index_name, c.conname
+    from pg_index i
+    join pg_class ic on ic.oid = i.indexrelid
+    left join pg_constraint c on c.conindid = i.indexrelid and c.conrelid = i.indrelid
+    where i.indrelid = 'public.journey_day_progress'::regclass
+      and i.indisunique
+      and (select array_agg(a.attname::text order by a.attname::text)
+             from pg_attribute a
+            where a.attrelid = i.indrelid and a.attnum = any (i.indkey))
+          = array['day_number', 'enrollment_id']
+  loop
+    if k.conname is not null then
+      execute format('alter table public.journey_day_progress drop constraint %I', k.conname);
+    else
+      execute format('drop index public.%I', k.index_name);
+    end if;
+  end loop;
+end
+$$;
+
+-- 2h. Foreign-key indexes (step 7's rule, after 0100:473-480): every
+-- foreign-key column this file adds leads an index, so a delete of its
+-- parent row (a program's cascade, a purged test run, an organisation's or a
+-- user's cascade) never scans the child table. Of the seventeen, these are
+-- the seven on the changed tables; five are on preview_runs (1d), and the
+-- other five come with the new tables of creation order item 3. Partial
+-- where the column is nullable, plain on journey_day_progress.day_id, which
+-- is not null.
+create index if not exists course_attempts_journey_version_idx
+  on public.course_attempts (journey_version_id) where journey_version_id is not null;
+create index if not exists course_attempts_preview_run_idx
+  on public.course_attempts (preview_run_id) where preview_run_id is not null;
+create index if not exists course_attempts_journey_day_idx
+  on public.course_attempts (journey_day_id) where journey_day_id is not null;
+create index if not exists attempt_requests_journey_day_idx
+  on public.attempt_requests (journey_day_id) where journey_day_id is not null;
+create index if not exists attempt_requests_learning_path_idx
+  on public.attempt_requests (learning_path_id) where learning_path_id is not null;
+create index if not exists attempt_requests_journey_enrollment_idx
+  on public.attempt_requests (journey_enrollment_id) where journey_enrollment_id is not null;
+create index if not exists journey_day_progress_day_idx
+  on public.journey_day_progress (day_id);
+
+-- 2i. xp_events (step 8, section F): a context's points rows per
+-- organisation, newest first.
+create index if not exists xp_events_org_ctx_created_idx
+  on public.xp_events (organization_id, context_key, created_at desc);
+
+-- ---------------------------------------------------------------------------
+-- 6. The plpgsql functions (ADR 0024 section B, creation order item 6)
+-- ---------------------------------------------------------------------------
+-- In any order among themselves: a plpgsql body is parsed when it is created
+-- and resolves its objects when it first runs. Sections 3 to 5 (creation
+-- order items 3 to 5) come before this one. This build holds one function of
+-- the item, the paste-window trigger function on journey_versions, followed
+-- by its trigger.
+
+-- 6a. journey_versions_derive_day_ids (step 91, note N6): for the paste
+-- window only; 0108 drops it and sets day_ids not null. The publish before
+-- phase 2 writes no day_ids; this trigger fills them as section 1 (1c) filled
+-- the versions before the paste: from journey_days by (program, day number),
+-- read with the same day-number parse, marked slot_backfill. (i) It fills
+-- day_ids only when the insert gives none (its when clause, and the body):
+-- a given map, from the phase 2 publish or an editor-sourced fixture, is kept
+-- as given. (ii) When an entry of the new row's days has no journey_days row
+-- for (program, day number), the predicate of Q8.version_days, it refuses the
+-- insert and writes nothing: a day identity is never invented, and leaving
+-- the day out would move the failure to the learner's launch, where the
+-- derive trigger (2c) refuses. A removed day has no number, so a version
+-- never maps one. A version with no days gets {}. The old publish never
+-- reaches the refusal, because every day it freezes comes from a
+-- journey_days row. Security invoker: every writer of a version (an org
+-- admin's session under the insert policy of 0058, or the service role)
+-- reads every journey_days row of its own program, and a version that names
+-- another organisation's program reads none and is refused.
+create or replace function public.journey_versions_derive_day_ids()
+returns trigger
+language plpgsql
+set search_path = pg_catalog, public
+as $$
+declare
+  v_unmapped bigint;
+  v_day_ids  jsonb;
+begin
+  if new.day_ids is not null then
+    return new;
+  end if;
+
+  select count(*) filter (where jd.id is null),
+         coalesce(jsonb_object_agg(x.day_number::text, jd.id::text) filter (where jd.id is not null),
+                  '{}'::jsonb)
+    into v_unmapped, v_day_ids
+    from (
+      select case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::int end as day_number
+      from jsonb_array_elements(
+        case when jsonb_typeof(new.days) = 'array' then new.days else '[]'::jsonb end) as d(e)
+    ) x
+    left join public.journey_days jd
+      on jd.program_id = new.program_id and jd.day_number = x.day_number;
+
+  if v_unmapped > 0 then
+    raise exception 'journey_versions: a day of this version has no journey_days row, so it has no day identity (ADR 0024)'
+      using errcode = 'P0001',
+            detail = format('program_id %s: %s day(s) of the version without a journey_days row',
+                            new.program_id, v_unmapped);
+  end if;
+
+  new.day_ids := v_day_ids;
+  new.day_ids_source := 'slot_backfill';
+  return new;
+end
+$$;
+
+revoke execute on function public.journey_versions_derive_day_ids() from public, anon, authenticated;
+grant execute on function public.journey_versions_derive_day_ids() to service_role;
+
+drop trigger if exists journey_versions_derive_day_ids on public.journey_versions;
+create trigger journey_versions_derive_day_ids
+  before insert on public.journey_versions
+  for each row
+  when (new.day_ids is null)
+  execute function public.journey_versions_derive_day_ids();
 
 notify pgrst, 'reload schema';
 
