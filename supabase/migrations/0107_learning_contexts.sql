@@ -31,11 +31,13 @@
 --   0106 if not yet pasted, THIS FILE, the release tag, 0108, 0109. 0106 is
 --   never pasted before 0105 inside that sitting. Production has no
 --   learners and no courses: every attempt, point, credit, enrolment and
---   journey count of section 0b is expected to read 0 there (Q4's
---   per-learner matviews may hold rows for members with no activity; the
---   rows Q5.* and Q8.paste carry no count, n is null and note says what they
---   read), and a Q8, Q9 or Q10 count above 0 goes to the owner before the
---   paste (ADR 0024 step 74).
+--   journey count of section 0b is expected to read 0 there, except two
+--   row counts of Q4 that are not learner records: mv_learner_metrics holds
+--   one row per organisation member whatever their activity (0073 reads it
+--   from organization_members) and mv_leaderboard one row per
+--   user_gamification row. The rows Q5.* and Q8.paste carry no count (n is
+--   null; note says what they read). A Q8, Q9 or Q10 count above 0 goes to
+--   the owner before the paste (ADR 0024 step 74).
 --
 -- REQUIRES 0100, 0103, 0104, 0105 and 0106 (the DO block of section 0a
 -- refuses without them; the full list is under PREREQUISITES).
