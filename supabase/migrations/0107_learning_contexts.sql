@@ -8,11 +8,17 @@
 -- CLI is linked to production).
 --
 -- BUILD STATE (this paragraph is removed when the file is complete): this
--- commit holds section 0 only, the prerequisites and the before-checks. It
--- checks and refuses; it creates and changes nothing outside its own
--- temporary table. Sections 1 to 7 (ADR 0024 section B, creation order items
--- 2 to 7) follow in later commits on the same branch. Do not paste a build
--- of this file that still carries this paragraph.
+-- build holds section 0 (the prerequisites and the before-checks) and
+-- section 1, the first part of ADR 0024 section B's creation order item 2:
+-- the new columns, their run-once backfills, the generated columns, the
+-- CHECKs and the table preview_runs. Not built yet: the rest of item 2
+-- (context_derive_log, the two trigger functions and their triggers, the two
+-- attempt foreign keys re-created on delete no action, and the indexes with
+-- the open-row, open-request and journey_day_progress key swaps), then items
+-- 3 to 7. On this build the old functions still write as before 0107 and
+-- would now fail (an attempt insert needs context_kind, a credit needs
+-- day_id). Do not paste a build of this file that still carries this
+-- paragraph.
 --
 -- ORDER (ADR 0024 steps 73 and 74):
 --   Staging: after pull request 1 (this file, 0108, the rehearsal, the pure
@@ -100,13 +106,37 @@
 --   only (ADR 0024 step 19).
 --   On staging a re-paste stays possible until 0109.
 --
--- Row writes: none in this commit (the temporary table of section 0b is the
--- session's own and is dropped at commit).
+-- Row writes: on the FIRST paste only, the run-once backfills of section 1,
+-- each into a column this file adds, never into an existing column
+-- (principle 5): course_attempts.context_kind on every row (1a);
+-- journey_versions.day_ids and day_ids_source on every version (1c);
+-- course_attempts.journey_day_id on journey rows (1e); preview_kind =
+-- 'legacy_role' on is_preview rows (1f); side_effects_sig and side_effects_at
+-- on completed or passed rows (1j); webhook_skip_reason = 'pre_0107' on such
+-- SCORM 1.2 rows with no webhook stamp (1k); revision_visits.context_key
+-- where the visit's attempt is not individual (1n); journey_day_progress.day_id
+-- on every credit (1q) and credit_kind = 'legacy_cross_context' on the
+-- credits Q7 counts so (1s). Existing org_api_keys rows read contract_version
+-- 1 from the column default (1t); every other new column takes its default.
+-- A later paste writes no row. The temporary table of section 0b is the
+-- session's own and is dropped at commit.
+--
+-- Locks: ACCESS EXCLUSIVE until commit on course_attempts, attempt_requests,
+-- revision_visits, xp_events, journey_days, journey_versions,
+-- journey_day_progress, journey_enrollments, journey_programs,
+-- course_assignments, learning_path_assignments, learning_path_courses,
+-- org_api_keys, org_integration_settings and notification_templates. The two
+-- stored generated columns of course_attempts and the one of attempt_requests
+-- rewrite those tables on the first paste (a rewrite per added generated
+-- column; a later paste skips them). lock_timeout 5 s: if a lock is not
+-- granted the whole file rolls back.
 --
 -- PREREQUISITES (the DO block of section 0a refuses to run without them; for
 -- every object this file replaces it accepts the earlier state and its own,
 -- so the second paste passes):
+--   0002  course_versions.manifest_type (the pre_0107 marker of section 1)
 --   0003  course_attempts.completion_status, success_status
+--   0005  course_assignments
 --   0008  learning_path_courses.step_number
 --   0014  notification_templates (the event-type check of 0065, below)
 --   0017  learning_paths.is_active
@@ -250,6 +280,7 @@ begin
     select * from (values
       ('public.organizations',                    '0001'),
       ('public.course_attempts',                  '0002'),
+      ('public.course_assignments',               '0005'),
       ('public.learning_paths',                   '0008'),
       ('public.learning_path_courses',            '0008'),
       ('public.learning_path_assignments',        '0008'),
@@ -304,6 +335,7 @@ begin
       ('course_attempts',          'served_language',       '0100'),
       ('course_attempts',          'is_revision',           '0103'),
       ('course_attempts',          'ignored_pass',          '0104'),
+      ('course_versions',          'manifest_type',         '0002'),
       ('learning_path_courses',    'step_number',           '0008'),
       ('learning_path_courses',    'release_at',            '0052'),
       ('learning_paths',           'is_active',             '0017'),
@@ -871,6 +903,660 @@ begin
   end if;
 end
 $$;
+
+-- ---------------------------------------------------------------------------
+-- 1. Columns, run-once backfills, generated columns and CHECKs (ADR 0024
+--    section B, creation order item 2; steps 5, 7, 8, 79 and 91)
+-- ---------------------------------------------------------------------------
+-- Everything below section 0c, so a refused paste changes nothing. The order
+-- is binding: a backfill or a generated column that reads a column not added
+-- yet stops the paste with 42703.
+--
+-- Backfills run once (step 4). Each backfill runs inside the DO block that
+-- adds its column, and only when that block finds the column absent; on a
+-- later paste the block does nothing, so a value the new code wrote is never
+-- touched again. Plain columns with a constant default and no backfill use
+-- `add column if not exists`, which a later paste skips with a notice.
+--
+-- Generated columns (note N3): every `generated always as (...)` of this file
+-- ends in `stored` and casts each uuid with `::text`. On Postgres 17 (staging
+-- reads 17.6) a generated column without `stored` is a syntax error, while the
+-- rehearsal's Postgres 18 would accept it as a virtual column; the rehearsal's
+-- static step checks the rule on the raw file.
+--
+-- No grant for a new column of an existing table: each table's privileges
+-- cover its new columns. The exception is org_api_keys (1t, step 8). The
+-- grants and policies of attempt_requests and revision_visits, which step 8
+-- restates unchanged, go into the last section with the other restated
+-- grants (creation order item 7; a later build).
+
+-- 1a. course_attempts.context_kind (step 5): added nullable, backfilled, then
+-- not null. preview first, then the journey tag, then the path tag, else
+-- individual: the rule section 0b counted as Q1.kind.*. Rows Q2 refuses
+-- never reach this block (section 0c).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_attempts' and column_name = 'context_kind'
+  ) then
+    alter table public.course_attempts
+      add column context_kind text
+        constraint course_attempts_context_kind_check
+        check (context_kind in ('individual', 'path', 'journey', 'preview'));
+    update public.course_attempts
+       set context_kind = case
+             when is_preview then 'preview'
+             when journey_enrollment_id is not null then 'journey'
+             when learning_path_id is not null then 'path'
+             else 'individual' end;
+    alter table public.course_attempts alter column context_kind set not null;
+  end if;
+end
+$$;
+
+comment on column public.course_attempts.context_kind is
+  'The product context of the attempt, fixed at insert (ADR 0024): individual, path, journey or preview. Backfilled at 0107 from is_preview and the two tags; never updated.';
+
+-- 1b. journey_days: a removed day is kept without a number (step 91). The
+-- unique key (program_id, day_number) of 0058 is unchanged and ignores the
+-- nulls; the day_number range check of 0058 admits a null.
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'journey_days' and column_name = 'removed_at'
+  ) then
+    alter table public.journey_days add column removed_at timestamptz;
+    alter table public.journey_days alter column day_number drop not null;
+    alter table public.journey_days
+      add constraint journey_days_removed_no_number_check
+      check (removed_at is null or day_number is null);
+  end if;
+end
+$$;
+
+comment on column public.journey_days.removed_at is
+  'When the day was removed from the program (ADR 0024 section U): the row is kept, without a number, so attempts and credits that name the day keep their parent.';
+
+-- 1c. journey_versions.day_ids (step 91): {"<day number>": "<day id>"} for
+-- every day of the version's days, from journey_days by (program, day
+-- number), read with the day-number parse of section 0b. A version with no
+-- days gets {} (never null; 0108 sets the column not null). Exact as a
+-- reading of history by slot: until the new editor ships, a row's id and its
+-- number are the same thing (step 90). Q8 refused the first paste on any
+-- version day without a journey_days row, so every day of every version is
+-- mapped. days itself is not rewritten (principle 5).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'journey_versions' and column_name = 'day_ids'
+  ) then
+    alter table public.journey_versions
+      add column day_ids jsonb,
+      add column day_ids_source text
+        constraint journey_versions_day_ids_source_check
+        check (day_ids_source in ('slot_backfill', 'editor'));
+    update public.journey_versions jv
+       set day_ids = coalesce((
+             select jsonb_object_agg(x.day_number::text, jd.id::text)
+             from (
+               select case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::int end as day_number
+               from jsonb_array_elements(
+                 case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end) as d(e)
+             ) x
+             join public.journey_days jd
+               on jd.program_id = jv.program_id and jd.day_number = x.day_number
+           ), '{}'::jsonb),
+           day_ids_source = 'slot_backfill';
+  end if;
+end
+$$;
+
+comment on column public.journey_versions.day_ids is
+  '{"<day number>": "<journey_days id>"} for every day of the version (ADR 0024 section U): the identity of each day. Backfilled at 0107 by slot; filled by the paste-window trigger for a version the old publish writes; written by the publish from the new editor.';
+comment on column public.journey_versions.day_ids_source is
+  'slot_backfill = day_ids read from journey_days by (program, day number); editor = written by the new editor''s publish (ADR 0024 steps 91 and 94).';
+
+-- 1d. preview_runs (step 79; decision A31): one row per test run, preview
+-- only. Created here because course_attempts.preview_run_id references it.
+-- It holds ids, a kind, dates and the activity days a tester marked done
+-- (decision A41; empty and unused until phase G): no result. No official
+-- reader reads it (step 86). Service role only; no delete is granted to any
+-- API role: rows leave through the purge function and the organisation and
+-- user cascades.
+create table if not exists public.preview_runs (
+  id                    uuid primary key default gen_random_uuid(),
+  organization_id       uuid not null references public.organizations(id) on delete cascade,
+  user_id               uuid not null references auth.users(id) on delete cascade,
+  kind                  text not null check (kind in ('path', 'journey')),
+  learning_path_id      uuid references public.learning_paths(id) on delete no action,
+  journey_program_id    uuid references public.journey_programs(id) on delete no action,
+  journey_version_id    uuid references public.journey_versions(id) on delete no action,
+  simulated_date        date,
+  created_at            timestamptz not null default now(),
+  done_activity_day_ids uuid[] not null default '{}',
+  constraint preview_runs_shape_chk check (
+    (kind = 'path'
+       and learning_path_id is not null
+       and journey_program_id is null and journey_version_id is null
+       and cardinality(done_activity_day_ids) = 0)
+    or (kind = 'journey'
+       and learning_path_id is null
+       and journey_program_id is not null and journey_version_id is not null))
+);
+
+-- Foreign-key indexes (step 7's rule, after 0100:473-480): the organisation
+-- and user cascades (the staging CI purge) and a path, program or version
+-- delete would otherwise scan the table.
+create index if not exists preview_runs_organization_idx
+  on public.preview_runs (organization_id);
+create index if not exists preview_runs_user_idx
+  on public.preview_runs (user_id);
+create index if not exists preview_runs_learning_path_idx
+  on public.preview_runs (learning_path_id) where learning_path_id is not null;
+create index if not exists preview_runs_journey_program_idx
+  on public.preview_runs (journey_program_id) where journey_program_id is not null;
+create index if not exists preview_runs_journey_version_idx
+  on public.preview_runs (journey_version_id) where journey_version_id is not null;
+
+comment on table public.preview_runs is
+  'One row per Preview test run of a Learning Path or a Day-wise Journey (ADR 0024 steps 79 and 89): ids, a kind and dates only. Never read by an official reader; deleted only by purge_preview_data and the organisation and user cascades.';
+comment on column public.preview_runs.simulated_date is
+  'The date the run''s unlock rules read; null = today.';
+comment on column public.preview_runs.done_activity_day_ids is
+  'The activity days a tester marked done inside a journey run (decision A41); always empty for a path run; unused until phase G.';
+
+alter table public.preview_runs enable row level security;
+drop policy if exists "no direct access to preview_runs" on public.preview_runs;
+create policy "no direct access to preview_runs" on public.preview_runs
+  for all
+  using (false)
+  with check (false);
+
+-- service_role is named in the revoke (the 0103 form), so a project's default
+-- privileges cannot leave it a delete the record does not grant.
+revoke all on public.preview_runs from public, anon, authenticated, service_role;
+grant select, insert, update on public.preview_runs to service_role;
+
+-- 1e. course_attempts.journey_day_id and journey_version_id (steps 5 and
+-- 91). journey_day_id is backfilled once, for journey rows only, with the
+-- journey_days id of (the enrolment's program, journey_day): exact, because
+-- until the new editor ships a day row's id is tied to its number (step 90).
+-- Previews are skipped, so a legacy_role row keeps a null day id (the shape
+-- check's legacy_role arm). journey_version_id has no backfill: older rows
+-- read null and are judged by the pinned version alone (step 13).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_attempts' and column_name = 'journey_day_id'
+  ) then
+    alter table public.course_attempts
+      add column journey_day_id uuid references public.journey_days(id) on delete no action;
+    update public.course_attempts a
+       set journey_day_id = jd.id
+      from public.journey_enrollments e
+      join public.journey_days jd on jd.program_id = e.program_id
+     where a.context_kind = 'journey'
+       and e.id = a.journey_enrollment_id
+       and jd.day_number = a.journey_day;
+  end if;
+end
+$$;
+
+alter table public.course_attempts
+  add column if not exists journey_version_id uuid references public.journey_versions(id) on delete no action;
+
+comment on column public.course_attempts.journey_day_id is
+  'The journey day the attempt belongs to, by identity (ADR 0024 section U): part of the journey context key. journey_day stays the day''s number at launch, for display.';
+comment on column public.course_attempts.journey_version_id is
+  'The journey version the enrolment was pinned to when the attempt was launched (ADR 0024 step 5, R14); null on rows from before phase 2 (judged by the pinned version alone).';
+
+-- 1f. course_attempts.preview_kind and preview_run_id (step 79). The rule
+-- that ties preview_kind to context_kind is part of the shape check (1h),
+-- added after this backfill: written on the column it would fail at once
+-- with 23514 on every is_preview row (note N2).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_attempts' and column_name = 'preview_kind'
+  ) then
+    alter table public.course_attempts
+      add column preview_kind text
+        constraint course_attempts_preview_kind_check
+        check (preview_kind in ('legacy_role', 'course', 'path_run', 'journey_run'));
+    update public.course_attempts
+       set preview_kind = 'legacy_role'
+     where is_preview;
+  end if;
+end
+$$;
+
+alter table public.course_attempts
+  add column if not exists preview_run_id uuid references public.preview_runs(id) on delete no action;
+
+comment on column public.course_attempts.preview_kind is
+  'Which kind of preview (ADR 0024 step 78): course, path_run, journey_run, or legacy_role (flagged by role before 0107; kept, never purged, step 82). Null outside the preview context.';
+comment on column public.course_attempts.preview_run_id is
+  'The preview_runs row of a path_run or journey_run preview (ADR 0024 step 79); null otherwise.';
+
+-- 1g. course_attempts.context_key (step 5): the one key of the context. The
+-- journey key names the day id (A27); a test run's previews have their own
+-- key; a legacy_role row keeps the plain key 'preview' whatever its old tags
+-- hold. Not declared not null: the shape check (1h) keeps it non-null.
+alter table public.course_attempts
+  add column if not exists context_key text
+    generated always as (
+      case context_kind
+        when 'path'    then 'path:' || learning_path_id::text
+        when 'journey' then 'journey:' || journey_enrollment_id::text || ':' || journey_day_id::text
+        when 'preview' then 'preview' || coalesce(':' || preview_run_id::text, '')
+                                      || coalesce(':' || journey_day_id::text, '')
+        else context_kind
+      end) stored;
+
+comment on column public.course_attempts.context_key is
+  'Generated: individual, path:<path id>, journey:<enrolment id>:<day id>, preview, preview:<run id> or preview:<run id>:<day id> (ADR 0024 step 5). Every official rule partitions by it.';
+
+-- 1h. course_attempts_context_shape_chk (steps 5 and 79, note N2). Every
+-- term is `is [not] null` or a non-null boolean (is_preview is not null since
+-- 0100), so no arm can read null and admit a row: a form such as
+-- `preview_kind in (...)` alone would admit a preview with a null kind.
+-- Dropped and added on every paste, so a re-paste carries this definition;
+-- it cannot fail on a later paste, because the check has held since the
+-- first. On the first paste it admits every row but the classes Q2 and Q8
+-- refuse (spike 2).
+alter table public.course_attempts drop constraint if exists course_attempts_context_shape_chk;
+alter table public.course_attempts
+  add constraint course_attempts_context_shape_chk check (
+    (case context_kind
+       when 'individual' then
+         learning_path_id is null and journey_enrollment_id is null and journey_day is null
+         and journey_day_id is null and not is_preview
+       when 'path' then
+         learning_path_id is not null and journey_enrollment_id is null and journey_day is null
+         and journey_day_id is null and not is_preview
+       when 'journey' then
+         journey_enrollment_id is not null and journey_day is not null and journey_day_id is not null
+         and learning_path_id is null and not is_preview
+       when 'preview' then
+         is_preview and preview_kind is not null and (
+           (preview_kind in ('course', 'path_run', 'journey_run')
+              and learning_path_id is null and journey_enrollment_id is null and journey_day is null
+              and (preview_run_id is not null) = (preview_kind in ('path_run', 'journey_run'))
+              and (journey_day_id is not null) = (preview_kind = 'journey_run'))
+           -- legacy_role: the old tags are left as they are (step 6)
+           or (preview_kind = 'legacy_role' and preview_run_id is null and journey_day_id is null))
+       else false
+     end)
+    and (context_kind = 'preview' or (preview_kind is null and preview_run_id is null))
+    and (context_kind = 'journey' or journey_version_id is null)
+    and ((preview_kind is not null) = (context_kind = 'preview'))
+  );
+
+-- 1i. course_attempts.settle_sig (step 7): the settled state of the row, which
+-- the completion writer compares with side_effects_sig. completion_status and
+-- success_status are not null (0003), so only the score needs a coalesce.
+alter table public.course_attempts
+  add column if not exists settle_sig text
+    generated always as (
+      completion_status || '|' || success_status || '|' || coalesce(score::text, '')) stored;
+
+comment on column public.course_attempts.settle_sig is
+  'Generated: completion_status|success_status|score, the settled state the completion writer compares with side_effects_sig (ADR 0024 step 7).';
+
+-- 1j. side_effects_sig and side_effects_at (step 7): the settled state the
+-- completion writer last handled. Backfilled once on every row already
+-- completed or passed (the 0103 rule's completed test), so the retry sweep
+-- never reaches history. No time is invented: completed_at, else started_at.
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_attempts' and column_name = 'side_effects_sig'
+  ) then
+    alter table public.course_attempts
+      add column side_effects_sig text,
+      add column side_effects_at  timestamptz;
+    update public.course_attempts
+       set side_effects_sig = settle_sig,
+           side_effects_at  = coalesce(completed_at, started_at)
+     where completion_status = 'completed' or success_status = 'passed';
+  end if;
+end
+$$;
+
+comment on column public.course_attempts.side_effects_sig is
+  'The settle_sig the completion writer last handled (ADR 0024 step 12); a completed row where it differs from settle_sig is a candidate of the retry sweep. Backfilled at 0107 on every completed row.';
+comment on column public.course_attempts.side_effects_at is
+  'When the completion writer last handled the row (ADR 0024 step 12); backfilled at 0107 from completed_at, else started_at.';
+
+-- 1k. webhook_skip_reason (step 7, step 31): a terminal marker for rows that
+-- will never send a completion webhook. Backfilled once with pre_0107 on
+-- every SCORM 1.2 row the 1j backfill stamped (completed or passed) whose
+-- completion_webhook_at is null: their message went out inline, unlatched,
+-- and without the marker the hold sweep (completion_webhook_at null,
+-- webhook_skip_reason null, side_effects_at set) would select them. No send
+-- time is invented.
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'course_attempts' and column_name = 'webhook_skip_reason'
+  ) then
+    alter table public.course_attempts
+      add column webhook_skip_reason text
+        constraint course_attempts_webhook_skip_reason_check
+        check (webhook_skip_reason in ('pre_0107', 'not_official', 'out_of_scope'));
+    update public.course_attempts a
+       set webhook_skip_reason = 'pre_0107'
+      from public.course_versions v
+     where v.id = a.course_version_id
+       and v.manifest_type = 'scorm12'
+       and (a.completion_status = 'completed' or a.success_status = 'passed')
+       and a.completion_webhook_at is null;
+  end if;
+end
+$$;
+
+comment on column public.course_attempts.webhook_skip_reason is
+  'Why the row will never send a completion webhook (ADR 0024 step 31): pre_0107 (a SCORM 1.2 completion from before 0107, sent inline and unlatched), not_official, out_of_scope. Null = the webhook may still be sent.';
+
+-- 1l. The is_preview comment, restated (step 5; the owner's R6 answer).
+comment on column public.course_attempts.is_preview is
+  'true = a preview launch; never a learner''s result, and excluded from every official rule (ADR 0024). Which launches are previews is decided by the launch code; preview_kind says which kind.';
+
+-- 1m. attempt_requests: the context of a grant (step 8; section U). Existing
+-- rows read individual: no writer could set a context. The same shape check
+-- as the attempt's, without the preview arm; a generated context_key with
+-- the attempt's journey formula (the day id).
+alter table public.attempt_requests
+  add column if not exists context_kind text not null default 'individual'
+    constraint attempt_requests_context_kind_check
+    check (context_kind in ('individual', 'path', 'journey')),
+  add column if not exists learning_path_id uuid
+    references public.learning_paths(id) on delete no action,
+  add column if not exists journey_enrollment_id uuid
+    references public.journey_enrollments(id) on delete no action,
+  add column if not exists journey_day integer,
+  add column if not exists journey_day_id uuid
+    references public.journey_days(id) on delete no action;
+
+alter table public.attempt_requests
+  add column if not exists context_key text
+    generated always as (
+      case context_kind
+        when 'path'    then 'path:' || learning_path_id::text
+        when 'journey' then 'journey:' || journey_enrollment_id::text || ':' || journey_day_id::text
+        else context_kind
+      end) stored;
+
+alter table public.attempt_requests drop constraint if exists attempt_requests_context_shape_chk;
+alter table public.attempt_requests
+  add constraint attempt_requests_context_shape_chk check (
+    case context_kind
+      when 'individual' then
+        learning_path_id is null and journey_enrollment_id is null and journey_day is null
+        and journey_day_id is null
+      when 'path' then
+        learning_path_id is not null and journey_enrollment_id is null and journey_day is null
+        and journey_day_id is null
+      when 'journey' then
+        journey_enrollment_id is not null and journey_day is not null and journey_day_id is not null
+        and learning_path_id is null
+      else false
+    end
+  );
+
+comment on column public.attempt_requests.context_kind is
+  'The product context the grant may be consumed in (ADR 0024 step 8): individual, path or journey. Rows from before 0107 read individual.';
+comment on column public.attempt_requests.context_key is
+  'Generated: individual, path:<path id> or journey:<enrolment id>:<day id>, the attempt''s formula (ADR 0024 step 8).';
+
+-- 1n. revision_visits.context_key (step 8): backfilled once from the visit's
+-- attempt where that row still exists (after course_attempts.context_key, 1g);
+-- a visit whose attempt row is gone stays individual (disclosed in the
+-- record).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'revision_visits' and column_name = 'context_key'
+  ) then
+    alter table public.revision_visits
+      add column context_key text not null default 'individual';
+    update public.revision_visits rv
+       set context_key = a.context_key
+      from public.course_attempts a
+     where a.id = rv.attempt_id
+       and rv.context_key is distinct from a.context_key;
+  end if;
+end
+$$;
+
+comment on column public.revision_visits.context_key is
+  'The context of the visit (ADR 0024 step 11); backfilled at 0107 from the visit''s attempt, individual when that row is gone.';
+
+-- 1o. xp_events (step 8, section F): nullable context columns and the
+-- 0-point event marker. Old rows stay null (the table is append-only,
+-- 0053:134-146); xp_events_rule_check (0084) is untouched.
+alter table public.xp_events
+  add column if not exists context_kind text,
+  add column if not exists context_key  text,
+  add column if not exists event_only   boolean not null default false;
+
+comment on column public.xp_events.context_key is
+  'The context of the attempt the row was written for (ADR 0024 section F); null on rows from before 0107.';
+comment on column public.xp_events.event_only is
+  'true = a 0-point event row recording a context''s completion (ADR 0024 D8); never adds to a total.';
+
+-- 1p. The pass rule per instance (step 8): null = inherit the course's
+-- courses.pass_required. The freeze into journey_versions.days is TypeScript
+-- (step 46).
+alter table public.learning_path_courses
+  add column if not exists pass_required boolean;
+alter table public.journey_days
+  add column if not exists pass_required boolean;
+
+comment on column public.learning_path_courses.pass_required is
+  'The step''s pass rule (ADR 0024 step 8): null = the course''s courses.pass_required.';
+comment on column public.journey_days.pass_required is
+  'The day''s pass rule in the draft (ADR 0024 step 8): null = the course''s courses.pass_required; frozen into journey_versions.days at publish.';
+
+-- 1q. journey_day_progress.day_id (step 91): backfilled once from (the
+-- enrolment's program, day_number), then not null. Q8 refused the first
+-- paste on any credit without a journey_days row. day_number stays the
+-- number when credited. The foreign key is added in 1s, after the last write
+-- to this table: it is deferred (note N1), and a deferred key with checks
+-- still pending makes any later alter of the table in this transaction fail
+-- with 55006. unique (enrollment_id, day_id) replaces unique (enrollment_id,
+-- day_number) later in this file, with the new journey_record_completion
+-- (note N5).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'journey_day_progress' and column_name = 'day_id'
+  ) then
+    alter table public.journey_day_progress add column day_id uuid;
+    update public.journey_day_progress pr
+       set day_id = jd.id
+      from public.journey_enrollments e
+      join public.journey_days jd on jd.program_id = e.program_id
+     where e.id = pr.enrollment_id
+       and jd.day_number = pr.day_number;
+    alter table public.journey_day_progress alter column day_id set not null;
+  end if;
+end
+$$;
+
+comment on column public.journey_day_progress.day_id is
+  'The credited journey day, by identity (ADR 0024 section U); day_number is the day''s number when credited.';
+
+-- 1r. Recorded enrolments (step 8; D15, D17). Existing rows take the default.
+-- No deadline_days column on enrolments (D17).
+alter table public.journey_enrollments
+  add column if not exists source text not null default 'admin'
+    constraint journey_enrollments_source_check
+    check (source in ('admin', 'audience', 'self'));
+alter table public.journey_programs
+  add column if not exists visibility text not null default 'private'
+    constraint journey_programs_visibility_check
+    check (visibility in ('private', 'org_public'));
+alter table public.course_assignments
+  add column if not exists source text not null default 'admin'
+    constraint course_assignments_source_check
+    check (source in ('admin', 'self'));
+alter table public.learning_path_assignments
+  add column if not exists source text not null default 'admin'
+    constraint learning_path_assignments_source_check
+    check (source in ('admin', 'self'));
+
+comment on column public.journey_enrollments.source is
+  'Who made the enrolment (ADR 0024 step 8): admin, audience (journey_auto_enroll) or self (Start journey).';
+comment on column public.journey_programs.visibility is
+  'private = enrolment by an admin or an audience; org_public = every member may start it (ADR 0024 step 8), the courses and paths form of 0033.';
+comment on column public.course_assignments.source is
+  'admin = assigned; self = the learner enrolled themselves (ADR 0024 D15).';
+comment on column public.learning_path_assignments.source is
+  'admin = assigned; self = the learner enrolled themselves (ADR 0024 D15).';
+
+-- 1s. journey_day_progress: credit_kind, recorded_by, late (step 8), then the
+-- deferred day_id key. A credit is backfilled legacy_cross_context once when
+-- no journey row of its own enrolment backs it (no attempt, a preview row, or
+-- another row): the classes section 0b counts as Q7. Such credits are kept
+-- and still count as credited (step 45).
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'journey_day_progress' and column_name = 'credit_kind'
+  ) then
+    alter table public.journey_day_progress
+      add column credit_kind text not null default 'attempt'
+        constraint journey_day_progress_credit_kind_check
+        check (credit_kind in ('attempt', 'legacy_cross_context', 'self', 'admin')),
+      add column recorded_by uuid,
+      add column late boolean not null default false;
+    update public.journey_day_progress pr
+       set credit_kind = 'legacy_cross_context'
+     where not exists (
+       select 1 from public.course_attempts a
+       where a.id = pr.attempt_id
+         and a.context_kind = 'journey'
+         and a.journey_enrollment_id = pr.enrollment_id);
+  end if;
+end
+$$;
+
+comment on column public.journey_day_progress.credit_kind is
+  'attempt = credited by a journey attempt of this enrolment; legacy_cross_context = a credit from before 0107 that no such attempt backs (kept, counts); self and admin from phase G (ADR 0024 step 8).';
+comment on column public.journey_day_progress.recorded_by is
+  'Who recorded a self or admin credit (an id only, no foreign key; ADR 0024 step 8).';
+comment on column public.journey_day_progress.late is
+  'true = credited after the day''s counted date (ADR 0024 step 13).';
+
+-- The day_id key, deferred (note N1): a program delete reaches a credit in two
+-- hops (program, enrolment, credit) and a day in one, so an immediate check
+-- could run before the credit's own cascade and refuse the delete. Deferred,
+-- the program delete passes, and a lone delete of a credited day is still
+-- refused, with 23503, at commit. Added after every write to this table in
+-- this file (see 1q); its validation of the existing rows runs here, at once.
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.journey_day_progress'::regclass
+      and conname = 'journey_day_progress_day_id_fkey'
+  ) then
+    alter table public.journey_day_progress
+      add constraint journey_day_progress_day_id_fkey
+      foreign key (day_id) references public.journey_days(id)
+      on delete no action deferrable initially deferred;
+  end if;
+end
+$$;
+
+-- 1t. org_api_keys: the CRM contract version (step 8, decision A28). Existing
+-- keys read 1 and keys created after the paste read 2: inside the run-once
+-- block the column is added with default 1, which labels every existing key
+-- 1, and the next statement sets the default to 2. A later paste does not
+-- reach the block, so it changes no key.
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'org_api_keys' and column_name = 'contract_version'
+  ) then
+    alter table public.org_api_keys
+      add column contract_version smallint not null default 1
+        constraint org_api_keys_contract_version_check
+        check (contract_version in (1, 2)),
+      add column allow_contract_override boolean not null default false;
+    alter table public.org_api_keys alter column contract_version set default 2;
+  end if;
+end
+$$;
+
+comment on column public.org_api_keys.contract_version is
+  'The CRM answer shape this key receives (ADR 0024 decision A28): 1 for keys from before 0107, 2 for keys created after it. Written by the service role only.';
+comment on column public.org_api_keys.allow_contract_override is
+  'Whether a request with this key may ask for the other contract version (ADR 0024 step 8). Written by the service role only.';
+
+-- The settings route writes this table with the user's session
+-- (app/api/org/api-keys/route.ts), and authenticated holds table-level insert
+-- and update from the project defaults (0071 granted nothing). A column-level
+-- revoke does nothing while the table-level privilege stands, so the
+-- table-level privileges are revoked (which also clears any column grant) and
+-- only what the route writes is granted back. Select and delete are
+-- untouched; the policy (super owners, 0071) is unchanged.
+revoke insert, update on public.org_api_keys from authenticated;
+grant insert (organization_id, name, key_prefix, key_hash, is_active, created_by)
+  on public.org_api_keys to authenticated;
+grant update (is_active) on public.org_api_keys to authenticated;
+
+-- 1u. user_badges.period, its column comment restated (step 8; 0053:227 wrote
+-- it as an inline comment).
+comment on column public.user_badges.period is
+  '''YYYY-MM'' for monthly badges; NULL = lifetime; ''enr:<enrolment id>'' for a journey badge (ADR 0024)';
+
+-- 1v. org_integration_settings.webhook_contexts (steps 8 and 31).
+alter table public.org_integration_settings
+  add column if not exists webhook_contexts text not null default 'individual'
+    constraint org_integration_settings_webhook_contexts_check
+    check (webhook_contexts in ('individual', 'all'));
+
+comment on column public.org_integration_settings.webhook_contexts is
+  'individual = one course_completed per Individual official completion (the default); all = one per product context (ADR 0024 step 31).';
+
+-- 1w. notification_templates_event_type_check, re-asserted from its latest
+-- form (0065:33-52) with journey_completion added (step 8). Widening a check
+-- never fails on existing rows.
+alter table public.notification_templates
+  drop constraint if exists notification_templates_event_type_check;
+alter table public.notification_templates
+  add constraint notification_templates_event_type_check
+    check (event_type in (
+      'account_creation',
+      'asset_assignment',
+      'asset_unassignment',
+      'asset_completion',
+      'asset_reminder',
+      'asset_update',
+      'custom_broadcast',
+      'path_assignment',
+      'path_unassignment',
+      'path_completion',
+      'password_reset',
+      'magic_link',
+      'account_invite',
+      'journey_nudge',
+      'journey_escalation',
+      'journey_completion'
+    ));
 
 notify pgrst, 'reload schema';
 

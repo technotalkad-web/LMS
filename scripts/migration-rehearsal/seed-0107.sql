@@ -5,8 +5,8 @@
 -- fixed ids whose last group starts 000107, emails at example.test.
 --
 -- Unlike seed-0105.sql these rows are COMMITTED before the first paste of
--- 0107, because the paste reads them (its before-checks now, its backfills in
--- later commits). No scenario runs the release audit after them: they add
+-- 0107, because the paste reads them (its before-checks and its backfills;
+-- assert-0107.sql checks the backfills row by row). No scenario runs the release audit after them: they add
 -- courses and attempts, which would change its D rows.
 --
 -- Learners (…000107010001 to …000107010006), Org A members:
@@ -35,7 +35,10 @@
 -- their furthest day, and a completed enrolment with a credit beyond its
 -- pinned version's days_total (history). Enrolments EJ (J, active), ES (S,
 -- active), EB (B, completed), EI (I, reset).
+-- A second program JE (…000107060002) whose only version has no days.
 -- An API key of Org A (contract version 1 after the first paste).
+-- Four revision visits (on I's revision row, P's path row, J's journey row,
+-- and one whose attempt row is gone), for 0107's context_key backfill.
 
 insert into auth.users (id, email) values
   ('00000000-0000-0000-0000-000107010001', 'learner-i-0107@example.test'),
@@ -120,6 +123,13 @@ insert into public.journey_versions (id, program_id, organization_id, version_nu
      {"day": 5, "course_id": "00000000-0000-0000-0000-0000000000c2", "mission_title": null}]');
 update public.journey_programs set current_version_id = '00000000-0000-0000-0000-000107062002'
  where id = '00000000-0000-0000-0000-000107060001';
+-- a second program whose only version has no days (no journey_days row,
+-- no enrolment): its day_ids backfill to {} (0107, 1c)
+insert into public.journey_programs (id, organization_id, name, days_total) values
+  ('00000000-0000-0000-0000-000107060002', '00000000-0000-0000-0000-00000000000a', 'Empty journey (0107)', 1);
+insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, count_sundays, completion_title, days) values
+  ('00000000-0000-0000-0000-000107062003', '00000000-0000-0000-0000-000107060002', '00000000-0000-0000-0000-00000000000a',
+   1, 'Empty journey (0107)', 1, false, 'Yoddha', '[]');
 insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status, completed_at) values
   ('00000000-0000-0000-0000-000107063001', '00000000-0000-0000-0000-000107060001', '00000000-0000-0000-0000-000107062001',
    '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107010004', current_date - 3, 'active', null),
@@ -252,3 +262,21 @@ insert into public.lrs_forward_outbox (organization_id, attempt_id, statement_id
 insert into public.org_api_keys (id, organization_id, name, key_prefix, key_hash, created_by) values
   ('00000000-0000-0000-0000-000107100001', '00000000-0000-0000-0000-00000000000a', 'CRM key (0107)', 'ambk_0107ab',
    'seed-0107-key-hash', '00000000-0000-0000-0000-0000000000a2');
+
+-- revision visits (0103), for the context_key backfill of 0107 (1n): one on
+-- I's revision row (Individual), one on P's path row, one on J's journey row
+-- and one whose attempt row is gone (attempt_id null); none is counted by
+-- the before-checks
+insert into public.revision_visits (id, organization_id, user_id, course_id, course_version_id, attempt_id, launch_kind, launched_at) values
+  ('00000000-0000-0000-0000-000107110001', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107010001',
+   '00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-000107070003',
+   'scorm12', now() - interval '2 days'),
+  ('00000000-0000-0000-0000-000107110002', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107010002',
+   '00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-000107070004',
+   'scorm12', now() - interval '8 days'),
+  ('00000000-0000-0000-0000-000107110003', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107010004',
+   '00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-000107070011',
+   'scorm12', now() - interval '2 days'),
+  ('00000000-0000-0000-0000-000107110004', '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107010001',
+   '00000000-0000-0000-0000-0000000000c2', null, null,
+   'cmi5', now() - interval '30 days');

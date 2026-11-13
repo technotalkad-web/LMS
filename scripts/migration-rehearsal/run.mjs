@@ -218,7 +218,9 @@ async function stepApply(db, s) {
 // A word rule on a migration's raw text (ADR 0014 step 2: "nothing in the
 // file names ..."): comments and string literals included, case-insensitive,
 // one check per token. The file is read as it is, never stripped, so the
-// header's own prose and its pasted SQL are held to the same rule.
+// header's own prose and its pasted SQL are held to the same rule. With
+// `generatedStored: N` it also checks that the file has exactly N generated
+// columns and that each is `stored` (added for 0107, ADR 0024 note N3).
 function stepStatic(s) {
   const [n] = expand([s.file]);
   const f = byNum.get(n);
@@ -226,8 +228,36 @@ function stepStatic(s) {
     check(false, `static: migration ${pad(n)} is missing`);
     return "next";
   }
-  const lines = fs.readFileSync(path.join(MIG, f), "utf8").toLowerCase().split(/\r?\n/);
-  for (const token of s.mustNotContain) {
+  const raw = fs.readFileSync(path.join(MIG, f), "utf8").toLowerCase();
+  const lines = raw.split(/\r?\n/);
+  if (s.generatedStored !== undefined) {
+    // ADR 0024 note N3: every `generated always as (...)` is followed by
+    // `stored`. Postgres 18 (PGlite) makes a column without it virtual and
+    // accepts it; 15 to 17 refuse it as a syntax error, so only this rule
+    // catches it here. Read on the code: comments dropped and string literals
+    // emptied in one left-to-right pass (as lintAudit does), then each
+    // expression's parentheses matched.
+    const code = raw.replace(/--[^\n]*|'(?:[^']|'')*'/g, (t) => (t[0] === "'" ? "''" : " "));
+    const re = /generated\s+always\s+as\s*\(/g;
+    let found = 0;
+    const bad = [];
+    for (const m of code.matchAll(re)) {
+      found += 1;
+      let depth = 1;
+      let i = m.index + m[0].length;
+      for (; i < code.length && depth > 0; i += 1) {
+        if (code[i] === "(") depth += 1;
+        else if (code[i] === ")") depth -= 1;
+      }
+      if (!/^\s*stored\b/.test(code.slice(i))) bad.push(code.slice(0, m.index).split("\n").length);
+    }
+    check(
+      found === s.generatedStored && bad.length === 0,
+      `${f}: every "generated always as (...)" ends in "stored" (${found} found, expected ${s.generatedStored})` +
+        `${bad.length ? `: NOT stored on line${bad.length === 1 ? "" : "s"} ${bad.join(", ")}` : ""}`,
+    );
+  }
+  for (const token of s.mustNotContain ?? []) {
     const t = token.toLowerCase();
     const hits = lines.flatMap((l, i) => (l.includes(t) ? [i + 1] : []));
     check(
