@@ -36,13 +36,17 @@
 --   (38) record_learning_activity on path and journey rows: the step facts
 --        and the path completion (build note O1-g (1), (3) to (5), (9) and
 --        (10), the writer halves), the journey credit and completion with
---        their claim
+--        their claim, and D14 (a live granted retake, then a failed one,
+--        after a pass and a path completion)
 --   (39) sweep_completion_side_effects: no row from before the paste, the
 --        two-minute floor, the completion branch only, a path row's step
 --        fact, one raising row
 --   (40) purge_preview_data: the scopes and their refusals, the dry run,
---        the hash, the isolation check, the audit row, rows flagged by role
---        never selected, the product delete, the API roles
+--        the hash, the isolation check on each of its seven tables, the
+--        audit row, rows flagged by role never selected, every row that is
+--        not new-kind preview data unchanged (each base table's rows and
+--        checksum), the product deletes, the user's and the organisation's
+--        cascades, the API roles
 -- The fixture rows have ids whose last group starts 00010718. The whole file
 -- is one transaction that ends in ROLLBACK; every check runs in its own
 -- savepoint, rolled back to it, so no check sees another's writes. Every
@@ -1139,6 +1143,67 @@ end
 $$;
 rollback to savepoint s38b;
 
+-- (38c) D14 through the writer: U2 passes WA and completes WB in PW (the
+-- path completes); a grant read as Individual (as every grant from before
+-- 0107, note N9) is used by a retake of WA in PW. While the retake is live
+-- it is the context's official candidate (the activity branch runs); it
+-- then fails at 0.95: it is the official attempt, number 2, the step stays
+-- done by its earlier pass, the path completion stands, and the high bonus
+-- is paid from it, because the consumed grant widens the scored window of
+-- the retake row's own context
+savepoint s38c;
+do $$
+declare
+  bad  text[] := '{}';
+  org  constant uuid := '00000000-0000-0000-0000-00000000000a';
+  pw   constant uuid := '00000000-0000-0000-0000-000107182001';
+  u2   constant uuid := '00000000-0000-0000-0000-000107180002';
+  wa   constant uuid := '00000000-0000-0000-0000-000107181001';
+  a    jsonb;
+begin
+  perform pg_temp.att8(pg_temp.u8('000107187041'), pg_temp.u8('000107181201'), u2, 'passed', 'path',
+                       pw, null, null, null, null, 60, 0.5);
+  perform public.record_learning_activity(pg_temp.u8('000107187041'));
+  perform pg_temp.att8(pg_temp.u8('000107187042'), pg_temp.u8('000107181202'), u2, 'completed', 'path',
+                       pw, null, null, null, null, 55, 0.7);
+  a := public.record_learning_activity(pg_temp.u8('000107187042'));
+  if a ->> 'path_completed' <> 'true' then
+    bad := bad || format('the path before the retake: %s', a);
+  end if;
+  perform pg_temp.att8(pg_temp.u8('000107187043'), pg_temp.u8('000107181201'), u2, 'in_progress', 'path',
+                       pw, null, null, null, null, 20);
+  insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, decided_at,
+                                       context_kind, used_at, used_attempt_id)
+  values (pg_temp.u8('000107187401'), org, wa, u2, 'approved', 'bulk', now() - interval '30 minutes', 'individual',
+          now() - interval '20 minutes', pg_temp.u8('000107187043'));
+  a := public.record_learning_activity(pg_temp.u8('000107187043'));
+  if a ->> 'activity' <> 'true' or a ->> 'official' <> 'false' or a -> 'attempt_number' <> 'null'::jsonb then
+    bad := bad || format('the live retake: %s (expected the activity branch, not official)', a);
+  end if;
+  update public.course_attempts
+     set status = 'failed', completion_status = 'completed', success_status = 'failed', score = 0.95,
+         completed_at = now()
+   where id = pg_temp.u8('000107187043');
+  a := public.record_learning_activity(pg_temp.u8('000107187043'));
+  if a ->> 'official' <> 'true' or a ->> 'attempt_number' <> '2' or a ->> 'done' <> 'true'
+     or a ->> 'passed_ever' <> 'true' or a ->> 'path_completed' <> 'false' or a -> 'notices' <> '[]'::jsonb then
+    bad := bad || format('the failed retake: %s', a);
+  end if;
+  if (select count(*) from public.learning_path_completions lc where lc.path_id = pw and lc.user_id = u2) <> 1
+     or not (select pp.completed from public.v_path_progress pp where pp.path_id = pw and pp.user_id = u2) then
+    bad := bad || 'the failed retake removed or blocked the path completion'::text;
+  end if;
+  if not exists (select 1 from public.xp_events e
+                  where e.dedupe_key = format('high:%s:%s', u2, wa) and e.attempt_id = pg_temp.u8('000107187043')) then
+    bad := bad || 'the granted retake''s high bonus was not paid (the grant did not widen its context''s window)'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (38) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s38c;
+
 -- ---------------------------------------------------------------------------
 -- (39) sweep_completion_side_effects
 -- ---------------------------------------------------------------------------
@@ -1346,13 +1411,41 @@ begin
 end
 $$;
 
-create function pg_temp.kept8() returns text language sql stable as $$
-  -- every row that is not new-kind preview data: ids and counts
-  select md5(coalesce((select string_agg(c.id::text, ',' order by c.id) from public.course_attempts c
-                        where not (c.context_kind = 'preview' and c.preview_kind in ('course', 'path_run', 'journey_run'))), ''))
-         || '/' || (select count(*) from public.xp_events) || '/' || (select count(*) from public.journey_day_progress)
-         || '/' || (select count(*) from public.attempt_requests) || '/' || (select count(*) from public.revision_visits)
-         || '/' || (select count(*) from public.completion_notices) || '/' || (select count(*) from public.user_badges)
+create function pg_temp.kept8() returns text language plpgsql as $$
+-- every base table of public and auth: its row count and an md5 over its
+-- rows, leaving out only new-kind preview data (the preview attempts of the
+-- kinds course, path_run and journey_run, the rows of the five tables that
+-- hang on them by attempt_id, the test runs and the purge's own audit rows)
+declare
+  r    record;
+  v    text;
+  acc  text := '';
+  prev constant text := '(select c.id from public.course_attempts c where c.context_kind = ''preview'' '
+                        || 'and c.preview_kind in (''course'', ''path_run'', ''journey_run''))';
+begin
+  for r in
+    select n.nspname, c.relname
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where c.relkind in ('r', 'p')
+       and n.nspname in ('public', 'auth')
+       and c.relname not in ('preview_runs', 'preview_purge_log')
+     order by 1, 2
+  loop
+    execute format('select count(*) || '':'' || md5(coalesce(string_agg(t::text, ''|'' order by t::text), '''')) '
+                   || 'from %I.%I t %s', r.nspname, r.relname,
+                   case
+                     when r.nspname = 'public' and r.relname = 'course_attempts' then 'where t.id not in ' || prev
+                     when r.nspname = 'public' and r.relname in ('xapi_statements', 'xapi_state', 'cmi5_launch_tokens',
+                                                                 'learning_sessions', 'lrs_forward_outbox')
+                       then 'where t.attempt_id is null or t.attempt_id not in ' || prev
+                     else ''
+                   end)
+      into v;
+    acc := acc || r.nspname || '.' || r.relname || '=' || v || ';';
+  end loop;
+  return md5(acc);
+end
 $$;
 
 create function pg_temp.left8() returns text language sql stable as $$
@@ -1505,6 +1598,9 @@ begin
        'left 9001,9002,9003,9005,9006 runs 9101,9103 | counts {"state": 0, "total": 2, "outbox": 0, "attempts": 1, "sessions": 0, "test_runs": 1, "statements": 0, "launch_tokens": 0} | excluded 0 | same=t | log product_delete/0009/1/1'),
       ('course WB, product delete (the breach kept)', '{"course_id": "00000000-0000-0000-0000-000107189502"}', 'product_delete',
        'left 9001,9002,9004,9005,9006 runs 9102,9103 | counts {"state": 0, "total": 2, "outbox": 0, "attempts": 1, "sessions": 0, "test_runs": 1, "statements": 0, "launch_tokens": 0} | excluded 1 | same=t | log product_delete/0009/1/1'),
+      ('tester T with path PP2 (S''s run with no attempt stays)',
+       '{"user_id": "00000000-0000-0000-0000-000107180002", "learning_path_id": "00000000-0000-0000-0000-000107189602"}', 'manual',
+       'left 9001,9002,9003,9004,9005,9006 runs 9101,9102,9103 | counts {"state": 0, "total": 0, "outbox": 0, "attempts": 0, "sessions": 0, "test_runs": 0, "statements": 0, "launch_tokens": 0} | excluded 0 | same=t | log none'),
       ('the organisation', '{"organization": true}', 'manual',
        'left 9006 runs  | counts {"state": 1, "total": 13, "outbox": 1, "attempts": 5, "sessions": 1, "test_runs": 3, "statements": 1, "launch_tokens": 1} | excluded 1 | same=t | log manual/0009/5/3')
     ) as t(k, scope, reason, want)
@@ -1532,8 +1628,8 @@ begin
   if failed is not null then
     raise exception 'assert-0107: (40) %', failed;
   end if;
-  if (select count(*) from pg_temp.r0107w_purge) <> 10 then
-    raise exception 'assert-0107: (40) % scopes ran (expected 10)', (select count(*) from pg_temp.r0107w_purge);
+  if (select count(*) from pg_temp.r0107w_purge) <> 11 then
+    raise exception 'assert-0107: (40) % scopes ran (expected 11)', (select count(*) from pg_temp.r0107w_purge);
   end if;
 end
 $$;
@@ -1560,6 +1656,139 @@ begin
                           || '"outbox": 0, "attempts": 0, "sessions": 0, "test_runs": 0, "statements": 0, '
                           || '"launch_tokens": 0} | excluded 1 | same=t | log manual/0009/0/0' then
     raise exception 'assert-0107: (40) a run whose attempt is set aside: % (expected the run kept)', got;
+  end if;
+end
+$$;
+
+-- step 63 case (5), arm by arm: a new-kind preview pointed at from each of
+-- the seven tables the isolation check reads is set aside with that table
+-- (B1 in R1 beside K3, B7 in R2 beside K4); a run scope deletes the clean
+-- K3 and keeps B1 with its run; the path and the program product deletes
+-- find their breach in the dry run; the organisation's call deletes none of
+-- B1 to B7 and changes no row that is not new-kind preview data; then the
+-- user's and the organisation's cascades pass over the test runs (case (8))
+do $$
+declare
+  bad  text[] := '{}';
+  org  constant uuid := '00000000-0000-0000-0000-000107189900';
+  act  constant uuid := '00000000-0000-0000-0000-000107180009';
+  s    constant uuid := '00000000-0000-0000-0000-000107180001';
+  t    constant uuid := '00000000-0000-0000-0000-000107180002';
+  pa   constant uuid := '00000000-0000-0000-0000-000107189501';
+  pp   constant uuid := '00000000-0000-0000-0000-000107189601';
+  got  text;
+  dry  jsonb;
+  k0   text;
+  st   text;
+begin
+  begin
+    perform pg_temp.prev8(pg_temp.u8('000107189801'), pg_temp.u8('000107189522'), s, 'path_run',
+                          pg_temp.u8('000107189101'), null, 1, org);
+    insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+    values (pg_temp.u8('000107189732'), pg_temp.u8('000107189701'), pg_temp.u8('000107189721'), org,
+            '00000000-0000-0000-0000-000107180006', current_date, 'active');
+    insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id, course_id,
+                                             attempt_id, credit_kind)
+    values (pg_temp.u8('000107189732'), org, '00000000-0000-0000-0000-000107180006', 1, pg_temp.u8('000107189711'), pa,
+            pg_temp.u8('000107189801'), 'legacy_cross_context');
+    perform pg_temp.prev8(pg_temp.u8('000107189802'), pg_temp.u8('000107189521'), s, 'course', null, null, 1, org);
+    insert into public.completion_notices (organization_id, user_id, product_kind, instance_id, attempt_id, event_type)
+    values (org, s, 'individual', pa, pg_temp.u8('000107189802'), 'asset_completion');
+    perform pg_temp.prev8(pg_temp.u8('000107189803'), pg_temp.u8('000107189521'), s, 'course', null, null, 1, org);
+    insert into public.learning_path_completions (organization_id, path_id, user_id, steps)
+    values (org, pp, t, jsonb_build_array(jsonb_build_object('step_number', 1, 'course_id', pa,
+                                                             'attempt_id', pg_temp.u8('000107189803'), 'score', 0.8)));
+    perform pg_temp.prev8(pg_temp.u8('000107189804'), pg_temp.u8('000107189521'), s, 'course', null, null, 1, org);
+    insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, attempt_id,
+                                                       rule_pass_required)
+    values (org, pp, pa, s, pg_temp.u8('000107189804'), false);
+    perform pg_temp.prev8(pg_temp.u8('000107189805'), pg_temp.u8('000107189521'), s, 'course', null, null, 1, org);
+    insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, decided_at,
+                                         context_kind, used_at, used_attempt_id)
+    values (pg_temp.u8('000107189402'), org, pa, t, 'approved', 'bulk', now(), 'individual', now(),
+            pg_temp.u8('000107189805'));
+    perform pg_temp.prev8(pg_temp.u8('000107189806'), pg_temp.u8('000107189521'), s, 'course', null, null, 1, org);
+    insert into public.revision_visits (organization_id, user_id, course_id, course_version_id, attempt_id, launch_kind)
+    values (org, s, pa, pg_temp.u8('000107189521'), pg_temp.u8('000107189806'), 'scorm12');
+    perform pg_temp.prev8(pg_temp.u8('000107189807'), pg_temp.u8('000107189521'), s, 'journey_run',
+                          pg_temp.u8('000107189102'), pg_temp.u8('000107189711'), 1, org);
+    insert into public.xp_events (organization_id, user_id, rule, xp, attempt_id, dedupe_key)
+    values (org, s, 'adjustment', 0, pg_temp.u8('000107189807'), 'assert-0107w-breach-b7');
+
+    -- a run scope: the clean K3 goes, B1 and its run R1 stay
+    got := pg_temp.purge8('{"run_id": "00000000-0000-0000-0000-000107189101"}');
+    if got is distinct from 'left 9001,9002,9004,9005,9006 runs 9101,9102,9103 | counts {"state": 0, "total": 1, '
+                            || '"outbox": 0, "attempts": 1, "sessions": 0, "test_runs": 0, "statements": 0, '
+                            || '"launch_tokens": 0} | excluded 1 | same=t | log manual/0009/1/0' then
+      bad := bad || format('a run with a clean and a set-aside attempt: %s', got);
+    end if;
+    -- the product deletes find their breach
+    dry := public.purge_preview_data(org, jsonb_build_object('learning_path_id', pp), 'product_delete', act, true);
+    if dry ->> 'excluded' <> '1' or (dry #>> '{counts,attempts}') <> '0' then
+      bad := bad || format('the path product delete''s dry run: %s (expected B1 excluded)', dry);
+    end if;
+    dry := public.purge_preview_data(org, '{"journey_program_id": "00000000-0000-0000-0000-000107189701"}',
+                                     'product_delete', act, true);
+    if dry ->> 'excluded' <> '1' or (dry #>> '{counts,attempts}') <> '1' then
+      bad := bad || format('the program product delete''s dry run: %s (expected K4 and B7 excluded)', dry);
+    end if;
+    -- the organisation: each set-aside attempt with its table
+    dry := public.purge_preview_data(org, '{"organization": true}', 'manual', act, true);
+    select string_agg(format('%s:%s', right(e ->> 'attempt_id', 4), (e -> 'tables')->>0), ',' order by e ->> 'attempt_id')
+      into got from jsonb_array_elements(dry -> 'excluded_attempts') e;
+    if got is distinct from '9006:xp_events,9801:journey_day_progress,9802:completion_notices,'
+                            || '9803:learning_path_completions,9804:learning_path_step_completions,'
+                            || '9805:attempt_requests,9806:revision_visits,9807:xp_events' then
+      bad := bad || format('the set-aside attempts and their tables: %s', got);
+    end if;
+    k0 := pg_temp.kept8();
+    perform public.purge_preview_data(org, '{"organization": true}', 'manual', act, false, dry ->> 'selection_hash');
+    if pg_temp.kept8() <> k0
+       or (select count(*) from public.course_attempts c where c.id::text like '%-00010718980_') <> 7 then
+      bad := bad || 'the organisation''s purge deleted a set-aside attempt or changed an official row'::text;
+    end if;
+    -- case (8): the cascades pass over the test runs that are left
+    st := pg_temp.state8('delete from auth.users where id = ''' || s || '''');
+    if st <> 'ok' then
+      bad := bad || format('the tester''s delete over test runs: %s', st);
+    end if;
+    -- the organisation's delete, on an organisation of its own (Org Q: a
+    -- course, a path, a test run with its attempt and a statement, no points
+    -- row, because a cascade re-checks the attempt key of points rows this
+    -- transaction inserted), with the service role, as the e2e purge
+    -- deletes an organisation (on any other session the delete guards refuse
+    -- the courses' cascade)
+    insert into public.organizations (id, name, slug)
+    values (pg_temp.u8('000107189950'), 'Org Q (0107 writer)', 'org-q-0107w');
+    insert into public.courses (id, organization_id, title, slug)
+    values (pg_temp.u8('000107189951'), pg_temp.u8('000107189950'), 'Q1 (0107 writer)', 'q1-0107w');
+    insert into public.course_packages (id, course_id, language, is_active)
+    values (pg_temp.u8('000107189952'), pg_temp.u8('000107189951'), null, true);
+    insert into public.course_versions (id, course_id, package_id, version_number, manifest_type, launch_url,
+                                        storage_prefix, manifest_data)
+    values (pg_temp.u8('000107189953'), pg_temp.u8('000107189951'), pg_temp.u8('000107189952'), 1, 'scorm12',
+            'index.html', 'courses/q1-0107w/v1/', '{"title":"0107 writer"}');
+    insert into public.learning_paths (id, organization_id, name, slug, is_active, visibility)
+    values (pg_temp.u8('000107189954'), pg_temp.u8('000107189950'), 'PQ1 (0107 writer)', 'pq1-0107w', true, 'private');
+    insert into public.preview_runs (id, organization_id, user_id, kind, learning_path_id)
+    values (pg_temp.u8('000107189955'), pg_temp.u8('000107189950'), t, 'path', pg_temp.u8('000107189954'));
+    perform pg_temp.prev8(pg_temp.u8('000107189956'), pg_temp.u8('000107189953'), t, 'path_run',
+                          pg_temp.u8('000107189955'), null, 1, pg_temp.u8('000107189950'));
+    insert into public.xapi_statements (attempt_id, statement_id, verb, raw)
+    values (pg_temp.u8('000107189956'), gen_random_uuid(), 'completed', '{}');
+    st := pg_temp.state8('delete from public.organizations where id = ''00000000-0000-0000-0000-000107189950''',
+                         '{"role": "service_role"}');
+    if st <> 'ok' then
+      bad := bad || format('the organisation''s delete over a test run: %s', st);
+    end if;
+    raise exception using errcode = 'R0107', message = 'assert-0107: undo';
+  exception when others then
+    if sqlstate <> 'R0107' then
+      bad := bad || format('error %s: %s', sqlstate, sqlerrm);
+    end if;
+  end;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (40) %', array_to_string(bad, '; ');
   end if;
 end
 $$;
