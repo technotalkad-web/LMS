@@ -272,6 +272,13 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
         const scormAns = (await lrsGet(expected["scorm answered q1"])).body;
         rec("S3 SCORM interaction translated with interactionType and success", scormAns?.object.definition?.interactionType === "choice" && scormAns?.result?.success === true && scormAns?.result?.response === "b", scormAns ? { def: scormAns.object.definition, result: scormAns.result } : "missing");
       }
+      if (expected["scorm completed"]) {
+        // The path half of the grouping (S2g covers course, journey and org):
+        // the path-tagged SCORM attempt's statements roll up into the path and its step.
+        const scormDone = (await lrsGet(expected["scorm completed"])).body;
+        const grouping = (scormDone?.context.contextActivities.grouping ?? []).map((g) => g.id);
+        rec("S3 grouping of the path-tagged attempt carries path and path step", [`${NS}activities/path/${path!.id}`, `${NS}activities/path/${path!.id}/step/1`].every((g) => grouping.includes(g)), scormDone ? grouping : "missing");
+      }
     });
 
     // ---------- S4 idempotency --------------------------------------------
