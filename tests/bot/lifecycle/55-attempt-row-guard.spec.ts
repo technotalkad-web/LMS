@@ -38,6 +38,10 @@
  *       journey inserts the attempt with the tag (ADR 0009 steps 2-3; spec
  *       02-journeys, which step 14 names, never launches through a journey).
  *       Two extra SCORM courses, so no other case's attempt is tagged.
+ *       From 0107 on (has0107(), a real select of course_attempts.context_kind)
+ *       the resume half changes: the immutability trigger refuses the re-tag,
+ *       the launch resumes the same row, and the row keeps no journey tag
+ *       (ADR 0024 step 60). The tagged insert is asserted on both schemas.
  *
  * Branches, decided by has0099() (a real select of
  * v_course_attempt_summary.live_attempt_count):
@@ -79,6 +83,7 @@ import {
   authTokenFor,
   cmi5Zip,
   has0099,
+  has0107,
   inProgressAttempt,
   sessionClient,
   scormZip,
@@ -301,7 +306,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     }
 
     // (i) the resume tag: a plain launch leaves an untagged in-progress
-    // attempt; the journey launch of the same course tags it.
+    // attempt; the journey launch of the same course tags it (before 0107)
+    // or resumes it untagged (from 0107 on).
     const plain = await lreq.get(`/${orgA.slug}/courses/${courses.resume.course}/launch`);
     expect(plain.ok(), `plain launch → ${plain.status()}`).toBeTruthy();
     const resumeAttempt = await inProgressAttempt(learner.id, courses.resume.version);
@@ -311,13 +317,26 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     expect(viaJourney.ok(), `journey launch (resume) → ${viaJourney.status()}`).toBeTruthy();
     expect(await inProgressAttempt(learner.id, courses.resume.version), "the same attempt is resumed").toBe(resumeAttempt);
     const tagged = await row(resumeAttempt);
-    expect(tagged, "the resumed attempt carries the journey tag").toMatchObject({
-      journey_enrollment_id: enrollments.resume,
-      journey_day: 1,
-      user_id: learner.id,
-      organization_id: orgA.id,
-      status: "in_progress",
-    });
+    if (await has0107()) {
+      // From 0107 on (ADR 0024 step 60) course_attempts_context_immutable
+      // refuses the old launch's re-tag; the launch logs it and resumes the
+      // row, which stays the learner's untagged attempt.
+      expect(tagged, "0107: the re-tag is refused; the resumed attempt keeps no journey tag").toMatchObject({
+        journey_enrollment_id: null,
+        journey_day: null,
+        user_id: learner.id,
+        organization_id: orgA.id,
+        status: "in_progress",
+      });
+    } else {
+      expect(tagged, "the resumed attempt carries the journey tag").toMatchObject({
+        journey_enrollment_id: enrollments.resume,
+        journey_day: 1,
+        user_id: learner.id,
+        organization_id: orgA.id,
+        status: "in_progress",
+      });
+    }
 
     // (ii) the tagged insert: a first launch through the journey.
     expect(await rowsFor(learner.id, courses.fresh.version), "never launched").toHaveLength(0);
