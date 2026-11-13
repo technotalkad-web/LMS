@@ -2269,7 +2269,7 @@
     },
     {
       "name": "0105-0106-then-0107",
-      "title": "ADR 0024 step 63, staging's order: 0100, 0103 and 0104 as the 0100-0103-0104-then-0106 scenario has them, then 0105 (pasted twice, its word rule, seed-0105.sql and assert-0105.sql, refresh, audit), then 0106 (pasted twice, assert-0106.sql, refresh, audit); then seed-0107.sql (rows shaped like staging before 0107), refresh, grants-0107.sql, the static rule that every generated column of 0107 is stored (note N3), and 0107 pasted twice: the first paste finds every before-check below its refusal line and backfills the seed (assert-0107.sql); seed-0107-repaste.sql writes the rows the new code could write; the second paste changes none of them (assert-0107.sql again, assert-0107-repaste.sql). No audit and no earlier assertion file runs after the seed",
+      "title": "ADR 0024 step 63, staging's order: 0100, 0103 and 0104 as the 0100-0103-0104-then-0106 scenario has them, then 0105 (pasted twice, its word rule, seed-0105.sql and assert-0105.sql, refresh, audit), then 0106 (pasted twice, assert-0106.sql, refresh, audit); then seed-0107.sql (rows shaped like staging before 0107), refresh, grants-0107.sql, the static rule that every generated column of 0107 is stored (note N3), and 0107 pasted twice: the first paste finds every before-check below its refusal line and backfills the seed (assert-0107.sql); seed-0107-repaste.sql writes the rows the new code could write; the second paste changes none of them (assert-0107.sql again, assert-0107-repaste.sql). Each paste is followed by refresh_report_views() (the LIVE matviews refresh on the views 0107 recreates) and each assert-0107.sql by assert-0107-views.sql (section 4, the views). No audit and no earlier assertion file runs after the seed",
       "steps": [
         { "sql": "shim.sql" },
         { "sql": "shim-dashboard.sql" },
@@ -2475,7 +2475,7 @@
     },
     {
       "name": "0106-then-0105-then-0107",
-      "title": "ADR 0024 step 63, the order production takes if an interim sitting pastes 0106 first: the 0103-0104-0100-then-0106 scenario whole, then 0105 (pasted twice, its word rule, seed-0105.sql and assert-0105.sql, refresh, audit); then seed-0107.sql, refresh, grants-0107.sql and 0107 pasted twice with assert-0107.sql after each paste and seed-0107-repaste.sql between them, as in 0105-0106-then-0107",
+      "title": "ADR 0024 step 63, the order production takes if an interim sitting pastes 0106 first: the 0103-0104-0100-then-0106 scenario whole, then 0105 (pasted twice, its word rule, seed-0105.sql and assert-0105.sql, refresh, audit); then seed-0107.sql, refresh, grants-0107.sql and 0107 pasted twice, each paste followed by refresh_report_views(), assert-0107.sql and assert-0107-views.sql, with seed-0107-repaste.sql between them, as in 0105-0106-then-0107",
       "steps": [
         { "sql": "shim.sql" },
         { "sql": "shim-dashboard.sql" },
@@ -2683,7 +2683,7 @@
     },
     {
       "name": "0107-refused-q8",
-      "title": "ADR 0024 steps 4 and 63, Q8: the 0105-0106-then-0107 scenario to its seed, plus seed-0107-q8.sql (the old lifecycle journey fixture: a published version day and an open journey attempt with no journey_days row); the first paste of 0107 is refused by Q8 alone (P0001, exactly \"0107 refused: Q8.journey_attempts = 1, Q8.version_days = 1. Nothing changed.\"); repair-0107-q8.sql gives the fixture its journey_days row, and 0107 then applies twice; assert-0107.sql then passes",
+      "title": "ADR 0024 steps 4 and 63, Q8: the 0105-0106-then-0107 scenario to its seed, plus seed-0107-q8.sql (the old lifecycle journey fixture: a published version day and an open journey attempt with no journey_days row); the first paste of 0107 is refused by Q8 alone (P0001, exactly \"0107 refused: Q8.journey_attempts = 1, Q8.version_days = 1. Nothing changed.\"); repair-0107-q8.sql gives the fixture its journey_days row, and 0107 then applies twice; refresh_report_views() answers without an error, and assert-0107.sql and assert-0107-views.sql then pass",
       "steps": [
         { "sql": "shim.sql" },
         { "sql": "shim-dashboard.sql" },
@@ -2883,7 +2883,7 @@
     },
     {
       "name": "0107-refused-q2",
-      "title": "ADR 0024 steps 4 and 63, Q2: the 0105-0106-then-0107 scenario to its seed, plus seed-0107-q2.sql (an orphaned journey-day row: a learner's journey attempt whose program was deleted, so journey_day is set and journey_enrollment_id is null); the first paste of 0107 is refused by Q2 alone (P0001, exactly \"0107 refused: Q2.orphan_day = 1. Nothing changed.\"); repair-0107-q2.sql removes the orphan, as step 73's reset does on staging, and 0107 then applies twice; assert-0107.sql then passes",
+      "title": "ADR 0024 steps 4 and 63, Q2: the 0105-0106-then-0107 scenario to its seed, plus seed-0107-q2.sql (an orphaned journey-day row: a learner's journey attempt whose program was deleted, so journey_day is set and journey_enrollment_id is null); the first paste of 0107 is refused by Q2 alone (P0001, exactly \"0107 refused: Q2.orphan_day = 1. Nothing changed.\"); repair-0107-q2.sql removes the orphan, as step 73's reset does on staging, and 0107 then applies twice; refresh_report_views() answers without an error, and assert-0107.sql and assert-0107-views.sql then pass",
       "steps": [
         { "sql": "shim.sql" },
         { "sql": "shim-dashboard.sql" },

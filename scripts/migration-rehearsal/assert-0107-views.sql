@@ -570,11 +570,11 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- The fixture world (ids 00010715…): learners L01 to L16 (Org A members);
--- courses C01 to C11, each with one SCORM 1.2 version; teams T1 (L01, L02)
--- and T2 (L02); paths PA (C01 step 1 with pass_required true, C02 step 2
+-- courses C01 to C12, each with one SCORM 1.2 version; teams T1 (L01, L02)
+-- and T2 (L02); a static Custom Group G (L07); paths PA (C01 step 1 with pass_required true, C02 step 2
 -- inheriting its course's true, C03 step 3 false over its course's true),
 -- PB (C05, C06), PC (C07, pass_required true), PD (C08, C09) and PT (no
--- step; for the terms)
+-- step; for the terms) and PG (no step; assigned to G only)
 -- ---------------------------------------------------------------------------
 create function pg_temp.id_0107v(p text) returns uuid language sql immutable as $$
   select ('00000000-0000-0000-0000-' || p)::uuid
@@ -644,7 +644,7 @@ begin
     insert into auth.users (id, email) values (pg_temp.u_0107v(i), format('learner-%s-0107v@example.test', i));
     insert into public.organization_members (organization_id, user_id, role) values (org, pg_temp.u_0107v(i), 'user');
   end loop;
-  for i in 1..11 loop
+  for i in 1..12 loop
     insert into public.courses (id, organization_id, title, slug, pass_required)
     values (pg_temp.c_0107v(i), org, format('C%s (0107 views)', lpad(i::text, 2, '0')), format('c%s-0107v', i),
             i in (2, 3));
@@ -668,7 +668,12 @@ begin
     (pg_temp.id_0107v('000107152002'), org, 'PB (0107 views)', 'pb-0107v', true, 'private'),
     (pg_temp.id_0107v('000107152003'), org, 'PC (0107 views)', 'pc-0107v', true, 'private'),
     (pg_temp.id_0107v('000107152004'), org, 'PD (0107 views)', 'pd-0107v', true, 'private'),
-    (pg_temp.id_0107v('000107152005'), org, 'PT (0107 views)', 'pt-0107v', true, 'private');
+    (pg_temp.id_0107v('000107152005'), org, 'PT (0107 views)', 'pt-0107v', true, 'private'),
+    (pg_temp.id_0107v('000107152006'), org, 'PG (0107 views)', 'pg-0107v', true, 'private');
+  insert into public.org_groups (id, organization_id, name, group_type, rules, is_active, system_key) values
+    (pg_temp.id_0107v('000107159001'), org, 'G (0107 views)', 'static', null, true, null);
+  insert into public.org_group_members (group_id, organization_id, user_id) values
+    (pg_temp.id_0107v('000107159001'), org, pg_temp.u_0107v(7));
   insert into public.learning_path_courses (path_id, course_id, step_number, pass_required) values
     (pg_temp.id_0107v('000107152001'), pg_temp.c_0107v(1), 1, true),
     (pg_temp.id_0107v('000107152001'), pg_temp.c_0107v(2), 2, null),
@@ -699,12 +704,16 @@ $$;
 --      (no due date, assigned 2000-01-05); team T1 (L01, L02; due
 --      2999-02-01, assigned 2000-01-02); team T2 (L02) not yet released
 --      (release 2999-01-01, due 2999-01-15, assigned 1999-12-31); org-wide
---      (due 2999-03-01, assigned 2000-01-03). Course C11: team T2 only,
---      unreleased. Path PT: a user row for L05 (2999-06-01, 2000-01-04), a
---      self user row for L06, team T1 (2999-02-01, 2000-01-02) and org-wide
---      (2999-03-01, 2000-01-03). The learner's own row wins, even with no
---      date; else the earliest of the others; enrolled_at is the first
---      assigned_at; an unreleased course assignment sets nothing
+--      (due 2999-03-01, assigned 2000-01-03); group G (L07; due 2999-01-20,
+--      assigned 2000-01-01). Course C11: one unreleased row of each arm
+--      (user, team T2, org-wide, group G; release 2999-01-01). Course C12
+--      and path PG: group G only (due 2999-01-25). Path PT: a user row for
+--      L05 (2999-06-01, 2000-01-04), a self user row for L06, team T1
+--      (2999-02-01, 2000-01-02), org-wide (2999-03-01, 2000-01-03) and
+--      group G (2999-01-20, 2000-01-01). The learner's own row wins, even
+--      with no date; else the earliest of the others; enrolled_at is the
+--      first assigned_at; an unreleased course assignment, of any arm, sets
+--      nothing and enrols no one
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -714,7 +723,10 @@ declare
   org constant uuid := '00000000-0000-0000-0000-00000000000a';
   ct  constant uuid := pg_temp.c_0107v(10);
   cu  constant uuid := pg_temp.c_0107v(11);
+  cg  constant uuid := pg_temp.c_0107v(12);
   pt  constant uuid := pg_temp.id_0107v('000107152005');
+  pg  constant uuid := pg_temp.id_0107v('000107152006');
+  g   constant uuid := pg_temp.id_0107v('000107159001');
   t1  constant uuid := pg_temp.id_0107v('000107156001');
   t2  constant uuid := pg_temp.id_0107v('000107156002');
 begin
@@ -732,6 +744,18 @@ begin
      '2000-01-03 00:00:00+00', null, 'admin'),
     (pg_temp.id_0107v('000107155006'), cu, org, 'team', null, t2, '2999-01-15 00:00:00+00',
      '1999-12-31 00:00:00+00', '2999-01-01 00:00:00+00', 'admin');
+  insert into public.course_assignments (id, course_id, organization_id, assignee_type, user_id, group_id, due_at,
+                                         assigned_at, release_at, source) values
+    (pg_temp.id_0107v('000107155007'), ct, org, 'group', null, g, '2999-01-20 00:00:00+00',
+     '2000-01-01 00:00:00+00', null, 'admin'),
+    (pg_temp.id_0107v('000107155008'), cu, org, 'user', pg_temp.u_0107v(1), null, '2999-01-15 00:00:00+00',
+     '1999-12-31 00:00:00+00', '2999-01-01 00:00:00+00', 'admin'),
+    (pg_temp.id_0107v('000107155009'), cu, org, 'org', null, null, '2999-01-15 00:00:00+00',
+     '1999-12-31 00:00:00+00', '2999-01-01 00:00:00+00', 'admin'),
+    (pg_temp.id_0107v('000107155010'), cu, org, 'group', null, g, '2999-01-15 00:00:00+00',
+     '1999-12-31 00:00:00+00', '2999-01-01 00:00:00+00', 'admin'),
+    (pg_temp.id_0107v('000107155016'), cg, org, 'group', null, g, '2999-01-25 00:00:00+00',
+     '2000-01-01 00:00:00+00', null, 'admin');
   insert into public.learning_path_assignments (id, path_id, organization_id, assignee_type, user_id, team_id, due_at,
                                                 assigned_at, source) values
     (pg_temp.id_0107v('000107155011'), pt, org, 'user', pg_temp.u_0107v(5), null, '2999-06-01 00:00:00+00',
@@ -742,6 +766,10 @@ begin
      '2000-01-02 00:00:00+00', 'admin'),
     (pg_temp.id_0107v('000107155014'), pt, org, 'org', null, null, '2999-03-01 00:00:00+00',
      '2000-01-03 00:00:00+00', 'admin');
+  insert into public.learning_path_assignments (id, path_id, organization_id, assignee_type, group_id, due_at,
+                                                assigned_at, source) values
+    (pg_temp.id_0107v('000107155015'), pt, org, 'group', g, '2999-01-20 00:00:00+00', '2000-01-01 00:00:00+00', 'admin'),
+    (pg_temp.id_0107v('000107155017'), pg, org, 'group', g, '2999-01-25 00:00:00+00', '2000-01-01 00:00:00+00', 'admin');
 
   for r in
     select * from (values
@@ -749,7 +777,11 @@ begin
       ('course', ct, 2, 'due=2999-02-01 at=2000-01-02', 'L02: the earliest of team T1 and org; unreleased T2 ignored'),
       ('course', ct, 3, 'due=- at=2000-01-03', 'L03: their own self row has no date, so none (never overdue)'),
       ('course', ct, 4, 'due=2999-03-01 at=2000-01-03', 'L04: org-wide only'),
+      ('course', ct, 7, 'due=2999-01-20 at=2000-01-01', 'L07: the group''s earlier date and assigned_at over org-wide'),
       ('course', cu, 2, 'none', 'L02 on C11: an unreleased assignment enrols no one and sets no date'),
+      ('course', cg, 7, 'due=2999-01-25 at=2000-01-01', 'L07 on C12: the group arm alone'),
+      ('path', pt, 7, 'due=2999-01-20 at=2000-01-01', 'L07 on PT: the group''s earlier date over org-wide'),
+      ('path', pg, 7, 'due=2999-01-25 at=2000-01-01', 'L07 on PG: the group arm alone'),
       ('path', pt, 1, 'due=2999-02-01 at=2000-01-02', 'L01 on PT: the earliest of team T1 and org'),
       ('path', pt, 5, 'due=2999-06-01 at=2000-01-03', 'L05 on PT: their own row wins'),
       ('path', pt, 6, 'due=- at=2000-01-03', 'L06 on PT: their own self row, no date'),
@@ -768,8 +800,19 @@ begin
      <> (select count(*) from public.organization_members where organization_id = org) then
     bad := bad || 'C10 or PT does not hold one terms row per member of Org A'::text;
   end if;
-  if exists (select 1 from public.v_course_enrollments_expanded where course_id = cu) then
-    bad := bad || 'C11, assigned only by an unreleased team row, enrols someone'::text;
+  if exists (select 1 from public.v_course_enrollments_expanded where course_id = cu)
+     or exists (select 1 from public.v_course_enrollment_terms where course_id = cu) then
+    bad := bad || 'C11, assigned only by unreleased rows of every arm, enrols someone or has a terms row'::text;
+  end if;
+  if (select string_agg(pg_temp.lbl_0107v(user_id), ',') from public.v_course_enrollments_expanded where course_id = cg)
+     is distinct from right(pg_temp.u_0107v(7)::text, 6)
+     or (select string_agg(pg_temp.lbl_0107v(user_id), ',') from public.v_path_enrollment_terms where path_id = pg)
+     is distinct from right(pg_temp.u_0107v(7)::text, 6) then
+    bad := bad || 'C12 or PG, assigned to group G only, does not reach exactly L07'::text;
+  end if;
+  got := pg_temp.prog_0107v(pg, pg_temp.u_0107v(7));
+  if got is distinct from '0/0 next=- nc=- score=- comp=F status=not_started due=2999-01-25 started=F done_at=F over=F' then
+    bad := bad || format('L07''s progress on PG, reached by the group only, reads %s', got);
   end if;
   if exists (select 1 from public.v_course_enrollment_terms where course_id = ct and organization_id <> org)
      or exists (select 1 from public.v_path_enrollment_terms where path_id = pt and organization_id <> org) then
@@ -1141,9 +1184,13 @@ $$;
 --      of Org A, reads every learner's progress on PA exactly as postgres
 --      does; a3, a member of QA Org, reads none of Org A's rows (the control:
 --      their own context row); anon is refused every view of section 4 with
---      42501 (the control: a table it holds select on). The statements name
---      ids, never auth.uid() (the shim gives the API roles no usage on schema
---      auth).
+--      42501 (the control: a table it holds select on). Pinned, not chosen
+--      here: L07, reached by group G only on C12 and PG, reads neither row on
+--      their own session (a learner's session reads no group membership, the
+--      0067 policies under 0105's invoker group_member_ids, as assert-0105.sql
+--      (2c) pins for the enrolment views), while the admin S reads them as
+--      postgres does. The statements name ids, never auth.uid() (the shim
+--      gives the API roles no usage on schema auth).
 -- ---------------------------------------------------------------------------
 create temporary table r0107v_roles (who text, what text, got text);
 grant select, insert on pg_temp.r0107v_roles to authenticated, anon;
@@ -1175,7 +1222,18 @@ select set_config('request.jwt.claims',
 set local role authenticated;
 insert into pg_temp.r0107v_roles values
   ('S', 'progress PA, every learner', pg_temp.allprog_0107v('00000000-0000-0000-0000-000107152001')),
-  ('S', 'steps PA of L13', pg_temp.steps_0107v('00000000-0000-0000-0000-000107152001', '00000000-0000-0000-0000-000107150013'));
+  ('S', 'steps PA of L13', pg_temp.steps_0107v('00000000-0000-0000-0000-000107152001', '00000000-0000-0000-0000-000107150013')),
+  ('S', 'terms C12 of L07', pg_temp.terms_0107v('course', '00000000-0000-0000-0000-000107151012', '00000000-0000-0000-0000-000107150007')),
+  ('S', 'progress PG of L07', pg_temp.prog_0107v('00000000-0000-0000-0000-000107152006', '00000000-0000-0000-0000-000107150007'));
+reset role;
+
+select set_config('request.jwt.claims',
+  '{"sub": "00000000-0000-0000-0000-000107150007", "role": "authenticated"}', true);
+set local role authenticated;
+insert into pg_temp.r0107v_roles values
+  ('L07', 'terms C12 (group only)', pg_temp.terms_0107v('course', '00000000-0000-0000-0000-000107151012', '00000000-0000-0000-0000-000107150007')),
+  ('L07', 'progress PG (group only)', pg_temp.prog_0107v('00000000-0000-0000-0000-000107152006', '00000000-0000-0000-0000-000107150007')),
+  ('L07', 'terms C10 (org-wide and group)', pg_temp.terms_0107v('course', '00000000-0000-0000-0000-000107151010', '00000000-0000-0000-0000-000107150007'));
 reset role;
 
 select set_config('request.jwt.claims',
@@ -1223,8 +1281,8 @@ declare
   pt  constant uuid := '00000000-0000-0000-0000-000107152005';
   l01 constant uuid := '00000000-0000-0000-0000-000107150001';
 begin
-  if (select count(*) from pg_temp.r0107v_roles) <> 28 then
-    bad := bad || format('%s of the 28 role cases ran', (select count(*) from pg_temp.r0107v_roles));
+  if (select count(*) from pg_temp.r0107v_roles) <> 33 then
+    bad := bad || format('%s of the 33 role cases ran', (select count(*) from pg_temp.r0107v_roles));
   end if;
   for r in select * from pg_temp.r0107v_roles loop
     exp := case r.who || '/' || r.what
@@ -1237,6 +1295,11 @@ begin
       when 'L01/its own scoring rows' then 'no error, 1 row(s)'
       when 'S/progress PA, every learner' then pg_temp.allprog_0107v(pa)
       when 'S/steps PA of L13' then pg_temp.steps_0107v(pa, pg_temp.u_0107v(13))
+      when 'S/terms C12 of L07' then pg_temp.terms_0107v('course', pg_temp.c_0107v(12), pg_temp.u_0107v(7))
+      when 'S/progress PG of L07' then pg_temp.prog_0107v('00000000-0000-0000-0000-000107152006', pg_temp.u_0107v(7))
+      when 'L07/terms C12 (group only)' then 'none'
+      when 'L07/progress PG (group only)' then 'none'
+      when 'L07/terms C10 (org-wide and group)' then 'due=2999-03-01 at=2000-01-03'
       when 'a3/v_context_attempt_summary, their own (control)' then 'no error, 1 row(s)'
       when 'anon/a table it holds select on (control)' then 'no error, 0 row(s)'
       else case when r.who = 'anon' then '42501' else 'no error, 0 row(s)' end
@@ -1245,6 +1308,11 @@ begin
       bad := bad || format('as %s, %s: %s (expected %s)', r.who, r.what, coalesce(r.got, 'null'), exp);
     end if;
   end loop;
+  -- postgres reads L07's group-only rows (the control of the pinned gap)
+  if pg_temp.terms_0107v('course', pg_temp.c_0107v(12), pg_temp.u_0107v(7)) = 'none'
+     or pg_temp.prog_0107v('00000000-0000-0000-0000-000107152006', pg_temp.u_0107v(7)) = 'none' then
+    bad := bad || 'postgres reads no group-only row for L07'::text;
+  end if;
   -- the learner's reads are not empty (the control that the session reads)
   if (select got from pg_temp.r0107v_roles where who = 'L01' and what = 'steps PA') not like 'C01#1 % off=a02 %' then
     bad := bad || 'L01''s own step rows on PA read empty'::text;

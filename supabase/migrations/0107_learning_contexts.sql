@@ -151,19 +151,25 @@
 -- PREREQUISITES (the DO block of section 0a refuses to run without them; for
 -- every object this file replaces it accepts the earlier state and its own,
 -- so the second paste passes):
+--   0001  organization_members (the org-wide arms of section 4's terms
+--         views)
 --   0002  course_versions.manifest_type (the pre_0107 marker of section 1);
 --         courses (the step facts' course key, section 3); is_org_admin(uuid)
 --         (the select policies of section 3; latest body 0056)
 --   0003  course_attempts.completion_status, success_status
---   0005  course_assignments
---   0008  learning_path_courses.step_number
+--   0005  course_assignments (due_at and assigned_at: the terms views)
+--   0007  team_members, course_assignments.team_id (the team arms of the
+--         terms views)
+--   0008  learning_path_courses.step_number; learning_path_assignments
+--         (due_at, assigned_at, team_id: the terms views)
 --   0014  notification_templates (the event-type check of 0065, below)
 --   0017  learning_paths.is_active
 --   0033  learning_paths.visibility
 --   0034  course_attempts.learning_path_id with its foreign key;
 --         learning_paths.sequence_mode
 --   0044  lrs_forward_outbox.attempt_id
---   0052  learning_path_courses.release_at
+--   0052  learning_path_courses.release_at; course_assignments.release_at
+--         (the release gates of section 4's course terms view)
 --   0053  xp_events, user_badges.period, gamification_settings.timezone,
 --         course_attempts.last_activity_at, gamification_close_month(),
 --         refresh_gamification_views()
@@ -173,6 +179,8 @@
 --         (the wrapper) and journey_record_completion(uuid)
 --   0065  journey_programs.deadline_days; the event-type check admits
 --         'journey_escalation'
+--   0069  course_assignments.group_id, learning_path_assignments.group_id
+--         (the Custom Group arms of the terms views)
 --   0071  org_api_keys, org_integration_settings
 --   0081  courses.pass_required, effective_attempt_policy(uuid)
 --   0082  course_attempts.completion_webhook_at
@@ -298,9 +306,11 @@ begin
   for r in
     select * from (values
       ('public.organizations',                    '0001'),
+      ('public.organization_members',             '0001'),
       ('public.courses',                          '0002'),
       ('public.course_attempts',                  '0002'),
       ('public.course_assignments',               '0005'),
+      ('public.team_members',                     '0007'),
       ('public.learning_paths',                   '0008'),
       ('public.learning_path_courses',            '0008'),
       ('public.learning_path_assignments',        '0008'),
@@ -358,6 +368,15 @@ begin
       ('course_versions',          'manifest_type',         '0002'),
       ('learning_path_courses',    'step_number',           '0008'),
       ('learning_path_courses',    'release_at',            '0052'),
+      ('course_assignments',       'due_at',                '0005'),
+      ('course_assignments',       'assigned_at',           '0005'),
+      ('course_assignments',       'team_id',               '0007'),
+      ('course_assignments',       'release_at',            '0052'),
+      ('course_assignments',       'group_id',              '0069'),
+      ('learning_path_assignments', 'due_at',              '0008'),
+      ('learning_path_assignments', 'assigned_at',         '0008'),
+      ('learning_path_assignments', 'team_id',             '0008'),
+      ('learning_path_assignments', 'group_id',            '0069'),
       ('learning_paths',           'is_active',             '0017'),
       ('learning_paths',           'visibility',            '0033'),
       ('learning_paths',           'sequence_mode',         '0034'),
