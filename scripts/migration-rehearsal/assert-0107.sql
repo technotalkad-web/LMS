@@ -11,8 +11,10 @@
 -- tables) and section 6's paste-window day_ids trigger on journey_versions:
 -- checks (0) to (6) for section 1, (7) to (10) for section 2 and 6a, (11)
 -- and (12) for section 3; the rows (7) to (10) write have ids whose last
--- group starts 00010713, those of (12) 00010714. The checks of the later
--- sections come with them. The whole file
+-- group starts 00010713, those of (12) 00010714. The checks of section 4
+-- (the views) are in assert-0107-views.sql, (13) to (19), because the rows
+-- of (7) to (12) stay in this file's transaction and the views read them;
+-- the checks of the later sections come with them. The whole file
 -- is one transaction that ends in ROLLBACK, so nothing it writes reaches the
 -- next step. Every check raises 'assert-0107: (n) …' on failure; the runner
 -- then reports the file as failed and stops the scenario.

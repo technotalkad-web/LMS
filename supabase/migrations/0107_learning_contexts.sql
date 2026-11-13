@@ -16,9 +16,12 @@
 -- open-request and journey_day_progress key swaps and the indexes), section
 -- 3, which is item 3 whole (learning_path_completions,
 -- learning_path_step_completions, completion_notices and preview_purge_log,
--- created empty), and of item 6 only the paste-window day_ids trigger on
--- journey_versions (section 6). Not built yet: items 4 and 5, the rest of
--- item 6 and item 7; nothing writes the four new tables yet. On this
+-- created empty), section 4, which is item 4 whole (the two context views,
+-- the two old-name views as the Individual context, the course enrolment
+-- view without its path arm and hold-back, the two terms views and the two
+-- path views), and of item 6 only the paste-window day_ids trigger on
+-- journey_versions (section 6). Not built yet: item 5, the rest of item 6
+-- and item 7; nothing writes the four new tables yet. On this
 -- build the old bodies still run and some now fail: the 0089
 -- journey_record_completion names the dropped credit key as its conflict
 -- target (42P10) and its untagged branch re-tags an attempt (refused by the
@@ -137,10 +140,13 @@
 -- ROW EXCLUSIVE until commit on the parents of the foreign keys this file
 -- adds or re-creates that are not in that list, learning_paths,
 -- organizations, auth.users and courses (writes to them wait, reads do
--- not). The two stored generated columns of course_attempts and the one of
--- attempt_requests rewrite those tables on the first paste (a rewrite per
--- added generated column; a later paste skips them). lock_timeout 5 s: if a
--- lock is not granted the whole file rolls back.
+-- not); ACCESS EXCLUSIVE until commit on the three views section 4
+-- replaces, v_course_attempt_scoring, v_course_attempt_summary and
+-- v_course_enrollments_expanded (their reads wait, the report matviews'
+-- refresh among them). The two stored generated columns of course_attempts
+-- and the one of attempt_requests rewrite those tables on the first paste
+-- (a rewrite per added generated column; a later paste skips them).
+-- lock_timeout 5 s: if a lock is not granted the whole file rolls back.
 --
 -- PREREQUISITES (the DO block of section 0a refuses to run without them; for
 -- every object this file replaces it accepts the earlier state and its own,
@@ -2189,12 +2195,865 @@ revoke all on public.preview_purge_log from public, anon, authenticated, service
 grant select on public.preview_purge_log to service_role;
 
 -- ---------------------------------------------------------------------------
+-- 4. The views (ADR 0024 section B, creation order item 4; steps 9 and 18;
+--    build notes N8 to N12 and O1-d)
+-- ---------------------------------------------------------------------------
+-- In the record's order: v_context_attempt_scoring; v_context_attempt_summary;
+-- the two old-name views; v_course_enrollments_expanded; the two terms views;
+-- v_path_step_status; v_path_progress. A view binds the relations it reads
+-- when it is created, so each comes after everything it reads: the summary
+-- after the scoring view, and the two path views last, after the terms view
+-- and the two path tables of section 3 (learning_path_completions,
+-- learning_path_step_completions).
+--
+-- create or replace view may only append columns and keeps a view's
+-- privileges. The two old-name views and the course enrolment view keep
+-- their columns, names, order and types exactly (the six LIVE report
+-- matviews and the app read them); the column list of each new view is
+-- fixed by this file's first paste. Every view is security_invoker, in the
+-- definition and restated by alter view, because a create or replace resets
+-- the view options it is not given and, without the option, a learner could
+-- read every organisation's rows through the Data API. Grants: the three
+-- existing views restate their own (0103:536 and :610; 0105:696-697); each
+-- new view's revoke names public, anon, authenticated and service_role, and
+-- its grant gives select to authenticated and service_role and nothing else
+-- (the form of section 3). authenticated needs the select: the views are
+-- read on the learner's session, and the path views read the terms view and
+-- the summary on it.
+--
+-- No view calls instance_pass_required (a learner's read would raise 42501):
+-- the path rule resolves pass_required by join,
+-- coalesce(learning_path_courses.pass_required, courses.pass_required)
+-- (step 9).
+
+-- 4a. v_context_attempt_scoring (step 9 (a), (b); notes N8, N9 and N12): the
+-- official attempt per (course, learner, context_key). The 0103 body
+-- (0103:430-530) with three changes and nothing else: (a) context_key in
+-- every partition, the distinct on, the group key and the join to official,
+-- so no row fans out across contexts; (b) the official rule, not a revision
+-- row, not a preview, not abandoned, in the completed CTE, where the
+-- official attempt is chosen (an abandoned row that is completed was official
+-- in the 0103 view and never in computeScoring; note N8); and two appended
+-- columns, context_key and passed_in_window (note N12: some row of the
+-- scored window passed, so the window logic exists here once and the path
+-- view reads it). A granted retake joins the window when an approved grant
+-- names it in used_attempt_id, whatever the grant's own context (note N9;
+-- the is_retake test of 0103:439-442, unchanged).
+create or replace view public.v_context_attempt_scoring with (security_invoker = on) as
+with completed as (
+  select
+    cv.course_id,
+    ca.user_id,
+    ca.context_key,
+    ca.id as attempt_id,
+    ca.score,
+    ca.success_status,
+    -- A consumed admin grant marks this attempt as an official RETAKE (0083).
+    exists (
+      select 1 from public.attempt_requests ar
+       where ar.used_attempt_id = ca.id and ar.status = 'approved'
+    ) as is_retake,
+    row_number() over (
+      partition by cv.course_id, ca.user_id, ca.context_key
+      order by coalesce(ca.completed_at, ca.started_at), ca.started_at, ca.id
+    ) as attempt_no
+  from public.course_attempts ca
+  join public.course_versions cv on cv.id = ca.course_version_id
+  -- 0103: parenthesised, so a revision row leaves both branches (ADR 0014 step 2)
+  where (ca.completion_status = 'completed' or ca.success_status = 'passed') and not ca.is_revision
+    -- 0107: the official rule (ADR 0024 step 9 (b), note N8)
+    and ca.context_kind <> 'preview' and ca.status <> 'abandoned'
+),
+ranked as (
+  select
+    c.*,
+    -- Slot among NON-retake completed attempts (the base scored window).
+    case when not c.is_retake then
+      row_number() over (partition by c.course_id, c.user_id, c.context_key, c.is_retake order by c.attempt_no)
+    end as base_no,
+    -- 1 = the NEWEST completed retake (it is THE official result).
+    case when c.is_retake then
+      row_number() over (partition by c.course_id, c.user_id, c.context_key, c.is_retake order by c.attempt_no desc)
+    end as retake_rank
+  from completed c
+),
+policy as (
+  select c.id as course_id, p.max_scored_attempts, p.official_basis, p.official_attempt_number
+    from public.courses c
+   cross join lateral public.effective_attempt_policy(c.id) p
+),
+scored as (
+  select
+    r.*,
+    p.max_scored_attempts,
+    p.official_basis,
+    p.official_attempt_number,
+    -- Scored window = first max_scored non-retake attempts + every completed retake.
+    (r.is_retake or r.base_no <= p.max_scored_attempts) as in_window,
+    bool_or(r.is_retake) over (partition by r.course_id, r.user_id, r.context_key) as has_retake,
+    max(r.base_no) filter (where r.base_no <= p.max_scored_attempts)
+      over (partition by r.course_id, r.user_id, r.context_key) as last_base_no
+  from ranked r
+  join policy p on p.course_id = r.course_id
+),
+official as (
+  -- Exactly one row per (course, user, context): the official attempt. The
+  -- newest completed retake wins; otherwise the basis rule over the base window.
+  select distinct on (s.course_id, s.user_id, s.context_key)
+    s.course_id, s.user_id, s.context_key, s.attempt_id, s.score, s.success_status
+  from scored s
+  where (s.has_retake and s.is_retake and s.retake_rank = 1)
+     or (not s.has_retake and not s.is_retake and s.base_no <= s.max_scored_attempts
+         and case s.official_basis
+               when 'best'   then true
+               when 'latest' then s.base_no = s.last_base_no
+               when 'nth'    then s.base_no = coalesce(s.official_attempt_number, 1)
+               else               s.base_no = 1
+             end)
+  order by s.course_id, s.user_id, s.context_key,
+           -- 'best' keeps every base-window row: highest score first, ties → earliest.
+           (case when s.official_basis = 'best' then -coalesce(s.score, -1) else 0 end),
+           s.base_no
+)
+select
+  x.course_id,
+  x.user_id,
+  x.max_scored_attempts,
+  x.official_basis,
+  x.official_attempt_number,
+  (count(*))::integer as completed_attempts,
+  (count(*) filter (where x.in_window))::integer as scored_attempts,
+  (count(*) filter (where not x.in_window))::integer as practice_attempts,
+  max(x.score) filter (where x.attempt_no = 1) as first_score,
+  max(x.score) filter (where x.in_window) as best_score,
+  -- Newest in the window; a completed retake is always newer than the base
+  -- window (mirrors computeScoring's scored = [...baseWindow, ...retakes]).
+  (array_agg(x.score order by x.is_retake desc, x.attempt_no desc) filter (where x.in_window))[1] as latest_score,
+  max(o.score) as official_score,
+  -- New trailing columns (0090). NULL when the policy designates no official
+  -- attempt yet (e.g. an 'nth' basis beyond the completed count) — the TS
+  -- engine then reports in_progress, never "completed".
+  case
+    when max(o.attempt_id::text) is null then null
+    when max(o.success_status) = 'passed' then 'passed'
+    when max(o.success_status) = 'failed' then 'failed'
+    else 'completed'
+  end as official_status,
+  max(o.attempt_id::text)::uuid as official_attempt_id,
+  -- 0107: the context, and whether some row of the scored window passed
+  -- (note N12; never the summary's ever_passed, which also counts practice
+  -- and abandoned rows)
+  x.context_key,
+  coalesce(bool_or(x.in_window and x.success_status = 'passed'), false) as passed_in_window
+from scored x
+left join official o on o.course_id = x.course_id and o.user_id = x.user_id and o.context_key = x.context_key
+group by x.course_id, x.user_id, x.context_key, x.max_scored_attempts, x.official_basis, x.official_attempt_number;
+
+alter view public.v_context_attempt_scoring set (security_invoker = on);
+
+comment on view public.v_context_attempt_scoring is
+  'The official attempt per (course, learner, context_key) (ADR 0024 step 9): the 0103 scoring rules within one context, over rows that are not revision rows, not previews and not abandoned. passed_in_window: some row of the scored window passed.';
+
+revoke all on public.v_context_attempt_scoring from public, anon, authenticated, service_role;
+grant select on public.v_context_attempt_scoring to authenticated, service_role;
+
+-- 4b. v_context_attempt_summary (step 9 (a), (c), (d); note N12): one row
+-- per (course, learner, context_key). The 0103 body (0103:547-604) with
+-- these changes and nothing else: base groups by context_key and filters
+-- not a revision row and not a preview only, so it keeps abandoned rows as
+-- 0103 does and the 0099 columns keep their meaning (attempt_count,
+-- latest_completion and total_time_seconds over every row; the live columns
+-- over rows that are not abandoned; 0 or null means only reset attempts);
+-- the left join to the scoring view adds context_key; and seven columns are
+-- appended: context_kind, context_key, learning_path_id,
+-- journey_enrollment_id, journey_day, journey_day_id (step 9 (d)) and
+-- passed_in_window (note N12, false when the context has no completed row).
+-- official_attempt_id is already column 19. The tags are fixed by
+-- context_key for every row base admits (the shape CHECK), so any row's
+-- value is the context's; each uuid is read with max(::text)::uuid, as 0103
+-- reads official_attempt_id. journey_day is the day's number at launch, for
+-- display only: two rows of one day can carry different numbers after a
+-- publish moved the day, so the newest row's number is shown (started_at,
+-- then id); every per-day reader joins on context_key or journey_day_id.
+create or replace view public.v_context_attempt_summary with (security_invoker = on) as
+with base as (
+  select
+    cv.course_id,
+    ca.user_id,
+    ca.context_key,
+    (array_agg(ca.completion_status order by ca.started_at desc))[1] as latest_completion,
+    (array_agg(ca.success_status   order by ca.started_at desc))[1] as latest_success,
+    coalesce(sum(
+      extract(epoch from (ca.completed_at - ca.started_at))
+    ) filter (where ca.completed_at is not null), 0) as total_time_seconds,
+    count(*) as attempt_count,
+    bool_or(ca.completion_status = 'completed' or ca.success_status = 'passed') as ever_completed,
+    bool_or(ca.success_status = 'passed') as ever_passed,
+    (array_agg(ca.success_status
+       order by coalesce(ca.completed_at, ca.started_at), ca.started_at, ca.id)
+       filter (where ca.completion_status = 'completed' or ca.success_status = 'passed')
+    )[1] = 'passed' as first_completed_passed,
+    -- 0099: live attempts only (a reset / force-restart / language-switch
+    -- abandoned attempt is not progress).
+    count(*) filter (where ca.status <> 'abandoned') as live_attempt_count,
+    (array_agg(ca.completion_status order by ca.started_at desc)
+       filter (where ca.status <> 'abandoned'))[1] as latest_live_completion,
+    (array_agg(ca.success_status   order by ca.started_at desc)
+       filter (where ca.status <> 'abandoned'))[1] as latest_live_success,
+    -- 0107: the context's tags (ADR 0024 step 9 (d))
+    max(ca.context_kind) as context_kind,
+    max(ca.learning_path_id::text)::uuid as learning_path_id,
+    max(ca.journey_enrollment_id::text)::uuid as journey_enrollment_id,
+    (array_agg(ca.journey_day order by ca.started_at desc, ca.id desc))[1] as journey_day,
+    max(ca.journey_day_id::text)::uuid as journey_day_id
+  from public.course_attempts ca
+  join public.course_versions cv on cv.id = ca.course_version_id
+  -- 0103: revision rows are not attempts (ADR 0014 step 2)
+  where not ca.is_revision
+    -- 0107: previews are no context's attempts (ADR 0024 step 9 (c))
+    and ca.context_kind <> 'preview'
+  group by cv.course_id, ca.user_id, ca.context_key
+)
+select
+  b.course_id,
+  b.user_id,
+  b.latest_completion,
+  b.latest_success,
+  s.best_score,
+  b.total_time_seconds,
+  b.attempt_count,
+  b.ever_completed,
+  b.ever_passed,
+  s.official_score,
+  s.first_score,
+  s.latest_score,
+  coalesce(s.scored_attempts, 0)   as scored_attempts,
+  coalesce(s.practice_attempts, 0) as practice_attempts,
+  s.official_basis,
+  s.max_scored_attempts,
+  coalesce(b.first_completed_passed, false) as first_completed_passed,
+  -- Trailing columns (0090): the OFFICIAL verdict; null = no official attempt yet.
+  s.official_status,
+  s.official_attempt_id,
+  -- Trailing columns (0099): live attempts; 0 / null = only reset attempts.
+  b.live_attempt_count,
+  b.latest_live_completion,
+  b.latest_live_success,
+  -- Trailing columns (0107): the context, and passed_in_window (note N12)
+  b.context_kind,
+  b.context_key,
+  b.learning_path_id,
+  b.journey_enrollment_id,
+  b.journey_day,
+  b.journey_day_id,
+  coalesce(s.passed_in_window, false) as passed_in_window
+from base b
+left join public.v_context_attempt_scoring s
+  on s.course_id = b.course_id and s.user_id = b.user_id and s.context_key = b.context_key;
+
+alter view public.v_context_attempt_summary set (security_invoker = on);
+
+comment on view public.v_context_attempt_summary is
+  'One row per (course, learner, context_key) (ADR 0024 step 9): the 0103 summary within one context, over rows that are not revision rows or previews (abandoned rows kept, as in the 0099 columns), with the context''s tags and passed_in_window appended.';
+
+revoke all on public.v_context_attempt_summary from public, anon, authenticated, service_role;
+grant select on public.v_context_attempt_summary to authenticated, service_role;
+
+-- 4c. The two old-name views (step 9; decision A8): v_course_attempt_scoring
+-- and v_course_attempt_summary keep their names, columns, column order and
+-- (course, learner) grain and become the Individual context. The 0103
+-- bodies (0103:430-530, :547-604) with one clause each and nothing else:
+-- context_kind = 'individual' and status <> 'abandoned' in the scoring
+-- view's completed CTE, and context_kind = 'individual' alone in the
+-- summary's base CTE (abandoned rows stay there, as in 4b). So the six LIVE
+-- report matviews that join the summary on (course, learner) keep one row
+-- per learner between this file and 0109 (section K). Option and grants as
+-- 0103 states them (0103:532, :536, :606, :610).
+create or replace view public.v_course_attempt_scoring with (security_invoker = on) as
+with completed as (
+  select
+    cv.course_id,
+    ca.user_id,
+    ca.id as attempt_id,
+    ca.score,
+    ca.success_status,
+    -- A consumed admin grant marks this attempt as an official RETAKE (0083).
+    exists (
+      select 1 from public.attempt_requests ar
+       where ar.used_attempt_id = ca.id and ar.status = 'approved'
+    ) as is_retake,
+    row_number() over (
+      partition by cv.course_id, ca.user_id
+      order by coalesce(ca.completed_at, ca.started_at), ca.started_at, ca.id
+    ) as attempt_no
+  from public.course_attempts ca
+  join public.course_versions cv on cv.id = ca.course_version_id
+  -- 0103: parenthesised, so a revision row leaves both branches (ADR 0014 step 2)
+  where (ca.completion_status = 'completed' or ca.success_status = 'passed') and not ca.is_revision
+    -- 0107: the Individual context under the official rule (ADR 0024 step 9)
+    and ca.context_kind = 'individual' and ca.status <> 'abandoned'
+),
+ranked as (
+  select
+    c.*,
+    -- Slot among NON-retake completed attempts (the base scored window).
+    case when not c.is_retake then
+      row_number() over (partition by c.course_id, c.user_id, c.is_retake order by c.attempt_no)
+    end as base_no,
+    -- 1 = the NEWEST completed retake (it is THE official result).
+    case when c.is_retake then
+      row_number() over (partition by c.course_id, c.user_id, c.is_retake order by c.attempt_no desc)
+    end as retake_rank
+  from completed c
+),
+policy as (
+  select c.id as course_id, p.max_scored_attempts, p.official_basis, p.official_attempt_number
+    from public.courses c
+   cross join lateral public.effective_attempt_policy(c.id) p
+),
+scored as (
+  select
+    r.*,
+    p.max_scored_attempts,
+    p.official_basis,
+    p.official_attempt_number,
+    -- Scored window = first max_scored non-retake attempts + every completed retake.
+    (r.is_retake or r.base_no <= p.max_scored_attempts) as in_window,
+    bool_or(r.is_retake) over (partition by r.course_id, r.user_id) as has_retake,
+    max(r.base_no) filter (where r.base_no <= p.max_scored_attempts)
+      over (partition by r.course_id, r.user_id) as last_base_no
+  from ranked r
+  join policy p on p.course_id = r.course_id
+),
+official as (
+  -- Exactly one row per (course, user): the official attempt. The newest
+  -- completed retake wins; otherwise the basis rule over the base window.
+  select distinct on (s.course_id, s.user_id)
+    s.course_id, s.user_id, s.attempt_id, s.score, s.success_status
+  from scored s
+  where (s.has_retake and s.is_retake and s.retake_rank = 1)
+     or (not s.has_retake and not s.is_retake and s.base_no <= s.max_scored_attempts
+         and case s.official_basis
+               when 'best'   then true
+               when 'latest' then s.base_no = s.last_base_no
+               when 'nth'    then s.base_no = coalesce(s.official_attempt_number, 1)
+               else               s.base_no = 1
+             end)
+  order by s.course_id, s.user_id,
+           -- 'best' keeps every base-window row: highest score first, ties → earliest.
+           (case when s.official_basis = 'best' then -coalesce(s.score, -1) else 0 end),
+           s.base_no
+)
+select
+  x.course_id,
+  x.user_id,
+  x.max_scored_attempts,
+  x.official_basis,
+  x.official_attempt_number,
+  (count(*))::integer as completed_attempts,
+  (count(*) filter (where x.in_window))::integer as scored_attempts,
+  (count(*) filter (where not x.in_window))::integer as practice_attempts,
+  max(x.score) filter (where x.attempt_no = 1) as first_score,
+  max(x.score) filter (where x.in_window) as best_score,
+  -- Newest in the window; a completed retake is always newer than the base
+  -- window (mirrors computeScoring's scored = [...baseWindow, ...retakes]).
+  (array_agg(x.score order by x.is_retake desc, x.attempt_no desc) filter (where x.in_window))[1] as latest_score,
+  max(o.score) as official_score,
+  -- New trailing columns (0090). NULL when the policy designates no official
+  -- attempt yet (e.g. an 'nth' basis beyond the completed count) — the TS
+  -- engine then reports in_progress, never "completed".
+  case
+    when max(o.attempt_id::text) is null then null
+    when max(o.success_status) = 'passed' then 'passed'
+    when max(o.success_status) = 'failed' then 'failed'
+    else 'completed'
+  end as official_status,
+  max(o.attempt_id::text)::uuid as official_attempt_id
+from scored x
+left join official o on o.course_id = x.course_id and o.user_id = x.user_id
+group by x.course_id, x.user_id, x.max_scored_attempts, x.official_basis, x.official_attempt_number;
+
+alter view public.v_course_attempt_scoring set (security_invoker = on);
+
+-- Data API grants (explicit; CREATE OR REPLACE keeps existing privileges, so
+-- this is idempotent).
+grant select on public.v_course_attempt_scoring to authenticated, service_role;
+
+create or replace view public.v_course_attempt_summary with (security_invoker = on) as
+with base as (
+  select
+    cv.course_id,
+    ca.user_id,
+    (array_agg(ca.completion_status order by ca.started_at desc))[1] as latest_completion,
+    (array_agg(ca.success_status   order by ca.started_at desc))[1] as latest_success,
+    coalesce(sum(
+      extract(epoch from (ca.completed_at - ca.started_at))
+    ) filter (where ca.completed_at is not null), 0) as total_time_seconds,
+    count(*) as attempt_count,
+    bool_or(ca.completion_status = 'completed' or ca.success_status = 'passed') as ever_completed,
+    bool_or(ca.success_status = 'passed') as ever_passed,
+    (array_agg(ca.success_status
+       order by coalesce(ca.completed_at, ca.started_at), ca.started_at, ca.id)
+       filter (where ca.completion_status = 'completed' or ca.success_status = 'passed')
+    )[1] = 'passed' as first_completed_passed,
+    -- 0099: live attempts only (a reset / force-restart / language-switch
+    -- abandoned attempt is not progress).
+    count(*) filter (where ca.status <> 'abandoned') as live_attempt_count,
+    (array_agg(ca.completion_status order by ca.started_at desc)
+       filter (where ca.status <> 'abandoned'))[1] as latest_live_completion,
+    (array_agg(ca.success_status   order by ca.started_at desc)
+       filter (where ca.status <> 'abandoned'))[1] as latest_live_success
+  from public.course_attempts ca
+  join public.course_versions cv on cv.id = ca.course_version_id
+  -- 0103: revision rows are not attempts (ADR 0014 step 2)
+  where not ca.is_revision
+    -- 0107: the Individual context (ADR 0024 step 9); abandoned rows stay
+    and ca.context_kind = 'individual'
+  group by cv.course_id, ca.user_id
+)
+select
+  b.course_id,
+  b.user_id,
+  b.latest_completion,
+  b.latest_success,
+  s.best_score,
+  b.total_time_seconds,
+  b.attempt_count,
+  b.ever_completed,
+  b.ever_passed,
+  s.official_score,
+  s.first_score,
+  s.latest_score,
+  coalesce(s.scored_attempts, 0)   as scored_attempts,
+  coalesce(s.practice_attempts, 0) as practice_attempts,
+  s.official_basis,
+  s.max_scored_attempts,
+  coalesce(b.first_completed_passed, false) as first_completed_passed,
+  -- Trailing columns (0090): the OFFICIAL verdict; null = no official attempt yet.
+  s.official_status,
+  s.official_attempt_id,
+  -- Trailing columns (0099): live attempts; 0 / null = only reset attempts.
+  b.live_attempt_count,
+  b.latest_live_completion,
+  b.latest_live_success
+from base b
+left join public.v_course_attempt_scoring s
+  on s.course_id = b.course_id and s.user_id = b.user_id;
+
+alter view public.v_course_attempt_summary set (security_invoker = on);
+
+-- Data API grants (explicit; CREATE OR REPLACE keeps existing privileges, so
+-- this is idempotent).
+grant select on public.v_course_attempt_summary to authenticated, service_role;
+
+-- 4d. v_course_enrollments_expanded (step 18; decision D2): the four direct
+-- arms with their release gates, nothing else. The 0105 body (0105:613-689)
+-- without its path arm (0105:656-670, the union and the released steps of
+-- assigned paths) and without the hold-back (0105:672-689): a course is
+-- enrolled only by a course assignment, and the Learning Path is its own
+-- product with its own enrolment and progress (v_path_step_status below). A
+-- self-enrolment is a user row, so the view needs no new arm. Same two
+-- columns, security_invoker, grants as 0105 (0105:691-697); the comment is
+-- restated for the direct arms.
+create or replace view public.v_course_enrollments_expanded with (security_invoker = on) as
+select
+  e.course_id,
+  e.user_id
+from (
+  -- direct user assignments, released
+  select
+    ca.course_id,
+    ca.user_id
+  from public.course_assignments ca
+  where ca.assignee_type = 'user'
+    and ca.user_id is not null
+    and (ca.release_at is null or ca.release_at <= now())
+  union
+  -- team assignments expanded via team_members, released
+  select
+    ca.course_id,
+    tm.user_id
+  from public.course_assignments ca
+  join public.team_members tm on tm.team_id = ca.team_id
+  where ca.assignee_type = 'team'
+    and ca.team_id is not null
+    and (ca.release_at is null or ca.release_at <= now())
+  union
+  -- org-wide assignments expanded via organization_members, released
+  select
+    ca.course_id,
+    om.user_id
+  from public.course_assignments ca
+  join public.courses c on c.id = ca.course_id
+  join public.organization_members om on om.organization_id = c.organization_id
+  where ca.assignee_type = 'org'
+    and (ca.release_at is null or ca.release_at <= now())
+  union
+  -- 0105: Custom Group assignments (0069), released, one call per group
+  select
+    ca.course_id,
+    x.user_id
+  from public.course_assignments ca
+  cross join lateral public.group_member_ids(ca.group_id) as x
+  where ca.assignee_type = 'group'
+    and ca.group_id is not null
+    and (ca.release_at is null or ca.release_at <= now())
+) as e;
+
+alter view public.v_course_enrollments_expanded set (security_invoker = on);
+
+comment on view public.v_course_enrollments_expanded is
+  'Learners enrolled on a course as an Individual course (0031; 0105, ADR 0020; ADR 0024 step 18): every released direct assignment (user, team, org-wide, Custom Group); a self-enrolment is a user row. A Learning Path step does not enrol (ADR 0024 decision D2). Distinct (course_id, user_id).';
+
+revoke all on public.v_course_enrollments_expanded from anon;
+grant select on public.v_course_enrollments_expanded to authenticated, service_role;
+
+-- 4e. The terms views (step 18; decision A9): one due-date rule for the
+-- whole LMS. Per (course or path, learner): due_at is the learner's own
+-- (user) row's due_at when the learner has a user row, even a null one, else
+-- the earliest due_at among the other assignments that reach the learner;
+-- enrolled_at is min(assigned_at) (0005:40, 0008:41). That is the rule of the
+-- CRM progress feed and the Report Card (lib/integrations/progress.ts
+-- 606-616, lib/manager/insights.ts 325-332), as A9 says, and it is why a
+-- self-enrolled learner (a user row with no due date) is never overdue. The
+-- assignments that reach a learner are the arms of the two enrolment views,
+-- written out again here with the assignment's dates (the enrolment views
+-- carry no dates): for a course the four released direct arms of 4d, so the
+-- terms view has a row exactly where v_course_enrollments_expanded has one
+-- and an unreleased assignment sets no date, as the two readers skip it;
+-- for a path the four arms of v_path_enrollments_expanded (0105:545-579;
+-- path assignments have no release date). organization_id is the course's
+-- or the path's. Both are security_invoker (a learner reads only the
+-- assignments RLS shows them; an admin their organisation's).
+create or replace view public.v_course_enrollment_terms with (security_invoker = on) as
+with reach as (
+  -- direct user assignments, released
+  select ca.course_id, ca.user_id, ca.assignee_type, ca.due_at, ca.assigned_at
+  from public.course_assignments ca
+  where ca.assignee_type = 'user'
+    and ca.user_id is not null
+    and (ca.release_at is null or ca.release_at <= now())
+  union all
+  -- team assignments expanded via team_members, released
+  select ca.course_id, tm.user_id, ca.assignee_type, ca.due_at, ca.assigned_at
+  from public.course_assignments ca
+  join public.team_members tm on tm.team_id = ca.team_id
+  where ca.assignee_type = 'team'
+    and ca.team_id is not null
+    and (ca.release_at is null or ca.release_at <= now())
+  union all
+  -- org-wide assignments expanded via organization_members, released
+  select ca.course_id, om.user_id, ca.assignee_type, ca.due_at, ca.assigned_at
+  from public.course_assignments ca
+  join public.courses c on c.id = ca.course_id
+  join public.organization_members om on om.organization_id = c.organization_id
+  where ca.assignee_type = 'org'
+    and (ca.release_at is null or ca.release_at <= now())
+  union all
+  -- Custom Group assignments, released, one call per group
+  select ca.course_id, x.user_id, ca.assignee_type, ca.due_at, ca.assigned_at
+  from public.course_assignments ca
+  cross join lateral public.group_member_ids(ca.group_id) as x
+  where ca.assignee_type = 'group'
+    and ca.group_id is not null
+    and (ca.release_at is null or ca.release_at <= now())
+)
+select
+  r.course_id,
+  r.user_id,
+  c.organization_id,
+  case when bool_or(r.assignee_type = 'user')
+       then max(r.due_at) filter (where r.assignee_type = 'user')
+       else min(r.due_at)
+  end as due_at,
+  min(r.assigned_at) as enrolled_at
+from reach r
+join public.courses c on c.id = r.course_id
+group by r.course_id, r.user_id, c.organization_id;
+
+alter view public.v_course_enrollment_terms set (security_invoker = on);
+
+comment on view public.v_course_enrollment_terms is
+  'Per (course, learner) enrolled by a released direct assignment: due_at (the learner''s own user row''s date when they have one, even null, else the earliest of the others) and enrolled_at (the first assigned_at) (ADR 0024 step 18, decision A9).';
+
+revoke all on public.v_course_enrollment_terms from public, anon, authenticated, service_role;
+grant select on public.v_course_enrollment_terms to authenticated, service_role;
+
+create or replace view public.v_path_enrollment_terms with (security_invoker = on) as
+with reach as (
+  -- direct user assignments
+  select pa.path_id, pa.user_id, pa.assignee_type, pa.due_at, pa.assigned_at
+  from public.learning_path_assignments pa
+  where pa.assignee_type = 'user'
+    and pa.user_id is not null
+  union all
+  -- team assignments
+  select pa.path_id, tm.user_id, pa.assignee_type, pa.due_at, pa.assigned_at
+  from public.learning_path_assignments pa
+  join public.team_members tm on tm.team_id = pa.team_id
+  where pa.assignee_type = 'team'
+    and pa.team_id is not null
+  union all
+  -- org-wide assignments
+  select pa.path_id, om.user_id, pa.assignee_type, pa.due_at, pa.assigned_at
+  from public.learning_path_assignments pa
+  join public.learning_paths lp on lp.id = pa.path_id
+  join public.organization_members om on om.organization_id = lp.organization_id
+  where pa.assignee_type = 'org'
+  union all
+  -- Custom Group assignments, one call per group
+  select pa.path_id, x.user_id, pa.assignee_type, pa.due_at, pa.assigned_at
+  from public.learning_path_assignments pa
+  cross join lateral public.group_member_ids(pa.group_id) as x
+  where pa.assignee_type = 'group'
+    and pa.group_id is not null
+)
+select
+  r.path_id,
+  r.user_id,
+  lp.organization_id,
+  case when bool_or(r.assignee_type = 'user')
+       then max(r.due_at) filter (where r.assignee_type = 'user')
+       else min(r.due_at)
+  end as due_at,
+  min(r.assigned_at) as enrolled_at
+from reach r
+join public.learning_paths lp on lp.id = r.path_id
+group by r.path_id, r.user_id, lp.organization_id;
+
+alter view public.v_path_enrollment_terms set (security_invoker = on);
+
+comment on view public.v_path_enrollment_terms is
+  'Per (path, learner) enrolled by an assignment: due_at (the learner''s own user row''s date when they have one, even null, else the earliest of the others) and enrolled_at (the first assigned_at) (ADR 0024 step 18, decision A9).';
+
+revoke all on public.v_path_enrollment_terms from public, anon, authenticated, service_role;
+grant select on public.v_path_enrollment_terms to authenticated, service_role;
+
+-- 4f. v_path_step_status (step 9; steps 44 and 18; notes N10 and N12; the
+-- owner's O1 answer, build note O1-d): one row per (path, enrolled learner,
+-- step), the one SQL definition of a path step's done. The enrolled
+-- learners of v_path_enrollments_expanded times the step list, left-joined
+-- to v_context_attempt_summary on the path's own key, 'path:' || path_id,
+-- and to the step's stored fact. Columns:
+--   pass_required    the resolved rule, by join (step 9): the step's own,
+--                    else the course's
+--   passed_by_rule   the computed half (note N12): some row of the path
+--                    context's scored window satisfies the rule as it stands
+--                    now (a passed window row under pass_required; else the
+--                    window is not empty)
+--   done_recorded_at the done_at of the step's row in
+--                    learning_path_step_completions, null when there is none
+--   passed_ever      passed_by_rule or a stored fact (O1-d); done = passed_ever
+--                    (step 44). A rule relaxed later helps at once; a rule
+--                    tightened later leaves a recorded step done.
+--   latest_result, latest_score, official_attempt_id   the standing official
+--                    result of the path context under today's rule
+--                    (official_status, official_score, official_attempt_id);
+--                    the fact never changes them
+--   retake_live      a row of (course, learner, path:P) in progress, neither
+--                    completed nor passed, not a revision row, named in
+--                    used_attempt_id by an approved grant of any context
+--                    (note N9; the test of consume_grant, 0103:782-797, with
+--                    the row's context added)
+--   failed           not passed_ever, the standing result failed, and no live
+--                    retake (step 44)
+--   open_attempt     an official row of the context in progress (in
+--                    progress and not a revision row)
+-- step_number and release_at come with the step (launch_context reads them
+-- here, step 18). Every boolean is non-null. No reader of a path step's done
+-- takes it from anywhere else in SQL (O1-k).
+create or replace view public.v_path_step_status with (security_invoker = on) as
+select
+  pe.path_id,
+  pe.user_id,
+  lpc.course_id,
+  lp.organization_id,
+  lpc.step_number,
+  lpc.release_at,
+  r.pass_required,
+  (r.passed_by_rule or f.done_at is not null) as passed_ever,
+  r.passed_by_rule,
+  f.done_at as done_recorded_at,
+  s.official_status as latest_result,
+  s.official_score as latest_score,
+  (r.passed_by_rule or f.done_at is not null) as done,
+  s.official_attempt_id,
+  coalesce(a.retake_live, false) as retake_live,
+  (not (r.passed_by_rule or f.done_at is not null)
+   and coalesce(s.official_status = 'failed', false)
+   and not coalesce(a.retake_live, false)) as failed,
+  coalesce(a.open_attempt, false) as open_attempt
+from public.v_path_enrollments_expanded pe
+join public.learning_paths lp on lp.id = pe.path_id
+join public.learning_path_courses lpc on lpc.path_id = pe.path_id
+join public.courses c on c.id = lpc.course_id
+left join public.v_context_attempt_summary s
+  on s.course_id = lpc.course_id
+ and s.user_id = pe.user_id
+ and s.context_key = 'path:' || pe.path_id::text
+left join public.learning_path_step_completions f
+  on f.path_id = pe.path_id
+ and f.user_id = pe.user_id
+ and f.course_id = lpc.course_id
+cross join lateral (
+  select
+    coalesce(lpc.pass_required, c.pass_required) as pass_required,
+    case when coalesce(lpc.pass_required, c.pass_required)
+         then coalesce(s.passed_in_window, false)
+         else coalesce(s.scored_attempts, 0) > 0
+    end as passed_by_rule
+) r
+cross join lateral (
+  select
+    bool_or(ca.completion_status is distinct from 'completed'
+            and ca.success_status is distinct from 'passed'
+            and exists (
+              select 1 from public.attempt_requests ar
+               where ar.used_attempt_id = ca.id
+                 and ar.status = 'approved'
+            )) as retake_live,
+    bool_or(true) as open_attempt
+  from public.course_attempts ca
+  join public.course_versions cv on cv.id = ca.course_version_id
+  where ca.user_id = pe.user_id
+    and cv.course_id = lpc.course_id
+    and ca.context_key = 'path:' || pe.path_id::text
+    and ca.status = 'in_progress'
+    and not ca.is_revision
+) a;
+
+alter view public.v_path_step_status set (security_invoker = on);
+
+comment on view public.v_path_step_status is
+  'One row per (path, enrolled learner, step) (ADR 0024 steps 9 and 44; build notes N10, N12, O1-d): the step''s resolved pass rule and its done (passed_ever = passed_by_rule or a stored step fact), with the standing official result in path:P, a live granted retake, failed and an open attempt.';
+
+revoke all on public.v_path_step_status from public, anon, authenticated, service_role;
+grant select on public.v_path_step_status to authenticated, service_role;
+
+-- 4g. v_path_progress (step 9; notes N11 and N22): one row per (path,
+-- enrolled learner), driven by v_path_enrollments_expanded, so a learner on
+-- a path with no step still has a row (0 of 0, not completed). Columns:
+--   steps_total, steps_done   the steps of the path, and those done
+--   next_step, next_course_id the lowest step_number not done and its
+--                             course, null when every step is done; release
+--                             dates and sequence_mode are applied by the
+--                             launch and the page, not here
+--   path_score                the mean of the steps' latest official scores
+--                             where a step has one; unrounded
+--   completed, completed_at   a learning_path_completions row exists, and
+--                             its completed_at (never undone, so a path
+--                             completed before a step was added reads
+--                             completed with steps_done < steps_total)
+--   status                    one of four, tested in this order: in_progress
+--                             when some current step has a live granted
+--                             retake (whether or not the path is completed);
+--                             completed; failed when some step is failed;
+--                             in_progress when some current step has a live
+--                             row in path:P (the summary's live_attempt_count
+--                             above 0, the 0099 meaning, so a learner with
+--                             reset attempts only reads not started);
+--                             not_started
+--   due_at, enrolled_at       from v_path_enrollment_terms
+--   started_at                the earliest started_at of the path context's
+--                             rows that are not revision rows and not
+--                             abandoned, on courses that are current steps
+--   overdue                   due_at is past and the path is not completed
+-- completed, completed_at and overdue do not follow status: while a granted
+-- retake is live on a completed path, status reads in_progress and completed
+-- reads true. A reader that splits every enrolment once reads status; a
+-- reader that asks whether the learner completed the path reads completed.
+-- A learner who finished a path before this file has no completion row and
+-- reads by the path rule (note N22).
+create or replace view public.v_path_progress with (security_invoker = on) as
+with steps as (
+  select
+    st.path_id,
+    st.user_id,
+    (count(*))::integer as steps_total,
+    (count(*) filter (where st.done))::integer as steps_done,
+    min(st.step_number) filter (where not st.done) as next_step,
+    (array_agg(st.course_id order by st.step_number) filter (where not st.done))[1] as next_course_id,
+    avg(st.latest_score) filter (where st.latest_score is not null) as path_score,
+    bool_or(st.retake_live) as retake_live,
+    bool_or(st.failed) as failed
+  from public.v_path_step_status st
+  group by st.path_id, st.user_id
+),
+live as (
+  select
+    lpc.path_id,
+    s.user_id,
+    bool_or(s.live_attempt_count > 0) as live
+  from public.learning_path_courses lpc
+  join public.v_context_attempt_summary s
+    on s.course_id = lpc.course_id
+   and s.context_key = 'path:' || lpc.path_id::text
+  group by lpc.path_id, s.user_id
+),
+started as (
+  select
+    lpc.path_id,
+    ca.user_id,
+    min(ca.started_at) as started_at
+  from public.learning_path_courses lpc
+  join public.course_versions cv on cv.course_id = lpc.course_id
+  join public.course_attempts ca
+    on ca.course_version_id = cv.id
+   and ca.context_key = 'path:' || lpc.path_id::text
+  where not ca.is_revision
+    and ca.status <> 'abandoned'
+  group by lpc.path_id, ca.user_id
+)
+select
+  pe.path_id,
+  pe.user_id,
+  lp.organization_id,
+  coalesce(st.steps_total, 0) as steps_total,
+  coalesce(st.steps_done, 0) as steps_done,
+  st.next_step,
+  st.next_course_id,
+  st.path_score,
+  (lc.path_id is not null) as completed,
+  case
+    when coalesce(st.retake_live, false) then 'in_progress'
+    when lc.path_id is not null then 'completed'
+    when coalesce(st.failed, false) then 'failed'
+    when coalesce(lv.live, false) then 'in_progress'
+    else 'not_started'
+  end as status,
+  t.due_at,
+  t.enrolled_at,
+  sa.started_at,
+  lc.completed_at,
+  (t.due_at is not null and t.due_at < now() and lc.path_id is null) as overdue
+from public.v_path_enrollments_expanded pe
+join public.learning_paths lp on lp.id = pe.path_id
+left join steps st
+  on st.path_id = pe.path_id and st.user_id = pe.user_id
+left join live lv
+  on lv.path_id = pe.path_id and lv.user_id = pe.user_id
+left join started sa
+  on sa.path_id = pe.path_id and sa.user_id = pe.user_id
+left join public.learning_path_completions lc
+  on lc.path_id = pe.path_id and lc.user_id = pe.user_id
+left join public.v_path_enrollment_terms t
+  on t.path_id = pe.path_id and t.user_id = pe.user_id;
+
+alter view public.v_path_progress set (security_invoker = on);
+
+comment on view public.v_path_progress is
+  'One row per (path, enrolled learner) (ADR 0024 step 9; build note N11): steps done of total, the next step and its course, the path score, completed (a learning_path_completions row), status (in_progress, completed, failed or not_started, in that order of tests), the terms, started_at and overdue.';
+
+revoke all on public.v_path_progress from public, anon, authenticated, service_role;
+grant select on public.v_path_progress to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
 -- 6. The plpgsql functions (ADR 0024 section B, creation order item 6)
 -- ---------------------------------------------------------------------------
 -- In any order among themselves: a plpgsql body is parsed when it is created
 -- and resolves its objects when it first runs. Sections 3 to 5 (creation
--- order items 3 to 5) come before this one; this build holds section 3, and
--- sections 4 and 5 come with a later build. This build holds one function of
+-- order items 3 to 5) come before this one; this build holds sections 3 and
+-- 4, and section 5 comes with a later build. This build holds one function of
 -- the item, the paste-window trigger function on journey_versions, followed
 -- by its trigger.
 

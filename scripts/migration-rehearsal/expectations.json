@@ -2462,10 +2462,14 @@
         { "sql": "grants-0107.sql" },
         { "static": { "file": "0107", "generatedStored": 3, "mustNotContain": [] } },
         { "apply": { "label": "0107 first paste (ADR 0024; a database at 0106 with 0105 first)", "files": ["0107"], "times": 1 } },
+        { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
+        { "sql": "assert-0107-views.sql" },
         { "sql": "seed-0107-repaste.sql" },
         { "apply": { "label": "0107 second paste (ADR 0024; rows the new code wrote in between)", "files": ["0107"], "times": 1 } },
+        { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
+        { "sql": "assert-0107-views.sql" },
         { "sql": "assert-0107-repaste.sql" }
       ]
     },
@@ -2666,10 +2670,14 @@
         { "refresh": { "views": 6 } },
         { "sql": "grants-0107.sql" },
         { "apply": { "label": "0107 first paste (ADR 0024; a database at 0105 with 0106 first)", "files": ["0107"], "times": 1 } },
+        { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
+        { "sql": "assert-0107-views.sql" },
         { "sql": "seed-0107-repaste.sql" },
         { "apply": { "label": "0107 second paste (ADR 0024; rows the new code wrote in between)", "files": ["0107"], "times": 1 } },
+        { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
+        { "sql": "assert-0107-views.sql" },
         { "sql": "assert-0107-repaste.sql" }
       ]
     },
@@ -2868,7 +2876,9 @@
         { "refresh": { "views": 6 } },
         { "sql": "grants-0107.sql" },
         { "apply": { "label": "0107 (ADR 0024; Q8 refuses a day identity it would invent)", "files": ["0107"], "times": 2, "refuseFirst": { "0107": { "why": "by Q8 on the first paste: a version day and a journey attempt with no journey_days row", "code": "P0001", "contains": "0107 refused: Q8.journey_attempts = 1, Q8.version_days = 1. Nothing changed.", "then": "repair-0107-q8.sql" } } } },
-        { "sql": "assert-0107.sql" }
+        { "refresh": { "views": 6 } },
+        { "sql": "assert-0107.sql" },
+        { "sql": "assert-0107-views.sql" }
       ]
     },
     {
@@ -3066,7 +3076,9 @@
         { "refresh": { "views": 6 } },
         { "sql": "grants-0107.sql" },
         { "apply": { "label": "0107 (ADR 0024; Q2 refuses the orphan)", "files": ["0107"], "times": 2, "refuseFirst": { "0107": { "why": "by Q2: a journey-day row with no enrolment, which the context shape check would refuse", "code": "P0001", "contains": "0107 refused: Q2.orphan_day = 1. Nothing changed.", "then": "repair-0107-q2.sql" } } } },
-        { "sql": "assert-0107.sql" }
+        { "refresh": { "views": 6 } },
+        { "sql": "assert-0107.sql" },
+        { "sql": "assert-0107-views.sql" }
       ]
     },
     {
