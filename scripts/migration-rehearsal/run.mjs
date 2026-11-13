@@ -112,7 +112,13 @@ function expand(list) {
 }
 
 async function applyMigration(db, f) {
-  const sql = fs.readFileSync(path.join(MIG, f), "utf8");
+  return applyFile(db, path.join(MIG, f), 220);
+}
+
+// A whole file in one exec, as the owner pastes it (a migration, or a script
+// of the repository's ops/ folder); on an error the session is rolled back.
+async function applyFile(db, file, keep) {
+  const sql = fs.readFileSync(file, "utf8");
   const t0 = performance.now();
   try {
     await db.exec(sql);
@@ -124,7 +130,7 @@ async function applyMigration(db, f) {
     } catch {
       // nothing to roll back
     }
-    const message = String(e?.message ?? e).split("\n")[0].slice(0, 220);
+    const message = String(e?.message ?? e).split("\n")[0].slice(0, keep);
     return { ok: false, ms: performance.now() - t0, code: e?.code ?? "", message };
   }
 }
@@ -213,6 +219,91 @@ async function stepApply(db, s) {
   }
   info(`${s.label}: first pastes took ${firstMs.toFixed(0)} ms in total`);
   return allOk ? "next" : "stop";
+}
+
+// A script of the repository's ops/ folder, pasted `times` times (added for
+// ADR 0024 step 61, ops/0107-reverse.sql): `refuseFirst` = a first paste
+// that must stop with that code and message, then a file of this folder
+// (the owner's reset), then the pastes; `times: 0` with `refuseFirst` = the
+// refusal and the reset only, so a later step can run between the reset and
+// the pastes.
+async function stepScript(db, s) {
+  const file = path.join(ROOT, s.file);
+  if (!fs.existsSync(file)) {
+    check(false, `${s.label}: ${s.file} is missing`);
+    return "stop";
+  }
+  let allOk = true;
+  const refuse = s.refuseFirst;
+  if (refuse) {
+    const r = await applyFile(db, file, 1000);
+    allOk =
+      check(
+        !r.ok && r.code === refuse.code && r.message.includes(refuse.contains),
+        `${s.file}: refused ${refuse.why} (expected ${refuse.code} "${refuse.contains}…")${r.ok ? ": it APPLIED" : ""}`,
+      ) && allOk;
+    if (!r.ok) info(`refusal: ${r.code} ${r.message}`);
+    if (!(await runSqlFile(db, refuse.then))) return "stop";
+    if (s.times === 0) return allOk ? "next" : "stop";
+  }
+  const results = [];
+  for (let i = 0; i < Math.max(1, s.times ?? 1); i += 1) results.push(await applyFile(db, file, 1000));
+  const words = results.map((r, i) => {
+    const verb = i === 0 ? "applied" : "re-applied";
+    return r.ok ? verb : `${verb} FAILED (${r.code}: ${r.message})`;
+  });
+  allOk =
+    check(results.every((r) => r.ok), `${s.label}: ${s.file} ${words.join(", ")} (${results[0].ms.toFixed(0)} ms)`) &&
+    allOk;
+  return allOk ? "next" : "stop";
+}
+
+// The catalog fingerprint of schema public (fingerprint.sql), kept in memory
+// for the scenario (added for ADR 0024 step 61): `take` stores it under a
+// label; `equals` compares the database with a stored one, object by object.
+// `except` names the keys allowed to differ, each with its reason; an
+// excepted key that does not differ fails too, so the list stays exact.
+const FINGERPRINT = fs.readFileSync(path.join(HERE, "fingerprint.sql"), "utf8");
+async function stepFingerprint(db, s, prints) {
+  let now;
+  try {
+    const r = await db.query(FINGERPRINT);
+    now = new Map(r.rows.map((x) => [x.k, x.v]));
+  } catch (e) {
+    check(false, `fingerprint failed: ${e?.code ?? ""} ${String(e?.message ?? e).split("\n")[0]}`);
+    return "stop";
+  }
+  if (s.take) {
+    prints.set(s.take, now);
+    info(`fingerprint "${s.take}" taken: ${now.size} objects of schema public`);
+    return "next";
+  }
+  const was = prints.get(s.equals);
+  if (!was) {
+    check(false, `fingerprint "${s.equals}" was never taken in this scenario`);
+    return "stop";
+  }
+  const except = s.except ?? {};
+  const diffs = [...new Set([...was.keys(), ...now.keys()])].filter((k) => was.get(k) !== now.get(k));
+  const unexpected = diffs.filter((k) => !(k in except)).sort();
+  const stale = Object.keys(except).filter((k) => !diffs.includes(k)).sort();
+  const named = diffs.length - unexpected.length;
+  check(
+    unexpected.length === 0 && stale.length === 0,
+    `${s.label}: schema public equals fingerprint "${s.equals}" (${was.size} objects then, ${now.size} now; ` +
+      `${named} named exception${named === 1 ? "" : "s"})` +
+      `${unexpected.length ? `: ${unexpected.length} DIFFER` : ""}${stale.length ? `: STALE EXCEPTION ${stale.join(" ")}` : ""}`,
+  );
+  for (const k of Object.keys(except).filter((x) => diffs.includes(x)).sort()) info(`exception ${k}: ${except[k]}`);
+  const show = s.show ?? 60;
+  const cut = (x) => (x === undefined ? "(absent)" : x.replace(/\s+/g, " ").slice(0, s.width ?? 160));
+  for (const k of unexpected.slice(0, show)) {
+    info(`differs ${k}`);
+    info(`  then: ${cut(was.get(k))}`);
+    info(`  now:  ${cut(now.get(k))}`);
+  }
+  if (unexpected.length > show) info(`... and ${unexpected.length - show} more`);
+  return "next";
 }
 
 // A word rule on a migration's raw text (ADR 0014 step 2: "nothing in the
@@ -517,6 +608,7 @@ lintAudit();
 for (const sc of scenarios) {
   console.log(`\n== ${sc.name}: ${sc.title}`);
   const db = await PGlite.create();
+  const prints = new Map();
   try {
     for (const step of sc.steps) {
       const [kind, s] = Object.entries(step)[0];
@@ -527,6 +619,8 @@ for (const sc of scenarios) {
       else if (kind === "audit") next = await stepAudit(db, s, EXP.mustNotAppear);
       else if (kind === "refresh") next = await stepRefresh(db, s);
       else if (kind === "static") next = stepStatic(s);
+      else if (kind === "script") next = await stepScript(db, s);
+      else if (kind === "fingerprint") next = await stepFingerprint(db, s, prints);
       else setupError(`unknown step "${kind}" in scenario ${sc.name}`);
       if (next === "stop") {
         info(`${sc.name}: stopped here`);
