@@ -21,7 +21,9 @@
 --        badge per enrolment, one claim with its origin
 --   (35) journey_record_completion: journey rows only, the credit by day
 --        identity (a moved day, a removed day as history), the lenient pass
---        rule of R14, late, a completed enrolment, a reset enrolment
+--        rule of R14, late, a completed enrolment, a reset enrolment, and
+--        step 63's open attempt that completes after a re-pin completed its
+--        enrolment, and a completion when the credit was already there
 --   (36) the XP core and its wrapper: the wrapper's two skips and no
 --        membership exemption; points under D8(c) through the writer (paid
 --        once per course, an event row per context, the context on every
@@ -36,7 +38,8 @@
 --        (10), the writer halves), the journey credit and completion with
 --        their claim
 --   (39) sweep_completion_side_effects: no row from before the paste, the
---        two-minute floor, the completion branch only, one raising row
+--        two-minute floor, the completion branch only, a path row's step
+--        fact, one raising row
 --   (40) purge_preview_data: the scopes and their refusals, the dry run,
 --        the hash, the isolation check, the audit row, rows flagged by role
 --        never selected, the product delete, the API roles
@@ -586,6 +589,99 @@ end
 $$;
 rollback to savepoint s35b;
 
+-- (35c) step 63: the new version is shorter, every remaining required day
+-- is credited and the learner holds an open attempt on the removed day:
+-- the re-pin completes the enrolment (origin publish), the open attempt
+-- then completes, and journey_record_completion writes a history credit on
+-- the completed enrolment with no second badge or claim
+savepoint s35c;
+do $$
+declare
+  bad  text[] := '{}';
+  org  constant uuid := '00000000-0000-0000-0000-00000000000a';
+  jw   constant uuid := '00000000-0000-0000-0000-000107183001';
+  ew   constant uuid := '00000000-0000-0000-0000-000107183401';
+  u5   constant uuid := '00000000-0000-0000-0000-000107180005';
+  vw1  constant uuid := '00000000-0000-0000-0000-000107183301';
+  a    jsonb;
+  got  text;
+begin
+  perform pg_temp.att8(pg_temp.u8('000107184041'), pg_temp.u8('000107181201'), u5, 'completed', 'journey',
+                       null, ew, 1, pg_temp.u8('000107183101'), vw1, 60);
+  perform pg_temp.att8(pg_temp.u8('000107184042'), pg_temp.u8('000107181202'), u5, 'completed', 'journey',
+                       null, ew, 2, pg_temp.u8('000107183102'), vw1, 50);
+  perform pg_temp.att8(pg_temp.u8('000107184043'), pg_temp.u8('000107181203'), u5, 'in_progress', 'journey',
+                       null, ew, 3, pg_temp.u8('000107183103'), vw1, 40);
+  perform public.journey_record_completion(pg_temp.u8('000107184041'));
+  perform public.journey_record_completion(pg_temp.u8('000107184042'));
+  insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total,
+                                       count_sundays, completion_title, days, day_ids, day_ids_source, unlock_mode)
+  values (pg_temp.u8('000107183303'), jw, org, 4, 'JW (0107 writer)', 2, true, 'Done',
+          jsonb_build_array(jsonb_build_object('day', 1, 'course_id', '00000000-0000-0000-0000-000107181001'),
+                            jsonb_build_object('day', 2, 'course_id', '00000000-0000-0000-0000-000107181002')),
+          jsonb_build_object('1', '00000000-0000-0000-0000-000107183101', '2', '00000000-0000-0000-0000-000107183102'),
+          'editor', 'calendar');
+  update public.journey_programs set current_version_id = pg_temp.u8('000107183303') where id = jw;
+  a := public.journey_repin_enrollments(jw, pg_temp.u8('000107183303'), null, false);
+  if a ->> 'completed_now' <> '1' or a ->> 'started_days_kept' <> '1' then
+    bad := bad || format('the re-pin: %s (expected one completion and one started day kept)', a);
+  end if;
+  select format('%s|%s', e.status, (select string_agg(n.origin, ',') from public.completion_notices n where n.instance_id = ew))
+    into got from public.journey_enrollments e where e.id = ew;
+  if got is distinct from 'completed|publish' then
+    bad := bad || format('EW after the re-pin: %s (expected completed with one publish claim)', got);
+  end if;
+  update public.course_attempts set status = 'completed', completion_status = 'completed', success_status = 'passed',
+                                    completed_at = now()
+   where id = pg_temp.u8('000107184043');
+  a := public.journey_record_completion(pg_temp.u8('000107184043'));
+  if a ->> 'credited' <> 'true' or a ->> 'history' <> 'true' or a ->> 'day_removed' <> 'true'
+     or a ->> 'yoddha_unlocked' <> 'false' then
+    bad := bad || format('the open attempt completed after the re-pin: %s (expected a history credit)', a);
+  end if;
+  if (select count(*) from public.completion_notices n where n.instance_id = ew) <> 1
+     or (select count(*) from public.user_badges b where b.period = 'enr:' || ew::text) <> 1
+     or (select count(*) from public.journey_day_progress p where p.enrollment_id = ew) <> 3 then
+    bad := bad || 'the history credit wrote a second claim or badge, or no credit'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (35) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s35c;
+
+-- (35d) completion after a credit that was already there: every required
+-- day of EW holds a credit (the day 3 credit written earlier, its
+-- completion not run) and EW is still active; the attempt's own call finds
+-- its credit in place and still completes EW through the core
+savepoint s35d;
+do $$
+declare
+  org  constant uuid := '00000000-0000-0000-0000-00000000000a';
+  ew   constant uuid := '00000000-0000-0000-0000-000107183401';
+  u5   constant uuid := '00000000-0000-0000-0000-000107180005';
+  vw1  constant uuid := '00000000-0000-0000-0000-000107183301';
+  a    jsonb;
+  i    int;
+begin
+  perform pg_temp.att8(pg_temp.u8('000107184053'), pg_temp.u8('000107181203'), u5, 'passed', 'journey',
+                       null, ew, 3, pg_temp.u8('000107183103'), vw1, 30);
+  for i in 1..3 loop
+    insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id, course_id,
+                                             attempt_id, credit_kind)
+    values (ew, org, u5, i, pg_temp.u8('00010718310' || i), pg_temp.u8('00010718100' || i),
+            case when i = 3 then pg_temp.u8('000107184053') end, case when i = 3 then 'attempt' else 'admin' end);
+  end loop;
+  a := public.journey_record_completion(pg_temp.u8('000107184053'));
+  if a ->> 'credited' <> 'false' or a ->> 'yoddha_unlocked' <> 'true'
+     or (select status from public.journey_enrollments where id = ew) <> 'completed' then
+    raise exception 'assert-0107: (35) a credit already in place: % (expected no new credit and the completion)', a;
+  end if;
+end
+$$;
+rollback to savepoint s35d;
+
 -- ---------------------------------------------------------------------------
 -- (36) the XP core and its wrapper
 -- ---------------------------------------------------------------------------
@@ -621,6 +717,15 @@ begin
   got := pg_temp.xp8(u5, wa);
   if got <> 'ev:course_completed@individual paid:course_completed=100@individual' then
     bad := bad || format('a journey member''s Individual completion: %s', got);
+  end if;
+  -- a later passed row of the same context is not official: through the
+  -- wrapper it earns no reward (no pass marker, no event row)
+  perform pg_temp.att8(pg_temp.u8('000107185004'), pg_temp.u8('000107181201'), u5, 'passed', 'individual',
+                       null, null, null, null, null, 10, 1.0);
+  a := public.gamification_record_activity(pg_temp.u8('000107185004'));
+  got := pg_temp.xp8(u5, wa);
+  if got <> 'ev:course_completed@individual paid:course_completed=100@individual' then
+    bad := bad || format('the wrapper on a row that is not official: %s (expected no reward)', got);
   end if;
 
   -- D8(c), through the writer: U4 completes WA at 0.95 individually, then
@@ -875,6 +980,11 @@ begin
   if got is distinct from 'f/t/t/f/failed' then
     bad := bad || format('O1-g (1), tightened after: %s', got);
   end if;
+  a := public.record_learning_activity(pg_temp.u8('000107187001'));
+  if a ->> 'done' <> 'true' or a ->> 'passed_by_rule' <> 'false' or a ->> 'passed_ever' <> 'true'
+     or a -> 'done_recorded_at' = 'null'::jsonb then
+    bad := bad || format('O1-g (1), the writer''s answer after the tightening: %s (expected done by the fact)', a);
+  end if;
   -- step 2: the path completes, with its steps and its claim
   perform pg_temp.att8(pg_temp.u8('000107187002'), pg_temp.u8('000107181202'), u2, 'completed', 'path',
                        pw, null, null, null, null, 40, 0.8);
@@ -1067,7 +1177,7 @@ begin
   end if;
 
   -- S1 handled; S2 raising (its claim is refused); S3 too fresh; S4 a
-  -- preview; S5 a revision row; S6 abandoned
+  -- preview; S5 a revision row; S6 abandoned; S7 below
   perform pg_temp.att8(pg_temp.u8('000107188001'), pg_temp.u8('000107181201'), u1, 'completed', 'individual',
                        null, null, null, null, null, 30);
   perform pg_temp.att8(pg_temp.u8('000107188002'), pg_temp.u8('000107181201'), u2, 'completed', 'individual',
@@ -1083,6 +1193,11 @@ begin
   perform pg_temp.att8(pg_temp.u8('000107188006'), pg_temp.u8('000107181203'), u2, 'abandoned', 'individual',
                        null, null, null, null, null, 30);
 
+  -- S7: U2's completed official row in PW, never handled: the sweep's
+  -- completion branch writes its step fact (O1-g (5), the sweep)
+  perform pg_temp.att8(pg_temp.u8('000107188007'), pg_temp.u8('000107181201'), u2, 'completed', 'path',
+                       pg_temp.u8('000107182001'), null, null, null, null, 30);
+
   a := public.sweep_completion_side_effects(1000);
   if (a ->> 'failed')::int < 1
      or not exists (select 1 from jsonb_array_elements(a -> 'errors') e
@@ -1092,8 +1207,19 @@ begin
   end if;
   select string_agg(right(c.id::text, 4) || '=' || (c.side_effects_sig is not distinct from c.settle_sig), ',' order by c.id)
     into st from public.course_attempts c where c.id::text like '%-0001071880__';
-  if st is distinct from '8001=true,8002=false,8003=false,8004=false,8005=false,8006=false' then
-    bad := bad || format('the rows after the sweep: %s (expected S1 handled only)', st);
+  if st is distinct from '8001=true,8002=false,8003=false,8004=false,8005=false,8006=false,8007=true' then
+    bad := bad || format('the rows after the sweep: %s (expected S1 and S7 handled only)', st);
+  end if;
+  if (select string_agg(right(f.attempt_id::text, 4), ',') from public.learning_path_step_completions f
+       where f.user_id = u2) is distinct from '8007' then
+    bad := bad || 'the sweep did not write S7''s step fact'::text;
+  end if;
+  -- a second sweep: S1 and S7 are no longer candidates; S2 still is
+  a := public.sweep_completion_side_effects(1000);
+  if not exists (select 1 from jsonb_array_elements(a -> 'errors') e
+                  where e ->> 'attempt_id' = '00000000-0000-0000-0000-000107188002')
+     or (select count(*) from public.learning_path_step_completions f where f.user_id = u2) <> 1 then
+    bad := bad || format('the second sweep: %s', a);
   end if;
   -- the completion branch only: S1's points without a daily row or a day
   if exists (select 1 from public.xp_events e where e.user_id = u1 and e.rule = 'daily_activity')
@@ -1408,6 +1534,32 @@ begin
   end if;
   if (select count(*) from pg_temp.r0107w_purge) <> 10 then
     raise exception 'assert-0107: (40) % scopes ran (expected 10)', (select count(*) from pg_temp.r0107w_purge);
+  end if;
+end
+$$;
+
+-- a run named by the scope whose only attempt is set aside (a points row
+-- points at K3): the attempt and its run stay, the audit row names the
+-- excluded attempt and deletes nothing
+do $$
+declare
+  got text;
+begin
+  begin
+    insert into public.xp_events (organization_id, user_id, rule, xp, attempt_id, dedupe_key)
+    values ('00000000-0000-0000-0000-000107189900', '00000000-0000-0000-0000-000107180001', 'adjustment', 0,
+            '00000000-0000-0000-0000-000107189003', 'assert-0107w-breach-k3');
+    got := pg_temp.purge8('{"run_id": "00000000-0000-0000-0000-000107189101"}');
+    raise exception using errcode = 'R0107', message = 'assert-0107: undo';
+  exception when others then
+    if sqlstate <> 'R0107' then
+      got := 'error ' || sqlstate || ': ' || sqlerrm;
+    end if;
+  end;
+  if got is distinct from 'left 9001,9002,9003,9004,9005,9006 runs 9101,9102,9103 | counts {"state": 0, "total": 0, '
+                          || '"outbox": 0, "attempts": 0, "sessions": 0, "test_runs": 0, "statements": 0, '
+                          || '"launch_tokens": 0} | excluded 1 | same=t | log manual/0009/0/0' then
+    raise exception 'assert-0107: (40) a run whose attempt is set aside: % (expected the run kept)', got;
   end if;
 end
 $$;
