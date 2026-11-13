@@ -2466,12 +2466,14 @@
         { "sql": "assert-0107.sql" },
         { "sql": "assert-0107-views.sql" },
         { "sql": "assert-0107-functions.sql" },
+        { "sql": "assert-0107-plpgsql.sql" },
         { "sql": "seed-0107-repaste.sql" },
         { "apply": { "label": "0107 second paste (ADR 0024; rows the new code wrote in between)", "files": ["0107"], "times": 1 } },
         { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
         { "sql": "assert-0107-views.sql" },
         { "sql": "assert-0107-functions.sql" },
+        { "sql": "assert-0107-plpgsql.sql" },
         { "sql": "assert-0107-repaste.sql" }
       ]
     },
@@ -2676,12 +2678,14 @@
         { "sql": "assert-0107.sql" },
         { "sql": "assert-0107-views.sql" },
         { "sql": "assert-0107-functions.sql" },
+        { "sql": "assert-0107-plpgsql.sql" },
         { "sql": "seed-0107-repaste.sql" },
         { "apply": { "label": "0107 second paste (ADR 0024; rows the new code wrote in between)", "files": ["0107"], "times": 1 } },
         { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
         { "sql": "assert-0107-views.sql" },
         { "sql": "assert-0107-functions.sql" },
+        { "sql": "assert-0107-plpgsql.sql" },
         { "sql": "assert-0107-repaste.sql" }
       ]
     },
@@ -2883,7 +2887,8 @@
         { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
         { "sql": "assert-0107-views.sql" },
-        { "sql": "assert-0107-functions.sql" }
+        { "sql": "assert-0107-functions.sql" },
+        { "sql": "assert-0107-plpgsql.sql" }
       ]
     },
     {
@@ -3084,7 +3089,8 @@
         { "refresh": { "views": 6 } },
         { "sql": "assert-0107.sql" },
         { "sql": "assert-0107-views.sql" },
-        { "sql": "assert-0107-functions.sql" }
+        { "sql": "assert-0107-functions.sql" },
+        { "sql": "assert-0107-plpgsql.sql" }
       ]
     },
     {

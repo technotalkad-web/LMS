@@ -143,6 +143,26 @@ begin
                        '{"course_attempts": 0, "total": 0}'::jsonb, '{}'::uuid[], '{}'::uuid[], '[]'::jsonb) then
     bad := bad || 'r10, the Preview deletion record, is missing or changed'::text;
   end if;
+  -- (R11) the curriculum save of r11: the days as the save left them (Q2
+  -- removed, without a number; Q3 and Q4 on 2 and 3, with their courses),
+  -- and VQ's day_ids as the paste-window trigger wrote them before the save
+  if (select string_agg(right(d.id::text, 2) || '=' || coalesce(d.day_number::text, '-')
+                        || case when d.removed_at is not null then 'r' else '' end
+                        || '/' || right(coalesce(d.course_id::text, '-'), 2), ' ' order by d.id)
+        from public.journey_days d where d.program_id = '00000000-0000-0000-0000-000107120201')
+     is distinct from '11=1/c1 12=-r/c2 13=2/c1 14=3/01' then
+    bad := bad || format('r11, the saved days, read %s',
+                         (select string_agg(right(d.id::text, 2) || '=' || coalesce(d.day_number::text, '-')
+                                            || case when d.removed_at is not null then 'r' else '' end
+                                            || '/' || right(coalesce(d.course_id::text, '-'), 2), ' ' order by d.id)
+                            from public.journey_days d where d.program_id = '00000000-0000-0000-0000-000107120201'));
+  end if;
+  if (select (day_ids, day_ids_source) from public.journey_versions where id = '00000000-0000-0000-0000-000107120221')
+     is distinct from (jsonb_build_object('1', '00000000-0000-0000-0000-000107120211', '2', '00000000-0000-0000-0000-000107120212',
+                                          '3', '00000000-0000-0000-0000-000107120213', '4', '00000000-0000-0000-0000-000107120214'),
+                       'slot_backfill'::text) then
+    bad := bad || 'r11, VQ''s day_ids, changed or were never filled'::text;
+  end if;
   if (select count(*) from pg_policy
        where polrelid in ('public.learning_path_completions'::regclass, 'public.learning_path_step_completions'::regclass,
                           'public.completion_notices'::regclass, 'public.preview_purge_log'::regclass)) <> 4 then

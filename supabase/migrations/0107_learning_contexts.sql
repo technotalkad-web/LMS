@@ -22,16 +22,20 @@
 -- path views), section 5, which is item 5 whole (official_attempt_in_context,
 -- instance_pass_required, journey_attempt_satisfies, journey_credit_state,
 -- and journey_reminder_counts dropped and created with its fourth column),
--- and of item 6 only the paste-window day_ids trigger on journey_versions
--- (section 6). Not built yet: the rest of item 6 and item 7; nothing writes
--- the four new tables yet, and of the four new functions only
--- journey_credit_state has a caller (journey_reminder_counts). On this
--- build the old bodies still run and some now fail: the 0089
+-- and of item 6 the paste-window day_ids trigger on journey_versions, the
+-- two delete guards, both forms of record_revision_visit and of
+-- consume_grant, journey_save_days and journey_repin_enrollments (section
+-- 6). Not built yet: the rest of item 6 (purge_preview_data,
+-- journey_record_completion, the completion core and its two wrappers,
+-- record_learning_activity, the sweep, the two refresh functions, the XP
+-- core, its wrapper and gamification_close_month, journey_auto_enroll and
+-- launch_context) and item 7; nothing writes the four new tables yet. On
+-- this build the old bodies still run and some now fail: the 0089
 -- journey_record_completion names the dropped credit key as its conflict
 -- target (42P10) and its untagged branch re-tags an attempt (refused by the
--- immutability trigger); the old consume_grant inserts a retake that the
--- derive trigger labels. Do not paste a build of this file that still
--- carries this paragraph.
+-- immutability trigger); a real run of journey_repin_enrollments calls the
+-- completion core, which a later section creates. Do not paste a build of
+-- this file that still carries this paragraph.
 --
 -- ORDER (ADR 0024 steps 73 and 74):
 --   Staging: after pull request 1 (this file, 0108, the rehearsal, the pure
@@ -180,6 +184,8 @@
 --   0058  the journey tables (programs, days, versions, enrolments,
 --         day progress), journey_enrollments.version_id and
 --         journey_day_progress.completed_at (section 5);
+--         journey_enrollments.start_date, journey_programs.current_version_id
+--         and journey_days.course_id and mission_title (section 6);
 --         course_attempts.journey_enrollment_id with its foreign key, and
 --         journey_day; gamification_record_activity(uuid) (the wrapper) and
 --         journey_record_completion(uuid)
@@ -190,8 +196,9 @@
 --   0071  org_api_keys, org_integration_settings
 --   0081  courses.pass_required, effective_attempt_policy(uuid)
 --   0082  course_attempts.completion_webhook_at
---   0083  attempt_requests (used_attempt_id); its open-request index, or
---         this file's
+--   0083  attempt_requests (used_attempt_id; decided_at, decision_note,
+--         expires_at and used_at, which consume_grant reads in section 6);
+--         its open-request index, or this file's
 --   0084  gamification_record_activity_core(uuid); xp_events_rule_check
 --         admits 'course_passed'
 --   0088  journey_programs.unlock_mode, journey_versions.unlock_mode
@@ -396,7 +403,15 @@ begin
       ('journey_versions',         'days_total',            '0058'),
       ('journey_versions',         'count_sundays',         '0058'),
       ('journey_enrollments',      'version_id',            '0058'),
+      ('journey_enrollments',      'start_date',            '0058'),
+      ('journey_programs',         'current_version_id',    '0058'),
+      ('journey_days',             'course_id',             '0058'),
+      ('journey_days',             'mission_title',         '0058'),
       ('journey_day_progress',     'completed_at',          '0058'),
+      ('attempt_requests',         'decided_at',            '0083'),
+      ('attempt_requests',         'decision_note',         '0083'),
+      ('attempt_requests',         'expires_at',            '0083'),
+      ('attempt_requests',         'used_at',               '0083'),
       ('courses',                  'pass_required',         '0081'),
       ('attempt_requests',         'used_attempt_id',       '0083'),
       ('attempt_requests',         'reissued_from',         '0103'),
@@ -3398,9 +3413,14 @@ grant execute on function public.journey_reminder_counts(uuid[]) to service_role
 -- ---------------------------------------------------------------------------
 -- In any order among themselves: a plpgsql body is parsed when it is created
 -- and resolves its objects when it first runs. Sections 3 to 5 (creation
--- order items 3 to 5) come before this one. This build holds one function of
--- the item, the paste-window trigger function on journey_versions, followed
--- by its trigger.
+-- order items 3 to 5) come before this one. Every function states security
+-- definer or security invoker and set search_path = pg_catalog, public, and
+-- names its relations with their schema: a create or replace that leaves
+-- either out resets it while a trigger stays bound (note N5, spike 6). This
+-- build holds, of the item: the paste-window trigger function on
+-- journey_versions with its trigger (6a), the two delete guards (6b), both
+-- forms of record_revision_visit (6c), both forms of consume_grant (6d),
+-- journey_save_days (6e) and journey_repin_enrollments (6f).
 
 -- 6a. journey_versions_derive_day_ids (step 91, note N6): for the paste
 -- window only; 0108 drops it and sets day_ids not null. The publish before
@@ -3467,6 +3487,960 @@ create trigger journey_versions_derive_day_ids
   for each row
   when (new.day_ids is null)
   execute function public.journey_versions_derive_day_ids();
+
+-- 6b. The two delete guards (step 7; note N5; row L2, answered no): recreated
+-- by create or replace from their latest bodies (0100:511-576, grants
+-- 0100:578-581), so the two triggers of 0098:249-257 stay bound and are not
+-- recreated. One clause changes in each: the count's `and not a.is_preview`
+-- becomes `and (not a.is_preview or a.preview_kind = 'legacy_role')`, so the
+-- guards count every attempt that is not a preview of one of the three new
+-- kinds: every learner attempt, as before, and every row flagged as a
+-- preview by role, which section 1 (1f) labelled legacy_role and which is
+-- never deleted (step 82). The clause is written in that form on purpose:
+-- preview_kind is null on every official row, so a test such as
+-- `preview_kind not in (...)` would read null there and stop counting
+-- learner attempts. The hint gains ADR 0024. Everything else is kept as it
+-- is: security definer, the pinned search_path, the claim read with its
+-- nullif, the return at once for the service role (so the e2e purge, the
+-- lifecycle cleanup and the upload rollbacks still delete by-role rows with
+-- everything else), the exception name learner_history_exists (the routes
+-- match on that text), the detail text, and the revoke and grant. 0098 and
+-- 0100 are never pasted again (header).
+create or replace function public.guard_learner_history_course_versions()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  claim_role text := coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  learner_attempts bigint;
+begin
+  if claim_role = 'service_role' then
+    return old;
+  end if;
+  select count(*) into learner_attempts
+  from public.course_attempts a
+  where a.course_version_id = old.id
+    and (not a.is_preview or a.preview_kind = 'legacy_role');
+  if learner_attempts > 0 then
+    raise exception 'learner_history_exists'
+      using detail = format(
+              'course_versions %s holds %s learner attempt(s). Deactivate the package or make another version current instead.',
+              old.id, learner_attempts
+            ),
+            hint = 'Learner history is never deleted (ADR 0003 step 10; is_preview since 0100; rows flagged by role counted since ADR 0024).';
+  end if;
+  return old;
+end
+$$;
+
+create or replace function public.guard_learner_history_courses()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  claim_role text := coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  learner_attempts bigint;
+begin
+  if claim_role = 'service_role' then
+    return old;
+  end if;
+  select count(*) into learner_attempts
+  from public.course_attempts a
+  join public.course_versions v on v.id = a.course_version_id
+  where v.course_id = old.id
+    and (not a.is_preview or a.preview_kind = 'legacy_role');
+  if learner_attempts > 0 then
+    raise exception 'learner_history_exists'
+      using detail = format(
+              'courses %s holds %s learner attempt(s). Deactivate the course instead.',
+              old.id, learner_attempts
+            ),
+            hint = 'Learner history is never deleted (ADR 0003 step 10; is_preview since 0100; rows flagged by role counted since ADR 0024).';
+  end if;
+  return old;
+end
+$$;
+
+revoke execute on function public.guard_learner_history_course_versions() from public, anon, authenticated;
+grant execute on function public.guard_learner_history_course_versions() to service_role;
+revoke execute on function public.guard_learner_history_courses() from public, anon, authenticated;
+grant execute on function public.guard_learner_history_courses() to service_role;
+
+-- 6c. record_revision_visit (step 11). The seven-argument form adds
+-- p_context_key text with no default (a default would make the six-name call
+-- ambiguous for PostgREST): the 0103 body (0103:656-683, grants
+-- 0103:685-686) with its advisory lock and 10-second dedupe keyed (learner,
+-- course, context) in place of (learner, course), and the visit row's
+-- context_key written. The six-argument form keeps its signature and becomes
+-- a wrapper passing 'individual': the launch code before phase 2 labels
+-- every visit Individual, path and journey visits included, and for those
+-- callers the dedupe answers as before. Both keep security definer; the
+-- search_path is pinned (0103 set it to public alone). Grants restated on
+-- both. 0103 is never pasted again (header).
+create or replace function public.record_revision_visit(
+  p_org uuid,
+  p_user uuid,
+  p_course uuid,
+  p_version uuid,
+  p_attempt uuid,
+  p_kind text,
+  p_context_key text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  perform pg_advisory_xact_lock(hashtext(p_user::text || ':' || p_course::text || ':' || p_context_key));
+  if exists (
+    select 1 from public.revision_visits v
+     where v.user_id = p_user and v.course_id = p_course and v.context_key = p_context_key
+       and v.launched_at > now() - interval '10 seconds'
+  ) then
+    return false;
+  end if;
+  insert into public.revision_visits
+    (organization_id, user_id, course_id, course_version_id, attempt_id, launch_kind, context_key)
+  values (p_org, p_user, p_course, p_version, p_attempt, p_kind, p_context_key);
+  return true;
+end;
+$$;
+
+comment on function public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text, text) is
+  'One revision visit row, deduplicated over 10 seconds per (learner, course, context_key) (ADR 0024 step 11). Service role only.';
+
+revoke execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text, text) from public, anon, authenticated;
+grant execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text, text) to service_role;
+
+create or replace function public.record_revision_visit(
+  p_org uuid,
+  p_user uuid,
+  p_course uuid,
+  p_version uuid,
+  p_attempt uuid,
+  p_kind text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  return public.record_revision_visit(p_org, p_user, p_course, p_version, p_attempt, p_kind, 'individual');
+end;
+$$;
+
+revoke execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text) to service_role;
+
+-- 6d. consume_grant (step 10; note N9): an approved grant consumed in one
+-- transaction, in one context. The nine-argument form adds p_journey_day_id
+-- uuid with no default (a default would make the eight-name call ambiguous
+-- for PostgREST); its body is the 0103 body (0103:721-905, grants
+-- 0103:907-908) with these changes and nothing else:
+--   - the context is computed from the three tags with the derive trigger's
+--     precedence (journey when p_journey_enrollment_id is given, the path
+--     tag then ignored; else path; else individual); the journey key names
+--     the day id, so a journey call whose day id is null has no key;
+--   - the grant lock matches that context as well (0103 matched id,
+--     learner, course and status): a grant of another context, a journey
+--     call with no day id, and a day id that differs from the grant's
+--     journey_day_id (it is part of the key) answer unavailable with
+--     nothing written; the grant's own context_key is read only here (N9);
+--   - for a journey context the enrolment row is locked after the grant, and
+--     the version it is pinned to is read from that locked row; the retake
+--     records it (journey_version_id) with the day id (A27);
+--   - retake_live, the official result, stands and the abandon read attempt
+--     rows of this context only (context_key); the live-retake test is on
+--     the retake row's own context, and the grant that names it may be of
+--     any context (N9);
+--   - the current official result is official_attempt_in_context (section
+--     5a, the one official rule), in place of 0103's chain query;
+--   - stands reads instance_pass_required (section 5b) in place of
+--     courses.pass_required; for a journey row it is the lenient rule of
+--     step 13: journey_attempt_satisfies (section 5c) with the pinned
+--     version's rule, and not failed;
+--   - the insert names context_kind and the tags that kind admits (0108
+--     removes the derive trigger), so a tag the context does not use is
+--     never written.
+-- Outcomes, in this order, under the grant row's lock: unavailable; (22023)
+-- version, course or organisation mismatch, raised; used; expired;
+-- retake_live; stale; stands; opened, as in 0103 (comment at 0103:690-719).
+-- Lock order in both forms: the grant, then the enrolment, then
+-- course_attempts rows. journey_record_completion and the re-pin lock the
+-- enrolment and no grant, so no cycle exists. A preview never reaches either
+-- form (step 37). 0103 is never pasted again (header).
+create or replace function public.consume_grant(
+  p_grant_id uuid,
+  p_user_id uuid,
+  p_course_id uuid,
+  p_version_id uuid,
+  p_org_id uuid,
+  p_learning_path_id uuid,
+  p_journey_enrollment_id uuid,
+  p_journey_day integer,
+  p_journey_day_id uuid
+)
+returns table (outcome text, attempt_id uuid, abandoned_ids uuid[])
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_grant         public.attempt_requests%rowtype;
+  v_kind          text;
+  v_key           text;
+  v_pinned        uuid;
+  v_pass_required boolean;
+  v_has_official  boolean;
+  v_off_id        uuid;
+  v_off_completed timestamptz;
+  v_off_started   timestamptz;
+  v_off_success   text;
+  v_off_when      text;
+  v_abandoned     uuid[];
+  v_new           uuid;
+begin
+  -- 0. the context the three tags name (the derive trigger's precedence); a
+  -- journey key with no day id is null and matches no grant
+  v_kind := case when p_journey_enrollment_id is not null then 'journey'
+                 when p_learning_path_id is not null then 'path'
+                 else 'individual' end;
+  v_key := case v_kind
+             when 'journey' then 'journey:' || p_journey_enrollment_id::text || ':' || p_journey_day_id::text
+             when 'path'    then 'path:' || p_learning_path_id::text
+             else 'individual'
+           end;
+
+  -- 1. the grant row, locked, in this context
+  select ar.* into v_grant
+    from public.attempt_requests ar
+   where ar.id = p_grant_id
+     and ar.user_id = p_user_id
+     and ar.course_id = p_course_id
+     and ar.status = 'approved'
+     and ar.context_key = v_key
+     for update;
+  if not found then
+    return query select 'unavailable'::text, null::uuid, '{}'::uuid[];
+    return;
+  end if;
+
+  -- 2. consistency (beyond the ADR; ADR 0014 addendum note)
+  if v_grant.organization_id is distinct from p_org_id
+     or not exists (
+       select 1 from public.course_versions cv
+        where cv.id = p_version_id and cv.course_id = p_course_id
+     ) then
+    raise exception 'consume_grant: version, course or organisation mismatch'
+      using errcode = '22023';
+  end if;
+
+  -- 2b. a journey context: the enrolment row, locked after the grant, and
+  -- the version it is pinned to
+  if v_kind = 'journey' then
+    select e.version_id into v_pinned
+      from public.journey_enrollments e
+     where e.id = p_journey_enrollment_id
+       for update;
+  end if;
+
+  -- 3. used, expired
+  if v_grant.used_at is not null then
+    return query select 'used'::text, null::uuid, '{}'::uuid[];
+    return;
+  end if;
+  if v_grant.expires_at is not null and v_grant.expires_at < now() then
+    return query select 'expired'::text, null::uuid, '{}'::uuid[];
+    return;
+  end if;
+
+  -- 4. retake_live (in this context: the retake row's own context_key)
+  if exists (
+    select 1
+      from public.course_attempts ca
+      join public.course_versions cv on cv.id = ca.course_version_id
+     where ca.user_id = p_user_id
+       and cv.course_id = p_course_id
+       and ca.context_key = v_key
+       and ca.status = 'in_progress'
+       and ca.completion_status is distinct from 'completed'
+       and ca.success_status is distinct from 'passed'
+       and not ca.is_revision
+       and exists (
+         select 1 from public.attempt_requests ar2
+          where ar2.used_attempt_id = ca.id
+            and ar2.status = 'approved'
+            and ar2.id <> p_grant_id
+       )
+  ) then
+    return query select 'retake_live'::text, null::uuid, '{}'::uuid[];
+    return;
+  end if;
+
+  -- 5. the current official result in this context (the official rule of
+  -- section 4a, through official_attempt_in_context) and its pass rule
+  v_pass_required := public.instance_pass_required(p_course_id, v_key);
+
+  v_off_id := public.official_attempt_in_context(p_user_id, p_course_id, v_key);
+  select ca.completed_at, ca.started_at, ca.success_status
+    into v_off_completed, v_off_started, v_off_success
+    from public.course_attempts ca
+   where ca.id = v_off_id;
+  v_has_official := found;
+  -- the date the two note suffixes name (started_at is not null, so this is
+  -- never null and the suffix never empties an existing note)
+  v_off_when := to_char(coalesce(v_off_completed, v_off_started) at time zone 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC';
+
+  -- 6. stale (a null decided_at is never stale)
+  if v_has_official
+     and v_grant.decided_at is not null
+     and v_off_completed is not null
+     and v_grant.decided_at < v_off_completed then
+    update public.attempt_requests ar
+       set status = 'expired',
+           decision_note = coalesce(ar.decision_note || ' ', '')
+             || 'expired unused: decided before the learner''s current official result of '
+             || v_off_when
+     where ar.id = p_grant_id;
+    return query select 'stale'::text, null::uuid, '{}'::uuid[];
+    return;
+  end if;
+
+  -- 7. stands (the SQL twin of officialDone and officialStatus <> 'failed');
+  -- a journey row by the lenient rule of step 13 (R14)
+  if v_has_official
+     and (case when v_kind = 'journey'
+               then public.journey_attempt_satisfies(v_off_id, v_pass_required)
+                    and v_off_success is distinct from 'failed'
+               else v_off_success = 'passed'
+                    or (v_off_success is distinct from 'failed' and not v_pass_required)
+          end)
+     and not v_grant.override_confirmed then
+    update public.attempt_requests ar
+       set status = 'expired',
+           decision_note = coalesce(ar.decision_note || ' ', '')
+             || 'expired unused: the learner''s official result of '
+             || v_off_when
+             || ' stands and this grant carries no post-pass confirmation'
+     where ar.id = p_grant_id;
+    return query select 'stands'::text, null::uuid, '{}'::uuid[];
+    return;
+  end if;
+
+  -- 8. opened: abandon (in this context), insert, stamp (a plain update ...
+  -- returning into would raise on more than one row)
+  with ab as (
+    update public.course_attempts ca
+       set status = 'abandoned'
+     where ca.user_id = p_user_id
+       and ca.context_key = v_key
+       and ca.status = 'in_progress'
+       and ca.course_version_id in (
+         select cv.id from public.course_versions cv where cv.course_id = p_course_id
+       )
+    returning ca.id
+  )
+  select coalesce(array_agg(ab.id), '{}'::uuid[]) into v_abandoned from ab;
+
+  insert into public.course_attempts as ca
+    (course_version_id, user_id, organization_id, status, cmi_data, is_revision, context_kind,
+     learning_path_id, journey_enrollment_id, journey_day, journey_day_id, journey_version_id)
+  values
+    (p_version_id, p_user_id, p_org_id, 'in_progress', '{}'::jsonb, false, v_kind,
+     case when v_kind = 'path' then p_learning_path_id end,
+     case when v_kind = 'journey' then p_journey_enrollment_id end,
+     case when v_kind = 'journey' then p_journey_day end,
+     case when v_kind = 'journey' then p_journey_day_id end,
+     case when v_kind = 'journey' then v_pinned end)
+  returning ca.id into v_new;
+
+  update public.attempt_requests ar
+     set used_at = now(),
+         used_attempt_id = v_new
+   where ar.id = p_grant_id
+     and ar.used_at is null;
+
+  return query select 'opened'::text, v_new, v_abandoned;
+end;
+$$;
+
+comment on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uuid, uuid, integer, uuid) is
+  'An approved grant consumed in one transaction, in the context the tags name; the journey form names the day id (ADR 0024 step 10). Service role only.';
+
+revoke execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uuid, uuid, integer, uuid) from public, anon, authenticated;
+grant execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uuid, uuid, integer, uuid) to service_role;
+
+-- The eight-argument form keeps its signature (0103:721-731) for the launch
+-- code before phase 2, as a wrapper. Its first statement is the grant lock
+-- of 0103:748-754; only then does it lock the enrolment row of a journey
+-- call and resolve p_journey_day to its day id through the version that row
+-- is pinned to; then it calls the nine-argument form, which takes the same
+-- two locks in the same order (the transaction already holds them). A
+-- wrapper that took the enrolment lock first could deadlock two launches of
+-- one learner. A journey day the pinned version does not map resolves to
+-- null, and the nine-argument form answers unavailable. 0108's
+-- preconditions end its use; it stays a wrapper.
+create or replace function public.consume_grant(
+  p_grant_id uuid,
+  p_user_id uuid,
+  p_course_id uuid,
+  p_version_id uuid,
+  p_org_id uuid,
+  p_learning_path_id uuid,
+  p_journey_enrollment_id uuid,
+  p_journey_day integer
+)
+returns table (outcome text, attempt_id uuid, abandoned_ids uuid[])
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_day_id uuid;
+begin
+  -- 1. the grant row, locked first
+  perform 1
+    from public.attempt_requests ar
+   where ar.id = p_grant_id
+     and ar.user_id = p_user_id
+     and ar.course_id = p_course_id
+     and ar.status = 'approved'
+     for update;
+
+  -- 2. a journey call: the enrolment row, locked, and the day id of
+  -- p_journey_day in the version it is pinned to
+  if p_journey_enrollment_id is not null then
+    select (jv.day_ids ->> p_journey_day::text)::uuid
+      into v_day_id
+      from public.journey_enrollments e
+      join public.journey_versions jv on jv.id = e.version_id
+     where e.id = p_journey_enrollment_id
+       for update of e;
+  end if;
+
+  -- 3. the nine-argument form
+  return query
+    select g.outcome, g.attempt_id, g.abandoned_ids
+      from public.consume_grant(p_grant_id, p_user_id, p_course_id, p_version_id, p_org_id,
+                                p_learning_path_id, p_journey_enrollment_id, p_journey_day, v_day_id) g;
+end;
+$$;
+
+revoke execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uuid, uuid, integer) from public, anon, authenticated;
+grant execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uuid, uuid, integer) to service_role;
+
+-- 6e. journey_save_days (steps 92 and 46; section U; spike 5): the curriculum
+-- save by day identity, in one transaction. Security invoker, so the admin
+-- write policy of journey_days (0058) still decides; execute is revoked from
+-- public and anon and granted to authenticated and service_role (step 92).
+-- p_days is a JSON array of day objects, each with the full shape (a key
+-- left out reads null, so a day keeps its content only by sending it):
+--   id             uuid of an existing day of this program; null = a new day
+--   day_number     its number after the save (1 to 365); ignored when removed
+--   course_id      the day's module; null = a rest day
+--   mission_title  text or null
+--   pass_required  boolean or null (null = inherit the course's rule)
+--   removed        true = remove the day (it is kept, without a number)
+-- In order: the save is checked (an array of objects, no new day removed, no
+-- day named twice, no number given twice); the program row is read and
+-- every named day is locked, and each must be a day of this program that the
+-- session may change; a removed day cannot be given a number again; the
+-- numbers of the days that move or are removed are cleared; removed days are
+-- marked; the named days get their numbers and content; new days are
+-- inserted; and the save raises if a day that is not removed is left
+-- without a number. Clearing first keeps today's non-deferrable unique
+-- (program_id, day_number) (0058:73), which the old editor's upsert needs
+-- through the paste window (spike 5). Days not named are left as they are.
+-- Every refusal is 22023 with a fixed message and writes nothing (the call
+-- is one transaction). The answer counts the save: saved (entries),
+-- renumbered (named days whose number changed), removed, inserted.
+create or replace function public.journey_save_days(p_program_id uuid, p_days jsonb)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = pg_catalog, public
+as $$
+declare
+  v_org        uuid;
+  v_saved      integer;
+  v_named      integer;
+  v_locked     integer;
+  v_renumbered integer;
+  v_removed    integer;
+  v_inserted   integer;
+begin
+  -- 1. the save itself
+  if jsonb_typeof(p_days) is distinct from 'array' then
+    raise exception 'journey_save_days: the days must be a JSON array of day objects (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  if exists (select 1 from jsonb_array_elements(p_days) as d(e) where jsonb_typeof(d.e) <> 'object') then
+    raise exception 'journey_save_days: the days must be a JSON array of day objects (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  if exists (select 1 from jsonb_to_recordset(p_days) as x(id uuid, removed boolean)
+              where x.id is null and coalesce(x.removed, false)) then
+    raise exception 'journey_save_days: a new day cannot be removed (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  if exists (select 1 from jsonb_to_recordset(p_days) as x(id uuid)
+              where x.id is not null group by x.id having count(*) > 1) then
+    raise exception 'journey_save_days: a day is named twice in the save (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  if exists (select 1 from jsonb_to_recordset(p_days) as x(day_number integer, removed boolean)
+              where x.day_number is not null and not coalesce(x.removed, false)
+              group by x.day_number having count(*) > 1) then
+    raise exception 'journey_save_days: two days of the save share a number (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  v_saved := jsonb_array_length(p_days);
+
+  -- 2. the program, and every named day locked: each must be a day of this
+  -- program that this session may change (the row-level policies decide)
+  select jp.organization_id into v_org
+    from public.journey_programs jp
+   where jp.id = p_program_id;
+  if not found then
+    raise exception 'journey_save_days: this session reads no journey program with this id (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  select count(*) into v_named
+    from (select distinct x.id from jsonb_to_recordset(p_days) as x(id uuid) where x.id is not null) n;
+  select count(*) into v_locked
+    from (select d.id
+            from public.journey_days d
+           where d.program_id = p_program_id
+             and d.id in (select x.id from jsonb_to_recordset(p_days) as x(id uuid))
+             for update) l;
+  if v_locked <> v_named then
+    raise exception 'journey_save_days: a day of the save is not a day of this program that this session may change (ADR 0024)'
+      using errcode = '22023';
+  end if;
+  if exists (select 1
+               from public.journey_days d
+               join jsonb_to_recordset(p_days) as x(id uuid, removed boolean) on x.id = d.id
+              where d.program_id = p_program_id
+                and d.removed_at is not null
+                and not coalesce(x.removed, false)) then
+    raise exception 'journey_save_days: a removed day cannot be given a number again (ADR 0024)'
+      using errcode = '22023';
+  end if;
+
+  -- 3. clear the numbers of the days that move or are removed
+  select count(*) into v_renumbered
+    from public.journey_days d
+    join jsonb_to_recordset(p_days) as x(id uuid, day_number integer, removed boolean) on x.id = d.id
+   where d.program_id = p_program_id
+     and not coalesce(x.removed, false)
+     and d.day_number is distinct from x.day_number;
+  update public.journey_days d
+     set day_number = null
+    from jsonb_to_recordset(p_days) as x(id uuid, day_number integer, removed boolean)
+   where d.id = x.id
+     and d.program_id = p_program_id
+     and d.day_number is not null
+     and (coalesce(x.removed, false) or d.day_number is distinct from x.day_number);
+
+  -- 4. mark the removed days (a day already removed keeps its time)
+  update public.journey_days d
+     set removed_at = now()
+    from jsonb_to_recordset(p_days) as x(id uuid, removed boolean)
+   where d.id = x.id
+     and d.program_id = p_program_id
+     and coalesce(x.removed, false)
+     and d.removed_at is null;
+  get diagnostics v_removed = row_count;
+
+  -- 5. the named days: their numbers and their content
+  update public.journey_days d
+     set day_number = x.day_number,
+         course_id = x.course_id,
+         mission_title = x.mission_title,
+         pass_required = x.pass_required
+    from jsonb_to_recordset(p_days)
+         as x(id uuid, day_number integer, course_id uuid, mission_title text, pass_required boolean, removed boolean)
+   where d.id = x.id
+     and d.program_id = p_program_id
+     and not coalesce(x.removed, false);
+
+  -- 6. the new days
+  insert into public.journey_days (program_id, organization_id, day_number, course_id, mission_title, pass_required)
+  select p_program_id, v_org, x.day_number, x.course_id, x.mission_title, x.pass_required
+    from jsonb_to_recordset(p_days)
+         as x(id uuid, day_number integer, course_id uuid, mission_title text, pass_required boolean)
+   where x.id is null;
+  get diagnostics v_inserted = row_count;
+
+  -- 7. no day that is not removed is left without a number
+  if exists (select 1 from public.journey_days d
+              where d.program_id = p_program_id and d.removed_at is null and d.day_number is null) then
+    raise exception 'journey_save_days: a day that is not removed was left without a number (ADR 0024)'
+      using errcode = '22023';
+  end if;
+
+  return jsonb_build_object('saved', v_saved, 'renumbered', v_renumbered,
+                            'removed', v_removed, 'inserted', v_inserted);
+end
+$$;
+
+comment on function public.journey_save_days(uuid, jsonb) is
+  'The journey curriculum save by day identity, in one transaction: moves, inserts and removals (a removed day is kept without a number) (ADR 0024 step 92). Security invoker: the admin write policy of journey_days decides.';
+
+revoke execute on function public.journey_save_days(uuid, jsonb) from public, anon;
+grant execute on function public.journey_save_days(uuid, jsonb) to authenticated, service_role;
+
+-- 6f. journey_repin_enrollments (steps 94, 95 and 47; section U; decision
+-- A27): the publish to all enrolled learners in one transaction, and its
+-- dry run. Security definer, service role only; no argument has a default.
+-- Two forms, and only these: a real run names the version to pin
+-- (p_version_id, p_draft null, p_dry_run false), which must belong to the
+-- program and be its current version; a dry run names no version and passes
+-- the would-be version as p_draft ({"days", "day_ids", "days_total"}, as the
+-- publish will freeze them; p_dry_run true). Both read the target into the
+-- same locals and compare every active enrolment of the program with it by
+-- the same statement, which computes every count before any write and
+-- writes only in a real run, so the dry run's counts are the real run's.
+-- A target is read as section 5 reads a version: a days entry's day is a
+-- number of one to six digits; a day number listed twice is one day, its
+-- course the first entry's that has one and its rule the first entry's; a
+-- required day carries a course and is numbered 1 to days_total; a day's id
+-- is its day_ids entry.
+-- A real run locks the active enrolments in id order. For each one not
+-- already pinned to the target:
+--   the gate (step 94): an enrolment pinned to a slot_backfill version is
+--     re-pinned only when the first day number at which the pinned version
+--     and the target differ (the course or none, beyond days_total on one
+--     side only, or the resolved pass rule of a day whose course is the
+--     same) is above its furthest day (the higher of its top credited day
+--     number and the top journey_day of its attempts that are not
+--     previews, as Q9 reads it); otherwise it stays on its version and is
+--     counted in kept_on_version. Any other enrolment is re-pinned.
+--   the credits of a relaxed rule (step 95): on a re-pinned enrolment, a
+--     required day of the target with no credit whose context holds an
+--     official attempt that satisfies the target's rule for that day
+--     (journey_attempt_satisfies with the day's rule in the target, else the
+--     attempt's course's rule) is credited with that attempt (credit_kind
+--     attempt; the day's number in the target; completed_at at the credit,
+--     the column default; late when the credit's date in the organisation's
+--     timezone is after the day's counted date in a calendar journey, the
+--     counted days of 0089:126-134 from the enrolment's start date). Where
+--     the context holds official attempts on two courses, the target's
+--     course is taken first. No credit is removed.
+-- Then a real run calls the completion core with the origin publish on
+-- every active enrolment of the program (step 13), and completed_now is the
+-- number it completed; a dry run computes the same set by the same rule
+-- (required days above 0, each credited by day identity) on the target for
+-- a re-pinned enrolment and through journey_credit_state on the pinned
+-- version for any other. The counts (step 47): repinned; kept_on_version;
+-- completed_now; sent_back (re-pinned enrolments whose open day moves to a
+-- lower number); started_days_kept (open official attempts of re-pinned
+-- enrolments on a required day of the pinned version that the target
+-- removes, renumbers or gives another course; each stays resumable);
+-- credits_now_history (credits of re-pinned enrolments on a required day of
+-- the pinned version that the target does not require);
+-- credited_by_rule_change. Completed and reset enrolments are never
+-- selected. No attempt row and no credit row is updated or deleted.
+-- Idempotent for the program's current version: a second real run finds
+-- every enrolment pinned to it, or kept, and writes nothing new.
+create or replace function public.journey_repin_enrollments(
+  p_program_id uuid,
+  p_version_id uuid,
+  p_draft jsonb,
+  p_dry_run boolean
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_days          jsonb;
+  v_day_ids       jsonb;
+  v_days_total    integer;
+  v_calendar      boolean := false;
+  v_count_sundays boolean := false;
+  v_tz            text;
+  v_today         date;
+  v_ids           uuid[];
+  v_c             record;
+  v_completed     integer;
+begin
+  -- 1. the target
+  if p_dry_run is false and p_version_id is not null and p_draft is null then
+    select jv.days, coalesce(jv.day_ids, '{}'::jsonb), jv.days_total,
+           coalesce(jv.unlock_mode, 'calendar') = 'calendar', jv.count_sundays
+      into v_days, v_day_ids, v_days_total, v_calendar, v_count_sundays
+      from public.journey_versions jv
+      join public.journey_programs jp on jp.id = jv.program_id
+     where jv.id = p_version_id
+       and jv.program_id = p_program_id
+       and jp.current_version_id = jv.id;
+    if not found then
+      raise exception 'journey_repin_enrollments: the version is not the current version of this program (ADR 0024)'
+        using errcode = '22023';
+    end if;
+  elsif p_dry_run is true and p_version_id is null and p_draft is not null then
+    if jsonb_typeof(p_draft -> 'days') is distinct from 'array'
+       or jsonb_typeof(p_draft -> 'day_ids') is distinct from 'object'
+       or coalesce(p_draft ->> 'days_total', '') !~ '^[0-9]{1,3}$' then
+      raise exception 'journey_repin_enrollments: the draft needs days (an array), day_ids (an object) and days_total (a whole number) (ADR 0024)'
+        using errcode = '22023';
+    end if;
+    v_days := p_draft -> 'days';
+    v_day_ids := p_draft -> 'day_ids';
+    v_days_total := (p_draft ->> 'days_total')::integer;
+  else
+    raise exception 'journey_repin_enrollments: a real run names a version and no draft; a dry run names a draft and no version (ADR 0024)'
+      using errcode = '22023';
+  end if;
+
+  select coalesce(gs.timezone, 'Asia/Kolkata') into v_tz
+    from public.journey_programs jp
+    left join public.gamification_settings gs on gs.organization_id = jp.organization_id
+   where jp.id = p_program_id;
+  v_today := (now() at time zone coalesce(v_tz, 'Asia/Kolkata'))::date;
+
+  -- 2. the program's active enrolments, in id order; a real run locks them
+  if p_dry_run then
+    select coalesce(array_agg(e.id order by e.id), '{}'::uuid[]) into v_ids
+      from public.journey_enrollments e
+     where e.program_id = p_program_id and e.status = 'active';
+  else
+    select coalesce(array_agg(l.id order by l.id), '{}'::uuid[]) into v_ids
+      from (select e.id
+              from public.journey_enrollments e
+             where e.program_id = p_program_id and e.status = 'active'
+             order by e.id
+               for update) l;
+  end if;
+
+  -- 3. compare and count on one snapshot, and write in a real run only
+  with
+  ver as (
+    -- the target (version_id null) and every version an enrolment is pinned to
+    select null::uuid as version_id, v_days as days, coalesce(v_day_ids, '{}'::jsonb) as day_ids,
+           v_days_total as days_total
+    union all
+    select jv.id, jv.days, coalesce(jv.day_ids, '{}'::jsonb), jv.days_total
+      from public.journey_versions jv
+     where jv.id in (select e.version_id from public.journey_enrollments e where e.id = any(v_ids))
+  ),
+  vday as (
+    -- one row per (version, day number)
+    select g.version_id, g.day_number, g.course_id, g.rule, g.day_id,
+           (g.course_id is not null and g.day_number between 1 and g.days_total) as required
+      from (
+        select v.version_id, v.days_total, x.day_number,
+               (array_agg(x.course_id order by x.ord) filter (where x.course_id is not null))[1] as course_id,
+               (array_agg(x.rule order by x.ord))[1] as rule,
+               min(v.day_ids ->> x.day_number::text)::uuid as day_id
+          from ver v
+          cross join lateral (
+            select case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::int end as day_number,
+                   lower(nullif(d.e ->> 'course_id', '')) as course_id,
+                   case when jsonb_typeof(d.e -> 'pass_required') = 'boolean'
+                        then (d.e ->> 'pass_required')::boolean end as rule,
+                   d.ord
+              from jsonb_array_elements(case when jsonb_typeof(v.days) = 'array' then v.days else '[]'::jsonb end)
+                   with ordinality as d(e, ord)
+          ) x
+         where x.day_number is not null
+         group by v.version_id, v.days_total, x.day_number
+      ) g
+  ),
+  tday as (
+    select t.* from vday t where t.version_id is null
+  ),
+  enr as (
+    select e.id, e.user_id, e.organization_id, e.version_id, e.start_date, jv.days_total,
+           jv.day_ids_source = 'slot_backfill' as slot
+      from public.journey_enrollments e
+      join public.journey_versions jv on jv.id = e.version_id
+     where e.id = any(v_ids)
+  ),
+  cred as (
+    select p.enrollment_id, p.day_id from public.journey_day_progress p where p.enrollment_id = any(v_ids)
+  ),
+  old_st as (
+    select s.* from public.journey_credit_state(v_ids) s
+  ),
+  dec as (
+    select en.id, en.user_id, en.organization_id, en.version_id, en.start_date,
+           not (coalesce(en.slot, false) and gt.first_diff is not null and gt.first_diff <= f.day_number) as repin
+      from enr en
+      cross join lateral (
+        -- the furthest day (Q9's reading)
+        select greatest(0,
+                 coalesce((select max(p.day_number) from public.journey_day_progress p
+                            where p.enrollment_id = en.id), 0),
+                 coalesce((select max(a.journey_day) from public.course_attempts a
+                            where a.journey_enrollment_id = en.id and not a.is_preview), 0)) as day_number
+      ) f
+      cross join lateral (
+        -- the first day number at which the pinned version and the target differ
+        select min(g.d) as first_diff
+          from generate_series(1, greatest(en.days_total, v_days_total)) as g(d)
+          left join vday o on o.version_id = en.version_id and o.day_number = g.d
+          left join tday t on t.day_number = g.d
+          left join public.courses c on c.id::text = coalesce(o.course_id, t.course_id)
+         where (case when g.d <= en.days_total then coalesce(o.course_id, '') else '#beyond' end,
+                case when g.d <= en.days_total and o.course_id is not null
+                     then coalesce(o.rule, c.pass_required, false) end)
+               is distinct from
+               (case when g.d <= v_days_total then coalesce(t.course_id, '') else '#beyond' end,
+                case when g.d <= v_days_total and t.course_id is not null
+                     then coalesce(t.rule, c.pass_required, false) end)
+      ) gt
+     where p_version_id is null or en.version_id <> p_version_id
+  ),
+  rc as (
+    -- the credits of a relaxed rule, one per (enrolment, day)
+    select distinct on (d.id, t.day_id)
+           d.id as enrollment_id, d.organization_id, d.user_id, t.day_number, t.day_id,
+           s.course_id, s.official_attempt_id as attempt_id,
+           (v_calendar
+            and (select count(*)
+                   from generate_series(d.start_date::timestamp, (v_today - 1)::timestamp, interval '1 day') as g(x)
+                  where v_count_sundays or extract(dow from g.x) <> 0) >= t.day_number) as late
+      from dec d
+      join tday t on t.required and t.day_id is not null
+      join public.v_context_attempt_scoring s
+        on s.user_id = d.user_id
+       and s.context_key = 'journey:' || d.id::text || ':' || t.day_id::text
+       and s.official_attempt_id is not null
+     where d.repin
+       and not exists (select 1 from cred c where c.enrollment_id = d.id and c.day_id = t.day_id)
+       and public.journey_attempt_satisfies(
+             s.official_attempt_id,
+             coalesce(t.rule, (select c.pass_required from public.courses c where c.id = s.course_id), false))
+     order by d.id, t.day_id, (s.course_id::text = t.course_id) desc, s.official_attempt_id
+  ),
+  new_day as (
+    -- the target's days for each re-pinned enrolment, credited by day identity
+    select d.id, t.day_number, t.required,
+           (exists (select 1 from cred c where c.enrollment_id = d.id and c.day_id = t.day_id)
+            or exists (select 1 from rc r where r.enrollment_id = d.id and r.day_id = t.day_id)) as credited
+      from dec d
+      cross join tday t
+     where d.repin
+  ),
+  new_st as (
+    select n.id,
+           count(*) filter (where n.required) as required_days,
+           min(n.day_number) filter (where n.required and not n.credited) as next_day
+      from new_day n
+     group by n.id
+  ),
+  upd as (
+    update public.journey_enrollments e
+       set version_id = p_version_id
+      from dec d
+     where not p_dry_run
+       and d.repin
+       and e.id = d.id
+    returning e.id
+  ),
+  ins as (
+    insert into public.journey_day_progress
+      (enrollment_id, organization_id, user_id, day_number, day_id, course_id, attempt_id, credit_kind, late)
+    select r.enrollment_id, r.organization_id, r.user_id, r.day_number, r.day_id, r.course_id, r.attempt_id,
+           'attempt', r.late
+      from rc r
+     where not p_dry_run
+    on conflict (enrollment_id, day_id) do nothing
+    returning 1
+  )
+  select
+    (select count(*) from dec d where d.repin)::integer as repinned,
+    (select count(*) from dec d where not d.repin)::integer as kept_on_version,
+    (select count(*)
+       from dec d
+       join old_st o on o.enrollment_id = d.id
+       join new_st n on n.id = d.id
+      where d.repin and n.next_day < o.next_day)::integer as sent_back,
+    (select count(*)
+       from dec d
+       join public.course_attempts a
+         on a.journey_enrollment_id = d.id
+        and a.context_kind = 'journey'
+        and a.status = 'in_progress'
+        and not a.is_revision
+       cross join lateral (
+         select o.day_number, o.course_id from vday o
+          where o.version_id = d.version_id and o.day_id = a.journey_day_id and o.required
+          order by o.day_number limit 1
+       ) od
+       left join lateral (
+         select t.day_number, t.course_id from tday t
+          where t.day_id = a.journey_day_id and t.required
+          order by t.day_number limit 1
+       ) nd on true
+      where d.repin
+        and (nd.day_number is null
+             or nd.day_number <> od.day_number
+             or nd.course_id is distinct from od.course_id))::integer as started_days_kept,
+    (select count(*)
+       from dec d
+       join cred c on c.enrollment_id = d.id
+      where d.repin
+        and exists (select 1 from vday o where o.version_id = d.version_id and o.day_id = c.day_id and o.required)
+        and not exists (select 1 from tday t where t.day_id = c.day_id and t.required))::integer
+      as credits_now_history,
+    (select count(*) from rc)::integer as credited_by_rule_change,
+    (select count(*)
+       from unnest(v_ids) as u(id)
+       left join dec d on d.id = u.id and d.repin
+       left join new_st n on n.id = u.id
+       left join old_st o on o.enrollment_id = u.id
+      where case when d.id is not null
+                 then coalesce(n.required_days, 0) > 0 and n.next_day is null
+                 else coalesce(o.required_days, 0) > 0 and o.next_day is null
+            end)::integer as completed_by_rule,
+    (select count(*) from upd)::integer as written_pins,
+    (select count(*) from ins)::integer as written_credits
+    into v_c;
+
+  -- 4. completion: the core in a real run (step 13), the same rule in a dry run
+  if p_dry_run then
+    v_completed := v_c.completed_by_rule;
+  else
+    select count(*)::integer into v_completed
+      from public.journey_complete_enrollments_core(v_ids, 'publish');
+  end if;
+
+  return jsonb_build_object(
+    'dry_run',                 p_dry_run,
+    'repinned',                v_c.repinned,
+    'kept_on_version',         v_c.kept_on_version,
+    'completed_now',           v_completed,
+    'sent_back',               v_c.sent_back,
+    'started_days_kept',       v_c.started_days_kept,
+    'credits_now_history',     v_c.credits_now_history,
+    'credited_by_rule_change', v_c.credited_by_rule_change
+  );
+end
+$$;
+
+comment on function public.journey_repin_enrollments(uuid, uuid, jsonb, boolean) is
+  'The publish to all enrolled learners, by day identity, in one transaction: re-pin (with the gate for slot_backfill pins), the credits of a relaxed rule, completion with the origin publish; or, with p_dry_run, the same counts with nothing written (ADR 0024 steps 47, 94, 95). Service role only.';
+
+revoke execute on function public.journey_repin_enrollments(uuid, uuid, jsonb, boolean) from public, anon, authenticated;
+grant execute on function public.journey_repin_enrollments(uuid, uuid, jsonb, boolean) to service_role;
 
 notify pgrst, 'reload schema';
 

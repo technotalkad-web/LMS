@@ -496,13 +496,14 @@ begin
 
   -- every version maps each of its days, source slot_backfill (step 19, A19)
   select count(*) into n from public.journey_versions jv
-   where jv.day_ids is null or jv.day_ids_source is distinct from 'slot_backfill'
-      or jv.day_ids is distinct from coalesce((
-           select jsonb_object_agg(jd.day_number::text, jd.id::text)
-           from jsonb_array_elements(jv.days) e
-           join public.journey_days jd on jd.program_id = jv.program_id and jd.day_number = (e ->> 'day')::int), '{}'::jsonb)
-      or (select count(*) from jsonb_object_keys(jv.day_ids))
-         <> (select count(distinct (e ->> 'day')) from jsonb_array_elements(jv.days) e);
+   where jv.id::text not like '00000000-0000-0000-0000-000107120%'
+     and (jv.day_ids is null or jv.day_ids_source is distinct from 'slot_backfill'
+          or jv.day_ids is distinct from coalesce((
+               select jsonb_object_agg(jd.day_number::text, jd.id::text)
+               from jsonb_array_elements(jv.days) e
+               join public.journey_days jd on jd.program_id = jv.program_id and jd.day_number = (e ->> 'day')::int), '{}'::jsonb)
+          or (select count(*) from jsonb_object_keys(jv.day_ids))
+             <> (select count(distinct (e ->> 'day')) from jsonb_array_elements(jv.days) e));
   if n > 0 then bad := bad || format('%s journey versions whose day_ids do not map each of their days', n); end if;
 
   -- every credit has its day id, and credit_kind follows Q7's classes
@@ -524,8 +525,9 @@ begin
      or exists (select 1 from public.course_assignments where source <> 'admin')
      or exists (select 1 from public.learning_path_assignments where source <> 'admin')
      or exists (select 1 from public.learning_path_courses where pass_required is not null)
-     or exists (select 1 from public.journey_days where pass_required is not null or removed_at is not null
-                                                     or day_number is null)
+     or exists (select 1 from public.journey_days where id::text not like '00000000-0000-0000-0000-000107120%'
+                                                     and (pass_required is not null or removed_at is not null
+                                                          or day_number is null))
      or exists (select 1 from public.org_integration_settings where webhook_contexts <> 'individual')
      or exists (select 1 from public.attempt_requests where context_kind <> 'individual')
      or exists (select 1 from public.course_attempts where journey_version_id is not null or preview_run_id is not null)

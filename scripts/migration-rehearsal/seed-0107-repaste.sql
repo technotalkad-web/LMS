@@ -31,6 +31,15 @@
 --       their policies and their append-only triggers and must leave every
 --       value as written. They name a path of their own, PR (no step, no
 --       attempt), so no reader of the later sections meets them.
+--   r11  a curriculum save by day identity (ADR 0024 step 63: "a first
+--       paste, then a day removed through journey_save_days, then a second
+--       paste, passes (Q8 only counts)"): program JQ of its own, days Q1 to
+--       Q4 (numbers 1 to 4) and a version VQ of all four, published before
+--       the save (the paste-window trigger fills its day_ids, slot_backfill);
+--       then one journey_save_days call removes Q2 and moves Q3 and Q4 to 2
+--       and 3. VQ's day 4 then has no journey_days row by number, which the
+--       second paste's Q8 counts and does not refuse. No enrolment, no
+--       attempt.
 -- r1 to r3 name context_kind, as the new code does, so they fire nothing.
 
 insert into public.course_attempts
@@ -100,3 +109,28 @@ insert into public.preview_purge_log (id, organization_id, ran_at, reason, actor
   ('00000000-0000-0000-0000-000107120010', '00000000-0000-0000-0000-00000000000a', '2026-11-13 09:10:00+00', 'manual',
    '00000000-0000-0000-0000-000107010006', '{"course_ids": ["00000000-0000-0000-0000-0000000000c2"]}',
    '{"course_attempts": 0, "total": 0}', '{}', '{}', '[]');
+
+-- r11: JQ, its days and version VQ, then the save (as postgres, the owner)
+insert into public.journey_programs (id, organization_id, name, days_total) values
+  ('00000000-0000-0000-0000-000107120201', '00000000-0000-0000-0000-00000000000a', 'JQ after the paste (0107)', 4);
+insert into public.journey_days (id, program_id, organization_id, day_number, course_id) values
+  ('00000000-0000-0000-0000-000107120211', '00000000-0000-0000-0000-000107120201', '00000000-0000-0000-0000-00000000000a',
+   1, '00000000-0000-0000-0000-0000000000c1'),
+  ('00000000-0000-0000-0000-000107120212', '00000000-0000-0000-0000-000107120201', '00000000-0000-0000-0000-00000000000a',
+   2, '00000000-0000-0000-0000-0000000000c2'),
+  ('00000000-0000-0000-0000-000107120213', '00000000-0000-0000-0000-000107120201', '00000000-0000-0000-0000-00000000000a',
+   3, '00000000-0000-0000-0000-0000000000c1'),
+  ('00000000-0000-0000-0000-000107120214', '00000000-0000-0000-0000-000107120201', '00000000-0000-0000-0000-00000000000a',
+   4, '00000000-0000-0000-0000-000107040001');
+insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, count_sundays,
+                                     completion_title, days) values
+  ('00000000-0000-0000-0000-000107120221', '00000000-0000-0000-0000-000107120201', '00000000-0000-0000-0000-00000000000a',
+   1, 'JQ after the paste (0107)', 4, false, 'Done',
+   '[{"day": 1, "course_id": "00000000-0000-0000-0000-0000000000c1", "mission_title": null},
+     {"day": 2, "course_id": "00000000-0000-0000-0000-0000000000c2", "mission_title": null},
+     {"day": 3, "course_id": "00000000-0000-0000-0000-0000000000c1", "mission_title": null},
+     {"day": 4, "course_id": "00000000-0000-0000-0000-000107040001", "mission_title": null}]');
+select public.journey_save_days('00000000-0000-0000-0000-000107120201',
+  '[{"id": "00000000-0000-0000-0000-000107120212", "removed": true},
+    {"id": "00000000-0000-0000-0000-000107120213", "day_number": 2, "course_id": "00000000-0000-0000-0000-0000000000c1"},
+    {"id": "00000000-0000-0000-0000-000107120214", "day_number": 3, "course_id": "00000000-0000-0000-0000-000107040001"}]');
