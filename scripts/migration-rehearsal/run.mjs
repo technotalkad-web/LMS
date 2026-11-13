@@ -220,7 +220,9 @@ async function stepApply(db, s) {
 // one check per token. The file is read as it is, never stripped, so the
 // header's own prose and its pasted SQL are held to the same rule. With
 // `generatedStored: N` it also checks that the file has exactly N generated
-// columns and that each is `stored` (added for 0107, ADR 0024 note N3).
+// columns and that each is `stored` (added for 0107, ADR 0024 note N3); with
+// `functionList: true`, that the after-checks' function list names exactly
+// the functions the file creates (added for 0107, ADR 0024 step 19).
 function stepStatic(s) {
   const [n] = expand([s.file]);
   const f = byNum.get(n);
@@ -255,6 +257,36 @@ function stepStatic(s) {
       found === s.generatedStored && bad.length === 0,
       `${f}: every "generated always as (...)" ends in "stored" (${found} found, expected ${s.generatedStored})` +
         `${bad.length ? `: NOT stored on line${bad.length === 1 ? "" : "s"} ${bad.join(", ")}` : ""}`,
+    );
+  }
+  if (s.functionList) {
+    // ADR 0024 step 19: the after-checks' privilege matrix covers "every
+    // function these files create or recreate". The list in the file, between
+    // its two marker comments, must name exactly the functions of the file's
+    // own create statements (read on the code: comments dropped, string
+    // literals emptied), each with its argument types.
+    const code = raw.replace(/--[^\n]*|'(?:[^']|'')*'/g, (t) => (t[0] === "'" ? "''" : " "));
+    const types = (args) =>
+      args
+        .split(",")
+        .map((a) => a.trim().replace(/\s+default\s+[\s\S]*$/, "").split(/\s+/).slice(1).join(""))
+        .filter(Boolean)
+        .join(",");
+    const created = [...code.matchAll(/create\s+(?:or\s+replace\s+)?function\s+public\.(\w+)\s*\(([^)]*)\)/g)]
+      .map((m) => `public.${m[1]}(${types(m[2])})`)
+      .sort();
+    const b = raw.indexOf("-- after-check function list: begin");
+    const e = raw.indexOf("-- after-check function list: end");
+    const listed = b < 0 || e < b ? [] : [...raw.slice(b, e).matchAll(/'(public\.\w+\([^)]*\))'/g)]
+      .map((m) => m[1].replace(/\s+/g, ""))
+      .sort();
+    const missing = created.filter((x) => !listed.includes(x));
+    const extra = listed.filter((x) => !created.includes(x));
+    check(
+      b >= 0 && e > b && missing.length === 0 && extra.length === 0 && new Set(listed).size === listed.length,
+      `${f}: the after-check function list names every function the file creates (${created.length} created, ` +
+        `${listed.length} listed)${missing.length ? `: NOT LISTED ${missing.join(" ")}` : ""}` +
+        `${extra.length ? `: NOT CREATED ${extra.join(" ")}` : ""}`,
     );
   }
   for (const token of s.mustNotContain ?? []) {

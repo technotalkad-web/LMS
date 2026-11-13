@@ -518,8 +518,12 @@ begin
                                      then 'attempt' else 'legacy_cross_context' end));
   if n > 0 then bad := bad || format('%s credits whose day_id or credit_kind break the backfill rule', n); end if;
 
-  -- every other new column holds its default
-  if exists (select 1 from public.xp_events where context_kind is not null or context_key is not null or event_only)
+  -- every other new column holds its default (the points the refresh after
+  -- the second paste paid for r1, a row written between the pastes, left
+  -- out: its sweep is the nightly's retry, step 16)
+  if exists (select 1 from public.xp_events
+              where (context_kind is not null or context_key is not null or event_only)
+                and (attempt_id is null or attempt_id::text not like '00000000-0000-0000-0000-000107120%'))
      or exists (select 1 from public.journey_enrollments where source <> 'admin')
      or exists (select 1 from public.journey_programs where visibility <> 'private')
      or exists (select 1 from public.course_assignments where source <> 'admin')

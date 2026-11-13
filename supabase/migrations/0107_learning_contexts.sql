@@ -7,34 +7,6 @@
 -- role selector on postgres, staging first; never `supabase db push` (the
 -- CLI is linked to production).
 --
--- BUILD STATE (this paragraph is removed when the file is complete): this
--- build holds section 0 (the prerequisites and the before-checks), sections
--- 1 and 2, which are ADR 0024 section B's creation order item 2 whole (the
--- new columns, their run-once backfills, the generated columns, the CHECKs,
--- preview_runs, context_derive_log, the immutability and derive triggers,
--- the two attempt foreign keys re-created on delete no action, the open-row,
--- open-request and journey_day_progress key swaps and the indexes), section
--- 3, which is item 3 whole (learning_path_completions,
--- learning_path_step_completions, completion_notices and preview_purge_log,
--- created empty), section 4, which is item 4 whole (the two context views,
--- the two old-name views as the Individual context, the course enrolment
--- view without its path arm and hold-back, the two terms views and the two
--- path views), section 5, which is item 5 whole (official_attempt_in_context,
--- instance_pass_required, journey_attempt_satisfies, journey_credit_state,
--- and journey_reminder_counts dropped and created with its fourth column),
--- and of item 6 the paste-window day_ids trigger on journey_versions, the
--- two delete guards, both forms of record_revision_visit and of
--- consume_grant, journey_save_days, journey_repin_enrollments, the journey
--- completion core with its two wrappers, journey_record_completion, the XP
--- core (two forms) with its wrapper, record_learning_activity (two forms),
--- sweep_completion_side_effects and purge_preview_data (section 6). Not
--- built yet: the rest of item 6 (the two refresh functions, which do not
--- call the sweep yet, gamification_close_month, journey_auto_enroll and
--- launch_context) and item 7. On this build the 0035 and 0056 refresh
--- bodies still run and no schedule calls the sweep; the 0073
--- gamification_close_month and the 0096 journey_auto_enroll still run. Do
--- not paste a build of this file that still carries this paragraph.
---
 -- ORDER (ADR 0024 steps 73 and 74):
 --   Staging: after pull request 1 (this file, 0108, the rehearsal, the pure
 --   modules and the fallback-safe readers) is on both staging deployments,
@@ -136,7 +108,11 @@
 -- The one row of context_derive_log, a new table (2a), is created on the
 -- first paste; the four tables of section 3 are created empty. A later
 -- paste writes no row. The temporary table of section 0b
--- is the session's own and is dropped at commit.
+-- is the session's own and is dropped at commit. The after-checks write
+-- nothing they keep: the completion sweep that A6 runs through the two
+-- refresh functions, and the refreshes themselves, are rolled back with the
+-- block that calls them; every other check reads, or tries a write as an
+-- API role that is refused before it touches a row.
 --
 -- Locks: ACCESS EXCLUSIVE until commit on course_attempts, attempt_requests,
 -- revision_visits, xp_events, journey_days, journey_versions,
@@ -152,6 +128,12 @@
 -- refresh among them). The two stored generated columns of course_attempts
 -- and the one of attempt_requests rewrite those tables on the first paste
 -- (a rewrite per added generated column; a later paste skips them).
+-- The after-check A6 (section 7b) takes the locks of the two refreshes, an
+-- EXCLUSIVE lock on each of the eight matviews as a scheduled refresh does,
+-- and releases them when its block rolls back: a scheduled refresh running
+-- at the same minute makes A6 wait, and after 5 s the refresh answers an
+-- error and the file rolls back (paste again, clear of 03:30 UTC and of the
+-- crons' :03 and :07 quarter-hour offsets).
 -- lock_timeout 5 s: if a lock is not granted the whole file rolls back.
 --
 -- PREREQUISITES (the DO block of section 0a refuses to run without them; for
@@ -165,14 +147,20 @@
 --   0003  course_attempts.completion_status, success_status
 --   0004  xapi_statements, xapi_state, cmi5_launch_tokens (the counts of
 --         purge_preview_data, section 6)
---   0005  course_assignments (due_at and assigned_at: the terms views)
+--   0005  course_assignments (due_at and assigned_at: the terms views;
+--         assignee_type: launch_context)
+--   0006  profiles (gamification_close_month's snapshots, section 6)
 --   0007  team_members, course_assignments.team_id (the team arms of the
---         terms views)
+--         terms views); teams (gamification_close_month)
 --   0008  learning_path_courses.step_number; learning_path_assignments
 --         (due_at, assigned_at, team_id: the terms views)
+--   0011  organization_members.status (launch_context's member.active),
+--         designation, job_role and city (journey_auto_enroll);
+--         profiles.first_name and last_name
 --   0014  notification_templates (the event-type check of 0065, below)
---   0017  learning_paths.is_active
---   0033  learning_paths.visibility
+--   0017  learning_paths.is_active; courses.is_active (launch_context)
+--   0027  profiles.email
+--   0033  learning_paths.visibility; courses.visibility (launch_context)
 --   0034  course_attempts.learning_path_id with its foreign key;
 --         learning_paths.sequence_mode
 --   0044  lrs_forward_outbox.attempt_id
@@ -182,7 +170,13 @@
 --         gamification_settings.timezone, user_gamification,
 --         gamification_badges, gamification_level_for(integer, jsonb) (the
 --         XP core, section 6), course_attempts.last_activity_at,
---         gamification_close_month(), refresh_gamification_views()
+--         gamification_close_month(), refresh_gamification_views();
+--         gamification_recognitions, xp_events.source_day,
+--         user_gamification.opted_out and the streak columns,
+--         gamification_settings.enabled and allow_opt_out and
+--         profiles.avatar_url (gamification_close_month, section 6)
+--   0056  organization_members.business_vertical and branch
+--         (journey_auto_enroll)
 --   0058  the journey tables (programs, days, versions, enrolments,
 --         day progress), journey_enrollments.version_id and
 --         journey_day_progress.completed_at (section 5);
@@ -191,7 +185,10 @@
 --         and journey_days.course_id and mission_title (section 6);
 --         course_attempts.journey_enrollment_id with its foreign key, and
 --         journey_day; gamification_record_activity(uuid) (the wrapper) and
---         journey_record_completion(uuid)
+--         journey_record_completion(uuid); journey_programs.is_active and
+--         auto_enroll_new_users, journey_enrollments.enrolled_by
+--         (journey_auto_enroll and launch_context)
+--   0063  journey_programs.audience (journey_auto_enroll)
 --   0065  journey_programs.deadline_days; the event-type check admits
 --         'journey_escalation'
 --   0069  course_assignments.group_id, learning_path_assignments.group_id
@@ -208,7 +205,9 @@
 --   0089  journey_reminder_counts(uuid[]) (either return type: this file
 --         drops and creates it with a fourth column)
 --   0090  v_course_attempt_summary.official_attempt_id; the report matviews
---   0096  journey_auto_enroll()
+--   0096  journey_auto_enroll(); journey_audience_matches(jsonb, text,
+--         text, text, text, text, text) and
+--         organization_members.department (its 0096 body, section 6)
 --   0098  the delete guards and their two triggers, still bound
 --   0099  v_course_attempt_summary.live_attempt_count
 --   0100  course_attempts.is_preview, launch_mode, served_language;
@@ -225,7 +224,9 @@
 --   0106  v_course_feedback_responses, course_feedback_summary(uuid)
 --   and, in either state: the open-row index of 0062 or this file's;
 --   unique (enrollment_id, day_number) on journey_day_progress or this
---   file's unique (enrollment_id, day_id).
+--   file's unique (enrollment_id, day_id); and auth.uid() of Supabase's auth
+--   schema (the restated policies of section 7a). The after-check A14 reads
+--   public.platform_owners (0021) when it exists, and needs it nowhere else.
 --
 -- BEFORE the apply (read-only; role postgres; counts only, never an id or a
 -- name). Q1 to Q10 are ONE read-only select: section 0b below, from the line
@@ -302,7 +303,16 @@
 --   Run the select again just before the paste.
 --
 -- AFTER the apply: the after-checks A1 to A24 (ADR 0024 step 19) run inside
--- this file, at its end, against the table of section 0b (a later commit).
+-- this file, at its end (section 7b), against the table of section 0b, and a
+-- failed check rolls the whole file back ("0107 after-check failed: ...
+-- Nothing changed."). Two counts are reported as notices and never refuse:
+-- on a later paste, the completed rows the completion writer has not
+-- handled yet (A9; the sweep's candidates); and active enrolments with a
+-- credit on every required day that are not completed (A18). A6 calls both
+-- refresh functions inside a block it rolls back, so the paste keeps
+-- neither the sweep's writes nor the refreshed matviews. After the paste,
+-- run `select public.refresh_report_views();` once (every entry's error
+-- null, the last entry completion_sweep) and record its timings.
 
 begin;
 
@@ -324,6 +334,8 @@ begin
       ('public.organizations',                    '0001'),
       ('public.organization_members',             '0001'),
       ('public.courses',                          '0002'),
+      ('public.profiles',                         '0006'),
+      ('public.teams',                            '0007'),
       ('public.course_attempts',                  '0002'),
       ('public.xapi_statements',                  '0004'),
       ('public.xapi_state',                       '0004'),
@@ -340,6 +352,7 @@ begin
       ('public.gamification_settings',            '0053'),
       ('public.user_gamification',                '0053'),
       ('public.gamification_badges',              '0053'),
+      ('public.gamification_recognitions',        '0053'),
       ('public.journey_programs',                 '0058'),
       ('public.journey_days',                     '0058'),
       ('public.journey_versions',                 '0058'),
@@ -399,6 +412,30 @@ begin
       ('learning_path_assignments', 'team_id',             '0008'),
       ('learning_path_assignments', 'group_id',            '0069'),
       ('learning_paths',           'is_active',             '0017'),
+      ('courses',                  'is_active',             '0017'),
+      ('courses',                  'visibility',            '0033'),
+      ('organization_members',     'status',                '0011'),
+      ('organization_members',     'designation',           '0011'),
+      ('organization_members',     'job_role',              '0011'),
+      ('organization_members',     'city',                  '0011'),
+      ('organization_members',     'business_vertical',     '0056'),
+      ('organization_members',     'branch',                '0056'),
+      ('organization_members',     'department',            '0096'),
+      ('profiles',                 'first_name',            '0011'),
+      ('profiles',                 'last_name',             '0011'),
+      ('profiles',                 'email',                 '0027'),
+      ('profiles',                 'avatar_url',            '0053'),
+      ('course_assignments',       'assignee_type',         '0005'),
+      ('xp_events',                'source_day',            '0053'),
+      ('user_gamification',        'opted_out',             '0053'),
+      ('user_gamification',        'current_streak_days',   '0053'),
+      ('user_gamification',        'longest_streak_days',   '0053'),
+      ('gamification_settings',    'enabled',               '0053'),
+      ('gamification_settings',    'allow_opt_out',         '0053'),
+      ('journey_programs',         'is_active',             '0058'),
+      ('journey_programs',         'auto_enroll_new_users', '0058'),
+      ('journey_programs',         'audience',              '0063'),
+      ('journey_enrollments',      'enrolled_by',           '0058'),
       ('learning_paths',           'visibility',            '0033'),
       ('learning_paths',           'sequence_mode',         '0034'),
       ('lrs_forward_outbox',       'attempt_id',            '0044'),
@@ -456,6 +493,8 @@ begin
       ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)',     '0103'),
       ('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text)',          '0103'),
       ('public.group_member_ids(uuid)',                                        '0105'),
+      ('public.journey_audience_matches(jsonb,text,text,text,text,text,text)', '0096'),
+      ('auth.uid()',                                                           'the Supabase auth schema'),
       ('public.course_feedback_summary(uuid)',                                 '0106')
     ) as t(fn, mig)
   loop
@@ -1002,7 +1041,7 @@ $$;
 -- cover its new columns. The exception is org_api_keys (1t, step 8). The
 -- grants and policies of attempt_requests and revision_visits, which step 8
 -- restates unchanged, go into the last section with the other restated
--- grants (creation order item 7; a later build).
+-- grants (creation order item 7, section 7a).
 
 -- 1a. course_attempts.context_kind (step 5): added nullable, backfilled, then
 -- not null. preview first, then the journey tag, then the path tag, else
@@ -3427,14 +3466,16 @@ grant execute on function public.journey_reminder_counts(uuid[]) to service_role
 -- order items 3 to 5) come before this one. Every function states security
 -- definer or security invoker and set search_path = pg_catalog, public, and
 -- names its relations with their schema: a create or replace that leaves
--- either out resets it while a trigger stays bound (note N5, spike 6). This
--- build holds, of the item: the paste-window trigger function on
--- journey_versions with its trigger (6a), the two delete guards (6b), both
--- forms of record_revision_visit (6c), both forms of consume_grant (6d),
+-- either out resets it while a trigger stays bound (note N5, spike 6). The
+-- item, whole: the paste-window trigger function on journey_versions with
+-- its trigger (6a), the two delete guards (6b), both forms of
+-- record_revision_visit (6c), both forms of consume_grant (6d),
 -- journey_save_days (6e), journey_repin_enrollments (6f), the journey
 -- completion core with its two wrappers (6g), journey_record_completion
 -- (6h), the XP core with its wrapper (6i), record_learning_activity (6j),
--- sweep_completion_side_effects (6k) and purge_preview_data (6l). Lock
+-- sweep_completion_side_effects (6k), purge_preview_data (6l), the two
+-- refresh functions (6m), gamification_close_month (6n),
+-- journey_auto_enroll (6o) and, last, launch_context (6p). Lock
 -- order, in every function of this section that takes more than one: an
 -- attempt_requests row, then journey_enrollments rows (in id order), then
 -- course_attempts rows; no function locks an attempt row before an
@@ -5525,7 +5566,7 @@ grant execute on function public.record_learning_activity(uuid) to service_role;
 -- {candidates, handled, failed, errors}, errors being at most five
 -- {attempt_id, sqlstate} (ids and codes only). p_limit below 1 or null
 -- raises 22023. Rows stamped by the 0107 backfill are never candidates
--- (history). The two refresh functions call it (a later section).
+-- (history). The two refresh functions call it (6m).
 create or replace function public.sweep_completion_side_effects(p_limit integer)
 returns jsonb
 language plpgsql
@@ -5872,6 +5913,1700 @@ comment on function public.purge_preview_data(uuid, jsonb, text, uuid, boolean, 
 
 revoke execute on function public.purge_preview_data(uuid, jsonb, text, uuid, boolean, text) from public, anon, authenticated;
 grant execute on function public.purge_preview_data(uuid, jsonb, text, uuid, boolean, text) to service_role;
+
+-- 6m. The two refresh functions (step 16): recreated from their latest
+-- bodies, refresh_report_views() from 0035:82-124 (its privileges from
+-- 0049:54 and :59) and refresh_gamification_views() from 0056:179-206, with
+-- these changes and nothing else: the pinned search_path of section B's
+-- header; the completion sweep (6k) runs first, inside an exception block of
+-- its own, so the matviews refreshed after it read the points and the
+-- completions it wrote; and its answer is appended as the last entry,
+-- {view: 'completion_sweep', ms, rows, error, sweep}, so every view entry
+-- keeps its place. rows is the number of rows the sweep handled; error is
+-- the sweep's own error, null when it ran (a row that fails is counted in
+-- sweep.failed, step 16, and is not an error of the refresh); sweep is its
+-- answer, or null when it raised. Each call handles at most 200 rows (the
+-- record names no limit; the next call takes the rest, oldest first).
+-- Neither function calls purge_preview_data: nothing deletes Preview data on
+-- a schedule (step 81). The matview lists are unchanged; 0109 recreates both
+-- functions again with its own (step 21).
+create or replace function public.refresh_report_views()
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  result jsonb := '[]'::jsonb;
+  view_name text;
+  t0 timestamptz;
+  rowcount bigint;
+  ms numeric;
+  err text;
+  sweep jsonb;
+  sweep_ms numeric;
+  sweep_err text;
+begin
+  -- 0107: the completion sweep first (ADR 0024 step 16)
+  t0 := clock_timestamp();
+  begin
+    sweep := public.sweep_completion_side_effects(200);
+  exception when others then
+    sweep_err := sqlerrm;
+  end;
+  sweep_ms := extract(milliseconds from (clock_timestamp() - t0));
+
+  foreach view_name in array array[
+    'mv_course_enrollment_status',
+    'mv_path_enrollment_status',
+    'mv_course_performance',
+    'mv_path_performance',
+    'mv_course_interaction_breakdown',
+    'mv_course_interaction_top_wrong'
+  ]
+  loop
+    t0 := clock_timestamp();
+    err := null;
+    rowcount := null;
+    begin
+      execute format('refresh materialized view concurrently public.%I', view_name);
+      execute format('select count(*) from public.%I', view_name) into rowcount;
+    exception when others then
+      err := sqlerrm;
+    end;
+    ms := extract(milliseconds from (clock_timestamp() - t0));
+    result := result || jsonb_build_object(
+      'view', view_name,
+      'ms', ms,
+      'rows', rowcount,
+      'error', err
+    );
+  end loop;
+
+  -- 0107: the sweep's entry, last
+  result := result || jsonb_build_object(
+    'view', 'completion_sweep',
+    'ms', sweep_ms,
+    'rows', (sweep ->> 'handled')::bigint,
+    'error', sweep_err,
+    'sweep', sweep
+  );
+  return result;
+end;
+$$;
+
+comment on function public.refresh_report_views() is
+  'Refreshes the six report matviews, each in its own exception block, after one run of the completion sweep (ADR 0024 step 16), whose answer is the last entry, completion_sweep. Never deletes Preview data. Service role only.';
+
+revoke execute on function public.refresh_report_views() from public, anon, authenticated;
+grant execute on function public.refresh_report_views() to service_role;
+
+create or replace function public.refresh_gamification_views()
+returns jsonb
+language plpgsql security definer set search_path = pg_catalog, public as $$
+declare
+  view_name text;
+  t0 timestamptz;
+  ms numeric;
+  rowcount bigint;
+  err text;
+  result jsonb := '[]'::jsonb;
+  sweep jsonb;
+  sweep_ms numeric;
+  sweep_err text;
+begin
+  -- 0107: the completion sweep first (ADR 0024 step 16)
+  t0 := clock_timestamp();
+  begin
+    sweep := public.sweep_completion_side_effects(200);
+  exception when others then
+    sweep_err := sqlerrm;
+  end;
+  sweep_ms := extract(milliseconds from (clock_timestamp() - t0));
+
+  foreach view_name in array array['mv_leaderboard', 'mv_learner_metrics']
+  loop
+    t0 := clock_timestamp(); err := null; rowcount := null;
+    begin
+      execute format('refresh materialized view concurrently public.%I', view_name);
+      execute format('select count(*) from public.%I', view_name) into rowcount;
+    exception when others then
+      err := sqlerrm;
+    end;
+    ms := extract(milliseconds from (clock_timestamp() - t0));
+    result := result || jsonb_build_object('view', view_name, 'ms', ms, 'rows', rowcount, 'error', err);
+  end loop;
+
+  -- 0107: the sweep's entry, last
+  result := result || jsonb_build_object('view', 'completion_sweep', 'ms', sweep_ms,
+                                         'rows', (sweep ->> 'handled')::bigint, 'error', sweep_err,
+                                         'sweep', sweep);
+  return result;
+end;
+$$;
+
+comment on function public.refresh_gamification_views() is
+  'Refreshes mv_leaderboard and mv_learner_metrics, each in its own exception block, after one run of the completion sweep (ADR 0024 step 16), whose answer is the last entry, completion_sweep. Never deletes Preview data. Service role only.';
+
+revoke all on function public.refresh_gamification_views() from public, anon, authenticated;
+grant execute on function public.refresh_gamification_views() to service_role;
+
+-- 6n. gamification_close_month (steps 17 and 35): recreated from the whole
+-- of its latest body, 0073:824-1022 (grants :1023-1024; never from 0053),
+-- with two changes and nothing else: the pinned search_path, and the
+-- highest_scorer chain (0073:905-939), which decided the official attempts
+-- per (learner, course) by its own window over every row, abandoned,
+-- revision and preview rows included (ADR 0024 "What the code does today",
+-- row 1). It now reads the per-context summary over the Individual and path
+-- contexts (step 35): the average of the official scores
+-- (v_context_attempt_summary.official_score, one per course and context)
+-- whose official attempt was completed in the month. So a practice row, a
+-- revision row, an abandoned row, a preview and a journey row never count,
+-- and the window logic exists once, in the scoring view (step 9). Every
+-- other category is the 0073 logic as it stands.
+create or replace function public.gamification_close_month()
+returns jsonb
+language plpgsql security definer set search_path = pg_catalog, public as $$
+declare
+  v_org record;
+  v_period text;
+  v_start timestamptz;
+  v_end timestamptz;
+  v_row record;
+  v_written integer := 0;
+  v_result jsonb := '[]'::jsonb;
+begin
+  for v_org in
+    select gs.organization_id, gs.timezone, gs.allow_opt_out
+      from public.gamification_settings gs
+     where gs.enabled
+  loop
+    v_period := to_char(((now() at time zone v_org.timezone)::date - interval '1 month'), 'YYYY-MM');
+    v_start := date_trunc('month', (now() at time zone v_org.timezone)::date - interval '1 month')::timestamp
+               at time zone v_org.timezone;
+    v_end := (date_trunc('month', (now() at time zone v_org.timezone)::date - interval '1 month')
+              + interval '1 month')::timestamp at time zone v_org.timezone;
+
+    -- top_overall (+ monthly badges for its winners).
+    v_written := 0;
+    for v_row in
+      select e.user_id, sum(e.xp) as metric,
+             row_number() over (order by sum(e.xp) desc, min(e.created_at) asc, e.user_id) as rn
+        from public.xp_events e
+        join public.user_gamification ug
+          on ug.organization_id = e.organization_id and ug.user_id = e.user_id
+       where e.organization_id = v_org.organization_id
+         and e.created_at >= v_start and e.created_at < v_end
+         and not (ug.opted_out and v_org.allow_opt_out)
+       group by e.user_id
+       order by 2 desc, e.user_id
+       limit 3
+    loop
+      insert into public.gamification_recognitions
+        (organization_id, period, category, rank, user_id, metric_value, snapshot)
+      select v_org.organization_id, v_period, 'top_overall', v_row.rn, v_row.user_id, v_row.metric,
+             jsonb_build_object('name', trim(coalesce(p.first_name,'') || ' ' || coalesce(p.last_name,'')),
+                                'email', p.email, 'avatar_url', p.avatar_url,
+                                'xp', v_row.metric)
+        from public.profiles p where p.id = v_row.user_id
+      on conflict (organization_id, period, category, rank) do nothing;
+      if found then v_written := v_written + 1; end if;
+
+      insert into public.user_badges (organization_id, user_id, badge_slug, period, metadata)
+      values (v_org.organization_id, v_row.user_id, 'top_3', v_period,
+              jsonb_build_object('rank', v_row.rn))
+      on conflict (organization_id, user_id, badge_slug, coalesce(period, '')) do nothing;
+      if v_row.rn = 1 then
+        insert into public.user_badges (organization_id, user_id, badge_slug, period)
+        values (v_org.organization_id, v_row.user_id, 'learning_champion', v_period)
+        on conflict (organization_id, user_id, badge_slug, coalesce(period, '')) do nothing;
+      end if;
+    end loop;
+
+    -- most_active: distinct active days in the month.
+    for v_row in
+      select e.user_id, count(distinct e.source_day) as metric,
+             row_number() over (order by count(distinct e.source_day) desc, e.user_id) as rn
+        from public.xp_events e
+        join public.user_gamification ug
+          on ug.organization_id = e.organization_id and ug.user_id = e.user_id
+       where e.organization_id = v_org.organization_id and e.rule = 'daily_activity'
+         and e.created_at >= v_start and e.created_at < v_end
+         and not (ug.opted_out and v_org.allow_opt_out)
+       group by e.user_id order by 2 desc, e.user_id limit 3
+    loop
+      insert into public.gamification_recognitions
+        (organization_id, period, category, rank, user_id, metric_value, snapshot)
+      select v_org.organization_id, v_period, 'most_active', v_row.rn, v_row.user_id, v_row.metric,
+             jsonb_build_object('name', trim(coalesce(p.first_name,'') || ' ' || coalesce(p.last_name,'')),
+                                'email', p.email, 'avatar_url', p.avatar_url,
+                                'active_days', v_row.metric)
+        from public.profiles p where p.id = v_row.user_id
+      on conflict (organization_id, period, category, rank) do nothing;
+    end loop;
+
+    -- highest_scorer (0107, ADR 0024 step 35): the average official score of
+    -- the learner's Individual and path contexts whose official attempt was
+    -- completed in the month, read from the per-context summary (one row
+    -- per course and context; the official rule of step 9).
+    for v_row in
+      select s.user_id, avg(s.official_score) as metric,
+             row_number() over (order by avg(s.official_score) desc, s.user_id) as rn
+        from public.v_context_attempt_summary s
+        join public.course_attempts ca on ca.id = s.official_attempt_id
+        join public.user_gamification ug
+          on ug.organization_id = v_org.organization_id and ug.user_id = s.user_id
+       where ca.organization_id = v_org.organization_id
+         and s.context_kind in ('individual', 'path')
+         and ca.completed_at >= v_start and ca.completed_at < v_end
+         and s.official_score is not null
+         and not (ug.opted_out and v_org.allow_opt_out)
+       group by s.user_id order by 2 desc, s.user_id limit 3
+    loop
+      insert into public.gamification_recognitions
+        (organization_id, period, category, rank, user_id, metric_value, snapshot)
+      select v_org.organization_id, v_period, 'highest_scorer', v_row.rn, v_row.user_id, v_row.metric,
+             jsonb_build_object('name', trim(coalesce(p.first_name,'') || ' ' || coalesce(p.last_name,'')),
+                                'email', p.email, 'avatar_url', p.avatar_url,
+                                'avg_score', round(v_row.metric * 100))
+        from public.profiles p where p.id = v_row.user_id
+      on conflict (organization_id, period, category, rank) do nothing;
+    end loop;
+
+    -- most_improved: month XP vs previous month XP (qualifier: prev >= 50).
+    for v_row in
+      with month_xp as (
+        select e.user_id,
+          sum(e.xp) filter (where e.created_at >= v_start and e.created_at < v_end) as cur_xp,
+          sum(e.xp) filter (where e.created_at >= v_start - interval '1 month'
+                              and e.created_at < v_start) as prev_xp
+          from public.xp_events e
+          join public.user_gamification ug
+            on ug.organization_id = e.organization_id and ug.user_id = e.user_id
+         where e.organization_id = v_org.organization_id
+           and e.created_at >= v_start - interval '1 month' and e.created_at < v_end
+           and not (ug.opted_out and v_org.allow_opt_out)
+         group by e.user_id
+      )
+      select user_id, (coalesce(cur_xp,0) - coalesce(prev_xp,0)) as metric,
+             row_number() over (order by (coalesce(cur_xp,0) - coalesce(prev_xp,0)) desc, user_id) as rn
+        from month_xp
+       where coalesce(prev_xp, 0) >= 50
+       order by 2 desc, user_id limit 3
+    loop
+      insert into public.gamification_recognitions
+        (organization_id, period, category, rank, user_id, metric_value, snapshot)
+      select v_org.organization_id, v_period, 'most_improved', v_row.rn, v_row.user_id, v_row.metric,
+             jsonb_build_object('name', trim(coalesce(p.first_name,'') || ' ' || coalesce(p.last_name,'')),
+                                'email', p.email, 'avatar_url', p.avatar_url,
+                                'xp_gain', v_row.metric)
+        from public.profiles p where p.id = v_row.user_id
+      on conflict (organization_id, period, category, rank) do nothing;
+      if v_row.rn = 1 then
+        insert into public.user_badges (organization_id, user_id, badge_slug, period)
+        values (v_org.organization_id, v_row.user_id, 'most_improved', v_period)
+        on conflict (organization_id, user_id, badge_slug, coalesce(period, '')) do nothing;
+      end if;
+    end loop;
+
+    -- longest_streak: streak state as of close (v1 approximation, documented).
+    for v_row in
+      select ug.user_id, ug.current_streak_days as metric,
+             row_number() over (order by ug.current_streak_days desc, ug.longest_streak_days desc, ug.user_id) as rn
+        from public.user_gamification ug
+       where ug.organization_id = v_org.organization_id
+         and ug.current_streak_days > 0
+         and not (ug.opted_out and v_org.allow_opt_out)
+       order by ug.current_streak_days desc, ug.user_id limit 3
+    loop
+      insert into public.gamification_recognitions
+        (organization_id, period, category, rank, user_id, metric_value, snapshot)
+      select v_org.organization_id, v_period, 'longest_streak', v_row.rn, v_row.user_id, v_row.metric,
+             jsonb_build_object('name', trim(coalesce(p.first_name,'') || ' ' || coalesce(p.last_name,'')),
+                                'email', p.email, 'avatar_url', p.avatar_url,
+                                'streak_days', v_row.metric)
+        from public.profiles p where p.id = v_row.user_id
+      on conflict (organization_id, period, category, rank) do nothing;
+    end loop;
+
+    -- team_top: month XP summed per team.
+    for v_row in
+      select t.id as team_id, t.name as team_name, sum(e.xp) as metric,
+             row_number() over (order by sum(e.xp) desc, t.id) as rn
+        from public.teams t
+        join public.team_members tm on tm.team_id = t.id
+        join public.xp_events e
+          on e.user_id = tm.user_id and e.organization_id = t.organization_id
+       where t.organization_id = v_org.organization_id
+         and e.created_at >= v_start and e.created_at < v_end
+       group by t.id, t.name order by 3 desc, t.id limit 3
+    loop
+      insert into public.gamification_recognitions
+        (organization_id, period, category, rank, team_id, metric_value, snapshot)
+      values (v_org.organization_id, v_period, 'team_top', v_row.rn, v_row.team_id, v_row.metric,
+              jsonb_build_object('team_name', v_row.team_name, 'xp', v_row.metric))
+      on conflict (organization_id, period, category, rank) do nothing;
+    end loop;
+
+    v_result := v_result || jsonb_build_object(
+      'organization_id', v_org.organization_id, 'period', v_period, 'written', v_written);
+  end loop;
+
+  return v_result;
+end;
+$$;
+revoke all on function public.gamification_close_month() from public, anon, authenticated;
+grant execute on function public.gamification_close_month() to service_role;
+
+-- 6o. journey_auto_enroll (step 8; decisions D15 and D17): recreated from
+-- its latest body, 0096:158-186, with two changes and nothing else: the
+-- pinned search_path, and the enrolment it inserts names source =
+-- 'audience', so an audience enrolment is told from an admin's and a
+-- self-enrolment (journey_enrollments.source, section 1r). The trigger
+-- organization_members_journey_enroll (0063:101-104) stays bound: this is
+-- create or replace. Its execute is revoked from the API roles, as every
+-- function of this file (section B's header); a trigger's function is not
+-- checked for execute when the trigger fires.
+create or replace function public.journey_auto_enroll()
+returns trigger language plpgsql security definer set search_path = pg_catalog, public as $$
+declare
+  v_prog record;
+  v_tz text;
+begin
+  select coalesce(gs.timezone, 'Asia/Kolkata') into v_tz
+    from public.gamification_settings gs
+   where gs.organization_id = new.organization_id;
+  for v_prog in
+    select id, current_version_id
+      from public.journey_programs
+     where organization_id = new.organization_id
+       and is_active and auto_enroll_new_users
+       and current_version_id is not null
+       and public.journey_audience_matches(
+             audience, new.designation, new.job_role, new.city,
+             new.business_vertical, new.branch, new.department)
+  loop
+    insert into public.journey_enrollments
+      (program_id, version_id, organization_id, user_id, start_date, enrolled_by, source)
+    values
+      (v_prog.id, v_prog.current_version_id, new.organization_id, new.user_id,
+       (now() at time zone coalesce(v_tz, 'Asia/Kolkata'))::date, null, 'audience')
+    on conflict do nothing;
+  end loop;
+  return new;
+end;
+$$;
+
+comment on function public.journey_auto_enroll() is
+  'Trigger on organization_members: enrols a new member on every active auto-enrol journey whose audience matches, with source audience (0096; ADR 0024 step 8).';
+
+revoke execute on function public.journey_auto_enroll() from public, anon, authenticated;
+grant execute on function public.journey_auto_enroll() to service_role;
+
+-- 6p. launch_context (step 18; build note N15; twins contract B7, A10): the
+-- facts the launch's pure resolver needs (step 22), in one call, for the
+-- subrequest budget (step 70). Facts only: it decides nothing. Created last
+-- among the objects of this file, after the path views it reads. Stable,
+-- plpgsql, security definer, service role only; the page passes the
+-- session's user id and asserts the organisation. Every read is filtered by
+-- p_org and p_user, because a definer reads past row-level security.
+-- The answer is the frozen key tree of note N15 (the rehearsal compares it
+-- as jsonb, which ignores key order and not array order):
+--   v             1
+--   member        {active}: an organization_members row of p_org with
+--                 status active
+--   course        {found, is_active, visibility, individual {enrolled,
+--                 upcoming_at}}; found is the course in p_org; enrolled is a
+--                 released direct enrolment (v_course_enrollments_expanded);
+--                 upcoming_at the earliest future release_at among the
+--                 direct assignments that reach the learner (the four arms
+--                 of that view), null when none
+--   path          null without p_path; else {found, is_active, visibility,
+--                 sequence_mode, enrolled, self_row, course_step, steps[]};
+--                 found is the path in p_org; enrolled a recorded enrolment
+--                 (v_path_enrollments_expanded); self_row a user row with
+--                 source self; course_step p_course's step_number, null when
+--                 it is not a step; steps[] {course_id, step_number,
+--                 release_at, done} by step_number, done from
+--                 v_path_step_status (false when the learner has no row)
+--   journey       null without p_enrollment; else {found, status,
+--                 program_id, program_is_active, start_date, version_id,
+--                 unlock_mode, count_sundays, days_total, timezone, day,
+--                 day_credit, day_open_attempt, required_days,
+--                 credited_days, next_day, next_day_id, resumable_day_ids};
+--                 found is the enrolment in p_org and p_user's; the version
+--                 facts are the pinned version's; timezone is
+--                 gamification_settings.timezone, default Asia/Kolkata
+--                 (0089:92-95). day {id, number, in_version, removed,
+--                 course_id}: id is p_day_id, else p_day resolved through the
+--                 pinned version's day_ids (an old link, step 93), null when
+--                 neither resolves; number its number in the pinned version
+--                 and in_version whether it has one; removed whether the
+--                 program's journey_days row is removed (false for a day of
+--                 another program); course_id the course the pinned version
+--                 holds that day (its first entry), null on a rest day or
+--                 outside the version. day_credit {course_id, attempt_id,
+--                 credit_kind, day_number} of that day's credit, null when
+--                 none. day_open_attempt {attempt_id, course_id}: an open
+--                 official journey attempt on that day (in progress, not a
+--                 revision row), the one of p_course first, then the oldest;
+--                 null when none. The counts, next_day, next_day_id and
+--                 resumable_day_ids (ascending uuid) are journey_credit_state's
+--                 (5d).
+--   holders       {paths[], journey_days[]}: paths [{path_id, step_number}]
+--                 by path_id, the active paths of p_org that hold p_course
+--                 and the learner is enrolled on; journey_days [{enrollment_id,
+--                 day_id, day_number, credited}] by enrollment_id, then
+--                 day_number, the required days (5d's definition) that hold
+--                 p_course in the pinned versions of the learner's active
+--                 enrolments of p_org
+--   run           null, reserved for phase P
+-- found: false carries no other key. Arrays are always present.
+create or replace function public.launch_context(
+  p_user uuid,
+  p_org uuid,
+  p_course uuid,
+  p_path uuid,
+  p_enrollment uuid,
+  p_day_id uuid,
+  p_day integer
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  c_uuid      constant text := '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+  v_course    record;
+  v_path      record;
+  v_enr       record;
+  v_ver       record;
+  v_cs        record;
+  v_day_ids   jsonb;
+  v_days      jsonb;
+  v_day_id    uuid;
+  v_day_no    integer;
+  v_day_crs   uuid;
+  v_removed   boolean := false;
+  j_member    jsonb;
+  j_course    jsonb;
+  j_path      jsonb;
+  j_journey   jsonb;
+  j_holders   jsonb;
+begin
+  -- member
+  j_member := jsonb_build_object('active', exists (
+    select 1 from public.organization_members om
+     where om.organization_id = p_org and om.user_id = p_user and om.status = 'active'));
+
+  -- course
+  select c.id, c.is_active, c.visibility into v_course
+    from public.courses c
+   where c.id = p_course and c.organization_id = p_org;
+  if not found then
+    j_course := jsonb_build_object('found', false);
+  else
+    j_course := jsonb_build_object(
+      'found', true,
+      'is_active', v_course.is_active,
+      'visibility', v_course.visibility,
+      'individual', jsonb_build_object(
+        'enrolled', exists (
+          select 1 from public.v_course_enrollments_expanded e
+           where e.course_id = p_course and e.user_id = p_user),
+        'upcoming_at', (
+          select min(u.release_at) from (
+            select ca.release_at
+              from public.course_assignments ca
+             where ca.course_id = p_course and ca.assignee_type = 'user' and ca.user_id = p_user
+               and ca.release_at > now()
+            union all
+            select ca.release_at
+              from public.course_assignments ca
+              join public.team_members tm on tm.team_id = ca.team_id
+             where ca.course_id = p_course and ca.assignee_type = 'team' and ca.team_id is not null
+               and tm.user_id = p_user and ca.release_at > now()
+            union all
+            select ca.release_at
+              from public.course_assignments ca
+              join public.courses c on c.id = ca.course_id
+              join public.organization_members om on om.organization_id = c.organization_id
+             where ca.course_id = p_course and ca.assignee_type = 'org'
+               and om.user_id = p_user and ca.release_at > now()
+            union all
+            select ca.release_at
+              from public.course_assignments ca
+             cross join lateral public.group_member_ids(ca.group_id) as x
+             where ca.course_id = p_course and ca.assignee_type = 'group' and ca.group_id is not null
+               and x.user_id = p_user and ca.release_at > now()
+          ) u)));
+  end if;
+
+  -- path
+  if p_path is not null then
+    select lp.id, lp.is_active, lp.visibility, lp.sequence_mode into v_path
+      from public.learning_paths lp
+     where lp.id = p_path and lp.organization_id = p_org;
+    if not found then
+      j_path := jsonb_build_object('found', false);
+    else
+      j_path := jsonb_build_object(
+        'found', true,
+        'is_active', v_path.is_active,
+        'visibility', v_path.visibility,
+        'sequence_mode', v_path.sequence_mode,
+        'enrolled', exists (
+          select 1 from public.v_path_enrollments_expanded pe
+           where pe.path_id = p_path and pe.user_id = p_user),
+        'self_row', exists (
+          select 1 from public.learning_path_assignments pa
+           where pa.path_id = p_path and pa.assignee_type = 'user' and pa.user_id = p_user
+             and pa.source = 'self'),
+        'course_step', (
+          select lpc.step_number from public.learning_path_courses lpc
+           where lpc.path_id = p_path and lpc.course_id = p_course),
+        'steps', coalesce((
+          select jsonb_agg(jsonb_build_object(
+                   'course_id', lpc.course_id,
+                   'step_number', lpc.step_number,
+                   'release_at', lpc.release_at,
+                   'done', coalesce(s.done, false))
+                 order by lpc.step_number)
+            from public.learning_path_courses lpc
+            left join public.v_path_step_status s
+              on s.path_id = lpc.path_id and s.course_id = lpc.course_id and s.user_id = p_user
+           where lpc.path_id = p_path), '[]'::jsonb));
+    end if;
+  end if;
+
+  -- journey
+  if p_enrollment is not null then
+    select en.id, en.status, en.program_id, en.start_date, en.version_id, jp.is_active as program_is_active
+      into v_enr
+      from public.journey_enrollments en
+      join public.journey_programs jp on jp.id = en.program_id
+     where en.id = p_enrollment and en.organization_id = p_org and en.user_id = p_user;
+    if not found then
+      j_journey := jsonb_build_object('found', false);
+    else
+      select jv.unlock_mode, jv.count_sundays, jv.days_total, jv.days, jv.day_ids into v_ver
+        from public.journey_versions jv
+       where jv.id = v_enr.version_id;
+      v_day_ids := case when jsonb_typeof(v_ver.day_ids) = 'object' then v_ver.day_ids else '{}'::jsonb end;
+      v_days    := case when jsonb_typeof(v_ver.days) = 'array' then v_ver.days else '[]'::jsonb end;
+
+      -- the day: by its id, else an old link's number through the pinned
+      -- version's day_ids (step 93)
+      v_day_id := p_day_id;
+      if v_day_id is null and p_day is not null and (v_day_ids ->> p_day::text) ~ c_uuid then
+        v_day_id := (v_day_ids ->> p_day::text)::uuid;
+      end if;
+      if v_day_id is not null then
+        select min(k.key::integer) into v_day_no
+          from jsonb_each_text(v_day_ids) as k(key, value)
+         where k.key ~ '^[0-9]{1,6}$' and lower(k.value) = v_day_id::text;
+        if v_day_no is not null then
+          select case when (d.e ->> 'course_id') ~ c_uuid then (d.e ->> 'course_id')::uuid end
+            into v_day_crs
+            from jsonb_array_elements(v_days) with ordinality as d(e, i)
+           where d.e ->> 'day' ~ '^[0-9]{1,6}$' and (d.e ->> 'day')::integer = v_day_no
+           order by d.i
+           limit 1;
+        end if;
+        v_removed := exists (
+          select 1 from public.journey_days jd
+           where jd.id = v_day_id and jd.program_id = v_enr.program_id and jd.removed_at is not null);
+      end if;
+
+      select cs.required_days, cs.credited_days, cs.next_day, cs.next_day_id, cs.resumable_day_ids
+        into v_cs
+        from public.journey_credit_state(array[p_enrollment]) cs;
+
+      j_journey := jsonb_build_object(
+        'found', true,
+        'status', v_enr.status,
+        'program_id', v_enr.program_id,
+        'program_is_active', v_enr.program_is_active,
+        'start_date', v_enr.start_date,
+        'version_id', v_enr.version_id,
+        'unlock_mode', v_ver.unlock_mode,
+        'count_sundays', v_ver.count_sundays,
+        'days_total', v_ver.days_total,
+        'timezone', coalesce((select gs.timezone from public.gamification_settings gs
+                               where gs.organization_id = p_org), 'Asia/Kolkata'),
+        'day', jsonb_build_object(
+                 'id', v_day_id,
+                 'number', v_day_no,
+                 'in_version', v_day_no is not null,
+                 'removed', v_removed,
+                 'course_id', v_day_crs),
+        'day_credit', (
+          select jsonb_build_object('course_id', p.course_id, 'attempt_id', p.attempt_id,
+                                    'credit_kind', p.credit_kind, 'day_number', p.day_number)
+            from public.journey_day_progress p
+           where p.enrollment_id = p_enrollment and p.day_id = v_day_id),
+        'day_open_attempt', (
+          select jsonb_build_object('attempt_id', ca.id, 'course_id', cv.course_id)
+            from public.course_attempts ca
+            join public.course_versions cv on cv.id = ca.course_version_id
+           where ca.journey_enrollment_id = p_enrollment
+             and ca.context_kind = 'journey'
+             and ca.journey_day_id = v_day_id
+             and ca.status = 'in_progress'
+             and not ca.is_revision
+           order by (cv.course_id is not distinct from p_course) desc, ca.started_at, ca.id
+           limit 1),
+        'required_days', v_cs.required_days,
+        'credited_days', v_cs.credited_days,
+        'next_day', v_cs.next_day,
+        'next_day_id', v_cs.next_day_id,
+        'resumable_day_ids', to_jsonb(coalesce(v_cs.resumable_day_ids, '{}'::uuid[])));
+    end if;
+  end if;
+
+  -- holders: the paths and journey days in which the learner holds the course
+  j_holders := jsonb_build_object(
+    'paths', coalesce((
+      select jsonb_agg(jsonb_build_object('path_id', lpc.path_id, 'step_number', lpc.step_number)
+                       order by lpc.path_id)
+        from public.learning_path_courses lpc
+        join public.learning_paths lp on lp.id = lpc.path_id
+       where lpc.course_id = p_course
+         and lp.organization_id = p_org
+         and lp.is_active
+         and exists (select 1 from public.v_path_enrollments_expanded pe
+                      where pe.path_id = lpc.path_id and pe.user_id = p_user)), '[]'::jsonb),
+    'journey_days', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'enrollment_id', r.enrollment_id,
+               'day_id', r.day_id,
+               'day_number', r.day_number,
+               'credited', exists (select 1 from public.journey_day_progress p
+                                    where p.enrollment_id = r.enrollment_id and p.day_id = r.day_id))
+             order by r.enrollment_id, r.day_number)
+        from (
+          select distinct
+                 en.id as enrollment_id,
+                 x.day_number,
+                 case when (jv.day_ids ->> x.day_number::text) ~ c_uuid
+                      then (jv.day_ids ->> x.day_number::text)::uuid end as day_id
+            from public.journey_enrollments en
+            join public.journey_versions jv on jv.id = en.version_id
+            cross join lateral (
+              select case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::integer end as day_number,
+                     lower(nullif(d.e ->> 'course_id', '')) as course_id
+                from jsonb_array_elements(
+                       case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end) as d(e)
+            ) x
+           where en.user_id = p_user
+             and en.organization_id = p_org
+             and en.status = 'active'
+             and x.course_id = lower(p_course::text)
+             and x.day_number between 1 and jv.days_total
+        ) r), '[]'::jsonb));
+
+  return jsonb_build_object(
+    'v', 1,
+    'member', j_member,
+    'course', j_course,
+    'path', j_path,
+    'journey', j_journey,
+    'holders', j_holders,
+    'run', null);
+end
+$$;
+
+comment on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer) is
+  'The facts of one launch in one call (ADR 0024 step 18, note N15): membership, the course and its Individual enrolment, the path and its steps, the journey enrolment and its day, and the paths and journey days that hold the course. Facts only; the launch''s resolver decides. Service role only.';
+
+revoke execute on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer) from public, anon, authenticated;
+grant execute on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 7. Restated grants, the after-checks A1 to A24 and notify pgrst (ADR 0024
+--    section B, creation order item 7; step 19)
+-- ---------------------------------------------------------------------------
+
+-- 7a. Restated policies and grants (step 8): attempt_requests keeps its two
+-- select policies and its grants as 0083:49-65 wrote them, and
+-- revision_visits its deny-all policy and grants as 0103:334-347 wrote them.
+-- The columns section 1 added to them take each table's privileges.
+alter table public.attempt_requests enable row level security;
+
+drop policy if exists "learners read their own attempt requests" on public.attempt_requests;
+create policy "learners read their own attempt requests"
+  on public.attempt_requests for select
+  using (user_id = auth.uid());
+
+drop policy if exists "admins read org attempt requests" on public.attempt_requests;
+create policy "admins read org attempt requests"
+  on public.attempt_requests for select
+  using (public.is_org_admin(organization_id));
+
+grant select on public.attempt_requests to authenticated, service_role;
+grant insert, update, delete on public.attempt_requests to service_role;
+
+alter table public.revision_visits enable row level security;
+drop policy if exists "no direct access to revision_visits" on public.revision_visits;
+create policy "no direct access to revision_visits" on public.revision_visits
+  for all
+  using (false)
+  with check (false);
+
+revoke all on public.revision_visits from anon, authenticated, service_role;
+grant select, insert on public.revision_visits to service_role;
+
+-- 7b. The after-checks A1 to A24 (step 19). Each raises, and a raise rolls
+-- the whole file back: "0107 after-check failed: ... Nothing changed." They
+-- read the database as this file left it and the table of section 0b. The
+-- record lists A1 to A16 as one sentence; they are numbered here in its
+-- order. The first paste is the one section 0b found without
+-- journey_day_progress.day_id (Q8.paste); the checks that count backfilled
+-- rows run on the first paste only (A9, A17's existing keys, A19's
+-- equality, A21's counts, A22's zeros). What the record says is counted and
+-- reported is a notice, never a raise: A9 on a later paste, A18's
+-- enrolments with every required day credited and no completion. Catalog
+-- reads follow note N3: not-null from pg_attribute.attnotnull, privileges
+-- from has_*_privilege per privilege, never 'MAINTAIN' (it raises on 15 and
+-- 16) and never the raw ACL text. The checks that run as anon or
+-- authenticated set the role inside their block and set it back to the role
+-- that runs the file before they raise; a learner's session there is a
+-- request.jwt.claims setting, set and cleared inside the transaction.
+--   A1   the new indexes present; the open-row and open-request indexes of
+--        0062 and 0083 absent
+--   A2   both attempt foreign keys on delete no action
+--   A3   both attempt triggers present, enabled and bound
+--   A4   the recreated function bodies name context_key
+--   A5   the privilege matrix: every new relation (the six tables and the
+--        six views; with A23, the two terms views and the two path views
+--        among them) and the three restated views, every function this
+--        file creates or recreates (its arguments, security definer or
+--        invoker, the pinned search_path in proconfig, and execute for the
+--        roles that hold it); three new columns hold no privilege of their
+--        own; and a real 42501 as anon on every new relation and on every
+--        function that is not a trigger function
+--   A6   both refresh functions answer with every error null and a
+--        completion_sweep entry; they run inside a block rolled back on
+--        purpose, so the paste keeps neither the sweep's writes nor the
+--        refreshed matviews (a later paste writes no row)
+--   A7   counts by context_kind equal Q1
+--   A8   Q2 unchanged
+--   A9   on the first paste, no completed row with side_effects_sig
+--        distinct from settle_sig; on a later paste they are counted only
+--   A10  the two old-name views keep their column lists (0103)
+--   A11  v_course_attempt_summary: one row per (course, learner)
+--   A12  v_context_attempt_summary: one row per (course, learner,
+--        context_key)
+--   A13  as authenticated, a write naming org_api_keys.contract_version
+--        raises 42501; the route's insert columns and its deactivate are
+--        still granted
+--   A14  as authenticated, a member reads 0 rows of another organisation
+--        from the terms views, the path views, learning_path_completions
+--        and learning_path_step_completions, and an insert, update or
+--        delete of either table raises 42501 (build note O1-f)
+--   A15  context_derive_log exists with RLS on
+--   A16  every new table with organization_id has RLS on and a policy
+--   A17  org_api_keys.contract_version defaults to 2; on the first paste
+--        every existing key reads 1
+--   A18  journey_credit_state answers for every active enrolment; active
+--        enrolments with required_days > 0 and next_day null are counted
+--   A19  every journey attempt has a journey_day_id, every credit a day_id,
+--        every version a day_ids entry for each of its days; on the first
+--        paste the counts of Q8 and Q9 a to d read again by day id equal
+--        the counts by (program, day number)
+--   A20  unique (enrollment_id, day_id) present, unique (enrollment_id,
+--        day_number) absent
+--   A21  every preview_kind belongs to an is_preview row; on the first
+--        paste every is_preview row reads legacy_role and their count
+--        equals Q10
+--   A22  purge_preview_data in dry-run mode, once per organisation with a
+--        fixed check actor, writes no log row; on the first paste every
+--        count and excluded read 0
+--   A23  preview_runs, preview_purge_log and learning_path_step_completions
+--        have RLS on with a policy; as anon and as authenticated a read of
+--        preview_runs and preview_purge_log raises 42501; neither refresh
+--        function names purge_preview_data; the append-only triggers of
+--        preview_purge_log and learning_path_step_completions are bound;
+--        the twenty foreign-key indexes of step 7 (build note O1-a) are
+--        present; both delete guards are security definer, name
+--        legacy_role, keep the service-role return and their two 0098
+--        triggers; v_path_step_status has its columns, the two of O1-d
+--        among them
+--   A24  journey_save_days, journey_repin_enrollments and both forms of
+--        consume_grant are in the privilege matrix
+
+-- A1 to A4 and A7 to A12, A15 to A21, A23 (the catalog and the rows)
+do $$
+declare
+  v_first boolean := (select b.refuses from pg_temp.adr0024_0107_before b where b.q = 'Q8.version_days');
+  bad     text[] := '{}';
+  r       record;
+  n       bigint;
+  got     text;
+  src     text;
+begin
+  -- A1
+  for r in
+    select * from (values
+      ('course_attempts_one_in_progress_ctx_idx', true),
+      ('course_attempts_user_version_ctx_idx',    false),
+      ('course_attempts_org_kind_completed_idx',  false),
+      ('course_attempts_ctx_user_idx',            false),
+      ('attempt_requests_one_open_ctx_idx',       true),
+      ('xp_events_org_ctx_created_idx',           false)
+    ) as t(idx, uniq)
+  loop
+    if not exists (select 1 from pg_index i
+                    where i.indexrelid = to_regclass('public.' || r.idx)
+                      and i.indisvalid and i.indisunique = r.uniq) then
+      bad := bad || format('A1 index %s is missing, invalid or not %s', r.idx,
+                           case when r.uniq then 'unique' else 'as defined' end);
+    end if;
+  end loop;
+  if to_regclass('public.course_attempts_one_in_progress_idx') is not null
+     or to_regclass('public.attempt_requests_one_open_idx') is not null then
+    bad := bad || 'A1 an open-row index of 0062 or 0083 is still present'::text;
+  end if;
+
+  -- A2
+  select count(*) into n from pg_constraint c
+   where c.conrelid = 'public.course_attempts'::regclass and c.contype = 'f' and c.confdeltype = 'a'
+     and c.conname in ('course_attempts_learning_path_id_fkey', 'course_attempts_journey_enrollment_id_fkey');
+  if n <> 2 then
+    bad := bad || format('A2 %s of the two attempt foreign keys read on delete no action', n);
+  end if;
+
+  -- A3
+  select count(*) into n from pg_trigger t
+   where t.tgrelid = 'public.course_attempts'::regclass and not t.tgisinternal and t.tgenabled <> 'D'
+     and ((t.tgname = 'course_attempts_context_immutable'
+           and t.tgfoid = 'public.course_attempts_context_immutable()'::regprocedure)
+       or (t.tgname = 'course_attempts_context_derive'
+           and t.tgfoid = 'public.course_attempts_context_derive()'::regprocedure));
+  if n <> 2 then
+    bad := bad || format('A3 %s of the two attempt triggers are present, enabled and bound', n);
+  end if;
+
+  -- A4: each recreated body that reads attempts names their context; a
+  -- recreated wrapper calls the form that does
+  for r in
+    select * from (values
+      ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)', 'context_key'),
+      ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)',
+       'public\.consume_grant\((\s*[a-z_]+\s*,){8}\s*[a-z_]+\s*\)'),
+      ('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text,text)',      'context_key'),
+      ('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text)',
+       'public\.record_revision_visit\([^)]*''individual''\)'),
+      ('public.journey_record_completion(uuid)',                                'context_key'),
+      ('public.gamification_record_activity_core(uuid,boolean,boolean)',        'context_key'),
+      ('public.gamification_record_activity_core(uuid)',                        'context_key'),
+      ('public.gamification_record_activity(uuid)',                             'context_kind'),
+      ('public.gamification_close_month()',                                     'context_kind')
+    ) as t(fn, pattern)
+  loop
+    select p.prosrc into src from pg_proc p where p.oid = to_regprocedure(r.fn);
+    if src is null or src !~ r.pattern then
+      bad := bad || format('A4 %s does not read the context', r.fn);
+    end if;
+  end loop;
+
+  -- A7
+  select string_agg(format('%s %s/%s', k.kind, coalesce(a.n, 0), coalesce(b.n, 0)), ', ' order by k.kind) into got
+    from (values ('individual'), ('path'), ('journey'), ('preview')) as k(kind)
+    left join (select ca.context_kind, count(*) as n from public.course_attempts ca group by 1) a
+      on a.context_kind = k.kind
+    left join pg_temp.adr0024_0107_before b on b.q = 'Q1.kind.' || k.kind
+   where coalesce(a.n, 0) <> coalesce(b.n, 0);
+  if got is not null
+     or (select count(*) from public.course_attempts)
+        <> (select b.n from pg_temp.adr0024_0107_before b where b.q = 'Q1.total') then
+    bad := bad || format('A7 counts by context_kind differ from Q1 (after/before): %s', coalesce(got, 'the total'));
+  end if;
+
+  -- A8
+  select string_agg(format('%s %s/%s', v.q, v.n, coalesce(b.n, -1)), ', ' order by v.q) into got
+    from (
+      select x.q, x.n from (
+        select
+          count(*) filter (where not ca.is_preview and ca.learning_path_id is not null
+                                 and ca.journey_enrollment_id is not null) as both_tags,
+          count(*) filter (where not ca.is_preview and ca.journey_enrollment_id is not null
+                                 and ca.journey_day is null) as journey_null_day,
+          count(*) filter (where not ca.is_preview and ca.journey_day is not null
+                                 and ca.journey_enrollment_id is null) as orphan_day,
+          count(*) filter (where ca.is_preview and (ca.learning_path_id is not null
+                                 or ca.journey_enrollment_id is not null or ca.journey_day is not null)) as preview_tagged,
+          count(*) filter (where ca.status = 'abandoned'
+                                 and (ca.completion_status = 'completed' or ca.success_status = 'passed')) as abandoned_done
+        from public.course_attempts ca) c
+      cross join lateral (values
+        ('Q2.both_tags', c.both_tags), ('Q2.journey_null_day', c.journey_null_day), ('Q2.orphan_day', c.orphan_day),
+        ('Q2.preview_tagged', c.preview_tagged), ('Q2.abandoned_done', c.abandoned_done)) as x(q, n)
+    ) v
+    left join pg_temp.adr0024_0107_before b on b.q = v.q
+   where b.n is distinct from v.n;
+  if got is not null then
+    bad := bad || format('A8 Q2 changed (after/before): %s', got);
+  end if;
+
+  -- A9
+  select count(*) into n from public.course_attempts ca
+   where (ca.completion_status = 'completed' or ca.success_status = 'passed')
+     and ca.side_effects_sig is distinct from ca.settle_sig;
+  if v_first and n > 0 then
+    bad := bad || format('A9 %s completed row(s) with side_effects_sig distinct from settle_sig on the first paste', n);
+  elsif n > 0 then
+    raise notice '0107 after-check A9 (counted): % completed row(s) not yet handled by the completion writer (the sweep''s candidates).', n;
+  end if;
+
+  -- A10
+  for r in
+    select * from (values
+      ('v_course_attempt_scoring',
+       'course_id, user_id, max_scored_attempts, official_basis, official_attempt_number, completed_attempts, '
+       || 'scored_attempts, practice_attempts, first_score, best_score, latest_score, official_score, '
+       || 'official_status, official_attempt_id'),
+      ('v_course_attempt_summary',
+       'course_id, user_id, latest_completion, latest_success, best_score, total_time_seconds, attempt_count, '
+       || 'ever_completed, ever_passed, official_score, first_score, latest_score, scored_attempts, '
+       || 'practice_attempts, official_basis, max_scored_attempts, first_completed_passed, official_status, '
+       || 'official_attempt_id, live_attempt_count, latest_live_completion, latest_live_success')
+    ) as t(v, cols)
+  loop
+    select string_agg(a.attname::text, ', ' order by a.attnum) into got
+      from pg_attribute a
+     where a.attrelid = ('public.' || r.v)::regclass and a.attnum > 0 and not a.attisdropped;
+    if got is distinct from r.cols then
+      bad := bad || format('A10 %s reads (%s)', r.v, got);
+    end if;
+  end loop;
+
+  -- A11, A12
+  select count(*) - count(distinct (s.course_id, s.user_id)) into n from public.v_course_attempt_summary s;
+  if n <> 0 then
+    bad := bad || format('A11 v_course_attempt_summary repeats %s (course, learner)', n);
+  end if;
+  select count(*) - count(distinct (s.course_id, s.user_id, s.context_key)) into n from public.v_context_attempt_summary s;
+  if n <> 0 then
+    bad := bad || format('A12 v_context_attempt_summary repeats %s (course, learner, context_key)', n);
+  end if;
+
+  -- A15
+  if to_regclass('public.context_derive_log') is null
+     or not (select c.relrowsecurity from pg_class c where c.oid = 'public.context_derive_log'::regclass) then
+    bad := bad || 'A15 context_derive_log is missing or has RLS off'::text;
+  end if;
+
+  -- A16
+  for r in
+    select c.oid::regclass::text as rel, c.relrowsecurity as rls,
+           (select count(*) from pg_policy p where p.polrelid = c.oid) as policies
+      from pg_class c
+     where c.oid in (to_regclass('public.preview_runs'), to_regclass('public.context_derive_log'),
+                     to_regclass('public.learning_path_completions'),
+                     to_regclass('public.learning_path_step_completions'),
+                     to_regclass('public.completion_notices'), to_regclass('public.preview_purge_log'))
+       and exists (select 1 from pg_attribute a
+                    where a.attrelid = c.oid and a.attname = 'organization_id' and not a.attisdropped)
+  loop
+    if not r.rls or r.policies = 0 then
+      bad := bad || format('A16 %s has RLS %s and %s polic(ies)', r.rel, case when r.rls then 'on' else 'off' end, r.policies);
+    end if;
+  end loop;
+
+  -- A17
+  select pg_get_expr(d.adbin, d.adrelid) into got
+    from pg_attrdef d
+    join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+   where d.adrelid = 'public.org_api_keys'::regclass and a.attname = 'contract_version';
+  if got is distinct from '2' then
+    bad := bad || format('A17 org_api_keys.contract_version defaults to %s, not 2', coalesce(got, 'nothing'));
+  end if;
+  if v_first and exists (select 1 from public.org_api_keys k where k.contract_version is distinct from 1) then
+    bad := bad || 'A17 an existing org_api_keys row does not read contract_version 1 on the first paste'::text;
+  end if;
+
+  -- A18
+  select count(*) into n
+    from public.journey_enrollments en
+   where en.status = 'active'
+     and not exists (select 1 from public.journey_credit_state(array[en.id]) cs where cs.enrollment_id = en.id);
+  if n > 0 then
+    bad := bad || format('A18 journey_credit_state does not answer for %s active enrolment(s)', n);
+  end if;
+  select count(*) into n
+    from public.journey_credit_state(array(select en.id from public.journey_enrollments en where en.status = 'active')) cs
+   where cs.required_days > 0 and cs.next_day is null;
+  if n > 0 then
+    raise notice '0107 after-check A18 (counted): % active enrolment(s) hold a credit on every required day and are not completed.', n;
+  end if;
+
+  -- A19
+  select count(*) into n from public.course_attempts ca
+   where ca.context_kind = 'journey' and ca.journey_day_id is null;
+  if n > 0 then
+    bad := bad || format('A19 %s journey attempt(s) without a journey_day_id', n);
+  end if;
+  if exists (select 1 from pg_attribute a
+              where a.attrelid = 'public.journey_day_progress'::regclass and a.attname = 'day_id' and not a.attnotnull) then
+    bad := bad || 'A19 journey_day_progress.day_id is not not null'::text;
+  end if;
+  select count(*) into n
+    from public.journey_versions jv
+   cross join lateral jsonb_array_elements(
+           case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end) as d(e)
+   where d.e ->> 'day' ~ '^[0-9]{1,6}$'
+     and not coalesce(jsonb_typeof(jv.day_ids) = 'object' and jv.day_ids ? ((d.e ->> 'day')::integer)::text, false);
+  if n > 0 then
+    bad := bad || format('A19 %s version day(s) without a day_ids entry', n);
+  end if;
+  if v_first then
+    select string_agg(format('%s %s/%s', v.q, v.n, coalesce(b.n, -1)), ', ' order by v.q) into got
+      from (
+        with vday as (
+          select jv.id as version_id, jv.program_id, jv.days_total, jv.day_ids,
+                 case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::integer end as day_number,
+                 lower(nullif(d.e ->> 'course_id', '')) as course_id
+            from public.journey_versions jv
+           cross join lateral jsonb_array_elements(
+                   case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end) as d(e)
+        ),
+        pin as (
+          select e.id as enrollment_id, e.program_id, e.version_id, e.status
+            from public.journey_enrollments e
+        ),
+        pin_day as (
+          select p.enrollment_id, vd.day_number, vd.course_id,
+                 (vd.day_ids ->> vd.day_number::text) as day_id,
+                 coalesce(vd.day_number between 1 and vd.days_total and vd.course_id is not null, false) as required
+            from pin p
+            join vday vd on vd.version_id = p.version_id
+        ),
+        credit as (
+          select pr.enrollment_id, pr.day_id::text as day_id, lower(pr.course_id::text) as course_id
+            from public.journey_day_progress pr
+        ),
+        jatt as (
+          select ca.id, ca.journey_enrollment_id, ca.journey_day_id::text as day_id, lower(cv.course_id::text) as course_id
+            from public.course_attempts ca
+            join public.course_versions cv on cv.id = ca.course_version_id
+           where ca.context_kind = 'journey' and ca.status = 'in_progress'
+        ),
+        open_day as (
+          select distinct on (pd.enrollment_id) pd.enrollment_id, pd.day_id
+            from pin_day pd
+           where pd.required
+             and not exists (select 1 from credit c where c.enrollment_id = pd.enrollment_id and c.day_id = pd.day_id)
+           order by pd.enrollment_id, pd.day_number
+        )
+        select x.q, x.n from (
+          select
+            (select count(*) from vday v
+              where v.day_number is not null
+                and not exists (select 1 from public.journey_days jd
+                                 where jd.program_id = v.program_id
+                                   and jd.id::text = (v.day_ids ->> v.day_number::text))) as version_days,
+            (select count(*) from public.course_attempts ca
+              where ca.context_kind = 'journey' and ca.journey_day_id is null) as journey_attempts,
+            (select count(*) from public.journey_day_progress pr where pr.day_id is null) as progress_rows,
+            (select count(*) from credit c join pin p on p.enrollment_id = c.enrollment_id
+              where c.course_id is distinct from
+                    (select max(pd.course_id) from pin_day pd
+                      where pd.enrollment_id = c.enrollment_id and pd.day_id = c.day_id)) as a,
+            (select count(*) from credit c join pin p on p.enrollment_id = c.enrollment_id
+              where not exists (select 1 from pin_day pd
+                                 where pd.enrollment_id = c.enrollment_id and pd.day_id = c.day_id and pd.required)) as b,
+            (select count(*) from jatt a
+               left join pin p on p.enrollment_id = a.journey_enrollment_id
+               left join open_day od on od.enrollment_id = a.journey_enrollment_id
+              where p.enrollment_id is null or a.day_id is distinct from od.day_id) as c_not_open_day,
+            (select count(*) from jatt a
+               left join pin p on p.enrollment_id = a.journey_enrollment_id
+              where p.enrollment_id is null
+                 or a.course_id is distinct from
+                    (select max(pd.course_id) from pin_day pd
+                      where pd.enrollment_id = a.journey_enrollment_id and pd.day_id = a.day_id)) as c_other_course,
+            (select count(*) from jatt a
+               left join pin p on p.enrollment_id = a.journey_enrollment_id
+               left join open_day od on od.enrollment_id = a.journey_enrollment_id
+              where p.enrollment_id is null
+                 or a.day_id is distinct from od.day_id
+                 or a.course_id is distinct from
+                    (select max(pd.course_id) from pin_day pd
+                      where pd.enrollment_id = a.journey_enrollment_id and pd.day_id = a.day_id)) as c_either,
+            (select count(*) from pin p
+              where p.status = 'active'
+                and exists (
+                  select 1 from pin_day rq
+                   where rq.enrollment_id = p.enrollment_id and rq.required
+                     and not exists (select 1 from credit c
+                                      where c.enrollment_id = rq.enrollment_id and c.day_id = rq.day_id)
+                     and exists (select 1 from pin_day l
+                                   join credit c on c.enrollment_id = l.enrollment_id and c.day_id = l.day_id
+                                  where l.enrollment_id = rq.enrollment_id and l.required
+                                    and l.day_number > rq.day_number))) as d
+        ) c
+        cross join lateral (values
+          ('Q8.version_days', c.version_days), ('Q8.journey_attempts', c.journey_attempts),
+          ('Q8.progress_rows', c.progress_rows), ('Q9.a', c.a), ('Q9.b', c.b),
+          ('Q9.c_not_open_day', c.c_not_open_day), ('Q9.c_other_course', c.c_other_course),
+          ('Q9.c', c.c_either), ('Q9.d', c.d)) as x(q, n)
+      ) v
+      left join pg_temp.adr0024_0107_before b on b.q = v.q
+     where b.n is distinct from v.n;
+    if got is not null then
+      bad := bad || format('A19 counts by day id differ from the counts by (program, day number) (by id/by number): %s', got);
+    end if;
+  end if;
+
+  -- A20
+  if not exists (
+       select 1 from pg_index i
+        where i.indrelid = 'public.journey_day_progress'::regclass and i.indisunique and i.indisvalid
+          and i.indnatts = 2
+          and (select array_agg(a.attname::text order by k.o)
+                 from unnest(i.indkey::int2[]) with ordinality as k(attnum, o)
+                 join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum) = array['enrollment_id', 'day_id'])
+     or exists (
+       select 1 from pg_index i
+        where i.indrelid = 'public.journey_day_progress'::regclass and i.indisunique
+          and (select array_agg(a.attname::text order by k.o)
+                 from unnest(i.indkey::int2[]) with ordinality as k(attnum, o)
+                 join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum) = array['enrollment_id', 'day_number']) then
+    bad := bad || 'A20 journey_day_progress lacks unique (enrollment_id, day_id) or still has unique (enrollment_id, day_number)'::text;
+  end if;
+
+  -- A21
+  if exists (select 1 from public.course_attempts ca where ca.preview_kind is not null and not ca.is_preview) then
+    bad := bad || 'A21 a row that is not is_preview carries a preview_kind'::text;
+  end if;
+  if v_first then
+    select count(*) into n from public.course_attempts ca where ca.is_preview;
+    if exists (select 1 from public.course_attempts ca
+                where ca.is_preview and ca.preview_kind is distinct from 'legacy_role')
+       or n <> (select b.n from pg_temp.adr0024_0107_before b where b.q = 'Q10.rows') then
+      bad := bad || format('A21 on the first paste %s is_preview row(s), not every one legacy_role, or not Q10''s %s', n,
+                           (select b.n from pg_temp.adr0024_0107_before b where b.q = 'Q10.rows'));
+    end if;
+  end if;
+
+  -- A23 (the catalog half; the reads as anon and authenticated are below)
+  for r in
+    select * from (values ('public.preview_runs'), ('public.preview_purge_log'),
+                          ('public.learning_path_step_completions')) as t(rel)
+  loop
+    if not (select c.relrowsecurity from pg_class c where c.oid = r.rel::regclass)
+       or not exists (select 1 from pg_policy p where p.polrelid = r.rel::regclass) then
+      bad := bad || format('A23 %s has RLS off or no policy', r.rel);
+    end if;
+  end loop;
+  if exists (select 1 from pg_proc p
+              where p.oid in (to_regprocedure('public.refresh_report_views()'),
+                              to_regprocedure('public.refresh_gamification_views()'))
+                and p.prosrc ~* 'purge_preview_data') then
+    bad := bad || 'A23 a refresh function names purge_preview_data'::text;
+  end if;
+  select count(*) into n from pg_trigger t
+   where not t.tgisinternal and t.tgenabled <> 'D'
+     and ((t.tgrelid = 'public.preview_purge_log'::regclass and t.tgname = 'preview_purge_log_no_mutation'
+           and t.tgfoid = 'public.preview_purge_log_append_only()'::regprocedure)
+       or (t.tgrelid = 'public.learning_path_step_completions'::regclass
+           and t.tgname = 'learning_path_step_completions_no_mutation'
+           and t.tgfoid = 'public.learning_path_step_completions_append_only()'::regprocedure));
+  if n <> 2 then
+    bad := bad || format('A23 %s of the two append-only triggers (preview_purge_log, learning_path_step_completions) are bound', n);
+  end if;
+  for r in
+    select * from (values
+      ('course_attempts',                'course_attempts_journey_version_idx',             'journey_version_id'),
+      ('course_attempts',                'course_attempts_preview_run_idx',                 'preview_run_id'),
+      ('course_attempts',                'course_attempts_journey_day_idx',                 'journey_day_id'),
+      ('attempt_requests',               'attempt_requests_journey_day_idx',                'journey_day_id'),
+      ('attempt_requests',               'attempt_requests_learning_path_idx',              'learning_path_id'),
+      ('attempt_requests',               'attempt_requests_journey_enrollment_idx',         'journey_enrollment_id'),
+      ('journey_day_progress',           'journey_day_progress_day_idx',                    'day_id'),
+      ('preview_runs',                   'preview_runs_organization_idx',                   'organization_id'),
+      ('preview_runs',                   'preview_runs_user_idx',                           'user_id'),
+      ('preview_runs',                   'preview_runs_learning_path_idx',                  'learning_path_id'),
+      ('preview_runs',                   'preview_runs_journey_program_idx',                'journey_program_id'),
+      ('preview_runs',                   'preview_runs_journey_version_idx',                'journey_version_id'),
+      ('learning_path_completions',      'learning_path_completions_organization_idx',      'organization_id'),
+      ('learning_path_completions',      'learning_path_completions_user_idx',              'user_id'),
+      ('learning_path_step_completions', 'learning_path_step_completions_organization_idx', 'organization_id'),
+      ('learning_path_step_completions', 'learning_path_step_completions_user_idx',         'user_id'),
+      ('learning_path_step_completions', 'learning_path_step_completions_course_idx',       'course_id'),
+      ('completion_notices',             'completion_notices_organization_idx',             'organization_id'),
+      ('completion_notices',             'completion_notices_attempt_idx',                  'attempt_id'),
+      ('preview_purge_log',              'preview_purge_log_organization_idx',              'organization_id')
+    ) as t(tbl, idx, col)
+  loop
+    if not exists (
+      select 1 from pg_index i
+      join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
+      where i.indexrelid = to_regclass('public.' || r.idx)
+        and i.indrelid = ('public.' || r.tbl)::regclass
+        and a.attname = r.col and i.indisvalid
+    ) then
+      bad := bad || format('A23 foreign-key index %s on %s (%s) is missing', r.idx, r.tbl, r.col);
+    end if;
+  end loop;
+  for r in
+    select * from (values
+      ('public.guard_learner_history_course_versions()', 'public.course_versions', 'course_versions_guard_learner_history'),
+      ('public.guard_learner_history_courses()',         'public.courses',         'courses_guard_learner_history')
+    ) as t(fn, rel, trg)
+  loop
+    select p.prosrc into src from pg_proc p where p.oid = to_regprocedure(r.fn) and p.prosecdef;
+    if src is null or strpos(src, 'legacy_role') = 0 or src !~ 'claim_role\s*=\s*''service_role''\s+then\s+return\s+old'
+       or not exists (select 1 from pg_trigger t
+                       where t.tgrelid = r.rel::regclass and t.tgname = r.trg and not t.tgisinternal
+                         and t.tgenabled <> 'D' and t.tgfoid = to_regprocedure(r.fn)) then
+      bad := bad || format('A23 %s is not security definer, does not name legacy_role, lost its service-role return or its trigger %s', r.fn, r.trg);
+    end if;
+  end loop;
+  select string_agg(a.attname::text, ', ' order by a.attnum) into got
+    from pg_attribute a where a.attrelid = 'public.v_path_step_status'::regclass and a.attnum > 0 and not a.attisdropped;
+  if got is distinct from 'path_id, user_id, course_id, organization_id, step_number, release_at, pass_required, '
+                          || 'passed_ever, passed_by_rule, done_recorded_at, latest_result, latest_score, done, '
+                          || 'official_attempt_id, retake_live, failed, open_attempt' then
+    bad := bad || format('A23 v_path_step_status reads (%s)', got);
+  end if;
+
+  if cardinality(bad) > 0 then
+    raise exception '0107 after-check failed: %. Nothing changed.', array_to_string(bad, '; ')
+      using hint = 'ADR 0024 step 19. The file rolled back whole; correct the cause and paste it again.';
+  end if;
+end
+$$;
+
+-- A5 (the privilege matrix) and A24. The function list is every function
+-- this file creates or recreates; the rehearsal's static step checks it
+-- against the file's own create statements, so a function added later and
+-- left out of the list fails there.
+do $$
+declare
+  bad    text[] := '{}';
+  r      record;
+  g      record;
+  p      text;
+  hold   boolean;
+  want   boolean;
+  v_role text;
+begin
+  -- relations: the privileges each role holds, read per privilege
+  for r in
+    select * from (values
+      -- (relation, anon, authenticated, service_role, is_strict): is_strict
+      -- reads every privilege; otherwise only select is read for
+      -- authenticated and service_role, because the three restated views keep
+      -- the grants of 0103 and 0105, which revoke nothing from authenticated;
+      -- anon null = not read (the two old-name views keep whatever 0073 to
+      -- 0103 left anon; they are invoker views over tables anon reads no row
+      -- of)
+      ('public.preview_runs',                   '', '',       'SELECT,INSERT,UPDATE', true),
+      ('public.context_derive_log',             '', '',       'SELECT,INSERT,UPDATE', true),
+      ('public.learning_path_completions',      '', 'SELECT', 'SELECT',               true),
+      ('public.learning_path_step_completions', '', 'SELECT', 'SELECT',               true),
+      ('public.completion_notices',             '', '',       'SELECT,UPDATE',        true),
+      ('public.preview_purge_log',              '', '',       'SELECT',               true),
+      ('public.v_context_attempt_scoring',      '', 'SELECT', 'SELECT',               true),
+      ('public.v_context_attempt_summary',      '', 'SELECT', 'SELECT',               true),
+      ('public.v_course_enrollment_terms',      '', 'SELECT', 'SELECT',               true),
+      ('public.v_path_enrollment_terms',        '', 'SELECT', 'SELECT',               true),
+      ('public.v_path_step_status',             '', 'SELECT', 'SELECT',               true),
+      ('public.v_path_progress',                '', 'SELECT', 'SELECT',               true),
+      ('public.v_course_attempt_scoring',       null, 'SELECT', 'SELECT',             false),
+      ('public.v_course_attempt_summary',       null, 'SELECT', 'SELECT',             false),
+      ('public.v_course_enrollments_expanded',  '', 'SELECT', 'SELECT',               false)
+    ) as t(rel, anon_p, auth_p, svc_p, is_strict)
+  loop
+    foreach p in array array['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'] loop
+      -- anon holds nothing on every relation it is read for
+      if r.anon_p is not null and has_table_privilege('anon', r.rel, p) then
+        bad := bad || format('A5 anon holds %s on %s', p, r.rel);
+      end if;
+      if r.is_strict or p = 'SELECT' then
+        want := p = any(string_to_array(r.auth_p, ','));
+        if has_table_privilege('authenticated', r.rel, p) <> want then
+          bad := bad || format('A5 authenticated %s %s on %s', case when want then 'lacks' else 'holds' end, p, r.rel);
+        end if;
+        want := p = any(string_to_array(r.svc_p, ','));
+        if has_table_privilege('service_role', r.rel, p) <> want then
+          bad := bad || format('A5 service_role %s %s on %s', case when want then 'lacks' else 'holds' end, p, r.rel);
+        end if;
+      end if;
+    end loop;
+  end loop;
+
+  -- three new columns hold no privilege of their own: each role holds on
+  -- the column exactly what it holds on its table (section B)
+  for r in
+    select * from (values
+      ('public.course_attempts',   'journey_version_id'),
+      ('public.preview_runs',      'done_activity_day_ids'),
+      ('public.preview_purge_log', 'excluded')
+    ) as t(rel, col)
+  loop
+    foreach v_role in array array['anon', 'authenticated', 'service_role'] loop
+      foreach p in array array['SELECT', 'INSERT', 'UPDATE', 'REFERENCES'] loop
+        if has_column_privilege(v_role, r.rel, r.col, p) <> has_table_privilege(v_role, r.rel, p) then
+          bad := bad || format('A5 %s holds %s on %s.%s apart from its table', v_role, p, r.rel, r.col);
+        end if;
+      end loop;
+    end loop;
+  end loop;
+
+  -- functions: every function this file creates or recreates
+  -- after-check function list: begin
+  for r in
+    select * from (values
+      ('public.course_attempts_context_immutable()',                            false, false),
+      ('public.course_attempts_context_derive()',                               true,  false),
+      ('public.learning_path_completions_append_only()',                        false, false),
+      ('public.learning_path_step_completions_append_only()',                   false, false),
+      ('public.preview_purge_log_append_only()',                                false, false),
+      ('public.official_attempt_in_context(uuid,uuid,text)',                    false, false),
+      ('public.instance_pass_required(uuid,text)',                              false, false),
+      ('public.journey_attempt_satisfies(uuid,boolean)',                        false, false),
+      ('public.journey_credit_state(uuid[])',                                   false, false),
+      ('public.journey_reminder_counts(uuid[])',                                true,  false),
+      ('public.journey_versions_derive_day_ids()',                              false, false),
+      ('public.guard_learner_history_course_versions()',                        true,  false),
+      ('public.guard_learner_history_courses()',                                true,  false),
+      ('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text,text)',      true,  false),
+      ('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text)',           true,  false),
+      ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)', true,  false),
+      ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)',      true,  false),
+      ('public.journey_save_days(uuid,jsonb)',                                  false, true),
+      ('public.journey_repin_enrollments(uuid,uuid,jsonb,boolean)',             true,  false),
+      ('public.journey_complete_enrollments_core(uuid[],text)',                 true,  false),
+      ('public.journey_complete_enrollment(uuid)',                              true,  false),
+      ('public.journey_complete_enrollments(uuid)',                             true,  false),
+      ('public.journey_record_completion(uuid)',                                true,  false),
+      ('public.gamification_record_activity_core(uuid,boolean,boolean)',        true,  false),
+      ('public.gamification_record_activity_core(uuid)',                        true,  false),
+      ('public.gamification_record_activity(uuid)',                             true,  false),
+      ('public.record_learning_activity(uuid,boolean)',                         true,  false),
+      ('public.record_learning_activity(uuid)',                                 true,  false),
+      ('public.sweep_completion_side_effects(integer)',                         true,  false),
+      ('public.purge_preview_data(uuid,jsonb,text,uuid,boolean,text)',          true,  false),
+      ('public.refresh_report_views()',                                         true,  false),
+      ('public.refresh_gamification_views()',                                   true,  false),
+      ('public.gamification_close_month()',                                     true,  false),
+      ('public.journey_auto_enroll()',                                          true,  false),
+      ('public.launch_context(uuid,uuid,uuid,uuid,uuid,uuid,integer)',          true,  false)
+    ) as t(fn, definer, auth_exec)
+  -- after-check function list: end
+  loop
+    select pr.prosecdef, pr.proconfig into g from pg_proc pr where pr.oid = to_regprocedure(r.fn);
+    if not found then
+      bad := bad || format('A5 %s is missing', r.fn);
+      continue;
+    end if;
+    if g.prosecdef <> r.definer then
+      bad := bad || format('A5 %s is security %s', r.fn, case when g.prosecdef then 'definer' else 'invoker' end);
+    end if;
+    if g.proconfig is distinct from array['search_path=pg_catalog, public'] then
+      bad := bad || format('A5 %s has proconfig %s', r.fn, coalesce(g.proconfig::text, 'null'));
+    end if;
+    if has_function_privilege('anon', to_regprocedure(r.fn), 'EXECUTE')
+       or has_function_privilege('authenticated', to_regprocedure(r.fn), 'EXECUTE') <> r.auth_exec
+       or not has_function_privilege('service_role', to_regprocedure(r.fn), 'EXECUTE') then
+      bad := bad || format('A5 %s: execute anon %s, authenticated %s, service_role %s', r.fn,
+                           has_function_privilege('anon', to_regprocedure(r.fn), 'EXECUTE'),
+                           has_function_privilege('authenticated', to_regprocedure(r.fn), 'EXECUTE'),
+                           has_function_privilege('service_role', to_regprocedure(r.fn), 'EXECUTE'));
+    end if;
+  end loop;
+
+  -- A24
+  if (select count(*) from pg_proc pr
+       where pr.oid in (to_regprocedure('public.journey_save_days(uuid,jsonb)'),
+                        to_regprocedure('public.journey_repin_enrollments(uuid,uuid,jsonb,boolean)'),
+                        to_regprocedure('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)'),
+                        to_regprocedure('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)'))
+         and pr.proconfig = array['search_path=pg_catalog, public']
+         and not has_function_privilege('anon', pr.oid, 'EXECUTE')
+         and has_function_privilege('service_role', pr.oid, 'EXECUTE')) <> 4 then
+    bad := bad || 'A24 journey_save_days, journey_repin_enrollments or a form of consume_grant is not in the privilege matrix'::text;
+  end if;
+
+  if cardinality(bad) > 0 then
+    raise exception '0107 after-check failed: %. Nothing changed.', array_to_string(bad, '; ')
+      using hint = 'ADR 0024 step 19 (the privilege matrix). The file rolled back whole; correct the cause and paste it again.';
+  end if;
+end
+$$;
+
+-- A5 (a real 42501 as anon) and A23 (the reads as anon and authenticated).
+-- The role is set inside the block and set back before any raise; the
+-- statements touch no row (where false, or a call refused before it runs).
+do $$
+declare
+  v_me    text := current_user;
+  bad     text[] := '{}';
+  r       record;
+  st      text;
+  v_role  text;
+begin
+  if not has_schema_privilege('anon', 'public', 'USAGE')
+     or not has_schema_privilege('authenticated', 'public', 'USAGE') then
+    raise exception '0107 after-check failed: A5 anon or authenticated holds no usage on schema public, so a 42501 below would prove nothing. Nothing changed.';
+  end if;
+  foreach v_role in array array['anon', 'authenticated'] loop
+    execute format('set local role %I', v_role);
+    for r in
+      select x.what, x.stmt from (
+        -- as anon: every new relation, and every function that is not a
+        -- trigger function; as authenticated: preview_runs and
+        -- preview_purge_log (A23)
+        select c.oid::regclass::text as what, format('select 1 from %s where false', c.oid::regclass) as stmt,
+               (v_role = 'anon' or c.oid in (to_regclass('public.preview_runs'), to_regclass('public.preview_purge_log'))) as wanted
+          from pg_class c
+         where c.oid in (to_regclass('public.preview_runs'), to_regclass('public.context_derive_log'),
+                         to_regclass('public.learning_path_completions'),
+                         to_regclass('public.learning_path_step_completions'),
+                         to_regclass('public.completion_notices'), to_regclass('public.preview_purge_log'),
+                         to_regclass('public.v_context_attempt_scoring'), to_regclass('public.v_context_attempt_summary'),
+                         to_regclass('public.v_course_enrollment_terms'), to_regclass('public.v_path_enrollment_terms'),
+                         to_regclass('public.v_path_step_status'), to_regclass('public.v_path_progress'))
+        union all
+        select pr.oid::regprocedure::text,
+               format('select %s.%s(%s)', quote_ident(n.nspname), quote_ident(pr.proname),
+                      (select coalesce(string_agg('null::' || format_type(t.oid, null), ', ' order by k.o), '')
+                         from unnest(pr.proargtypes::oid[]) with ordinality as k(oid, o)
+                         join pg_type t on t.oid = k.oid)),
+               v_role = 'anon'
+          from pg_proc pr
+          join pg_namespace n on n.oid = pr.pronamespace
+         where pr.oid in (
+                 to_regprocedure('public.official_attempt_in_context(uuid,uuid,text)'),
+                 to_regprocedure('public.instance_pass_required(uuid,text)'),
+                 to_regprocedure('public.journey_attempt_satisfies(uuid,boolean)'),
+                 to_regprocedure('public.journey_credit_state(uuid[])'),
+                 to_regprocedure('public.journey_reminder_counts(uuid[])'),
+                 to_regprocedure('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text,text)'),
+                 to_regprocedure('public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text)'),
+                 to_regprocedure('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)'),
+                 to_regprocedure('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)'),
+                 to_regprocedure('public.journey_save_days(uuid,jsonb)'),
+                 to_regprocedure('public.journey_repin_enrollments(uuid,uuid,jsonb,boolean)'),
+                 to_regprocedure('public.journey_complete_enrollments_core(uuid[],text)'),
+                 to_regprocedure('public.journey_complete_enrollment(uuid)'),
+                 to_regprocedure('public.journey_complete_enrollments(uuid)'),
+                 to_regprocedure('public.journey_record_completion(uuid)'),
+                 to_regprocedure('public.gamification_record_activity_core(uuid,boolean,boolean)'),
+                 to_regprocedure('public.gamification_record_activity_core(uuid)'),
+                 to_regprocedure('public.gamification_record_activity(uuid)'),
+                 to_regprocedure('public.record_learning_activity(uuid,boolean)'),
+                 to_regprocedure('public.record_learning_activity(uuid)'),
+                 to_regprocedure('public.sweep_completion_side_effects(integer)'),
+                 to_regprocedure('public.purge_preview_data(uuid,jsonb,text,uuid,boolean,text)'),
+                 to_regprocedure('public.refresh_report_views()'),
+                 to_regprocedure('public.refresh_gamification_views()'),
+                 to_regprocedure('public.gamification_close_month()'),
+                 to_regprocedure('public.launch_context(uuid,uuid,uuid,uuid,uuid,uuid,integer)'))
+      ) x
+      where x.wanted
+    loop
+      st := null;
+      begin
+        execute r.stmt;
+      exception when others then
+        st := sqlstate;
+      end;
+      if st is distinct from '42501' then
+        bad := bad || format('%s as %s answered %s, not 42501', r.what, v_role, coalesce(st, 'no error'));
+      end if;
+    end loop;
+    execute format('set local role %I', v_me);
+  end loop;
+
+  if cardinality(bad) > 0 then
+    raise exception '0107 after-check failed: A5/A23 %. Nothing changed.', array_to_string(bad, '; ')
+      using hint = 'ADR 0024 step 19 (a real 42501 as anon). The file rolled back whole; correct the cause and paste it again.';
+  end if;
+end
+$$;
+
+-- A13 and A14: as authenticated. A14 reads as a member of some
+-- organisation who is not a platform owner (the first by user id); with no
+-- such member there is nobody to read as and A14 is skipped with a notice.
+do $$
+declare
+  v_me     text := current_user;
+  v_claims text := current_setting('request.jwt.claims', true);
+  v_sub    text := current_setting('request.jwt.claim.sub', true);
+  v_user   uuid;
+  v_orgs   uuid[];
+  bad      text[] := '{}';
+  r        record;
+  st       text;
+  n        bigint;
+begin
+  -- A13: no claims; the statements touch no row
+  execute 'set local role authenticated';
+  for r in
+    select * from (values
+      ('update naming contract_version', 'update public.org_api_keys set contract_version = 1 where false', '42501'),
+      ('insert naming contract_version',
+       'insert into public.org_api_keys (organization_id, name, key_prefix, key_hash, contract_version) '
+       || 'select null, null, null, null, 1 where false', '42501'),
+      ('the route''s insert columns',
+       'insert into public.org_api_keys (organization_id, name, key_prefix, key_hash, is_active, created_by) '
+       || 'select null, null, null, null, null, null where false', 'ok'),
+      ('the route''s deactivate', 'update public.org_api_keys set is_active = false where false', 'ok')
+    ) as t(what, stmt, want)
+  loop
+    st := 'ok';
+    begin
+      execute r.stmt;
+    exception when others then
+      st := sqlstate;
+    end;
+    if st <> r.want then
+      bad := bad || format('A13 %s as authenticated answered %s, not %s', r.what, st, r.want);
+    end if;
+  end loop;
+  execute format('set local role %I', v_me);
+
+  -- A14: a member's session
+  select om.user_id into v_user
+    from public.organization_members om
+   where to_regclass('public.platform_owners') is null
+      or not exists (select 1 from public.platform_owners po where po.user_id = om.user_id)
+   order by om.user_id
+   limit 1;
+  if v_user is null then
+    raise notice '0107 after-check A14 skipped: no organisation member to read as.';
+  else
+    select array_agg(om.organization_id) into v_orgs from public.organization_members om where om.user_id = v_user;
+    perform set_config('request.jwt.claims', json_build_object('sub', v_user, 'role', 'authenticated')::text, true);
+    -- auth.uid() reads request.jwt.claim.sub first when it is set; it is
+    -- touched only then, so the file leaves no such setting behind
+    if nullif(v_sub, '') is not null then
+      perform set_config('request.jwt.claim.sub', v_user::text, true);
+    end if;
+    execute 'set local role authenticated';
+    for r in
+      select * from (values
+        ('v_course_enrollment_terms'), ('v_path_enrollment_terms'), ('v_path_step_status'), ('v_path_progress'),
+        ('learning_path_completions'), ('learning_path_step_completions')
+      ) as t(rel)
+    loop
+      st := null;
+      begin
+        execute format('select count(*) from public.%I where organization_id <> all ($1)', r.rel) into n using v_orgs;
+      exception when others then
+        st := sqlstate;
+      end;
+      if st is not null then
+        bad := bad || format('A14 a member''s read of %s raised %s', r.rel, st);
+      elsif n <> 0 then
+        bad := bad || format('A14 a member reads %s row(s) of another organisation from %s', n, r.rel);
+      end if;
+    end loop;
+    for r in
+      select * from (values
+        ('learning_path_completions', 'insert into public.learning_path_completions (organization_id, path_id, user_id) select null, null, null where false'),
+        ('learning_path_completions', 'update public.learning_path_completions set path_score = null where false'),
+        ('learning_path_completions', 'delete from public.learning_path_completions where false'),
+        ('learning_path_step_completions', 'insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, rule_pass_required) select null, null, null, null, null where false'),
+        ('learning_path_step_completions', 'update public.learning_path_step_completions set attempt_id = null where false'),
+        ('learning_path_step_completions', 'delete from public.learning_path_step_completions where false')
+      ) as t(rel, stmt)
+    loop
+      st := 'ok';
+      begin
+        execute r.stmt;
+      exception when others then
+        st := sqlstate;
+      end;
+      if st <> '42501' then
+        bad := bad || format('A14 a member''s write of %s answered %s, not 42501', r.rel, st);
+      end if;
+    end loop;
+    execute format('set local role %I', v_me);
+    perform set_config('request.jwt.claims', coalesce(v_claims, ''), true);
+    if nullif(v_sub, '') is not null then
+      perform set_config('request.jwt.claim.sub', v_sub, true);
+    end if;
+  end if;
+
+  if cardinality(bad) > 0 then
+    raise exception '0107 after-check failed: %. Nothing changed.', array_to_string(bad, '; ')
+      using hint = 'ADR 0024 step 19 (as authenticated). The file rolled back whole; correct the cause and paste it again.';
+  end if;
+end
+$$;
+
+-- A6: both refresh functions, once each, inside a block that is rolled back
+-- on purpose once they have answered: the paste keeps neither the
+-- completion sweep's writes nor the refreshed matviews, so a later paste
+-- writes no row (step 63, "the second paste changes nothing"); the next
+-- scheduled refresh does both. A plpgsql variable keeps its value when its
+-- block rolls back.
+do $$
+declare
+  bad      text[] := '{}';
+  res_rep  jsonb;
+  res_gam  jsonb;
+  r        record;
+begin
+  begin
+    res_rep := public.refresh_report_views();
+    res_gam := public.refresh_gamification_views();
+    raise exception 'adr0024_0107_a6_undo' using errcode = 'P0001';
+  exception when sqlstate 'P0001' then
+    if sqlerrm <> 'adr0024_0107_a6_undo' then
+      raise;
+    end if;
+  end;
+  for r in select * from (values ('refresh_report_views', res_rep), ('refresh_gamification_views', res_gam)) as t(fn, res) loop
+    if jsonb_typeof(r.res) is distinct from 'array'
+       or exists (select 1 from jsonb_array_elements(r.res) e where e ->> 'error' is not null)
+       or (select count(*) from jsonb_array_elements(r.res) e where e ->> 'view' = 'completion_sweep') <> 1 then
+      bad := bad || format('A6 %s() answered %s', r.fn, coalesce(r.res::text, 'null'));
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception '0107 after-check failed: %. Nothing changed.', array_to_string(bad, '; ')
+      using hint = 'ADR 0024 step 19 (the refresh functions and the completion sweep). The file rolled back whole.';
+  end if;
+end
+$$;
+
+-- A22: a dry run per organisation, with a fixed check actor; it must write
+-- no log row, and on the first paste find nothing to delete
+do $$
+declare
+  v_first boolean := (select b.refuses from pg_temp.adr0024_0107_before b where b.q = 'Q8.version_days');
+  v_logs  bigint := (select count(*) from public.preview_purge_log);
+  bad     text[] := '{}';
+  r       record;
+  a       jsonb;
+begin
+  for r in select o.id from public.organizations o order by o.id loop
+    a := public.purge_preview_data(r.id, '{"organization": true}'::jsonb, 'manual',
+                                   '00000000-0000-0000-0000-000000000000'::uuid, true);
+    if (a ->> 'dry_run')::boolean is distinct from true then
+      bad := bad || format('A22 the dry run of an organisation answered %s', a);
+    elsif v_first and ((a -> 'counts' ->> 'total')::integer <> 0 or (a ->> 'excluded')::integer <> 0) then
+      bad := bad || format('A22 on the first paste the dry run of an organisation found %s, excluded %s',
+                           a -> 'counts', a ->> 'excluded');
+    end if;
+  end loop;
+  if (select count(*) from public.preview_purge_log) <> v_logs then
+    bad := bad || 'A22 a dry run wrote a preview_purge_log row'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception '0107 after-check failed: %. Nothing changed.', array_to_string(bad, '; ')
+      using hint = 'ADR 0024 step 19 (the purge dry run). The file rolled back whole.';
+  end if;
+end
+$$;
 
 notify pgrst, 'reload schema';
 

@@ -10,9 +10,10 @@
 -- committed rows first. The checks continue assert-0107.sql's numbering:
 --   (13) the objects: each view's columns, security_invoker, privileges,
 --        comment and what its body reads
---   (14) refresh_report_views() on the recreated views: six entries, none
---        with an error, and the LIVE course and path matviews equal the
---        views they read
+--   (14) refresh_report_views() on the recreated views: six view entries
+--        and the completion sweep's entry last (step 16), none with an
+--        error, and the LIVE course and path matviews equal the views they
+--        read
 --   (15) the seed through the views, and the invariants of the official
 --        rule on every row (run again after the fixtures)
 --   (16) the terms views (decision A9) on fixture assignments
@@ -413,7 +414,8 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- (14) refresh_report_views() on the recreated views (before any fixture
---      row): six entries, none with an error; then the LIVE matviews equal
+--      row): six view entries and the completion sweep's entry last (step
+--      16), none with an error; then the LIVE matviews equal
 --      the views they read: per course, mv_course_enrollment_status and
 --      mv_course_performance count the learners of
 --      v_course_enrollments_expanded, and mv_course_enrollment_status's
@@ -427,7 +429,8 @@ declare
   bad text;
 begin
   res := public.refresh_report_views();
-  if jsonb_array_length(res) <> 6
+  if jsonb_array_length(res) <> 7
+     or res -> 6 ->> 'view' is distinct from 'completion_sweep'
      or exists (select 1 from jsonb_array_elements(res) e where e ->> 'error' is not null) then
     raise exception 'assert-0107: (14) refresh_report_views(): %', res;
   end if;
