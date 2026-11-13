@@ -108,7 +108,13 @@ export ALDS_P4="on"
 # failure of any kind, is reported as before. Owner, 2026-11-13: "The retry
 # must happen only once. Persistent errors and genuine code/build failures
 # must still be reported normally and must not be hidden."
-FONT_FETCH_FAILURE='@next[/\]font[/\]dist[/\]google[/\]|Failed to fetch( font)? .*Google Fonts|Failed to fetch font'
+# Only the two final failures match: an error thrown from next/font's Google
+# loader (its stack names the loader path) and its "Failed to fetch `X` from
+# Google Fonts." Its own retry lines ("Failed to fetch font `X`: <url>
+# Retrying 1/3...") are printed even when a later try succeeds, so they must
+# not match: a build that recovered and then failed for a real reason is not
+# retried.
+FONT_FETCH_FAILURE='@next[/\]font[/\]dist[/\]google[/\]|Failed to fetch `[^`]+` from Google Fonts'
 font_fetch_failure() { grep -E -q "$FONT_FETCH_FAILURE" "$1" 2>/dev/null; }
 build_failed() {
   echo "::error title=Lifecycle nightly::the app build failed"

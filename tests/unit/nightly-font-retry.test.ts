@@ -29,13 +29,19 @@ const winLine = ["    at D:", "x", "node_modules", "next", "dist", "compiled", "
 const hits: Array<[string, string, boolean]> = [
   ["the runner's loader.js TypeError line", "    at /home/runner/work/LMS/LMS/node_modules/next/dist/compiled/@next/font/dist/google/loader.js:122:78", true],
   ["the same line on Windows", winLine, true],
-  ["Failed to fetch font", "Failed to fetch font `Inter`.", true],
-  ["Failed to fetch from Google Fonts", "Failed to fetch `Inter` from Google Fonts.", true],
+  ["Failed to fetch from Google Fonts (the final network failure)", "Failed to fetch `Inter` from Google Fonts.", true],
+  ["next/font's own retry line (printed even when a later try succeeds)", "Failed to fetch font `Inter`: https://fonts.googleapis.com/css2?family=Inter&display=swap\nRetrying 1/3...", false],
+  ["next/font's font-file retry line", "Failed to fetch font file from `https://fonts.gstatic.com/s/inter/v13/x.woff2`.\nRetrying 1/3...", false],
   ["a type error", "Type error: Property 'x' does not exist on type 'Y'.", false],
   ["a missing next/font module (a code error)", "Module not found: Can't resolve 'next/font/google'", false],
   ["a generic compile failure", "Failed to compile.", false],
 ];
 for (const [n, line, want] of hits) eq(n, re.test(line), want);
+eq(
+  "a build that recovered from a font retry and then failed on a type error does not match",
+  re.test("Failed to fetch font `Inter`: https://fonts.googleapis.com/css2?family=Inter\nRetrying 1/3...\nType error: Property 'x' does not exist on type 'Y'."),
+  false
+);
 
 console.log("\nthe build step retries once, only on the font failure");
 eq("npm run build appears exactly twice (the first build and the one retry)", (src.match(/npm run build/g) ?? []).length, 2);
