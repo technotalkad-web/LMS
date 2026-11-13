@@ -10,6 +10,13 @@
  *     admin session → learner_history_exists, for a current member's attempt
  *     and for a removed member's attempt (no membership = learner)
  *                                                          (needs 0098)
+ *   - delete of a course_packages row (a language) with learner attempts
+ *     through an admin session → learner_history_exists by cascade into
+ *     course_versions; the language DELETE route refuses with 409 and, on a
+ *     language with no learner attempt, deletes it on the caller's session
+ *     (the route never deletes through the service role, which skips the
+ *     guard: an attempt inserted after its count would cascade away)
+ *                                                          (needs 0098)
  *   - update of storage_prefix or launch_url on a ready version →
  *     course_version_frozen; storage_driver stays writable  (needs 0098)
  *   - a test org with learner attempts deleted through the service client
@@ -24,7 +31,7 @@
 import { test, expect, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { assignCourse, authedContext } from "./helpers";
-import { NEEDS_0098, has0098, scormZip, sha256, uploadNew, zipFile } from "./p0-helpers";
+import { NEEDS_0098, has0098, scormZip, sessionClient, sha256, uploadNew, zipFile } from "./p0-helpers";
 import { cleanupLifecycleData } from "./cleanup";
 
 type User = { id: string; email: string; password: string };
@@ -132,6 +139,42 @@ test.describe.serial("ADR 0003 — record guard", () => {
       expect(still, `course ${courseId === s.courseA ? "A" : "B"}'s version still exists`).toBeTruthy();
     }
     void browser; void baseURL;
+  });
+
+  test("deleting a language with learner attempts → learner_history_exists by cascade; the route refuses with 409", async () => {
+    test.skip(!(await has0098()), NEEDS_0098);
+    const { data: pk } = await svc().from("course_packages").select("id").eq("course_id", s.courseA!);
+    const pkgIds = ((pk ?? []) as Array<{ id: string }>).map((p) => p.id);
+    expect(pkgIds.length, "course A has one language").toBe(1);
+    // The route deletes on the caller's session; a learner attempt that
+    // arrives after its count is caught here, by the version guard firing
+    // through the package -> version cascade under the admin's JWT. The
+    // race itself cannot be forced from outside: the route's 409 below
+    // comes from its count, and both cases here would also pass on the old
+    // route. tests/unit/language-delete-session.test.ts is what tells the
+    // two apart (the delete runs on the session client).
+    const admin = await sessionClient(s.admin!);
+    const { error } = await admin.from("course_packages").delete().eq("id", pkgIds[0]);
+    expect(error?.message ?? "", "the cascade reaches the version guard").toMatch(/learner_history_exists/);
+    const { data: still } = await svc().from("course_packages").select("id").eq("id", pkgIds[0]).maybeSingle();
+    expect(still, "course A's language still exists").toBeTruthy();
+    const res = await s.adminCtx!.request.delete(`/api/courses/${s.courseA}/packages/${pkgIds[0]}?orgSlug=${s.org!.slug}`);
+    expect(res.status(), await res.text()).toBe(409);
+    const { data: after } = await svc().from("course_packages").select("id").eq("id", pkgIds[0]).maybeSingle();
+    expect(after, "course A's language still exists after the route").toBeTruthy();
+  });
+
+  test("a language with no learner attempt deletes through the route, on the caller's session", async () => {
+    const up = await uploadNew(s.adminCtx!.request, s.org!.slug, "QA Guard D.zip", await scormZip({ title: "QA Guard D" }));
+    expect(up.ok(), `upload D → ${up.status()}: ${await up.text()}`).toBeTruthy();
+    const courseD = (await up.json()).courseId as string;
+    const { data: pk } = await svc().from("course_packages").select("id").eq("course_id", courseD);
+    const pkgIds = ((pk ?? []) as Array<{ id: string }>).map((p) => p.id);
+    expect(pkgIds.length, "course D has one language").toBe(1);
+    const res = await s.adminCtx!.request.delete(`/api/courses/${courseD}/packages/${pkgIds[0]}?orgSlug=${s.org!.slug}`);
+    expect(res.status(), await res.text()).toBe(200);
+    const { data: gone } = await svc().from("course_packages").select("id").eq("id", pkgIds[0]).maybeSingle();
+    expect(gone, "the language is deleted").toBeNull();
   });
 
   test("a ready version's storage_prefix is frozen → course_version_frozen", async () => {
