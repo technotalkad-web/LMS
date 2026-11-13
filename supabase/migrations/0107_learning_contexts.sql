@@ -19,9 +19,13 @@
 -- created empty), section 4, which is item 4 whole (the two context views,
 -- the two old-name views as the Individual context, the course enrolment
 -- view without its path arm and hold-back, the two terms views and the two
--- path views), and of item 6 only the paste-window day_ids trigger on
--- journey_versions (section 6). Not built yet: item 5, the rest of item 6
--- and item 7; nothing writes the four new tables yet. On this
+-- path views), section 5, which is item 5 whole (official_attempt_in_context,
+-- instance_pass_required, journey_attempt_satisfies, journey_credit_state,
+-- and journey_reminder_counts dropped and created with its fourth column),
+-- and of item 6 only the paste-window day_ids trigger on journey_versions
+-- (section 6). Not built yet: the rest of item 6 and item 7; nothing writes
+-- the four new tables yet, and of the four new functions only
+-- journey_credit_state has a caller (journey_reminder_counts). On this
 -- build the old bodies still run and some now fail: the 0089
 -- journey_record_completion names the dropped credit key as its conflict
 -- target (42P10) and its untagged branch re-tags an attempt (refused by the
@@ -174,9 +178,11 @@
 --         course_attempts.last_activity_at, gamification_close_month(),
 --         refresh_gamification_views()
 --   0058  the journey tables (programs, days, versions, enrolments,
---         day progress); course_attempts.journey_enrollment_id with its
---         foreign key, and journey_day; gamification_record_activity(uuid)
---         (the wrapper) and journey_record_completion(uuid)
+--         day progress), journey_enrollments.version_id and
+--         journey_day_progress.completed_at (section 5);
+--         course_attempts.journey_enrollment_id with its foreign key, and
+--         journey_day; gamification_record_activity(uuid) (the wrapper) and
+--         journey_record_completion(uuid)
 --   0065  journey_programs.deadline_days; the event-type check admits
 --         'journey_escalation'
 --   0069  course_assignments.group_id, learning_path_assignments.group_id
@@ -389,6 +395,8 @@ begin
       ('journey_versions',         'days',                  '0058'),
       ('journey_versions',         'days_total',            '0058'),
       ('journey_versions',         'count_sundays',         '0058'),
+      ('journey_enrollments',      'version_id',            '0058'),
+      ('journey_day_progress',     'completed_at',          '0058'),
       ('courses',                  'pass_required',         '0081'),
       ('attempt_requests',         'used_attempt_id',       '0083'),
       ('attempt_requests',         'reissued_from',         '0103'),
@@ -3067,12 +3075,330 @@ revoke all on public.v_path_progress from public, anon, authenticated, service_r
 grant select on public.v_path_progress to authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
+-- 5. The language sql functions (ADR 0024 section B, creation order item 5;
+--    steps 9 and 13; build note N14)
+-- ---------------------------------------------------------------------------
+-- In the record's order, each after what it reads: a language sql body is
+-- checked against its objects when it is created (42P01 otherwise), so
+-- official_attempt_in_context follows the scoring view of section 4 and
+-- journey_reminder_counts follows journey_credit_state. Every function is
+-- stable, names its relations with their schema and carries set search_path
+-- = pg_catalog, public (section B's header). Execute is revoked from public,
+-- anon and authenticated and granted to service_role only: no view calls
+-- any of them (a learner's read of such a view would raise 42501; the views
+-- of section 4 resolve the rule by join), and their callers are the service
+-- role and the security definer functions of section 6.
+--
+-- The four new functions are security invoker; the record does not say.
+-- Each caller is either the service role, which bypasses row-level security
+-- and holds select on every relation they read (the project defaults on the
+-- tables, this file's grant on v_context_attempt_scoring), or a security
+-- definer function of section 6, which runs them as its owner.
+-- journey_reminder_counts keeps the security definer of its 0089 body.
+--
+-- The day parse is section 0b's: a days entry's day is a number of one to
+-- six digits, else it names no day. A days entry's pass_required counts only
+-- as a JSON boolean (null = inherit the course's courses.pass_required, step
+-- 8). Where a version lists one day number twice (Q8 counts such versions;
+-- staging holds none), the day is one day: it is required once, and its rule
+-- is read from its first entry in array order.
+
+-- 5a. official_attempt_in_context (step 9): the official attempt of one
+-- (learner, course, context), read from v_context_attempt_scoring, the one
+-- definition of the official rule (section 4a); null while the context has
+-- none. It replaces the ad-hoc chains of consume_grant,
+-- gamification_close_month and the XP ordinal (section 6). Views never call
+-- it per row: they join official_attempt_id set-based.
+create or replace function public.official_attempt_in_context(p_user uuid, p_course uuid, p_context_key text)
+returns uuid
+language sql
+stable
+security invoker
+set search_path = pg_catalog, public
+as $$
+  select s.official_attempt_id
+    from public.v_context_attempt_scoring s
+   where s.user_id = p_user
+     and s.course_id = p_course
+     and s.context_key = p_context_key;
+$$;
+
+comment on function public.official_attempt_in_context(uuid, uuid, text) is
+  'The official attempt of one (learner, course, context_key), from v_context_attempt_scoring; null while the context has none (ADR 0024 step 9). Service role only.';
+
+revoke execute on function public.official_attempt_in_context(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.official_attempt_in_context(uuid, uuid, text) to service_role;
+
+-- 5b. instance_pass_required (step 9; twins contract 1.4): the pass rule of
+-- one context, in the record's order: for a path key, the step's own
+-- learning_path_courses.pass_required; for a journey key, the pass_required
+-- of the day in the enrolment's pinned version (the days entry whose
+-- day_ids entry is the key's day id); else, and whenever that value is null
+-- (inherit) or the step or the day is not found (a course that is no longer
+-- a step, a day the pinned version does not hold, an unknown enrolment), the
+-- course's courses.pass_required. Individual and preview keys take the
+-- course's rule. It never answers null: false for an unknown course (the
+-- coalesce of 0089:117 and 0103's consume_grant). The key's ids are read
+-- with patterns that yield null on any other form, so no key, however
+-- malformed, makes a cast fail. It answers the pinned version's rule only;
+-- the lenient rule of R14 is journey_attempt_satisfies (5c). The path arm
+-- equals v_path_step_status.pass_required on every step row (the rehearsal
+-- asserts it).
+create or replace function public.instance_pass_required(p_course uuid, p_context_key text)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = pg_catalog, public
+as $$
+  with k as (
+    select
+      substring(p_context_key
+        from '^path:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$')::uuid as path_id,
+      substring(p_context_key
+        from '^journey:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')::uuid as enrollment_id,
+      substring(p_context_key
+        from '^journey:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$')::uuid as day_id
+  )
+  select coalesce(
+           -- a path key: the step's own rule
+           (select lpc.pass_required
+              from public.learning_path_courses lpc
+             where lpc.path_id = k.path_id
+               and lpc.course_id = p_course),
+           -- a journey key: the day's rule in the enrolment's pinned version
+           (select case when jsonb_typeof(d.e -> 'pass_required') = 'boolean'
+                        then (d.e ->> 'pass_required')::boolean end
+              from public.journey_enrollments en
+              join public.journey_versions jv on jv.id = en.version_id
+              cross join lateral jsonb_array_elements(
+                case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end
+              ) with ordinality as d(e, ord)
+             where en.id = k.enrollment_id
+               and (jv.day_ids ->> (case when d.e ->> 'day' ~ '^[0-9]{1,6}$'
+                                         then (d.e ->> 'day')::int end)::text)::uuid = k.day_id
+             order by d.ord
+             limit 1),
+           -- else, and whenever neither answers: the course's rule
+           (select c.pass_required from public.courses c where c.id = p_course),
+           false)
+    from k;
+$$;
+
+comment on function public.instance_pass_required(uuid, text) is
+  'The pass rule of one context (ADR 0024 step 9): the path step''s, else the day''s in the enrolment''s pinned version, else the course''s; never null. Service role only; views resolve the rule by join.';
+
+revoke execute on function public.instance_pass_required(uuid, text) from public, anon, authenticated;
+grant execute on function public.instance_pass_required(uuid, text) to service_role;
+
+-- 5c. journey_attempt_satisfies (step 13, R14): whether one attempt's
+-- result satisfies a day's pass rule, leniently. True when it satisfies the
+-- rule the caller gives, p_target_rule (the resolved pass_required of the
+-- attempt's day in the version the caller judges against: the pinned
+-- version for journey_record_completion and consume_grant, the target
+-- version or the draft for journey_repin_enrollments), or the rule of the
+-- attempt's day in the version it was launched under
+-- (course_attempts.journey_version_id; the days entry whose day_ids entry is
+-- the attempt's journey_day_id, null = the course's courses.pass_required).
+-- It reads the launched version and never the target, so it can judge a
+-- draft that has no version row. With a null journey_version_id (rows from
+-- before phase 2) or a launched version that does not map the day, the
+-- target's rule alone judges. A result satisfies a rule as
+-- journey_record_completion has credited a day since 0081 (0089:42-51):
+-- under pass_required, success_status passed; otherwise completed or passed,
+-- so a completed row that failed satisfies a rule that requires no pass. The
+-- not-failed term of consume_grant's stands test (0103, its step 7) is that
+-- caller's own. It judges the result only: the caller checks the row's
+-- context, revision flag and status. It never answers null: false for an
+-- unknown or null attempt id; a null p_target_rule is read as pass required
+-- (a rule the caller could not resolve never relaxes the test).
+create or replace function public.journey_attempt_satisfies(p_attempt_id uuid, p_target_rule boolean)
+returns boolean
+language sql
+stable
+security invoker
+set search_path = pg_catalog, public
+as $$
+  select coalesce((
+    select ca.success_status = 'passed'
+           or (ca.completion_status = 'completed'
+               and (p_target_rule is false or lr.pass_required is false))
+      from public.course_attempts ca
+      join public.course_versions cv on cv.id = ca.course_version_id
+      left join lateral (
+        -- the day's rule in the version the attempt was launched under
+        select coalesce(
+                 case when jsonb_typeof(d.e -> 'pass_required') = 'boolean'
+                      then (d.e ->> 'pass_required')::boolean end,
+                 (select c.pass_required from public.courses c where c.id = cv.course_id)) as pass_required
+          from public.journey_versions jv
+          cross join lateral jsonb_array_elements(
+            case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end
+          ) with ordinality as d(e, ord)
+         where jv.id = ca.journey_version_id
+           and (jv.day_ids ->> (case when d.e ->> 'day' ~ '^[0-9]{1,6}$'
+                                     then (d.e ->> 'day')::int end)::text)::uuid = ca.journey_day_id
+         order by d.ord
+         limit 1
+      ) lr on true
+     where ca.id = p_attempt_id
+  ), false);
+$$;
+
+comment on function public.journey_attempt_satisfies(uuid, boolean) is
+  'Whether an attempt''s result satisfies the caller''s rule for its day or the day''s rule in the version the attempt was launched under (ADR 0024 step 13, R14); never null. Service role only.';
+
+revoke execute on function public.journey_attempt_satisfies(uuid, boolean) from public, anon, authenticated;
+grant execute on function public.journey_attempt_satisfies(uuid, boolean) to service_role;
+
+-- 5d. journey_credit_state (step 13, decision A27, section U; build note
+-- N14; twins contract 4.1): the one journey completion rule, by day
+-- identity. One row per enrolment of p_ids that exists, whatever its status
+-- (a completed enrolment's credits are still read), in enrollment_id order.
+-- A required day is a day of the pinned version's days that carries a
+-- course (a non-empty course_id) and whose number is between 1 and
+-- days_total (0089:131-134); its id is the version's day_ids entry for that
+-- number. A credit counts only when its day_id is the id of a required day,
+-- whatever its kind (legacy_cross_context included) and whatever its
+-- day_number; a credit on a rest day, above days_total or on a day the
+-- version does not hold counts towards nothing. credited lists the numbers
+-- of the credited required days ascending, credited_day_ids their ids in the
+-- same order, credited_days their count; next_day and next_day_id name the
+-- lowest-numbered required day with no credit, null when none is left. Zero
+-- required days: required_days 0 and next_day null, so the enrolment is
+-- never complete (complete = required_days > 0 and next_day is null).
+-- resumable_day_ids: the journey_day_id of every open official attempt of
+-- the enrolment (context_kind journey, status in_progress, not a revision
+-- row), whether or not the day is still in the pinned version, in ascending
+-- uuid order (a removed day has no number). Arrays are never null. Every SQL
+-- reader of a journey's progress uses it: the completion functions and
+-- launch_context (section 6), journey_reminder_counts (5e) and 0109.
+create or replace function public.journey_credit_state(p_ids uuid[])
+returns table (
+  enrollment_id     uuid,
+  required_days     integer,
+  credited_days     integer,
+  credited          integer[],
+  credited_day_ids  uuid[],
+  next_day          integer,
+  next_day_id       uuid,
+  resumable_day_ids uuid[]
+)
+language sql
+stable
+security invoker
+set search_path = pg_catalog, public
+as $$
+  with enr as (
+    select en.id, en.version_id
+      from public.journey_enrollments en
+     where en.id = any(p_ids)
+  ),
+  req as (
+    -- the required days of each pinned version, one row per day number
+    select distinct
+           en.id as enrollment_id,
+           x.day_number,
+           (jv.day_ids ->> x.day_number::text)::uuid as day_id
+      from enr en
+      join public.journey_versions jv on jv.id = en.version_id
+      cross join lateral (
+        select case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::int end as day_number,
+               nullif(d.e ->> 'course_id', '') as course_id
+          from jsonb_array_elements(
+                 case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end) as d(e)
+      ) x
+     where x.course_id is not null
+       and x.day_number between 1 and jv.days_total
+  ),
+  st as (
+    select r.enrollment_id,
+           r.day_number,
+           r.day_id,
+           exists (
+             select 1 from public.journey_day_progress p
+              where p.enrollment_id = r.enrollment_id
+                and p.day_id = r.day_id
+           ) as is_credited
+      from req r
+  )
+  select
+    en.id,
+    count(st.day_number)::integer,
+    (count(*) filter (where st.is_credited))::integer,
+    coalesce(array_agg(st.day_number order by st.day_number) filter (where st.is_credited), '{}'::integer[]),
+    coalesce(array_agg(st.day_id order by st.day_number) filter (where st.is_credited), '{}'::uuid[]),
+    (array_agg(st.day_number order by st.day_number) filter (where not st.is_credited))[1],
+    (array_agg(st.day_id order by st.day_number) filter (where not st.is_credited))[1],
+    coalesce((
+      select array_agg(distinct ca.journey_day_id order by ca.journey_day_id)
+        from public.course_attempts ca
+       where ca.journey_enrollment_id = en.id
+         and ca.context_kind = 'journey'
+         and ca.status = 'in_progress'
+         and not ca.is_revision
+         and ca.journey_day_id is not null
+    ), '{}'::uuid[])
+  from enr en
+  left join st on st.enrollment_id = en.id
+  group by en.id
+  order by en.id;
+$$;
+
+comment on function public.journey_credit_state(uuid[]) is
+  'The journey completion rule by day identity (ADR 0024 step 13, section U): per enrolment, the required days of the pinned version, the credited ones (numbers ascending, ids parallel), the open day and the resumable day ids. Complete = required_days > 0 and next_day is null. Service role only.';
+
+revoke execute on function public.journey_credit_state(uuid[]) from public, anon, authenticated;
+grant execute on function public.journey_credit_state(uuid[]) to service_role;
+
+-- 5e. journey_reminder_counts (step 13): recreated from its latest body,
+-- 0089:147-169, grants 0089:171-172. enrollment_id and done_today are as in
+-- 0089 (done_today: some credit row of the enrolment is stamped today in the
+-- organisation's timezone); done is now journey_credit_state's credited_days,
+-- credits by day identity in place of a count of progress rows; a fourth
+-- column, credited, the numbers of the credited days, which the nudges cron
+-- passes to the TypeScript twin. The old cron code reads the three columns
+-- it knows. A new output column changes the return type, which create or
+-- replace refuses (42P13), so the function is dropped and created on every
+-- paste; the drop resets its privileges, which are restated below. Security
+-- definer as in 0089; the search_path is pinned (section B's header).
+drop function if exists public.journey_reminder_counts(uuid[]);
+
+create function public.journey_reminder_counts(p_ids uuid[])
+returns table (enrollment_id uuid, done integer, done_today boolean, credited integer[])
+language sql
+stable
+security definer
+set search_path = pg_catalog, public
+as $$
+  select e.id as enrollment_id,
+         cs.credited_days as done,
+         coalesce(
+           bool_or(
+             p.completed_at is not null
+             and (p.completed_at at time zone coalesce(gs.timezone, 'Asia/Kolkata'))::date
+                 = (now() at time zone coalesce(gs.timezone, 'Asia/Kolkata'))::date
+           ),
+           false
+         ) as done_today,
+         cs.credited
+    from public.journey_enrollments e
+    left join public.gamification_settings gs on gs.organization_id = e.organization_id
+    left join public.journey_day_progress p on p.enrollment_id = e.id
+    join public.journey_credit_state(p_ids) cs on cs.enrollment_id = e.id
+   where e.id = any(p_ids)
+   group by e.id, cs.credited_days, cs.credited;
+$$;
+
+revoke all on function public.journey_reminder_counts(uuid[]) from public, anon, authenticated;
+grant execute on function public.journey_reminder_counts(uuid[]) to service_role;
+
+-- ---------------------------------------------------------------------------
 -- 6. The plpgsql functions (ADR 0024 section B, creation order item 6)
 -- ---------------------------------------------------------------------------
 -- In any order among themselves: a plpgsql body is parsed when it is created
 -- and resolves its objects when it first runs. Sections 3 to 5 (creation
--- order items 3 to 5) come before this one; this build holds sections 3 and
--- 4, and section 5 comes with a later build. This build holds one function of
+-- order items 3 to 5) come before this one. This build holds one function of
 -- the item, the paste-window trigger function on journey_versions, followed
 -- by its trigger.
 
