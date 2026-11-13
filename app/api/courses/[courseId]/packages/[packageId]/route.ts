@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
 import { deactivationRefusal, isReadyVersion, type DeactivationRefusal } from "@/lib/courses/default-rule";
+import { isLearnerHistoryError } from "@/lib/courses/learner-history";
 
 /**
  * PATCH /api/courses/{courseId}/packages/{packageId}
@@ -229,6 +230,15 @@ async function touchCourse(svc: SupabaseClient, courseId: string) {
  * `default_slot` when it holds the course default while another active
  * language with a ready current version exists (ADR 0008 step 12).
  *
+ * The delete itself runs on the caller's session, never the service role:
+ * deleting a package cascades to its course_versions and on to their
+ * course_attempts, and the learner-history guard on course_versions (0098,
+ * 0100) is skipped for the service role. The count above cannot see an
+ * attempt inserted after it; on the session the guard refuses that delete
+ * with learner_history_exists (409) and nothing is deleted (ADR 0003 step 10:
+ * learner history is never deleted). RLS "org admins write packages" (0030)
+ * admits the roles this route admits.
+ *
  * Closes #158 Phase 1c (DELETE half).
  */
 export async function DELETE(
@@ -264,8 +274,9 @@ export async function DELETE(
   );
 
   // Tenant guard: the course must belong to the caller's org. The caller is only
-  // authorized as admin of `orgSlug`; everything below runs on the service-role
-  // client (bypasses RLS). Without this, an admin of org A could delete a
+  // authorized as admin of `orgSlug`; the reads below run on the service-role
+  // client (bypasses RLS), and the delete itself on the caller's session (see
+  // the comment above the handler). Without this, an admin of org A could delete a
   // package from org B's course by passing org B's courseId/packageId. (The PATCH
   // handler already does this join; DELETE was missing it.)
   const { data: courseOwner } = await svc
@@ -323,8 +334,30 @@ export async function DELETE(
     );
   }
 
-  const { error } = await svc.from("course_packages").delete().eq("id", packageId);
-  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  const { data: deleted, error } = await supabase
+    .from("course_packages")
+    .delete()
+    .eq("id", packageId)
+    .select("id");
+  if (error) {
+    if (isLearnerHistoryError(error)) {
+      return NextResponse.json(
+        {
+          error: "Cannot delete: learner attempts exist on this language. Deactivate instead (PATCH { is_active: false }) to preserve history.",
+          attempt_count: null,
+        },
+        { status: 409 }
+      );
+    }
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+  // RLS filters rather than errors: no row back means nothing was deleted
+  // here. A concurrent delete already removed it (404); otherwise RLS refused.
+  if (((deleted ?? []) as unknown[]).length !== 1) {
+    const { data: stillThere } = await svc.from("course_packages").select("id").eq("id", packageId).maybeSingle();
+    if (!stillThere) return NextResponse.json({ error: "Package not found" }, { status: 404 });
+    return NextResponse.json({ error: "Package not deleted" }, { status: 403 });
+  }
 
   // The default went with it: date the course for catalogue deltas.
   if (check.holdsDefault) await touchCourse(svc, courseId);
