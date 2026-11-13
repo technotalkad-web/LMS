@@ -52,14 +52,11 @@
 -- raises 'assert-0107: (n) …' on failure; the runner then reports the file
 -- as failed and stops the scenario.
 --
--- The completion core (journey_complete_enrollments_core, step 13) belongs
--- to a later section of 0107. Until it exists this file gives the real run
--- of journey_repin_enrollments a stand-in, created in this transaction only
--- and only while the real one is missing: it completes, as step 13 says,
--- the named active enrolments whose journey_credit_state reads required
--- days above 0 and no open day, and returns their ids (no badge, no claim).
--- Step 63's cases that need journey_record_completion (an open attempt that
--- completes after a re-pin) come with that function.
+-- The real run of journey_repin_enrollments calls the completion core of
+-- section 6 (6g), which writes the badge and the claim of each enrolment it
+-- completes; assert-0107-writer.sql checks those writes, and step 63's
+-- cases that need journey_record_completion (an open attempt that completes
+-- after a re-pin).
 --
 -- PGlite runs as postgres. grants-0107.sql gave anon and authenticated
 -- usage on public and select on every table; where (31) runs as
@@ -1299,30 +1296,6 @@ rollback to savepoint s31;
 -- ---------------------------------------------------------------------------
 -- (32) journey_repin_enrollments
 -- ---------------------------------------------------------------------------
--- The completion core's stand-in, while the real one is missing (header)
-do $$
-begin
-  if to_regprocedure('public.journey_complete_enrollments_core(uuid[],text)') is null then
-    execute $f$
-      create function public.journey_complete_enrollments_core(p_ids uuid[], p_origin text)
-      returns setof uuid language plpgsql as $b$
-      begin
-        perform 1 from public.journey_enrollments e
-         where e.id = any(p_ids) and e.status = 'active' order by e.id for update;
-        return query
-          update public.journey_enrollments e
-             set status = 'completed', completed_at = now()
-            from public.journey_credit_state(p_ids) s
-           where s.enrollment_id = e.id and e.status = 'active'
-             and s.required_days > 0 and s.next_day is null
-          returning e.id;
-      end
-      $b$
-    $f$;
-  end if;
-end
-$$;
-
 -- The re-pin world of one case: program JR with days R1 to R6 (numbers 1 to
 -- 6: CA, CB, CA, CC, CB, CA); version VR1 (days 1 to 4, days_total 4, day 3
 -- requiring a pass in mode strict), current, with its day_ids source given;
