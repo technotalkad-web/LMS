@@ -101,13 +101,35 @@ export E2E_BASE_URL="$BASE"
 # 409: a pairing of flag and database that no deployment runs.
 export ALDS_P4="on"
 
-echo "lifecycle-nightly: building (log kept off the console)"
-if ! npm run build > "$OUT/build.log" 2>&1; then
+# A build that failed only because next/font could not fetch Google Fonts
+# (an unparseable or missing answer from fonts.googleapis.com; seen three
+# times on 2026-11-12 and 13, each passing on the next run) is retried ONCE,
+# with a warning that stays on the run. Any other failure, and a second
+# failure of any kind, is reported as before. Owner, 2026-11-13: "The retry
+# must happen only once. Persistent errors and genuine code/build failures
+# must still be reported normally and must not be hidden."
+FONT_FETCH_FAILURE='@next[/\]font[/\]dist[/\]google[/\]|Failed to fetch( font)? .*Google Fonts|Failed to fetch font'
+font_fetch_failure() { grep -E -q "$FONT_FETCH_FAILURE" "$1" 2>/dev/null; }
+build_failed() {
   echo "::error title=Lifecycle nightly::the app build failed"
   echo "lifecycle-nightly: build failed; error lines of the build log (masked):"
   error_excerpt "$OUT/build.log"
   echo "lifecycle-nightly: reproduce locally with this script"
   exit 1
+}
+
+echo "lifecycle-nightly: building (log kept off the console)"
+if ! npm run build > "$OUT/build.log" 2>&1; then
+  if ! font_fetch_failure "$OUT/build.log"; then
+    build_failed
+  fi
+  echo "::warning title=Lifecycle nightly::the app build failed fetching Google Fonts; retrying the build once"
+  mv "$OUT/build.log" "$OUT/build-attempt-1.log"
+  sleep 30
+  echo "lifecycle-nightly: building again (the only retry)"
+  if ! npm run build > "$OUT/build.log" 2>&1; then
+    build_failed
+  fi
 fi
 
 echo "lifecycle-nightly: starting the app on port $PORT"
