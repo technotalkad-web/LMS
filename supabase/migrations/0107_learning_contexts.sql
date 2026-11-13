@@ -136,11 +136,11 @@
 -- org_api_keys, org_integration_settings and notification_templates; SHARE
 -- ROW EXCLUSIVE until commit on the parents of the foreign keys this file
 -- adds or re-creates that are not in that list, learning_paths,
--- organizations, auth.users and courses (writes to them wait, reads do not). The two
--- stored generated columns of course_attempts and the one of attempt_requests
--- rewrite those tables on the first paste (a rewrite per added generated
--- column; a later paste skips them). lock_timeout 5 s: if a lock is not
--- granted the whole file rolls back.
+-- organizations, auth.users and courses (writes to them wait, reads do
+-- not). The two stored generated columns of course_attempts and the one of
+-- attempt_requests rewrite those tables on the first paste (a rewrite per
+-- added generated column; a later paste skips them). lock_timeout 5 s: if a
+-- lock is not granted the whole file rolls back.
 --
 -- PREREQUISITES (the DO block of section 0a refuses to run without them; for
 -- every object this file replaces it accepts the earlier state and its own,
@@ -1901,9 +1901,10 @@ create index if not exists xp_events_org_ctx_created_idx
 -- 3. The new tables (ADR 0024 section B, creation order item 3; steps 14, 15
 --    and 79; build note O1-a, O1-b and O1-f)
 -- ---------------------------------------------------------------------------
--- In the record's order: learning_path_completions, learning_path_step_completions
--- (build note O1-f places it here, after learning_path_completions and before
--- completion_notices), completion_notices, preview_purge_log. preview_runs
+-- In the record's order: learning_path_completions,
+-- learning_path_step_completions (build note O1-f places it here, after
+-- learning_path_completions and before completion_notices),
+-- completion_notices, preview_purge_log. preview_runs
 -- (1d) and context_derive_log (2a) are item 2's. Each table is created empty
 -- (no backfill: note N22 for learning_path_completions, note O1-h (1) for the
 -- step facts), with its row-level security, its policy, its grants and its
