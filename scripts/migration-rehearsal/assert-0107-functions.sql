@@ -370,7 +370,8 @@ begin
   -- day 2 under VB, passed; s17 day 2 under VA, open; s18 day 5 on F5 under
   -- VA (the string "true" is no rule: F5's false), completed with no
   -- verdict; s19 day 1 under VC, which does not hold day 1, failed; s20 an
-  -- Individual row on F1, failed
+  -- Individual row on F1, failed; s21 day 2 under VA, failed (VA lists day
+  -- 2 twice: the first entry's false is its rule, not the second's true)
   perform pg_temp.att_0107f(11, 1, 5, 5, 1, 1, 2, 'failed', 600);
   perform pg_temp.att_0107f(12, 2, 5, 5, 2, 2, 2, 'failed', 590);
   perform pg_temp.att_0107f(13, 1, 5, 5, 1, 1, 1, 'failed', 580);
@@ -381,6 +382,7 @@ begin
   perform pg_temp.att_0107f(18, 5, 5, 5, 5, 5, 1, 'completed', 530);
   perform pg_temp.att_0107f(19, 1, 5, 5, 1, 1, 3, 'failed', 520);
   perform pg_temp.att_0107f(20, 1, 5, null, null, null, null, 'failed', 510);
+  perform pg_temp.att_0107f(21, 2, 5, 5, 2, 2, 1, 'failed', 500);
 end
 $$;
 
@@ -592,6 +594,7 @@ begin
       ('s19, target false', 19, false, true),
       ('s20 an Individual row, failed, target false', 20, false, true),
       ('s20, target true', 20, true, false),
+      ('s21 failed, launched under VA (day 2 listed twice: the first entry''s false), target true', 21, true, true),
       ('E1''s open row on D02, target false', 1, false, false),
       ('E1''s passed row on D03, target true', 5, true, true)
     ) as t(what, n, target, expect)
