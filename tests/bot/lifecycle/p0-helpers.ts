@@ -67,6 +67,28 @@ export async function has0099(): Promise<boolean> {
 }
 export const NEEDS_0099 = "needs 0099";
 
+let probe0107: boolean | null = null;
+/**
+ * Is migration 0107 (ADR 0024: learning contexts, day identity, Preview
+ * data) applied? course_attempts.context_kind comes in the same transaction
+ * as the recreated delete guards that count by-role (legacy_role) rows, so
+ * one real select of that column settles it. Fails closed like has0098():
+ * only Postgres 42703 (undefined column) means "not applied"; any other
+ * error throws. The filter on an id no row has still makes Postgres
+ * validate the column, and no organisation's row is read.
+ */
+export async function has0107(): Promise<boolean> {
+  if (probe0107 !== null) return probe0107;
+  const { error } = await svc()
+    .from("course_attempts")
+    .select("context_kind")
+    .eq("id", "00000000-0000-0000-0000-000000000000")
+    .limit(1);
+  if (error && error.code !== "42703") throw new Error(`has0107 probe failed: ${error.code ?? ""} ${error.message}`);
+  probe0107 = !error;
+  return probe0107;
+}
+
 /**
  * A PostgREST client carrying the user's own session (anon key + password
  * sign-in, the spec 50 pattern): what a learner or an admin can do with

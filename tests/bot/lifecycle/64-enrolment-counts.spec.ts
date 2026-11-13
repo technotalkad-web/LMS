@@ -49,6 +49,28 @@
  *   9. P4's step moved into the past: C6 = {L1}; G3's row on C5 moved into the
  *      past: C5 gains L6 (team 2, joined 10 days ago) and not L11.
  *
+ * From 0107 on (ADR 0024 step 18, D2) the view keeps its four direct arms with
+ * their release gates and loses the path arm and the hold-back, so path-only
+ * learners are absent from a course's enrolment and counts. has0107() (a real
+ * select of course_attempts.context_kind) picks the branch; before 0107 every
+ * assertion is as above. After 0107:
+ *   1. C1 {L4}, C2 {}, C3 {L4} (no hold-back by P1), C6 {L1} (no hold-back by
+ *      P4); C4, C5 and P1's path set are unchanged;
+ *   3. C1's learners table and CSV list L4 only, via Direct; C2 has nobody
+ *      enrolled, so its course page shows the empty state (no Total enrolled
+ *      tile) and Reports §4.1 reads 0; the other counts still equal the view;
+ *   6. the feed (unchanged code) still lists every step of an assigned active
+ *      path, so every path-only course is extra: C1 and C3 for L3, L9, L10;
+ *      C1, C2 and C3 for L5 to L8; none for L1 and L4;
+ *   7. P2 reaches L1 as a path learner only: C2 stays {} (P2's path set gains
+ *      L1); the Organisation Reports tiles still do not move;
+ *   8. after P1's step is released C3 is still {L4}. The launch assertions do
+ *      not branch: the old launch code holds L4 and L5 back on ?lp=P1 until
+ *      phase 2, so in this window the launch no longer agrees with the view
+ *      for L4.
+ * Cases 2, 4, 5 and 9 hold on both schemas (4 and 5 compare with the view as
+ * it reads; 9's sets are the same either way).
+ *
  * A separate block, "staging note", records one real path-taught course's
  * Reports §4.1 and §4.2 counts for the staging note (counts only): run it with
  * ENROLMENT_NOTE_COURSE=<course id> before the paste and after the first
@@ -64,7 +86,7 @@
 import { test, expect, type APIResponse, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
 import { authedContext, courseHandle, latestAttemptId, scormCommit, type CourseHandle } from "./helpers";
-import { scormZip, uploadNew } from "./p0-helpers";
+import { has0107, scormZip, uploadNew } from "./p0-helpers";
 import { resolveManyGroups } from "../../../lib/org/groups";
 
 type User = { id: string; email: string; password: string };
@@ -265,12 +287,21 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
   });
 
   test("1: the view's set per course equals the rehearsal's; P1's path set includes G1's learners", async () => {
-    expect(await viewSet(1)).toEqual(want(3, 4, 5, 6, 7, 8, 9, 10));
-    expect(await viewSet(2)).toEqual(want(5, 6, 7, 8));
-    expect(await viewSet(3), "L4 and L5 held back by P1; L3, L9, L10 on P1's unreleased step").toEqual(want(6, 7, 8));
+    const after0107 = await has0107();
+    if (after0107) {
+      // ADR 0024 step 18 (D2): no path arm, no hold-back.
+      expect(await viewSet(1), "0107: L4's direct row only; P1's and P2's learners are not counted").toEqual(want(4));
+      expect(await viewSet(2), "0107: C2 is reached through P2 only").toEqual([]);
+      expect(await viewSet(3), "0107: L4's direct row counts although P1 still holds C3 unreleased").toEqual(want(4));
+    } else {
+      expect(await viewSet(1)).toEqual(want(3, 4, 5, 6, 7, 8, 9, 10));
+      expect(await viewSet(2)).toEqual(want(5, 6, 7, 8));
+      expect(await viewSet(3), "L4 and L5 held back by P1; L3, L9, L10 on P1's unreleased step").toEqual(want(6, 7, 8));
+    }
     expect(await viewSet(4), "P3 is inactive").toEqual([]);
     expect(await viewSet(5), "not L2, G3 (future rows), L13 (inactive member), L14 (inactive group)").toEqual(want(1, 12));
-    expect(await viewSet(6), "L1 held back by the org_public P4").toEqual([]);
+    if (after0107) expect(await viewSet(6), "0107: L1's direct row counts although the org_public P4 holds C6 unreleased").toEqual(want(1));
+    else expect(await viewSet(6), "L1 held back by the org_public P4").toEqual([]);
     const { data } = await svc().from("v_path_enrollments_expanded").select("user_id").eq("path_id", s.paths.get(1)!);
     expect(sorted(((data ?? []) as Array<{ user_id: string }>).map((r) => labelOf(r.user_id)))).toEqual(want(3, 4, 5, 9, 10));
   });
@@ -293,21 +324,35 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
 
   test("3: the Library course page, the Reports page, the learners table and its CSV agree with the view", async () => {
     test.setTimeout(600_000);
+    const after0107 = await has0107();
     for (const n of [1, 2, 3, 5]) {
       const expected = (await viewSet(n)).length;
       const page = await s.adminCtx!.newPage();
       await page.goto(`/${s.org!.slug}/library/${c(n)}`, { timeout: 120_000 });
-      await expect(page.getByTestId("sum-total"), `C${n} course page`).toHaveText(String(expected), { timeout: 60_000 });
+      if (after0107 && expected === 0) {
+        // 0107: C2 has no direct row, so nobody is enrolled; the course page
+        // shows its empty state instead of the summary tiles.
+        await expect(page.getByText("No learners are enrolled yet"), `C${n} course page empty state (0107)`).toBeVisible({ timeout: 60_000 });
+        await expect(page.getByTestId("sum-total"), `C${n} course page has no Total enrolled tile (0107)`).toHaveCount(0);
+      } else {
+        await expect(page.getByTestId("sum-total"), `C${n} course page`).toHaveText(String(expected), { timeout: 60_000 });
+      }
       await page.goto(`/${s.org!.slug}/library/${c(n)}/reports`, { timeout: 120_000 });
       await expect(page.getByTestId("enr-total"), `C${n} Reports §4.1`).toHaveText(String(expected), { timeout: 60_000 });
       await page.close();
     }
 
     // The learners table and its CSV on C1 (path and direct learners) and C5 (direct and group).
-    const viaWanted: Record<number, Record<string, string>> = {
-      1: { L3: "path", L4: "user", L5: "path", L6: "path", L7: "path", L8: "path", L9: "path", L10: "path" },
-      5: { L1: "user", L12: "group" },
-    };
+    // From 0107 on C1 holds its direct learner only (ADR 0024 step 18).
+    const viaWanted: Record<number, Record<string, string>> = after0107
+      ? {
+          1: { L4: "user" },
+          5: { L1: "user", L12: "group" },
+        }
+      : {
+          1: { L3: "path", L4: "user", L5: "path", L6: "path", L7: "path", L8: "path", L9: "path", L10: "path" },
+          5: { L1: "user", L12: "group" },
+        };
     const cellOf: Record<string, string> = { user: "Direct", group: "Group", path: "Path" };
     for (const n of [1, 5]) {
       const page = await s.adminCtx!.newPage();
@@ -374,7 +419,20 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
     const courseLabel = new Map([...s.courses].map(([n, h]) => [h.courseId, `C${n}`]));
     // The feed lists every step of an assigned active path (no step gate) and
     // applies no hold-back (decision 2): C3 for the P1 learners, C6 for L1.
-    const extraInFeed: Record<string, string[]> = { L1: ["C6"], L3: ["C3"], L4: ["C3"], L5: ["C3"], L9: ["C3"], L10: ["C3"] };
+    // From 0107 on the view counts no path learner (ADR 0024 step 18) while the
+    // feed's code is unchanged, so every path-only course is extra; L1's C6 and
+    // L4's C1 and C3 are direct rows the view now counts.
+    const extraInFeed: Record<string, string[]> = (await has0107())
+      ? {
+          L3: ["C1", "C3"],
+          L5: ["C1", "C2", "C3"],
+          L6: ["C1", "C2", "C3"],
+          L7: ["C1", "C2", "C3"],
+          L8: ["C1", "C2", "C3"],
+          L9: ["C1", "C3"],
+          L10: ["C1", "C3"],
+        }
+      : { L1: ["C6"], L3: ["C3"], L4: ["C3"], L5: ["C3"], L9: ["C3"], L10: ["C3"] };
     for (let n = 1; n <= 14; n++) {
       const user = u(n);
       const r = await s.adminCtx!.request.get(`/api/integrations/progress?email=${encodeURIComponent(user.email)}`, { headers: { Authorization: `Bearer ${s.key}` } });
@@ -414,7 +472,16 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
     const before = await kpis();
     const [row] = await ins("learning_path_assignments", { organization_id: s.org!.id, path_id: s.paths.get(2), assignee_type: "user", user_id: u(1).id });
     try {
-      expect(await viewSet(2), "P2 now reaches L1 (the view moves)").toContain("L1");
+      if (await has0107()) {
+        // 0107 (ADR 0024 step 18): P2 reaches L1 as a path learner, and the
+        // course view does not count path learners.
+        const { data, error } = await svc().from("v_path_enrollments_expanded").select("user_id").eq("path_id", s.paths.get(2)!);
+        expect(error, `path view read: ${error?.message}`).toBeNull();
+        expect(sorted(((data ?? []) as Array<{ user_id: string }>).map((r) => labelOf(r.user_id))), "P2 now reaches L1 (the path view moves)").toContain("L1");
+        expect(await viewSet(2), "0107: C2's course enrolment does not move").toEqual([]);
+      } else {
+        expect(await viewSet(2), "P2 now reaches L1 (the view moves)").toContain("L1");
+      }
       expect(await kpis(), "Organisation Reports reads members and official pairs only").toEqual(before);
     } finally {
       await svc().from("learning_path_assignments").delete().eq("id", row.id as string);
@@ -440,7 +507,10 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
 
       const { error } = await svc().from("learning_path_courses").update({ release_at: aMinuteAgo() }).eq("path_id", s.paths.get(1)!).eq("course_id", c3);
       expect(error).toBeNull();
-      expect(await viewSet(3)).toEqual(want(3, 4, 5, 6, 7, 8, 9, 10));
+      // From 0107 on the view counts only L4's direct row, released or not
+      // (ADR 0024 step 18); the launch assertions are the old launch code's.
+      if (await has0107()) expect(await viewSet(3), "0107: C3 holds its direct learner only").toEqual(want(4));
+      else expect(await viewSet(3)).toEqual(want(3, 4, 5, 6, 7, 8, 9, 10));
       const now = await l4.request.get(`/${s.org!.slug}/courses/${c3}/launch?lp=${s.paths.get(1)}`, { maxRedirects: 0 });
       expect(now.status(), "L4 opens C3 once P1's step is released").toBe(200);
       expect(await redirectedExactly(now, baseURL!, target)).toBe(false);
