@@ -4134,7 +4134,10 @@ grant execute on function public.journey_save_days(uuid, jsonb) to authenticated
 --     required day of the target with no credit whose context holds an
 --     official attempt that satisfies the target's rule for that day
 --     (journey_attempt_satisfies with the day's rule in the target, else the
---     attempt's course's rule) is credited with that attempt (credit_kind
+--     attempt's course's rule) and does not satisfy the pinned version's
+--     rule (instance_pass_required: a day whose attempt already satisfies
+--     it waits for its own writer or the sweep, through
+--     journey_record_completion) is credited with that attempt (credit_kind
 --     attempt; the day's number in the target; completed_at at the credit,
 --     the column default; late when the credit's date in the organisation's
 --     timezone is after the day's counted date in a calendar journey, the
@@ -4328,6 +4331,11 @@ begin
        and public.journey_attempt_satisfies(
              s.official_attempt_id,
              coalesce(t.rule, (select c.pass_required from public.courses c where c.id = s.course_id), false))
+       -- a rule change only: not a day whose attempt already satisfies the
+       -- pinned version's rule (its missing credit is the writer's, or the
+       -- sweep's, through journey_record_completion)
+       and not public.journey_attempt_satisfies(
+             s.official_attempt_id, public.instance_pass_required(s.course_id, s.context_key))
      order by d.id, t.day_id, (s.course_id::text = t.course_id) desc, s.official_attempt_id
   ),
   new_day as (

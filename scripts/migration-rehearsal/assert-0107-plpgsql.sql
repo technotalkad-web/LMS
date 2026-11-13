@@ -40,7 +40,12 @@
 --        63's re-pin cases (a) to (h) as far as this build reaches, each with
 --        the dry run's counts equal to the real run's, no attempt or credit
 --        row updated or deleted, and the credit state after; the credit of
---        a relaxed rule (its columns); a second real run writes nothing
+--        a relaxed rule (its columns) and its negative controls (no
+--        change, a day that inherits a pass-required course, a day whose
+--        credit is only pending); late false in a progress journey and
+--        before the counted date; a second real run writes nothing; one
+--        call over three enrolments (re-pinned, kept and completed,
+--        enrolled after the publish)
 -- The fixture rows have ids whose last group starts 00010717. The whole file
 -- is one transaction that ends in ROLLBACK; every case runs in its own
 -- savepoint, rolled back to it, so no case sees another's writes. Every check
@@ -1320,11 +1325,18 @@ $$;
 
 -- The re-pin world of one case: program JR with days R1 to R6 (numbers 1 to
 -- 6: CA, CB, CA, CC, CB, CA); version VR1 (days 1 to 4, days_total 4, day 3
--- requiring a pass when p_strict), current, with its day_ids source given;
--- enrolment ER of L4 on VR1 (status given), started 10 days ago; days 1 to
--- 3 completed by official journey rows (credited, except day 3 when
--- p_strict, where the row failed) and an open official row on day 4
-create function pg_temp.repin_world7(p_source text, p_status text, p_strict boolean) returns void
+-- requiring a pass in mode strict), current, with its day_ids source given;
+-- enrolment ER of L4 on VR1 (status given), started p_start days ago; days
+-- 1 to 3 completed by official journey rows and credited, and an open
+-- official row on day 4, except: strict, day 3's row failed and holds no
+-- credit; pending, day 3's row completed and its credit is not written yet
+-- (the writer's call pending); inherit, day 4's row failed (CC requires a
+-- pass and the day inherits it) and no row is open. With p_extra, also a
+-- slot_backfill version VR0 (version 9, VR1's days) and on it enrolment EK
+-- of L1, every required day credited with no attempt (complete under its
+-- own version, not yet marked)
+create function pg_temp.repin_world7(p_source text, p_status text, p_mode text, p_start int, p_extra boolean)
+returns void
 language plpgsql as $$
 declare
   org constant uuid := '00000000-0000-0000-0000-00000000000a';
@@ -1341,7 +1353,7 @@ begin
   values (jr, org, 'JR (0107 plpgsql)', 4);
   for i in 1..6 loop
     insert into public.journey_days (id, program_id, organization_id, day_number, course_id, pass_required)
-    values (pg_temp.u7('00010717810' || i), jr, org, i, c[i], case when i = 3 and p_strict then true end);
+    values (pg_temp.u7('00010717810' || i), jr, org, i, c[i], case when i = 3 and p_mode = 'strict' then true end);
   end loop;
   insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total,
                                        count_sundays, completion_title, days, day_ids, day_ids_source)
@@ -1353,19 +1365,36 @@ begin
   update public.journey_programs set current_version_id = pg_temp.u7('000107178301') where id = jr;
   insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status,
                                           completed_at)
-  values (er, jr, pg_temp.u7('000107178301'), org, l4, current_date - 10, p_status,
+  values (er, jr, pg_temp.u7('000107178301'), org, l4, current_date - p_start, p_status,
           case when p_status = 'completed' then now() end);
   for i in 1..4 loop
     perform pg_temp.att7(pg_temp.u7('00010717850' || i), v[i], l4,
-                         case when i = 4 then 'in_progress' when i = 3 and p_strict then 'failed' else 'completed' end,
+                         case when i = 4 then case when p_mode = 'inherit' then 'failed' else 'in_progress' end
+                              when i = 3 and p_mode = 'strict' then 'failed' else 'completed' end,
                          null, er, i, pg_temp.u7('00010717810' || i), pg_temp.u7('000107178301'), 1000 - i * 100);
-    if i <= 3 and not (i = 3 and p_strict) then
+    if i <= 3 and not (i = 3 and p_mode in ('strict', 'pending')) then
       insert into public.journey_day_progress (id, enrollment_id, organization_id, user_id, day_number, day_id,
                                                course_id, attempt_id, completed_at)
       values (pg_temp.u7('00010717860' || i), er, org, l4, i, pg_temp.u7('00010717810' || i), c[i],
               pg_temp.u7('00010717850' || i), now() - make_interval(days => 10 - i));
     end if;
   end loop;
+  if p_extra then
+    insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total,
+                                         count_sundays, completion_title, days, day_ids, day_ids_source)
+    select pg_temp.u7('000107178309'), jr, org, 9, 'JR (0107 plpgsql)', 4, true, 'Done', jv.days, jv.day_ids,
+           'slot_backfill'
+      from public.journey_versions jv where jv.id = pg_temp.u7('000107178301');
+    insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+    values (pg_temp.u7('000107178402'), jr, pg_temp.u7('000107178309'), org, pg_temp.u7('000107170001'),
+            current_date - 10, 'active');
+    for i in 1..4 loop
+      insert into public.journey_day_progress (id, enrollment_id, organization_id, user_id, day_number, day_id,
+                                               course_id, completed_at)
+      values (pg_temp.u7('00010717870' || i), pg_temp.u7('000107178402'), org, pg_temp.u7('000107170001'), i,
+              pg_temp.u7('00010717810' || i), c[i], now() - make_interval(days => 10 - i));
+    end loop;
+  end if;
 end
 $$;
 
@@ -1383,11 +1412,14 @@ create function pg_temp.draft7(p_days_total int) returns jsonb language sql stab
 $$;
 
 -- One case: the save (if any), the dry run on the draft, the publish of the
--- draft as a version (editor, current), the real run; answers the dry run's
+-- draft as a version (editor, current, unlock mode given), a hook (an
+-- enrolment made after the publish, when given), the real run; answers the
+-- dry run's
 -- counts, whether the real run's equal them, whether the dry run wrote
 -- nothing and whether the real run updated or deleted no attempt or credit
 -- row, then the version ER is pinned to and its credit state
-create function pg_temp.repin_case7(p_save text, p_days_total int) returns text language plpgsql as $$
+create function pg_temp.repin_case7(p_save text, p_days_total int, p_unlock text, p_hook text) returns text
+language plpgsql as $$
 declare
   jr    constant uuid := '00000000-0000-0000-0000-000107178001';
   er    constant uuid := '00000000-0000-0000-0000-000107178401';
@@ -1411,10 +1443,13 @@ begin
   same_dry := pg_temp.rows7(er, 'attempts') = a0 and pg_temp.rows7(er, 'credits') = p0
               and (select version_id from public.journey_enrollments where id = er) = pin0;
   insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total,
-                                       count_sundays, completion_title, days, day_ids, day_ids_source)
+                                       count_sundays, completion_title, days, day_ids, day_ids_source, unlock_mode)
   values ('00000000-0000-0000-0000-000107178302', jr, '00000000-0000-0000-0000-00000000000a', 2, 'JR (0107 plpgsql)',
-          p_days_total, true, 'Done', draft -> 'days', draft -> 'day_ids', 'editor');
+          p_days_total, true, 'Done', draft -> 'days', draft -> 'day_ids', 'editor', p_unlock);
   update public.journey_programs set current_version_id = '00000000-0000-0000-0000-000107178302' where id = jr;
+  if p_hook is not null then
+    execute p_hook;
+  end if;
   v_real := public.journey_repin_enrollments(jr, '00000000-0000-0000-0000-000107178302', null, false);
   kept_rows := pg_temp.rows7(er, 'attempts') = a0
                and (select bool_and(strpos(pg_temp.rows7(er, 'credits'), x) > 0)
@@ -1428,7 +1463,7 @@ $$;
 
 -- the two forms and their refusals (22023, nothing written)
 savepoint s32f;
-select pg_temp.repin_world7('editor', 'active', false);
+select pg_temp.repin_world7('editor', 'active', 'normal', 10, false);
 do $$
 declare
   bad text[] := '{}';
@@ -1475,15 +1510,17 @@ rollback to savepoint s32f;
 -- (pg_temp.case7), so no case sees another's rows; its answer is kept.
 -- Expected counts are the dry run's; same=true says the real run's are
 -- equal (format prints a boolean as t or f).
-create function pg_temp.case7(p_source text, p_status text, p_strict boolean, p_save text, p_days_total int,
-                              p_after text) returns text language plpgsql as $$
+create function pg_temp.case7(p_source text, p_status text, p_mode text, p_save text, p_days_total int,
+                              p_after text, p_start int default 10, p_unlock text default 'calendar',
+                              p_extra boolean default false, p_hook text default null)
+returns text language plpgsql as $$
 declare
   v     text;
   after text;
 begin
   begin
-    perform pg_temp.repin_world7(p_source, p_status, p_strict);
-    v := pg_temp.repin_case7(p_save, p_days_total);
+    perform pg_temp.repin_world7(p_source, p_status, p_mode, p_start, p_extra);
+    v := pg_temp.repin_case7(p_save, p_days_total, p_unlock, p_hook);
     if p_after is not null then
       execute p_after into after;
       v := v || ' || ' || coalesce(after, 'null');
@@ -1502,14 +1539,14 @@ create temporary table r0107p_repin (k text, got text, want text);
 
 insert into pg_temp.r0107p_repin values
 -- no change at all (control): re-pinned, nothing else
-('none', pg_temp.case7('editor', 'active', false, null, 4, null),
+('none', pg_temp.case7('editor', 'active', 'normal', null, 4, null),
  '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
  || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
  || 'pin=8302 state=req=4 done=3 cred={1,2,3} next=4'),
 -- (a) a day inserted at number 2: the credits and the open attempt keep
 -- their day ids; the inserted day is the open day; the open attempt's day
 -- moved from 4 to 5 (started_days_kept); sent back from 4 to 2
-('a', pg_temp.case7('editor', 'active', false,
+('a', pg_temp.case7('editor', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178101", "day_number": 1, "course_id": "00000000-0000-0000-0000-000107171001"},'
   || ' {"id": null, "day_number": 2, "course_id": "00000000-0000-0000-0000-000107171003"},'
   || ' {"id": "00000000-0000-0000-0000-000107178102", "day_number": 3, "course_id": "00000000-0000-0000-0000-000107171002"},'
@@ -1523,7 +1560,7 @@ insert into pg_temp.r0107p_repin values
  || 'pin=8302 state=req=5 done=3 cred={1,3,4} next=2'),
 -- (b) days 2 and 3 swapped: the credits follow their days; no credited day
 -- is the open day; nothing sent back, the open day 4 unmoved
-('b', pg_temp.case7('editor', 'active', false,
+('b', pg_temp.case7('editor', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178102", "day_number": 3, "course_id": "00000000-0000-0000-0000-000107171002"},'
   || ' {"id": "00000000-0000-0000-0000-000107178103", "day_number": 2, "course_id": "00000000-0000-0000-0000-000107171001"}]',
   4, null),
@@ -1532,7 +1569,7 @@ insert into pg_temp.r0107p_repin values
  || 'pin=8302 state=req=4 done=3 cred={1,2,3} next=4'),
 -- (c) the course on day 4 swapped (CC to CB): the open attempt is a started
 -- day kept; the day stays the open day
-('c', pg_temp.case7('editor', 'active', false,
+('c', pg_temp.case7('editor', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178104", "day_number": 4, "course_id": "00000000-0000-0000-0000-000107171002"}]',
   4, null),
  '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 1, '
@@ -1541,38 +1578,38 @@ insert into pg_temp.r0107p_repin values
 -- (d) day 4 removed (days_total kept at 4): the remaining required days are
 -- credited, so the publish completes the enrolment; the open attempt on the
 -- removed day is a started day kept (it stays resumable)
-('d', pg_temp.case7('editor', 'active', false,
+('d', pg_temp.case7('editor', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178104", "removed": true}]', 4, null),
  '{"repinned": 1, "sent_back": 0, "completed_now": 1, "kept_on_version": 0, "started_days_kept": 1, '
  || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
  || 'pin=8302 state=req=3 done=3 cred={1,2,3} next=-'),
 -- (e) the new version is shorter (days_total 3) and every remaining
 -- required day is credited: completed at once; day 4 is beyond the cut
-('e', pg_temp.case7('editor', 'active', false, null, 3, null),
+('e', pg_temp.case7('editor', 'active', 'normal', null, 3, null),
  '{"repinned": 1, "sent_back": 0, "completed_now": 1, "kept_on_version": 0, "started_days_kept": 1, '
  || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
  || 'pin=8302 state=req=3 done=3 cred={1,2,3} next=-'),
 -- (f) a completed enrolment is not re-pinned
-('f', pg_temp.case7('editor', 'completed', false, null, 3, null),
+('f', pg_temp.case7('editor', 'completed', 'normal', null, 3, null),
  '{"repinned": 0, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
  || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
  || 'pin=8301 state=req=4 done=3 cred={1,2,3} next=4'),
 -- (g) pinned to a slot_backfill version: the course of day 2 swapped (at or
 -- below the furthest day, 4) keeps it on its version
-('g1', pg_temp.case7('slot_backfill', 'active', false,
+('g1', pg_temp.case7('slot_backfill', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178102", "day_number": 2, "course_id": "00000000-0000-0000-0000-000107171003"}]',
   4, null),
  '{"repinned": 0, "sent_back": 0, "completed_now": 0, "kept_on_version": 1, "started_days_kept": 0, '
  || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
  || 'pin=8301 state=req=4 done=3 cred={1,2,3} next=4'),
 -- (g) the same pin, a day added at 5 (above the furthest day): re-pinned
-('g2', pg_temp.case7('slot_backfill', 'active', false, null, 5, null),
+('g2', pg_temp.case7('slot_backfill', 'active', 'normal', null, 5, null),
  '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
  || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
  || 'pin=8302 state=req=5 done=3 cred={1,2,3} next=4'),
 -- (g) the same pin, the pass rule of day 2 tightened (course unchanged): a
 -- difference at day 2, so kept
-('g3', pg_temp.case7('slot_backfill', 'active', false,
+('g3', pg_temp.case7('slot_backfill', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178102", "day_number": 2, "course_id": "00000000-0000-0000-0000-000107171002",'
   || ' "pass_required": true}]', 4, null),
  '{"repinned": 0, "sent_back": 0, "completed_now": 0, "kept_on_version": 1, "started_days_kept": 0, '
@@ -1586,7 +1623,7 @@ insert into pg_temp.r0107p_repin values
 -- clock, the column default) and late, since day 3's counted date (the 3rd
 -- counted day from a start 10 days ago, Sundays counted) has passed; then a
 -- second real run on the same version, which writes nothing new
-('h', pg_temp.case7('editor', 'active', true,
+('h', pg_temp.case7('editor', 'active', 'strict',
   '[{"id": "00000000-0000-0000-0000-000107178103", "day_number": 3, "course_id": "00000000-0000-0000-0000-000107171001",'
   || ' "pass_required": false}]', 4,
   'select (select format(''%s/%s/%s/%s/%s/%s/%s'', right(p.course_id::text, 4), right(p.attempt_id::text, 4), '
@@ -1602,11 +1639,70 @@ insert into pg_temp.r0107p_repin values
  || '"started_days_kept": 0, "credits_now_history": 0, "credited_by_rule_change": 0}'),
 -- day 2 made a rest day (its course cleared): its credit now counts towards
 -- nothing (credits_now_history); the open day stays 4
-('history', pg_temp.case7('editor', 'active', false,
+('history', pg_temp.case7('editor', 'active', 'normal',
   '[{"id": "00000000-0000-0000-0000-000107178102", "day_number": 2, "course_id": null}]', 4, null),
  '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
  || '"credits_now_history": 1, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
- || 'pin=8302 state=req=3 done=2 cred={1,3} next=4');
+ || 'pin=8302 state=req=3 done=2 cred={1,3} next=4'),
+-- the negative controls of the relaxed-rule credit. h0: the strict world
+-- published with no change: day 3's failed row satisfies neither rule, no
+-- credit, day 3 stays open
+('h0', pg_temp.case7('editor', 'active', 'strict', null, 4, null),
+ '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
+ || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
+ || 'pin=8302 state=req=4 done=2 cred={1,2} next=3'),
+-- inherit: day 4 inherits CC's pass rule and its row failed; published with
+-- no change, nothing is credited (the target's rule is the course's, not
+-- false)
+('inherit', pg_temp.case7('editor', 'active', 'inherit', null, 4, null),
+ '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
+ || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
+ || 'pin=8302 state=req=4 done=3 cred={1,2,3} next=4'),
+-- pending: day 3's row completed under a rule it satisfies and its credit
+-- is not written yet; the re-pin does not write it (no rule changed: it is
+-- journey_record_completion's, by the writer or the sweep)
+('pending', pg_temp.case7('editor', 'active', 'pending', null, 4, null),
+ '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
+ || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
+ || 'pin=8302 state=req=4 done=2 cred={1,2} next=3'),
+-- late is false for the same relaxed-rule credit in a progress journey, and
+-- in a calendar journey that started today (day 3's counted date is ahead)
+('h progress', pg_temp.case7('editor', 'active', 'strict',
+  '[{"id": "00000000-0000-0000-0000-000107178103", "day_number": 3, "course_id": "00000000-0000-0000-0000-000107171001",'
+  || ' "pass_required": false}]', 4,
+  'select (select format(''%s/%s'', p.credit_kind, p.late) from public.journey_day_progress p '
+  || 'where p.enrollment_id = ''00000000-0000-0000-0000-000107178401'' '
+  || 'and p.day_id = ''00000000-0000-0000-0000-000107178103'')', 10, 'progress'),
+ '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
+ || '"credits_now_history": 0, "credited_by_rule_change": 1} same=t dry_wrote_nothing=t rows_kept=t '
+ || 'pin=8302 state=req=4 done=3 cred={1,2,3} next=4 || attempt/f'),
+('h today', pg_temp.case7('editor', 'active', 'strict',
+  '[{"id": "00000000-0000-0000-0000-000107178103", "day_number": 3, "course_id": "00000000-0000-0000-0000-000107171001",'
+  || ' "pass_required": false}]', 4,
+  'select (select format(''%s/%s'', p.credit_kind, p.late) from public.journey_day_progress p '
+  || 'where p.enrollment_id = ''00000000-0000-0000-0000-000107178401'' '
+  || 'and p.day_id = ''00000000-0000-0000-0000-000107178103'')', 0, 'calendar'),
+ '{"repinned": 1, "sent_back": 0, "completed_now": 0, "kept_on_version": 0, "started_days_kept": 0, '
+ || '"credits_now_history": 0, "credited_by_rule_change": 1} same=t dry_wrote_nothing=t rows_kept=t '
+ || 'pin=8302 state=req=4 done=3 cred={1,2,3} next=4 || attempt/f'),
+-- one call over three enrolments: ER (editor pin) re-pinned; EK (a
+-- slot_backfill pin, every required day credited, course of day 2 changed
+-- at or below its furthest day) kept on its version and completed by the
+-- publish; ET, enrolled on the new version after it was published (the
+-- hook), neither re-pinned nor completed. The dry run, made before ET
+-- existed, counts the same
+('multi', pg_temp.case7('editor', 'active', 'normal',
+  '[{"id": "00000000-0000-0000-0000-000107178102", "day_number": 2, "course_id": "00000000-0000-0000-0000-000107171003"}]', 4,
+  'select string_agg(right(e.id::text, 4) || '':'' || right(e.version_id::text, 4) || '':'' || e.status, '' '' '
+  || 'order by e.id) from public.journey_enrollments e '
+  || 'where e.program_id = ''00000000-0000-0000-0000-000107178001''', 10, 'calendar', true,
+  'insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status) '
+  || 'values (''00000000-0000-0000-0000-000107178403'', ''00000000-0000-0000-0000-000107178001'', '
+  || '''00000000-0000-0000-0000-000107178302'', ''00000000-0000-0000-0000-00000000000a'', '
+  || '''00000000-0000-0000-0000-000107170003'', current_date, ''active'')'),
+ '{"repinned": 1, "sent_back": 0, "completed_now": 1, "kept_on_version": 1, "started_days_kept": 0, '
+ || '"credits_now_history": 0, "credited_by_rule_change": 0} same=t dry_wrote_nothing=t rows_kept=t '
+ || 'pin=8302 state=req=4 done=3 cred={1,2,3} next=4 || 8401:8302:active 8402:8309:completed 8403:8302:active');
 
 do $$
 declare
@@ -1618,8 +1714,8 @@ begin
   if failed is not null then
     raise exception 'assert-0107: (32) %', failed;
   end if;
-  if (select count(*) from pg_temp.r0107p_repin) <> 12 then
-    raise exception 'assert-0107: (32) % cases ran (expected 12)', (select count(*) from pg_temp.r0107p_repin);
+  if (select count(*) from pg_temp.r0107p_repin) <> 18 then
+    raise exception 'assert-0107: (32) % cases ran (expected 18)', (select count(*) from pg_temp.r0107p_repin);
   end if;
   -- every case was undone: no JR program is left
   if exists (select 1 from public.journey_programs where id = '00000000-0000-0000-0000-000107178001') then
