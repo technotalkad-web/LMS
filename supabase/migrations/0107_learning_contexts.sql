@@ -310,9 +310,22 @@
 -- handled yet (A9; the sweep's candidates); and active enrolments with a
 -- credit on every required day that are not completed (A18). A6 calls both
 -- refresh functions inside a block it rolls back, so the paste keeps
--- neither the sweep's writes nor the refreshed matviews. After the paste,
--- run `select public.refresh_report_views();` once (every entry's error
--- null, the last entry completion_sweep) and record its timings.
+-- neither the sweep's writes nor the refreshed matviews. The SQL editor may
+-- not show a notice, so after the paste run these reads and record them
+-- under ADR 0024 (the first runs the refreshes and the sweep for real; the
+-- other two only read):
+--   R1  select public.refresh_report_views();
+--       every entry's error null, the last entry completion_sweep; record
+--       the ms of each
+--   R2  A9's count (0 on the first paste; on a later paste, the sweep's
+--       candidates):
+--       select count(*) from public.course_attempts
+--        where (completion_status = 'completed' or success_status = 'passed')
+--          and side_effects_sig is distinct from settle_sig;
+--   R3  A18's count (expected 0; above 0 it goes to the owner):
+--       select count(*) from public.journey_credit_state(array(
+--         select id from public.journey_enrollments where status = 'active'))
+--        where required_days > 0 and next_day is null;
 
 begin;
 

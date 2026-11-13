@@ -3278,7 +3278,7 @@
     },
     {
       "name": "0107-then-0108",
-      "title": "ADR 0024 steps 20 and 63 (0107-then-0108): the 0105-0106-then-0107 scenario through 0107's first paste and its assertion files; then seed-0108.sql, committed: an attempt inserted with no context_kind, which the paste-window derive trigger labels and counts in context_derive_log, and a journey version whose day_ids is null; the static rule that 0108 has no generated column; 0108's first paste is refused by both (P0001, \"0108 refused: 1 journey_versions row(s) have no day_ids; the derive trigger fired within the last 24 hours (fired_count 1, last at …\"); repair-0108.sql moves the firing 25 hours back and gives the version its map; 0108 then applies twice; assert-0108.sql: the two paste-window triggers, their functions and context_derive_log are gone, day_ids is not null, and an insert that names no context_kind fails not null; refresh_report_views() answers its seven entries with no error",
+      "title": "ADR 0024 steps 20 and 63 (0107-then-0108): the 0105-0106-then-0107 scenario through 0107's first paste and its assertion files; then seed-0108.sql, committed: an attempt inserted with no context_kind, which the paste-window derive trigger labels and counts in context_derive_log, and a journey version whose day_ids is null; the static rule that 0108 has no generated column; 0108's first paste is refused by both (P0001, \"0108 refused: 1 journey_versions row(s) have no day_ids; the derive trigger fired within the last 24 hours (fired_count 1, last at …\"); repair-0108.sql moves the firing 25 hours back and gives the version its map; 0108 then applies twice; assert-0108.sql: the two paste-window triggers, their functions and context_derive_log are gone, day_ids is not null, and an insert that names no context_kind fails not null; refresh_report_views() answers its seven entries with no error; then 0107 pasted again (as staging may before 0109; its after-checks pass on the database 0108 left), refresh, assert-0107-launch.sql, and 0108 pasted again, which finds the recreated log never fired and applies, and assert-0108.sql again",
       "steps": [
         { "sql": "shim.sql" },
         { "sql": "shim-dashboard.sql" },
@@ -3485,7 +3485,12 @@
               "contains": "0108 refused: 1 journey_versions row(s) have no day_ids; the derive trigger fired within the last 24 hours (fired_count 1, last at ",
               "then": "repair-0108.sql" } } } },
         { "sql": "assert-0108.sql" },
-        { "refresh": { "views": 7 } }
+        { "refresh": { "views": 7 } },
+        { "apply": { "label": "0107 pasted again after 0108 (staging, before 0109; it recreates the three paste-window objects)", "files": ["0107"], "times": 1 } },
+        { "refresh": { "views": 7 } },
+        { "sql": "assert-0107-launch.sql" },
+        { "apply": { "label": "0108 pasted again after that (its header: paste it again after any later paste of 0107)", "files": ["0108"], "times": 1 } },
+        { "sql": "assert-0108.sql" }
       ]
     }
   ]

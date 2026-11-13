@@ -1,7 +1,8 @@
 -- scripts/migration-rehearsal/assert-0107-launch.sql
--- The four 0107 scenarios that apply it, after each assert-0107-writer.sql:
--- what section 6p of 0107_learning_contexts.sql, launch_context (ADR 0024
--- step 18; build note N15; twins contract 5.1, B7 and A10), must answer.
+-- The four 0107 scenarios that apply it, after each assert-0107-writer.sql,
+-- and 0107-then-0108 after the first paste: what section 6p of
+-- 0107_learning_contexts.sql, launch_context (ADR 0024 step 18; build note
+-- N15; twins contract 5.1, B7 and A10), must answer, and what 6m to 6o did.
 -- One transaction that ends in ROLLBACK; every check raises
 -- 'assert-0107: (4n) ...' on failure. It continues the numbering of
 -- assert-0107-writer.sql:
@@ -28,7 +29,18 @@
 --        (2); a step tightened before it was done reads not done (3), and
 --        done again at once when relaxed (4); tightened again with no
 --        completion it reads not done (8); a failed granted retake on a
---        step done by its fact keeps it done (11)
+--        step done by its fact keeps it done (11); a completed path whose
+--        step is tightened stays completed with every step done (6); a step
+--        removed and added again finds its fact (7)
+-- and the other three parts of section 6 that slice 9 built beside it:
+--   (45) 6m, the two refresh functions: their view entries in order, then
+--        the completion sweep's entry, which counts the row it handled
+--   (46) 6n, gamification_close_month's highest_scorer (step 35) on an
+--        organisation of its own: last month's official Individual and path
+--        results averaged per learner; revision, abandoned, preview and
+--        journey rows and this month's results never count
+--   (47) 6o, journey_auto_enroll: a new member reached by an auto-enrol
+--        journey is enrolled with source audience
 
 begin;
 
@@ -542,6 +554,38 @@ begin
         is distinct from 'failed' then
     bad := bad || format('O1-g (11), a failed retake on a step done by its fact: launch_context reads %s', got);
   end if;
+  -- (6) L11 completes C2 without a pass: every step is done, the writer
+  -- records the step and the path completion; C2 is then made
+  -- pass-required, and the path stays completed with both steps done
+  insert into public.course_attempts (id, course_version_id, user_id, organization_id, status, completion_status,
+                                      success_status, score, started_at, completed_at, context_kind, learning_path_id,
+                                      launch_mode)
+  values (pg_temp.u('000107190904'), '00000000-0000-0000-0000-0000000000e3', l11, org, 'failed', 'completed', 'failed',
+          0.2, now() - interval '9 minutes', now() - interval '8 minutes', 'path', po, 'Normal');
+  perform public.record_learning_activity(pg_temp.u('000107190904'));
+  update public.learning_path_courses set pass_required = true where path_id = po and course_id = c2;
+  select string_agg((s ->> 'done'), ',' order by (s ->> 'step_number')::int) into got
+    from jsonb_array_elements(pg_temp.lc(l11, org, c2, po, null, null, null) -> 'path' -> 'steps') s;
+  if got is distinct from 'true,true'
+     or not exists (select 1 from public.learning_path_completions c where c.path_id = po and c.user_id = l11)
+     or (select format('%s/%s %s', p.steps_done, p.steps_total, p.completed) from public.v_path_progress p
+          where p.path_id = po and p.user_id = l11) is distinct from '2/2 t' then
+    bad := bad || format('O1-g (6), a completed path tightened: launch_context reads %s', got);
+  end if;
+  -- (7) step 1 removed and added again finds its fact
+  delete from public.learning_path_courses where path_id = po and course_id = c1;
+  select string_agg((s ->> 'done'), ',' order by (s ->> 'step_number')::int) into got
+    from jsonb_array_elements(pg_temp.lc(l11, org, c2, po, null, null, null) -> 'path' -> 'steps') s;
+  if got is distinct from 'true' then
+    bad := bad || format('O1-g (7), the step removed: launch_context reads %s', got);
+  end if;
+  insert into public.learning_path_courses (path_id, course_id, step_number) values (po, c1, 1);
+  select string_agg((s ->> 'done'), ',' order by (s ->> 'step_number')::int) into got
+    from jsonb_array_elements(pg_temp.lc(l11, org, c2, po, null, null, null) -> 'path' -> 'steps') s;
+  if got is distinct from 'true,true' then
+    bad := bad || format('O1-g (7), the step added again: launch_context reads %s', got);
+  end if;
+  update public.learning_path_courses set pass_required = null where path_id = po and course_id = c2;
   update public.courses set pass_required = false where id = c1;
 
   -- (3) L12: step 1 made pass-required first, then completed without a
@@ -576,6 +620,184 @@ begin
 
   if cardinality(bad) > 0 then
     raise exception 'assert-0107: (44) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (45) 6m, the two refresh functions: the six (and two) view entries, then
+--      the completion sweep's entry last; the sweep handles a completed row
+--      whose writer call never ran, and its entry counts it; a second call
+--      finds nothing left
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  bad text[] := '{}';
+  res jsonb;
+  a   constant uuid := '00000000-0000-0000-0000-000107191001';
+begin
+  insert into public.course_attempts (id, course_version_id, user_id, organization_id, status, completion_status,
+                                      success_status, score, started_at, completed_at, context_kind, launch_mode)
+  values (a, '00000000-0000-0000-0000-0000000000e3', '00000000-0000-0000-0000-000107010005',
+          '00000000-0000-0000-0000-00000000000a', 'completed', 'completed', 'unknown', null,
+          now() - interval '40 minutes', now() - interval '30 minutes', 'individual', 'Normal');
+  res := public.refresh_report_views();
+  if jsonb_array_length(res) <> 7 or res -> 6 ->> 'view' <> 'completion_sweep'
+     or exists (select 1 from jsonb_array_elements(res) e where e ->> 'error' is not null)
+     or (res -> 6 ->> 'rows')::int < 1 or (res -> 6 -> 'sweep' ->> 'handled')::int <> (res -> 6 ->> 'rows')::int
+     or array(select e ->> 'view' from jsonb_array_elements(res) e) <> array[
+          'mv_course_enrollment_status', 'mv_path_enrollment_status', 'mv_course_performance', 'mv_path_performance',
+          'mv_course_interaction_breakdown', 'mv_course_interaction_top_wrong', 'completion_sweep'] then
+    bad := bad || format('refresh_report_views() answered %s', res);
+  end if;
+  if (select c.side_effects_sig is distinct from c.settle_sig from public.course_attempts c where c.id = a) then
+    bad := bad || 'the refresh''s sweep did not handle the completed row'::text;
+  end if;
+  res := public.refresh_gamification_views();
+  if jsonb_array_length(res) <> 3
+     or array(select e ->> 'view' from jsonb_array_elements(res) e) <> array['mv_leaderboard', 'mv_learner_metrics', 'completion_sweep']
+     or exists (select 1 from jsonb_array_elements(res) e where e ->> 'error' is not null)
+     or (res -> 2 ->> 'rows')::int <> 0 then
+    bad := bad || format('refresh_gamification_views() answered %s', res);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (45) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (46) 6n, gamification_close_month's highest_scorer (step 35): in Org Z, of
+--      its own (gamification on, UTC), last month's official results of the
+--      Individual and path contexts are averaged per learner; a revision
+--      row, an abandoned row, a preview and a journey row of last month, and
+--      an official result of this month, never count
+--   Z1: Individual C1 0.8 and path PZ C2 0.6, both official, last month; a
+--       revision row 1.0 and an abandoned completed row 1.0 on C1, a
+--       preview 1.0 on C2, last month                       -> 0.7, rank 1
+--   Z2: Individual C1 0.5 last month; Individual C2 0.9 this month
+--                                                           -> 0.5, rank 2
+--   Z3: a journey row 1.0 last month only                   -> no row
+-- ---------------------------------------------------------------------------
+insert into public.organizations (id, name, slug) values
+  ('00000000-0000-0000-0000-000107192000', 'Org Z (0107)', 'org-z-0107');
+insert into public.gamification_settings (organization_id, enabled, timezone, allow_opt_out) values
+  ('00000000-0000-0000-0000-000107192000', true, 'UTC', true)
+on conflict (organization_id) do update set enabled = true, timezone = 'UTC', allow_opt_out = true;
+insert into auth.users (id, email) values
+  ('00000000-0000-0000-0000-000107192001', 'z1-0107@example.test'),
+  ('00000000-0000-0000-0000-000107192002', 'z2-0107@example.test'),
+  ('00000000-0000-0000-0000-000107192003', 'z3-0107@example.test');
+insert into public.profiles (id, email) values
+  ('00000000-0000-0000-0000-000107192001', 'z1-0107@example.test'),
+  ('00000000-0000-0000-0000-000107192002', 'z2-0107@example.test'),
+  ('00000000-0000-0000-0000-000107192003', 'z3-0107@example.test')
+on conflict (id) do nothing;
+insert into public.organization_members (organization_id, user_id, role) values
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192001', 'user'),
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192002', 'user'),
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192003', 'user');
+insert into public.user_gamification (organization_id, user_id) values
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192001'),
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192002'),
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192003');
+insert into public.learning_paths (id, organization_id, name, slug) values
+  ('00000000-0000-0000-0000-000107192101', '00000000-0000-0000-0000-000107192000', 'PZ (0107)', 'pz-0107');
+insert into public.learning_path_courses (path_id, course_id, step_number) values
+  ('00000000-0000-0000-0000-000107192101', '00000000-0000-0000-0000-0000000000c2', 1);
+insert into public.journey_programs (id, organization_id, name, days_total) values
+  ('00000000-0000-0000-0000-000107192201', '00000000-0000-0000-0000-000107192000', 'JZ (0107)', 1);
+insert into public.journey_days (id, program_id, organization_id, day_number, course_id) values
+  ('00000000-0000-0000-0000-000107192211', '00000000-0000-0000-0000-000107192201', '00000000-0000-0000-0000-000107192000',
+   1, '00000000-0000-0000-0000-0000000000c1');
+insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, count_sundays,
+                                     completion_title, days) values
+  ('00000000-0000-0000-0000-000107192221', '00000000-0000-0000-0000-000107192201', '00000000-0000-0000-0000-000107192000',
+   1, 'JZ (0107)', 1, false, 'Yoddha', '[{"day": 1, "course_id": "00000000-0000-0000-0000-0000000000c1"}]');
+update public.journey_programs set current_version_id = '00000000-0000-0000-0000-000107192221'
+ where id = '00000000-0000-0000-0000-000107192201';
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status) values
+  ('00000000-0000-0000-0000-000107192231', '00000000-0000-0000-0000-000107192201', '00000000-0000-0000-0000-000107192221',
+   '00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192003', '2000-01-03', 'active');
+
+do $$
+declare
+  bad  text[] := '{}';
+  orgz constant uuid := '00000000-0000-0000-0000-000107192000';
+  z1   constant uuid := '00000000-0000-0000-0000-000107192001';
+  z2   constant uuid := '00000000-0000-0000-0000-000107192002';
+  z3   constant uuid := '00000000-0000-0000-0000-000107192003';
+  e1   constant uuid := '00000000-0000-0000-0000-0000000000e1';
+  e3   constant uuid := '00000000-0000-0000-0000-0000000000e3';
+  pz   constant uuid := '00000000-0000-0000-0000-000107192101';
+  -- the middle of last month and of this month, in UTC (Org Z's zone)
+  lm   constant timestamptz :=
+         (date_trunc('month', (now() at time zone 'UTC')::date - interval '1 month') + interval '10 days')::timestamp
+         at time zone 'UTC';
+  tm   constant timestamptz := date_trunc('month', (now() at time zone 'UTC'))::timestamp at time zone 'UTC'
+                               + interval '1 hour';
+  got  text;
+begin
+  insert into public.course_attempts (id, course_version_id, user_id, organization_id, status, completion_status,
+                                      success_status, score, started_at, completed_at, context_kind, learning_path_id,
+                                      is_revision, is_preview, preview_kind, journey_enrollment_id, journey_day,
+                                      journey_day_id, launch_mode)
+  values
+    -- Z1: official, Individual C1 0.8 and path PZ C2 0.6
+    (pg_temp.u('000107192301'), e1, z1, orgz, 'completed', 'completed', 'unknown', 0.8, lm, lm + interval '5 minutes',
+     'individual', null, false, false, null, null, null, null, 'Normal'),
+    (pg_temp.u('000107192302'), e3, z1, orgz, 'completed', 'completed', 'unknown', 0.6, lm, lm + interval '6 minutes',
+     'path', pz, false, false, null, null, null, null, 'Normal'),
+    -- Z1: a revision row, an abandoned completed row, a preview: never
+    (pg_temp.u('000107192303'), e1, z1, orgz, 'completed', 'completed', 'unknown', 1.0, lm + interval '1 day',
+     lm + interval '1 day', 'individual', null, true, false, null, null, null, null, 'Review'),
+    (pg_temp.u('000107192304'), e1, z1, orgz, 'abandoned', 'completed', 'unknown', 1.0, lm + interval '2 days',
+     lm + interval '2 days', 'individual', null, false, false, null, null, null, null, 'Normal'),
+    (pg_temp.u('000107192305'), e3, z1, orgz, 'completed', 'completed', 'unknown', 1.0, lm + interval '3 days',
+     lm + interval '3 days', 'preview', null, false, true, 'course', null, null, null, 'Normal'),
+    -- Z2: Individual C1 0.5 last month; Individual C2 0.9 this month
+    (pg_temp.u('000107192306'), e1, z2, orgz, 'completed', 'completed', 'unknown', 0.5, lm, lm + interval '5 minutes',
+     'individual', null, false, false, null, null, null, null, 'Normal'),
+    (pg_temp.u('000107192307'), e3, z2, orgz, 'completed', 'completed', 'unknown', 0.9, tm, tm + interval '5 minutes',
+     'individual', null, false, false, null, null, null, null, 'Normal'),
+    -- Z3: a journey row only
+    (pg_temp.u('000107192308'), e1, z3, orgz, 'completed', 'completed', 'unknown', 1.0, lm, lm + interval '5 minutes',
+     'journey', null, false, false, null, pg_temp.u('000107192231'), 1, pg_temp.u('000107192211'), 'Normal');
+
+  perform public.gamification_close_month();
+  select string_agg(format('%s %s %s', r.rank, right(r.user_id::text, 1), round(r.metric_value, 4)), '; ' order by r.rank)
+    into got
+    from public.gamification_recognitions r
+   where r.organization_id = orgz and r.category = 'highest_scorer'
+     and r.period = to_char((now() at time zone 'UTC')::date - interval '1 month', 'YYYY-MM');
+  if got is distinct from '1 1 0.7000; 2 2 0.5000' then
+    bad := bad || format('highest_scorer of Org Z reads %s (expected 1 Z1 0.7000; 2 Z2 0.5000)', coalesce(got, 'nothing'));
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (46) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (47) 6o, journey_auto_enroll: a new member of Org Z, whom JZ's audience
+--      (none: everyone) reaches, is enrolled with source audience
+-- ---------------------------------------------------------------------------
+update public.journey_programs set auto_enroll_new_users = true
+ where id = '00000000-0000-0000-0000-000107192201';
+insert into auth.users (id, email) values ('00000000-0000-0000-0000-000107192004', 'z4-0107@example.test');
+insert into public.organization_members (organization_id, user_id, role) values
+  ('00000000-0000-0000-0000-000107192000', '00000000-0000-0000-0000-000107192004', 'user');
+
+do $$
+declare
+  got text;
+begin
+  select string_agg(format('%s %s %s', e.source, right(e.version_id::text, 4), e.status), '; ') into got
+    from public.journey_enrollments e
+   where e.user_id = '00000000-0000-0000-0000-000107192004';
+  if got is distinct from 'audience 2221 active' then
+    raise exception 'assert-0107: (47) the audience enrolment reads %', coalesce(got, 'nothing');
   end if;
 end
 $$;
