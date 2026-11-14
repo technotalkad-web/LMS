@@ -100,11 +100,14 @@ function callArgs(src: string, fn: string): string[][] {
  * columns constant naming `status`: readWithOptionalColumn, or its paged form
  * readPagedWithOptionalColumn (the closure then takes `from, to` and the
  * options follow the constant; ADR 0020's chunked reads of the enrolled set).
+ * The closure may be wrapped in individualContextOnly(individual, …), which
+ * passes it a fourth argument (ADR 0024 step 49: the Individual product's
+ * reads; tests/unit/enrolment-definition.test.ts (e) says which files).
  */
 function fallbackSelect(src: string, constant: string): boolean {
   const decl = new RegExp(`const ${constant} =\\s*"[^"]*\\bstatus\\b[^"]*";`).test(src);
   const read = new RegExp(
-    `read(?:Paged)?WithOptionalColumn<[^>]*>\\(\\s*"is_revision",\\s*\\(columns(?:, from, to)?\\)[^=]*?=>\\s*[\\s\\S]{0,40}?\\.from\\("course_attempts"\\)\\s*\\.select\\(columns\\)[\\s\\S]{0,400}?,\\s*${constant}\\s*[,)]`
+    `read(?:Paged)?WithOptionalColumn<[^>]*>\\(\\s*"is_revision",\\s*(?:individualContextOnly\\(individual,\\s*)?\\(columns(?:, from, to(?:, only)?)?\\)[^=]*?=>\\s*[\\s\\S]{0,60}?\\.from\\("course_attempts"\\)\\s*\\.select\\(columns\\)[\\s\\S]{0,400}?,\\s*${constant}\\s*[,)]`
   ).test(src);
   return decl && read;
 }

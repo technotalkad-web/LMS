@@ -9,6 +9,10 @@
  * matched either probe would be hidden. So each of them raises SQLSTATE P0001
  * with a fixed message, and this test reads every message from the migration
  * itself (not from a copied list), feeds it to both probes, and expects false.
+ * It does so for every trigger function 0107 binds (the three N7 names and
+ * the three append-only triggers), read from the file's own `create trigger
+ * ... execute function` statements, so a trigger added to 0107 later is
+ * checked without a change here; 0108 binds none.
  * The rehearsal (scripts/migration-rehearsal/assert-0107.sql, checks (8) and
  * (10)) asserts the same on the errors PGlite raises.
  *
@@ -50,11 +54,33 @@ function raises(src: string): { message: string; code: string | null }[] {
 }
 
 const PROBE_CODES = ["42703", "42P01", "42883", "PGRST204", "PGRST202", "PGRST205"];
-const TRIGGERS = [
+/** The three triggers note N7 names. */
+const N7_TRIGGERS = [
   "course_attempts_context_immutable",
   "course_attempts_context_derive",
   "journey_versions_derive_day_ids",
 ];
+
+/** The function of every `create trigger ... execute function public.<fn>()` of a migration. */
+function boundFunctions(src: string): string[] {
+  const out: string[] = [];
+  for (const m of src.matchAll(/create\s+(?:or\s+replace\s+)?trigger\s+\w+[\s\S]*?execute\s+(?:function|procedure)\s+public\.(\w+)\(\)/gi)) {
+    if (!out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+console.log("the trigger functions 0107 binds");
+const TRIGGERS = boundFunctions(sql);
+eq("the three N7 triggers are among them", N7_TRIGGERS.every((t) => TRIGGERS.includes(t)), true);
+eq("the six of 0107: the three N7 triggers and the three append-only triggers", [...TRIGGERS].sort(), [
+  ...N7_TRIGGERS,
+  "learning_path_completions_append_only",
+  "learning_path_step_completions_append_only",
+  "preview_purge_log_append_only",
+].sort());
+const sql0108 = fs.readFileSync(path.resolve(__dirname, "../../supabase/migrations/0108_drop_context_derive.sql"), "utf8");
+eq("0108 binds no trigger", boundFunctions(sql0108), []);
 
 for (const name of TRIGGERS) {
   console.log(name);

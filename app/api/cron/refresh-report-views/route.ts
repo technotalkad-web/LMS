@@ -28,6 +28,30 @@ function unauthorized() {
   return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 }
 
+/**
+ * ADR 0024 step 81, with step 16: from migration 0107 the function runs the
+ * completion sweep first and appends its entry last, {view:
+ * "completion_sweep", ms, rows, error, sweep}. The sweep is the only retry of
+ * the fail-closed completion writer, so a sweep that failed must not pass
+ * unseen: when that entry carries an error the route answers 500 and the
+ * heartbeat reads "error". Only the sweep's own error counts. A row that
+ * failed inside the sweep is counted in sweep.failed and retried by the next
+ * run; it is not an error of the refresh. Every other entry keeps today's
+ * behaviour (a view's error is reported in its entry and the route answers
+ * 200), and a database without 0107 has no such entry. The answer has no
+ * entry for Preview data: nothing deletes it on a schedule (step 81).
+ */
+function completionSweepError(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const entry of data) {
+    if (entry && typeof entry === "object" && (entry as { view?: unknown }).view === "completion_sweep") {
+      const err = (entry as { error?: unknown }).error;
+      return err === null || err === undefined ? null : String(err);
+    }
+  }
+  return null;
+}
+
 async function run() {
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -47,10 +71,12 @@ async function run() {
     };
   }
 
+  const sweepError = completionSweepError(data);
   return {
-    ok: true,
+    ok: sweepError === null,
     total_ms,
     ...(data as Record<string, unknown>),
+    ...(sweepError === null ? {} : { error: `completion_sweep: ${sweepError}` }),
   };
 }
 

@@ -15,7 +15,12 @@
  *   (d) readContextResult on a stub client: three reads, each with its own
  *       abort signal; {ok: false} on every error and on an empty answer;
  *       the pre-0107 fallback only on a 42703 naming a context column, and
- *       what it answers.
+ *       what it answers;
+ *   (e) individualContextOnly (step 49) under readPagedWithOptionalColumn on
+ *       a fake database of each schema: the Individual filter with 0107,
+ *       today's rows without it, decided once for every page and chunk, in
+ *       either order of the two missing-column errors; any other error
+ *       decides nothing and is returned as it is.
  *
  * No database.
  *
@@ -31,7 +36,8 @@ import {
   type ContextGrant,
   type ContextKind,
 } from "../../lib/scoring/context";
-import { readContextResult } from "../../lib/scoring/context-read";
+import { individualContextOnly, readContextResult, type IndividualFilterState } from "../../lib/scoring/context-read";
+import { readPagedWithOptionalColumn, type OptionalColumnState, type PgError } from "../../lib/scoring/attempt-kind";
 import { DEFAULT_POLICY } from "../../lib/scoring/policy";
 
 let pass = 0, fail = 0;
@@ -415,8 +421,121 @@ async function main() {
     eq("a preview key without 0107: {ok: false, no_context_schema}; no second read", [r.ok ? "ok" : r.reason, calls.filter((c) => c.table === "course_attempts").length], ["no_context_schema", 1]);
   }
 
+  await individualFilterCases();
+
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail > 0) process.exit(1);
+}
+
+// ---- (e) individualContextOnly on a fake database ----
+type FakeQuery = { columns: string; from: number; to: number; individual: boolean };
+type FakeRow = { id: string; context_kind: string };
+/**
+ * A course_attempts table behind PostgREST, as each schema answers a paged
+ * read: without 0103 a select naming is_revision is a 42703, without 0107 a
+ * filter on context_kind is a 42703 (`first` says which one Postgres names
+ * when both are missing), and otherwise the rows (the Individual ones when
+ * filtered) in pages. `fail` answers another error for chosen queries.
+ */
+function fakeAttempts(
+  schema: { has0103: boolean; has0107: boolean; first?: "select" | "filter" },
+  rows: FakeRow[],
+  fail?: (q: FakeQuery, nth: number) => PgError
+) {
+  const queries: FakeQuery[] = [];
+  const missing = (col: string) => ({ data: null, error: { code: "42703", message: `column course_attempts.${col} does not exist` } });
+  const read = (columns: string, from: number, to: number, individual: boolean): PromiseLike<{ data: FakeRow[] | null; error: PgError }> => {
+    const q = { columns, from, to, individual };
+    queries.push(q);
+    const err = fail?.(q, queries.length);
+    if (err) return Promise.resolve({ data: null, error: err });
+    const selectMissing = !schema.has0103 && /\bis_revision\b/.test(columns);
+    const filterMissing = individual && !schema.has0107;
+    if (selectMissing && filterMissing) return Promise.resolve(missing(schema.first === "filter" ? "context_kind" : "is_revision"));
+    if (selectMissing) return Promise.resolve(missing("is_revision"));
+    if (filterMissing) return Promise.resolve(missing("context_kind"));
+    const set = individual ? rows.filter((r) => r.context_kind === "individual") : rows;
+    return Promise.resolve({ data: set.slice(from, to + 1), error: null });
+  };
+  return { read, queries };
+}
+const fakeRows: FakeRow[] = [
+  { id: "r1", context_kind: "individual" },
+  { id: "r2", context_kind: "path" },
+  { id: "r3", context_kind: "individual" },
+  { id: "r4", context_kind: "journey" },
+  { id: "r5", context_kind: "individual" },
+  { id: "r6", context_kind: "preview" },
+];
+const BASE = "id, status";
+const pagedRead = (db: ReturnType<typeof fakeAttempts>, decided: OptionalColumnState, individual: IndividualFilterState) =>
+  readPagedWithOptionalColumn<FakeRow>("is_revision", individualContextOnly(individual, db.read), BASE, { pageSize: 2, state: decided });
+const shapeOf = (q: FakeQuery) => `${q.columns.includes("is_revision") ? "rev" : "base"}${q.individual ? "+ind" : ""}@${q.from}`;
+
+async function individualFilterCases() {
+  console.log("\n(e) individualContextOnly: the Individual filter when 0107 is there (step 49)");
+  {
+    const db = fakeAttempts({ has0103: true, has0107: true }, fakeRows);
+    const decided: OptionalColumnState = { columns: null };
+    const individual: IndividualFilterState = { applies: null };
+    const r = await pagedRead(db, decided, individual);
+    eq("with 0107: every page is filtered, the Individual rows only (a path, a journey and a preview row left out)",
+      [r.data.map((x) => x.id), r.error, db.queries.map(shapeOf)], [["r1", "r3", "r5"], null, ["rev+ind@0", "rev+ind@2"]]);
+    eq("…the first answer decided: applies true, the column list with is_revision", [individual.applies, decided.columns], [true, `${BASE}, is_revision`]);
+    const second = await pagedRead(db, decided, individual);
+    eq("…a second chunk sharing the state reads filtered at once, no probe", [second.data.length, db.queries.slice(2).map(shapeOf)], [3, ["rev+ind@0", "rev+ind@2"]]);
+  }
+  {
+    const db = fakeAttempts({ has0103: true, has0107: false }, fakeRows);
+    const decided: OptionalColumnState = { columns: null };
+    const individual: IndividualFilterState = { applies: null };
+    const r = await pagedRead(db, decided, individual);
+    eq("without 0107: the first page's 42703 naming context_kind re-reads that page without the filter, then today's rows on every page",
+      [r.data.map((x) => x.id), r.error, db.queries.map(shapeOf)],
+      [["r1", "r2", "r3", "r4", "r5", "r6"], null, ["rev+ind@0", "rev@0", "rev@2", "rev@4", "rev@6"]]);
+    eq("…decided: applies false", individual.applies, false);
+    const before = db.queries.length;
+    await pagedRead(db, decided, individual);
+    eq("…a second chunk sharing the state never tries the filter again (one extra read per request)",
+      db.queries.slice(before).map(shapeOf), ["rev@0", "rev@2", "rev@4", "rev@6"]);
+  }
+  for (const first of ["select", "filter"] as const) {
+    const db = fakeAttempts({ has0103: false, has0107: false, first }, fakeRows);
+    const decided: OptionalColumnState = { columns: null };
+    const individual: IndividualFilterState = { applies: null };
+    const r = await pagedRead(db, decided, individual);
+    eq(`without 0103 (Postgres names the ${first === "select" ? "select's is_revision" : "filter's context_kind"} first): today's narrower read, every row`,
+      [r.data.length, r.error, individual.applies, decided.columns, db.queries.slice(-1).map(shapeOf)], [6, null, false, BASE, ["base@6"]]);
+    eq("…the first page took", db.queries.filter((q) => q.from === 0).map(shapeOf),
+      first === "select" ? ["rev+ind@0", "base+ind@0", "base@0"] : ["rev+ind@0", "rev@0", "base@0"]);
+  }
+  {
+    const timeout = { code: "57014", message: "canceling statement due to statement timeout" };
+    const db = fakeAttempts({ has0103: true, has0107: false }, fakeRows, (_q, nth) => (nth === 1 ? timeout : null));
+    const decided: OptionalColumnState = { columns: null };
+    const individual: IndividualFilterState = { applies: null };
+    const r = await pagedRead(db, decided, individual);
+    eq("another error on the first page: returned as it is, nothing decided, no retry without the filter",
+      [r.data.length, r.error?.code, individual.applies, decided.columns, db.queries.map(shapeOf)], [0, "57014", null, null, ["rev+ind@0"]]);
+    const again = await pagedRead(db, decided, individual);
+    eq("…the next read decides as a first read does", [again.data.length, individual.applies, db.queries.slice(1, 3).map(shapeOf)], [6, false, ["rev+ind@0", "rev@0"]]);
+  }
+  {
+    const other = { code: "42703", message: "column course_attempts.progress_pct does not exist" };
+    const db = fakeAttempts({ has0103: true, has0107: true }, fakeRows, (_q, nth) => (nth === 1 ? other : null));
+    const individual: IndividualFilterState = { applies: null };
+    const r = await pagedRead(db, { columns: null }, individual);
+    eq("a 42703 naming another column is an error, never a reason to drop the filter",
+      [r.error?.message, individual.applies, db.queries.map(shapeOf)], [other.message, null, ["rev+ind@0"]]);
+  }
+  {
+    const db = fakeAttempts({ has0103: true, has0107: true }, fakeRows, (q, nth) =>
+      nth === 2 ? { code: "42703", message: "column course_attempts.context_kind does not exist" } : null);
+    const individual: IndividualFilterState = { applies: null };
+    const r = await pagedRead(db, { columns: null }, individual);
+    eq("once decided, a later page's 42703 naming context_kind is returned with the rows read so far, never re-read without the filter",
+      [r.data.map((x) => x.id), r.error?.code, individual.applies, db.queries.map(shapeOf)], [["r1", "r3"], "42703", true, ["rev+ind@0", "rev+ind@2"]]);
+  }
 }
 
 main().catch((e) => {

@@ -28,6 +28,10 @@
  * false}`; a database whose attempts carry the context columns while its
  * grants do not is an error, never a fallback.
  *
+ * The file also holds individualContextOnly(), the same rule for the
+ * Individual product's paged report reads (step 49): the filter when 0107 is
+ * there, today's read when it is not.
+ *
  * Server-side by use, but free of next/* and Supabase runtime imports (the
  * shape of lib/scoring/attempt-kind.ts), so every branch is unit-tested with
  * a stub client (tests/unit/learning-context.test.ts).
@@ -59,6 +63,55 @@ const GRANT_COLUMNS = "id, used_attempt_id, used_at, expires_at, created_at";
 /** A 42703 (or PGRST204) that names one of 0107's context columns, or no column: a database without 0107. */
 export function isMissingContextColumn(error: PgError): boolean {
   return CONTEXT_COLUMNS_0107.some((c) => isMissingColumn(error, c));
+}
+
+/**
+ * Whether a request's attempts reads apply the Individual filter
+ * (individualContextOnly): null until an answer decides, then true on a
+ * database with 0107 and false on one without it. One object is shared by
+ * every page and chunk of a request, so the decision is made once.
+ */
+export type IndividualFilterState = { applies: boolean | null };
+
+/**
+ * The Individual product's attempts reads on its report surfaces (ADR 0024
+ * step 49: "From the first pull request the readers tolerate the absent
+ * columns and apply the Individual filter when present"): the course card
+ * and Reports tab (loadEnrolledCourseStatus), the course learners table and
+ * its CSV. On a database with 0107 they read `context_kind = 'individual'`,
+ * the rows the old-name summary views and the course matviews read from
+ * 0107 on (step 9), so a path's, a journey's or a preview's attempt no
+ * longer counts in the course's numbers; on a database without 0107 they
+ * read today's rows (`docs/ARCHITECTURE.md` principle 6).
+ *
+ * Wraps a paged read's query: `read(columns, from, to, individual)` builds
+ * it and adds `.eq("context_kind", "individual")` when `individual` is
+ * true. The first answer decides, for every later page and chunk that
+ * shares `state`: an answer without an error is a database with 0107; a
+ * missing-column error naming context_kind (isMissingColumn) is a database
+ * without it, and the same page is read again without the filter. Once
+ * decided it is never revisited, and a later error, a missing-column error
+ * included, is returned as it is. Any other error decides nothing and is
+ * returned as it is, so the caller keeps its own error path. It composes
+ * with readPagedWithOptionalColumn's is_revision fallback in either order of
+ * the two errors (a database without 0103 has no 0107 either).
+ */
+export function individualContextOnly<T>(
+  state: IndividualFilterState,
+  read: (columns: string, from: number, to: number, individual: boolean) => PromiseLike<{ data: T[] | null; error: PgError }>
+): (columns: string, from: number, to: number) => Promise<{ data: T[] | null; error: PgError }> {
+  return async (columns, from, to) => {
+    if (state.applies === false) return await read(columns, from, to, false);
+    const res = await read(columns, from, to, true);
+    if (state.applies === null) {
+      if (!res.error) state.applies = true;
+      else if (isMissingColumn(res.error, "context_kind")) {
+        state.applies = false;
+        return await read(columns, from, to, false);
+      }
+    }
+    return res;
+  };
 }
 
 export type ReadContextAttempt = ContextAttempt;

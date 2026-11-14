@@ -29,7 +29,15 @@
  *         reads attempts with is_revision (the fallback) or select("*"), and
  *         only the per-course display calls pass a third argument (the
  *         retakeIds whitelist: the path and journey roll-ups stay
- *         retake-unaware, ADR 0014:195).
+ *         retake-unaware, ADR 0014:195);
+ *   (vii) ADR 0024 step 41, the allow-list guard: computeScoring is called by
+ *         contextResult (lib/scoring/context.ts) only. Today's direct callers
+ *         are named on the dated list PENDING_0024 (the form of ADR 0023
+ *         step 3 and of PENDING_1B above); the scan's callers outside
+ *         lib/scoring/context.ts must equal the list exactly, so a new direct
+ *         caller fails here and a file that stops calling must leave the list.
+ *         Each later pull request that moves its files onto contextResult
+ *         removes them; the last one asserts the list empty.
  *
  * Run:  npx tsx tests/unit/revision-listing.test.ts   (or npm run test:unit)
  */
@@ -245,7 +253,7 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
   // no caller can hand it rows without them; abandoned and revision rows are
   // dropped before computeScoring sees them. Its strict reader is
   // lib/scoring/context-read.ts (below). Step 41's allow-list turn-around
-  // (contextResult as the only caller) is a later pull request's.
+  // (contextResult as the only caller) is block (vii).
   "lib/scoring/context.ts": {
     calls: ["computeScoring(officialRows)", "hasLiveGrantedRetake(officialRows)"],
     feeds: [
@@ -477,6 +485,70 @@ console.log("\n(vi) the courseProgress feeds and the retakeIds whitelist");
     /const progressOf = \(cid: string\): CourseProgressView =>\s*courseProgress\(attemptsOfCourse\.get\(cid\) \?\? \[\], unitCountByVersion\);/.test(analytics), true);
   eq("the path learners export's per-step progress passes no retakeIds",
     /courseProgress\(\s*myAttempts\.filter\(\(a\) => courseByVersion\.get\(a\.course_version_id\) === s\.course_id\),\s*unitCountByVersion\s*\)/.test(sources.get("app/api/learning-paths/[id]/learners/export/route.ts") ?? ""), true);
+}
+
+/**
+ * PENDING_0024 (2026-11-14, ADR 0024 phase 1): every file that calls
+ * computeScoring directly today, besides its definition
+ * (lib/scoring/policy.ts) and contextResult (lib/scoring/context.ts), the one
+ * caller step 41 keeps. The phases that move these surfaces onto
+ * contextResult (and its strict reader, readContextResult) remove their files
+ * from this list in the same pull request; the last of them asserts it empty.
+ * A file is never added.
+ */
+const PENDING_0024: string[] = [
+  "app/[org]/(admin)/analytics/page.tsx",
+  "app/[org]/(admin)/attempt-requests/page.tsx",
+  "app/[org]/(admin)/library/[courseId]/learners/page.tsx",
+  "app/[org]/(learner)/continue/page.tsx",
+  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx",
+  "app/[org]/(learner)/courses/[courseId]/page.tsx",
+  "app/[org]/(learner)/courses/page.tsx",
+  "app/[org]/(learner)/dashboard/page.tsx",
+  "app/[org]/(learner)/paths/[pathId]/page.tsx",
+  "app/api/attempt-requests/[id]/route.ts",
+  "app/api/attempt-requests/bulk/route.ts",
+  "app/api/attempt-requests/route.ts",
+  "app/api/attempts/[attemptId]/result-stored/route.ts",
+  "app/api/integrations/learner-summary/route.ts",
+  "lib/attempts/force-restart.ts",
+  "lib/attempts/grant.ts",
+  "lib/integrations/progress.ts",
+  "lib/manager/insights.ts",
+  "lib/scoring/attempt-kind.ts",
+  "lib/scoring/status.ts",
+];
+
+console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult only; today's direct callers are on PENDING_0024");
+{
+  /** A call of computeScoring (not its definition, an import, a re-export or a mention in a string). */
+  const directCall = /(?<!function\s)(?<![\w$.'"`])computeScoring\s*\(/;
+  const RULE_OWNER = "lib/scoring/context.ts";
+  const DEFINITION = "lib/scoring/policy.ts";
+  const callers = [...sources.entries()].filter(([f, s]) => f !== DEFINITION && directCall.test(s)).map(([f]) => f).sort();
+  eq("contextResult (lib/scoring/context.ts) calls computeScoring", callers.includes(RULE_OWNER), true);
+  eq("every other direct caller is on PENDING_0024, and the list names only direct callers",
+    callers.filter((f) => f !== RULE_OWNER), [...PENDING_0024].sort());
+  eq("PENDING_0024 has no duplicate and never names the rule's owner or the definition",
+    [new Set(PENDING_0024).size === PENDING_0024.length, PENDING_0024.includes(RULE_OWNER), PENDING_0024.includes(DEFINITION)], [true, false, false]);
+  // The scan agrees with block (i)'s own reading of the call sites, so the
+  // two cannot drift: block (i)'s callsIn sees a computeScoring call in
+  // exactly the files above.
+  const viaCallsIn = [...sources.entries()]
+    .filter(([f, s]) => f !== DEFINITION && callsIn(s).some((c) => c.startsWith("computeScoring(")))
+    .map(([f]) => f)
+    .sort();
+  eq("block (i)'s callsIn finds the same computeScoring callers", viaCallsIn, callers);
+  // The control: a direct call is found, and the definition, an import and a
+  // re-export are not calls.
+  eq("control: the pattern finds a call and skips the definition, an import and a re-export",
+    [
+      directCall.test("const s = computeScoring(rows, policy, ids);"),
+      directCall.test("export function computeScoring(attempts: A[]) {"),
+      directCall.test('import { computeScoring } from "./policy";'),
+      directCall.test("export { attemptCounts, computeScoring, courseStatus };"),
+    ],
+    [true, false, false, false]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
