@@ -3,9 +3,19 @@
 #
 # Subset: 00, 32, 33, 34, 43, 47, 48, 49, 50-53 (ADR 0007 step 15), 54
 # (ADR 0008 step 17), 55 (ADR 0009 step 12), 63 (ADR 0019 decision 7),
-# 64 (ADR 0020 step 10) and 65 (ADR 0021 F.5), each added after a green
-# run on staging. The golden canary of ADR 0005 step 12 joins when it
-# exists (P4).
+# 64 (ADR 0020 step 10), 65 (ADR 0021 F.5) and 66 (ADR 0022 item 18), each
+# added after a green run on staging. The golden canary of ADR 0005 step 12
+# joins when it exists (P4).
+#
+# Two jobs, one after the other (ADR 0024 step 73: split before new specs
+# join, never side by side on the one staging database): `lifecycle` runs
+# that subset (DEFAULT_SPECS); `lifecycle-products` then runs PRODUCT_SPECS,
+# the ADR 0024 specs (68 onward) as each joins, and runs even when the first
+# job failed (!cancelled()). With PRODUCT_SPECS empty, or a dispatch that
+# names specs (they run in the first job), the second job's selection step
+# says so and the job passes without installing or building. A green night
+# is both jobs green. Worst case 22:41 + 90 + 60 min = 01:11 UTC, clear of
+# the 03:30 UTC refresh and the 04:00 UTC e2e.
 #
 # Target: this commit, built and started INSIDE the runner on
 # http://localhost:3100, against the STAGING Supabase project, with the same
@@ -57,8 +67,9 @@ jobs:
     name: Lifecycle nightly (staging)
     # ubuntu-24.04, not ubuntu-latest (now 26.04): Playwright 1.60 cannot install chromium on 26.04.
     runs-on: ubuntu-24.04
-    # Build about 5 min; the subset about 40-50 min serially (workers: 1).
-    timeout-minutes: 75
+    # Build about 5 min; the subset about 40-80 min serially (workers: 1;
+    # ADR 0024 step 73 plans for the longer figure).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,5 +89,47 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
           NEXT_TELEMETRY_DISABLED: "1"
           LIFECYCLE_PORT: "3100"
+          LIFECYCLE_SPECS: ${{ inputs.specs }}
+        run: bash scripts/lifecycle-nightly.sh
+
+  lifecycle-products:
+    name: Lifecycle nightly, products (staging)
+    # After the first job, never beside it; also after a red or timed-out first job.
+    needs: lifecycle
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # No secrets: it only reads the lists in scripts/lifecycle-nightly.sh.
+      - name: Select the product list
+        id: plan
+        env:
+          LIFECYCLE_LIST: products
+          LIFECYCLE_PLAN_ONLY: "1"
+          LIFECYCLE_SPECS: ${{ inputs.specs }}
+        run: bash scripts/lifecycle-nightly.sh
+      - uses: actions/setup-node@v4
+        if: steps.plan.outputs.run == 'true'
+        with:
+          node-version: "22"
+          cache: npm
+      - if: steps.plan.outputs.run == 'true'
+        run: npm ci
+      - name: Install Playwright browsers
+        if: steps.plan.outputs.run == 'true'
+        run: npx playwright install --with-deps chromium
+      # The staging secrets reach this step only.
+      - name: Build, start and run the product specs (counts, failing-test locations and durations)
+        if: steps.plan.outputs.run == 'true'
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+          NEXT_TELEMETRY_DISABLED: "1"
+          LIFECYCLE_PORT: "3100"
+          LIFECYCLE_LIST: products
           LIFECYCLE_SPECS: ${{ inputs.specs }}
         run: bash scripts/lifecycle-nightly.sh

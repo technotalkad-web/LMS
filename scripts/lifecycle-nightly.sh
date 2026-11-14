@@ -17,6 +17,19 @@
 #                               refused unless the URL is the staging project
 #   LIFECYCLE_PORT              default 3100 (3001 is the hand-run dev server)
 #   LIFECYCLE_SPECS             spec numbers, default the ADR subset below
+#   LIFECYCLE_LIST              default | products (default "default"): which
+#                               list runs. The workflow's first job runs
+#                               DEFAULT_SPECS (or LIFECYCLE_SPECS when given);
+#                               its second job runs PRODUCT_SPECS, and passes
+#                               at once when that list is empty or when
+#                               LIFECYCLE_SPECS is given (those run in the
+#                               first job). ADR 0024 step 73: the nightly is
+#                               split into two jobs that run one after the
+#                               other before new specs join.
+#   LIFECYCLE_PLAN_ONLY         when set: print the choice, write run=true or
+#                               run=false to $GITHUB_OUTPUT, and stop before
+#                               anything is built or run (the workflow's
+#                               selection step; it needs no secrets)
 #   LIFECYCLE_OUT               where the logs and the JSON report go
 #                               (default $RUNNER_TEMP/lifecycle-nightly)
 #
@@ -42,10 +55,47 @@
 set -euo pipefail
 
 DEFAULT_SPECS="00 32 33 34 43 47 48 49 50 51 52 53 54 55 63 64 65 66"
+# The second job's list: the specs of ADR 0024 (68 onward) join here, each
+# after one green run by hand on staging. A spec number is in one list only
+# (tests/unit/lifecycle-nightly-lists.test.ts).
+PRODUCT_SPECS=""
 PORT="${LIFECYCLE_PORT:-3100}"
-SPECS="${LIFECYCLE_SPECS:-$DEFAULT_SPECS}"
-OUT="${LIFECYCLE_OUT:-${RUNNER_TEMP:-$(mktemp -d)}/lifecycle-nightly}"
 STAGING_REF="zeaclbapadosqqttexxh"
+
+# Which list runs. Both early exits come before anything is built or run.
+LIST="${LIFECYCLE_LIST:-default}"
+GIVEN="${LIFECYCLE_SPECS:-}"
+SKIP=""
+case "$LIST" in
+  default) SPECS="${GIVEN:-$DEFAULT_SPECS}" ;;
+  products)
+    if [[ -n "${GIVEN// /}" ]]; then
+      SKIP="skipped: specs given (they run in the first job)"
+    elif [[ -z "${PRODUCT_SPECS// /}" ]]; then
+      SKIP="no product specs yet"
+    else
+      SPECS="$PRODUCT_SPECS"
+    fi
+    ;;
+  *) echo "lifecycle-nightly: LIFECYCLE_LIST must be 'default' or 'products'"; exit 2 ;;
+esac
+if [[ -n "${LIFECYCLE_PLAN_ONLY:-}" ]]; then
+  if [[ -n "$SKIP" ]]; then
+    echo "lifecycle-nightly: $SKIP"
+    run=false
+  else
+    echo "lifecycle-nightly: list '$LIST' will run: $SPECS"
+    run=true
+  fi
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "run=$run" >> "$GITHUB_OUTPUT"; fi
+  exit 0
+fi
+if [[ -n "$SKIP" ]]; then
+  echo "lifecycle-nightly: $SKIP"
+  exit 0
+fi
+
+OUT="${LIFECYCLE_OUT:-${RUNNER_TEMP:-$(mktemp -d)}/lifecycle-nightly}"
 
 cd "$(dirname "$0")/.."
 mkdir -p "$OUT"

@@ -152,7 +152,14 @@ runner by `lifecycle-nightly.yml`):
 ```bash
 E2E_BASE_URL=http://localhost:3001 npx playwright test --config=playwright.lifecycle.config.ts tests/bot/lifecycle/55-attempt-row-guard.spec.ts
 bash scripts/lifecycle-nightly.sh     # what the nightly runs: build, start on :3100, the ALDS subset, counts and failing-test locations and durations only
+LIFECYCLE_LIST=products bash scripts/lifecycle-nightly.sh   # the nightly's second job: the ADR 0024 product specs (PRODUCT_SPECS); passes at once while that list is empty
 ```
+
+The nightly is two jobs that run one after the other, never side by side on
+the one staging database (ADR 0024 step 73): `lifecycle` (DEFAULT_SPECS,
+90 minutes) and then `lifecycle-products` (PRODUCT_SPECS, 60 minutes). A
+spec number is in one list only; a new ADR 0024 spec joins PRODUCT_SPECS
+after one green run by hand on staging. A green night is both jobs green.
 
 Stop any `next dev` in the same checkout before running the script: it runs
 `next build`, which rewrites the `.next` folder the dev server uses.
