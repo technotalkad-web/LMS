@@ -37,7 +37,15 @@
  *         lib/scoring/context.ts must equal the list exactly, so a new direct
  *         caller fails here and a file that stops calling must leave the list.
  *         Each later pull request that moves its files onto contextResult
- *         removes them; the last one asserts the list empty.
+ *         removes them; the last one asserts the list empty. The list never
+ *         holds more than its 20 files of 2026-11-14. Hardening H3 of the
+ *         ADR's note of 2026-11-14: a call under another name is refused
+ *         outside the allow-list (the rule's owner, the definition and
+ *         PENDING_0024): an aliased import or re-export (`computeScoring
+ *         as`), `computeScoring.bind`, `.call` or `.apply`, and a namespace,
+ *         dynamic, star or require import of lib/scoring/policy or
+ *         lib/scoring/status (status.ts re-exports it), whose member call
+ *         the scan by name cannot see.
  *
  * Run:  npx tsx tests/unit/revision-listing.test.ts   (or npm run test:unit)
  */
@@ -531,6 +539,57 @@ console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult
     callers.filter((f) => f !== RULE_OWNER), [...PENDING_0024].sort());
   eq("PENDING_0024 has no duplicate and never names the rule's owner or the definition",
     [new Set(PENDING_0024).size === PENDING_0024.length, PENDING_0024.includes(RULE_OWNER), PENDING_0024.includes(DEFINITION)], [true, false, false]);
+  eq("PENDING_0024 never grows: at most its 20 files of 2026-11-14", PENDING_0024.length <= 20, true);
+
+  // H3 (the ADR's note of 2026-11-14): the forms that call computeScoring
+  // under another name, which the scan by name above cannot see, are refused
+  // outside the allow-list.
+  const ALLOWED = new Set([RULE_OWNER, DEFINITION, ...PENDING_0024]);
+  const SCORING_MODULES = ["lib/scoring/policy", "lib/scoring/status"];
+  /** A module specifier as a repository path without its extension, or null for a package. */
+  const resolveSpec = (file: string, spec: string): string | null => {
+    let p: string;
+    if (spec.startsWith("@/")) p = spec.slice(2);
+    else if (spec.startsWith(".")) p = path.posix.normalize(path.posix.join(path.posix.dirname(file), spec));
+    else return null;
+    return p.replace(/\.(ts|tsx|js|mjs)$/, "").replace(/\/index$/, "");
+  };
+  /** Every form in a file's code (comments blanked) that can call computeScoring under another name. */
+  const indirectForms = (file: string, src: string): string[] => {
+    const found: string[] = [];
+    if (/\bcomputeScoring\s+as\s+[A-Za-z_$]/.test(src)) found.push("computeScoring as");
+    if (/(?<![\w$.'"`])computeScoring\s*\.\s*(?:bind|call|apply)\b/.test(src)) found.push("computeScoring.bind/call/apply");
+    for (const m of src.matchAll(/\bimport\s+\*\s+as\s+[\w$]+\s+from\s*["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\bexport\s+\*\s+(?:as\s+[\w$]+\s+)?from\s*["']([^"']+)["']|\brequire\s*\(\s*["']([^"']+)["']\s*\)/g)) {
+      const target = resolveSpec(file, m[1] ?? m[2] ?? m[3] ?? m[4]);
+      if (target && SCORING_MODULES.includes(target)) found.push(`the whole of ${target}`);
+    }
+    return found;
+  };
+  const indirect = [...sources.entries()]
+    .filter(([f]) => !ALLOWED.has(f))
+    .flatMap(([f, src]) => indirectForms(f, src).map((x) => `${f}: ${x}`))
+    .sort();
+  eq("no file outside the allow-list aliases computeScoring, binds it, or imports lib/scoring/policy or lib/scoring/status whole",
+    indirect, []);
+  eq("control: each indirect form is found, and a named import is not one",
+    [
+      indirectForms("lib/x.ts", 'import { computeScoring as cs } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'export { computeScoring as score } from "./scoring/status";'),
+      indirectForms("lib/x.ts", "const f = computeScoring.bind(null, rows);"),
+      indirectForms("lib/x.ts", "computeScoring.call(undefined, rows, policy);"),
+      indirectForms("app/x/page.tsx", 'import * as policy from "@/lib/scoring/policy";'),
+      indirectForms("lib/scoring/x.ts", 'import * as st from "./status";'),
+      indirectForms("lib/x.ts", 'const m = await import("@/lib/scoring/status");'),
+      indirectForms("lib/x.ts", 'export * from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'const p = require("../lib/scoring/policy");'),
+      indirectForms("lib/x.ts", 'import { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'import * as other from "@/lib/scoring/context";'),
+    ],
+    [
+      ["computeScoring as"], ["computeScoring as"], ["computeScoring.bind/call/apply"], ["computeScoring.bind/call/apply"],
+      ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/status"], ["the whole of lib/scoring/status"],
+      ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/policy"], [], [],
+    ]);
   // The scan agrees with block (i)'s own reading of the call sites, so the
   // two cannot drift: block (i)'s callsIn sees a computeScoring call in
   // exactly the files above.
