@@ -1108,6 +1108,35 @@ async function statusCases() {
       ["failed", "not_started", "not_started", { total: 3, completed: 0, failed: 1, inProgress: 0, notStarted: 2 }]);
   }
   {
+    // A grant consumed before 0107 whose retake old consume_grant tagged with
+    // a path (note N9): the grant read returns it, the filtered attempts read
+    // does not return its row, and the Individual result is the Library one.
+    const rows = [...ctxRows, ctxRow("p9", "u1", "path", "passed", 5)];
+    const { client } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") return enrolled;
+      if (q.table === "attempt_requests") return { data: [{ user_id: "u1", course_id: "c1", used_attempt_id: "p9" }] };
+      if (q.table === "course_attempts") {
+        const only = filteredBy(q);
+        return { data: only.length ? rows.filter((r) => only.includes(r.context_kind)) : rows };
+      }
+      return { data: [] };
+    });
+    const r = await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+    eq("with 0107, a used grant whose retake is a path row: u1 reads the Library fail, the retake id changes nothing",
+      [statusOf(r.officialByUser, "u1", "c1"), r.officialByUser.get("u1:c1")?.scoring.officialAttempt?.id], ["failed", "a2"]);
+    // The control: the same grant over every row (no filter) makes the
+    // retake official, so the grant read above did reach the scoring.
+    const { client: all } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") return enrolled;
+      if (q.table === "attempt_requests") return { data: [{ user_id: "u1", course_id: "c1", used_attempt_id: "p9" }] };
+      if (q.table === "course_attempts") return { data: rows };
+      return { data: [] };
+    });
+    const control = await loadEnrolledCourseStatus(all, "o1", "c1", ["v1"]);
+    eq("…control: over every row the same grant makes p9 the official attempt",
+      [statusOf(control.officialByUser, "u1", "c1"), control.officialByUser.get("u1:c1")?.scoring.officialAttempt?.id], ["passed", "p9"]);
+  }
+  {
     const versions = Array.from({ length: 151 }, (_, i) => `v${i}`);
     const { client, queries } = recordingClient((q) => {
       if (q.table === "v_course_enrollments_expanded") return enrolled;

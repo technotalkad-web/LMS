@@ -184,5 +184,25 @@ console.log("\nreset: a granted retake abandoned by a forced restart (ADR 0014:1
   eq("several resets are listed in the ordering key's order", order.reset.map((r) => r.attemptId), ["r1", "r3"]);
 }
 
+// ADR 0024 step 49: from 0107 the course learners table and its CSV read the
+// Individual context's attempts only, while their grant read still returns
+// every grant of the (learner, course). A grant consumed before 0107 can name
+// a retake that old consume_grant tagged with a path or journey (note N9), so
+// the retake is not among the rows. It belongs to its own context's chain;
+// the Individual chain leaves it out without an error.
+console.log("\na used grant whose retake row is not among the rows (another context's, ADR 0024 step 49)");
+{
+  const a1 = att("a1", 1, "failed");
+  const g1 = grant("g1", "p1", 3);
+  const h = officialHistory([a1], [g1]);
+  eq("the chain is the rows' own: official #1 only, no retake entry, nothing running or reset",
+    [h.entries.map((e) => [e.attemptId, e.kind]), h.running, h.reset], [[["a1", "first"]], null, []]);
+  eq("…the retake state is none and the current result is the Individual one",
+    [officialRetakeState(h).state, officialRetakeState(h).current?.attemptId, officialRetakeState(h).current?.status], ["none", "a1", "failed"]);
+  const s = computeScoring([a1], DEFAULT_POLICY, new Set(["p1"]));
+  eq("computeScoring with that retake id: the official attempt is a1, failed (an id not among the rows changes nothing)",
+    [s.officialAttempt?.id, s.officialStatus, s.scoredAttempts], ["a1", "failed", 1]);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);
