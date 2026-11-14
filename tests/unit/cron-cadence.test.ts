@@ -184,12 +184,43 @@ eq("the list names lrs-forward, gamification-refresh and journey-nudges", [...su
   "journey-nudges",
   "lrs-forward",
 ]);
-eq(`the ceiling (${subdaily.ceilingMin} min) is at least a day`, subdaily.ceilingMin >= 24 * 60, true);
+// 26 h is the value ADR 0007's note, ADR 0024's note, docs/ARCHITECTURE.md and
+// ops/RUNBOOK.md state; change them together.
+eq("the ceiling is 26 h, as the records state", subdaily.ceilingMin, 26 * 60);
 eq(
   "the ceiling is above every listed job's threshold",
   subdaily.warnOnly.filter((j) => !((cadence.get(j) ?? Infinity) < subdaily.ceilingMin)),
   []
 );
+{
+  // The route hands exactly these two constants (and the cadence map) to classifyCrons.
+  const file = path.join(root, HEALTH_ROUTE);
+  const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+  const wiring: Record<string, string>[] = [];
+  const visit = (node: ts.Node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "classifyCrons" &&
+      node.arguments.length === 1 &&
+      ts.isObjectLiteralExpression(node.arguments[0])
+    ) {
+      const props: Record<string, string> = {};
+      for (const p of node.arguments[0].properties) {
+        if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) props[p.name.text] = p.initializer.getText();
+      }
+      wiring.push(props);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  eq("the route calls classifyCrons once", wiring.length, 1);
+  eq(
+    "with CRON_CADENCE_MIN, SUBDAILY_STALE_WARN and SUBDAILY_STALE_DEGRADED_MIN",
+    wiring.map((w) => [w.cadenceMin, w.staleWarnOnly, w.staleDegradedAfterMin]),
+    [["CRON_CADENCE_MIN", "SUBDAILY_STALE_WARN", "SUBDAILY_STALE_DEGRADED_MIN"]]
+  );
+}
 
 console.log("\neach cadence entry's route records its heartbeat under that name");
 for (const job of cadenceJobs) {

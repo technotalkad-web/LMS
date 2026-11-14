@@ -37,6 +37,9 @@ Procedure:
    digest issue does not exist yet, create it (title "📊 Ops digest (rolling)",
    label `ops-digest`).
 4. If you found a P1/P2 with NO open `ops-incident` issue, open one (label
-   `ops-incident`) with the evidence and the playbook reference.
+   `ops-incident`) with the evidence and the playbook reference. Never title
+   it "🔴 Ops incident: prod health <status>": that title is reserved for the
+   watchdog (ops-watch.yml), which comments on and auto-closes only issues
+   with it.
 5. If a signal source is unreachable (labels missing, no runs yet), say so
    plainly in the report instead of guessing.

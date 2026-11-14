@@ -17,7 +17,9 @@ const eq = (n: string, got: unknown, want: unknown) => {
 
 const NOW = Date.parse("2026-11-14T12:00:00Z");
 const ago = (min: number) => new Date(NOW - min * 60_000).toISOString();
-const CADENCE = { "lrs-forward": 30, "journey-nudges": 360, reaper: 26 * 60 };
+// `daily` is unlisted with a threshold under the ceiling, so the list check is
+// what keeps it from reading warn (a daily job given, say, 24 h one day).
+const CADENCE = { "lrs-forward": 30, "journey-nudges": 360, reaper: 26 * 60, daily: 24 * 60 };
 const WARN_ONLY = ["lrs-forward", "journey-nudges"];
 const CEILING = 26 * 60;
 
@@ -31,7 +33,7 @@ function crons(rows: Array<[string, number, string?]>, expectCrons = true) {
     expectCrons,
   });
 }
-const fresh: Array<[string, number]> = [["lrs-forward", 3], ["journey-nudges", 30], ["reaper", 60]];
+const fresh: Array<[string, number]> = [["lrs-forward", 3], ["journey-nudges", 30], ["reaper", 60], ["daily", 60]];
 const with_ = (name: string, age: number, st?: string) =>
   fresh.map(([n, a]) => (n === name ? ([n, age, st] as [string, number, string?]) : ([n, a] as [string, number])));
 
@@ -42,14 +44,19 @@ eq("sub-daily job stale at the ceiling → warn", crons(with_("lrs-forward", CEI
 eq("sub-daily job stale past the ceiling → fail", crons(with_("lrs-forward", CEILING + 1)).status, "fail");
 eq("hourly job stale 10.5 h (the worst gap measured) → warn", crons(with_("journey-nudges", 630)).status, "warn");
 eq("daily job stale → fail", crons(with_("reaper", 26 * 60 + 1)).status, "fail");
+eq("unlisted job stale under the ceiling → fail, not warn", crons(with_("daily", 25 * 60)).status, "fail");
 eq("sub-daily job never seen → fail", crons(fresh.filter(([n]) => n !== "lrs-forward")).status, "fail");
 eq("daily job never seen → fail", crons(fresh.filter(([n]) => n !== "reaper")).status, "fail");
 eq(
   "one warn and one fail → fail",
-  crons([["lrs-forward", 31], ["journey-nudges", 30], ["reaper", 26 * 60 + 1]]).status,
+  crons([["lrs-forward", 31], ["journey-nudges", 30], ["reaper", 26 * 60 + 1], ["daily", 60]]).status,
   "fail"
 );
-eq("two sub-daily jobs stale → warn", crons([["lrs-forward", 31], ["journey-nudges", 400], ["reaper", 60]]).status, "warn");
+eq(
+  "two sub-daily jobs stale → warn",
+  crons([["lrs-forward", 31], ["journey-nudges", 400], ["reaper", 60], ["daily", 60]]).status,
+  "warn"
+);
 eq("last run errored, not stale → ok (unchanged)", crons(with_("reaper", 60, "error")).status, "ok");
 eq("its job state reads last-run-errored", crons(with_("reaper", 60, "error")).jobs.reaper.status, "last-run-errored");
 eq("a warn job's state still reads stale", crons(with_("lrs-forward", 31)).jobs["lrs-forward"].status, "stale");
@@ -57,7 +64,11 @@ eq("a never-seen job's state", crons([]).jobs["lrs-forward"], { status: "never-s
 eq("a job not in the cadence map is ignored", crons([...fresh, ["other", 99999]]).status, "ok");
 
 console.log("\nclassifyCrons on staging (expectCrons unset)");
-eq("everything stale → ok", crons([["lrs-forward", 99999], ["journey-nudges", 99999], ["reaper", 99999]], false).status, "ok");
+eq(
+  "everything stale → ok",
+  crons([["lrs-forward", 99999], ["journey-nudges", 99999], ["reaper", 99999], ["daily", 99999]], false).status,
+  "ok"
+);
 eq("nothing seen → ok", crons([], false).status, "ok");
 
 console.log("\noverallStatus");

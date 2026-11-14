@@ -78,7 +78,7 @@ drift-safe (`if exists`, `to_regclass()` guards) and probe before releases (§6.
 
 | Signal | Where | Semantics |
 |---|---|---|
-| **Deep health** | `GET /api/ops/health` (`x-cron-secret` header for detail) | `ok` / `warn` (advisory: LRS backlog, email failures, or a job scheduled more than once a day — `lrs-forward`, `gamification-refresh`, `journey-nudges` — stale for under 26 h, which GitHub's cron starvation causes) / `degraded` (storage; a stale daily, weekly or monthly job; a job never seen; a frequent job stale for over 26 h) / `down` (DB unreachable, HTTP 503). Heartbeats count on prod only (`OPS_EXPECT_CRONS=1`); ADR 0007, note of 2026-11-14 on decision 4 |
+| **Deep health** | `GET /api/ops/health` (`x-cron-secret` header for detail) | `ok` / `warn` (advisory: LRS backlog, email failures, or a job scheduled more than once a day — `lrs-forward`, `gamification-refresh`, `journey-nudges` — stale with its last run less than 26 h ago, which GitHub's cron starvation causes) / `degraded` (storage; a stale daily, weekly or monthly job; a job never seen; a frequent job whose last run is more than 26 h ago) / `down` (DB unreachable, HTTP 503). Heartbeats count on prod only (`OPS_EXPECT_CRONS=1`); ADR 0007, note of 2026-11-14 on decision 4 |
 | **Cron heartbeats** | `ops_heartbeats` table (migration 0050); each cron upserts on every run | staleness vs cadence map in the health route |
 | **Watchdog + digest** | GitHub issues labelled `ops-incident` / `ops-digest` | incident lifecycle + daily history |
 | **RLS cross-tenant audit** | `rls-audit.yml` on migration PRs + weekly cron | FAILs policy-less org-scoped tables & runtime leaks |
@@ -133,7 +133,7 @@ blast radius (which tenants/flows) → recommended action → what approval is n
 - **`Cron /api/cron/X returned 404`** → the schedule shipped to `main` before the prod deploy carried the route (GH schedules run from default branch immediately; prod deploys only on tag). Fix: tag the release, or accept red until the next tag. *(Lived: lrs-forward 404s until v1.0.5.)*
 - 401/403 → `PROD_CRON_SECRET` repo secret ≠ worker's `CRON_SECRET` (rotated one side only).
 - Heartbeat stale but cron.yml green → route ran but errored inside; check the run's response body, then the job's `last_detail` in `ops_heartbeats`.
-- GH Actions outage/jitter → verify at githubstatus.com; cadence thresholds already absorb minutes of jitter. GitHub starts only a share of the frequent schedules (gaps of up to about 10.5 h per job measured in Nov 2026), so a stale frequent job reads `warn`, not `degraded`, for its first 26 h; past that, treat it as a real fault.
+- GH Actions outage/jitter → verify at githubstatus.com; cadence thresholds already absorb minutes of jitter. GitHub starts only a share of the frequent schedules (gaps of up to about 10.5 h per job measured in Nov 2026), so a stale frequent job reads `warn`, not `degraded`, while its last run is less than 26 h ago; past that, treat it as a real fault.
 
 ### 6.3 Email delivery broken (P2)
 1. Triage source: `notification_log` — group recent `failed` rows by `error`.

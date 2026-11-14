@@ -53,6 +53,9 @@ jobs:
             -H "x-cron-secret: ${CRON_SECRET}" "${BASE}/api/ops/health" || echo "000")
           status=$(jq -r '.status // "unreachable"' /tmp/health.json 2>/dev/null || echo "unreachable")
           if [ "$code" != "200" ] && [ "$code" != "503" ]; then status="unreachable"; fi
+          # Only the route's own values pass: the issue title is built from this,
+          # and the alert step finds its issue by a lowercase title.
+          case "$status" in ok|warn|degraded|down|unreachable) ;; *) status="unreachable" ;; esac
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           {
