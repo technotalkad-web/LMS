@@ -63,13 +63,15 @@ PORT="${LIFECYCLE_PORT:-3100}"
 STAGING_REF="zeaclbapadosqqttexxh"
 
 # Which list runs. Both early exits come before anything is built or run.
+# Given specs that are only blanks count as none, in both jobs.
 LIST="${LIFECYCLE_LIST:-default}"
-GIVEN="${LIFECYCLE_SPECS:-}"
+GIVEN=""
+if [[ "${LIFECYCLE_SPECS:-}" =~ [^[:space:]] ]]; then GIVEN="$LIFECYCLE_SPECS"; fi
 SKIP=""
 case "$LIST" in
   default) SPECS="${GIVEN:-$DEFAULT_SPECS}" ;;
   products)
-    if [[ -n "${GIVEN// /}" ]]; then
+    if [[ -n "$GIVEN" ]]; then
       SKIP="skipped: specs given (they run in the first job)"
     elif [[ -z "${PRODUCT_SPECS// /}" ]]; then
       SKIP="no product specs yet"
@@ -141,6 +143,8 @@ for n in $SPECS; do
   fi
   FILES+=("${matches[0]}")
 done
+# Playwright given no file runs the whole folder; never let that happen.
+[[ ${#FILES[@]} -gt 0 ]] || { echo "lifecycle-nightly: no spec to run"; exit 2; }
 
 BASE="http://localhost:$PORT"
 export NEXT_TELEMETRY_DISABLED=1

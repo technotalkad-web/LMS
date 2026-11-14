@@ -14,8 +14,14 @@
 # job failed (!cancelled()). With PRODUCT_SPECS empty, or a dispatch that
 # names specs (they run in the first job), the second job's selection step
 # says so and the job passes without installing or building. A green night
-# is both jobs green. Worst case 22:41 + 90 + 60 min = 01:11 UTC, clear of
-# the 03:30 UTC refresh and the 04:00 UTC e2e.
+# is both jobs green. Timing: GitHub starts the 22:41 schedule late (runs
+# created between about 00:30 and 04:20 UTC in Oct-Nov 2026), and the split
+# makes a run up to 150 minutes long, so no clock window is clear of it:
+# before a staging paste or a hand-run harness, check that no run is in
+# progress (`gh run list --workflow lifecycle-nightly.yml --status
+# in_progress`). Unverified in this repository: whether a first job that
+# times out (rather than fails) still lets the second run; if it does not,
+# that red night only loses the product specs.
 #
 # Target: this commit, built and started INSIDE the runner on
 # http://localhost:3100, against the STAGING Supabase project, with the same

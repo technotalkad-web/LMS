@@ -77,6 +77,8 @@ const second = job("lifecycle-products");
 const field = (j: string, key: string) => (j.match(new RegExp(`^ {4}${key}: (.+)$`, "m")) ?? [])[1]?.trim();
 eq("the first job: timeout 90 minutes", field(first, "timeout-minutes"), "90");
 eq("the first job does not set LIFECYCLE_LIST (it runs DEFAULT_SPECS)", /LIFECYCLE_LIST/.test(first), false);
+eq("the first job never runs plan-only (it would run nothing and read green)", /LIFECYCLE_PLAN_ONLY/.test(first), false);
+eq("neither job has a job-level env (a secret there would reach every step)", [field(first, "env"), field(second, "env"), /^ {4}env:/m.test(first + second)], [undefined, undefined, false]);
 eq("the second job: needs the first", field(second, "needs"), "lifecycle");
 eq("the second job: runs unless the run was cancelled", field(second, "if"), "${{ !cancelled() }}");
 eq("the second job: timeout 60 minutes", field(second, "timeout-minutes"), "60");
@@ -94,7 +96,10 @@ eq("it holds no secret", plan.includes("secrets."), false);
 eq("it runs scripts/lifecycle-nightly.sh", /run: bash scripts\/lifecycle-nightly\.sh/.test(plan), true);
 eq("only the checkout comes before it", steps.slice(0, planIdx).map((s) => (s.match(/uses: (\S+)/) ?? [])[1] ?? "run"), ["actions/checkout@v4"]);
 const later = steps.slice(planIdx + 1);
-eq("every later step runs only when the selection says so", later.filter((s) => !s.includes("if: steps.plan.outputs.run == 'true'")).length, 0);
+// The condition must be a YAML key of the step itself, not text in a comment.
+const CONDITION = /^ {6}(?:- | {2})if: steps\.plan\.outputs\.run == 'true'$/m;
+eq("every later step runs only when the selection says so", later.filter((s) => !CONDITION.test(s)).length, 0);
+eq("the secrets appear in the second job's last step only", second.split("secrets.").length - 1, (later[later.length - 1] ?? "").split("secrets.").length - 1);
 eq("the later steps install, build and run (four steps)", later.length, 4);
 const runStep = later[later.length - 1] ?? "";
 eq("the last step runs the script with LIFECYCLE_LIST=products", /\n {10}LIFECYCLE_LIST: products\n/.test(runStep) && runStep.includes("run: bash scripts/lifecycle-nightly.sh"), true);
@@ -125,8 +130,10 @@ function run(env: Record<string, string>, script = SCRIPT) {
 }
 const probe = spawnSync("bash", ["-c", "echo ok"], { encoding: "utf8" });
 if (probe.status !== 0) {
-  fail++;
-  console.log(`  ✗ bash is not available to run the script (${probe.error?.message ?? probe.stderr}); the CI runner has it`);
+  // As content-backup-workflow.test.ts: skipped off CI (e.g. PowerShell
+  // without Git Bash on PATH), a failure on CI, where bash is always present.
+  console.log(`  (bash is not available: ${probe.error?.message ?? probe.stderr}; the selection cases are skipped)`);
+  eq("skipped only off CI", Boolean(process.env.CI), false);
 } else {
   const defaultLine = `lifecycle-nightly: list 'default' will run: ${DEFAULT.join(" ")}`;
   let r = run({ LIFECYCLE_PLAN_ONLY: "1" });
@@ -143,8 +150,10 @@ if (probe.status !== 0) {
       ? [0, `lifecycle-nightly: list 'products' will run: ${PRODUCTS.join(" ")}`, "run=true"]
       : [0, "lifecycle-nightly: no product specs yet", "run=false"]
   );
-  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products", LIFECYCLE_SPECS: "  " });
-  eq("blank given specs count as none", r.output, PRODUCTS.length ? "run=true" : "run=false");
+  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products", LIFECYCLE_SPECS: " \t " });
+  eq("blank given specs count as none in the second job", r.output, PRODUCTS.length ? "run=true" : "run=false");
+  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_SPECS: " \t " });
+  eq("blank given specs count as none in the first job", [r.status, r.stdout], [0, defaultLine]);
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "everything" });
   eq("an unknown list is refused (exit 2)", [r.status, r.output], [2, ""]);
 
@@ -164,6 +173,12 @@ if (probe.status !== 0) {
   r = run({});
   eq("the first job without secrets still stops at the secrets check (exit 2)", [r.status, r.stdout], [2, "lifecycle-nightly: NEXT_PUBLIC_SUPABASE_URL is not set"]);
 }
+eq(
+  "an empty file list stops the run (Playwright given no file would run the whole folder)",
+  /\[\[ \$\{#FILES\[@\]\} -gt 0 \]\] \|\| \{ echo "lifecycle-nightly: no spec to run"; exit 2; \}/.test(src) &&
+    src.indexOf("no spec to run") < src.indexOf("npx playwright test"),
+  true
+);
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);
