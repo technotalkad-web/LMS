@@ -232,15 +232,7 @@ export type FixtureAttemptContext =
   | { context_kind: "individual" }
   | { context_kind: "path"; learning_path_id: string }
   | { context_kind: "journey"; journey_enrollment_id: string; journey_day: number; journey_day_id: string }
-  | {
-      context_kind: "preview";
-      is_preview: true;
-      preview_kind: "legacy_role";
-      /** Old tags a by-role row may keep (the check's legacy_role arm; ADR 0024 step 6). */
-      learning_path_id?: string;
-      journey_enrollment_id?: string;
-      journey_day?: number;
-    };
+  | { context_kind: "preview"; is_preview: true; preview_kind: "legacy_role" };
 
 const given = (v: unknown) => v !== undefined && v !== null;
 
@@ -251,8 +243,11 @@ const given = (v: unknown) => v !== undefined && v !== null;
  * (which 0108 drops; each firing is counted in context_derive_log).
  *
  *   is_preview true            → preview, preview_kind 'legacy_role' (the
- *                                by-role kind: old tags kept as given, no
- *                                journey_day_id)
+ *                                by-role kind), with no official tag and
+ *                                no journey_day_id: a new preview never
+ *                                carries an official tag (ADR 0024 step 6;
+ *                                the check would admit old tags on a
+ *                                legacy_role row, the helper does not)
  *   journey_enrollment_id      → journey, with journey_day and journey_day_id
  *   learning_path_id           → path
  *   otherwise                  → individual
@@ -279,14 +274,10 @@ export function fixtureAttemptContext(flags: Readonly<Record<string, unknown>> =
     if (given(dayId)) {
       throw new Error("fixtureAttemptContext: a legacy_role preview has no journey_day_id (0107's shape check)");
     }
-    return {
-      context_kind: "preview",
-      is_preview: true,
-      preview_kind: "legacy_role",
-      ...(typeof path === "string" ? { learning_path_id: path } : {}),
-      ...(typeof enrollment === "string" ? { journey_enrollment_id: enrollment } : {}),
-      ...(typeof day === "number" ? { journey_day: day } : {}),
-    };
+    if (given(path) || given(enrollment) || given(day)) {
+      throw new Error("fixtureAttemptContext: a preview fixture carries no official tag (ADR 0024 step 6)");
+    }
+    return { context_kind: "preview", is_preview: true, preview_kind: "legacy_role" };
   }
   if (given(path) && journeyTags > 0) {
     throw new Error("fixtureAttemptContext: one tag per attempt (0107 refuses a path tag with a journey tag)");

@@ -12,40 +12,75 @@
  * is:
  *
  *   - a supabase-js chain `.from("course_attempts")...insert(` or
- *     `.upsert(`, followed across lines and through a variable that holds
- *     the `.from(...)` chain;
- *   - a REST POST: `rest("/course_attempts...", { method: "POST", body })`
- *     or any call whose URL holds `/rest/v1/course_attempts` with
- *     `method: "POST"` (fetch and the like); a call without a method is a
- *     GET and not an insert;
- *   - a batch call: `batch("course_attempts", rows)` (any call named like
- *     batch, insert or upsert whose first argument is the table name).
+ *     `.upsert(` (also `["insert"](`), followed across lines, through a
+ *     variable (declared or assigned) that holds the `.from(...)` chain or
+ *     an arrow function whose body is that chain, and through a constant
+ *     that holds the table name inside `.from(...)`;
+ *   - a REST write: any call whose URL (a literal, a template, a `+`
+ *     concatenation, `new URL(...)`, or a variable holding one of these) is
+ *     `/course_attempts...` or holds `/rest/v1/course_attempts`, with
+ *     `method: "POST"` or `"PUT"` (PostgREST answers a PUT as an upsert);
+ *     a call named post or put (Playwright's request.post, axios.post, a
+ *     helper of that name) is that method, its rows the options' `data` or
+ *     `body`, else its second argument. A call with no method is a GET and
+ *     not an insert; a method the scan cannot read (not a literal, a
+ *     shorthand, or behind a spread) is flagged, never taken for a GET;
+ *   - a batch-like call: any named call (`batch(...)`, `helpers.batch(...)`,
+ *     spec 64's `ins(...)` form) whose first argument is the literal table
+ *     name and that has a second argument, read as the rows. This fails
+ *     closed: a read or delete helper written that way is flagged too, and
+ *     takes the table another way.
  *
  * The inserted rows (the insert's argument, the body inside JSON.stringify,
- * the batch's rows; an identifier is followed to its initializer and to
- * every `.push(...)` on it) are object literals, and each must:
+ * the batch's rows) are object literals, or a variable followed in scope to
+ * its declaration, its assignments and every `.push(...)` on it; a variable
+ * that is a parameter, an import, or a loop or catch binding cannot be
+ * followed and is flagged. Each row must:
  *
- *   (1) name `context_kind`, or spread `fixtureAttemptContext(...)`, the
- *       helper of both harnesses (tests/e2e/helpers/supabase.ts, re-exported
- *       by tests/bot/lifecycle/p0-helpers.ts), imported from one of them;
- *   (2) when it names a journey tag or the literal kind 'journey', name
+ *   (1) name `context_kind` with a value (a literal null or undefined is no
+ *       context: the derive trigger fills it), or spread
+ *       `fixtureAttemptContext(...)`, the helper of both harnesses
+ *       (tests/e2e/helpers/supabase.ts, re-exported by
+ *       tests/bot/lifecycle/p0-helpers.ts), imported from one of them;
+ *   (2) when it names an enrolment tag or the literal kind 'journey', name
  *       `journey_day_id` (step 62);
  *   (3) when it is a preview (the literal kind 'preview' or is_preview:
  *       true), name `preview_kind` and no official tag (learning_path_id,
- *       journey_enrollment_id, journey_day) (steps 6 and 62).
+ *       journey_enrollment_id, journey_day) (steps 6 and 62);
+ *   (4) in app/ and lib/, when it is a journey row by (2), also name
+ *       `journey_version_id`, not as a literal null (steps 13 and 23; a
+ *       fixture under tests/ or scripts/ may leave it null, the legal
+ *       "pinned version only" value). A preview of a journey test run names
+ *       a day id and no enrolment, so it is not a journey row here.
  *
- * A helper-routed row is held to 0107's shape check by the helper itself,
- * proven by section (c) against a transcription of the check: a journey row
- * gets journey_day_id or throws (rule 2); a preview row is the by-role kind,
- * legacy_role, which the check lets keep old tags (step 6), so rule (3)'s
- * "no official tag" binds the literal rows, where a new preview kind is
- * written. A row whose kind is computed (not a string literal) is held to
- * (1) only by this scan; P2-6 states how the launch page's computed kinds
- * are read.
+ * A row that spreads the helper names none of the context columns beside it
+ * (context_kind, context_key, preview_kind, preview_run_id,
+ * journey_version_id, journey_day_id and the official tags) and no literal
+ * `is_preview: true`, and spreads nothing after it: the flags go to the
+ * helper, which answers the whole context. The helper is for tests/ and
+ * scripts/ only. It holds a row to 0107's shape check itself, proven by
+ * section (c) against a transcription of the check tied to 0107's text: a
+ * journey row gets journey_day_id or throws (rule 2); a preview row is the
+ * by-role kind, legacy_role, with no official tag and no day id, or throws
+ * (rule 3; step 6: a new preview never carries an official tag, though the
+ * check admits one on a legacy_role row). A row whose kind is computed (not
+ * a string literal) is held to (1), (2) and (4) by this scan; P2-6 states
+ * how the launch page's computed kinds are read.
+ *
+ * Known limits (forms not followed; none exists in the tree today): a
+ * builder or URL passed in as a parameter, returned by a function with a
+ * block body, or held in an object property; a table name built at run
+ * time, or held in a variable outside `.from(...)` (a batch-like call needs
+ * the literal); a URL path inside a substitution (`${base}/course_attempts`
+ * is read, `${attemptsPath}` is not); a call through an unnamed callee
+ * (`(0, f)(...)`); `.cjs`, `.cts`, `.mts` and `.jsx` files (the plan names
+ * four extensions); writes made by database functions (`.rpc(...)`), which
+ * the database's own guards cover.
  *
  * Exceptions, each listed with its date and reason:
  *   - PENDING: the launch page, until P2-6 names the context on both of its
- *     inserts. The test fails when a pending file no longer needs the entry.
+ *     inserts. Pinned to exactly its two open inserts; the test fails when a
+ *     pending file no longer needs the entry.
  *   - REFUSED: spec 55's two inserts made on a learner's own session, which
  *     the database must refuse; they are not fixtures (step 64) and stay as
  *     they are. Pinned to exactly that receiver and count.
@@ -78,6 +113,11 @@ const TABLE = "course_attempts";
 const HELPER = "fixtureAttemptContext";
 const HELPER_MODULES = ["tests/e2e/helpers/supabase.ts", "tests/bot/lifecycle/p0-helpers.ts"];
 const OFFICIAL_TAGS = ["learning_path_id", "journey_enrollment_id", "journey_day"];
+/** The columns the helper answers: a row that spreads it names none of them beside it. */
+const HELPER_OWNED = ["context_kind", "context_key", "preview_kind", "preview_run_id", "journey_version_id", "journey_day_id", ...OFFICIAL_TAGS];
+/** A URL path of the table: PostgREST's `/course_attempts...` (a REST helper's) or a full `/rest/v1/course_attempts...`. */
+const REST_PATH = /^\/course_attempts(?![\w])\S*$/;
+const REST_V1 = /^\S*\/rest\/v1\/course_attempts(?![\w])\S*$/;
 
 const rel = (f: string) => path.relative(root, f).split(path.sep).join("/");
 function walk(dir: string, out: string[]): void {
@@ -117,15 +157,34 @@ function literalText(e: ts.Expression | undefined): string | null {
   return ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u) ? u.text : null;
 }
 
-/** A URL argument's text, with `${}` for each substitution. */
-function urlText(e: ts.Expression | undefined): string | null {
-  if (!e) return null;
+/** A literal null, undefined or `void ...`: the column is then not given. */
+function isNullish(e: ts.Expression | null | undefined): boolean {
+  if (!e) return false;
+  const u = unwrap(e);
+  return u.kind === ts.SyntaxKind.NullKeyword || ts.isVoidExpression(u) || (ts.isIdentifier(u) && u.text === "undefined");
+}
+
+/**
+ * A URL argument's text, with `${}` for each substitution; `new URL(path, base)`
+ * is read as its path, and a variable as the first initializer or assignment
+ * of that name that is a URL of the table (by name, file-wide: detection
+ * over-reads on purpose).
+ */
+function urlText(e: ts.Expression | undefined, idx?: FileIndex, depth = 0): string | null {
+  if (!e || depth > 3) return null;
   const u = unwrap(e);
   const lit = literalText(u);
   if (lit !== null) return lit;
   if (ts.isTemplateExpression(u)) return u.head.text + u.templateSpans.map((s) => "${}" + s.literal.text).join("");
   if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.PlusToken) {
-    return (urlText(u.left) ?? "${}") + (urlText(u.right) ?? "${}");
+    return (urlText(u.left, idx, depth + 1) ?? "${}") + (urlText(u.right, idx, depth + 1) ?? "${}");
+  }
+  if (ts.isNewExpression(u) && ts.isIdentifier(u.expression) && u.expression.text === "URL") return urlText(u.arguments?.[0], idx, depth + 1);
+  if (ts.isIdentifier(u) && idx) {
+    for (const init of idx.decls.get(u.text) ?? []) {
+      const t = urlText(init, idx, depth + 1);
+      if (t !== null && (REST_PATH.test(t) || REST_V1.test(t))) return t;
+    }
   }
   return null;
 }
@@ -138,24 +197,71 @@ function calleeName(c: ts.CallExpression): string | null {
   const e = unwrap(c.expression);
   if (ts.isIdentifier(e)) return e.text;
   if (ts.isPropertyAccessExpression(e)) return e.name.text;
+  if (ts.isElementAccessExpression(e)) return literalText(e.argumentExpression);
   return null;
 }
 
-type FileIndex = { decls: Map<string, ts.Expression[]>; pushes: Map<string, ts.Expression[]>; helperImported: boolean };
+/**
+ * The declaration a name refers to at this point, by the scopes around it:
+ * a parameter, a variable (or a for, catch, function or class binding), or
+ * null (an import, a global, or a `var` the walk does not hoist).
+ */
+function bindingOf(id: ts.Identifier): ts.Node | null {
+  const name = id.text;
+  const declares = (b: ts.BindingName): boolean =>
+    ts.isIdentifier(b) ? b.text === name : (b.elements as ts.NodeArray<ts.ArrayBindingElement>).some((el) => ts.isBindingElement(el) && declares(el.name));
+  const inList = (l: ts.VariableDeclarationList) => l.declarations.find((d) => declares(d.name)) ?? null;
+  for (let p: ts.Node | undefined = id.parent; p; p = p.parent) {
+    if (ts.isFunctionLike(p)) {
+      const param = p.parameters.find((q) => declares(q.name));
+      if (param) return param;
+    }
+    if ((ts.isForStatement(p) || ts.isForOfStatement(p) || ts.isForInStatement(p)) && p.initializer && ts.isVariableDeclarationList(p.initializer)) {
+      const d = inList(p.initializer);
+      if (d) return d;
+    }
+    if (ts.isCatchClause(p) && p.variableDeclaration && declares(p.variableDeclaration.name)) return p.variableDeclaration;
+    if (ts.isBlock(p) || ts.isSourceFile(p) || ts.isModuleBlock(p) || ts.isCaseClause(p) || ts.isDefaultClause(p)) {
+      for (const st of p.statements) {
+        if (ts.isVariableStatement(st)) {
+          const d = inList(st.declarationList);
+          if (d) return d;
+        }
+        if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st)) && st.name?.text === name) return st;
+      }
+    }
+  }
+  return null;
+}
+
+type FileIndex = {
+  /** By name, file-wide: initializers and assignments, to find what a write is made on (over-reads on purpose: more is counted, never less). */
+  decls: Map<string, ts.Expression[]>;
+  /** By declaration, in scope: assignments and `.push(...)` arguments, to read the rows themselves. */
+  assigns: Map<ts.Node, ts.Expression[]>;
+  pushes: Map<ts.Node, ts.Expression[]>;
+  helperImported: boolean;
+};
 
 function indexFile(file: string, sf: ts.SourceFile): FileIndex {
   const decls = new Map<string, ts.Expression[]>();
-  const pushes = new Map<string, ts.Expression[]>();
+  const assigns = new Map<ts.Node, ts.Expression[]>();
+  const pushes = new Map<ts.Node, ts.Expression[]>();
+  const addTo = <K>(m: Map<K, ts.Expression[]>, k: K, ...es: ts.Expression[]) => m.set(k, [...(m.get(k) ?? []), ...es]);
   let helperImported = HELPER_MODULES.includes(file);
   const visit = (n: ts.Node) => {
-    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) {
-      decls.set(n.name.text, [...(decls.get(n.name.text) ?? []), n.initializer]);
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) addTo(decls, n.name.text, n.initializer);
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(unwrap(n.left))) {
+      const id = unwrap(n.left) as ts.Identifier;
+      addTo(decls, id.text, n.right);
+      const b = bindingOf(id);
+      if (b) addTo(assigns, b, n.right);
     }
     if (ts.isCallExpression(n)) {
       const callee = unwrap(n.expression);
       if (ts.isPropertyAccessExpression(callee) && callee.name.text === "push" && ts.isIdentifier(unwrap(callee.expression))) {
-        const name = (unwrap(callee.expression) as ts.Identifier).text;
-        pushes.set(name, [...(pushes.get(name) ?? []), ...n.arguments]);
+        const b = bindingOf(unwrap(callee.expression) as ts.Identifier);
+        if (b) addTo(pushes, b, ...n.arguments);
       }
     }
     if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier)) {
@@ -169,20 +275,31 @@ function indexFile(file: string, sf: ts.SourceFile): FileIndex {
     ts.forEachChild(n, visit);
   };
   visit(sf);
-  return { decls, pushes, helperImported };
+  return { decls, assigns, pushes, helperImported };
 }
 
-/** The `.from("course_attempts")` call a write is made on, if any (through a variable once). */
+/** The table a `.from(...)` names: a literal, or a variable whose initializer or assignment is the literal table name. */
+function tableOf(e: ts.Expression | undefined, idx: FileIndex): string | null {
+  const lit = literalText(e);
+  if (lit !== null || !e) return lit;
+  const u = unwrap(e);
+  if (ts.isIdentifier(u) && (idx.decls.get(u.text) ?? []).some((init) => literalText(init) === TABLE)) return TABLE;
+  return null;
+}
+
+/** The `.from("course_attempts")` call a write is made on, if any (through variables and an arrow function's expression body). */
 function fromCallIn(e: ts.Expression, idx: FileIndex, seen = new Set<string>()): ts.CallExpression | null {
   let cur: ts.Expression = e;
   for (;;) {
     cur = unwrap(cur);
     if (ts.isCallExpression(cur)) {
       const callee = unwrap(cur.expression);
-      if (ts.isPropertyAccessExpression(callee) && callee.name.text === "from" && literalText(cur.arguments[0]) === TABLE) return cur;
+      if (ts.isPropertyAccessExpression(callee) && callee.name.text === "from" && tableOf(cur.arguments[0], idx) === TABLE) return cur;
       cur = callee;
     } else if (ts.isPropertyAccessExpression(cur) || ts.isElementAccessExpression(cur)) {
       cur = cur.expression;
+    } else if (ts.isArrowFunction(cur) && !ts.isBlock(cur.body)) {
+      cur = cur.body;
     } else if (ts.isIdentifier(cur)) {
       if (seen.has(cur.text)) return null;
       seen.add(cur.text);
@@ -199,10 +316,14 @@ function fromCallIn(e: ts.Expression, idx: FileIndex, seen = new Set<string>()):
 
 type Verdict = { problems: string[]; rows: number; helper: boolean };
 
-function checkObject(obj: ts.ObjectLiteralExpression): Verdict {
+const isTrue = (e: ts.Expression | null | undefined) => !!e && unwrap(e).kind === ts.SyntaxKind.TrueKeyword;
+const APP_OR_LIB = /^(app|lib)\//;
+
+function checkObject(obj: ts.ObjectLiteralExpression, file: string): Verdict {
   const props = new Map<string, ts.Expression | null>();
-  let helper = false;
-  for (const p of obj.properties) {
+  let helperAt = -1;
+  let lastOtherSpread = -1;
+  obj.properties.forEach((p, i) => {
     if (ts.isPropertyAssignment(p)) {
       const name = propName(p.name);
       if (name) props.set(name, p.initializer);
@@ -210,47 +331,78 @@ function checkObject(obj: ts.ObjectLiteralExpression): Verdict {
       props.set(p.name.text, null);
     } else if (ts.isSpreadAssignment(p)) {
       const s = unwrap(p.expression);
-      if (ts.isCallExpression(s) && ts.isIdentifier(unwrap(s.expression)) && (unwrap(s.expression) as ts.Identifier).text === HELPER) helper = true;
+      if (ts.isCallExpression(s) && ts.isIdentifier(unwrap(s.expression)) && (unwrap(s.expression) as ts.Identifier).text === HELPER) helperAt = i;
+      else lastOtherSpread = i;
     }
-  }
+  });
+  const helper = helperAt >= 0;
+  /** Named with a value: a shorthand or any expression counts; a literal null or undefined does not. */
+  const named = (k: string) => props.has(k) && !isNullish(props.get(k));
   const problems: string[] = [];
-  if (!helper && !props.has("context_kind")) problems.push("names no context_kind");
-  if (!helper) {
+  if (helper) {
+    const beside = HELPER_OWNED.filter((c) => props.has(c));
+    if (beside.length) problems.push(`names ${beside.join(", ")} beside ${HELPER}; pass the flags to the helper`);
+    if (isTrue(props.get("is_preview"))) problems.push(`names is_preview: true beside ${HELPER}; pass the flags to the helper`);
+    if (lastOtherSpread > helperAt) problems.push(`spreads another object after ${HELPER}; spread the helper last`);
+    if (APP_OR_LIB.test(file)) problems.push(`${HELPER} is a fixture helper (tests/ and scripts/ only)`);
+  } else {
+    if (!named("context_kind")) problems.push("names no context_kind");
     const kind = literalText(props.get("context_kind") ?? undefined);
-    const isTrue = (e: ts.Expression | null | undefined) => !!e && unwrap(e).kind === ts.SyntaxKind.TrueKeyword;
-    const isNull = (e: ts.Expression | null | undefined) => !!e && unwrap(e).kind === ts.SyntaxKind.NullKeyword;
-    if ((kind === "journey" || props.has("journey_enrollment_id")) && !props.has("journey_day_id")) {
-      problems.push("a journey insert names no journey_day_id");
+    const journey = kind === "journey" || named("journey_enrollment_id");
+    if (journey && !named("journey_day_id")) problems.push("a journey insert names no journey_day_id");
+    if (journey && APP_OR_LIB.test(file) && !named("journey_version_id")) {
+      problems.push("a journey insert in app/ or lib/ names no journey_version_id (steps 13 and 23)");
     }
     if (kind === "preview" || isTrue(props.get("is_preview"))) {
-      if (!props.has("preview_kind")) problems.push("a preview insert names no preview_kind");
-      const tags = OFFICIAL_TAGS.filter((t) => props.has(t) && !isNull(props.get(t)));
+      if (!named("preview_kind")) problems.push("a preview insert names no preview_kind");
+      const tags = OFFICIAL_TAGS.filter(named);
       if (tags.length) problems.push(`a preview insert names an official tag (${tags.join(", ")})`);
     }
   }
   return { problems, rows: 1, helper };
 }
 
-function checkRows(e: ts.Expression | undefined, idx: FileIndex, depth = 0): Verdict {
-  if (!e) return { problems: ["the insert has no rows argument"], rows: 0, helper: false };
+const unreadable = (why: string): Verdict => ({ problems: [why], rows: 0, helper: false });
+
+function checkRows(e: ts.Expression | undefined, idx: FileIndex, file: string, depth = 0): Verdict {
+  if (!e) return unreadable("the insert has no rows argument");
   const u = unwrap(e);
   const merge = (vs: Verdict[]): Verdict => ({
     problems: vs.flatMap((v) => v.problems),
     rows: vs.reduce((n, v) => n + v.rows, 0),
     helper: vs.length > 0 && vs.every((v) => v.helper),
   });
-  if (ts.isObjectLiteralExpression(u)) return checkObject(u);
+  if (ts.isObjectLiteralExpression(u)) return checkObject(u, file);
   if (ts.isArrayLiteralExpression(u)) {
-    return merge(u.elements.map((el) => checkRows(ts.isSpreadElement(el) ? el.expression : el, idx, depth + 1)));
+    return merge(u.elements.map((el) => checkRows(ts.isSpreadElement(el) ? el.expression : el, idx, file, depth + 1)));
   }
-  if (ts.isCallExpression(u) && u.expression.getText() === "JSON.stringify") return checkRows(u.arguments[0], idx, depth + 1);
+  if (ts.isCallExpression(u) && u.expression.getText() === "JSON.stringify") return checkRows(u.arguments[0], idx, file, depth + 1);
   if (ts.isIdentifier(u) && depth < 4) {
-    const sources = [...(idx.decls.get(u.text) ?? []), ...(idx.pushes.get(u.text) ?? [])];
-    const v = merge(sources.map((s) => checkRows(s, idx, depth + 1)));
+    // Read in scope: the declaration this name refers to here, never another
+    // function's variable of the same name.
+    const b = bindingOf(u);
+    if (b && ts.isParameter(b)) return unreadable(`the rows in \`${u.text}\` are a parameter, which the scan cannot follow`);
+    const followable = b && ts.isVariableDeclaration(b) && ts.isIdentifier(b.name) && ts.isVariableDeclarationList(b.parent) &&
+      !ts.isForOfStatement(b.parent.parent) && !ts.isForInStatement(b.parent.parent);
+    if (!followable) return unreadable(`the rows in \`${u.text}\` are not a variable declared in scope that the scan can follow`);
+    const sources = [...(b.initializer ? [b.initializer] : []), ...(idx.assigns.get(b) ?? []), ...(idx.pushes.get(b) ?? [])];
+    const v = merge(sources.map((s) => checkRows(s, idx, file, depth + 1)));
     if (v.rows === 0) v.problems.push(`the rows in \`${u.text}\` cannot be found (no object literal assigned or pushed)`);
     return v;
   }
-  return { problems: [`the rows (\`${u.getText().slice(0, 60)}\`) are not an object literal, an array of them or a variable the scan can follow`], rows: 0, helper: false };
+  return unreadable(`the rows (\`${u.getText().slice(0, 60)}\`) are not an object literal, an array of them or a variable the scan can follow`);
+}
+
+/** The rows a request's options carry: `body` (fetch, rest) or `data` (Playwright), written out or as a shorthand. */
+function rowsOption(opts: ts.Expression | undefined): ts.Expression | undefined {
+  if (!opts || !ts.isObjectLiteralExpression(opts)) return undefined;
+  for (const k of ["body", "data"]) {
+    for (const p of opts.properties) {
+      if (ts.isPropertyAssignment(p) && propName(p.name) === k) return p.initializer;
+      if (ts.isShorthandPropertyAssignment(p) && p.name.text === k) return p.name;
+    }
+  }
+  return undefined;
 }
 
 /** Every insert into course_attempts in one file, with what is wrong with each. */
@@ -268,33 +420,41 @@ function scanSource(file: string, text: string): Site[] {
       const callee = unwrap(n.expression);
       const name = calleeName(n);
       // (1) supabase-js chains.
-      if (ts.isPropertyAccessExpression(callee) && (name === "insert" || name === "upsert")) {
+      if ((ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) && (name === "insert" || name === "upsert")) {
         const from = fromCallIn(callee.expression, idx);
         if (from) {
           const on = unwrap(from.expression) as ts.PropertyAccessExpression;
-          add(n, "chain", on.expression.getText(sf), checkRows(n.arguments[0], idx));
+          add(n, "chain", on.expression.getText(sf), checkRows(n.arguments[0], idx, file));
         }
       }
-      // (2) REST POSTs.
-      const url = urlText(n.arguments[0]);
-      // A URL has no white space (a test's name that mentions the path is not one).
-      const restPath = name === "rest" && url !== null && /^\/course_attempts(?![\w])\S*$/.test(url);
-      const restV1 = url !== null && /^\S*\/rest\/v1\/course_attempts(?![\w])\S*$/.test(url);
-      if (restPath || restV1) {
-        const opts = n.arguments[1] ? unwrap(n.arguments[1]) : undefined;
-        if (opts && !ts.isObjectLiteralExpression(opts)) {
-          add(n, "rest", name ?? "?", { problems: [], rows: 0, helper: false }, ["the request options are not an object literal, so the method cannot be read"]);
+      // (2) REST writes. A URL has no white space (a test's name that
+      // mentions the path is not one).
+      const url = urlText(n.arguments[0], idx);
+      if (url !== null && (REST_PATH.test(url) || REST_V1.test(url))) {
+        const receiver = name ?? "?";
+        const second = n.arguments[1];
+        const opts = second ? unwrap(second) : undefined;
+        if (name === "post" || name === "put") {
+          // A call named for the verb: its rows are the options' data or
+          // body, else its second argument (axios's form); none is flagged.
+          add(n, "rest", receiver, checkRows(rowsOption(opts) ?? second, idx, file));
+        } else if (opts && !ts.isObjectLiteralExpression(opts)) {
+          add(n, "rest", receiver, unreadable("the request options are not an object literal, so the method cannot be read"));
         } else if (opts) {
-          const prop = (k: string) => opts.properties.find((p): p is ts.PropertyAssignment => ts.isPropertyAssignment(p) && propName(p.name) === k);
-          const method = prop("method");
-          const m = method ? literalText(method.initializer) : "GET";
-          if (m === null) add(n, "rest", name ?? "?", { problems: [], rows: 0, helper: false }, ["the method is not a string literal"]);
-          else if (m.toUpperCase() === "POST") add(n, "rest", name ?? "?", checkRows(prop("body")?.initializer, idx));
+          const ps = opts.properties;
+          const lastAt = (f: (p: ts.ObjectLiteralElementLike) => boolean) => ps.reduce((at, p, i) => (f(p) ? i : at), -1);
+          const methodAt = lastAt((p) => ts.isPropertyAssignment(p) && propName(p.name) === "method");
+          // A spread, or a shorthand method, hides the method unless a
+          // literal one is written after it.
+          const hiddenAt = lastAt((p) => ts.isSpreadAssignment(p) || (ts.isShorthandPropertyAssignment(p) && p.name.text === "method"));
+          const m = methodAt > hiddenAt ? literalText((ps[methodAt] as ts.PropertyAssignment).initializer) : hiddenAt >= 0 ? null : "GET";
+          if (m === null) add(n, "rest", receiver, unreadable("the method cannot be read (not a string literal, a shorthand, or behind a spread)"));
+          else if (/^(post|put)$/i.test(m)) add(n, "rest", receiver, checkRows(rowsOption(opts), idx, file));
         }
       }
-      // (3) batch calls: batch("course_attempts", rows).
-      if (ts.isIdentifier(callee) && /batch|insert|upsert/i.test(callee.text) && literalText(n.arguments[0]) === TABLE) {
-        add(n, "batch", callee.text, checkRows(n.arguments[1], idx));
+      // (3) batch-like calls: any named call with the literal table name and rows.
+      if (name !== null && name !== "from" && n.arguments.length >= 2 && literalText(n.arguments[0]) === TABLE) {
+        add(n, "batch", name, checkRows(n.arguments[1], idx, file));
       }
     }
     ts.forEachChild(n, visit);
@@ -306,10 +466,13 @@ function scanSource(file: string, text: string): Site[] {
 // ---------------------------------------------------------------------------
 // Exceptions.
 // ---------------------------------------------------------------------------
-const PENDING = {
-  since: "2026-11-14",
-  until: "emptied by P2-6 (ADR 0024 step 23: both launch inserts name context_kind with the tags)",
-  files: ["app/[org]/(learner)/courses/[courseId]/launch/page.tsx"],
+/** Files whose inserts may stay open until a named slice; each pinned to its exact count of open inserts. */
+const PENDING: Record<string, { since: string; until: string; sites: number }> = {
+  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
+    since: "2026-11-14",
+    until: "emptied by P2-6 (ADR 0024 step 23: both launch inserts name context_kind with the tags)",
+    sites: 2,
+  },
 };
 /** Inserts the database must refuse, on a learner's own session: not fixtures (ADR 0024 step 64). */
 const REFUSED: Record<string, { receiver: string; sites: number; why: string }> = {
@@ -366,12 +529,16 @@ console.log(`\n(a) every course_attempts insert in ${SCAN_DIRS.join("/, ")}/ nam
       sites.filter((s) => s.file === file && refused(s)).length, r.sites);
   }
   const open = sites.filter((s) => s.problems.length > 0 && !refused(s));
-  const pendingOpen = open.filter((s) => PENDING.files.includes(s.file));
-  eq("no insert outside the pending list names no context (or breaks rule 2 or 3)",
-    open.filter((s) => !PENDING.files.includes(s.file)).map(show), []);
-  eq(`the pending list (since ${PENDING.since}, ${PENDING.until}) holds only files that still need it`,
-    stalePending(sites.filter((s) => !refused(s)), PENDING.files), []);
-  if (pendingOpen.length) console.log(`  note: pending since ${PENDING.since}: ${pendingOpen.map((s) => `${s.file}:${s.line}`).join(", ")}`);
+  eq("no insert outside the pending list names no context (or breaks rules 2 to 4, or the helper's rules)",
+    open.filter((s) => !(s.file in PENDING)).map(show), []);
+  eq("the pending list holds only files that still need it",
+    stalePending(sites.filter((s) => !refused(s)), Object.keys(PENDING)), []);
+  for (const [file, p] of Object.entries(PENDING)) {
+    const pendingOpen = open.filter((s) => s.file === file);
+    eq(`${file}: exactly ${p.sites} open inserts, pending since ${p.since}, ${p.until} (no further one hides behind the entry)`,
+      pendingOpen.length, p.sites);
+    if (pendingOpen.length) console.log(`  note: pending since ${p.since}: ${pendingOpen.map((s) => `${s.file}:${s.line}`).join(", ")}`);
+  }
   eq("the fixture inserts P2-2 item 1 names (specs 32, 34, 45, 46, 58, 60, 65, consume-grant) spread the helper",
     sites.filter((s) => s.file in FLOORS && /^tests\/(bot|e2e)\//.test(s.file) && !refused(s) && s.kind === "chain" && !s.helper).map(show), []);
 }
@@ -453,6 +620,123 @@ console.log("\n(b) planted cases");
   eq("rule 3: a preview with preview_kind and null tags passes",
     problemsOf(`await db.from("course_attempts").insert({ context_kind: "preview", is_preview: true, preview_kind: "course", journey_day: null });`), []);
 
+  // Rule 4: a journey insert in app/ and lib/ names journey_version_id (steps 13 and 23).
+  const LIB = "lib/attempts/planted.ts";
+  const NO_VERSION = "a journey insert in app/ or lib/ names no journey_version_id (steps 13 and 23)";
+  eq("rule 4: a journey insert in lib/ without journey_version_id is flagged",
+    problemsOf(`await svc.from("course_attempts").insert({ context_kind: "journey", journey_enrollment_id: e, journey_day: 1, journey_day_id: d });`, LIB),
+    [NO_VERSION]);
+  eq("rule 4: with journey_version_id it passes",
+    problemsOf(`await svc.from("course_attempts").insert({ context_kind: "journey", journey_enrollment_id: e, journey_day: 1, journey_day_id: d, journey_version_id: v });`, LIB), []);
+  eq("rule 4: a computed kind with an enrolment tag and a literal null journey_version_id, in app/, is flagged",
+    problemsOf(`await svc.from("course_attempts").insert({ context_kind: kind, journey_enrollment_id: enr ?? null, journey_day: day, journey_day_id: dayId, journey_version_id: null });`, "app/planted/page.tsx"),
+    [NO_VERSION]);
+  eq("rule 4: a fixture's journey insert may leave journey_version_id null (tests/ and scripts/)",
+    problemsOf(`await svc().from("course_attempts").insert({ context_kind: "journey", journey_enrollment_id: e, journey_day: 1, journey_day_id: d });`), []);
+  eq("rule 4: a journey test run's preview in lib/ (a day id, no enrolment) is not a journey insert",
+    problemsOf(`await svc.from("course_attempts").insert({ context_kind: "preview", is_preview: true, preview_kind: "journey_run", preview_run_id: r, journey_day_id: d });`, LIB), []);
+
+  // Calls that write rows without .from(...).insert, a method or a name like batch.
+  eq("a call of any name with the table and rows (spec 64's ins helper form) is counted and flagged",
+    verdict(`const ins = async (table: string, rows: Record<string, unknown>) => svc().from(table).insert(rows);\nawait ins("course_attempts", { user_id: "x" });`),
+    [{ kind: "batch", ok: false }]);
+  eq("the same call naming context_kind passes",
+    verdict(`await ins("course_attempts", { user_id: "x", context_kind: "individual" });`), [{ kind: "batch", ok: true }]);
+  eq("a batch called on an object (helpers.batch) is counted and flagged",
+    verdict(`await helpers.batch("course_attempts", [{ user_id: "x" }]);`, "scripts/planted.mjs"), [{ kind: "batch", ok: false }]);
+  eq("a call with the table name alone is not an insert",
+    verdict(`const n = await count("course_attempts");`), []);
+  eq("a Playwright post to /rest/v1/course_attempts is a POST, its rows read from data, and is flagged",
+    verdict("await req.post(`${SUPA}/rest/v1/course_attempts`, { data: { user_id: \"x\" } });"), [{ kind: "rest", ok: false }]);
+  eq("the same post naming context_kind passes",
+    verdict("await req.post(`${SUPA}/rest/v1/course_attempts`, { headers, data: [{ user_id: \"x\", context_kind: \"individual\" }] });"), [{ kind: "rest", ok: true }]);
+  eq("a post with no rows is flagged",
+    verdict("await req.post(`${SUPA}/rest/v1/course_attempts`);"), [{ kind: "rest", ok: false }]);
+  eq("a post whose second argument is the rows (no data or body) reads them",
+    verdict("await http.post(`${SUPA}/rest/v1/course_attempts`, [{ user_id: \"x\", context_kind: \"individual\" }]);"), [{ kind: "rest", ok: true }]);
+  eq("a shorthand data option is followed to its rows",
+    verdict("const data = { user_id: \"x\", context_kind: \"individual\" };\nawait req.post(`${SUPA}/rest/v1/course_attempts`, { headers, data });"), [{ kind: "rest", ok: true }]);
+  eq("a Playwright get and patch are not inserts",
+    verdict("await req.get(`${SUPA}/rest/v1/course_attempts?select=id`, { headers });\nawait req.patch(`${SUPA}/rest/v1/course_attempts?id=eq.${id}`, { data: { status: \"abandoned\" } });"), []);
+
+  // Rows that spread the helper name no context column beside it.
+  const IMPORT = `import { fixtureAttemptContext } from "./p0-helpers";\n`;
+  eq("a path tag beside the helper is flagged (the helper, given no flags, answers individual)",
+    problemsOf(`${IMPORT}await db.from("course_attempts").insert({ user_id: u, learning_path_id: p, ...fixtureAttemptContext() });`),
+    [`names learning_path_id beside ${HELPER}; pass the flags to the helper`]);
+  eq("context columns written after the helper are flagged",
+    problemsOf(`${IMPORT}await db.from("course_attempts").insert({ user_id: "x", ...fixtureAttemptContext(), context_kind: "journey", journey_enrollment_id: "e" });`),
+    [`names context_kind, journey_enrollment_id beside ${HELPER}; pass the flags to the helper`]);
+  eq("a literal is_preview: true beside the helper is flagged",
+    problemsOf(`${IMPORT}await db.from("course_attempts").insert({ user_id: "x", is_preview: true, ...fixtureAttemptContext() });`),
+    [`names is_preview: true beside ${HELPER}; pass the flags to the helper`]);
+  eq("a computed is_preview beside the helper, given the same flags, passes (spec 65)",
+    verdict(`${IMPORT}await db.from("course_attempts").insert({ is_revision: flags.is_revision ?? false, is_preview: flags.is_preview ?? false, ...fixtureAttemptContext(flags) });`),
+    [{ kind: "chain", ok: true }]);
+  eq("a spread after the helper is flagged (it could override the context)",
+    problemsOf(`${IMPORT}await db.from("course_attempts").insert({ ...fixtureAttemptContext(row), ...row });`),
+    [`spreads another object after ${HELPER}; spread the helper last`]);
+  eq("the helper in lib/ is flagged (a fixture helper; rule 4 binds lib/)",
+    problemsOf(`import { fixtureAttemptContext } from "../../tests/e2e/helpers/supabase";\nawait svc.from("course_attempts").insert({ ...fixtureAttemptContext(flags) });`, LIB),
+    [`${HELPER} is a fixture helper (tests/ and scripts/ only)`]);
+
+  // A method the scan cannot read is never taken for a GET.
+  eq("a POST whose method is a shorthand property is flagged",
+    verdict("const method = \"POST\";\nawait fetch(`${SUPA}/rest/v1/course_attempts`, { method, body: JSON.stringify({ user_id: \"x\", context_kind: \"individual\" }) });", "scripts/planted.mjs"),
+    [{ kind: "rest", ok: false }]);
+  eq("a POST whose options spread another object is flagged",
+    verdict("const POST = { method: \"POST\" };\nawait fetch(`${SUPA}/rest/v1/course_attempts`, { ...POST, body: JSON.stringify({ user_id: \"x\", context_kind: \"individual\" }) });", "scripts/planted.mjs"),
+    [{ kind: "rest", ok: false }]);
+  eq("a literal method written after a spread is read (a GET is not an insert)",
+    verdict("await fetch(`${SUPA}/rest/v1/course_attempts?select=id`, { ...init, method: \"GET\" });", "scripts/planted.mjs"), []);
+
+  // Names are read in scope; a null kind is no kind.
+  eq("rows that are a parameter are flagged, though another function's rows of that name name the context",
+    problemsOf(`function a() { const rows = [{ user_id: "y", context_kind: "individual" }]; return rows; }\nasync function b(rows: unknown[]) { await svc().from("course_attempts").insert(rows); }`),
+    ["the rows in `rows` are a parameter, which the scan cannot follow"]);
+  eq("rows are read from the declaration in scope, not another function's of the same name",
+    verdict(`function a() { const rows = [{ user_id: "y" }]; return rows; }\nasync function b() { const rows = [{ user_id: "z", context_kind: "individual" }]; await svc().from("course_attempts").insert(rows); }`),
+    [{ kind: "chain", ok: true }]);
+  eq("pushes are read on the variable in scope only",
+    verdict(`function a() { const rows = []; rows.push({ user_id: "y", context_kind: "individual" }); return rows; }\nasync function b() { const rows = []; rows.push({ user_id: "z" }); await svc().from("course_attempts").insert(rows); }`),
+    [{ kind: "chain", ok: false }]);
+  eq("rows bound by a loop are flagged",
+    problemsOf(`for (const r of batches) await db.from("course_attempts").insert(r);`),
+    ["the rows in `r` are not a variable declared in scope that the scan can follow"]);
+  eq("rows assigned to an uninitialised let are followed",
+    verdict(`let rows;\nrows = [{ user_id: "z", context_kind: "individual" }];\nawait db.from("course_attempts").insert(rows);`), [{ kind: "chain", ok: true }]);
+  eq("context_kind: null is no context",
+    problemsOf(`await db.from("course_attempts").insert({ user_id: "x", context_kind: null });`), ["names no context_kind"]);
+  eq("context_kind: undefined is no context",
+    problemsOf(`await db.from("course_attempts").insert({ user_id: "x", context_kind: undefined });`), ["names no context_kind"]);
+  eq("a shorthand context_kind passes",
+    verdict(`await db.from("course_attempts").insert({ user_id: "x", context_kind });`), [{ kind: "chain", ok: true }]);
+  eq("rule 2: a literal null journey_day_id on a journey row is flagged",
+    problemsOf(`await db.from("course_attempts").insert({ context_kind: "journey", journey_enrollment_id: e, journey_day: 3, journey_day_id: null });`),
+    ["a journey insert names no journey_day_id"]);
+
+  // Forms followed since the review (each a known gap before it).
+  eq("a table name held in a constant is followed in .from()",
+    verdict(`const T = "course_attempts";\nawait svc().from(T).insert({ user_id: "x" });`), [{ kind: "chain", ok: false }]);
+  eq("a builder returned by an arrow function is followed",
+    verdict(`const attempts = () => svc().from("course_attempts");\nawait attempts().insert({ user_id: "x" });`), [{ kind: "chain", ok: false }]);
+  eq("an element-access insert is counted",
+    verdict(`await svc().from("course_attempts")["insert"]({ user_id: "x" });`), [{ kind: "chain", ok: false }]);
+  eq("a builder held by an assignment is followed",
+    verdict(`let q: any;\nq = svc().from("course_attempts");\nawait q.insert({ user_id: "x" });`), [{ kind: "chain", ok: false }]);
+  eq("a URL held in a variable is followed",
+    verdict("const url = `${SUPA}/rest/v1/course_attempts`;\nawait fetch(url, { method: \"POST\", body: JSON.stringify({ user_id: \"x\" }) });", "scripts/planted.mjs"),
+    [{ kind: "rest", ok: false }]);
+  eq("a URL built with new URL() is read",
+    verdict("await fetch(new URL(\"/rest/v1/course_attempts\", SUPA), { method: \"POST\", body: JSON.stringify({ user_id: \"x\" }) });", "scripts/planted.mjs"),
+    [{ kind: "rest", ok: false }]);
+  eq("a REST helper of another name called with the /course_attempts path is counted",
+    verdict("const post = (p, b) => api(`/rest/v1${p}`, { method: \"POST\", body: JSON.stringify(b) });\nawait post(\"/course_attempts\", { user_id: \"x\" });", "scripts/planted.mjs"),
+    [{ kind: "rest", ok: false }]);
+  eq("a PUT is an insert (PostgREST upserts on PUT)",
+    verdict("await fetch(`${SUPA}/rest/v1/course_attempts?id=eq.${id}`, { method: \"PUT\", body: JSON.stringify({ id, user_id: \"x\" }) });", "scripts/planted.mjs"),
+    [{ kind: "rest", ok: false }]);
+
   const PAGE = "app/planted/launch/page.tsx";
   eq("a pending file whose inserts all name the context is stale (the test fails until it leaves the list)",
     stalePending(scanSource(PAGE, `await svcAttempt.from("course_attempts").insert({ user_id: user.id, context_kind: kind });`), [PAGE]), [PAGE]);
@@ -465,19 +749,52 @@ console.log("\n(b) planted cases");
 // ---------------------------------------------------------------------------
 console.log("\n(c) fixtureAttemptContext against course_attempts_context_shape_chk (0107)");
 {
-  const sql = fs.readFileSync(path.join(root, "supabase/migrations/0107_learning_contexts.sql"), "utf8").replace(/\s+/g, " ");
-  // The arms transcribed below, as 0107 writes them (whitespace collapsed).
-  const ARMS = [
-    "when 'individual' then learning_path_id is null and journey_enrollment_id is null and journey_day is null and journey_day_id is null and not is_preview",
-    "when 'path' then learning_path_id is not null and journey_enrollment_id is null and journey_day is null and journey_day_id is null and not is_preview",
-    "when 'journey' then journey_enrollment_id is not null and journey_day is not null and journey_day_id is not null and learning_path_id is null and not is_preview",
-    "when 'preview' then is_preview and preview_kind is not null and (",
-    "or (preview_kind = 'legacy_role' and preview_run_id is null and journey_day_id is null))",
-    "and (context_kind = 'preview' or (preview_kind is null and preview_run_id is null))",
-    "and (context_kind = 'journey' or journey_version_id is null)",
-    "and ((preview_kind is not null) = (context_kind = 'preview'))",
-  ];
-  eq("0107 holds the transcribed arms of the shape check", ARMS.filter((a) => !sql.includes(a)), []);
+  const raw = fs.readFileSync(path.join(root, "supabase/migrations/0107_learning_contexts.sql"), "utf8");
+  const sql = raw.replace(/\s+/g, " ");
+  /** SQL with its line comments dropped and its white space collapsed. */
+  const flat = (s: string) => s.replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
+  // The whole check, as 0107 writes it (comments dropped). shapeOk below is
+  // its transcription; any change to the check in 0107 fails here first.
+  const SHAPE_CHECK = `(
+    (case context_kind
+       when 'individual' then
+         learning_path_id is null and journey_enrollment_id is null and journey_day is null
+         and journey_day_id is null and not is_preview
+       when 'path' then
+         learning_path_id is not null and journey_enrollment_id is null and journey_day is null
+         and journey_day_id is null and not is_preview
+       when 'journey' then
+         journey_enrollment_id is not null and journey_day is not null and journey_day_id is not null
+         and learning_path_id is null and not is_preview
+       when 'preview' then
+         is_preview and preview_kind is not null and (
+           (preview_kind in ('course', 'path_run', 'journey_run')
+              and learning_path_id is null and journey_enrollment_id is null and journey_day is null
+              and (preview_run_id is not null) = (preview_kind in ('path_run', 'journey_run'))
+              and (journey_day_id is not null) = (preview_kind = 'journey_run'))
+           or (preview_kind = 'legacy_role' and preview_run_id is null and journey_day_id is null))
+       else false
+     end)
+    and (context_kind = 'preview' or (preview_kind is null and preview_run_id is null))
+    and (context_kind = 'journey' or journey_version_id is null)
+    and ((preview_kind is not null) = (context_kind = 'preview'))
+  )`;
+  /** The parenthesised body of `add constraint <name> check (...)` in 0107, comments dropped; null when absent. */
+  const checkBody = (name: string): string | null => {
+    const text = flat(raw);
+    const anchor = `add constraint ${name} check (`;
+    const at = text.indexOf(anchor);
+    if (at < 0 || text.indexOf(anchor, at + 1) >= 0) return null;
+    const start = at + anchor.length - 1;
+    let depth = 0;
+    for (let i = start; i < text.length; i++) {
+      if (text[i] === "(") depth++;
+      else if (text[i] === ")" && --depth === 0) return text.slice(start, i + 1);
+    }
+    return null;
+  };
+  eq("0107's course_attempts_context_shape_chk, added once, is the whole check transcribed here",
+    checkBody("course_attempts_context_shape_chk"), flat(SHAPE_CHECK));
   eq("0107: context_key is generated (an insert may not name it)",
     /add column if not exists context_key text generated always as \(/.test(sql), true);
   eq("0107: day_ids_source admits 'editor'",
@@ -513,18 +830,17 @@ console.log("\n(c) fixtureAttemptContext against course_attempts_context_shape_c
     ["a journey tag with its day and day id", { journey_enrollment_id: "e", journey_day: 3, journey_day_id: "d" }, "journey"],
     ["is_preview true", { is_preview: true }, "preview"],
     ["null tags read as absent", { learning_path_id: null, journey_enrollment_id: null, journey_day: null }, "individual"],
-    ["a by-role preview with an old path tag (the legacy_role arm)", { is_preview: true, learning_path_id: "p" }, "preview"],
-    ["a by-role preview with an old journey tag, no day id", { is_preview: true, journey_enrollment_id: "e", journey_day: 2 }, "preview"],
+    ["is_preview true with null tags", { is_preview: true, learning_path_id: null, journey_day: null }, "preview"],
   ];
   for (const [name, flags, kind] of cases) {
     const r = row(flags);
     eq(`${name}: context_kind ${kind}, and the merged row passes the shape check`, [r.context_kind, shapeOk(r)], [kind, true]);
   }
-  eq("is_preview true: preview_kind legacy_role",
+  eq("is_preview true: preview_kind legacy_role, and nothing else",
     fixtureAttemptContext({ is_preview: true }), { context_kind: "preview", is_preview: true, preview_kind: "legacy_role" });
-  eq("a by-role preview keeps the old tags it was given",
-    fixtureAttemptContext({ is_preview: true, journey_enrollment_id: "e", journey_day: 2 }),
-    { context_kind: "preview", is_preview: true, preview_kind: "legacy_role", journey_enrollment_id: "e", journey_day: 2 });
+  eq("the check admits a legacy_role preview with an old path tag; the helper refuses it (step 6: a new preview carries no official tag)",
+    [shapeOk({ context_kind: "preview", is_preview: true, preview_kind: "legacy_role", learning_path_id: "p" }), thrown({ is_preview: true, learning_path_id: "p" })],
+    [true, true]);
   eq("a journey row carries its three journey columns",
     fixtureAttemptContext({ journey_enrollment_id: "e", journey_day: 3, journey_day_id: "d" }),
     { context_kind: "journey", journey_enrollment_id: "e", journey_day: 3, journey_day_id: "d" });
@@ -535,13 +851,18 @@ console.log("\n(c) fixtureAttemptContext against course_attempts_context_shape_c
     ["a journey tag without journey_day_id", { journey_enrollment_id: "e", journey_day: 3 }],
     ["journey_day_id without the enrolment", { journey_day: 3, journey_day_id: "d" }],
     ["a preview with journey_day_id", { is_preview: true, journey_enrollment_id: "e", journey_day: 1, journey_day_id: "d" }],
+    ["a preview with a path tag", { is_preview: true, learning_path_id: "p" }],
+    ["a preview with a journey tag and no day id", { is_preview: true, journey_enrollment_id: "e", journey_day: 2 }],
+    ["a preview with a journey day number alone", { is_preview: true, journey_day: 2 }],
     ["a row that names context_kind", { context_kind: "individual" }],
     ["a row that names context_key", { context_key: "individual" }],
     ["a row that names preview_kind", { is_preview: true, preview_kind: "course" }],
   ];
   for (const [name, flags] of refusals) eq(`refused before the database: ${name}`, thrown(flags), true);
-  // The first four are pairings the check itself refuses; the last three
-  // name columns the helper derives, or that no insert may name.
+  // The first four are pairings the check itself refuses; the next three are
+  // previews with an official tag, which step 6 forbids though the check's
+  // legacy_role arm admits them; the last three name columns the helper
+  // derives, or that no insert may name.
   eq("the check refuses a path tag with a journey tag", shapeOk({ context_kind: "path", learning_path_id: "p", journey_enrollment_id: "e", journey_day: 3, journey_day_id: "d" }), false);
   eq("the check refuses a journey row without journey_day_id", shapeOk({ context_kind: "journey", journey_enrollment_id: "e", journey_day: 3 }), false);
   eq("the check refuses an individual row with journey_day_id alone", shapeOk({ context_kind: "individual", journey_day: 3, journey_day_id: "d" }), false);
