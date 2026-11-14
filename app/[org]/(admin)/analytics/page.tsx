@@ -23,6 +23,7 @@ import {
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { isOfficialFailed } from "@/lib/scoring/status";
 import { fetchGrantRetakeIdsForUsers, isMissingColumn, readWithOptionalColumn, type PgError } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 import { contentFilterInOrg } from "@/lib/content/analytics-filter";
 import { fetchInteractionLabels, mergeInteractionLabels, missingLabelIds } from "@/lib/interactions/labels";
@@ -424,13 +425,19 @@ export default async function AnalyticsPage({
   // narrower-select fallback; a missing column (a database without 0103,
   // where no row is flagged) stops the read at its first page and it is
   // re-read without the column. Any other failed page reads as empty, as before.
+  // ADR 0024 steps 49 and 80 (P2-3): a preview moves no number and no date
+  // here (the tally, last activity and every fold below read these rows):
+  // the read drops `context_kind = 'preview'` rows. On a database without
+  // 0107 the filter's missing-column error also stops the read at its first
+  // page, and readWithContextFilter reads today's select once.
   const ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units";
+  const previews: ContextFilterState = { applies: null };
   const attempts: AttemptRow[] = scopedIds.length
     ? (
         await readWithOptionalColumn<AttemptRow[]>(
           "is_revision",
-          async (columns) => {
+          (columns) => readWithContextFilter(previews, async (apply) => {
             let error: PgError = null;
             const data = await fetchByIds<AttemptRow>(
               svc,
@@ -438,14 +445,14 @@ export default async function AnalyticsPage({
               columns,
               "user_id",
               scopedIds,
-              (q) => q.eq("organization_id", org.id),
+              (q) => withoutPreviews(q.eq("organization_id", org.id), apply),
               (e) => {
                 error ??= e;
-                return isMissingColumn(e, "is_revision");
+                return isMissingColumn(e, "is_revision") || isMissingColumn(e, "context_kind");
               }
             );
             return { data, error };
-          },
+          }),
           ATTEMPT_COLUMNS
         )
       ).data ?? []

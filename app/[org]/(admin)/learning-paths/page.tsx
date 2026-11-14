@@ -11,6 +11,7 @@ import { loadScopes, type ContentScopes } from "@/lib/content/scopes";
 import { fetchScoringRules } from "@/lib/scoring/resolve";
 import { courseProgress, pathProgress, type CourseProgressView } from "@/lib/courses/progress-view";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 export const dynamic = "force-dynamic";
 
@@ -210,17 +211,21 @@ export default async function LearningPathsPage({
   // ADR 0014 step 12: the select names is_revision through the narrower-select
   // fallback, so a revision row never supplies a step's progress. No
   // retakeIds: the per-step progress feeds pathProgress, a roll-up.
+  // ADR 0024 steps 49 and 80 (P2-3): nor does a preview; the read drops
+  // `context_kind = 'preview'` rows (today's select without 0107,
+  // readWithContextFilter).
   const ATTEMPT_COLUMNS =
     "user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units";
+  const previews: ContextFilterState = { applies: null };
   const { data: attemptsAll } = enrolleeUserIds.length && allVerIds.length
     ? await readWithOptionalColumn<unknown[]>(
         "is_revision",
         (columns) =>
-          supabase
-            .from("course_attempts")
-            .select(columns)
-            .in("user_id", enrolleeUserIds)
-            .in("course_version_id", allVerIds),
+          readWithContextFilter(previews, (apply) =>
+            withoutPreviews(supabase.from("course_attempts").select(columns), apply)
+              .in("user_id", enrolleeUserIds)
+              .in("course_version_id", allVerIds)
+          ),
         ATTEMPT_COLUMNS
       )
     : { data: [] };

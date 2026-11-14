@@ -30,13 +30,23 @@
  *
  * The file also holds individualContextOnly(), the same rule for the
  * Individual product's paged report reads (step 49): the filter when 0107 is
- * there, today's read when it is not.
+ * there, today's read when it is not; and the preview filter of the feeds and
+ * the raw readers (ADR 0024 phase 2, P2-3; steps 49 and 80):
+ * withoutPreviews() drops `context_kind = 'preview'` rows, and
+ * readWithContextFilter(), the one fallback both filters read through, reads
+ * today's select once on a database without the column.
  *
  * Server-side by use, but free of next/* and Supabase runtime imports (the
  * shape of lib/scoring/attempt-kind.ts), so every branch is unit-tested with
  * a stub client (tests/unit/learning-context.test.ts).
  */
-import { isMissingColumn, isSchemaMissing, type PgError } from "@/lib/scoring/attempt-kind";
+import {
+  isMissingColumn,
+  isSchemaMissing,
+  readWithOptionalFilter,
+  type OptionalFilterState,
+  type PgError,
+} from "@/lib/scoring/attempt-kind";
 import { DEFAULT_POLICY } from "@/lib/scoring/policy";
 import {
   ContextKeyError,
@@ -67,12 +77,46 @@ export function isMissingContextColumn(error: PgError): boolean {
 }
 
 /**
- * Whether a request's attempts reads apply the Individual filter
- * (individualContextOnly): null until an answer decides, then true on a
+ * Whether a request's reads apply a filter on `context_kind`
+ * (readWithContextFilter): null until an answer decides, then true on a
  * database with 0107 and false on one without it. One object is shared by
- * every page and chunk of a request, so the decision is made once.
+ * every page, chunk and read of a request (or of one sweep run), so the
+ * decision is made once (OptionalFilterState).
  */
-export type IndividualFilterState = { applies: boolean | null };
+export type ContextFilterState = OptionalFilterState;
+/** The Individual filter's state (individualContextOnly): the same decision. */
+export type IndividualFilterState = ContextFilterState;
+
+/**
+ * The one fallback for a filter on `context_kind` (`docs/ARCHITECTURE.md`
+ * principle 6; ADR 0024 step 49, "the readers tolerate the absent columns
+ * and apply the filter when present"): readWithOptionalFilter on that
+ * column. `read(apply)` builds the read and adds the filter when `apply` is
+ * true. On a database without 0107 the first answer is a missing-column
+ * error naming context_kind, and the same read is made once without the
+ * filter: today's select. Any other error is returned as it is.
+ */
+export function readWithContextFilter<R extends { error: PgError }>(
+  state: ContextFilterState,
+  read: (apply: boolean) => PromiseLike<R>
+): Promise<R> {
+  return readWithOptionalFilter("context_kind", state, read);
+}
+
+/**
+ * The preview filter (ADR 0024 steps 49 and 80, P2-3): drops the rows whose
+ * `context_kind` is `preview` when `apply` is true, so a Preview (a staff
+ * member's by-role row since the 0107 paste, or a Preview by mode from P2-5)
+ * moves no tenant LRS statement, CRM row, report number or date. 0107 makes
+ * the column not null, so `neq` keeps every other row. `column` names the
+ * column through an `!inner` embed (`course_attempts.context_kind`) for a
+ * read that reaches attempts that way. Always used inside
+ * readWithContextFilter, which decides `apply`.
+ */
+export function withoutPreviews<Q>(query: Q, apply: boolean, column = "context_kind"): Q {
+  if (!apply) return query;
+  return (query as unknown as { neq: (column: string, value: string) => Q }).neq(column, "preview");
+}
 
 /**
  * The Individual product's attempts reads on its report surfaces (ADR 0024
@@ -95,24 +139,14 @@ export type IndividualFilterState = { applies: boolean | null };
  * included, is returned as it is. Any other error decides nothing and is
  * returned as it is, so the caller keeps its own error path. It composes
  * with readPagedWithOptionalColumn's is_revision fallback in either order of
- * the two errors (a database without 0103 has no 0107 either).
+ * the two errors (a database without 0103 has no 0107 either). The decision
+ * is readWithContextFilter's, the one fallback.
  */
 export function individualContextOnly<T>(
   state: IndividualFilterState,
   read: (columns: string, from: number, to: number, individual: boolean) => PromiseLike<{ data: T[] | null; error: PgError }>
 ): (columns: string, from: number, to: number) => Promise<{ data: T[] | null; error: PgError }> {
-  return async (columns, from, to) => {
-    if (state.applies === false) return await read(columns, from, to, false);
-    const res = await read(columns, from, to, true);
-    if (state.applies === null) {
-      if (!res.error) state.applies = true;
-      else if (isMissingColumn(res.error, "context_kind")) {
-        state.applies = false;
-        return await read(columns, from, to, false);
-      }
-    }
-    return res;
-  };
+  return (columns, from, to) => readWithContextFilter(state, (individual) => read(columns, from, to, individual));
 }
 
 export type ReadContextAttempt = ContextAttempt;

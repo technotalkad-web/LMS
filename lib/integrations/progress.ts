@@ -17,6 +17,7 @@ import {
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { courseStatus, officialDone } from "@/lib/scoring/policy";
 import { fetchPassRequired, grantSnapshotForUsers } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { officialHistory, officialRetakeState } from "@/lib/scoring/official-history";
 import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 import { fetchReferenceCodes, journeyVersionCode } from "@/lib/reference-codes";
@@ -284,12 +285,16 @@ export function hasAttemptFilters(f: ProgressFilters): boolean {
  * Users with at least one attempt matching EVERY attempt-level filter
  * (course, completion window, last-access window). Mirrors the Upside
  * Progress API, where a filtered call returns only learners with a
- * matching record.
+ * matching record. A preview is never a matching record (ADR 0024 steps 49
+ * and 80, P2-3): the read drops `context_kind = 'preview'` rows, and on a
+ * database without 0107 reads today's select (readWithContextFilter;
+ * `previews` is the request's one decision).
  */
 export async function usersMatchingAttempts(
   svc: SupabaseClient,
   orgId: string,
-  f: ProgressFilters
+  f: ProgressFilters,
+  previews: ContextFilterState = { applies: null }
 ): Promise<Set<string>> {
   let verIds: string[] | null = null;
   if (f.courseIds.length) {
@@ -306,16 +311,18 @@ export async function usersMatchingAttempts(
     [from ? `${col}.gte.${from}` : null, to ? `${col}.lte.${to}` : null].filter(Boolean).join(",");
   const out = new Set<string>();
   for (const vers of verIds ? chunk(verIds, 200) : [null]) {
-    const rows = await drain<{ user_id: string }>((from, to) => {
-      let q = svc.from("course_attempts").select("user_id").eq("organization_id", orgId);
-      if (vers) q = q.in("course_version_id", vers);
-      if (f.completedFrom) q = q.gte("completed_at", f.completedFrom);
-      if (f.completedTo) q = q.lte("completed_at", f.completedTo);
-      if (f.lastAccessFrom || f.lastAccessTo) {
-        q = q.or(`last_activity_at.is.null,and(${win("last_activity_at", f.lastAccessFrom, f.lastAccessTo)})`);
-      }
-      return q.order("id").range(from, to);
-    });
+    const rows = await drain<{ user_id: string }>((from, to) =>
+      readWithContextFilter(previews, (apply) => {
+        let q = withoutPreviews(svc.from("course_attempts").select("user_id").eq("organization_id", orgId), apply);
+        if (vers) q = q.in("course_version_id", vers);
+        if (f.completedFrom) q = q.gte("completed_at", f.completedFrom);
+        if (f.completedTo) q = q.lte("completed_at", f.completedTo);
+        if (f.lastAccessFrom || f.lastAccessTo) {
+          q = q.or(`last_activity_at.is.null,and(${win("last_activity_at", f.lastAccessFrom, f.lastAccessTo)})`);
+        }
+        return q.order("id").range(from, to);
+      })
+    );
     for (const r of rows) out.add(r.user_id);
   }
   return out;
@@ -385,6 +392,11 @@ type Att = {
  * GrantReadError, which the route answers with 503: a feed must never flip
  * between in_progress and passed across polls); the revision-visit counts
  * answer null for the batch when they could not be read.
+ *
+ * ADR 0024 steps 49 and 80 (P2-3): a preview is never a CRM row. The
+ * attempts read drops `context_kind = 'preview'` rows, and on a database
+ * without 0107 reads today's select once (readWithContextFilter; `previews`
+ * is the request's one decision, shared by every batch).
  */
 export async function buildProgress(
   svc: SupabaseClient,
@@ -392,7 +404,8 @@ export async function buildProgress(
   orgSlug: string,
   members: MemberRow[],
   f: ProgressFilters,
-  timezone?: string
+  timezone?: string,
+  previews: ContextFilterState = { applies: null }
 ): Promise<LearnerProgress[]> {
   if (members.length === 0) return [];
   const uids = members.map((m) => m.user_id);
@@ -401,13 +414,11 @@ export async function buildProgress(
 
   // ---- attempts (select * for deploy safety across 0073/0075 columns) ----
   const attempts = await drain<Att>((from, to) =>
-    svc
-      .from("course_attempts")
-      .select("*")
-      .eq("organization_id", orgId)
-      .in("user_id", uids)
-      .order("id")
-      .range(from, to)
+    readWithContextFilter(previews, (apply) =>
+      withoutPreviews(svc.from("course_attempts").select("*").eq("organization_id", orgId).in("user_id", uids), apply)
+        .order("id")
+        .range(from, to)
+    )
   );
   const verIds = [...new Set(attempts.map((a) => a.course_version_id))];
   const courseOfVer = new Map<string, string>();

@@ -2,6 +2,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { derivedStatementsSkip, loadLrsConfig } from "./config";
 import { loadAttemptContexts, loadGroupMembership } from "./context";
 import { abandonedBuilt, enqueueBuilt, type Built } from "./sweep";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 /**
  * Live "abandoned" statement for the tenant LRS, queued at every abandon site
@@ -21,6 +22,14 @@ import { abandonedBuilt, enqueueBuilt, type Built } from "./sweep";
  * resolves on every error, so an LRS problem never fails or undoes an abandon.
  * Only rows whose status is 'abandoned' when read are queued.
  *
+ * Never a preview's (ADR 0024 steps 49 and 80, P2-3): the select drops
+ * `context_kind = 'preview'` rows, `legacy_role` ones included, so a restart
+ * over an open preview and the close of an open by-role row send no
+ * "abandoned" statement carrying the tester's identity to a store the LMS
+ * cannot delete from. On a database without 0107 the filter's
+ * missing-column error re-reads today's select once (readWithContextFilter;
+ * one decision for every slice of the call).
+ *
  * Batches (force restart, per-version restart, direct-upload replace) are
  * built in slices of SLICE attempts, so no `.in()` list outgrows the URL
  * limit (the context loader turns a failed read into "no rows"), and above
@@ -37,11 +46,15 @@ export async function enqueueAbandonedStatements(svc: SupabaseClient, attemptIds
     if (ids.length === 0) return;
     type Row = { id: string; organization_id: string; status: string | null; started_at: string | null; last_activity_at: string | null };
     const rows: Row[] = [];
+    const previews: ContextFilterState = { applies: null };
     for (let i = 0; i < ids.length; i += SLICE) {
-      const { data, error } = await svc
-        .from("course_attempts")
-        .select("id, organization_id, status, started_at, last_activity_at")
-        .in("id", ids.slice(i, i + SLICE));
+      const slice = ids.slice(i, i + SLICE);
+      const { data, error } = await readWithContextFilter(previews, (apply) =>
+        withoutPreviews(
+          svc.from("course_attempts").select("id, organization_id, status, started_at, last_activity_at").in("id", slice),
+          apply
+        )
+      );
       if (error) {
         console.warn("[lrs] abandoned enqueue skipped: attempts read failed:", error.message);
         return;
@@ -61,7 +74,7 @@ export async function enqueueAbandonedStatements(svc: SupabaseClient, attemptIds
           const slice = list.slice(i, i + SLICE);
           // One failing slice never drops the others.
           try {
-            const ctxs = await loadAttemptContexts(svc, slice.map((r) => r.id), groups);
+            const ctxs = await loadAttemptContexts(svc, slice.map((r) => r.id), groups, previews);
             if (ctxs.size < slice.length) {
               console.warn(`[lrs] abandoned enqueue: context loaded for ${ctxs.size} of ${slice.length} attempts in org`, orgId);
             }

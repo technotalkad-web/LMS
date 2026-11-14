@@ -10,6 +10,10 @@
  *    pre-0078 config → no outbox row.
  *  - Fail-soft: an outbox or read error never throws; a row that is not
  *    abandoned is never queued; nothing is posted (no fetch).
+ *  - ADR 0024 P2-3 (steps 49 and 80): a preview's id enqueues nothing, a
+ *    `legacy_role` one included; on a database without 0107 the filter's
+ *    missing-column error reads today's rows once, one decision for every
+ *    slice and for the contexts.
  *
  * Run:  npx tsx tests/unit/lrs-abandoned.test.ts   (or npm run test:unit)
  * (No DB: a fake query builder answers by table name.)
@@ -60,15 +64,21 @@ eq("enabled ambak-v1 → queued", derivedStatementsSkip(cfg()), null);
 // Answers by table name and honours .eq / .neq / .in on top-level columns
 // (embedded "a.b" filters and columns a row does not carry are ignored), so a
 // read returns only the ids it asked for. Every .in() list length is recorded.
+// `no0107`: a database without 0107, where a filter naming context_kind
+// answers 42703 naming the column (each such answer is counted).
 type Upsert = { table: string; rows: Array<Record<string, unknown>>; opts: unknown };
-function fakeDb(tables: Record<string, unknown[]>, opts: { failUpsert?: boolean; failRead?: string } = {}) {
+const MISSING_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+function fakeDb(tables: Record<string, unknown[]>, opts: { failUpsert?: boolean; failRead?: string; no0107?: boolean } = {}) {
   const upserts: Upsert[] = [];
   const inLists: Array<{ table: string; col: string; n: number }> = [];
+  const counts = { missingContext: 0, previewFiltered: 0 };
   const from = (table: string) => {
     let single = false;
     let result: unknown = null;
+    let namesContext = false;
     const preds: Array<(r: Record<string, unknown>) => boolean> = [];
     const onCol = (col: string, test: (v: unknown) => boolean) => {
+      if (col === "context_kind" || col.endsWith(".context_kind")) namesContext = true;
       if (col.includes(".")) return;
       preds.push((r) => !(col in r) || test(r[col]));
     };
@@ -77,9 +87,13 @@ function fakeDb(tables: Record<string, unknown[]>, opts: { failUpsert?: boolean;
       get(_t, prop) {
         if (prop === "then") {
           const rows = ((tables[table] ?? []) as Array<Record<string, unknown>>).filter((r) => preds.every((p) => p(r)));
+          if (namesContext && !opts.no0107) counts.previewFiltered++;
+          if (namesContext && opts.no0107) counts.missingContext++;
           const value =
             result ??
-            (opts.failRead === table
+            (namesContext && opts.no0107
+              ? { data: null, error: MISSING_CONTEXT }
+              : opts.failRead === table
               ? { data: null, error: { message: "boom", code: "XX000" } }
               : { data: single ? rows[0] ?? null : rows, error: null });
           return (res: (v: unknown) => unknown, rej: (e: unknown) => unknown) => Promise.resolve(value).then(res, rej);
@@ -107,7 +121,7 @@ function fakeDb(tables: Record<string, unknown[]>, opts: { failUpsert?: boolean;
     });
     return proxy;
   };
-  return { db: { from } as unknown as SupabaseClient, upserts, inLists };
+  return { db: { from } as unknown as SupabaseClient, upserts, inLists, counts };
 }
 
 const attemptRow = (status: string, id = ATTEMPT, user = USER) => ({
@@ -256,6 +270,47 @@ async function main() {
     eq("attempts read error does not throw", threw, false);
     eq("attempts read error → no row", live.upserts.length, 0);
   }
+  console.log("\nADR 0024 P2-3: previews are never queued (steps 49 and 80)");
+  {
+    const preview = { ...attemptRow("abandoned"), context_kind: "preview", preview_kind: "legacy_role" };
+    const live = fakeDb({ course_attempts: [preview], tenant_lrs_config: [cfg()] });
+    await enqueueAbandonedStatements(live.db, [ATTEMPT]);
+    eq("a preview id enqueues nothing (a legacy_role row: a restart over a staff member's open preview)", live.upserts.length, 0);
+    eq("…the read named the preview filter", live.counts.previewFiltered >= 1, true);
+  }
+  {
+    const P = "11111111-2222-4333-8444-000000000009";
+    const tables = {
+      course_attempts: [
+        { ...attemptRow("abandoned"), context_kind: "individual" },
+        { ...attemptRow("abandoned", P), context_kind: "preview", preview_kind: "course" },
+      ],
+      tenant_lrs_config: [cfg()],
+    };
+    const live = fakeDb(tables);
+    await enqueueAbandonedStatements(live.db, [ATTEMPT, P]);
+    const queued = live.upserts.filter((u) => u.table === "lrs_forward_outbox").flatMap((u) => u.rows);
+    eq("a real attempt and a preview closed together: only the real one is queued", queued.map((r) => r.attempt_id), [ATTEMPT]);
+  }
+  {
+    // A database without 0107: the rows carry no context_kind, and the
+    // filter answers 42703 naming it. Today's rows are read once more.
+    const live = fakeDb({ course_attempts: [attemptRow("abandoned")], tenant_lrs_config: [cfg()] }, { no0107: true });
+    await enqueueAbandonedStatements(live.db, [ATTEMPT]);
+    const out = live.upserts.filter((u) => u.table === "lrs_forward_outbox").flatMap((u) => u.rows);
+    eq("without the column, today's rows: the abandoned attempt is queued", out.map((r) => r.statement_id), [abandonedStatementId(ATTEMPT)]);
+    eq("…after exactly one failed read: the decision is shared with the contexts' reads", live.counts.missingContext, 1);
+  }
+  {
+    const hex = (n: number) => n.toString(16).padStart(12, "0");
+    const ids = Array.from({ length: 320 }, (_, n) => `00000000-0000-4000-8000-${hex(n + 1)}`);
+    const users = Array.from({ length: 320 }, (_, n) => `00000000-0000-4000-9000-${hex(n + 1)}`);
+    const live = fakeDb({ course_attempts: ids.map((id, n) => attemptRow("abandoned", id, users[n])), tenant_lrs_config: [cfg()] }, { no0107: true });
+    await enqueueAbandonedStatements(live.db, ids);
+    const queued = live.upserts.filter((u) => u.table === "lrs_forward_outbox").flatMap((u) => u.rows);
+    eq("without the column, a sliced batch: every attempt queued, one failed read for all its slices", [queued.length, live.counts.missingContext], [320, 1]);
+  }
+
   eq("nothing posted to an LRS", fetched, 0);
   globalThis.fetch = realFetch;
 

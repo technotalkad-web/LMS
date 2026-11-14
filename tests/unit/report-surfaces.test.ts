@@ -102,12 +102,15 @@ function callArgs(src: string, fn: string): string[][] {
  * options follow the constant; ADR 0020's chunked reads of the enrolled set).
  * The closure may be wrapped in individualContextOnly(individual, …), which
  * passes it a fourth argument (ADR 0024 step 49: the Individual product's
- * reads; tests/unit/enrolment-definition.test.ts (e) says which files).
+ * reads; tests/unit/enrolment-definition.test.ts (e) says which files), and
+ * its query may sit in readWithContextFilter(previews, (apply) =>
+ * withoutPreviews(…)) (ADR 0024 P2-3, the raw readers' preview filter;
+ * tests/unit/preview-isolation-sites.test.ts says which files).
  */
 function fallbackSelect(src: string, constant: string): boolean {
   const decl = new RegExp(`const ${constant} =\\s*"[^"]*\\bstatus\\b[^"]*";`).test(src);
   const read = new RegExp(
-    `read(?:Paged)?WithOptionalColumn<[^>]*>\\(\\s*"is_revision",\\s*(?:individualContextOnly\\(individual,\\s*)?\\(columns(?:, from, to(?:, only)?)?\\)[^=]*?=>\\s*[\\s\\S]{0,60}?\\.from\\("course_attempts"\\)\\s*\\.select\\(columns\\)[\\s\\S]{0,400}?,\\s*${constant}\\s*[,)]`
+    `read(?:Paged)?WithOptionalColumn<[^>]*>\\(\\s*"is_revision",\\s*(?:individualContextOnly\\(individual,\\s*)?\\(columns(?:, from, to(?:, only)?)?\\)[^=]*?=>\\s*(?:readWithContextFilter\\(previews, \\(apply\\) =>\\s*withoutPreviews\\()?[\\s\\S]{0,60}?\\.from\\("course_attempts"\\)\\s*\\.select\\(columns\\)[\\s\\S]{0,400}?,\\s*${constant}\\s*[,)]`
   ).test(src);
   return decl && read;
 }
@@ -221,9 +224,9 @@ console.log("\n(iv) the path pages, the org Reports page, the Course Reports til
   eq("PR: per-step passed / failed from the STANDING verdict, never statusOf", /const verdict = standingVerdictOf\(official, uid, cid\);\s*agg\.passed = verdict === "passed";\s*agg\.failed = verdict === "failed";/.test(pr) && !/\bstatusOf\(/.test(pr), true);
 
   const or = code(ORG_REPORTS);
-  eq("org Reports: the select names is_revision with the fallback, the first page deciding", /const ATTEMPT_COLUMNS =\s*"[^"]*\bstatus\b[^"]*";/.test(or) && /readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,200}?ATTEMPT_COLUMNS,\s*\{ maxPages: 500 \}\s*\)/.test(or), true);
-  eq("org Reports: the pages are taken in id order, so they are disjoint",
-    /readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) => supabase\.from\("course_attempts"\)\.select\(columns\)\.eq\("organization_id", org\.id\)\.order\("id"\)\.range\(f, t\),/.test(or), true);
+  eq("org Reports: the select names is_revision with the fallback, the first page deciding", /const ATTEMPT_COLUMNS =\s*"[^"]*\bstatus\b[^"]*";/.test(or) && /readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,400}?ATTEMPT_COLUMNS,\s*\{ maxPages: 500 \}\s*\)/.test(or), true);
+  eq("org Reports: the pages are taken in id order, so they are disjoint (the preview filter inside, ADR 0024 P2-3)",
+    /readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(supabase\.from\("course_attempts"\)\.select\(columns\)\.eq\("organization_id", org\.id\), apply\)\.order\("id"\)\.range\(f, t\)\s*\),/.test(or), true);
 
   // Every score fold on the page counts only the rows
   // that count for scoring (excludeAbandoned: no revision visit, no reset
@@ -284,7 +287,7 @@ console.log("\n(v) Analytics");
 {
   const src = code(ANALYTICS);
   eq("the explicit select names is_revision through readWithOptionalColumn around fetchByIds", /const ATTEMPT_COLUMNS =\s*"[^"]*\bstatus\b[^"]*";/.test(src) && /readWithOptionalColumn<AttemptRow\[\]>\(\s*"is_revision",[\s\S]{0,200}?fetchByIds<AttemptRow>\(\s*svc,\s*"course_attempts",\s*columns,/.test(src), true);
-  eq("…a missing column stops the read at its first page", /return isMissingColumn\(e, "is_revision"\);/.test(src) && /if \(error && onError\?\.\(error\)\) return out;/.test(src), true);
+  eq("…a missing column (is_revision, or the preview filter's context_kind, ADR 0024 P2-3) stops the read at its first page", /return isMissingColumn\(e, "is_revision"\) \|\| isMissingColumn\(e, "context_kind"\);/.test(src) && /if \(error && onError\?\.\(error\)\) return out;/.test(src), true);
   eq("toScorable carries is_revision (the mapper predicate)", /const toScorable = \(a: AttemptRow\) => \(\{[\s\S]*?is_revision: a\.is_revision \?\? null,[\s\S]*?\}\);/.test(src), true);
   eq("the lastActive fold and latestByCourse skip revision rows", /for \(const a of my\) \{\s*if \(isRevisionAttempt\(a\)\) continue;\s*const t = a\.last_activity_at/.test(src) && /const latestByCourse = new Map<string, AttemptRow>\(\);\s*for \(const a of my\) \{\s*if \(isRevisionAttempt\(a\)\) continue;/.test(src), true);
   eq("hasStarted ignores revision rows; the learner's attempts are attemptCounts' live count", /my\.some\(\(a\) => a\.status !== "abandoned" && !isRevisionAttempt\(a\)\)/.test(src) && /attempts: attemptCounts\(my\)\.live,/.test(src), true);

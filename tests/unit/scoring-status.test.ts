@@ -458,8 +458,9 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
   /** Per site: its call (the fallback over ATTEMPT_COLUMNS, the select taking the decided list) and its error rule, unchanged. */
   const SITES: Record<string, Array<[string, RegExp]>> = {
     [ORG_REPORTS_FILE]: [
-      ["the call: by organisation, in id order, paged by range, at most 500 pages (fetchAll's 500,000-row ceiling)",
-        /const \{ data: attemptRows, error: attemptsErr \} = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) => supabase\.from\("course_attempts"\)\.select\(columns\)\.eq\("organization_id", org\.id\)\.order\("id"\)\.range\(f, t\),\s*ATTEMPT_COLUMNS,\s*\{ maxPages: 500 \}\s*\);/],
+      // ADR 0024 P2-3: the preview filter inside, one decision for the page.
+      ["the call: by organisation, in id order, paged by range, at most 500 pages (fetchAll's 500,000-row ceiling), previews dropped",
+        /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attemptRows, error: attemptsErr \} = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(supabase\.from\("course_attempts"\)\.select\(columns\)\.eq\("organization_id", org\.id\), apply\)\.order\("id"\)\.range\(f, t\)\s*\),\s*ATTEMPT_COLUMNS,\s*\{ maxPages: 500 \}\s*\);/],
       ["the error rule: the rows read so far, as fetchAll; only the section that states completeness reads the error (ADR 0017 step 14)", /const attempts = attemptRows as Attempt\[\];[\s\S]*?const notAppliedRows =\s*ignoredErr \|\| attemptsErr\s*\? null/],
     ],
     "lib/scoring/status.ts": [
@@ -471,8 +472,9 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
         /if \(res\.error\) console\.warn\("\[enrolled-status\] attempts read failed:", res\.error\.message \?\? ""\);\s*for \(const a of res\.data as/],
     ],
     "lib/manager/insights.ts": [
-      ["the call: by user chunk of 150, in id order, one decision for every chunk",
-        /const decided: OptionalColumnState = \{ columns: null \};\s*for \(const part of chunk\(\[\.\.\.new Set\(userIds\.filter\(Boolean\)\)\], 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(cols, from, to\)[^=]*=>\s*svc\.from\("course_attempts"\)\.select\(cols\)\.in\("user_id", part\)\.eq\("organization_id", orgId\)\.order\("id"\)\.range\(from, to\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
+      // ADR 0024 P2-3: the preview filter inside, one decision for every chunk.
+      ["the call: by user chunk of 150, in id order, one decision for every chunk, previews dropped",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*const previews: ContextFilterState = \{ applies: null \};\s*for \(const part of chunk\(\[\.\.\.new Set\(userIds\.filter\(Boolean\)\)\], 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(cols, from, to\)[^=]*=>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(svc\.from\("course_attempts"\)\.select\(cols\)\.in\("user_id", part\)\.eq\("organization_id", orgId\), apply\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
       ["the error rule: any error throws, as fetchByIds does", /if \(res\.error\) throw new Error\(`course_attempts: \$\{res\.error\.message \?\? ""\}`\);/],
     ],
     "app/api/attempt-requests/bulk/route.ts": [
@@ -481,8 +483,9 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
       ["the error rule: 503 before any insert", /if \(attemptsRead\.error\) return unreadable\("attempts"\);/],
     ],
     "app/[org]/(admin)/attempt-requests/page.tsx": [
-      ["the call: the requests' versions and learners, in id order, an empty answer an error",
-        /readPagedWithOptionalColumn<Row>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*svc\s*\.from\("course_attempts"\)\s*\.select\(cols\)\s*\.in\("course_version_id", verIds\)\s*\.in\("user_id", userIds\)\s*\.order\("id"\)\s*\.range\(from, to\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
+      // ADR 0024 P2-3: the preview filter inside, one decision for every page.
+      ["the call: the requests' versions and learners, in id order, an empty answer an error, previews dropped",
+        /readPagedWithOptionalColumn<Row>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(svc\.from\("course_attempts"\)\.select\(cols\)\.in\("course_version_id", verIds\)\.in\("user_id", userIds\), apply\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
       ["the error rule: the rows read so far, and the history unavailable", /if \(attemptsRead\.error\) \{\s*historyUnavailable = true;/],
     ],
     "lib/attempts/grant.ts": [

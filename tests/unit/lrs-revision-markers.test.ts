@@ -18,7 +18,12 @@
  *     the source not done (the next run retries the chunk);
  *   - the siblings tier: 42703 → today's unfiltered
  *     select; any other error → ContextReadError, no statement;
- *   - PROFILE_VERSION is 1.1.0 and the profile-version extension carries it.
+ *   - PROFILE_VERSION is 1.1.0 and the profile-version extension carries it;
+ *   - ADR 0024 P2-3 (item 1b): a staff member's preview before a real attempt
+ *     moves neither the real attempt's attempt/number nor its attempt/scored,
+ *     and the sweep forwards nothing of the preview; on a database without
+ *     0107 the filter's missing-column error reads today's rows once, so the
+ *     ordinal there is today's.
  *
  * Run:  npx tsx tests/unit/lrs-revision-markers.test.ts   (or npm run test:unit)
  * (No DB, no network: any fetch fails the test.)
@@ -276,6 +281,60 @@ async function main() {
       [e instanceof ContextReadError, (e as ContextReadError | null)?.read, f.queries.filter(isSiblings).length], [true, "siblings", 1]);
     const g = fakeDb(tables(), (q) => (isSiblings(q) ? BOOM : null));
     eq("…and no statement is built", (await rejects(runSource(g.db, "attempts", ORG))) instanceof ContextReadError, true);
+  }
+
+  console.log("\nADR 0024 P2-3: a preview never counts in a real attempt's number (item 1b)");
+  {
+    const P0 = "a1a1a1a1-0000-4000-8000-000000000004"; // a staff member's by-role preview, before the real attempt
+    const previewTables = (with0107: boolean): Record<string, Row[]> => {
+      const rows = [
+        attemptRow(P0, 1, { status: "completed", context_kind: "preview", preview_kind: "legacy_role" }),
+        attemptRow(A1, 2, { status: "passed", context_kind: "individual" }),
+      ];
+      return {
+        course_attempts: with0107 ? rows : rows.map(({ context_kind: _k, preview_kind: _p, ...r }) => (void _k, void _p, r)),
+        attempt_requests: [],
+      };
+    };
+    const namesContext = (q: Q) => q.ops.some((o) => (o.op === "neq" || o.op === "eq") && typeof o.args[0] === "string" && /(^|\.)context_kind$/.test(o.args[0]));
+    const MISSING_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+    {
+      const f = fakeDb(previewTables(true));
+      const ctxs = await loadAttemptContexts(f.db, [A1]);
+      eq("with 0107: the real attempt is attempt/number 1 and attempt/scored true (the preview before it does not count)",
+        [ctxs.get(A1)?.attemptNumber, ctxs.get(A1)?.scored], [1, true]);
+      const sib = f.queries.find(isSiblings);
+      eq("…the siblings tier drops context_kind = 'preview'", sib?.ops.some((o) => o.op === "neq" && o.args[0] === "context_kind" && o.args[1] === "preview"), true);
+      const g = fakeDb(previewTables(true));
+      const { statements } = await runSource(g.db, "attempts", ORG);
+      eq("the sweep's attempts source: no statement for the preview; the real attempt's launched is number 1, scored",
+        [statements.map((s) => s.context?.registration), markers(launchedOf(statements, A1))], [[A1], { scored: true, launchMode: "(absent)", number: 1 }]);
+      eq("…one decision for the run: every attempts read named the filter, none failed",
+        g.queries.filter((q) => q.table === "course_attempts").every(namesContext), true);
+    }
+    {
+      const fault = (q: Q) => (q.table === "course_attempts" && namesContext(q) ? MISSING_CONTEXT : null);
+      const f = fakeDb(previewTables(false), fault);
+      const ctxs = await loadAttemptContexts(f.db, [A1]);
+      eq("without the column: today's ordinal (the by-role row counts, as it always has): number 2, not scored",
+        [ctxs.get(A1)?.attemptNumber, ctxs.get(A1)?.scored], [2, false]);
+      eq("…one failed read for the call: the first tier decides, the siblings and the ignored-pass read follow",
+        f.queries.filter(namesContext).length, 1);
+      const g = fakeDb(previewTables(false), fault);
+      const { statements } = await runSource(g.db, "attempts", ORG);
+      eq("…and the sweep's attempts source reads today's rows (both launched)", statements.map((s) => s.context?.registration).sort(), [A1, P0].sort());
+      eq("…one failed read for the whole run", g.queries.filter(namesContext).length, 1);
+    }
+    {
+      const f = fakeDb({ xapi_statements: [], course_attempts: [] });
+      await runSource(f.db, "statements", ORG);
+      const q = f.queries.filter((x) => x.table === "xapi_statements");
+      eq("the statements source drops a preview's statements through its attempts embed (course_attempts.context_kind)",
+        q.map((x) => x.ops.some((o) => o.op === "neq" && o.args[0] === "course_attempts.context_kind" && o.args[1] === "preview")), [true]);
+      const g = fakeDb({ xapi_statements: [], course_attempts: [] }, (x) => (x.table === "xapi_statements" && namesContext(x) ? MISSING_CONTEXT : null));
+      await runSource(g.db, "statements", ORG);
+      eq("…without the column: today's select once more", g.queries.filter((x) => x.table === "xapi_statements").map(namesContext), [true, false]);
+    }
   }
 
   console.log("\nthe profile version");

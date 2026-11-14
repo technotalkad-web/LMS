@@ -8,6 +8,8 @@
  *         appear only in the listed P4 files, and never under the grading,
  *         completion, Report Card, CRM, journey, xAPI or LRS code;
  *   (ii)  is_preview / launch_mode appear only in the launch contract's files;
+ *   (ii-b) preview_kind / preview_run_id appear only in the preview files
+ *         (ADR 0024 step 62's one amendment, built in P2-3);
  *   (iii) the alds_set_version_tier RPC is called only from tier-writer.ts;
  *   (iv)  package_certifications is written only by guardian.ts (one insert,
  *         one update, both org-scoped; never deleted);
@@ -169,6 +171,34 @@ console.log("\n(ii) is_preview / launch_mode are written only by the launch cont
   const allowed = ["lib/alds/launch.ts", LAUNCH_PAGE, "lib/alds/rpc.ts"];
   eq("only lib/alds/launch.ts, the launch page and lib/alds/rpc.ts name them", hits.filter((f) => !allowed.includes(f)), []);
   eq("never under the grading prefixes", hits.filter(isForbidden), []);
+}
+
+/**
+ * (ii-b) ADR 0024 step 62 (the one amendment; step 86 and the ADR 0005 note
+ * refer to it): check (ii) is not loosened. Every other reader that must
+ * tell a preview apart tests `context_kind = 'preview'` (not guarded by
+ * name: every product reader needs it). The names `preview_kind` and
+ * `preview_run_id` are limited to the launch page, lib/alds/launch.ts,
+ * lib/preview/, the two preview routes and the Preview Reports pages. The
+ * ADR names no path for the two routes or the pages yet: each joins
+ * PREVIEW_COLUMN_FILES in the pull request that creates it (phase P). The
+ * resolver, lib/attempts/launch-context.ts, returns the preview kind as a
+ * result field and names neither column. launch_mode, the tiers and the
+ * manifest stay forbidden to the files (ii-b) adds.
+ */
+const PREVIEW_COLUMN_FILES: string[] = [LAUNCH_PAGE, "lib/alds/launch.ts"];
+const PREVIEW_COLUMN_PREFIXES = ["lib/preview/"];
+const previewColumnsAllowed = (f: string) => PREVIEW_COLUMN_FILES.includes(f) || PREVIEW_COLUMN_PREFIXES.some((p) => f.startsWith(p));
+console.log("\n(ii-b) preview_kind / preview_run_id appear only in the preview files (ADR 0024 step 62)");
+{
+  const hits = filesMatching(/\b(preview_kind|preview_run_id)\b/);
+  eq("only the launch page, lib/alds/launch.ts and lib/preview/ name them", hits.filter((f) => !previewColumnsAllowed(f)), []);
+  eq("never under the grading prefixes", hits.filter(isForbidden), []);
+  eq("the resolver names neither column (it returns the kind as a field)", hits.includes("lib/attempts/launch-context.ts"), false);
+  const added = [...raw.keys()].filter((f) => previewColumnsAllowed(f) && !["lib/alds/launch.ts", LAUNCH_PAGE, "lib/alds/rpc.ts"].includes(f));
+  eq("the files (ii-b) adds name no launch_mode, tier column or manifest column",
+    added.filter((f) => /\b(launch_mode|analytics_tier\w*|certified_at|certification_id|alds_manifest)\b/.test(code(f))), []);
+  eq("non-vacuous: the resolver exists and returns the kind as a field", /previewKind:/.test(code("lib/attempts/launch-context.ts")), true);
 }
 
 console.log("\n(iii) alds_set_version_tier is called only from lib/alds/tier-writer.ts");

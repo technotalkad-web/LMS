@@ -251,7 +251,8 @@ console.log("\nThe Attempt Requests page: the strict chain read, the request-tim
   eq("admin-gated (canManage): not an analyst-visible page; every read is on the service client", /if \(!canManage\(role\)\)/.test(src) && /createServiceClient\(/.test(src), true);
   eq("the attempts select names status and adds is_revision through readPagedWithOptionalColumn (the first page decides)",
     /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src) &&
-      /readPagedWithOptionalColumn<Row>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*svc\s*\.from\("course_attempts"\)\s*\.select\(cols\)[\s\S]*?\.order\("id"\)\s*\.range\(from, to\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/.test(src) &&
+      // ADR 0024 P2-3: the query sits in the preview filter.
+      /readPagedWithOptionalColumn<Row>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(svc\s*\.from\("course_attempts"\)\s*\.select\(cols\)[\s\S]*?\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/.test(src) &&
       !/= usedColumns;|readWithOptionalColumn\b/.test(src), true);
   eq("…an attempts page with neither rows nor an error is an error, so it too sets historyUnavailable (nullIsError)",
     /ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) \{\s*historyUnavailable = true;/.test(src), true);

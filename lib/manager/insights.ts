@@ -20,6 +20,7 @@ import {
   type PgError,
 } from "@/lib/scoring/attempt-kind";
 import { officialHistory, officialRetakeState } from "@/lib/scoring/official-history";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 import { courseProgress } from "@/lib/courses/progress-view";
 import {
@@ -157,15 +158,26 @@ const ATTEMPT_COLUMNS =
  * failure, so the pages are read here. The first page decides: once it
  * answers, every later page and chunk reads the same column list (one
  * `decided` for every chunk). Any other error throws, as fetchByIds does.
+ *
+ * ADR 0024 steps 49 and 80 (P2-3): a preview moves no engagement value
+ * ("last active") and no line of the Report Card: the read drops
+ * `context_kind = 'preview'` rows, one decision for every chunk and page
+ * (`previews`); on a database without 0107 the filter's missing-column error
+ * reads today's select once (readWithContextFilter).
  */
 async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: string[]): Promise<AttemptRow[]> {
   const out: AttemptRow[] = [];
   const decided: OptionalColumnState = { columns: null };
+  const previews: ContextFilterState = { applies: null };
   for (const part of chunk([...new Set(userIds.filter(Boolean))], 150)) {
     const res = await readPagedWithOptionalColumn<unknown>(
       "is_revision",
       (cols, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
-        svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId).order("id").range(from, to),
+        readWithContextFilter(previews, (apply) =>
+          withoutPreviews(svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId), apply)
+            .order("id")
+            .range(from, to)
+        ),
       ATTEMPT_COLUMNS,
       { state: decided }
     );

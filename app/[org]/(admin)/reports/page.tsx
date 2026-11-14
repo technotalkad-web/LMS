@@ -6,6 +6,7 @@ import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { officialStatuses, countsByCourse, hasOfficialResult, EMPTY_STATUS_COUNTS, attemptCounts, excludeAbandoned } from "@/lib/scoring/status";
 import { isRevisionAttempt } from "@/lib/scoring/policy";
 import { readPagedWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { canViewReports } from "@/lib/auth/permissions";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
@@ -213,11 +214,19 @@ export default async function ReportsPage({
   // The pages are taken in id order: range pages without an order are not
   // guaranteed to be disjoint, and attempt rows are updated on every progress
   // write, so a row could be counted twice or missed.
+  // ADR 0024 steps 49 and 80 (P2-3): a preview moves no number here. Both
+  // attempts reads drop `context_kind = 'preview'` rows, one decision for the
+  // page (`previews`); on a database without 0107 the filter's
+  // missing-column error reads today's select once (readWithContextFilter).
   const ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct";
+  const previews: ContextFilterState = { applies: null };
   const { data: attemptRows, error: attemptsErr } = await readPagedWithOptionalColumn<unknown>(
     "is_revision",
-    (columns, f, t) => supabase.from("course_attempts").select(columns).eq("organization_id", org.id).order("id").range(f, t),
+    (columns, f, t) =>
+      readWithContextFilter(previews, (apply) =>
+        withoutPreviews(supabase.from("course_attempts").select(columns).eq("organization_id", org.id), apply).order("id").range(f, t)
+      ),
     ATTEMPT_COLUMNS,
     { maxPages: 500 }
   );
@@ -230,14 +239,13 @@ export default async function ReportsPage({
   // section, its card and the marker are not rendered at all. The same when the
   // attempts read ended early: the rows are joined to it, and the section's empty
   // state says every such attempt is listed.
-  const { data: ignoredRows, error: ignoredErr } = await supabase
-    .from("course_attempts")
-    .select("id, ignored_pass")
-    .eq("organization_id", org.id)
-    .eq("success_status", "failed")
-    .not("ignored_pass", "is", null)
-    .order("ignored_pass->>last_at", { ascending: false })
-    .limit(NOT_APPLIED_REPORT_LIMIT);
+  const { data: ignoredRows, error: ignoredErr } = await readWithContextFilter(previews, (apply) =>
+    withoutPreviews(supabase.from("course_attempts").select("id, ignored_pass").eq("organization_id", org.id), apply)
+      .eq("success_status", "failed")
+      .not("ignored_pass", "is", null)
+      .order("ignored_pass->>last_at", { ascending: false })
+      .limit(NOT_APPLIED_REPORT_LIMIT)
+  );
   if ((ignoredRows ?? []).length >= NOT_APPLIED_REPORT_LIMIT) {
     console.warn(JSON.stringify({ event: "ignored_pass_reports_truncated", organization_id: org.id }));
   }

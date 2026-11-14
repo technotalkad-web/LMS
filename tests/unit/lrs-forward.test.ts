@@ -14,7 +14,9 @@
  * PostgREST: app/api/cron/lrs-forward/route.ts over repeated runs on a fake clock
  * (a statement the isolation budget did not reach counts no failed attempt, so it
  * never dead-letters for that, while an outage still backs off and dead-letters),
- * and lib/lrs/enqueue.ts (only what the LRS accepted is marked sent).
+ * and lib/lrs/enqueue.ts (only what the LRS accepted is marked sent; ADR 0024
+ * P2-3: a preview's attempt is never mirrored, and on a database without 0107
+ * the organisation read falls back to today's select once).
  *
  * A 200 counts only if it carries a list of ids, and the redirect shapes behind
  * that rule depend on what the real fetch does, so those cases post to a server
@@ -462,6 +464,13 @@ async function enqueueCases() {
   const aloneConflict = new Set<string>();
   let conflicts = new Set<string>();
   let signInPage = false;
+  // ADR 0024 P2-3: how the stubbed PostgREST answers the attempt's
+  // organisation read ("real": every read finds it; "preview": a read that
+  // drops previews finds nothing; "no0107": a read naming context_kind
+  // answers 42703, as a database without 0107 does).
+  let attempt: "real" | "preview" | "no0107" = "real";
+  const attemptReads: string[] = [];
+  let outboxWrites = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init?.method ?? "GET").toUpperCase();
@@ -476,7 +485,17 @@ async function enqueueCases() {
       for (const p of posted) stored.add(p.id);
       return json(posted.map((p) => p.id));
     }
-    if (url.pathname === "/rest/v1/course_attempts") return json([{ organization_id: "org-a" }]);
+    if (url.pathname === "/rest/v1/course_attempts") {
+      const filter = url.searchParams.get("context_kind");
+      attemptReads.push(filter ?? "(none)");
+      if (filter !== null && attempt === "no0107") return json({ code: "42703", details: null, hint: null, message: "column course_attempts.context_kind does not exist" }, 400);
+      if (filter === "neq.preview" && attempt === "preview") return json([]);
+      return json([{ organization_id: "org-a" }]);
+    }
+    if (url.pathname === "/rest/v1/lrs_forward_outbox" && method === "POST") {
+      outboxWrites++;
+      return json([], 201);
+    }
     if (url.pathname === "/rest/v1/tenant_lrs_config") {
       return json([{ organization_id: "org-a", enabled: true, endpoint: "http://lrs.test/xapi", auth_key: "k", auth_secret: "s", xapi_version: "1.0.3", statement_profile: "raw" }]);
     }
@@ -525,6 +544,37 @@ async function enqueueCases() {
     signInPage = false;
     eq("a sign-in page answers 200: nothing is marked sent", sentIds, []);
     eq("a sign-in page answers 200: every row keeps the error", errored.length, 8);
+  }
+
+  console.log("\nthe live mirror and previews (ADR 0024 P2-3, steps 49 and 80)");
+  {
+    reset([]);
+    attempt = "preview";
+    attemptReads.length = 0;
+    outboxWrites = 0;
+    await mirrorToExternalLrs("att-p", batch(4) as never);
+    await settle();
+    eq("a preview's attempt: the organisation read drops previews and finds nothing", attemptReads, ["neq.preview"]);
+    eq("…nothing is enqueued or posted", [outboxWrites, stored.size, sentIds.length], [0, 0, 0]);
+  }
+  {
+    reset([]);
+    attempt = "no0107";
+    attemptReads.length = 0;
+    outboxWrites = 0;
+    await mirrorToExternalLrs("att-1", batch(4) as never);
+    await settle();
+    eq("without the column: the filtered read answers 42703 and today's select is read once", attemptReads, ["neq.preview", "(none)"]);
+    eq("…and the statements are mirrored as before", [outboxWrites, stored.size, sentIds.length], [1, 4, 4]);
+  }
+  {
+    reset([]);
+    attempt = "real";
+    attemptReads.length = 0;
+    outboxWrites = 0;
+    await mirrorToExternalLrs("att-1", batch(4) as never);
+    await settle();
+    eq("a real attempt with 0107: one filtered read, mirrored", [attemptReads, outboxWrites, stored.size], [["neq.preview"], 1, 4]);
   }
 }
 

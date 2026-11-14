@@ -8,6 +8,7 @@ import { LearnersFilters } from "../../../library/[courseId]/learners/learners-f
 import { excludeAbandoned, officialStatuses, standingVerdictOf } from "@/lib/scoring/status";
 import { isRevisionAttempt } from "@/lib/scoring/policy";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 // =============================================================================
 // Dedicated enrolled-learners page for an admin viewing one learning path.
@@ -236,18 +237,21 @@ export default async function PathLearnersPage({
 
   // ADR 0014 step 12: the select names is_revision through the narrower-select
   // fallback, so the folds below drop revision rows (none before 0103).
+  // ADR 0024 steps 49 and 80 (P2-3): and preview rows, `context_kind =
+  // 'preview'` (today's select without 0107, readWithContextFilter).
   const ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at";
+  const previews: ContextFilterState = { applies: null };
   const { data: attemptRows } =
     enrolledUserIds.length && versionIds.length
       ? await readWithOptionalColumn<unknown[]>(
           "is_revision",
           (columns) =>
-            supabase
-              .from("course_attempts")
-              .select(columns)
-              .in("user_id", enrolledUserIds)
-              .in("course_version_id", versionIds),
+            readWithContextFilter(previews, (apply) =>
+              withoutPreviews(supabase.from("course_attempts").select(columns), apply)
+                .in("user_id", enrolledUserIds)
+                .in("course_version_id", versionIds)
+            ),
           ATTEMPT_COLUMNS
         )
       : { data: [] };

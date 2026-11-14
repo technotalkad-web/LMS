@@ -7,6 +7,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { officialStatuses, standingVerdictOf } from "@/lib/scoring/status";
 import { isRevisionAttempt } from "@/lib/scoring/policy";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 // =============================================================================
 // /[org]/learning-paths/[pathId]/reports — Path Reports surface.
@@ -196,19 +197,23 @@ export default async function PathReportsPage({
   // ---- Path-context attempts only (the key separation from course-level reports) ----
   // ADR 0014 step 12: both attempts selects name is_revision through the
   // narrower-select fallback (a database without 0103 has no revision rows).
+  // ADR 0024 steps 49 and 80 (P2-3): both drop preview rows, `context_kind =
+  // 'preview'`, one decision for the page (today's select without 0107,
+  // readWithContextFilter).
   const PATH_ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id";
+  const previews: ContextFilterState = { applies: null };
   const { data: attemptRows } =
     assignedIdArr.length && allVersionIds.length
       ? await readWithOptionalColumn<unknown[]>(
           "is_revision",
           (columns) =>
-            supabase
-              .from("course_attempts")
-              .select(columns)
-              .eq("learning_path_id", pathId)
-              .in("user_id", assignedIdArr)
-              .in("course_version_id", allVersionIds),
+            readWithContextFilter(previews, (apply) =>
+              withoutPreviews(supabase.from("course_attempts").select(columns), apply)
+                .eq("learning_path_id", pathId)
+                .in("user_id", assignedIdArr)
+                .in("course_version_id", allVersionIds)
+            ),
           PATH_ATTEMPT_COLUMNS
         )
       : { data: [] };
@@ -281,11 +286,11 @@ export default async function PathReportsPage({
       ? await readWithOptionalColumn<unknown[]>(
           "is_revision",
           (columns) =>
-            supabase
-              .from("course_attempts")
-              .select(columns)
-              .in("user_id", assignedIdArr)
-              .in("course_version_id", allVersionIds),
+            readWithContextFilter(previews, (apply) =>
+              withoutPreviews(supabase.from("course_attempts").select(columns), apply)
+                .in("user_id", assignedIdArr)
+                .in("course_version_id", allVersionIds)
+            ),
           ALL_ATTEMPT_COLUMNS
         )
       : { data: [] };

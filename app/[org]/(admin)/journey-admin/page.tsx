@@ -10,6 +10,7 @@ import { fetchScoringRule } from "@/lib/scoring/resolve";
 import { computeJourneyState, parseVersionDays } from "@/lib/journey/journey";
 import { courseProgress } from "@/lib/courses/progress-view";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import {
   JourneyAdminClient,
   type ProgramRow,
@@ -212,17 +213,21 @@ export default async function JourneyAdminPage({
       // ADR 0014 step 12: the select names is_revision through the
       // narrower-select fallback, so a revision row never supplies the
       // mission's progress. No retakeIds: the mission feeds a journey roll-up.
+      // ADR 0024 steps 49 and 80 (P2-3): nor does a preview; the read drops
+      // `context_kind = 'preview'` rows (today's select without 0107,
+      // readWithContextFilter).
       const ATTEMPT_COLUMNS =
         "user_id, course_version_id, status, completion_status, success_status, started_at, progress_pct, units:cmi_data->cmi5->units";
+      const previews: ContextFilterState = { applies: null };
       const { data: aRows } = vers.length && userIds.length
         ? await readWithOptionalColumn<unknown[]>(
             "is_revision",
             (columns) =>
-              svc
-                .from("course_attempts")
-                .select(columns)
-                .in("user_id", userIds)
-                .in("course_version_id", vers.map((v) => v.id)),
+              readWithContextFilter(previews, (apply) =>
+                withoutPreviews(svc.from("course_attempts").select(columns), apply)
+                  .in("user_id", userIds)
+                  .in("course_version_id", vers.map((v) => v.id))
+              ),
             ATTEMPT_COLUMNS
           )
         : { data: [] };

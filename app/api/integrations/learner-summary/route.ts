@@ -18,6 +18,7 @@ import { resolvePolicies } from "@/lib/scoring/resolve";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { courseStatus, officialDone } from "@/lib/scoring/policy";
 import { fetchPassRequired, grantSnapshotForUsers, GrantReadError, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews } from "@/lib/scoring/context-read";
 import { officialHistory, officialRetakeState } from "@/lib/scoring/official-history";
 import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
 
@@ -150,12 +151,13 @@ export async function GET(request: Request) {
   }
 
   // ---- attempts → status/score per course ----
-  const { data: atRows } = await svc
-    .from("course_attempts")
-    // select("*") for 0075 deploy safety (progress_pct).
-    .select("*")
-    .eq("organization_id", orgId)
-    .eq("user_id", uid);
+  // select("*") for 0075 deploy safety (progress_pct). A preview is never a
+  // CRM row (ADR 0024 steps 49 and 80, P2-3): the read drops
+  // `context_kind = 'preview'` rows, and on a database without 0107 reads
+  // today's select once (readWithContextFilter).
+  const { data: atRows } = await readWithContextFilter({ applies: null }, (apply) =>
+    withoutPreviews(svc.from("course_attempts").select("*").eq("organization_id", orgId).eq("user_id", uid), apply)
+  );
   type Att = {
     id: string;
     course_version_id: string;
