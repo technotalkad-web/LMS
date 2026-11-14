@@ -1,0 +1,506 @@
+{
+  "$comment": "Pair 1 of the twins contract, the official rule per context (ADR 0024 steps 9, 41 and 62; build notes N8, N9, N13, N16; contract 2.4 and 2.5). SQL: v_context_attempt_scoring, v_context_attempt_summary, official_attempt_in_context() and instance_pass_required() on the given rows, in assert-0107-parity.sql (P1). TypeScript: contextResult() on the same rows, in tests/unit/context-parity.test.ts. A writer case also calls record_learning_activity on call.writer_attempt_id. Rows use database column names; ids are symbols; synthetic rows only.",
+  "format": 1,
+  "pair": "official",
+  "now": "2026-06-01T00:00:00Z",
+  "ids": {
+    "@ORG": "00000000-0000-0000-0107-0a0000000001",
+    "@L1": "00000000-0000-0000-0107-010000000001",
+    "@LB": "00000000-0000-0000-0107-010000000002",
+    "@C1": "00000000-0000-0000-0107-020000000001",
+    "@C2": "00000000-0000-0000-0107-020000000002",
+    "@V1": "00000000-0000-0000-0107-040000000001",
+    "@V2": "00000000-0000-0000-0107-040000000002",
+    "@P1": "00000000-0000-0000-0107-050000000001",
+    "@P2": "00000000-0000-0000-0107-050000000002",
+    "@JP": "00000000-0000-0000-0107-0d0000000001",
+    "@D1": "00000000-0000-0000-0107-0e0000000001",
+    "@JV": "00000000-0000-0000-0107-0f0000000001",
+    "@E1": "00000000-0000-0000-0107-100000000001",
+    "@RUN": "00000000-0000-0000-0107-150000000001",
+    "@A1": "00000000-0000-0000-0107-0b0000000001",
+    "@A2": "00000000-0000-0000-0107-0b0000000002",
+    "@A3": "00000000-0000-0000-0107-0b0000000003",
+    "@G1": "00000000-0000-0000-0107-0c0000000001",
+    "@G2": "00000000-0000-0000-0107-0c0000000002",
+    "@G3": "00000000-0000-0000-0107-0c0000000003"
+  },
+  "world": {
+    "organizations": [{ "id": "@ORG" }],
+    "users": [{ "id": "@L1", "organization_id": "@ORG" }, { "id": "@LB", "organization_id": "@ORG" }],
+    "courses": [
+      { "id": "@C1", "organization_id": "@ORG", "pass_required": true },
+      { "id": "@C2", "organization_id": "@ORG", "pass_required": false }
+    ],
+    "course_versions": [{ "id": "@V1", "course_id": "@C1" }, { "id": "@V2", "course_id": "@C2" }],
+    "learning_paths": [
+      { "id": "@P1", "organization_id": "@ORG" },
+      { "id": "@P2", "organization_id": "@ORG" }
+    ]
+  },
+  "cases": [
+    {
+      "name": "official/f6: an abandoned row that is completed is official on neither side (N8)",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "abandoned", "completion_status": "completed", "success_status": "passed", "score": 0.9,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": null, "official_status": null, "official_score": null,
+        "first_score": null, "best_score": null, "latest_score": null,
+        "completed_attempts": 0, "scored_attempts": 0, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 0, "pass_required": true,
+        "status": "not_started", "stored": false, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/a revision row that passed after a failed official attempt leaves the official result failed",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.95,
+            "started_at": "2026-02-05T09:00:00Z", "completed_at": "2026-02-05T09:30:00Z", "is_revision": true }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.4, "best_score": 0.4, "latest_score": 0.4,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "failed", "stored": true, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/learner B, the Individual context of a course B also learns in two paths",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.8,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.5,
+            "started_at": "2026-02-02T09:00:00Z", "completed_at": "2026-02-02T09:30:00Z", "is_revision": false },
+          { "id": "@A3", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P2", "context_key": "path:@P2",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.7,
+            "started_at": "2026-02-03T09:00:00Z", "completed_at": "2026-02-03T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@LB", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "passed", "official_score": 0.8,
+        "first_score": 0.8, "best_score": 0.8, "latest_score": 0.8,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "passed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/learner B, path P1: its own official attempt, number 1 of its context",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.8,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.5,
+            "started_at": "2026-02-02T09:00:00Z", "completed_at": "2026-02-02T09:30:00Z", "is_revision": false },
+          { "id": "@A3", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P2", "context_key": "path:@P2",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.7,
+            "started_at": "2026-02-03T09:00:00Z", "completed_at": "2026-02-03T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@LB", "course_id": "@C1", "context_key": "path:@P1", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A2", "official_status": "failed", "official_score": 0.5,
+        "first_score": 0.5, "best_score": 0.5, "latest_score": 0.5,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "failed", "stored": true, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/learner B, path P2: its own official attempt, passed",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.8,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.5,
+            "started_at": "2026-02-02T09:00:00Z", "completed_at": "2026-02-02T09:30:00Z", "is_revision": false },
+          { "id": "@A3", "course_version_id": "@V1", "user_id": "@LB", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P2", "context_key": "path:@P2",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.7,
+            "started_at": "2026-02-03T09:00:00Z", "completed_at": "2026-02-03T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@LB", "course_id": "@C1", "context_key": "path:@P2", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A3", "official_status": "passed", "official_score": 0.7,
+        "first_score": 0.7, "best_score": 0.7, "latest_score": 0.7,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "passed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/N9: an open legacy path retake whose grant reads individual is live in path:P1",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "in_progress", "completion_status": "in_progress", "success_status": "unknown", "score": null,
+            "started_at": "2026-02-10T09:00:00Z", "completed_at": null, "is_revision": false }
+        ],
+        "attempt_requests": [
+          { "id": "@G1", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "individual", "context_key": "individual",
+            "used_attempt_id": "@A2", "used_at": "2026-02-10T09:00:00Z", "expires_at": null, "created_at": "2026-02-05T00:00:00Z" }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "path:@P1", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.4, "best_score": 0.4, "latest_score": 0.4,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 2, "live_attempt_count": 2, "pass_required": true,
+        "status": "in_progress", "stored": false, "done": false, "live_retake": true, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/N9: the same rows read in the Individual context hold nothing and no live retake",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "in_progress", "completion_status": "in_progress", "success_status": "unknown", "score": null,
+            "started_at": "2026-02-10T09:00:00Z", "completed_at": null, "is_revision": false }
+        ],
+        "attempt_requests": [
+          { "id": "@G1", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "individual", "context_key": "individual",
+            "used_attempt_id": "@A2", "used_at": "2026-02-10T09:00:00Z", "expires_at": null, "created_at": "2026-02-05T00:00:00Z" }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": null, "official_status": null, "official_score": null,
+        "first_score": null, "best_score": null, "latest_score": null,
+        "completed_attempts": 0, "scored_attempts": 0, "practice_attempts": 0,
+        "attempt_count": 0, "live_attempt_count": 0, "pass_required": true,
+        "status": "not_started", "stored": false, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/a granted retake that failed after a pass is the official result; not done under pass_required",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.9,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-03-01T09:00:00Z", "completed_at": "2026-03-01T09:30:00Z", "is_revision": false }
+        ],
+        "attempt_requests": [
+          { "id": "@G1", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "individual", "context_key": "individual",
+            "used_attempt_id": "@A2", "used_at": "2026-03-01T09:00:00Z", "expires_at": null, "created_at": "2026-02-20T00:00:00Z" }
+        ]
+      },
+      "writer": true,
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true, "writer_attempt_id": "@A2" },
+      "expect": {
+        "official_attempt_id": "@A2", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.9, "best_score": 0.9, "latest_score": 0.4,
+        "completed_attempts": 2, "scored_attempts": 2, "practice_attempts": 0,
+        "attempt_count": 2, "live_attempt_count": 2, "pass_required": true,
+        "status": "failed", "stored": true, "done": false, "live_retake": false, "unused_grant_id": null,
+        "writer": { "official": true, "done": false, "passed_ever": null, "passed_by_rule": null, "path_completed": false, "attempt_number": 2, "fact_written": false }
+      }
+    },
+    {
+      "name": "official/a live granted retake: in progress, not stored, the earlier row still the standing official",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "in_progress", "completion_status": "in_progress", "success_status": "unknown", "score": null,
+            "started_at": "2026-03-01T09:00:00Z", "completed_at": null, "is_revision": false }
+        ],
+        "attempt_requests": [
+          { "id": "@G1", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "individual", "context_key": "individual",
+            "used_attempt_id": "@A2", "used_at": "2026-03-01T09:00:00Z", "expires_at": null, "created_at": "2026-02-20T00:00:00Z" }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.4, "best_score": 0.4, "latest_score": 0.4,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 2, "live_attempt_count": 2, "pass_required": true,
+        "status": "in_progress", "stored": false, "done": false, "live_retake": true, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/a legacy_role preview tagged with the path is never counted in path:P1",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "preview", "context_key": "preview", "is_preview": true, "preview_kind": "legacy_role",
+            "learning_path_id": "@P1",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.9,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "path:@P1", "pass_required": true },
+      "expect": {
+        "official_attempt_id": null, "official_status": null, "official_score": null,
+        "first_score": null, "best_score": null, "latest_score": null,
+        "completed_attempts": 0, "scored_attempts": 0, "practice_attempts": 0,
+        "attempt_count": 0, "live_attempt_count": 0, "pass_required": true,
+        "status": "not_started", "stored": false, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/a context holding only an open row has no official attempt and one live row",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V2", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "in_progress", "completion_status": "in_progress", "success_status": "unknown", "score": null,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": null, "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C2", "context_key": "individual", "pass_required": false },
+      "expect": {
+        "official_attempt_id": null, "official_status": null, "official_score": null,
+        "first_score": null, "best_score": null, "latest_score": null,
+        "completed_attempts": 0, "scored_attempts": 0, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": false,
+        "status": "in_progress", "stored": false, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/tie-break: two rows completed at the same instant, the lower id is official on both sides",
+      "given": {
+        "course_attempts": [
+          { "id": "@A2", "course_version_id": "@V2", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.9,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A1", "course_version_id": "@V2", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C2", "context_key": "individual", "pass_required": false },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.4, "best_score": 0.4, "latest_score": 0.4,
+        "completed_attempts": 2, "scored_attempts": 1, "practice_attempts": 1,
+        "attempt_count": 2, "live_attempt_count": 2, "pass_required": false,
+        "status": "failed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/the unused grant is the context's own: an older open grant of a path context is not the Individual one's",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.3,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ],
+        "attempt_requests": [
+          { "id": "@G1", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "used_attempt_id": null, "used_at": null, "expires_at": null, "created_at": "2026-02-02T00:00:00Z" },
+          { "id": "@G3", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "individual", "context_key": "individual",
+            "used_attempt_id": null, "used_at": null, "expires_at": "2999-01-01T00:00:00Z", "created_at": "2026-02-04T00:00:00Z" }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.3,
+        "first_score": 0.3, "best_score": 0.3, "latest_score": 0.3,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "failed", "stored": true, "done": false, "live_retake": false, "unused_grant_id": "@G3"
+      }
+    },
+    {
+      "name": "official/an expired open grant is no unused grant",
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.3,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ],
+        "attempt_requests": [
+          { "id": "@G2", "organization_id": "@ORG", "user_id": "@L1", "course_id": "@C1", "status": "approved",
+            "context_kind": "individual", "context_key": "individual",
+            "used_attempt_id": null, "used_at": null, "expires_at": "2000-01-01T00:00:00Z", "created_at": "2026-02-03T00:00:00Z" }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.3,
+        "first_score": 0.3, "best_score": 0.3, "latest_score": 0.3,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "failed", "stored": true, "done": false, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/the resolved rule: a step's own pass_required overrides the course's",
+      "given": {
+        "learning_path_courses": [{ "path_id": "@P1", "course_id": "@C1", "step_number": 1, "pass_required": false }],
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "path", "learning_path_id": "@P1", "context_key": "path:@P1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "path:@P1", "pass_required": false },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.4, "best_score": 0.4, "latest_score": 0.4,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": false,
+        "status": "failed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/the resolved rule: a journey day's value in the pinned version overrides the course's",
+      "given": {
+        "journey_programs": [{ "id": "@JP", "organization_id": "@ORG" }],
+        "journey_days": [{ "id": "@D1", "program_id": "@JP", "organization_id": "@ORG", "day_number": 1, "course_id": "@C1" }],
+        "journey_versions": [
+          { "id": "@JV", "program_id": "@JP", "organization_id": "@ORG", "days_total": 1,
+            "days": [{ "day": 1, "course_id": "@C1", "mission_title": null, "pass_required": false }],
+            "day_ids": { "1": "@D1" } }
+        ],
+        "journey_enrollments": [
+          { "id": "@E1", "program_id": "@JP", "version_id": "@JV", "organization_id": "@ORG", "user_id": "@L1", "start_date": "2026-01-05" }
+        ],
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "journey", "journey_enrollment_id": "@E1", "journey_day": 1, "journey_day_id": "@D1",
+            "journey_version_id": "@JV", "context_key": "journey:@E1:@D1",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.4,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "journey:@E1:@D1", "pass_required": false },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "failed", "official_score": 0.4,
+        "first_score": 0.4, "best_score": 0.4, "latest_score": 0.4,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": false,
+        "status": "failed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null
+      }
+    },
+    {
+      "name": "official/the writer on an Individual row passed under pass_required: official, done, number 1",
+      "writer": true,
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "individual",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.85,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true, "writer_attempt_id": "@A1" },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "passed", "official_score": 0.85,
+        "first_score": 0.85, "best_score": 0.85, "latest_score": 0.85,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 1, "live_attempt_count": 1, "pass_required": true,
+        "status": "passed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null,
+        "writer": { "official": true, "done": true, "passed_ever": null, "passed_by_rule": null, "path_completed": false, "attempt_number": 1, "fact_written": false }
+      }
+    },
+    {
+      "name": "official/TypeScript only: a row with an empty context_key throws (step 41)",
+      "sides": ["ts"],
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "individual", "context_key": "",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.9,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "individual", "pass_required": true },
+      "expect": { "throws": "ContextKeyError" }
+    },
+    {
+      "name": "official/TypeScript only: a preview key keeps its previews and drops abandoned and revision rows (contract A1)",
+      "sides": ["ts"],
+      "given": {
+        "course_attempts": [
+          { "id": "@A1", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "preview", "context_key": "preview:@RUN",
+            "status": "passed", "completion_status": "completed", "success_status": "passed", "score": 0.8,
+            "started_at": "2026-02-01T09:00:00Z", "completed_at": "2026-02-01T09:30:00Z", "is_revision": false },
+          { "id": "@A2", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "preview", "context_key": "preview:@RUN",
+            "status": "abandoned", "completion_status": "completed", "success_status": "failed", "score": 0.1,
+            "started_at": "2026-01-01T09:00:00Z", "completed_at": "2026-01-01T09:30:00Z", "is_revision": false },
+          { "id": "@A3", "course_version_id": "@V1", "user_id": "@L1", "organization_id": "@ORG",
+            "context_kind": "preview", "context_key": "preview:@RUN",
+            "status": "failed", "completion_status": "completed", "success_status": "failed", "score": 0.2,
+            "started_at": "2026-01-15T09:00:00Z", "completed_at": "2026-01-15T09:30:00Z", "is_revision": true }
+        ]
+      },
+      "call": { "user_id": "@L1", "course_id": "@C1", "context_key": "preview:@RUN", "pass_required": true },
+      "expect": {
+        "official_attempt_id": "@A1", "official_status": "passed", "official_score": 0.8,
+        "first_score": 0.8, "best_score": 0.8, "latest_score": 0.8,
+        "completed_attempts": 1, "scored_attempts": 1, "practice_attempts": 0,
+        "attempt_count": 2, "live_attempt_count": 1, "pass_required": true,
+        "status": "passed", "stored": true, "done": true, "live_retake": false, "unused_grant_id": null
+      }
+    }
+  ]
+}

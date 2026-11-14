@@ -45,7 +45,9 @@
 --        credit is only pending); late false in a progress journey and
 --        before the counted date; a second real run writes nothing; one
 --        call over three enrolments (re-pinned, kept and completed,
---        enrolled after the publish)
+--        enrolled after the publish); and each real run of (a) to (h)
+--        reaches the counts of its static after-state in the twins'
+--        parity fixtures (build note N16; twins contract 4.4)
 -- The fixture rows have ids whose last group starts 00010717. The whole file
 -- is one transaction that ends in ROLLBACK; every case runs in its own
 -- savepoint, rolled back to it, so no case sees another's writes. Every check
@@ -1693,6 +1695,52 @@ begin
   -- every case was undone: no JR program is left
   if exists (select 1 from public.journey_programs where id = '00000000-0000-0000-0000-000107178001') then
     raise exception 'assert-0107: (32) a case was not undone';
+  end if;
+end
+$$;
+
+-- The static after-states (ADR 0024 build note N16; twins contract 4.4):
+-- fixtures/parity-journey.cases.json holds each re-pin case's after-state as
+-- the case journey/repin-<letter>, which assert-0107-parity.sql (P3) runs
+-- through journey_credit_state with its day ids. Here each real run of (a)
+-- to (h) above must reach that case's counts (required days, credited days,
+-- the credited numbers, the open day); g is its first case, g1. The cases
+-- are read from the session's parity_cases table (run.mjs's cases step).
+do $$
+declare
+  bad  text[] := '{}';
+  r    record;
+  c    jsonb;
+  want text;
+  got  text;
+begin
+  if to_regclass('pg_temp.parity_cases') is null then
+    raise exception 'assert-0107: (32) the parity cases are not loaded (run.mjs''s cases step comes first)';
+  end if;
+  for r in select * from (values ('a', 'a'), ('b', 'b'), ('c', 'c'), ('d', 'd'), ('e', 'e'), ('f', 'f'), ('g', 'g1'),
+                                 ('h', 'h')) as v(letter, k) loop
+    c := null;
+    select x into c
+      from pg_temp.parity_cases p
+     cross join lateral jsonb_array_elements(p.doc -> 'cases') as x
+     where p.pair = 'journey' and x ->> 'name' like 'journey/repin-' || r.letter || ':%';
+    if c is null then
+      bad := bad || format('no static case journey/repin-%s', r.letter);
+      continue;
+    end if;
+    want := format('state=req=%s done=%s cred={%s} next=%s', c #>> '{expect,required_days}',
+                   c #>> '{expect,credited_days}',
+                   coalesce((select string_agg(e.v, ',' order by e.o)
+                               from jsonb_array_elements_text(c #> '{expect,credited}') with ordinality as e(v, o)), ''),
+                   coalesce(c #>> '{expect,next_day}', '-'));
+    select x.got into got from pg_temp.r0107p_repin x where x.k = r.k;
+    if got is null or position(want || ' ' in got || ' ') = 0 then
+      bad := bad || format('(%s) the real run reached %s; journey/repin-%s says %s', r.k, coalesce(got, 'nothing'),
+                           r.letter, want);
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (32) the static after-states: %', array_to_string(bad, '; ');
   end if;
 end
 $$;

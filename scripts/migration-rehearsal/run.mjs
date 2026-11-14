@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadCases } from "./parity-cases.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..", "..");
@@ -392,6 +393,38 @@ function stepStatic(s) {
   return "next";
 }
 
+// The twins' parity fixtures (added for ADR 0024 build note N16): each file
+// of `files` (or the one `file`) is read, checked and resolved by
+// parity-cases.mjs, the loader the unit tests import too, and bound as one
+// jsonb parameter into the session's temporary table parity_cases, one row
+// per pair, which assert-0107-parity.sql expands. Nothing is generated or
+// written beside the JSON; the table lives as long as the scenario's session.
+async function stepCases(db, s) {
+  const list = s.files ?? [s.file];
+  try {
+    await db.exec("create temp table if not exists parity_cases (pair text primary key, doc jsonb not null)");
+  } catch (e) {
+    check(false, `cases: the temporary table could not be made: ${e?.code ?? ""} ${String(e?.message ?? e).split("\n")[0]}`);
+    return "stop";
+  }
+  for (const f of list) {
+    let doc;
+    try {
+      doc = loadCases(f);
+    } catch (e) {
+      check(false, `cases ${f}: ${String(e?.message ?? e)}`);
+      return "stop";
+    }
+    await db.query(
+      "insert into parity_cases (pair, doc) values ($1, $2::jsonb) on conflict (pair) do update set doc = excluded.doc",
+      [doc.pair, JSON.stringify(doc)],
+    );
+    const sql = doc.cases.filter((c) => c.sides.includes("sql")).length;
+    check(true, `cases ${f} loaded (${doc.cases.length} cases, ${sql} on the SQL side)`);
+  }
+  return "next";
+}
+
 async function stepRefresh(db, s) {
   try {
     const r = await db.query("select public.refresh_report_views() as r");
@@ -621,6 +654,7 @@ for (const sc of scenarios) {
       else if (kind === "static") next = stepStatic(s);
       else if (kind === "script") next = await stepScript(db, s);
       else if (kind === "fingerprint") next = await stepFingerprint(db, s, prints);
+      else if (kind === "cases") next = await stepCases(db, s);
       else setupError(`unknown step "${kind}" in scenario ${sc.name}`);
       if (next === "stop") {
         info(`${sc.name}: stopped here`);
