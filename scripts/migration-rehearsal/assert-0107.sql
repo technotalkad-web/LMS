@@ -828,8 +828,10 @@ $$;
 -- ---------------------------------------------------------------------------
 -- (7) section 2 and 6a, the objects: context_derive_log (its one row, RLS
 --     with a no-access policy, service_role select, insert and update only);
---     the three triggers (timing, when clause, function) and their
---     functions (security definer only for the derive trigger, the pinned
+--     the four triggers (timing, when clause, function: the immutability,
+--     derive and owner triggers of course_attempts and the day_ids trigger)
+--     and their functions (security definer for the derive and owner
+--     triggers only, the pinned
 --     search_path, execute for service_role only); the indexes exactly as
 --     defined, with the three replaced keys gone. With the five of (2), these
 --     are twelve of the twenty foreign-key indexes (step 7's seventeen and
@@ -1016,7 +1018,8 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
--- (8) the two attempt triggers at work. The derive trigger: every branch
+-- (8) the derive and immutability triggers at work (the owner trigger's
+--     refusals are in (5)). The derive trigger: every branch
 --     (individual, path, journey with its day id read from the pinned
 --     version and the path tag nulled, a given day id kept, preview as
 --     legacy_role with its old tags), its two refusals, no firing for an

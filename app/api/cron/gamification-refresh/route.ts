@@ -51,8 +51,10 @@ function unauthorized() {
 /**
  * The completion sweep's own error from refresh_gamification_views()'s
  * answer, or null (no entry, or its error null). The same rule as
- * completionSweepError in app/api/cron/refresh-report-views/route.ts; a route
- * file exports its handlers only, so each route keeps its copy.
+ * completionSweepError in app/api/cron/refresh-report-views/route.ts. Each
+ * route keeps its own copy, so that neither route module exports anything
+ * but its handlers and no new file is added (ruling A4);
+ * tests/unit/gamification-refresh-route.test.ts pins the two copies equal.
  */
 function completionSweepError(data: unknown): string | null {
   if (!Array.isArray(data)) return null;
