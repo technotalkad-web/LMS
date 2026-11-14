@@ -155,7 +155,7 @@ $$;
 
 -- the foreign keys on exactly one column of a table, 'table|delete action|deferrable|deferred'
 create function pg_temp.fks(p_tbl text, p_col text) returns text language sql stable as $$
-  select string_agg(n.nspname || '.' || r.relname || '|' || c.confdeltype || '|' || c.condeferrable || '|' || c.condeferred,
+  select string_agg(n.nspname || '.' || r.relname || '|' || c.confdeltype::text || '|' || c.condeferrable || '|' || c.condeferred,
                     ', ' order by c.conname)
     from pg_constraint c
     join pg_class r on r.oid = c.confrelid
@@ -1927,7 +1927,7 @@ insert into public.journey_versions (id, program_id, organization_id, version_nu
                                      completion_title, days, unlock_mode, day_ids, day_ids_source)
 values (pg_temp.id('3b9'), pg_temp.id('3a2'), pg_temp.id('a0'), 1, 'Indep Jn', 1, false, 'Yoddha',
         jsonb_build_array(jsonb_build_object('day', 1, 'course_id', pg_temp.id('1c6'), 'mission_title', 'm1')),
-        jsonb_build_object('1', pg_temp.id('3d9')), 'editor');
+        'progress', jsonb_build_object('1', pg_temp.id('3d9')), 'editor');
 update public.journey_programs set current_version_id = pg_temp.id('3b9') where id = pg_temp.id('3a2');
 insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
 values (pg_temp.id('3c9'), pg_temp.id('3a2'), pg_temp.id('3b9'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 5, 'active');
@@ -2213,17 +2213,17 @@ rollback to savepoint s2g;
 --      when its grant reads Individual; the old-name views are the Individual
 --      context; the summary keeps one row per context and a reset-only learner
 savepoint s2h;
-select pg_temp.att('{"id":"4h01","user":"102","ver":"1e4","kind":"individual","status":"passed","score":80,"ago":600}');
-select pg_temp.att('{"id":"4h02","user":"102","ver":"1e4","kind":"individual","revision":true,"ago":500}');
-select pg_temp.att('{"id":"4h03","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"abandoned","completion":"completed","ago":590}');
-select pg_temp.att('{"id":"4h04","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"failed","score":40,"ago":580}');
-select pg_temp.att('{"id":"4h05","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"passed","score":70,"ago":560}');
-select pg_temp.att('{"id":"4h06","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"passed","score":90,"ago":540}');
-select pg_temp.att('{"id":"4h07","user":"102","ver":"1e4","kind":"preview","pkind":"course","status":"passed","score":100,"ago":530}');
-select pg_temp.att('{"id":"4h08","user":"108","ver":"1e4","kind":"individual","status":"abandoned","ago":100}');
+select pg_temp.att('{"id":"4701","user":"102","ver":"1e4","kind":"individual","status":"passed","score":80,"ago":600}');
+select pg_temp.att('{"id":"4702","user":"102","ver":"1e4","kind":"individual","revision":true,"ago":500}');
+select pg_temp.att('{"id":"4703","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"abandoned","completion":"completed","ago":590}');
+select pg_temp.att('{"id":"4704","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"failed","score":40,"ago":580}');
+select pg_temp.att('{"id":"4705","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"passed","score":70,"ago":560}');
+select pg_temp.att('{"id":"4706","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"passed","score":90,"ago":540}');
+select pg_temp.att('{"id":"4707","user":"102","ver":"1e4","kind":"preview","pkind":"course","status":"passed","score":100,"ago":530}');
+select pg_temp.att('{"id":"4708","user":"108","ver":"1e4","kind":"individual","status":"abandoned","ago":100}');
 insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, decided_at, used_at, used_attempt_id)
-values (pg_temp.id('6h01'), pg_temp.id('a0'), pg_temp.id('1c4'), pg_temp.id('102'), 'approved', 'bulk',
-        now() - interval '9 hours', now() - interval '9 hours', pg_temp.id('4h06'));
+values (pg_temp.id('6701'), pg_temp.id('a0'), pg_temp.id('1c4'), pg_temp.id('102'), 'approved', 'bulk',
+        now() - interval '9 hours', now() - interval '9 hours', pg_temp.id('4706'));
 do $$
 declare
   bad text[] := '{}';
@@ -2234,18 +2234,18 @@ declare
 begin
   select s.official_attempt_id into got from public.v_context_attempt_scoring s
    where s.course_id = c4 and s.user_id = l2 and s.context_key = 'individual';
-  if got is distinct from pg_temp.id('4h01') then
-    bad := bad || format('Individual official attempt %s (expected 4h01)', got);
+  if got is distinct from pg_temp.id('4701') then
+    bad := bad || format('Individual official attempt %s (expected 4701)', got);
   end if;
   select s.official_attempt_id into got from public.v_context_attempt_scoring s
    where s.course_id = c4 and s.user_id = l2 and s.context_key = pk;
-  if got is distinct from pg_temp.id('4h06') then
-    bad := bad || format('path official attempt %s (expected the granted retake 4h06)', got);
+  if got is distinct from pg_temp.id('4706') then
+    bad := bad || format('path official attempt %s (expected the granted retake 4706)', got);
   end if;
   if exists (select 1 from public.v_context_attempt_scoring s where s.course_id = c4 and s.user_id = l2
-              and s.official_attempt_id in (pg_temp.id('4h02'), pg_temp.id('4h03'), pg_temp.id('4h05'), pg_temp.id('4h07')))
+              and s.official_attempt_id in (pg_temp.id('4702'), pg_temp.id('4703'), pg_temp.id('4705'), pg_temp.id('4707')))
      or exists (select 1 from public.v_context_attempt_summary s where s.course_id = c4 and s.user_id = l2
-              and s.official_attempt_id in (pg_temp.id('4h02'), pg_temp.id('4h03'), pg_temp.id('4h05'), pg_temp.id('4h07'))) then
+              and s.official_attempt_id in (pg_temp.id('4702'), pg_temp.id('4703'), pg_temp.id('4705'), pg_temp.id('4707'))) then
     bad := bad || 'a revision, abandoned, practice or preview row is official'::text;
   end if;
   if (select array_agg(s.context_key order by s.context_key) from public.v_context_attempt_summary s
@@ -2264,15 +2264,15 @@ begin
   end if;
   -- the old-name views are the Individual context, one row per (course, learner)
   if (select s.official_attempt_id from public.v_course_attempt_scoring s where s.course_id = c4 and s.user_id = l2)
-     is distinct from pg_temp.id('4h01')
+     is distinct from pg_temp.id('4701')
      or (select count(*) from public.v_course_attempt_summary s where s.course_id = c4 and s.user_id = l2) <> 1
      or (select s.official_attempt_id from public.v_course_attempt_summary s where s.course_id = c4 and s.user_id = l2)
-        is distinct from pg_temp.id('4h01') then
+        is distinct from pg_temp.id('4701') then
     bad := bad || 'the old-name views are not the Individual context for (c4, L2)'::text;
   end if;
   -- official_attempt_in_context agrees with the view (step 9)
-  if public.official_attempt_in_context(l2, c4, 'individual') is distinct from pg_temp.id('4h01')
-     or public.official_attempt_in_context(l2, c4, pk) is distinct from pg_temp.id('4h06')
+  if public.official_attempt_in_context(l2, c4, 'individual') is distinct from pg_temp.id('4701')
+     or public.official_attempt_in_context(l2, c4, pk) is distinct from pg_temp.id('4706')
      or public.official_attempt_in_context(l2, c4, 'preview') is not null then
     bad := bad || format('official_attempt_in_context answers %s / %s / %s',
       public.official_attempt_in_context(l2, c4, 'individual'), public.official_attempt_in_context(l2, c4, pk),
@@ -2303,17 +2303,17 @@ rollback to savepoint s2h;
 --      used_attempt_id whatever its grant's context, and the day-id form
 --      refuses a day other than the grant's and writes the day and version
 savepoint s2i;
-select pg_temp.att('{"id":"4i01","user":"103","ver":"1e5","kind":"individual","status":"passed","ago":600}');
-select pg_temp.att('{"id":"4i02","user":"103","ver":"1e5","kind":"individual","status":"in_progress","ago":10}');
+select pg_temp.att('{"id":"4801","user":"103","ver":"1e5","kind":"individual","status":"passed","ago":600}');
+select pg_temp.att('{"id":"4802","user":"103","ver":"1e5","kind":"individual","status":"in_progress","ago":10}');
 insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind, learning_path_id)
-values (pg_temp.id('6i01'), pg_temp.id('a0'), pg_temp.id('1c5'), pg_temp.id('103'), 'approved', 'bulk', 'path', pg_temp.id('2a3'));
+values (pg_temp.id('6801'), pg_temp.id('a0'), pg_temp.id('1c5'), pg_temp.id('103'), 'approved', 'bulk', 'path', pg_temp.id('2a3'));
 insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source)
-values (pg_temp.id('6i02'), pg_temp.id('a0'), pg_temp.id('1c5'), pg_temp.id('103'), 'approved', 'bulk');
+values (pg_temp.id('6802'), pg_temp.id('a0'), pg_temp.id('1c5'), pg_temp.id('103'), 'approved', 'bulk');
 insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
 values (pg_temp.id('3c3'), pg_temp.id('3a1'), pg_temp.id('3b1'), pg_temp.id('a0'), pg_temp.id('103'), current_date - 3, 'active');
 insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind,
                                      journey_enrollment_id, journey_day, journey_day_id)
-values (pg_temp.id('6i04'), pg_temp.id('a0'), pg_temp.id('1c2'), pg_temp.id('103'), 'approved', 'bulk', 'journey',
+values (pg_temp.id('6804'), pg_temp.id('a0'), pg_temp.id('1c2'), pg_temp.id('103'), 'approved', 'bulk', 'journey',
         pg_temp.id('3c3'), 2, pg_temp.id('3d2'));
 do $$
 declare
@@ -2328,17 +2328,17 @@ declare
 begin
   -- (i) the path grant in path:P3
   begin
-    select * into g from public.consume_grant(pg_temp.id('6i01'), l3, c5, e5, org, p3, null, null);
+    select * into g from public.consume_grant(pg_temp.id('6801'), l3, c5, e5, org, p3, null, null);
     if g.outcome <> 'opened' or g.abandoned_ids <> '{}'::uuid[] then
       bad := bad || format('(i) the path grant: %s, abandoned %s (expected opened, none)', g.outcome, g.abandoned_ids);
     elsif (select a.context_kind || '/' || a.learning_path_id || '/' || a.status from public.course_attempts a where a.id = g.attempt_id)
           is distinct from 'path/' || p3 || '/in_progress' then
       bad := bad || '(i) the opened row is not an open path row of P3'::text;
     end if;
-    if (select status from public.course_attempts where id = pg_temp.id('4i02')) <> 'in_progress' then
+    if (select status from public.course_attempts where id = pg_temp.id('4802')) <> 'in_progress' then
       bad := bad || '(i) the open Library row was abandoned by a path grant'::text;
     end if;
-    if (select used_attempt_id from public.attempt_requests where id = pg_temp.id('6i01')) is distinct from g.attempt_id then
+    if (select used_attempt_id from public.attempt_requests where id = pg_temp.id('6801')) is distinct from g.attempt_id then
       bad := bad || '(i) the path grant does not name its retake'::text;
     end if;
     raise exception 'undo' using errcode = 'U0107';
@@ -2346,16 +2346,16 @@ begin
   end;
   -- (ii) an Individual grant from a path launch, (iii) a path grant from an Individual launch
   begin
-    select * into g from public.consume_grant(pg_temp.id('6i02'), l3, c5, e5, org, p3, null, null);
+    select * into g from public.consume_grant(pg_temp.id('6802'), l3, c5, e5, org, p3, null, null);
     if g.outcome <> 'unavailable' then
       bad := bad || format('(ii) an Individual grant from a path launch: %s (expected unavailable)', g.outcome);
     end if;
-    select * into g from public.consume_grant(pg_temp.id('6i01'), l3, c5, e5, org, null, null, null);
+    select * into g from public.consume_grant(pg_temp.id('6801'), l3, c5, e5, org, null, null, null);
     if g.outcome <> 'unavailable' then
       bad := bad || format('(iii) a path grant from an Individual launch: %s (expected unavailable)', g.outcome);
     end if;
     if (select count(*) from public.course_attempts where user_id = l3) <> n0
-       or exists (select 1 from public.attempt_requests where id in (pg_temp.id('6i01'), pg_temp.id('6i02'))
+       or exists (select 1 from public.attempt_requests where id in (pg_temp.id('6801'), pg_temp.id('6802'))
                    and (used_at is not null or status <> 'approved')) then
       bad := bad || '(ii, iii) an unavailable call wrote something'::text;
     end if;
@@ -2364,7 +2364,7 @@ begin
   end;
   -- (iv) the Individual grant in the Individual context: the passed official result stands there
   begin
-    select * into g from public.consume_grant(pg_temp.id('6i02'), l3, c5, e5, org, null, null, null);
+    select * into g from public.consume_grant(pg_temp.id('6802'), l3, c5, e5, org, null, null, null);
     if g.outcome <> 'stands' then
       bad := bad || format('(iv) the Individual grant over a passed Individual result: %s (expected stands)', g.outcome);
     end if;
@@ -2373,11 +2373,11 @@ begin
   end;
   -- (v) N9: an open path retake whose grant reads Individual is live in path:P3
   begin
-    perform pg_temp.att('{"id":"4i03","user":"103","ver":"1e5","kind":"path","path":"2a3","status":"in_progress","ago":5}');
+    perform pg_temp.att('{"id":"4803","user":"103","ver":"1e5","kind":"path","path":"2a3","status":"in_progress","ago":5}');
     insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, decided_at, used_at, used_attempt_id)
-    values (pg_temp.id('6i03'), org, c5, l3, 'approved', 'bulk', now(), now(), pg_temp.id('4i03'));
-    select * into g from public.consume_grant(pg_temp.id('6i01'), l3, c5, e5, org, p3, null, null);
-    if g.outcome <> 'retake_live' or (select status from public.course_attempts where id = pg_temp.id('4i03')) <> 'in_progress' then
+    values (pg_temp.id('6803'), org, c5, l3, 'approved', 'bulk', now(), now(), pg_temp.id('4803'));
+    select * into g from public.consume_grant(pg_temp.id('6801'), l3, c5, e5, org, p3, null, null);
+    if g.outcome <> 'retake_live' or (select status from public.course_attempts where id = pg_temp.id('4803')) <> 'in_progress' then
       bad := bad || format('(v) a second path grant over a live legacy retake: %s (expected retake_live, nothing abandoned)', g.outcome);
     end if;
     raise exception 'undo' using errcode = 'U0107';
@@ -2385,11 +2385,11 @@ begin
   end;
   -- (vi) the day-id form (step 10): another day than the grant's is unavailable, nothing written
   begin
-    select * into g from public.consume_grant(pg_temp.id('6i04'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
+    select * into g from public.consume_grant(pg_temp.id('6804'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
                                               null, pg_temp.id('3c3'), 2, pg_temp.id('3d3'));
     if g.outcome <> 'unavailable'
        or exists (select 1 from public.course_attempts where user_id = l3 and course_version_id = pg_temp.id('1e2'))
-       or (select used_at from public.attempt_requests where id = pg_temp.id('6i04')) is not null then
+       or (select used_at from public.attempt_requests where id = pg_temp.id('6804')) is not null then
       bad := bad || format('(vi) the day-id form with another day: %s (expected unavailable, nothing written)', g.outcome);
     end if;
     raise exception 'undo' using errcode = 'U0107';
@@ -2397,7 +2397,7 @@ begin
   end;
   -- (vii) the day-id form with the grant's day writes the day id and the pinned version
   begin
-    select * into g from public.consume_grant(pg_temp.id('6i04'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
+    select * into g from public.consume_grant(pg_temp.id('6804'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
                                               null, pg_temp.id('3c3'), 2, pg_temp.id('3d2'));
     if g.outcome <> 'opened'
        or (select a.context_key || '/' || coalesce(a.journey_version_id::text, '-') from public.course_attempts a where a.id = g.attempt_id)
@@ -2409,7 +2409,7 @@ begin
   end;
   -- (viii) the old form resolves the number through the pinned version
   begin
-    select * into g from public.consume_grant(pg_temp.id('6i04'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
+    select * into g from public.consume_grant(pg_temp.id('6804'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
                                               null, pg_temp.id('3c3'), 2);
     if g.outcome <> 'opened'
        or (select a.journey_day_id from public.course_attempts a where a.id = g.attempt_id) is distinct from pg_temp.id('3d2') then
@@ -2505,18 +2505,18 @@ begin
     bad := bad || 'a step that requires no pass over a pass-required course resolves true'::text;
   end if;
   -- R14: journey_attempt_satisfies by the caller's rule or the launched version's
-  perform pg_temp.att('{"id":"4k01","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","jver":"3b1","status":"failed"}');
-  perform pg_temp.att('{"id":"4k02","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"failed"}');
-  perform pg_temp.att('{"id":"4k03","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","jver":"3b1","status":"passed"}');
-  if (public.journey_attempt_satisfies(pg_temp.id('4k01'), true), public.journey_attempt_satisfies(pg_temp.id('4k01'), false),
-      public.journey_attempt_satisfies(pg_temp.id('4k02'), true), public.journey_attempt_satisfies(pg_temp.id('4k02'), false),
-      public.journey_attempt_satisfies(pg_temp.id('4k03'), true), public.journey_attempt_satisfies(pg_temp.id('4b4'), false))
+  perform pg_temp.att('{"id":"4901","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","jver":"3b1","status":"failed"}');
+  perform pg_temp.att('{"id":"4902","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"failed"}');
+  perform pg_temp.att('{"id":"4903","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","jver":"3b1","status":"passed"}');
+  if (public.journey_attempt_satisfies(pg_temp.id('4901'), true), public.journey_attempt_satisfies(pg_temp.id('4901'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4902'), true), public.journey_attempt_satisfies(pg_temp.id('4902'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4903'), true), public.journey_attempt_satisfies(pg_temp.id('4b4'), false))
      is distinct from (true, true, false, true, true, false) then
     bad := bad || format('journey_attempt_satisfies: failed under V1 (true %s, false %s), failed with no version (true %s, false %s), '
                          || 'passed (true %s), open (false %s); expected true true false true true false',
-      public.journey_attempt_satisfies(pg_temp.id('4k01'), true), public.journey_attempt_satisfies(pg_temp.id('4k01'), false),
-      public.journey_attempt_satisfies(pg_temp.id('4k02'), true), public.journey_attempt_satisfies(pg_temp.id('4k02'), false),
-      public.journey_attempt_satisfies(pg_temp.id('4k03'), true), public.journey_attempt_satisfies(pg_temp.id('4b4'), false));
+      public.journey_attempt_satisfies(pg_temp.id('4901'), true), public.journey_attempt_satisfies(pg_temp.id('4901'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4902'), true), public.journey_attempt_satisfies(pg_temp.id('4902'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4903'), true), public.journey_attempt_satisfies(pg_temp.id('4b4'), false));
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0107-independent: (2k0) credit state and pass rules (steps 9, 13; N14; R14): %', array_to_string(bad, '; ');
@@ -2670,9 +2670,9 @@ select pg_temp.jversion('3b4', 2, '[[1,"3d1","1c1",false],[2,"3d2","1c2",false],
 update public.journey_enrollments set version_id = pg_temp.id('3b4') where id = pg_temp.id('3c1');
 insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
 values (pg_temp.id('3c4'), pg_temp.id('3a1'), pg_temp.id('3b4'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 2, 'active');
-select pg_temp.att('{"id":"4k21","user":"102","ver":"1e1","kind":"journey","enr":"3c4","day":1,"day_id":"3d1","jver":"3b4"}');
+select pg_temp.att('{"id":"4921","user":"102","ver":"1e1","kind":"journey","enr":"3c4","day":1,"day_id":"3d1","jver":"3b4"}');
 insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, course_id, attempt_id, day_id)
-values (pg_temp.id('3c4'), pg_temp.id('a0'), pg_temp.id('102'), 1, pg_temp.id('1c1'), pg_temp.id('4k21'), pg_temp.id('3d1'));
+values (pg_temp.id('3c4'), pg_temp.id('a0'), pg_temp.id('102'), 1, pg_temp.id('1c1'), pg_temp.id('4921'), pg_temp.id('3d1'));
 select pg_temp.jversion('3b2', 3,
   '[[1,"3d1","1c1",false],[2,"3d6","1c6",false],[3,"3d2","1c2",false],[4,"3d3","1c3",false],[5,"3d4","1c4",false]]', 5, true);
 do $$
@@ -2718,7 +2718,7 @@ update public.journey_enrollments set status = 'reset' where id = pg_temp.id('3c
 select pg_temp.jversion('3b5', 2, '[[1,"3d1","1c1",true],[2,"3d2","1c2",false]]', 2, true);
 insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
 values (pg_temp.id('3c5'), pg_temp.id('3a1'), pg_temp.id('3b5'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 2, 'active');
-select pg_temp.att('{"id":"4k31","user":"102","ver":"1e1","kind":"journey","enr":"3c5","day":1,"day_id":"3d1","jver":"3b5","status":"failed"}');
+select pg_temp.att('{"id":"4931","user":"102","ver":"1e1","kind":"journey","enr":"3c5","day":1,"day_id":"3d1","jver":"3b5","status":"failed"}');
 do $$
 declare
   bad text[] := '{}';
@@ -2726,7 +2726,7 @@ declare
   diff text;
   eh uuid := pg_temp.id('3c5');
 begin
-  perform public.journey_record_completion(pg_temp.id('4k31'));
+  perform public.journey_record_completion(pg_temp.id('4931'));
   if exists (select 1 from public.journey_day_progress where enrollment_id = eh) then
     bad := bad || 'a failed attempt was credited on a pass-required day'::text;
   end if;
@@ -2770,8 +2770,8 @@ begin
     bad := bad || 'E1 was not re-pinned to the stricter version'::text;
   end if;
   -- an attempt with no launched version, failed: the pinned (stricter) rule refuses it
-  perform pg_temp.att('{"id":"4k41","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"failed","ago":20}');
-  perform public.journey_record_completion(pg_temp.id('4k41'));
+  perform pg_temp.att('{"id":"4941","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"failed","ago":20}');
+  perform public.journey_record_completion(pg_temp.id('4941'));
   if exists (select 1 from public.journey_day_progress where enrollment_id = e1 and day_id = pg_temp.id('3d4')) then
     bad := bad || 'a failed attempt with no launched version was credited under the stricter pinned rule'::text;
   end if;
@@ -2870,7 +2870,7 @@ rollback to savepoint s2kl;
 --      the fact cannot be updated or deleted; the path completion with its
 --      claim; then (3) tighten before done applies and (4) relax helps at once
 savepoint s2l1;
-select pg_temp.att('{"id":"4l01","user":"103","ver":"1e1","kind":"path","path":"2a2","ago":100}');
+select pg_temp.att('{"id":"4001","user":"103","ver":"1e1","kind":"path","path":"2a2","ago":100}');
 do $$
 declare
   bad text[] := '{}';
@@ -2883,20 +2883,20 @@ declare
   got text;
   nid uuid;
 begin
-  w := public.record_learning_activity(pg_temp.id('4l01'));
+  w := public.record_learning_activity(pg_temp.id('4001'));
   if w->>'official' is distinct from 'true' or w->'context'->>'kind' is distinct from 'path'
      or w->>'done' is distinct from 'true' or w->>'passed_ever' is distinct from 'true'
      or w->>'passed_by_rule' is distinct from 'true' or w->>'done_recorded_at' is null then
     bad := bad || format('(1) the writer on a completed path row answered %s (expected official, path, done, passed_ever, '
                          || 'passed_by_rule true, done_recorded_at set)', w);
   end if;
-  if (select count(*) || '/' || bool_and(not f.rule_pass_required) || '/' || bool_and(f.attempt_id = pg_temp.id('4l01'))
+  if (select count(*) || '/' || bool_and(not f.rule_pass_required) || '/' || bool_and(f.attempt_id = pg_temp.id('4001'))
         from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1)
      is distinct from '1/true/true' then
     bad := bad || '(1) not one fact for (P2, L3, c1) under rule false naming the attempt'::text;
   end if;
   if (select a.side_effects_sig is distinct from a.settle_sig or a.side_effects_at is null
-        from public.course_attempts a where a.id = pg_temp.id('4l01')) then
+        from public.course_attempts a where a.id = pg_temp.id('4001')) then
     bad := bad || '(1) the writer did not stamp side_effects_sig and side_effects_at'::text;
   end if;
   select f.done_at into d0 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1;
@@ -2914,7 +2914,7 @@ begin
     bad := bad || format('(1) the path reads %s (expected next step 2 = c2, 1 of 2 done, not completed)', row_to_json(v));
   end if;
   -- (5) a second call writes nothing more; the fact is append-only for postgres
-  w := public.record_learning_activity(pg_temp.id('4l01'));
+  w := public.record_learning_activity(pg_temp.id('4001'));
   if (select count(*) from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3) <> 1
      or (select f.done_at from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1)
         is distinct from d0 then
@@ -2929,8 +2929,8 @@ begin
     bad := bad || '(5) a fact was deleted'::text;
   end if;
   -- step 2 completes: the path completion, its claim (origin learner) and the notice in the answer (steps 14, 15)
-  perform pg_temp.att('{"id":"4l02","user":"103","ver":"1e2","kind":"path","path":"2a2","ago":50}');
-  w := public.record_learning_activity(pg_temp.id('4l02'));
+  perform pg_temp.att('{"id":"4002","user":"103","ver":"1e2","kind":"path","path":"2a2","ago":50}');
+  w := public.record_learning_activity(pg_temp.id('4002'));
   select n.id into nid from public.completion_notices n where n.user_id = l3 and n.product_kind = 'path' and n.instance_id = p2;
   if w->>'path_completed' is distinct from 'true'
      or (select count(*) from public.learning_path_completions c where c.path_id = p2 and c.user_id = l3) <> 1
@@ -2945,7 +2945,7 @@ begin
   if v.completed is distinct from true or v.status is distinct from 'completed' then
     bad := bad || format('the completed path reads %s', row_to_json(v));
   end if;
-  w := public.record_learning_activity(pg_temp.id('4l02'));
+  w := public.record_learning_activity(pg_temp.id('4002'));
   if (select count(*) from public.learning_path_completions c where c.path_id = p2 and c.user_id = l3) <> 1
      or (select count(*) from public.completion_notices n where n.user_id = l3 and n.product_kind = 'path' and n.instance_id = p2) <> 1
      or coalesce(w->>'path_completed', 'false') = 'true' then
@@ -2961,7 +2961,7 @@ rollback to savepoint s2l1;
 
 savepoint s2l3;
 update public.learning_path_courses set pass_required = true where path_id = pg_temp.id('2a2') and course_id = pg_temp.id('1c1');
-select pg_temp.att('{"id":"4l03","user":"103","ver":"1e1","kind":"path","path":"2a2","ago":100}');
+select pg_temp.att('{"id":"4003","user":"103","ver":"1e1","kind":"path","path":"2a2","ago":100}');
 do $$
 declare
   bad text[] := '{}';
@@ -2971,7 +2971,7 @@ declare
   w jsonb;
   v record;
 begin
-  w := public.record_learning_activity(pg_temp.id('4l03'));
+  w := public.record_learning_activity(pg_temp.id('4003'));
   if exists (select 1 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3)
      or w->>'done' is distinct from 'false' then
     bad := bad || format('(3) completed without a pass under a pass-required rule: %s, facts %s (expected not done, no fact)', w,
@@ -3005,7 +3005,7 @@ rollback to savepoint s2l3;
 --      attempt number 2), the skips (preview, revision, abandoned) with
 --      nothing written, and a claim with gamification off
 savepoint s2m;
-select pg_temp.att('{"id":"4m01","user":"102","ver":"1e6","kind":"individual","score":70,"ago":100}');
+select pg_temp.att('{"id":"4101","user":"102","ver":"1e6","kind":"individual","score":70,"ago":100}');
 do $$
 declare
   bad text[] := '{}';
@@ -3015,7 +3015,7 @@ declare
   nid uuid;
   sym text;
 begin
-  w := public.record_learning_activity(pg_temp.id('4m01'));
+  w := public.record_learning_activity(pg_temp.id('4101'));
   if not (w ?& array['activity', 'official', 'attempt_number', 'context', 'done', 'passed_ever', 'xp', 'journey_credited',
                      'journey_completed', 'path_completed', 'notices']) then
     bad := bad || format('the answer lacks keys of step 12.4: %s', w);
@@ -3040,7 +3040,7 @@ begin
     bad := bad || 'the Individual claim is not of origin learner and unsent'::text;
   end if;
   if (select a.side_effects_sig is distinct from a.settle_sig or a.side_effects_at is null or a.webhook_skip_reason is not null
-        from public.course_attempts a where a.id = pg_temp.id('4m01')) then
+        from public.course_attempts a where a.id = pg_temp.id('4101')) then
     bad := bad || 'the official row is not stamped, or carries a skip reason'::text;
   end if;
   -- section F: the paid key, unchanged, and the 0-point event row of the context
@@ -3050,25 +3050,25 @@ begin
     bad := bad || 'the paid complete key or its 0-point event row of the Individual context is missing'::text;
   end if;
   -- a second call: nothing new
-  w := public.record_learning_activity(pg_temp.id('4m01'));
+  w := public.record_learning_activity(pg_temp.id('4101'));
   if coalesce(jsonb_array_length(w->'notices'), 0) <> 0
      or (select count(*) from public.completion_notices n where n.user_id = l2 and n.instance_id = c6) <> 1 then
     bad := bad || format('a second call on a stamped row: %s', w);
   end if;
   -- a later completion that is not official (the one-attempt clamp)
-  perform pg_temp.att('{"id":"4m02","user":"102","ver":"1e6","kind":"individual","score":90,"ago":50}');
-  w := public.record_learning_activity(pg_temp.id('4m02'));
+  perform pg_temp.att('{"id":"4102","user":"102","ver":"1e6","kind":"individual","score":90,"ago":50}');
+  w := public.record_learning_activity(pg_temp.id('4102'));
   if w->>'official' is distinct from 'false' or (w->>'attempt_number')::int is distinct from 2
-     or (select a.webhook_skip_reason from public.course_attempts a where a.id = pg_temp.id('4m02')) is distinct from 'not_official'
-     or (select a.side_effects_sig is distinct from a.settle_sig from public.course_attempts a where a.id = pg_temp.id('4m02'))
+     or (select a.webhook_skip_reason from public.course_attempts a where a.id = pg_temp.id('4102')) is distinct from 'not_official'
+     or (select a.side_effects_sig is distinct from a.settle_sig from public.course_attempts a where a.id = pg_temp.id('4102'))
      or (select count(*) from public.completion_notices n where n.user_id = l2 and n.instance_id = c6) <> 1 then
     bad := bad || format('a later row that is not official: %s (expected official false, number 2, not_official, stamped, no claim)', w);
   end if;
   -- the skips: a preview, a revision row, an abandoned row
-  perform pg_temp.att('{"id":"4m03","user":"102","ver":"1e6","kind":"preview","pkind":"course","ago":40}');
-  perform pg_temp.att('{"id":"4m04","user":"102","ver":"1e6","kind":"individual","revision":true,"ago":30}');
-  perform pg_temp.att('{"id":"4m05","user":"102","ver":"1e6","kind":"individual","status":"abandoned","completion":"completed","ago":20}');
-  foreach sym in array array['4m03', '4m04', '4m05'] loop
+  perform pg_temp.att('{"id":"4103","user":"102","ver":"1e6","kind":"preview","pkind":"course","ago":40}');
+  perform pg_temp.att('{"id":"4104","user":"102","ver":"1e6","kind":"individual","revision":true,"ago":30}');
+  perform pg_temp.att('{"id":"4105","user":"102","ver":"1e6","kind":"individual","status":"abandoned","completion":"completed","ago":20}');
+  foreach sym in array array['4103', '4104', '4105'] loop
     w := public.record_learning_activity(pg_temp.id(sym));
     if not (w ? 'skipped')
        or exists (select 1 from public.xp_events x where x.attempt_id = pg_temp.id(sym))
@@ -3078,8 +3078,8 @@ begin
   end loop;
   -- gamification off: no points, the claim still taken (step 15)
   update public.gamification_settings set enabled = false where organization_id = pg_temp.id('a0');
-  perform pg_temp.att('{"id":"4m06","user":"108","ver":"1e6","kind":"individual","ago":10}');
-  w := public.record_learning_activity(pg_temp.id('4m06'));
+  perform pg_temp.att('{"id":"4106","user":"108","ver":"1e6","kind":"individual","ago":10}');
+  w := public.record_learning_activity(pg_temp.id('4106'));
   if exists (select 1 from public.xp_events x where x.user_id = pg_temp.id('108'))
      or (select count(*) from public.completion_notices n where n.user_id = pg_temp.id('108') and n.instance_id = c6) <> 1 then
     bad := bad || format('with gamification off: %s (expected no points and one claim)', w);
@@ -3104,26 +3104,26 @@ insert into public.preview_runs (id, organization_id, user_id, kind, learning_pa
 values (pg_temp.id('501'), pg_temp.id('a0'), pg_temp.id('105'), 'path', pg_temp.id('2a1'));
 insert into public.preview_runs (id, organization_id, user_id, kind, journey_program_id, journey_version_id)
 values (pg_temp.id('502'), pg_temp.id('a0'), pg_temp.id('105'), 'journey', pg_temp.id('3a1'), pg_temp.id('3b1'));
-select pg_temp.att('{"id":"4n01","user":"105","ver":"1e1","kind":"preview","pkind":"course","ago":900}');
-select pg_temp.att('{"id":"4n02","user":"105","ver":"1e2","kind":"preview","pkind":"path_run","run":"501","ago":800}');
-select pg_temp.att('{"id":"4n03","user":"105","ver":"1e3","kind":"preview","pkind":"journey_run","run":"502","day_id":"3d1","ago":700}');
-select pg_temp.att('{"id":"4n04","user":"104","ver":"1e2","kind":"preview","pkind":"course","ago":600}');
-select pg_temp.att('{"id":"4n05","user":"105","ver":"1e3","kind":"preview","pkind":"legacy_role","path":"2a1","ago":500}');
-select pg_temp.att('{"id":"4n06","user":"105","ver":"1e1","kind":"individual","ago":400}');
+select pg_temp.att('{"id":"4201","user":"105","ver":"1e1","kind":"preview","pkind":"course","ago":900}');
+select pg_temp.att('{"id":"4202","user":"105","ver":"1e2","kind":"preview","pkind":"path_run","run":"501","ago":800}');
+select pg_temp.att('{"id":"4203","user":"105","ver":"1e3","kind":"preview","pkind":"journey_run","run":"502","day_id":"3d1","ago":700}');
+select pg_temp.att('{"id":"4204","user":"104","ver":"1e2","kind":"preview","pkind":"course","ago":600}');
+select pg_temp.att('{"id":"4205","user":"105","ver":"1e3","kind":"preview","pkind":"legacy_role","path":"2a1","ago":500}');
+select pg_temp.att('{"id":"4206","user":"105","ver":"1e1","kind":"individual","ago":400}');
 insert into public.xapi_statements (attempt_id, statement_id, verb, raw)
-values (pg_temp.id('4n01'), gen_random_uuid(), 'http://adlnet.gov/expapi/verbs/completed', '{}');
-insert into public.xapi_state (attempt_id, state_id, content) values (pg_temp.id('4n01'), 'indep-state', '{}');
-insert into public.cmi5_launch_tokens (auth_token, attempt_id) values ('indep-0107-token-1', pg_temp.id('4n01'));
+values (pg_temp.id('4201'), gen_random_uuid(), 'http://adlnet.gov/expapi/verbs/completed', '{}');
+insert into public.xapi_state (attempt_id, state_id, content) values (pg_temp.id('4201'), 'indep-state', '{}');
+insert into public.cmi5_launch_tokens (auth_token, attempt_id) values ('indep-0107-token-1', pg_temp.id('4201'));
 insert into public.learning_sessions (organization_id, attempt_id, launch_kind, activity_id, launch_mode)
-values (pg_temp.id('a0'), pg_temp.id('4n01'), 'cmi5', 'indep-activity', 'Normal');
+values (pg_temp.id('a0'), pg_temp.id('4201'), 'cmi5', 'indep-activity', 'Normal');
 insert into public.lrs_forward_outbox (organization_id, attempt_id, statement_id, payload)
-values (pg_temp.id('a0'), pg_temp.id('4n01'), 'indep-statement-1', '{}');
+values (pg_temp.id('a0'), pg_temp.id('4201'), 'indep-statement-1', '{}');
 do $$
 declare
   bad text[] := '{}';
   org uuid := pg_temp.id('a0');
   t uuid := pg_temp.id('105');
-  pa uuid := pg_temp.id('4n01');
+  pa uuid := pg_temp.id('4201');
   k0 text := pg_temp.keep_md5();
   n_log0 bigint := (select count(*) from public.preview_purge_log);
   n_prev0 bigint := (select count(*) from public.course_attempts where organization_id = pg_temp.id('a0')
@@ -3192,7 +3192,7 @@ begin
          or exists (select 1 from public.lrs_forward_outbox where attempt_id = pa) then
         bad := bad || 'one preview: the attempt or a child row is still there'::text;
       end if;
-      if (select count(*) from public.course_attempts where id in (pg_temp.id('4n02'), pg_temp.id('4n03'), pg_temp.id('4n04'))) <> 3
+      if (select count(*) from public.course_attempts where id in (pg_temp.id('4202'), pg_temp.id('4203'), pg_temp.id('4204'))) <> 3
          or (select count(*) from public.preview_runs where id in (pg_temp.id('500'), pg_temp.id('501'), pg_temp.id('502'))) <> 3
          or pg_temp.keep_md5() <> k0 then
         bad := bad || 'one preview: a row outside the scope changed'::text;
@@ -3232,12 +3232,12 @@ begin
   -- "covers" it is not stated), so they are neither required gone nor kept
   for r in select * from (values
     ('organization', '{"organization": true}'::jsonb, 'manual',
-     array['4n01', '4n02', '4n03', '4n04'], array['500', '501', '502'], array[]::text[]),
-    ('run', jsonb_build_object('run_id', pg_temp.id('501')), 'manual', array['4n02'], array['501'], array[]::text[]),
-    ('tester', jsonb_build_object('user_id', t), 'manual', array['4n01', '4n02', '4n03'], array['501', '502'], array['500']),
-    ('tester and course', jsonb_build_object('user_id', t, 'course_id', pg_temp.id('1c1')), 'manual', array['4n01'],
+     array['4201', '4202', '4203', '4204'], array['500', '501', '502'], array[]::text[]),
+    ('run', jsonb_build_object('run_id', pg_temp.id('501')), 'manual', array['4202'], array['501'], array[]::text[]),
+    ('tester', jsonb_build_object('user_id', t), 'manual', array['4201', '4202', '4203'], array['501', '502'], array['500']),
+    ('tester and course', jsonb_build_object('user_id', t, 'course_id', pg_temp.id('1c1')), 'manual', array['4201'],
      array[]::text[], array[]::text[]),
-    ('course, product delete', jsonb_build_object('course_id', pg_temp.id('1c1')), 'product_delete', array['4n01'],
+    ('course, product delete', jsonb_build_object('course_id', pg_temp.id('1c1')), 'product_delete', array['4201'],
      array[]::text[], array[]::text[])
   ) as v(what, scope, reason, gone_attempts, gone_runs, open_runs)
   loop
@@ -3253,14 +3253,14 @@ begin
           bad := bad || format('%s: a selected attempt or run is still there', r.what);
         end if;
         if (select count(*) from public.course_attempts a where a.id in (select pg_temp.id(s)
-              from unnest(array['4n01', '4n02', '4n03', '4n04']) s where not (s = any(r.gone_attempts))))
+              from unnest(array['4201', '4202', '4203', '4204']) s where not (s = any(r.gone_attempts))))
            <> 4 - cardinality(r.gone_attempts)
            or (select count(*) from public.preview_runs p where p.id in (select pg_temp.id(s)
                  from unnest(array['500', '501', '502']) s where not (s = any(r.gone_runs)) and not (s = any(r.open_runs))))
               <> 3 - cardinality(r.gone_runs) - cardinality(r.open_runs) then
           bad := bad || format('%s: a row outside the scope was deleted', r.what);
         end if;
-        if pg_temp.keep_md5() <> k0 or not exists (select 1 from public.course_attempts where id = pg_temp.id('4n05')) then
+        if pg_temp.keep_md5() <> k0 or not exists (select 1 from public.course_attempts where id = pg_temp.id('4205')) then
           bad := bad || format('%s: a row that is not new-kind preview data changed (a by-role row included)', r.what);
         end if;
         select l.* into lg from public.preview_purge_log l where l.organization_id = org order by l.ran_at desc limit 1;
@@ -3291,7 +3291,7 @@ begin
     x := case when got like 'ok:%' then substr(got, 4)::jsonb end;
     if (x->>'excluded')::int is distinct from 1 or not exists (select 1 from public.course_attempts where id = pa)
        or not exists (select 1 from public.xp_events where dedupe_key = 'indep-0107-isolation-1')
-       or exists (select 1 from public.course_attempts where id in (pg_temp.id('4n02'), pg_temp.id('4n03'), pg_temp.id('4n04'))) then
+       or exists (select 1 from public.course_attempts where id in (pg_temp.id('4202'), pg_temp.id('4203'), pg_temp.id('4204'))) then
       bad := bad || format('isolation: the real call answered %s (expected the set-aside preview and its points row kept, the rest deleted)',
                            coalesce(x::text, got));
     end if;
@@ -3308,10 +3308,10 @@ begin
   begin
     got := pg_temp.purge(org, '{"organization": true}', 'manual', t, true);
     d := case when got like 'ok:%' then substr(got, 4)::jsonb end;
-    perform pg_temp.att('{"id":"4n07","user":"105","ver":"1e3","kind":"preview","pkind":"course","ago":5}');
+    perform pg_temp.att('{"id":"4207","user":"105","ver":"1e3","kind":"preview","pkind":"course","ago":5}');
     got := pg_temp.purge(org, '{"organization": true}', 'manual', t, false, d->>'selection_hash');
     if got like 'ok:%' or (select count(*) from public.preview_purge_log) <> n_log0
-       or (select count(*) from public.course_attempts where id in (pa, pg_temp.id('4n02'), pg_temp.id('4n07'))) <> 3 then
+       or (select count(*) from public.course_attempts where id in (pa, pg_temp.id('4202'), pg_temp.id('4207'))) <> 3 then
       bad := bad || format('a preview launched after the dry run: %s (expected a raise, nothing deleted)', left(got, 120));
     end if;
     raise exception 'undo' using errcode = 'U0107';
