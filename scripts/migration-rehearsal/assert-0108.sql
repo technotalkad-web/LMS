@@ -6,8 +6,9 @@
 --   (1) the derive trigger, its function and context_derive_log are gone;
 --       so are the day_ids trigger on journey_versions and its function;
 --       day_ids is not null; the immutability trigger, the owner trigger
---       (the ADR 0024 note of 2026-11-14), launch_context and the rest of
---       0107 are still there
+--       (the ADR 0024 note of 2026-11-14), the three rule-change triggers
+--       of 0107 section 6q (the owner's O3 answer), launch_context and the
+--       rest of 0107 are still there
 --   (2) the attempt seed-0108.sql inserted with no context_kind before the
 --       paste still reads the label the derive trigger gave it (individual);
 --       after the paste the same insert fails not null on context_kind
@@ -47,6 +48,15 @@ begin
      or not exists (select 1 from pg_attribute a
                      where a.attrelid = 'public.course_attempts'::regclass and a.attname = 'context_kind' and a.attnotnull) then
     bad := bad || 'an object of 0107 is missing after 0108'::text;
+  end if;
+  if (select count(*) from pg_trigger t
+       where not t.tgisinternal and t.tgenabled = 'O'
+         and t.tgfoid = to_regprocedure('public.learning_path_step_facts_before_rule_change()')
+         and ((t.tgrelid = 'public.learning_path_courses'::regclass
+               and t.tgname in ('learning_path_courses_facts_before_rule_update',
+                                'learning_path_courses_facts_before_step_delete'))
+              or (t.tgrelid = 'public.courses'::regclass and t.tgname = 'courses_facts_before_rule_update'))) <> 3 then
+    bad := bad || 'the three rule-change triggers of 0107 (section 6q) are not all present and enabled after 0108'::text;
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0108: (1) %', array_to_string(bad, '; ');

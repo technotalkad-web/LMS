@@ -1140,20 +1140,29 @@ begin
      or exists (select 1 from public.learning_path_step_completions where path_id = pc) then
     bad := bad || format('O1-g (4), relaxed: %s', got);
   end if;
-  -- (8) tightened again with no completion in between: not done (the limit
-  -- of O1-h (2), pinned)
+  -- (8) tightened again with no completion in between: done, by the fact
+  -- the rule-change trigger of section 6q records before the change (the
+  -- owner's O3 answer closes the limit of O1-h (2), which this case pinned
+  -- as not done before it): the rule before the change, false, and the
+  -- step's official attempt
   update public.learning_path_courses set pass_required = true where path_id = pc;
   got := pg_temp.steps_0107v(pc, l15);
-  if got is distinct from 'C07#1 pr=T pbr=F fact=F pe=F done=F res=failed sc=0.4 off=a32 rl=F f=T open=F' then
+  if got is distinct from 'C07#1 pr=T pbr=F fact=T pe=T done=T res=failed sc=0.4 off=a32 rl=F f=F open=F' then
     bad := bad || format('O1-g (8), tightened again: %s', got);
   end if;
-  -- (4), second half: relaxed, the writer's statement records the step, and
-  -- a later tightening leaves it done
+  select format('%s %s rule=%s', count(*), max(pg_temp.lbl_0107v(attempt_id)), bool_and(rule_pass_required))
+    into got from public.learning_path_step_completions f where f.path_id = pc and f.user_id = l15;
+  if got is distinct from '1 a32 rule=f' then
+    bad := bad || format('O1-g (8): the rule-change fact reads %s (expected 1 a32 rule=f)', got);
+  end if;
+  -- (4), second half: relaxed again, the writer's statement finds the fact
+  -- the trigger wrote and writes nothing, and a later tightening leaves the
+  -- step done
   update public.learning_path_courses set pass_required = false where path_id = pc;
   n := pg_temp.write_facts_0107v(pc, l15);
   update public.learning_path_courses set pass_required = true where path_id = pc;
   got := pg_temp.steps_0107v(pc, l15);
-  if n <> 1 or got is distinct from 'C07#1 pr=T pbr=F fact=T pe=T done=T res=failed sc=0.4 off=a32 rl=F f=F open=F' then
+  if n <> 0 or got is distinct from 'C07#1 pr=T pbr=F fact=T pe=T done=T res=failed sc=0.4 off=a32 rl=F f=F open=F' then
     bad := bad || format('O1-g (4), recorded then tightened: %s fact(s), %s', n, got);
   end if;
 

@@ -54,7 +54,11 @@
 --       record_learning_activity, journey_complete_enrollment,
 --       journey_complete_enrollments, journey_complete_enrollments_core,
 --       journey_credit_state, official_attempt_in_context,
---       instance_pass_required, v_path_progress, v_path_step_status,
+--       instance_pass_required, the three rule-change triggers on
+--       learning_path_courses and courses with their function
+--       learning_path_step_facts_before_rule_change (0107 section 6q, the
+--       owner's O3 answer; before part 4 drops the column they name),
+--       v_path_progress, v_path_step_status,
 --       learning_path_step_completions with its trigger function (after
 --       v_path_step_status, which reads it; build note O1-f), the two terms
 --       views, v_context_attempt_summary, v_context_attempt_scoring,
@@ -117,9 +121,10 @@
 -- journey_versions, journey_day_progress, journey_enrollments,
 -- journey_programs, course_assignments, learning_path_assignments,
 -- learning_path_courses, org_api_keys, org_integration_settings,
--- notification_templates), on the tables parts 3 and 4 drop, on the three
--- views part 2 replaces, and on the parents of every foreign key the script
--- drops, because dropping a key locks its parent that way (read on the
+-- notification_templates), on courses and learning_path_courses for the
+-- rule-change triggers part 3 drops, on the tables parts 3 and 4 drop, on
+-- the three views part 2 replaces, and on the parents of every foreign key
+-- the script drops, because dropping a key locks its parent that way (read on the
 -- rehearsal's Postgres): organizations, auth.users, courses and
 -- learning_paths besides the tables above. Every read and write of those
 -- tables waits until commit; the rehearsal's paste takes about 50 ms.
@@ -1683,6 +1688,14 @@ drop function if exists public.journey_complete_enrollments_core(uuid[], text);
 drop function if exists public.journey_credit_state(uuid[]);
 drop function if exists public.official_attempt_in_context(uuid, uuid, text);
 drop function if exists public.instance_pass_required(uuid, text);
+-- the rule-change triggers of 0107 section 6q and their function (the
+-- owner's O3 answer): before the path views and before part 4 drops
+-- learning_path_courses.pass_required, which a trigger naming the column
+-- would refuse
+drop trigger if exists learning_path_courses_facts_before_rule_update on public.learning_path_courses;
+drop trigger if exists learning_path_courses_facts_before_step_delete on public.learning_path_courses;
+drop trigger if exists courses_facts_before_rule_update on public.courses;
+drop function if exists public.learning_path_step_facts_before_rule_change();
 drop view if exists public.v_path_progress;
 drop view if exists public.v_path_step_status;
 drop table if exists public.learning_path_step_completions;
@@ -1945,6 +1958,7 @@ begin
       'public.course_attempts_context_immutable()', 'public.course_attempts_context_derive()',
       'public.course_attempts_context_owner()', 'public.journey_versions_derive_day_ids()', 'public.learning_path_completions_append_only()',
       'public.learning_path_step_completions_append_only()', 'public.preview_purge_log_append_only()',
+      'public.learning_path_step_facts_before_rule_change()',
       'public.official_attempt_in_context(uuid, uuid, text)', 'public.instance_pass_required(uuid, text)',
       'public.journey_attempt_satisfies(uuid, boolean)', 'public.journey_credit_state(uuid[])',
       'public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text, text)',
@@ -1964,7 +1978,9 @@ begin
   select string_agg(t.tgname, ', ' order by t.tgname) into v_list
     from pg_trigger t
    where t.tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
-                      'course_attempts_context_owner', 'journey_versions_derive_day_ids')
+                      'course_attempts_context_owner', 'journey_versions_derive_day_ids',
+                      'learning_path_courses_facts_before_rule_update',
+                      'learning_path_courses_facts_before_step_delete', 'courses_facts_before_rule_update')
      and not t.tgisinternal;
   if v_list is not null then
     bad := bad || format('triggers still present: %s', v_list);

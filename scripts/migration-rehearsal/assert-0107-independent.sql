@@ -749,8 +749,9 @@ begin
 end
 $$;
 
--- (0d) triggers (steps 7, 14, 79, 91): bound once, with their timing, and the
---      two 0098 guard triggers still bound to the recreated guards
+-- (0d) triggers (steps 7, 14, 79, 91; the owner's O3 answer, section 6q):
+--      bound once, with their timing, and the two 0098 guard triggers still
+--      bound to the recreated guards
 do $$
 declare
   bad text[] := '{}';
@@ -767,6 +768,11 @@ begin
      'public.learning_path_completions_append_only()'),
     ('public.learning_path_step_completions', 'learning_path_step_completions_no_mutation', 27,
      'public.learning_path_step_completions_append_only()'),
+    ('public.learning_path_courses', 'learning_path_courses_facts_before_rule_update', 19,
+     'public.learning_path_step_facts_before_rule_change()'),
+    ('public.learning_path_courses', 'learning_path_courses_facts_before_step_delete', 11,
+     'public.learning_path_step_facts_before_rule_change()'),
+    ('public.courses', 'courses_facts_before_rule_update', 19, 'public.learning_path_step_facts_before_rule_change()'),
     ('public.courses', 'courses_guard_learner_history', null, 'public.guard_learner_history_courses()'),
     ('public.course_versions', 'course_versions_guard_learner_history', null,
      'public.guard_learner_history_course_versions()')
@@ -903,7 +909,8 @@ begin
     ('public.launch_context(uuid,uuid,uuid,uuid,uuid,uuid,integer)', 'jsonb', 'plpgsql', true, 's', null, false),
     ('public.learning_path_completions_append_only()', 'trigger', 'plpgsql', null, null, null, false),
     ('public.learning_path_step_completions_append_only()', 'trigger', 'plpgsql', null, null, null, false),
-    ('public.preview_purge_log_append_only()', 'trigger', 'plpgsql', null, null, null, false)
+    ('public.preview_purge_log_append_only()', 'trigger', 'plpgsql', null, null, null, false),
+    ('public.learning_path_step_facts_before_rule_change()', 'trigger', 'plpgsql', true, null, null, false)
   ) as t(sig, res, lang, secdef, vol, ndef, auth_exec)
   loop
     f := to_regprocedure(r.sig);
@@ -3554,7 +3561,7 @@ begin
               'guard_learner_history_course_versions', 'guard_learner_history_courses', 'journey_save_days',
               'journey_repin_enrollments', 'purge_preview_data', 'launch_context',
               'learning_path_completions_append_only', 'learning_path_step_completions_append_only',
-              'preview_purge_log_append_only')
+              'preview_purge_log_append_only', 'learning_path_step_facts_before_rule_change')
             or p.oid in (select t.tgfoid from pg_trigger t
                           where not t.tgisinternal
                             and (t.tgrelid = 'public.course_attempts'::regclass

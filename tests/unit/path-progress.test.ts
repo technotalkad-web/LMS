@@ -9,9 +9,11 @@
  *   (b) the path status in N11's order, a live granted retake first;
  *   (c) the owner's O1 answer (option ii): the four readings of O1-i (a fact
  *       row on a step now pass-required with a standing result that did not
- *       pass; no fact with a rule relaxed; O1-h (2)'s limit; a fact row and
- *       then a granted retake that failed) and the fact rows as a required
- *       input;
+ *       pass; no fact with a rule relaxed; no fact under a pass-required rule
+ *       with no pass, the state of rows O1-h (2) left before the owner's O3
+ *       answer, whose rule-change trigger now records the fact in SQL; a fact
+ *       row and then a granted retake that failed) and the fact rows as a
+ *       required input;
  *   (d) pathStepStatus answers what pathProgress answers for the step;
  *   (e) ruling A5 of the ADR's note of 2026-11-14: the older roll-up of the
  *       same name in lib/courses/progress-view.ts is deprecated (a pointer to
@@ -262,9 +264,13 @@ console.log("\n(c) the stored fact (the owner's O1 answer, option ii)");
   const relaxed = run({ steps: [step(C1, 1, false)], attempts: [row(1, C1, P, "failed", 1)] });
   eq("no fact, the rule relaxed: done at once by the rule, no fact needed", [relaxed.steps[0].passed_by_rule, relaxed.steps[0].done_recorded_at, relaxed.steps[0].done], [true, null, true]);
 
-  // O1-i reading 3: the limit of O1-h (2): relaxed, nothing completed, tightened again.
+  // O1-i reading 3: no fact, the rule pass-required, no pass. Procedurally
+  // (relaxed, nothing completed, tightened again) the rule-change trigger of
+  // 0107 section 6q now records the fact before the tightening (the owner's
+  // O3 answer), so this is a state of rows, not that sequence: the twin
+  // judges the rows it is given and writes nothing.
   const limit = run({ steps: ONE, attempts: [row(1, C1, P, "failed", 1)] });
-  eq("O1-h (2): relaxed, no completion, tightened again: no fact, not done", [limit.steps[0].done, limit.steps[0].failed], [false, true]);
+  eq("no fact, the rule pass-required, no pass: not done (a state of rows)", [limit.steps[0].done, limit.steps[0].failed], [false, true]);
 
   // O1-i reading 4: a fact row, then a granted retake that failed.
   const retakeRows = [row(1, C1, P, "completed", 1), row(2, C1, P, "open", 5)];

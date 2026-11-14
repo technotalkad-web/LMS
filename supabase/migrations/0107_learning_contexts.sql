@@ -107,7 +107,9 @@
 -- 1 from the column default (1t); every other new column takes its default.
 -- The one row of context_derive_log, a new table (2a), is created on the
 -- first paste; the four tables of section 3 are created empty. A later
--- paste writes no row. The temporary table of section 0b
+-- paste writes no row. The rule-change triggers of section 6q write nothing
+-- during a paste: no statement of this file updates a pass_required or
+-- deletes a step row. The temporary table of section 0b
 -- is the session's own and is dropped at commit. The after-checks write
 -- nothing they keep: the completion sweep that A6 runs through the two
 -- refresh functions, and the refreshes themselves, are rolled back with the
@@ -122,9 +124,14 @@
 -- ROW EXCLUSIVE until commit on the parents of the foreign keys this file
 -- adds or re-creates that are not in that list, learning_paths,
 -- organizations, auth.users and courses (writes to them wait, reads do
--- not); ACCESS EXCLUSIVE until commit on the three views section 4
--- replaces, v_course_attempt_scoring, v_course_attempt_summary and
--- v_course_enrollments_expanded (their reads wait, the report matviews'
+-- not; courses also takes it for the rule-change trigger of section 6q);
+-- on a LATER paste, ACCESS EXCLUSIVE until commit on courses as well,
+-- because dropping its rule-change trigger to create it again takes that
+-- lock (read on the rehearsal's Postgres; the first paste finds no trigger
+-- to drop), so reads of courses wait too; ACCESS EXCLUSIVE until commit on
+-- the three views section 4 replaces, v_course_attempt_scoring,
+-- v_course_attempt_summary and v_course_enrollments_expanded (their reads
+-- wait, the report matviews'
 -- refresh among them). The two stored generated columns of course_attempts
 -- and the one of attempt_requests rewrite those tables on the first paste
 -- (a rewrite per added generated column; a later paste skips them).
@@ -2180,7 +2187,10 @@ grant select on public.learning_path_completions to authenticated, service_role;
 -- a course with learner attempts is deleted only where the delete guards let
 -- it through (the service role, the organisation's cascade), and its attempts
 -- leave with it. The path key refuses, as the attempts' own path key does.
--- Built without the second writer at rule changes (question O3, open).
+-- A second writer records the steps done at the moment an admin changes a
+-- step's resolved rule, before the change (the owner's O3 answer of
+-- 2026-11-14; section 6q): the same columns and conflict target as the
+-- writer of step 12, narrowed to the affected step.
 create or replace function public.learning_path_step_completions_append_only()
 returns trigger
 language plpgsql
@@ -2219,7 +2229,7 @@ create index if not exists learning_path_step_completions_course_idx
   on public.learning_path_step_completions (course_id);
 
 comment on table public.learning_path_step_completions is
-  'One row per (path, learner, course): the path step was done under the rule in force when the writer recorded it (ADR 0024 build note O1). Inserted only by the completion writer; append-only.';
+  'One row per (path, learner, course): the path step was done under the rule in force when the fact was recorded (ADR 0024 build note O1; the owner''s O3 answer). Inserted only by the completion writer (record_learning_activity) and by the rule-change trigger function learning_path_step_facts_before_rule_change(); append-only.';
 comment on column public.learning_path_step_completions.attempt_id is
   'The step''s official attempt when the fact was written: an id only, no foreign key.';
 comment on column public.learning_path_step_completions.rule_pass_required is
@@ -3550,7 +3560,8 @@ grant execute on function public.journey_reminder_counts(uuid[]) to service_role
 -- (6h), the XP core with its wrapper (6i), record_learning_activity (6j),
 -- sweep_completion_side_effects (6k), purge_preview_data (6l), the two
 -- refresh functions (6m), gamification_close_month (6n),
--- journey_auto_enroll (6o) and, last, launch_context (6p). Lock
+-- journey_auto_enroll (6o), launch_context (6p) and, last, the rule-change
+-- trigger function with its three triggers (6q; the owner's O3 answer). Lock
 -- order, in every function of this section that takes more than one: an
 -- attempt_requests row, then journey_enrollments rows (in id order), then
 -- course_attempts rows; no function locks an attempt row before an
@@ -6738,6 +6749,127 @@ comment on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, in
 revoke execute on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer) from public, anon, authenticated;
 grant execute on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer) to service_role;
 
+-- 6q. learning_path_step_facts_before_rule_change (the owner's O3 answer of
+-- 2026-11-14; the ADR 0024 note of 2026-11-14, items O3-a to O3-h): the
+-- second writer of learning_path_step_completions. "Once a learner completes
+-- a Learning Path step, their completed status must remain preserved ...
+-- even if the Admin changes the step's rules later." The completion writer
+-- of step 12 (6j) records a step the first time it satisfies the rule in
+-- force; this function records, at the moment an admin changes a step's
+-- resolved rule and before the change, every enrolled learner whose step
+-- reads passed_by_rule with no fact yet: a step finished before this file,
+-- a completion the writer has not processed, or a rule relaxed with nothing
+-- completed since (O1-h). The resolved rule is coalesce(the step's own
+-- pass_required, the course's), computed only in v_path_step_status (4f);
+-- for one (path, course) it changes in exactly three ways, one binding each:
+--   (1) learning_path_courses_facts_before_rule_update: the step's own
+--       pass_required is updated (before update of pass_required, when the
+--       value is distinct: a step's own rule starts null, so null to true
+--       fires; <> would not)
+--   (2) learning_path_courses_facts_before_step_delete: the step row is
+--       deleted (it would come back by an insert with its own rule null,
+--       under whatever the course's rule is by then)
+--   (3) courses_facts_before_rule_update: the course's pass_required is
+--       updated; only steps with no rule of their own inherit it (the join to
+--       learning_path_courses, because the view shows the resolved rule and
+--       not whether the step has its own)
+-- A reorder (step_number), a release date (release_at) and an update that
+-- sets the same value fire nothing; there is no insert binding. The insert
+-- is the writer's (6j): its column list and conflict target, narrowed to the
+-- affected step, so the two writers cannot write different rows for one
+-- step. It holds no copy of the rule and does not compare the old rule with
+-- the new one: it fires on any change, a relaxation included. Each fact
+-- reads rule_pass_required = the rule before the change (the trigger is
+-- before, so the view still reads the old row), attempt_id = the step's
+-- official attempt at that moment, and done_at = the time of the change,
+-- by the column default: when the fact was recorded, not when the learner
+-- finished (the attempt's own times say that). Nothing is written at
+-- trigger depth above 1: a path, course, organisation or user delete
+-- cascades to the step rows, and those rows are leaving. Never returns null:
+-- a null from a before-delete trigger would cancel the admin's delete
+-- without an error. Any other table raises P0001 with a fixed message (note
+-- N7). Security definer: the admin who changes a rule is authenticated,
+-- holds no insert on the table and does not read every learner's rows on
+-- their own session; inside this function v_path_step_status,
+-- v_path_enrollments_expanded (security_invoker) and group_member_ids read
+-- as the owner, as in record_learning_activity, so a learner reached only by
+-- a Custom Group is recorded. Who may change a rule is unchanged: the row
+-- policies of learning_path_courses and courses decide it before the
+-- trigger runs. What the bindings do not catch is disclosed in O3-j (a
+-- learner not enrolled at the change, a lowered attempt policy, a direct
+-- update of a step's course_id or path_id, a disabled trigger) and put to
+-- the owner as O6. The phase 2 step editor changes a step's rule by an
+-- update of that row, never from inside a trigger and never by deleting and
+-- re-inserting the list in a cascade, where this function records nothing.
+create or replace function public.learning_path_step_facts_before_rule_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  if pg_trigger_depth() > 1 then
+    return case tg_op when 'DELETE' then old else new end;
+  end if;
+
+  if tg_table_name = 'learning_path_courses' then
+    insert into public.learning_path_step_completions
+      (organization_id, path_id, course_id, user_id, attempt_id, rule_pass_required)
+    select st.organization_id, st.path_id, st.course_id, st.user_id, st.official_attempt_id, st.pass_required
+      from public.v_path_step_status st
+     where st.path_id = old.path_id
+       and st.course_id = old.course_id
+       and st.passed_by_rule
+       and st.done_recorded_at is null
+    on conflict (path_id, user_id, course_id) do nothing;
+  elsif tg_table_name = 'courses' then
+    insert into public.learning_path_step_completions
+      (organization_id, path_id, course_id, user_id, attempt_id, rule_pass_required)
+    select st.organization_id, st.path_id, st.course_id, st.user_id, st.official_attempt_id, st.pass_required
+      from public.v_path_step_status st
+      join public.learning_path_courses lpc
+        on lpc.path_id = st.path_id
+       and lpc.course_id = st.course_id
+     where st.course_id = old.id
+       and lpc.pass_required is null
+       and st.passed_by_rule
+       and st.done_recorded_at is null
+    on conflict (path_id, user_id, course_id) do nothing;
+  else
+    raise exception 'learning_path_step_facts_before_rule_change is bound only to learning_path_courses and courses (ADR 0024)'
+      using errcode = 'P0001';
+  end if;
+
+  return case tg_op when 'DELETE' then old else new end;
+end
+$$;
+
+comment on function public.learning_path_step_facts_before_rule_change() is
+  'The second writer of learning_path_step_completions (ADR 0024, the owner''s O3 answer of 2026-11-14): before a step''s resolved pass rule changes (its own pass_required, its row deleted, or its course''s pass_required while it has none of its own), records every enrolled learner whose step reads passed_by_rule with no fact. Nothing at trigger depth above 1.';
+
+revoke execute on function public.learning_path_step_facts_before_rule_change() from public, anon, authenticated;
+grant execute on function public.learning_path_step_facts_before_rule_change() to service_role;
+
+drop trigger if exists learning_path_courses_facts_before_rule_update on public.learning_path_courses;
+create trigger learning_path_courses_facts_before_rule_update
+  before update of pass_required on public.learning_path_courses
+  for each row
+  when (old.pass_required is distinct from new.pass_required)
+  execute function public.learning_path_step_facts_before_rule_change();
+
+drop trigger if exists learning_path_courses_facts_before_step_delete on public.learning_path_courses;
+create trigger learning_path_courses_facts_before_step_delete
+  before delete on public.learning_path_courses
+  for each row
+  execute function public.learning_path_step_facts_before_rule_change();
+
+drop trigger if exists courses_facts_before_rule_update on public.courses;
+create trigger courses_facts_before_rule_update
+  before update of pass_required on public.courses
+  for each row
+  when (old.pass_required is distinct from new.pass_required)
+  execute function public.learning_path_step_facts_before_rule_change();
+
 -- ---------------------------------------------------------------------------
 -- 7. Restated grants, the after-checks A1 to A24 and notify pgrst (ADR 0024
 --    section B, creation order item 7; step 19)
@@ -6849,7 +6981,11 @@ grant select, insert on public.revision_visits to service_role;
 --        present; both delete guards are security definer, name
 --        legacy_role, keep the service-role return and their two 0098
 --        triggers; v_path_step_status has its columns, the two of O1-d
---        among them
+--        among them; the three rule-change triggers of section 6q (the
+--        owner's O3 answer) are bound to its function on their tables,
+--        enabled, before and per row, the two update triggers on the
+--        column pass_required alone with a when, the delete trigger with
+--        none (read from pg_trigger, never from text)
 --   A24  journey_save_days, journey_repin_enrollments and both forms of
 --        consume_grant are in the privilege matrix
 
@@ -7297,6 +7433,30 @@ begin
                           || 'official_attempt_id, retake_live, failed, open_attempt' then
     bad := bad || format('A23 v_path_step_status reads (%s)', got);
   end if;
+  -- the rule-change triggers (section 6q): tgtype 19 = row, before, update;
+  -- 11 = row, before, delete; tgattr read as column names (an int2vector
+  -- cast to an array is 0-based)
+  for r in
+    select * from (values
+      ('public.learning_path_courses', 'learning_path_courses_facts_before_rule_update', 19, true),
+      ('public.learning_path_courses', 'learning_path_courses_facts_before_step_delete', 11, false),
+      ('public.courses',               'courses_facts_before_rule_update',              19, true)
+    ) as t(rel, trg, typ, is_update)
+  loop
+    if not exists (
+         select 1 from pg_trigger t
+          where t.tgrelid = r.rel::regclass and t.tgname = r.trg and not t.tgisinternal
+            and t.tgfoid = to_regprocedure('public.learning_path_step_facts_before_rule_change()')
+            and t.tgenabled = 'O' and t.tgtype = r.typ
+            and (t.tgqual is not null) = r.is_update
+            and (select coalesce(array_agg(a.attname::text order by k.o), '{}')
+                   from unnest(t.tgattr::int2[]) with ordinality as k(attnum, o)
+                   join pg_attribute a on a.attrelid = t.tgrelid and a.attnum = k.attnum)
+                = case when r.is_update then array['pass_required'] else '{}'::text[] end) then
+      bad := bad || format('A23 the rule-change trigger %s on %s is missing, disabled, not bound to its function, '
+                           || 'or not of its timing, column and when', r.trg, r.rel);
+    end if;
+  end loop;
 
   if cardinality(bad) > 0 then
     raise exception '0107 after-check failed: %. Nothing changed.', array_to_string(bad, '; ')
@@ -7421,7 +7581,8 @@ begin
       ('public.refresh_gamification_views()',                                   true,  false),
       ('public.gamification_close_month()',                                     true,  false),
       ('public.journey_auto_enroll()',                                          true,  false),
-      ('public.launch_context(uuid,uuid,uuid,uuid,uuid,uuid,integer)',          true,  false)
+      ('public.launch_context(uuid,uuid,uuid,uuid,uuid,uuid,integer)',          true,  false),
+      ('public.learning_path_step_facts_before_rule_change()',                  true,  false)
     ) as t(fn, definer, auth_exec)
   -- after-check function list: end
   loop

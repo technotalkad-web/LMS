@@ -98,8 +98,10 @@ begin
          and tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
                         'course_attempts_context_owner',
                         'journey_versions_derive_day_ids', 'learning_path_completions_no_mutation',
-                        'learning_path_step_completions_no_mutation', 'preview_purge_log_no_mutation')) <> 7 then
-    bad := bad || 'the seven triggers of 0107 are not present exactly once each'::text;
+                        'learning_path_step_completions_no_mutation', 'preview_purge_log_no_mutation',
+                        'learning_path_courses_facts_before_rule_update',
+                        'learning_path_courses_facts_before_step_delete', 'courses_facts_before_rule_update')) <> 10 then
+    bad := bad || 'the ten triggers of 0107 (the three rule-change triggers of section 6q among them) are not present exactly once each'::text;
   end if;
   if (select count(*) from pg_constraint
        where conrelid = 'public.course_attempts'::regclass and contype = 'f'

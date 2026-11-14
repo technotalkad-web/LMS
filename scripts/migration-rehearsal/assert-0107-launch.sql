@@ -618,12 +618,20 @@ begin
   if got is distinct from 'true,false' then
     bad := bad || format('O1-g (4), relaxed: launch_context reads %s', got);
   end if;
-  -- (8) tightened again with no completion in between: not done
+  -- (8) tightened again with no completion in between: done, by the fact
+  -- the rule-change trigger of section 6q records before the change (the
+  -- owner's O3 answer; before it this case read not done, the limit of
+  -- O1-h (2)): the rule before the change, false, and L12's attempt
   update public.learning_path_courses set pass_required = true where path_id = po and course_id = c1;
   select string_agg((s ->> 'done'), ',' order by (s ->> 'step_number')::int) into got
     from jsonb_array_elements(pg_temp.lc(l12, org, c2, po, null, null, null) -> 'path' -> 'steps') s;
-  if got is distinct from 'false,false' then
-    bad := bad || format('O1-g (8), tightened again: launch_context reads %s', got);
+  if got is distinct from 'true,false'
+     or (select format('%s %s %s', count(*), bool_and(not f.rule_pass_required),
+                       bool_and(f.attempt_id = pg_temp.u('000107190911')))
+           from public.learning_path_step_completions f
+          where f.path_id = po and f.user_id = l12 and f.course_id = c1) is distinct from '1 t t' then
+    bad := bad || format('O1-g (8), tightened again: launch_context reads %s (expected true,false by a rule-change fact '
+                         || 'under rule false naming L12''s attempt)', got);
   end if;
 
   if cardinality(bad) > 0 then
