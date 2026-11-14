@@ -50,11 +50,6 @@
 --   R0     test run 500 (a path run of T on P1)
 begin;
 
--- no claim: a delete is "made in the SQL editor" until a check sets one
-select set_config('request.jwt.claims', '', true);
-select set_config('request.jwt.claim.role', '', true);
-select set_config('request.jwt.claim.sub', '', true);
-
 -- this file's own minimal Supabase-like setup (rolled back with the file)
 grant usage on schema public to anon, authenticated, service_role;
 
@@ -65,6 +60,21 @@ create function pg_temp.id(p text) returns uuid language sql immutable as $$
   select case when p is null then null
               else ('e1070000-0000-4000-8000-' || lpad(p, 12, '0'))::uuid end
 $$;
+
+-- the session's claim, in all three settings the shim's auth.uid() and
+-- auth.role() and the 0100 guards read (request.jwt.claim.sub and .role win
+-- over request.jwt.claims when set, so all three are set together);
+-- (null, null) is no claim: a delete "made in the SQL editor"
+create function pg_temp.claim(p_sub uuid, p_role text) returns void language plpgsql as $$
+begin
+  perform set_config('request.jwt.claim.sub', coalesce(p_sub::text, ''), true);
+  perform set_config('request.jwt.claim.role', coalesce(p_role, ''), true);
+  perform set_config('request.jwt.claims',
+    case when p_sub is null and p_role is null then ''
+         else json_build_object('sub', p_sub, 'role', p_role)::text end, true);
+end
+$$;
+select pg_temp.claim(null, null);
 
 -- one attempt row from a json spec; a missing "kind" leaves context_kind null
 -- (the code before phase 2, which the derive trigger labels)
@@ -600,19 +610,20 @@ begin
     -- note N1: the day key of a credit is deferred, initially deferred
     ('public.journey_day_progress', 'day_id', 'public.journey_days|a|true|true'),
     ('public.preview_runs', 'organization_id', 'public.organizations|c|%'),
-    ('public.preview_runs', 'user_id', 'auth.users|c|%'),
+    -- the record says only "cascade" for these three user keys; the target table is not asserted
+    ('public.preview_runs', 'user_id', '%|c|%'),
     ('public.preview_runs', 'learning_path_id', 'public.learning_paths|a|%'),
     ('public.preview_runs', 'journey_program_id', 'public.journey_programs|a|%'),
     ('public.preview_runs', 'journey_version_id', 'public.journey_versions|a|%'),
     ('public.learning_path_completions', 'organization_id', 'public.organizations|c|%'),
     ('public.learning_path_completions', 'path_id', 'public.learning_paths|a|%'),
-    ('public.learning_path_completions', 'user_id', 'auth.users|c|%'),
+    ('public.learning_path_completions', 'user_id', '%|c|%'),
     ('public.learning_path_step_completions', 'organization_id', 'public.organizations|c|%'),
     ('public.learning_path_step_completions', 'path_id', 'public.learning_paths|a|%'),
     ('public.learning_path_step_completions', 'course_id', 'public.courses|c|%'),
     ('public.learning_path_step_completions', 'user_id', 'auth.users|c|%'),
     ('public.completion_notices', 'organization_id', 'public.organizations|c|%'),
-    ('public.completion_notices', 'user_id', 'auth.users|c|%'),
+    ('public.completion_notices', 'user_id', '%|c|%'),
     ('public.completion_notices', 'attempt_id', 'public.course_attempts|n|%'),
     ('public.preview_purge_log', 'organization_id', 'public.organizations|c|%')
   ) as t(tbl, col, pat)
@@ -1113,107 +1124,6 @@ begin
 end
 $$;
 
--- (0h) comments the record restates (steps 5 and 8), and the bodies the
---      record pins: the two guards (step 7), the refresh functions (steps 16,
---      81), the delete holders (R6-a), the lock order (steps 10, 13)
-do $$
-declare
-  bad text[] := '{}';
-  r record;
-  src text;
-  pre text;
-begin
-  if coalesce(col_description('public.course_attempts'::regclass,
-       (select a.attnum from pg_attribute a where a.attrelid = 'public.course_attempts'::regclass
-                                             and a.attname = 'is_preview')), '')
-     not like 'true = a preview launch; never a learner''s result, and excluded from every official rule (ADR 0024).%' then
-    bad := bad || 'course_attempts.is_preview has not the comment of step 5'::text;
-  end if;
-  if coalesce(col_description('public.user_badges'::regclass,
-       (select a.attnum from pg_attribute a where a.attrelid = 'public.user_badges'::regclass and a.attname = 'period')), '')
-     not like '%''enr:<enrolment id>'' for a journey badge (ADR 0024)%' then
-    bad := bad || 'user_badges.period has not the comment of step 8'::text;
-  end if;
-
-  -- the guards (step 7): the by-role clause, the service-role return, the exception name, ADR 0024 in the hint
-  for r in select * from (values ('public.guard_learner_history_course_versions()'),
-                                  ('public.guard_learner_history_courses()')) as t(fn)
-  loop
-    src := lower(regexp_replace(regexp_replace(regexp_replace(
-             (select p.prosrc from pg_proc p where p.oid = to_regprocedure(r.fn)), '\s+', ' ', 'g'),
-             '\(\s+', '(', 'g'), '\s+\)', ')', 'g'));
-    if src not like '%(not a.is_preview or a.preview_kind = ''legacy_role'')%' then
-      bad := bad || format('%s does not count by-role rows with the clause of step 7', r.fn);
-    end if;
-    if src not like '%service_role%' or src not like '%learner_history_exists%' or src not like '%adr 0024%' then
-      bad := bad || format('%s lost the service-role return, learner_history_exists or ADR 0024', r.fn);
-    end if;
-  end loop;
-
-  -- the two refresh functions call the sweep and never the purge (steps 16, 81)
-  for r in select * from (values ('public.refresh_report_views()'), ('public.refresh_gamification_views()')) as t(fn)
-  loop
-    src := lower((select p.prosrc from pg_proc p where p.oid = to_regprocedure(r.fn)));
-    if src like '%purge_preview_data%' then
-      bad := bad || format('%s names purge_preview_data', r.fn);
-    end if;
-    if src not like '%sweep_completion_side_effects%' or src not like '%completion_sweep%' then
-      bad := bad || format('%s has no completion_sweep entry calling the sweep', r.fn);
-    end if;
-  end loop;
-
-  -- R6-a: of the functions 0107 creates or recreates, only purge_preview_data
-  -- deletes from course_attempts or preview_runs
-  for r in
-    select p.oid::regprocedure::text as fn, p.prosrc
-      from pg_proc p
-     where p.pronamespace = 'public'::regnamespace
-       and (p.proname in ('official_attempt_in_context', 'instance_pass_required', 'journey_attempt_satisfies',
-              'journey_credit_state', 'journey_reminder_counts', 'consume_grant', 'record_revision_visit',
-              'record_learning_activity', 'journey_record_completion', 'journey_complete_enrollments_core',
-              'journey_complete_enrollment', 'journey_complete_enrollments', 'sweep_completion_side_effects',
-              'refresh_gamification_views', 'refresh_report_views', 'gamification_record_activity',
-              'gamification_record_activity_core', 'gamification_close_month', 'journey_auto_enroll',
-              'guard_learner_history_course_versions', 'guard_learner_history_courses', 'journey_save_days',
-              'journey_repin_enrollments', 'purge_preview_data', 'launch_context',
-              'learning_path_completions_append_only', 'learning_path_step_completions_append_only',
-              'preview_purge_log_append_only')
-            or p.oid in (select t.tgfoid from pg_trigger t
-                          where not t.tgisinternal
-                            and (t.tgrelid = 'public.course_attempts'::regclass
-                                 or (t.tgrelid = 'public.journey_versions'::regclass and t.tgtype = 7))))
-  loop
-    if (lower(r.prosrc) ~ '\mdelete\s+from\s+(only\s+)?(public\.)?(course_attempts|preview_runs)\M')
-       <> (r.fn like 'purge_preview_data(%') then
-      bad := bad || format('%s: deletes from course_attempts or preview_runs = %s', r.fn,
-                           lower(r.prosrc) ~ '\mdelete\s+from\s+(only\s+)?(public\.)?(course_attempts|preview_runs)\M');
-    end if;
-  end loop;
-
-  -- lock order (steps 10 and 63): in both consume_grant forms the first
-  -- locking statement (the text from the previous ';' to the first
-  -- 'for update') names attempt_requests and not the enrolment
-  for r in select * from (values ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)'),
-                                  ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)')) as t(fn)
-  loop
-    src := lower((select p.prosrc from pg_proc p where p.oid = to_regprocedure(r.fn)));
-    pre := substring(src from '([^;]*)\mfor\s+update\M');
-    if pre is null or pre not like '%attempt_requests%' or pre like '%journey_enrollments%' then
-      bad := bad || format('%s: the first locking statement is not the grant row''s', r.fn);
-    end if;
-  end loop;
-  -- step 13: journey_record_completion's first lock is the enrolment row's
-  src := lower((select p.prosrc from pg_proc p where p.oid = to_regprocedure('public.journey_record_completion(uuid)')));
-  pre := substring(src from '([^;]*)\mfor\s+update\M');
-  if pre is null or pre not like '%journey_enrollments%' then
-    bad := bad || 'journey_record_completion: the first locking statement is not the enrolment row''s'::text;
-  end if;
-  if cardinality(bad) > 0 then
-    raise exception 'assert-0107-independent: (0h) comments and bodies: %', array_to_string(bad, '; ');
-  end if;
-end
-$$;
-
 -- ===========================================================================
 -- (1) the privilege matrix (steps 7, 8, 9, 14, 15, 18, 19, 66, 79; O1-b;
 --     note N3: has_*_privilege per privilege, never MAINTAIN), then real
@@ -1475,8 +1385,7 @@ grant select on public.org_api_keys to authenticated;
 grant select on public.organization_members to authenticated;
 insert into public.org_api_keys (id, organization_id, name, key_prefix, key_hash, created_by)
 values (pg_temp.id('7a1'), pg_temp.id('a0'), 'indep key 1', 'ik1', 'indep-0107-hash-1', pg_temp.id('104'));
-select set_config('request.jwt.claims',
-  json_build_object('sub', pg_temp.id('104'), 'role', 'authenticated')::text, true);
+select pg_temp.claim(pg_temp.id('104'), 'authenticated');
 do $$
 declare
   bad text[] := '{}';
@@ -1526,8 +1435,125 @@ begin
   end if;
 end
 $$;
-select set_config('request.jwt.claims', '', true);
+select pg_temp.claim(null, null);
 rollback to savepoint s1c;
+
+-- (1d) the grants at work, the other way round (step 63: "the path views and
+--      the terms views, read as authenticated, return the member's own
+--      organisation's rows (the control: more than 0, and no 42501) and 0
+--      rows for another organisation"; step 14: authenticated needs the
+--      select on the path tables because the path views are invoker views).
+--      Every table that existed before 0107 is given what the project
+--      defaults give it (authenticated select; service_role all four); the
+--      six tables of 0107 and every view keep only what 0107 and earlier
+--      files granted. Then L1 reads the four views, a member of Y reads none
+--      of X, and service_role writes a test run and calls functions
+create function pg_temp.count_as(p_role text, p_sql text) returns text language plpgsql as $$
+declare
+  n bigint;
+  s text;
+  m text;
+begin
+  execute format('set local role %I', p_role);
+  begin
+    execute p_sql into n;
+  exception when others then
+    get stacked diagnostics s = returned_sqlstate, m = message_text;
+    execute 'reset role';
+    return s || '|' || m;
+  end;
+  execute 'reset role';
+  return n::text;
+end
+$$;
+savepoint s1d;
+do $$
+declare
+  r record;
+begin
+  for r in select c.relname from pg_class c
+            where c.relnamespace = 'public'::regnamespace and c.relkind in ('r', 'p')
+              and c.relname not in ('preview_runs', 'context_derive_log', 'learning_path_completions',
+                                    'learning_path_step_completions', 'completion_notices', 'preview_purge_log')
+  loop
+    execute format('grant select on public.%I to authenticated', r.relname);
+    execute format('grant select, insert, update, delete on public.%I to service_role', r.relname);
+  end loop;
+end
+$$;
+insert into public.course_assignments (course_id, organization_id, assignee_type, user_id, due_at)
+values (pg_temp.id('1c1'), pg_temp.id('a0'), 'user', pg_temp.id('101'), '2030-01-01');
+do $$
+declare
+  bad text[] := '{}';
+  v text;
+  got text;
+  r record;
+begin
+  foreach v in array array['v_path_step_status', 'v_path_progress', 'v_course_enrollment_terms', 'v_path_enrollment_terms'] loop
+    perform pg_temp.claim(pg_temp.id('101'), 'authenticated');
+    got := pg_temp.count_as('authenticated', format('select count(*) from public.%I where organization_id = %L', v, pg_temp.id('a0')));
+    if (case when got ~ '^[0-9]+$' then got::bigint = 0 else true end) then
+      bad := bad || format('L1 reads %s of its organisation: %s (expected more than 0 rows, no 42501)', v, got);
+    end if;
+    perform pg_temp.claim(pg_temp.id('106'), 'authenticated');
+    got := pg_temp.count_as('authenticated', format('select count(*) from public.%I where organization_id = %L', v, pg_temp.id('a0')));
+    if got is distinct from '0' then
+      bad := bad || format('a member of Y reads %s of X: %s (expected 0)', v, got);
+    end if;
+  end loop;
+  perform pg_temp.claim(null, 'service_role');
+  -- service_role on preview_runs: select, insert, update; never delete (step 79)
+  got := pg_temp.as_role('service_role',
+           format('insert into public.preview_runs (id, organization_id, user_id, kind, learning_path_id) values (%L, %L, %L, ''path'', %L)',
+                  pg_temp.id('5d1'), pg_temp.id('a0'), pg_temp.id('105'), pg_temp.id('2a1')));
+  if got <> 'ok' then
+    bad := bad || format('service_role insert into preview_runs: %s', got);
+  end if;
+  got := pg_temp.as_role('service_role', format('update public.preview_runs set simulated_date = current_date where id = %L', pg_temp.id('5d1')));
+  if got <> 'ok' then
+    bad := bad || format('service_role update of preview_runs: %s', got);
+  end if;
+  got := pg_temp.count_as('service_role', format('select count(*) from public.preview_runs where id = %L', pg_temp.id('5d1')));
+  if got is distinct from '1' then
+    bad := bad || format('service_role select of preview_runs: %s', got);
+  end if;
+  got := pg_temp.as_role('service_role', format('delete from public.preview_runs where id = %L', pg_temp.id('5d1')));
+  if not pg_temp.denied(got, 'preview_runs') then
+    bad := bad || format('service_role delete from preview_runs: %s (expected 42501, step 79: no delete is granted)', got);
+  end if;
+  -- service_role calls (the execute grants of the header of section B)
+  for r in select * from (values
+    ('journey_credit_state', format('select count(*) from public.journey_credit_state(array[%L]::uuid[]) s where s.credited_days = 3', pg_temp.id('3c1'))),
+    ('official_attempt_in_context', format('select count(*) from (select public.official_attempt_in_context(%L, %L, ''individual'')) s',
+                                           pg_temp.id('101'), pg_temp.id('1c1'))),
+    ('instance_pass_required', format('select count(*) from (select public.instance_pass_required(%L, ''individual'') b) s where b is not null',
+                                      pg_temp.id('1c1'))),
+    ('journey_attempt_satisfies', format('select count(*) from (select public.journey_attempt_satisfies(%L, false) b) s where b',
+                                         pg_temp.id('4b1'))),
+    ('launch_context', format('select count(*) from (select public.launch_context(%L, %L, %L, %L, null, null, null::int) j) s where j->>''v'' = ''1''',
+                              pg_temp.id('101'), pg_temp.id('a0'), pg_temp.id('1c1'), pg_temp.id('2a1'))),
+    ('purge_preview_data', format('select count(*) from (select public.purge_preview_data(%L, %L::jsonb, ''manual'', %L, true) j) s where j ? ''selection_hash''',
+                                  pg_temp.id('a0'), jsonb_build_object('attempt_id', gen_random_uuid()), pg_temp.id('105'))),
+    ('consume_grant', format('select count(*) from public.consume_grant(gen_random_uuid(), %L, %L, %L, %L, null, null, null::int) g where g.outcome = ''unavailable''',
+                             pg_temp.id('101'), pg_temp.id('1c1'), pg_temp.id('1e1'), pg_temp.id('a0'))),
+    ('record_revision_visit', format('select count(*) from (select public.record_revision_visit(%L, %L, %L, null, null, ''scorm12'', ''individual'') b) s where b',
+                                     pg_temp.id('a0'), pg_temp.id('108'), pg_temp.id('1c9')))
+  ) as t(fn, stmt)
+  loop
+    got := pg_temp.count_as('service_role', r.stmt);
+    if got is distinct from '1' then
+      bad := bad || format('service_role call of %s: %s (expected one answer)', r.fn, got);
+    end if;
+  end loop;
+  perform pg_temp.claim(null, null);
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (1d) the grants at work (steps 14, 19, 63, 79): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+select pg_temp.claim(null, null);
+rollback to savepoint s1d;
 
 -- ===========================================================================
 -- (2) behaviour
@@ -1838,8 +1864,8 @@ begin
   perform pg_temp.att('{"id":"4e07","user":"105","ver":"1e7","kind":"preview","pkind":"legacy_role"}');
   perform pg_temp.att('{"id":"4e08","user":"108","ver":"1e8","kind":"individual"}');
   perform pg_temp.att('{"id":"4e09","user":"105","ver":"1e9","kind":"preview","pkind":"course"}');
-  foreach claim in array array['', '{"role":"authenticated"}'] loop
-    perform set_config('request.jwt.claims', claim, true);
+  foreach claim in array array['', 'authenticated'] loop
+    perform pg_temp.claim(case when claim = '' then null else pg_temp.id('104') end, nullif(claim, ''));
     for r in select * from (values
       ('courses', '1c7'), ('course_versions', '1e7'), ('course_packages', '1d7'),
       ('courses', '1c8'), ('course_versions', '1e8'), ('course_packages', '1d8')
@@ -1857,7 +1883,7 @@ begin
     bad := bad || 'a refused delete removed a row'::text;
   end if;
   -- the hint names ADR 0024 (step 7)
-  perform set_config('request.jwt.claims', '', true);
+  perform pg_temp.claim(null, null);
   begin
     delete from public.courses where id = pg_temp.id('1c7');
   exception when others then
@@ -1872,9 +1898,9 @@ begin
     bad := bad || format('a course holding only a course preview: %s', got);
   end if;
   -- the service-role claim passes the guard (step 7: what is unchanged)
-  perform set_config('request.jwt.claims', '{"role":"service_role"}', true);
+  perform pg_temp.claim(null, 'service_role');
   got := pg_temp.try(format('delete from public.courses where id = %L', pg_temp.id('1c7')));
-  perform set_config('request.jwt.claims', '', true);
+  perform pg_temp.claim(null, null);
   if got <> 'ok' or exists (select 1 from public.course_attempts where id = pg_temp.id('4e07')) then
     bad := bad || format('the service-role claim over a by-role row: %s', got);
   end if;
@@ -1883,7 +1909,7 @@ begin
   end if;
 end
 $$;
-select set_config('request.jwt.claims', '', true);
+select pg_temp.claim(null, null);
 rollback to savepoint s2e;
 
 -- (2f) the keys' delete rules at work (steps 7, 79; notes N1, N19): a lone
@@ -1980,7 +2006,7 @@ begin
       bad := bad || format('the user''s delete: %s %s', sqlstate, sqlerrm);
   end;
   -- the organisation's delete, on the service client (the e2e purge's path)
-  perform set_config('request.jwt.claims', '{"role":"service_role"}', true);
+  perform pg_temp.claim(null, 'service_role');
   begin
     insert into public.learning_path_completions (id, organization_id, path_id, user_id, completed_at)
     values (gen_random_uuid(), pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('101'), now());
@@ -2005,13 +2031,13 @@ begin
     when others then
       bad := bad || format('the organisation''s delete: %s %s', sqlstate, sqlerrm);
   end;
-  perform set_config('request.jwt.claims', '', true);
+  perform pg_temp.claim(null, null);
   if cardinality(bad) > 0 then
     raise exception 'assert-0107-independent: (2f) delete rules (steps 7, 79; N1, N19): %', array_to_string(bad, '; ');
   end if;
 end
 $$;
-select set_config('request.jwt.claims', '', true);
+select pg_temp.claim(null, null);
 rollback to savepoint s2f;
 
 -- (2g) the open-row and open-request keys (steps 7, 8; N4), the credit key
@@ -3200,15 +3226,20 @@ begin
     end;
   end if;
 
-  -- each scope deletes exactly its selection (dry run, then the real call with its hash)
+  -- each scope deletes exactly its selection (dry run, then the real call with
+  -- its hash). open_runs: runs whose fate the record does not fix for that
+  -- scope (the tester's run 500 holds no attempt: whether a tester scope
+  -- "covers" it is not stated), so they are neither required gone nor kept
   for r in select * from (values
     ('organization', '{"organization": true}'::jsonb, 'manual',
-     array['4n01', '4n02', '4n03', '4n04'], array['500', '501', '502']),
-    ('run', jsonb_build_object('run_id', pg_temp.id('501')), 'manual', array['4n02'], array['501']),
-    ('tester', jsonb_build_object('user_id', t), 'manual', array['4n01', '4n02', '4n03'], array['500', '501', '502']),
-    ('tester and course', jsonb_build_object('user_id', t, 'course_id', pg_temp.id('1c1')), 'manual', array['4n01'], array[]::text[]),
-    ('course, product delete', jsonb_build_object('course_id', pg_temp.id('1c1')), 'product_delete', array['4n01'], array[]::text[])
-  ) as v(what, scope, reason, gone_attempts, gone_runs)
+     array['4n01', '4n02', '4n03', '4n04'], array['500', '501', '502'], array[]::text[]),
+    ('run', jsonb_build_object('run_id', pg_temp.id('501')), 'manual', array['4n02'], array['501'], array[]::text[]),
+    ('tester', jsonb_build_object('user_id', t), 'manual', array['4n01', '4n02', '4n03'], array['501', '502'], array['500']),
+    ('tester and course', jsonb_build_object('user_id', t, 'course_id', pg_temp.id('1c1')), 'manual', array['4n01'],
+     array[]::text[], array[]::text[]),
+    ('course, product delete', jsonb_build_object('course_id', pg_temp.id('1c1')), 'product_delete', array['4n01'],
+     array[]::text[], array[]::text[])
+  ) as v(what, scope, reason, gone_attempts, gone_runs, open_runs)
   loop
     begin
       got := pg_temp.purge(org, r.scope, r.reason, t, true);
@@ -3225,8 +3256,8 @@ begin
               from unnest(array['4n01', '4n02', '4n03', '4n04']) s where not (s = any(r.gone_attempts))))
            <> 4 - cardinality(r.gone_attempts)
            or (select count(*) from public.preview_runs p where p.id in (select pg_temp.id(s)
-                 from unnest(array['500', '501', '502']) s where not (s = any(r.gone_runs))))
-              <> 3 - cardinality(r.gone_runs) then
+                 from unnest(array['500', '501', '502']) s where not (s = any(r.gone_runs)) and not (s = any(r.open_runs))))
+              <> 3 - cardinality(r.gone_runs) - cardinality(r.open_runs) then
           bad := bad || format('%s: a row outside the scope was deleted', r.what);
         end if;
         if pg_temp.keep_md5() <> k0 or not exists (select 1 from public.course_attempts where id = pg_temp.id('4n05')) then
@@ -3236,9 +3267,9 @@ begin
         if lg.reason is distinct from r.reason or lg.actor_user_id is distinct from t
            or (select array_agg(i order by i) from unnest(lg.attempt_ids) i)
               is distinct from (select array_agg(pg_temp.id(s) order by pg_temp.id(s)) from unnest(r.gone_attempts) s)
-           or cardinality(r.gone_runs) > 0
-              and (select array_agg(i order by i) from unnest(lg.run_ids) i)
-                  is distinct from (select array_agg(pg_temp.id(s) order by pg_temp.id(s)) from unnest(r.gone_runs) s) then
+           or not (coalesce(lg.run_ids, '{}') @> (select coalesce(array_agg(pg_temp.id(s)), '{}') from unnest(r.gone_runs) s))
+           or not (coalesce(lg.run_ids, '{}') <@ (select coalesce(array_agg(pg_temp.id(s)), '{}')
+                                                   from unnest(r.gone_runs || r.open_runs) s)) then
           bad := bad || format('%s: the audit row reads reason %s, attempts %s, runs %s', r.what, lg.reason, lg.attempt_ids, lg.run_ids);
         end if;
       end if;
@@ -3336,7 +3367,7 @@ begin
       bad := bad || format('control: postgres reads %s rows of %s', n, tbl);
     end if;
     for r in select * from (values ('101', 1), ('104', 2), ('106', 0)) as t(sym, want) loop
-      perform set_config('request.jwt.claims', json_build_object('sub', pg_temp.id(r.sym), 'role', 'authenticated')::text, true);
+      perform pg_temp.claim(pg_temp.id(r.sym), 'authenticated');
       execute 'set local role authenticated';
       execute format('select count(*) from public.%I where organization_id = %L', tbl, pg_temp.id('a0')) into n;
       execute 'reset role';
@@ -3344,7 +3375,7 @@ begin
         bad := bad || format('%s as user %s: %s rows (expected %s)', tbl, r.sym, n, r.want);
       end if;
     end loop;
-    perform set_config('request.jwt.claims', '', true);
+    perform pg_temp.claim(null, null);
     got := pg_temp.try(format('update public.%I set user_id = user_id where organization_id = %L', tbl, pg_temp.id('a0')));
     if got = 'ok' then
       bad := bad || format('%s: an update as postgres passed (append-only)', tbl);
@@ -3378,7 +3409,7 @@ begin
   end if;
 end
 $$;
-select set_config('request.jwt.claims', '', true);
+select pg_temp.claim(null, null);
 rollback to savepoint s2o;
 
 -- (2p) journey_auto_enroll writes source audience (step 8); the paste-window
@@ -3419,5 +3450,113 @@ begin
 end
 $$;
 rollback to savepoint s2p;
+
+-- (3) comments the record restates (steps 5 and 8), and the stored bodies
+--     the record pins: the two guards (step 7), the refresh functions (steps
+--     16, 81), the delete holders (R6-a), the lock order (steps 10, 13, 63).
+--     Last in the file: a text match is the check most likely to fail on a
+--     wording the record does not fix, and the first failure stops the file.
+--     Comments are stripped from the bodies before matching.
+create function pg_temp.code(p_fn oid) returns text language sql stable as $$
+  select lower(regexp_replace(regexp_replace(p.prosrc, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'))
+    from pg_proc p where p.oid = p_fn
+$$;
+do $$
+declare
+  bad text[] := '{}';
+  r record;
+  src text;
+  pre text;
+begin
+  if coalesce(col_description('public.course_attempts'::regclass,
+       (select a.attnum from pg_attribute a where a.attrelid = 'public.course_attempts'::regclass
+                                             and a.attname = 'is_preview')), '')
+     not like 'true = a preview launch; never a learner''s result, and excluded from every official rule (ADR 0024).%' then
+    bad := bad || 'course_attempts.is_preview has not the comment of step 5'::text;
+  end if;
+  if coalesce(col_description('public.user_badges'::regclass,
+       (select a.attnum from pg_attribute a where a.attrelid = 'public.user_badges'::regclass and a.attname = 'period')), '')
+     not like '%''enr:<enrolment id>'' for a journey badge (ADR 0024)%' then
+    bad := bad || 'user_badges.period has not the comment of step 8'::text;
+  end if;
+
+  -- the guards (step 7): the by-role clause, the service-role return, the exception name, ADR 0024 in the hint
+  for r in select * from (values ('public.guard_learner_history_course_versions()'),
+                                  ('public.guard_learner_history_courses()')) as t(fn)
+  loop
+    src := lower(regexp_replace(regexp_replace(regexp_replace(
+             pg_temp.code(to_regprocedure(r.fn)), '\s+', ' ', 'g'),
+             '\(\s+', '(', 'g'), '\s+\)', ')', 'g'));
+    if src not like '%(not a.is_preview or a.preview_kind = ''legacy_role'')%' then
+      bad := bad || format('%s does not count by-role rows with the clause of step 7', r.fn);
+    end if;
+    if src not like '%service_role%' or src not like '%learner_history_exists%' or src not like '%adr 0024%' then
+      bad := bad || format('%s lost the service-role return, learner_history_exists or ADR 0024', r.fn);
+    end if;
+  end loop;
+
+  -- the two refresh functions call the sweep and never the purge (steps 16, 81)
+  for r in select * from (values ('public.refresh_report_views()'), ('public.refresh_gamification_views()')) as t(fn)
+  loop
+    src := pg_temp.code(to_regprocedure(r.fn));
+    if src like '%purge_preview_data%' then
+      bad := bad || format('%s names purge_preview_data', r.fn);
+    end if;
+    if src not like '%sweep_completion_side_effects%' or src not like '%completion_sweep%' then
+      bad := bad || format('%s has no completion_sweep entry calling the sweep', r.fn);
+    end if;
+  end loop;
+
+  -- R6-a: of the functions 0107 creates or recreates, only purge_preview_data
+  -- deletes from course_attempts or preview_runs
+  for r in
+    select p.oid::regprocedure::text as fn, pg_temp.code(p.oid) as code
+      from pg_proc p
+     where p.pronamespace = 'public'::regnamespace
+       and (p.proname in ('official_attempt_in_context', 'instance_pass_required', 'journey_attempt_satisfies',
+              'journey_credit_state', 'journey_reminder_counts', 'consume_grant', 'record_revision_visit',
+              'record_learning_activity', 'journey_record_completion', 'journey_complete_enrollments_core',
+              'journey_complete_enrollment', 'journey_complete_enrollments', 'sweep_completion_side_effects',
+              'refresh_gamification_views', 'refresh_report_views', 'gamification_record_activity',
+              'gamification_record_activity_core', 'gamification_close_month', 'journey_auto_enroll',
+              'guard_learner_history_course_versions', 'guard_learner_history_courses', 'journey_save_days',
+              'journey_repin_enrollments', 'purge_preview_data', 'launch_context',
+              'learning_path_completions_append_only', 'learning_path_step_completions_append_only',
+              'preview_purge_log_append_only')
+            or p.oid in (select t.tgfoid from pg_trigger t
+                          where not t.tgisinternal
+                            and (t.tgrelid = 'public.course_attempts'::regclass
+                                 or (t.tgrelid = 'public.journey_versions'::regclass and t.tgtype = 7))))
+  loop
+    if (r.code ~ '\mdelete\s+from\s+(only\s+)?(public\.)?(course_attempts|preview_runs)\M')
+       <> (r.fn like 'purge_preview_data(%') then
+      bad := bad || format('%s: deletes from course_attempts or preview_runs = %s', r.fn,
+                           r.code ~ '\mdelete\s+from\s+(only\s+)?(public\.)?(course_attempts|preview_runs)\M');
+    end if;
+  end loop;
+
+  -- lock order (steps 10 and 63): in both consume_grant forms the first
+  -- locking statement (the text from the previous ';' to the first
+  -- 'for update') names attempt_requests and not the enrolment
+  for r in select * from (values ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)'),
+                                  ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)')) as t(fn)
+  loop
+    src := pg_temp.code(to_regprocedure(r.fn));
+    pre := substring(src from '([^;]*)\mfor\s+update\M');
+    if pre is null or pre not like '%attempt_requests%' or pre like '%journey_enrollments%' then
+      bad := bad || format('%s: the first locking statement is not the grant row''s', r.fn);
+    end if;
+  end loop;
+  -- step 13: journey_record_completion's first lock is the enrolment row's
+  src := pg_temp.code(to_regprocedure('public.journey_record_completion(uuid)'));
+  pre := substring(src from '([^;]*)\mfor\s+update\M');
+  if pre is null or pre not like '%journey_enrollments%' then
+    bad := bad || 'journey_record_completion: the first locking statement is not the enrolment row''s'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (3) comments and stored bodies: %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
 
 rollback;
