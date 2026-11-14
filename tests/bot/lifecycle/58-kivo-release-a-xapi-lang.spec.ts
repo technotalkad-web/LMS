@@ -36,6 +36,7 @@ import crypto from "node:crypto";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
+import { fixtureAttemptContext } from "./p0-helpers";
 
 const ZIP = process.env.KIVO_RELEASE_A_XAPI_ZIP ?? "";
 const TINCAN = process.env.KIVO_RELEASE_A_TINCAN ?? "";
@@ -609,7 +610,7 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     for (let i = 0; i < 26; i++) {
       const u = await createAuthUser({ profile: { first_name: "Kivo", last_name: `Copy ${i + 1}`, must_change_password: false } });
       await addMember({ organizationId: org.id, userId: u.id, role: "member" });
-      const { data: a, error: aErr } = await svc().from("course_attempts").insert({ ...(att as Record<string, unknown>), user_id: u.id, organization_id: org.id }).select("id").single();
+      const { data: a, error: aErr } = await svc().from("course_attempts").insert({ ...(att as Record<string, unknown>), user_id: u.id, organization_id: org.id, ...fixtureAttemptContext(att as Record<string, unknown>) }).select("id").single();
       expect(aErr).toBeNull();
       const attemptId = (a as { id: string }).id;
       attemptIds.push(attemptId);

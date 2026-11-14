@@ -278,12 +278,16 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
         .select("id")
         .single();
       expect(pErr, `program: ${pErr?.message}`).toBeNull();
-      // The draft day row before the version (ADR 0024 step 64): 0107's Q8
-      // before-check and its paste-window trigger find day 1 by (program,
-      // day number), so the day gets its identity.
-      const { error: dErr } = await db
+      // The draft day row before the version (ADR 0024 step 64; 0107's Q8
+      // before-check finds day 1 by (program, day number)). The version names
+      // the day's identity itself, day_ids by this row's own id with source
+      // 'editor', so it needs neither 0107's paste-window trigger nor
+      // anything 0108 drops (P2-N9).
+      const { data: day1, error: dErr } = await db
         .from("journey_days")
-        .insert({ program_id: program!.id, organization_id: orgA.id, day_number: 1, course_id: courses[key].course, mission_title: `QA mission ${key}` });
+        .insert({ program_id: program!.id, organization_id: orgA.id, day_number: 1, course_id: courses[key].course, mission_title: `QA mission ${key}` })
+        .select("id")
+        .single();
       expect(dErr, `journey day: ${dErr?.message}`).toBeNull();
       const { data: jv, error: vErr } = await db
         .from("journey_versions")
@@ -296,6 +300,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
           count_sundays: true,
           completion_title: "Yoddha",
           days: [{ day: 1, course_id: courses[key].course, mission_title: `QA mission ${key}` }],
+          day_ids: { "1": (day1 as { id: string }).id },
+          day_ids_source: "editor",
         })
         .select("id")
         .single();

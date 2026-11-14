@@ -112,7 +112,7 @@ if (!NO_SEED) {
     for (const uid of [lr, l2, l3]) {
       const existing = await rest(`/course_attempts?course_version_id=eq.${v.id}&user_id=eq.${uid}&completion_status=eq.completed&select=id&limit=1`);
       if (existing.length) continue;
-      await rest(`/course_attempts`, { method: "POST", body: JSON.stringify({ course_version_id: v.id, user_id: uid, organization_id: org.id, status: "completed", completion_status: "completed", success_status: "passed", score: scores[uid], started_at: daysAgo(4), completed_at: daysAgo(4), progress_pct: 100 }) });
+      await rest(`/course_attempts`, { method: "POST", body: JSON.stringify({ course_version_id: v.id, user_id: uid, organization_id: org.id, context_kind: "individual", status: "completed", completion_status: "completed", success_status: "passed", score: scores[uid], started_at: daysAgo(4), completed_at: daysAgo(4), progress_pct: 100 }) });
     }
   }
   for (const fn of ["refresh_gamification_views", "refresh_report_views"]) {

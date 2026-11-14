@@ -40,7 +40,7 @@ import { test, expect, type BrowserContext } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext, uploadCourse } from "./helpers";
-import { getNoFollow } from "./p0-helpers";
+import { fixtureAttemptContext, getNoFollow } from "./p0-helpers";
 import { auActivityId } from "../../../lib/alds/types";
 
 type User = { id: string; email: string; password: string };
@@ -223,6 +223,8 @@ test.describe.serial("ADR 0021 — Learner Feedback section and CSV", () => {
           cmi_data: {},
           is_revision: flags.is_revision ?? false,
           is_preview: flags.is_preview ?? false,
+          // The context from the same flags; a preview is the by-role kind, legacy_role (ADR 0024 step 64).
+          ...fixtureAttemptContext(flags),
         })
         .select("id")
         .single();

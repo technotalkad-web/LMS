@@ -27,7 +27,7 @@ import { test, expect, type APIRequestContext, type BrowserContext } from "@play
 import { randomUUID } from "node:crypto";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { assignCourse, authedContext, grantDecidedAfter, uploadCourse } from "./helpers";
-import { authTokenFor, cmi5Zip, directUpload, getNoFollow, VERB, XAPI_HEADERS } from "./p0-helpers";
+import { authTokenFor, cmi5Zip, directUpload, fixtureAttemptContext, getNoFollow, VERB, XAPI_HEADERS } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
 const AU = "https://qa.bot/cmi5/au1";
@@ -226,11 +226,13 @@ test.describe.serial("ADR 0014 — the grant flow and the fail-closed launch (PR
     const { error: e1 } = await svc().from("course_attempts").insert({
       ...base, status: "passed", completion_status: "completed", success_status: "passed", score: 0.9,
       started_at: new Date(now - 7_200_000).toISOString(), completed_at: new Date(now - 3_600_000).toISOString(),
+      ...fixtureAttemptContext(base),
     });
     expect(e1).toBeNull();
     const { error: e2 } = await svc().from("course_attempts").insert({
       ...base, status: "in_progress", completion_status: "completed", success_status: "unknown",
       started_at: new Date(now - 1_800_000).toISOString(),
+      ...fixtureAttemptContext(base),
     });
     expect(e2).toBeNull();
     const before = (await attemptsOf(l3.id)).length;

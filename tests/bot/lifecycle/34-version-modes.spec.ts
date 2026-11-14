@@ -33,7 +33,7 @@ import {
   svc,
 } from "./data";
 import { authedContext, uploadCourse, assignCourse, launch, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
-import { directUpload } from "./p0-helpers";
+import { directUpload, fixtureAttemptContext } from "./p0-helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 const zipBuf = () => fs.readFileSync(path.join(FIXTURES, "scorm12.zip"));
@@ -76,6 +76,8 @@ async function seed(
       success_status: "unknown",
       cmi_data: { "cmi.core.lesson_location": "page-3" },
       ...attempt,
+      // The context from the overrides' flags, the only flags of the row (ADR 0024 step 64).
+      ...fixtureAttemptContext(attempt),
     })
     .select("id")
     .single();
@@ -308,6 +310,7 @@ async function seedAttempt(
       success_status: "unknown",
       cmi_data: { "cmi.core.lesson_location": "page-2" },
       ...over,
+      ...fixtureAttemptContext(over),
     })
     .select("id")
     .single();
