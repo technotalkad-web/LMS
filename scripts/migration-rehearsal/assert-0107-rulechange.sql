@@ -33,8 +33,12 @@
 --   (R4)  O1-h (2) through binding (3), at the course
 --   (R5)  O1-h (3) through binding (1): a completion the writer has not
 --         processed, tightened; then the writer runs and answers done with
---         the one fact row and its done_at
---   (R6)  O1-h (3) through binding (3); the writer then completes the path
+--         the one fact row, the trigger's: the same id and
+--         rule_pass_required false, read before the writer (not "the same
+--         done_at", which defaults to now() and is one instant for every
+--         write of this transaction, so it could not fail)
+--   (R6)  O1-h (3) through binding (3), the fact identified the same way;
+--         the writer then completes the path
 --   (R7)  a relaxation records too, with rule_pass_required true
 --   (R8)  a step removed (binding (2) records it), the course tightened,
 --         the step added again: done by its fact
@@ -414,7 +418,12 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- (R5) a completion the writer has not processed, tightened at the step;
---      the writer then runs
+--      the writer then runs. The trigger's fact is identified by its id and
+--      its rule_pass_required, read before the writer: a fact the writer
+--      wrote or rewrote would carry a new id, and the writer writes only
+--      under the rule as it stands (true here). done_at cannot tell them
+--      apart: it defaults to now(), the same instant for every write of
+--      this one transaction (the final review of 2026-11-14, F7)
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -422,26 +431,30 @@ declare
   got text;
   w   jsonb;
   d0  timestamptz;
+  f0  uuid;
+  r0  boolean;
 begin
   perform pg_temp.rc_att(7, 7, 18, 6, 'failed', 0.3);
   update public.learning_path_courses set pass_required = true where path_id = pg_temp.rcp(6) and course_id = pg_temp.rcc(7);
-  select f.done_at into d0 from public.learning_path_step_completions f
+  select f.done_at, f.id, f.rule_pass_required into d0, f0, r0 from public.learning_path_step_completions f
    where f.path_id = pg_temp.rcp(6) and f.user_id = pg_temp.rcu(18);
   got := pg_temp.rc_step(6, 18, 7) || ' / ' || pg_temp.rc_fact(6, 18, 7) || ' / ' || pg_temp.rc_prog(6, 18)
          || ' / ' || pg_temp.rc_lc(6, 18, 7);
   if got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a07 / rule=F att=a07 / '
-                          || '1/2 next=2 status=in_progress / true,false' then
-    bad := bad || format('before the writer: %s', got);
+                          || '1/2 next=2 status=in_progress / true,false' or f0 is null or r0 is distinct from false then
+    bad := bad || format('before the writer: %s (fact %s, rule %s)', got, f0, r0);
   end if;
   w := public.record_learning_activity(pg_temp.rca(7));
   if w ->> 'done' is distinct from 'true' or w ->> 'passed_ever' is distinct from 'true'
      or w ->> 'passed_by_rule' is distinct from 'false' or (w ->> 'done_recorded_at')::timestamptz is distinct from d0
      or (select count(*) from public.learning_path_step_completions f
           where f.path_id = pg_temp.rcp(6) and f.user_id = pg_temp.rcu(18)) <> 1
-     or (select f.done_at from public.learning_path_step_completions f
-          where f.path_id = pg_temp.rcp(6) and f.user_id = pg_temp.rcu(18)) is distinct from d0 then
+     or (select f.id from public.learning_path_step_completions f
+          where f.path_id = pg_temp.rcp(6) and f.user_id = pg_temp.rcu(18)) is distinct from f0
+     or (select f.rule_pass_required from public.learning_path_step_completions f
+          where f.path_id = pg_temp.rcp(6) and f.user_id = pg_temp.rcu(18)) is distinct from r0 then
     bad := bad || format('the writer answered %s (expected done and passed_ever true, passed_by_rule false, '
-                         || 'done_recorded_at the fact''s, one fact row with the same done_at)', w);
+                         || 'done_recorded_at the fact''s, one fact row: the trigger''s, same id and rule false)', w);
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0107-rulechange: (R5) O1-h (3) through binding (1): %', array_to_string(bad, '; ');
@@ -451,7 +464,8 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- (R6) a completion the writer has not processed, tightened at the course;
---      the writer then runs and completes the one-step path
+--      the writer then runs and completes the one-step path. The fact is
+--      identified by its id and rule_pass_required, as in (R5)
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -459,25 +473,31 @@ declare
   got text;
   w   jsonb;
   d0  timestamptz;
+  f0  uuid;
+  r0  boolean;
 begin
   perform pg_temp.rc_att(8, 9, 19, 7, 'failed', 0.3);
   update public.courses set pass_required = true where id = pg_temp.rcc(9);
-  select f.done_at into d0 from public.learning_path_step_completions f
+  select f.done_at, f.id, f.rule_pass_required into d0, f0, r0 from public.learning_path_step_completions f
    where f.path_id = pg_temp.rcp(7) and f.user_id = pg_temp.rcu(19);
   got := pg_temp.rc_step(7, 19, 9) || ' / ' || pg_temp.rc_fact(7, 19, 9) || ' / ' || pg_temp.rc_prog(7, 19)
          || ' / ' || pg_temp.rc_lc(7, 19, 9);
   if got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a08 / rule=F att=a08 / '
-                          || '1/1 next=- status=in_progress / true' then
-    bad := bad || format('before the writer: %s', got);
+                          || '1/1 next=- status=in_progress / true' or f0 is null or r0 is distinct from false then
+    bad := bad || format('before the writer: %s (fact %s, rule %s)', got, f0, r0);
   end if;
   w := public.record_learning_activity(pg_temp.rca(8));
   if w ->> 'done' is distinct from 'true' or w ->> 'passed_ever' is distinct from 'true'
      or (w ->> 'done_recorded_at')::timestamptz is distinct from d0 or w ->> 'path_completed' is distinct from 'true'
      or (select count(*) from public.learning_path_step_completions f
           where f.path_id = pg_temp.rcp(7) and f.user_id = pg_temp.rcu(19)) <> 1
+     or (select f.id from public.learning_path_step_completions f
+          where f.path_id = pg_temp.rcp(7) and f.user_id = pg_temp.rcu(19)) is distinct from f0
+     or (select f.rule_pass_required from public.learning_path_step_completions f
+          where f.path_id = pg_temp.rcp(7) and f.user_id = pg_temp.rcu(19)) is distinct from r0
      or pg_temp.rc_prog(7, 19) is distinct from '1/1 next=- status=completed' then
-    bad := bad || format('the writer answered %s, the path reads %s (expected done, the fact''s done_at, one fact row, '
-                         || 'the path completed)', w, pg_temp.rc_prog(7, 19));
+    bad := bad || format('the writer answered %s, the path reads %s (expected done, the fact''s done_at, one fact row: '
+                         || 'the trigger''s, same id and rule false; the path completed)', w, pg_temp.rc_prog(7, 19));
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0107-rulechange: (R6) O1-h (3) through binding (3): %', array_to_string(bad, '; ');

@@ -54,6 +54,7 @@ import {
 } from "./profile";
 import { uuid5 } from "./uuid5";
 import { abandonedStatementId } from "./statement-id";
+import { isMissingColumn, type PgError } from "@/lib/scoring/attempt-kind";
 
 type Row = Record<string, unknown>;
 type Obj = Record<string, unknown>;
@@ -554,16 +555,39 @@ async function srcJourneys(env: Env, cursor: string): Promise<SourceResult> {
   return { built, nextCursor: advance(cursor, last, list.length >= env.chunk), done: list.length < env.chunk };
 }
 
-async function srcXp(env: Env, cursor: string): Promise<SourceResult> {
-  const list = await rows(
-    env.db
+/**
+ * One chunk of xp_events for srcXp, without the 0-point event rows (ADR 0024
+ * step 35). From the 0107 paste on, every official completion that reaches
+ * the XP core writes `event_only` rows under the paid rule names
+ * (course_completed, course_passed, perfect_score, high_score), and a tenant
+ * LRS cannot be cleaned up afterwards, so the skip ships with phase 1 and not
+ * with phase 5 (the ADR 0024 note of 2026-11-14, final review, F2). On a
+ * database without 0107 the filter answers a missing-column error naming
+ * `event_only`; only then is today's select read once (no row there is an
+ * event row). Any other error answers no rows, as rows() always has, so the
+ * cursor stays where it was.
+ */
+async function xpChunk(env: Env, cursor: string): Promise<Row[]> {
+  const page = (skipEvents: boolean) => {
+    let q = env.db
       .from("xp_events")
       .select("id, user_id, rule, xp, course_id, attempt_id, created_at")
-      .eq("organization_id", env.orgId)
-      .gte("created_at", cursor)
-      .order("created_at", { ascending: true })
-      .limit(env.chunk)
-  );
+      .eq("organization_id", env.orgId);
+    if (skipEvents) q = q.eq("event_only", false);
+    return q.gte("created_at", cursor).order("created_at", { ascending: true }).limit(env.chunk);
+  };
+  try {
+    const { data, error } = (await page(true)) as { data: Row[] | null; error: PgError };
+    if (!error) return data ?? [];
+    if (!isMissingColumn(error, "event_only")) return [];
+  } catch {
+    return [];
+  }
+  return rows(page(false));
+}
+
+async function srcXp(env: Env, cursor: string): Promise<SourceResult> {
+  const list = await xpChunk(env, cursor);
   const learners = await learnersFor(env, list.map((r) => String(r.user_id)));
   const built: Built[] = [];
   for (const r of list) {

@@ -11,6 +11,24 @@
 -- grants-0107.sql or the other 0107 files of this folder. A failure here is
 -- a defect of 0107 or a misreading of the record; the record decides which.
 --
+-- Provenance. The sentence above holds for the file as of e54e417, the last
+-- of its four first commits (0f1fb6a, fed2c9b, a8e7a1a, e54e417). Later
+-- commits of the builders, each of which also changed 0107 or its
+-- rehearsal, edited it so that it keeps passing; for what they changed the
+-- independence claim does not hold:
+--   b6168f9 (the user-delete ruling of 2026-11-14): pg_temp.own_enr(),
+--           which routes the fixtures around the new owner trigger, and
+--           the owner-trigger rows;
+--   ebebdf7 (the owner's O3 answer): the three rule-change triggers and
+--           their function in (0d);
+--   c45b9cb (O4-b): passed_in_window among the expected columns of
+--           v_path_step_status;
+--   the final review of 2026-11-14 (the commit that adds this paragraph):
+--           the O1-g (5) check identifies the step fact by its id as well
+--           as its done_at, which is one instant for the whole transaction
+--           and could not fail alone; and the privileges paragraph below is
+--           qualified for grants-0107-defaults.sql.
+--
 -- House form (assert-0103.sql, assert-0105.sql): one transaction that ends
 -- in ROLLBACK; every mutating check runs in its own savepoint and is rolled
 -- back to it; every check raises 'assert-0107-independent: (id) ...' on
@@ -26,7 +44,12 @@
 -- inside a savepoint whatever table privilege a role needs to reach the
 -- thing a check tests. Every refusal (42501, "permission denied") has a
 -- control: the same statement after the missing privilege is granted in a
--- nested savepoint no longer fails on a privilege.
+-- nested savepoint no longer fails on a privilege. In 0105-0106-then-0107,
+-- grants-0107-defaults.sql has also given every object 0107 creates all
+-- privileges for anon, authenticated and service_role by default, so there
+-- a refusal on a new object is 0107's own revoke at work; in
+-- 0106-then-0105-then-0107 it has not, so there a refusal on a new object
+-- holds whether or not 0107 revokes.
 --
 -- Fixtures: two organisations of this file's own (X and Y), seven users,
 -- ten courses, three paths and a journey program with six days. Every id
@@ -2920,6 +2943,7 @@ declare
   w jsonb;
   v record;
   d0 timestamptz;
+  f0 uuid;
   got text;
   nid uuid;
 begin
@@ -2939,7 +2963,7 @@ begin
         from public.course_attempts a where a.id = pg_temp.id('4001')) then
     bad := bad || '(1) the writer did not stamp side_effects_sig and side_effects_at'::text;
   end if;
-  select f.done_at into d0 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1;
+  select f.done_at, f.id into d0, f0 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1;
   -- the admin tightens step 1 after the learner finished it
   update public.learning_path_courses set pass_required = true where path_id = p2 and course_id = c1;
   select * into v from public.v_path_step_status s where s.path_id = p2 and s.user_id = l3 and s.course_id = c1;
@@ -2957,7 +2981,9 @@ begin
   w := public.record_learning_activity(pg_temp.id('4001'));
   if (select count(*) from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3) <> 1
      or (select f.done_at from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1)
-        is distinct from d0 then
+        is distinct from d0
+     or (select f.id from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1)
+        is distinct from f0 then
     bad := bad || '(5) a second writer call changed the facts'::text;
   end if;
   got := pg_temp.try(format('update public.learning_path_step_completions set rule_pass_required = true where path_id = %L', p2));

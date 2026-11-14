@@ -975,6 +975,7 @@ declare
   a    jsonb;
   got  text;
   d0   timestamptz;
+  f0   uuid;
 begin
   -- O1-g (1): U2 completes WA in PW without a pass while no pass is
   -- required: the fact is written, the step is done
@@ -991,7 +992,7 @@ begin
   if got is distinct from '1001/f/7001' then
     bad := bad || format('the facts of U2: %s (expected WA under no pass rule, attempt 7001)', got);
   end if;
-  select f.done_at into d0 from public.learning_path_step_completions f where f.path_id = pw and f.user_id = u2;
+  select f.done_at, f.id into d0, f0 from public.learning_path_step_completions f where f.path_id = pw and f.user_id = u2;
   -- the rule tightened after: still done, with the standing result
   update public.learning_path_courses set pass_required = true where path_id = pw and course_id = wa;
   select format('%s/%s/%s/%s/%s', st.passed_by_rule, st.done_recorded_at is not null, st.done, st.failed, st.latest_result)
@@ -1021,12 +1022,15 @@ begin
     bad := bad || format('the path completion row: %s (expected score 0.65 and both steps with their attempts)', got);
   end if;
   -- O1-g (5): step 1 passes later (the branch runs again): one fact, the
-  -- same done_at, no second completion or claim
+  -- same row by its id (done_at alone could not tell: it is one instant
+  -- for the whole transaction), no second completion or claim
   update public.course_attempts set success_status = 'passed' where id = pg_temp.u8('000107187001');
   a := public.record_learning_activity(pg_temp.u8('000107187001'));
   if a ->> 'path_completed' <> 'false' or a -> 'notices' <> '[]'::jsonb
      or (select count(*) from public.learning_path_step_completions f where f.path_id = pw and f.user_id = u2) <> 2
      or (select done_at from public.learning_path_step_completions f where f.path_id = pw and f.user_id = u2 and f.course_id = wa) <> d0
+     or (select f.id from public.learning_path_step_completions f where f.path_id = pw and f.user_id = u2 and f.course_id = wa)
+        is distinct from f0
      or (select count(*) from public.completion_notices n where n.user_id = u2) <> 1 then
     bad := bad || format('O1-g (5), a second branch: %s', a);
   end if;

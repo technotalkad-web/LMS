@@ -35,7 +35,14 @@
 --        removed and added again finds its fact (7)
 -- and the other three parts of section 6 that slice 9 built beside it:
 --   (45) 6m, the two refresh functions: their view entries in order, then
---        the completion sweep's entry, which counts the row it handled
+--        the completion sweep's entry, which counts the row it handled;
+--        every entry's keys exactly, and its error a JSON null
+--   (45b) the sweep's own error: in a savepoint the sweep is replaced by a
+--        body that raises; both functions still answer, every view entry
+--        refreshed, and the last entry carries exactly view, ms, rows,
+--        error and sweep, with error the message and rows and sweep null
+--        (the half of the cron routes' 500 rule that lives in SQL); rolled
+--        back, and the real body is asserted back
 --   (46) 6n, gamification_close_month's highest_scorer (step 35) on an
 --        organisation of its own: last month's official Individual and path
 --        results averaged per learner; revision, abandoned, preview and
@@ -644,7 +651,9 @@ $$;
 -- (45) 6m, the two refresh functions: the six (and two) view entries, then
 --      the completion sweep's entry last; the sweep handles a completed row
 --      whose writer call never ran, and its entry counts it; a second call
---      finds nothing left
+--      finds nothing left. Every entry's keys are read as a set, and its
+--      error as a JSON null, so a missing or renamed key fails (the final
+--      review of 2026-11-14, F6)
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -659,7 +668,11 @@ begin
           now() - interval '40 minutes', now() - interval '30 minutes', 'individual', 'Normal');
   res := public.refresh_report_views();
   if jsonb_array_length(res) <> 7 or res -> 6 ->> 'view' <> 'completion_sweep'
-     or exists (select 1 from jsonb_array_elements(res) e where e ->> 'error' is not null)
+     or exists (select 1 from jsonb_array_elements(res) e
+                 where pg_temp.keys(e) <> case when e ->> 'view' = 'completion_sweep'
+                                               then 'error,ms,rows,sweep,view' else 'error,ms,rows,view' end
+                    or jsonb_typeof(e -> 'error') <> 'null')
+     or jsonb_typeof(res -> 6 -> 'sweep') <> 'object'
      or (res -> 6 ->> 'rows')::int < 1 or (res -> 6 -> 'sweep' ->> 'handled')::int <> (res -> 6 ->> 'rows')::int
      or array(select e ->> 'view' from jsonb_array_elements(res) e) <> array[
           'mv_course_enrollment_status', 'mv_path_enrollment_status', 'mv_course_performance', 'mv_path_performance',
@@ -672,12 +685,97 @@ begin
   res := public.refresh_gamification_views();
   if jsonb_array_length(res) <> 3
      or array(select e ->> 'view' from jsonb_array_elements(res) e) <> array['mv_leaderboard', 'mv_learner_metrics', 'completion_sweep']
-     or exists (select 1 from jsonb_array_elements(res) e where e ->> 'error' is not null)
+     or exists (select 1 from jsonb_array_elements(res) e
+                 where pg_temp.keys(e) <> case when e ->> 'view' = 'completion_sweep'
+                                               then 'error,ms,rows,sweep,view' else 'error,ms,rows,view' end
+                    or jsonb_typeof(e -> 'error') <> 'null')
+     or jsonb_typeof(res -> 2 -> 'sweep') <> 'object'
      or (res -> 2 ->> 'rows')::int <> 0 then
     bad := bad || format('refresh_gamification_views() answered %s', res);
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0107: (45) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (45b) 6m, the sweep's own error (step 81; ruling A4 of 2026-11-14): the
+--      two cron routes answer 500 only when the last entry is the
+--      completion sweep's and carries its own error, so that half of the
+--      contract is asserted here, on the SQL side. Inside a savepoint the
+--      sweep is replaced by a body that raises a fixed message; each
+--      refresh function still answers, every view entry refreshed with its
+--      error a JSON null, and the last entry's keys are exactly view, ms,
+--      rows, error and sweep, with error the message and rows and sweep
+--      JSON nulls. Rolled back to the savepoint; the real body is then back
+--      (its source hash, security definer and search_path as before, and a
+--      call answers its four keys), for (46) and (47)
+-- ---------------------------------------------------------------------------
+create temp table t45b_sweep_body as
+  select md5(p.prosrc) as h, p.prosecdef as secdef, p.proconfig as cfg
+    from pg_proc p
+   where p.oid = 'public.sweep_completion_side_effects(integer)'::regprocedure;
+
+savepoint s45b_sweep_raises;
+
+create or replace function public.sweep_completion_side_effects(p_limit integer)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  raise exception 'assert-0107 (45b): the sweep raised on purpose';
+end
+$$;
+
+do $$
+declare
+  bad  text[] := '{}';
+  res  jsonb;
+  v_sw jsonb;
+  fn   text;
+  msg  constant text := 'assert-0107 (45b): the sweep raised on purpose';
+begin
+  foreach fn in array array['refresh_report_views', 'refresh_gamification_views'] loop
+    execute format('select public.%I()', fn) into res;
+    v_sw := res -> (jsonb_array_length(res) - 1);
+    if pg_temp.keys(v_sw) <> 'error,ms,rows,sweep,view' or v_sw ->> 'view' is distinct from 'completion_sweep'
+       or v_sw ->> 'error' is distinct from msg or jsonb_typeof(v_sw -> 'rows') <> 'null'
+       or jsonb_typeof(v_sw -> 'sweep') <> 'null' or jsonb_typeof(v_sw -> 'ms') <> 'number' then
+      bad := bad || format('%s() answered the sweep entry %s (expected exactly view, ms, rows, error and sweep; '
+                           || 'error "%s"; rows and sweep null)', fn, v_sw, msg);
+    end if;
+    if jsonb_array_length(res) <> (case fn when 'refresh_report_views' then 7 else 3 end)
+       or exists (select 1 from jsonb_array_elements(res) with ordinality as e(v, i)
+                   where i < jsonb_array_length(res)
+                     and (pg_temp.keys(v) <> 'error,ms,rows,view' or jsonb_typeof(v -> 'error') <> 'null'
+                          or jsonb_typeof(v -> 'rows') <> 'number')) then
+      bad := bad || format('%s() answered %s (expected every view entry refreshed, its error null)', fn, res);
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (45b) %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+rollback to savepoint s45b_sweep_raises;
+
+do $$
+declare
+  res jsonb;
+begin
+  if (select md5(p.prosrc) is distinct from t.h or p.prosecdef is distinct from t.secdef
+                                                or p.proconfig is distinct from t.cfg
+        from pg_proc p, t45b_sweep_body t
+       where p.oid = 'public.sweep_completion_side_effects(integer)'::regprocedure) then
+    raise exception 'assert-0107: (45b) the sweep''s body was not restored by the rollback to the savepoint';
+  end if;
+  res := public.sweep_completion_side_effects(1);
+  if pg_temp.keys(res) <> 'candidates,errors,failed,handled' then
+    raise exception 'assert-0107: (45b) the restored sweep answered %', res;
   end if;
 end
 $$;

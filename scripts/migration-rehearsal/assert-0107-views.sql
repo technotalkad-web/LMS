@@ -1051,6 +1051,7 @@ declare
   kept constant text := 'C05#1 pr=T pbr=F fact=T pe=T done=T res=failed sc=0.3 off=a30 rl=F f=F open=F; '
                         || 'C06#2 pr=F pbr=F fact=F pe=F done=F res=- sc=- off=- rl=F f=F open=F';
   v_done_at timestamptz;
+  v_fact_id uuid;
   a    uuid;
 begin
   -- PB, L14: C05 completed without a pass while none is required
@@ -1063,7 +1064,7 @@ begin
   if n <> 1 then
     bad := bad || format('O1-c: the writer''s statement wrote %s fact(s) for L14 (expected 1, C05)', n);
   end if;
-  select format('%s rule=%s', pg_temp.lbl_0107v(attempt_id), rule_pass_required), f.done_at into got, v_done_at
+  select format('%s rule=%s', pg_temp.lbl_0107v(attempt_id), rule_pass_required), f.done_at, f.id into got, v_done_at, v_fact_id
     from public.learning_path_step_completions f where f.path_id = pb and f.user_id = l14;
   if got is distinct from 'a30 rule=f' then
     bad := bad || format('L14''s fact reads %s (expected a30 rule=f)', got);
@@ -1117,12 +1118,13 @@ begin
     bad := bad || format('O1-g (11), the retake failed: %s', got);
   end if;
   -- (5), static half: the writer's statement again writes nothing, and the
-  -- fact is the one written first
+  -- fact is the one written first: the same row by its id (done_at alone
+  -- could not tell, it is one instant for the whole transaction)
   n := pg_temp.write_facts_0107v(pb, l14);
-  select format('%s %s rule=%s same_time=%s', count(*), max(pg_temp.lbl_0107v(attempt_id)), bool_and(rule_pass_required),
-                bool_and(f.done_at = v_done_at))
+  select format('%s %s rule=%s same_row=%s', count(*), max(pg_temp.lbl_0107v(attempt_id)), bool_and(rule_pass_required),
+                bool_and(f.id = v_fact_id and f.done_at = v_done_at))
     into got from public.learning_path_step_completions f where f.path_id = pb and f.user_id = l14;
-  if n <> 0 or got is distinct from '1 a30 rule=f same_time=t' then
+  if n <> 0 or got is distinct from '1 a30 rule=f same_row=t' then
     bad := bad || format('O1-g (5): the second run wrote %s and the facts read %s', n, got);
   end if;
 

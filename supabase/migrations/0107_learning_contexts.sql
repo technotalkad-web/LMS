@@ -120,11 +120,19 @@
 -- revision_visits, xp_events, journey_days, journey_versions,
 -- journey_day_progress, journey_enrollments, journey_programs,
 -- course_assignments, learning_path_assignments, learning_path_courses,
--- org_api_keys, org_integration_settings and notification_templates; SHARE
--- ROW EXCLUSIVE until commit on the parents of the foreign keys this file
--- adds or re-creates that are not in that list, learning_paths,
--- organizations, auth.users and courses (writes to them wait, reads do
--- not; courses also takes it for the rule-change trigger of section 6q);
+-- org_api_keys, org_integration_settings and notification_templates; on
+-- the FIRST paste, ACCESS EXCLUSIVE until commit on learning_paths as well:
+-- section 2d drops the 0034 key course_attempts_learning_path_id_fkey to
+-- create it again as no action, and dropping a foreign key locks its
+-- parent that way (read on the rehearsal's Postgres; ops/0107-reverse.sql
+-- says the same of its own key drops), so every read of learning_paths
+-- (the path pages, the dashboard, the library, the refreshes) waits for
+-- the whole first paste, the after-check A6 included; a later paste finds
+-- that key already no action and drops nothing; SHARE ROW EXCLUSIVE until
+-- commit on the parents of the foreign keys this file adds that are not in
+-- that list, organizations, auth.users and courses (writes to them wait,
+-- reads do not; courses also takes it for the rule-change trigger of
+-- section 6q);
 -- on a LATER paste, ACCESS EXCLUSIVE until commit on courses as well,
 -- because dropping its rule-change trigger to create it again takes that
 -- lock (read on the rehearsal's Postgres; the first paste finds no trigger
@@ -234,6 +242,12 @@
 --   file's unique (enrollment_id, day_id); and auth.uid() of Supabase's auth
 --   schema (the restated policies of section 7a). The after-check A14 reads
 --   public.platform_owners (0021) when it exists, and needs it nowhere else.
+--   And the pasting role's right to SET ROLE to anon and to authenticated:
+--   the after-checks A5, A13, A14 and A23 run statements as those roles.
+--   Section 0a tries both (set local role, then back) before any write and
+--   refuses with a fixed message when either is denied; without that try a
+--   denial would surface only at the after-checks, after the file's whole
+--   work, and roll it back (the ADR 0024 note of 2026-11-14, final review).
 --
 -- BEFORE the apply (read-only; role postgres; counts only, never an id or a
 -- name). Q1 to Q10 are ONE read-only select: section 0b below, from the line
@@ -628,6 +642,31 @@ begin
   ) then
     raise exception '0107 refused: journey_day_progress has no unique key per (enrolment, day) (apply 0058 first).';
   end if;
+end
+$$;
+
+-- The pasting role may SET ROLE to anon and to authenticated (PREREQUISITES,
+-- last item). The after-checks A5, A13, A14 and A23 do exactly this, at the
+-- end of the file; here each role is set and the role of the paste set back
+-- inside a block of its own, so a denial (42501) refuses before any write,
+-- and a role that is set is undone with the block when it raises. A real
+-- try, not pg_has_role(..., 'MEMBER'): from Postgres 16 a membership granted
+-- WITH SET FALSE reads member and still refuses SET ROLE (shown on the
+-- rehearsal's Postgres).
+do $$
+declare
+  v_me   text := current_user;
+  v_role text;
+begin
+  foreach v_role in array array['anon', 'authenticated'] loop
+    begin
+      execute format('set local role %I', v_role);
+      execute format('set local role %I', v_me);
+    exception when insufficient_privilege then
+      raise exception '0107 refused: the role % cannot set role %, which the after-checks A5, A13, A14 and A23 need. Nothing changed.', v_me, v_role
+        using hint = 'ADR 0024 note of 2026-11-14 (final review, F4): paste with the role selector on postgres.';
+    end;
+  end loop;
 end
 $$;
 

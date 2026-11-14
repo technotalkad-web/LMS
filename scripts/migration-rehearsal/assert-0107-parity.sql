@@ -35,8 +35,12 @@
 -- must equal the count the file gives the SQL side, and (H1 of the ADR's
 -- note of 2026-11-14) each pair's count must equal the both-sided count
 -- pinned in parity-cases.mjs (BOTH_SIDED) and in
--- tests/unit/context-parity.test.ts: the SQL side runs no case alone. One
--- transaction that ends in ROLLBACK.
+-- tests/unit/context-parity.test.ts: the SQL side runs no case alone,
+-- except the journey pair. Its 17 cases are marked for both sides, but the
+-- TypeScript side runs none of them yet: they stand on
+-- context-parity.test.ts's dated JOURNEY_TS_PENDING list until the phase 2
+-- pull request (ADR 0024 note N17), so today the journey pair is proven on
+-- this side only. One transaction that ends in ROLLBACK.
 
 begin;
 
