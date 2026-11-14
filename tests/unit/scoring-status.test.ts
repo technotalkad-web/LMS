@@ -463,8 +463,10 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
       ["the error rule: the rows read so far, as fetchAll; only the section that states completeness reads the error (ADR 0017 step 14)", /const attempts = attemptRows as Attempt\[\];[\s\S]*?const notAppliedRows =\s*ignoredErr \|\| attemptsErr\s*\? null/],
     ],
     "lib/scoring/status.ts": [
-      ["the call: by version chunk, in id order, one decision for every chunk",
-        /const decided: OptionalColumnState = \{ columns: null \};[\s\S]*?for \(let i = 0; i < versionIds\.length; i \+= CHUNK\) \{[\s\S]*?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, f, t\) => client\.from\("course_attempts"\)\.select\(columns\)\.in\("course_version_id", part\)\.order\("id"\)\.range\(f, t\),\s*ATTEMPT_COLUMNS,\s*\{ pageSize: PAGE, state: decided \}\s*\);/],
+      // ADR 0024 step 49: the Individual context when 0107 is there, decided
+      // once for every chunk as the column list is.
+      ["the call: by version chunk, in id order, one decision for every chunk, the Individual filter through individualContextOnly",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*const individual: IndividualFilterState = \{ applies: null \};[\s\S]*?for \(let i = 0; i < versionIds\.length; i \+= CHUNK\) \{[\s\S]*?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*individualContextOnly\(individual, \(columns, f, t, only\) => \{\s*const q = client\.from\("course_attempts"\)\.select\(columns\)\.in\("course_version_id", part\)\.order\("id"\)\.range\(f, t\);\s*return only \? q\.eq\("context_kind", "individual"\) : q;\s*\}\),\s*ATTEMPT_COLUMNS,\s*\{ pageSize: PAGE, state: decided \}\s*\);/],
       ["the error rule: logged as `paged` logs it, the chunk keeps the rows read so far",
         /if \(res\.error\) console\.warn\("\[enrolled-status\] attempts read failed:", res\.error\.message \?\? ""\);\s*for \(const a of res\.data as/],
     ],
@@ -491,15 +493,17 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
     // ADR 0020 (the lead's ruling of 2026-11-11): the enrolled set in chunks
     // of 150 (lib/db/chunked.ts), each paged in id order, never one .in()
     // over the whole set.
+    // ADR 0024 step 49: both Individual surfaces add the Individual filter
+    // through individualContextOnly, decided once for every chunk.
     [LP_FILE]: [
-      ["the call: the enrolled ids by chunk of 150 on the course's versions, in id order, one decision for every chunk",
-        /const decided: OptionalColumnState = \{ columns: null \};\s*for \(const part of chunk\(enrolledUserIds, 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, from, to\)[^=]*=>\s*supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.in\("user_id", part\)\s*\.in\("course_version_id", versionIds\)\s*\.order\("id"\)\s*\.range\(from, to\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
+      ["the call: the enrolled ids by chunk of 150 on the course's versions, in id order, one decision for every chunk, the Individual filter through individualContextOnly",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*const individual: IndividualFilterState = \{ applies: null \};\s*for \(const part of chunk\(enrolledUserIds, 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*individualContextOnly\(individual, \(columns, from, to, only\)[^=]*=>\s*\{\s*const q = supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.in\("user_id", part\)\s*\.in\("course_version_id", versionIds\)\s*\.order\("id"\)\s*\.range\(from, to\);\s*return only \? q\.eq\("context_kind", "individual"\) : q;\s*\}\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
       ["the error rule: logged, the rows read so far kept (as the page's other reads)",
         /if \(res\.error\) console\.warn\("\[learners\] attempts read failed:", res\.error\.message \?\? ""\);\s*attemptRows\.push\(\.\.\.res\.data\);/],
     ],
     "app/api/courses/[courseId]/learners/export/route.ts": [
-      ["the call: the enrolled ids by chunk of 150 on the course's versions, in id order, one decision for every chunk",
-        /const decided: OptionalColumnState = \{ columns: null \};\s*for \(const part of chunk\(enrolledUserIds, 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(columns, from, to\)[^=]*=>\s*supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.in\("user_id", part\)\s*\.in\("course_version_id", versionIds\)\s*\.order\("id"\)\s*\.range\(from, to\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
+      ["the call: the enrolled ids by chunk of 150 on the course's versions, in id order, one decision for every chunk, the Individual filter through individualContextOnly",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*const individual: IndividualFilterState = \{ applies: null \};\s*for \(const part of chunk\(enrolledUserIds, 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*individualContextOnly\(individual, \(columns, from, to, only\)[^=]*=>\s*\{\s*const q = supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.in\("user_id", part\)\s*\.in\("course_version_id", versionIds\)\s*\.order\("id"\)\s*\.range\(from, to\);\s*return only \? q\.eq\("context_kind", "individual"\) : q;\s*\}\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
       ["the error rule: logged, the rows read so far kept (as the page's rule and the CSV's other reads)",
         /if \(res\.error\) console\.warn\("\[learners-export\] attempts read failed:", res\.error\.message \?\? ""\);\s*attemptRows\.push\(\.\.\.res\.data\);/],
     ],
@@ -1064,6 +1068,107 @@ async function statusCases() {
       eq("a failed view read: fail-soft, the summary counts what was read (0), no attempts read",
         [r.summary.total, queries.some((q) => q.table === "course_attempts")], [0, false]);
       eq("…and the warning is logged", warned.some((w) => w.startsWith("[enrolled-status] enrolments read failed:") && w.includes("statement timeout")), true);
+    } finally {
+      console.warn = warn;
+    }
+  }
+
+  // ADR 0024 step 49: the Individual product's loader takes the Individual
+  // context when 0107 is there and today's rows when it is not.
+  console.log("\nloadEnrolledCourseStatus: the Individual context when 0107 is there (ADR 0024 step 49)");
+  const ctxRow = (id: string, user: string, kind: string, outcome: "passed" | "failed", day: number) => ({
+    id, user_id: user, status: outcome, completion_status: "completed", success_status: outcome, score: outcome === "passed" ? 0.9 : 0.3,
+    started_at: `2026-10-0${day}T09:00Z`, completed_at: `2026-10-0${day}T09:30Z`, is_revision: false, context_kind: kind,
+  });
+  // u1 passed first in a path and failed later on the Library; u2 completed
+  // the course only in a path; u3 opened it only as a preview.
+  const ctxRows = [
+    ctxRow("a1", "u1", "path", "passed", 1),
+    ctxRow("a2", "u1", "individual", "failed", 2),
+    ctxRow("a3", "u2", "path", "passed", 3),
+    ctxRow("a4", "u3", "preview", "passed", 4),
+  ];
+  const MISSING_CTX = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+  const filteredBy = (q: Query) => q.ops.filter((o) => o.op === "eq" && o.args[0] === "context_kind").map((o) => o.args[1]);
+  const enrolled = { data: [{ user_id: "u1" }, { user_id: "u2" }, { user_id: "u3" }] };
+  {
+    const { client, queries } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") return enrolled;
+      if (q.table === "course_attempts") {
+        const only = filteredBy(q);
+        return { data: only.length ? ctxRows.filter((r) => only.includes(r.context_kind)) : ctxRows };
+      }
+      return { data: [] };
+    });
+    const r = await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+    const reads = queries.filter((q) => q.table === "course_attempts");
+    eq("with 0107: one attempts read, filtered context_kind = individual", reads.map(filteredBy), [["individual"]]);
+    eq("…u1's Individual result is the Library fail (the earlier path pass is another product's); u2's path pass and u3's preview count nowhere here",
+      [statusOf(r.officialByUser, "u1", "c1"), statusOf(r.officialByUser, "u2", "c1"), statusOf(r.officialByUser, "u3", "c1"), r.summary],
+      ["failed", "not_started", "not_started", { total: 3, completed: 0, failed: 1, inProgress: 0, notStarted: 2 }]);
+  }
+  {
+    // A grant consumed before 0107 whose retake old consume_grant tagged with
+    // a path (note N9): the grant read returns it, the filtered attempts read
+    // does not return its row, and the Individual result is the Library one.
+    const rows = [...ctxRows, ctxRow("p9", "u1", "path", "passed", 5)];
+    const { client } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") return enrolled;
+      if (q.table === "attempt_requests") return { data: [{ user_id: "u1", course_id: "c1", used_attempt_id: "p9" }] };
+      if (q.table === "course_attempts") {
+        const only = filteredBy(q);
+        return { data: only.length ? rows.filter((r) => only.includes(r.context_kind)) : rows };
+      }
+      return { data: [] };
+    });
+    const r = await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+    eq("with 0107, a used grant whose retake is a path row: u1 reads the Library fail, the retake id changes nothing",
+      [statusOf(r.officialByUser, "u1", "c1"), r.officialByUser.get("u1:c1")?.scoring.officialAttempt?.id], ["failed", "a2"]);
+    // The control: the same grant over every row (no filter) makes the
+    // retake official, so the grant read above did reach the scoring.
+    const { client: all } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") return enrolled;
+      if (q.table === "attempt_requests") return { data: [{ user_id: "u1", course_id: "c1", used_attempt_id: "p9" }] };
+      if (q.table === "course_attempts") return { data: rows };
+      return { data: [] };
+    });
+    const control = await loadEnrolledCourseStatus(all, "o1", "c1", ["v1"]);
+    eq("…control: over every row the same grant makes p9 the official attempt",
+      [statusOf(control.officialByUser, "u1", "c1"), control.officialByUser.get("u1:c1")?.scoring.officialAttempt?.id], ["passed", "p9"]);
+  }
+  {
+    const versions = Array.from({ length: 151 }, (_, i) => `v${i}`);
+    const { client, queries } = recordingClient((q) => {
+      if (q.table === "v_course_enrollments_expanded") return enrolled;
+      if (q.table === "course_attempts") {
+        if (filteredBy(q).length) return { data: null, error: MISSING_CTX };
+        const inV = (q.ops.find((o) => o.op === "in")?.args[1] ?? []) as string[];
+        return { data: inV.includes("v0") ? ctxRows : [] };
+      }
+      return { data: [] };
+    });
+    const r = await loadEnrolledCourseStatus(client, "o1", "c1", versions);
+    const reads = queries.filter((q) => q.table === "course_attempts");
+    eq("without 0107: the first read's 42703 naming context_kind re-reads it unfiltered; the second version chunk reads unfiltered at once",
+      reads.map((q) => [filteredBy(q).length > 0, (q.ops.find((o) => o.op === "in")?.args[1] as string[]).length]), [[true, 150], [false, 150], [false, 1]]);
+    eq("…today's reading, every product's row on the course: u1's official attempt is the first (the path pass), u2's path pass counts, the preview too",
+      [statusOf(r.officialByUser, "u1", "c1"), statusOf(r.officialByUser, "u2", "c1"), statusOf(r.officialByUser, "u3", "c1")],
+      ["passed", "passed", "passed"]);
+  }
+  {
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+    try {
+      const { client, queries } = recordingClient((q) => {
+        if (q.table === "v_course_enrollments_expanded") return enrolled;
+        if (q.table === "course_attempts") return { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } };
+        return { data: [] };
+      });
+      const r = await loadEnrolledCourseStatus(client, "o1", "c1", ["v1"]);
+      const reads = queries.filter((q) => q.table === "course_attempts");
+      eq("another error: no read without the filter, logged, the summary counts what was read",
+        [reads.map(filteredBy), r.summary.notStarted, warned.some((w) => w.startsWith("[enrolled-status] attempts read failed:"))], [[["individual"]], 3, true]);
     } finally {
       console.warn = warn;
     }

@@ -123,6 +123,16 @@ export type StepProgressView = {
 /**
  * Learning-path progress. `steps` in sequence order; `progressByCourse`
  * gives each step's CourseProgressView for this learner.
+ *
+ * @deprecated ADR 0024 step 43: the path rule is `pathProgress()` in
+ * lib/paths/progress.ts (the twin of v_path_step_status and
+ * v_path_progress). This older roll-up stays only for the admin Learning
+ * Paths page, the Analytics page and the path learners CSV (ruling A5 of the
+ * ADR's note of 2026-11-14); tests/unit/path-progress.test.ts pins its
+ * importers to exactly those three files on a dated list. The pull request
+ * that moves the last of them onto the views or the new function (O1-k's
+ * "Path Reports, Learners, the CSV" row) empties that list and deletes this
+ * function. No file imports both.
  */
 export function pathProgress(
   steps: Array<{ course_id: string; title: string }>,

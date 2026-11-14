@@ -8,7 +8,14 @@
  *       joined_within_days), the 200-value cap and the 3650-day cap, so a
  *       rule key added to TypeScript fails CI until the SQL twin learns it;
  *       each of the three view bodies expands groups through
- *       group_member_ids (never a join of the whole group view);
+ *       group_member_ids (never a join of the whole group view). The group
+ *       and path views are 0105's; the course view is read from its latest
+ *       definer, supabase/migrations/0107_learning_contexts.sql (ADR 0024
+ *       step 18, decision D2): the four direct arms (user, team, org-wide,
+ *       Custom Group), each behind its release gate, no path arm and no
+ *       hold-back; 0105's body, which has both, is the control that those
+ *       checks can fail. The two terms views of 0107 write the same arms out
+ *       again with their dates, so they are held to the same rules;
  *   (b) Organisation Reports stays on members and official pairs: its page
  *       reads neither the enrolment view, the course matviews nor the loader,
  *       its Completion rate is completed over official pairs and its Total
@@ -19,9 +26,16 @@
  *       their "path" label is what no read direct row reaches, and read the
  *       attempts and profiles of the enrolled set in chunks of 150, paged
  *       (lib/db/chunked.ts);
- *   (d) the launch page's hold-back gate is still there (the view's
- *       `not exists` clause copies it; ADR 0020 rule 2: a change to the gate
- *       changes the view in the same pull request).
+ *   (d) the launch page's hold-back gate is still there. 0105's view
+ *       copied it (ADR 0020 rule 2); from 0107 the view has no hold-back
+ *       (ADR 0024 decision D2), and the gate stays on the launch page until
+ *       phase 2's resolver replaces it (ADR 0024 step 22);
+ *   (e) ADR 0024 step 49: the three attempts reads over the enrolled set (the
+ *       loader behind the course card and Reports tab, the learners table,
+ *       its CSV) are the Individual product, so each goes through
+ *       individualContextOnly and adds `.eq("context_kind", "individual")`
+ *       when it applies; no other file calls individualContextOnly (a path
+ *       or journey surface must never read the Individual context only).
  *
  * Run:  npx tsx tests/unit/enrolment-definition.test.ts   (or npm run test:unit)
  */
@@ -50,6 +64,11 @@ const stripTsComments = (src: string) =>
   src.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " ")).replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
 
 const MIGRATION = "supabase/migrations/0105_enrolment_expansion.sql";
+/** The course view's latest definer (ADR 0024 step 18). */
+const MIGRATION_0107 = "supabase/migrations/0107_learning_contexts.sql";
+/** The body of `create or replace view public.<view>`, up to its first `;` (in SQL already comment-stripped and lower-cased). */
+const viewBody = (sql: string, view: string) =>
+  new RegExp(`create\\s+or\\s+replace\\s+view\\s+public\\.${view}\\b([^;]*);`).exec(sql)?.[1] ?? null;
 
 console.log("\n(a) the SQL twin of parseGroupRules knows every TypeScript rule key");
 {
@@ -60,16 +79,64 @@ console.log("\n(a) the SQL twin of parseGroupRules knows every TypeScript rule k
   eq("non-vacuous: RULE_ARRAY_KEYS has the nine array keys", RULE_ARRAY_KEYS.length, 9);
   eq("0105 caps a rule list at 200 values (`limit 200`)", /\blimit\s+200\b/.test(sql), true);
   eq("0105 caps joined_within_days at 3650 (`<= 3650`)", /<=\s*3650\b/.test(sql), true);
-  const views = ["v_group_members_expanded", "v_path_enrollments_expanded", "v_course_enrollments_expanded"];
-  for (const v of views) {
-    const m = new RegExp(`create\\s+or\\s+replace\\s+view\\s+public\\.${v}\\b([^;]*);`).exec(sql);
-    eq(`${v}: its body is in 0105`, m !== null, true);
-    eq(`${v}: its body expands groups through group_member_ids`, /\bgroup_member_ids\s*\(/.test(m?.[1] ?? ""), true);
-    eq(`${v}: its body joins no whole group view`, /\bjoin\s+public\.v_group_members_expanded\b/.test(m?.[1] ?? ""), false);
+  const sql0107 = stripSqlComments(read(MIGRATION_0107)).toLowerCase();
+  // Each view's body from its latest definer: the group and path views are
+  // 0105's, the course view 0107's (ADR 0024 step 18).
+  const bodies: Array<[string, string, string]> = [
+    ["v_group_members_expanded", "0105", sql],
+    ["v_path_enrollments_expanded", "0105", sql],
+    ["v_course_enrollments_expanded", "0107", sql0107],
+  ];
+  for (const [v, file, src] of bodies) {
+    const body = viewBody(src, v);
+    eq(`${v}: its body is in ${file}`, body !== null, true);
+    eq(`${v}: its body expands groups through group_member_ids`, /\bgroup_member_ids\s*\(/.test(body ?? ""), true);
+    eq(`${v}: its body joins no whole group view`, /\bjoin\s+public\.v_group_members_expanded\b/.test(body ?? ""), false);
   }
-  const course = new RegExp("create\\s+or\\s+replace\\s+view\\s+public\\.v_course_enrollments_expanded\\b([^;]*);").exec(sql)?.[1] ?? "";
-  eq("the course view keeps the launch page's hold-back (a future step of an org_public or assigned path)",
-    [/\bnot\s+exists\b/.test(course), /release_at\s*>\s*now\(\)/.test(course), /'org_public'/.test(course)], [true, true, true]);
+
+  // The latest definer of the course view is 0107, so the checks below read
+  // the body the database has after it (a later migration that redefines the
+  // view fails here until this test reads its body).
+  const definers = fs
+    .readdirSync(path.join(root, "supabase/migrations"))
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .filter((f) => viewBody(stripSqlComments(read(`supabase/migrations/${f}`)).toLowerCase(), "v_course_enrollments_expanded") !== null);
+  eq("v_course_enrollments_expanded is defined by 0031, 0105 and 0107, the last of them 0107",
+    definers, ["0031_reports_foundation.sql", "0105_enrolment_expansion.sql", "0107_learning_contexts.sql"]);
+
+  /** A course enrolment body's shape: its direct arms (the assignment rows, alias ca), their release gates, a path arm, the hold-back. */
+  const shape = (body: string) => ({
+    arms: [...body.matchAll(/\bca\.assignee_type\s*=\s*'(\w+)'/g)].map((m) => m[1]).sort(),
+    releaseGates: (body.match(/\(\s*ca\.release_at\s+is\s+null\s+or\s+ca\.release_at\s*<=\s*now\(\)\s*\)/g) ?? []).length,
+    pathArm: /\b(learning_path_courses|learning_paths|learning_path_assignments|v_path_enrollments_expanded)\b/.test(body),
+    holdBack: [/\bnot\s+exists\b/.test(body), /release_at\s*>\s*now\(\)/.test(body), /'org_public'/.test(body)],
+  });
+  const course0107 = shape(viewBody(sql0107, "v_course_enrollments_expanded") ?? "");
+  eq("0107's course view: the four direct arms (user, team, org-wide, Custom Group), each behind its release gate",
+    [course0107.arms, course0107.releaseGates], [["group", "org", "team", "user"], 4]);
+  eq("0107's course view: no path arm (no step, path or path-assignment table, no path enrolment view; decision D2)",
+    course0107.pathArm, false);
+  eq("0107's course view: no hold-back (no `not exists`, no future release, no org_public path)",
+    course0107.holdBack, [false, false, false]);
+  // The control: 0105's body has the path arm and the hold-back, so the two
+  // checks above can fail.
+  const course0105 = shape(viewBody(sql, "v_course_enrollments_expanded") ?? "");
+  eq("control: 0105's course view has the four arms, the path arm and the hold-back",
+    [course0105.arms, course0105.pathArm, course0105.holdBack], [["group", "org", "team", "user"], true, [true, true, true]]);
+
+  // The terms views of 0107 write the enrolment arms out again with their
+  // dates (step 18): the same group expansion, and for a course the same
+  // four released direct arms and no path arm.
+  for (const v of ["v_course_enrollment_terms", "v_path_enrollment_terms"]) {
+    const body = viewBody(sql0107, v);
+    eq(`${v}: its body is in 0107`, body !== null, true);
+    eq(`${v}: it expands groups through group_member_ids, never a join of the whole group view`,
+      [/\bgroup_member_ids\s*\(/.test(body ?? ""), /\bjoin\s+public\.v_group_members_expanded\b/.test(body ?? "")], [true, false]);
+  }
+  const terms = shape(viewBody(sql0107, "v_course_enrollment_terms") ?? "");
+  eq("v_course_enrollment_terms: the course view's four released direct arms, no path arm",
+    [terms.arms, terms.releaseGates, terms.pathArm], [["group", "org", "team", "user"], 4, false]);
 }
 
 console.log("\n(b) Organisation Reports stays on members and official pairs");
@@ -132,11 +199,46 @@ console.log("\n(c) the four readers read the enrolled set from the view");
   }
 }
 
-console.log("\n(d) the launch page's hold-back gate is still there");
+console.log("\n(d) the launch page's hold-back gate is still there (until ADR 0024 phase 2's resolver, step 22)");
 {
   const launch = read("app/[org]/(learner)/courses/[courseId]/launch/page.tsx");
   eq("launch/page.tsx redirects to dashboard?upcoming=", launch.includes("dashboard?upcoming="), true);
   eq("launch/page.tsx computes enforcedPathIds", launch.includes("enforcedPathIds"), true);
+}
+
+console.log("\n(e) the Individual product's attempts reads take the Individual context when 0107 is there (ADR 0024 step 49)");
+{
+  const INDIVIDUAL_READERS = [
+    "lib/scoring/status.ts",
+    "app/[org]/(admin)/library/[courseId]/learners/page.tsx",
+    "app/api/courses/[courseId]/learners/export/route.ts",
+  ];
+  for (const f of INDIVIDUAL_READERS) {
+    const src = stripTsComments(read(f));
+    const reads = src.split(`.from("course_attempts")`).slice(1).map((after) => after.split(";")[0]);
+    eq(`${f}: one course_attempts read`, reads.length, 1);
+    eq(`${f}: it is built inside individualContextOnly(individual, …), one state for every chunk`,
+      [/const individual: IndividualFilterState = \{ applies: null \};/.test(src),
+        /individualContextOnly\(individual, \((columns), (f|from), (t|to), only\)[^=]*=>\s*\{\s*const q = [a-z]+\s*\.from\("course_attempts"\)/.test(src)],
+      [true, true]);
+    eq(`${f}: and adds .eq("context_kind", "individual") when it applies, nothing else`,
+      /\.range\((f|from), (t|to)\);\s*return only \? q\.eq\("context_kind", "individual"\) : q;\s*\}\)/.test(src), true);
+  }
+  // No other file calls it: a path or journey surface reads its own context
+  // (ADR 0024 steps 43 and 45), never the Individual one.
+  const walk = (dir: string, out: string[]) => {
+    if (!fs.existsSync(dir)) return;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p, out);
+      else if (/\.(ts|tsx|js|mjs)$/.test(e.name)) out.push(path.relative(root, p).split(path.sep).join("/"));
+    }
+  };
+  const all: string[] = [];
+  for (const d of ["app", "lib", "components"]) walk(path.join(root, d), all);
+  const callers = all.filter((f) => /(?<!function\s)\bindividualContextOnly\(/.test(stripTsComments(read(f)))).sort();
+  eq("individualContextOnly is called by exactly these three files", callers, [...INDIVIDUAL_READERS].sort());
 }
 
 console.log(`\n==== enrolment definition: ${pass} passed, ${fail} failed ====`);

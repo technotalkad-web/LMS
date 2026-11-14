@@ -14,6 +14,7 @@ import {
   type OptionalColumnState,
   type PgError,
 } from "@/lib/scoring/attempt-kind";
+import { individualContextOnly, type IndividualFilterState } from "@/lib/scoring/context-read";
 import { chunk, fetchByIds } from "@/lib/db/chunked";
 import {
   officialHistory,
@@ -387,23 +388,29 @@ export default async function LearnersPage({
   // readPagedWithOptionalColumn (fetchByIds cannot tell a missing column from
   // another error). The first page decides the column list for every chunk
   // (one `decided`). A failed page is logged and the rows read so far are
-  // kept, as the reads above do.
+  // kept, as the reads above do. ADR 0024 step 49: this table is the
+  // Individual product, so on a database with 0107 the read takes the
+  // Individual context only (individualContextOnly, decided once for every
+  // chunk: one `individual`), the rows the course Reports tab counts.
   const ATTEMPT_COLUMNS =
     "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, progress_pct, units:cmi_data->cmi5->units";
   const attemptRows: unknown[] = [];
   if (enrolledUserIds.length && versionIds.length) {
     const decided: OptionalColumnState = { columns: null };
+    const individual: IndividualFilterState = { applies: null };
     for (const part of chunk(enrolledUserIds, 150)) {
       const res = await readPagedWithOptionalColumn<unknown>(
         "is_revision",
-        (columns, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
-          supabase
+        individualContextOnly(individual, (columns, from, to, only): PromiseLike<{ data: unknown[] | null; error: PgError }> => {
+          const q = supabase
             .from("course_attempts")
             .select(columns)
             .in("user_id", part)
             .in("course_version_id", versionIds)
             .order("id")
-            .range(from, to),
+            .range(from, to);
+          return only ? q.eq("context_kind", "individual") : q;
+        }),
         ATTEMPT_COLUMNS,
         { state: decided }
       );

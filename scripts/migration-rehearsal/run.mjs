@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadCases } from "./parity-cases.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..", "..");
@@ -112,7 +113,13 @@ function expand(list) {
 }
 
 async function applyMigration(db, f) {
-  const sql = fs.readFileSync(path.join(MIG, f), "utf8");
+  return applyFile(db, path.join(MIG, f), 220);
+}
+
+// A whole file in one exec, as the owner pastes it (a migration, or a script
+// of the repository's ops/ folder); on an error the session is rolled back.
+async function applyFile(db, file, keep) {
+  const sql = fs.readFileSync(file, "utf8");
   const t0 = performance.now();
   try {
     await db.exec(sql);
@@ -124,7 +131,7 @@ async function applyMigration(db, f) {
     } catch {
       // nothing to roll back
     }
-    const message = String(e?.message ?? e).split("\n")[0].slice(0, 220);
+    const message = String(e?.message ?? e).split("\n")[0].slice(0, keep);
     return { ok: false, ms: performance.now() - t0, code: e?.code ?? "", message };
   }
 }
@@ -215,10 +222,99 @@ async function stepApply(db, s) {
   return allOk ? "next" : "stop";
 }
 
+// A script of the repository's ops/ folder, pasted `times` times (added for
+// ADR 0024 step 61, ops/0107-reverse.sql): `refuseFirst` = a first paste
+// that must stop with that code and message, then a file of this folder
+// (the owner's reset), then the pastes; `times: 0` with `refuseFirst` = the
+// refusal and the reset only, so a later step can run between the reset and
+// the pastes.
+async function stepScript(db, s) {
+  const file = path.join(ROOT, s.file);
+  if (!fs.existsSync(file)) {
+    check(false, `${s.label}: ${s.file} is missing`);
+    return "stop";
+  }
+  let allOk = true;
+  const refuse = s.refuseFirst;
+  if (refuse) {
+    const r = await applyFile(db, file, 1000);
+    allOk =
+      check(
+        !r.ok && r.code === refuse.code && r.message.includes(refuse.contains),
+        `${s.file}: refused ${refuse.why} (expected ${refuse.code} "${refuse.contains}…")${r.ok ? ": it APPLIED" : ""}`,
+      ) && allOk;
+    if (!r.ok) info(`refusal: ${r.code} ${r.message}`);
+    if (!(await runSqlFile(db, refuse.then))) return "stop";
+    if (s.times === 0) return allOk ? "next" : "stop";
+  }
+  const results = [];
+  for (let i = 0; i < Math.max(1, s.times ?? 1); i += 1) results.push(await applyFile(db, file, 1000));
+  const words = results.map((r, i) => {
+    const verb = i === 0 ? "applied" : "re-applied";
+    return r.ok ? verb : `${verb} FAILED (${r.code}: ${r.message})`;
+  });
+  allOk =
+    check(results.every((r) => r.ok), `${s.label}: ${s.file} ${words.join(", ")} (${results[0].ms.toFixed(0)} ms)`) &&
+    allOk;
+  return allOk ? "next" : "stop";
+}
+
+// The catalog fingerprint of schema public (fingerprint.sql), kept in memory
+// for the scenario (added for ADR 0024 step 61): `take` stores it under a
+// label; `equals` compares the database with a stored one, object by object.
+// `except` names the keys allowed to differ, each with its reason; an
+// excepted key that does not differ fails too, so the list stays exact.
+const FINGERPRINT = fs.readFileSync(path.join(HERE, "fingerprint.sql"), "utf8");
+async function stepFingerprint(db, s, prints) {
+  let now;
+  try {
+    const r = await db.query(FINGERPRINT);
+    now = new Map(r.rows.map((x) => [x.k, x.v]));
+  } catch (e) {
+    check(false, `fingerprint failed: ${e?.code ?? ""} ${String(e?.message ?? e).split("\n")[0]}`);
+    return "stop";
+  }
+  if (s.take) {
+    prints.set(s.take, now);
+    info(`fingerprint "${s.take}" taken: ${now.size} objects of schema public`);
+    return "next";
+  }
+  const was = prints.get(s.equals);
+  if (!was) {
+    check(false, `fingerprint "${s.equals}" was never taken in this scenario`);
+    return "stop";
+  }
+  const except = s.except ?? {};
+  const diffs = [...new Set([...was.keys(), ...now.keys()])].filter((k) => was.get(k) !== now.get(k));
+  const unexpected = diffs.filter((k) => !(k in except)).sort();
+  const stale = Object.keys(except).filter((k) => !diffs.includes(k)).sort();
+  const named = diffs.length - unexpected.length;
+  check(
+    unexpected.length === 0 && stale.length === 0,
+    `${s.label}: schema public equals fingerprint "${s.equals}" (${was.size} objects then, ${now.size} now; ` +
+      `${named} named exception${named === 1 ? "" : "s"})` +
+      `${unexpected.length ? `: ${unexpected.length} DIFFER` : ""}${stale.length ? `: STALE EXCEPTION ${stale.join(" ")}` : ""}`,
+  );
+  for (const k of Object.keys(except).filter((x) => diffs.includes(x)).sort()) info(`exception ${k}: ${except[k]}`);
+  const show = s.show ?? 60;
+  const cut = (x) => (x === undefined ? "(absent)" : x.replace(/\s+/g, " ").slice(0, s.width ?? 160));
+  for (const k of unexpected.slice(0, show)) {
+    info(`differs ${k}`);
+    info(`  then: ${cut(was.get(k))}`);
+    info(`  now:  ${cut(now.get(k))}`);
+  }
+  if (unexpected.length > show) info(`... and ${unexpected.length - show} more`);
+  return "next";
+}
+
 // A word rule on a migration's raw text (ADR 0014 step 2: "nothing in the
 // file names ..."): comments and string literals included, case-insensitive,
 // one check per token. The file is read as it is, never stripped, so the
-// header's own prose and its pasted SQL are held to the same rule.
+// header's own prose and its pasted SQL are held to the same rule. With
+// `generatedStored: N` it also checks that the file has exactly N generated
+// columns and that each is `stored` (added for 0107, ADR 0024 note N3); with
+// `functionList: true`, that the after-checks' function list names exactly
+// the functions the file creates (added for 0107, ADR 0024 step 19).
 function stepStatic(s) {
   const [n] = expand([s.file]);
   const f = byNum.get(n);
@@ -226,8 +322,66 @@ function stepStatic(s) {
     check(false, `static: migration ${pad(n)} is missing`);
     return "next";
   }
-  const lines = fs.readFileSync(path.join(MIG, f), "utf8").toLowerCase().split(/\r?\n/);
-  for (const token of s.mustNotContain) {
+  const raw = fs.readFileSync(path.join(MIG, f), "utf8").toLowerCase();
+  const lines = raw.split(/\r?\n/);
+  if (s.generatedStored !== undefined) {
+    // ADR 0024 note N3: every `generated always as (...)` is followed by
+    // `stored`. Postgres 18 (PGlite) makes a column without it virtual and
+    // accepts it; 15 to 17 refuse it as a syntax error, so only this rule
+    // catches it here. Read on the code: comments dropped and string literals
+    // emptied in one left-to-right pass (as lintAudit does), then each
+    // expression's parentheses matched.
+    const code = raw.replace(/--[^\n]*|'(?:[^']|'')*'/g, (t) => (t[0] === "'" ? "''" : " "));
+    const re = /generated\s+always\s+as\s*\(/g;
+    let found = 0;
+    const bad = [];
+    for (const m of code.matchAll(re)) {
+      found += 1;
+      let depth = 1;
+      let i = m.index + m[0].length;
+      for (; i < code.length && depth > 0; i += 1) {
+        if (code[i] === "(") depth += 1;
+        else if (code[i] === ")") depth -= 1;
+      }
+      if (!/^\s*stored\b/.test(code.slice(i))) bad.push(code.slice(0, m.index).split("\n").length);
+    }
+    check(
+      found === s.generatedStored && bad.length === 0,
+      `${f}: every "generated always as (...)" ends in "stored" (${found} found, expected ${s.generatedStored})` +
+        `${bad.length ? `: NOT stored on line${bad.length === 1 ? "" : "s"} ${bad.join(", ")}` : ""}`,
+    );
+  }
+  if (s.functionList) {
+    // ADR 0024 step 19: the after-checks' privilege matrix covers "every
+    // function these files create or recreate". The list in the file, between
+    // its two marker comments, must name exactly the functions of the file's
+    // own create statements (read on the code: comments dropped, string
+    // literals emptied), each with its argument types.
+    const code = raw.replace(/--[^\n]*|'(?:[^']|'')*'/g, (t) => (t[0] === "'" ? "''" : " "));
+    const types = (args) =>
+      args
+        .split(",")
+        .map((a) => a.trim().replace(/\s+default\s+[\s\S]*$/, "").split(/\s+/).slice(1).join(""))
+        .filter(Boolean)
+        .join(",");
+    const created = [...code.matchAll(/create\s+(?:or\s+replace\s+)?function\s+public\.(\w+)\s*\(([^)]*)\)/g)]
+      .map((m) => `public.${m[1]}(${types(m[2])})`)
+      .sort();
+    const b = raw.indexOf("-- after-check function list: begin");
+    const e = raw.indexOf("-- after-check function list: end");
+    const listed = b < 0 || e < b ? [] : [...raw.slice(b, e).matchAll(/'(public\.\w+\([^)]*\))'/g)]
+      .map((m) => m[1].replace(/\s+/g, ""))
+      .sort();
+    const missing = created.filter((x) => !listed.includes(x));
+    const extra = listed.filter((x) => !created.includes(x));
+    check(
+      b >= 0 && e > b && missing.length === 0 && extra.length === 0 && new Set(listed).size === listed.length,
+      `${f}: the after-check function list names every function the file creates (${created.length} created, ` +
+        `${listed.length} listed)${missing.length ? `: NOT LISTED ${missing.join(" ")}` : ""}` +
+        `${extra.length ? `: NOT CREATED ${extra.join(" ")}` : ""}`,
+    );
+  }
+  for (const token of s.mustNotContain ?? []) {
     const t = token.toLowerCase();
     const hits = lines.flatMap((l, i) => (l.includes(t) ? [i + 1] : []));
     check(
@@ -235,6 +389,38 @@ function stepStatic(s) {
       `${f}: contains no "${token}" (raw text, comments included, case-insensitive)` +
         `${hits.length ? `: FOUND on line${hits.length === 1 ? "" : "s"} ${hits.slice(0, 10).join(", ")}` : ""}`,
     );
+  }
+  return "next";
+}
+
+// The twins' parity fixtures (added for ADR 0024 build note N16): each file
+// of `files` (or the one `file`) is read, checked and resolved by
+// parity-cases.mjs, the loader the unit tests import too, and bound as one
+// jsonb parameter into the session's temporary table parity_cases, one row
+// per pair, which assert-0107-parity.sql expands. Nothing is generated or
+// written beside the JSON; the table lives as long as the scenario's session.
+async function stepCases(db, s) {
+  const list = s.files ?? [s.file];
+  try {
+    await db.exec("create temp table if not exists parity_cases (pair text primary key, doc jsonb not null)");
+  } catch (e) {
+    check(false, `cases: the temporary table could not be made: ${e?.code ?? ""} ${String(e?.message ?? e).split("\n")[0]}`);
+    return "stop";
+  }
+  for (const f of list) {
+    let doc;
+    try {
+      doc = loadCases(f);
+    } catch (e) {
+      check(false, `cases ${f}: ${String(e?.message ?? e)}`);
+      return "stop";
+    }
+    await db.query(
+      "insert into parity_cases (pair, doc) values ($1, $2::jsonb) on conflict (pair) do update set doc = excluded.doc",
+      [doc.pair, JSON.stringify(doc)],
+    );
+    const sql = doc.cases.filter((c) => c.sides.includes("sql")).length;
+    check(true, `cases ${f} loaded (${doc.cases.length} cases, ${sql} on the SQL side)`);
   }
   return "next";
 }
@@ -455,6 +641,7 @@ lintAudit();
 for (const sc of scenarios) {
   console.log(`\n== ${sc.name}: ${sc.title}`);
   const db = await PGlite.create();
+  const prints = new Map();
   try {
     for (const step of sc.steps) {
       const [kind, s] = Object.entries(step)[0];
@@ -465,6 +652,9 @@ for (const sc of scenarios) {
       else if (kind === "audit") next = await stepAudit(db, s, EXP.mustNotAppear);
       else if (kind === "refresh") next = await stepRefresh(db, s);
       else if (kind === "static") next = stepStatic(s);
+      else if (kind === "script") next = await stepScript(db, s);
+      else if (kind === "fingerprint") next = await stepFingerprint(db, s, prints);
+      else if (kind === "cases") next = await stepCases(db, s);
       else setupError(`unknown step "${kind}" in scenario ${sc.name}`);
       if (next === "stop") {
         info(`${sc.name}: stopped here`);

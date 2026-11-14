@@ -29,7 +29,28 @@
  *         reads attempts with is_revision (the fallback) or select("*"), and
  *         only the per-course display calls pass a third argument (the
  *         retakeIds whitelist: the path and journey roll-ups stay
- *         retake-unaware, ADR 0014:195).
+ *         retake-unaware, ADR 0014:195);
+ *   (vii) ADR 0024 step 41, the allow-list guard: computeScoring is called by
+ *         contextResult (lib/scoring/context.ts) only. Today's direct callers
+ *         are named on the dated list PENDING_0024 (the form of ADR 0023
+ *         step 3 and of PENDING_1B above); the scan's callers outside
+ *         lib/scoring/context.ts must equal the list exactly, so a new direct
+ *         caller fails here and a file that stops calling must leave the list.
+ *         Each later pull request that moves its files onto contextResult
+ *         removes them; the last one asserts the list empty. The list never
+ *         holds more than its 20 files of 2026-11-14. Hardening H3 of the
+ *         ADR's note of 2026-11-14: a call under another name is refused
+ *         outside the allow-list (the rule's owner, the definition and
+ *         PENDING_0024): an aliased import or re-export (`computeScoring
+ *         as`), `computeScoring.bind`, `.call` or `.apply`, and a namespace,
+ *         dynamic, star or require import of lib/scoring/policy or
+ *         lib/scoring/status (status.ts re-exports it), whose member call
+ *         the scan by name cannot see. A named import or re-export of
+ *         computeScoring, from any module, is refused there as well (added
+ *         the same day after an independent check): with a plain-named
+ *         import a file can pass the function along as a value (`const
+ *         score = computeScoring`, `xs.map(computeScoring)`), which no call
+ *         scan sees.
  *
  * Run:  npx tsx tests/unit/revision-listing.test.ts   (or npm run test:unit)
  */
@@ -239,6 +260,32 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     // loadEnrolledCourseStatus's own select is the one checked here.
     calls: ["computeScoring(list)"],
     feeds: [...columnsFeeds(), pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,600}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ pageSize: PAGE, state: decided \}\s*\)/)],
+  },
+  // ADR 0024 step 41: the official rule per context. A pure function: its
+  // rows come typed, and the type makes status and is_revision required, so
+  // no caller can hand it rows without them; abandoned and revision rows are
+  // dropped before computeScoring sees them. Its strict reader is
+  // lib/scoring/context-read.ts (below). Step 41's allow-list turn-around
+  // (contextResult as the only caller) is block (vii).
+  "lib/scoring/context.ts": {
+    calls: ["computeScoring(officialRows)", "hasLiveGrantedRetake(officialRows)"],
+    feeds: [
+      ["ContextAttempt requires status", /export type ContextAttempt = \{[^}]*\n\s*status: "in_progress" \| "completed" \| "failed" \| "passed" \| "abandoned";/],
+      ["ContextAttempt requires is_revision", /export type ContextAttempt = \{[^}]*\n\s*is_revision: boolean;/],
+      ["officialRows drop abandoned and revision rows", /const officialRows = rows\.filter\(\s*\(a\) => !isAbandonedAttempt\(a\) && !isRevisionAttempt\(a\)/],
+      ["computeScoring gets officialRows", /computeScoring\(officialRows, i\.policy, retakeIds\)/],
+    ],
+  },
+  // ADR 0024 step 41: the strict reader of contextResult; no helper call of
+  // its own, and its select carries the two columns the rule reads.
+  "lib/scoring/context-read.ts": {
+    calls: [],
+    feeds: [
+      ["CONTEXT_ATTEMPT_COLUMNS names status", /export const CONTEXT_ATTEMPT_COLUMNS =\s*"[^"]*\bstatus\b[^"]*";/],
+      ["the read adds is_revision, and leaves it out only on a 42703 naming it",
+        /read\(`\$\{CONTEXT_ATTEMPT_COLUMNS\}, is_revision, \$\{CONTEXT_SELECT\}`, true\)[\s\S]*?if \(res\.error && isMissingColumn\(res\.error, "is_revision"\)\) res = await read\(CONTEXT_ATTEMPT_COLUMNS, false\);/],
+      ["the course_attempts select takes the column list", /\.from\("course_attempts"\)\.select\(columns\)/],
+    ],
   },
   // ADR 0019: the continue address scores the learner's own attempts on the course it waits on.
   "app/[org]/(learner)/continue/page.tsx": {
@@ -451,6 +498,150 @@ console.log("\n(vi) the courseProgress feeds and the retakeIds whitelist");
     /const progressOf = \(cid: string\): CourseProgressView =>\s*courseProgress\(attemptsOfCourse\.get\(cid\) \?\? \[\], unitCountByVersion\);/.test(analytics), true);
   eq("the path learners export's per-step progress passes no retakeIds",
     /courseProgress\(\s*myAttempts\.filter\(\(a\) => courseByVersion\.get\(a\.course_version_id\) === s\.course_id\),\s*unitCountByVersion\s*\)/.test(sources.get("app/api/learning-paths/[id]/learners/export/route.ts") ?? ""), true);
+}
+
+/**
+ * PENDING_0024 (2026-11-14, ADR 0024 phase 1): every file that calls
+ * computeScoring directly today, besides its definition
+ * (lib/scoring/policy.ts) and contextResult (lib/scoring/context.ts), the one
+ * caller step 41 keeps. The phases that move these surfaces onto
+ * contextResult (and its strict reader, readContextResult) remove their files
+ * from this list in the same pull request; the last of them asserts it empty.
+ * A file is never added.
+ */
+const PENDING_0024: string[] = [
+  "app/[org]/(admin)/analytics/page.tsx",
+  "app/[org]/(admin)/attempt-requests/page.tsx",
+  "app/[org]/(admin)/library/[courseId]/learners/page.tsx",
+  "app/[org]/(learner)/continue/page.tsx",
+  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx",
+  "app/[org]/(learner)/courses/[courseId]/page.tsx",
+  "app/[org]/(learner)/courses/page.tsx",
+  "app/[org]/(learner)/dashboard/page.tsx",
+  "app/[org]/(learner)/paths/[pathId]/page.tsx",
+  "app/api/attempt-requests/[id]/route.ts",
+  "app/api/attempt-requests/bulk/route.ts",
+  "app/api/attempt-requests/route.ts",
+  "app/api/attempts/[attemptId]/result-stored/route.ts",
+  "app/api/integrations/learner-summary/route.ts",
+  "lib/attempts/force-restart.ts",
+  "lib/attempts/grant.ts",
+  "lib/integrations/progress.ts",
+  "lib/manager/insights.ts",
+  "lib/scoring/attempt-kind.ts",
+  "lib/scoring/status.ts",
+];
+
+console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult only; today's direct callers are on PENDING_0024");
+{
+  /** A call of computeScoring (not its definition, an import, a re-export or a mention in a string). */
+  const directCall = /(?<!function\s)(?<![\w$.'"`])computeScoring\s*\(/;
+  const RULE_OWNER = "lib/scoring/context.ts";
+  const DEFINITION = "lib/scoring/policy.ts";
+  const callers = [...sources.entries()].filter(([f, s]) => f !== DEFINITION && directCall.test(s)).map(([f]) => f).sort();
+  eq("contextResult (lib/scoring/context.ts) calls computeScoring", callers.includes(RULE_OWNER), true);
+  eq("every other direct caller is on PENDING_0024, and the list names only direct callers",
+    callers.filter((f) => f !== RULE_OWNER), [...PENDING_0024].sort());
+  eq("PENDING_0024 has no duplicate and never names the rule's owner or the definition",
+    [new Set(PENDING_0024).size === PENDING_0024.length, PENDING_0024.includes(RULE_OWNER), PENDING_0024.includes(DEFINITION)], [true, false, false]);
+  eq("PENDING_0024 never grows: at most its 20 files of 2026-11-14", PENDING_0024.length <= 20, true);
+
+  // H3 (the ADR's note of 2026-11-14): the forms that call computeScoring
+  // under another name, which the scan by name above cannot see, are refused
+  // outside the allow-list.
+  const ALLOWED = new Set([RULE_OWNER, DEFINITION, ...PENDING_0024]);
+  const SCORING_MODULES = ["lib/scoring/policy", "lib/scoring/status"];
+  /** A module specifier as a repository path without its extension, or null for a package. */
+  const resolveSpec = (file: string, spec: string): string | null => {
+    let p: string;
+    if (spec.startsWith("@/")) p = spec.slice(2);
+    else if (spec.startsWith(".")) p = path.posix.normalize(path.posix.join(path.posix.dirname(file), spec));
+    else return null;
+    return p.replace(/\.(ts|tsx|js|mjs)$/, "").replace(/\/index$/, "");
+  };
+  /** Every form in a file's code (comments blanked) that can call computeScoring under another name. */
+  const indirectForms = (file: string, src: string): string[] => {
+    const found: string[] = [];
+    if (/\bcomputeScoring\s+as\s+[A-Za-z_$]/.test(src)) found.push("computeScoring as");
+    if (/(?<![\w$.'"`])computeScoring\s*\.\s*(?:bind|call|apply)\b/.test(src)) found.push("computeScoring.bind/call/apply");
+    for (const m of src.matchAll(/\bimport\s+\*\s+as\s+[\w$]+\s+from\s*["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\bexport\s+\*\s+(?:as\s+[\w$]+\s+)?from\s*["']([^"']+)["']|\brequire\s*\(\s*["']([^"']+)["']\s*\)/g)) {
+      const target = resolveSpec(file, m[1] ?? m[2] ?? m[3] ?? m[4]);
+      if (target && SCORING_MODULES.includes(target)) found.push(`the whole of ${target}`);
+    }
+    // A named import or re-export of computeScoring, from any module (a
+    // brace list over any number of lines, `import type`, a default import
+    // before the braces, with or without `from`): with the function in hand
+    // under its own name a file can pass it along as a value, which neither
+    // the call scan nor the forms above see.
+    for (const m of src.matchAll(/\b(?:import|export)\s+(?:type\s+)?(?:[\w$]+\s*,\s*)?\{([^{}]*)\}/g)) {
+      if (/(?<![\w$])computeScoring(?![\w$])/.test(m[1])) found.push("computeScoring imported or re-exported by name");
+    }
+    return found;
+  };
+  const indirect = [...sources.entries()]
+    .filter(([f]) => !ALLOWED.has(f))
+    .flatMap(([f, src]) => indirectForms(f, src).map((x) => `${f}: ${x}`))
+    .sort();
+  eq("no file outside the allow-list aliases computeScoring, binds it, imports or re-exports it by name, or imports lib/scoring/policy or lib/scoring/status whole",
+    indirect, []);
+  const NAMED = "computeScoring imported or re-exported by name";
+  eq("control: each indirect form is found, a named import of computeScoring among them, and other imports are not",
+    [
+      indirectForms("lib/x.ts", 'import { computeScoring as cs } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'export { computeScoring as score } from "./scoring/status";'),
+      indirectForms("lib/x.ts", "const f = computeScoring.bind(null, rows);"),
+      indirectForms("lib/x.ts", "computeScoring.call(undefined, rows, policy);"),
+      indirectForms("app/x/page.tsx", 'import * as policy from "@/lib/scoring/policy";'),
+      indirectForms("lib/scoring/x.ts", 'import * as st from "./status";'),
+      indirectForms("lib/x.ts", 'const m = await import("@/lib/scoring/status");'),
+      indirectForms("lib/x.ts", 'export * from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'const p = require("../lib/scoring/policy");'),
+      indirectForms("lib/x.ts", 'import { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/scoring/x.ts", 'import { computeScoring } from "./status";'),
+      indirectForms("lib/x.ts", 'import type { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'export { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", "export { computeScoring };"),
+      indirectForms("lib/x.ts", 'import * as other from "@/lib/scoring/context";'),
+      indirectForms("lib/x.ts", 'import { attemptCounts, type ScoringResult } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'import { computeScoringLabel } from "@/lib/labels";'),
+    ],
+    [
+      ["computeScoring as", NAMED], ["computeScoring as", NAMED], ["computeScoring.bind/call/apply"], ["computeScoring.bind/call/apply"],
+      ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/status"], ["the whole of lib/scoring/status"],
+      ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/policy"], [NAMED], [NAMED], [NAMED], [NAMED], [NAMED],
+      [], [], [],
+    ]);
+  // The control for each form that passes computeScoring along as a value:
+  // the call scan does not see it (directCall false), and the named import
+  // it needs is refused (a multi-line brace list and a default import
+  // before the braces included).
+  const passing = [
+    'import { computeScoring } from "@/lib/scoring/policy";\nconst score = computeScoring;\nscore(rows, policy);',
+    'import { computeScoring } from "../scoring/status";\nconst results = groups.map(computeScoring);',
+    'import {\n  DEFAULT_POLICY,\n  computeScoring,\n  type ScorableAttempt,\n} from "@/lib/scoring/policy";\nrun(computeScoring, DEFAULT_POLICY);',
+    'import Policy, { computeScoring } from "@/lib/scoring/status";\nconst table = { score: computeScoring };',
+  ];
+  eq("control: a reference passed as a value is no direct call, and its named import is refused",
+    passing.map((s) => [directCall.test(s), indirectForms("lib/attempts/x.ts", s)]),
+    passing.map(() => [false, [NAMED]]));
+  // The scan agrees with block (i)'s own reading of the call sites, so the
+  // two cannot drift: block (i)'s callsIn sees a computeScoring call in
+  // exactly the files above.
+  const viaCallsIn = [...sources.entries()]
+    .filter(([f, s]) => f !== DEFINITION && callsIn(s).some((c) => c.startsWith("computeScoring(")))
+    .map(([f]) => f)
+    .sort();
+  eq("block (i)'s callsIn finds the same computeScoring callers", viaCallsIn, callers);
+  // The control: a direct call is found, and the definition, an import and a
+  // re-export are not calls.
+  eq("control: the pattern finds a call and skips the definition, an import and a re-export",
+    [
+      directCall.test("const s = computeScoring(rows, policy, ids);"),
+      directCall.test("export function computeScoring(attempts: A[]) {"),
+      directCall.test('import { computeScoring } from "./policy";'),
+      directCall.test("export { attemptCounts, computeScoring, courseStatus };"),
+    ],
+    [true, false, false, false]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

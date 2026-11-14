@@ -13,6 +13,7 @@ import {
 } from "./policy";
 import { resolvePolicies } from "./resolve";
 import { fetchGrantRetakeIdsForUsers, readPagedWithOptionalColumn, type OptionalColumnState, type PgError } from "./attempt-kind";
+import { individualContextOnly, type IndividualFilterState } from "./context-read";
 
 /**
  * THE learner course-status definitions (Phase 0a, product decision 1).
@@ -208,12 +209,14 @@ export function enrolledStatusSummary(
 }
 
 /**
- * The one SQL definition of "enrolled on a course" (migration 0105, ADR 0020):
- * every released assignment that reaches the learner, direct (user, team,
- * org-wide, Custom Group) or a released step of an active Learning Path they
- * are assigned to, minus the learners a path still holds back (the launch
- * page's gate). Distinct (course_id, user_id). The course report matviews
- * read the same view, so the pages and the matviews cannot drift.
+ * The one SQL definition of "enrolled on a course" (migration 0105, ADR 0020;
+ * migration 0107, ADR 0024 step 18): from 0107, every released direct
+ * assignment that reaches the learner (user, team, org-wide, Custom Group);
+ * a Learning Path step does not enrol (ADR 0024 decision D2). Before 0107
+ * (0105), also every released step of an active Learning Path they are
+ * assigned to, minus the learners a path still holds back (the launch page's
+ * gate). Distinct (course_id, user_id). The course report matviews read the
+ * same view, so the pages and the matviews cannot drift.
  *
  * Read it with an admin session or the service role only: the view is
  * security_invoker and Custom Group membership (org_groups,
@@ -226,16 +229,20 @@ export const ENROLMENTS_VIEW = "v_course_enrollments_expanded";
 /**
  * The enrolled learners of one course and their official statuses, read the
  * SAME way for the Library course card and the course Reports tab, so the
- * two pages always agree (gap 3). Enrolled = every released assignment that
- * reaches the learner, direct (user, team, org-wide, Custom Group) or a
- * released step of an active Learning Path, minus the learners a path still
- * holds back, from the one SQL definition the report matviews use
- * (`ENROLMENTS_VIEW`, 0105, ADR 0020). Before 0105 is applied the view is the
- * 0031 one (user, team and org-wide rows), which is exactly the expansion
- * this loader made in TypeScript before. Every read is paged at the
- * PostgREST row cap and every `.in()` list is chunked, so a large org-wide
- * course is counted completely; attempts are read by the course's versions
- * and narrowed to the enrolled learners in memory.
+ * two pages always agree (gap 3). Enrolled = the one SQL definition the
+ * report matviews use (`ENROLMENTS_VIEW`): from 0107 the released direct
+ * assignments only (ADR 0024 step 18); under 0105 (ADR 0020) also the
+ * released steps of an active Learning Path, minus the learners a path still
+ * holds back. Before 0105 is applied the view is the 0031 one (user, team and
+ * org-wide rows), which is exactly the expansion this loader made in
+ * TypeScript before. Every read is paged at the PostgREST row cap and every
+ * `.in()` list is chunked, so a large org-wide course is counted completely;
+ * attempts are read by the course's versions and narrowed to the enrolled
+ * learners in memory. This is the Individual product's loader (ADR 0024 step
+ * 49, `loadIndividualStatus` there): on a database with 0107 the attempts
+ * read takes the Individual context only (individualContextOnly), as the
+ * course matviews do from 0107 on, and on a database without it today's
+ * rows.
  * Fail-soft: a failed read is logged and the summary counts what was read.
  * The caller's client must be an admin session or the service role: a
  * data_analyst session reads an incomplete set through the invoker view
@@ -278,16 +285,22 @@ export async function loadEnrolledCourseStatus(
   // narrower-select fallback, paged by readPagedWithOptionalColumn. The first
   // page decides: once it answers, every later page and chunk reads the same
   // column list (one `decided` for every chunk). As `paged` does, a failed
-  // page is logged and the chunk keeps the rows read so far.
+  // page is logged and the chunk keeps the rows read so far. ADR 0024 step
+  // 49: the Individual context only when 0107 is there, decided once for
+  // every page and chunk (one `individual`).
   const ATTEMPT_COLUMNS = "id, user_id, status, completion_status, success_status, score, started_at, completed_at";
   const decided: OptionalColumnState = { columns: null };
+  const individual: IndividualFilterState = { applies: null };
   const attempts: StatusAttempt[] = [];
   if (enrolledUserIds.size > 0) {
     for (let i = 0; i < versionIds.length; i += CHUNK) {
       const part = versionIds.slice(i, i + CHUNK);
       const res = await readPagedWithOptionalColumn<unknown>(
         "is_revision",
-        (columns, f, t) => client.from("course_attempts").select(columns).in("course_version_id", part).order("id").range(f, t),
+        individualContextOnly(individual, (columns, f, t, only) => {
+          const q = client.from("course_attempts").select(columns).in("course_version_id", part).order("id").range(f, t);
+          return only ? q.eq("context_kind", "individual") : q;
+        }),
         ATTEMPT_COLUMNS,
         { pageSize: PAGE, state: decided }
       );
