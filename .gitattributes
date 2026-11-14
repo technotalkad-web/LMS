@@ -1,1 +1,4 @@
 tests/unit/engine-version-fixtures/* -text
+
+# fonts vendored in app/fonts: binary, never line-ending converted
+app/fonts/**/*.woff2 binary
