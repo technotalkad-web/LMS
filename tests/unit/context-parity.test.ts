@@ -463,7 +463,7 @@ console.log("\n(e) the loader's refusals (a minimal official file, written to a 
       name: "launch/minimal",
       given: {},
       call: {
-        user_id: "@L", org_id: "@O", course_id: "@C", path_id: null as string | null, enrollment_id: "@E",
+        user_id: "@L", org_id: "@O", course_id: "@C", path_id: null as string | null, enrollment_id: "@E" as string | null,
         day_id: "@D" as string | null, day: null as number | null, role: "user",
         params: { lp: null as string | null, journey: "@E" as string | null, day: "@D" as string | null, mode: null as string | null, run: null as string | null },
       },
