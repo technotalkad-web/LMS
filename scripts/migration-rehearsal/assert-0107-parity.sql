@@ -32,8 +32,11 @@
 -- the insert and compared with the value the database generated. Every
 -- mismatch names the case, the field, the expected and the actual value
 -- (ids, numbers and flags of synthetic rows only); the count of cases run
--- must equal the count the file gives the SQL side. One transaction that
--- ends in ROLLBACK.
+-- must equal the count the file gives the SQL side, and (H1 of the ADR's
+-- note of 2026-11-14) each pair's count must equal the both-sided count
+-- pinned in parity-cases.mjs (BOTH_SIDED) and in
+-- tests/unit/context-parity.test.ts: the SQL side runs no case alone. One
+-- transaction that ends in ROLLBACK.
 
 begin;
 
@@ -457,6 +460,10 @@ begin
     from pg_temp.parity_cases p;
   if ran is distinct from want then
     raise exception 'assert-0107: (P0) cases run on the SQL side: % (the files give %)', ran, want;
+  end if;
+  -- H1: the both-sided counts, pinned (parity-cases.mjs BOTH_SIDED)
+  if ran is distinct from 'journey=17 launch=28 official=17 path=27' then
+    raise exception 'assert-0107: (P0) cases run on the SQL side: % (pinned: journey=17 launch=28 official=17 path=27)', ran;
   end if;
   raise notice 'assert-0107: parity, the SQL side: % cases agree (%)', (select count(*) from pg_temp.r0107_parity), ran;
 end

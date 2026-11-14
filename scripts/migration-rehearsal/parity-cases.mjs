@@ -31,7 +31,17 @@
 //     be missing and a field neither side compares cannot be there. A
 //     `writer` case also carries expect.writer with exactly its fields.
 //   - attempt and grant rows name the columns whose table defaults the two
-//     sides would otherwise read differently (ROW_REQUIRED).
+//     sides would otherwise read differently (ROW_REQUIRED);
+//   - one side alone (H1 of the ADR's note of 2026-11-14): a case that names
+//     one side runs there only if ONE_SIDED lists it, by name, with that
+//     side; any other case runs on both sides, so no case goes one-sided by
+//     a word in `sides`. BOTH_SIDED pins each pair's count of cases both
+//     sides run; the unit tests and assert-0107-parity.sql compare with it;
+//   - a launch case's two halves agree (H2 of the same note): the SQL call's
+//     path_id, enrollment_id, day_id and day are the resolver's params lp,
+//     journey and day as the resolver reads them (trimmed, empty is absent,
+//     a uuid day is the day id, digits are an old link's day number), and a
+//     case the SQL side runs asks for no preview and names no run.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +98,72 @@ export const FIELDS = {
   // call's now(), so only its presence is pinned).
   writer: ["official", "done", "passed_ever", "passed_by_rule", "path_completed", "attempt_number", "fact_written"],
 };
+
+// The cases one side runs alone (H1), by pair and name, each with its side
+// and its reason. tests/unit/context-parity.test.ts checks that the list
+// names exactly the files' one-sided cases.
+export const ONE_SIDED = {
+  official: {
+    "official/TypeScript only: a row with an empty context_key throws (step 41)": {
+      side: "ts",
+      why: "the generated column never holds an empty key, so no SQL row can carry one",
+    },
+    "official/TypeScript only: a preview key keeps its previews and drops abandoned and revision rows (contract A1)": {
+      side: "ts",
+      why: "contract A1: the SQL views read no official result of a preview key",
+    },
+  },
+  path: {},
+  journey: {},
+  launch: {
+    "launch/TypeScript only: both product parameters are refused before any fact is read": {
+      side: "ts",
+      why: "the conflict row: the page makes no launch_context call (step 22)",
+    },
+  },
+};
+
+// Each pair's count of cases both sides run (H1), pinned on 2026-11-14 after
+// ruling A1 and H5 changed the launch pair; a case added on both sides
+// raises the number here in the same change.
+export const BOTH_SIDED = { official: 17, path: 27, journey: 17, launch: 28 };
+
+const UUID_LOWER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// The resolver's reading of a launch parameter: trimmed, an empty one absent.
+const launchParam = (v) => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
+
+// H2: a launch case's SQL call and the resolver's params name one launch.
+function launchProblems(c) {
+  const call = c.call;
+  const params = isObject(call.params) ? call.params : null;
+  if (!params) return [`${c.name}: call.params is not an object`];
+  const out = [];
+  const same = (what, sqlValue, paramValue) => {
+    if ((sqlValue ?? null) !== paramValue) {
+      out.push(`${c.name}: call.${what} ${JSON.stringify(sqlValue ?? null)} and the params' ${JSON.stringify(paramValue)} differ`);
+    }
+  };
+  same("path_id", call.path_id, launchParam(params.lp));
+  same("enrollment_id", call.enrollment_id, launchParam(params.journey));
+  const day = launchParam(params.day);
+  if (day === null) {
+    same("day_id", call.day_id, null);
+    same("day", call.day, null);
+  } else if (UUID_LOWER.test(day)) {
+    same("day_id", call.day_id, day);
+    same("day", call.day, null);
+  } else if (/^[0-9]{1,6}$/.test(day)) {
+    same("day_id", call.day_id, null);
+    same("day", call.day, Number(day));
+  } else {
+    same("day_id", call.day_id, null);
+    same("day", call.day, null);
+  }
+  if (c.sides.includes("sql") && (launchParam(params.mode) !== null || launchParam(params.run) !== null)) {
+    out.push(`${c.name}: a case the SQL side runs asks for a preview or names a run, which launch_context does not take`);
+  }
+  return out;
+}
 
 // Columns a row must name, because a table default would be read by SQL and
 // not by TypeScript (started_at defaults to now(), the statuses to their
@@ -277,6 +353,16 @@ export function loadCases(file) {
       expect: resolve(c0.expect, raw.ids, abs, `${name}.expect`),
     };
     if (c.writer && !c.sides.includes("sql")) throw new ParityFixtureError(abs, `${name}: a writer case runs on the SQL side`);
+    if (c.sides.length === 1) {
+      const allowed = ONE_SIDED[raw.pair]?.[name];
+      if (!allowed || allowed.side !== c.sides[0]) {
+        throw new ParityFixtureError(abs, `${name}: runs on the ${c.sides[0]} side only and is not on ONE_SIDED with that side (H1: every other case runs on both sides)`);
+      }
+    }
+    if (raw.pair === "launch") {
+      const bad = launchProblems(c);
+      if (bad.length) throw new ParityFixtureError(abs, bad.join("; "));
+    }
     if (raw.pair === "official" && !(isObject(c.expect) && "throws" in c.expect) && c.call.pass_required !== c.expect?.pass_required) {
       // TypeScript reads the resolved rule from call; SQL asserts that
       // instance_pass_required() answers expect's (contract 1.4)

@@ -31,7 +31,13 @@
  *       folder, edited one rule at a time);
  *   (f) the key twin: contextKeyOf() built from each fixture row's kind and
  *       tags gives the context_key the row names, which the SQL side compares
- *       with the generated column (contract 1.1).
+ *       with the generated column (contract 1.1);
+ *   (g) H1 and H2 of the ADR's note of 2026-11-14: each pair's count of cases
+ *       both sides run equals the loader's pinned BOTH_SIDED (the SQL side
+ *       compares the same numbers in assert-0107-parity.sql), the loader's
+ *       ONE_SIDED names exactly the files' one-sided cases, and the loader
+ *       refuses a one-sided case off that list and a launch case whose SQL
+ *       call and resolver params disagree (in (e)).
  *
  * The launch pair runs in launch-context-facts.test.ts, as the record names
  * it (step 62).
@@ -41,7 +47,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CASE_FILES, FIELDS, loadCases } from "../../scripts/migration-rehearsal/parity-cases.mjs";
+import { BOTH_SIDED, CASE_FILES, FIELDS, ONE_SIDED, loadCases } from "../../scripts/migration-rehearsal/parity-cases.mjs";
 import {
   ContextKeyError,
   contextKeyOf,
@@ -366,6 +372,25 @@ for (const d of docs.values()) {
   ok(`${d.pair}: ${rows.length} rows`, problems);
 }
 
+// --- (g) the both-sided counts and the one-sided list (H1) ------------------------
+console.log("\n(g) H1: the cases both sides run, pinned per pair; the one-sided list exact");
+{
+  const counts: Record<string, number> = {};
+  for (const d of docs.values()) counts[d.pair] = d.cases.filter((c) => c.sides.length === 2).length;
+  const pinned = BOTH_SIDED as Record<string, number>;
+  ok("each pair's both-sided count is the pinned BOTH_SIDED", [...new Set([...Object.keys(counts), ...Object.keys(pinned)])].sort()
+    .flatMap((p) => (counts[p] === pinned[p] ? [] : [`${p}: ${counts[p] ?? "no file"} cases on both sides, pinned ${pinned[p] ?? "none"}`])));
+  ok("the pinned counts, as 2026-11-14 left them (official 17, path 27, journey 17, launch 28)",
+    JSON.stringify(pinned) === JSON.stringify({ official: 17, path: 27, journey: 17, launch: 28 }) ? [] : [`BOTH_SIDED is ${JSON.stringify(pinned)}`]);
+  const oneSided = [...docs.values()].flatMap((d) => d.cases.filter((c) => c.sides.length === 1).map((c) => `${d.pair} ${c.sides[0]} ${c.name}`)).sort();
+  const listed = Object.entries(ONE_SIDED as Record<string, Record<string, { side: string }>>)
+    .flatMap(([pair, cases]) => Object.entries(cases).map(([name, v]) => `${pair} ${v.side} ${name}`)).sort();
+  ok("ONE_SIDED names exactly the files' one-sided cases, each with its side", [
+    ...oneSided.filter((x) => !listed.includes(x)).map((x) => `not on ONE_SIDED: ${x}`),
+    ...listed.filter((x) => !oneSided.includes(x)).map((x) => `on ONE_SIDED, not a one-sided case of the files: ${x}`),
+  ]);
+}
+
 // --- (e) the loader refuses a file that could pass by omission ------------------
 console.log("\n(e) the loader's refusals (a minimal official file, written to a temporary folder)");
 {
@@ -411,10 +436,70 @@ console.log("\n(e) the loader's refusals (a minimal official file, written to a 
         context_key: "individual", status: "in_progress", completion_status: "in_progress", success_status: "unknown" }];
     }, /does not name started_at/],
     ["call and expect disagreeing on the resolved rule", (d) => { d.cases[0].call.pass_required = true; }, /pass_required differ/],
+    ["a one-sided case that is not on ONE_SIDED (H1)", (d) => { (d.cases[0] as Record<string, unknown>).sides = ["sql"]; }, /is not on ONE_SIDED/],
+    ["a case on ONE_SIDED with the other side (H1)", (d) => {
+      d.cases[0].name = "official/TypeScript only: a row with an empty context_key throws (step 41)";
+      (d.cases[0] as Record<string, unknown>).sides = ["sql"];
+    }, /is not on ONE_SIDED/],
   ];
   for (const [what, edit, re] of refusals) {
     const err = tryLoad(what.replace(/\W+/g, "-"), edit);
     ok(`refused: ${what}`, err !== null && re.test(err) ? [] : [`got ${err ?? "no error"}`]);
+  }
+
+  // H2: a minimal launch file, its SQL call and its resolver params edited
+  // one rule at a time
+  const launchBase = () => ({
+    format: 1,
+    pair: "launch",
+    now: "2026-06-01T00:00:00Z",
+    ids: {
+      "@L": "00000000-0000-0000-0107-010000000001", "@O": "00000000-0000-0000-0107-0a0000000001",
+      "@C": "00000000-0000-0000-0107-020000000001", "@P": "00000000-0000-0000-0107-050000000001",
+      "@E": "00000000-0000-0000-0107-100000000001", "@D": "00000000-0000-0000-0107-0e0000000001",
+    },
+    world: {},
+    cases: [{
+      name: "launch/minimal",
+      given: {},
+      call: {
+        user_id: "@L", org_id: "@O", course_id: "@C", path_id: null as string | null, enrollment_id: "@E",
+        day_id: "@D" as string | null, day: null as number | null, role: "user",
+        params: { lp: null as string | null, journey: "@E" as string | null, day: "@D" as string | null, mode: null as string | null, run: null as string | null },
+      },
+      expect: { facts: { v: 1 }, decision: { kind: "refused", reason: "not_member" } } as Record<string, unknown>,
+    }],
+  });
+  type LaunchDoc = ReturnType<typeof launchBase>;
+  const tryLaunch = (name: string, edit: (d: LaunchDoc) => void): string | null => {
+    const d = launchBase();
+    edit(d);
+    const file = path.join(dir, `${name}.cases.json`);
+    fs.writeFileSync(file, JSON.stringify(d));
+    try {
+      loadCases(file);
+      return null;
+    } catch (e) {
+      return String(e);
+    }
+  };
+  ok("the minimal launch file loads", tryLaunch("launch-ok", () => {}) === null ? [] : [String(tryLaunch("launch-ok", () => {}))]);
+  ok("…and an old link's day number, the call's day the same number", tryLaunch("launch-number", (d) => {
+    d.cases[0].call.day_id = null; d.cases[0].call.day = 2; d.cases[0].call.params.day = "2";
+  }) === null ? [] : ["refused"]);
+  const launchRefusals: Array<[string, (d: LaunchDoc) => void, RegExp]> = [
+    ["a path the call names and the params do not", (d) => { d.cases[0].call.path_id = "@P"; }, /call\.path_id .* differ/],
+    ["an enrolment of the params that the call does not name", (d) => { d.cases[0].call.enrollment_id = null; }, /call\.enrollment_id .* differ/],
+    ["a day id in the params with a null day id in the call", (d) => { d.cases[0].call.day_id = null; }, /call\.day_id .* differ/],
+    ["an old link's number with a day id in the call", (d) => { d.cases[0].call.params.day = "2"; }, /call\.day_id .* differ/],
+    ["an old link's number the call reads as another", (d) => {
+      d.cases[0].call.day_id = null; d.cases[0].call.day = 3; d.cases[0].call.params.day = "2";
+    }, /call\.day .* differ/],
+    ["a preview asked for on a case the SQL side runs", (d) => { d.cases[0].call.params.mode = "preview"; }, /asks for a preview or names a run/],
+  ];
+  for (const [what, edit, re] of launchRefusals) {
+    const err = tryLaunch(`launch-${what.replace(/\W+/g, "-")}`, edit);
+    ok(`refused (H2): ${what}`, err !== null && re.test(err) ? [] : [`got ${err ?? "no error"}`]);
   }
   fs.rmSync(dir, { recursive: true, force: true });
 }
