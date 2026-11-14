@@ -64,13 +64,15 @@ type DueRow = {
  * The rows of a due batch whose attempt is a Preview (ADR 0024 decision A35,
  * step 80; P2-3). The live mirror and the sweep's sources drop previews
  * before they enqueue, but rows queued before that (a staff member's by-role
- * row) can still be due, "Resend all history" sets every row of the org back
- * to pending (lib/lrs/sweep.ts, dead-lettered rows included), and the points
- * and journey-day sources can name a preview's attempt. So the drain asks,
- * once per batch, which of the attempts its rows name are previews, and parks
- * their rows (PARK_UNTIL): never posted, and never deleted here. The explicit
- * purge of step 80 (purge_preview_data, by attempt_id) is what deletes a
- * new-kind preview's outbox rows; the by-role rows are preserved (reading R26).
+ * row) can still be due, "Resend all history" sets the org's rows that are
+ * not pending back to pending and due now (lib/lrs/sweep.ts: sent, failed and
+ * dead-lettered rows, a parked failed row included; a parked pending row
+ * stays parked), and the points and journey-day sources can name a preview's
+ * attempt. So the drain asks, once per batch, which of the attempts its rows
+ * name are previews, and parks their rows (PARK_UNTIL): never posted, and
+ * never deleted here. The explicit purge of step 80 (purge_preview_data, by
+ * attempt_id) is what deletes a new-kind preview's outbox rows; the by-role
+ * rows are preserved (reading R26).
  *
  * Reads `context_kind = 'preview'` only, in slices of 150 ids. Not through
  * readWithContextFilter: its fallback drops the filter, which here would
@@ -78,7 +80,11 @@ type DueRow = {
  * database without 0107; isMissingColumn) means no attempt there is a
  * preview: none, today's drain. Any other error, or an answer with neither
  * rows nor an error, answers `{ error }`, and the caller holds every row
- * that names an attempt, so a failed read never lets a preview out.
+ * that names an attempt, so a failed read never lets a preview out. Only the
+ * attempts this read finds are previews: an attempt_id with no course_attempts
+ * row (the outbox keeps the id without a foreign key, and an attempt goes with
+ * its user's or its course version's cascade) is not in the answer, so its row
+ * is posted as a real attempt's is.
  */
 async function previewRowIds(db: SupabaseClient, rows: DueRow[]): Promise<{ ids: Set<string> } | { error: string }> {
   const attemptIds = [...new Set(rows.map((r) => r.attempt_id).filter((id): id is string => !!id))];

@@ -153,10 +153,13 @@ type Row = { id: string; organization_id: string; statement_id: string; payload:
 type Spec = { org?: string; conflict?: boolean; poison?: boolean; fail500?: boolean; attempts?: number; rowStatementId?: (id: string) => string; idIn?: (id: string) => string; attempt?: string; preview?: boolean; status?: "pending" | "failed" | "dead" };
 type LrsMode = "fake" | 503 | 401 | "network" | "page200";
 type ConfigAnswer = "enabled" | "disabled" | "no endpoint" | "no row" | 500;
-/** How the drain's preview check is answered: a database with 0107, one without it (42703), or a failed read. */
-type AttemptsAnswer = "0107" | "no0107" | 500;
-/** How a park write (the PATCH that sets next_attempt_at = PARK_UNTIL) is answered. */
-type ParkAnswer = "ok" | 500;
+/**
+ * How the drain's preview check is answered: a database with 0107, one without it (42703 naming context_kind), a failed read,
+ * a 200 whose body is null (neither rows nor an error), or a 42703 naming another column (a real failure, not a missing 0107).
+ */
+type AttemptsAnswer = "0107" | "no0107" | 500 | "nodata" | "other42703";
+/** How a park write (the PATCH that sets next_attempt_at = PARK_UNTIL) is answered: written, or a 500 (with this message). */
+type ParkAnswer = "ok" | 500 | { fail: string };
 /** The route's park (app/api/cron/lrs-forward/route.ts, not exported there): pinned here as literals. */
 const PARK_UNTIL = "2999-12-31T00:00:00.000Z";
 const PARK_REASON = "preview: never forwarded (ADR 0024 A35)";
@@ -168,8 +171,9 @@ const list = (v: string | null) => (v ?? "").replace(/^in\.\(|\)$/g, "").split("
 /**
  * An outbox, an LRS and a clock. n rows, s0 to s(n-1), in the order given. `config` answers the org's config read in place of
  * a healthy one; `attemptsAnswer` answers the drain's preview check (course_attempts), every read recorded in `attemptReads`;
- * `parkAnswer` answers each park write, every one recorded in `parkWrites`. Every outbox DELETE is recorded in `outboxDeletes`,
- * and a run counts every PostgREST call it makes (`calls`).
+ * `parkAnswer` answers each park write, every one recorded in `parkWrites` with the query parameters it filters on (`params`:
+ * the fake PATCH honours `id` alone, so any other filter shows there). Every outbox DELETE is recorded in `outboxDeletes`, and a
+ * run counts every PostgREST call it makes (`calls`).
  */
 function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer, attemptsAnswer: () => AttemptsAnswer = () => "0107", parkAnswer: () => ParkAnswer = () => "ok") {
   const start = Date.parse("2026-01-01T00:00:00.000Z");
@@ -190,7 +194,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
   });
   const previewAttempts = new Set(specs.filter((sp) => sp.preview && sp.attempt).map((sp) => sp.attempt as string));
   const attemptReads: Array<{ ids: string[]; contextKind: string | null }> = [];
-  const parkWrites: Array<{ ids: string[]; ok: boolean }> = [];
+  const parkWrites: Array<{ ids: string[]; ok: boolean; params: string[] }> = [];
   const outboxDeletes: string[][] = [];
   const conflicts = new Set(rows.filter((_, i) => specs[i].conflict).map((r) => r.payload.id));
   const fail500 = new Set(rows.filter((_, i) => specs[i].fail500).map((r) => r.payload.id));
@@ -235,9 +239,10 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
         const ids = new Set(list(url.searchParams.get("id")));
         const patch = JSON.parse(String(init?.body)) as Partial<Row>;
         if (patch.next_attempt_at === PARK_UNTIL) {
-          const ok = parkAnswer() === "ok";
-          parkWrites.push({ ids: [...ids], ok });
-          if (!ok) return json({ message: "upstream connect error" }, 500);
+          const answer = parkAnswer();
+          const ok = answer === "ok";
+          parkWrites.push({ ids: [...ids], ok, params: [...url.searchParams.keys()] });
+          if (answer !== "ok") return json({ message: answer === 500 ? "upstream connect error" : answer.fail }, 500);
         }
         for (const r of rows) if (ids.has(r.id)) Object.assign(r, patch);
         return new Response(null, { status: 204 });
@@ -256,6 +261,8 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       attemptReads.push({ ids, contextKind });
       const answer = attemptsAnswer();
       if (answer === 500) return json({ message: "upstream connect error" }, 500);
+      if (answer === "nodata") return json(null);
+      if (answer === "other42703") return json({ code: "42703", details: null, hint: null, message: "column course_attempts.other_column does not exist" }, 400);
       if (contextKind !== null && answer === "no0107") {
         return json({ code: "42703", details: null, hint: null, message: "column course_attempts.context_kind does not exist" }, 400);
       }
@@ -557,6 +564,8 @@ async function routeCases() {
     eq("the real rows and the row that names no attempt are sent", [countBy(w.rows, "sent"), [...w.stored].sort()], [3, ["s0", "s2", "s4"]]);
     eq("the body counts them", [body.processed, body.sent, body.previewsParked, body.held ?? null, body.parkError ?? null, "previewsDropped" in body], [3, 3, 3, null, null, false]);
     eq("one park write for the 3 rows", w.parkWrites.map((p) => [p.ids.slice().sort(), p.ok]), [[["row-1", "row-3", "row-5"], true]]);
+    eq("…filtered by id alone (a park that also filtered on status would leave the failed rows due, run after run)",
+      w.parkWrites.map((p) => p.params), [["id"]]);
     eq("ops health: the parks add nothing to the backlog, even years later, nor to the dead letters (the one there before stays)",
       [health(w.rows, "2030-01-01T00:00:00.000Z"), w.rows.filter((r) => r.status === "dead").map((r) => r.id)], [{ backlog: 0, dead: 1 }, ["row-6"]]);
 
@@ -572,8 +581,8 @@ async function routeCases() {
       ["pending:0:parked", "pending:0:due", "pending:0:due", "pending:0:due"]);
     const third = await w.run();
     eq("…the next run checks again and parks them again: none posted, none deleted",
-      [w.attemptReads.length, w.parkWrites.map((p) => p.ids.slice().sort()), [1, 3, 5, 6].every((i) => isParked(rowAt(w.rows, i))), postedPreview(), w.outboxDeletes, third.body.previewsParked],
-      [2, [["row-1", "row-3", "row-5"], ["row-3", "row-5", "row-6"]], true, [[], []], [], 3]);
+      [w.attemptReads.length, w.parkWrites.map((p) => [p.ids.slice().sort(), p.params]), [1, 3, 5, 6].every((i) => isParked(rowAt(w.rows, i))), postedPreview(), w.outboxDeletes, third.body.previewsParked],
+      [2, [[["row-1", "row-3", "row-5"], ["id"]], [["row-3", "row-5", "row-6"], ["id"]]], true, [[], []], [], 3]);
     eq("…status pending and attempts 0, as the resend left them; no row dead",
       [[1, 3, 5, 6].map((i) => [rowAt(w.rows, i).status, rowAt(w.rows, i).attempts]), countBy(w.rows, "dead")], [[["pending", 0], ["pending", 0], ["pending", 0], ["pending", 0]], 0]);
     eq("…the real rows the resend set back to pending are sent again", [0, 2, 4].map((i) => rowAt(w.rows, i).status), ["sent", "sent", "sent"]);
@@ -583,6 +592,14 @@ async function routeCases() {
     const sweep = fs.readFileSync(path.join(__dirname, "../../lib/lrs/sweep.ts"), "utf8");
     eq("the world's resend is lib/lrs/sweep.ts's: the org's rows that are not pending go back to pending, attempts 0, due now",
       /\.from\("lrs_forward_outbox"\)\s*\.update\(\{ status: "pending", attempts: 0, last_error: null, next_attempt_at: new Date\(\)\.toISOString\(\) \}\)\s*\.eq\("organization_id", orgId\)\s*\.neq\("status", "pending"\);/.test(sweep), true);
+    // The case's health helper is checkLrsOutbox's two counts (app/api/ops/health/route.ts).
+    const healthSrc = fs.readFileSync(path.join(__dirname, "../../app/api/ops/health/route.ts"), "utf8");
+    const at = healthSrc.indexOf("async function checkLrsOutbox(");
+    const check = at < 0 ? "" : healthSrc.slice(at, healthSrc.indexOf("\n}\n", at));
+    eq("the case's health helper is checkLrsOutbox's: the backlog is pending or failed rows due 15 minutes ago, the dead letters every dead row",
+      /const overdueIso = new Date\(Date\.now\(\) - 15 \* 60_000\)\.toISOString\(\);/.test(check) &&
+        /\.from\("lrs_forward_outbox"\)\s*\.select\("id", \{ count: "exact", head: true \}\)\s*\.in\("status", \["pending", "failed"\]\)\s*\.lte\("next_attempt_at", overdueIso\);/.test(check) &&
+        /\.from\("lrs_forward_outbox"\)\s*\.select\("id", \{ count: "exact", head: true \}\)\s*\.eq\("status", "dead"\);/.test(check), true);
   }
   {
     const w = world([{ attempt: "att-prev", preview: true }, { attempt: "att-prev", preview: true }]);
@@ -594,6 +611,20 @@ async function routeCases() {
     const w = world(rowsOf(8));
     await w.run();
     eq("rows that name no attempt: no preview check is read", w.attemptReads.length, 0);
+  }
+  {
+    // The oldest due row names no attempt: the check still runs for the rows behind it.
+    const specs: Spec[] = [{}, { attempt: "att-prev", preview: true }, { attempt: "att-real" }];
+    const w = world(specs);
+    const { body } = await w.run();
+    eq("the first row names no attempt, a later one a preview's: one preview check, the preview parked, never posted or stored",
+      [w.attemptReads.map((r) => [r.ids.slice().sort(), r.contextKind]), isParked(rowAt(w.rows, 1)), w.postedIds.flat().includes("s1"), w.stored.has("s1"), body.previewsParked],
+      [[[["att-prev", "att-real"], "eq.preview"]], true, false, false, 1]);
+    eq("…the row that names no attempt and the real one are sent", [rowAt(w.rows, 0).status, rowAt(w.rows, 2).status, [...w.stored].sort()], ["sent", "sent", ["s0", "s2"]]);
+    const f = world(specs, "fake", undefined, () => 500);
+    const failed = await f.run();
+    eq("…the same batch with a failed check: the two rows that name an attempt held, only the first posted",
+      [failed.body.held, failed.body.previewCheckError, f.postedIds.flat(), f.rows.map((r) => r.status)], [2, "upstream connect error", ["s0"], ["sent", "pending", "pending"]]);
   }
   {
     // 200 rows, each its own attempt: two slices of 150 ids at most.
@@ -644,6 +675,18 @@ async function routeCases() {
       [w.rows.map((r) => `${r.id}:${r.status}`), isParked(rowAt(w.rows, 1)), w.postedIds.flat().includes("s1"), w.outboxDeletes],
       [["row-0:sent", "row-1:pending", "row-2:sent"], true, false, []]);
   }
+  for (const c of [
+    { answer: "nodata" as const, name: "a check answered 200 with neither rows nor an error", error: "attempts read answered neither rows nor an error" },
+    { answer: "other42703" as const, name: "a check answered 42703 naming another column (not a database without 0107)", error: "column course_attempts.other_column does not exist" },
+  ]) {
+    const w = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => c.answer);
+    const { body } = await w.run();
+    eq(`${c.name}: held as a failed check, only the row that names no attempt posted`,
+      [body.held, body.previewCheckError, w.postedIds.flat(), w.parkWrites.length],
+      [2, c.error, ["s2"], 0]);
+    eq(`${c.name}: the held rows are as they were, still due`,
+      [0, 1].every((i) => rowAt(w.rows, i).status === "pending" && rowAt(w.rows, i).attempts === 0 && rowAt(w.rows, i).last_error === null && rowAt(w.rows, i).next_attempt_at === "2026-01-01T00:00:00.000Z"), true);
+  }
   {
     let park: ParkAnswer = 500;
     const w = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => "0107", () => park);
@@ -667,6 +710,15 @@ async function routeCases() {
     eq("one of two park writes fails: the body counts the 50 parked and names the error; nothing posted; the 150 stay due",
       [body.previewsParked, body.parkError, posts, w.rows.filter(isParked).length, w.rows.filter((r) => r.next_attempt_at === "2026-01-01T00:00:00.000Z").length],
       [50, "upstream connect error", 0, 50, 150]);
+  }
+  {
+    // Both park writes fail, each with its own message: the body names the first.
+    let n = 0;
+    const w = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: true })), "fake", undefined, () => "0107", () => ({ fail: ++n === 1 ? "first write failed" : "second write failed" }));
+    const { body, posts } = await w.run();
+    eq("both park writes fail: the body names the first error, counts none parked; nothing posted, every row still due",
+      [body.parkError, body.previewsParked, posts, w.rows.filter(isParked).length, w.rows.filter((r) => r.next_attempt_at === "2026-01-01T00:00:00.000Z").length],
+      ["first write failed", 0, 0, 0, 200]);
   }
 
   console.log("\nthe cron route: the calls the preview check adds to a run (P2-6's subrequest count)");
