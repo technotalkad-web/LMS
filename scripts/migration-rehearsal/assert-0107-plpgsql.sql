@@ -322,7 +322,14 @@ begin
   end if;
 
   -- the lock order of both consume_grant forms: the grant row (for update),
-  -- then the enrolment row (for update)
+  -- then the enrolment row (for update). The enrolment read (from its from
+  -- clause to its for update, one statement) names the learner's id and the
+  -- grant's organisation as code lines, the two columns the owner trigger
+  -- (2j) compares (the ADR 0024 note of 2026-11-14), so no enrolment of
+  -- another learner or of another organisation is locked. The wrapper's
+  -- predicates are asserted here only: the nine-argument form it calls
+  -- answers unavailable without them as well, so (30j) and (30k) cannot see
+  -- them go
   for r in select * from (values ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)'),
                                  ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)')) as t(fn)
   loop
@@ -335,6 +342,10 @@ begin
        or strpos(substr(src, p_ar, p_fu1 - p_ar), ';') > 0 or strpos(substr(src, p_je, p_fu2 - p_je), ';') > 0 then
       bad := bad || format('%s: the grant is not locked before the enrolment (%s, %s, %s, %s)',
                            r.fn, p_ar, p_fu1, p_je, p_fu2);
+    elsif substr(src, p_je, p_fu2 - p_je) !~ '\n\s*and\s+e\.user_id\s*=\s*p_user_id\s*\n'
+       or substr(src, p_je, p_fu2 - p_je) !~ '\n\s*and\s+e\.organization_id\s*=\s*p_org_id\s*\n' then
+      bad := bad || format('%s: the enrolment read does not name the learner''s id and the grant''s organisation: %s',
+                           r.fn, substr(src, p_je, p_fu2 - p_je));
     end if;
   end loop;
 
@@ -1138,6 +1149,67 @@ begin
 end
 $$;
 rollback to savepoint s30j;
+
+-- (k) the variant of (j) in another organisation: L1 is also a member of
+--     Org X and enrolled there (program JX, day 2 with its own identity, its
+--     version, enrolment EX); an approved journey grant of L1 on CB, in Org
+--     A, names EX and its day. The owner trigger of 2j refuses a retake
+--     whose enrolment is of another organisation, so both forms read the
+--     enrolment with the learner's id and the grant's organisation and
+--     answer unavailable, with nothing written and the grant unused.
+--     Without the nine-argument form's organisation predicate the call goes
+--     on to the insert, which the owner trigger refuses (P0001), so this
+--     check fails then; the eight-argument form's predicate is asserted on
+--     its stored body in (26)
+savepoint s30k;
+do $$
+declare
+  got text := '';
+  o   text;
+  l1  constant uuid := '00000000-0000-0000-0000-000107170001';
+  cb  constant uuid := '00000000-0000-0000-0000-000107171002';
+  vb  constant uuid := '00000000-0000-0000-0000-000107171203';
+  ox  constant uuid := '00000000-0000-0000-0000-000107170900';
+  jx  constant uuid := '00000000-0000-0000-0000-000107173901';
+  dx  constant uuid := '00000000-0000-0000-0000-000107173911';
+  jvx constant uuid := '00000000-0000-0000-0000-000107173921';
+  ex  constant uuid := '00000000-0000-0000-0000-000107173931';
+begin
+  insert into public.organization_members (organization_id, user_id, role) values (ox, l1, 'user');
+  insert into public.journey_programs (id, organization_id, name, days_total)
+  values (jx, ox, 'JX (0107 plpgsql)', 2);
+  insert into public.journey_days (id, program_id, organization_id, day_number, course_id)
+  values (dx, jx, ox, 2, null);
+  insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total,
+                                       count_sundays, completion_title, days, day_ids, day_ids_source)
+  values (jvx, jx, ox, 1, 'JX (0107 plpgsql)', 2, true, 'Done',
+          jsonb_build_array(jsonb_build_object('day', 2, 'course_id', null, 'mission_title', null)),
+          jsonb_build_object('2', dx::text), 'editor');
+  update public.journey_programs set current_version_id = jvx where id = jx;
+  insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+  values (ex, jx, jvx, ox, l1, current_date - 10, 'active');
+
+  perform pg_temp.grant7(pg_temp.u7('000107177150'), l1, cb, 'journey', null, ex, 2, dx, now());
+  begin
+    select g.outcome into o from pg_temp.cg9(pg_temp.u7('000107177150'), l1, cb, vb, null, ex, 2, dx) g;
+  exception when others then
+    o := sqlstate;
+  end;
+  got := got || o || ' ';
+  begin
+    select g.outcome into o from pg_temp.cg8(pg_temp.u7('000107177150'), l1, cb, vb, null, ex, 2) g;
+  exception when others then
+    o := sqlstate;
+  end;
+  got := got || o;
+  if got <> 'unavailable unavailable'
+     or exists (select 1 from public.course_attempts where journey_enrollment_id = ex)
+     or (select used_at from public.attempt_requests where id = pg_temp.u7('000107177150')) is not null then
+    raise exception 'assert-0107: (30k) a journey grant naming the learner''s enrolment in another organisation: % (expected unavailable twice, nothing written)', got;
+  end if;
+end
+$$;
+rollback to savepoint s30k;
 
 -- ---------------------------------------------------------------------------
 -- (31) journey_save_days. Program JS with days S1, S2, S3 (numbers 1 to 3;

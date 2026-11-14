@@ -2029,7 +2029,8 @@ create index if not exists xp_events_org_ctx_created_idx
 -- enrolment while A's attempt stays, and the delete would be refused with
 -- 23503. No application writer makes such a row (the launch reads the
 -- enrolment by the learner's id, as launch_context does, and consume_grant
--- does since the same ruling), but nothing in the database forbade it.
+-- does since the same ruling, with the grant's organisation as well), but
+-- nothing in the database forbade it.
 -- Before insert, every kind (a legacy_role preview's old tag included);
 -- the immutability trigger (2b) keeps the tag from changing afterwards. An
 -- id that names no enrolment is left to the foreign key (23503). Rows from
@@ -3797,10 +3798,12 @@ grant execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, u
 --     the version it is pinned to is read from that locked row; the retake
 --     records it (journey_version_id) with the day id (A27). The enrolment
 --     is read with the learner's id (the ADR 0024 note of 2026-11-14, the
---     ruling "A user delete can be refused"): an enrolment of another
---     learner, or none, answers unavailable with nothing written, so no
---     other learner's enrolment is locked and the retake never names one
---     (the owner trigger of 2j would refuse that insert);
+--     ruling "A user delete can be refused") and the grant's organisation,
+--     the two columns the owner trigger of 2j compares: an enrolment of
+--     another learner, one of the learner's in another organisation, or
+--     none, answers unavailable with nothing written, so no such enrolment
+--     is locked and the retake never names one (the owner trigger would
+--     refuse that insert);
 --   - retake_live, the official result, stands and the abandon read attempt
 --     rows of this context only (context_key); the live-retake test is on
 --     the retake row's own context, and the grant that names it may be of
@@ -3816,7 +3819,8 @@ grant execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, u
 --     never written.
 -- Outcomes, in this order, under the grant row's lock: unavailable; (22023)
 -- version, course or organisation mismatch, raised; unavailable for a
--- journey context whose enrolment is not the learner's; used; expired;
+-- journey context whose enrolment is not the learner's own in the grant's
+-- organisation; used; expired;
 -- retake_live; stale; stands; opened, as in 0103 (comment at 0103:690-719).
 -- Lock order in both forms: the grant, then the enrolment, then
 -- course_attempts rows. journey_record_completion and the re-pin lock the
@@ -3888,14 +3892,16 @@ begin
       using errcode = '22023';
   end if;
 
-  -- 2b. a journey context: the learner's own enrolment row, locked after the
-  -- grant, and the version it is pinned to; an enrolment of another
-  -- learner, or none, is unavailable (the note of 2026-11-14)
+  -- 2b. a journey context: the learner's own enrolment row in the grant's
+  -- organisation, locked after the grant, and the version it is pinned to;
+  -- an enrolment of another learner, one in another organisation, or none,
+  -- is unavailable (the note of 2026-11-14)
   if v_kind = 'journey' then
     select e.version_id into v_pinned
       from public.journey_enrollments e
      where e.id = p_journey_enrollment_id
        and e.user_id = p_user_id
+       and e.organization_id = p_org_id
        for update;
     if not found then
       return query select 'unavailable'::text, null::uuid, '{}'::uuid[];
@@ -4032,14 +4038,15 @@ grant execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uui
 -- The eight-argument form keeps its signature (0103:721-731) for the launch
 -- code before phase 2, as a wrapper. Its first statement is the grant lock
 -- of 0103:748-754; only then does it lock the enrolment row of a journey
--- call (the learner's own only, read with the learner's id as the
--- nine-argument form reads it) and resolve p_journey_day to its day id
--- through the version that row is pinned to; then it calls the
--- nine-argument form, which takes the same two locks in the same order (the
--- transaction already holds them). A wrapper that took the enrolment lock
--- first could deadlock two launches of one learner. A journey day the
--- pinned version does not map, or an enrolment of another learner, resolves
--- to null, and the nine-argument form answers unavailable. 0108's
+-- call (the learner's own only, read with the learner's id and the grant's
+-- organisation as the nine-argument form reads it) and resolve
+-- p_journey_day to its day id through the version that row is pinned to;
+-- then it calls the nine-argument form, which takes the same two locks in
+-- the same order (the transaction already holds them). A wrapper that took
+-- the enrolment lock first could deadlock two launches of one learner. A
+-- journey day the pinned version does not map, or an enrolment of another
+-- learner or of another organisation, resolves to null, and the
+-- nine-argument form answers unavailable. 0108's
 -- preconditions end its use; it stays a wrapper.
 create or replace function public.consume_grant(
   p_grant_id uuid,
@@ -4068,9 +4075,10 @@ begin
      and ar.status = 'approved'
      for update;
 
-  -- 2. a journey call: the learner's own enrolment row, locked, and the day
-  -- id of p_journey_day in the version it is pinned to; another learner's
-  -- enrolment is neither locked nor read, its day id stays null, and the
+  -- 2. a journey call: the learner's own enrolment row in the grant's
+  -- organisation, locked, and the day id of p_journey_day in the version it
+  -- is pinned to; another learner's enrolment, or one in another
+  -- organisation, is neither locked nor read, its day id stays null, and the
   -- nine-argument form answers unavailable (the note of 2026-11-14)
   if p_journey_enrollment_id is not null then
     select (jv.day_ids ->> p_journey_day::text)::uuid
@@ -4079,6 +4087,7 @@ begin
       join public.journey_versions jv on jv.id = e.version_id
      where e.id = p_journey_enrollment_id
        and e.user_id = p_user_id
+       and e.organization_id = p_org_id
        for update of e;
   end if;
 
