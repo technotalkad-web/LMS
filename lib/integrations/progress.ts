@@ -18,7 +18,7 @@ import {
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { courseStatus, officialDone } from "@/lib/scoring/policy";
-import { fetchPassRequired, grantSnapshotForUsers } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, grantSnapshotForUsers, type OptionalColumnState } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { officialHistory, officialRetakeState } from "@/lib/scoring/official-history";
 import { fetchRevisionVisitStats } from "@/lib/attempts/revision-visits";
@@ -399,6 +399,10 @@ type Att = {
  * attempts read drops `context_kind = 'preview'` rows, and on a database
  * without 0107 reads today's select once (readWithContextFilter; `previews`
  * is the request's one decision, shared by every batch).
+ *
+ * ADR 0024 step 45 (P2-4): the journey credits are read by day id through
+ * readJourneyCredits; `journeyCredits` is the request's one decision on the
+ * day_id column, shared by every batch in the same way.
  */
 export async function buildProgress(
   svc: SupabaseClient,
@@ -407,7 +411,8 @@ export async function buildProgress(
   members: MemberRow[],
   f: ProgressFilters,
   timezone?: string,
-  previews: ContextFilterState = { applies: null }
+  previews: ContextFilterState = { applies: null },
+  journeyCredits: OptionalColumnState = { columns: null }
 ): Promise<LearnerProgress[]> {
   if (members.length === 0) return [];
   const uids = members.map((m) => m.user_id);
@@ -547,7 +552,11 @@ export async function buildProgress(
   // twin's counts read them by day id. Outside the try above, so a failed
   // read is an error of the feed, never "no journeys" (a database without
   // journeys has no enrolment, and the reader then reads nothing).
-  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })));
+  const credits = await readJourneyCredits(
+    svc,
+    enrollments.map((e) => ({ id: e.id, version_id: e.version_id })),
+    { state: journeyCredits }
+  );
   if (!credits.ok) throw new Error(`journey credits read failed (${credits.error?.code ?? "no code"})`);
   // PENDING (ADR 0024 phase 9a, tests/unit/journey-credit-sites.test.ts):
   // the feed's per-day rows still look a credit up by its day_number; phase

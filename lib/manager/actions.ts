@@ -10,8 +10,10 @@ import {
   courseDaysOf,
   dateOfDay,
   parseVersionDays,
+  reminderCountsFrom,
   reminderCreditedDays,
   todayStr,
+  type ReminderCounts,
 } from "@/lib/journey/journey";
 import { loadScopes } from "@/lib/content/scopes";
 import { loadManagerContext, partitionByScope, type ManagerContext } from "./access";
@@ -244,15 +246,12 @@ export async function sendReminders(
   // RPC the hourly cron uses), instead of a query per learner. `credited`
   // (0107) is the day numbers credited by day id; reminderCreditedDays falls
   // back to the first `done` course days on a database without it (ADR 0024
-  // step 45). A failed read reminds nobody: it is never "nothing done".
-  const counts = new Map<string, { done: number; done_today: boolean; credited?: unknown }>();
-  let countsFailed = false;
+  // step 45). A failed read reminds nobody: it is never "nothing done"
+  // (reminderCountsFrom).
+  let counts: ReminderCounts = reminderCountsFrom([], null);
   if (byUser.size) {
     const { data: cntRows, error: cntErr } = await a.svc.rpc("journey_reminder_counts", { p_ids: [...byUser.values()].map((e) => e.id) });
-    if (cntErr) countsFailed = true;
-    for (const c of (cntRows ?? []) as Array<{ enrollment_id: string; done: number; done_today: boolean; credited?: unknown }>) {
-      counts.set(c.enrollment_id, { done: c.done ?? 0, done_today: c.done_today === true, credited: c.credited });
-    }
+    counts = reminderCountsFrom(cntRows, cntErr);
   }
   const courseTitle = new Map<string, string>();
   for (const uid of ids) {
@@ -265,8 +264,8 @@ export async function sendReminders(
     if (!v || !p || p.is_active === false) { results.push({ userId: uid, status: "skipped", reason: "journey inactive" }); continue; }
     if (e.last_daily_reminder_on === today) { results.push({ userId: uid, status: "skipped", reason: "already reminded today" }); continue; }
     const unlockMode = v.unlock_mode === "progress" ? "progress" : "calendar";
-    const cnt = counts.get(e.id);
-    if (countsFailed || !cnt) { results.push({ userId: uid, status: "skipped", reason: "journey progress unreadable" }); continue; }
+    const cnt = counts.ok ? counts.countOf(e.id) : null;
+    if (!cnt) { results.push({ userId: uid, status: "skipped", reason: "journey progress unreadable" }); continue; }
     const courseDays = courseDaysOf(v.days, v.days_total);
     const st = computeJourneyState({
       startDate: e.start_date, today, creditedDays: reminderCreditedDays(cnt, courseDays), daysTotal: v.days_total,

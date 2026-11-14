@@ -16,18 +16,29 @@
  *       day outside the pinned version counts towards nothing;
  *   (c) blocked_failed from its two inputs (an output only: it never changes
  *       todayUnlocked or openableDay), Behind equal to the rule (released
- *       course days not credited, minus today's), zero missions never
- *       finished nor open, nextDay;
+ *       course days not credited, minus today's; a case where it differs
+ *       from "released minus credited"), zero missions never finished nor
+ *       open, nextDay;
  *   (d) creditedDaysFor: by id, by number only when the reader fell back
  *       (day_ids null), `{}` credits nothing; reminderCreditedDays's
- *       fallback to the first `done` course days; resumableDayIdsFor;
- *       parseVersionDays' dayId and a day listed twice;
+ *       fallback to the first `done` course days; reminderCountsFrom (a
+ *       failed call reminds nobody, a missing row is no reminder);
+ *       resumableDayIdsFor; parseVersionDays' dayId, a day listed twice and
+ *       0107's reading of a day number;
  *   (e) readJourneyCredits (lib/journey/credits-read.ts) on a stub client: the
  *       two reads with day_id and day_ids, each request with its own abort
- *       signal; on a missing-column error naming day_id, today's reading by
- *       number and no versions read; day_ids missing while day_id is there,
- *       and any other error, answer {ok: false}; chunks and pages decided
- *       once.
+ *       signal; the versions read only for enrolments that hold a credit; on
+ *       a missing-column error naming day_id or day_ids, today's reading by
+ *       number; any other error, and a pinned version the read did not
+ *       answer, {ok: false}; chunks and pages decided once, a shared state
+ *       deciding once for several calls;
+ *   (f) learnerCanAccessCourse's journey branch (lib/auth/course-access.ts)
+ *       on a stub client: a credited day numbered above the open day stays
+ *       open for review, a day past the open day that holds no credit does
+ *       not, a failed credit read grants nothing, and the caller's own read
+ *       is used only when it is ok and covers every enrolment. P2-6 creates
+ *       tests/unit/course-access.test.ts with step 23's cases; these stay
+ *       here with the twin they test.
  *
  * Not here, because the twin does not answer them (step 62's row names them
  * for the journey surfaces of later phases): `late` (a credit's column, written
@@ -45,12 +56,15 @@ import {
   courseDaysOf,
   creditedDaysFor,
   parseVersionDays,
+  reminderCountsFrom,
   reminderCreditedDays,
   resumableDayIdsFor,
   type JourneyCreditRow,
   type JourneyUnlockMode,
 } from "../../lib/journey/journey";
-import { readJourneyCredits } from "../../lib/journey/credits-read";
+import { readJourneyCredits, type JourneyCredits } from "../../lib/journey/credits-read";
+import { learnerCanAccessCourse } from "../../lib/auth/course-access";
+import type { OptionalColumnState } from "../../lib/scoring/attempt-kind";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -210,6 +224,13 @@ async function main() {
       [gap.allowedDay, gap.pendingDays, gap.behindDays, gap.nextDay, gap.completedCount], [4, 2, 1, 2, 2]);
     const prog = stateOf(v, [credit(D(1), 1), credit(D(3), 3)], { today: "2026-01-08", unlockMode: "progress" });
     eq("…progress mode is never behind", [prog.pendingDays, prog.behindDays, prog.todayUnlocked, prog.openableDay], [0, 0, true, 2]);
+    // A day inserted at 2 before a credited day (d2 moves to 3), calendar day
+    // 2: released course days 1 and 2, credited 1 (and 3, not yet released).
+    // "Released minus credited" would read 2 - 2 = 0; the rule reads 1.
+    const inserted = version([[1, D(1), "A"], [2, NEW, "N"], [3, D(2), "B"], [4, D(3), "C"], [5, D(4), "D"], [6, D(5), "E"]], 6);
+    const ins = stateOf(inserted, [credit(D(1), 1), credit(D(2), 2)], { today: "2026-01-06" });
+    eq("…a credited day beyond the calendar does not cancel a released one: allowed 2, pending 1, behind 0, open day 2",
+      [ins.allowedDay, ins.pendingDays, ins.behindDays, ins.nextDay], [2, 1, 0, 2]);
 
     const none = computeJourneyState({ startDate: "2026-01-05", today: "2026-01-20", creditedDays: [], daysTotal: 5, countSundays: true, courseDays: [] });
     eq("zero missions (courseDays []): never finished, nothing open, no next day, 0%",
@@ -231,6 +252,22 @@ async function main() {
     eq("…without the column, done 0", reminderCreditedDays({ done: 0 }, [1, 2]), []);
     eq("…without the column, done above the course days", reminderCreditedDays({ done: 9 }, [1, 2]), [1, 2]);
 
+    const failedCounts = reminderCountsFrom(null, { code: "57014", message: "statement timeout" });
+    eq("reminderCountsFrom: a failed call is {ok: false} (reminds nobody, never \"nothing done\")", failedCounts.ok, false);
+    eq("…a failed call with rows beside the error is still {ok: false}",
+      reminderCountsFrom([{ enrollment_id: "e1", done: 0, done_today: false }], { code: "XX000" }).ok, false);
+    const counts = reminderCountsFrom([
+      { enrollment_id: "e1", done: 2, done_today: true, credited: [1, 3] },
+      { enrollment_id: "e2", done: 1, done_today: false },
+    ], null);
+    const c1 = counts.ok ? counts.countOf("e1") : null;
+    const c2 = counts.ok ? counts.countOf("e2") : null;
+    eq("…0107's row keeps `credited`, which reminderCreditedDays takes", [c1?.done_today, c1 ? reminderCreditedDays(c1, [1, 2, 3, 4]) : null], [true, [1, 3]]);
+    eq("…a row without `credited` (no 0107): the first `done` course days", c2 ? reminderCreditedDays(c2, [2, 4, 6]) : null, [2]);
+    eq("…an enrolment the answer has no row for: null (no reminder)", counts.ok ? counts.countOf("e9") : "failed", null);
+    const empty = reminderCountsFrom(null, null);
+    eq("…no rows and no error: ok, every enrolment null", [empty.ok, empty.ok ? empty.countOf("e1") : "failed"], [true, null]);
+
     const E = "e1";
     const row = (o: Record<string, unknown>) => ({ journey_enrollment_id: E, context_kind: "journey", status: "in_progress", is_revision: false, ...o });
     eq("resumableDayIdsFor: open official journey rows of the enrolment, distinct, ascending", resumableDayIdsFor(E, [
@@ -248,6 +285,14 @@ async function main() {
     eq("parseVersionDays: a day listed twice takes the first entry's course that has one", days.get(1)?.course_id, "C1");
     eq("…the dayId from the map, in lower case; none for a number the map lacks", [days.get(1)?.dayId, days.get(2)?.dayId], [D(1), null]);
     eq("…no map: every dayId null", parseVersionDays([{ day: 1, course_id: "C" }]).get(1)?.dayId, null);
+    // 0107 reads a day as `->> 'day' ~ '^[0-9]{1,6}$'`: a whole JSON number or a string of digits.
+    const odd = parseVersionDays([
+      { day: 2.5, course_id: "X" }, { day: "1e1", course_id: "X" }, { day: " 4", course_id: "X" }, { day: true, course_id: "X" },
+      { day: "3", course_id: "C3" }, { day: 7, course_id: "C7" }, { day: 1234567, course_id: "X" }, null,
+    ]);
+    eq("…a day number as 0107 reads it: 2.5, \"1e1\", \" 4\", true and seven digits are no day; \"3\" and 7 are", [...odd.keys()].sort((a, b) => a - b), [3, 7]);
+    eq("…so a fractional day is no required day of creditedDaysFor either",
+      creditedDaysFor({ days: [{ day: 1, course_id: "A" }, { day: 2.5, course_id: "B" }], days_total: 3, day_ids: { "1": D(1), "3": D(3) } }, [credit(D(1), 1), credit(D(3), 3)]), [1]);
   }
 
   console.log("\n(e) readJourneyCredits on a stub client");
@@ -277,7 +322,8 @@ async function main() {
           }
           if (table === "journey_versions") {
             if (w.versionsError) return { data: null, error: w.versionsError };
-            return { data: w.versions ?? [], error: null };
+            const ids = (r.ops.find(([op]) => op === "in")?.[1][1] ?? []) as string[];
+            return { data: (w.versions ?? []).filter((v) => ids.includes(String(v.id))), error: null };
           }
           return { data: [], error: null };
         };
@@ -328,9 +374,15 @@ async function main() {
         r.ok ? stateOf({ ...v, day_ids: r.dayIdsOf("v1") }, r.rowsOf("e1")).nextDay : null, 3);
     }
     {
-      const s = stub({ progress: [P("e1", 1)], versionsError: { code: "42703", message: "column journey_versions.day_ids does not exist" } });
+      // A missing-column error naming day_ids: today's reading by number too
+      // (P2-4 item 2), the rows already read kept.
+      const s = stub({ progress: [P("e1", 1), P("e1", 2)], versionsError: { code: "42703", message: "column journey_versions.day_ids does not exist" } });
       const r = await readJourneyCredits(s.client, ENR);
-      eq("day_id there but day_ids missing: {ok: false}, never a fallback", r.ok, false);
+      eq("day_id there but day_ids missing (42703 naming day_ids): ok, read by number", r.ok ? [r.byDayId, r.dayIdsOf("v1")] : null, [false, null]);
+      eq("…no second read of the rows", s.reqs.map((q) => q.table), ["journey_day_progress", "journey_versions"]);
+      const v = version([[1, D(1), "A"], [2, D(2), "B"], [3, D(3), "C"]], 3);
+      eq("…today's reading: days 1 and 2 credited by number, the open day 3",
+        r.ok ? stateOf({ ...v, day_ids: r.dayIdsOf("v1") }, r.rowsOf("e1")).nextDay : null, 3);
     }
     {
       const s = stub({ progressError: { code: "XX000", message: "boom" } });
@@ -338,14 +390,48 @@ async function main() {
       eq("any other error: {ok: false}, no second read", [r.ok, s.reqs.length], [false, 1]);
     }
     {
-      const s = stub({ versionsError: { code: "57014", message: "statement timeout" } });
+      const s = stub({ progress: [P("e1", 1)], versionsError: { code: "57014", message: "statement timeout" } });
       const r = await readJourneyCredits(s.client, ENR);
-      eq("a failed versions read: {ok: false}", r.ok, false);
+      eq("a failed versions read (any other error): {ok: false}, never by number", [r.ok, s.reqs.map((q) => q.table)], [false, ["journey_day_progress", "journey_versions"]]);
+    }
+    {
+      const s = stub({ progress: [P("e1", 1)], versionsError: { code: "42703", message: "column journey_versions.version_number does not exist" } });
+      const r = await readJourneyCredits(s.client, ENR);
+      eq("…a missing column that is not day_ids is a failure too", r.ok, false);
+    }
+    {
+      const s = stub({ progress: [P("e1", 1)], versions: [] });
+      const r = await readJourneyCredits(s.client, ENR);
+      eq("a pinned version the versions read did not answer: {ok: false} (never a version that credits nothing)",
+        r.ok ? "ok" : r.error?.code, "version_unreadable");
+    }
+    {
+      const s = stub({ progress: [], versions: [{ id: "v1", day_ids: { "1": D(1) } }] });
+      const r = await readJourneyCredits(s.client, ENR);
+      eq("no enrolment holds a credit: ok, one request (no versions read)", [r.ok, s.reqs.map((q) => q.table)], [true, ["journey_day_progress"]]);
+      eq("…dayIdsOf {} and no rows, so nothing is credited", r.ok ? creditedDaysFor({ ...version([[1, D(1), "A"]], 1), day_ids: r.dayIdsOf("v1") }, r.rowsOf("e1")) : null, []);
+    }
+    {
+      const two = [{ id: "e1", version_id: "v1" }, { id: "e3", version_id: "v2" }];
+      const s = stub({ progress: [P("e1", 1)], versions: [{ id: "v1", day_ids: { "1": D(1) } }, { id: "v2", day_ids: { "1": D(1) } }] });
+      const r = await readJourneyCredits(s.client, two);
+      eq("only the versions of enrolments that hold a credit are read",
+        s.reqs.filter((q) => q.table === "journey_versions").map((q) => q.ops.find(([op]) => op === "in")?.[1][1]), [["v1"]]);
+      eq("…the other version answers {} (its enrolment has no row to map)", r.ok ? [r.dayIdsOf("v2"), r.rowsOf("e3")] : null, [{}, []]);
     }
     {
       const s = stub({});
       const r = await readJourneyCredits(s.client, []);
       eq("no enrolment: ok with nothing, no request", [r.ok, s.reqs.length], [true, 0]);
+    }
+    {
+      // Two calls of one request sharing the decision (the CRM feed's batches).
+      const s = stub({ no0107: true, progress: [P("e1", 1), P("e2", 2)] });
+      const state: OptionalColumnState = { columns: null };
+      const first = await readJourneyCredits(s.client, [ENR[0]], { state });
+      const second = await readJourneyCredits(s.client, [ENR[1]], { state });
+      eq("a shared state: one failed read for both calls, each by number",
+        [first.ok && !first.byDayId, second.ok && !second.byDayId, s.reqs.filter((q) => q.select.includes("day_id")).length, s.reqs.length], [true, true, 1, 3]);
     }
     {
       // 160 enrolments (two chunks of 150 and 10) and 1,200 rows on the first enrolment (two pages).
@@ -362,6 +448,77 @@ async function main() {
         [[true, 150, [0, 999]], [false, 150, [0, 999]], [false, 150, [1000, 1999]], [false, 10, [0, 999]]]);
       eq("…every row read", r.ok ? [r.rowsOf("e0").length, r.rowsOf("e159").length] : null, [1200, 1]);
     }
+  }
+
+  console.log("\n(f) learnerCanAccessCourse's journey branch on a stub client");
+  {
+    // One active enrolment on a version where a day was inserted at 2 before
+    // credited days: credits on d1, d2 and d3 (numbers 1, 3 and 4 now), the
+    // open day 2 (the new day). Started long ago, so the calendar allows
+    // every day and the ceiling is the open day in both modes.
+    type Req = { table: string; select: string; ops: Array<[string, unknown[]]> };
+    type World = { mode: "calendar" | "progress"; progressError?: { code: string; message: string } };
+    const DAYS = [[1, "A"], [2, "N"], [3, "B"], [4, "C"], [5, "D"]].map(([day, course_id]) => ({ day, course_id, mission_title: null }));
+    const DAY_IDS = { "1": D(1), "2": NEW, "3": D(2), "4": D(3), "5": D(4) };
+    const stub = (w: World) => {
+      const reqs: Req[] = [];
+      const answerOf = (r: Req, single: boolean) => {
+        const rows = (() => {
+          switch (r.table) {
+            case "journey_enrollments":
+              return [{ id: "e1", version_id: "v1", start_date: "2026-01-01", status: "active", journey_programs: { is_active: true } }];
+            case "journey_versions":
+              return [{ id: "v1", days_total: 5, count_sundays: true, days: DAYS, unlock_mode: w.mode, day_ids: DAY_IDS }];
+            case "journey_day_progress":
+              if (w.progressError) return w.progressError;
+              return [1, 2, 3].map((n) => ({ enrollment_id: "e1", day_number: n, completed_at: "2026-01-02T10:00:00Z", day_id: D(n) }));
+            default:
+              return [];
+          }
+        })();
+        if (!Array.isArray(rows)) return { data: null, error: rows };
+        return { data: single ? rows[0] ?? null : rows, error: null };
+      };
+      const from = (table: string) => {
+        const r: Req = { table, select: "", ops: [] };
+        reqs.push(r);
+        let single = false;
+        const b: Record<string, unknown> = {};
+        for (const op of ["eq", "in", "order", "range", "abortSignal", "neq", "is", "limit"]) b[op] = (...a: unknown[]) => (r.ops.push([op, a]), b);
+        b.select = (s: string) => ((r.select = s), b);
+        b.maybeSingle = () => ((single = true), b);
+        b.then = (res: (v: unknown) => unknown, rej: (e: unknown) => unknown) => Promise.resolve(answerOf(r, single)).then(res, rej);
+        return b;
+      };
+      return { client: { from }, reqs };
+    };
+    const access = async (w: World, courseId: string, journeyCredits?: { ids: ReadonlySet<string>; credits: JourneyCredits }) => {
+      const s = stub(w);
+      const res = await learnerCanAccessCourse({
+        supabase: s.client as never, orgId: "org-1", userId: "u1", courseId, isAdmin: false, visibility: "private", journeyCredits,
+      });
+      return { res, creditReads: s.reqs.filter((q) => q.table === "journey_day_progress").length };
+    };
+    const allowed = { allowed: true, upcomingAt: null };
+    const denied = { allowed: false, upcomingAt: null };
+    for (const mode of ["calendar", "progress"] as const) {
+      eq(`${mode}: the course of a credited day numbered above the open day (day 3) stays open for review`, (await access({ mode }, "B")).res, allowed);
+      eq(`${mode}: …and of the credited day 4`, (await access({ mode }, "C")).res, allowed);
+      eq(`${mode}: the open day's course (day 2) is open`, (await access({ mode }, "N")).res, allowed);
+      eq(`${mode}: a day past the open day that holds no credit (day 5) is not`, (await access({ mode }, "D")).res, denied);
+    }
+    eq("a failed credit read grants nothing through the journey, the open day included",
+      (await access({ mode: "calendar", progressError: { code: "XX000", message: "boom" } }, "N")).res, denied);
+
+    const own = stub({ mode: "calendar" });
+    const read = await readJourneyCredits(own.client, [{ id: "e1", version_id: "v1" }]);
+    const given = await access({ mode: "calendar" }, "B", { ids: new Set(["e1"]), credits: read });
+    eq("the caller's own read, ok and covering the enrolment, is used: no second credit read", [given.res, given.creditReads], [allowed, 0]);
+    const other = await access({ mode: "calendar" }, "B", { ids: new Set(["e9"]), credits: read });
+    eq("…a read that does not cover the enrolment: the credits are read here", [other.res, other.creditReads], [allowed, 1]);
+    const failed: JourneyCredits = { ok: false, error: { code: "XX000", message: "boom" } };
+    const notOk = await access({ mode: "calendar" }, "B", { ids: new Set(["e1"]), credits: failed });
+    eq("…a failed read handed in: the credits are read here, never taken as none", [notOk.res, notOk.creditReads], [allowed, 1]);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

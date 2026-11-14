@@ -14,23 +14,38 @@
  *      day_id) for the enrolments, in chunks of ids and pages of 1,000 rows
  *      (readPagedWithOptionalColumn, the first page deciding for every
  *      chunk);
- *   2. journey_versions (id, day_ids) for the enrolments' pinned versions.
+ *   2. journey_versions (id, day_ids) for the pinned versions of the
+ *      enrolments that hold a credit row (creditedDaysFor over no rows is []
+ *      whatever the map, so an enrolment without credits costs no version
+ *      read, and dayIdsOf answers `{}` for a version it did not read).
  *
- * Deploy-safe in both orders (docs/ARCHITECTURE.md principle 6): when the
- * first read answers a missing-column error naming day_id (isMissingColumn),
- * the database has no 0107, so it reads the rows without the column and
- * makes no second read: every version answers `day_ids: null`, which
- * creditedDaysFor reads by day number (today's reading). On a database with
- * 0107 a version whose day_ids is not an object answers `{}` and credits
- * nothing, as journey_credit_state does. Any other error, and a missing
- * day_ids while day_id is present, answers `{ok: false}`: a failed read is
- * never "no credits", and each caller treats it as its own failed read.
+ * Deploy-safe in both orders (docs/ARCHITECTURE.md principle 6): a
+ * missing-column error naming day_id or day_ids (isMissingColumn) means the
+ * database has no 0107, and the reader answers today's reading by number:
+ * every version answers `day_ids: null`, which creditedDaysFor reads by day
+ * number. On day_id the rows are read once more without the column and no
+ * version is read; on day_ids the rows already read are kept. On a database
+ * with 0107 a version whose day_ids is not an object answers `{}` and
+ * credits nothing, as journey_credit_state does. Any other error, and a
+ * pinned version the versions read did not answer, is `{ok: false}`: a
+ * failed read is never "no credits", and each caller treats it as its own
+ * failed read.
+ *
+ * `opts.state` lets several calls in one request share the first page's
+ * decision (the CRM feed reads per batch of learners), so a database
+ * without 0107 pays its one failed read once per request, not per call.
+ * Never kept between requests.
  *
  * Server-side by use, but free of next/* and Supabase runtime imports (the
  * shape of lib/scoring/context-read.ts), so every branch is unit-tested with
  * a stub client (tests/unit/journey-state.test.ts).
  */
-import { readPagedWithOptionalColumn, type OptionalColumnState, type PgError } from "@/lib/scoring/attempt-kind";
+import {
+  isMissingColumn,
+  readPagedWithOptionalColumn,
+  type OptionalColumnState,
+  type PgError,
+} from "@/lib/scoring/attempt-kind";
 import type { JourneyCreditRow } from "@/lib/journey/journey";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -40,6 +55,7 @@ type AnyClient = any;
 const CHUNK = 150;
 const BASE = "enrollment_id, day_number, completed_at";
 const DAY_ID = "day_id";
+const DAY_IDS = "day_ids";
 
 export type JourneyCredits =
   | {
@@ -48,7 +64,7 @@ export type JourneyCredits =
       byDayId: boolean;
       /** The enrolment's credit rows (none when it holds no credit). */
       rowsOf: (enrollmentId: string) => JourneyCreditRow[];
-      /** The pinned version's day_ids for creditedDaysFor: the map, `{}` when the version has none, null when read by number. */
+      /** The pinned version's day_ids for creditedDaysFor: the map; `{}` when the version has none, or was not read because none of its enrolments holds a credit; null when read by number. */
       dayIdsOf: (versionId: string) => Record<string, unknown> | null;
     }
   | { ok: false; error: PgError };
@@ -71,13 +87,13 @@ const isMap = (x: unknown): x is Record<string, unknown> =>
  */
 export async function readJourneyCredits(
   client: AnyClient,
-  enrollments: ReadonlyArray<{ id: string; version_id: string }>
+  enrollments: ReadonlyArray<{ id: string; version_id: string }>,
+  opts: { state?: OptionalColumnState } = {}
 ): Promise<JourneyCredits> {
   const enrollmentIds = [...new Set(enrollments.map((e) => e.id).filter(Boolean))];
-  const versionIds = [...new Set(enrollments.map((e) => e.version_id).filter(Boolean))];
   const byEnrollment = new Map<string, JourneyCreditRow[]>();
   const dayIds = new Map<string, Record<string, unknown>>();
-  const decided: OptionalColumnState = { columns: null };
+  const decided: OptionalColumnState = opts.state ?? { columns: null };
 
   for (const part of chunk(enrollmentIds, CHUNK)) {
     const res = await readPagedWithOptionalColumn<Record<string, unknown>>(
@@ -110,18 +126,33 @@ export async function readJourneyCredits(
   }
 
   // No enrolment, so no read decided: nothing to map either way.
-  const byDayId = decided.columns === null || decided.columns.includes(DAY_ID);
-  if (byDayId && enrollmentIds.length > 0) {
+  let byDayId = decided.columns === null || decided.columns.includes(DAY_ID);
+  // Only the versions of enrolments that hold a credit row are read.
+  const versionIds = [
+    ...new Set(enrollments.filter((e) => byEnrollment.has(e.id)).map((e) => e.version_id).filter(Boolean)),
+  ];
+  if (byDayId && versionIds.length > 0) {
     for (const part of chunk(versionIds, CHUNK)) {
       const { data, error } = await client
         .from("journey_versions")
         .select("id, day_ids")
         .in("id", part)
         .abortSignal(fresh());
-      // day_id is there, so 0107 is: a missing day_ids is an error here, never a fallback.
+      if (error && isMissingColumn(error, DAY_IDS)) {
+        // day_ids is not on this database: today's reading by number for
+        // every version (the rows already read keep their day_number).
+        byDayId = false;
+        dayIds.clear();
+        break;
+      }
       if (error) return { ok: false, error };
       if (data == null) return { ok: false, error: { code: "empty_answer", message: "the versions read answered neither rows nor an error" } };
       for (const v of data as Array<{ id: string; day_ids: unknown }>) dayIds.set(v.id, isMap(v.day_ids) ? v.day_ids : {});
+      // A pinned version asked for and not answered is a failed read, never
+      // a version that credits nothing.
+      if (part.some((id) => !dayIds.has(id))) {
+        return { ok: false, error: { code: "version_unreadable", message: "a pinned version did not come back from the versions read" } };
+      }
     }
   }
 

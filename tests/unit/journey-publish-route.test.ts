@@ -18,13 +18,21 @@
  *     message, one log line; never zeros reported as a success;
  *   - without apply_to=all: no call at all;
  *   - the route's own checks are unchanged: signed out 401, a plain member
- *     403, neither writes.
+ *     403, neither writes; the program is read within the caller's
+ *     organisation, and a program outside it answers 404 with no write and
+ *     no call (the barrier in front of the service-role call);
+ *   - no email (decision A20, step 62): the route imports nothing that
+ *     sends one (lib/notifications/, lib/email/, resend), read from its
+ *     source, with planted cases.
  *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/journey-publish-route.test.ts   (or npm run test:unit)
  */
 import Module from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import ts from "typescript";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -33,7 +41,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 type Row = Record<string, unknown>;
-type Req = { method: string; path: string; select: string; body: unknown; apikey: string | null };
+type Req = { method: string; path: string; select: string; query: string; body: unknown; apikey: string | null };
 
 const SUPABASE = "http://stub.supabase.test";
 const ANON = "stub-anon-key";
@@ -55,7 +63,8 @@ const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._loa
   return load.call(this, request, ...rest);
 };
 
-type World = { role: string; rpc: { status: number; body: unknown } };
+/** `inOrg: false`: the program is not in the caller's organisation, so the org-scoped read finds no row. */
+type World = { role: string; rpc: { status: number; body: unknown }; inOrg: boolean };
 const COUNTS = {
   dry_run: false,
   repinned: 3,
@@ -66,7 +75,7 @@ const COUNTS = {
   credits_now_history: 4,
   credited_by_rule_change: 0,
 };
-const base = (): World => ({ role: "admin", rpc: { status: 200, body: COUNTS } });
+const base = (): World => ({ role: "admin", rpc: { status: 200, body: COUNTS }, inOrg: true });
 let world: World = base();
 let requests: Req[] = [];
 let logs: string[] = [];
@@ -83,12 +92,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (typeof init?.body === "string") {
     try { body = JSON.parse(init.body); } catch { body = init.body; }
   }
-  requests.push({ method, path: p, select: url.searchParams.get("select") ?? "", body, apikey: headers.get("apikey") });
+  requests.push({ method, path: p, select: url.searchParams.get("select") ?? "", query: decodeURIComponent(url.search), body, apikey: headers.get("apikey") });
   const object = (headers.get("accept") ?? "").includes("vnd.pgrst.object");
   if (p === "/auth/v1/user") return json(USER);
   if (p === "/rest/v1/organizations") return json([{ id: "org-1" }]);
   if (p === "/rest/v1/organization_members") return json([{ role: world.role }]);
   if (p === "/rest/v1/journey_programs" && method === "GET") {
+    if (!world.inOrg) return json([]);
     return json([{ id: PROGRAM, organization_id: "org-1", name: "Yoddha", icon: "🏹", days_total: 3, count_sundays: false, unlock_mode: "calendar", milestones: null, copy: null, completion_title: "Yoddha" }]);
   }
   if (p === "/rest/v1/journey_programs" && method === "PATCH") return new Response(null, { status: 204 });
@@ -162,7 +172,7 @@ async function main() {
     eq("no enrolment update, no badge insert, no credit read or count (the loop is gone)", touches(all), []);
     eq("…nothing logged", all.lines, []);
     const other = await run({ rpc: { status: 200, body: { ...COUNTS, repinned: 0, kept_on_version: 0, completed_now: 0 } } });
-    eq("the counts pass through whatever they are (a second, idempotent run)", [other.body.repinned, other.body.completed_now, other.body.kept_on_version], [0, 0, 0]);
+    eq("the counts pass through whatever they are (a run that moves nobody)", [other.body.repinned, other.body.completed_now, other.body.kept_on_version], [0, 0, 0]);
 
     console.log("\nPGRST202: a database without 0107");
     const missing = await run({ rpc: { status: 404, body: { code: "PGRST202", message: "Could not find the function public.journey_repin_enrollments(p_draft, p_dry_run, p_program_id, p_version_id) in the schema cache", details: null, hint: null } } });
@@ -193,6 +203,12 @@ async function main() {
     eq("a plain member: 403, nothing written", [member.status, member.writes], [403, []]);
     const analyst = await run({ role: "data_analyst" });
     eq("a data analyst: 403, nothing written", [analyst.status, analyst.writes], [403, []]);
+    // The org-scoped program read is the barrier in front of the
+    // service-role call (with the function's current-version check behind it).
+    eq("the program is read within the caller's organisation",
+      all.rest.filter((q) => q.method === "GET" && q.path === "/rest/v1/journey_programs").map((q) => /(^|[?&])organization_id=eq\.org-1(&|$)/.test(q.query)), [true]);
+    const foreign = await run({ inOrg: false });
+    eq("a program outside the caller's organisation: 404, nothing written, no call", [foreign.status, foreign.writes, foreign.rpcs.length], [404, [], 0]);
 
     eq("the stub answered every request the route made", unmatched, []);
   } finally {
@@ -200,6 +216,39 @@ async function main() {
     console.warn = realWarn;
     console.error = realError;
   }
+
+  console.log("\nno email (decision A20): the route imports nothing that sends one");
+  {
+    const SENDERS = /^@\/lib\/(notifications|email)(\/|$)|(^|\/)lib\/(notifications|email)(\/|$)|^resend(\/|$)/;
+    // Every module the source names: static imports and re-exports, dynamic
+    // import() and require(), parsed with the TypeScript parser.
+    const senders = (file: string, text: string): string[] => {
+      const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const out: string[] = [];
+      const visit = (n: ts.Node) => {
+        let spec: ts.Expression | undefined;
+        if ((ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) && n.moduleSpecifier) spec = n.moduleSpecifier;
+        else if (ts.isCallExpression(n) && (n.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(n.expression) && n.expression.text === "require"))) spec = n.arguments[0];
+        if (spec && (ts.isStringLiteral(spec) || ts.isNoSubstitutionTemplateLiteral(spec)) && SENDERS.test(spec.text)) out.push(spec.text);
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
+      return out;
+    };
+    const ROUTE = "app/api/journey/program/route.ts";
+    const text = fs.readFileSync(path.resolve(__dirname, "../..", ROUTE), "utf8");
+    eq(`${ROUTE} imports no sender`, senders(ROUTE, text), []);
+    eq("…the scan reads the route (it imports the server client)", /@\/lib\/supabase\/server/.test(text), true);
+    eq("planted: a static import of the notifications sender is flagged",
+      senders("p.ts", `import { notifyBackground } from "@/lib/notifications/send";`), ["@/lib/notifications/send"]);
+    eq("planted: a dynamic import of the email client is flagged",
+      senders("p.ts", `async function f() { const m = await import("@/lib/email/resend"); return m; }`), ["@/lib/email/resend"]);
+    eq("planted: a relative import, a re-export and the resend package are flagged",
+      senders("p.ts", `import a from "../../../lib/notifications/templates";\nexport { b } from "@/lib/email/resend";\nimport { Resend } from "resend";`),
+      ["../../../lib/notifications/templates", "@/lib/email/resend", "resend"]);
+    eq("planted: other modules pass", senders("p.ts", `import { DEFAULT_MILESTONES } from "@/lib/journey/journey";`), []);
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   if (fail > 0) process.exit(1);
 }

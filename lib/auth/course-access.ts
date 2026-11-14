@@ -9,7 +9,7 @@ import {
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
-import { readJourneyCredits } from "@/lib/journey/credits-read";
+import { readJourneyCredits, type JourneyCredits } from "@/lib/journey/credits-read";
 
 export type CourseAccess = {
   allowed: boolean;
@@ -56,6 +56,14 @@ export async function learnerCanAccessCourse(opts: {
   isAdmin: boolean;
   /** Pass `courses.visibility` if already loaded to skip a query. */
   visibility?: string | null;
+  /**
+   * The caller's own journey credit read (readJourneyCredits, same client)
+   * and the enrolment ids it covers, so one render reads the credits once
+   * (the launch page's journey block). Used only when it is ok and covers
+   * every active enrolment that holds the course; otherwise the credits are
+   * read here.
+   */
+  journeyCredits?: { ids: ReadonlySet<string>; credits: JourneyCredits };
 }): Promise<CourseAccess> {
   const { supabase, orgId, userId, courseId, isAdmin } = opts;
   if (isAdmin) return { allowed: true, upcomingAt: null };
@@ -264,37 +272,47 @@ export async function learnerCanAccessCourse(opts: {
       // The credits of every active enrolment that holds the course, in one
       // read by day id (ADR 0024 step 45), never a count per enrolment. A
       // failed read grants nothing through a journey: it is never "no
-      // credits", which would open the first course day.
-      const credits = await readJourneyCredits(
-        supabase,
-        holding.map((h) => ({ id: h.enr.id, version_id: h.enr.version_id }))
-      );
+      // credits", which would open the first course day. The caller's own
+      // read is used when it covers every enrolment here.
+      const given = opts.journeyCredits;
+      const credits =
+        given && given.credits.ok && holding.every((h) => given.ids.has(h.enr.id))
+          ? given.credits
+          : await readJourneyCredits(
+              supabase,
+              holding.map((h) => ({ id: h.enr.id, version_id: h.enr.version_id }))
+            );
       if (!credits.ok) {
         console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "course_access", code: credits.error?.code ?? null }));
       } else {
         for (const { enr, v, courseDays } of holding) {
+          const credited = creditedDaysFor(
+            { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+            credits.rowsOf(enr.id)
+          );
           const state = computeJourneyState({
             startDate: enr.start_date,
             today: todayStr(tz),
-            creditedDays: creditedDaysFor(
-              { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
-              credits.rowsOf(enr.id)
-            ),
+            creditedDays: credited,
             daysTotal: v.days_total,
             countSundays: v.count_sundays === true,
             unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
             courseDays: courseDaysOf(v.days, v.days_total),
           });
-          // Launchable day = the day the learner may open now, plus earlier
-          // (completed) days for revision. Progress mode has no calendar ceiling,
-          // so it keys off openableDay; calendar keeps the drip ceiling.
+          // Launchable: a day up to the one the learner may open now, or a
+          // day whose id holds a credit, for revision (ADR 0024 step 45). A
+          // re-pin can number a credited day above the open day, so a
+          // credited day is granted by its own credit, never by being under
+          // the ceiling. Progress mode has no calendar ceiling, so it keys
+          // off openableDay; calendar keeps the drip ceiling. A started day
+          // past the ceiling is step 23's grant (P2-6).
           const ceiling =
             v.unlock_mode === "progress"
               ? state.finished
                 ? v.days_total
                 : state.openableDay
               : Math.min(state.allowedDay, state.currentDay);
-          if (courseDays.some((d) => d <= ceiling)) {
+          if (courseDays.some((d) => d <= ceiling || credited.includes(d))) {
             return { allowed: true, upcomingAt: null };
           }
         }

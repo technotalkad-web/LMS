@@ -11,7 +11,11 @@ import { resolveManyGroups } from "@/lib/org/groups";
  *   DELETE /api/journey/program { orgSlug, program_id, confirm_name }
  *
  * Admin-only; the caller-bound client runs under RLS (admins manage journey
- * tables), so RLS is the final authority on every write.
+ * tables), so RLS is the final authority on every write it makes. The one
+ * exception is the publish's re-pin with apply_to=all (ADR 0024 step 47): a
+ * service-role call of journey_repin_enrollments, whose authority is ctx()'s
+ * role check, the program read scoped to the caller's organisation and the
+ * function's own check that the version is the program's current one.
  */
 
 async function ctx(orgSlug: string | undefined) {
@@ -134,8 +138,12 @@ export async function POST(request: Request) {
     // attempt or credit row is updated or deleted, and no email is sent
     // (decision A20). Service role only. The version insert, the pointer
     // update and this call stay three requests: if the call fails after the
-    // pointer moved, the version stands for new enrolments and the admin
-    // repeats "apply to all", which the function answers idempotently.
+    // pointer moved, the version stands for new enrolments. The admin's
+    // retry ("Publish again with apply to all") publishes once more, a new
+    // version of the same draft, and this call re-pins to that one. That is
+    // safe because the function selects active enrolments only and inserts
+    // credits without updating or deleting any credit or attempt; it is not
+    // the same call repeated.
     if (body.apply_to === "all") {
       const svc = createServiceClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,

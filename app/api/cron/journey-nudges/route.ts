@@ -7,6 +7,7 @@ import {
   courseDaysOf,
   dateOfDay,
   parseVersionDays,
+  reminderCountsFrom,
   reminderCreditedDays,
   todayStr,
   DEFAULT_JOURNEY_TZ,
@@ -180,16 +181,13 @@ async function run() {
       // reminderCreditedDays falls back to the first `done` course days on a
       // database without it (ADR 0024 step 45). A failed read reminds
       // nobody on the page: it is never "nothing done", which would email
-      // every learner that they are behind.
+      // every learner that they are behind (reminderCountsFrom).
       const { data: cntRows, error: cntErr } = await svc.rpc("journey_reminder_counts", {
         p_ids: batch.map((e) => e.id),
       });
-      const counts = new Map<string, { done: number; done_today: boolean; credited?: unknown }>();
+      const counts = reminderCountsFrom(cntRows, cntErr);
       if (cntErr) {
         console.warn(JSON.stringify({ event: "journey_reminder_counts_failed", program_id: p.id, code: cntErr.code ?? null }));
-      }
-      for (const c of (cntRows ?? []) as Array<{ enrollment_id: string; done: number; done_today: boolean; credited?: unknown }>) {
-        counts.set(c.enrollment_id, { done: c.done ?? 0, done_today: c.done_today === true, credited: c.credited });
       }
 
       for (const e of batch) {
@@ -203,8 +201,8 @@ async function run() {
           : e.journey_versions;
         if (!v) continue;
         const unlockMode = v.unlock_mode === "progress" ? "progress" : "calendar";
-        const cnt = counts.get(e.id);
-        if (cntErr || !cnt) continue;
+        const cnt = counts.ok ? counts.countOf(e.id) : null;
+        if (!cnt) continue;
         const doneToday = cnt.done_today;
         const courseDays = courseDaysOf(v.days, v.days_total);
         const state = computeJourneyState({

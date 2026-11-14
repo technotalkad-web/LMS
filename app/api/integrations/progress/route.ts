@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { authenticateApiKey } from "@/lib/integrations/auth";
 import { readParams, pick, list, bool, int, iso, isUuid } from "@/lib/integrations/params";
 import { resolveIdsOrCodes } from "@/lib/reference-codes";
-import { GrantReadError } from "@/lib/scoring/attempt-kind";
+import { GrantReadError, type OptionalColumnState } from "@/lib/scoring/attempt-kind";
 import type { ContextFilterState } from "@/lib/scoring/context-read";
 import {
   buildProgress,
@@ -114,6 +114,9 @@ async function handle(request: Request) {
     // The preview filter's one decision for the request (ADR 0024 P2-3): a
     // database without 0107 pays its one failed read once, not per batch.
     const previews: ContextFilterState = { applies: null };
+    // The journey credit read's one decision on day_id for the request (ADR
+    // 0024 P2-4), shared by every batch in the same way.
+    const journeyCredits: OptionalColumnState = { columns: null };
     if (hasAttemptFilters(f)) {
       // Exact rows for every candidate, then page: the attempt pre-selection
       // is a superset and buildProgress applies the row-level filter.
@@ -121,13 +124,13 @@ async function handle(request: Request) {
       const candidates = members.filter((m) => matching.has(m.user_id));
       const rows: LearnerProgress[] = [];
       for (let i = 0; i < candidates.length; i += BATCH) {
-        rows.push(...(await buildProgress(svc, orgId, orgSlug, candidates.slice(i, i + BATCH), f, tz, previews)));
+        rows.push(...(await buildProgress(svc, orgId, orgSlug, candidates.slice(i, i + BATCH), f, tz, previews, journeyCredits)));
       }
       total = rows.length;
       progress = rows.slice((page - 1) * perPage, page * perPage);
     } else {
       total = members.length;
-      progress = await buildProgress(svc, orgId, orgSlug, members.slice((page - 1) * perPage, page * perPage), f, tz, previews);
+      progress = await buildProgress(svc, orgId, orgSlug, members.slice((page - 1) * perPage, page * perPage), f, tz, previews, journeyCredits);
     }
 
     return NextResponse.json({

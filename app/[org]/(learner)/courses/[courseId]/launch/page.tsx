@@ -19,7 +19,7 @@ import {
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
-import { readJourneyCredits } from "@/lib/journey/credits-read";
+import { readJourneyCredits, type JourneyCredits } from "@/lib/journey/credits-read";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
@@ -153,6 +153,9 @@ export default async function LaunchPage({
   // The next journey day's course — warmed in the background by the runtime
   // while the learner works through today's mission (never launched here).
   let journeyNextCourseId: string | null = null;
+  // The block's credit read, handed to the access check below so the render
+  // reads the same credits once (ADR 0024 P2-4).
+  let journeyCredits: { ids: ReadonlySet<string>; credits: JourneyCredits } | undefined;
   if (journeyParam && dayParam) {
     const dayN = parseInt(dayParam, 10);
     // Rules and curriculum come from the enrollment's PINNED VERSION —
@@ -203,6 +206,7 @@ export default async function LaunchPage({
         // retry notice and writes nothing (ADR 0014 step 3, fail closed).
         const credits = await readJourneyCredits(supabase, [{ id: enr.id, version_id: enr.version_id }]);
         if (!credits.ok) refuse("journey_credits_unreadable");
+        journeyCredits = { ids: new Set([enr.id]), credits };
         const creditedDays = creditedDaysFor(
           { days: prog.days, days_total: prog.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
           credits.rowsOf(enr.id)
@@ -252,6 +256,7 @@ export default async function LaunchPage({
     userId: user.id,
     courseId: c.id,
     isAdmin: canManage(role),
+    journeyCredits,
   });
   if (!access.allowed) {
     redirect(

@@ -106,6 +106,18 @@ function dayIdMap(dayIds: unknown): Record<string, unknown> | null {
 }
 
 /**
+ * A days entry's day number as 0107 reads it (`d.e ->> 'day' ~
+ * '^[0-9]{1,6}$'`): a whole number of one to six digits, given as a JSON
+ * number or as a string of digits. Anything else (2.5, "1e1", " 3", true)
+ * is no day, so the twin and journey_credit_state require the same days.
+ */
+function dayNumberOf(x: unknown): number | null {
+  if (typeof x === "number") return Number.isInteger(x) && x >= 0 && x <= 999999 ? x : null;
+  if (typeof x === "string" && /^[0-9]{1,6}$/.test(x)) return Number(x);
+  return null;
+}
+
+/**
  * A version's days by number. `dayIds` is the version's `day_ids` (0107);
  * without it every entry's dayId is null. A day number listed twice is one
  * day whose course is the first entry's that has one (the reading of
@@ -116,9 +128,9 @@ export function parseVersionDays(days: unknown, dayIds?: unknown): Map<number, J
   const ids = dayIdMap(dayIds);
   if (Array.isArray(days)) {
     for (const raw of days) {
-      const o = raw as Partial<JourneyDayEntry>;
-      const day = Math.round(Number(o?.day));
-      if (!Number.isFinite(day) || day < 1) continue;
+      const o = (raw ?? {}) as Partial<JourneyDayEntry>;
+      const day = dayNumberOf(o.day);
+      if (day === null || day < 1) continue;
       const courseId = typeof o.course_id === "string" && o.course_id ? o.course_id : null;
       const title =
         typeof o.mission_title === "string" && o.mission_title.trim() ? o.mission_title.trim() : null;
@@ -200,6 +212,37 @@ export function reminderCreditedDays(
   }
   const done = Math.max(0, Math.floor(Number(row.done ?? 0)) || 0);
   return [...courseDays].sort((a, b) => a - b).slice(0, done);
+}
+
+/** One journey_reminder_counts row, as reminderCreditedDays reads it. */
+export type ReminderCount = { done: number; done_today: boolean; credited?: unknown };
+
+/**
+ * journey_reminder_counts' answer for a batch of enrolments, read once for
+ * the nudges cron and the Report Card's reminder action (ADR 0024 step 45).
+ * A failed call answers {ok: false}: it reminds nobody, because it is never
+ * "nothing done", which would tell every learner they are behind. On
+ * success, countOf answers an enrolment's row (its `credited` kept for
+ * reminderCreditedDays), or null when the answer has no row for it, which
+ * reminds that learner neither.
+ */
+export type ReminderCounts =
+  | { ok: false }
+  | { ok: true; countOf: (enrollmentId: string) => ReminderCount | null };
+
+export function reminderCountsFrom(data: unknown, error: unknown): ReminderCounts {
+  if (error) return { ok: false };
+  const byId = new Map<string, ReminderCount>();
+  for (const raw of Array.isArray(data) ? data : []) {
+    const c = (raw ?? {}) as Record<string, unknown>;
+    if (typeof c.enrollment_id !== "string") continue;
+    byId.set(c.enrollment_id, {
+      done: Number(c.done ?? 0) || 0,
+      done_today: c.done_today === true,
+      credited: c.credited,
+    });
+  }
+  return { ok: true, countOf: (enrollmentId) => byId.get(enrollmentId) ?? null };
 }
 
 /**

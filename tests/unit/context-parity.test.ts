@@ -286,7 +286,10 @@ function runPath(doc: ParityDoc, c: ParityCase): string[] {
 // days, and resumableDayIdsFor() over the enrolment's attempts. The SQL side
 // is journey_credit_state() with finished = required_days > 0 and next_day is
 // null (assert-0107-parity.sql (P3)). The phase 1 dated list that held these
-// cases pending (N17) is gone: phase 2 runs them here.
+// cases pending (N17) is gone: phase 2 runs them here. Each case that reaches
+// the comparison records the fields it compared, so the run below can prove
+// every both-sided case was compared on every SQL field.
+const journeyCompared = new Map<string, string[]>();
 function runJourney(doc: ParityDoc, c: ParityCase): string[] {
   const t = tables(doc, c);
   const enrollmentId = String(c.call.enrollment_id);
@@ -333,7 +336,9 @@ function runJourney(doc: ParityDoc, c: ParityCase): string[] {
     finished: state.finished,
     resumable_day_ids: state.resumableDayIds,
   };
-  return diff("expect", only(c.expect, FIELDS.journey.sql), got);
+  const want = only(c.expect, FIELDS.journey.sql);
+  journeyCompared.set(c.name, Object.keys(want).sort());
+  return diff("expect", want, got);
 }
 
 // --- run ----------------------------------------------------------------------
@@ -370,6 +375,15 @@ if (journey) {
   for (const c of run) ok(c.name, runJourney(journey, c));
   ok("the TypeScript side runs every journey case both sides run (N17: nothing pending)",
     run.length === (BOTH_SIDED as Record<string, number>).journey ? [] : [`${run.length} run, ${(BOTH_SIDED as Record<string, number>).journey} pinned`]);
+  // Counted from the comparisons made, not from the list filtered above: a
+  // case skipped or answered before its comparison fails here.
+  const bothSided = journey.cases.filter((x) => x.sides.length === 2).map((x) => x.name);
+  const fields = [...FIELDS.journey.sql].sort().join();
+  ok("…each of them reached the comparison, on every SQL field of journey_credit_state", [
+    ...bothSided.filter((n) => !journeyCompared.has(n)).map((n) => `${n}: never compared`),
+    ...bothSided.filter((n) => journeyCompared.has(n) && journeyCompared.get(n)?.join() !== fields).map((n) => `${n}: compared ${journeyCompared.get(n)?.join()}`),
+    ...(bothSided.filter((n) => journeyCompared.has(n)).length === (BOTH_SIDED as Record<string, number>).journey ? [] : [`${bothSided.filter((n) => journeyCompared.has(n)).length} compared, ${(BOTH_SIDED as Record<string, number>).journey} pinned`]),
+  ]);
 }
 
 // --- (f) the key twin: contextKeyOf() against the generated column -------------
