@@ -133,6 +133,18 @@ export function todayStr(tz: string = DEFAULT_JOURNEY_TZ): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
 }
 
+/**
+ * The date (YYYY-MM-DD) in `tz` at the instant `nowIso`: todayStr with the
+ * clock passed in, so a pure decision can be tested at a fixed instant (ADR
+ * 0024 step 22, the launch resolver; twins contract A12). An unparseable
+ * instant or an unknown timezone throws, as todayStr does for the zone.
+ */
+export function todayStrAt(nowIso: string, tz: string = DEFAULT_JOURNEY_TZ): string {
+  const at = new Date(nowIso);
+  if (!Number.isFinite(at.getTime())) throw new RangeError("todayStrAt: an invalid instant");
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(at);
+}
+
 /** Day-of-week 0=Sun..6=Sat for a YYYY-MM-DD string (timezone-agnostic). */
 function dow(dateStr: string): number {
   return new Date(`${dateStr}T00:00:00Z`).getUTCDay();

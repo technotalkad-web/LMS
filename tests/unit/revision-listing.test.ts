@@ -240,6 +240,32 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     calls: ["computeScoring(list)"],
     feeds: [...columnsFeeds(), pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,600}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ pageSize: PAGE, state: decided \}\s*\)/)],
   },
+  // ADR 0024 step 41: the official rule per context. A pure function: its
+  // rows come typed, and the type makes status and is_revision required, so
+  // no caller can hand it rows without them; abandoned and revision rows are
+  // dropped before computeScoring sees them. Its strict reader is
+  // lib/scoring/context-read.ts (below). Step 41's allow-list turn-around
+  // (contextResult as the only caller) is a later pull request's.
+  "lib/scoring/context.ts": {
+    calls: ["computeScoring(officialRows)", "hasLiveGrantedRetake(officialRows)"],
+    feeds: [
+      ["ContextAttempt requires status", /export type ContextAttempt = \{[^}]*\n\s*status: "in_progress" \| "completed" \| "failed" \| "passed" \| "abandoned";/],
+      ["ContextAttempt requires is_revision", /export type ContextAttempt = \{[^}]*\n\s*is_revision: boolean;/],
+      ["officialRows drop abandoned and revision rows", /const officialRows = rows\.filter\(\s*\(a\) => !isAbandonedAttempt\(a\) && !isRevisionAttempt\(a\)/],
+      ["computeScoring gets officialRows", /computeScoring\(officialRows, i\.policy, retakeIds\)/],
+    ],
+  },
+  // ADR 0024 step 41: the strict reader of contextResult; no helper call of
+  // its own, and its select carries the two columns the rule reads.
+  "lib/scoring/context-read.ts": {
+    calls: [],
+    feeds: [
+      ["CONTEXT_ATTEMPT_COLUMNS names status", /export const CONTEXT_ATTEMPT_COLUMNS =\s*"[^"]*\bstatus\b[^"]*";/],
+      ["the read adds is_revision, and leaves it out only on a 42703 naming it",
+        /read\(`\$\{CONTEXT_ATTEMPT_COLUMNS\}, is_revision, \$\{CONTEXT_SELECT\}`, true\)[\s\S]*?if \(res\.error && isMissingColumn\(res\.error, "is_revision"\)\) res = await read\(CONTEXT_ATTEMPT_COLUMNS, false\);/],
+      ["the course_attempts select takes the column list", /\.from\("course_attempts"\)\.select\(columns\)/],
+    ],
+  },
   // ADR 0019: the continue address scores the learner's own attempts on the course it waits on.
   "app/[org]/(learner)/continue/page.tsx": {
     calls: ["computeScoring(attempts)"],
