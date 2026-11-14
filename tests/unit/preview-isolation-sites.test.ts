@@ -14,30 +14,39 @@
  * sits inside `withoutPreviews(…, apply)` (or, for a helper call, passes a
  * function that calls it) and `apply` is the parameter of the function
  * given to `readWithContextFilter(state, (apply) => …)`, the one fallback
- * (`lib/scoring/context-read.ts`): on a database without 0107 it reads
- * today's select once (`docs/ARCHITECTURE.md` principle 6). A read inside
- * `individualContextOnly(…)` takes the Individual context only, which
- * leaves previews out by construction (step 49; which files is
- * tests/unit/enrolment-definition.test.ts (e)).
+ * (`lib/scoring/context-read.ts`), with `state` a variable, a property or a
+ * fresh `{ applies: null }`: on a database without 0107 it reads today's
+ * select once (`docs/ARCHITECTURE.md` principle 6). A read inside
+ * `individualContextOnly(state, …)` (the same rule for its state) takes the
+ * Individual context only, which leaves previews out by construction (step
+ * 49; which files is tests/unit/enrolment-definition.test.ts (e)). A read
+ * that selects previews only (`.eq("context_kind", "preview")`) outside
+ * every fallback is the drain's check (only-previews).
  *
  *   (a) the tenant LRS: every course_attempts read under lib/lrs/
  *       (lib/lrs/abandoned.ts included) is filtered, except the listed
  *       selects of a database without 0103 (which has no 0107 either);
  *       every loadAttemptContexts call there passes its caller's decision;
  *       the sweep's state is one per run; the live mirror's organisation
- *       read is filtered. The callers of enqueueAbandonedStatements are
- *       scanned in tests/unit/lrs-abandon-sites.test.ts, extended by this
- *       slice, not copied here.
+ *       read is filtered; the outbox drainer deletes a Preview's rows
+ *       before any post ("Resend all history" sets every row back to
+ *       pending). The callers of enqueueAbandonedStatements are scanned in
+ *       tests/unit/lrs-abandon-sites.test.ts, extended by this slice, not
+ *       copied here.
  *   (b) the raw readers (step 49's row): every course_attempts read under
- *       lib/manager/, lib/attention/, lib/integrations/, the admin pages
- *       (app/[org]/(admin)/), the CRM routes (app/api/integrations/) and
- *       the two learners CSV routes is filtered or takes the Individual
- *       context, except the listed exemptions with their reason and phase;
- *       READERS lists every reader of items 1 to 1c of the plan, so a new
- *       reader fails here until it is filtered and listed.
+ *       lib/manager/, lib/attention/, lib/integrations/, lib/interactions/,
+ *       the admin pages (app/[org]/(admin)/), the Report Card pages
+ *       (app/[org]/(learner)/team-performance/), the CRM routes
+ *       (app/api/integrations/) and the two learners CSV routes is filtered
+ *       or takes the Individual context, except the listed exemptions with
+ *       their reason and phase; READERS lists every reader of items 1 to 1c
+ *       of the plan, so a new reader fails here until it is filtered and
+ *       listed.
  *   (c) the dated interim limits the plan records (P2-3 item 1c).
  *   (d) no ContextFilterState lives at module level (a decision made before
- *       a paste must not outlive its request).
+ *       a paste must not outlive its request); every `applies:` an object
+ *       literal writes under app/, lib/ and components/ is `null`, and only
+ *       the fallback (lib/scoring/attempt-kind.ts) assigns `.applies`.
  *   (e) step 81: only lib/preview/purge.ts may name purge_preview_data (no
  *       application file names it today), and no workflow names it.
  *   (f) planted sources: the scanner flags what it must.
@@ -83,7 +92,8 @@ const sources = new Map<string, string>(files.map((f) => [rel(f), fs.readFileSyn
 // ---------------------------------------------------------------------------
 const TABLE = "course_attempts";
 const EMBED = /\bcourse_attempts(?:!inner)?\(/;
-type Filter = "preview" | "individual" | "none";
+/** "only-previews": the read selects previews only (`.eq("context_kind", "preview")`) outside every fallback (the drain's check). */
+type Filter = "preview" | "individual" | "only-previews" | "none";
 type Site = { file: string; fn: string; line: number; kind: "read" | "write"; filter: Filter; column: string | null };
 
 const calleeName = (c: ts.CallExpression): string | null =>
@@ -124,10 +134,27 @@ function chainMethods(n: ts.Node): string[] {
   return out;
 }
 
+const propText = (n: ts.PropertyName): string | null => (ts.isIdentifier(n) || ts.isStringLiteral(n) ? n.text : null);
+
+/**
+ * A fallback's state argument as the readers pass it: a variable or a
+ * property (a decision handed in), or a fresh `{ applies: null }`. A literal
+ * that decides (`{ applies: false }`, which never filters) or any other
+ * expression does not count as decided by the fallback.
+ */
+function stateHandedIn(n: ts.Expression | undefined): boolean {
+  if (!n) return false;
+  if (ts.isIdentifier(n) || ts.isPropertyAccessExpression(n)) return true;
+  if (!ts.isObjectLiteralExpression(n) || n.properties.length !== 1) return false;
+  const p = n.properties[0];
+  return ts.isPropertyAssignment(p) && propText(p.name) === "applies" && p.initializer.kind === ts.SyntaxKind.NullKeyword;
+}
+
 /**
  * Whether `w`, a `withoutPreviews(query, apply, column?)` call, takes its
- * `apply` from the function given to `readWithContextFilter(state, fn)` and
- * that function also holds the site.
+ * `apply` from the function given to `readWithContextFilter(state, fn)`,
+ * that function also holds the site, and `state` is handed in or fresh
+ * (stateHandedIn).
  */
 function decidedByFallback(w: ts.CallExpression, site: ts.Node): boolean {
   const apply = w.arguments[1];
@@ -140,17 +167,45 @@ function decidedByFallback(w: ts.CallExpression, site: ts.Node): boolean {
     return (
       params.length === 1 &&
       !!call && ts.isCallExpression(call) && calleeName(call) === "readWithContextFilter" &&
+      stateHandedIn(call.arguments[0]) &&
       call.arguments[1] === p && within(site, p)
     );
   }
   return false;
 }
 
+/** The fallbacks: on a database without the column each re-reads without the filter. */
+const FALLBACKS = new Set(["readWithContextFilter", "readWithOptionalFilter", "individualContextOnly"]);
+
+/**
+ * Whether the site's chain selects previews only (`.eq("context_kind",
+ * "preview")`) outside every fallback. Inside one the re-read would drop the
+ * filter and select every attempt, so it does not count.
+ */
+function previewsOnly(site: ts.Node): boolean {
+  let eqPreview = false;
+  const visit = (x: ts.Node) => {
+    if (ts.isCallExpression(x) && ts.isPropertyAccessExpression(x.expression)) {
+      const [a0, a1] = x.arguments;
+      if (x.expression.name.text === "eq" && isStr(a0) && a0.text === "context_kind" && isStr(a1) && a1.text === "preview") eqPreview = true;
+      visit(x.expression.expression);
+    }
+  };
+  visit(chainOf(site));
+  if (!eqPreview) return false;
+  for (let p: ts.Node | undefined = site.parent; p; p = p.parent) {
+    if (ts.isCallExpression(p) && FALLBACKS.has(calleeName(p) ?? "")) return false;
+  }
+  return true;
+}
+
 function filterOf(site: ts.Node, helperCall: boolean): { filter: Filter; column: string | null } {
   const candidates: ts.CallExpression[] = [];
   for (let p: ts.Node | undefined = site.parent; p; p = p.parent) {
     if (ts.isCallExpression(p) && calleeName(p) === "withoutPreviews" && p.arguments[0] && within(site, p.arguments[0])) candidates.push(p);
-    if (ts.isCallExpression(p) && calleeName(p) === "individualContextOnly") return { filter: "individual", column: null };
+    if (ts.isCallExpression(p) && calleeName(p) === "individualContextOnly") {
+      return stateHandedIn(p.arguments[0]) ? { filter: "individual", column: null } : { filter: "none", column: null };
+    }
   }
   if (helperCall) {
     const visit = (x: ts.Node) => {
@@ -165,6 +220,7 @@ function filterOf(site: ts.Node, helperCall: boolean): { filter: Filter; column:
       return { filter: "preview", column: col === undefined ? "context_kind" : isStr(col) ? col.text : "?" };
     }
   }
+  if (!helperCall && previewsOnly(site)) return { filter: "only-previews", column: null };
   return { filter: "none", column: null };
 }
 
@@ -275,6 +331,20 @@ console.log("\n(a) the tenant LRS: every course_attempts read under lib/lrs/ dro
   eq("the live mirror: the organisation read comes first and carries the call's decision; a preview's null org returns before any config read or enqueue",
     /const previews: ContextFilterState = \{ applies: null \};\s*const orgId = await orgForAttempt\(attemptId, previews\);\s*if \(!orgId\) return;\s*const cfg = await loadLrsConfig\(orgId\);/.test(enq) &&
       /await enrichForOutbox\(attemptId, statements, statementProfileOf\(cfg\), previews\)/.test(enq), true);
+
+  // The outbox drainer: rows queued before the sources dropped previews, rows
+  // "Resend all history" sets back to pending, and points or journey-day rows
+  // that name a preview's attempt are deleted before any post (behaviour:
+  // tests/unit/lrs-forward.test.ts).
+  const DRAINER = "app/api/cron/lrs-forward/route.ts";
+  eq("the drainer: one course_attempts read, previews only and outside every fallback (whose re-read would select every attempt)",
+    reads.filter((s) => s.file === DRAINER).map(key), [`${DRAINER} :: previewRowIds :: only-previews`]);
+  const drainer = read(DRAINER);
+  eq("…the due select names attempt_id; a missing context_kind reads as no previews; the check runs before the batch is grouped and posted",
+    /\.select\("id, organization_id, statement_id, payload, attempts, attempt_id"\)/.test(drainer) &&
+      /if \(isMissingColumn\(error, "context_kind"\)\) return \{ ids: new Set\(\) \};/.test(drainer) &&
+      drainer.indexOf("await previewRowIds(db, rows)") > 0 &&
+      drainer.indexOf("await previewRowIds(db, rows)") < drainer.indexOf("const byOrg = new Map"), true);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +353,9 @@ const RAW_SCOPE = (f: string) =>
   f.startsWith("lib/manager/") ||
   f.startsWith("lib/attention/") ||
   f.startsWith("lib/integrations/") ||
+  f.startsWith("lib/interactions/") ||
   f.startsWith("app/[org]/(admin)/") ||
+  f.startsWith("app/[org]/(learner)/team-performance/") ||
   f.startsWith("app/api/integrations/") ||
   f === "app/api/learning-paths/[id]/learners/export/route.ts" ||
   f === "app/api/courses/[courseId]/learners/export/route.ts";
@@ -315,7 +387,9 @@ const EXEMPT: Array<[string, string]> = [
   ["lib/integrations/webhook.ts :: fireCompletionWebhookForAttempt :: none",
     "the completion webhook of one attempt, not a feed: P2-5 item 5 (step 60) keeps the write routes from calling it for a preview, and phase 3 fires it from the writer's official claim (step 80's webhook row)"],
   ["lib/integrations/webhook-hold.ts :: heldWebhookPage :: none",
-    "the held-webhook sweep and the Attention count built on it select completions by the webhook latch; phase 3 moves the webhook onto the writer, which skips previews (step 80's webhook row)"],
+    "the held-webhook sweep and the Attention count built on it: P2-5 item 5b adds the preview filter (the entry then moves to READERS); phase 3's writer replaces it"],
+  ["lib/interactions/labels.ts :: readChunk :: none",
+    "question labels only: the text a stored statement gives a question id, through an attempts embed by version; no learner identity, no count and no date (no phase: not a learner record)"],
 ];
 {
   const raw = reads.filter((s) => RAW_SCOPE(s.file));
@@ -356,7 +430,43 @@ console.log("\n(c) the interim limits recorded by P2-3 (item 1c), each with the 
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n(d) no preview decision lives at module level");
+/** The one file that may decide a filter state (readWithOptionalFilter). */
+const DECIDER = "lib/scoring/attempt-kind.ts";
+/**
+ * Every `applies` a source writes. An object literal's `applies:` must be
+ * `null` (a fresh decision; `{ applies: false }` would never filter), a
+ * shorthand `{ applies }` is not allowed, and an assignment to `.applies` or
+ * `["applies"]` is allowed only in DECIDER. A type's `applies:` is a
+ * property signature, not a write, and is not read. Pure over (file, text),
+ * so (f) plants through it.
+ */
+function stateWrites(file: string, src: string): { fresh: number; assigned: number; violations: string[] } {
+  const sf = parse(file, src);
+  const out = { fresh: 0, assigned: 0, violations: [] as string[] };
+  const at = (n: ts.Node) => `${file}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`;
+  const visit = (n: ts.Node) => {
+    if (ts.isPropertyAssignment(n) && propText(n.name) === "applies") {
+      if (n.initializer.kind === ts.SyntaxKind.NullKeyword) out.fresh++;
+      else out.violations.push(`${at(n)} applies: ${n.initializer.getText(sf)}`);
+    } else if (ts.isShorthandPropertyAssignment(n) && n.name.text === "applies") {
+      out.violations.push(`${at(n)} { applies }`);
+    } else if (
+      ts.isBinaryExpression(n) &&
+      n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      n.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      ((ts.isPropertyAccessExpression(n.left) && n.left.name.text === "applies") ||
+        (ts.isElementAccessExpression(n.left) && isStr(n.left.argumentExpression) && n.left.argumentExpression.text === "applies"))
+    ) {
+      if (file === DECIDER) out.assigned++;
+      else out.violations.push(`${at(n)} ${n.getText(sf)}`);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+console.log("\n(d) no preview decision lives at module level, and none is made outside the fallback");
 {
   const top: string[] = [];
   for (const [file, src] of sources) {
@@ -367,6 +477,18 @@ console.log("\n(d) no preview decision lives at module level");
     }
   }
   eq("no top-level `{ applies: null }`: a decision made before a paste must not outlive its request", top, []);
+
+  let fresh = 0, assigned = 0;
+  const violations: string[] = [];
+  for (const [file, src] of sources) {
+    if (!src.includes("applies")) continue;
+    const w = stateWrites(file, src);
+    fresh += w.fresh;
+    assigned += w.assigned;
+    violations.push(...w.violations);
+  }
+  eq("every `applies:` an object literal writes under app/, lib/ and components/ is null, and only the fallback assigns `.applies`", violations, []);
+  eq("non-vacuous: the fresh states were found (more than 20), and the fallback's two assignments", [fresh > 20, assigned], [true, 2]);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +531,34 @@ console.log("\n(f) planted sources: the scanner flags what it must");
   eq("a helper given the table, no filter: none", one(`async function f(svc) { return fetchByIds(svc, "course_attempts", "id", "user_id", ids); }`), ["read:none"]);
   eq("the Individual filter: individual",
     one(`async function f(db, st) { return individualContextOnly(st, (c, a, b, only) => { const q = db.from("course_attempts").select(c); return only ? q.eq("context_kind", "individual") : q; }); }`), ["read:individual"]);
+
+  // The state the fallback is given (finding M10 of the P2-3 review).
+  const through = (state: string) =>
+    one(`async function f(db, s, env) { return readWithContextFilter(${state}, (apply) => withoutPreviews(db.from("course_attempts").select("id"), apply)); }`);
+  eq("a state handed in (a variable, a property) or a fresh { applies: null }: preview",
+    [through("s"), through("env.previews"), through("{ applies: null }")], [["read:preview"], ["read:preview"], ["read:preview"]]);
+  eq("a decided literal ({ applies: false } never filters, { applies: true }) or a call: none",
+    [through("{ applies: false }"), through("{ applies: true }"), through("fresh()"), through("{ applies: null, other: 1 }")],
+    [["read:none"], ["read:none"], ["read:none"], ["read:none"]]);
+  eq("the Individual filter given a decided literal: none",
+    one(`async function f(db) { return individualContextOnly({ applies: false }, (c, a, b, only) => db.from("course_attempts").select(c)); }`), ["read:none"]);
+
+  // The drain's check: previews only, outside every fallback.
+  eq("a previews-only select: only-previews",
+    one(`async function f(db, ids) { return db.from("course_attempts").select("id").in("id", ids).eq("context_kind", "preview"); }`), ["read:only-previews"]);
+  eq("a previews-only select inside the fallback (its re-read selects every attempt): none",
+    one(`async function f(db, s) { return readWithContextFilter(s, (apply) => db.from("course_attempts").select("id").eq("context_kind", "preview")); }`), ["read:none"]);
+  eq("another context_kind value: none",
+    one(`async function f(db) { return db.from("course_attempts").select("id").eq("context_kind", "individual"); }`), ["read:none"]);
+
+  // Writes to a state (finding M11 of the P2-3 review: env.previews.applies = false in sweepOrg).
+  const writes = (src: string, file = "planted.ts") => stateWrites(file, src).violations.length;
+  eq("an assignment to .applies outside the fallback, in every form: flagged",
+    [writes(`function f(env) { env.previews.applies = false; }`), writes(`function f(s) { s["applies"] = true; }`), writes(`function f(s) { s.applies ??= false; }`)], [1, 1, 1]);
+  eq("a decided literal, a spread over a state and a shorthand: flagged",
+    [writes(`const s = { applies: false };`), writes(`function f(s) { return { ...s, applies: true }; }`), writes(`function f(applies) { return { applies }; }`)], [1, 1, 1]);
+  eq("a fresh literal, a type's property and the fallback's own assignment: not flagged",
+    [writes(`type T = { applies: boolean | null }; function f() { const s: T = { applies: null }; return s; }`), writes(`function f(s) { s.applies = true; }`, DECIDER)], [0, 0]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -13,7 +13,9 @@
  * The second half runs both callers for real against the same fake and a stubbed
  * PostgREST: app/api/cron/lrs-forward/route.ts over repeated runs on a fake clock
  * (a statement the isolation budget did not reach counts no failed attempt, so it
- * never dead-letters for that, while an outage still backs off and dead-letters),
+ * never dead-letters for that, while an outage still backs off and dead-letters;
+ * ADR 0024 P2-3: a Preview's rows are deleted before any post, without 0107 every
+ * row goes as today, and a failed check holds the rows that name an attempt),
  * and lib/lrs/enqueue.ts (only what the LRS accepted is marked sent; ADR 0024
  * P2-3: a preview's attempt is never mirrored, and on a database without 0107
  * the organisation read falls back to today's select once).
@@ -139,17 +141,23 @@ async function onLoopback(handler: (req: http.IncomingMessage, res: http.ServerR
 
 /* ---------------- the callers: a stubbed PostgREST, the fake LRS, a fake clock ---------------- */
 
-type Row = { id: string; organization_id: string; statement_id: string; payload: Stmt; status: string; attempts: number; next_attempt_at: string; last_error: string | null };
-type Spec = { org?: string; conflict?: boolean; poison?: boolean; fail500?: boolean; attempts?: number; rowStatementId?: (id: string) => string; idIn?: (id: string) => string };
+type Row = { id: string; organization_id: string; statement_id: string; payload: Stmt; status: string; attempts: number; next_attempt_at: string; last_error: string | null; attempt_id: string | null };
+/** `attempt` names the row's attempt; `preview` makes that attempt a Preview (ADR 0024 P2-3). */
+type Spec = { org?: string; conflict?: boolean; poison?: boolean; fail500?: boolean; attempts?: number; rowStatementId?: (id: string) => string; idIn?: (id: string) => string; attempt?: string; preview?: boolean };
 type LrsMode = "fake" | 503 | 401 | "network" | "page200";
 type ConfigAnswer = "enabled" | "disabled" | "no endpoint" | "no row" | 500;
+/** How the drain's preview check is answered: a database with 0107, one without it (42703), or a failed read. */
+type AttemptsAnswer = "0107" | "no0107" | 500;
 
 const CADENCE_MS = 5 * 60_000;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const list = (v: string | null) => (v ?? "").replace(/^in\.\(|\)$/g, "").split(",").map((x) => x.replace(/^"|"$/g, ""));
 
-/** An outbox, an LRS and a clock. n rows, s0 to s(n-1), in the order given. `config` answers the org's config read in place of a healthy one. */
-function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer) {
+/**
+ * An outbox, an LRS and a clock. n rows, s0 to s(n-1), in the order given. `config` answers the org's config read in place of
+ * a healthy one; `attemptsAnswer` answers the drain's preview check (course_attempts), every read recorded in `attemptReads`.
+ */
+function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer, attemptsAnswer: () => AttemptsAnswer = () => "0107") {
   const start = Date.parse("2026-01-01T00:00:00.000Z");
   const clock = { now: start };
   const rows: Row[] = specs.map((sp, i) => {
@@ -163,8 +171,11 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       attempts: sp.attempts ?? 0,
       next_attempt_at: new Date(start).toISOString(),
       last_error: null,
+      attempt_id: sp.attempt ?? null,
     };
   });
+  const previewAttempts = new Set(specs.filter((sp) => sp.preview && sp.attempt).map((sp) => sp.attempt as string));
+  const attemptReads: Array<{ ids: string[]; contextKind: string | null }> = [];
   const conflicts = new Set(rows.filter((_, i) => specs[i].conflict).map((r) => r.payload.id));
   const fail500 = new Set(rows.filter((_, i) => specs[i].fail500).map((r) => r.payload.id));
   const stored = new Set<string>();
@@ -214,6 +225,19 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
         return new Response(null, { status: 204 });
       }
     }
+    if (url.pathname === "/rest/v1/course_attempts" && method === "GET") {
+      // The drain's preview check: `id=in.(…)` and `context_kind=eq.preview`, honoured as a database would.
+      const ids = list(url.searchParams.get("id"));
+      const contextKind = url.searchParams.get("context_kind");
+      attemptReads.push({ ids, contextKind });
+      const answer = attemptsAnswer();
+      if (answer === 500) return json({ message: "upstream connect error" }, 500);
+      if (contextKind !== null && answer === "no0107") {
+        return json({ code: "42703", details: null, hint: null, message: "column course_attempts.context_kind does not exist" }, 400);
+      }
+      const hits = ids.filter((a) => (contextKind === "eq.preview" ? previewAttempts.has(a) : true));
+      return json(hits.map((id) => ({ id })));
+    }
     if (url.pathname === "/rest/v1/tenant_lrs_config") {
       // No backfill_cursor: the sweep skips the org, so a run counts the drain only.
       const org = (url.searchParams.get("organization_id") ?? "").replace(/^eq\./, "");
@@ -243,6 +267,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
     stored,
     aloneConflict,
     postedIds,
+    attemptReads,
     open,
     /** One cron firing, 5 minutes after the last. Answers the route's body and the posts it made. */
     async run() {
@@ -453,6 +478,67 @@ async function routeCases() {
     const w = world([...rowsOf(100, () => ({ conflict: true })), ...rowsOf(100, () => ({ org: "org-b", conflict: true }))]);
     const { body } = await w.run();
     eq("two orgs in one run: the unsettled count adds both", body.unsettled, w.rows.filter((r) => r.status === "pending").length);
+  }
+
+  console.log("\nthe cron route: a Preview's rows are never posted (ADR 0024 P2-3, decision A35, step 80)");
+  {
+    // Rows queued before the sources dropped previews, or set back to pending by "Resend all history".
+    const specs: Spec[] = [
+      { attempt: "att-real" },
+      { attempt: "att-prev", preview: true },
+      { attempt: "att-real" },
+      { attempt: "att-prev", preview: true, attempts: 36 },
+      {},
+      { attempt: "att-old", preview: true, org: "org-b", attempts: 3 },
+    ];
+    const w = world(specs);
+    const { body } = await w.run();
+    const prevStatements = ["s1", "s3", "s5"];
+    eq("one preview check for the batch: the distinct attempt ids, previews only",
+      w.attemptReads.map((r) => [r.ids.slice().sort(), r.contextKind]), [[["att-old", "att-prev", "att-real"], "eq.preview"]]);
+    eq("the preview rows are deleted from the outbox, a dead-lettered one and another org's included",
+      w.rows.map((r) => r.id), ["row-0", "row-2", "row-4"]);
+    eq("…and never posted or stored", [w.postedIds.flat().filter((id) => prevStatements.includes(id)), [...w.stored].filter((id) => prevStatements.includes(id))], [[], []]);
+    eq("the real rows and the row that names no attempt are sent", [countBy(w.rows, "sent"), [...w.stored].sort()], [3, ["s0", "s2", "s4"]]);
+    eq("the body counts them", [body.processed, body.sent, body.previewsDropped, body.held ?? null], [3, 3, 3, null]);
+  }
+  {
+    const w = world([{ attempt: "att-prev", preview: true }, { attempt: "att-prev", preview: true }]);
+    const { body, posts } = await w.run();
+    eq("a batch of previews only: nothing posted, the rows deleted", [posts, w.rows.length, body.processed, body.previewsDropped], [0, 0, 0, 2]);
+  }
+  {
+    const w = world(rowsOf(8));
+    await w.run();
+    eq("rows that name no attempt: no preview check is read", w.attemptReads.length, 0);
+  }
+  {
+    // 200 rows, each its own attempt: two slices of 150 ids at most.
+    const w = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: i % 50 === 7 })));
+    const { body } = await w.run();
+    eq("200 attempts: two reads of at most 150 ids, every one previews only",
+      w.attemptReads.map((r) => [r.ids.length, r.contextKind]), [[150, "eq.preview"], [50, "eq.preview"]]);
+    eq("…the 4 previews dropped, the 196 others sent", [body.previewsDropped, countBy(w.rows, "sent"), w.stored.size, w.rows.length], [4, 196, 196, 196]);
+  }
+  {
+    // A database without 0107 (production until its sitting): no attempt there is a preview.
+    const w = world([{ attempt: "att-a" }, { attempt: "att-b", preview: true }, {}], "fake", undefined, () => "no0107");
+    const { body } = await w.run();
+    eq("without the column: one failed read, then every row is posted, today's drain",
+      [w.attemptReads.length, countBy(w.rows, "sent"), w.stored.size, body.previewsDropped ?? null, body.held ?? null], [1, 3, 3, null, null]);
+  }
+  {
+    let answer: AttemptsAnswer = 500;
+    const w = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => answer);
+    const first = await w.run();
+    eq("a failed preview check: only the row that names no attempt is posted", [w.postedIds.flat(), countBy(w.rows, "sent")], [["s2"], 1]);
+    eq("…the rows that name an attempt are held as they were, still due",
+      w.rows.filter((r) => r.attempt_id).every((r) => r.status === "pending" && r.attempts === 0 && r.last_error === null && r.next_attempt_at === "2026-01-01T00:00:00.000Z"), true);
+    eq("…and the body says why", [first.body.held, first.body.previewCheckError], [2, "upstream connect error"]);
+    answer = "0107";
+    await w.run();
+    eq("the next run checks again: the preview deleted, never posted; the real row sent",
+      [w.rows.map((r) => `${r.id}:${r.status}`), w.postedIds.flat().includes("s1")], [["row-0:sent", "row-2:sent"], false]);
   }
 }
 

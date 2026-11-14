@@ -28,7 +28,10 @@ import { readWithContextFilter, withoutPreviews, type ContextFilterState } from 
  * "abandoned" statement carrying the tester's identity to a store the LMS
  * cannot delete from. On a database without 0107 the filter's
  * missing-column error re-reads today's select once (readWithContextFilter;
- * one decision for every slice of the call).
+ * one decision for every slice of the call). The read comes before the
+ * organisation's config check, so there every non-empty call pays that one
+ * failed read whether or not forwarding is configured; the launch's closes
+ * are among the callers, so P2-6's launch subrequest count includes it.
  *
  * Batches (force restart, per-version restart, direct-upload replace) are
  * built in slices of SLICE attempts, so no `.in()` list outgrows the URL
