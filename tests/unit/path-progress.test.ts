@@ -5,7 +5,8 @@
  *
  *   (a) passed_ever against latest_result, with the passed-then-failed-retake
  *       fixture (D14); done, next step, path score; the contract's minimum
- *       path cases (3.5);
+ *       path cases (3.5); passed_in_window (the ADR 0024 note of
+ *       2026-11-14, O4-b) against passed_by_rule;
  *   (b) the path status in N11's order, a live granted retake first;
  *   (c) the owner's O1 answer (option ii): the four readings of O1-i (a fact
  *       row on a step now pass-required with a standing result that did not
@@ -120,6 +121,7 @@ const stepView = (s: ReturnType<typeof run>["steps"][number]) => ({
   retake_live: s.retake_live,
   failed: s.failed,
   open_attempt: s.open_attempt,
+  passed_in_window: s.passed_in_window,
 });
 
 console.log("\n(a) passed_ever against latest_result (D14), done, next step, path score");
@@ -128,7 +130,7 @@ console.log("\n(a) passed_ever against latest_result (D14), done, next step, pat
   const d14 = run({ steps: ONE, attempts: [row(1, C1, P, "passed", 1), row(2, C1, P, "failed", 3)], grants: [grant(1, C1, P, A(2), 2)] });
   eq("D14: passed earlier, the standing result failed: done, not failed", stepView(d14.steps[0]), {
     passed_ever: true, passed_by_rule: true, done_recorded_at: null, latest_result: "failed", latest_score: 0.4, done: true,
-    official_attempt_id: A(2), retake_live: false, failed: false, open_attempt: false,
+    official_attempt_id: A(2), retake_live: false, failed: false, open_attempt: false, passed_in_window: true,
   });
   eq("…the path: 1 of 1 done, no next step, the score is the standing 0.4, in progress without a completion row", {
     steps_total: d14.steps_total, steps_done: d14.steps_done, next_step: d14.next_step, next_course_id: d14.next_course_id,
@@ -137,6 +139,20 @@ console.log("\n(a) passed_ever against latest_result (D14), done, next step, pat
     steps_total: 1, steps_done: 1, next_step: null, next_course_id: null, path_score: 0.4, completed: false, status: "in_progress",
     started_at: "2026-02-01T09:00:00Z",
   });
+
+  // passed_in_window (the ADR 0024 note of 2026-11-14, O4-b): some row of
+  // the scored window passed, whatever the rule. Under no required pass,
+  // passed_by_rule says only that the window is not empty.
+  const noRule = (rows: PathAttempt[], grants: PathGrant[] = []) => run({ steps: [step(C1, 1, false)], attempts: rows, grants }).steps[0];
+  eq("O4-b: no pass required, failed, never passed: passed_by_rule true, passed_in_window false",
+    [noRule([row(1, C1, P, "failed", 1)]).passed_by_rule, noRule([row(1, C1, P, "failed", 1)]).passed_in_window], [true, false]);
+  eq("O4-b: no pass required, D14 (passed, then a failed granted retake): passed_in_window true",
+    noRule([row(1, C1, P, "passed", 1), row(2, C1, P, "failed", 3)], [grant(1, C1, P, A(2), 2)]).passed_in_window, true);
+  eq("O4-b: a pass required: passed_in_window equals passed_by_rule",
+    [d14.steps[0].passed_in_window === d14.steps[0].passed_by_rule,
+     run({ steps: ONE, attempts: [row(1, C1, P, "failed", 1)] }).steps[0].passed_in_window], [true, false]);
+  eq("O4-b: a passed row in another context does not count for the path step",
+    noRule([row(1, C1, I, "passed", 1), row(2, C1, P, "failed", 3)]).passed_in_window, false);
 
   // Case 2: fail, grant, pass.
   const recovered = run({ steps: ONE, attempts: [row(1, C1, P, "failed", 1), row(2, C1, P, "passed", 3)], grants: [grant(1, C1, P, A(2), 2)] });
@@ -250,7 +266,7 @@ console.log("\n(c) the stored fact (the owner's O1 answer, option ii)");
   const factOnly = run({ steps: TWO, attempts: [row(1, C1, P, "completed", 1)], facts: [fact(C1)] });
   eq("a fact row, the step now pass-required, completed without a pass: done by the fact (O1-g (1))", stepView(factOnly.steps[0]), {
     passed_ever: true, passed_by_rule: false, done_recorded_at: "2026-03-01T00:00:00Z", latest_result: "completed", latest_score: 0.7, done: true,
-    official_attempt_id: A(1), retake_live: false, failed: false, open_attempt: false,
+    official_attempt_id: A(1), retake_live: false, failed: false, open_attempt: false, passed_in_window: false,
   });
   eq("…the same rows without the fact read the same standing result (the fact never changes it)",
     (() => { const s = run({ steps: TWO, attempts: [row(1, C1, P, "completed", 1)] }).steps[0]; return [s.latest_result, s.latest_score, s.official_attempt_id, s.done]; })(),
@@ -283,7 +299,7 @@ console.log("\n(c) the stored fact (the owner's O1 answer, option ii)");
     ...stepView(afterFail.steps[0]), next_step: afterFail.next_step,
   }, {
     passed_ever: true, passed_by_rule: false, done_recorded_at: "2026-03-01T00:00:00Z", latest_result: "failed", latest_score: 0.4, done: true,
-    official_attempt_id: A(2), retake_live: false, failed: false, open_attempt: false, next_step: 2,
+    official_attempt_id: A(2), retake_live: false, failed: false, open_attempt: false, passed_in_window: false, next_step: 2,
   });
   const completedPath = run({ steps: TWO, attempts: [row(1, C1, P, "completed", 1), row(2, C1, P, "failed", 5), row(3, C2, P, "passed", 6)], grants: retakeGrant, facts: [fact(C1)], completion: { completed_at: "2026-02-04T00:00:00Z" } });
   eq("…a stored path completion is unchanged by it", [completedPath.completed, completedPath.status, completedPath.steps_done], [true, "completed", 2]);

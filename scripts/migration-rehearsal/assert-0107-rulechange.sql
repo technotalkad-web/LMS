@@ -44,7 +44,14 @@
 --         insert into the table as authenticated still raises 42501; an
 --         authenticated learner's update of the step's or the course's rule
 --         changes no row and writes no fact
---   (R11) the deletes behave as before and write nothing: a user delete,
+--   (R11) the depth test: a rule change made from inside a trigger (depth
+--         2) records nothing, so the learner then reads by the new rule
+--         (the phase 2 rule of O3-a: never change a rule from a trigger);
+--         the same change made as a statement records the step (the
+--         control). The cascades of (R12) pass with or without the depth
+--         test, because by the time a step row leaves in a cascade its
+--         parent is gone and the view shows no row for it
+--   (R12) the deletes behave as before and write nothing: a user delete,
 --         a course delete with the service-role claim over a step done by
 --         its rule with no fact (the step row leaves in the cascade, where
 --         the depth test writes nothing), a lone delete of a path with no
@@ -163,18 +170,18 @@ $$;
 -- only. Paths, each assigned by user rows unless said otherwise (own rule
 -- of each step in brackets, null = inherit):
 --   P01 C01 (null), C02 (null): u11, u12, u13      (R1)
---   P02 C03 (null), C04 (null): u14                (R2, R11)
---   P03 C03 (false): u15                           (R2)
+--   P02 C03 (null), C04 (null): u14                (R2, R12)
+--   P03 C03 (false): u15                           (R2, R11)
 --   P04 C05 (true): u16                            (R3)
 --   P05 C06 (null): u17                            (R4)
 --   P06 C07 (null), C08 (null): u18                (R5)
 --   P07 C09 (null): u19                            (R6)
 --   P08 C10 (true): u21                            (R7)
 --   P09 C11 (null), C12 (null): u22                (R8)
---   P10 C13 (false), C14 (null): u23               (R9, R11)
+--   P10 C13 (false), C14 (null): u23               (R9, R12)
 --   P11 C15 (null): group GR only                  (R10)
---   P12 C16 (null): u24                            (R10)
---   P13 C01 (null): u12, no attempt                (R11)
+--   P12 C16 (null): u24                            (R10, R11)
+--   P13 C01 (null): u12, no attempt                (R12)
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -626,7 +633,48 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
--- (R11) the deletes write nothing and behave as before
+-- (R11) the depth test
+-- ---------------------------------------------------------------------------
+create temporary table rc_fire (path_id uuid, course_id uuid, rule boolean);
+create function pg_temp.rc_fire_fn() returns trigger language plpgsql as $$
+begin
+  update public.learning_path_courses set pass_required = new.rule
+   where path_id = new.path_id and course_id = new.course_id;
+  return new;
+end
+$$;
+create trigger rc_fire_trg after insert on pg_temp.rc_fire for each row execute function pg_temp.rc_fire_fn();
+
+do $$
+declare
+  bad text[] := '{}';
+  got text;
+  n0  bigint := pg_temp.rc_nf();
+begin
+  -- u24 on P12 (C16, its own rule null, the course's false) is done by the
+  -- rule with no fact (R10 left it so); the step is tightened from inside a
+  -- trigger
+  insert into pg_temp.rc_fire values (pg_temp.rcp(12), pg_temp.rcc(16), true);
+  got := pg_temp.rc_step(12, 24, 16) || ' / ' || pg_temp.rc_fact(12, 24, 16);
+  if got is distinct from 'pr=T pbr=F fact=F done=F failed=T res=failed off=a14 / none' or pg_temp.rc_nf() <> n0 then
+    bad := bad || format('a tightening from inside a trigger: u24 reads %s, %s fact(s) written (expected none, '
+                         || 'not done by the new rule)', got, pg_temp.rc_nf() - n0);
+  end if;
+  -- the control: u15 on P03 (C03, its own rule false), done by the rule with
+  -- no fact, tightened by a statement
+  update public.learning_path_courses set pass_required = true where path_id = pg_temp.rcp(3) and course_id = pg_temp.rcc(3);
+  got := pg_temp.rc_step(3, 15, 3) || ' / ' || pg_temp.rc_fact(3, 15, 3);
+  if got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a04 / rule=F att=a04' then
+    bad := bad || format('the control, the same tightening as a statement: u15 reads %s', got);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-rulechange: (R11) the depth test: %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (R12) the deletes write nothing and behave as before
 -- ---------------------------------------------------------------------------
 do $$
 declare
@@ -680,7 +728,7 @@ begin
     bad := bad || format('the organisation delete of Org R: %s, %s fact(s) left', got, pg_temp.rc_nf());
   end if;
   if cardinality(bad) > 0 then
-    raise exception 'assert-0107-rulechange: (R11) the deletes: %', array_to_string(bad, '; ');
+    raise exception 'assert-0107-rulechange: (R12) the deletes: %', array_to_string(bad, '; ');
   end if;
 end
 $$;
