@@ -9,9 +9,10 @@
 -- One transaction that ends in ROLLBACK; every check raises
 -- 'assert-0107-rulechange: (Rn) ...' on failure. The fixture world is an
 -- organisation of its own, Org R (ids …000107210…), so a course rule change
--- here reaches no seed path. Each case asserts the fact row
--- (rule_pass_required, attempt_id), the view row, v_path_progress and
--- launch_context's steps[].done.
+-- here reaches no seed path. Each of (R1) to (R11) asserts the facts
+-- (rule_pass_required, attempt_id, or that none was written), the view row,
+-- v_path_progress and launch_context's steps[].done (ADR 0024 O3-i); (R0)
+-- reads the catalog and (R12) the deletes.
 --   (R0)  after any paste: the function once, exactly three triggers bound
 --         to it
 --   (R1)  O1-h (1), a step finished before 0107 (attempt rows that make the
@@ -493,8 +494,12 @@ declare
 begin
   perform pg_temp.rc_att(9, 10, 21, 8, 'passed', 0.9);
   update public.learning_path_courses set pass_required = false where path_id = pg_temp.rcp(8);
-  got := pg_temp.rc_step(8, 21, 10) || ' / ' || pg_temp.rc_fact(8, 21, 10) || ' / ' || pg_temp.rc_lc(8, 21, 10);
-  if got is distinct from 'pr=F pbr=T fact=T done=T failed=F res=passed off=a09 / rule=T att=a09 / true' then
+  -- one step, done, and no completion row (the writer is not called), so
+  -- the path reads in_progress, as (R6) does before its writer
+  got := pg_temp.rc_step(8, 21, 10) || ' / ' || pg_temp.rc_fact(8, 21, 10) || ' / ' || pg_temp.rc_prog(8, 21)
+         || ' / ' || pg_temp.rc_lc(8, 21, 10);
+  if got is distinct from 'pr=F pbr=T fact=T done=T failed=F res=passed off=a09 / rule=T att=a09 / '
+                          || '1/1 next=- status=in_progress / true' then
     raise exception 'assert-0107-rulechange: (R7) a relaxed step reads % (expected a fact under rule true naming a09)', got;
   end if;
 end
@@ -551,9 +556,12 @@ begin
   if pg_temp.rc_nf() <> n0 then
     bad := bad || format('%s fact(s) written (expected none)', pg_temp.rc_nf() - n0);
   end if;
-  got := pg_temp.rc_step(10, 23, 13) || ' / ' || pg_temp.rc_step(10, 23, 14);
-  if got is distinct from 'pr=F pbr=T fact=F done=T failed=F res=failed off=a11 / pr=F pbr=T fact=F done=T failed=F res=failed off=a12' then
-    bad := bad || format('P10 reads %s (expected both steps done by the rule, no fact)', got);
+  got := pg_temp.rc_step(10, 23, 13) || ' / ' || pg_temp.rc_step(10, 23, 14) || ' / ' || pg_temp.rc_prog(10, 23)
+         || ' / ' || pg_temp.rc_lc(10, 23, 13);
+  if got is distinct from 'pr=F pbr=T fact=F done=T failed=F res=failed off=a11 / pr=F pbr=T fact=F done=T failed=F res=failed off=a12 / '
+                          || '2/2 next=- status=in_progress / true,true' then
+    bad := bad || format('P10 reads %s (expected both steps done by the rule, no fact, live rows and no completion '
+                         || 'row: in_progress; the release date does not change done)', got);
   end if;
   if cardinality(bad) > 0 then
     raise exception 'assert-0107-rulechange: (R9) a reorder, a release date, the same value: %', array_to_string(bad, '; ');
@@ -596,8 +604,10 @@ begin
   end;
   execute format('set local role %I', v_me);
   perform set_config('request.jwt.claims', '', true);
-  got := pg_temp.rc_step(11, 20, 15) || ' / ' || pg_temp.rc_fact(11, 20, 15) || ' / ' || pg_temp.rc_lc(11, 20, 15);
-  if n <> 1 or got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a13 / rule=F att=a13 / true' then
+  got := pg_temp.rc_step(11, 20, 15) || ' / ' || pg_temp.rc_fact(11, 20, 15) || ' / ' || pg_temp.rc_prog(11, 20)
+         || ' / ' || pg_temp.rc_lc(11, 20, 15);
+  if n <> 1 or got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a13 / rule=F att=a13 / '
+                                    || '1/1 next=- status=in_progress / true' then
     bad := bad || format('the admin''s change updated %s row(s); u20 reads %s (expected 1 row, a fact under rule false)', n, got);
   end if;
   if st is distinct from '42501' then
@@ -655,16 +665,20 @@ begin
   -- rule with no fact (R10 left it so); the step is tightened from inside a
   -- trigger
   insert into pg_temp.rc_fire values (pg_temp.rcp(12), pg_temp.rcc(16), true);
-  got := pg_temp.rc_step(12, 24, 16) || ' / ' || pg_temp.rc_fact(12, 24, 16);
-  if got is distinct from 'pr=T pbr=F fact=F done=F failed=T res=failed off=a14 / none' or pg_temp.rc_nf() <> n0 then
+  got := pg_temp.rc_step(12, 24, 16) || ' / ' || pg_temp.rc_fact(12, 24, 16) || ' / ' || pg_temp.rc_prog(12, 24)
+         || ' / ' || pg_temp.rc_lc(12, 24, 16);
+  if got is distinct from 'pr=T pbr=F fact=F done=F failed=T res=failed off=a14 / none / '
+                          || '0/1 next=1 status=failed / false' or pg_temp.rc_nf() <> n0 then
     bad := bad || format('a tightening from inside a trigger: u24 reads %s, %s fact(s) written (expected none, '
                          || 'not done by the new rule)', got, pg_temp.rc_nf() - n0);
   end if;
   -- the control: u15 on P03 (C03, its own rule false), done by the rule with
   -- no fact, tightened by a statement
   update public.learning_path_courses set pass_required = true where path_id = pg_temp.rcp(3) and course_id = pg_temp.rcc(3);
-  got := pg_temp.rc_step(3, 15, 3) || ' / ' || pg_temp.rc_fact(3, 15, 3);
-  if got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a04 / rule=F att=a04' then
+  got := pg_temp.rc_step(3, 15, 3) || ' / ' || pg_temp.rc_fact(3, 15, 3) || ' / ' || pg_temp.rc_prog(3, 15)
+         || ' / ' || pg_temp.rc_lc(3, 15, 3);
+  if got is distinct from 'pr=T pbr=F fact=T done=T failed=F res=failed off=a04 / rule=F att=a04 / '
+                          || '1/1 next=- status=in_progress / true' then
     bad := bad || format('the control, the same tightening as a statement: u15 reads %s', got);
   end if;
   if cardinality(bad) > 0 then

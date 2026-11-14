@@ -6803,10 +6803,10 @@ grant execute on function public.launch_context(uuid, uuid, uuid, uuid, uuid, uu
 -- as the owner, as in record_learning_activity, so a learner reached only by
 -- a Custom Group is recorded. Who may change a rule is unchanged: the row
 -- policies of learning_path_courses and courses decide it before the
--- trigger runs. What the bindings do not catch is disclosed in O3-j (a
--- learner not enrolled at the change, a lowered attempt policy, a direct
--- update of a step's course_id or path_id, a disabled trigger) and put to
--- the owner as O6. The phase 2 step editor changes a step's rule by an
+-- trigger runs. Not caught (O3-j): a learner not enrolled at the change,
+-- put to the owner as O6; a direct update of a step's course_id or
+-- path_id; a disabled trigger. A lowered attempt policy cannot occur
+-- under 0103's clamp. The phase 2 step editor changes a step's rule by an
 -- update of that row, never from inside a trigger and never by deleting and
 -- re-inserting the list in a cascade, where this function records nothing.
 create or replace function public.learning_path_step_facts_before_rule_change()
