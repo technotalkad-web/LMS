@@ -17,6 +17,7 @@ import http from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import { test, expect } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
+import { fixtureAttemptContext } from "./p0-helpers";
 import { lintStatement } from "../lib/xapi-lint";
 
 const NS = "https://ambak.com/xapi/";
@@ -110,7 +111,7 @@ test("LRS analytics profile: enriched copy, raw internal, lint-clean delivery, d
     await db.from("courses").update({ current_version_id: version!.id }).eq("id", course!.id);
     const { data: attempt } = await db
       .from("course_attempts")
-      .insert({ course_version_id: version!.id, user_id: learner.id, organization_id: org.id, status: "in_progress", completion_status: "in_progress", success_status: "unknown" })
+      .insert({ course_version_id: version!.id, user_id: learner.id, organization_id: org.id, status: "in_progress", completion_status: "in_progress", success_status: "unknown", ...fixtureAttemptContext() })
       .select("id")
       .single();
     const token = randomBytes(32).toString("hex");

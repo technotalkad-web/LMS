@@ -18,6 +18,7 @@ import {
   svc,
 } from "./data";
 import { authedContext, uploadCourse, assignCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
+import { fixtureAttemptContext } from "./p0-helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 
@@ -94,6 +95,7 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
       course_id: course.courseId,
       language: "en",
     });
+    // An Individual attempt that names its context (ADR 0024 step 64).
     const { error: attErr } = await svc().from("course_attempts").insert({
       course_version_id: s.enVersionId,
       user_id: learner.id,
@@ -101,6 +103,7 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
       status: "in_progress",
       completion_status: "in_progress",
       success_status: "unknown",
+      ...fixtureAttemptContext(),
     });
     expect(attErr, attErr ? JSON.stringify(attErr) : "").toBeNull();
   });

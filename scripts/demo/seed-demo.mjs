@@ -328,6 +328,7 @@ for (const u of active) {
     const completedAt = new Date(when).toISOString();
     const ok = score >= 0.7;
     attempts.push({ course_version_id: c.version_id, user_id: u.id, organization_id: org.id,
+      context_kind: "individual", // ADR 0024: every insert names its context
       status: ok ? "passed" : "failed", completion_status: "completed",
       success_status: ok ? "passed" : "failed", score, cmi_data: {},
       started_at: startedAt, completed_at: completedAt, last_activity_at: completedAt });
@@ -397,6 +398,7 @@ for (const u of active.slice(0, 25)) {
   const started = new Date(now - between(0, 3) * DAY).toISOString();
   // NOTE: bulk-insert rows must share identical keys (PGRST102).
   attempts.push({ course_version_id: c.version_id, user_id: u.id, organization_id: org.id,
+    context_kind: "individual",
     status: "in_progress", completion_status: "in_progress", success_status: "unknown",
     score: null, cmi_data: {}, started_at: started, completed_at: null,
     last_activity_at: started });

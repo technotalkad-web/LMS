@@ -1,7 +1,8 @@
 /**
  * Shared helpers for the P0 specs 50-53 (ADR 0003, ADR 0004): fixture
  * variants built from the committed zips, the 0098 probe, the direct-upload
- * API flow and the cmi5 auth handshake.
+ * API flow and the cmi5 auth handshake. Also the lifecycle harness's helper
+ * for a fixture attempt's context (ADR 0024 step 64).
  */
 import { expect, type APIRequestContext } from "@playwright/test";
 import { createHash } from "node:crypto";
@@ -11,6 +12,15 @@ import JSZip from "jszip";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { svc } from "../../e2e/helpers/supabase";
 import { GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
+
+/**
+ * The context columns of a fixture attempt, from the row's flags: every
+ * service-role course_attempts insert of a lifecycle spec spreads it after
+ * its row (`{ ...row, ...fixtureAttemptContext(row) }`). One implementation,
+ * in the e2e helper, shared by both harnesses as data.ts shares svc().
+ */
+export { fixtureAttemptContext } from "../../e2e/helpers/supabase";
+export type { FixtureAttemptContext } from "../../e2e/helpers/supabase";
 
 export const FIXTURES = path.resolve(__dirname, "../fixtures");
 export const XAPI_HEADERS = { "Content-Type": "application/json", "X-Experience-API-Version": "1.0.3" };

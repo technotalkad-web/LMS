@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { test, expect } from "../helpers/fixtures";
-import { addMember, createAuthUser, createOrg, rand, svc, type SeededOrg, type SeededUser } from "../helpers/supabase";
+import { addMember, createAuthUser, createOrg, fixtureAttemptContext, rand, svc, type SeededOrg, type SeededUser } from "../helpers/supabase";
 
 /**
  * ADR 0014 step 17, database-backed (pr-checks `e2e`: the pushed code built
@@ -86,7 +86,8 @@ async function addCourse(org: SeededOrg, name: string): Promise<{ courseId: stri
 async function attempt(s: Seeded, row: Record<string, unknown>): Promise<string> {
   const { data, error } = await svc()
     .from("course_attempts")
-    .insert({ course_version_id: s.versionId, user_id: s.learner.id, organization_id: s.org.id, ...row })
+    // The context from the row's flags (ADR 0024 step 64): every row here is Individual.
+    .insert({ course_version_id: s.versionId, user_id: s.learner.id, organization_id: s.org.id, ...row, ...fixtureAttemptContext(row) })
     .select("id")
     .single();
   if (error || !data) throw new Error(`attempt insert failed: ${error?.message}`);

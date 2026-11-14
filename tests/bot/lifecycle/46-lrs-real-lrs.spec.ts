@@ -16,6 +16,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { test, expect } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
+import { fixtureAttemptContext } from "./p0-helpers";
 import { authedContext } from "../lib/session";
 import { lintStatement } from "../lib/xapi-lint";
 import { uuid5 } from "../../../lib/lrs/uuid5";
@@ -126,17 +127,20 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
   await db.from("learning_path_courses").insert({ path_id: path!.id, course_id: course!.id, step_number: 1 });
   const { data: program } = await db.from("journey_programs").insert({ organization_id: org.id, name: "QA Journey", days_total: 30 }).select("id").single();
   // ADR 0024 step 64: day 3 (the day the attempt and the progress row use) has
-  // a draft row before the version and is in the version's days, so 0107's Q8
-  // before-check and its paste-window trigger give it a day identity.
-  const { error: dayErr } = await db.from("journey_days").insert({ program_id: program!.id, organization_id: org.id, day_number: 3, course_id: course!.id, mission_title: "QA mission" });
+  // a draft row before the version and is in the version's days (0107's Q8
+  // before-check). The version names the day's identity itself, day_ids by
+  // the row's own id with source 'editor', so it needs neither 0107's
+  // paste-window trigger nor anything 0108 drops (P2-N9).
+  const { data: day3, error: dayErr } = await db.from("journey_days").insert({ program_id: program!.id, organization_id: org.id, day_number: 3, course_id: course!.id, mission_title: "QA mission" }).select("id").single();
   expect(dayErr, `journey day insert: ${dayErr?.message}`).toBeNull();
-  const { data: jversion } = await db.from("journey_versions").insert({ program_id: program!.id, organization_id: org.id, version_number: 1, name: "QA Journey", days_total: 30, count_sundays: false, completion_title: "Yoddha", days: [{ day: 3, course_id: course!.id, mission_title: "QA mission" }] }).select("id").single();
+  const { data: jversion } = await db.from("journey_versions").insert({ program_id: program!.id, organization_id: org.id, version_number: 1, name: "QA Journey", days_total: 30, count_sundays: false, completion_title: "Yoddha", days: [{ day: 3, course_id: course!.id, mission_title: "QA mission" }], day_ids: { "3": day3!.id }, day_ids_source: "editor" }).select("id").single();
   await db.from("journey_programs").update({ current_version_id: jversion!.id }).eq("id", program!.id);
   const { data: enrollment } = await db.from("journey_enrollments").insert({ program_id: program!.id, version_id: jversion!.id, organization_id: org.id, user_id: learner.id, start_date: new Date().toISOString().slice(0, 10), status: "active" }).select("id").single();
 
   // One tag per attempt (ADR 0024; 0107's Q2 refuses a row with both): this
-  // one is the journey's; the SCORM attempt below carries the path tag.
-  const { data: attempt, error: attErr } = await db.from("course_attempts").insert({ course_version_id: version!.id, user_id: learner.id, organization_id: org.id, status: "in_progress", completion_status: "in_progress", success_status: "unknown", journey_enrollment_id: enrollment!.id, journey_day: 3 }).select("id").single();
+  // one is the journey's, with the day's identity; the SCORM attempt below
+  // carries the path tag. Each names its context (ADR 0024 step 64).
+  const { data: attempt, error: attErr } = await db.from("course_attempts").insert({ course_version_id: version!.id, user_id: learner.id, organization_id: org.id, status: "in_progress", completion_status: "in_progress", success_status: "unknown", ...fixtureAttemptContext({ journey_enrollment_id: enrollment!.id, journey_day: 3, journey_day_id: day3!.id }) }).select("id").single();
   expect(attErr, `attempt insert: ${attErr?.message}`).toBeNull();
   const token = randomBytes(32).toString("hex");
   await db.from("cmi5_launch_tokens").insert({ auth_token: token, attempt_id: attempt!.id });
@@ -212,7 +216,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
     // use that row when it exists, otherwise seed one.
     const { data: autoProgress } = await db.from("journey_day_progress").select("id").eq("enrollment_id", enrollment!.id).eq("day_number", 3).maybeSingle();
     summary.journeyDayAutoRecordedByLms = !!autoProgress;
-    const progress = autoProgress ?? (await ins("journey_day_progress", db.from("journey_day_progress").insert({ enrollment_id: enrollment!.id, organization_id: org.id, user_id: learner.id, day_number: 3, course_id: course!.id, attempt_id: attempt!.id, completed_at: new Date().toISOString() }).select("id").single()));
+    const progress = autoProgress ?? (await ins("journey_day_progress", db.from("journey_day_progress").insert({ enrollment_id: enrollment!.id, organization_id: org.id, user_id: learner.id, day_number: 3, day_id: day3!.id, course_id: course!.id, attempt_id: attempt!.id, completed_at: new Date().toISOString() }).select("id").single()));
     await ins("journey_enrollments.completed", db.from("journey_enrollments").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", enrollment!.id).select("id").single());
     await ins("course_ratings", db.from("course_ratings").insert({ user_id: learner.id, course_id: course!.id, rating: 4, comment: "QA rating" }).select("id").single());
     await ins("xp_events", db.from("xp_events").insert({ organization_id: org.id, user_id: learner.id, rule: "course_completed", xp: 50, course_id: course!.id, attempt_id: attempt!.id, dedupe_key: `qa-${attempt!.id}` }).select("id").single());
@@ -221,7 +225,7 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
     // SCORM 1.2 attempt (finished) for the translation source.
     const sversion = await ins("scorm course_version", db.from("course_versions").insert({ course_id: course!.id, version_number: 2, manifest_type: "scorm12", launch_url: "index_lms.html", storage_prefix: `courses/${course!.id}/v2/`, manifest_data: { raw: { activityId: `${auId}-scorm` }, unitCount: 8 }, package_id: pkg!.id }).select("id").single());
     const sattempt = sversion
-      ? await ins("scorm course_attempt", db.from("course_attempts").insert({ course_version_id: sversion.id, user_id: learner.id, organization_id: org.id, learning_path_id: path!.id, status: "passed", completion_status: "completed", success_status: "passed", score: 0.8, completed_at: new Date().toISOString(), cmi_data: { "cmi.core.score.raw": 8, "cmi.core.score.max": 10, "cmi.core.score.min": 0, "cmi.core.total_time": "0000:12:30.00", "cmi.core.lesson_status": "passed", "cmi.interactions.0.id": "q1", "cmi.interactions.0.type": "choice", "cmi.interactions.0.student_response": "b", "cmi.interactions.0.correct_responses.0.pattern": "b", "cmi.interactions.0.result": "correct", "cmi.interactions.0.latency": "0000:00:20.00", "cmi.interactions.1.id": "q2", "cmi.interactions.1.type": "true-false", "cmi.interactions.1.student_response": "f", "cmi.interactions.1.correct_responses.0.pattern": "t", "cmi.interactions.1.result": "wrong" } }).select("id").single())
+      ? await ins("scorm course_attempt", db.from("course_attempts").insert({ course_version_id: sversion.id, user_id: learner.id, organization_id: org.id, ...fixtureAttemptContext({ learning_path_id: path!.id }), status: "passed", completion_status: "completed", success_status: "passed", score: 0.8, completed_at: new Date().toISOString(), cmi_data: { "cmi.core.score.raw": 8, "cmi.core.score.max": 10, "cmi.core.score.min": 0, "cmi.core.total_time": "0000:12:30.00", "cmi.core.lesson_status": "passed", "cmi.interactions.0.id": "q1", "cmi.interactions.0.type": "choice", "cmi.interactions.0.student_response": "b", "cmi.interactions.0.correct_responses.0.pattern": "b", "cmi.interactions.0.result": "correct", "cmi.interactions.0.latency": "0000:00:20.00", "cmi.interactions.1.id": "q2", "cmi.interactions.1.type": "true-false", "cmi.interactions.1.student_response": "f", "cmi.interactions.1.correct_responses.0.pattern": "t", "cmi.interactions.1.result": "wrong" } }).select("id").single())
       : null;
     rec("Fixtures for LMS-derived events seeded (journey day, journey completion, rating, XP, badge, SCORM attempt)", Object.keys(fixtureErrors).length === 0, Object.keys(fixtureErrors).length ? fixtureErrors : "all seeded");
 

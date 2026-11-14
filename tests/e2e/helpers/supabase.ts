@@ -224,6 +224,78 @@ export async function seedOtp(email: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// ATTEMPT FIXTURES: the learning context of a seeded course_attempts row
+// ---------------------------------------------------------------------------
+
+/** The context columns of a fixture attempt; spread into the insert after the row. */
+export type FixtureAttemptContext =
+  | { context_kind: "individual" }
+  | { context_kind: "path"; learning_path_id: string }
+  | { context_kind: "journey"; journey_enrollment_id: string; journey_day: number; journey_day_id: string }
+  | { context_kind: "preview"; is_preview: true; preview_kind: "legacy_role" };
+
+const given = (v: unknown) => v !== undefined && v !== null;
+
+/**
+ * The context columns of a fixture attempt (ADR 0024 steps 5 and 64), from
+ * the row's own flags, so every service-role insert of a fixture names
+ * `context_kind` and never relies on 0107's paste-window derive trigger
+ * (which 0108 drops; each firing is counted in context_derive_log).
+ *
+ *   is_preview true            → preview, preview_kind 'legacy_role' (the
+ *                                by-role kind), with no official tag and
+ *                                no journey_day_id: a new preview never
+ *                                carries an official tag (ADR 0024 step 6;
+ *                                the check would admit old tags on a
+ *                                legacy_role row, the helper does not)
+ *   journey_enrollment_id      → journey, with journey_day and journey_day_id
+ *   learning_path_id           → path
+ *   otherwise                  → individual
+ *
+ * The order is 0107's backfill and derive order. What is returned passes
+ * course_attempts_context_shape_chk on its own, with the row's tags; a
+ * pairing the check refuses throws here, before the database is asked.
+ * Never returned: context_key, a generated column an insert may not name;
+ * journey_version_id, which may stay null on a fixture.
+ *
+ * Usage: `.insert({ ...row, ...fixtureAttemptContext(row) })`, the spread
+ * written inside the insert (tests/unit/attempt-insert-sites.test.ts reads it).
+ */
+export function fixtureAttemptContext(flags: Readonly<Record<string, unknown>> = {}): FixtureAttemptContext {
+  for (const col of ["context_kind", "context_key", "preview_kind", "preview_run_id", "journey_version_id"]) {
+    if (given(flags[col])) throw new Error(`fixtureAttemptContext: the row names ${col}; the helper derives the context from the flags`);
+  }
+  const path = flags.learning_path_id;
+  const enrollment = flags.journey_enrollment_id;
+  const day = flags.journey_day;
+  const dayId = flags.journey_day_id;
+  const journeyTags = [enrollment, day, dayId].filter(given).length;
+  if (flags.is_preview === true) {
+    if (given(dayId)) {
+      throw new Error("fixtureAttemptContext: a legacy_role preview has no journey_day_id (0107's shape check)");
+    }
+    if (given(path) || given(enrollment) || given(day)) {
+      throw new Error("fixtureAttemptContext: a preview fixture carries no official tag (ADR 0024 step 6)");
+    }
+    return { context_kind: "preview", is_preview: true, preview_kind: "legacy_role" };
+  }
+  if (given(path) && journeyTags > 0) {
+    throw new Error("fixtureAttemptContext: one tag per attempt (0107 refuses a path tag with a journey tag)");
+  }
+  if (journeyTags > 0) {
+    if (typeof enrollment !== "string" || typeof day !== "number" || typeof dayId !== "string") {
+      throw new Error("fixtureAttemptContext: a journey fixture needs journey_enrollment_id, journey_day and journey_day_id (the journey_days row id)");
+    }
+    return { context_kind: "journey", journey_enrollment_id: enrollment, journey_day: day, journey_day_id: dayId };
+  }
+  if (given(path)) {
+    if (typeof path !== "string") throw new Error("fixtureAttemptContext: learning_path_id must be a path id");
+    return { context_kind: "path", learning_path_id: path };
+  }
+  return { context_kind: "individual" };
+}
+
+// ---------------------------------------------------------------------------
 // CLEANUP
 // ---------------------------------------------------------------------------
 
