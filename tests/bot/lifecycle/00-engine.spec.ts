@@ -19,6 +19,7 @@ import {
   svc,
 } from "./data";
 import { authedContext } from "../lib/session";
+import { GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 
@@ -99,6 +100,7 @@ test.describe.serial("lifecycle engine — SCORM 1.2 + cmi5", () => {
             buffer: fs.readFileSync(path.join(FIXTURES, zip)),
           },
         },
+        timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
       });
       expect(res.ok(), `${zip} upload → ${res.status()}: ${await res.text()}`).toBeTruthy();
       return (await res.json()).courseId as string;

@@ -18,7 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext } from "./helpers";
+import { assignCourse, authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 
@@ -102,6 +102,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
         orgSlug: org.slug,
         file: { name: "alds47-v1.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-EN-V1") },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(up.ok(), `upload v1 → ${up.status()}: ${await up.text()}`).toBeTruthy();
     s.courseId = (await up.json()).courseId as string;
@@ -134,6 +135,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
         mode: "grandfather",
         file: { name: "alds47-v2.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-EN-V2") },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(rep.ok(), `replace → ${rep.status()}: ${await rep.text()}`).toBeTruthy();
     s.v2 = (await rep.json()).version_id as string;
@@ -192,6 +194,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
         display_name: "Hindi",
         file: { name: "alds47-hi.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-HI-V1") },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
     const { data: hiPkg } = await svc()
@@ -221,6 +224,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
         mode: "grandfather",
         file: { name: "alds47-v3.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-EN-V3") },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(rep.ok(), `replace en → ${rep.status()}: ${await rep.text()}`).toBeTruthy();
     const v3 = (await rep.json()).version_id as string;
@@ -254,6 +258,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
         orgSlug: s.org!.slug,
         file: { name: "alds47-other.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-OTHER", "QA ALDS47 Other Course") },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(up2.ok(), `upload other → ${up2.status()}`).toBeTruthy();
     s.otherCourseId = (await up2.json()).courseId as string;
@@ -271,6 +276,7 @@ test.describe.serial("ALDS P1 — content is served from the attempt's version",
         orgSlug: org2.slug,
         file: { name: "alds47-foreign.zip", mimeType: "application/zip", buffer: await markedZip("ALDS47-FOREIGN") },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(up3.ok(), `upload foreign → ${up3.status()}`).toBeTruthy();
     s.foreignCourseId = (await up3.json()).courseId as string;

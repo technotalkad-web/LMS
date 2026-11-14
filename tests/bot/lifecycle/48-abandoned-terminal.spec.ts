@@ -17,7 +17,7 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext, uploadCourse } from "./helpers";
+import { assignCourse, authedContext, uploadCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 const XAPI_HEADERS = { "Content-Type": "application/json", "X-Experience-API-Version": "1.0.3" };
@@ -41,6 +41,7 @@ async function bilingualCourse(adminReq: APIRequestContext, orgSlug: string, zip
       display_name: "Hindi",
       file: { name: zip, mimeType: "application/zip", buffer: fs.readFileSync(path.join(FIXTURES, zip)) },
     },
+    timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
   });
   expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
   const { data: hi } = await svc()
@@ -306,6 +307,7 @@ test.describe.serial("ALDS P4 — abandoned is terminal", () => {
           mode: "force_restart",
           file: { name: "cmi5.zip", mimeType: "application/zip", buffer: fs.readFileSync(path.join(FIXTURES, "cmi5.zip")) },
         },
+        timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
       }
     );
     expect(rep.ok(), `replace → ${rep.status()}: ${await rep.text()}`).toBeTruthy();

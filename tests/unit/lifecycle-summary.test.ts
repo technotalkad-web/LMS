@@ -9,7 +9,9 @@
  *     its spec file, title path and the file:line:column of its first error
  *     (an error location inside tests/, else a tests/ stack frame, else the
  *     test's declaration), repository-relative, on stdout and in the job
- *     summary under "Failing tests (location only)"; only a location that
+ *     summary under "Failing tests (location and duration only)", with how
+ *     long that result ran ("after 1.0 s"; "duration unknown" when the report
+ *     has no finite non-negative number); only a location that
  *     names an existing file of this checkout counts, so a frame-shaped line
  *     in a message (which Playwright reports back as the error's location)
  *     never prints;
@@ -158,24 +160,24 @@ console.log("\nfailures: one line each, location only");
   eq("exit 1 on a failure", r.code, 1);
   eq("headline unchanged", out[0], "lifecycle: 2 passed, 14 failed, 1 flaky, 2 skipped in 6 spec file(s), 61 s; top-level errors 0");
   eq("counts line unchanged", out[6], "  55-attempt-row-guard.spec.ts         passed 0  failed 11  flaky 0  skipped 0");
-  eq("section heading after the counts", out[7], "lifecycle: failing tests (location only)");
+  eq("section heading after the counts", out[7], "lifecycle: failing tests (location and duration only)");
   const want = [
-    "  timedOut    43-xapi-resume.spec.ts › xAPI resume › browser  (tests/bot/lifecycle/43-xapi-resume.spec.ts:151:26)",
-    "  failed      50-record-guard.spec.ts › guard  (tests/bot/fixtures/make-packages.mjs:222:9)",
-    "  interrupted 51-no-overwrite.spec.ts › Overwrite › webhook  (no error location; test at tests/bot/lifecycle/51-no-overwrite.spec.ts:41:7)",
-    "  flaky       52-integrity-check.spec.ts › Integrity › retry  (tests/bot/lifecycle/52-integrity-check.spec.ts:88:5)",
-    "  failed      54-course-default.spec.ts › ADR 0008 B — explicit course default › Set as default from the Library → moves, audit row; again → noop  (tests/bot/lifecycle/54-course-default.spec.ts:239:56)",
-    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:11:3)",
-    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:21:3)",
-    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:31:3)",
-    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:41:3)",
-    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:51:3)",
-    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:61:3)",
-    "  failed      55-attempt-row-guard.spec.ts › Guards › in a package  (node_modules/@supabase/auth-js/dist/main/lib/fetch.js:5:9)",
-    "  failed      55-attempt-row-guard.spec.ts › Guards › outside  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:80:7)",
-    "  failed      55-attempt-row-guard.spec.ts › Guards › odd file  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:90:7)",
-    "  failed      55-attempt-row-guard.spec.ts › Guards › framed message  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:100:7)",
-    "  failed      55-attempt-row-guard.spec.ts › Guards › escape  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:110:7)",
+    "  timedOut    43-xapi-resume.spec.ts › xAPI resume › browser  (tests/bot/lifecycle/43-xapi-resume.spec.ts:151:26; after 1.0 s)",
+    "  failed      50-record-guard.spec.ts › guard  (tests/bot/fixtures/make-packages.mjs:222:9; after 1.0 s)",
+    "  interrupted 51-no-overwrite.spec.ts › Overwrite › webhook  (no error location; test at tests/bot/lifecycle/51-no-overwrite.spec.ts:41:7; after 1.0 s)",
+    "  flaky       52-integrity-check.spec.ts › Integrity › retry  (tests/bot/lifecycle/52-integrity-check.spec.ts:88:5; after 1.0 s)",
+    "  failed      54-course-default.spec.ts › ADR 0008 B — explicit course default › Set as default from the Library → moves, audit row; again → noop  (tests/bot/lifecycle/54-course-default.spec.ts:239:56; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:11:3; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:21:3; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:31:3; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:41:3; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:51:3; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › <title redacted>  (tests/bot/lifecycle/55-attempt-row-guard.spec.ts:61:3; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › Guards › in a package  (node_modules/@supabase/auth-js/dist/main/lib/fetch.js:5:9; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › Guards › outside  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:80:7; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › Guards › odd file  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:90:7; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › Guards › framed message  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:100:7; after 1.0 s)",
+    "  failed      55-attempt-row-guard.spec.ts › Guards › escape  (no error location; test at tests/bot/lifecycle/55-attempt-row-guard.spec.ts:110:7; after 1.0 s)",
   ];
   eq("one line per failing test, in report order", out.slice(8, 8 + want.length), want);
   eq("then the skip warning", out[8 + want.length], "::warning title=Lifecycle nightly skipped tests::2 test(s) skipped in 51-no-overwrite.spec.ts, 54-course-default.spec.ts; a healthy run skips none");
@@ -184,11 +186,34 @@ console.log("\nfailures: one line each, location only");
   eq("stdout: no runner or home path", /home\/runner|Users[\\/]someone|private/.test(r.out), false);
 
   const md = lines(r.md);
-  const at = md.indexOf("### Failing tests (location only)");
+  const at = md.indexOf("### Failing tests (location and duration only)");
   eq("summary: the section follows the table", md[at - 2]?.startsWith("| 55-attempt-row-guard.spec.ts |"), true);
   eq("summary: the same lines as an indented code block", md.slice(at + 2, at + 2 + want.length), want.map((l) => `  ${l}`));
   eq("summary: footer after the section", md[at + 3 + want.length]?.startsWith("Error messages, test output and attachments are not published"), true);
   eq("summary: no planted data", leaks(r.md), []);
+}
+
+console.log("\ndurations: a number of seconds, or 'duration unknown'");
+{
+  const at = (d: unknown) => ({ ...result("failed", [{ location: { file: inRepo("tests/bot/lifecycle/66-alds-guardian-fixture.spec.ts"), line: 355, column: 5 } }]), duration: d });
+  const r = run("durations", report([
+    fileSuite("66-alds-guardian-fixture.spec.ts", "Guardian", [
+      spec("66-alds-guardian-fixture.spec.ts", "a request timeout", 10, [testOf("unexpected", [at(20012)])]),
+      spec("66-alds-guardian-fixture.spec.ts", "zero", 20, [testOf("unexpected", [at(0)])]),
+      spec("66-alds-guardian-fixture.spec.ts", "a string", 30, [testOf("unexpected", [at(`20012 ${EMAIL}`)])]),
+      spec("66-alds-guardian-fixture.spec.ts", "negative", 40, [testOf("unexpected", [at(-5)])]),
+      spec("66-alds-guardian-fixture.spec.ts", "missing", 50, [testOf("unexpected", [at(undefined)])]),
+    ]),
+  ]));
+  const where = "(tests/bot/lifecycle/66-alds-guardian-fixture.spec.ts:355:5;";
+  eq("durations print as seconds with one decimal, else 'duration unknown'", lines(r.out).slice(3, 8), [
+    `  failed      66-alds-guardian-fixture.spec.ts › Guardian › a request timeout  ${where} after 20.0 s)`,
+    `  failed      66-alds-guardian-fixture.spec.ts › Guardian › zero  ${where} after 0.0 s)`,
+    `  failed      66-alds-guardian-fixture.spec.ts › Guardian › a string  ${where} duration unknown)`,
+    `  failed      66-alds-guardian-fixture.spec.ts › Guardian › negative  ${where} duration unknown)`,
+    `  failed      66-alds-guardian-fixture.spec.ts › Guardian › missing  ${where} duration unknown)`,
+  ]);
+  eq("durations: no planted data", leaks(r.out + r.md), []);
 }
 
 console.log("\nexit codes and the green path unchanged");
@@ -210,7 +235,7 @@ console.log("\nexit codes and the green path unchanged");
     spec("51-no-overwrite.spec.ts", "webhook", 41, [testOf("skipped", [result("interrupted")])]),
   ])]));
   eq("interrupted only: exit 0 as before", cut.code, 0);
-  eq("interrupted only: listed", cut.out.includes("  interrupted 51-no-overwrite.spec.ts › Overwrite › webhook  (no error location; test at tests/bot/lifecycle/51-no-overwrite.spec.ts:41:7)"), true);
+  eq("interrupted only: listed", cut.out.includes("  interrupted 51-no-overwrite.spec.ts › Overwrite › webhook  (no error location; test at tests/bot/lifecycle/51-no-overwrite.spec.ts:41:7; after 1.0 s)"), true);
 
   const top = run("top-errors", report([fileSuite("00-engine.spec.ts", "Engine", [passed("00-engine.spec.ts", "a", 10)])], { errors: [{ message, stack: message }] }));
   eq("top-level error: exit 1", top.code, 1);

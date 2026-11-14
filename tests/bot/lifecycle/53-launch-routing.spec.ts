@@ -20,7 +20,7 @@
  */
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext } from "./helpers";
+import { assignCourse, authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { attemptStatuses, cmi5Zip, getNoFollow, inProgressAttempt, scormZip, uploadNew, zipFile } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
@@ -36,6 +36,7 @@ async function bilingual(req: APIRequestContext, orgSlug: string, name: string, 
   expect(promote.ok(), `promote → ${promote.status()}: ${await promote.text()}`).toBeTruthy();
   const addHi = await req.post(`/api/courses/${courseId}/packages`, {
     multipart: { orgSlug, language: "hi", display_name: "Hindi", file: zipFile(name, buffer) },
+    timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
   });
   expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
   const { data: hi } = await svc().from("course_packages").select("id, current_version_id").eq("course_id", courseId).eq("language", "hi").single();

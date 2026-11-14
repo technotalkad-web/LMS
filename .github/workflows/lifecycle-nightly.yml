@@ -24,10 +24,10 @@
 #
 # Public-log rule: the build log, server log, Playwright output and JSON
 # report stay in $RUNNER_TEMP; nothing is uploaded. The job prints counts
-# per spec file and, for each failing test, its title path and the
-# file:line:column of its first error; never an error message, test output
-# or attachment (scripts/lifecycle-summary.mjs; ADR 0007 decision 2, note of
-# 2026-10-19). Reproduce a failure locally: bash scripts/lifecycle-nightly.sh
+# per spec file and, for each failing test, its title path, the
+# file:line:column of its first error and how long it ran; never an error
+# message, test output or attachment (scripts/lifecycle-summary.mjs; ADR 0007
+# decision 2, notes of 2026-10-19 and 2026-11-14). Reproduce a failure locally: bash scripts/lifecycle-nightly.sh
 # (header there).
 name: Lifecycle nightly (staging)
 
@@ -71,7 +71,7 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
       # The staging secrets reach this step only.
-      - name: Build, start and run the lifecycle subset (counts and failing-test locations)
+      - name: Build, start and run the lifecycle subset (counts, failing-test locations and durations)
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.STAGING_NEXT_PUBLIC_SUPABASE_ANON_KEY }}

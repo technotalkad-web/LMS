@@ -8,9 +8,12 @@
  * Prints totals and per-spec-file counts (passed / failed / flaky / skipped)
  * to stdout and, in GitHub Actions, to the job summary. Under them, one line
  * per failed, timed-out, interrupted or flaky test: its status, spec file,
- * title path and the file:line:column of its first error (the test's own
- * declaration when no error has one), so a red run names the failing line;
- * a location prints only when it names an existing file of this checkout.
+ * title path, the file:line:column of its first error (the test's own
+ * declaration when no error has one), so a red run names the failing line,
+ * and how long that result ran (a number: a duration at a request's or the
+ * test's timeout tells a timeout from an assertion, ADR 0007 note of
+ * 2026-11-14); a location prints only when it names an existing file of
+ * this checkout.
  * Never prints error messages, stack text, test output or attachments: the
  * repository is public and spec failure messages embed response bodies and
  * test emails. Titles are static strings here; one that looks like data
@@ -121,7 +124,10 @@ function failingLine(fileName, titles, spec, t) {
   const where = loc ?? `no error location; test at ${declared ?? "<location redacted>"}`;
   // "passed" only under test.fail(); a status Playwright does not write reads "failed".
   const status = t.status === "flaky" ? "flaky" : ["failed", "timedOut", "interrupted", "passed"].includes(res.status) ? res.status : "failed";
-  return `${status.padEnd(11)} ${fileName} › ${safeTitle(titles)}  (${where})`;
+  // Only a finite, non-negative number of milliseconds prints, as seconds.
+  const ms = typeof res.duration === "number" && Number.isFinite(res.duration) && res.duration >= 0 ? res.duration : null;
+  const ran = ms === null ? "duration unknown" : `after ${(ms / 1000).toFixed(1)} s`;
+  return `${status.padEnd(11)} ${fileName} › ${safeTitle(titles)}  (${where}; ${ran})`;
 }
 
 function walk(suite, fileName, titles) {
@@ -156,7 +162,7 @@ for (const n of names) {
   console.log(`  ${n.padEnd(36)} passed ${r.passed}  failed ${r.failed}  flaky ${r.flaky}  skipped ${r.skipped}`);
 }
 if (failing.length) {
-  console.log("lifecycle: failing tests (location only)");
+  console.log("lifecycle: failing tests (location and duration only)");
   for (const l of failing) console.log(`  ${l}`);
 }
 
@@ -182,7 +188,7 @@ if (process.env.GITHUB_STEP_SUMMARY) {
       return `| ${n} | ${r.passed} | ${r.failed} | ${r.flaky} | ${r.skipped} |`;
     }),
     // An indented code block: shown verbatim, no Markdown or HTML in a title is rendered.
-    ...(failing.length ? ["", "### Failing tests (location only)", "", ...failing.map((l) => `    ${l}`)] : []),
+    ...(failing.length ? ["", "### Failing tests (location and duration only)", "", ...failing.map((l) => `    ${l}`)] : []),
     "",
     ok
       ? skipNote

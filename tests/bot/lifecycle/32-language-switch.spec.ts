@@ -17,7 +17,7 @@ import {
   createOrg,
   svc,
 } from "./data";
-import { authedContext, uploadCourse, assignCourse } from "./helpers";
+import { authedContext, uploadCourse, assignCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 
@@ -76,6 +76,7 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
           buffer: fs.readFileSync(path.join(FIXTURES, "scorm12.zip")),
         },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
 
