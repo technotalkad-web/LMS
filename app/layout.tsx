@@ -25,6 +25,17 @@ import { UiProviders } from "@/components/ui/providers";
 //   ./fonts/fallbacks.css, which keep the metrics next/font/google used.
 // next/font needs every option written as a literal, so nothing here is
 // shared through constants.
+//
+// Splitting a family over several calls works only because next/font keeps
+// the declared font-family ("Inter") as it is, so all the calls' faces share
+// one family name. Next 15.5 does this (with webpack, which the build and dev
+// scripts use); Next 14.2 renamed the family per call ('__Inter_<hash>'), and
+// next/font's own comments still describe that renaming, so it is not a
+// documented contract. Under per-call names only the latin faces would apply:
+// the rupee sign (Inter, latin-ext) and Hindi (Poppins, devanagari) would fall
+// back without any error. scripts/check-built-fonts.mjs checks the built CSS
+// after every PR build (the e2e job); see ADR 0025 before a Next upgrade or a
+// move to Turbopack.
 
 // Inter: variable font, weight range 100 900; 7 subsets, latin last.
 const interCyrillicExt = localFont({

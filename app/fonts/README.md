@@ -40,12 +40,39 @@ folder is `inter`, `poppins`, `plusjakartasans`, `roboto`, `merriweather` or
 `fallbacks.css` holds the six fallback faces (`Inter Fallback` and so on)
 with the metrics `next/font/google` generated for these families.
 
+The decision and its limits are recorded in
+`docs/adr/0025-self-hosted-fonts.md`.
+
+## One family, several calls: what this relies on
+
+Each family is split over several `localFont` calls, one per subset, and
+every call declares the same `font-family` (`Inter`, `Poppins` and so on).
+That works only because `next/font` keeps a declared family name as it is,
+so all the faces of a family end up under one name, the one its CSS variable
+points at. Next 15.5 does this with webpack, which `npm run build` and
+`npm run dev` use. Next 14.2 did not: it renamed the family per call
+(`'__Inter_<hash>'`), and `next/font`'s own comments still describe that
+renaming. If that behaviour came back, only the latin faces would apply; the
+rupee sign in Inter (latin-ext) and Hindi in Poppins (devanagari) would fall
+back to another font, with no error.
+
+`scripts/check-built-fonts.mjs` guards this. It runs after the build in the
+pull request e2e job (`scripts/e2e-in-runner.sh`) and fails unless the built
+CSS has the 83 `url()` faces under exactly the six family names, the six
+fallback faces and the six variables. To run it by hand after a build:
+`node scripts/check-built-fonts.mjs` (or pass the build folder). Run it, and
+compare a page's fonts before and after, on any Next upgrade and before any
+move to Turbopack, which has not been checked.
+
 ## Changing the set
 
 Take new files the same way (a `next/font/google` build, or the Google Fonts
 CSS2 API with the same parameters), add one `localFont` call per subset in
-`app/layout.tsx`, and add each file to the table below.
-`tests/unit/self-hosted-fonts.test.ts` checks every file against this table.
+`app/layout.tsx`, and add each file to the table below. Then update the
+expected values in `tests/unit/self-hosted-fonts.test.ts` (the subset
+ranges, the families and the fallback metrics) and `EXPECTED_FACES` in
+`scripts/check-built-fonts.mjs`. The unit test checks every file against this
+table and the layout against those values.
 
 ## Files
 
