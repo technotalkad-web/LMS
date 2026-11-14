@@ -1967,3 +1967,10 @@ The round 3 days per phase, before any addition (the Days column of step 72's ta
     - (6) `lib/lrs/sweep.ts` as it was before F2: the new unit test fails 5 of its 9 checks.
     - (7) Section 0a's refusal, on a scratch database (F4).
 
+  **Measured at aada683, the fixes commit of the third revision:**
+  - 37 functions (`functionList`: 37 created, 37 listed).
+  - Rehearsal: `RESULT: PASS: 5307 checks, 0 failed`, 31 scenarios. That is 5302 at 24ee499 plus one check in each of the five scenarios that run `grants-0107-defaults.sql` (its `sql` step).
+  - Unit tests: 82 of 82 files, `lrs-xp-event-only.test.ts` among them. `npx tsc --noEmit` is clean, eslint is clean on the 29 script files the branch changes, and `scripts/check-migration-grants.mjs` passes (53 relations).
+  - Parity cases on both sides: official 17, path 27, launch 28. Journey 17 runs on the SQL side only (N17).
+  - 0107 at aada683 is 7,947 lines and 415,387 bytes (the git blob).
+
