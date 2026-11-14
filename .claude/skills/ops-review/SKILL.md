@@ -28,6 +28,8 @@ data/schema/secrets/releases needs explicit user approval.
    trends → top 3 recommended actions → what needs the user's approval.
    If `gh` is available and something is actionable, open/update an issue
    (label `ops-incident` or comment on `ops-digest`); otherwise list the
-   actions for the user.
+   actions for the user. Never title an issue "🔴 Ops incident: prod health
+   <status>": that title is reserved for the watchdog (ops-watch.yml), which
+   comments on and auto-closes only issues with it.
 
 Never fix prod inline during a review — propose, get approval, then act.

@@ -12,7 +12,9 @@
  *     PENDING_NEXT_TAG, whose entry waits for the next tag (report-card-refresh:
  *     its route reaches production only with v1.3.0);
  *   - each threshold is longer than its schedule's nominal interval;
- *   - every schedule line has exactly one case arm and every arm a schedule.
+ *   - every schedule line has exactly one case arm and every arm a schedule;
+ *   - SUBDAILY_STALE_WARN is exactly the cadence entries whose schedule fires
+ *     more than once a day, and its ceiling is at least a day.
  *
  * A job scheduled outside cron.yml (pg_cron, ADR 0007 step 11) would need its
  * own list here.
@@ -74,6 +76,34 @@ function readCadence(): Map<string, number> {
   return out;
 }
 
+/** SUBDAILY_STALE_WARN (an array of string literals) and SUBDAILY_STALE_DEGRADED_MIN. */
+function readSubdaily(): { warnOnly: string[]; ceilingMin: number } {
+  const file = path.join(root, HEALTH_ROUTE);
+  const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+  const warnOnly: string[][] = [];
+  const ceiling: number[] = [];
+  const visit = (node: ts.Node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      if (node.name.text === "SUBDAILY_STALE_WARN") {
+        if (!ts.isArrayLiteralExpression(node.initializer)) throw new Error("SUBDAILY_STALE_WARN is not an array literal");
+        warnOnly.push(
+          node.initializer.elements.map((e) => {
+            if (!ts.isStringLiteral(e)) throw new Error(`unsupported SUBDAILY_STALE_WARN element: ${e.getText()}`);
+            return e.text;
+          })
+        );
+      }
+      if (node.name.text === "SUBDAILY_STALE_DEGRADED_MIN") ceiling.push(numeric(node.initializer));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  if (warnOnly.length !== 1 || ceiling.length !== 1) {
+    throw new Error(`expected one SUBDAILY_STALE_WARN and one SUBDAILY_STALE_DEGRADED_MIN in ${HEALTH_ROUTE}`);
+  }
+  return { warnOnly: warnOnly[0], ceilingMin: ceiling[0] };
+}
+
 // ── cron.yml: schedule lines and the case arms that map them to a route ──────
 const yml = fs.readFileSync(path.join(root, CRON_YML), "utf8");
 const schedules = [...yml.matchAll(/^\s*-\s*cron:\s*"([^"]+)"/gm)].map((m) => m[1]);
@@ -133,6 +163,63 @@ for (const [job, minutes] of cadence) {
   eq(`${job} ("${expr}"): known schedule shape`, iv !== null, true);
   if (iv !== null) eq(`${job}: ${minutes} min > ${iv} min`, minutes > iv, true);
   eq(`${job}: positive whole minutes`, Number.isInteger(minutes) && minutes > 0, true);
+}
+
+// The owner's decision of 2026-11-14 (ADR 0007, note on decision 4): a stale
+// heartbeat of a job scheduled more than once a day reads "warn", up to a
+// ceiling. The list must be exactly the cadence entries whose schedule fires
+// more than once a day, so a new frequent job cannot page and a daily one
+// cannot be quietened by accident.
+console.log("\nSUBDAILY_STALE_WARN: exactly the cadence entries scheduled more than once a day");
+const subdaily = readSubdaily();
+const firesSubDaily = cadenceJobs.filter((j) => {
+  const expr = exprByJob.get(j);
+  const iv = expr ? intervalMin(expr) : null;
+  return iv !== null && iv < 24 * 60;
+});
+eq("the list equals the sub-daily cadence entries", [...subdaily.warnOnly].sort(), [...firesSubDaily].sort());
+eq("no job is listed twice", subdaily.warnOnly.filter((j, i) => subdaily.warnOnly.indexOf(j) !== i), []);
+eq("the list names lrs-forward, gamification-refresh and journey-nudges", [...subdaily.warnOnly].sort(), [
+  "gamification-refresh",
+  "journey-nudges",
+  "lrs-forward",
+]);
+// 26 h is the value ADR 0007's note, ADR 0024's note, docs/ARCHITECTURE.md and
+// ops/RUNBOOK.md state; change them together.
+eq("the ceiling is 26 h, as the records state", subdaily.ceilingMin, 26 * 60);
+eq(
+  "the ceiling is above every listed job's threshold",
+  subdaily.warnOnly.filter((j) => !((cadence.get(j) ?? Infinity) < subdaily.ceilingMin)),
+  []
+);
+{
+  // The route hands exactly these two constants (and the cadence map) to classifyCrons.
+  const file = path.join(root, HEALTH_ROUTE);
+  const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+  const wiring: Record<string, string>[] = [];
+  const visit = (node: ts.Node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "classifyCrons" &&
+      node.arguments.length === 1 &&
+      ts.isObjectLiteralExpression(node.arguments[0])
+    ) {
+      const props: Record<string, string> = {};
+      for (const p of node.arguments[0].properties) {
+        if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) props[p.name.text] = p.initializer.getText();
+      }
+      wiring.push(props);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  eq("the route calls classifyCrons once", wiring.length, 1);
+  eq(
+    "with CRON_CADENCE_MIN, SUBDAILY_STALE_WARN and SUBDAILY_STALE_DEGRADED_MIN",
+    wiring.map((w) => [w.cadenceMin, w.staleWarnOnly, w.staleDegradedAfterMin]),
+    [["CRON_CADENCE_MIN", "SUBDAILY_STALE_WARN", "SUBDAILY_STALE_DEGRADED_MIN"]]
+  );
 }
 
 console.log("\neach cadence entry's route records its heartbeat under that name");

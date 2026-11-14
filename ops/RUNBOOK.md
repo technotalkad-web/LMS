@@ -10,7 +10,7 @@ routine) and any human on-call should follow this document.
 
 | Layer | What | Cadence | Cost of failure |
 |---|---|---|---|
-| **L1 Deterministic watchdog** | `.github/workflows/ops-watch.yml` probes `GET /api/ops/health` on prod; files/updates a GitHub issue (`ops-incident`) on degraded/down; auto-closes on recovery; posts a daily digest comment (`ops-digest` issue). | every 10 min, 24/7 | none — it's dumb and reliable |
+| **L1 Deterministic watchdog** | `.github/workflows/ops-watch.yml` probes `GET /api/ops/health` on prod; files/updates its own GitHub issue (`ops-incident`, titled "🔴 Ops incident: prod health <status>") on degraded/down; auto-closes that issue on recovery, and never touches any other `ops-incident` issue; posts a daily digest comment (`ops-digest` issue). | every 10 min, 24/7 | none — it's dumb and reliable |
 | **L2 AI review** | `.github/workflows/ops-review.yml` — headless Claude Code in Actions (daily 02:15 UTC, issues-only, subscription token — no metered billing possible) — plus `/ops-review` (skill) for on-demand interactive sessions: reads health + heartbeats + digests + recent workflow runs, triages against this runbook, opens issues; fixes are drafted only in interactive sessions. | daily + on-demand | bounded by §7 safe-actions |
 | **L3 Human (you)** | Approves anything in §7's "requires approval" list; receives pages via GitHub notifications on `ops-incident` issues. | on page / daily digest | — |
 
@@ -78,7 +78,7 @@ drift-safe (`if exists`, `to_regclass()` guards) and probe before releases (§6.
 
 | Signal | Where | Semantics |
 |---|---|---|
-| **Deep health** | `GET /api/ops/health` (`x-cron-secret` header for detail) | `ok` / `warn` (advisory: LRS backlog, email failures) / `degraded` (storage or stale crons) / `down` (DB unreachable, HTTP 503) |
+| **Deep health** | `GET /api/ops/health` (`x-cron-secret` header for detail) | `ok` / `warn` (advisory: LRS backlog, email failures, or a job scheduled more than once a day — `lrs-forward`, `gamification-refresh`, `journey-nudges` — stale with its last run less than 26 h ago, which GitHub's cron starvation causes) / `degraded` (storage; a stale daily, weekly or monthly job; a job never seen; a frequent job whose last run is more than 26 h ago) / `down` (DB unreachable, HTTP 503). Heartbeats count on prod only (`OPS_EXPECT_CRONS=1`); ADR 0007, note of 2026-11-14 on decision 4 |
 | **Cron heartbeats** | `ops_heartbeats` table (migration 0050); each cron upserts on every run | staleness vs cadence map in the health route |
 | **Watchdog + digest** | GitHub issues labelled `ops-incident` / `ops-digest` | incident lifecycle + daily history |
 | **RLS cross-tenant audit** | `rls-audit.yml` on migration PRs + weekly cron | FAILs policy-less org-scoped tables & runtime leaks |
@@ -133,7 +133,7 @@ blast radius (which tenants/flows) → recommended action → what approval is n
 - **`Cron /api/cron/X returned 404`** → the schedule shipped to `main` before the prod deploy carried the route (GH schedules run from default branch immediately; prod deploys only on tag). Fix: tag the release, or accept red until the next tag. *(Lived: lrs-forward 404s until v1.0.5.)*
 - 401/403 → `PROD_CRON_SECRET` repo secret ≠ worker's `CRON_SECRET` (rotated one side only).
 - Heartbeat stale but cron.yml green → route ran but errored inside; check the run's response body, then the job's `last_detail` in `ops_heartbeats`.
-- GH Actions outage/jitter → verify at githubstatus.com; cadence thresholds already absorb minutes of jitter.
+- GH Actions outage/jitter → verify at githubstatus.com; cadence thresholds already absorb minutes of jitter. GitHub starts only a share of the frequent schedules (gaps of up to about 10.5 h per job measured in Nov 2026), so a stale frequent job reads `warn`, not `degraded`, while its last run is less than 26 h ago; past that, treat it as a real fault.
 
 ### 6.3 Email delivery broken (P2)
 1. Triage source: `notification_log` — group recent `failed` rows by `error`.
