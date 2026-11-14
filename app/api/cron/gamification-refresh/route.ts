@@ -27,10 +27,42 @@ import { classifyAttempt } from "@/lib/scoring/attempt-kind";
  * rides the same schedule (no new cron line, no CRON_CADENCE_MIN change), so a
  * held unscored plain-xAPI completion fires 15 to 30 minutes after its
  * completed_at, plus whatever GitHub delays the run by.
+ *
+ * Step 1's answer (ADR 0024 step 16; the note of 2026-11-14, ruling A4): from
+ * migration 0107 the function runs the completion sweep first and appends its
+ * entry last, {view: "completion_sweep", ms, rows, error, sweep}. This route
+ * runs every 15 minutes, so it is the sweep's most frequent caller, and it
+ * follows the report route's rule of step 81
+ * (app/api/cron/refresh-report-views/route.ts): when that entry carries an
+ * error of its own the route answers 500, `ok` false and `error`
+ * "completion_sweep: <message>", and the heartbeat reads "error", so the
+ * 15-minute job reads red while the sweep of the fail-closed writer is
+ * broken. Only the sweep's own error counts: a row that failed inside the
+ * sweep (sweep.failed) is retried by the next run, a view entry's error is
+ * reported in its entry as before, and an answer without the entry (a
+ * database without 0107) keeps today's 200. The held-webhook sweep below
+ * still runs in every case, stays in the body and never decides `ok`.
  */
 
 function unauthorized() {
   return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+}
+
+/**
+ * The completion sweep's own error from refresh_gamification_views()'s
+ * answer, or null (no entry, or its error null). The same rule as
+ * completionSweepError in app/api/cron/refresh-report-views/route.ts; a route
+ * file exports its handlers only, so each route keeps its copy.
+ */
+function completionSweepError(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const entry of data) {
+    if (entry && typeof entry === "object" && (entry as { view?: unknown }).view === "completion_sweep") {
+      const err = (entry as { error?: unknown }).error;
+      return err === null || err === undefined ? null : String(err);
+    }
+  }
+  return null;
 }
 
 async function run() {
@@ -63,6 +95,10 @@ async function run() {
 
   if (error) {
     return { ok: false, total_ms, error: error.message, webhook_sweep };
+  }
+  const sweepError = completionSweepError(data);
+  if (sweepError !== null) {
+    return { ok: false, total_ms, views: data, error: `completion_sweep: ${sweepError}`, webhook_sweep };
   }
   return { ok: true, total_ms, views: data, webhook_sweep };
 }
