@@ -127,9 +127,10 @@ export const ONE_SIDED = {
 };
 
 // Each pair's count of cases both sides run (H1), pinned on 2026-11-14 after
-// ruling A1 and H5 changed the launch pair; a case added on both sides
-// raises the number here in the same change.
-export const BOTH_SIDED = { official: 17, path: 27, journey: 17, launch: 28 };
+// ruling A1 and H5 changed the launch pair, and raised the same day by the
+// eight launch cases of the owner's O5 answer (28 to 36); a case added on
+// both sides raises the number here in the same change.
+export const BOTH_SIDED = { official: 17, path: 27, journey: 17, launch: 36 };
 
 const UUID_LOWER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // The resolver's reading of a launch parameter: trimmed, an empty one absent.

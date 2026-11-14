@@ -44,6 +44,18 @@
  *      to the chooser, and with none an upcoming direct assignment goes to
  *      the `upcoming` redirect, else `not_enrolled`.
  *
+ * Inactive content (the owner's O5 answer of 2026-11-14): a course, path or
+ * journey program made inactive is closed to every learner, completed or in
+ * progress. An inactive course refuses every launch of it in every product
+ * (3, before any product row); an inactive path every `?lp=` launch (4); an
+ * inactive program every `?journey=` launch, a completed enrolment's review
+ * and a resume included (5, before resume, review and open). Review and
+ * revision visits are launches too, so none is admitted. launch_context
+ * names no holder for an inactive course, path or program, and its facts
+ * flip back when the content is made active again: the saved attempts,
+ * credits and step facts are never touched, so the same launch is admitted
+ * again from them under the rules then in force.
+ *
  * The refusal reasons are names for tests and logs; the page keeps today's
  * redirects and notices. Ids in a decision are lower case.
  *
@@ -244,7 +256,8 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
   if (facts === null) throw new TypeError("resolveLaunchContext: launch_context's facts are required past the conflict row");
   if (facts.v !== 1) throw new TypeError("resolveLaunchContext: an unknown launch_context answer version");
 
-  // 3. Membership and the course.
+  // 3. Membership and the course. An inactive course is refused here, before
+  //    any product row, so no product reviews, resumes or opens it (O5).
   if (!facts.member.active) return refused("not_member");
   const course = facts.course;
   if (!course.found || !course.is_active) return refused("course_unavailable");
@@ -254,6 +267,8 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
     if (!UUID.test(lp)) return refused("path_unavailable");
     const pathId = lp.toLowerCase();
     const p = facts.path;
+    // An inactive path refuses every launch, a done step's review and an
+    // open step's resume included (the owner's O5 answer).
     if (!p || !p.found || !p.is_active) return refused("path_unavailable");
     let selfEnrol: null | "path" = null;
     if (!p.enrolled) {
@@ -277,6 +292,8 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
     const j = facts.journey;
     if (!j || !j.found) return refused("journey_unavailable");
     if (j.status !== "active" && j.status !== "completed") return refused("journey_unavailable");
+    // An inactive program refuses every launch, a completed enrolment's
+    // review and a resume included (step 22; the owner's O5 answer).
     if (!j.program_is_active) return refused("journey_unavailable");
 
     // The day: by its id, or an old link's number the call resolved.

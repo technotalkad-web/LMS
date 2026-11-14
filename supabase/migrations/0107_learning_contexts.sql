@@ -6529,7 +6529,12 @@ grant execute on function public.journey_auto_enroll() to service_role;
 --                 2026-11-14: a journey whose program is inactive is never a
 --                 holder, as the paths arm keeps active paths only, so a
 --                 launch with no product parameter never redirects into a
---                 journey the journey row then refuses)
+--                 journey the journey row then refuses). Both arrays are
+--                 empty when p_course is not found in p_org or is inactive
+--                 (the owner's O5 answer of 2026-11-14: an inactive course,
+--                 path or journey is closed to every learner, completed or
+--                 in progress, so no holder ever names one; the attempts,
+--                 credits and step facts stay as they are)
 --   run           null, reserved for phase P
 -- found: false carries no other key. Arrays are always present.
 create or replace function public.launch_context(
@@ -6560,6 +6565,7 @@ declare
   v_day_no    integer;
   v_day_crs   uuid;
   v_removed   boolean := false;
+  v_course_on boolean := false;
   j_member    jsonb;
   j_course    jsonb;
   j_path      jsonb;
@@ -6578,6 +6584,8 @@ begin
   if not found then
     j_course := jsonb_build_object('found', false);
   else
+    -- kept here: the selects below overwrite found
+    v_course_on := v_course.is_active is true;
     j_course := jsonb_build_object(
       'found', true,
       'is_active', v_course.is_active,
@@ -6736,14 +6744,16 @@ begin
     end if;
   end if;
 
-  -- holders: the paths and journey days in which the learner holds the course
+  -- holders: the paths and journey days in which the learner holds the
+  -- course; none for a course not found or inactive (the owner's O5 answer)
   j_holders := jsonb_build_object(
     'paths', coalesce((
       select jsonb_agg(jsonb_build_object('path_id', lpc.path_id, 'step_number', lpc.step_number)
                        order by lpc.path_id)
         from public.learning_path_courses lpc
         join public.learning_paths lp on lp.id = lpc.path_id
-       where lpc.course_id = p_course
+       where v_course_on
+         and lpc.course_id = p_course
          and lp.organization_id = p_org
          and lp.is_active
          and exists (select 1 from public.v_path_enrollments_expanded pe
@@ -6771,7 +6781,8 @@ begin
                 from jsonb_array_elements(
                        case when jsonb_typeof(jv.days) = 'array' then jv.days else '[]'::jsonb end) as d(e)
             ) x
-           where en.user_id = p_user
+           where v_course_on
+             and en.user_id = p_user
              and en.organization_id = p_org
              and en.status = 'active'
              and jp.is_active

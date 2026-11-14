@@ -49,6 +49,22 @@
 --        journey rows and this month's results never count
 --   (47) 6o, journey_auto_enroll: a new member reached by an auto-enrol
 --        journey is enrolled with source audience
+-- and, last, the launch_context half of the owner's O5 answer of 2026-11-14
+-- (an inactive course, path or journey is closed to every learner,
+-- completed or in progress; the records stay; reactivation restores access
+-- from the saved progress):
+--   (48) on fixtures of its own, a learner who completed a course in the
+--        Individual product, as a path step (its fact written by the writer)
+--        and as a credited journey day, and has a second course open on the
+--        path and on the journey: the course, the path and the program are
+--        made inactive in turn; each time the facts say so, no holder names
+--        the inactive course, path or program, and the learner's attempts,
+--        credits, step facts and the path and journey rows read from them
+--        are unchanged; made active again, every launch_context answer
+--        equals the one read before, key for key, and the rows are still
+--        unchanged. The resolver's refusals on such facts are
+--        tests/unit/launch-context.test.ts (h) and the O5 cases of
+--        fixtures/parity-launch.cases.json
 
 begin;
 
@@ -912,6 +928,265 @@ begin
    where e.user_id = '00000000-0000-0000-0000-000107192004';
   if got is distinct from 'audience 2221 active' then
     raise exception 'assert-0107: (47) the audience enrolment reads %', coalesce(got, 'nothing');
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (48) the owner's O5 answer of 2026-11-14, the launch_context half: in Org
+--      A, learner L48 completed K48 in the Individual product, as step 1 of
+--      the strict path P48 and as day 1 of the journey E48 (credited), and
+--      has K49 open as step 2 of P48 and as day 2 of E48. K48, P48 and E48's
+--      program are made inactive in turn, then active again
+-- ---------------------------------------------------------------------------
+insert into auth.users (id, email) values ('00000000-0000-0000-0000-000107193001', 'launch-l48-0107@example.test');
+insert into public.organization_members (organization_id, user_id, role) values
+  ('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107193001', 'user');
+insert into public.courses (id, organization_id, title, slug, is_active, visibility) values
+  ('00000000-0000-0000-0000-000107193011', '00000000-0000-0000-0000-00000000000a', 'K48 (0107 O5)', 'k48-0107-o5', true, 'private'),
+  ('00000000-0000-0000-0000-000107193021', '00000000-0000-0000-0000-00000000000a', 'K49 (0107 O5)', 'k49-0107-o5', true, 'private');
+insert into public.course_packages (id, course_id, language, is_active) values
+  ('00000000-0000-0000-0000-000107193012', '00000000-0000-0000-0000-000107193011', null, true),
+  ('00000000-0000-0000-0000-000107193022', '00000000-0000-0000-0000-000107193021', null, true);
+insert into public.course_versions (id, course_id, package_id, version_number, manifest_type, launch_url, storage_prefix,
+                                    manifest_data) values
+  ('00000000-0000-0000-0000-000107193013', '00000000-0000-0000-0000-000107193011', '00000000-0000-0000-0000-000107193012',
+   1, 'scorm12', 'index.html', 'courses/k48-0107-o5/v1/', '{"title":"0107 O5"}'),
+  ('00000000-0000-0000-0000-000107193023', '00000000-0000-0000-0000-000107193021', '00000000-0000-0000-0000-000107193022',
+   1, 'scorm12', 'index.html', 'courses/k49-0107-o5/v1/', '{"title":"0107 O5"}');
+update public.course_packages set current_version_id = '00000000-0000-0000-0000-000107193013'
+ where id = '00000000-0000-0000-0000-000107193012';
+update public.course_packages set current_version_id = '00000000-0000-0000-0000-000107193023'
+ where id = '00000000-0000-0000-0000-000107193022';
+update public.courses set current_version_id = '00000000-0000-0000-0000-000107193013'
+ where id = '00000000-0000-0000-0000-000107193011';
+update public.courses set current_version_id = '00000000-0000-0000-0000-000107193023'
+ where id = '00000000-0000-0000-0000-000107193021';
+insert into public.course_assignments (id, course_id, organization_id, assignee_type, user_id, assigned_by, release_at) values
+  ('00000000-0000-0000-0000-000107193061', '00000000-0000-0000-0000-000107193011', '00000000-0000-0000-0000-00000000000a',
+   'user', '00000000-0000-0000-0000-000107193001', '00000000-0000-0000-0000-0000000000a2', null);
+insert into public.learning_paths (id, organization_id, name, slug, is_active, visibility, sequence_mode) values
+  ('00000000-0000-0000-0000-000107193031', '00000000-0000-0000-0000-00000000000a', 'P48 (0107 O5)', 'p48-0107-o5', true, 'private', 'strict');
+insert into public.learning_path_courses (path_id, course_id, step_number) values
+  ('00000000-0000-0000-0000-000107193031', '00000000-0000-0000-0000-000107193011', 1),
+  ('00000000-0000-0000-0000-000107193031', '00000000-0000-0000-0000-000107193021', 2);
+insert into public.learning_path_assignments (id, path_id, organization_id, assignee_type, user_id, assigned_by) values
+  ('00000000-0000-0000-0000-000107193032', '00000000-0000-0000-0000-000107193031', '00000000-0000-0000-0000-00000000000a',
+   'user', '00000000-0000-0000-0000-000107193001', '00000000-0000-0000-0000-0000000000a2');
+insert into public.journey_programs (id, organization_id, name, days_total) values
+  ('00000000-0000-0000-0000-000107193041', '00000000-0000-0000-0000-00000000000a', 'J48 (0107 O5)', 2);
+insert into public.journey_days (id, program_id, organization_id, day_number, course_id) values
+  ('00000000-0000-0000-0000-000107193042', '00000000-0000-0000-0000-000107193041', '00000000-0000-0000-0000-00000000000a', 1, '00000000-0000-0000-0000-000107193011'),
+  ('00000000-0000-0000-0000-000107193043', '00000000-0000-0000-0000-000107193041', '00000000-0000-0000-0000-00000000000a', 2, '00000000-0000-0000-0000-000107193021');
+insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, count_sundays,
+                                     completion_title, days, unlock_mode) values
+  ('00000000-0000-0000-0000-000107193044', '00000000-0000-0000-0000-000107193041', '00000000-0000-0000-0000-00000000000a',
+   1, 'J48 (0107 O5)', 2, true, 'Yoddha',
+   '[{"day": 1, "course_id": "00000000-0000-0000-0000-000107193011"},
+     {"day": 2, "course_id": "00000000-0000-0000-0000-000107193021"}]', 'progress');
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status) values
+  ('00000000-0000-0000-0000-000107193045', '00000000-0000-0000-0000-000107193041', '00000000-0000-0000-0000-000107193044',
+   '00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-000107193001', '2000-01-03', 'active');
+insert into public.course_attempts (id, course_version_id, user_id, organization_id, status, completion_status,
+                                    success_status, score, started_at, completed_at, context_kind, learning_path_id,
+                                    journey_enrollment_id, journey_day, journey_day_id, journey_version_id, launch_mode)
+values
+  -- K48: Individual, completed
+  ('00000000-0000-0000-0000-000107193051', '00000000-0000-0000-0000-000107193013', '00000000-0000-0000-0000-000107193001',
+   '00000000-0000-0000-0000-00000000000a', 'completed', 'completed', 'unknown', 0.8, '2000-02-01 09:00+00', '2000-02-01 09:30+00',
+   'individual', null, null, null, null, null, 'Normal'),
+  -- K48: step 1 of P48, completed; K49: step 2, open
+  ('00000000-0000-0000-0000-000107193052', '00000000-0000-0000-0000-000107193013', '00000000-0000-0000-0000-000107193001',
+   '00000000-0000-0000-0000-00000000000a', 'completed', 'completed', 'unknown', 0.8, '2000-02-02 09:00+00', '2000-02-02 09:30+00',
+   'path', '00000000-0000-0000-0000-000107193031', null, null, null, null, 'Normal'),
+  ('00000000-0000-0000-0000-000107193053', '00000000-0000-0000-0000-000107193023', '00000000-0000-0000-0000-000107193001',
+   '00000000-0000-0000-0000-00000000000a', 'in_progress', 'in_progress', 'unknown', null, '2000-02-03 09:00+00', null,
+   'path', '00000000-0000-0000-0000-000107193031', null, null, null, null, 'Normal'),
+  -- K48: day 1 of E48, completed (credited below); K49: day 2, open
+  ('00000000-0000-0000-0000-000107193054', '00000000-0000-0000-0000-000107193013', '00000000-0000-0000-0000-000107193001',
+   '00000000-0000-0000-0000-00000000000a', 'completed', 'completed', 'unknown', 0.8, '2000-02-04 09:00+00', '2000-02-04 09:30+00',
+   'journey', null, '00000000-0000-0000-0000-000107193045', 1, '00000000-0000-0000-0000-000107193042',
+   '00000000-0000-0000-0000-000107193044', 'Normal'),
+  ('00000000-0000-0000-0000-000107193055', '00000000-0000-0000-0000-000107193023', '00000000-0000-0000-0000-000107193001',
+   '00000000-0000-0000-0000-00000000000a', 'in_progress', 'in_progress', 'unknown', null, '2000-02-05 09:00+00', null,
+   'journey', null, '00000000-0000-0000-0000-000107193045', 2, '00000000-0000-0000-0000-000107193043',
+   '00000000-0000-0000-0000-000107193044', 'Normal');
+insert into public.journey_day_progress (id, enrollment_id, organization_id, user_id, day_number, day_id, course_id,
+                                         attempt_id, completed_at, credit_kind) values
+  ('00000000-0000-0000-0000-000107193071', '00000000-0000-0000-0000-000107193045', '00000000-0000-0000-0000-00000000000a',
+   '00000000-0000-0000-0000-000107193001', 1, '00000000-0000-0000-0000-000107193042', '00000000-0000-0000-0000-000107193011',
+   '00000000-0000-0000-0000-000107193054', '2000-02-04 10:00+00', 'attempt');
+
+-- The learner's stored records and the rows read from them, as one text
+-- (compared by its hash; a difference names the stage).
+create function pg_temp.o5_rows() returns text language sql stable as $$
+  select md5(concat_ws(' | ',
+    (select jsonb_agg(to_jsonb(a) order by a.id)::text from public.course_attempts a
+      where a.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(p) order by p.id)::text from public.journey_day_progress p
+      where p.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(f) order by f.course_id)::text from public.learning_path_step_completions f
+      where f.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(c) order by c.path_id)::text from public.learning_path_completions c
+      where c.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(e) order by e.id)::text from public.journey_enrollments e
+      where e.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(s) order by s.course_id)::text from public.v_path_step_status s
+      where s.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(g) order by g.path_id)::text from public.v_path_progress g
+      where g.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(v) order by v.course_id, v.context_key)::text from public.v_context_attempt_summary v
+      where v.user_id = '00000000-0000-0000-0000-000107193001'),
+    (select jsonb_agg(to_jsonb(cs))::text from public.journey_credit_state(array['00000000-0000-0000-0000-000107193045'::uuid]) cs)))
+$$;
+
+do $$
+declare
+  bad   text[] := '{}';
+  org   constant uuid := '00000000-0000-0000-0000-00000000000a';
+  l48   constant uuid := pg_temp.u('000107193001');
+  k48   constant uuid := pg_temp.u('000107193011');
+  k49   constant uuid := pg_temp.u('000107193021');
+  p48   constant uuid := pg_temp.u('000107193031');
+  jp48  constant uuid := pg_temp.u('000107193041');
+  d1    constant uuid := pg_temp.u('000107193042');
+  d2    constant uuid := pg_temp.u('000107193043');
+  e48   constant uuid := pg_temp.u('000107193045');
+  rows0 text;
+  -- the five launches, read before: K48 with no product parameter, in P48,
+  -- on day 1 of E48; K49 in P48 and on day 2 of E48
+  i0 jsonb; p0 jsonb; j0 jsonb; q0 jsonb; n0 jsonb;
+  j  jsonb;
+  st text;
+begin
+  perform public.record_learning_activity(pg_temp.u('000107193052'));
+  if not exists (select 1 from public.learning_path_step_completions f
+                  where f.path_id = p48 and f.user_id = l48 and f.course_id = k48) then
+    bad := bad || 'the writer recorded no fact for L48''s step 1'::text;
+  end if;
+  rows0 := pg_temp.o5_rows();
+  i0 := pg_temp.lc(l48, org, k48, null, null, null, null);
+  p0 := pg_temp.lc(l48, org, k48, p48, null, null, null);
+  j0 := pg_temp.lc(l48, org, k48, null, e48, d1, null);
+  q0 := pg_temp.lc(l48, org, k49, p48, null, null, null);
+  n0 := pg_temp.lc(l48, org, k49, null, e48, d2, null);
+  -- what access rests on before: the Individual enrolment, the holders, the
+  -- done step 1, the credit of day 1, the open attempts
+  if i0 -> 'course' <> '{"found": true, "is_active": true, "visibility": "private", "individual": {"enrolled": true, "upcoming_at": null}}'::jsonb
+     or i0 -> 'holders' <> jsonb_build_object(
+          'paths', jsonb_build_array(jsonb_build_object('path_id', p48, 'step_number', 1)),
+          'journey_days', jsonb_build_array(jsonb_build_object('enrollment_id', e48, 'day_id', d1, 'day_number', 1, 'credited', true)))
+     or p0 -> 'path' ->> 'is_active' <> 'true'
+     or (select string_agg(s ->> 'done', ',' order by (s ->> 'step_number')::int)
+           from jsonb_array_elements(p0 -> 'path' -> 'steps') s) is distinct from 'true,false'
+     or j0 -> 'journey' ->> 'program_is_active' <> 'true'
+     or j0 -> 'journey' -> 'day_credit' <> jsonb_build_object('course_id', k48, 'attempt_id', pg_temp.u('000107193054'),
+                                                              'credit_kind', 'attempt', 'day_number', 1)
+     or n0 -> 'journey' -> 'day_open_attempt' <> jsonb_build_object('attempt_id', pg_temp.u('000107193055'), 'course_id', k49)
+     or q0 -> 'path' ->> 'course_step' <> '2' then
+    bad := bad || format('before: %s / %s / %s / %s', i0, p0 -> 'path', j0 -> 'journey', n0 -> 'journey' -> 'day_open_attempt');
+  end if;
+
+  -- K48 inactive: every launch of it says so, in every product; no holder
+  update public.courses set is_active = false where id = k48;
+  st := 'K48 inactive';
+  foreach j in array array[pg_temp.lc(l48, org, k48, null, null, null, null), pg_temp.lc(l48, org, k48, p48, null, null, null),
+                           pg_temp.lc(l48, org, k48, null, e48, d1, null)] loop
+    if j -> 'course' ->> 'is_active' <> 'false' or j -> 'holders' <> '{"paths": [], "journey_days": []}'::jsonb then
+      bad := bad || format('%s: %s', st, j);
+    end if;
+  end loop;
+  -- the path and journey facts are as before (the course alone closes it)
+  if pg_temp.lc(l48, org, k48, p48, null, null, null) -> 'path' <> p0 -> 'path'
+     or pg_temp.lc(l48, org, k48, null, e48, d1, null) -> 'journey' <> j0 -> 'journey' then
+    bad := bad || format('%s: the path or journey facts moved', st);
+  end if;
+  -- K49 is not touched
+  if pg_temp.lc(l48, org, k49, p48, null, null, null) <> q0 then
+    bad := bad || format('%s: K49''s facts moved', st);
+  end if;
+  if pg_temp.o5_rows() <> rows0 then
+    bad := bad || format('%s: the stored records or the rows read from them changed', st);
+  end if;
+  update public.courses set is_active = true where id = k48;
+
+  -- P48 inactive: its launches say so; it is no holder of K48 or K49; the
+  -- steps read as before
+  update public.learning_paths set is_active = false where id = p48;
+  st := 'P48 inactive';
+  j := pg_temp.lc(l48, org, k48, p48, null, null, null);
+  if j -> 'path' <> jsonb_set(p0 -> 'path', '{is_active}', 'false') or j -> 'course' <> p0 -> 'course' then
+    bad := bad || format('%s, step 1: %s', st, j -> 'path');
+  end if;
+  j := pg_temp.lc(l48, org, k49, p48, null, null, null);
+  if j -> 'path' <> jsonb_set(q0 -> 'path', '{is_active}', 'false') then
+    bad := bad || format('%s, step 2: %s', st, j -> 'path');
+  end if;
+  if pg_temp.lc(l48, org, k48, null, null, null, null) -> 'holders' -> 'paths' <> '[]'::jsonb
+     or j -> 'holders' -> 'paths' <> '[]'::jsonb then
+    bad := bad || format('%s: still a holder', st);
+  end if;
+  if pg_temp.o5_rows() <> rows0 then
+    bad := bad || format('%s: the stored records or the rows read from them changed', st);
+  end if;
+  update public.learning_paths set is_active = true where id = p48;
+
+  -- E48's program inactive: its launches say so, the credit of day 1 and
+  -- the open attempt of day 2 read as before; it is no holder
+  update public.journey_programs set is_active = false where id = jp48;
+  st := 'J48 inactive';
+  j := pg_temp.lc(l48, org, k48, null, e48, d1, null);
+  if j -> 'journey' <> jsonb_set(j0 -> 'journey', '{program_is_active}', 'false') then
+    bad := bad || format('%s, day 1: %s', st, j -> 'journey');
+  end if;
+  j := pg_temp.lc(l48, org, k49, null, e48, d2, null);
+  if j -> 'journey' <> jsonb_set(n0 -> 'journey', '{program_is_active}', 'false') then
+    bad := bad || format('%s, day 2: %s', st, j -> 'journey');
+  end if;
+  if pg_temp.lc(l48, org, k48, null, null, null, null) -> 'holders' -> 'journey_days' <> '[]'::jsonb
+     or j -> 'holders' -> 'journey_days' <> '[]'::jsonb then
+    bad := bad || format('%s: still a holder', st);
+  end if;
+  if pg_temp.o5_rows() <> rows0 then
+    bad := bad || format('%s: the stored records or the rows read from them changed', st);
+  end if;
+  update public.journey_programs set is_active = true where id = jp48;
+
+  -- all three inactive at once, then all three active again
+  update public.courses set is_active = false where id = k48;
+  update public.learning_paths set is_active = false where id = p48;
+  update public.journey_programs set is_active = false where id = jp48;
+  if pg_temp.o5_rows() <> rows0 then
+    bad := bad || 'all three inactive: the stored records or the rows read from them changed'::text;
+  end if;
+  update public.courses set is_active = true where id = k48;
+  update public.learning_paths set is_active = true where id = p48;
+  update public.journey_programs set is_active = true where id = jp48;
+
+  -- reactivated: every answer equals the one read before, and the records
+  -- are unchanged (access comes back from the saved progress)
+  st := 'reactivated';
+  if pg_temp.lc(l48, org, k48, null, null, null, null) <> i0 then
+    bad := bad || format('%s, K48 with no product parameter: %s', st, pg_temp.lc(l48, org, k48, null, null, null, null));
+  end if;
+  if pg_temp.lc(l48, org, k48, p48, null, null, null) <> p0 then
+    bad := bad || format('%s, K48 in P48: %s', st, pg_temp.lc(l48, org, k48, p48, null, null, null));
+  end if;
+  if pg_temp.lc(l48, org, k48, null, e48, d1, null) <> j0 then
+    bad := bad || format('%s, K48 on day 1: %s', st, pg_temp.lc(l48, org, k48, null, e48, d1, null));
+  end if;
+  if pg_temp.lc(l48, org, k49, p48, null, null, null) <> q0 then
+    bad := bad || format('%s, K49 in P48: %s', st, pg_temp.lc(l48, org, k49, p48, null, null, null));
+  end if;
+  if pg_temp.lc(l48, org, k49, null, e48, d2, null) <> n0 then
+    bad := bad || format('%s, K49 on day 2: %s', st, pg_temp.lc(l48, org, k49, null, e48, d2, null));
+  end if;
+  if pg_temp.o5_rows() <> rows0 then
+    bad := bad || format('%s: the stored records or the rows read from them changed', st);
+  end if;
+
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107: (48) %', array_to_string(bad, '; ');
   end if;
 end
 $$;

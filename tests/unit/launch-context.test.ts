@@ -19,7 +19,13 @@
  *   (f) no product parameter: the Individual row, the self-enrol branch for
  *       an "Everyone" course, and the redirect row (one holder, several,
  *       none with an upcoming assignment, none);
- *   (g) todayStrAt and journeyOpenDayIsOpen.
+ *   (g) todayStrAt and journeyOpenDayIsOpen;
+ *   (h) the owner's O5 answer of 2026-11-14: an inactive course, path or
+ *       program refuses the completed learner's review and the in-progress
+ *       learner's resume or launch, in every product; made active again,
+ *       the same facts (the saved progress, untouched) give the same launch
+ *       as before. assert-0107-launch.sql (48) shows launch_context's facts
+ *       flipping back with the stored rows unchanged.
  *
  * The preview row (phase 2) and the test-run row (phase P) add their cases
  * here when they are built.
@@ -279,6 +285,74 @@ console.log("\n(g) todayStrAt and journeyOpenDayIsOpen");
   eq("…with Sundays counted, day 8 is", journeyOpenDayIsOpen({ ...base, next_day: 8, count_sundays: true }, NOW), true);
   eq("…capped at days_total", journeyOpenDayIsOpen({ ...base, days_total: 5, next_day: 6 }, NOW), false);
   eq("no next day: never open", journeyOpenDayIsOpen({ ...base, next_day: null }, NOW), false);
+}
+
+console.log("\n(h) O5: inactive content is closed to every learner; reactivation restores access from the saved progress");
+{
+  const credit = { course_id: COURSE, attempt_id: ATT, credit_kind: "attempt", day_number: 4 };
+  const course = (is_active: boolean, enrolled = true) =>
+    ({ found: true as const, is_active, visibility: "private", individual: { enrolled, upcoming_at: null } });
+  const doneStep = { course_step: 1, steps: [{ course_id: COURSE, step_number: 1, release_at: null, done: true }] };
+  // Each launch: what, its params, the facts while the content is active,
+  // the same facts with the content inactive, and the refusal. The facts
+  // carry no Individual attempt (the course row refuses before the attempts
+  // are read), so a completed and an in-progress Individual learner meet the
+  // same refusal.
+  const launches: Array<[string, Partial<LaunchParams>, LaunchContextFacts, LaunchContextFacts, string]> = [
+    ["an Individual course the learner completed: the revision visit", {},
+      facts({ course: course(true) }), facts({ course: course(false) }), "course_unavailable"],
+    ["…an \"Everyone\" course: no self-enrolment", {},
+      facts({ course: { ...course(true, false), visibility: "org_public" } }),
+      facts({ course: { ...course(false, false), visibility: "org_public" } }), "course_unavailable"],
+    ["a done path step, its course inactive: the review in the path", { lp: PATH },
+      facts({ course: course(true, false), path: pathFacts(doneStep) }),
+      facts({ course: course(false, false), path: pathFacts(doneStep) }), "course_unavailable"],
+    ["a done path step, the path inactive: the review", { lp: PATH },
+      facts({ path: pathFacts(doneStep) }), facts({ path: pathFacts({ ...doneStep, is_active: false }) }), "path_unavailable"],
+    ["…the path's open step, the path inactive: the resume", { lp: PATH },
+      facts({ path: pathFacts() }), facts({ path: pathFacts({ is_active: false }) }), "path_unavailable"],
+    ["…an \"Everyone\" path, the path inactive: no self-enrolment", { lp: PATH },
+      facts({ path: pathFacts({ enrolled: false, visibility: "org_public" }) }),
+      facts({ path: pathFacts({ enrolled: false, visibility: "org_public", is_active: false }) }), "path_unavailable"],
+    ["a credited day, its course inactive: the review in the journey", { journey: ENR, day: DAY4 },
+      facts({ course: course(true, false), journey: journeyFacts({ day_credit: credit, next_day: 5, next_day_id: DAY9 }) }),
+      facts({ course: course(false, false), journey: journeyFacts({ day_credit: credit, next_day: 5, next_day_id: DAY9 }) }), "course_unavailable"],
+    ["a completed enrolment's credited day, the program inactive: the review", { journey: ENR, day: DAY4 },
+      facts({ journey: journeyFacts({ status: "completed", day_credit: credit, next_day: null, next_day_id: null }) }),
+      facts({ journey: journeyFacts({ status: "completed", program_is_active: false, day_credit: credit, next_day: null, next_day_id: null }) }),
+      "journey_unavailable"],
+    ["…a completed enrolment's attempt open when a publish completed it, the program inactive: the resume", { journey: ENR, day: DAY4 },
+      facts({ journey: journeyFacts({ status: "completed", day_open_attempt: { attempt_id: ATT, course_id: COURSE }, next_day: null, next_day_id: null }) }),
+      facts({ journey: journeyFacts({ status: "completed", program_is_active: false, day_open_attempt: { attempt_id: ATT, course_id: COURSE }, next_day: null, next_day_id: null }) }),
+      "journey_unavailable"],
+    ["…an active enrolment's open attempt, the program inactive: the resume", { journey: ENR, day: DAY4 },
+      facts({ journey: journeyFacts({ day_open_attempt: { attempt_id: ATT, course_id: COURSE }, resumable_day_ids: [DAY4] }) }),
+      facts({ journey: journeyFacts({ program_is_active: false, day_open_attempt: { attempt_id: ATT, course_id: COURSE }, resumable_day_ids: [DAY4] }) }),
+      "journey_unavailable"],
+    ["…an active enrolment's open day, the program inactive: the launch", { journey: ENR, day: DAY4 },
+      facts({ journey: journeyFacts() }), facts({ journey: journeyFacts({ program_is_active: false }) }), "journey_unavailable"],
+  ];
+  for (const [what, p, active, inactive, reason] of launches) {
+    const before = resolve(p, active);
+    eq(`${what}: admitted while active`, before.kind, "launch");
+    eq(`${what}: refused while inactive`, resolve(p, inactive), refused(reason));
+    // made active again: launch_context answers the facts it answered before
+    // (assert-0107-launch.sql (48)), so the launch is the same one
+    eq(`${what}: the same launch once active again`, resolve(p, JSON.parse(JSON.stringify(active)) as LaunchContextFacts), before);
+  }
+  eq("the admissions while active, in order",
+    launches.map(([, p, active]) => {
+      const d = resolve(p, active);
+      if (d.kind !== "launch") return d.kind;
+      return d.context.kind === "journey" ? d.context.admission : d.context.kind + (d.selfEnrol ? " (self-enrolled)" : "");
+    }),
+    ["individual", "individual (self-enrolled)", "path", "path", "path", "path (self-enrolled)", "review", "review", "resume", "resume", "open"]);
+  // launch_context names no holder for an inactive course, path or program
+  // (0107 6p; ruling A1 and the O5 answer); were one there, an inactive
+  // course is still refused before any holder is read.
+  eq("no product parameter, an inactive course with holders in the facts: refused before any holder is read",
+    resolve({}, facts({ course: course(false, false), holders: { paths: [{ path_id: PATH, step_number: 1 }], journey_days: [{ enrollment_id: ENR, day_id: DAY4, day_number: 4, credited: true }] } })),
+    refused("course_unavailable"));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
