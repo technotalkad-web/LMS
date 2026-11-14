@@ -30,7 +30,7 @@ import { test, expect, type APIRequestContext, type BrowserContext, type Page } 
 import { createHash, randomUUID } from "node:crypto";
 import JSZip from "jszip";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { authedContext } from "./helpers";
+import { authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { directUpload, uploadNew } from "./p0-helpers";
 import { engineDigest } from "../../../lib/alds/rules/engine-digest";
 import { D1_SENTENCE } from "../../../lib/alds/tier";
@@ -470,7 +470,7 @@ test.describe.serial("ADR 0022 G item 18: the Package Guardian's write path with
 
   test("8. the certify route: 403 admin, 400 reasons, 200 super owner (new run row, audit row), 409 no_manifest", async () => {
     const certify = (req: APIRequestContext, courseId: string, packageId: string, versionId: string, reason: string) =>
-      req.post(`/api/courses/${courseId}/packages/${packageId}/versions/${versionId}/certify`, { data: { orgSlug: slug(), reason } });
+      req.post(`/api/courses/${courseId}/packages/${packageId}/versions/${versionId}/certify`, { data: { orgSlug: slug(), reason }, timeout: GUARDIAN_ROUTE_TIMEOUT_MS });
     const before = (await runsOf(s.a2!)).map((r) => r.id);
 
     const asAdmin = await certify(s.adminCtx!.request, s.courseA!, s.pkgA!, s.a2!, RERUN_REASON);

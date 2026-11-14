@@ -11,7 +11,7 @@ import { test, expect } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { authedContext, uploadCourse } from "./helpers";
+import { authedContext, uploadCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 const zipBuf = () => fs.readFileSync(path.join(FIXTURES, "scorm12.zip"));
@@ -44,6 +44,7 @@ test("admin replaces a package's content → new current version, prefixes packa
       display_name: "Hindi",
       file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
     },
+    timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
   });
   expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
   const hiPkgId = (await addHi.json()).package_id as string;
@@ -62,6 +63,7 @@ test("admin replaces a package's content → new current version, prefixes packa
         orgSlug: org.slug,
         file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     }
   );
   expect(replace.ok(), `replace → ${replace.status()}: ${await replace.text()}`).toBeTruthy();

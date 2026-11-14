@@ -4,7 +4,7 @@
 # ADR 0022 G item 18).
 # Builds THIS checkout, starts it on a local port against
 # the STAGING Supabase project, runs the ALDS lifecycle subset against it and
-# prints counts and failing-test locations only. Run by
+# prints counts and failing-test locations and durations only. Run by
 # .github/workflows/lifecycle-nightly.yml; the same command reproduces a
 # nightly run on a laptop (Git Bash or Linux):
 #
@@ -27,9 +27,10 @@
 # the Playwright output and its JSON report stay in LIFECYCLE_OUT; they are
 # never uploaded. Spec failure messages embed response bodies and test
 # emails, so the Playwright output is never printed: only the counts and,
-# for each failing test, its title path and the file:line:column of its
-# first error (scripts/lifecycle-summary.mjs; ADR 0007 decision 2, note of
-# 2026-10-19) and the cleanup's count line reach stdout.
+# for each failing test, its title path, the file:line:column of its
+# first error and how long it ran (scripts/lifecycle-summary.mjs; ADR 0007
+# decision 2, notes of 2026-10-19 and 2026-11-14) and the cleanup's count
+# line reach stdout.
 # A build or server-start failure prints at most 40 matching lines of its
 # log with emails and tokens masked (compiler and Node errors name files of
 # this public repository, not data). Reproduce a failure locally with this

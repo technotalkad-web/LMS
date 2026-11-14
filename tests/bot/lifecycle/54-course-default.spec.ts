@@ -20,7 +20,7 @@
  */
 import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext } from "./helpers";
+import { assignCourse, authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { directUpload, scormZip, uploadNew, zipFile } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
@@ -157,6 +157,7 @@ test.describe.serial("ADR 0008 B — explicit course default", () => {
   test("add a language → the default is unchanged", async ({ request }) => {
     const addHi = await areq().post(`/api/courses/${s.courseA}/packages`, {
       multipart: { orgSlug: slug(), language: "hi", display_name: "Hindi", file: zipFile("default-a-hi1.zip", await zipA("A-HI-V1")) },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
     const j = await addHi.json();
@@ -169,6 +170,7 @@ test.describe.serial("ADR 0008 B — explicit course default", () => {
   test("replace in the default slot → follows (multipart, then direct finalize)", async ({ request }) => {
     const rep = await areq().post(`/api/courses/${s.courseA}/packages/${s.enPkg}/versions`, {
       multipart: { orgSlug: slug(), mode: "grandfather", file: zipFile("default-a-en2.zip", await zipA("A-EN-V2")) },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(rep.ok(), `replace en → ${rep.status()}: ${await rep.text()}`).toBeTruthy();
     s.enV2 = (await rep.json()).version_id as string;

@@ -10,6 +10,7 @@ import path from "node:path";
 import JSZip from "jszip";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { svc } from "../../e2e/helpers/supabase";
+import { GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 export const FIXTURES = path.resolve(__dirname, "../fixtures");
 export const XAPI_HEADERS = { "Content-Type": "application/json", "X-Experience-API-Version": "1.0.3" };
@@ -151,7 +152,7 @@ export const zipFile = (name: string, buffer: Buffer) => ({ name, mimeType: "app
 
 /** Multipart upload of a new course; returns the raw response. */
 export async function uploadNew(req: APIRequestContext, orgSlug: string, name: string, buffer: Buffer, extra: Record<string, string> = {}) {
-  return req.post("/api/courses/upload", { multipart: { orgSlug, ...extra, file: zipFile(name, buffer) } });
+  return req.post("/api/courses/upload", { multipart: { orgSlug, ...extra, file: zipFile(name, buffer) }, timeout: GUARDIAN_ROUTE_TIMEOUT_MS });
 }
 
 /**
@@ -231,6 +232,7 @@ export async function directUpload(
   }
   const fin = await req.post("/api/courses/upload/finalize", {
     data: { orgSlug: opts.orgSlug, versionId, ...(opts.mode ? { mode: opts.mode } : {}) },
+    timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
   });
   return {
     validate,

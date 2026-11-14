@@ -28,7 +28,7 @@ import fs from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext } from "./helpers";
+import { assignCourse, authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { directUpload, uploadNew, zipFile } from "./p0-helpers";
 // Static imports: the runner's transform does not follow lib/storage's
 // dynamic import() of a .ts module.
@@ -311,7 +311,7 @@ test("direct upload: an unfinished upload never becomes current; abort keeps a f
   const only = signed.uploads.find((u) => u.path === "tincan.xml")!;
   const put = await req.put(only.url, { headers: only.headers, data: await zip.file("tincan.xml")!.async("nodebuffer") });
   expect(put.ok(), `PUT to storage → ${put.status()}`).toBeTruthy();
-  const fin = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId } });
+  const fin = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId }, timeout: GUARDIAN_ROUTE_TIMEOUT_MS });
   expect(fin.status()).toBe(409);
   expect((await fin.json()).retryable).toBe(true);
   expect(await currentVersionId(j.courseId)).toBeNull();
@@ -343,7 +343,7 @@ test("direct upload: an unfinished upload never becomes current; abort keeps a f
   // …but a failed row holds no content, so it is never a collision.
   expect(await verdictElsewhere()).not.toBe("blocked");
   // A failed row is not uploading: no more signing or finalising…
-  const finFailed = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId } });
+  const finFailed = await req.post("/api/courses/upload/finalize", { data: { orgSlug: w.org.slug, versionId: j.versionId }, timeout: GUARDIAN_ROUTE_TIMEOUT_MS });
   expect(finFailed.status()).toBe(409);
   expect((await finFailed.json()).error).toMatch(/failed, not uploading/);
   expect((await req.post("/api/courses/upload/sign", { data: { orgSlug: w.org.slug, versionId: j.versionId, files: [{ path: "tincan.xml" }] } })).status()).toBe(409);

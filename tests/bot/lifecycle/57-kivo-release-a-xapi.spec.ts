@@ -39,6 +39,7 @@ import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext } from "../lib/session";
 import { VERB, XAPI_HEADERS } from "./p0-helpers";
 import { WEBHOOK_HOLD_MINUTES } from "../../../lib/integrations/webhook-hold";
+import { GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const ZIP = process.env.KIVO_RELEASE_A_XAPI_ZIP ?? "";
 const KIT = process.env.KIVO_RELEASE_A_KIT ?? "";
@@ -163,7 +164,7 @@ async function seedWorld(browser: Browser, baseURL: string, zip: string, label: 
   await addMember({ organizationId: org.id, userId: learner.id, role: "member" });
   const zr = zipRecord(zip);
   const actx = await authedContext(browser, baseURL, admin.email, admin.password);
-  const up = await actx.request.post("/api/courses/upload", { multipart: { orgSlug: org.slug, file: { name: path.basename(zip), mimeType: "application/zip", buffer: fs.readFileSync(zip) } }, timeout: 120_000 });
+  const up = await actx.request.post("/api/courses/upload", { multipart: { orgSlug: org.slug, file: { name: path.basename(zip), mimeType: "application/zip", buffer: fs.readFileSync(zip) } }, timeout: GUARDIAN_ROUTE_TIMEOUT_MS });
   const upText = await up.text();
   expect(up.ok(), `upload → ${up.status()}: ${upText.slice(0, 300)}`).toBeTruthy();
   const courseId = JSON.parse(upText).courseId as string;
@@ -288,7 +289,7 @@ test.describe.serial("KIVO Release A xAPI package on the LMS (staging)", () => {
     const ctx = await authedContext(browser, baseURL!, state.admin!.email, state.admin!.password);
     const res = await ctx.request.post("/api/courses/upload", {
       multipart: { orgSlug: state.org!.slug, file: { name: path.basename(ZIP), mimeType: "application/zip", buffer: fs.readFileSync(ZIP) } },
-      timeout: 120_000,
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     const text = await res.text();
     expect(res.ok(), `upload → ${res.status()}: ${text}`).toBeTruthy();
@@ -528,7 +529,7 @@ test.describe.serial("KIVO Release A xAPI: tab closed right after Results (exper
     const learner = await createAuthUser({ profile: { first_name: "Kivo", last_name: "Learner", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: learner.id, role: "member" });
     const actx = await authedContext(browser, baseURL!, admin.email, admin.password);
-    const up = await actx.request.post("/api/courses/upload", { multipart: { orgSlug: org.slug, file: { name: path.basename(ZIP), mimeType: "application/zip", buffer: fs.readFileSync(ZIP) } }, timeout: 120_000 });
+    const up = await actx.request.post("/api/courses/upload", { multipart: { orgSlug: org.slug, file: { name: path.basename(ZIP), mimeType: "application/zip", buffer: fs.readFileSync(ZIP) } }, timeout: GUARDIAN_ROUTE_TIMEOUT_MS });
     expect(up.ok(), `upload → ${up.status()}`).toBeTruthy();
     const courseId = (await up.json()).courseId as string;
     const as = await actx.request.post("/api/assignments", { data: { orgSlug: org.slug, courseId, userIds: [learner.id] } });

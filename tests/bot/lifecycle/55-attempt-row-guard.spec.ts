@@ -78,7 +78,7 @@
 import { test, expect, type BrowserContext } from "@playwright/test";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
-import { assignCourse, authedContext, uploadCourse } from "./helpers";
+import { assignCourse, authedContext, uploadCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { todayStr } from "../../../lib/journey/journey";
 import {
   NEEDS_0099,
@@ -489,6 +489,7 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
         mode: "force_restart",
         file: zipFile("cmi5-v2.zip", await cmi5Zip({ courseId: CMI5_ID, title: CMI5_TITLE, marker: "attempt-guard-v2" })),
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(rep.ok(), `replace → ${rep.status()}: ${await rep.text()}`).toBeTruthy();
     const j = await rep.json();

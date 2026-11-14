@@ -26,7 +26,7 @@ import { test, expect, type APIRequestContext, type BrowserContext } from "@play
 import fs from "node:fs";
 import path from "node:path";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
-import { assignCourse, authedContext, uploadCourse } from "./helpers";
+import { assignCourse, authedContext, uploadCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 type User = { id: string; email: string; password: string };
@@ -53,6 +53,7 @@ async function bilingualScorm(adminReq: APIRequestContext, orgSlug: string) {
       display_name: "Hindi",
       file: { name: zip, mimeType: "application/zip", buffer: fs.readFileSync(path.join(FIXTURES, zip)) },
     },
+    timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
   });
   expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
   const { data: hi } = await svc().from("course_packages").select("current_version_id").eq("course_id", course.courseId).eq("language", "hi").single();

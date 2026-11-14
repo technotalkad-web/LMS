@@ -10,6 +10,19 @@ import { authedContext } from "../lib/session";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
 
+/**
+ * The request timeout for every call to a route that runs the Package Guardian
+ * (ADR 0022): the multipart upload, the browser-direct finalize, a new language
+ * package, a new version and the certify re-run. A context's `request` inherits
+ * the config's actionTimeout (20 s), and the Guardian alone may run for
+ * GUARDIAN_DEADLINE_MS (20 s, lib/alds/guardian.ts) after the upload's storage
+ * writes, so on a slow runner the test gave up first and the nightly then stopped
+ * the app with the run row still `pending` (spec 66, 13 and 14 Nov 2026).
+ * tests/unit/lifecycle-guardian-timeouts.test.ts checks every such call passes it.
+ */
+export const GUARDIAN_ROUTE_TIMEOUT_MS = 120_000;
+
+
 export interface CourseHandle {
   courseId: string;
   versionId: string;
@@ -50,6 +63,7 @@ export async function uploadCourse(
         buffer: fs.readFileSync(path.join(FIXTURES, zip)),
       },
     },
+    timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
   });
   expect(res.ok(), `${zip} upload → ${res.status()}: ${await res.text()}`).toBeTruthy();
   return courseHandle((await res.json()).courseId as string);

@@ -32,7 +32,7 @@ import {
   createOrg,
   svc,
 } from "./data";
-import { authedContext, uploadCourse, assignCourse, launch } from "./helpers";
+import { authedContext, uploadCourse, assignCourse, launch, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { directUpload } from "./p0-helpers";
 
 const FIXTURES = path.resolve(__dirname, "../fixtures");
@@ -94,6 +94,7 @@ test("grandfather: in-progress learner resumes the retired version", async ({ br
         mode: "grandfather",
         file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     }
   );
   expect(replace.ok(), `replace → ${replace.status()}: ${await replace.text()}`).toBeTruthy();
@@ -136,6 +137,7 @@ test("force_restart: old attempt abandoned, fresh attempt on the new version", a
         mode: "force_restart",
         file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     }
   );
   const body = await replace.text();
@@ -198,6 +200,7 @@ test("force_restart with nobody in progress: 200, the genuine zero; the passed a
         mode: "force_restart",
         file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     }
   );
   const body = await replace.text();
@@ -403,6 +406,7 @@ test.describe.serial("per-version restart (ADR 0008 A)", () => {
         mode: "grandfather",
         file: { name: "scorm12.zip", mimeType: "application/zip", buffer: zipBuf() },
       },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     expect(replace.ok(), `replace → ${replace.status()}: ${await replace.text()}`).toBeTruthy();
     s.v2 = (await replace.json()).version_id as string;

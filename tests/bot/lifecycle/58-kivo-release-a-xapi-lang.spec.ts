@@ -35,6 +35,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { addMember, createAuthUser, createOrg, svc } from "./data";
 import { authedContext } from "../lib/session";
+import { GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 
 const ZIP = process.env.KIVO_RELEASE_A_XAPI_ZIP ?? "";
 const TINCAN = process.env.KIVO_RELEASE_A_TINCAN ?? "";
@@ -256,7 +257,7 @@ test.describe.serial(`KIVO Release A xAPI package (${LANG}) on the LMS (staging)
     const zip = { path: ZIP, name: path.basename(ZIP), bytes: zipBuf.length, sha256: crypto.createHash("sha256").update(zipBuf).digest("hex") };
     const res = await ctx.request.post("/api/courses/upload", {
       multipart: { orgSlug: state.org!.slug, file: { name: path.basename(ZIP), mimeType: "application/zip", buffer: zipBuf } },
-      timeout: 120_000,
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
     });
     const text = await res.text();
     expect(res.ok(), `upload → ${res.status()}: ${text}`).toBeTruthy();

@@ -31,7 +31,7 @@
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
-import { assignCourse, authedContext } from "./helpers";
+import { assignCourse, authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
 import { NEEDS_0098, has0098, has0107, scormZip, sessionClient, sha256, uploadNew, zipFile } from "./p0-helpers";
 import { cleanupLifecycleData } from "./cleanup";
 
@@ -297,6 +297,7 @@ test.describe.serial("ADR 0003 — record guard", () => {
         bodies.map((b, i) =>
           areq.post(`/api/courses/${s.courseA}/packages/${pkgId}/versions`, {
             multipart: { orgSlug: s.org!.slug, mode: "grandfather", file: zipFile(`race-${i}.zip`, b) },
+            timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
           })
         )
       );
