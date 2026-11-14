@@ -260,11 +260,14 @@ begin
   select count(*) into n
     from public.v_path_step_status s
    where s.passed_ever is null or s.passed_by_rule is null or s.done is null or s.retake_live is null
-      or s.failed is null or s.open_attempt is null or s.pass_required is null
+      or s.failed is null or s.open_attempt is null or s.pass_required is null or s.passed_in_window is null
+      or (s.pass_required and s.passed_in_window <> s.passed_by_rule)
+      or (s.passed_in_window and not s.passed_by_rule)
       or s.done <> s.passed_ever
       or s.passed_ever <> (s.passed_by_rule or s.done_recorded_at is not null)
       or s.failed <> (not s.passed_ever and coalesce(s.latest_result = 'failed', false) and not s.retake_live);
-  if n <> 0 then bad := bad || format('%s v_path_step_status row(s) break step 44''s rule or hold a null', n); end if;
+  if n <> 0 then bad := bad || format('%s v_path_step_status row(s) break step 44''s rule, O4-b''s (passed_in_window '
+                                     || 'equals passed_by_rule under a required pass and implies it), or hold a null', n); end if;
 
   select count(*) into n from (
     (select course_id, user_id from public.v_course_enrollment_terms
@@ -328,7 +331,8 @@ begin
       ('v_path_step_status', 'path_id uuid, user_id uuid, course_id uuid, organization_id uuid, step_number integer, '
        || 'release_at timestamp with time zone, pass_required boolean, passed_ever boolean, passed_by_rule boolean, '
        || 'done_recorded_at timestamp with time zone, latest_result text, latest_score numeric, done boolean, '
-       || 'official_attempt_id uuid, retake_live boolean, failed boolean, open_attempt boolean', 'new'),
+       || 'official_attempt_id uuid, retake_live boolean, failed boolean, open_attempt boolean, '
+       || 'passed_in_window boolean', 'new'),
       ('v_path_progress', 'path_id uuid, user_id uuid, organization_id uuid, steps_total integer, steps_done integer, '
        || 'next_step integer, next_course_id uuid, path_score numeric, completed boolean, status text, '
        || 'due_at timestamp with time zone, enrolled_at timestamp with time zone, '

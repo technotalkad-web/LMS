@@ -297,7 +297,8 @@ begin
                'pass_required', st.pass_required, 'passed_ever', st.passed_ever, 'passed_by_rule', st.passed_by_rule,
                'done_recorded_at', st.done_recorded_at, 'latest_result', st.latest_result,
                'latest_score', st.latest_score, 'done', st.done, 'official_attempt_id', st.official_attempt_id,
-               'retake_live', st.retake_live, 'failed', st.failed, 'open_attempt', st.open_attempt)
+               'retake_live', st.retake_live, 'failed', st.failed, 'open_attempt', st.open_attempt,
+               'passed_in_window', st.passed_in_window)
              order by st.step_number, st.course_id)
         from public.v_path_step_status st
        where st.path_id = v_path and st.user_id = v_user), '[]'::jsonb),

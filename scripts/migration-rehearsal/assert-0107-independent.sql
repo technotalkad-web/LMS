@@ -1063,7 +1063,7 @@ begin
     ('public.v_path_enrollment_terms', array['organization_id', 'due_at', 'enrolled_at']),
     ('public.v_path_step_status', array['path_id', 'user_id', 'course_id', 'organization_id', 'step_number', 'release_at',
        'pass_required', 'passed_ever', 'latest_result', 'latest_score', 'done', 'official_attempt_id', 'retake_live',
-       'failed', 'open_attempt', 'passed_by_rule', 'done_recorded_at']),
+       'failed', 'open_attempt', 'passed_by_rule', 'done_recorded_at', 'passed_in_window']),
     ('public.v_path_progress', array['path_id', 'user_id', 'organization_id', 'steps_total', 'steps_done', 'next_step',
        'next_course_id', 'path_score', 'completed', 'status', 'due_at', 'enrolled_at', 'started_at', 'completed_at',
        'overdue'])
@@ -1082,6 +1082,7 @@ begin
     ('public.v_path_step_status', 'retake_live', 'boolean'), ('public.v_path_step_status', 'failed', 'boolean'),
     ('public.v_path_step_status', 'open_attempt', 'boolean'), ('public.v_path_step_status', 'passed_by_rule', 'boolean'),
     ('public.v_path_step_status', 'done_recorded_at', 'timestamp with time zone'),
+    ('public.v_path_step_status', 'passed_in_window', 'boolean'),
     ('public.v_path_step_status', 'step_number', 'integer'),
     ('public.v_path_step_status', 'release_at', 'timestamp with time zone'),
     ('public.v_path_step_status', 'official_attempt_id', 'uuid'),

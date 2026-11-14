@@ -17,6 +17,11 @@
  *   done_recorded_at  the done_at of the step's stored fact, the
  *                     learning_path_step_completions row (O1-a), null when
  *                     there is none
+ *   passed_in_window  some row of the context's scored window passed,
+ *                     whatever the rule (the ADR 0024 note of 2026-11-14,
+ *                     O4-b): equal to passed_by_rule under pass_required;
+ *                     under no required pass, passed_by_rule says only that
+ *                     the window is not empty
  *   passed_ever       passed_by_rule or a stored fact (the owner's O1
  *                     answer, option (ii)); done = passed_ever (step 44)
  *   latest_result, latest_score, official_attempt_id   the standing official
@@ -36,6 +41,10 @@
  * not_started. `completed`, `completed_at` and `overdue` read the stored
  * completion row, never the step count, so a path completed before a step
  * was added stays completed (section L).
+ *
+ * `pathStepLabel()` picks the words a person reads beside a done step (the
+ * owner's O4 answer of 2026-11-14, option (ii)); `PATH_STEP_LABEL_TEXT`
+ * holds them, and no page writes them itself.
  *
  * The fact rows are a required input with no default (O1-i), so a caller
  * cannot leave them out and silently judge every step by today's rule. A
@@ -107,6 +116,8 @@ export type PathStepStatus = {
   passed_ever: boolean;
   passed_by_rule: boolean;
   done_recorded_at: string | null;
+  /** Some row of the scored window passed, whatever the rule (O4-b; the view's last column). */
+  passed_in_window: boolean;
   latest_result: "passed" | "failed" | "completed" | null;
   latest_score: number | null;
   done: boolean;
@@ -162,7 +173,8 @@ function readStep(i: {
     now: i.now,
   });
   const s = context.scoring;
-  const passedByRule = i.step.pass_required ? passedInWindow(context) : s.scoredAttempts > 0;
+  const passedInWin = passedInWindow(context);
+  const passedByRule = i.step.pass_required ? passedInWin : s.scoredAttempts > 0;
   const doneRecordedAt = i.fact ? i.fact.done_at : null;
   const passedEver = passedByRule || doneRecordedAt !== null;
   const latestResult = s.officialStatus;
@@ -179,6 +191,7 @@ function readStep(i: {
       passed_ever: passedEver,
       passed_by_rule: passedByRule,
       done_recorded_at: doneRecordedAt,
+      passed_in_window: passedInWin,
       latest_result: latestResult,
       latest_score: s.officialScore,
       done: passedEver,
@@ -291,4 +304,48 @@ export function pathProgress(i: PathProgressInput): PathProgress {
     completed_at: i.completion ? i.completion.completed_at : null,
     overdue: i.terms.due_at !== null && Number.isFinite(dueMs) && dueMs < ms(i.now) && !completed,
   };
+}
+
+/**
+ * The words a person reads beside a path step that is done without a
+ * standing pass (the owner's O4 answer of 2026-11-14, option (ii): "Please
+ * show "Completed Under the Earlier Rule" when a learner completed a step
+ * without passing under the previous rules. Show "Passed Earlier" only when
+ * the learner actually passed."), exactly so, with those capitals. The path
+ * page, the dashboard tile, Path Reports, Learners and the CSV read them
+ * from here through `pathStepLabel()`.
+ */
+export const PATH_STEP_LABEL_TEXT = {
+  passed_earlier: "Passed Earlier",
+  completed_under_earlier_rule: "Completed Under the Earlier Rule",
+} as const;
+
+export type PathStepLabel = keyof typeof PATH_STEP_LABEL_TEXT;
+
+/**
+ * The label of one step's answer (the ADR 0024 note of 2026-11-14, O4-a), in
+ * this order:
+ *   1. not done (passed_ever false): none;
+ *   2. passed_by_rule false: the step is done only by its stored fact and no
+ *      row of its scored window passed, so "Completed Under the Earlier
+ *      Rule";
+ *   3. the standing result is not a pass (latest_result can be null) and
+ *      some row of the scored window passed (passed_in_window): "Passed
+ *      Earlier", D14's case, beside the latest result;
+ *   4. otherwise none: the step is done by its standing result under the
+ *      rule as it stands.
+ * A learner who never passed is never labelled "Passed Earlier", including
+ * a step with no required pass whose standing result failed. "Passed" means
+ * a pass in the scored window of the path's own context; practice,
+ * abandoned, revision and preview rows never count (N12). Pure: the caller
+ * passes a step of `pathProgress()` or `pathStepStatus()`, or a row of
+ * v_path_step_status with the same column names.
+ */
+export function pathStepLabel(
+  step: Pick<PathStepStatus, "passed_ever" | "passed_by_rule" | "passed_in_window" | "latest_result">,
+): PathStepLabel | null {
+  if (!step.passed_ever) return null;
+  if (!step.passed_by_rule) return "completed_under_earlier_rule";
+  if (step.latest_result !== "passed" && step.passed_in_window) return "passed_earlier";
+  return null;
 }

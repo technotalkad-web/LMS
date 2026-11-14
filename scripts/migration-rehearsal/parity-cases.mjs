@@ -58,7 +58,9 @@ const PAST = Date.parse("2001-01-01T00:00:00Z");
 const FUTURE = Date.parse("2999-01-01T00:00:00Z");
 
 // The projection of each pair (twins contract 2.4, 3.4, 4.3, 5.3; build notes
-// N10, N11, N12, O1-d, O1-e). `sql` = what the SQL side compares, `ts` = what
+// N10, N11, N12, O1-d, O1-e; the path steps' passed_in_window, appended last
+// by the ADR 0024 note of 2026-11-14, O4-b, for the owner's O4 labels).
+// `sql` = what the SQL side compares, `ts` = what
 // the TypeScript side compares; expect holds exactly their union.
 export const FIELDS = {
   official: {
@@ -78,6 +80,7 @@ export const FIELDS = {
     steps: [
       "course_id", "step_number", "release_at", "pass_required", "passed_ever", "passed_by_rule", "done_recorded_at",
       "latest_result", "latest_score", "done", "official_attempt_id", "retake_live", "failed", "open_attempt",
+      "passed_in_window",
     ],
     progress: [
       "steps_total", "steps_done", "next_step", "next_course_id", "path_score", "completed", "status", "due_at",

@@ -3036,6 +3036,13 @@ grant select on public.v_path_enrollment_terms to authenticated, service_role;
 --                    retake (step 44)
 --   open_attempt     an official row of the context in progress (in
 --                    progress and not a revision row)
+--   passed_in_window some row of the path context's scored window passed,
+--                    whatever the rule (the summary's column; the ADR 0024
+--                    note of 2026-11-14, O4-b): it tells "Passed Earlier"
+--                    from no label under no required pass, where
+--                    passed_by_rule says only that the window is not empty
+--                    (the owner's O4 answer). Appended last, so the column
+--                    list before it is unchanged
 -- step_number and release_at come with the step (launch_context reads them
 -- here, step 18). Every boolean is non-null. No reader of a path step's done
 -- takes it from anywhere else in SQL (O1-k).
@@ -3059,7 +3066,8 @@ select
   (not (r.passed_by_rule or f.done_at is not null)
    and coalesce(s.official_status = 'failed', false)
    and not coalesce(a.retake_live, false)) as failed,
-  coalesce(a.open_attempt, false) as open_attempt
+  coalesce(a.open_attempt, false) as open_attempt,
+  coalesce(s.passed_in_window, false) as passed_in_window
 from public.v_path_enrollments_expanded pe
 join public.learning_paths lp on lp.id = pe.path_id
 join public.learning_path_courses lpc on lpc.path_id = pe.path_id
@@ -3102,7 +3110,7 @@ cross join lateral (
 alter view public.v_path_step_status set (security_invoker = on);
 
 comment on view public.v_path_step_status is
-  'One row per (path, enrolled learner, step) (ADR 0024 steps 9 and 44; build notes N10, N12, O1-d): the step''s resolved pass rule and its done (passed_ever = passed_by_rule or a stored step fact), with the standing official result in path:P, a live granted retake, failed and an open attempt.';
+  'One row per (path, enrolled learner, step) (ADR 0024 steps 9 and 44; build notes N10, N12, O1-d): the step''s resolved pass rule and its done (passed_ever = passed_by_rule or a stored step fact), with the standing official result in path:P, a live granted retake, failed and an open attempt; passed_in_window last (note of 2026-11-14, O4-b): some row of the scored window passed, whatever the rule.';
 
 revoke all on public.v_path_step_status from public, anon, authenticated, service_role;
 grant select on public.v_path_step_status to authenticated, service_role;
@@ -6981,11 +6989,12 @@ grant select, insert on public.revision_visits to service_role;
 --        present; both delete guards are security definer, name
 --        legacy_role, keep the service-role return and their two 0098
 --        triggers; v_path_step_status has its columns, the two of O1-d
---        among them; the three rule-change triggers of section 6q (the
---        owner's O3 answer) are bound to its function on their tables,
---        enabled, before and per row, the two update triggers on the
---        column pass_required alone with a when, the delete trigger with
---        none (read from pg_trigger, never from text)
+--        among them and passed_in_window (O4-b) last; the three
+--        rule-change triggers of section 6q (the owner's O3 answer) are
+--        bound to its function on their tables, enabled, before and per
+--        row, the two update triggers on the column pass_required alone
+--        with a when, the delete trigger with none (read from pg_trigger,
+--        never from text)
 --   A24  journey_save_days, journey_repin_enrollments and both forms of
 --        consume_grant are in the privilege matrix
 
@@ -7430,7 +7439,7 @@ begin
     from pg_attribute a where a.attrelid = 'public.v_path_step_status'::regclass and a.attnum > 0 and not a.attisdropped;
   if got is distinct from 'path_id, user_id, course_id, organization_id, step_number, release_at, pass_required, '
                           || 'passed_ever, passed_by_rule, done_recorded_at, latest_result, latest_score, done, '
-                          || 'official_attempt_id, retake_live, failed, open_attempt' then
+                          || 'official_attempt_id, retake_live, failed, open_attempt, passed_in_window' then
     bad := bad || format('A23 v_path_step_status reads (%s)', got);
   end if;
   -- the rule-change triggers (section 6q): tgtype 19 = row, before, update;
