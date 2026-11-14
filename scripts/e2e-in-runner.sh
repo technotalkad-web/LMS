@@ -46,7 +46,8 @@
 # scripts/lifecycle-nightly.sh does. The Playwright list reporter prints to the
 # job log as the job did before this change.
 #
-# Exit code: Playwright's. A build or start failure exits 1; bad input
+# Exit code: Playwright's. A build or start failure exits 1, as does a build
+# whose CSS fails scripts/check-built-fonts.mjs (ADR 0025); bad input
 # (including a .env.test.local in the checkout) exits 2.
 set -euo pipefail
 
@@ -129,6 +130,13 @@ if ! npm run build > "$OUT/build.log" 2>&1; then
   echo "e2e-in-runner: build failed; error lines of the build log (masked):"
   error_excerpt "$OUT/build.log"
   echo "e2e-in-runner: reproduce locally with this script"
+  exit 1
+fi
+
+# The self-hosted fonts reached the built CSS under their own family names
+# (ADR 0025). It prints counts and family names only.
+if ! node scripts/check-built-fonts.mjs .next; then
+  echo "::error title=e2e::the built CSS does not carry the self-hosted fonts as declared (ADR 0025)"
   exit 1
 fi
 

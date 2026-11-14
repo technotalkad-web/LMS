@@ -1,0 +1,63 @@
+/*
+ * Fallback faces for the self-hosted fonts in app/layout.tsx.
+ *
+ * These are the six rules next/font/google generated (adjustFontFallback) in the
+ * last build before the fonts moved into the repository, copied value for value.
+ * next/font/local would compute its own numbers from the font files, and those
+ * differ (Merriweather size-adjust 117.59% against 122.09%), so the layout sets
+ * adjustFontFallback: false and names these families in `fallback` instead.
+ */
+
+@font-face {
+  font-family: "Inter Fallback";
+  src: local("Arial");
+  ascent-override: 90.44%;
+  descent-override: 22.52%;
+  line-gap-override: 0.00%;
+  size-adjust: 107.12%;
+}
+
+@font-face {
+  font-family: "Poppins Fallback";
+  src: local("Arial");
+  ascent-override: 93.62%;
+  descent-override: 31.21%;
+  line-gap-override: 8.92%;
+  size-adjust: 112.16%;
+}
+
+@font-face {
+  font-family: "Plus Jakarta Sans Fallback";
+  src: local("Arial");
+  ascent-override: 98.88%;
+  descent-override: 21.15%;
+  line-gap-override: 0.00%;
+  size-adjust: 104.98%;
+}
+
+@font-face {
+  font-family: "Roboto Fallback";
+  src: local("Arial");
+  ascent-override: 92.98%;
+  descent-override: 24.47%;
+  line-gap-override: 0.00%;
+  size-adjust: 99.78%;
+}
+
+@font-face {
+  font-family: "Merriweather Fallback";
+  src: local("Times New Roman");
+  ascent-override: 80.59%;
+  descent-override: 22.36%;
+  line-gap-override: 0.00%;
+  size-adjust: 122.09%;
+}
+
+@font-face {
+  font-family: "Geist Mono Fallback";
+  src: local("Arial");
+  ascent-override: 74.67%;
+  descent-override: 21.92%;
+  line-gap-override: 0.00%;
+  size-adjust: 134.59%;
+}
