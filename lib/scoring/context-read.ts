@@ -14,16 +14,19 @@
  *
  * Deploy-safe in both orders (`docs/ARCHITECTURE.md` principle 6; step 49,
  * "the readers tolerate the absent columns and apply the context filter when
- * present"): when the attempts read answers 42703 naming a column 0107 adds
- * (a database without 0107), it reads again without the context columns and
+ * present"): when the attempts read answers 42703 naming a column 0107 adds,
+ * or naming is_revision (0107 requires 0103, so a database without the flag
+ * has no 0107 either), it reads again without the context columns and
  * without the key filter, and every row and grant is read as the context
- * asked for. That is today's reading, one undivided set of rows per learner
- * and course, previews included, because no context and no new-kind preview
- * exists there. The answer says so (`contextColumns: false`). A preview key
- * has no such reading and answers `{ok: false}` there. Any other error,
- * another column's 42703 included, answers `{ok: false}`; a database whose
- * attempts carry the context columns while its grants do not is an error,
- * never a fallback.
+ * asked for. When the course has no version, no attempts read runs and the
+ * grants read decides the same way: no context_key column, or no
+ * attempt_requests table. That is today's reading, one undivided set of
+ * rows per learner and course, previews included, because no context and no
+ * new-kind preview exists there. The answer says so (`contextColumns:
+ * false`). A preview key has no such reading and answers `{ok: false}`
+ * there. Any other error, another column's 42703 included, answers `{ok:
+ * false}`; a database whose attempts carry the context columns while its
+ * grants do not is an error, never a fallback.
  *
  * Server-side by use, but free of next/* and Supabase runtime imports (the
  * shape of lib/scoring/attempt-kind.ts), so every branch is unit-tested with
@@ -125,7 +128,11 @@ export async function readContextResult(
 
     let attempts: ContextAttempt[] = [];
     let contextColumns = true;
+    // Whether the attempts read decided the schema; with no version it never
+    // runs, and the grants read decides it instead.
+    let attemptsRead = false;
     if (versionIds.length > 0) {
+      attemptsRead = true;
       const ids = versionIds;
       const read = (columns: string, keyFilter: boolean): PromiseLike<Answer<Array<Record<string, unknown>>>> => {
         let q = client.from("course_attempts").select(columns).eq("user_id", opts.userId).in("course_version_id", ids);
@@ -133,8 +140,11 @@ export async function readContextResult(
         return q.abortSignal(signal());
       };
       let res = await read(`${CONTEXT_ATTEMPT_COLUMNS}, is_revision, ${CONTEXT_SELECT}`, true);
-      if (res.error && isMissingContextColumn(res.error)) {
-        // A database without 0107: today's select, no context filter.
+      // A database without 0107: a 42703 naming a context column, or naming
+      // is_revision, which comes first in the select list and which every
+      // database with 0107 has (0107 requires 0103). Today's select, no
+      // context filter.
+      if (res.error && (isMissingContextColumn(res.error) || isMissingColumn(res.error, "is_revision"))) {
         if (kind === "preview") return fail("no_context_schema", res.error);
         contextColumns = false;
         res = await read(`${CONTEXT_ATTEMPT_COLUMNS}, is_revision`, false);
@@ -158,13 +168,22 @@ export async function readContextResult(
         .eq("course_id", opts.courseId)
         .eq("status", "approved")
         .abortSignal(signal());
-    let grants: ContextGrant[];
+    let grants: ContextGrant[] = [];
     if (contextColumns) {
       const g = await readGrants(`${GRANT_COLUMNS}, context_key`);
-      if (g.error) return fail("grants_read", g.error);
-      if (g.data == null) return fail("empty_answer");
-      grants = g.data.map((r) => toGrant(r));
-    } else {
+      const missing = g.error && (isMissingColumn(g.error, "context_key") || g.error.code === "42P01" || g.error.code === "PGRST205");
+      if (missing && !attemptsRead) {
+        // No attempts read decided the schema, and the grants have no
+        // context_key (or no table, before 0083): a database without 0107.
+        if (kind === "preview") return fail("no_context_schema", g.error);
+        contextColumns = false;
+      } else {
+        if (g.error) return fail("grants_read", g.error);
+        if (g.data == null) return fail("empty_answer");
+        grants = g.data.map((r) => toGrant(r));
+      }
+    }
+    if (!contextColumns) {
       const g = await readGrants(GRANT_COLUMNS);
       // A database without attempt_requests (before 0083) has no grants, as
       // grantSnapshotFor reads it.

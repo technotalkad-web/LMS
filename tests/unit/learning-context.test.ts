@@ -337,8 +337,7 @@ async function main() {
   }
 
   console.log("\n(d) readContextResult on a database without 0107 (principle 6, step 49)");
-  // Today's rows: no context columns; one of them a by-role preview, which
-  // today's reading counts too.
+  // Today's rows: no context columns.
   const pre = [row(1, I, "failed", 1), row(2, I, "passed", 3), row(3, I, "open", 5)].map((r) => {
     const { context_key: _k, context_kind: _c, journey_day_id: _d, journey_version_id: _v, ...rest } = r;
     void _k; void _c; void _d; void _v;
@@ -369,6 +368,35 @@ async function main() {
     const r = await readContextResult(client, { userId: "u1", courseId: "c1", key: I, passRequired: false, now: NOW });
     eq("without 0103 too: a third read, no is_revision; ok", [r.ok, calls.filter((c) => c.table === "course_attempts").length], [true, 3]);
     eq("…the last select names neither is_revision nor a context column", [calls[3].columns.includes("is_revision"), calls[3].columns.includes("context")], [false, false]);
+  }
+  {
+    // Postgres names the first unresolved column of the select list, and
+    // is_revision comes before the context columns: a database without 0103
+    // (so without 0107) names is_revision on the first read.
+    const { client, calls } = stub((c, nth) =>
+      c.table === "course_attempts" ? (nth <= 2 ? MISSING("is_revision") : { data: pre, error: null }) : pre0107(c, nth));
+    const r = await readContextResult(client, { userId: "u1", courseId: "c1", key: I, passRequired: false, now: NOW });
+    eq("a first read naming is_revision: no 0107 either; today's reading, ok", [r.ok, r.ok && r.contextColumns, r.ok && r.result.rows.length], [true, false, 3]);
+    eq("…three attempts reads, the last with neither is_revision nor a context column",
+      [calls.filter((c) => c.table === "course_attempts").length, calls[3].columns.includes("is_revision"), calls[3].columns.includes("context")], [3, false, false]);
+  }
+  {
+    // A course with no version: no attempts read, so the grants read decides.
+    const noVersions = (c: Call, nth: number): Ans => (c.table === "course_versions" ? { data: [], error: null } : pre0107(c, nth));
+    const { client, calls } = stub(noVersions);
+    const r = await readContextResult(client, { userId: "u1", courseId: "c1", key: P, passRequired: true, now: NOW });
+    eq("no version, grants without context_key: ok, contextColumns false, the grants read again without it",
+      [r.ok, r.ok && r.contextColumns, calls.map((c) => c.table), calls.map((c) => c.columns.includes("context_key"))],
+      [true, false, ["course_versions", "attempt_requests", "attempt_requests"], [false, true, false]]);
+    const { client: c2 } = stub((c, nth) => (c.table === "attempt_requests" ? { data: null, error: { code: "PGRST205", message: "Could not find the table 'public.attempt_requests' in the schema cache" } } : noVersions(c, nth)));
+    const r2 = await readContextResult(c2, { userId: "u1", courseId: "c1", key: I, passRequired: false, now: NOW });
+    eq("…no attempt_requests table either (before 0083): ok, no grants", [r2.ok, r2.ok && r2.contextColumns, r2.ok && r2.result.retakeIds.size], [true, false, 0]);
+    const { client: c3 } = stub(noVersions);
+    const r3 = await readContextResult(c3, { userId: "u1", courseId: "c1", key: `preview:${RUN}`, passRequired: false, now: NOW });
+    eq("…a preview key there: {ok: false, no_context_schema}", r3.ok ? "ok" : r3.reason, "no_context_schema");
+    const { client: c4 } = stub((c, nth) => (c.table === "attempt_requests" ? { data: null, error: { code: "42703", message: "column attempt_requests.used_at does not exist" } } : noVersions(c, nth)));
+    const r4 = await readContextResult(c4, { userId: "u1", courseId: "c1", key: I, passRequired: false, now: NOW });
+    eq("…a grants 42703 naming another column: {ok: false}", r4.ok ? "ok" : r4.reason, "grants_read");
   }
   {
     const { client } = stub((c, nth) =>
