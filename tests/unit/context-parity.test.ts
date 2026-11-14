@@ -19,11 +19,12 @@
  *       and for a writer case the writer's done, passed_ever and
  *       passed_by_rule against the step's (the writer reads them from
  *       v_path_step_status, O1-c and O1-k, never from contextResult);
- *   (c) pair 3, the journey credit rule: its TypeScript twin changes its
- *       signature for every caller in phase 2 (step 45), so its cases are on
- *       the dated pending list below, which must name exactly the file's
- *       cases; the phase 2 pull request runs them and empties it (N17,
- *       contract A14). The SQL side runs them now.
+ *   (c) pair 3, the journey credit rule: creditedDaysFor() over the
+ *       enrolment's credits and its pinned version's day_ids, then
+ *       computeJourneyState() and resumableDayIdsFor() (step 45; N14, N18);
+ *       every column of journey_credit_state's answer and finished. Phase 1
+ *       held these cases on a dated pending list; phase 2 (P2-4) runs them
+ *       and the list is gone (N17, contract A14).
  *   (d) the files themselves: the four load, and the projection lists the
  *       loader enforces are the ones this test compares;
  *   (e) the loader refuses a file that could let a side pass by omission or
@@ -58,6 +59,13 @@ import {
 } from "../../lib/scoring/context";
 import { pathProgress, type PathAttempt, type PathGrant, type PathStepFact, type PathStepInput } from "../../lib/paths/progress";
 import { DEFAULT_POLICY } from "../../lib/scoring/policy";
+import {
+  computeJourneyState,
+  courseDaysOf,
+  creditedDaysFor,
+  parseVersionDays,
+  resumableDayIdsFor,
+} from "../../lib/journey/journey";
 
 let pass = 0, fail = 0;
 const ok = (n: string, problems: string[]) => {
@@ -271,35 +279,62 @@ function runPath(doc: ParityDoc, c: ParityCase): string[] {
   return out;
 }
 
-// --- (c) the journey credit rule: pending until phase 2 ----------------------
-// Dated 2026-11-14 (ADR 0024 phase 1; build note N17, contract A14). The
-// TypeScript twin (computeJourneyState on creditedDays, creditedDaysFor,
-// resumableDayIdsFor) takes its new signature in phase 2 (step 45); the
-// phase 2 pull request runs these cases on it and empties this list. Until
-// then the SQL side runs them (assert-0107-parity.sql (P3)).
-const JOURNEY_TS_PENDING = {
-  since: "2026-11-14",
-  until: "the phase 2 pull request (ADR 0024 step 45)",
-  cases: [
-    "journey/no re-pin: the credits read by day identity equal the old count",
-    "journey/a course on two days: each day is its own required day",
-    "journey/a legacy_cross_context credit counts like any other kind",
-    "journey/a credit on a day now a rest day counts towards nothing",
-    "journey/a credit above days_total counts towards nothing",
-    "journey/a credit on a removed day counts towards nothing; an open attempt there is resumable",
-    "journey/zero required days: never complete",
-    "journey/a completed enrolment's credits are still read",
-    "journey/resumable: open official journey rows only, in uuid order",
-    "journey/repin-a: a day inserted at number 2",
-    "journey/repin-b: days 2 and 3 swapped",
-    "journey/repin-c: the course of day 4 swapped",
-    "journey/repin-d: day 4 removed, every remaining day credited",
-    "journey/repin-e: a shorter version, every remaining day credited",
-    "journey/repin-f: a completed enrolment stays on its version",
-    "journey/repin-g: kept on a slot_backfill version",
-    "journey/repin-h: day 3 relaxed and credited by the rule change",
-  ],
-};
+// --- (c) the journey credit rule ------------------------------------------------
+// The TypeScript twin (ADR 0024 step 45, build notes N14, N17 and N18):
+// creditedDaysFor() over the enrolment's credit rows and its pinned version's
+// day_ids, computeJourneyState() on those day numbers and the version's course
+// days, and resumableDayIdsFor() over the enrolment's attempts. The SQL side
+// is journey_credit_state() with finished = required_days > 0 and next_day is
+// null (assert-0107-parity.sql (P3)). The phase 1 dated list that held these
+// cases pending (N17) is gone: phase 2 runs them here.
+function runJourney(doc: ParityDoc, c: ParityCase): string[] {
+  const t = tables(doc, c);
+  const enrollmentId = String(c.call.enrollment_id);
+  const enr = t("journey_enrollments").find((e) => e.id === enrollmentId);
+  if (!enr) return [`the case names no journey_enrollments row ${enrollmentId}`];
+  const version = t("journey_versions").find((v) => v.id === enr.version_id);
+  if (!version) return [`the enrolment's pinned version ${String(enr.version_id)} is not in the case`];
+  const daysTotal = Number(version.days_total);
+  // As credits-read.ts answers a version on a database with 0107: its map,
+  // or {} when it has none (never the by-number fallback).
+  const dayIds = version.day_ids !== null && typeof version.day_ids === "object" && !Array.isArray(version.day_ids)
+    ? (version.day_ids as Record<string, unknown>)
+    : {};
+  const credits = t("journey_day_progress")
+    .filter((p) => p.enrollment_id === enrollmentId)
+    .map((p) => ({ day_id: str(p.day_id), day_number: Number(p.day_number), completed_at: str(p.completed_at) }));
+  const creditedDays = creditedDaysFor({ days: version.days, days_total: daysTotal, day_ids: dayIds }, credits);
+  const courseDays = courseDaysOf(version.days, daysTotal);
+  const state = computeJourneyState({
+    startDate: String(enr.start_date),
+    today: doc.now.slice(0, 10),
+    creditedDays,
+    daysTotal,
+    countSundays: false,
+    courseDays,
+    resumableDayIds: resumableDayIdsFor(enrollmentId, t("course_attempts").map((r) => ({
+      journey_enrollment_id: str(r.journey_enrollment_id),
+      context_kind: str(r.context_kind),
+      status: str(r.status),
+      is_revision: r.is_revision === true,
+      journey_day_id: str(r.journey_day_id),
+    }))),
+  });
+  const byNumber = parseVersionDays(version.days, dayIds);
+  const idOf = (n: number | null) => (n === null ? null : (byNumber.get(n)?.dayId ?? null));
+  const credited = courseDays.filter((d) => creditedDays.includes(d));
+  const got = {
+    required_days: courseDays.length,
+    credited_days: state.completedCount,
+    credited,
+    credited_day_ids: credited.map(idOf),
+    next_day: state.nextDay,
+    next_day_id: idOf(state.nextDay),
+    finished: state.finished,
+    resumable_day_ids: state.resumableDayIds,
+  };
+  return diff("expect", only(c.expect, FIELDS.journey.sql), got);
+}
 
 // --- run ----------------------------------------------------------------------
 const docs = new Map<string, ParityDoc>();
@@ -330,14 +365,11 @@ if (pathDoc) {
 }
 const journey = docs.get("journey");
 if (journey) {
-  console.log(`\n(c) the journey credit rule: TypeScript side pending since ${JOURNEY_TS_PENDING.since}, until ${JOURNEY_TS_PENDING.until}`);
-  const names = journey.cases.filter((x) => x.sides.includes("ts")).map((x) => x.name);
-  const listed = JOURNEY_TS_PENDING.cases;
-  ok(`the pending list names exactly the file's ${names.length} journey cases`, [
-    ...names.filter((n) => !listed.includes(n)).map((n) => `not on the pending list: ${n}`),
-    ...listed.filter((n) => !names.includes(n)).map((n) => `on the pending list, not in the file: ${n}`),
-  ]);
-  for (const n of names) console.log(`  … pending (phase 2): ${n}`);
+  console.log("\n(c) the journey credit rule: creditedDaysFor() and computeJourneyState()");
+  const run = journey.cases.filter((x) => x.sides.includes("ts"));
+  for (const c of run) ok(c.name, runJourney(journey, c));
+  ok("the TypeScript side runs every journey case both sides run (N17: nothing pending)",
+    run.length === (BOTH_SIDED as Record<string, number>).journey ? [] : [`${run.length} run, ${(BOTH_SIDED as Record<string, number>).journey} pinned`]);
 }
 
 // --- (f) the key twin: contextKeyOf() against the generated column -------------

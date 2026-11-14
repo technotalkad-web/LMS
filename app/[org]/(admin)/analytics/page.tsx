@@ -44,10 +44,12 @@ import {
 import {
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   dateOfDay,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 import { AdminPageHeader, KpiCard, KpiStrip } from "@/components/admin";
 import { Avatar } from "@/components/ui/avatar";
 import { FilterBar, type FilterOption, type FilterState } from "./filter-bar";
@@ -500,7 +502,7 @@ export default async function AnalyticsPage({
   const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
   const today = todayStr(tz);
   type EnrRow = {
-    id: string; user_id: string; program_id: string; status: string; start_date: string;
+    id: string; user_id: string; program_id: string; version_id: string; status: string; start_date: string;
     journey_versions:
       | { days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }
       | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
@@ -508,19 +510,16 @@ export default async function AnalyticsPage({
   const enrollments = scopedIds.length
     ? await fetchByIds<EnrRow>(
         svc, "journey_enrollments",
-        "id, user_id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
+        "id, user_id, program_id, version_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
         "user_id", scopedIds, (q) => q.eq("organization_id", org.id)
       )
     : [];
-  const progressRows = enrollments.length
-    ? await fetchByIds<{ enrollment_id: string }>(
-        svc, "journey_day_progress", "enrollment_id", "enrollment_id",
-        enrollments.map((e) => e.id)
-      )
-    : [];
-  const progressCount = new Map<string, number>();
-  for (const r of progressRows) {
-    progressCount.set(r.enrollment_id, (progressCount.get(r.enrollment_id) ?? 0) + 1);
+  // The credits by day id, through the one reader (ADR 0024 step 45); the
+  // days done are the twin's count, never the number of progress rows. A
+  // failed read shows no journey line rather than one counted on a guess.
+  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })));
+  if (!credits.ok) {
+    console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "learner_analytics", code: credits.error?.code ?? null }));
   }
   type JourneyView = {
     userId: string; programId: string; programName: string; status: string;
@@ -530,13 +529,17 @@ export default async function AnalyticsPage({
   };
   const journeyViews: JourneyView[] = [];
   for (const e of enrollments) {
+    if (!credits.ok) break; // a failed credit read: no journey line
     const v = Array.isArray(e.journey_versions) ? e.journey_versions[0] : e.journey_versions;
     const prog = programById.get(e.program_id);
     if (!v || !prog || prog.is_active === false) continue;
     const state = computeJourneyState({
       startDate: e.start_date,
       today,
-      completedCount: progressCount.get(e.id) ?? 0,
+      creditedDays: creditedDaysFor(
+        { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(e.version_id) },
+        credits.rowsOf(e.id)
+      ),
       daysTotal: v.days_total,
       countSundays: v.count_sundays === true,
       unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
@@ -556,7 +559,7 @@ export default async function AnalyticsPage({
       behind: e.status === "active" && !state.finished ? state.behindDays : 0,
       overdueDeadline:
         e.status === "active" && deadline !== null && today > deadline,
-      daysDone: progressCount.get(e.id) ?? 0,
+      daysDone: state.completedCount,
       courseDays: courseDaysOf(v.days, v.days_total).length,
       currentCourseId:
         e.status === "active" && !state.finished

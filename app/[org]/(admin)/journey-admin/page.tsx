@@ -7,7 +7,8 @@ import { loadScopesFor } from "@/lib/content/scopes";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { courseDaysOf, todayStr, DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
 import { fetchScoringRule } from "@/lib/scoring/resolve";
-import { computeJourneyState, parseVersionDays } from "@/lib/journey/journey";
+import { computeJourneyState, creditedDaysFor, parseVersionDays } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 import { courseProgress } from "@/lib/courses/progress-view";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
@@ -62,7 +63,7 @@ export default async function JourneyAdminPage({
   let enrollments: EnrollmentRow[] = [];
   let currentVersion: { id: string; version_number: number; published_at: string } | null = null;
   if (program) {
-    const [{ data: dayRows }, { data: enrRows }, { data: doneRows }, { data: verRows }] =
+    const [{ data: dayRows }, { data: enrRows }, { data: verRows }] =
       await Promise.all([
         supabase
           .from("journey_days")
@@ -74,15 +75,17 @@ export default async function JourneyAdminPage({
           .select("id, user_id, version_id, start_date, status, completed_at, created_at")
           .eq("program_id", program.id)
           .order("created_at", { ascending: false }),
-        svc
-          .from("journey_day_progress")
-          .select("enrollment_id")
-          .eq("organization_id", org.id),
         supabase
           .from("journey_versions")
           .select("id, version_number, published_at, days_total, count_sundays, days, unlock_mode")
           .eq("program_id", program.id),
       ]);
+    // The program's credits by day id, through the one reader (ADR 0024
+    // step 45): each enrolment carries its credited day numbers, never a
+    // count of its rows. A failed read is an error, never "no days done".
+    const enrList = (enrRows ?? []) as Array<{ id: string; version_id: string }>;
+    const credits = await readJourneyCredits(svc, enrList.map((e) => ({ id: e.id, version_id: e.version_id })));
+    if (!credits.ok) throw new Error(`journey credits read failed: ${credits.error?.message ?? "no answer"}`);
     days = (dayRows ?? []) as DayRow[];
     const versions = (verRows ?? []) as Array<{
       id: string;
@@ -97,20 +100,18 @@ export default async function JourneyAdminPage({
     currentVersion = program.current_version_id
       ? (verById.get(program.current_version_id) ?? null)
       : null;
-    const doneByEnr = new Map<string, number>();
-    for (const r of (doneRows ?? []) as Array<{ enrollment_id: string }>) {
-      doneByEnr.set(r.enrollment_id, (doneByEnr.get(r.enrollment_id) ?? 0) + 1);
-    }
     enrollments = ((enrRows ?? []) as Array<
       Omit<
         EnrollmentRow,
-        "completed_count" | "name" | "email" | "version_number" | "days_total" | "count_sundays" | "unlock_mode"
+        "credited_days" | "name" | "email" | "version_number" | "days_total" | "count_sundays" | "unlock_mode"
       > & { version_id: string }
     >).map((e) => {
       const v = verById.get(e.version_id);
       return {
         ...e,
-        completed_count: doneByEnr.get(e.id) ?? 0,
+        credited_days: v
+          ? creditedDaysFor({ days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(e.version_id) }, credits.rowsOf(e.id))
+          : [],
         name: "",
         email: "",
         version_number: v?.version_number ?? 0,
@@ -190,7 +191,7 @@ export default async function JourneyAdminPage({
       const st = computeJourneyState({
         startDate: e.start_date,
         today: tzNow,
-        completedCount: e.completed_count,
+        creditedDays: e.credited_days,
         daysTotal: e.days_total,
         countSundays: e.count_sundays === true,
         unlockMode: e.unlock_mode,

@@ -69,7 +69,9 @@ export type EnrollmentRow = {
   status: "active" | "completed" | "reset";
   completed_at: string | null;
   created_at: string;
-  completed_count: number;
+  /** The credited day numbers in the pinned version, by day id: the server's
+   *  creditedDaysFor (page.tsx; ADR 0024 step 45), never a row count. */
+  credited_days: number[];
   name: string;
   email: string;
   /** Pinned version — later publishes never move these. */
@@ -169,10 +171,12 @@ export function JourneyAdminClient({
           apply_to: applyTo,
         }),
       });
+      // With apply_to=all the route answers journey_repin_enrollments' counts
+      // (ADR 0024 step 47); `repinned` is the learners moved to the version.
       const j = (await res.json().catch(() => ({}))) as {
         error?: string;
         version_number?: number;
-        migrated?: number;
+        repinned?: number;
         completed_now?: number;
       };
       if (!res.ok) {
@@ -181,7 +185,7 @@ export function JourneyAdminClient({
       }
       toast.success(
         applyTo === "all"
-          ? `Published v${j.version_number} — ${j.migrated ?? 0} active learner${(j.migrated ?? 0) === 1 ? "" : "s"} updated${(j.completed_now ?? 0) > 0 ? `, ${j.completed_now} completed by the new curriculum` : ""}, progress preserved`
+          ? `Published v${j.version_number} — ${j.repinned ?? 0} active learner${(j.repinned ?? 0) === 1 ? "" : "s"} updated${(j.completed_now ?? 0) > 0 ? `, ${j.completed_now} completed by the new curriculum` : ""}, progress preserved`
           : `Published v${j.version_number} — new enrollments use it; runs in flight keep their version`
       );
       router.refresh();
@@ -779,7 +783,7 @@ function EnrollmentsTab({
               const st = computeJourneyState({
                 startDate: e.start_date,
                 today,
-                completedCount: e.completed_count,
+                creditedDays: e.credited_days,
                 daysTotal: e.days_total,
                 countSundays: e.count_sundays === true,
                 unlockMode: e.unlock_mode,
@@ -796,14 +800,14 @@ function EnrollmentsTab({
                   </td>
                   <td className="px-4 py-3 tabular-nums text-muted">{e.start_date}</td>
                   <td className="px-4 py-3 tabular-nums">
-                    {e.completed_count}/{e.days_total}
+                    {st.completedCount}/{e.days_total}
                     {e.status === "active" && typeof e.current_day === "number" && (
                       <span className="block text-[11px] text-muted">
                         {e.course_days.length > 0
                           ? `${Math.min(
                               100,
                               Math.round(
-                                ((e.completed_count + ((e.current_pct ?? 0) / 100)) / e.course_days.length) * 100
+                                ((st.completedCount + ((e.current_pct ?? 0) / 100)) / e.course_days.length) * 100
                               )
                             )}% overall · `
                           : ""}
@@ -877,7 +881,7 @@ function ReportsTab({
           state: computeJourneyState({
             startDate: e.start_date,
             today,
-            completedCount: e.completed_count,
+            creditedDays: e.credited_days,
             daysTotal: e.days_total,
             countSundays: e.count_sundays === true,
             unlockMode: e.unlock_mode,

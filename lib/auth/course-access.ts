@@ -4,10 +4,12 @@ import { resolveUserGroupIds } from "@/lib/org/groups";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   parseVersionDays,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 
 export type CourseAccess = {
   allowed: boolean;
@@ -243,6 +245,8 @@ export async function learnerCanAccessCourse(opts: {
       .eq("organization_id", orgId)
       .maybeSingle();
     const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+    type Version = NonNullable<ReturnType<typeof versions.get>>;
+    const holding: Array<{ enr: (typeof enrollments)[number]; v: Version; courseDays: number[] }> = [];
     for (const enr of enrollments) {
       const v = versions.get(enr.version_id);
       if (!v) continue;
@@ -254,30 +258,46 @@ export async function learnerCanAccessCourse(opts: {
         // Yoddha alumni keep review access to their journey modules.
         return { allowed: true, upcomingAt: null };
       }
-      const { count } = await supabase
-        .from("journey_day_progress")
-        .select("id", { count: "exact", head: true })
-        .eq("enrollment_id", enr.id);
-      const state = computeJourneyState({
-        startDate: enr.start_date,
-        today: todayStr(tz),
-        completedCount: count ?? 0,
-        daysTotal: v.days_total,
-        countSundays: v.count_sundays === true,
-        unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
-        courseDays: courseDaysOf(v.days, v.days_total),
-      });
-      // Launchable day = the day the learner may open now, plus earlier
-      // (completed) days for revision. Progress mode has no calendar ceiling,
-      // so it keys off openableDay; calendar keeps the drip ceiling.
-      const ceiling =
-        v.unlock_mode === "progress"
-          ? state.finished
-            ? v.days_total
-            : state.openableDay
-          : Math.min(state.allowedDay, state.currentDay);
-      if (courseDays.some((d) => d <= ceiling)) {
-        return { allowed: true, upcomingAt: null };
+      holding.push({ enr, v, courseDays });
+    }
+    if (holding.length > 0) {
+      // The credits of every active enrolment that holds the course, in one
+      // read by day id (ADR 0024 step 45), never a count per enrolment. A
+      // failed read grants nothing through a journey: it is never "no
+      // credits", which would open the first course day.
+      const credits = await readJourneyCredits(
+        supabase,
+        holding.map((h) => ({ id: h.enr.id, version_id: h.enr.version_id }))
+      );
+      if (!credits.ok) {
+        console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "course_access", code: credits.error?.code ?? null }));
+      } else {
+        for (const { enr, v, courseDays } of holding) {
+          const state = computeJourneyState({
+            startDate: enr.start_date,
+            today: todayStr(tz),
+            creditedDays: creditedDaysFor(
+              { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+              credits.rowsOf(enr.id)
+            ),
+            daysTotal: v.days_total,
+            countSundays: v.count_sundays === true,
+            unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
+            courseDays: courseDaysOf(v.days, v.days_total),
+          });
+          // Launchable day = the day the learner may open now, plus earlier
+          // (completed) days for revision. Progress mode has no calendar ceiling,
+          // so it keys off openableDay; calendar keeps the drip ceiling.
+          const ceiling =
+            v.unlock_mode === "progress"
+              ? state.finished
+                ? v.days_total
+                : state.openableDay
+              : Math.min(state.allowedDay, state.currentDay);
+          if (courseDays.some((d) => d <= ceiling)) {
+            return { allowed: true, upcomingAt: null };
+          }
+        }
       }
     }
   }

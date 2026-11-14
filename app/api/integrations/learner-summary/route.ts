@@ -4,9 +4,11 @@ import { resolveUserGroupIds } from "@/lib/org/groups";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 import {
   DEFAULT_POLICY,
   computeScoring,
@@ -347,35 +349,44 @@ export async function GET(request: Request) {
     const { data: enrRows } = await svc
       .from("journey_enrollments")
       .select(
-        "id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode), journey_programs!inner(name, is_active)"
+        "id, program_id, version_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode), journey_programs!inner(name, is_active)"
       )
       .eq("organization_id", orgId)
       .eq("user_id", uid)
       .in("status", ["active", "completed"]);
-    const journeyCodes = await fetchReferenceCodes(
-      svc,
-      "journey_programs",
-      ((enrRows ?? []) as Array<{ program_id: string }>).map((e) => e.program_id)
-    );
-    for (const e of (enrRows ?? []) as Array<{
+    const enrList = (enrRows ?? []) as Array<{
       id: string;
       program_id: string;
+      version_id: string;
       status: string;
       start_date: string;
       journey_versions: { days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null } | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
       journey_programs: { name: string; is_active: boolean } | Array<{ name: string; is_active: boolean }>;
-    }>) {
+    }>;
+    const journeyCodes = await fetchReferenceCodes(
+      svc,
+      "journey_programs",
+      enrList.map((e) => e.program_id)
+    );
+    // The learner's credits by day id, in one read for every enrolment
+    // (ADR 0024 step 45), never a count per enrolment. A failed read lists
+    // no journey rather than a day counted on a guess.
+    const credits = await readJourneyCredits(svc, enrList.map((e) => ({ id: e.id, version_id: e.version_id })));
+    if (!credits.ok) {
+      console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "learner_summary", code: credits.error?.code ?? null }));
+      throw new Error("journey credits unreadable");
+    }
+    for (const e of enrList) {
       const v = Array.isArray(e.journey_versions) ? e.journey_versions[0] : e.journey_versions;
       const prog = Array.isArray(e.journey_programs) ? e.journey_programs[0] : e.journey_programs;
       if (!v || !prog || prog.is_active === false) continue;
-      const { count } = await svc
-        .from("journey_day_progress")
-        .select("id", { count: "exact", head: true })
-        .eq("enrollment_id", e.id);
       const state = computeJourneyState({
         startDate: e.start_date,
         today,
-        completedCount: count ?? 0,
+        creditedDays: creditedDaysFor(
+          { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(e.version_id) },
+          credits.rowsOf(e.id)
+        ),
         daysTotal: v.days_total,
         countSundays: v.count_sundays === true,
         unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
@@ -393,7 +404,7 @@ export async function GET(request: Request) {
       });
     }
   } catch {
-    /* pre-journey database */
+    /* pre-journey database, or the credits unreadable (logged above) */
   }
 
   // ---- engagement ----

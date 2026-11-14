@@ -530,8 +530,14 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
   };
   walk("app");
   walk("lib");
-  eq("every readPagedWithOptionalColumn caller is listed (the eight, and attempt-kind.ts's grant snapshot)",
-    callers.sort(), [...Object.keys(SITES), "lib/scoring/attempt-kind.ts"].sort());
+  // ADR 0024 P2-4: the journey credit reader pages journey_day_progress (not
+  // course_attempts, so it has no ATTEMPT_COLUMNS) through the same helper.
+  const OTHER_TABLES = ["lib/journey/credits-read.ts"];
+  for (const f of OTHER_TABLES) {
+    eq(`${f}: no local copy of the first-page closure (the helper is the one implementation)`, /= used;|= usedColumns;|attemptColumns|\bcolumns = used\b/.test(codeOf(f)), false);
+  }
+  eq("every readPagedWithOptionalColumn caller is listed (the eight, attempt-kind.ts's grant snapshot and the journey credit reader)",
+    callers.sort(), [...Object.keys(SITES), "lib/scoring/attempt-kind.ts", ...OTHER_TABLES].sort());
 }
 
 console.log("\norg Reports' Recent attempts: a revision row is a \"Review visit\" with no score");

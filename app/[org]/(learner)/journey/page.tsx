@@ -14,6 +14,7 @@ import { JourneyIcon } from "@/components/ui/journey-icon";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   dateOfDay,
   effectiveJourneyCopy,
   effectiveMilestones,
@@ -23,6 +24,7 @@ import {
   DEFAULT_JOURNEY_TZ,
   type Milestone,
 } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 
 export const dynamic = "force-dynamic";
 
@@ -141,7 +143,9 @@ export default async function JourneyPage({
     );
   }
 
-  const [{ data: verRow }, { data: progressRows }, { data: gsRow }] =
+  // The learner's credits by day id (ADR 0024 step 45), through the one
+  // reader, which falls back to the day number on a database without 0107.
+  const [{ data: verRow }, credits, { data: gsRow }] =
     await Promise.all([
       supabase
         .from("journey_versions")
@@ -150,10 +154,7 @@ export default async function JourneyPage({
         )
         .eq("id", enrollment.version_id)
         .maybeSingle(),
-      supabase
-        .from("journey_day_progress")
-        .select("day_number, completed_at")
-        .eq("enrollment_id", enrollment.id),
+      readJourneyCredits(supabase, [{ id: enrollment.id, version_id: enrollment.version_id }]),
       supabase
         .from("gamification_settings")
         .select("timezone")
@@ -179,6 +180,16 @@ export default async function JourneyPage({
       </div>
     );
   }
+  // A failed credit read is never "no missions done": the page says so and
+  // shows no day as open or locked on a guess.
+  if (!credits.ok) {
+    console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "journey_page", code: credits.error?.code ?? null }));
+    return (
+      <div className="max-w-2xl mx-auto text-center py-16 text-muted text-sm">
+        Your journey progress could not be loaded. Refresh the page to try again.
+      </div>
+    );
+  }
 
   // COSMETIC fields (name, icon, milestones, completion title — nothing that
   // moves a learner's progress) come LIVE from the program: an admin rename
@@ -195,29 +206,35 @@ export default async function JourneyPage({
   const dayByNumber = parseVersionDays(version.days);
   const courseDays = courseDaysOf(version.days, version.days_total);
   const courseDaySet = new Set(courseDays);
-  const progress = (progressRows ?? []) as Array<{
-    day_number: number;
-    completed_at: string;
-  }>;
+  const progress = credits.rowsOf(enrollment.id);
   const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
   const today = todayStr(tz);
 
+  // Each day is marked done by its own credit, never by position: the
+  // numbers, in the pinned version, of the days whose id holds a credit.
+  const creditedDays = creditedDaysFor(
+    { days: version.days, days_total: version.days_total, day_ids: credits.dayIdsOf(enrollment.version_id) },
+    progress
+  );
   const unlockMode = version.unlock_mode === "progress" ? "progress" : "calendar";
   const state = computeJourneyState({
     startDate: enrollment.start_date,
     today,
-    completedCount: progress.length,
+    creditedDays,
     daysTotal: version.days_total,
     countSundays: version.count_sundays === true,
     unlockMode,
     courseDays,
   });
   const milestones = effectiveMilestones(version.milestones, version.days_total);
-  const doneDays = new Set(progress.map((p) => p.day_number));
+  const doneDays = new Set(creditedDays);
+  // The streak reads the credits' dates (activity on a day), not a count.
   const streak = journeyStreak(
-    progress.map((p) =>
-      new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(p.completed_at))
-    ),
+    progress
+      .filter((p) => p.completed_at)
+      .map((p) =>
+        new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date(p.completed_at as string))
+      ),
     today,
     version.count_sundays === true
   );

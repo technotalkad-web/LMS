@@ -340,9 +340,21 @@ console.log("\n(i) every scoring helper's call site reads status and is_revision
     "lib/scoring/attempt-kind.ts",
     "lib/scoring/status.ts",
   ];
+  // Paged readers of a table other than course_attempts: no scoring helper
+  // reads their rows, so they are listed here and not in SCOPED.
+  const PAGED_OTHER: Record<string, string> = {
+    // ADR 0024 P2-4: the journey credit reader (journey_day_progress, day_id).
+    "lib/journey/credits-read.ts": "journey_day_progress",
+  };
   const paged = [...sources.entries()].filter(([, s]) => /(?<!function\s)\breadPagedWithOptionalColumn</.test(s)).map(([f]) => f).sort();
-  eq("every readPagedWithOptionalColumn caller is listed: the eight paged attempts reads and the paged grant reader", paged, [...PAGED_CALLERS].sort());
-  eq("…each is in SCOPED", PAGED_CALLERS.every((f) => f in SCOPED), true);
+  eq("every readPagedWithOptionalColumn caller is listed: the eight paged attempts reads, the paged grant reader and the journey credit reader",
+    paged, [...PAGED_CALLERS, ...Object.keys(PAGED_OTHER)].sort());
+  eq("…each attempts reader is in SCOPED", PAGED_CALLERS.every((f) => f in SCOPED), true);
+  eq("…each other paged reader reads its own table and never course_attempts",
+    Object.entries(PAGED_OTHER).map(([f, t]) => {
+      const s = sources.get(f) ?? "";
+      return s.includes(`.from("${t}")`) && !s.includes("course_attempts");
+    }), Object.keys(PAGED_OTHER).map(() => true));
 }
 
 console.log("\n(ii) both gamification_record_activity call sites carry the revision gate");

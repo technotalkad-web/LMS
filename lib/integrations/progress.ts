@@ -4,9 +4,11 @@ import {
   DEFAULT_JOURNEY_TZ,
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   parseVersionDays,
   todayStr,
 } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 import {
   DEFAULT_POLICY,
   computeScoring,
@@ -538,23 +540,26 @@ export async function buildProgress(
         .order("id")
         .range(from, to)
     );
-    for (const ids of chunk(enrollments.map((e) => e.id), 300)) {
-      const rows = await drain<{ enrollment_id: string; day_number: number; completed_at: string }>((from, to) =>
-        svc
-          .from("journey_day_progress")
-          .select("enrollment_id, day_number, completed_at")
-          .in("enrollment_id", ids)
-          .order("id")
-          .range(from, to)
-      );
-      for (const r of rows) {
-        const m = dayDone.get(r.enrollment_id) ?? new Map<number, string>();
-        if (!m.has(r.day_number) || r.completed_at < (m.get(r.day_number) as string)) m.set(r.day_number, r.completed_at);
-        dayDone.set(r.enrollment_id, m);
-      }
-    }
   } catch (e) {
     if (!isMissingRelation(e)) throw e; // pre-journey database → no journeys
+  }
+  // The credits by day id, through the one reader (ADR 0024 step 45): the
+  // twin's counts read them by day id. Outside the try above, so a failed
+  // read is an error of the feed, never "no journeys" (a database without
+  // journeys has no enrolment, and the reader then reads nothing).
+  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })));
+  if (!credits.ok) throw new Error(`journey credits read failed (${credits.error?.code ?? "no code"})`);
+  // PENDING (ADR 0024 phase 9a, tests/unit/journey-credit-sites.test.ts):
+  // the feed's per-day rows still look a credit up by its day_number; phase
+  // 9a moves `days[]` to the day id with an additive `day_id`. Every count
+  // of the feed already reads the twin.
+  for (const e of enrollments) {
+    for (const r of credits.rowsOf(e.id)) {
+      if (!r.completed_at) continue;
+      const m = dayDone.get(e.id) ?? new Map<number, string>();
+      if (!m.has(r.day_number) || r.completed_at < (m.get(r.day_number) as string)) m.set(r.day_number, r.completed_at);
+      dayDone.set(e.id, m);
+    }
   }
   const today = todayStr(tz);
 
@@ -766,7 +771,10 @@ export async function buildProgress(
       const state = computeJourneyState({
         startDate: e.start_date,
         today,
-        completedCount: done.size,
+        creditedDays: creditedDaysFor(
+          { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(e.version_id) },
+          credits.rowsOf(e.id)
+        ),
         daysTotal: v.days_total,
         countSundays: v.count_sundays === true,
         unlockMode,
@@ -825,7 +833,7 @@ export async function buildProgress(
         start_date: e.start_date,
         day: state.currentDay,
         days_total: state.daysTotal,
-        days_completed: done.size,
+        days_completed: state.completedCount,
         pending_days: active ? state.pendingDays : 0,
         behind_days: active ? state.behindDays : 0,
         on_track: !active || state.pendingDays === 0,

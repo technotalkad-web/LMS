@@ -8,7 +8,7 @@
 //
 // The four files, under fixtures/: parity-official (pair 1, the official
 // rule), parity-path (pair 2, the path rule), parity-journey (pair 3, the
-// journey credit rule; its TypeScript side waits for phase 2, N17) and
+// journey credit rule; its TypeScript side runs since phase 2, P2-4, N17) and
 // parity-launch (pair 4, launch_context's facts and the resolver's decision).
 //
 // What the loader enforces, so that neither side can pass by omission:

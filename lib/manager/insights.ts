@@ -27,10 +27,12 @@ import {
   DEFAULT_JOURNEY_TZ,
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   dateOfDay,
   parseVersionDays,
   todayStr,
 } from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 import { fetchActiveMembers, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
 import { isReleased } from "@/lib/learner/release";
 import { THRESHOLDS } from "./report-card";
@@ -122,6 +124,7 @@ type EnrRow = {
   id: string;
   user_id: string;
   program_id: string;
+  version_id: string;
   status: string;
   start_date: string;
   journey_versions:
@@ -376,28 +379,29 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   };
   const enrollments = await fetchByIds<EnrRow>(
     svc, "journey_enrollments",
-    "id, user_id, program_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
+    "id, user_id, program_id, version_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
     "user_id", userIds, (q) => q.eq("organization_id", orgId).in("status", ["active", "completed"])
   ).catch(tolerateMissing<EnrRow>);
-  const dayRows = enrollments.length
-    ? await fetchByIds<{ enrollment_id: string; completed_at: string | null }>(
-        svc, "journey_day_progress", "enrollment_id, completed_at", "enrollment_id", enrollments.map((e) => e.id)
-      ).catch(tolerateMissing<{ enrollment_id: string; completed_at: string | null }>)
-    : [];
-  const dayDoneByEnr = new Map<string, string[]>();
-  for (const r of dayRows) dayDoneByEnr.set(r.enrollment_id, [...(dayDoneByEnr.get(r.enrollment_id) ?? []), r.completed_at ?? ""]);
+  // The credits by day id, through the one reader (ADR 0024 step 45). A
+  // failed read throws, as every other read of the Report Card does: it is
+  // never "no days done".
+  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })));
+  if (!credits.ok) throw new Error(`journey credits read failed: ${credits.error?.message ?? "no answer"}`);
   const journeysByUser = new Map<string, Array<JourneyInsight & { dayCompletions: string[]; courseIds: Set<string> }>>();
   for (const e of enrollments) {
     const v = Array.isArray(e.journey_versions) ? e.journey_versions[0] : e.journey_versions;
     const prog = programById.get(e.program_id);
     if (!v || !prog || prog.is_active === false) continue;
     if (lensJourney && e.program_id !== lensJourney) continue;
-    const done = dayDoneByEnr.get(e.id) ?? [];
+    const rows = credits.rowsOf(e.id);
+    // The credits' dates feed the period's activity and "last active"; the
+    // days done are the twin's count, never the number of rows.
+    const done = rows.map((r) => r.completed_at ?? "");
     const unlockMode: "calendar" | "progress" = v.unlock_mode === "progress" ? "progress" : "calendar";
     const state = computeJourneyState({
       startDate: e.start_date,
       today,
-      completedCount: done.length,
+      creditedDays: creditedDaysFor({ days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(e.version_id) }, rows),
       daysTotal: v.days_total,
       countSundays: v.count_sundays === true,
       unlockMode,
@@ -420,7 +424,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       total: state.daysTotal,
       behind,
       overdueDeadline,
-      daysDone: done.length,
+      daysDone: state.completedCount,
       courseDays: courseDaysOf(v.days, v.days_total).length,
       nextModule,
       onTrack: !active || (behind === 0 && !overdueDeadline),
