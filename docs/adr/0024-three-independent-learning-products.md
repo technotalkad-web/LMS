@@ -1966,6 +1966,7 @@ The round 3 days per phase, before any addition (the Days column of step 72's ta
     - (5) Section 6m: the sweep entry's key `error` renamed `err` in `refresh_gamification_views()`. (45) catches it by its key set. With `assert-0107-launch.sql` as it was before this revision, the same mutation passes.
     - (6) `lib/lrs/sweep.ts` as it was before F2: the new unit test fails 5 of its 9 checks.
     - (7) Section 0a's refusal, on a scratch database (F4).
+    - (8) Line 5786: `grant execute on function public.sweep_completion_side_effects(integer) to service_role;` removed (run after aada683, on the same file). In `0105-0106-then-0107`, which has default privileges, it is not caught, because the default gives `service_role` execute. In `0106-then-0105-then-0107`, A5 refuses the paste inside it: "A5 public.sweep_completion_side_effects(integer): execute anon f, authenticated f, service_role f". That is why one scenario runs without the default privileges (F5).
 
   **Measured at aada683, the fixes commit of the third revision:**
   - 37 functions (`functionList`: 37 created, 37 listed).
