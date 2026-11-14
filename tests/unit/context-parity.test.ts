@@ -28,7 +28,10 @@
  *       loader enforces are the ones this test compares;
  *   (e) the loader refuses a file that could let a side pass by omission or
  *       disagree with the database's clock (a minimal file in a temporary
- *       folder, edited one rule at a time).
+ *       folder, edited one rule at a time);
+ *   (f) the key twin: contextKeyOf() built from each fixture row's kind and
+ *       tags gives the context_key the row names, which the SQL side compares
+ *       with the generated column (contract 1.1).
  *
  * The launch pair runs in launch-context-facts.test.ts, as the record names
  * it (step 62).
@@ -39,7 +42,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CASE_FILES, FIELDS, loadCases } from "../../scripts/migration-rehearsal/parity-cases.mjs";
-import { ContextKeyError, contextResult, type ContextAttempt, type ContextGrant } from "../../lib/scoring/context";
+import {
+  ContextKeyError,
+  contextKeyOf,
+  contextResult,
+  type ContextAttempt,
+  type ContextGrant,
+  type ContextRef,
+} from "../../lib/scoring/context";
 import { pathProgress, type PathAttempt, type PathGrant, type PathStepFact, type PathStepInput } from "../../lib/paths/progress";
 import { DEFAULT_POLICY } from "../../lib/scoring/policy";
 
@@ -322,6 +332,38 @@ if (journey) {
     ...listed.filter((n) => !names.includes(n)).map((n) => `on the pending list, not in the file: ${n}`),
   ]);
   for (const n of names) console.log(`  … pending (phase 2): ${n}`);
+}
+
+// --- (f) the key twin: contextKeyOf() against the generated column -------------
+// The SQL side compares every context_key a fixture row names with the value
+// the database generates (assert-0107-parity.sql, par_put); here every such
+// row of the four files is given to contextKeyOf() built from the row's kind
+// and tags (twins contract 1.1), so the two keys are one string on both sides.
+console.log("\n(f) contextKeyOf() gives every fixture row's generated key");
+for (const d of docs.values()) {
+  const rows: Array<[string, Row]> = [];
+  for (const t of ["course_attempts", "attempt_requests"]) {
+    for (const r of d.world[t] ?? []) rows.push([`world.${t}`, r]);
+    for (const c of d.cases.filter((x) => x.sides.includes("sql"))) {
+      for (const r of c.given[t] ?? []) rows.push([`${c.name}: ${t}`, r]);
+    }
+  }
+  const problems: string[] = [];
+  for (const [where, r] of rows) {
+    const ref: ContextRef =
+      r.context_kind === "path" ? { kind: "path", pathId: String(r.learning_path_id) }
+      : r.context_kind === "journey" ? { kind: "journey", enrollmentId: String(r.journey_enrollment_id), dayId: String(r.journey_day_id) }
+      : r.context_kind === "preview" ? { kind: "preview", runId: str(r.preview_run_id), dayId: str(r.journey_day_id) }
+      : { kind: "individual" };
+    let key: string;
+    try {
+      key = contextKeyOf(ref);
+    } catch (e) {
+      key = `threw ${String(e)}`;
+    }
+    if (key !== r.context_key) problems.push(`${where} ${String(r.id)}: contextKeyOf gives ${key}, the row says ${String(r.context_key)}`);
+  }
+  ok(`${d.pair}: ${rows.length} rows`, problems);
 }
 
 // --- (e) the loader refuses a file that could pass by omission ------------------
