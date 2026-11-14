@@ -4,7 +4,8 @@
  * N8, N9 and N12; twins contract section 2):
  *
  *   (a) contextKeyOf and contextKindOfKey: the generated column's key, ids
- *       in lower case, a non-uuid id throws;
+ *       in lower case, a non-uuid id throws; isContextKey accepts every key
+ *       contextKeyOf writes and nothing else (H4 of the note of 2026-11-14);
  *   (b) contextResult over every row mix in each of the four kinds, the
  *       contract's minimum official cases (2.5), a row or a grant without
  *       context_key throws; previews, revision rows and abandoned rows are
@@ -31,6 +32,7 @@ import {
   contextKeyOf,
   contextKindOfKey,
   contextResult,
+  isContextKey,
   passedInWindow,
   type ContextAttempt,
   type ContextGrant,
@@ -131,6 +133,23 @@ console.log("\n(a) contextKeyOf and contextKindOfKey: the generated column's key
   throwsKey("a path id that is not a uuid throws", () => contextKeyOf({ kind: "path", pathId: "3" }));
   throwsKey("a journey day given as a number throws", () => contextKeyOf({ kind: "journey", enrollmentId: ENR, dayId: "4" }));
   eq("the kind of each key", [I, P, J1, "preview", `preview:${RUN}`, "nonsense", ""].map(contextKindOfKey), ["individual", "path", "journey", "preview", "preview", null, null]);
+  const written = [
+    contextKeyOf({ kind: "individual" }),
+    contextKeyOf({ kind: "path", pathId: PATH_P.toUpperCase() }),
+    contextKeyOf({ kind: "journey", enrollmentId: ENR, dayId: DAY1 }),
+    contextKeyOf({ kind: "preview" }),
+    contextKeyOf({ kind: "preview", runId: RUN }),
+    contextKeyOf({ kind: "preview", dayId: DAY1 }),
+    contextKeyOf({ kind: "preview", runId: RUN, dayId: DAY1 }),
+  ];
+  eq("isContextKey: every key contextKeyOf writes has the generated form", written.map(isContextKey), written.map(() => true));
+  const notKeys = [
+    P.toUpperCase(), `path:${PATH_P.toUpperCase()}`, "path:3", "path:", `path:${PATH_P}:${DAY1}`, `journey:${ENR}`,
+    `journey:${ENR}:4`, `journey:${ENR}:${DAY1}:${DAY2}`, `preview:${RUN}:${DAY1}:${DAY2}`, "preview:", ` ${I}`, `${P} `,
+    "Individual", "nonsense", "",
+  ];
+  eq("isContextKey: an upper-case id, a missing, extra or non-uuid id, padding or other text is not a key",
+    notKeys.filter(isContextKey), []);
 }
 
 console.log("\n(b) contextResult: the official rule per context");
@@ -340,6 +359,20 @@ async function main() {
     const { client } = stub(clean);
     const r = await readContextResult(client, { userId: "u1", courseId: "c1", key: "nonsense", passRequired: true, now: NOW });
     eq("a key of no kind: {ok: false, bad_key}, no read", r.ok ? "ok" : r.reason, "bad_key");
+  }
+  // H4 (the note of 2026-11-14): a key of a known kind that is not in the
+  // generated form matches no row; before the check it read as not started
+  for (const [what, key] of [
+    ["an upper-case path key", `path:${PATH_P.toUpperCase()}`],
+    ["a path key whose id is not a uuid", "path:3"],
+    ["a journey key without its day id", `journey:${ENR}`],
+    ["a journey key with a day number in place of its id", `journey:${ENR}:4`],
+    ["a preview key with three ids", `preview:${RUN}:${DAY1}:${DAY2}`],
+    ["a padded Individual key", `${I} `],
+  ] as Array<[string, string]>) {
+    const { client, calls } = stub(clean);
+    const r = await readContextResult(client, { userId: "u1", courseId: "c1", key, passRequired: true, now: NOW });
+    eq(`${what}: {ok: false, bad_key}, no read`, [r.ok ? "ok" : r.reason, calls.length], ["bad_key", 0]);
   }
 
   console.log("\n(d) readContextResult on a database without 0107 (principle 6, step 49)");

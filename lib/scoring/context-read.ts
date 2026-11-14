@@ -42,6 +42,7 @@ import {
   ContextKeyError,
   contextKindOfKey,
   contextResult,
+  isContextKey,
   type ContextAttempt,
   type ContextGrant,
   type ContextResult,
@@ -163,8 +164,12 @@ export async function readContextResult(
     versionIds?: string[];
   }
 ): Promise<ContextRead> {
+  // A key that is not in the generated column's form (an upper-case id, a
+  // missing id, any other text; isContextKey) matches no row, so it would
+  // read as not started: it answers bad_key before any read (H4 of the
+  // ADR's note of 2026-11-14).
   const kind = contextKindOfKey(opts.key);
-  if (kind === null) return fail("bad_key");
+  if (kind === null || !isContextKey(opts.key)) return fail("bad_key");
   const now = opts.now ?? new Date().toISOString();
   try {
     let versionIds = opts.versionIds;

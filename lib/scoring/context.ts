@@ -180,6 +180,25 @@ export function contextKindOfKey(key: string): ContextKind | null {
   return null;
 }
 
+/** A uuid as Postgres prints it: lower-case hex only. */
+const KEY_ID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const GENERATED_KEY = new RegExp(
+  `^(?:individual|path:${KEY_ID}|journey:${KEY_ID}:${KEY_ID}|preview(?::${KEY_ID}){0,2})$`
+);
+
+/**
+ * Whether a key has one of the forms of the generated column
+ * course_attempts.context_key (step 5, 0107 section 1g), the forms
+ * contextKeyOf writes: `individual`, `path:<id>`, `journey:<id>:<id>`,
+ * `preview` with zero to two ids. Ids are lower-case uuids, as Postgres
+ * prints them. An upper-case id, a missing or extra id, padding or any other
+ * text is a key no row can hold: a read filtered by it finds nothing, which
+ * would read as "not started" (H4 of the ADR's note of 2026-11-14).
+ */
+export function isContextKey(key: string): boolean {
+  return typeof key === "string" && GENERATED_KEY.test(key);
+}
+
 function hasKey(x: { context_key?: unknown }): boolean {
   return typeof x.context_key === "string" && x.context_key !== "";
 }
