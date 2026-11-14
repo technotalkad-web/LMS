@@ -97,7 +97,7 @@ function run(name: string, rep: unknown, raw?: string) {
 const lines = (s: string) => s.split(/\r?\n/);
 const leaks = (s: string) => MARKERS.filter((m) => s.includes(m));
 
-console.log("\nfailures: one line each, location only");
+console.log("\nfailures: one line each, location and duration only");
 {
   const r = run("mixed", report([
     fileSuite("43-xapi-resume.spec.ts", "xAPI resume", [

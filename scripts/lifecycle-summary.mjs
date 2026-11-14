@@ -10,10 +10,10 @@
  * per failed, timed-out, interrupted or flaky test: its status, spec file,
  * title path, the file:line:column of its first error (the test's own
  * declaration when no error has one), so a red run names the failing line,
- * and how long that result ran (a number: a duration at a request's or the
- * test's timeout tells a timeout from an assertion, ADR 0007 note of
- * 2026-11-14); a location prints only when it names an existing file of
- * this checkout.
+ * and how long that result ran (a number; it covers the whole test, hooks
+ * and earlier steps included, so a duration at or just above a timeout
+ * value suggests a request or test timeout; ADR 0007 note of 2026-11-14); a
+ * location prints only when it names an existing file of this checkout.
  * Never prints error messages, stack text, test output or attachments: the
  * repository is public and spec failure messages embed response bodies and
  * test emails. Titles are static strings here; one that looks like data

@@ -26,8 +26,8 @@
 # report stay in $RUNNER_TEMP; nothing is uploaded. The job prints counts
 # per spec file and, for each failing test, its title path, the
 # file:line:column of its first error and how long it ran; never an error
-# message, test output or attachment (scripts/lifecycle-summary.mjs; ADR 0007
-# decision 2, notes of 2026-10-19 and 2026-11-14). Reproduce a failure locally: bash scripts/lifecycle-nightly.sh
+# message, test output or attachment (scripts/lifecycle-summary.mjs;
+# ADR 0007 decision 2, notes of 2026-10-19 and 2026-11-14). Reproduce a failure locally: bash scripts/lifecycle-nightly.sh
 # (header there).
 name: Lifecycle nightly (staging)
 
