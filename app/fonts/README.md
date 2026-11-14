@@ -32,8 +32,10 @@ look the same as before.
 | Merriweather | `merriweather/` | v33 | SIL Open Font License 1.1, `merriweather/OFL.txt` (Reserved Font Name "Merriweather") |
 | Geist Mono | `geist-mono/` | v6 | SIL Open Font License 1.1, `geist-mono/OFL.txt` |
 
-Each `OFL.txt` is the family's licence file from the google/fonts repository
-(`https://github.com/google/fonts/tree/main/ofl/<family>/OFL.txt`).
+Each `OFL.txt` is the family's licence file from the google/fonts repository,
+`https://github.com/google/fonts/blob/main/ofl/<folder>/OFL.txt`, where the
+folder is `inter`, `poppins`, `plusjakartasans`, `roboto`, `merriweather` or
+`geistmono`.
 
 `fallbacks.css` holds the six fallback faces (`Inter Fallback` and so on)
 with the metrics `next/font/google` generated for these families.
