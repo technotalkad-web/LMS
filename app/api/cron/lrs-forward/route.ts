@@ -15,13 +15,29 @@ import { isMissingColumn } from "@/lib/scoring/attempt-kind";
  * with exponential backoff. Dead-letters after MAX_ATTEMPTS so a permanently
  * broken endpoint doesn't retry forever. Idempotent: statements carry their own
  * ids, so a re-send the LRS already has is a no-op. A Preview's rows are never
- * posted: they are deleted from the batch first (previewRowIds; ADR 0024 A35).
+ * posted (previewRowIds; ADR 0024 A35) and never deleted here: they are parked
+ * (PARK_UNTIL). Preview data is kept until an authorised admin deletes it by
+ * hand: the explicit purge of step 80 (purge_preview_data, by attempt_id)
+ * deletes a new-kind preview's outbox rows, and the earlier by-role rows are
+ * preserved (reading R26). A parked row keeps its status: a dead letter would
+ * breach ops health.
  */
 const BATCH = 200;
 // Retry budget before a row dead-letters. With the 5-minute cron and the backoff
 // below (2^n seconds, capped at 1 hour) 36 attempts cover roughly 27 hours of a
 // continuous LRS outage; 8 covered about 40 minutes.
 const MAX_ATTEMPTS = 36;
+/**
+ * Where a Preview's outbox row is parked (ADR 0024 A35, P2-3): next_attempt_at
+ * this far ahead, a timestamp Postgres timestamptz accepts, takes the row out
+ * of every due select and out of the ops health backlog (rows due 15 minutes
+ * ago) with its status, attempts and payload unchanged. "Resend all history"
+ * sets a parked row that is not pending back to pending and now; the next drain
+ * checks it and parks it again. Not exported: a route file exports handlers only.
+ */
+const PARK_UNTIL = "2999-12-31T00:00:00.000Z";
+/** A parked row's last_error: why it is never forwarded. */
+const PARK_REASON = "preview: never forwarded (ADR 0024 A35)";
 
 function svc() {
   return createServiceClient(
@@ -51,7 +67,10 @@ type DueRow = {
  * row) can still be due, "Resend all history" sets every row of the org back
  * to pending (lib/lrs/sweep.ts, dead-lettered rows included), and the points
  * and journey-day sources can name a preview's attempt. So the drain asks,
- * once per batch, which of the attempts its rows name are previews.
+ * once per batch, which of the attempts its rows name are previews, and parks
+ * their rows (PARK_UNTIL): never posted, and never deleted here. The explicit
+ * purge of step 80 (purge_preview_data, by attempt_id) is what deletes a
+ * new-kind preview's outbox rows; the by-role rows are preserved (reading R26).
  *
  * Reads `context_kind = 'preview'` only, in slices of 150 ids. Not through
  * readWithContextFilter: its fallback drops the filter, which here would
@@ -102,11 +121,16 @@ export async function POST(request: Request) {
 
   let rows = (due ?? []) as DueRow[];
 
-  // A Preview is never forwarded (previewRowIds). Its rows are deleted before
-  // any post (step 80's purge row expects none in the outbox); a failed check
-  // holds every row that names an attempt for the next run, untouched, as a
-  // failed config read does, and lets only the rows that name none go out.
-  const previewCheck: { previewsDropped?: number; held?: number; previewCheckError?: string } = {};
+  // A Preview is never forwarded (previewRowIds). Its rows leave this run's
+  // batch before any post and are parked, never deleted here (preview data is
+  // kept until an authorised admin deletes it by hand; reading R26 preserves
+  // the by-role rows): next_attempt_at = PARK_UNTIL and PARK_REASON in
+  // last_error, status, attempts and payload unchanged, in slices of 150 ids.
+  // A failed park write is reported (parkError) and its rows come back due next
+  // run, checked again, still never posted. A failed check holds every row that
+  // names an attempt for the next run, untouched, as a failed config read does,
+  // and lets only the rows that name none go out.
+  const previewCheck: { previewsParked?: number; parkError?: string; held?: number; previewCheckError?: string } = {};
   if (rows.some((r) => r.attempt_id)) {
     const check = await previewRowIds(db, rows);
     if ("error" in check) {
@@ -115,9 +139,17 @@ export async function POST(request: Request) {
       previewCheck.held = before - rows.length;
       previewCheck.previewCheckError = check.error;
     } else if (check.ids.size > 0) {
-      await db.from("lrs_forward_outbox").delete().in("id", [...check.ids]);
       rows = rows.filter((r) => !check.ids.has(r.id));
-      previewCheck.previewsDropped = check.ids.size;
+      let parked = 0;
+      for (const part of chunk([...check.ids], 150)) {
+        const { error } = await db
+          .from("lrs_forward_outbox")
+          .update({ next_attempt_at: PARK_UNTIL, last_error: PARK_REASON })
+          .in("id", part);
+        if (error) previewCheck.parkError ??= error.message || "park write failed";
+        else parked += part.length;
+      }
+      previewCheck.previewsParked = parked;
     }
   }
 

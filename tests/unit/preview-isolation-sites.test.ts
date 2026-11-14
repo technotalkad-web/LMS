@@ -28,9 +28,12 @@
  *       selects of a database without 0103 (which has no 0107 either);
  *       every loadAttemptContexts call there passes its caller's decision;
  *       the sweep's state is one per run; the live mirror's organisation
- *       read is filtered; the outbox drainer deletes a Preview's rows
- *       before any post ("Resend all history" sets every row back to
- *       pending). The callers of enqueueAbandonedStatements are scanned in
+ *       read is filtered; the outbox drainer parks a Preview's rows before
+ *       any post ("Resend all history" sets every row back to pending), and
+ *       its preview path (previewRowIds and the statement that calls it)
+ *       deletes nothing and writes only next_attempt_at and last_error
+ *       (preview data is deleted by hand only; reading R26). The callers
+ *       of enqueueAbandonedStatements are scanned in
  *       tests/unit/lrs-abandon-sites.test.ts, extended by this slice, not
  *       copied here.
  *   (b) the raw readers (step 49's row): every course_attempts read under
@@ -258,6 +261,45 @@ const allSites: Site[] = [];
 for (const [file, src] of sources) if (src.includes(TABLE)) allSites.push(...scan(file, src));
 const reads = allSites.filter((s) => s.kind === "read");
 
+/**
+ * The outbox drainer's preview path: the function previewRowIds and the
+ * statement of the calling function's body that holds its call (the block
+ * that consumes its answer). Answers whether both were found, every
+ * `.delete(…)` call inside them, and the keys of every `.update({ … })` they
+ * write. Preview data is kept until an authorised admin deletes it by hand
+ * and the by-role rows are preserved (ADR 0024 line "Preview data", reading
+ * R26), so the path parks a Preview's rows and never deletes them; the
+ * route's other delete (an org whose forwarding is off) is outside it. Pure
+ * over (file name, text), so (f) plants through it.
+ */
+function previewPath(file: string, src: string): { found: boolean; deletes: string[]; updates: string[][] } {
+  const sf = parse(file, src);
+  const at: { fn?: ts.Node; consumer?: ts.Node } = {};
+  const find = (n: ts.Node) => {
+    if (ts.isFunctionDeclaration(n) && n.name?.text === "previewRowIds") at.fn = n;
+    if (ts.isCallExpression(n) && calleeName(n) === "previewRowIds") {
+      let s: ts.Node = n;
+      while (s.parent && !(ts.isBlock(s.parent) && isFn(s.parent.parent))) s = s.parent;
+      if (s.parent) at.consumer = s;
+    }
+    ts.forEachChild(n, find);
+  };
+  find(sf);
+  const deletes: string[] = [];
+  const updates: string[][] = [];
+  const visit = (x: ts.Node) => {
+    if (ts.isCallExpression(x) && ts.isPropertyAccessExpression(x.expression)) {
+      const name = x.expression.name.text;
+      if (name === "delete") deletes.push(`${fnName(x)}:${sf.getLineAndCharacterOfPosition(x.getStart()).line + 1}`);
+      const a0 = x.arguments[0];
+      if (name === "update") updates.push(a0 && ts.isObjectLiteralExpression(a0) ? a0.properties.map((p) => (p.name ? p.name.getText(sf) : "…")) : ["?"]);
+    }
+    ts.forEachChild(x, visit);
+  };
+  for (const root of [at.fn, at.consumer]) if (root) visit(root);
+  return { found: !!at.fn && !!at.consumer, deletes, updates };
+}
+
 // ---------------------------------------------------------------------------
 console.log("\n(a) the tenant LRS: every course_attempts read under lib/lrs/ drops previews");
 {
@@ -334,8 +376,8 @@ console.log("\n(a) the tenant LRS: every course_attempts read under lib/lrs/ dro
 
   // The outbox drainer: rows queued before the sources dropped previews, rows
   // "Resend all history" sets back to pending, and points or journey-day rows
-  // that name a preview's attempt are deleted before any post (behaviour:
-  // tests/unit/lrs-forward.test.ts).
+  // that name a preview's attempt are parked before any post, never posted
+  // and never deleted (behaviour: tests/unit/lrs-forward.test.ts).
   const DRAINER = "app/api/cron/lrs-forward/route.ts";
   eq("the drainer: one course_attempts read, previews only and outside every fallback (whose re-read would select every attempt)",
     reads.filter((s) => s.file === DRAINER).map(key), [`${DRAINER} :: previewRowIds :: only-previews`]);
@@ -345,6 +387,8 @@ console.log("\n(a) the tenant LRS: every course_attempts read under lib/lrs/ dro
       /if \(isMissingColumn\(error, "context_kind"\)\) return \{ ids: new Set\(\) \};/.test(drainer) &&
       drainer.indexOf("await previewRowIds(db, rows)") > 0 &&
       drainer.indexOf("await previewRowIds(db, rows)") < drainer.indexOf("const byOrg = new Map"), true);
+  eq("…its preview path (previewRowIds and the statement that calls it) deletes nothing: its one write parks (next_attempt_at, last_error), status and attempts untouched",
+    previewPath(DRAINER, drainer), { found: true, deletes: [], updates: [["next_attempt_at", "last_error"]] });
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +594,30 @@ console.log("\n(f) planted sources: the scanner flags what it must");
     one(`async function f(db, s) { return readWithContextFilter(s, (apply) => db.from("course_attempts").select("id").eq("context_kind", "preview")); }`), ["read:none"]);
   eq("another context_kind value: none",
     one(`async function f(db) { return db.from("course_attempts").select("id").eq("context_kind", "individual"); }`), ["read:none"]);
+
+  // The drainer's preview path: a delete put back where the park is, or into previewRowIds, is flagged.
+  const drain = (consume: string, inFn = "") =>
+    previewPath("planted.ts", `async function previewRowIds(db, rows) { ${inFn} const { data } = await db.from("course_attempts").select("id").in("id", ids).eq("context_kind", "preview"); return { ids: new Set() }; }
+export async function POST() {
+  let rows = [];
+  if (rows.some((r) => r.attempt_id)) {
+    const check = await previewRowIds(db, rows);
+    if (check.ids.size > 0) { ${consume} }
+  }
+  await db.from("lrs_forward_outbox").delete().in("id", off);
+}`);
+  const PARK = `await db.from("lrs_forward_outbox").update({ next_attempt_at: PARK_UNTIL, last_error: PARK_REASON }).in("id", part);`;
+  eq("the park as the route writes it (the delete for an org whose forwarding is off is outside the path): nothing flagged",
+    drain(PARK), { found: true, deletes: [], updates: [["next_attempt_at", "last_error"]] });
+  eq("the delete put back in place of the park: flagged",
+    drain(`await db.from("lrs_forward_outbox").delete().in("id", [...check.ids]);`), { found: true, deletes: ["POST:6"], updates: [] });
+  eq("a delete inside previewRowIds: flagged",
+    drain(PARK, `await db.from("lrs_forward_outbox").delete().in("attempt_id", ids);`).deletes, ["previewRowIds:1"]);
+  eq("a park that also writes status (a dead letter would breach ops health): its keys show it",
+    drain(`await db.from("lrs_forward_outbox").update({ status: "dead", next_attempt_at: PARK_UNTIL, last_error: PARK_REASON }).in("id", part);`).updates, [["status", "next_attempt_at", "last_error"]]);
+  eq("a source without previewRowIds or its call: not found",
+    [previewPath("planted.ts", `export async function POST() { await db.from("lrs_forward_outbox").delete().in("id", ids); }`).found,
+      previewPath("planted.ts", `async function previewRowIds() { return { ids: new Set() }; }`).found], [false, false]);
 
   // Writes to a state (finding M11 of the P2-3 review: env.previews.applies = false in sweepOrg).
   const writes = (src: string, file = "planted.ts") => stateWrites(file, src).violations.length;
