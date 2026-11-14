@@ -216,6 +216,21 @@ exception when others then
 end
 $$;
 
+-- one preview_purge_log row (the record states no default for its id, nor
+-- its type: the insert names it only when the table asks for it)
+create function pg_temp.log_row(p_org uuid, p_reason text) returns void language plpgsql as $$
+begin
+  begin
+    insert into public.preview_purge_log (organization_id, reason, actor_user_id, counts)
+    values (p_org, p_reason, pg_temp.id('105'), '{}');
+  exception when not_null_violation then
+    execute 'insert into public.preview_purge_log (id, organization_id, reason, actor_user_id, counts) '
+            || 'values (gen_random_uuid(), $1, $2, $3, ''{}'')'
+      using p_org, p_reason, pg_temp.id('105');
+  end;
+end
+$$;
+
 -- the attempt and credit rows of one enrolment (a re-pin must change none, step 95 (4))
 create function pg_temp.enr_rows_md5(p_enr uuid) returns text language sql stable as $$
   select md5(concat_ws('#',
@@ -256,23 +271,63 @@ begin
 end
 $$;
 
--- one re-pin, dry run from the draft then the real run (steps 47, 94);
--- answers jsonb_build_object('dry', ..., 'real', ...)
+-- program J1's enrolments with their attempts, credits, badges and claims
+create function pg_temp.j1_md5() returns text language sql stable as $$
+  select md5(concat_ws('#',
+    (select md5(coalesce(string_agg(t::text, ',' order by t.id), '')) from public.journey_enrollments t
+      where t.program_id = pg_temp.id('3a1')),
+    (select md5(coalesce(string_agg(t::text, ',' order by t.id), '')) from public.course_attempts t
+      where t.journey_enrollment_id in (select e.id from public.journey_enrollments e where e.program_id = pg_temp.id('3a1'))),
+    (select md5(coalesce(string_agg(t::text, ',' order by t.id), '')) from public.journey_day_progress t
+      where t.enrollment_id in (select e.id from public.journey_enrollments e where e.program_id = pg_temp.id('3a1'))),
+    (select md5(coalesce(string_agg(t::text, ',' order by t.id), '')) from public.user_badges t
+      where t.organization_id = pg_temp.id('a0')),
+    (select md5(coalesce(string_agg(t::text, ',' order by t.id), '')) from public.completion_notices t
+      where t.organization_id = pg_temp.id('a0'))))
+$$;
+
+-- one re-pin of J1 (steps 47, 94): the dry run from the would-be version
+-- (days, day_ids, days_total), then the pointer moved, then the real run;
+-- answers {dry, real, dry_wrote}
 create function pg_temp.repin(p_version text, p_total int) returns jsonb language plpgsql as $$
 declare
   v uuid := pg_temp.id(p_version);
   d jsonb;
   r jsonb;
+  s0 text;
+  s1 text;
 begin
+  s0 := pg_temp.j1_md5();
   select public.journey_repin_enrollments(
            pg_temp.id('3a1'), null,
            jsonb_build_object('days', jv.days, 'day_ids', jv.day_ids, 'days_total', p_total), true)
     into d
     from public.journey_versions jv where jv.id = v;
+  s1 := pg_temp.j1_md5();
   update public.journey_programs set current_version_id = v where id = pg_temp.id('3a1');
   r := public.journey_repin_enrollments(pg_temp.id('3a1'), v, null, false);
-  return jsonb_build_object('dry', d, 'real', r);
+  return jsonb_build_object('dry', d, 'real', r, 'dry_wrote', s0 is distinct from s1);
 end
+$$;
+
+-- every attempt and credit row of J1's enrolments, as text (step 95 (4): a
+-- publish updates or deletes none; a relaxed rule may only add credits)
+create function pg_temp.j1_rows() returns text[] language sql stable as $$
+  select coalesce(array_agg(x), '{}') from (
+    select 'a' || t::text as x from public.course_attempts t
+     where t.journey_enrollment_id in (select e.id from public.journey_enrollments e where e.program_id = pg_temp.id('3a1'))
+    union all
+    select 'p' || t::text from public.journey_day_progress t
+     where t.enrollment_id in (select e.id from public.journey_enrollments e where e.program_id = pg_temp.id('3a1'))
+  ) s
+$$;
+
+-- the seven counts of step 47, equal between the dry run and the real run
+create function pg_temp.repin_counts_equal(x jsonb) returns text language sql immutable as $$
+  select string_agg(k || ' dry ' || coalesce(x->'dry'->>k, '-') || ' real ' || coalesce(x->'real'->>k, '-'), ', ')
+    from unnest(array['repinned', 'kept_on_version', 'completed_now', 'sent_back', 'started_days_kept',
+                      'credits_now_history', 'credited_by_rule_change']) k
+   where x->'dry'->k is null or x->'real'->k is null or x->'dry'->k is distinct from x->'real'->k
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -1084,9 +1139,9 @@ begin
   for r in select * from (values ('public.guard_learner_history_course_versions()'),
                                   ('public.guard_learner_history_courses()')) as t(fn)
   loop
-    src := lower(regexp_replace(regexp_replace(
+    src := lower(regexp_replace(regexp_replace(regexp_replace(
              (select p.prosrc from pg_proc p where p.oid = to_regprocedure(r.fn)), '\s+', ' ', 'g'),
-             '\(\s+|\s+\)', '', 'g'));
+             '\(\s+', '(', 'g'), '\s+\)', ')', 'g'));
     if src not like '%(not a.is_preview or a.preview_kind = ''legacy_role'')%' then
       bad := bad || format('%s does not count by-role rows with the clause of step 7', r.fn);
     end if;
@@ -1362,7 +1417,9 @@ begin
     ('consume_grant', 'public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)',
      'select * from public.consume_grant(gen_random_uuid(), null::uuid, null::uuid, null::uuid, null::uuid, null::uuid, null::uuid, null::integer, null::uuid)', true),
     ('record_revision_visit', 'public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text,text)',
-     'select public.record_revision_visit(null::uuid, null::uuid, null::uuid, null::uuid, null::uuid, null::text, null::text)', false),
+     'select public.record_revision_visit(null::uuid, null::uuid, null::uuid, null::uuid, null::uuid, null::text, null::text)', true),
+    ('record_revision_visit', 'public.record_revision_visit(uuid,uuid,uuid,uuid,uuid,text)',
+     'select public.record_revision_visit(null::uuid, null::uuid, null::uuid, null::uuid, null::uuid, null::text)', true),
     ('record_learning_activity', 'public.record_learning_activity(uuid)',
      'select public.record_learning_activity(gen_random_uuid())', true),
     ('journey_record_completion', 'public.journey_record_completion(uuid)',
@@ -1473,6 +1530,1894 @@ select set_config('request.jwt.claims', '', true);
 rollback to savepoint s1c;
 
 -- ===========================================================================
--- END OF FILE MARKER (sections are inserted above this line)
+-- (2) behaviour
 -- ===========================================================================
+
+-- (2a) the shape check (step 5, note N2) refuses every arm the record lists,
+--      as postgres and as service_role, and admits the legal rows: a by-role
+--      row keeping its old tags, a course preview, the two run kinds, a
+--      journey row with and without its launched version
+savepoint s2a;
+grant select, insert, update on public.course_attempts to service_role;
+do $$
+declare
+  bad text[] := '{}';
+  r record;
+  rl text;
+  got text;
+  base jsonb := '{"user":"108","ver":"1e7"}';
+begin
+  foreach rl in array array['postgres', 'service_role'] loop
+    for r in select * from (values
+      -- spec, true = the named shape check, false = any check of course_attempts (N2 allows a constraint of its own)
+      ('{"kind":"individual","path":"2a1"}', true),
+      ('{"kind":"individual","day_id":"3d1"}', true),
+      ('{"kind":"individual","preview":true}', true),
+      ('{"kind":"path"}', true),
+      ('{"kind":"path","path":"2a1","enr":"3c1","day":1,"day_id":"3d1"}', true),
+      ('{"kind":"path","path":"2a1","preview":true}', true),
+      ('{"kind":"path","path":"2a1","jver":"3b1"}', true),
+      ('{"kind":"journey","enr":"3c1","day":1}', true),
+      ('{"kind":"journey","enr":"3c1","day_id":"3d1"}', true),
+      ('{"kind":"journey","enr":"3c1","day":1,"day_id":"3d1","path":"2a1"}', true),
+      ('{"kind":"journey","enr":"3c1","day":1,"day_id":"3d1","preview":true}', true),
+      ('{"kind":"preview","preview":false,"pkind":"course"}', true),
+      ('{"kind":"preview","pkind":"course","path":"2a1"}', true),
+      ('{"kind":"preview","pkind":"course","run":"500"}', true),
+      ('{"kind":"preview","pkind":"course","jver":"3b1"}', true),
+      ('{"kind":"preview","pkind":"path_run"}', true),
+      ('{"kind":"preview","pkind":"path_run","run":"500","day_id":"3d1"}', true),
+      ('{"kind":"preview","pkind":"journey_run","run":"500"}', true),
+      ('{"kind":"preview","pkind":"journey_run","run":"500","day_id":"3d1","enr":"3c1","day":1}', true),
+      ('{"kind":"preview","pkind":"legacy_role","run":"500"}', true),
+      ('{"kind":"preview","pkind":"legacy_role","day_id":"3d1"}', true),
+      ('{"kind":"preview"}', false),
+      ('{"kind":"individual","pkind":"course"}', false),
+      ('{"kind":"preview","pkind":"other"}', false),
+      ('{"kind":"other"}', false)
+    ) as t(spec, named)
+    loop
+      if rl = 'postgres' then
+        got := pg_temp.try_att(base || r.spec::jsonb);
+      else
+        execute 'set local role service_role';
+        got := pg_temp.try_att(base || r.spec::jsonb);
+        execute 'reset role';
+      end if;
+      if split_part(got, '|', 1) <> '23514'
+         or (r.named and split_part(got, '|', 2) <> 'course_attempts_context_shape_chk') then
+        bad := bad || format('%s %s: %s', rl, r.spec, got);
+      end if;
+    end loop;
+    for r in select * from (values
+      ('{"kind":"preview","pkind":"legacy_role","path":"2a1","enr":"3c1","day":1}'),
+      ('{"kind":"preview","pkind":"course"}'),
+      ('{"kind":"preview","pkind":"path_run","run":"500"}'),
+      ('{"kind":"preview","pkind":"journey_run","run":"500","day_id":"3d1"}'),
+      ('{"kind":"journey","enr":"3c1","day":1,"day_id":"3d1"}'),
+      ('{"kind":"journey","enr":"3c1","day":1,"day_id":"3d1","jver":"3b1"}'),
+      ('{"kind":"individual"}'),
+      ('{"kind":"path","path":"2a1"}')
+    ) as t(spec)
+    loop
+      if rl = 'postgres' then
+        got := pg_temp.try_att(base || r.spec::jsonb);
+      else
+        execute 'set local role service_role';
+        got := pg_temp.try_att(base || r.spec::jsonb);
+        execute 'reset role';
+      end if;
+      if got <> 'ok' then
+        bad := bad || format('%s legal row %s refused: %s', rl, r.spec, got);
+      end if;
+    end loop;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2a) shape check (step 5, N2): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2a;
+
+-- (2b) the generated columns (steps 5 and 7): context_key by kind, settle_sig,
+--      and neither can be written
+savepoint s2b;
+do $$
+declare
+  bad text[] := '{}';
+  r record;
+  got text;
+begin
+  perform pg_temp.att('{"id":"4a01","user":"108","ver":"1e7","kind":"individual","status":"passed","score":87.5}');
+  perform pg_temp.att('{"id":"4a02","user":"108","ver":"1e7","kind":"path","path":"2a1"}');
+  perform pg_temp.att('{"id":"4a03","user":"108","ver":"1e7","kind":"journey","enr":"3c1","day":1,"day_id":"3d1","jver":"3b1"}');
+  perform pg_temp.att('{"id":"4a04","user":"105","ver":"1e7","kind":"preview","pkind":"legacy_role","path":"2a1","enr":"3c1","day":1}');
+  perform pg_temp.att('{"id":"4a05","user":"105","ver":"1e7","kind":"preview","pkind":"course"}');
+  perform pg_temp.att('{"id":"4a06","user":"105","ver":"1e7","kind":"preview","pkind":"path_run","run":"500"}');
+  perform pg_temp.att('{"id":"4a07","user":"105","ver":"1e7","kind":"preview","pkind":"journey_run","run":"500","day_id":"3d1"}');
+  for r in select * from (values
+    ('4a01', 'individual'),
+    ('4a02', 'path:' || pg_temp.id('2a1')),
+    ('4a03', 'journey:' || pg_temp.id('3c1') || ':' || pg_temp.id('3d1')),
+    ('4a04', 'preview'),
+    ('4a05', 'preview'),
+    ('4a06', 'preview:' || pg_temp.id('500')),
+    ('4a07', 'preview:' || pg_temp.id('500') || ':' || pg_temp.id('3d1'))
+  ) as t(sym, want)
+  loop
+    select a.context_key into got from public.course_attempts a where a.id = pg_temp.id(r.sym);
+    if got is distinct from r.want then
+      bad := bad || format('%s context_key %s (expected %s)', r.sym, got, r.want);
+    end if;
+  end loop;
+  if (select settle_sig from public.course_attempts where id = pg_temp.id('4a01')) is distinct from 'completed|passed|87.5' then
+    bad := bad || format('settle_sig of a passed row scored 87.5 reads %s',
+                         (select settle_sig from public.course_attempts where id = pg_temp.id('4a01')));
+  end if;
+  if (select settle_sig from public.course_attempts where id = pg_temp.id('4a02')) is distinct from 'completed|unknown|' then
+    bad := bad || format('settle_sig of a row with no score reads %s',
+                         (select settle_sig from public.course_attempts where id = pg_temp.id('4a02')));
+  end if;
+  got := pg_temp.try('update public.course_attempts set context_key = ''x'' where id = ' || quote_literal(pg_temp.id('4a01')));
+  if got = 'ok' then
+    bad := bad || 'context_key was written by an update'::text;
+  end if;
+  got := pg_temp.try('update public.course_attempts set settle_sig = ''x'' where id = ' || quote_literal(pg_temp.id('4a01')));
+  if got = 'ok' then
+    bad := bad || 'settle_sig was written by an update'::text;
+  end if;
+  got := pg_temp.try('insert into public.course_attempts (course_version_id, user_id, organization_id, context_kind, context_key) values ('
+                     || quote_literal(pg_temp.id('1e7')) || ', ' || quote_literal(pg_temp.id('108')) || ', '
+                     || quote_literal(pg_temp.id('a0')) || ', ''individual'', ''individual'')');
+  if got = 'ok' then
+    bad := bad || 'an insert naming context_key was admitted'::text;
+  end if;
+  -- the attempt_requests key (step 8): the same journey formula, individual by default
+  insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source)
+  values (pg_temp.id('6a01'), pg_temp.id('a0'), pg_temp.id('1c7'), pg_temp.id('108'), 'pending', 'bulk');
+  insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind,
+                                       journey_enrollment_id, journey_day, journey_day_id)
+  values (pg_temp.id('6a02'), pg_temp.id('a0'), pg_temp.id('1c2'), pg_temp.id('101'), 'pending', 'bulk', 'journey',
+          pg_temp.id('3c1'), 2, pg_temp.id('3d2'));
+  if (select context_kind || '/' || context_key from public.attempt_requests where id = pg_temp.id('6a01'))
+     is distinct from 'individual/individual' then
+    bad := bad || 'a request that names no context does not read individual'::text;
+  end if;
+  if (select context_key from public.attempt_requests where id = pg_temp.id('6a02'))
+     is distinct from 'journey:' || pg_temp.id('3c1') || ':' || pg_temp.id('3d2') then
+    bad := bad || format('a journey request reads the key %s',
+                         (select context_key from public.attempt_requests where id = pg_temp.id('6a02')));
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2b) generated columns (steps 5, 7, 8): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2b;
+
+-- (2c) the immutability trigger (step 7, D6): each of its nine columns, for
+--      postgres and for service_role, raises P0001 with a message neither
+--      launch probe matches (N7); the resume re-tag (journey columns on an
+--      existing row) and the analyst's is_preview write are among them.
+--      Controls: an update of other columns, and of a column to its own
+--      value, passes; a delete is not stopped
+savepoint s2c;
+grant select, insert, update, delete on public.course_attempts to service_role;
+do $$
+declare
+  bad text[] := '{}';
+  r record;
+  rl text;
+  got text;
+begin
+  perform pg_temp.att('{"id":"4c01","user":"108","ver":"1e7","kind":"individual"}');
+  perform pg_temp.att('{"id":"4c02","user":"108","ver":"1e8","kind":"path","path":"2a1"}');
+  foreach rl in array array['postgres', 'service_role'] loop
+    for r in select * from (values
+      ('4c01', 'context_kind', '''path'''),
+      ('4c01', 'learning_path_id', quote_literal(pg_temp.id('2a1'))),
+      ('4c01', 'journey_enrollment_id', quote_literal(pg_temp.id('3c1'))),
+      ('4c01', 'journey_day', '1'),
+      ('4c01', 'journey_day_id', quote_literal(pg_temp.id('3d1'))),
+      ('4c01', 'journey_version_id', quote_literal(pg_temp.id('3b1'))),
+      ('4c01', 'is_preview', 'true'),
+      ('4c01', 'preview_kind', '''course'''),
+      ('4c01', 'preview_run_id', quote_literal(pg_temp.id('500'))),
+      ('4c02', 'learning_path_id', 'null')
+    ) as t(sym, col, val)
+    loop
+      if rl = 'service_role' then execute 'set local role service_role'; end if;
+      got := pg_temp.try(format('update public.course_attempts set %I = %s where id = %L', r.col, r.val, pg_temp.id(r.sym)));
+      if rl = 'service_role' then execute 'reset role'; end if;
+      if not pg_temp.probe_safe(got) then
+        bad := bad || format('%s: %s.%s := %s → %s (expected P0001, no probe phrase)', rl, r.sym, r.col, r.val, got);
+      end if;
+    end loop;
+    if rl = 'service_role' then execute 'set local role service_role'; end if;
+    got := pg_temp.try(format('update public.course_attempts set score = 50, last_activity_at = now() where id = %L', pg_temp.id('4c01')));
+    if got <> 'ok' then
+      bad := bad || format('%s: control, an update of score and last_activity_at: %s', rl, got);
+    end if;
+    got := pg_temp.try(format('update public.course_attempts set context_kind = ''individual'', is_preview = false where id = %L',
+                              pg_temp.id('4c01')));
+    if got <> 'ok' then
+      bad := bad || format('%s: control, context columns written with their own values: %s', rl, got);
+    end if;
+    if rl = 'service_role' then execute 'reset role'; end if;
+  end loop;
+  if (select context_kind || '/' || coalesce(learning_path_id::text, '-') from public.course_attempts where id = pg_temp.id('4c01'))
+     is distinct from 'individual/-' then
+    bad := bad || 'a refused update changed 4c01'::text;
+  end if;
+  got := pg_temp.try(format('delete from public.course_attempts where id = %L', pg_temp.id('4c02')));
+  if got <> 'ok' then
+    bad := bad || format('the trigger stops a delete: %s', got);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2c) immutability trigger (step 7, D6, N7): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2c;
+
+-- (2d) the derive trigger (step 7): an insert that names no kind is labelled,
+--      a journey tag nulls a path tag and takes its day id from the pinned
+--      version, a by-role preview is legacy_role with its tags kept, a day
+--      the pinned version does not hold raises P0001 (N7); each firing is
+--      counted in context_derive_log, an insert naming its kind is not
+savepoint s2d;
+do $$
+declare
+  bad text[] := '{}';
+  n0 bigint := coalesce((select fired_count from public.context_derive_log), 0);
+  got text;
+  r record;
+begin
+  perform pg_temp.att('{"id":"4d01","user":"108","ver":"1e6"}');
+  perform pg_temp.att('{"id":"4d02","user":"108","ver":"1e7","path":"2a1"}');
+  perform pg_temp.att('{"id":"4d03","user":"101","ver":"1e2","enr":"3c1","day":2,"path":"2a1"}');
+  perform pg_temp.att('{"id":"4d04","user":"105","ver":"1e3","preview":true,"path":"2a1"}');
+  got := pg_temp.try_att('{"user":"101","ver":"1e6","enr":"3c1","day":6}');
+  if not pg_temp.probe_safe(got) then
+    bad := bad || format('a journey day the pinned version does not hold: %s (expected P0001, no probe phrase)', got);
+  end if;
+  if (select fired_count from public.context_derive_log) is distinct from n0 + 4 then
+    bad := bad || format('fired_count moved from %s to %s (expected +4)', n0, (select fired_count from public.context_derive_log));
+  end if;
+  if not coalesce((select last_fired_at >= now() from public.context_derive_log), false) then
+    bad := bad || 'last_fired_at was not set by the firings'::text;
+  end if;
+  perform pg_temp.att('{"id":"4d05","user":"108","ver":"1e8","kind":"individual"}');
+  if (select fired_count from public.context_derive_log) is distinct from n0 + 4 then
+    bad := bad || 'an insert that names its kind was counted as a firing'::text;
+  end if;
+  if (select count(*) from public.context_derive_log) <> 1 then
+    bad := bad || format('context_derive_log holds %s rows (expected one)', (select count(*) from public.context_derive_log));
+  end if;
+  for r in
+    select a.id, a.context_kind, a.learning_path_id, a.journey_enrollment_id, a.journey_day, a.journey_day_id,
+           a.journey_version_id, a.preview_kind, a.preview_run_id
+      from public.course_attempts a where a.id in (pg_temp.id('4d01'), pg_temp.id('4d02'), pg_temp.id('4d03'), pg_temp.id('4d04'))
+  loop
+    if r.id = pg_temp.id('4d01') and (r.context_kind <> 'individual' or r.preview_kind is not null) then
+      bad := bad || format('a tagless insert reads %s', r.context_kind);
+    elsif r.id = pg_temp.id('4d02') and (r.context_kind <> 'path' or r.learning_path_id is distinct from pg_temp.id('2a1')) then
+      bad := bad || format('a path-tagged insert reads %s', r.context_kind);
+    elsif r.id = pg_temp.id('4d03') and (r.context_kind <> 'journey' or r.learning_path_id is not null
+          or r.journey_day_id is distinct from pg_temp.id('3d2') or r.journey_version_id is not null) then
+      bad := bad || format('a journey-tagged insert reads %s, path %s, day id %s, version %s (expected journey, null, d2, null)',
+                           r.context_kind, r.learning_path_id, r.journey_day_id, r.journey_version_id);
+    elsif r.id = pg_temp.id('4d04') and (r.context_kind <> 'preview' or r.preview_kind is distinct from 'legacy_role'
+          or r.learning_path_id is distinct from pg_temp.id('2a1') or r.preview_run_id is not null or r.journey_day_id is not null) then
+      bad := bad || format('a by-role preview reads %s / %s with path %s', r.context_kind, r.preview_kind, r.learning_path_id);
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2d) derive trigger (step 7, N7): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2d;
+
+-- (2e) the two delete guards (step 7; step 63's guard cases). With no claim
+--      (the SQL editor) and with an authenticated claim, a delete of the
+--      course, the version or the language (package, through the cascade)
+--      over one by-role row raises learner_history_exists and keeps the row;
+--      the same over one learner attempt raises too (the clause still counts
+--      official rows); over a course preview only, the course deletes by
+--      cascade; with the service-role claim the by-role course deletes
+savepoint s2e;
+do $$
+declare
+  bad text[] := '{}';
+  r record;
+  claim text;
+  got text;
+  hint text;
+begin
+  perform pg_temp.att('{"id":"4e07","user":"105","ver":"1e7","kind":"preview","pkind":"legacy_role"}');
+  perform pg_temp.att('{"id":"4e08","user":"108","ver":"1e8","kind":"individual"}');
+  perform pg_temp.att('{"id":"4e09","user":"105","ver":"1e9","kind":"preview","pkind":"course"}');
+  foreach claim in array array['', '{"role":"authenticated"}'] loop
+    perform set_config('request.jwt.claims', claim, true);
+    for r in select * from (values
+      ('courses', '1c7'), ('course_versions', '1e7'), ('course_packages', '1d7'),
+      ('courses', '1c8'), ('course_versions', '1e8'), ('course_packages', '1d8')
+    ) as t(tbl, sym)
+    loop
+      got := pg_temp.try(format('delete from public.%I where id = %L', r.tbl, pg_temp.id(r.sym)));
+      if split_part(got, '|', 3) <> 'learner_history_exists' then
+        bad := bad || format('claim %s: delete of %s %s → %s (expected learner_history_exists)', coalesce(nullif(claim, ''), 'none'),
+                             r.tbl, r.sym, got);
+      end if;
+    end loop;
+  end loop;
+  if (select count(*) from public.course_attempts where id in (pg_temp.id('4e07'), pg_temp.id('4e08'))) <> 2
+     or (select count(*) from public.courses where id in (pg_temp.id('1c7'), pg_temp.id('1c8'))) <> 2 then
+    bad := bad || 'a refused delete removed a row'::text;
+  end if;
+  -- the hint names ADR 0024 (step 7)
+  perform set_config('request.jwt.claims', '', true);
+  begin
+    delete from public.courses where id = pg_temp.id('1c7');
+  exception when others then
+    get stacked diagnostics hint = pg_exception_hint;
+  end;
+  if coalesce(hint, '') not like '%ADR 0024%' then
+    bad := bad || format('the guard''s hint is %s (expected ADR 0024 in it)', hint);
+  end if;
+  -- a course whose only attempt is a course preview deletes, the preview with it
+  got := pg_temp.try(format('delete from public.courses where id = %L', pg_temp.id('1c9')));
+  if got <> 'ok' or exists (select 1 from public.course_attempts where id = pg_temp.id('4e09')) then
+    bad := bad || format('a course holding only a course preview: %s', got);
+  end if;
+  -- the service-role claim passes the guard (step 7: what is unchanged)
+  perform set_config('request.jwt.claims', '{"role":"service_role"}', true);
+  got := pg_temp.try(format('delete from public.courses where id = %L', pg_temp.id('1c7')));
+  perform set_config('request.jwt.claims', '', true);
+  if got <> 'ok' or exists (select 1 from public.course_attempts where id = pg_temp.id('4e07')) then
+    bad := bad || format('the service-role claim over a by-role row: %s', got);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2e) delete guards (step 7): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+select set_config('request.jwt.claims', '', true);
+rollback to savepoint s2e;
+
+-- (2f) the keys' delete rules at work (steps 7, 79; notes N1, N19): a lone
+--      delete of a path or of an enrolment that an attempt names raises
+--      23503 on the attempt's key; a program with a credit and no learner
+--      attempt deletes while a lone delete of its credited day is refused at
+--      the deferred check; the user's and the organisation's deletes pass
+--      over a path attempt, a journey attempt, a credit and a grant
+savepoint s2f;
+insert into public.journey_programs (id, organization_id, name, days_total, unlock_mode)
+values (pg_temp.id('3a2'), pg_temp.id('a0'), 'Indep Jn', 1, 'progress');
+insert into public.journey_days (id, program_id, organization_id, day_number, course_id)
+values (pg_temp.id('3d9'), pg_temp.id('3a2'), pg_temp.id('a0'), 1, pg_temp.id('1c6'));
+insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, count_sundays,
+                                     completion_title, days, unlock_mode, day_ids, day_ids_source)
+values (pg_temp.id('3b9'), pg_temp.id('3a2'), pg_temp.id('a0'), 1, 'Indep Jn', 1, false, 'Yoddha',
+        jsonb_build_array(jsonb_build_object('day', 1, 'course_id', pg_temp.id('1c6'), 'mission_title', 'm1')),
+        jsonb_build_object('1', pg_temp.id('3d9')), 'editor');
+update public.journey_programs set current_version_id = pg_temp.id('3b9') where id = pg_temp.id('3a2');
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+values (pg_temp.id('3c9'), pg_temp.id('3a2'), pg_temp.id('3b9'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 5, 'active');
+insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, course_id, attempt_id, day_id, credit_kind)
+values (pg_temp.id('3c9'), pg_temp.id('a0'), pg_temp.id('102'), 1, pg_temp.id('1c6'), null, pg_temp.id('3d9'), 'legacy_cross_context');
+select pg_temp.att('{"id":"4f01","user":"101","ver":"1e5","kind":"path","path":"2a3"}');
+select pg_temp.att('{"id":"4f02","user":"101","ver":"1e1","kind":"path","path":"2a1"}');
+insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind, learning_path_id)
+values (pg_temp.id('6f01'), pg_temp.id('a0'), pg_temp.id('1c1'), pg_temp.id('101'), 'pending', 'bulk', 'path', pg_temp.id('2a1'));
+insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind,
+                                     journey_enrollment_id, journey_day, journey_day_id, decided_at, used_at, used_attempt_id)
+values (pg_temp.id('6f02'), pg_temp.id('a0'), pg_temp.id('1c2'), pg_temp.id('101'), 'approved', 'bulk', 'journey',
+        pg_temp.id('3c1'), 2, pg_temp.id('3d2'), now(), now(), pg_temp.id('4b2'));
+do $$
+declare
+  bad text[] := '{}';
+  got text;
+  fk_day text := (select c.conname from pg_constraint c
+                   where c.conrelid = 'public.journey_day_progress'::regclass and c.contype = 'f'
+                     and c.conkey = array[(select a.attnum from pg_attribute a
+                                            where a.attrelid = 'public.journey_day_progress'::regclass
+                                              and a.attname = 'day_id')]::int2[]);
+begin
+  -- a lone path delete over a path attempt (P3 holds no test run)
+  got := pg_temp.try(format('delete from public.learning_paths where id = %L', pg_temp.id('2a3')));
+  if split_part(got, '|', 1) <> '23503'
+     or (select c.conrelid from pg_constraint c where c.conname = split_part(got, '|', 2) and c.contype = 'f'
+          limit 1) is distinct from 'public.course_attempts'::regclass then
+    bad := bad || format('a lone path delete: %s (expected 23503 on the attempt''s key)', got);
+  end if;
+  -- a lone enrolment delete over journey attempts
+  got := pg_temp.try(format('delete from public.journey_enrollments where id = %L', pg_temp.id('3c1')));
+  if split_part(got, '|', 1) <> '23503' then
+    bad := bad || format('a lone enrolment delete: %s (expected 23503)', got);
+  end if;
+  -- note N1: a program with a credit and no learner attempt deletes ...
+  begin
+    delete from public.journey_programs where id = pg_temp.id('3a2');
+    execute format('set constraints %I immediate', fk_day);
+    execute format('set constraints %I deferred', fk_day);
+    if exists (select 1 from public.journey_day_progress where enrollment_id = pg_temp.id('3c9')) then
+      bad := bad || 'the program delete left its credit'::text;
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception
+    when sqlstate 'U0107' then null;
+    when others then
+      bad := bad || format('a program with a credit and no learner attempt: %s %s', sqlstate, sqlerrm);
+  end;
+  -- ... and a lone delete of its credited day is refused at the deferred check
+  got := 'ok';
+  begin
+    delete from public.journey_days where id = pg_temp.id('3d9');
+    execute format('set constraints %I immediate', fk_day);
+  exception when others then
+    got := sqlstate;
+  end;
+  execute format('set constraints %I deferred', fk_day);
+  if got <> '23503' then
+    bad := bad || format('a lone delete of a credited day: %s (expected 23503 at the deferred check)', got);
+  end if;
+  -- note N19: the user's delete over a path attempt, a journey attempt, a credit and a grant
+  begin
+    delete from auth.users where id = pg_temp.id('101');
+    execute format('set constraints %I immediate', fk_day);
+    execute format('set constraints %I deferred', fk_day);
+    if exists (select 1 from public.course_attempts where user_id = pg_temp.id('101'))
+       or exists (select 1 from public.journey_day_progress where user_id = pg_temp.id('101'))
+       or exists (select 1 from public.attempt_requests where user_id = pg_temp.id('101')) then
+      bad := bad || 'the user''s delete left a row of the user'::text;
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception
+    when sqlstate 'U0107' then null;
+    when others then
+      bad := bad || format('the user''s delete: %s %s', sqlstate, sqlerrm);
+  end;
+  -- the organisation's delete, on the service client (the e2e purge's path)
+  perform set_config('request.jwt.claims', '{"role":"service_role"}', true);
+  begin
+    insert into public.learning_path_completions (id, organization_id, path_id, user_id, completed_at)
+    values (gen_random_uuid(), pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('101'), now());
+    insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, rule_pass_required)
+    values (pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('1c1'), pg_temp.id('101'), false);
+    insert into public.completion_notices (id, organization_id, user_id, product_kind, instance_id, event_type)
+    values (gen_random_uuid(), pg_temp.id('a0'), pg_temp.id('101'), 'path', pg_temp.id('2a1'), 'path_completion');
+    perform pg_temp.log_row(pg_temp.id('a0'), 'manual');
+    delete from public.organizations where id = pg_temp.id('a0');
+    execute format('set constraints %I immediate', fk_day);
+    execute format('set constraints %I deferred', fk_day);
+    if exists (select 1 from public.course_attempts where organization_id = pg_temp.id('a0'))
+       or exists (select 1 from public.preview_runs where organization_id = pg_temp.id('a0'))
+       or exists (select 1 from public.learning_path_completions where organization_id = pg_temp.id('a0'))
+       or exists (select 1 from public.learning_path_step_completions where organization_id = pg_temp.id('a0'))
+       or exists (select 1 from public.preview_purge_log where organization_id = pg_temp.id('a0')) then
+      bad := bad || 'the organisation''s delete left a row of the organisation'::text;
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception
+    when sqlstate 'U0107' then null;
+    when others then
+      bad := bad || format('the organisation''s delete: %s %s', sqlstate, sqlerrm);
+  end;
+  perform set_config('request.jwt.claims', '', true);
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2f) delete rules (steps 7, 79; N1, N19): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+select set_config('request.jwt.claims', '', true);
+rollback to savepoint s2f;
+
+-- (2g) the open-row and open-request keys (steps 7, 8; N4), the credit key
+--      (step 91), and every other check the record states, each refusing
+--      with 23514
+savepoint s2g;
+do $$
+declare
+  bad text[] := '{}';
+  got text;
+  r record;
+begin
+  -- three open rows of one learner and version in three contexts, and a preview beside them
+  perform pg_temp.att('{"user":"101","ver":"1e4","kind":"individual","status":"in_progress"}');
+  perform pg_temp.att('{"user":"101","ver":"1e4","kind":"path","path":"2a1","status":"in_progress"}');
+  perform pg_temp.att('{"user":"101","ver":"1e4","kind":"preview","pkind":"course","status":"in_progress"}');
+  got := pg_temp.try_att('{"user":"101","ver":"1e4","kind":"individual","status":"in_progress"}');
+  if split_part(got, '|', 1) <> '23505' or split_part(got, '|', 2) <> 'course_attempts_one_in_progress_ctx_idx' then
+    bad := bad || format('a second open row in one context: %s (expected 23505 on course_attempts_one_in_progress_ctx_idx)', got);
+  end if;
+  got := pg_temp.try_att('{"user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"in_progress"}');
+  if split_part(got, '|', 1) <> '23505' then
+    bad := bad || format('a second open row in the journey day''s context: %s (expected 23505)', got);
+  end if;
+  -- note N4: an open by-role row and a new open course preview share the key preview
+  perform pg_temp.att('{"user":"105","ver":"1e5","kind":"preview","pkind":"legacy_role","status":"in_progress"}');
+  got := pg_temp.try_att('{"user":"105","ver":"1e5","kind":"preview","pkind":"course","status":"in_progress"}');
+  if split_part(got, '|', 1) <> '23505' or split_part(got, '|', 2) <> 'course_attempts_one_in_progress_ctx_idx' then
+    bad := bad || format('a course preview beside an open by-role row: %s (expected 23505)', got);
+  end if;
+
+  -- two open requests of one learner and course in two contexts; a second in one context refused
+  insert into public.attempt_requests (organization_id, course_id, user_id, status, source)
+  values (pg_temp.id('a0'), pg_temp.id('1c1'), pg_temp.id('108'), 'pending', 'bulk');
+  insert into public.attempt_requests (organization_id, course_id, user_id, status, source, context_kind, learning_path_id)
+  values (pg_temp.id('a0'), pg_temp.id('1c1'), pg_temp.id('108'), 'approved', 'bulk', 'path', pg_temp.id('2a1'));
+  got := pg_temp.try(format('insert into public.attempt_requests (organization_id, course_id, user_id, status, source) '
+                            || 'values (%L, %L, %L, ''pending'', ''bulk'')', pg_temp.id('a0'), pg_temp.id('1c1'), pg_temp.id('108')));
+  if split_part(got, '|', 1) <> '23505' or split_part(got, '|', 2) <> 'attempt_requests_one_open_ctx_idx' then
+    bad := bad || format('a second open request in one context: %s (expected 23505 on attempt_requests_one_open_ctx_idx)', got);
+  end if;
+  -- the request shape check (step 8: the attempt's check without the preview arm)
+  for r in select * from (values
+    ('''individual'', ' || quote_literal(pg_temp.id('2a1')) || ', null, null, null'),
+    ('''path'', null, null, null, null'),
+    ('''path'', ' || quote_literal(pg_temp.id('2a1')) || ', ' || quote_literal(pg_temp.id('3c1')) || ', 1, ' || quote_literal(pg_temp.id('3d1'))),
+    ('''journey'', null, ' || quote_literal(pg_temp.id('3c1')) || ', 1, null'),
+    ('''journey'', ' || quote_literal(pg_temp.id('2a1')) || ', ' || quote_literal(pg_temp.id('3c1')) || ', 1, ' || quote_literal(pg_temp.id('3d1'))),
+    ('''preview'', null, null, null, null')
+  ) as t(vals)
+  loop
+    got := pg_temp.try('insert into public.attempt_requests (organization_id, course_id, user_id, status, source, context_kind, '
+                       || 'learning_path_id, journey_enrollment_id, journey_day, journey_day_id) values ('
+                       || quote_literal(pg_temp.id('a0')) || ', ' || quote_literal(pg_temp.id('1c3')) || ', '
+                       || quote_literal(pg_temp.id('108')) || ', ''rejected'', ''bulk'', ' || r.vals || ')');
+    if split_part(got, '|', 1) <> '23514' then
+      bad := bad || format('a request (%s): %s (expected 23514)', r.vals, got);
+    end if;
+  end loop;
+
+  -- the credit key (step 91): unique per (enrolment, day id); two credits of one number on two days admitted
+  got := pg_temp.try(format('insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id) '
+                            || 'values (%L, %L, %L, 9, %L)', pg_temp.id('3c1'), pg_temp.id('a0'), pg_temp.id('101'), pg_temp.id('3d1')));
+  if split_part(got, '|', 1) <> '23505' then
+    bad := bad || format('a second credit of one day id: %s (expected 23505)', got);
+  end if;
+  insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id)
+  values (pg_temp.id('3c1'), pg_temp.id('a0'), pg_temp.id('101'), 4, pg_temp.id('3d4')),
+         (pg_temp.id('3c1'), pg_temp.id('a0'), pg_temp.id('101'), 4, pg_temp.id('3d5'));
+  if (select count(*) from public.journey_day_progress where enrollment_id = pg_temp.id('3c1') and day_number = 4) <> 2 then
+    bad := bad || 'two credits of one number on two days were not both kept'::text;
+  end if;
+  if exists (select 1 from public.journey_day_progress where enrollment_id = pg_temp.id('3c1')
+              and (credit_kind <> 'attempt' or late)) then
+    bad := bad || 'a credit written without credit_kind or late does not read attempt and not late'::text;
+  end if;
+
+  -- the other checks of steps 8, 12, 15, 79 and 91 (each in its own subtransaction via try)
+  for r in select * from (values
+    ('journey_day_progress.credit_kind',
+     format('insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, day_id, credit_kind) '
+            || 'values (%L, %L, %L, 7, %L, ''other'')', pg_temp.id('3c1'), pg_temp.id('a0'), pg_temp.id('101'), pg_temp.id('3d6'))),
+    ('journey_days removed with a number',
+     format('update public.journey_days set removed_at = now() where id = %L', pg_temp.id('3d6'))),
+    ('journey_versions.day_ids_source',
+     format('update public.journey_versions set day_ids_source = ''other'' where id = %L', pg_temp.id('3b1'))),
+    ('journey_enrollments.source',
+     format('update public.journey_enrollments set source = ''other'' where id = %L', pg_temp.id('3c1'))),
+    ('journey_programs.visibility',
+     format('update public.journey_programs set visibility = ''public'' where id = %L', pg_temp.id('3a1'))),
+    ('learning_path_assignments.source',
+     format('update public.learning_path_assignments set source = ''audience'' where path_id = %L', pg_temp.id('2a1'))),
+    ('course_assignments.source',
+     format('insert into public.course_assignments (course_id, organization_id, assignee_type, user_id, source) '
+            || 'values (%L, %L, ''user'', %L, ''audience'')', pg_temp.id('1c1'), pg_temp.id('a0'), pg_temp.id('101'))),
+    ('org_api_keys.contract_version',
+     format('insert into public.org_api_keys (organization_id, name, key_prefix, key_hash, contract_version) '
+            || 'values (%L, ''k'', ''k'', ''indep-0107-hash-9'', 3)', pg_temp.id('a0'))),
+    ('org_integration_settings.webhook_contexts',
+     format('insert into public.org_integration_settings (organization_id, webhook_contexts) values (%L, ''some'')', pg_temp.id('a0'))),
+    ('course_attempts.webhook_skip_reason',
+     format('update public.course_attempts set webhook_skip_reason = ''other'' where id = %L', pg_temp.id('4b1'))),
+    ('completion_notices.product_kind',
+     format('insert into public.completion_notices (id, organization_id, user_id, product_kind, instance_id, event_type) '
+            || 'values (gen_random_uuid(), %L, %L, ''preview'', %L, ''x'')', pg_temp.id('a0'), pg_temp.id('101'), pg_temp.id('1c1'))),
+    ('completion_notices.origin',
+     format('insert into public.completion_notices (id, organization_id, user_id, product_kind, instance_id, event_type, origin) '
+            || 'values (gen_random_uuid(), %L, %L, ''individual'', %L, ''x'', ''cron'')', pg_temp.id('a0'), pg_temp.id('101'),
+            pg_temp.id('1c1'))),
+    ('preview_purge_log.reason',
+     format('select pg_temp.log_row(%L, ''auto'')', pg_temp.id('a0'))),
+    ('preview_runs.kind',
+     format('insert into public.preview_runs (id, organization_id, user_id, kind) values (gen_random_uuid(), %L, %L, ''course'')',
+            pg_temp.id('a0'), pg_temp.id('105'))),
+    ('a path run naming a program',
+     format('insert into public.preview_runs (id, organization_id, user_id, kind, learning_path_id, journey_program_id) '
+            || 'values (gen_random_uuid(), %L, %L, ''path'', %L, %L)', pg_temp.id('a0'), pg_temp.id('105'), pg_temp.id('2a1'), pg_temp.id('3a1'))),
+    ('a journey run naming a path',
+     format('insert into public.preview_runs (id, organization_id, user_id, kind, learning_path_id, journey_program_id, journey_version_id) '
+            || 'values (gen_random_uuid(), %L, %L, ''journey'', %L, %L, %L)', pg_temp.id('a0'), pg_temp.id('105'),
+            pg_temp.id('2a1'), pg_temp.id('3a1'), pg_temp.id('3b1'))),
+    ('a path run with activity days (decision A41)',
+     format('insert into public.preview_runs (id, organization_id, user_id, kind, learning_path_id, done_activity_day_ids) '
+            || 'values (gen_random_uuid(), %L, %L, ''path'', %L, array[%L]::uuid[])', pg_temp.id('a0'), pg_temp.id('105'),
+            pg_temp.id('2a1'), pg_temp.id('3d1'))),
+    ('context_derive_log.id',
+     'insert into public.context_derive_log (id, fired_count) values (false, 0)'),
+    ('notification_templates_event_type_check',
+     format('insert into public.notification_templates (organization_id, event_type, subject, body_md) '
+            || 'values (%L, ''journey_unknown'', ''s'', ''b'')', pg_temp.id('a0')))
+  ) as t(what, stmt)
+  loop
+    got := pg_temp.try(r.stmt);
+    if split_part(got, '|', 1) <> '23514' then
+      bad := bad || format('%s: %s (expected 23514)', r.what, got);
+    end if;
+  end loop;
+  -- the legal values: a removed day without a number, a journey run, the journey_completion template (step 8)
+  for r in select * from (values
+    ('a removed day without a number',
+     format('update public.journey_days set removed_at = now(), day_number = null where id = %L', pg_temp.id('3d6'))),
+    ('a journey run',
+     format('insert into public.preview_runs (id, organization_id, user_id, kind, journey_program_id, journey_version_id) '
+            || 'values (gen_random_uuid(), %L, %L, ''journey'', %L, %L)', pg_temp.id('a0'), pg_temp.id('105'),
+            pg_temp.id('3a1'), pg_temp.id('3b1'))),
+    ('the journey_completion template',
+     format('insert into public.notification_templates (organization_id, event_type, subject, body_md) '
+            || 'values (%L, ''journey_completion'', ''s'', ''b'')', pg_temp.id('a0'))),
+    ('the self source',
+     format('update public.journey_enrollments set source = ''self'' where id = %L', pg_temp.id('3c1'))),
+    ('an org_public program',
+     format('update public.journey_programs set visibility = ''org_public'' where id = %L', pg_temp.id('3a1'))),
+    ('webhook scope all',
+     format('insert into public.org_integration_settings (organization_id, webhook_contexts) values (%L, ''all'') '
+            || 'on conflict (organization_id) do update set webhook_contexts = ''all''', pg_temp.id('a0')))
+  ) as t(what, stmt)
+  loop
+    got := pg_temp.try(r.stmt);
+    if got <> 'ok' then
+      bad := bad || format('%s refused: %s', r.what, got);
+    end if;
+  end loop;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2g) keys and checks (steps 7, 8, 12, 15, 79, 91; N4): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2g;
+
+-- (2h) the official rule per context (step 9, N8, N9): within (learner,
+--      course, context) an abandoned row, a revision row and a preview are
+--      never official; a granted retake is official by used_attempt_id even
+--      when its grant reads Individual; the old-name views are the Individual
+--      context; the summary keeps one row per context and a reset-only learner
+savepoint s2h;
+select pg_temp.att('{"id":"4h01","user":"102","ver":"1e4","kind":"individual","status":"passed","score":80,"ago":600}');
+select pg_temp.att('{"id":"4h02","user":"102","ver":"1e4","kind":"individual","revision":true,"ago":500}');
+select pg_temp.att('{"id":"4h03","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"abandoned","completion":"completed","ago":590}');
+select pg_temp.att('{"id":"4h04","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"failed","score":40,"ago":580}');
+select pg_temp.att('{"id":"4h05","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"passed","score":70,"ago":560}');
+select pg_temp.att('{"id":"4h06","user":"102","ver":"1e4","kind":"path","path":"2a1","status":"passed","score":90,"ago":540}');
+select pg_temp.att('{"id":"4h07","user":"102","ver":"1e4","kind":"preview","pkind":"course","status":"passed","score":100,"ago":530}');
+select pg_temp.att('{"id":"4h08","user":"108","ver":"1e4","kind":"individual","status":"abandoned","ago":100}');
+insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, decided_at, used_at, used_attempt_id)
+values (pg_temp.id('6h01'), pg_temp.id('a0'), pg_temp.id('1c4'), pg_temp.id('102'), 'approved', 'bulk',
+        now() - interval '9 hours', now() - interval '9 hours', pg_temp.id('4h06'));
+do $$
+declare
+  bad text[] := '{}';
+  c4 uuid := pg_temp.id('1c4');
+  l2 uuid := pg_temp.id('102');
+  pk text := 'path:' || pg_temp.id('2a1');
+  got uuid;
+begin
+  select s.official_attempt_id into got from public.v_context_attempt_scoring s
+   where s.course_id = c4 and s.user_id = l2 and s.context_key = 'individual';
+  if got is distinct from pg_temp.id('4h01') then
+    bad := bad || format('Individual official attempt %s (expected 4h01)', got);
+  end if;
+  select s.official_attempt_id into got from public.v_context_attempt_scoring s
+   where s.course_id = c4 and s.user_id = l2 and s.context_key = pk;
+  if got is distinct from pg_temp.id('4h06') then
+    bad := bad || format('path official attempt %s (expected the granted retake 4h06)', got);
+  end if;
+  if exists (select 1 from public.v_context_attempt_scoring s where s.course_id = c4 and s.user_id = l2
+              and s.official_attempt_id in (pg_temp.id('4h02'), pg_temp.id('4h03'), pg_temp.id('4h05'), pg_temp.id('4h07')))
+     or exists (select 1 from public.v_context_attempt_summary s where s.course_id = c4 and s.user_id = l2
+              and s.official_attempt_id in (pg_temp.id('4h02'), pg_temp.id('4h03'), pg_temp.id('4h05'), pg_temp.id('4h07'))) then
+    bad := bad || 'a revision, abandoned, practice or preview row is official'::text;
+  end if;
+  if (select array_agg(s.context_key order by s.context_key) from public.v_context_attempt_summary s
+       where s.course_id = c4 and s.user_id = l2) is distinct from array['individual', pk] then
+    bad := bad || format('the summary rows of (c4, L2) carry the keys %s (expected individual and the path, no preview)',
+      (select array_agg(s.context_key order by s.context_key) from public.v_context_attempt_summary s
+        where s.course_id = c4 and s.user_id = l2));
+  end if;
+  if exists (select 1 from public.v_context_attempt_summary s where s.context_key like 'preview%')
+     or exists (select 1 from public.v_context_attempt_scoring s where s.context_key like 'preview%' and s.official_attempt_id is not null) then
+    bad := bad || 'a preview key has an official attempt or a summary row'::text;
+  end if;
+  if not coalesce((select s.passed_in_window from public.v_context_attempt_summary s
+                    where s.course_id = c4 and s.user_id = l2 and s.context_key = pk), false) then
+    bad := bad || 'the path context''s passed_in_window is not true over a passed granted retake (N12)'::text;
+  end if;
+  -- the old-name views are the Individual context, one row per (course, learner)
+  if (select s.official_attempt_id from public.v_course_attempt_scoring s where s.course_id = c4 and s.user_id = l2)
+     is distinct from pg_temp.id('4h01')
+     or (select count(*) from public.v_course_attempt_summary s where s.course_id = c4 and s.user_id = l2) <> 1
+     or (select s.official_attempt_id from public.v_course_attempt_summary s where s.course_id = c4 and s.user_id = l2)
+        is distinct from pg_temp.id('4h01') then
+    bad := bad || 'the old-name views are not the Individual context for (c4, L2)'::text;
+  end if;
+  -- official_attempt_in_context agrees with the view (step 9)
+  if public.official_attempt_in_context(l2, c4, 'individual') is distinct from pg_temp.id('4h01')
+     or public.official_attempt_in_context(l2, c4, pk) is distinct from pg_temp.id('4h06')
+     or public.official_attempt_in_context(l2, c4, 'preview') is not null then
+    bad := bad || format('official_attempt_in_context answers %s / %s / %s',
+      public.official_attempt_in_context(l2, c4, 'individual'), public.official_attempt_in_context(l2, c4, pk),
+      public.official_attempt_in_context(l2, c4, 'preview'));
+  end if;
+  -- grains (step 19): one row per (course, learner, context_key) and per (course, learner)
+  if exists (select 1 from public.v_context_attempt_summary s group by s.course_id, s.user_id, s.context_key having count(*) > 1)
+     or exists (select 1 from public.v_context_attempt_scoring s group by s.course_id, s.user_id, s.context_key having count(*) > 1)
+     or exists (select 1 from public.v_course_attempt_summary s group by s.course_id, s.user_id having count(*) > 1) then
+    bad := bad || 'a view breaks its grain'::text;
+  end if;
+  -- a learner whose only row is a reset attempt is kept, with live_attempt_count 0 (step 9 (c))
+  if (select s.live_attempt_count from public.v_context_attempt_summary s
+       where s.course_id = c4 and s.user_id = pg_temp.id('108') and s.context_key = 'individual') is distinct from 0 then
+    bad := bad || 'a reset-only learner is not a summary row with live_attempt_count 0'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2h) the official rule per context (step 9, N8, N9): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2h;
+
+-- (2i) consume_grant per context (steps 10, 63; N9): a path grant opens a
+--      path attempt and leaves the open Library row alone, stands is judged
+--      in the context only, a grant whose context differs from the launch is
+--      unavailable with nothing written, a live retake is found by
+--      used_attempt_id whatever its grant's context, and the day-id form
+--      refuses a day other than the grant's and writes the day and version
+savepoint s2i;
+select pg_temp.att('{"id":"4i01","user":"103","ver":"1e5","kind":"individual","status":"passed","ago":600}');
+select pg_temp.att('{"id":"4i02","user":"103","ver":"1e5","kind":"individual","status":"in_progress","ago":10}');
+insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind, learning_path_id)
+values (pg_temp.id('6i01'), pg_temp.id('a0'), pg_temp.id('1c5'), pg_temp.id('103'), 'approved', 'bulk', 'path', pg_temp.id('2a3'));
+insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source)
+values (pg_temp.id('6i02'), pg_temp.id('a0'), pg_temp.id('1c5'), pg_temp.id('103'), 'approved', 'bulk');
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+values (pg_temp.id('3c3'), pg_temp.id('3a1'), pg_temp.id('3b1'), pg_temp.id('a0'), pg_temp.id('103'), current_date - 3, 'active');
+insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, context_kind,
+                                     journey_enrollment_id, journey_day, journey_day_id)
+values (pg_temp.id('6i04'), pg_temp.id('a0'), pg_temp.id('1c2'), pg_temp.id('103'), 'approved', 'bulk', 'journey',
+        pg_temp.id('3c3'), 2, pg_temp.id('3d2'));
+do $$
+declare
+  bad text[] := '{}';
+  g record;
+  l3 uuid := pg_temp.id('103');
+  c5 uuid := pg_temp.id('1c5');
+  e5 uuid := pg_temp.id('1e5');
+  org uuid := pg_temp.id('a0');
+  p3 uuid := pg_temp.id('2a3');
+  n0 bigint := (select count(*) from public.course_attempts where user_id = pg_temp.id('103'));
+begin
+  -- (i) the path grant in path:P3
+  begin
+    select * into g from public.consume_grant(pg_temp.id('6i01'), l3, c5, e5, org, p3, null, null);
+    if g.outcome <> 'opened' or g.abandoned_ids <> '{}'::uuid[] then
+      bad := bad || format('(i) the path grant: %s, abandoned %s (expected opened, none)', g.outcome, g.abandoned_ids);
+    elsif (select a.context_kind || '/' || a.learning_path_id || '/' || a.status from public.course_attempts a where a.id = g.attempt_id)
+          is distinct from 'path/' || p3 || '/in_progress' then
+      bad := bad || '(i) the opened row is not an open path row of P3'::text;
+    end if;
+    if (select status from public.course_attempts where id = pg_temp.id('4i02')) <> 'in_progress' then
+      bad := bad || '(i) the open Library row was abandoned by a path grant'::text;
+    end if;
+    if (select used_attempt_id from public.attempt_requests where id = pg_temp.id('6i01')) is distinct from g.attempt_id then
+      bad := bad || '(i) the path grant does not name its retake'::text;
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  -- (ii) an Individual grant from a path launch, (iii) a path grant from an Individual launch
+  begin
+    select * into g from public.consume_grant(pg_temp.id('6i02'), l3, c5, e5, org, p3, null, null);
+    if g.outcome <> 'unavailable' then
+      bad := bad || format('(ii) an Individual grant from a path launch: %s (expected unavailable)', g.outcome);
+    end if;
+    select * into g from public.consume_grant(pg_temp.id('6i01'), l3, c5, e5, org, null, null, null);
+    if g.outcome <> 'unavailable' then
+      bad := bad || format('(iii) a path grant from an Individual launch: %s (expected unavailable)', g.outcome);
+    end if;
+    if (select count(*) from public.course_attempts where user_id = l3) <> n0
+       or exists (select 1 from public.attempt_requests where id in (pg_temp.id('6i01'), pg_temp.id('6i02'))
+                   and (used_at is not null or status <> 'approved')) then
+      bad := bad || '(ii, iii) an unavailable call wrote something'::text;
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  -- (iv) the Individual grant in the Individual context: the passed official result stands there
+  begin
+    select * into g from public.consume_grant(pg_temp.id('6i02'), l3, c5, e5, org, null, null, null);
+    if g.outcome <> 'stands' then
+      bad := bad || format('(iv) the Individual grant over a passed Individual result: %s (expected stands)', g.outcome);
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  -- (v) N9: an open path retake whose grant reads Individual is live in path:P3
+  begin
+    perform pg_temp.att('{"id":"4i03","user":"103","ver":"1e5","kind":"path","path":"2a3","status":"in_progress","ago":5}');
+    insert into public.attempt_requests (id, organization_id, course_id, user_id, status, source, decided_at, used_at, used_attempt_id)
+    values (pg_temp.id('6i03'), org, c5, l3, 'approved', 'bulk', now(), now(), pg_temp.id('4i03'));
+    select * into g from public.consume_grant(pg_temp.id('6i01'), l3, c5, e5, org, p3, null, null);
+    if g.outcome <> 'retake_live' or (select status from public.course_attempts where id = pg_temp.id('4i03')) <> 'in_progress' then
+      bad := bad || format('(v) a second path grant over a live legacy retake: %s (expected retake_live, nothing abandoned)', g.outcome);
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  -- (vi) the day-id form (step 10): another day than the grant's is unavailable, nothing written
+  begin
+    select * into g from public.consume_grant(pg_temp.id('6i04'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
+                                              null, pg_temp.id('3c3'), 2, pg_temp.id('3d3'));
+    if g.outcome <> 'unavailable'
+       or exists (select 1 from public.course_attempts where user_id = l3 and course_version_id = pg_temp.id('1e2'))
+       or (select used_at from public.attempt_requests where id = pg_temp.id('6i04')) is not null then
+      bad := bad || format('(vi) the day-id form with another day: %s (expected unavailable, nothing written)', g.outcome);
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  -- (vii) the day-id form with the grant's day writes the day id and the pinned version
+  begin
+    select * into g from public.consume_grant(pg_temp.id('6i04'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
+                                              null, pg_temp.id('3c3'), 2, pg_temp.id('3d2'));
+    if g.outcome <> 'opened'
+       or (select a.context_key || '/' || coalesce(a.journey_version_id::text, '-') from public.course_attempts a where a.id = g.attempt_id)
+          is distinct from 'journey:' || pg_temp.id('3c3') || ':' || pg_temp.id('3d2') || '/' || pg_temp.id('3b1') then
+      bad := bad || format('(vii) the day-id form: %s (expected opened in journey:E3:d2 with version V1)', g.outcome);
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  -- (viii) the old form resolves the number through the pinned version
+  begin
+    select * into g from public.consume_grant(pg_temp.id('6i04'), l3, pg_temp.id('1c2'), pg_temp.id('1e2'), org,
+                                              null, pg_temp.id('3c3'), 2);
+    if g.outcome <> 'opened'
+       or (select a.journey_day_id from public.course_attempts a where a.id = g.attempt_id) is distinct from pg_temp.id('3d2') then
+      bad := bad || format('(viii) the eight-argument form on a journey grant: %s (expected opened on day id d2)', g.outcome);
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2i) consume_grant per context (steps 10, 63; N9): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2i;
+
+-- (2j) record_revision_visit per context (step 11): the dedupe is keyed
+--      (learner, course, context); the six-argument form writes individual
+savepoint s2j;
+do $$
+declare
+  bad text[] := '{}';
+  org uuid := pg_temp.id('a0');
+  l4 uuid := pg_temp.id('108');
+  c3 uuid := pg_temp.id('1c3');
+  pk text := 'path:' || pg_temp.id('2a1');
+  b1 boolean; b2 boolean; b3 boolean; b4 boolean; b5 boolean;
+begin
+  b1 := public.record_revision_visit(org, l4, c3, null, null, 'scorm12', pk);
+  b2 := public.record_revision_visit(org, l4, c3, null, null, 'scorm12', pk);
+  b3 := public.record_revision_visit(org, l4, c3, null, null, 'scorm12', 'individual');
+  b4 := public.record_revision_visit(org, l4, c3, null, null, 'scorm12');
+  b5 := public.record_revision_visit(org, l4, pg_temp.id('1c2'), null, null, 'scorm12');
+  if (b1, b2, b3, b4, b5) is distinct from (true, false, true, false, true) then
+    bad := bad || format('the five visits answered %s %s %s %s %s (expected true false true false true)', b1, b2, b3, b4, b5);
+  end if;
+  if (select array_agg(v.context_key order by v.context_key) from public.revision_visits v
+       where v.user_id = l4 and v.course_id = c3) is distinct from array['individual', pk] then
+    bad := bad || format('the visits of (L4, c3) carry %s',
+      (select array_agg(v.context_key order by v.context_key) from public.revision_visits v where v.user_id = l4 and v.course_id = c3));
+  end if;
+  if (select v.context_key from public.revision_visits v where v.user_id = l4 and v.course_id = pg_temp.id('1c2')) is distinct from 'individual' then
+    bad := bad || 'the six-argument form did not write individual'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2j) record_revision_visit (step 11): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2j;
+
+-- (2k) journey day identity (steps 13, 91, 93 to 95, section U; N14): the
+--      credit state by day id on the base enrolment, the resolved pass rule,
+--      the lenient rule of R14, and step 63's re-pin cases on a learner who
+--      completed days 1 to 3 and holds an open attempt on day 4. Each re-pin
+--      case: the dry run's seven counts equal the real run's, the dry run
+--      writes nothing, the real run updates or deletes no attempt or credit
+savepoint s2k0;
+do $$
+declare
+  bad text[] := '{}';
+  s record;
+  e1 uuid := pg_temp.id('3c1');
+begin
+  select * into s from public.journey_credit_state(array[e1]);
+  if s.enrollment_id is distinct from e1 or s.required_days <> 4 or s.credited_days <> 3
+     or s.credited is distinct from array[1, 2, 3]
+     or s.credited_day_ids is distinct from array[pg_temp.id('3d1'), pg_temp.id('3d2'), pg_temp.id('3d3')]
+     or s.next_day is distinct from 4 or s.next_day_id is distinct from pg_temp.id('3d4')
+     or s.resumable_day_ids is distinct from array[pg_temp.id('3d4')] then
+    bad := bad || format('journey_credit_state(E1) = %s (expected 4 required, 3 credited [1,2,3] by d1-d3, next 4 = d4, resumable d4)', row_to_json(s));
+  end if;
+  select * into s from public.journey_reminder_counts(array[e1]);
+  if s.done <> 3 or s.credited is distinct from array[1, 2, 3] then
+    bad := bad || format('journey_reminder_counts(E1) = %s (expected done 3, credited [1,2,3])', row_to_json(s));
+  end if;
+  -- the resolved pass rule (step 9): the day's value in the pinned version, the
+  -- path step's, else the course's; never null
+  if public.instance_pass_required(pg_temp.id('1c4'), 'journey:' || e1 || ':' || pg_temp.id('3d4')) is distinct from false
+     or public.instance_pass_required(pg_temp.id('1c1'), 'path:' || pg_temp.id('2a1')) is distinct from false
+     or public.instance_pass_required(pg_temp.id('1c1'), 'individual') is distinct from false then
+    bad := bad || 'instance_pass_required does not answer false on rules that are all false'::text;
+  end if;
+  update public.learning_path_courses set pass_required = true where path_id = pg_temp.id('2a1') and course_id = pg_temp.id('1c1');
+  update public.courses set pass_required = true where id = pg_temp.id('1c2');
+  if public.instance_pass_required(pg_temp.id('1c1'), 'path:' || pg_temp.id('2a1')) is distinct from true
+     or public.instance_pass_required(pg_temp.id('1c2'), 'path:' || pg_temp.id('2a1')) is distinct from true
+     or public.instance_pass_required(pg_temp.id('1c2'), 'individual') is distinct from true
+     or public.instance_pass_required(pg_temp.id('1c1'), 'individual') is distinct from false then
+    bad := bad || 'instance_pass_required does not resolve the step''s rule, then the course''s'::text;
+  end if;
+  update public.learning_path_courses set pass_required = false where path_id = pg_temp.id('2a1') and course_id = pg_temp.id('1c2');
+  if public.instance_pass_required(pg_temp.id('1c2'), 'path:' || pg_temp.id('2a1')) is distinct from false then
+    bad := bad || 'a step that requires no pass over a pass-required course resolves true'::text;
+  end if;
+  -- R14: journey_attempt_satisfies by the caller's rule or the launched version's
+  perform pg_temp.att('{"id":"4k01","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","jver":"3b1","status":"failed"}');
+  perform pg_temp.att('{"id":"4k02","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"failed"}');
+  perform pg_temp.att('{"id":"4k03","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","jver":"3b1","status":"passed"}');
+  if (public.journey_attempt_satisfies(pg_temp.id('4k01'), true), public.journey_attempt_satisfies(pg_temp.id('4k01'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4k02'), true), public.journey_attempt_satisfies(pg_temp.id('4k02'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4k03'), true), public.journey_attempt_satisfies(pg_temp.id('4b4'), false))
+     is distinct from (true, true, false, true, true, false) then
+    bad := bad || format('journey_attempt_satisfies: failed under V1 (true %s, false %s), failed with no version (true %s, false %s), '
+                         || 'passed (true %s), open (false %s); expected true true false true true false',
+      public.journey_attempt_satisfies(pg_temp.id('4k01'), true), public.journey_attempt_satisfies(pg_temp.id('4k01'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4k02'), true), public.journey_attempt_satisfies(pg_temp.id('4k02'), false),
+      public.journey_attempt_satisfies(pg_temp.id('4k03'), true), public.journey_attempt_satisfies(pg_temp.id('4b4'), false));
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k0) credit state and pass rules (steps 9, 13; N14; R14): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2k0;
+
+-- (2k-a) a day inserted at number 2 (step 63 (a)), with (f): a completed
+--        enrolment is not re-pinned; then the open attempt completes and
+--        credits its own day under its new number
+savepoint s2ka;
+select pg_temp.jversion('3b2', 2,
+  '[[1,"3d1","1c1",false],[2,"3d6","1c6",false],[3,"3d2","1c2",false],[4,"3d3","1c3",false],[5,"3d4","1c4",false]]', 5, true);
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status, completed_at)
+values (pg_temp.id('3c2'), pg_temp.id('3a1'), pg_temp.id('3b1'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 40,
+        'completed', now() - interval '1 day');
+do $$
+declare
+  bad text[] := '{}';
+  before_rows text[] := pg_temp.j1_rows();
+  x jsonb;
+  s record;
+  e1 uuid := pg_temp.id('3c1');
+  diff text;
+  j jsonb;
+begin
+  x := pg_temp.repin('3b2', 5);
+  diff := pg_temp.repin_counts_equal(x);
+  if diff is not null then
+    bad := bad || format('dry and real counts differ: %s', diff);
+  end if;
+  if (x->>'dry_wrote')::boolean then
+    bad := bad || 'the dry run wrote'::text;
+  end if;
+  if not (pg_temp.j1_rows() @> before_rows) then
+    bad := bad || 'the real run updated or deleted an attempt or a credit'::text;
+  end if;
+  if (x->'real'->>'repinned', x->'real'->>'kept_on_version', x->'real'->>'completed_now', x->'real'->>'sent_back',
+      x->'real'->>'started_days_kept', x->'real'->>'credits_now_history', x->'real'->>'credited_by_rule_change')
+     is distinct from ('1', '0', '0', '1', '1', '0', '0') then
+    bad := bad || format('the real run answered %s (expected repinned 1, kept 0, completed 0, sent_back 1, started_days_kept 1, '
+                         || 'history 0, by rule 0)', x->'real');
+  end if;
+  if (select version_id from public.journey_enrollments where id = e1) is distinct from pg_temp.id('3b2')
+     or (select version_id from public.journey_enrollments where id = pg_temp.id('3c2')) is distinct from pg_temp.id('3b1') then
+    bad := bad || 'E1 is not pinned to the new version, or the completed enrolment was re-pinned (f)'::text;
+  end if;
+  select * into s from public.journey_credit_state(array[e1]);
+  if s.required_days <> 5 or s.credited_days <> 3 or s.credited is distinct from array[1, 3, 4]
+     or s.credited_day_ids is distinct from array[pg_temp.id('3d1'), pg_temp.id('3d2'), pg_temp.id('3d3')]
+     or s.next_day is distinct from 2 or s.next_day_id is distinct from pg_temp.id('3d6')
+     or s.resumable_day_ids is distinct from array[pg_temp.id('3d4')] then
+    bad := bad || format('after the insert at 2: %s (expected 5 required, credited [1,3,4] by d1-d3, next 2 = d6, resumable d4)',
+                         row_to_json(s));
+  end if;
+  -- the started day, one number later, completes and credits its own day
+  update public.course_attempts set status = 'completed', completion_status = 'completed', completed_at = now()
+   where id = pg_temp.id('4b4');
+  j := public.journey_record_completion(pg_temp.id('4b4'));
+  if (select p.day_number || '/' || p.credit_kind from public.journey_day_progress p
+       where p.enrollment_id = e1 and p.day_id = pg_temp.id('3d4')) is distinct from '5/attempt' then
+    bad := bad || format('the moved day''s completion: %s, credit %s (expected a credit on d4 under number 5, kind attempt)', j,
+      (select p.day_number || '/' || p.credit_kind from public.journey_day_progress p where p.enrollment_id = e1 and p.day_id = pg_temp.id('3d4')));
+  end if;
+  select * into s from public.journey_credit_state(array[e1]);
+  if s.credited_days <> 4 or s.next_day is distinct from 2
+     or (select r.done from public.journey_reminder_counts(array[e1]) r) is distinct from s.credited_days then
+    bad := bad || format('after the moved day''s credit: %s (expected 4 credited, next 2, reminder counts agreeing)', row_to_json(s));
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k-a) a day inserted (step 63 (a), (f); steps 13, 47, 94, 95): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2ka;
+
+-- (2k-d) day 4 removed and the version shorter, every remaining required day
+--        credited (step 63 (d), (e)): the publish completes E1 with one badge
+--        and one claim of origin publish; the open attempt then completes and
+--        writes a history credit, day_removed, with no second badge or claim
+savepoint s2kd;
+select pg_temp.jversion('3b3', 2, '[[1,"3d1","1c1",false],[2,"3d2","1c2",false],[3,"3d3","1c3",false]]', 3, true);
+do $$
+declare
+  bad text[] := '{}';
+  before_rows text[] := pg_temp.j1_rows();
+  x jsonb;
+  j jsonb;
+  e1 uuid := pg_temp.id('3c1');
+  l1 uuid := pg_temp.id('101');
+  diff text;
+begin
+  x := pg_temp.repin('3b3', 3);
+  diff := pg_temp.repin_counts_equal(x);
+  if diff is not null then
+    bad := bad || format('dry and real counts differ: %s', diff);
+  end if;
+  if (x->>'dry_wrote')::boolean then
+    bad := bad || 'the dry run wrote'::text;
+  end if;
+  if not (pg_temp.j1_rows() @> before_rows) then
+    bad := bad || 'the real run updated or deleted an attempt or a credit'::text;
+  end if;
+  if (x->'real'->>'repinned', x->'real'->>'kept_on_version', x->'real'->>'completed_now', x->'real'->>'started_days_kept',
+      x->'real'->>'credits_now_history')
+     is distinct from ('1', '0', '1', '1', '0') then
+    bad := bad || format('the real run answered %s (expected repinned 1, kept 0, completed_now 1, started_days_kept 1, history 0)', x->'real');
+  end if;
+  if (select status from public.journey_enrollments where id = e1) <> 'completed'
+     or (select completed_at from public.journey_enrollments where id = e1) is null then
+    bad := bad || 'the publish did not complete E1 with its completed_at'::text;
+  end if;
+  if (select count(*) from public.user_badges where user_id = l1 and badge_slug = 'yoddha' and period = 'enr:' || e1) <> 1 then
+    bad := bad || 'not exactly one yoddha badge with the period enr:<E1>'::text;
+  end if;
+  if (select array_agg(n.origin) from public.completion_notices n
+       where n.user_id = l1 and n.product_kind = 'journey' and n.instance_id = e1) is distinct from array['publish'] then
+    bad := bad || 'not exactly one journey claim of origin publish'::text;
+  end if;
+  -- the open attempt on the removed day completes: a history credit, day_removed
+  update public.course_attempts set status = 'completed', completion_status = 'completed', completed_at = now()
+   where id = pg_temp.id('4b4');
+  j := public.journey_record_completion(pg_temp.id('4b4'));
+  if coalesce((j->>'day_removed')::boolean, false) is not true then
+    bad := bad || format('journey_record_completion on the removed day answered %s (expected day_removed true)', j);
+  end if;
+  if (select p.day_number from public.journey_day_progress p where p.enrollment_id = e1 and p.day_id = pg_temp.id('3d4'))
+     is distinct from 4 then
+    bad := bad || 'no history credit on d4 under the attempt''s number 4'::text;
+  end if;
+  if (select count(*) from public.user_badges where user_id = l1 and badge_slug = 'yoddha' and period = 'enr:' || e1) <> 1
+     or (select count(*) from public.completion_notices n where n.user_id = l1 and n.product_kind = 'journey' and n.instance_id = e1) <> 1
+     or (select status from public.journey_enrollments where id = e1) <> 'completed'
+     or (select s.credited_days from public.journey_credit_state(array[e1]) s) <> 3 then
+    bad := bad || 'the history credit gave a second badge or claim, changed the enrolment or counted towards it'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k-d) a day removed, a shorter version (step 63 (d), (e); steps 13, 15): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2kd;
+
+-- (2k-g) the slot_backfill gate (step 94, step 63 (g)): a version inserted
+--        without a map is filled by slot and marked slot_backfill (step 91,
+--        N6); an enrolment on it with a change at or below its furthest day
+--        is kept on its version, one with the change after it is re-pinned
+savepoint s2kg;
+select pg_temp.jversion('3b4', 2, '[[1,"3d1","1c1",false],[2,"3d2","1c2",false],[3,"3d3","1c3",false],[4,"3d4","1c4",false]]', 4, false);
+update public.journey_enrollments set version_id = pg_temp.id('3b4') where id = pg_temp.id('3c1');
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+values (pg_temp.id('3c4'), pg_temp.id('3a1'), pg_temp.id('3b4'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 2, 'active');
+select pg_temp.att('{"id":"4k21","user":"102","ver":"1e1","kind":"journey","enr":"3c4","day":1,"day_id":"3d1","jver":"3b4"}');
+insert into public.journey_day_progress (enrollment_id, organization_id, user_id, day_number, course_id, attempt_id, day_id)
+values (pg_temp.id('3c4'), pg_temp.id('a0'), pg_temp.id('102'), 1, pg_temp.id('1c1'), pg_temp.id('4k21'), pg_temp.id('3d1'));
+select pg_temp.jversion('3b2', 3,
+  '[[1,"3d1","1c1",false],[2,"3d6","1c6",false],[3,"3d2","1c2",false],[4,"3d3","1c3",false],[5,"3d4","1c4",false]]', 5, true);
+do $$
+declare
+  bad text[] := '{}';
+  x jsonb;
+  diff text;
+begin
+  if (select day_ids_source from public.journey_versions where id = pg_temp.id('3b4')) is distinct from 'slot_backfill'
+     or (select day_ids from public.journey_versions where id = pg_temp.id('3b4'))
+        is distinct from jsonb_build_object('1', pg_temp.id('3d1'), '2', pg_temp.id('3d2'), '3', pg_temp.id('3d3'), '4', pg_temp.id('3d4')) then
+    bad := bad || format('a version inserted without a map reads %s / %s (expected the slot map, slot_backfill)',
+      (select day_ids_source from public.journey_versions where id = pg_temp.id('3b4')),
+      (select day_ids from public.journey_versions where id = pg_temp.id('3b4')));
+  end if;
+  if (select day_ids_source from public.journey_versions where id = pg_temp.id('3b2')) is distinct from 'editor' then
+    bad := bad || 'a version inserted with its map lost its source editor (N6)'::text;
+  end if;
+  x := pg_temp.repin('3b2', 5);
+  diff := pg_temp.repin_counts_equal(x);
+  if diff is not null then
+    bad := bad || format('dry and real counts differ: %s', diff);
+  end if;
+  if (x->'real'->>'kept_on_version', x->'real'->>'repinned') is distinct from ('1', '1') then
+    bad := bad || format('the real run answered %s (expected kept_on_version 1, repinned 1)', x->'real');
+  end if;
+  if (select version_id from public.journey_enrollments where id = pg_temp.id('3c1')) is distinct from pg_temp.id('3b4')
+     or (select version_id from public.journey_enrollments where id = pg_temp.id('3c4')) is distinct from pg_temp.id('3b2') then
+    bad := bad || 'E1 (furthest day 4, change at 2) was re-pinned, or the enrolment credited on day 1 only was not'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k-g) the slot_backfill gate (steps 91, 94; N6): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2kg;
+
+-- (2k-h) a per-day pass rule relaxed on a failed day credits it at the
+--        publish (step 95, step 63 (h)); E1 is reset first, so only the
+--        enrolment of this case is selected
+savepoint s2kh;
+update public.journey_enrollments set status = 'reset' where id = pg_temp.id('3c1');
+select pg_temp.jversion('3b5', 2, '[[1,"3d1","1c1",true],[2,"3d2","1c2",false]]', 2, true);
+insert into public.journey_enrollments (id, program_id, version_id, organization_id, user_id, start_date, status)
+values (pg_temp.id('3c5'), pg_temp.id('3a1'), pg_temp.id('3b5'), pg_temp.id('a0'), pg_temp.id('102'), current_date - 2, 'active');
+select pg_temp.att('{"id":"4k31","user":"102","ver":"1e1","kind":"journey","enr":"3c5","day":1,"day_id":"3d1","jver":"3b5","status":"failed"}');
+do $$
+declare
+  bad text[] := '{}';
+  x jsonb;
+  diff text;
+  eh uuid := pg_temp.id('3c5');
+begin
+  perform public.journey_record_completion(pg_temp.id('4k31'));
+  if exists (select 1 from public.journey_day_progress where enrollment_id = eh) then
+    bad := bad || 'a failed attempt was credited on a pass-required day'::text;
+  end if;
+  perform pg_temp.jversion('3b6', 3, '[[1,"3d1","1c1",false],[2,"3d2","1c2",false]]', 2, true);
+  x := pg_temp.repin('3b6', 2);
+  diff := pg_temp.repin_counts_equal(x);
+  if diff is not null then
+    bad := bad || format('dry and real counts differ: %s', diff);
+  end if;
+  if (x->'real'->>'credited_by_rule_change') is distinct from '1' then
+    bad := bad || format('the real run answered %s (expected credited_by_rule_change 1)', x->'real');
+  end if;
+  if (select count(*) from public.journey_day_progress where enrollment_id = eh and day_id = pg_temp.id('3d1')) <> 1 then
+    bad := bad || 'the relaxed day holds no credit after the publish'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k-h) a relaxed day rule (steps 13, 95): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2kh;
+
+-- (2k-r) a publish never makes a started day harder (R14, step 13): day 4 made
+--        pass-required; an attempt launched under V1 that fails is credited,
+--        one with no launched version that fails is judged by the pinned rule
+savepoint s2kr;
+select pg_temp.jversion('3b7', 2, '[[1,"3d1","1c1",false],[2,"3d2","1c2",false],[3,"3d3","1c3",false],[4,"3d4","1c4",true]]', 4, true);
+do $$
+declare
+  bad text[] := '{}';
+  x jsonb;
+  diff text;
+  e1 uuid := pg_temp.id('3c1');
+begin
+  x := pg_temp.repin('3b7', 4);
+  diff := pg_temp.repin_counts_equal(x);
+  if diff is not null then
+    bad := bad || format('dry and real counts differ: %s', diff);
+  end if;
+  if (select version_id from public.journey_enrollments where id = e1) is distinct from pg_temp.id('3b7') then
+    bad := bad || 'E1 was not re-pinned to the stricter version'::text;
+  end if;
+  -- an attempt with no launched version, failed: the pinned (stricter) rule refuses it
+  perform pg_temp.att('{"id":"4k41","user":"101","ver":"1e4","kind":"journey","enr":"3c1","day":4,"day_id":"3d4","status":"failed","ago":20}');
+  perform public.journey_record_completion(pg_temp.id('4k41'));
+  if exists (select 1 from public.journey_day_progress where enrollment_id = e1 and day_id = pg_temp.id('3d4')) then
+    bad := bad || 'a failed attempt with no launched version was credited under the stricter pinned rule'::text;
+  end if;
+  -- the attempt started under V1 fails and is still credited
+  update public.course_attempts set status = 'failed', completion_status = 'completed', success_status = 'failed', completed_at = now()
+   where id = pg_temp.id('4b4');
+  perform public.journey_record_completion(pg_temp.id('4b4'));
+  if not exists (select 1 from public.journey_day_progress where enrollment_id = e1 and day_id = pg_temp.id('3d4')) then
+    bad := bad || 'the attempt launched under V1 was not credited after the rule was made stricter'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k-r) a stricter rule never fails started work (R14, step 13): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2kr;
+
+-- (2k-l) launch_context (step 18; N15's key tree): the facts of the seed of
+--        this file equal what direct selects give; a missing course is
+--        found false with no other key; another organisation's learner gets
+--        no enrolment fact
+savepoint s2kl;
+do $$
+declare
+  bad text[] := '{}';
+  l1 uuid := pg_temp.id('101');
+  org uuid := pg_temp.id('a0');
+  lc jsonb;
+  st jsonb;
+  i int;
+begin
+  lc := public.launch_context(l1, org, pg_temp.id('1c1'), pg_temp.id('2a1'), null, null, null);
+  if not (lc ?& array['v', 'member', 'course', 'path', 'journey', 'holders', 'run']) then
+    bad := bad || format('the top-level keys are %s', (select array_agg(k) from jsonb_object_keys(lc) k));
+  end if;
+  if lc->>'v' is distinct from '1' or lc->'journey' is distinct from 'null'::jsonb or lc->'run' is distinct from 'null'::jsonb
+     or lc->'member'->>'active' is distinct from 'true' or lc->'course'->>'found' is distinct from 'true' then
+    bad := bad || format('v %s, journey %s, run %s, member %s, course found %s (expected 1, null, null, active, true)',
+      lc->>'v', lc->'journey', lc->'run', lc->'member', lc->'course'->>'found');
+  end if;
+  if lc->'path'->>'sequence_mode' is distinct from 'strict' or lc->'path'->>'enrolled' is distinct from 'true'
+     or jsonb_array_length(lc->'path'->'steps') is distinct from 3 then
+    bad := bad || format('the path facts %s', lc->'path');
+  else
+    for i in 0..2 loop
+      st := lc->'path'->'steps'->i;
+      if not (st ?& array['course_id', 'step_number', 'release_at', 'done'])
+         or (st->>'step_number')::int <> i + 1
+         or st->>'course_id' is distinct from pg_temp.id('1c' || (i + 1))::text
+         or (st->>'done')::boolean is distinct from (select v.done from public.v_path_step_status v
+                                                     where v.path_id = pg_temp.id('2a1') and v.user_id = l1
+                                                       and v.course_id = pg_temp.id('1c' || (i + 1))) then
+        bad := bad || format('step %s reads %s', i + 1, st);
+      end if;
+    end loop;
+  end if;
+  lc := public.launch_context(l1, org, gen_random_uuid(), null, null, null, null);
+  if lc->'course' is distinct from '{"found": false}'::jsonb or lc->'path' is distinct from 'null'::jsonb then
+    bad := bad || format('a missing course reads %s, path %s (expected {"found": false} and null)', lc->'course', lc->'path');
+  end if;
+  lc := public.launch_context(l1, org, pg_temp.id('1c4'), null, pg_temp.id('3c1'), pg_temp.id('3d4'), null);
+  if lc->'journey'->>'found' is distinct from 'true' or lc->'journey'->>'status' is distinct from 'active'
+     or lc->'journey'->>'program_id' is distinct from pg_temp.id('3a1')::text
+     or lc->'journey'->>'version_id' is distinct from pg_temp.id('3b1')::text
+     or (lc->'journey'->>'required_days')::int is distinct from 4 or (lc->'journey'->>'credited_days')::int is distinct from 3
+     or (lc->'journey'->>'next_day')::int is distinct from 4
+     or lc->'journey'->>'next_day_id' is distinct from pg_temp.id('3d4')::text
+     or lc->'journey'->'resumable_day_ids' is distinct from jsonb_build_array(pg_temp.id('3d4'))
+     or lc->'journey'->'day'->>'id' is distinct from pg_temp.id('3d4')::text
+     or (lc->'journey'->'day'->>'number')::int is distinct from 4
+     or lc->'journey'->'day'->>'in_version' is distinct from 'true' or lc->'journey'->'day'->>'removed' is distinct from 'false'
+     or lc->'journey'->'day'->>'course_id' is distinct from pg_temp.id('1c4')::text
+     or lc->'journey'->'day_open_attempt'->>'attempt_id' is distinct from pg_temp.id('4b4')::text
+     or lc->'journey'->'day_credit' is distinct from 'null'::jsonb then
+    bad := bad || format('the journey facts of E1 on d4: %s', lc->'journey');
+  end if;
+  lc := public.launch_context(l1, org, pg_temp.id('1c4'), null, pg_temp.id('3c1'), null, 4);
+  if lc->'journey'->'day'->>'id' is distinct from pg_temp.id('3d4')::text then
+    bad := bad || format('an old link''s number 4 resolves to %s (expected d4)', lc->'journey'->'day');
+  end if;
+  lc := public.launch_context(pg_temp.id('106'), org, pg_temp.id('1c1'), pg_temp.id('2a1'), null, null, null);
+  if lc->'member'->>'active' = 'true' or lc->'path'->>'enrolled' = 'true' then
+    bad := bad || format('a member of another organisation reads member %s, path %s', lc->'member', lc->'path');
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2k-l) launch_context (step 18; N15): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2kl;
+
+-- (2l) the stored fact of a done step (build note O1-a to O1-g, owner's
+--      option (ii)) through the writer (step 12, O1-c, O1-e) on path P2
+--      (steps c1, c2; learner L3): (1) tighten after done keeps the step done
+--      and step 2 unlocked; (5) a second writer call writes nothing more and
+--      the fact cannot be updated or deleted; the path completion with its
+--      claim; then (3) tighten before done applies and (4) relax helps at once
+savepoint s2l1;
+select pg_temp.att('{"id":"4l01","user":"103","ver":"1e1","kind":"path","path":"2a2","ago":100}');
+do $$
+declare
+  bad text[] := '{}';
+  p2 uuid := pg_temp.id('2a2');
+  l3 uuid := pg_temp.id('103');
+  c1 uuid := pg_temp.id('1c1');
+  w jsonb;
+  v record;
+  d0 timestamptz;
+  got text;
+  nid uuid;
+begin
+  w := public.record_learning_activity(pg_temp.id('4l01'));
+  if w->>'official' is distinct from 'true' or w->'context'->>'kind' is distinct from 'path'
+     or w->>'done' is distinct from 'true' or w->>'passed_ever' is distinct from 'true'
+     or w->>'passed_by_rule' is distinct from 'true' or w->>'done_recorded_at' is null then
+    bad := bad || format('(1) the writer on a completed path row answered %s (expected official, path, done, passed_ever, '
+                         || 'passed_by_rule true, done_recorded_at set)', w);
+  end if;
+  if (select count(*) || '/' || bool_and(not f.rule_pass_required) || '/' || bool_and(f.attempt_id = pg_temp.id('4l01'))
+        from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1)
+     is distinct from '1/true/true' then
+    bad := bad || '(1) not one fact for (P2, L3, c1) under rule false naming the attempt'::text;
+  end if;
+  if (select a.side_effects_sig is distinct from a.settle_sig or a.side_effects_at is null
+        from public.course_attempts a where a.id = pg_temp.id('4l01')) then
+    bad := bad || '(1) the writer did not stamp side_effects_sig and side_effects_at'::text;
+  end if;
+  select f.done_at into d0 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1;
+  -- the admin tightens step 1 after the learner finished it
+  update public.learning_path_courses set pass_required = true where path_id = p2 and course_id = c1;
+  select * into v from public.v_path_step_status s where s.path_id = p2 and s.user_id = l3 and s.course_id = c1;
+  if v.passed_by_rule is distinct from false or v.done_recorded_at is distinct from d0 or v.passed_ever is distinct from true
+     or v.done is distinct from true or v.failed is distinct from false or v.pass_required is distinct from true then
+    bad := bad || format('(1) after the tightening the step reads %s (expected passed_by_rule false, done by its fact, not failed)',
+                         row_to_json(v));
+  end if;
+  select * into v from public.v_path_progress s where s.path_id = p2 and s.user_id = l3;
+  if v.next_step is distinct from 2 or v.next_course_id is distinct from pg_temp.id('1c2') or v.steps_done is distinct from 1
+     or v.steps_total is distinct from 2 or v.completed is distinct from false then
+    bad := bad || format('(1) the path reads %s (expected next step 2 = c2, 1 of 2 done, not completed)', row_to_json(v));
+  end if;
+  -- (5) a second call writes nothing more; the fact is append-only for postgres
+  w := public.record_learning_activity(pg_temp.id('4l01'));
+  if (select count(*) from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3) <> 1
+     or (select f.done_at from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3 and f.course_id = c1)
+        is distinct from d0 then
+    bad := bad || '(5) a second writer call changed the facts'::text;
+  end if;
+  got := pg_temp.try(format('update public.learning_path_step_completions set rule_pass_required = true where path_id = %L', p2));
+  if got = 'ok' then
+    bad := bad || '(5) a fact was updated'::text;
+  end if;
+  got := pg_temp.try(format('delete from public.learning_path_step_completions where path_id = %L', p2));
+  if got = 'ok' then
+    bad := bad || '(5) a fact was deleted'::text;
+  end if;
+  -- step 2 completes: the path completion, its claim (origin learner) and the notice in the answer (steps 14, 15)
+  perform pg_temp.att('{"id":"4l02","user":"103","ver":"1e2","kind":"path","path":"2a2","ago":50}');
+  w := public.record_learning_activity(pg_temp.id('4l02'));
+  select n.id into nid from public.completion_notices n where n.user_id = l3 and n.product_kind = 'path' and n.instance_id = p2;
+  if w->>'path_completed' is distinct from 'true'
+     or (select count(*) from public.learning_path_completions c where c.path_id = p2 and c.user_id = l3) <> 1
+     or nid is null
+     or (select n.origin from public.completion_notices n where n.id = nid) is distinct from 'learner'
+     or not exists (select 1 from jsonb_array_elements(w->'notices') e
+                     where e->>'id' = nid::text and e->>'product_kind' = 'path' and e->>'instance_id' = p2::text
+                       and e ? 'event_type') then
+    bad := bad || format('the last step''s writer call answered %s (expected path_completed, one completion row, one claim of origin learner in notices)', w);
+  end if;
+  select * into v from public.v_path_progress s where s.path_id = p2 and s.user_id = l3;
+  if v.completed is distinct from true or v.status is distinct from 'completed' then
+    bad := bad || format('the completed path reads %s', row_to_json(v));
+  end if;
+  w := public.record_learning_activity(pg_temp.id('4l02'));
+  if (select count(*) from public.learning_path_completions c where c.path_id = p2 and c.user_id = l3) <> 1
+     or (select count(*) from public.completion_notices n where n.user_id = l3 and n.product_kind = 'path' and n.instance_id = p2) <> 1
+     or coalesce(w->>'path_completed', 'false') = 'true' then
+    bad := bad || format('a second call on the last step: %s (expected nothing new)', w);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2l-1) the stored fact and the path completion (O1-c to O1-g; steps 12, 14, 15): %',
+      array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2l1;
+
+savepoint s2l3;
+update public.learning_path_courses set pass_required = true where path_id = pg_temp.id('2a2') and course_id = pg_temp.id('1c1');
+select pg_temp.att('{"id":"4l03","user":"103","ver":"1e1","kind":"path","path":"2a2","ago":100}');
+do $$
+declare
+  bad text[] := '{}';
+  p2 uuid := pg_temp.id('2a2');
+  l3 uuid := pg_temp.id('103');
+  c1 uuid := pg_temp.id('1c1');
+  w jsonb;
+  v record;
+begin
+  w := public.record_learning_activity(pg_temp.id('4l03'));
+  if exists (select 1 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3)
+     or w->>'done' is distinct from 'false' then
+    bad := bad || format('(3) completed without a pass under a pass-required rule: %s, facts %s (expected not done, no fact)', w,
+      (select count(*) from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3));
+  end if;
+  if (select s.done from public.v_path_step_status s where s.path_id = p2 and s.user_id = l3 and s.course_id = c1) is distinct from false
+     or (select s.next_step from public.v_path_progress s where s.path_id = p2 and s.user_id = l3) is distinct from 1 then
+    bad := bad || '(3) the step is done or the next step is not 1'::text;
+  end if;
+  -- (4) the rule relaxed: done at once, with no fact and no writer call
+  update public.learning_path_courses set pass_required = false where path_id = p2 and course_id = c1;
+  select * into v from public.v_path_step_status s where s.path_id = p2 and s.user_id = l3 and s.course_id = c1;
+  if v.done is distinct from true or v.passed_by_rule is distinct from true or v.done_recorded_at is not null
+     or exists (select 1 from public.learning_path_step_completions f where f.path_id = p2 and f.user_id = l3) then
+    bad := bad || format('(4) after the relaxation the step reads %s (expected done by rule, no fact)', row_to_json(v));
+  end if;
+  if (select s.next_step from public.v_path_progress s where s.path_id = p2 and s.user_id = l3) is distinct from 2 then
+    bad := bad || '(4) the next step is not 2 after the relaxation'::text;
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2l-3) tighten before done, relax after (O1-g (3), (4)): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2l3;
+
+-- (2m) the writer on Individual rows (step 12; N13; section F): its answer's
+--      keys, the official first completion with its claim (origin learner)
+--      and its stamps, the paid key and the 0-point event row, nothing new on
+--      a second call, a later row that is not official (not_official,
+--      attempt number 2), the skips (preview, revision, abandoned) with
+--      nothing written, and a claim with gamification off
+savepoint s2m;
+select pg_temp.att('{"id":"4m01","user":"102","ver":"1e6","kind":"individual","score":70,"ago":100}');
+do $$
+declare
+  bad text[] := '{}';
+  l2 uuid := pg_temp.id('102');
+  c6 uuid := pg_temp.id('1c6');
+  w jsonb;
+  nid uuid;
+  sym text;
+begin
+  w := public.record_learning_activity(pg_temp.id('4m01'));
+  if not (w ?& array['activity', 'official', 'attempt_number', 'context', 'done', 'passed_ever', 'xp', 'journey_credited',
+                     'journey_completed', 'path_completed', 'notices']) then
+    bad := bad || format('the answer lacks keys of step 12.4: %s', w);
+  end if;
+  if not (coalesce(w->'context', '{}') ?& array['kind', 'learning_path_id', 'journey_enrollment_id', 'journey_day']) then
+    bad := bad || format('the answer''s context lacks keys: %s', w->'context');
+  end if;
+  select n.id into nid from public.completion_notices n where n.user_id = l2 and n.product_kind = 'individual' and n.instance_id = c6;
+  if w->>'official' is distinct from 'true' or (w->>'attempt_number')::int is distinct from 1
+     or w->'context'->>'kind' is distinct from 'individual' or w->>'done' is distinct from 'true'
+     or jsonb_typeof(w->'passed_ever') is distinct from 'null'
+     or jsonb_array_length(w->'notices') is distinct from 1
+     or w->'notices'->0->>'id' is distinct from nid::text
+     or w->'notices'->0->>'product_kind' is distinct from 'individual'
+     or w->'notices'->0->>'instance_id' is distinct from c6::text
+     or not (w->'notices'->0 ? 'event_type') then
+    bad := bad || format('the first official completion answered %s (expected official, number 1, individual, done, passed_ever null, '
+                         || 'one notice naming the claim)', w);
+  end if;
+  if (select n.origin || '/' || coalesce(n.sent_at::text, '-') from public.completion_notices n where n.id = nid)
+     is distinct from 'learner/-' then
+    bad := bad || 'the Individual claim is not of origin learner and unsent'::text;
+  end if;
+  if (select a.side_effects_sig is distinct from a.settle_sig or a.side_effects_at is null or a.webhook_skip_reason is not null
+        from public.course_attempts a where a.id = pg_temp.id('4m01')) then
+    bad := bad || 'the official row is not stamped, or carries a skip reason'::text;
+  end if;
+  -- section F: the paid key, unchanged, and the 0-point event row of the context
+  if (select count(*) from public.xp_events x where x.dedupe_key = format('complete:%s:%s', l2, c6)) <> 1
+     or (select x.xp || '/' || x.event_only || '/' || x.context_kind || '/' || x.context_key from public.xp_events x
+          where x.dedupe_key = format('complete:%s:%s:individual', l2, c6)) is distinct from '0/true/individual/individual' then
+    bad := bad || 'the paid complete key or its 0-point event row of the Individual context is missing'::text;
+  end if;
+  -- a second call: nothing new
+  w := public.record_learning_activity(pg_temp.id('4m01'));
+  if coalesce(jsonb_array_length(w->'notices'), 0) <> 0
+     or (select count(*) from public.completion_notices n where n.user_id = l2 and n.instance_id = c6) <> 1 then
+    bad := bad || format('a second call on a stamped row: %s', w);
+  end if;
+  -- a later completion that is not official (the one-attempt clamp)
+  perform pg_temp.att('{"id":"4m02","user":"102","ver":"1e6","kind":"individual","score":90,"ago":50}');
+  w := public.record_learning_activity(pg_temp.id('4m02'));
+  if w->>'official' is distinct from 'false' or (w->>'attempt_number')::int is distinct from 2
+     or (select a.webhook_skip_reason from public.course_attempts a where a.id = pg_temp.id('4m02')) is distinct from 'not_official'
+     or (select a.side_effects_sig is distinct from a.settle_sig from public.course_attempts a where a.id = pg_temp.id('4m02'))
+     or (select count(*) from public.completion_notices n where n.user_id = l2 and n.instance_id = c6) <> 1 then
+    bad := bad || format('a later row that is not official: %s (expected official false, number 2, not_official, stamped, no claim)', w);
+  end if;
+  -- the skips: a preview, a revision row, an abandoned row
+  perform pg_temp.att('{"id":"4m03","user":"102","ver":"1e6","kind":"preview","pkind":"course","ago":40}');
+  perform pg_temp.att('{"id":"4m04","user":"102","ver":"1e6","kind":"individual","revision":true,"ago":30}');
+  perform pg_temp.att('{"id":"4m05","user":"102","ver":"1e6","kind":"individual","status":"abandoned","completion":"completed","ago":20}');
+  foreach sym in array array['4m03', '4m04', '4m05'] loop
+    w := public.record_learning_activity(pg_temp.id(sym));
+    if not (w ? 'skipped')
+       or exists (select 1 from public.xp_events x where x.attempt_id = pg_temp.id(sym))
+       or exists (select 1 from public.completion_notices n where n.attempt_id = pg_temp.id(sym)) then
+      bad := bad || format('%s answered %s (expected skipped, nothing written)', sym, w);
+    end if;
+  end loop;
+  -- gamification off: no points, the claim still taken (step 15)
+  update public.gamification_settings set enabled = false where organization_id = pg_temp.id('a0');
+  perform pg_temp.att('{"id":"4m06","user":"108","ver":"1e6","kind":"individual","ago":10}');
+  w := public.record_learning_activity(pg_temp.id('4m06'));
+  if exists (select 1 from public.xp_events x where x.user_id = pg_temp.id('108'))
+     or (select count(*) from public.completion_notices n where n.user_id = pg_temp.id('108') and n.instance_id = c6) <> 1 then
+    bad := bad || format('with gamification off: %s (expected no points and one claim)', w);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2m) the writer on Individual rows (steps 12, 15, 33; N13): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2m;
+
+-- (2n) purge_preview_data (steps 79, 81, 82; step 63's purge rehearsal) in
+--      organisation X: refusals that delete nothing, the dry run and its
+--      hash, each scope deleting exactly its selection with the children of
+--      its attempts, the audit row, the isolation check, the hash binding a
+--      real call to its dry run, another organisation's call selecting
+--      nothing, by-role rows never selected, the audit table append-only.
+--      Every row that is not new-kind preview data is compared before and
+--      after each call (pg_temp.keep_md5)
+savepoint s2n;
+insert into public.preview_runs (id, organization_id, user_id, kind, learning_path_id)
+values (pg_temp.id('501'), pg_temp.id('a0'), pg_temp.id('105'), 'path', pg_temp.id('2a1'));
+insert into public.preview_runs (id, organization_id, user_id, kind, journey_program_id, journey_version_id)
+values (pg_temp.id('502'), pg_temp.id('a0'), pg_temp.id('105'), 'journey', pg_temp.id('3a1'), pg_temp.id('3b1'));
+select pg_temp.att('{"id":"4n01","user":"105","ver":"1e1","kind":"preview","pkind":"course","ago":900}');
+select pg_temp.att('{"id":"4n02","user":"105","ver":"1e2","kind":"preview","pkind":"path_run","run":"501","ago":800}');
+select pg_temp.att('{"id":"4n03","user":"105","ver":"1e3","kind":"preview","pkind":"journey_run","run":"502","day_id":"3d1","ago":700}');
+select pg_temp.att('{"id":"4n04","user":"104","ver":"1e2","kind":"preview","pkind":"course","ago":600}');
+select pg_temp.att('{"id":"4n05","user":"105","ver":"1e3","kind":"preview","pkind":"legacy_role","path":"2a1","ago":500}');
+select pg_temp.att('{"id":"4n06","user":"105","ver":"1e1","kind":"individual","ago":400}');
+insert into public.xapi_statements (attempt_id, statement_id, verb, raw)
+values (pg_temp.id('4n01'), gen_random_uuid(), 'http://adlnet.gov/expapi/verbs/completed', '{}');
+insert into public.xapi_state (attempt_id, state_id, content) values (pg_temp.id('4n01'), 'indep-state', '{}');
+insert into public.cmi5_launch_tokens (auth_token, attempt_id) values ('indep-0107-token-1', pg_temp.id('4n01'));
+insert into public.learning_sessions (organization_id, attempt_id, launch_kind, activity_id, launch_mode)
+values (pg_temp.id('a0'), pg_temp.id('4n01'), 'cmi5', 'indep-activity', 'Normal');
+insert into public.lrs_forward_outbox (organization_id, attempt_id, statement_id, payload)
+values (pg_temp.id('a0'), pg_temp.id('4n01'), 'indep-statement-1', '{}');
+do $$
+declare
+  bad text[] := '{}';
+  org uuid := pg_temp.id('a0');
+  t uuid := pg_temp.id('105');
+  pa uuid := pg_temp.id('4n01');
+  k0 text := pg_temp.keep_md5();
+  n_log0 bigint := (select count(*) from public.preview_purge_log);
+  n_prev0 bigint := (select count(*) from public.course_attempts where organization_id = pg_temp.id('a0')
+                      and context_kind = 'preview' and preview_kind in ('course', 'path_run', 'journey_run'));
+  r record;
+  got text;
+  d jsonb;
+  x jsonb;
+  lg record;
+  h_empty text;
+begin
+  -- refusals: 22023 where step 79, 81 or 63 says so, a raise otherwise; nothing deleted
+  for r in select * from (values
+    (org, '{"foo":"x"}'::jsonb, 'manual', t, true, null::text, '22023'),
+    (org, '{}'::jsonb, 'manual', t, true, null, '22023'),
+    (org, null::jsonb, 'manual', t, true, null, '22023'),
+    (org, '{"attempt_id": null}'::jsonb, 'manual', t, true, null, '22023'),
+    (org, jsonb_build_object('course_id', pg_temp.id('1c1'), 'learning_path_id', pg_temp.id('2a1')), 'manual', t, true, null, '22023'),
+    (org, jsonb_build_object('attempt_ids', jsonb_build_array(pa)), 'manual', t, true, null, '22023'),
+    (org, '{"legacy_role": true}'::jsonb, 'manual', t, true, null, '22023'),
+    (org, jsonb_build_object('attempt_id', pa), 'product_delete', t, true, null, '22023'),
+    (org, jsonb_build_object('attempt_id', pa), 'manual', t, false, null, '22023'),
+    (null::uuid, '{"organization": true}'::jsonb, 'manual', t, true, null, '22023'),
+    (org, jsonb_build_object('attempt_id', pa), 'manual', null::uuid, true, null, null),
+    (org, jsonb_build_object('attempt_id', pa), 'auto', t, true, null, null),
+    (org, jsonb_build_object('attempt_id', pa), 'manual', t, false, 'not-the-hash', null)
+  ) as v(p_org, p_scope, p_reason, p_actor, p_dry, p_hash, want)
+  loop
+    got := pg_temp.purge(r.p_org, r.p_scope, r.p_reason, r.p_actor, r.p_dry, r.p_hash);
+    if got like 'ok:%' or (r.want is not null and split_part(got, '|', 1) <> r.want) then
+      bad := bad || format('purge(%s, %s, %s, actor %s, dry %s, hash %s) → %s (expected %s)', coalesce(r.p_org::text, 'null'),
+        coalesce(r.p_scope::text, 'null'), r.p_reason, coalesce(r.p_actor::text, 'null'), r.p_dry, coalesce(r.p_hash, 'null'),
+        left(got, 120), coalesce(r.want, 'a raise'));
+    end if;
+  end loop;
+  if pg_temp.keep_md5() <> k0 or (select count(*) from public.preview_purge_log) <> n_log0
+     or (select count(*) from public.course_attempts where organization_id = org and context_kind = 'preview'
+          and preview_kind in ('course', 'path_run', 'journey_run')) <> n_prev0
+     or not exists (select 1 from public.xapi_statements where attempt_id = pa) then
+    bad := bad || 'a refused call changed something'::text;
+  end if;
+
+  -- the dry run: counts and a hash, nothing written, no audit row (step 81)
+  got := pg_temp.purge(org, jsonb_build_object('attempt_id', pa), 'manual', t, true);
+  if got not like 'ok:%' then
+    bad := bad || format('the dry run of one preview: %s', got);
+  else
+    d := substr(got, 4)::jsonb;
+    if coalesce(d->>'selection_hash', '') = '' or (d->>'excluded')::int is distinct from 0 then
+      bad := bad || format('the dry run answered %s (expected a selection_hash and excluded 0)', d);
+    end if;
+    if (select count(*) from public.preview_purge_log) <> n_log0 or not exists (select 1 from public.course_attempts where id = pa) then
+      bad := bad || 'the dry run wrote'::text;
+    end if;
+    -- (one preview) the real call with that hash
+    begin
+      got := pg_temp.purge(org, jsonb_build_object('attempt_id', pa), 'manual', t, false, d->>'selection_hash');
+      if got not like 'ok:%' then
+        bad := bad || format('the real call of one preview: %s', got);
+      end if;
+      if exists (select 1 from public.course_attempts where id = pa)
+         or exists (select 1 from public.xapi_statements where attempt_id = pa)
+         or exists (select 1 from public.xapi_state where attempt_id = pa)
+         or exists (select 1 from public.cmi5_launch_tokens where attempt_id = pa)
+         or exists (select 1 from public.learning_sessions where attempt_id = pa)
+         or exists (select 1 from public.lrs_forward_outbox where attempt_id = pa) then
+        bad := bad || 'one preview: the attempt or a child row is still there'::text;
+      end if;
+      if (select count(*) from public.course_attempts where id in (pg_temp.id('4n02'), pg_temp.id('4n03'), pg_temp.id('4n04'))) <> 3
+         or (select count(*) from public.preview_runs where id in (pg_temp.id('500'), pg_temp.id('501'), pg_temp.id('502'))) <> 3
+         or pg_temp.keep_md5() <> k0 then
+        bad := bad || 'one preview: a row outside the scope changed'::text;
+      end if;
+      -- the audit row (step 79): who, when, why, the scope, how many, the ids
+      if (select count(*) from public.preview_purge_log) <> n_log0 + 1 then
+        bad := bad || 'one preview: not exactly one audit row'::text;
+      else
+        select l.* into lg from public.preview_purge_log l where l.organization_id = org order by l.ran_at desc limit 1;
+        if lg.actor_user_id is distinct from t or lg.reason is distinct from 'manual' or lg.ran_at is null
+           or lg.scope is distinct from jsonb_build_object('attempt_id', pa)
+           or lg.attempt_ids is distinct from array[pa]
+           or jsonb_typeof(lg.counts) is distinct from 'object'
+           or not coalesce((select bool_or((e.value #>> '{}')::numeric = 6
+                                           and 2 * (e.value #>> '{}')::numeric
+                                               = (select sum((e2.value #>> '{}')::numeric) from jsonb_each(lg.counts) e2
+                                                   where jsonb_typeof(e2.value) = 'number'))
+                              from jsonb_each(lg.counts) e where jsonb_typeof(e.value) = 'number'), false) then
+          bad := bad || format('one preview: the audit row reads actor %s, reason %s, scope %s, ids %s, counts %s '
+                               || '(expected T, manual, the scope, {PA}, six rows per table with their total 6)',
+                               lg.actor_user_id, lg.reason, lg.scope, lg.attempt_ids, lg.counts);
+        end if;
+        -- the audit table is append-only
+        if pg_temp.try(format('update public.preview_purge_log set reason = ''manual'' where organization_id = %L', org)) = 'ok'
+           or pg_temp.try(format('delete from public.preview_purge_log where organization_id = %L', org)) = 'ok' then
+          bad := bad || 'an audit row was updated or deleted'::text;
+        end if;
+      end if;
+      raise exception 'undo' using errcode = 'U0107';
+    exception when sqlstate 'U0107' then null;
+    end;
+  end if;
+
+  -- each scope deletes exactly its selection (dry run, then the real call with its hash)
+  for r in select * from (values
+    ('organization', '{"organization": true}'::jsonb, 'manual',
+     array['4n01', '4n02', '4n03', '4n04'], array['500', '501', '502']),
+    ('run', jsonb_build_object('run_id', pg_temp.id('501')), 'manual', array['4n02'], array['501']),
+    ('tester', jsonb_build_object('user_id', t), 'manual', array['4n01', '4n02', '4n03'], array['500', '501', '502']),
+    ('tester and course', jsonb_build_object('user_id', t, 'course_id', pg_temp.id('1c1')), 'manual', array['4n01'], array[]::text[]),
+    ('course, product delete', jsonb_build_object('course_id', pg_temp.id('1c1')), 'product_delete', array['4n01'], array[]::text[])
+  ) as v(what, scope, reason, gone_attempts, gone_runs)
+  loop
+    begin
+      got := pg_temp.purge(org, r.scope, r.reason, t, true);
+      d := case when got like 'ok:%' then substr(got, 4)::jsonb end;
+      got := pg_temp.purge(org, r.scope, r.reason, t, false, d->>'selection_hash');
+      if got not like 'ok:%' then
+        bad := bad || format('%s: %s', r.what, got);
+      else
+        if exists (select 1 from public.course_attempts a where a.id in (select pg_temp.id(s) from unnest(r.gone_attempts) s))
+           or exists (select 1 from public.preview_runs p where p.id in (select pg_temp.id(s) from unnest(r.gone_runs) s)) then
+          bad := bad || format('%s: a selected attempt or run is still there', r.what);
+        end if;
+        if (select count(*) from public.course_attempts a where a.id in (select pg_temp.id(s)
+              from unnest(array['4n01', '4n02', '4n03', '4n04']) s where not (s = any(r.gone_attempts))))
+           <> 4 - cardinality(r.gone_attempts)
+           or (select count(*) from public.preview_runs p where p.id in (select pg_temp.id(s)
+                 from unnest(array['500', '501', '502']) s where not (s = any(r.gone_runs))))
+              <> 3 - cardinality(r.gone_runs) then
+          bad := bad || format('%s: a row outside the scope was deleted', r.what);
+        end if;
+        if pg_temp.keep_md5() <> k0 or not exists (select 1 from public.course_attempts where id = pg_temp.id('4n05')) then
+          bad := bad || format('%s: a row that is not new-kind preview data changed (a by-role row included)', r.what);
+        end if;
+        select l.* into lg from public.preview_purge_log l where l.organization_id = org order by l.ran_at desc limit 1;
+        if lg.reason is distinct from r.reason or lg.actor_user_id is distinct from t
+           or (select array_agg(i order by i) from unnest(lg.attempt_ids) i)
+              is distinct from (select array_agg(pg_temp.id(s) order by pg_temp.id(s)) from unnest(r.gone_attempts) s)
+           or cardinality(r.gone_runs) > 0
+              and (select array_agg(i order by i) from unnest(lg.run_ids) i)
+                  is distinct from (select array_agg(pg_temp.id(s) order by pg_temp.id(s)) from unnest(r.gone_runs) s) then
+          bad := bad || format('%s: the audit row reads reason %s, attempts %s, runs %s', r.what, lg.reason, lg.attempt_ids, lg.run_ids);
+        end if;
+      end if;
+      raise exception 'undo' using errcode = 'U0107';
+    exception when sqlstate 'U0107' then null;
+    end;
+  end loop;
+
+  -- the isolation check (step 81): a points row on a preview sets it aside
+  begin
+    insert into public.xp_events (organization_id, user_id, rule, xp, attempt_id, dedupe_key)
+    values (org, t, 'manual', 0, pa, 'indep-0107-isolation-1');
+    got := pg_temp.purge(org, '{"organization": true}', 'manual', t, true);
+    d := case when got like 'ok:%' then substr(got, 4)::jsonb end;
+    if (d->>'excluded')::int is distinct from 1 then
+      bad := bad || format('isolation: the dry run answered %s (expected excluded 1)', coalesce(d::text, got));
+    end if;
+    got := pg_temp.purge(org, '{"organization": true}', 'manual', t, false, d->>'selection_hash');
+    x := case when got like 'ok:%' then substr(got, 4)::jsonb end;
+    if (x->>'excluded')::int is distinct from 1 or not exists (select 1 from public.course_attempts where id = pa)
+       or not exists (select 1 from public.xp_events where dedupe_key = 'indep-0107-isolation-1')
+       or exists (select 1 from public.course_attempts where id in (pg_temp.id('4n02'), pg_temp.id('4n03'), pg_temp.id('4n04'))) then
+      bad := bad || format('isolation: the real call answered %s (expected the set-aside preview and its points row kept, the rest deleted)',
+                           coalesce(x::text, got));
+    end if;
+    select l.* into lg from public.preview_purge_log l where l.organization_id = org order by l.ran_at desc limit 1;
+    if coalesce(lg.excluded::text, '') not like '%xp_events%' or coalesce(lg.excluded::text, '') not like '%' || pa || '%'
+       or pa = any(coalesce(lg.attempt_ids, '{}')) then
+      bad := bad || format('isolation: the audit row''s excluded reads %s', lg.excluded);
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+
+  -- the hash binds the real call to its dry run: a preview launched between them makes the call raise
+  begin
+    got := pg_temp.purge(org, '{"organization": true}', 'manual', t, true);
+    d := case when got like 'ok:%' then substr(got, 4)::jsonb end;
+    perform pg_temp.att('{"id":"4n07","user":"105","ver":"1e3","kind":"preview","pkind":"course","ago":5}');
+    got := pg_temp.purge(org, '{"organization": true}', 'manual', t, false, d->>'selection_hash');
+    if got like 'ok:%' or (select count(*) from public.preview_purge_log) <> n_log0
+       or (select count(*) from public.course_attempts where id in (pa, pg_temp.id('4n02'), pg_temp.id('4n07'))) <> 3 then
+      bad := bad || format('a preview launched after the dry run: %s (expected a raise, nothing deleted)', left(got, 120));
+    end if;
+    raise exception 'undo' using errcode = 'U0107';
+  exception when sqlstate 'U0107' then null;
+  end;
+
+  -- another organisation's call names X's preview and selects nothing; an empty selection writes no audit row
+  got := pg_temp.purge(org, jsonb_build_object('attempt_id', gen_random_uuid()), 'manual', t, true);
+  h_empty := case when got like 'ok:%' then substr(got, 4)::jsonb->>'selection_hash' end;
+  got := pg_temp.purge(pg_temp.id('b0'), jsonb_build_object('attempt_id', pa), 'manual', pg_temp.id('106'), true);
+  d := case when got like 'ok:%' then substr(got, 4)::jsonb end;
+  if d is null or d->>'selection_hash' is distinct from h_empty or (d->>'excluded')::int is distinct from 0 then
+    bad := bad || format('another organisation''s dry run naming X''s preview: %s (expected the empty selection''s hash %s)', got, h_empty);
+  end if;
+  got := pg_temp.purge(pg_temp.id('b0'), jsonb_build_object('attempt_id', pa), 'manual', pg_temp.id('106'), false, d->>'selection_hash');
+  if got not like 'ok:%' or not exists (select 1 from public.course_attempts where id = pa)
+     or (select count(*) from public.preview_purge_log) <> n_log0 then
+    bad := bad || format('another organisation''s real call: %s (expected nothing deleted and no audit row)', got);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2n) purge_preview_data (steps 79, 81, 82, 63): %', array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2n;
+
+-- (2o) the two path tables as the API roles (O1-b, step 14): a learner reads
+--      only their own rows, an admin of the organisation all of them, a
+--      member of another organisation none (control: postgres reads both);
+--      every append-only table refuses an update and a delete, and a claim's
+--      sent_at stamp passes for service_role (step 15)
+savepoint s2o;
+insert into public.learning_path_completions (id, organization_id, path_id, user_id, completed_at) values
+  (gen_random_uuid(), pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('101'), now()),
+  (gen_random_uuid(), pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('102'), now());
+insert into public.learning_path_step_completions (organization_id, path_id, course_id, user_id, rule_pass_required) values
+  (pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('1c1'), pg_temp.id('101'), false),
+  (pg_temp.id('a0'), pg_temp.id('2a1'), pg_temp.id('1c1'), pg_temp.id('102'), false);
+insert into public.completion_notices (id, organization_id, user_id, product_kind, instance_id, event_type)
+values (pg_temp.id('7c1'), pg_temp.id('a0'), pg_temp.id('101'), 'path', pg_temp.id('2a1'), 'path_completion');
+select pg_temp.log_row(pg_temp.id('a0'), 'manual');
+do $$
+declare
+  bad text[] := '{}';
+  r record;
+  tbl text;
+  n bigint;
+  got text;
+begin
+  foreach tbl in array array['learning_path_completions', 'learning_path_step_completions'] loop
+    execute format('select count(*) from public.%I where organization_id = %L', tbl, pg_temp.id('a0')) into n;
+    if n <> 2 then
+      bad := bad || format('control: postgres reads %s rows of %s', n, tbl);
+    end if;
+    for r in select * from (values ('101', 1), ('104', 2), ('106', 0)) as t(sym, want) loop
+      perform set_config('request.jwt.claims', json_build_object('sub', pg_temp.id(r.sym), 'role', 'authenticated')::text, true);
+      execute 'set local role authenticated';
+      execute format('select count(*) from public.%I where organization_id = %L', tbl, pg_temp.id('a0')) into n;
+      execute 'reset role';
+      if n <> r.want then
+        bad := bad || format('%s as user %s: %s rows (expected %s)', tbl, r.sym, n, r.want);
+      end if;
+    end loop;
+    perform set_config('request.jwt.claims', '', true);
+    got := pg_temp.try(format('update public.%I set user_id = user_id where organization_id = %L', tbl, pg_temp.id('a0')));
+    if got = 'ok' then
+      bad := bad || format('%s: an update as postgres passed (append-only)', tbl);
+    end if;
+    got := pg_temp.try(format('delete from public.%I where organization_id = %L', tbl, pg_temp.id('a0')));
+    if got = 'ok' then
+      bad := bad || format('%s: a delete as postgres passed (append-only)', tbl);
+    end if;
+  end loop;
+  -- preview_purge_log: append-only for postgres and for service_role (step 63)
+  foreach tbl in array array['postgres', 'service_role'] loop
+    if tbl = 'service_role' then execute 'set local role service_role'; end if;
+    got := pg_temp.try(format('update public.preview_purge_log set reason = ''manual'' where organization_id = %L', pg_temp.id('a0')));
+    n := case when got = 'ok' then 1 else 0 end;
+    got := pg_temp.try(format('delete from public.preview_purge_log where organization_id = %L', pg_temp.id('a0')));
+    if tbl = 'service_role' then execute 'reset role'; end if;
+    if n = 1 or got = 'ok' then
+      bad := bad || format('preview_purge_log: an update or a delete as %s passed', tbl);
+    end if;
+  end loop;
+  -- the claim's sent_at stamp (step 15: select and update for service_role)
+  execute 'set local role service_role';
+  got := pg_temp.try(format('update public.completion_notices set sent_at = now() where id = %L', pg_temp.id('7c1')));
+  execute 'reset role';
+  if got <> 'ok' or (select sent_at from public.completion_notices where id = pg_temp.id('7c1')) is null then
+    bad := bad || format('service_role could not stamp sent_at: %s', got);
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2o) the path tables as the API roles, append-only tables (O1-b; steps 14, 15, 79): %',
+      array_to_string(bad, '; ');
+  end if;
+end
+$$;
+select set_config('request.jwt.claims', '', true);
+rollback to savepoint s2o;
+
+-- (2p) journey_auto_enroll writes source audience (step 8); the paste-window
+--      trigger refuses a version day with no journey_days row with P0001 and
+--      gives a version with no days an empty map (N6, N7)
+savepoint s2p;
+update public.journey_programs set auto_enroll_new_users = true, is_active = true where id = pg_temp.id('3a1');
+insert into auth.users (id, email) values (pg_temp.id('107'), 'indep-new@example.test');
+insert into public.organization_members (organization_id, user_id, role) values (pg_temp.id('a0'), pg_temp.id('107'), 'user');
+do $$
+declare
+  bad text[] := '{}';
+  got text;
+begin
+  if (select array_agg(e.source) from public.journey_enrollments e
+       where e.user_id = pg_temp.id('107') and e.program_id = pg_temp.id('3a1')) is distinct from array['audience'] then
+    bad := bad || format('a member enrolled by journey_auto_enroll reads %s (expected one enrolment, source audience)',
+      (select array_agg(e.source) from public.journey_enrollments e where e.user_id = pg_temp.id('107')));
+  end if;
+  got := pg_temp.try(format('insert into public.journey_versions (program_id, organization_id, version_number, name, days_total, '
+                            || 'count_sundays, completion_title, days, unlock_mode) values (%L, %L, 8, ''x'', 7, false, ''Y'', %L, ''progress'')',
+                            pg_temp.id('3a1'), pg_temp.id('a0'),
+                            jsonb_build_array(jsonb_build_object('day', 7, 'course_id', pg_temp.id('1c1'), 'mission_title', 'm7'))));
+  if not pg_temp.probe_safe(got) then
+    bad := bad || format('a version day with no journey_days row: %s (expected P0001, no probe phrase)', got);
+  end if;
+  insert into public.journey_versions (id, program_id, organization_id, version_number, name, days_total, count_sundays,
+                                       completion_title, days, unlock_mode)
+  values (pg_temp.id('3b8'), pg_temp.id('3a1'), pg_temp.id('a0'), 9, 'x', 1, false, 'Y', '[]', 'progress');
+  if (select day_ids from public.journey_versions where id = pg_temp.id('3b8')) is distinct from '{}'::jsonb then
+    bad := bad || format('a version with no days reads day_ids %s (expected {})',
+                         (select day_ids from public.journey_versions where id = pg_temp.id('3b8')));
+  end if;
+  if cardinality(bad) > 0 then
+    raise exception 'assert-0107-independent: (2p) auto-enrol source and the day_ids trigger (steps 8, 91; N6, N7): %',
+      array_to_string(bad, '; ');
+  end if;
+end
+$$;
+rollback to savepoint s2p;
+
 rollback;

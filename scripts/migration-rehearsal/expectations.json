@@ -2478,7 +2478,8 @@
         { "sql": "assert-0107-functions.sql" },
         { "sql": "assert-0107-plpgsql.sql" },
         { "sql": "assert-0107-writer.sql" },
-        { "sql": "assert-0107-launch.sql" }
+        { "sql": "assert-0107-launch.sql" },
+        { "sql": "assert-0107-independent.sql" }
       ]
     },
     {
@@ -2694,7 +2695,8 @@
         { "sql": "assert-0107-functions.sql" },
         { "sql": "assert-0107-plpgsql.sql" },
         { "sql": "assert-0107-writer.sql" },
-        { "sql": "assert-0107-launch.sql" }
+        { "sql": "assert-0107-launch.sql" },
+        { "sql": "assert-0107-independent.sql" }
       ]
     },
     {
