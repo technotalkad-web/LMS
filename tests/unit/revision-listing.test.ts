@@ -45,7 +45,12 @@
  *         as`), `computeScoring.bind`, `.call` or `.apply`, and a namespace,
  *         dynamic, star or require import of lib/scoring/policy or
  *         lib/scoring/status (status.ts re-exports it), whose member call
- *         the scan by name cannot see.
+ *         the scan by name cannot see. A named import or re-export of
+ *         computeScoring, from any module, is refused there as well (added
+ *         the same day after an independent check): with a plain-named
+ *         import a file can pass the function along as a value (`const
+ *         score = computeScoring`, `xs.map(computeScoring)`), which no call
+ *         scan sees.
  *
  * Run:  npx tsx tests/unit/revision-listing.test.ts   (or npm run test:unit)
  */
@@ -563,15 +568,24 @@ console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult
       const target = resolveSpec(file, m[1] ?? m[2] ?? m[3] ?? m[4]);
       if (target && SCORING_MODULES.includes(target)) found.push(`the whole of ${target}`);
     }
+    // A named import or re-export of computeScoring, from any module (a
+    // brace list over any number of lines, `import type`, a default import
+    // before the braces, with or without `from`): with the function in hand
+    // under its own name a file can pass it along as a value, which neither
+    // the call scan nor the forms above see.
+    for (const m of src.matchAll(/\b(?:import|export)\s+(?:type\s+)?(?:[\w$]+\s*,\s*)?\{([^{}]*)\}/g)) {
+      if (/(?<![\w$])computeScoring(?![\w$])/.test(m[1])) found.push("computeScoring imported or re-exported by name");
+    }
     return found;
   };
   const indirect = [...sources.entries()]
     .filter(([f]) => !ALLOWED.has(f))
     .flatMap(([f, src]) => indirectForms(f, src).map((x) => `${f}: ${x}`))
     .sort();
-  eq("no file outside the allow-list aliases computeScoring, binds it, or imports lib/scoring/policy or lib/scoring/status whole",
+  eq("no file outside the allow-list aliases computeScoring, binds it, imports or re-exports it by name, or imports lib/scoring/policy or lib/scoring/status whole",
     indirect, []);
-  eq("control: each indirect form is found, and a named import is not one",
+  const NAMED = "computeScoring imported or re-exported by name";
+  eq("control: each indirect form is found, a named import of computeScoring among them, and other imports are not",
     [
       indirectForms("lib/x.ts", 'import { computeScoring as cs } from "@/lib/scoring/policy";'),
       indirectForms("lib/x.ts", 'export { computeScoring as score } from "./scoring/status";'),
@@ -583,13 +597,33 @@ console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult
       indirectForms("lib/x.ts", 'export * from "@/lib/scoring/policy";'),
       indirectForms("lib/x.ts", 'const p = require("../lib/scoring/policy");'),
       indirectForms("lib/x.ts", 'import { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/scoring/x.ts", 'import { computeScoring } from "./status";'),
+      indirectForms("lib/x.ts", 'import type { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'export { computeScoring } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", "export { computeScoring };"),
       indirectForms("lib/x.ts", 'import * as other from "@/lib/scoring/context";'),
+      indirectForms("lib/x.ts", 'import { attemptCounts, type ScoringResult } from "@/lib/scoring/policy";'),
+      indirectForms("lib/x.ts", 'import { computeScoringLabel } from "@/lib/labels";'),
     ],
     [
-      ["computeScoring as"], ["computeScoring as"], ["computeScoring.bind/call/apply"], ["computeScoring.bind/call/apply"],
+      ["computeScoring as", NAMED], ["computeScoring as", NAMED], ["computeScoring.bind/call/apply"], ["computeScoring.bind/call/apply"],
       ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/status"], ["the whole of lib/scoring/status"],
-      ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/policy"], [], [],
+      ["the whole of lib/scoring/policy"], ["the whole of lib/scoring/policy"], [NAMED], [NAMED], [NAMED], [NAMED], [NAMED],
+      [], [], [],
     ]);
+  // The control for each form that passes computeScoring along as a value:
+  // the call scan does not see it (directCall false), and the named import
+  // it needs is refused (a multi-line brace list and a default import
+  // before the braces included).
+  const passing = [
+    'import { computeScoring } from "@/lib/scoring/policy";\nconst score = computeScoring;\nscore(rows, policy);',
+    'import { computeScoring } from "../scoring/status";\nconst results = groups.map(computeScoring);',
+    'import {\n  DEFAULT_POLICY,\n  computeScoring,\n  type ScorableAttempt,\n} from "@/lib/scoring/policy";\nrun(computeScoring, DEFAULT_POLICY);',
+    'import Policy, { computeScoring } from "@/lib/scoring/status";\nconst table = { score: computeScoring };',
+  ];
+  eq("control: a reference passed as a value is no direct call, and its named import is refused",
+    passing.map((s) => [directCall.test(s), indirectForms("lib/attempts/x.ts", s)]),
+    passing.map(() => [false, [NAMED]]));
   // The scan agrees with block (i)'s own reading of the call sites, so the
   // two cannot drift: block (i)'s callsIn sees a computeScoring call in
   // exactly the files above.
