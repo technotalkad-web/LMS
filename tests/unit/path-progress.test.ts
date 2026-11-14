@@ -12,13 +12,20 @@
  *       pass; no fact with a rule relaxed; O1-h (2)'s limit; a fact row and
  *       then a granted retake that failed) and the fact rows as a required
  *       input;
- *   (d) pathStepStatus answers what pathProgress answers for the step.
+ *   (d) pathStepStatus answers what pathProgress answers for the step;
+ *   (e) ruling A5 of the ADR's note of 2026-11-14: the older roll-up of the
+ *       same name in lib/courses/progress-view.ts is deprecated (a pointer to
+ *       step 43), its importers under app/, lib/ and components/ are exactly
+ *       the three files of the dated list OLD_PATH_PROGRESS_IMPORTERS, and
+ *       no file imports both functions.
  *
  * No database. The SQL twin is asserted on the same readings in the
  * rehearsal (assert-0107-*.sql).
  *
  * Run:  npx tsx tests/unit/path-progress.test.ts   (or npm run test:unit)
  */
+import fs from "node:fs";
+import path from "node:path";
 import { pathProgress, pathStepStatus, type PathAttempt, type PathGrant, type PathProgressInput, type PathStepFact, type PathStepInput } from "../../lib/paths/progress";
 import { contextKindOfKey } from "../../lib/scoring/context";
 
@@ -293,6 +300,109 @@ console.log("\n(d) pathStepStatus answers what pathProgress answers for the step
   eq("…a fact of another course is not the step's", pathStepStatus({ pathId: PATH, step: step(C1, 1), attempts: [], grants: [], fact: fact(C2), now: NOW }).done_recorded_at, null);
   eq("…rows without a course_id are the caller's in-context read of the step's course (Continue, O1-k)",
     pathStepStatus({ pathId: PATH, step: step(C1, 1), attempts: [row(1, C1, P, "passed", 1)].map(({ course_id: _c, ...r }) => { void _c; return r; }), grants: [], fact: null, now: NOW }).done, true);
+}
+
+/**
+ * OLD_PATH_PROGRESS_IMPORTERS (2026-11-14, ADR 0024 phase 1; ruling A5 of the
+ * ADR's note of that day): every file under app/, lib/ and components/ that
+ * imports the older pathProgress of lib/courses/progress-view.ts. The pull
+ * request that moves the last of them onto the path views or onto
+ * lib/paths/progress.ts with the fact rows (O1-k's "Path Reports, Learners,
+ * the CSV" row) removes its files from this list, and the one that empties it
+ * deletes the old function. A file is never added.
+ */
+const OLD_PATH_PROGRESS_IMPORTERS = {
+  since: "2026-11-14",
+  until: "the pull request that moves the last of these files onto the path views or lib/paths/progress.ts (ADR 0024 step 43, O1-k)",
+  files: [
+    "app/[org]/(admin)/analytics/page.tsx",
+    "app/[org]/(admin)/learning-paths/page.tsx",
+    "app/api/learning-paths/[id]/learners/export/route.ts",
+  ],
+};
+
+console.log(`\n(e) ruling A5: the old pathProgress (lib/courses/progress-view.ts), pinned since ${OLD_PATH_PROGRESS_IMPORTERS.since}`);
+{
+  const root = path.resolve(__dirname, "../..");
+  const rel = (f: string) => path.relative(root, f).split(path.sep).join("/");
+  const walk = (dir: string, out: string[]): string[] => {
+    if (!fs.existsSync(dir)) return out;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p, out);
+      else if (/\.(ts|tsx|js|mjs)$/.test(e.name)) out.push(p);
+    }
+    return out;
+  };
+  /** A module specifier as a repository path without its extension, or null for a package. */
+  const resolveSpec = (file: string, spec: string): string | null => {
+    let p: string;
+    if (spec.startsWith("@/")) p = spec.slice(2);
+    else if (spec.startsWith(".")) p = path.posix.normalize(path.posix.join(path.posix.dirname(rel(file)), spec));
+    else return null;
+    return p.replace(/\.(ts|tsx|js|mjs)$/, "").replace(/\/index$/, "");
+  };
+  const OLD = "lib/courses/progress-view";
+  const NEW = "lib/paths/progress";
+  /** What a file takes from a module: the names of its named imports and re-exports (an alias read by its imported name), and whether it imports the whole module (a namespace or a dynamic import). Comments blanked first. */
+  const takes = (file: string, src: string, mod: string): { names: string[]; whole: boolean } => {
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+    const names: string[] = [];
+    let whole = false;
+    for (const m of code.matchAll(/\b(?:import|export)\s+(?:type\s+)?(?:[\w$]+\s*,\s*)?\{([^}]*)\}\s*from\s*["']([^"']+)["']/g)) {
+      if (resolveSpec(file, m[2]) !== mod) continue;
+      for (const part of m[1].split(",")) {
+        const name = part.trim().replace(/^type\s+/, "").split(/\s+as\s+/)[0].trim();
+        if (name) names.push(name);
+      }
+    }
+    for (const m of code.matchAll(/\bimport\s+\*\s+as\s+[\w$]+\s+from\s*["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)|\bexport\s+\*\s+from\s*["']([^"']+)["']/g)) {
+      if (resolveSpec(file, m[1] ?? m[2] ?? m[3]) === mod) whole = true;
+    }
+    return { names, whole };
+  };
+  const files = ["app", "lib", "components", "tests"].flatMap((d) => walk(path.join(root, d), []));
+  const sources = new Map(files.map((f) => [rel(f), { file: f, src: fs.readFileSync(f, "utf8") }]));
+  const takesOld = (f: string) => {
+    const t = takes(sources.get(f)!.file, sources.get(f)!.src, OLD);
+    return t.whole || t.names.includes("pathProgress");
+  };
+  const takesNew = (f: string) => {
+    const t = takes(sources.get(f)!.file, sources.get(f)!.src, NEW);
+    return t.whole || t.names.includes("pathProgress");
+  };
+  const product = [...sources.keys()].filter((f) => /^(app|lib|components)\//.test(f));
+  eq("its importers under app/, lib/ and components/ are exactly the dated list",
+    product.filter(takesOld).sort(), [...OLD_PATH_PROGRESS_IMPORTERS.files].sort());
+  eq("the dated list holds at most the three files of ruling A5 and no duplicate",
+    [OLD_PATH_PROGRESS_IMPORTERS.files.length <= 3, new Set(OLD_PATH_PROGRESS_IMPORTERS.files).size === OLD_PATH_PROGRESS_IMPORTERS.files.length], [true, true]);
+  // this file is left out: its control below holds import lines as strings
+  eq("no file under app/, lib/, components/ or tests/ imports both pathProgress functions",
+    [...sources.keys()].filter((f) => f !== "tests/unit/path-progress.test.ts" && takesOld(f) && takesNew(f)), []);
+  const old = sources.get("lib/courses/progress-view.ts")?.src ?? "";
+  eq("the old function is marked @deprecated with a pointer to step 43, in the comment right above it",
+    /\/\*\*(?:(?!\*\/)[\s\S])*@deprecated ADR 0024 step 43(?:(?!\*\/)[\s\S])*\*\/\s*export function pathProgress\(/.test(old), true);
+  // The control: the scan reads an import that spans several lines (the
+  // Analytics page's), an alias, a type-only list, a relative path, a
+  // namespace import and a dynamic import, and skips a package and a comment.
+  const probe = (src: string, at = "app/x/page.tsx") => {
+    const t = takes(path.join(root, at), src, OLD);
+    return t.whole || t.names.includes("pathProgress");
+  };
+  eq("control: the scan finds every import form and skips what is not one",
+    [
+      probe('import {\n  courseProgress,\n  pathProgress,\n  type CourseProgressView,\n} from "@/lib/courses/progress-view";'),
+      probe('import { pathProgress as pp } from "@/lib/courses/progress-view";'),
+      probe('import { pathProgress } from "../courses/progress-view";', "lib/paths/x.ts"),
+      probe('import * as pv from "@/lib/courses/progress-view";'),
+      probe('const m = await import("@/lib/courses/progress-view");'),
+      probe('import { courseProgress } from "@/lib/courses/progress-view";'),
+      probe('import { pathProgress } from "@/lib/paths/progress";'),
+      probe('// import { pathProgress } from "@/lib/courses/progress-view";'),
+      probe('import { pathProgress } from "progress-view";'),
+    ],
+    [true, true, true, true, true, false, false, false, false]);
 }
 
 // The fact rows are a required input with no default (O1-i): leaving them out
