@@ -198,7 +198,7 @@ Other decisions requested in the ADRs (items marked "not in the reviewed plan" w
 | 0006 | 4 | Guardian reason `launch_contract_missing` (review suggestion) | Yes | Decided |
 | 0007 | 2 | Lifecycle-nightly target | Cloud Run staging with continuous deploy; else Workers with retries | Decided; the Cloud Run continuous deploy is an owner action still to be done |
 | 0007 | 3 | `statement_profile` per enabled tenant LRS configuration | `raw` unless the consumer was told | Decided |
-| 0007 | 4 | Accept the `lrs-forward` watchdog noise until pg_cron lands | Yes | Decided |
+| 0007 | 4 | Accept the `lrs-forward` watchdog noise until pg_cron lands | Yes | Decided; changed by the owner 2026-11-14: a stale heartbeat of a job scheduled more than once a day reads `warn` (up to 26 h), and the watchdog touches only its own issue (ADR 0007, note on decision 4) |
 | 0007 | 5 | Fund about one executor-day for a warm v1.2.1 branch | No | Decided |
 | 0007 | 6 | Audit additions: `validate_existing` and a listing baseline (not in the reviewed plan) | Yes for `validate_existing`; baseline with P5 | Decided |
 

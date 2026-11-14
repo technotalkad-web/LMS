@@ -3,9 +3,13 @@ name: Ops watchdog (prod)
 # The deterministic, always-on layer of the LMS ops agent (see ops/RUNBOOK.md).
 #
 #   */10  probe   — GET /api/ops/health on PROD. On degraded/down/unreachable it
-#                   opens (or updates) a GitHub issue labelled `ops-incident` and
-#                   fails the run. On recovery it comments + auto-closes the
-#                   issue. GitHub notifications deliver the page (email/mobile).
+#                   opens (or updates) its own GitHub issue, labelled
+#                   `ops-incident` and titled "🔴 Ops incident: prod health
+#                   <status>", and fails the run. On ok/warn it comments on and
+#                   auto-closes that issue. It never comments on or closes any
+#                   other `ops-incident` issue (#168; the owner's decision of
+#                   2026-11-14, ADR 0007 note on decision 4). GitHub
+#                   notifications deliver the page (email/mobile).
 #   01:30 digest  — daily UTC (07:00 IST): posts the health status as a
 #                   comment on the rolling `ops-digest` issue, so there is a
 #                   browsable daily history and a hook for the AI review.
@@ -67,8 +71,12 @@ jobs:
           set -euo pipefail
           gh label create ops-incident --repo "$GITHUB_REPOSITORY" \
             --color B60205 --description "Auto-filed by the ops watchdog" 2>/dev/null || true
+          # The watchdog's own issue only: the newest open `ops-incident` whose
+          # title is exactly the one created below. Issues filed by people or
+          # by the ops review are never commented on or closed here (#168).
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ops-incident \
-            --state open --json number --jq '.[0].number // empty')
+            --state open --limit 200 --json number,title \
+            --jq '[.[] | select(.title | test("^🔴 Ops incident: prod health [a-z]+$"))] | .[0].number // empty')
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           now="$(date -u +%FT%TZ)"
 

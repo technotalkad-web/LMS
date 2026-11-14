@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import {
+  classifyCrons,
+  overallStatus,
+  type CheckStatus,
+  type HeartbeatRow,
+} from "@/lib/ops/health-status";
 
 export const dynamic = "force-dynamic";
 
@@ -21,10 +27,11 @@ export const dynamic = "force-dynamic";
  *
  * *Cron staleness only affects overall status when OPS_EXPECT_CRONS=1 is set on
  * the worker (true on PROD, where cron.yml fires; staging has no schedule, so
- * heartbeats there are naturally stale and must not page anyone).
+ * heartbeats there are naturally stale and must not page anyone). A stale job
+ * of SUBDAILY_STALE_WARN reads WARN instead, up to SUBDAILY_STALE_DEGRADED_MIN;
+ * a job never seen reads DEGRADED (lib/ops/health-status.ts).
  */
 
-type CheckStatus = "ok" | "warn" | "fail" | "unknown";
 type Check = { status: CheckStatus; latency_ms?: number; detail?: unknown };
 
 /**
@@ -41,7 +48,8 @@ type Check = { status: CheckStatus; latency_ms?: number; detail?: unknown };
  *
  * GitHub starts only a small share of scheduled runs (ADR 0007 Context), so
  * the sub-daily entries read stale most of the time; ADR 0007 step 17 and
- * decision 4 accept that until pg_cron replaces GitHub-driven schedules.
+ * decision 4 accept that until pg_cron replaces GitHub-driven schedules, and
+ * SUBDAILY_STALE_WARN below keeps it from reading degraded.
  */
 const CRON_CADENCE_MIN: Record<string, number> = {
   "lrs-forward": 30, //           */5 schedule; generous for GH cron jitter
@@ -54,6 +62,18 @@ const CRON_CADENCE_MIN: Record<string, number> = {
   "rls-audit": 8 * 24 * 60, //    weekly (Mondays)
   "gamification-monthly": 32 * 24 * 60, // monthly (1st, 00:30 UTC); longest month + 1 day
 };
+
+/**
+ * The jobs scheduled more than once a day. A stale heartbeat of one of these
+ * reads "warn", not "degraded" (the owner's decision of 2026-11-14; ADR 0007,
+ * the note of that date on decision 4), until it is older than
+ * SUBDAILY_STALE_DEGRADED_MIN: GitHub's gaps between runs of one of these
+ * jobs measured at most about 10.5 hours (5–14 Nov 2026), so a day and more
+ * without a run is a fault, not a slow scheduler, and reads "degraded".
+ * tests/unit/cron-cadence.test.ts checks this list against cron.yml.
+ */
+const SUBDAILY_STALE_WARN = ["lrs-forward", "gamification-refresh", "journey-nudges"];
+const SUBDAILY_STALE_DEGRADED_MIN = 26 * 60;
 
 const OUTBOX_BACKLOG_WARN = 50; // overdue-but-undelivered statements
 const EMAIL_FAILURES_WARN = 5; // failed sends in the last 24h
@@ -106,33 +126,15 @@ async function checkCrons(expectCrons: boolean): Promise<Check> {
       // Table missing (migration 0050 not applied) — visible, but not a page.
       return { status: "unknown", detail: error.message };
     }
-    const byName = new Map(
-      ((data ?? []) as Array<{ name: string; last_run_at: string; last_status: string }>).map(
-        (r) => [r.name, r]
-      )
-    );
-    const jobs: Record<string, { status: string; last_run_at?: string; age_min?: number }> = {};
-    let stale = 0;
-    for (const [name, cadence] of Object.entries(CRON_CADENCE_MIN)) {
-      const row = byName.get(name);
-      if (!row) {
-        jobs[name] = { status: "never-seen" };
-        if (expectCrons) stale++;
-        continue;
-      }
-      const ageMin = Math.round((Date.now() - new Date(row.last_run_at).getTime()) / 60_000);
-      const isStale = ageMin > cadence;
-      jobs[name] = {
-        status: isStale ? "stale" : row.last_status === "ok" ? "ok" : "last-run-errored",
-        last_run_at: row.last_run_at,
-        age_min: ageMin,
-      };
-      if (isStale && expectCrons) stale++;
-    }
-    return {
-      status: stale > 0 ? "fail" : "ok",
-      detail: { expect_crons: expectCrons, jobs },
-    };
+    const { status, jobs } = classifyCrons({
+      cadenceMin: CRON_CADENCE_MIN,
+      staleWarnOnly: SUBDAILY_STALE_WARN,
+      staleDegradedAfterMin: SUBDAILY_STALE_DEGRADED_MIN,
+      rows: (data ?? []) as HeartbeatRow[],
+      nowMs: Date.now(),
+      expectCrons,
+    });
+    return { status, detail: { expect_crons: expectCrons, jobs } };
   });
 }
 
@@ -190,10 +192,13 @@ export async function GET(request: Request) {
     checkEmail(),
   ]);
 
-  let status: "ok" | "warn" | "degraded" | "down" = "ok";
-  if ([lrsOutbox, email].some((c) => c.status === "warn")) status = "warn";
-  if (storage.status === "fail" || crons.status === "fail") status = "degraded";
-  if (db.status === "fail") status = "down";
+  const status = overallStatus({
+    db: db.status,
+    storage: storage.status,
+    crons: crons.status,
+    lrsOutbox: lrsOutbox.status,
+    email: email.status,
+  });
 
   const authed =
     !!process.env.CRON_SECRET &&
