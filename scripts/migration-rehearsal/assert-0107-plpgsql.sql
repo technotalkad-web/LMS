@@ -13,7 +13,9 @@
 --        no argument default, comments and the execute matrix; the guards'
 --        stored bodies (legacy_role, the service-role return) and their two
 --        0098 triggers still bound; the lock order of both consume_grant
---        forms, read on their stored bodies (one connection cannot race)
+--        forms, read on their stored bodies (one connection cannot race),
+--        and their enrolment reads naming the learner's id and the grant's
+--        organisation
 --   (27) the delete guards at work: rows flagged by role block a delete on
 --        any session but the service role's; previews of the new kinds do
 --        not; learner attempts still do
@@ -31,8 +33,10 @@
 --        retake on the retake row's own context (note N9), stands by the
 --        step's rule and by the lenient journey rule (R14), the day id
 --        through the wrapper and through the nine-argument form, the
---        atomicity of a refused insert, and a journey grant that names
---        another learner's enrolment (the note of 2026-11-14)
+--        atomicity of a refused insert, a journey grant that names another
+--        learner's enrolment or the learner's own in another organisation
+--        (the note of 2026-11-14), and a journey call whose organisation is
+--        not the grant's (22023 through both forms)
 --   (31) journey_save_days: moves, inserts and removals by identity, its
 --        refusals, the old editor's upsert, and as the API roles (an admin
 --        of the organisation, a learner, another organisation's admin,
@@ -326,12 +330,16 @@ begin
   -- clause to its for update, one statement) names the learner's id and the
   -- grant's organisation as code lines, the two columns the owner trigger
   -- (2j) compares (the ADR 0024 note of 2026-11-14), so no enrolment of
-  -- another learner or of another organisation is locked. The wrapper's
-  -- predicates are asserted here only: the nine-argument form it calls
-  -- answers unavailable without them as well, so (30j) and (30k) cannot see
-  -- them go
-  for r in select * from (values ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)'),
-                                 ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)')) as t(fn)
+  -- another learner or of another organisation is locked. Each form names
+  -- its own operand for the organisation: the nine-argument form p_org_id,
+  -- which its consistency check (2) has proved is the grant's; the wrapper
+  -- v_grant_org, read at its grant lock, because nothing has checked
+  -- p_org_id there ((30l) holds the behaviour). The wrapper's two
+  -- predicates are seen here only when they go: the nine-argument form it
+  -- calls answers unavailable without them as well, so (30j) and (30k)
+  -- read the same
+  for r in select * from (values ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer,uuid)', 'p_org_id'),
+                                 ('public.consume_grant(uuid,uuid,uuid,uuid,uuid,uuid,uuid,integer)', 'v_grant_org')) as t(fn, org_operand)
   loop
     select p.prosrc into src from pg_proc p where p.oid = to_regprocedure(r.fn);
     p_ar := strpos(src, 'from public.attempt_requests ar');
@@ -343,9 +351,9 @@ begin
       bad := bad || format('%s: the grant is not locked before the enrolment (%s, %s, %s, %s)',
                            r.fn, p_ar, p_fu1, p_je, p_fu2);
     elsif substr(src, p_je, p_fu2 - p_je) !~ '\n\s*and\s+e\.user_id\s*=\s*p_user_id\s*\n'
-       or substr(src, p_je, p_fu2 - p_je) !~ '\n\s*and\s+e\.organization_id\s*=\s*p_org_id\s*\n' then
-      bad := bad || format('%s: the enrolment read does not name the learner''s id and the grant''s organisation: %s',
-                           r.fn, substr(src, p_je, p_fu2 - p_je));
+       or substr(src, p_je, p_fu2 - p_je) !~ ('\n\s*and\s+e\.organization_id\s*=\s*' || r.org_operand || '\s*\n') then
+      bad := bad || format('%s: the enrolment read does not name the learner''s id and the grant''s organisation (%s): %s',
+                           r.fn, r.org_operand, substr(src, p_je, p_fu2 - p_je));
     end if;
   end loop;
 
@@ -1210,6 +1218,51 @@ begin
 end
 $$;
 rollback to savepoint s30k;
+
+-- (l) the caller's organisation is not the grant's: L2's approved journey
+--     grant on CB, in Org A, names L2's own enrolment E7 and day 2; both
+--     forms are called with Org X. The nine-argument form raises 22023 at
+--     its consistency check (2); the wrapper reads the enrolment in the
+--     grant's organisation, read at its grant lock, so it resolves the day
+--     id and the nine-argument form raises the same 22023 (0103's outcome),
+--     where a wrapper that compared with the caller's organisation would
+--     resolve no day id and answer unavailable. Nothing written, the grant
+--     unused
+savepoint s30l;
+do $$
+declare
+  got text := '';
+  o   text;
+  l2  constant uuid := '00000000-0000-0000-0000-000107170002';
+  cb  constant uuid := '00000000-0000-0000-0000-000107171002';
+  vb  constant uuid := '00000000-0000-0000-0000-000107171203';
+  ox  constant uuid := '00000000-0000-0000-0000-000107170900';
+  e7  constant uuid := '00000000-0000-0000-0000-000107173401';
+  d2  constant uuid := '00000000-0000-0000-0000-000107173102';
+begin
+  perform pg_temp.grant7(pg_temp.u7('000107177160'), l2, cb, 'journey', null, e7, 2, d2, now());
+  begin
+    select g.outcome into o
+      from public.consume_grant(pg_temp.u7('000107177160'), l2, cb, vb, ox, null, e7, 2, d2) g;
+  exception when others then
+    o := sqlstate;
+  end;
+  got := got || o || ' ';
+  begin
+    select g.outcome into o
+      from public.consume_grant(pg_temp.u7('000107177160'), l2, cb, vb, ox, null, e7, 2) g;
+  exception when others then
+    o := sqlstate;
+  end;
+  got := got || o;
+  if got <> '22023 22023'
+     or exists (select 1 from public.course_attempts where journey_enrollment_id = e7)
+     or (select used_at from public.attempt_requests where id = pg_temp.u7('000107177160')) is not null then
+    raise exception 'assert-0107: (30l) a journey call whose organisation is not the grant''s: % (expected 22023 twice, nothing written)', got;
+  end if;
+end
+$$;
+rollback to savepoint s30l;
 
 -- ---------------------------------------------------------------------------
 -- (31) journey_save_days. Program JS with days S1, S2, S3 (numbers 1 to 3;

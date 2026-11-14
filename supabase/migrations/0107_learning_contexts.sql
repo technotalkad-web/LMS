@@ -3893,9 +3893,10 @@ begin
   end if;
 
   -- 2b. a journey context: the learner's own enrolment row in the grant's
-  -- organisation, locked after the grant, and the version it is pinned to;
-  -- an enrolment of another learner, one in another organisation, or none,
-  -- is unavailable (the note of 2026-11-14)
+  -- organisation (p_org_id, which 2 has proved is the grant's), locked after
+  -- the grant, and the version it is pinned to; an enrolment of another
+  -- learner, one in another organisation, or none, is unavailable (the note
+  -- of 2026-11-14)
   if v_kind = 'journey' then
     select e.version_id into v_pinned
       from public.journey_enrollments e
@@ -4037,17 +4038,21 @@ grant execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uui
 
 -- The eight-argument form keeps its signature (0103:721-731) for the launch
 -- code before phase 2, as a wrapper. Its first statement is the grant lock
--- of 0103:748-754; only then does it lock the enrolment row of a journey
--- call (the learner's own only, read with the learner's id and the grant's
--- organisation as the nine-argument form reads it) and resolve
--- p_journey_day to its day id through the version that row is pinned to;
--- then it calls the nine-argument form, which takes the same two locks in
--- the same order (the transaction already holds them). A wrapper that took
--- the enrolment lock first could deadlock two launches of one learner. A
--- journey day the pinned version does not map, or an enrolment of another
--- learner or of another organisation, resolves to null, and the
--- nine-argument form answers unavailable. 0108's
--- preconditions end its use; it stays a wrapper.
+-- of 0103:748-754, which also reads the grant's organisation; only then
+-- does it lock the enrolment row of a journey call (the learner's own only,
+-- read with the learner's id and the grant's organisation, as the
+-- nine-argument form reads it once its consistency check has proved
+-- p_org_id is the grant's) and resolve p_journey_day to its day id through
+-- the version that row is pinned to; then it calls the nine-argument form,
+-- which takes the same two locks in the same order (the transaction already
+-- holds them). A wrapper that took the enrolment lock first could deadlock
+-- two launches of one learner. A journey day the pinned version does not
+-- map, or an enrolment of another learner or of another organisation than
+-- the grant's, resolves to null, and the nine-argument form answers
+-- unavailable. The wrapper compares with the grant's organisation, not with
+-- p_org_id, which nothing has checked at that point: a call whose p_org_id
+-- is not the grant's still reaches the nine-argument form's 22023 (0103's
+-- outcome). 0108's preconditions end its use; it stays a wrapper.
 create or replace function public.consume_grant(
   p_grant_id uuid,
   p_user_id uuid,
@@ -4064,10 +4069,12 @@ security definer
 set search_path = pg_catalog, public
 as $$
 declare
-  v_day_id uuid;
+  v_grant_org uuid;
+  v_day_id    uuid;
 begin
-  -- 1. the grant row, locked first
-  perform 1
+  -- 1. the grant row, locked first, and its organisation (null when no
+  -- grant matches; the nine-argument form then answers unavailable)
+  select ar.organization_id into v_grant_org
     from public.attempt_requests ar
    where ar.id = p_grant_id
      and ar.user_id = p_user_id
@@ -4078,8 +4085,9 @@ begin
   -- 2. a journey call: the learner's own enrolment row in the grant's
   -- organisation, locked, and the day id of p_journey_day in the version it
   -- is pinned to; another learner's enrolment, or one in another
-  -- organisation, is neither locked nor read, its day id stays null, and the
-  -- nine-argument form answers unavailable (the note of 2026-11-14)
+  -- organisation than the grant's, is neither locked nor read, its day id
+  -- stays null, and the nine-argument form answers unavailable (the note of
+  -- 2026-11-14)
   if p_journey_enrollment_id is not null then
     select (jv.day_ids ->> p_journey_day::text)::uuid
       into v_day_id
@@ -4087,7 +4095,7 @@ begin
       join public.journey_versions jv on jv.id = e.version_id
      where e.id = p_journey_enrollment_id
        and e.user_id = p_user_id
-       and e.organization_id = p_org_id
+       and e.organization_id = v_grant_org
        for update of e;
   end if;
 
