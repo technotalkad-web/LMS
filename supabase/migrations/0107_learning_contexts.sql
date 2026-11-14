@@ -6372,7 +6372,11 @@ grant execute on function public.journey_auto_enroll() to service_role;
 --                 day_id, day_number, credited}] by enrollment_id, then
 --                 day_number, the required days (5d's definition) that hold
 --                 p_course in the pinned versions of the learner's active
---                 enrolments of p_org
+--                 enrolments of p_org on active programs (ruling A1 of
+--                 2026-11-14: a journey whose program is inactive is never a
+--                 holder, as the paths arm keeps active paths only, so a
+--                 launch with no product parameter never redirects into a
+--                 journey the journey row then refuses)
 --   run           null, reserved for phase P
 -- found: false carries no other key. Arrays are always present.
 create or replace function public.launch_context(
@@ -6606,6 +6610,7 @@ begin
                  case when (jv.day_ids ->> x.day_number::text) ~ c_uuid
                       then (jv.day_ids ->> x.day_number::text)::uuid end as day_id
             from public.journey_enrollments en
+            join public.journey_programs jp on jp.id = en.program_id
             join public.journey_versions jv on jv.id = en.version_id
             cross join lateral (
               select case when d.e ->> 'day' ~ '^[0-9]{1,6}$' then (d.e ->> 'day')::integer end as day_number,
@@ -6616,6 +6621,7 @@ begin
            where en.user_id = p_user
              and en.organization_id = p_org
              and en.status = 'active'
+             and jp.is_active
              and x.course_id = lower(p_course::text)
              and x.day_number between 1 and jv.days_total
         ) r), '[]'::jsonb));

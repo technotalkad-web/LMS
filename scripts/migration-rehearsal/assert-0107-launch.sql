@@ -22,7 +22,8 @@
 --        an unreleased step, a course assignment not yet released
 --        (upcoming_at), an open attempt on a removed day (resume), a course
 --        swapped on a credited day, a completed enrolment, a day of another
---        program, an inactive course and program, a member who is not active
+--        program, an inactive course and program (whose journey days are
+--        then no holder, ruling A1 of 2026-11-14), a member who is not active
 --   (44) build note O1-g, the launch_context legs: on a strict path, a step
 --        done without a pass and recorded by the writer stays done in
 --        steps[].done when its rule is tightened (1), at the course as well
@@ -452,6 +453,13 @@ begin
   j := pg_temp.lc(l1, org, c2, null, el1, dl2, null);
   if j -> 'course' -> 'is_active' <> 'false'::jsonb or j -> 'journey' -> 'program_is_active' <> 'false'::jsonb then
     bad := bad || format('an inactive course or program: %s', j);
+  end if;
+  -- ruling A1 (2026-11-14): a journey of an inactive program is never a
+  -- holder; the holder day of K for L1 (EL1's day 3, listed above while the
+  -- program was active) is gone, and so is every other day of JL
+  if pg_temp.lc(l1, org, k, null, null, null, null) -> 'holders' -> 'journey_days' <> '[]'::jsonb
+     or pg_temp.lc(l1, org, c1, null, null, null, null) -> 'holders' -> 'journey_days' <> '[]'::jsonb then
+    bad := bad || 'a day of a journey whose program is inactive is still a holder (ruling A1)'::text;
   end if;
   -- found false carries no other key, at every level
   j := pg_temp.lc(l1, org, pg_temp.u('000107199999'), pg_temp.u('000107199998'), pg_temp.u('000107199997'), null, null);
