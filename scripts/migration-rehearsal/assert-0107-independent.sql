@@ -133,6 +133,13 @@ exception when others then
 end
 $$;
 
+-- A spec whose journey tag is 3c1 written by its learner, L1: a journey tag
+-- names the row's own learner's enrolment (the ADR 0024 note of 2026-11-14),
+-- so a check that reads another rule never meets that refusal first
+create function pg_temp.own_enr(p jsonb) returns jsonb language sql immutable as $$
+  select case when p ->> 'enr' = '3c1' then p || '{"user":"101"}'::jsonb else p end
+$$;
+
 -- note N7: a refusal of the new triggers never matches the launch's schema
 -- probes (lib/alds/flag.ts, lib/scoring/attempt-kind.ts)
 create function pg_temp.probe_safe(p_result text) returns boolean language sql immutable as $$
@@ -755,6 +762,7 @@ begin
   for r in select * from (values
     ('public.course_attempts', 'course_attempts_context_immutable', 19, null::text),
     ('public.course_attempts', 'course_attempts_context_derive', 7, null),
+    ('public.course_attempts', 'course_attempts_context_owner', 7, 'public.course_attempts_context_owner()'),
     ('public.learning_path_completions', 'learning_path_completions_no_mutation', 27,
      'public.learning_path_completions_append_only()'),
     ('public.learning_path_step_completions', 'learning_path_step_completions_no_mutation', 27,
@@ -789,11 +797,13 @@ begin
     bad := bad || 'course_attempts_context_derive has not the when clause new.context_kind is null'::text;
   end if;
   -- "It is the first trigger on this table" (step 7): before 0108 the table
-  -- holds exactly the immutability and derive triggers
+  -- holds exactly the immutability and derive triggers, and the owner
+  -- trigger of the note of 2026-11-14 (before insert, permanent)
   if (select array_agg(t.tgname::text order by t.tgname) from pg_trigger t
        where t.tgrelid = 'public.course_attempts'::regclass and not t.tgisinternal)
-     is distinct from array['course_attempts_context_derive', 'course_attempts_context_immutable'] then
-    bad := bad || format('course_attempts carries the triggers %s (expected the derive and immutability triggers only)',
+     is distinct from array['course_attempts_context_derive', 'course_attempts_context_immutable',
+                            'course_attempts_context_owner'] then
+    bad := bad || format('course_attempts carries the triggers %s (expected the derive, immutability and owner triggers only)',
       (select string_agg(t.tgname::text, ', ') from pg_trigger t
         where t.tgrelid = 'public.course_attempts'::regclass and not t.tgisinternal));
   end if;
@@ -819,7 +829,8 @@ begin
     select t.tgfoid::regprocedure from pg_trigger t
      where not t.tgisinternal
        and ((t.tgrelid = 'public.course_attempts'::regclass
-             and t.tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive'))
+             and t.tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
+                              'course_attempts_context_owner'))
             or (t.tgrelid = 'public.journey_versions'::regclass and t.tgtype = 7))
   loop
     if (select l.lanname from pg_proc p join pg_language l on l.oid = p.prolang where p.oid = fn) <> 'plpgsql' then
@@ -1604,10 +1615,10 @@ begin
     ) as t(spec, named)
     loop
       if rl = 'postgres' then
-        got := pg_temp.try_att(base || r.spec::jsonb);
+        got := pg_temp.try_att(pg_temp.own_enr(base || r.spec::jsonb));
       else
         execute 'set local role service_role';
-        got := pg_temp.try_att(base || r.spec::jsonb);
+        got := pg_temp.try_att(pg_temp.own_enr(base || r.spec::jsonb));
         execute 'reset role';
       end if;
       if split_part(got, '|', 1) <> '23514'
@@ -1627,14 +1638,35 @@ begin
     ) as t(spec)
     loop
       if rl = 'postgres' then
+        got := pg_temp.try_att(pg_temp.own_enr(base || r.spec::jsonb));
+      else
+        execute 'set local role service_role';
+        got := pg_temp.try_att(pg_temp.own_enr(base || r.spec::jsonb));
+        execute 'reset role';
+      end if;
+      if got <> 'ok' then
+        bad := bad || format('%s legal row %s refused: %s', rl, r.spec, got);
+      end if;
+    end loop;
+    -- the ADR 0024 note of 2026-11-14 (the ruling "A user delete can be
+    -- refused"): a journey tag that names another learner's enrolment, or
+    -- the learner's own in another organisation, is refused before insert
+    -- with P0001 and a message no schema probe matches, whatever the kind
+    for r in select * from (values
+      ('{"user":"108","kind":"journey","enr":"3c1","day":1,"day_id":"3d1"}'),
+      ('{"user":"105","kind":"preview","pkind":"legacy_role","path":"2a1","enr":"3c1","day":1}'),
+      ('{"user":"101","org":"b0","kind":"journey","enr":"3c1","day":1,"day_id":"3d1"}')
+    ) as t(spec)
+    loop
+      if rl = 'postgres' then
         got := pg_temp.try_att(base || r.spec::jsonb);
       else
         execute 'set local role service_role';
         got := pg_temp.try_att(base || r.spec::jsonb);
         execute 'reset role';
       end if;
-      if got <> 'ok' then
-        bad := bad || format('%s legal row %s refused: %s', rl, r.spec, got);
+      if not pg_temp.probe_safe(got) then
+        bad := bad || format('%s a journey tag of another learner or organisation %s: %s (expected P0001)', rl, r.spec, got);
       end if;
     end loop;
   end loop;
@@ -1656,8 +1688,8 @@ declare
 begin
   perform pg_temp.att('{"id":"4a01","user":"108","ver":"1e7","kind":"individual","status":"passed","score":87.5}');
   perform pg_temp.att('{"id":"4a02","user":"108","ver":"1e7","kind":"path","path":"2a1"}');
-  perform pg_temp.att('{"id":"4a03","user":"108","ver":"1e7","kind":"journey","enr":"3c1","day":1,"day_id":"3d1","jver":"3b1"}');
-  perform pg_temp.att('{"id":"4a04","user":"105","ver":"1e7","kind":"preview","pkind":"legacy_role","path":"2a1","enr":"3c1","day":1}');
+  perform pg_temp.att('{"id":"4a03","user":"101","ver":"1e7","kind":"journey","enr":"3c1","day":1,"day_id":"3d1","jver":"3b1"}');
+  perform pg_temp.att('{"id":"4a04","user":"101","ver":"1e7","kind":"preview","pkind":"legacy_role","path":"2a1","enr":"3c1","day":1}');
   perform pg_temp.att('{"id":"4a05","user":"105","ver":"1e7","kind":"preview","pkind":"course"}');
   perform pg_temp.att('{"id":"4a06","user":"105","ver":"1e7","kind":"preview","pkind":"path_run","run":"500"}');
   perform pg_temp.att('{"id":"4a07","user":"105","ver":"1e7","kind":"preview","pkind":"journey_run","run":"500","day_id":"3d1"}');

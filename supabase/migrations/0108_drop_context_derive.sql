@@ -63,7 +63,8 @@
 --
 -- AFTER the apply: the after-checks of section 3 run inside this file and
 -- raise on failure, which rolls the whole file back: the two triggers, the
--- two functions and the table are gone; day_ids is not null; an insert that
+-- two functions and the table are gone; the immutability and owner triggers
+-- of course_attempts are still there; day_ids is not null; an insert that
 -- names no context_kind fails not null on context_kind (inside a block that
 -- is rolled back, so it writes nothing).
 
@@ -186,11 +187,18 @@ begin
                   where a.attrelid = 'public.journey_versions'::regclass and a.attname = 'day_ids' and a.attnotnull) then
     bad := bad || 'journey_versions.day_ids is not not null'::text;
   end if;
-  -- the immutability trigger stays (step 7): only the paste window ends
+  -- the immutability trigger stays (step 7), and so does the owner trigger
+  -- (the ADR 0024 note of 2026-11-14): only the paste window ends
   if not exists (select 1 from pg_trigger t
                   where t.tgrelid = 'public.course_attempts'::regclass and t.tgname = 'course_attempts_context_immutable'
                     and not t.tgisinternal and t.tgenabled <> 'D') then
     bad := bad || 'the immutability trigger course_attempts_context_immutable is missing'::text;
+  end if;
+  if not exists (select 1 from pg_trigger t
+                  where t.tgrelid = 'public.course_attempts'::regclass and t.tgname = 'course_attempts_context_owner'
+                    and t.tgfoid = to_regprocedure('public.course_attempts_context_owner()')
+                    and not t.tgisinternal and t.tgenabled <> 'D') then
+    bad := bad || 'the owner trigger course_attempts_context_owner is missing'::text;
   end if;
 
   -- a tagless insert fails not null on context_kind; the block rolls back,

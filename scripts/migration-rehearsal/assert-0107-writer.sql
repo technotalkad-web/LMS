@@ -569,9 +569,24 @@ begin
     bad := bad || format('the credit of a rest day counts: %s (expected req=2 done=0)', got);
   end if;
 
-  -- another learner's attempt on EW, and EW reset
+  -- another learner's attempt on EW, and EW reset. The owner trigger (0107
+  -- section 2j, the ADR 0024 note of 2026-11-14) refuses such a row now
+  -- (P0001, nothing written); one from before the paste stays, so it is
+  -- written here with that trigger disabled for the one insert, and
+  -- journey_record_completion must still skip it
+  begin
+    perform pg_temp.att8(pg_temp.u8('000107184032'), pg_temp.u8('000107181201'), pg_temp.u8('000107180006'),
+                         'completed', 'journey', null, ew, 1, pg_temp.u8('000107183101'), vw1, 15);
+    bad := bad || 'another learner''s attempt on EW was written: the owner trigger did not refuse it'::text;
+  exception when others then
+    if sqlstate <> 'P0001' then
+      bad := bad || format('another learner''s attempt on EW: %s %s (expected P0001 from the owner trigger)', sqlstate, sqlerrm);
+    end if;
+  end;
+  alter table public.course_attempts disable trigger course_attempts_context_owner;
   perform pg_temp.att8(pg_temp.u8('000107184032'), pg_temp.u8('000107181201'), pg_temp.u8('000107180006'),
                        'completed', 'journey', null, ew, 1, pg_temp.u8('000107183101'), vw1, 15);
+  alter table public.course_attempts enable trigger course_attempts_context_owner;
   a := public.journey_record_completion(pg_temp.u8('000107184032'));
   if a ->> 'skipped' is distinct from 'enrollment_inactive' then
     bad := bad || format('another learner''s attempt: %s (expected skipped enrollment_inactive)', a);

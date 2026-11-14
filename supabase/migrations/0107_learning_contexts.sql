@@ -248,8 +248,13 @@
 --        (journey_null_day); journey_day set with no journey_enrollment_id,
 --        the orphans of deleted programs (orphan_day). Counted only: preview
 --        rows that carry any tag (step 6: they become legacy_role and keep
---        their tags) and abandoned rows that are completed or passed
---        (expected 0, ADR 0010 step 7).
+--        their tags); abandoned rows that are completed or passed
+--        (expected 0, ADR 0010 step 7); and rows of any kind whose journey
+--        tag names an enrolment of another learner or of another
+--        organisation (cross_owner; the note of 2026-11-14: the owner
+--        trigger of section 2j refuses new ones, the rows already there are
+--        kept as they are, and a user delete that meets one is refused with
+--        23503; expected 0 on production, which has no learner rows).
 --   Q3   open rows (status in_progress), distinct (learner, version) pairs
 --        among them, the most on one pair (1 while the 0062 index holds), and
 --        open rows by context_kind.
@@ -637,7 +642,7 @@ first_paste as (
   ) as yes
 ),
 att as (
-  select a.id, a.user_id, a.course_version_id, a.status, a.completion_status,
+  select a.id, a.user_id, a.organization_id, a.course_version_id, a.status, a.completion_status,
          a.success_status, a.is_preview, a.is_revision, a.launch_mode,
          a.learning_path_id, a.journey_enrollment_id, a.journey_day, v.course_id,
          case when a.is_preview then 'preview'
@@ -775,14 +780,20 @@ q as (
           count(*) filter (where is_preview and (learning_path_id is not null
                                  or journey_enrollment_id is not null or journey_day is not null)) as preview_tagged,
           count(*) filter (where status = 'abandoned'
-                                 and (completion_status = 'completed' or success_status = 'passed')) as abandoned_done
-        from att) c
+                                 and (completion_status = 'completed' or success_status = 'passed')) as abandoned_done,
+          count(*) filter (where t.journey_enrollment_id is not null
+                                 and exists (select 1 from public.journey_enrollments e
+                                              where e.id = t.journey_enrollment_id
+                                                and (e.user_id is distinct from t.user_id
+                                                     or e.organization_id is distinct from t.organization_id))) as cross_owner
+        from att t) c
   cross join lateral (values
     ('Q2.both_tags',        c.both_tags,        'not previews with a path and a journey tag', true),
     ('Q2.journey_null_day', c.journey_null_day, 'not previews with a journey tag and a null journey_day', true),
     ('Q2.orphan_day',       c.orphan_day,       'not previews with journey_day and no enrolment', true),
     ('Q2.preview_tagged',   c.preview_tagged,   'previews that carry a tag (kept as legacy_role)', false),
-    ('Q2.abandoned_done',   c.abandoned_done,   'abandoned rows that are completed or passed (expected 0)', false)
+    ('Q2.abandoned_done',   c.abandoned_done,   'abandoned rows that are completed or passed (expected 0)', false),
+    ('Q2.cross_owner',      c.cross_owner,      'rows whose journey tag names another learner''s or organisation''s enrolment (counted only)', false)
   ) as v(q, n, note, refuses)
   union all
   -- Q3: open rows per (learner, version)
@@ -1685,18 +1696,20 @@ alter table public.notification_templates
     ));
 
 -- ---------------------------------------------------------------------------
--- 2. The paste-window log, the two attempt triggers, the two attempt foreign
---    keys and the indexes (ADR 0024 section B, the end of creation order
---    item 2; steps 7, 8 and 91; notes N1, N5 and N7)
+-- 2. The paste-window log, the three attempt triggers, the two attempt
+--    foreign keys and the indexes (ADR 0024 section B, the end of creation
+--    order item 2; steps 7, 8 and 91; notes N1, N5 and N7; the owner
+--    trigger of 2j by the note of 2026-11-14)
 -- ---------------------------------------------------------------------------
 -- After every backfill of section 1: the immutability trigger would refuse
 -- the context_kind backfill itself, and no row this file writes may reach
 -- the derive trigger.
 --
--- Errors (note N7). The two triggers here and the day_ids trigger of section
--- 6 raise SQLSTATE P0001 with a fixed short message. No message uses a
--- phrase that the old launch code's schema probes match (isAldsSchemaMissing
--- in lib/alds/flag.ts and isSchemaMissing in lib/scoring/attempt-kind.ts;
+-- Errors (note N7). The three triggers here (2b, 2c and 2j) and the day_ids
+-- trigger of section 6 raise SQLSTATE P0001 with a fixed short message. No
+-- message uses a phrase that the old launch code's schema probes match
+-- (isAldsSchemaMissing in lib/alds/flag.ts and isSchemaMissing in
+-- lib/scoring/attempt-kind.ts;
 -- note N7 lists them), and no error carries a code they match (42703, 42P01,
 -- 42883, PGRST20x): a match would make the old launch retry its insert
 -- without the ALDS_P4 columns, or log a refusal as a missing schema, and
@@ -2007,6 +2020,54 @@ create index if not exists journey_day_progress_day_idx
 -- organisation, newest first.
 create index if not exists xp_events_org_ctx_created_idx
   on public.xp_events (organization_id, context_key, created_at desc);
+
+-- 2j. course_attempts_context_owner (the ADR 0024 note of 2026-11-14, the
+-- ruling "A user delete can be refused (23503)"): a journey tag names an
+-- enrolment of the row's own learner and organisation. Under the no action
+-- key of 2d the user cascade of step 7 works only then: if learner A's
+-- attempt named learner B's enrolment, a delete of B would remove the
+-- enrolment while A's attempt stays, and the delete would be refused with
+-- 23503. No application writer makes such a row (the launch reads the
+-- enrolment by the learner's id, as launch_context does, and consume_grant
+-- does since the same ruling), but nothing in the database forbade it.
+-- Before insert, every kind (a legacy_role preview's old tag included);
+-- the immutability trigger (2b) keeps the tag from changing afterwards. An
+-- id that names no enrolment is left to the foreign key (23503). Rows from
+-- before the first paste are never touched (principle 5): section 0b counts
+-- them (Q2.cross_owner), and a user delete that meets one is still refused.
+-- Permanent: 0108 keeps it. P0001 with a fixed message (note N7). Security
+-- definer: the session that inserts may not read another learner's
+-- enrolment.
+create or replace function public.course_attempts_context_owner()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+begin
+  if new.journey_enrollment_id is not null
+     and exists (
+       select 1 from public.journey_enrollments e
+        where e.id = new.journey_enrollment_id
+          and (e.user_id is distinct from new.user_id
+               or e.organization_id is distinct from new.organization_id)) then
+    raise exception 'course_attempts: a journey tag must name the learner''s own enrolment in the same organisation (ADR 0024)'
+      using errcode = 'P0001',
+            detail = 'journey_enrollment_id must name an enrolment whose user_id and organization_id are the row''s own.';
+  end if;
+  return new;
+end
+$$;
+
+revoke execute on function public.course_attempts_context_owner() from public, anon, authenticated;
+grant execute on function public.course_attempts_context_owner() to service_role;
+
+drop trigger if exists course_attempts_context_owner on public.course_attempts;
+create trigger course_attempts_context_owner
+  before insert on public.course_attempts
+  for each row
+  when (new.journey_enrollment_id is not null)
+  execute function public.course_attempts_context_owner();
 
 -- ---------------------------------------------------------------------------
 -- 3. The new tables (ADR 0024 section B, creation order item 3; steps 14, 15
@@ -3734,7 +3795,12 @@ grant execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, u
 --     nothing written; the grant's own context_key is read only here (N9);
 --   - for a journey context the enrolment row is locked after the grant, and
 --     the version it is pinned to is read from that locked row; the retake
---     records it (journey_version_id) with the day id (A27);
+--     records it (journey_version_id) with the day id (A27). The enrolment
+--     is read with the learner's id (the ADR 0024 note of 2026-11-14, the
+--     ruling "A user delete can be refused"): an enrolment of another
+--     learner, or none, answers unavailable with nothing written, so no
+--     other learner's enrolment is locked and the retake never names one
+--     (the owner trigger of 2j would refuse that insert);
 --   - retake_live, the official result, stands and the abandon read attempt
 --     rows of this context only (context_key); the live-retake test is on
 --     the retake row's own context, and the grant that names it may be of
@@ -3749,7 +3815,8 @@ grant execute on function public.record_revision_visit(uuid, uuid, uuid, uuid, u
 --     removes the derive trigger), so a tag the context does not use is
 --     never written.
 -- Outcomes, in this order, under the grant row's lock: unavailable; (22023)
--- version, course or organisation mismatch, raised; used; expired;
+-- version, course or organisation mismatch, raised; unavailable for a
+-- journey context whose enrolment is not the learner's; used; expired;
 -- retake_live; stale; stands; opened, as in 0103 (comment at 0103:690-719).
 -- Lock order in both forms: the grant, then the enrolment, then
 -- course_attempts rows. journey_record_completion and the re-pin lock the
@@ -3821,13 +3888,19 @@ begin
       using errcode = '22023';
   end if;
 
-  -- 2b. a journey context: the enrolment row, locked after the grant, and
-  -- the version it is pinned to
+  -- 2b. a journey context: the learner's own enrolment row, locked after the
+  -- grant, and the version it is pinned to; an enrolment of another
+  -- learner, or none, is unavailable (the note of 2026-11-14)
   if v_kind = 'journey' then
     select e.version_id into v_pinned
       from public.journey_enrollments e
      where e.id = p_journey_enrollment_id
+       and e.user_id = p_user_id
        for update;
+    if not found then
+      return query select 'unavailable'::text, null::uuid, '{}'::uuid[];
+      return;
+    end if;
   end if;
 
   -- 3. used, expired
@@ -3959,12 +4032,14 @@ grant execute on function public.consume_grant(uuid, uuid, uuid, uuid, uuid, uui
 -- The eight-argument form keeps its signature (0103:721-731) for the launch
 -- code before phase 2, as a wrapper. Its first statement is the grant lock
 -- of 0103:748-754; only then does it lock the enrolment row of a journey
--- call and resolve p_journey_day to its day id through the version that row
--- is pinned to; then it calls the nine-argument form, which takes the same
--- two locks in the same order (the transaction already holds them). A
--- wrapper that took the enrolment lock first could deadlock two launches of
--- one learner. A journey day the pinned version does not map resolves to
--- null, and the nine-argument form answers unavailable. 0108's
+-- call (the learner's own only, read with the learner's id as the
+-- nine-argument form reads it) and resolve p_journey_day to its day id
+-- through the version that row is pinned to; then it calls the
+-- nine-argument form, which takes the same two locks in the same order (the
+-- transaction already holds them). A wrapper that took the enrolment lock
+-- first could deadlock two launches of one learner. A journey day the
+-- pinned version does not map, or an enrolment of another learner, resolves
+-- to null, and the nine-argument form answers unavailable. 0108's
 -- preconditions end its use; it stays a wrapper.
 create or replace function public.consume_grant(
   p_grant_id uuid,
@@ -3993,14 +4068,17 @@ begin
      and ar.status = 'approved'
      for update;
 
-  -- 2. a journey call: the enrolment row, locked, and the day id of
-  -- p_journey_day in the version it is pinned to
+  -- 2. a journey call: the learner's own enrolment row, locked, and the day
+  -- id of p_journey_day in the version it is pinned to; another learner's
+  -- enrolment is neither locked nor read, its day id stays null, and the
+  -- nine-argument form answers unavailable (the note of 2026-11-14)
   if p_journey_enrollment_id is not null then
     select (jv.day_ids ->> p_journey_day::text)::uuid
       into v_day_id
       from public.journey_enrollments e
       join public.journey_versions jv on jv.id = e.version_id
      where e.id = p_journey_enrollment_id
+       and e.user_id = p_user_id
        for update of e;
   end if;
 
@@ -6696,7 +6774,9 @@ grant select, insert on public.revision_visits to service_role;
 --   A1   the new indexes present; the open-row and open-request indexes of
 --        0062 and 0083 absent
 --   A2   both attempt foreign keys on delete no action
---   A3   both attempt triggers present, enabled and bound
+--   A3   the three attempt triggers present, enabled and bound (the
+--        immutability and derive triggers, and the owner trigger of the
+--        note of 2026-11-14)
 --   A4   the recreated function bodies name context_key
 --   A5   the privilege matrix: every new relation (the six tables and the
 --        six views; with A23, the two terms views and the two path views
@@ -6803,9 +6883,11 @@ begin
      and ((t.tgname = 'course_attempts_context_immutable'
            and t.tgfoid = 'public.course_attempts_context_immutable()'::regprocedure)
        or (t.tgname = 'course_attempts_context_derive'
-           and t.tgfoid = 'public.course_attempts_context_derive()'::regprocedure));
-  if n <> 2 then
-    bad := bad || format('A3 %s of the two attempt triggers are present, enabled and bound', n);
+           and t.tgfoid = 'public.course_attempts_context_derive()'::regprocedure)
+       or (t.tgname = 'course_attempts_context_owner'
+           and t.tgfoid = 'public.course_attempts_context_owner()'::regprocedure));
+  if n <> 3 then
+    bad := bad || format('A3 %s of the three attempt triggers are present, enabled and bound', n);
   end if;
 
   -- A4: each recreated body that reads attempts names their context; a
@@ -6858,11 +6940,17 @@ begin
           count(*) filter (where ca.is_preview and (ca.learning_path_id is not null
                                  or ca.journey_enrollment_id is not null or ca.journey_day is not null)) as preview_tagged,
           count(*) filter (where ca.status = 'abandoned'
-                                 and (ca.completion_status = 'completed' or ca.success_status = 'passed')) as abandoned_done
+                                 and (ca.completion_status = 'completed' or ca.success_status = 'passed')) as abandoned_done,
+          count(*) filter (where ca.journey_enrollment_id is not null
+                                 and exists (select 1 from public.journey_enrollments e
+                                              where e.id = ca.journey_enrollment_id
+                                                and (e.user_id is distinct from ca.user_id
+                                                     or e.organization_id is distinct from ca.organization_id))) as cross_owner
         from public.course_attempts ca) c
       cross join lateral (values
         ('Q2.both_tags', c.both_tags), ('Q2.journey_null_day', c.journey_null_day), ('Q2.orphan_day', c.orphan_day),
-        ('Q2.preview_tagged', c.preview_tagged), ('Q2.abandoned_done', c.abandoned_done)) as x(q, n)
+        ('Q2.preview_tagged', c.preview_tagged), ('Q2.abandoned_done', c.abandoned_done),
+        ('Q2.cross_owner', c.cross_owner)) as x(q, n)
     ) v
     left join pg_temp.adr0024_0107_before b on b.q = v.q
    where b.n is distinct from v.n;
@@ -7283,6 +7371,7 @@ begin
     select * from (values
       ('public.course_attempts_context_immutable()',                            false, false),
       ('public.course_attempts_context_derive()',                               true,  false),
+      ('public.course_attempts_context_owner()',                                true,  false),
       ('public.learning_path_completions_append_only()',                        false, false),
       ('public.learning_path_step_completions_append_only()',                   false, false),
       ('public.preview_purge_log_append_only()',                                false, false),

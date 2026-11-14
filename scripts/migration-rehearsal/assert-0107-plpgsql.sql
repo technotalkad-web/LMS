@@ -30,8 +30,9 @@
 --        at the lock, the abandon and the insert per context, the live
 --        retake on the retake row's own context (note N9), stands by the
 --        step's rule and by the lenient journey rule (R14), the day id
---        through the wrapper and through the nine-argument form, and the
---        atomicity of a refused insert
+--        through the wrapper and through the nine-argument form, the
+--        atomicity of a refused insert, and a journey grant that names
+--        another learner's enrolment (the note of 2026-11-14)
 --   (31) journey_save_days: moves, inserts and removals by identity, its
 --        refusals, the old editor's upsert, and as the API roles (an admin
 --        of the organisation, a learner, another organisation's admin,
@@ -1097,6 +1098,46 @@ begin
 end
 $$;
 rollback to savepoint s30i;
+
+-- (j) the ADR 0024 note of 2026-11-14 (the ruling "A user delete can be
+--     refused"): an approved journey grant of L1 that names L2's enrolment
+--     E7 (attempt_requests does not refuse such a row). Both forms read the
+--     enrolment with the learner's id and answer unavailable, with nothing
+--     written and the grant unused. Without the nine-argument form's
+--     predicate the call goes on to open a retake that the owner trigger
+--     refuses (P0001), so this check fails then
+savepoint s30j;
+do $$
+declare
+  got text := '';
+  o   text;
+  l1  constant uuid := '00000000-0000-0000-0000-000107170001';
+  cb  constant uuid := '00000000-0000-0000-0000-000107171002';
+  vb  constant uuid := '00000000-0000-0000-0000-000107171203';
+  e7  constant uuid := '00000000-0000-0000-0000-000107173401';
+  d2  constant uuid := '00000000-0000-0000-0000-000107173102';
+begin
+  perform pg_temp.grant7(pg_temp.u7('000107177140'), l1, cb, 'journey', null, e7, 2, d2, now());
+  begin
+    select g.outcome into o from pg_temp.cg9(pg_temp.u7('000107177140'), l1, cb, vb, null, e7, 2, d2) g;
+  exception when others then
+    o := sqlstate;
+  end;
+  got := got || o || ' ';
+  begin
+    select g.outcome into o from pg_temp.cg8(pg_temp.u7('000107177140'), l1, cb, vb, null, e7, 2) g;
+  exception when others then
+    o := sqlstate;
+  end;
+  got := got || o;
+  if got <> 'unavailable unavailable'
+     or exists (select 1 from public.course_attempts where journey_enrollment_id = e7 and user_id = l1)
+     or (select used_at from public.attempt_requests where id = pg_temp.u7('000107177140')) is not null then
+    raise exception 'assert-0107: (30j) a journey grant naming another learner''s enrolment: % (expected unavailable twice, nothing written)', got;
+  end if;
+end
+$$;
+rollback to savepoint s30j;
 
 -- ---------------------------------------------------------------------------
 -- (31) journey_save_days. Program JS with days S1, S2, S3 (numbers 1 to 3;

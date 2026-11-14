@@ -5,8 +5,9 @@
 -- 'assert-0108: (n) ...' on failure.
 --   (1) the derive trigger, its function and context_derive_log are gone;
 --       so are the day_ids trigger on journey_versions and its function;
---       day_ids is not null; the immutability trigger, launch_context and
---       the rest of 0107 are still there
+--       day_ids is not null; the immutability trigger, the owner trigger
+--       (the ADR 0024 note of 2026-11-14), launch_context and the rest of
+--       0107 are still there
 --   (2) the attempt seed-0108.sql inserted with no context_kind before the
 --       paste still reads the label the derive trigger gave it (individual);
 --       after the paste the same insert fails not null on context_kind
@@ -37,6 +38,9 @@ begin
   if not exists (select 1 from pg_trigger t
                   where t.tgrelid = 'public.course_attempts'::regclass and t.tgname = 'course_attempts_context_immutable'
                     and t.tgfoid = 'public.course_attempts_context_immutable()'::regprocedure)
+     or not exists (select 1 from pg_trigger t
+                     where t.tgrelid = 'public.course_attempts'::regclass and t.tgname = 'course_attempts_context_owner'
+                       and t.tgfoid = 'public.course_attempts_context_owner()'::regprocedure and t.tgenabled = 'O')
      or to_regprocedure('public.launch_context(uuid,uuid,uuid,uuid,uuid,uuid,integer)') is null
      or to_regprocedure('public.record_learning_activity(uuid)') is null
      or to_regclass('public.v_path_step_status') is null

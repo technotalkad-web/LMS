@@ -6,7 +6,7 @@
 -- This build covers sections 1 and 2 of the file (ADR 0024 section B,
 -- creation order item 2 whole: the columns, their run-once backfills, the
 -- generated columns, the CHECKs, preview_runs, context_derive_log, the
--- immutability and derive triggers, the two attempt foreign keys, the key
+-- immutability, derive and owner triggers, the two attempt foreign keys, the key
 -- swaps and the indexes), section 3 (creation order item 3: the four new
 -- tables) and section 6's paste-window day_ids trigger on journey_versions:
 -- checks (0) to (6) for section 1, (7) to (10) for section 2 and 6a, (11)
@@ -547,8 +547,10 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- (5) the checks refuse what the record forbids (each with its SQLSTATE) and
---     admit the legal rows; the deferred day_id key still refuses a lone
---     delete of a credited day (note N1); a generated column cannot be written
+--     admit the legal rows; the owner trigger refuses a journey tag of
+--     another learner's or organisation's enrolment (the note of
+--     2026-11-14); the deferred day_id key still refuses a lone delete of a
+--     credited day (note N1); a generated column cannot be written
 -- ---------------------------------------------------------------------------
 create function pg_temp.expect_state(p_stmt text, p_state text, p_what text) returns text
 language plpgsql as $$
@@ -580,6 +582,12 @@ declare
     || 'journey_day_id, journey_version_id, preview_run_id) values ('
     || '''00000000-0000-0000-0000-0000000000e3'', ''00000000-0000-0000-0000-000107010002'', '
     || '''00000000-0000-0000-0000-00000000000a'', ''completed'', ''completed'', ''unknown'', ';
+  -- the same insert by J (EJ's learner) and by S (ES's learner): a journey
+  -- tag names the row's own learner's enrolment, or the owner trigger
+  -- (0107 section 2j, the ADR 0024 note of 2026-11-14) refuses the row
+  -- before any check constraint is read
+  ins_j constant text := replace(ins, '000107010002', '000107010004');
+  ins_s constant text := replace(ins, '000107010002', '000107010006');
   p1  constant text := '''00000000-0000-0000-0000-000107050001''';
   ej  constant text := '''00000000-0000-0000-0000-000107063001''';
   es  constant text := '''00000000-0000-0000-0000-000107063002''';
@@ -589,9 +597,9 @@ begin
   for m in
     select pg_temp.expect_state(s, st, w) from (values
       -- refused (23514): every arm of the shape check (steps 5 and 79)
-      (ins || '''journey'', false, null, ' || p1 || ', ' || ej || ', 1, ' || d1 || ', null, null)', '23514',
+      (ins_j || '''journey'', false, null, ' || p1 || ', ' || ej || ', 1, ' || d1 || ', null, null)', '23514',
        'a journey row that also carries a path tag'),
-      (ins || '''journey'', false, null, null, ' || ej || ', 1, null, null, null)', '23514',
+      (ins_j || '''journey'', false, null, null, ' || ej || ', 1, null, null, null)', '23514',
        'a journey row without a day id'),
       (ins || '''path'', false, null, null, null, null, null, null, null)', '23514',
        'a path row without a path'),
@@ -620,10 +628,21 @@ begin
       -- refusal
       (ins || 'null, false, null, null, null, null, null, null, null)', 'no error',
        'a null context_kind (labelled by the derive trigger)'),
+      -- refused (P0001): a journey tag that names another learner's
+      -- enrolment, or the learner's own in another organisation (the owner
+      -- trigger, 0107 section 2j; the ADR 0024 note of 2026-11-14), whatever
+      -- the kind; such a row would block that learner's delete (23503)
+      (ins || '''journey'', false, null, null, ' || es || ', 1, ' || d1 || ', null, null)', 'P0001',
+       'a journey row of P naming S''s enrolment (the owner trigger)'),
+      (ins || '''preview'', true, ''legacy_role'', ' || p1 || ', ' || es || ', 2, null, null, null)', 'P0001',
+       'a legacy_role row of P naming S''s enrolment (the owner trigger)'),
+      (replace(ins_s, '00000000000a', '00000000000b') || '''journey'', false, null, null, ' || es || ', 1, ' || d1 || ', null, null)',
+       'P0001', 'a journey row of S in another organisation naming S''s enrolment (the owner trigger)'),
       -- admitted: an old tagged preview (legacy_role keeps its tags) and a course preview;
-      -- the tag names ES, not J's EJ, so the user cascade of J in (9) meets no
-      -- other row that names J's enrolment (such a row blocks it, step 6)
-      (ins || '''preview'', true, ''legacy_role'', ' || p1 || ', ' || es || ', 2, null, null, null)', 'no error',
+      -- the tag names ES, S's own, not J's EJ, so the user cascade of J in (9)
+      -- meets no other row that names J's enrolment (such a row blocks it,
+      -- step 6)
+      (ins_s || '''preview'', true, ''legacy_role'', ' || p1 || ', ' || es || ', 2, null, null, null)', 'no error',
        'a legacy_role row keeping both old tags'),
       (ins || '''preview'', true, ''course'', null, null, null, null, null, null)', 'no error',
        'a course preview'),
@@ -876,6 +895,7 @@ begin
     select * from (values
       ('course_attempts',  'course_attempts_context_immutable', 19, null::text),
       ('course_attempts',  'course_attempts_context_derive',     7, '%WHEN ((new.context_kind IS NULL))%'),
+      ('course_attempts',  'course_attempts_context_owner',      7, '%WHEN ((new.journey_enrollment_id IS NOT NULL))%'),
       ('journey_versions', 'journey_versions_derive_day_ids',    7, '%WHEN ((new.day_ids IS NULL))%')
     ) as t(tbl, tg, tgtype, when_like)
   loop
@@ -894,15 +914,16 @@ begin
     end if;
   end loop;
   if (select count(*) from pg_trigger
-       where tgrelid = 'public.course_attempts'::regclass and not tgisinternal) <> 2 then
-    bad := bad || 'course_attempts does not have exactly its two triggers'::text;
+       where tgrelid = 'public.course_attempts'::regclass and not tgisinternal) <> 3 then
+    bad := bad || 'course_attempts does not have exactly its three triggers'::text;
   end if;
 
-  -- the three functions
+  -- the four functions
   for r in
     select * from (values
       ('public.course_attempts_context_immutable()', false),
       ('public.course_attempts_context_derive()',    true),
+      ('public.course_attempts_context_owner()',     true),
       ('public.journey_versions_derive_day_ids()',   false)
     ) as t(fn, secdef)
   loop

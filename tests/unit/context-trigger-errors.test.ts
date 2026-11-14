@@ -9,10 +9,12 @@
  * matched either probe would be hidden. So each of them raises SQLSTATE P0001
  * with a fixed message, and this test reads every message from the migration
  * itself (not from a copied list), feeds it to both probes, and expects false.
- * It does so for every trigger function 0107 binds (the three N7 names and
- * the three append-only triggers), read from the file's own `create trigger
- * ... execute function` statements, so a trigger added to 0107 later is
- * checked without a change here; 0108 binds none.
+ * It does so for every trigger function 0107 binds (the three N7 names, the
+ * owner trigger of the ADR 0024 note of 2026-11-14, which raises in N7's
+ * form, and the three append-only triggers), read from the file's own
+ * `create trigger ... execute function` statements, so a trigger added to
+ * 0107 later is checked without a change to the loop; the list of seven
+ * below pins the set; 0108 binds none.
  * The rehearsal (scripts/migration-rehearsal/assert-0107.sql, checks (8) and
  * (10)) asserts the same on the errors PGlite raises.
  *
@@ -60,6 +62,8 @@ const N7_TRIGGERS = [
   "course_attempts_context_derive",
   "journey_versions_derive_day_ids",
 ];
+/** The owner trigger (the note of 2026-11-14, the ruling "A user delete can be refused"): N7's form. */
+const OWNER_TRIGGER = "course_attempts_context_owner";
 
 /** The function of every `create trigger ... execute function public.<fn>()` of a migration. */
 function boundFunctions(src: string): string[] {
@@ -73,8 +77,9 @@ function boundFunctions(src: string): string[] {
 console.log("the trigger functions 0107 binds");
 const TRIGGERS = boundFunctions(sql);
 eq("the three N7 triggers are among them", N7_TRIGGERS.every((t) => TRIGGERS.includes(t)), true);
-eq("the six of 0107: the three N7 triggers and the three append-only triggers", [...TRIGGERS].sort(), [
+eq("the seven of 0107: the three N7 triggers, the owner trigger and the three append-only triggers", [...TRIGGERS].sort(), [
   ...N7_TRIGGERS,
+  OWNER_TRIGGER,
   "learning_path_completions_append_only",
   "learning_path_step_completions_append_only",
   "preview_purge_log_append_only",

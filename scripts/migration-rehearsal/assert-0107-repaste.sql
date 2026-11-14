@@ -96,9 +96,10 @@ begin
   if (select count(*) from pg_trigger
        where not tgisinternal
          and tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
+                        'course_attempts_context_owner',
                         'journey_versions_derive_day_ids', 'learning_path_completions_no_mutation',
-                        'learning_path_step_completions_no_mutation', 'preview_purge_log_no_mutation')) <> 6 then
-    bad := bad || 'the six triggers of 0107 are not present exactly once each'::text;
+                        'learning_path_step_completions_no_mutation', 'preview_purge_log_no_mutation')) <> 7 then
+    bad := bad || 'the seven triggers of 0107 are not present exactly once each'::text;
   end if;
   if (select count(*) from pg_constraint
        where conrelid = 'public.course_attempts'::regclass and contype = 'f'

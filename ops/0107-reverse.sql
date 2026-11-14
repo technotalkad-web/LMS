@@ -67,8 +67,10 @@
 --       0107 and reading context_key; step 61's list predates it).
 --       preview_runs is not dropped here: course_attempts.preview_run_id
 --       still references it (2BP01).
---   (4) Drops the attempt triggers and the paste-window day_ids trigger with
---       their functions (if exists: 0108 may have dropped two of them), the
+--   (4) Drops the three attempt triggers (immutability, derive and the owner
+--       trigger of the ADR 0024 note of 2026-11-14) and the paste-window
+--       day_ids trigger with their functions (if exists: 0108 may have
+--       dropped two of them), the
 --       CHECKs 0107 added, re-creates the 0062 and 0083 indexes and then
 --       drops the context indexes, re-creates the two attempt foreign keys
 --       on delete set null under their own names (0034, 0058), re-creates
@@ -1716,9 +1718,11 @@ drop function if exists public.gamification_record_activity_core(uuid, boolean, 
 -- with 55006.
 drop trigger if exists course_attempts_context_immutable on public.course_attempts;
 drop trigger if exists course_attempts_context_derive on public.course_attempts;
+drop trigger if exists course_attempts_context_owner on public.course_attempts;
 drop trigger if exists journey_versions_derive_day_ids on public.journey_versions;
 drop function if exists public.course_attempts_context_immutable();
 drop function if exists public.course_attempts_context_derive();
+drop function if exists public.course_attempts_context_owner();
 drop function if exists public.journey_versions_derive_day_ids();
 
 -- The CHECKs 0107 added, each by name. The column checks would also go with
@@ -1939,7 +1943,7 @@ begin
   select string_agg(f, ', ' order by f) into v_list
     from unnest(array[
       'public.course_attempts_context_immutable()', 'public.course_attempts_context_derive()',
-      'public.journey_versions_derive_day_ids()', 'public.learning_path_completions_append_only()',
+      'public.course_attempts_context_owner()', 'public.journey_versions_derive_day_ids()', 'public.learning_path_completions_append_only()',
       'public.learning_path_step_completions_append_only()', 'public.preview_purge_log_append_only()',
       'public.official_attempt_in_context(uuid, uuid, text)', 'public.instance_pass_required(uuid, text)',
       'public.journey_attempt_satisfies(uuid, boolean)', 'public.journey_credit_state(uuid[])',
@@ -1960,7 +1964,7 @@ begin
   select string_agg(t.tgname, ', ' order by t.tgname) into v_list
     from pg_trigger t
    where t.tgname in ('course_attempts_context_immutable', 'course_attempts_context_derive',
-                      'journey_versions_derive_day_ids')
+                      'course_attempts_context_owner', 'journey_versions_derive_day_ids')
      and not t.tgisinternal;
   if v_list is not null then
     bad := bad || format('triggers still present: %s', v_list);
