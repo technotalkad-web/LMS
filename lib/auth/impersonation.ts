@@ -249,6 +249,9 @@ export async function endImpersonation(): Promise<void> {
  * End this browser's impersonation before its sign-in changes: sign-out,
  * a server route that signs a user in, a password change. Call it while
  * the current user is still signed in, so the owner's row can be stamped.
+ * A password set with the service role (the forgot-password reset) may
+ * already have ended the signed-in user's sessions; then only the cookie
+ * goes and the row runs to its expiry.
  *
  * Route handlers and server actions only (it deletes a cookie). It never
  * throws: the caller's own work (signing out, signing in) goes ahead
