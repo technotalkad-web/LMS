@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import {
   cloudflareSaasConfigured,
   getCustomHostname,
@@ -12,8 +12,10 @@ import {
  *
  * Polls Cloudflare for the tenant's custom-hostname provisioning state and
  * flips custom_domain_verified once the hostname + certificate are active.
- * Admin-only via RLS (is_org_admin on the update). Safe to call repeatedly —
- * the settings UI uses it for the "Check status" button.
+ * Admin-only: requireOrgAdminApi checks the caller's role before the
+ * Cloudflare call (the update is also RLS-checked by is_org_admin, and an
+ * update that changes no row is an error). Safe to call repeatedly — the
+ * settings UI uses it for the "Check status" button.
  */
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as { orgSlug?: string };
@@ -21,16 +23,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
   }
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  // The role check comes first: every member can read the organizations row,
+  // so that read is not a guard for the Cloudflare call below.
+  const auth = await requireOrgAdminApi(body.orgSlug);
+  if ("error" in auth) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
+  }
+  const supabase = auth.supabase;
 
   const { data: org } = await supabase
     .from("organizations")
     .select("id, custom_domain, custom_domain_verified, custom_domain_status, cf_hostname_id")
-    .eq("slug", body.orgSlug)
+    .eq("id", auth.org.id)
     .maybeSingle();
   if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
 
@@ -55,13 +59,21 @@ export async function POST(request: Request) {
   }
 
   const active = isActive(hn);
-  await supabase
+  const { data: updated, error } = await supabase
     .from("organizations")
     .update({
       custom_domain_verified: active,
       custom_domain_status: active ? "active" : hn.status,
     })
-    .eq("id", org.id);
+    .eq("id", org.id)
+    .select("id");
+  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  if (!updated?.length) {
+    return NextResponse.json(
+      { error: "The domain status was not saved." },
+      { status: 403 }
+    );
+  }
 
   return NextResponse.json({
     status: active ? "active" : hn.status,

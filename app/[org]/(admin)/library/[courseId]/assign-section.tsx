@@ -150,6 +150,12 @@ export function AssignSection({
   async function unassign(id: string) {
     if (!await confirm("Remove this assignment?")) return;
     const res = await fetch(`/api/assignments/${id}`, { method: "DELETE" });
+    // 404: the assignment is already gone (another tab or a second click);
+    // refresh so the list matches, with no error.
+    if (res.status === 404) {
+      router.refresh();
+      return;
+    }
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       toast.error(j.error ?? "Failed");

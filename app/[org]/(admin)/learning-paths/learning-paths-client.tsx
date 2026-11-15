@@ -381,6 +381,12 @@ export function LearningPathsClient({
     const res = await fetch(`/api/learning-path-assignments/${id}`, {
       method: "DELETE",
     });
+    // 404: the assignment is already gone (another tab or a second click);
+    // refresh so the list matches, with no error.
+    if (res.status === 404) {
+      router.refresh();
+      return;
+    }
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       toast.error(j.error ?? "Failed");

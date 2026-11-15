@@ -122,7 +122,13 @@ export async function POST(request: Request) {
   // Tenant guard: keep only assignees that actually belong to this org. The
   // rows are inserted and the assignees are then emailed via the service-role
   // notifier, so unvalidated user_ids/team_ids would leak assignments + PII to
-  // another tenant's users.
+  // another tenant's users. A failed check read answers 503 and writes
+  // nothing, so no named assignee is dropped silently.
+  const checkFailed = () =>
+    NextResponse.json(
+      { error: "Could not check the assignees. Nothing was assigned; try again." },
+      { status: 503 }
+    );
   const reqUserIds = (body.userIds ?? []).filter(Boolean);
   const reqTeamIds = (body.teamIds ?? []).filter(Boolean);
   const reqGroupIds = (body.groupIds ?? []).filter(Boolean);
@@ -130,27 +136,30 @@ export async function POST(request: Request) {
   let validTeamIds: string[] = [];
   let validGroupIds: string[] = [];
   if (reqUserIds.length) {
-    const { data: m } = await supabase
+    const { data: m, error: mErr } = await supabase
       .from("organization_members")
       .select("user_id")
       .eq("organization_id", org.id)
       .in("user_id", reqUserIds);
+    if (mErr) return checkFailed();
     validUserIds = ((m ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
   }
   if (reqTeamIds.length) {
-    const { data: t } = await supabase
+    const { data: t, error: tErr } = await supabase
       .from("teams")
       .select("id")
       .eq("organization_id", org.id)
       .in("id", reqTeamIds);
+    if (tErr) return checkFailed();
     validTeamIds = ((t ?? []) as Array<{ id: string }>).map((r) => r.id);
   }
   if (reqGroupIds.length) {
-    const { data: g } = await supabase
+    const { data: g, error: gErr } = await supabase
       .from("org_groups")
       .select("id")
       .eq("organization_id", org.id)
       .in("id", reqGroupIds);
+    if (gErr) return checkFailed();
     validGroupIds = ((g ?? []) as Array<{ id: string }>).map((r) => r.id);
   }
 
