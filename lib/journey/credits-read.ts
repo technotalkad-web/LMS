@@ -1,19 +1,21 @@
 /**
  * The journey credit reader (ADR 0024 phase 2, P2-4; steps 13 and 45,
  * decision A27, build note N18): the credit rows of a list of enrolments,
- * each with the day id it credits, and the `day_ids` map of each enrolment's
- * pinned version, which creditedDaysFor() (lib/journey/journey.ts) needs to
- * turn the rows into the day numbers the twin takes. Every reader of
+ * each with the day id it credits and the course it was earned on, and the
+ * `day_ids` map of each enrolment's pinned version, which creditedDaysFor()
+ * (lib/journey/journey.ts) needs to turn the rows into the day numbers the
+ * twin takes. Every reader of
  * journey_day_progress that feeds computeJourneyState reads through here;
  * tests/unit/journey-credit-sites.test.ts holds them to it.
  *
  * Two reads, each request with its own abort signal (step 25: Next memoizes
  * identical GET fetches inside one server render, so a re-read of the same
  * rows would otherwise answer the first read's rows):
- *   1. journey_day_progress (enrollment_id, day_number, completed_at and
- *      day_id) for the enrolments, in chunks of ids and pages of 1,000 rows
- *      (readPagedWithOptionalColumn, the first page deciding for every
- *      chunk);
+ *   1. journey_day_progress (enrollment_id, day_number, completed_at,
+ *      course_id and day_id) for the enrolments, in chunks of ids and pages
+ *      of 1,000 rows (readPagedWithOptionalColumn, the first page deciding
+ *      for every chunk). course_id is on every database (0058), so it is in
+ *      the base select and needs no fallback; creditCoursesFor reads it;
  *   2. journey_versions (id, day_ids) for the pinned versions of the
  *      enrolments that hold a credit row (creditedDaysFor over no rows is []
  *      whatever the map, so an enrolment without credits costs no version
@@ -32,8 +34,11 @@
  * failed read.
  *
  * `opts.state` lets several calls in one request share the first page's
- * decision (the CRM feed reads per batch of learners), so a database
- * without 0107 pays its one failed read once per request, not per call.
+ * decision on day_id (the CRM feed reads per batch of learners), so a
+ * database without 0107 pays its one failed read of day_id once per
+ * request, not per call. The day_ids decision is not shared: a database
+ * with day_id and without day_ids (impossible on a real database, since
+ * 0107 adds both columns) pays its failed versions read once per call.
  * Never kept between requests.
  *
  * Server-side by use, but free of next/* and Supabase runtime imports (the
@@ -53,7 +58,7 @@ type AnyClient = any;
 
 /** Ids per `.in(...)` filter: well inside a request line's length. */
 const CHUNK = 150;
-const BASE = "enrollment_id, day_number, completed_at";
+const BASE = "enrollment_id, day_number, completed_at, course_id";
 const DAY_ID = "day_id";
 const DAY_IDS = "day_ids";
 
@@ -117,6 +122,7 @@ export async function readJourneyCredits(
       const row: JourneyCreditRow = {
         day_id: typeof r.day_id === "string" ? r.day_id.toLowerCase() : null,
         day_number: n,
+        course_id: typeof r.course_id === "string" && r.course_id ? r.course_id : null,
         completed_at: typeof r.completed_at === "string" ? r.completed_at : null,
       };
       const list = byEnrollment.get(enr);
@@ -140,9 +146,10 @@ export async function readJourneyCredits(
         .abortSignal(fresh());
       if (error && isMissingColumn(error, DAY_IDS)) {
         // day_ids is not on this database: today's reading by number for
-        // every version (the rows already read keep their day_number).
+        // every version (the rows already read keep their day_number);
+        // dayIdsOf answers null for every version from here, so the map
+        // read so far is never consulted.
         byDayId = false;
-        dayIds.clear();
         break;
       }
       if (error) return { ok: false, error };

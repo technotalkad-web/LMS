@@ -109,7 +109,9 @@ function dayIdMap(dayIds: unknown): Record<string, unknown> | null {
  * A days entry's day number as 0107 reads it (`d.e ->> 'day' ~
  * '^[0-9]{1,6}$'`): a whole number of one to six digits, given as a JSON
  * number or as a string of digits. Anything else (2.5, "1e1", " 3", true)
- * is no day, so the twin and journey_credit_state require the same days.
+ * is no day, so the twin and journey_credit_state require the same days,
+ * except a jsonb number written with a scale (3.0), which 0107's regex
+ * refuses; no writer produces one.
  */
 function dayNumberOf(x: unknown): number | null {
   if (typeof x === "number") return Number.isInteger(x) && x >= 0 && x <= 999999 ? x : null;
@@ -157,8 +159,48 @@ export type JourneyCreditRow = {
   day_id: string | null;
   /** The day's number when it was credited. */
   day_number: number;
+  /** The course the credit was earned on (0058); null when that course was deleted. */
+  course_id: string | null;
   completed_at: string | null;
 };
+
+type CreditVersion = { days: unknown; days_total: number; day_ids: Record<string, unknown> | null };
+
+/**
+ * The one matching of credits to course days, behind creditedDaysFor and
+ * creditCoursesFor: each course day of the pinned version that holds a
+ * credit, with the credit row that matched it (the first such row in read
+ * order). The rule is creditedDaysFor's, written once.
+ */
+function creditRowsByDay<R extends Pick<JourneyCreditRow, "day_id" | "day_number">>(
+  version: CreditVersion,
+  progressRows: ReadonlyArray<R>
+): Map<number, R> {
+  const byNumber = parseVersionDays(version.days, version.day_ids ?? undefined);
+  const required = [...byNumber.values()].filter(
+    (d) => d.course_id !== null && d.day <= version.days_total
+  );
+  const out = new Map<number, R>();
+  if (version.day_ids === null) {
+    const rows = new Map<number, R>();
+    for (const r of progressRows) if (!rows.has(r.day_number)) rows.set(r.day_number, r);
+    for (const d of required) {
+      const r = rows.get(d.day);
+      if (r) out.set(d.day, r);
+    }
+  } else {
+    const rows = new Map<string, R>();
+    for (const r of progressRows) {
+      const id = typeof r.day_id === "string" && r.day_id ? r.day_id.toLowerCase() : null;
+      if (id && !rows.has(id)) rows.set(id, r);
+    }
+    for (const d of required) {
+      const r = d.dayId !== null ? rows.get(d.dayId) : undefined;
+      if (r) out.set(d.day, r);
+    }
+  }
+  return out;
+}
 
 /**
  * The numbers, in the pinned version, of the course days whose id holds a
@@ -176,24 +218,28 @@ export type JourneyCreditRow = {
  * count wherever no re-pin moved a day.
  */
 export function creditedDaysFor(
-  version: { days: unknown; days_total: number; day_ids: Record<string, unknown> | null },
+  version: CreditVersion,
   progressRows: ReadonlyArray<Pick<JourneyCreditRow, "day_id" | "day_number">>
 ): number[] {
-  const byNumber = parseVersionDays(version.days, version.day_ids ?? undefined);
-  const required = [...byNumber.values()].filter(
-    (d) => d.course_id !== null && d.day <= version.days_total
-  );
-  const out = new Set<number>();
-  if (version.day_ids === null) {
-    const numbers = new Set(progressRows.map((r) => r.day_number));
-    for (const d of required) if (numbers.has(d.day)) out.add(d.day);
-  } else {
-    const ids = new Set(
-      progressRows.map((r) => (typeof r.day_id === "string" ? r.day_id.toLowerCase() : null)).filter((x): x is string => !!x)
-    );
-    for (const d of required) if (d.dayId !== null && ids.has(d.dayId)) out.add(d.day);
-  }
-  return [...out].sort((a, b) => a - b);
+  return [...creditRowsByDay(version, progressRows).keys()].sort((a, b) => a - b);
+}
+
+/**
+ * The course on each credited day's credit row, by the day's number in the
+ * pinned version: the days of creditedDaysFor, matched by the same rule (by
+ * id; by number only when the reader fell back), each with its row's
+ * `course_id` (null when that course was deleted). A credited day's review
+ * opens the course on its credit row, never a course a later publish put on
+ * the day (ADR 0024 step 22's row for `?journey=E&day=`, section 95's row
+ * "A day's course swapped").
+ */
+export function creditCoursesFor(
+  version: CreditVersion,
+  progressRows: ReadonlyArray<Pick<JourneyCreditRow, "day_id" | "day_number" | "course_id">>
+): Map<number, string | null> {
+  const out = new Map<number, string | null>();
+  for (const [day, r] of creditRowsByDay(version, progressRows)) out.set(day, r.course_id);
+  return out;
 }
 
 /**

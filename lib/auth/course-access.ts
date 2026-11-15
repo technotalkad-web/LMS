@@ -4,6 +4,7 @@ import { resolveUserGroupIds } from "@/lib/org/groups";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditCoursesFor,
   creditedDaysFor,
   parseVersionDays,
   todayStr,
@@ -286,9 +287,15 @@ export async function learnerCanAccessCourse(opts: {
         console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "course_access", code: credits.error?.code ?? null }));
       } else {
         for (const { enr, v, courseDays } of holding) {
+          const rows = credits.rowsOf(enr.id);
           const credited = creditedDaysFor(
             { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
-            credits.rowsOf(enr.id)
+            rows
+          );
+          // The course on each credited day's credit row, matched as above.
+          const creditCourse = creditCoursesFor(
+            { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+            rows
           );
           const state = computeJourneyState({
             startDate: enr.start_date,
@@ -300,19 +307,26 @@ export async function learnerCanAccessCourse(opts: {
             courseDays: courseDaysOf(v.days, v.days_total),
           });
           // Launchable: a day up to the one the learner may open now, or a
-          // day whose id holds a credit, for revision (ADR 0024 step 45). A
+          // credited day whose credit row holds this course, for review
+          // (ADR 0024 step 45; step 22's row for `?journey=E&day=`: "the day
+          // is credited and this course is the course on its credit row"). A
           // re-pin can number a credited day above the open day, so a
           // credited day is granted by its own credit, never by being under
-          // the ceiling. Progress mode has no calendar ceiling, so it keys
-          // off openableDay; calendar keeps the drip ceiling. A started day
-          // past the ceiling is step 23's grant (P2-6).
+          // the ceiling, and only for the course its credit was earned on: a
+          // publish that swapped the day's course does not offer the new
+          // course inside the journey (section 95's row "A day's course
+          // swapped"), and a credit row without a course grants nothing.
+          // Progress mode has no calendar ceiling, so it keys off
+          // openableDay; calendar keeps the drip ceiling. Step 23's grant
+          // (P2-6) adds the rest: a started day past the ceiling, and the
+          // credit row's own course once the day holds another.
           const ceiling =
             v.unlock_mode === "progress"
               ? state.finished
                 ? v.days_total
                 : state.openableDay
               : Math.min(state.allowedDay, state.currentDay);
-          if (courseDays.some((d) => d <= ceiling || credited.includes(d))) {
+          if (courseDays.some((d) => d <= ceiling || (credited.includes(d) && creditCourse.get(d) === courseId))) {
             return { allowed: true, upcomingAt: null };
           }
         }
