@@ -12,6 +12,7 @@ import {
   type PgError,
 } from "@/lib/scoring/attempt-kind";
 import { officialHistory, officialResultAt, type OfficialHistory } from "@/lib/scoring/official-history";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { resultStands } from "@/lib/attempts/request-decision";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { resolveEmails } from "@/lib/users/emails";
@@ -138,19 +139,22 @@ export default async function AttemptRequestsPage({
       // fallback, readPagedWithOptionalColumn: the first page decides the
       // column list for the rest), so an abandoned or a revision visit's row
       // never counts. A page with neither rows nor an error is an error
-      // (nullIsError), never the end of the read.
+      // (nullIsError), never the end of the read. A preview never counts
+      // either (ADR 0024 steps 49 and 80, P2-3): the read drops
+      // `context_kind = 'preview'` rows, and on a database without 0107 the
+      // filter's missing-column error reads today's select once
+      // (readWithContextFilter, one decision for every page).
       const ATTEMPT_COLUMNS = "id, user_id, course_version_id, status, score, started_at, completed_at, completion_status, success_status";
       type Row = ScorableAttempt & { user_id: string; course_version_id: string };
+      const previews: ContextFilterState = { applies: null };
       const attemptsRead = await readPagedWithOptionalColumn<Row>(
         "is_revision",
         (cols, from, to) =>
-          svc
-            .from("course_attempts")
-            .select(cols)
-            .in("course_version_id", verIds)
-            .in("user_id", userIds)
-            .order("id")
-            .range(from, to) as unknown as PromiseLike<{ data: Row[] | null; error: PgError }>,
+          readWithContextFilter(previews, (apply) =>
+            withoutPreviews(svc.from("course_attempts").select(cols).in("course_version_id", verIds).in("user_id", userIds), apply)
+              .order("id")
+              .range(from, to)
+          ) as unknown as PromiseLike<{ data: Row[] | null; error: PgError }>,
         ATTEMPT_COLUMNS,
         { nullIsError: true }
       );

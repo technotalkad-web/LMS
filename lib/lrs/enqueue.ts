@@ -4,6 +4,7 @@ import { forwardStatements } from "./forward";
 import { enrichStatement } from "./enrich";
 import { loadAttemptContexts } from "./context";
 import type { XapiStatement } from "@/lib/xapi/types";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 /**
  * Fan-out hook called from the xAPI ingestion route AFTER our own statements
@@ -20,13 +21,18 @@ function svc() {
   );
 }
 
-async function orgForAttempt(attemptId: string): Promise<string | null> {
-  const { data } = await svc()
-    .from("course_attempts")
-    .select("organization_id")
-    .eq("id", attemptId)
-    .maybeSingle();
-  return (data?.organization_id as string | undefined) ?? null;
+/**
+ * The attempt's organisation, or null. A preview's attempt answers null, so
+ * its statements are never forwarded (ADR 0024 steps 49 and 80, P2-3;
+ * decision A35): the select drops `context_kind = 'preview'` rows, and on a
+ * database without 0107 reads today's select once (readWithContextFilter).
+ */
+async function orgForAttempt(attemptId: string, previews: ContextFilterState): Promise<string | null> {
+  const db = svc();
+  const { data } = await readWithContextFilter(previews, (apply) =>
+    withoutPreviews(db.from("course_attempts").select("organization_id").eq("id", attemptId), apply).maybeSingle()
+  );
+  return ((data as { organization_id?: string } | null)?.organization_id as string | undefined) ?? null;
 }
 
 /** Mark a set of (org, statement_id) outbox rows as delivered. */
@@ -45,11 +51,12 @@ async function markSent(orgId: string, statementIds: string[]) {
 export async function enrichForOutbox(
   attemptId: string,
   statements: XapiStatement[],
-  profile: "ambak-v1" | "raw"
+  profile: "ambak-v1" | "raw",
+  previews: ContextFilterState = { applies: null }
 ): Promise<XapiStatement[]> {
   if (profile === "raw") return statements;
   try {
-    const ctx = (await loadAttemptContexts(svc(), [attemptId])).get(attemptId);
+    const ctx = (await loadAttemptContexts(svc(), [attemptId], undefined, previews)).get(attemptId);
     if (!ctx) return statements;
     return statements.map((s) => {
       try {
@@ -71,7 +78,9 @@ export async function mirrorToExternalLrs(
   statements: XapiStatement[]
 ): Promise<void> {
   try {
-    const orgId = await orgForAttempt(attemptId);
+    // One decision for the call's reads (orgForAttempt, then the context).
+    const previews: ContextFilterState = { applies: null };
+    const orgId = await orgForAttempt(attemptId, previews);
     if (!orgId) return;
 
     const cfg = await loadLrsConfig(orgId);
@@ -84,7 +93,7 @@ export async function mirrorToExternalLrs(
     // learner/content/path/journey dimensions). Our own xapi_statements row
     // stays the raw engine statement. Enrichment failing for any reason
     // falls back to the raw statement — the LRS never misses an event.
-    const outbound = await enrichForOutbox(attemptId, statements, statementProfileOf(cfg));
+    const outbound = await enrichForOutbox(attemptId, statements, statementProfileOf(cfg), previews);
 
     // 1) Durable enqueue (idempotent on (org, statement_id)).
     const rows = outbound

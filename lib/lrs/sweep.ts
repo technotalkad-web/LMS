@@ -54,7 +54,8 @@ import {
 } from "./profile";
 import { uuid5 } from "./uuid5";
 import { abandonedStatementId } from "./statement-id";
-import { isMissingColumn, type PgError } from "@/lib/scoring/attempt-kind";
+import { readWithOptionalFilter } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 type Row = Record<string, unknown>;
 type Obj = Record<string, unknown>;
@@ -257,6 +258,15 @@ type Env = {
   org: OrgDims;
   groups: Map<string, string[]>;
   chunk: number;
+  /**
+   * The preview filter's decision for this run (ADR 0024 steps 49 and 80,
+   * P2-3): every source that reads attempts drops `context_kind = 'preview'`
+   * rows, through readWithContextFilter, and passes the same state to
+   * loadAttemptContexts, so a database without 0107 pays one failed read per
+   * run. "Resend all history" runs the same sources from the beginning of
+   * time, so it is filtered the same way.
+   */
+  previews: ContextFilterState;
 };
 
 async function learnersFor(env: Env, userIds: string[]): Promise<Map<string, LearnerDims>> {
@@ -278,16 +288,24 @@ function emptyLearner(userId: string): LearnerDims {
 }
 
 async function srcStatements(env: Env, cursor: string): Promise<SourceResult> {
+  // A preview's statements never leave (ADR 0024 step 80): the attempts
+  // embed drops `context_kind = 'preview'` (today's select without 0107).
   const list = await rows(
-    env.db
-      .from("xapi_statements")
-      .select("id, attempt_id, statement_id, raw, stored, course_attempts!inner(organization_id)")
-      .eq("course_attempts.organization_id", env.orgId)
-      .gte("stored", cursor)
-      .order("stored", { ascending: true })
-      .limit(env.chunk)
+    readWithContextFilter(env.previews, (apply) =>
+      withoutPreviews(
+        env.db
+          .from("xapi_statements")
+          .select("id, attempt_id, statement_id, raw, stored, course_attempts!inner(organization_id)")
+          .eq("course_attempts.organization_id", env.orgId),
+        apply,
+        "course_attempts.context_kind"
+      )
+        .gte("stored", cursor)
+        .order("stored", { ascending: true })
+        .limit(env.chunk)
+    )
   );
-  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.attempt_id)), env.groups);
+  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.attempt_id)), env.groups, env.previews);
   const built: Built[] = [];
   for (const r of list) {
     const raw = r.raw as XapiStatement | null;
@@ -309,15 +327,20 @@ async function srcStatements(env: Env, cursor: string): Promise<SourceResult> {
 
 async function srcAttempts(env: Env, cursor: string): Promise<SourceResult> {
   const list = await rows(
-    env.db
-      .from("course_attempts")
-      .select("id, started_at, status, last_activity_at")
-      .eq("organization_id", env.orgId)
-      .gte("started_at", cursor)
-      .order("started_at", { ascending: true })
-      .limit(env.chunk)
+    readWithContextFilter(env.previews, (apply) =>
+      withoutPreviews(
+        env.db
+          .from("course_attempts")
+          .select("id, started_at, status, last_activity_at")
+          .eq("organization_id", env.orgId),
+        apply
+      )
+        .gte("started_at", cursor)
+        .order("started_at", { ascending: true })
+        .limit(env.chunk)
+    )
   );
-  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.id)), env.groups);
+  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.id)), env.groups, env.previews);
   const built: Built[] = [];
   for (const r of list) {
     const ctx = ctxs.get(String(r.id));
@@ -361,17 +384,22 @@ export function abandonedBuilt(
 
 async function srcPathSteps(env: Env, cursor: string): Promise<SourceResult> {
   const list = await rows(
-    env.db
-      .from("course_attempts")
-      .select("id, user_id, learning_path_id, completed_at, course_versions!inner(course_id)")
-      .eq("organization_id", env.orgId)
-      .eq("completion_status", "completed")
-      .not("learning_path_id", "is", null)
-      .gte("completed_at", cursor)
-      .order("completed_at", { ascending: true })
-      .limit(env.chunk)
+    readWithContextFilter(env.previews, (apply) =>
+      withoutPreviews(
+        env.db
+          .from("course_attempts")
+          .select("id, user_id, learning_path_id, completed_at, course_versions!inner(course_id)")
+          .eq("organization_id", env.orgId)
+          .eq("completion_status", "completed")
+          .not("learning_path_id", "is", null),
+        apply
+      )
+        .gte("completed_at", cursor)
+        .order("completed_at", { ascending: true })
+        .limit(env.chunk)
+    )
   );
-  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.id)), env.groups);
+  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.id)), env.groups, env.previews);
   const built: Built[] = [];
   const touched = new Map<string, { userId: string; pathId: string }>();
   for (const r of list) {
@@ -399,19 +427,26 @@ async function srcPathSteps(env: Env, cursor: string): Promise<SourceResult> {
 
   // Derived: learning path satisfied when every step has a completed
   // path-context attempt. Deterministic id → emitted once per (user, path).
+  // A preview never completes a step here (step 80): the statement names
+  // no attempt, so its read carries the filter itself.
   if (touched.size) {
     const pathIds = [...new Set([...touched.values()].map((t) => t.pathId))];
     const userIds = [...new Set([...touched.values()].map((t) => t.userId))];
     const [steps, done, paths] = await Promise.all([
       rows(env.db.from("learning_path_courses").select("path_id, course_id").in("path_id", pathIds)),
       rows(
-        env.db
-          .from("course_attempts")
-          .select("user_id, learning_path_id, completed_at, course_versions!inner(course_id)")
-          .eq("organization_id", env.orgId)
-          .eq("completion_status", "completed")
-          .in("learning_path_id", pathIds)
-          .in("user_id", userIds)
+        readWithContextFilter(env.previews, (apply) =>
+          withoutPreviews(
+            env.db
+              .from("course_attempts")
+              .select("user_id, learning_path_id, completed_at, course_versions!inner(course_id)")
+              .eq("organization_id", env.orgId)
+              .eq("completion_status", "completed")
+              .in("learning_path_id", pathIds)
+              .in("user_id", userIds),
+            apply
+          )
+        )
       ),
       rows(env.db.from("learning_paths").select("id, name").in("id", pathIds)),
     ]);
@@ -564,8 +599,9 @@ async function srcJourneys(env: Env, cursor: string): Promise<SourceResult> {
  * with phase 5 (the ADR 0024 note of 2026-11-14, final review, F2). On a
  * database without 0107 the filter answers a missing-column error naming
  * `event_only`; only then is today's select read once (no row there is an
- * event row). Any other error answers no rows, as rows() always has, so the
- * cursor stays where it was.
+ * event row): readWithOptionalFilter, the fallback written once. Any other
+ * error answers no rows, as rows() always has, so the cursor stays where it
+ * was.
  */
 async function xpChunk(env: Env, cursor: string): Promise<Row[]> {
   const page = (skipEvents: boolean) => {
@@ -576,14 +612,7 @@ async function xpChunk(env: Env, cursor: string): Promise<Row[]> {
     if (skipEvents) q = q.eq("event_only", false);
     return q.gte("created_at", cursor).order("created_at", { ascending: true }).limit(env.chunk);
   };
-  try {
-    const { data, error } = (await page(true)) as { data: Row[] | null; error: PgError };
-    if (!error) return data ?? [];
-    if (!isMissingColumn(error, "event_only")) return [];
-  } catch {
-    return [];
-  }
-  return rows(page(false));
+  return rows(readWithOptionalFilter("event_only", { applies: null }, page));
 }
 
 async function srcXp(env: Env, cursor: string): Promise<SourceResult> {
@@ -801,17 +830,22 @@ export function scormDuration(v: string | null): string | null {
 
 async function srcScorm(env: Env, cursor: string): Promise<SourceResult> {
   const list = await rows(
-    env.db
-      .from("course_attempts")
-      .select("id, completed_at, completion_status, success_status, score, cmi_data, course_versions!inner(manifest_type)")
-      .eq("organization_id", env.orgId)
-      .eq("completion_status", "completed")
-      .like("course_versions.manifest_type", "scorm%")
-      .gte("completed_at", cursor)
-      .order("completed_at", { ascending: true })
-      .limit(env.chunk)
+    readWithContextFilter(env.previews, (apply) =>
+      withoutPreviews(
+        env.db
+          .from("course_attempts")
+          .select("id, completed_at, completion_status, success_status, score, cmi_data, course_versions!inner(manifest_type)")
+          .eq("organization_id", env.orgId)
+          .eq("completion_status", "completed")
+          .like("course_versions.manifest_type", "scorm%"),
+        apply
+      )
+        .gte("completed_at", cursor)
+        .order("completed_at", { ascending: true })
+        .limit(env.chunk)
+    )
   );
-  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.id)), env.groups);
+  const ctxs = await loadAttemptContexts(env.db, list.map((r) => String(r.id)), env.groups, env.previews);
   const built: Built[] = [];
   for (const r of list) {
     const ctx = ctxs.get(String(r.id));
@@ -894,7 +928,7 @@ export async function runSource(
 ): Promise<{ statements: XapiStatement[]; nextCursor: string; done: boolean }> {
   const org = (await loadOrgs(db, [orgId])).get(orgId) ?? { id: orgId, slug: null, name: null };
   const groups = await loadGroupMembership(db, orgId);
-  const res = await RUNNERS[source]({ db, orgId, org, groups, chunk }, cursor);
+  const res = await RUNNERS[source]({ db, orgId, org, groups, chunk, previews: { applies: null } }, cursor);
   return { statements: res.built.map((b) => b.payload), nextCursor: res.nextCursor, done: res.done };
 }
 
@@ -975,7 +1009,7 @@ export async function sweepOrg(
 
   const org = (await loadOrgs(db, [orgId])).get(orgId) ?? { id: orgId, slug: null, name: null };
   const groups = await loadGroupMembership(db, orgId);
-  const env: Env = { db, orgId, org, groups, chunk };
+  const env: Env = { db, orgId, org, groups, chunk, previews: { applies: null } };
 
   // statements every run + a rotating window over the other sources.
   const others = SWEEP_SOURCES.filter((s) => s !== "statements");

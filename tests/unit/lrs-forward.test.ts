@@ -13,8 +13,14 @@
  * The second half runs both callers for real against the same fake and a stubbed
  * PostgREST: app/api/cron/lrs-forward/route.ts over repeated runs on a fake clock
  * (a statement the isolation budget did not reach counts no failed attempt, so it
- * never dead-letters for that, while an outage still backs off and dead-letters),
- * and lib/lrs/enqueue.ts (only what the LRS accepted is marked sent).
+ * never dead-letters for that, while an outage still backs off and dead-letters;
+ * ADR 0024 P2-3: a Preview's rows are parked, never posted and never deleted,
+ * status and attempts unchanged, so neither the backlog nor the dead letters of
+ * ops health count them; without 0107 every row goes as today; a failed check
+ * holds the rows that name an attempt; the calls the check adds to a run),
+ * and lib/lrs/enqueue.ts (only what the LRS accepted is marked sent; ADR 0024
+ * P2-3: a preview's attempt is never mirrored, and on a database without 0107
+ * the organisation read falls back to today's select once).
  *
  * A 200 counts only if it carries a list of ids, and the redirect shapes behind
  * that rule depend on what the real fetch does, so those cases post to a server
@@ -24,7 +30,9 @@
  *
  * Run:  npx tsx tests/unit/lrs-forward.test.ts   (or npm run test:unit)
  */
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { forwardStatements, shuffled, testConnection, type ForwardResult } from "../../lib/lrs/forward";
 
 let pass = 0, fail = 0;
@@ -137,17 +145,37 @@ async function onLoopback(handler: (req: http.IncomingMessage, res: http.ServerR
 
 /* ---------------- the callers: a stubbed PostgREST, the fake LRS, a fake clock ---------------- */
 
-type Row = { id: string; organization_id: string; statement_id: string; payload: Stmt; status: string; attempts: number; next_attempt_at: string; last_error: string | null };
-type Spec = { org?: string; conflict?: boolean; poison?: boolean; fail500?: boolean; attempts?: number; rowStatementId?: (id: string) => string; idIn?: (id: string) => string };
+type Row = { id: string; organization_id: string; statement_id: string; payload: Stmt; status: string; attempts: number; next_attempt_at: string; last_error: string | null; attempt_id: string | null };
+/**
+ * `attempt` names the row's attempt; `preview` makes that attempt a Preview (ADR 0024 P2-3). `status` sets the row's status
+ * (by default failed when `attempts` is above 0, else pending).
+ */
+type Spec = { org?: string; conflict?: boolean; poison?: boolean; fail500?: boolean; attempts?: number; rowStatementId?: (id: string) => string; idIn?: (id: string) => string; attempt?: string; preview?: boolean; status?: "pending" | "failed" | "dead" };
 type LrsMode = "fake" | 503 | 401 | "network" | "page200";
 type ConfigAnswer = "enabled" | "disabled" | "no endpoint" | "no row" | 500;
+/**
+ * How the drain's preview check is answered: a database with 0107, one without it (42703 naming context_kind), a failed read,
+ * a 200 whose body is null (neither rows nor an error), or a 42703 naming another column (a real failure, not a missing 0107).
+ */
+type AttemptsAnswer = "0107" | "no0107" | 500 | "nodata" | "other42703";
+/** How a park write (the PATCH that sets next_attempt_at = PARK_UNTIL) is answered: written, or a 500 (with this message). */
+type ParkAnswer = "ok" | 500 | { fail: string };
+/** The route's park (app/api/cron/lrs-forward/route.ts, not exported there): pinned here as literals. */
+const PARK_UNTIL = "2999-12-31T00:00:00.000Z";
+const PARK_REASON = "preview: never forwarded (ADR 0024 A35)";
 
 const CADENCE_MS = 5 * 60_000;
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const list = (v: string | null) => (v ?? "").replace(/^in\.\(|\)$/g, "").split(",").map((x) => x.replace(/^"|"$/g, ""));
 
-/** An outbox, an LRS and a clock. n rows, s0 to s(n-1), in the order given. `config` answers the org's config read in place of a healthy one. */
-function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer) {
+/**
+ * An outbox, an LRS and a clock. n rows, s0 to s(n-1), in the order given. `config` answers the org's config read in place of
+ * a healthy one; `attemptsAnswer` answers the drain's preview check (course_attempts), every read recorded in `attemptReads`;
+ * `parkAnswer` answers each park write, every one recorded in `parkWrites` with the query parameters it filters on (`params`:
+ * the fake PATCH honours `id` alone, so any other filter shows there). Every outbox DELETE is recorded in `outboxDeletes`, and a
+ * run counts every PostgREST call it makes (`calls`).
+ */
+function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer, attemptsAnswer: () => AttemptsAnswer = () => "0107", parkAnswer: () => ParkAnswer = () => "ok") {
   const start = Date.parse("2026-01-01T00:00:00.000Z");
   const clock = { now: start };
   const rows: Row[] = specs.map((sp, i) => {
@@ -157,12 +185,17 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       organization_id: sp.org ?? "org-a",
       statement_id: (sp.rowStatementId ?? ((x: string) => x))(id),
       payload: sp.poison ? { id } : { id, verb: VERB },
-      status: (sp.attempts ?? 0) > 0 ? "failed" : "pending",
+      status: sp.status ?? ((sp.attempts ?? 0) > 0 ? "failed" : "pending"),
       attempts: sp.attempts ?? 0,
       next_attempt_at: new Date(start).toISOString(),
       last_error: null,
+      attempt_id: sp.attempt ?? null,
     };
   });
+  const previewAttempts = new Set(specs.filter((sp) => sp.preview && sp.attempt).map((sp) => sp.attempt as string));
+  const attemptReads: Array<{ ids: string[]; contextKind: string | null }> = [];
+  const parkWrites: Array<{ ids: string[]; ok: boolean; params: string[] }> = [];
+  const outboxDeletes: string[][] = [];
   const conflicts = new Set(rows.filter((_, i) => specs[i].conflict).map((r) => r.payload.id));
   const fail500 = new Set(rows.filter((_, i) => specs[i].fail500).map((r) => r.payload.id));
   const stored = new Set<string>();
@@ -170,6 +203,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
   const postedIds: string[][] = [];
   const random = seeded(20261105);
   let postsThisRun = 0;
+  let callsThisRun = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init?.method ?? "GET").toUpperCase();
@@ -189,6 +223,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       for (const p of posted) stored.add(p.id);
       return json(posted.map((p) => p.id));
     }
+    callsThisRun++;
     if (url.pathname === "/rest/v1/lrs_forward_outbox") {
       if (method === "GET") {
         const lte = (url.searchParams.get("next_attempt_at") ?? "").replace(/^lte\./, "");
@@ -203,14 +238,36 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       if (method === "PATCH") {
         const ids = new Set(list(url.searchParams.get("id")));
         const patch = JSON.parse(String(init?.body)) as Partial<Row>;
+        if (patch.next_attempt_at === PARK_UNTIL) {
+          const answer = parkAnswer();
+          const ok = answer === "ok";
+          parkWrites.push({ ids: [...ids], ok, params: [...url.searchParams.keys()] });
+          if (answer !== "ok") return json({ message: answer === 500 ? "upstream connect error" : answer.fail }, 500);
+        }
         for (const r of rows) if (ids.has(r.id)) Object.assign(r, patch);
         return new Response(null, { status: 204 });
       }
       if (method === "DELETE") {
         const ids = new Set(list(url.searchParams.get("id")));
+        outboxDeletes.push([...ids]);
         for (let i = rows.length - 1; i >= 0; i--) if (ids.has(rows[i].id)) rows.splice(i, 1);
         return new Response(null, { status: 204 });
       }
+    }
+    if (url.pathname === "/rest/v1/course_attempts" && method === "GET") {
+      // The drain's preview check: `id=in.(…)` and `context_kind=eq.preview`, honoured as a database would.
+      const ids = list(url.searchParams.get("id"));
+      const contextKind = url.searchParams.get("context_kind");
+      attemptReads.push({ ids, contextKind });
+      const answer = attemptsAnswer();
+      if (answer === 500) return json({ message: "upstream connect error" }, 500);
+      if (answer === "nodata") return json(null);
+      if (answer === "other42703") return json({ code: "42703", details: null, hint: null, message: "column course_attempts.other_column does not exist" }, 400);
+      if (contextKind !== null && answer === "no0107") {
+        return json({ code: "42703", details: null, hint: null, message: "column course_attempts.context_kind does not exist" }, 400);
+      }
+      const hits = ids.filter((a) => (contextKind === "eq.preview" ? previewAttempts.has(a) : true));
+      return json(hits.map((id) => ({ id })));
     }
     if (url.pathname === "/rest/v1/tenant_lrs_config") {
       // No backfill_cursor: the sweep skips the org, so a run counts the drain only.
@@ -241,18 +298,31 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
     stored,
     aloneConflict,
     postedIds,
+    attemptReads,
+    parkWrites,
+    outboxDeletes,
     open,
-    /** One cron firing, 5 minutes after the last. Answers the route's body and the posts it made. */
+    /**
+     * "Resend all history" as lib/lrs/sweep.ts writes it (pinned below): the org's rows whose status is not pending go back to
+     * pending, attempts 0, no error, due now. A row still pending (a parked one included) is left as it is.
+     */
+    resend(org: string) {
+      for (const r of rows) {
+        if (r.organization_id === org && r.status !== "pending") Object.assign(r, { status: "pending", attempts: 0, last_error: null, next_attempt_at: new Date(clock.now).toISOString() });
+      }
+    },
+    /** One cron firing, 5 minutes after the last. Answers the route's body, the posts it made and its PostgREST calls. */
     async run() {
       const { POST } = await import("../../app/api/cron/lrs-forward/route");
       clock.now += CADENCE_MS;
       postsThisRun = 0;
+      callsThisRun = 0;
       (globalThis as { Date: unknown }).Date = FakeDate;
       const realRandom = Math.random;
       Math.random = random;
       try {
         const res = await POST(new Request("http://lms.test/api/cron/lrs-forward", { method: "POST", headers: { "x-cron-secret": "stub-cron" } }));
-        return { body: (await res.json()) as Record<string, unknown>, posts: postsThisRun };
+        return { body: (await res.json()) as Record<string, unknown>, posts: postsThisRun, calls: callsThisRun };
       } finally {
         (globalThis as { Date: unknown }).Date = RealDate;
         Math.random = realRandom;
@@ -452,6 +522,245 @@ async function routeCases() {
     const { body } = await w.run();
     eq("two orgs in one run: the unsettled count adds both", body.unsettled, w.rows.filter((r) => r.status === "pending").length);
   }
+
+  console.log("\nthe cron route: a Preview's rows are parked, never posted and never deleted (ADR 0024 P2-3, decision A35, step 80, reading R26)");
+  /** A row with the two fields a park writes left out: its status, attempts and payload are all still in it. */
+  const unparked = (r: Row) => JSON.stringify({ ...r, next_attempt_at: undefined, last_error: undefined });
+  const isParked = (r: Row) => r.next_attempt_at === PARK_UNTIL && r.last_error === PARK_REASON;
+  /** Row row-i, looked up by id (a row deleted from the outbox answers a placeholder, so a case fails on it instead of throwing). */
+  const rowAt = (rows: Row[], i: number) => rows.find((r) => r.id === `row-${i}`) ?? ({ id: `row-${i}`, status: "(deleted)" } as Row);
+  /** What ops health (app/api/ops/health, checkLrsOutbox) counts at `atIso`: the backlog due 15 minutes ago, and the dead letters. */
+  const health = (rows: Row[], atIso: string) => {
+    const overdue = new Date(Date.parse(atIso) - 15 * 60_000).toISOString();
+    return { backlog: rows.filter((r) => (r.status === "pending" || r.status === "failed") && r.next_attempt_at <= overdue).length, dead: countBy(rows, "dead") };
+  };
+  {
+    // Rows queued before the sources dropped previews (a staff member's by-role rows), or set back to pending by "Resend all history".
+    const specs: Spec[] = [
+      { attempt: "att-real" },
+      { attempt: "att-prev", preview: true },
+      { attempt: "att-real" },
+      { attempt: "att-prev", preview: true, attempts: 35 }, // one failure short of the dead letter
+      {},
+      { attempt: "att-old", preview: true, org: "org-b", attempts: 3 },
+      { attempt: "att-prev", preview: true, status: "dead", attempts: 36 }, // dead-lettered: not due until a resend
+    ];
+    const w = world(specs);
+    const before = w.rows.map((r) => ({ ...r }));
+    const { body } = await w.run();
+    const prevStatements = ["s1", "s3", "s5", "s6"];
+    const postedPreview = () => [w.postedIds.flat().filter((id) => prevStatements.includes(id)), [...w.stored].filter((id) => prevStatements.includes(id))];
+    eq("one preview check for the batch: the distinct attempt ids, previews only",
+      w.attemptReads.map((r) => [r.ids.slice().sort(), r.contextKind]), [[["att-old", "att-prev", "att-real"], "eq.preview"]]);
+    eq("the preview rows stay in the outbox: every row is still there and no DELETE is sent",
+      [w.rows.map((r) => r.id), w.outboxDeletes], [["row-0", "row-1", "row-2", "row-3", "row-4", "row-5", "row-6"], []]);
+    eq("…each due one is parked: next_attempt_at PARK_UNTIL and the reason in last_error, another org's included",
+      [1, 3, 5].map((i) => [rowAt(w.rows, i).next_attempt_at, rowAt(w.rows, i).last_error]), [[PARK_UNTIL, PARK_REASON], [PARK_UNTIL, PARK_REASON], [PARK_UNTIL, PARK_REASON]]);
+    eq("…status, attempts and payload unchanged (pending at 0; failed at 35; another org's failed at 3)",
+      [[1, 3, 5].map((i) => [rowAt(w.rows, i).status, rowAt(w.rows, i).attempts]), [1, 3, 5].every((i) => unparked(rowAt(w.rows, i)) === unparked(before[i]))],
+      [[["pending", 0], ["failed", 35], ["failed", 3]], true]);
+    eq("…the dead-lettered row is not due: untouched", JSON.stringify(rowAt(w.rows, 6)), JSON.stringify(before[6]));
+    eq("…and never posted or stored", postedPreview(), [[], []]);
+    eq("the real rows and the row that names no attempt are sent", [countBy(w.rows, "sent"), [...w.stored].sort()], [3, ["s0", "s2", "s4"]]);
+    eq("the body counts them", [body.processed, body.sent, body.previewsParked, body.held ?? null, body.parkError ?? null, "previewsDropped" in body], [3, 3, 3, null, null, false]);
+    eq("one park write for the 3 rows", w.parkWrites.map((p) => [p.ids.slice().sort(), p.ok]), [[["row-1", "row-3", "row-5"], true]]);
+    eq("…filtered by id alone (a park that also filtered on status would leave the failed rows due, run after run)",
+      w.parkWrites.map((p) => p.params), [["id"]]);
+    eq("ops health: the parks add nothing to the backlog, even years later, nor to the dead letters (the one there before stays)",
+      [health(w.rows, "2030-01-01T00:00:00.000Z"), w.rows.filter((r) => r.status === "dead").map((r) => r.id)], [{ backlog: 0, dead: 1 }, ["row-6"]]);
+
+    const parked = JSON.stringify(w.rows);
+    const second = await w.run();
+    eq("the next run: the parked rows are not due, so no preview read, no post and no write",
+      [second.body.processed, second.posts, w.attemptReads.length, w.parkWrites.length, JSON.stringify(w.rows) === parked], [0, 0, 1, 1, true]);
+
+    w.resend("org-a");
+    w.resend("org-b");
+    eq("\"Resend all history\": the parked rows that were failed and the dead one are due again; the parked pending row stays parked",
+      [1, 3, 5, 6].map((i) => `${rowAt(w.rows, i).status}:${rowAt(w.rows, i).attempts}:${isParked(rowAt(w.rows, i)) ? "parked" : "due"}`),
+      ["pending:0:parked", "pending:0:due", "pending:0:due", "pending:0:due"]);
+    const third = await w.run();
+    eq("…the next run checks again and parks them again: none posted, none deleted",
+      [w.attemptReads.length, w.parkWrites.map((p) => [p.ids.slice().sort(), p.params]), [1, 3, 5, 6].every((i) => isParked(rowAt(w.rows, i))), postedPreview(), w.outboxDeletes, third.body.previewsParked],
+      [2, [[["row-1", "row-3", "row-5"], ["id"]], [["row-3", "row-5", "row-6"], ["id"]]], true, [[], []], [], 3]);
+    eq("…status pending and attempts 0, as the resend left them; no row dead",
+      [[1, 3, 5, 6].map((i) => [rowAt(w.rows, i).status, rowAt(w.rows, i).attempts]), countBy(w.rows, "dead")], [[["pending", 0], ["pending", 0], ["pending", 0], ["pending", 0]], 0]);
+    eq("…the real rows the resend set back to pending are sent again", [0, 2, 4].map((i) => rowAt(w.rows, i).status), ["sent", "sent", "sent"]);
+  }
+  {
+    // The world's resend is lib/lrs/sweep.ts's (the facts the case above relies on).
+    const sweep = fs.readFileSync(path.join(__dirname, "../../lib/lrs/sweep.ts"), "utf8");
+    eq("the world's resend is lib/lrs/sweep.ts's: the org's rows that are not pending go back to pending, attempts 0, due now",
+      /\.from\("lrs_forward_outbox"\)\s*\.update\(\{ status: "pending", attempts: 0, last_error: null, next_attempt_at: new Date\(\)\.toISOString\(\) \}\)\s*\.eq\("organization_id", orgId\)\s*\.neq\("status", "pending"\);/.test(sweep), true);
+    // The case's health helper is checkLrsOutbox's two counts (app/api/ops/health/route.ts).
+    const healthSrc = fs.readFileSync(path.join(__dirname, "../../app/api/ops/health/route.ts"), "utf8");
+    const at = healthSrc.indexOf("async function checkLrsOutbox(");
+    const check = at < 0 ? "" : healthSrc.slice(at, healthSrc.indexOf("\n}\n", at));
+    eq("the case's health helper is checkLrsOutbox's: the backlog is pending or failed rows due 15 minutes ago, the dead letters every dead row",
+      /const overdueIso = new Date\(Date\.now\(\) - 15 \* 60_000\)\.toISOString\(\);/.test(check) &&
+        /\.from\("lrs_forward_outbox"\)\s*\.select\("id", \{ count: "exact", head: true \}\)\s*\.in\("status", \["pending", "failed"\]\)\s*\.lte\("next_attempt_at", overdueIso\);/.test(check) &&
+        /\.from\("lrs_forward_outbox"\)\s*\.select\("id", \{ count: "exact", head: true \}\)\s*\.eq\("status", "dead"\);/.test(check), true);
+  }
+  {
+    const w = world([{ attempt: "att-prev", preview: true }, { attempt: "att-prev", preview: true }]);
+    const { body, posts } = await w.run();
+    eq("a batch of previews only: nothing posted, both rows kept and parked, no DELETE",
+      [posts, w.rows.length, w.rows.every(isParked), w.outboxDeletes, body.processed, body.previewsParked], [0, 2, true, [], 0, 2]);
+  }
+  {
+    const w = world(rowsOf(8));
+    await w.run();
+    eq("rows that name no attempt: no preview check is read", w.attemptReads.length, 0);
+  }
+  {
+    // The oldest due row names no attempt: the check still runs for the rows behind it.
+    const specs: Spec[] = [{}, { attempt: "att-prev", preview: true }, { attempt: "att-real" }];
+    const w = world(specs);
+    const { body } = await w.run();
+    eq("the first row names no attempt, a later one a preview's: one preview check, the preview parked, never posted or stored",
+      [w.attemptReads.map((r) => [r.ids.slice().sort(), r.contextKind]), isParked(rowAt(w.rows, 1)), w.postedIds.flat().includes("s1"), w.stored.has("s1"), body.previewsParked],
+      [[[["att-prev", "att-real"], "eq.preview"]], true, false, false, 1]);
+    eq("…the row that names no attempt and the real one are sent", [rowAt(w.rows, 0).status, rowAt(w.rows, 2).status, [...w.stored].sort()], ["sent", "sent", ["s0", "s2"]]);
+    const f = world(specs, "fake", undefined, () => 500);
+    const failed = await f.run();
+    eq("…the same batch with a failed check: the two rows that name an attempt held, only the first posted",
+      [failed.body.held, failed.body.previewCheckError, f.postedIds.flat(), f.rows.map((r) => r.status)], [2, "upstream connect error", ["s0"], ["sent", "pending", "pending"]]);
+  }
+  {
+    // 200 rows, each its own attempt: two slices of 150 ids at most.
+    const w = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: i % 50 === 7 })));
+    const { body } = await w.run();
+    eq("200 attempts: two reads of at most 150 ids, every one previews only",
+      w.attemptReads.map((r) => [r.ids.length, r.contextKind]), [[150, "eq.preview"], [50, "eq.preview"]]);
+    eq("…the 4 previews parked in one write, the 196 others sent, no row deleted",
+      [body.previewsParked, w.parkWrites.map((p) => p.ids.length), countBy(w.rows, "sent"), w.stored.size, w.rows.length, w.rows.filter(isParked).length, w.outboxDeletes],
+      [4, [4], 196, 196, 200, 4, []]);
+  }
+  {
+    const w = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: true })));
+    const { body, posts } = await w.run();
+    eq("200 previews, each its own attempt: two reads (150 + 50) and two park writes (150 + 50); nothing posted or deleted",
+      [w.attemptReads.map((r) => r.ids.length), w.parkWrites.map((p) => p.ids.length), body.previewsParked, posts, w.rows.filter(isParked).length, w.outboxDeletes],
+      [[150, 50], [150, 50], 200, 0, 200, []]);
+  }
+  {
+    const w = world(rowsOf(200, () => ({ attempt: "att-p", preview: true })));
+    const { body } = await w.run();
+    eq("200 rows of one preview attempt: one read of 1 id, two park writes (150 + 50)",
+      [w.attemptReads.map((r) => r.ids.length), w.parkWrites.map((p) => p.ids.length), body.previewsParked], [[1], [150, 50], 200]);
+  }
+  {
+    // A database without 0107 (production until its sitting): no attempt there is a preview.
+    const specs: Spec[] = [{ attempt: "att-a" }, { attempt: "att-b", preview: true }, {}];
+    const w = world(specs, "fake", undefined, () => "no0107");
+    const run = await w.run();
+    eq("without the column: one failed read, then every row is posted, today's drain",
+      [w.attemptReads.length, countBy(w.rows, "sent"), w.stored.size, run.body.previewsParked ?? null, run.body.held ?? null, w.parkWrites.length], [1, 3, 3, null, null, 0]);
+    const b = world(specs.map((sp) => ({ ...sp, attempt: undefined, preview: undefined })));
+    const base = await b.run();
+    eq("…exactly as the same rows naming no attempt drain: the same posts, the same body, the same rows",
+      [w.postedIds, run.body, w.rows.map((r) => [r.status, r.attempts, r.last_error])], [b.postedIds, base.body, b.rows.map((r) => [r.status, r.attempts, r.last_error])]);
+  }
+  {
+    let answer: AttemptsAnswer = 500;
+    const w = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => answer);
+    const first = await w.run();
+    eq("a failed preview check: only the row that names no attempt is posted", [w.postedIds.flat(), countBy(w.rows, "sent")], [["s2"], 1]);
+    eq("…the rows that name an attempt are held as they were, still due",
+      w.rows.filter((r) => r.attempt_id).every((r) => r.status === "pending" && r.attempts === 0 && r.last_error === null && r.next_attempt_at === "2026-01-01T00:00:00.000Z"), true);
+    eq("…and the body says why", [first.body.held, first.body.previewCheckError], [2, "upstream connect error"]);
+    answer = "0107";
+    await w.run();
+    eq("the next run checks again: the preview parked, never posted, never deleted; the real row sent",
+      [w.rows.map((r) => `${r.id}:${r.status}`), isParked(rowAt(w.rows, 1)), w.postedIds.flat().includes("s1"), w.outboxDeletes],
+      [["row-0:sent", "row-1:pending", "row-2:sent"], true, false, []]);
+  }
+  for (const c of [
+    { answer: "nodata" as const, name: "a check answered 200 with neither rows nor an error", error: "attempts read answered neither rows nor an error" },
+    { answer: "other42703" as const, name: "a check answered 42703 naming another column (not a database without 0107)", error: "column course_attempts.other_column does not exist" },
+  ]) {
+    const w = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => c.answer);
+    const { body } = await w.run();
+    eq(`${c.name}: held as a failed check, only the row that names no attempt posted`,
+      [body.held, body.previewCheckError, w.postedIds.flat(), w.parkWrites.length],
+      [2, c.error, ["s2"], 0]);
+    eq(`${c.name}: the held rows are as they were, still due`,
+      [0, 1].every((i) => rowAt(w.rows, i).status === "pending" && rowAt(w.rows, i).attempts === 0 && rowAt(w.rows, i).last_error === null && rowAt(w.rows, i).next_attempt_at === "2026-01-01T00:00:00.000Z"), true);
+  }
+  {
+    let park: ParkAnswer = 500;
+    const w = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => "0107", () => park);
+    const before = JSON.stringify(rowAt(w.rows, 1));
+    const first = await w.run();
+    eq("a failed park write: nothing of the preview posted, the others sent",
+      [w.postedIds.flat().includes("s1"), countBy(w.rows, "sent"), [...w.stored].sort()], [false, 2, ["s0", "s2"]]);
+    eq("…the body names the error and counts no row parked", [first.body.parkError, first.body.previewsParked], ["upstream connect error", 0]);
+    eq("…the preview's row is as it was, still due, not deleted", [JSON.stringify(rowAt(w.rows, 1)) === before, w.outboxDeletes], [true, []]);
+    park = "ok";
+    const second = await w.run();
+    eq("…the next run checks it again and parks it; still never posted",
+      [w.attemptReads.map((r) => r.ids), isParked(rowAt(w.rows, 1)), rowAt(w.rows, 1).status, w.postedIds.flat().includes("s1"), second.body.previewsParked, second.body.parkError ?? null],
+      [[["att-real", "att-prev"], ["att-prev"]], true, "pending", false, 1, null]);
+  }
+  {
+    // 200 previews: the first park write (150 ids) fails, the second (50) is written.
+    let n = 0;
+    const w = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: true })), "fake", undefined, () => "0107", () => (++n === 1 ? 500 : "ok"));
+    const { body, posts } = await w.run();
+    eq("one of two park writes fails: the body counts the 50 parked and names the error; nothing posted; the 150 stay due",
+      [body.previewsParked, body.parkError, posts, w.rows.filter(isParked).length, w.rows.filter((r) => r.next_attempt_at === "2026-01-01T00:00:00.000Z").length],
+      [50, "upstream connect error", 0, 50, 150]);
+  }
+  {
+    // Both park writes fail, each with its own message: the body names the first.
+    let n = 0;
+    const w = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: true })), "fake", undefined, () => "0107", () => ({ fail: ++n === 1 ? "first write failed" : "second write failed" }));
+    const { body, posts } = await w.run();
+    eq("both park writes fail: the body names the first error, counts none parked; nothing posted, every row still due",
+      [body.parkError, body.previewsParked, posts, w.rows.filter(isParked).length, w.rows.filter((r) => r.next_attempt_at === "2026-01-01T00:00:00.000Z").length],
+      ["first write failed", 0, 0, 0, 200]);
+  }
+
+  console.log("\nthe cron route: the calls the preview check adds to a run (P2-6's subrequest count)");
+  {
+    /**
+     * A run's PostgREST calls minus a baseline's: the same rows, none naming an attempt, the previews' not due (with 0107 they
+     * are not posted). A batch of N rows naming A distinct attempts with P preview rows adds ceil(A/150) reads and
+     * ceil(P/150) park writes.
+     */
+    const extraCalls = async (specs: Spec[], answer: AttemptsAnswer = "0107") => {
+      const w = world(specs, "fake", undefined, () => answer);
+      const run = await w.run();
+      const b = world(specs);
+      specs.forEach((sp, i) => {
+        b.rows[i].attempt_id = null;
+        if (sp.preview && answer === "0107") b.rows[i].status = "sent";
+      });
+      const base = await b.run();
+      return run.calls - base.calls;
+    };
+    const formula = (specs: Spec[]) => {
+      const a = new Set(specs.map((sp) => sp.attempt).filter(Boolean)).size;
+      const p = specs.filter((sp) => sp.attempt && sp.preview).length;
+      return Math.ceil(a / 150) + Math.ceil(p / 150);
+    };
+    const pins: Array<{ name: string; specs: Spec[]; extra: number }> = [
+      { name: "8 rows naming no attempt (A 0, P 0)", specs: rowsOf(8), extra: 0 },
+      { name: "10 rows naming 2 attempts, no preview (A 2, P 0)", specs: rowsOf(10, (i) => ({ attempt: `att-${i % 2}` })), extra: 1 },
+      {
+        name: "6 rows in two orgs naming 3 attempts, 3 previews (A 3, P 3)",
+        specs: [{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, { attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}, { attempt: "att-old", preview: true, org: "org-b" }],
+        extra: 2,
+      },
+      { name: "200 rows, 200 attempts, 4 previews (A 200, P 4)", specs: rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: i % 50 === 7 })), extra: 3 },
+      { name: "200 rows, 200 attempts, all previews (A 200, P 200)", specs: rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: true })), extra: 4 },
+      { name: "200 rows of one preview attempt (A 1, P 200)", specs: rowsOf(200, () => ({ attempt: "att-p", preview: true })), extra: 3 },
+      { name: "151 previews, each its own attempt, and 49 rows naming none (A 151, P 151)", specs: rowsOf(200, (i) => (i < 151 ? { attempt: `att-${i}`, preview: true } : {})), extra: 4 },
+    ];
+    for (const p of pins) eq(`${p.name}: ceil(A/150) reads + ceil(P/150) writes = ${p.extra}`, [await extraCalls(p.specs), formula(p.specs)], [p.extra, p.extra]);
+    eq("without 0107: one failed read whatever A is, and no write",
+      [await extraCalls(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: i % 50 === 7 })), "no0107"), await extraCalls(rowsOf(10, (i) => ({ attempt: `att-${i % 2}` })), "no0107")], [1, 1]);
+  }
 }
 
 async function enqueueCases() {
@@ -462,6 +771,13 @@ async function enqueueCases() {
   const aloneConflict = new Set<string>();
   let conflicts = new Set<string>();
   let signInPage = false;
+  // ADR 0024 P2-3: how the stubbed PostgREST answers the attempt's
+  // organisation read ("real": every read finds it; "preview": a read that
+  // drops previews finds nothing; "no0107": a read naming context_kind
+  // answers 42703, as a database without 0107 does).
+  let attempt: "real" | "preview" | "no0107" = "real";
+  const attemptReads: string[] = [];
+  let outboxWrites = 0;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init?.method ?? "GET").toUpperCase();
@@ -476,7 +792,17 @@ async function enqueueCases() {
       for (const p of posted) stored.add(p.id);
       return json(posted.map((p) => p.id));
     }
-    if (url.pathname === "/rest/v1/course_attempts") return json([{ organization_id: "org-a" }]);
+    if (url.pathname === "/rest/v1/course_attempts") {
+      const filter = url.searchParams.get("context_kind");
+      attemptReads.push(filter ?? "(none)");
+      if (filter !== null && attempt === "no0107") return json({ code: "42703", details: null, hint: null, message: "column course_attempts.context_kind does not exist" }, 400);
+      if (filter === "neq.preview" && attempt === "preview") return json([]);
+      return json([{ organization_id: "org-a" }]);
+    }
+    if (url.pathname === "/rest/v1/lrs_forward_outbox" && method === "POST") {
+      outboxWrites++;
+      return json([], 201);
+    }
     if (url.pathname === "/rest/v1/tenant_lrs_config") {
       return json([{ organization_id: "org-a", enabled: true, endpoint: "http://lrs.test/xapi", auth_key: "k", auth_secret: "s", xapi_version: "1.0.3", statement_profile: "raw" }]);
     }
@@ -525,6 +851,37 @@ async function enqueueCases() {
     signInPage = false;
     eq("a sign-in page answers 200: nothing is marked sent", sentIds, []);
     eq("a sign-in page answers 200: every row keeps the error", errored.length, 8);
+  }
+
+  console.log("\nthe live mirror and previews (ADR 0024 P2-3, steps 49 and 80)");
+  {
+    reset([]);
+    attempt = "preview";
+    attemptReads.length = 0;
+    outboxWrites = 0;
+    await mirrorToExternalLrs("att-p", batch(4) as never);
+    await settle();
+    eq("a preview's attempt: the organisation read drops previews and finds nothing", attemptReads, ["neq.preview"]);
+    eq("…nothing is enqueued or posted", [outboxWrites, stored.size, sentIds.length], [0, 0, 0]);
+  }
+  {
+    reset([]);
+    attempt = "no0107";
+    attemptReads.length = 0;
+    outboxWrites = 0;
+    await mirrorToExternalLrs("att-1", batch(4) as never);
+    await settle();
+    eq("without the column: the filtered read answers 42703 and today's select is read once", attemptReads, ["neq.preview", "(none)"]);
+    eq("…and the statements are mirrored as before", [outboxWrites, stored.size, sentIds.length], [1, 4, 4]);
+  }
+  {
+    reset([]);
+    attempt = "real";
+    attemptReads.length = 0;
+    outboxWrites = 0;
+    await mirrorToExternalLrs("att-1", batch(4) as never);
+    await settle();
+    eq("a real attempt with 0107: one filtered read, mirrored", [attemptReads, outboxWrites, stored.size], [["neq.preview"], 1, 4]);
   }
 }
 

@@ -350,8 +350,10 @@ function pages() {
   const reports = read("app/[org]/(admin)/reports/page.tsx");
   const attemptsRead = reports.slice(reports.indexOf("const ATTEMPT_COLUMNS ="), reports.indexOf("const attempts = attemptRows as Attempt[];"));
   eq("the attempts read never names the column", attemptsRead.includes("ignored_pass"), false);
-  eq("the separate read: the org, failed, with a record, newest first, the ceiling",
-    /\.select\("id, ignored_pass"\)\s*\.eq\("organization_id", org\.id\)\s*\.eq\("success_status", "failed"\)\s*\.not\("ignored_pass", "is", null\)\s*\.order\("ignored_pass->>last_at", \{ ascending: false \}\)\s*\.limit\(NOT_APPLIED_REPORT_LIMIT\);/.test(reports), true);
+  // ADR 0024 P2-3: the read drops preview rows (withoutPreviews inside
+  // readWithContextFilter, the page's one decision).
+  eq("the separate read: the org, failed, with a record, newest first, the ceiling, previews dropped",
+    /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(supabase\.from\("course_attempts"\)\.select\("id, ignored_pass"\)\.eq\("organization_id", org\.id\), apply\)\s*\.eq\("success_status", "failed"\)\s*\.not\("ignored_pass", "is", null\)\s*\.order\("ignored_pass->>last_at", \{ ascending: false \}\)\s*\.limit\(NOT_APPLIED_REPORT_LIMIT\)\s*\);/.test(reports), true);
   eq("on the page's service client, after the role gate", reports.indexOf("canViewReports(role)") < reports.indexOf('select("id, ignored_pass")'), true);
   eq("a full page is logged, ids only", /\.length >= NOT_APPLIED_REPORT_LIMIT\) \{\s*console\.warn\(JSON\.stringify\(\{ event: "ignored_pass_reports_truncated", organization_id: org\.id \}\)\);/.test(reports), true);
   eq("{ error } on either read → no rows at all (null), which removes the section, the card and the marker", /const \{ data: attemptRows, error: attemptsErr \} = await readPagedWithOptionalColumn/.test(reports) && /const notAppliedRows =\s*ignoredErr \|\| attemptsErr\s*\? null\s*: notAppliedReportRows\(/.test(reports), true);

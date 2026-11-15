@@ -7,7 +7,8 @@
 import { resolveEmails } from "@/lib/users/emails";
 import { defaultSlotFinding, isReadyVersion } from "@/lib/courses/default-rule";
 import { heldWebhookItem, heldWebhookSummary } from "@/lib/integrations/webhook-hold";
-import { classifyAttempt } from "@/lib/scoring/attempt-kind";
+import { classifyAttempt, type PgError } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews } from "@/lib/scoring/context-read";
 import { NOT_APPLIED_TITLE, attentionContextLine, ignoredPassCount, readIgnoredRecord } from "@/lib/xapi/ignored-pass";
 import {
   ATTENTION_PROVIDERS,
@@ -429,17 +430,25 @@ async function heldWebhookItems(svc: AnyClient, orgId: string, orgSlug: string, 
  * attempt. `occurredAt` is the record's last_at, so a later ignored pass brings a
  * marked-read item back and a repeat of the same SCORM dictionary does not.
  * Fail-soft: supabase-js answers `{ error }` on a database without 0104 and does
- * not throw, so the fetcher checks it and answers no items.
+ * not throw, so the fetcher checks it and answers no items. A preview is never
+ * an item (ADR 0024 steps 49 and 80, P2-3): the read drops `context_kind =
+ * 'preview'` rows, and on a database without 0107 the filter's missing-column
+ * error reads today's select once (readWithContextFilter).
  */
 async function ignoredPassItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
-  const { data, error } = await svc
-    .from("course_attempts")
-    .select("id, user_id, course_version_id, score, completed_at, ignored_pass, course_versions(course_id)")
-    .eq("organization_id", orgId)
-    .not("ignored_pass", "is", null)
-    .eq("success_status", "failed")
-    .order("ignored_pass->>last_at", { ascending: false })
-    .limit(200);
+  const { data, error } = await readWithContextFilter<{ data: unknown[] | null; error: PgError }>({ applies: null }, (apply) =>
+    withoutPreviews(
+      svc
+        .from("course_attempts")
+        .select("id, user_id, course_version_id, score, completed_at, ignored_pass, course_versions(course_id)")
+        .eq("organization_id", orgId),
+      apply
+    )
+      .not("ignored_pass", "is", null)
+      .eq("success_status", "failed")
+      .order("ignored_pass->>last_at", { ascending: false })
+      .limit(200)
+  );
   if (error) return [];
   const courseIdOf = (r: { course_versions: { course_id: string } | Array<{ course_id: string }> | null }) =>
     (Array.isArray(r.course_versions) ? r.course_versions[0] : r.course_versions)?.course_id ?? null;

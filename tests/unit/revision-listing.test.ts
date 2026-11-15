@@ -427,12 +427,15 @@ console.log("\n(iv) the officialStatuses / loadEnrolledCourseStatus callers read
 console.log("\n(v) the lib/lrs/context.ts reads behind the markers select is_revision with the fallback");
 {
   const src = sources.get("lib/lrs/context.ts") ?? "";
-  eq("the first tier names is_revision through readOrMissing",
-    /const flagged = await readOrMissing<Row\[\]>\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\(\s*"[^"]*\bstatus, is_revision, "/.test(src), true);
+  // ADR 0024 P2-3: both tiers read through the preview filter
+  // (readWithContextFilter(previews, (apply) => withoutPreviews(…, apply))),
+  // inside readOrMissing, so a missing is_revision still falls back.
+  eq("the first tier names is_revision through readOrMissing (the preview filter inside)",
+    /const flagged = await readOrMissing<Row\[\]>\(\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\(\s*"[^"]*\bstatus, is_revision, "/.test(src), true);
   eq("…and a failed first tier throws ContextReadError (only a missing column falls back)",
     /if \("failed" in flagged\) throw new ContextReadError\("attempts"\);/.test(src), true);
-  eq("the siblings tier names is_revision and filters is_revision = false through readOrMissing",
-    /readOrMissing<Row\[\]>\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\("[^"]*\bis_revision\b[^"]*"\)[\s\S]*?\.eq\("is_revision", false\),\s*"is_revision"\s*\)/.test(src), true);
+  eq("the siblings tier names is_revision and filters is_revision = false through readOrMissing (the preview filter inside)",
+    /readOrMissing<Row\[\]>\(\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\("[^"]*\bis_revision\b[^"]*"\)[\s\S]*?\.eq\("is_revision", false\),\s*apply\s*\)\s*\),\s*"is_revision"\s*\)/.test(src), true);
   eq("…and a failed siblings tier throws ContextReadError",
     /if \("failed" in flagged\) throw new ContextReadError\("siblings"\);/.test(src), true);
   eq("readOrMissing answers missing only on isMissingColumn",

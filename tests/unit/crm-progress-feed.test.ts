@@ -14,7 +14,11 @@
  *   - a failed grant read throws GrantReadError (the route's 503);
  *   - `revision_visits` / `last_revision_at` from the visits, null/null when
  *     the read fails (or stops at the page cap), 0/null when the table is
- *     missing; the shape of every new field.
+ *     missing; the shape of every new field;
+ *   - ADR 0024 P2-3 (steps 49 and 80): a preview row (a staff member's
+ *     by-role row since the 0107 paste) is never a CRM row; on a database
+ *     without 0107 the filter's missing-column error reads today's rows
+ *     once, one decision shared by every batch of a request.
  *
  * learner-summary computes the same per-course fields inline (it has no
  * callable pure half: it authenticates by API key and does its reads in the
@@ -44,7 +48,7 @@ type Op = { op: string; args: unknown[] };
 type Q = { table: string; ops: Op[] };
 type Fault = (q: Q) => { code: string; message: string } | null;
 /**
- * Answers by table name, honours .eq / .in on top-level columns a row
+ * Answers by table name, honours .eq / .neq / .in on top-level columns a row
  * carries (embedded and .or filters are ignored), and ignores ranges unless
  * `pageOf` says otherwise; `fault` may answer any query with an error; rpc
  * answers no policy rows (DEFAULT_POLICY).
@@ -55,6 +59,7 @@ function fakeDb(tables: Record<string, Row[]>, opts: { fault?: Fault; pageOf?: (
     const [col, v] = o.args as [unknown, unknown];
     if (typeof col !== "string" || col.includes(".") || !(col in r)) return true;
     if (o.op === "eq") return r[col] === v;
+    if (o.op === "neq") return r[col] !== v;
     if (o.op === "in") return (v as unknown[]).includes(r[col]);
     return true;
   };
@@ -289,6 +294,33 @@ async function main() {
     eq("the five new fields are present", ["revision_visits", "last_revision_at", "official_retake", "previous_official_score", "previous_official_status"].every((k) => keys.includes(k)), true);
     eq("…typed: number, null, none, null, null for a learner with no retake and no visit", [c.revision_visits, c.last_revision_at, c.official_retake, c.previous_official_score, c.previous_official_status], [0, null, "none", null, null]);
     eq("practice_attempts is kept", keys.includes("practice_attempts"), true);
+  }
+
+  console.log("\nADR 0024 P2-3: a preview is never a CRM row (steps 49 and 80)");
+  {
+    const preview = attempt("p1", 2, "passed", { context_kind: "preview", preview_kind: "legacy_role" });
+    const real = attempt("a1", 5, "failed", { context_kind: "individual" });
+    const pick = (c: CourseProgress) => [c.status, c.attempts, c.score, c.first_access, c.last_access];
+    const only = run(tables([preview]));
+    eq("a staff member's preview alone: the assigned course reads not started, no attempt, no access", pick(courseOf(await only.out)), ["not_started", 0, null, null, null]);
+    eq("…the attempts read dropped context_kind = 'preview'",
+      only.queries.filter((q) => q.table === "course_attempts").map((q) => q.ops.some((o) => o.op === "neq" && o.args[0] === "context_kind" && o.args[1] === "preview")), [true]);
+    eq("a preview beside a real attempt: the real attempt's values only", pick(courseOf(await run(tables([preview, real])).out)), pick(courseOf(await run(tables([real])).out)));
+  }
+  {
+    // A database without 0107: no row carries context_kind, and a filter
+    // naming it answers 42703. Today's rows are read once more.
+    const MISSING_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+    const namesContext = (q: Q) => q.ops.some((o) => o.op === "neq" && o.args[0] === "context_kind");
+    const fault = (q: Q) => (q.table === "course_attempts" && namesContext(q) ? MISSING_CONTEXT : null);
+    const row = attempt("a1", 1, "passed");
+    const f = fakeDb(tables([row]), { fault });
+    const previews = { applies: null as boolean | null };
+    const first = await buildProgress(f.db, ORG, "org", [MEMBER], NO_FILTERS, "Asia/Kolkata", previews);
+    const second = await buildProgress(f.db, ORG, "org", [MEMBER], NO_FILTERS, "Asia/Kolkata", previews);
+    eq("without the column, today's rows: the course reads passed in both batches", [courseOf(first).status, courseOf(second).status], ["passed", "passed"]);
+    eq("…one failed read for the request: the decision is shared by every batch", f.queries.filter((q) => q.table === "course_attempts" && namesContext(q)).length, 1);
+    eq("…and the decision is recorded as 'not there'", previews.applies, false);
   }
 
   /* ---------------- the routes: source checks ---------------- */

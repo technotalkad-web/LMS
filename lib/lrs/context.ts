@@ -18,6 +18,7 @@ import { launchedActivityIds } from "@/lib/xapi/process-statement";
 import { notAppliedStatementIds } from "@/lib/xapi/ignored-pass";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import { isMissingColumn, type PgError } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import {
   fetchActiveMembers,
   resolveGroupMembers,
@@ -95,16 +96,34 @@ async function readOrMissing<T>(p: PromiseLike<any>, column: string): Promise<{ 
  * database); any other error throws ContextReadError, since an ordinal
  * re-read with revision rows in it would stamp write-once statements with
  * a wrong attempt/number.
+ *
+ * ADR 0024 P2-3 (item 1b): the first tier also drops preview rows
+ * (withoutPreviews), so a real attempt is never forwarded with an
+ * attempt/number or an attempt/scored that counts a staff member's Preview.
+ * On a database without 0107 the filter's missing-column error re-reads the
+ * same tier once without it (readWithContextFilter; production today:
+ * is_revision there, context_kind not); a missing is_revision still falls
+ * back to today's select, and any other error still throws.
  */
-async function loadSiblings(svc: SupabaseClient, userIds: string[], courseIds: string[]): Promise<Row[] | null> {
+async function loadSiblings(
+  svc: SupabaseClient,
+  userIds: string[],
+  courseIds: string[],
+  previews: ContextFilterState
+): Promise<Row[] | null> {
   const flagged = await readOrMissing<Row[]>(
-    svc
-      .from("course_attempts")
-      .select("id, user_id, started_at, status, is_revision, course_versions!inner(course_id)")
-      .in("user_id", userIds)
-      .in("course_versions.course_id", courseIds)
-      .neq("status", "abandoned")
-      .eq("is_revision", false),
+    readWithContextFilter(previews, (apply) =>
+      withoutPreviews(
+        svc
+          .from("course_attempts")
+          .select("id, user_id, started_at, status, is_revision, course_versions!inner(course_id)")
+          .in("user_id", userIds)
+          .in("course_versions.course_id", courseIds)
+          .neq("status", "abandoned")
+          .eq("is_revision", false),
+        apply
+      )
+    ),
     "is_revision"
   );
   if ("data" in flagged) return flagged.data;
@@ -254,11 +273,21 @@ export async function loadOrgs(
   return out;
 }
 
-/** Full context for each attempt id (missing attempts are simply absent). */
+/**
+ * Full context for each attempt id (missing attempts are simply absent).
+ *
+ * ADR 0024 P2-3: a preview's id is absent too. The first tier, the ordinal's
+ * siblings and the ignored-pass read drop `context_kind = 'preview'` rows
+ * (withoutPreviews, through readWithContextFilter); `previews` carries the
+ * caller's decision (one per sweep run or live enqueue), so a database
+ * without 0107 pays its one failed read once. The two older tiers are the
+ * selects of a database without 0103, which has no 0107 either.
+ */
 export async function loadAttemptContexts(
   svc: SupabaseClient,
   attemptIds: string[],
-  groupsByOrgUser?: Map<string, string[]>
+  groupsByOrgUser?: Map<string, string[]>,
+  previews: ContextFilterState = { applies: null }
 ): Promise<Map<string, AttemptContext>> {
   const out = new Map<string, AttemptContext>();
   const ids = [...new Set(attemptIds.filter(Boolean))];
@@ -269,14 +298,19 @@ export async function loadAttemptContexts(
   // falls back to today's two tiers, and the flag then reads false; any
   // other error throws ContextReadError (the sweep retries the chunk).
   const flagged = await readOrMissing<Row[]>(
-    svc
-      .from("course_attempts")
-      .select(
-        "id, user_id, organization_id, course_version_id, learning_path_id, journey_enrollment_id, journey_day, started_at, status, is_revision, " +
-          "course_versions!inner(id, course_id, version_number, manifest_type, package_id, manifest_data, courses!course_versions_course_id_fkey(id, title), " +
-          "course_packages!course_versions_package_id_fkey(id, language))"
+    readWithContextFilter(previews, (apply) =>
+      withoutPreviews(
+        svc
+          .from("course_attempts")
+          .select(
+            "id, user_id, organization_id, course_version_id, learning_path_id, journey_enrollment_id, journey_day, started_at, status, is_revision, " +
+              "course_versions!inner(id, course_id, version_number, manifest_type, package_id, manifest_data, courses!course_versions_course_id_fkey(id, title), " +
+              "course_packages!course_versions_package_id_fkey(id, language))"
+          )
+          .in("id", ids),
+        apply
       )
-      .in("id", ids),
+    ),
     "is_revision"
   );
   if ("failed" in flagged) throw new ContextReadError("attempts");
@@ -334,7 +368,7 @@ export async function loadAttemptContexts(
       : null,
     resolvePolicies(svc, courseIds).catch(() => new Map()),
     // Every non-abandoned, non-revision attempt of these users on these courses → ordinal.
-    loadSiblings(svc, userIds, courseIds),
+    loadSiblings(svc, userIds, courseIds, previews),
     // ADR 0014 step 7: `scored` is grant-aware (a grant retake is scored).
     // Fail-soft: the mirror is not a chain renderer (ADR 0014:188's strict
     // rule is for the history surfaces).
@@ -346,7 +380,9 @@ export async function loadAttemptContexts(
     // marked); any other error throws below, so an ignored pass never leaves
     // enriched and unmarked.
     readOrMissing<Row[]>(
-      svc.from("course_attempts").select("id, ignored_pass").in("id", ids).not("ignored_pass", "is", null),
+      readWithContextFilter(previews, (apply) =>
+        withoutPreviews(svc.from("course_attempts").select("id, ignored_pass").in("id", ids), apply).not("ignored_pass", "is", null)
+      ),
       "ignored_pass"
     ),
   ]);

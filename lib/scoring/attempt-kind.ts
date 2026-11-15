@@ -29,7 +29,9 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
  *                         the trigger of the narrower-select fallbacks, and
  *                         readWithOptionalColumn() writes that fallback once
  *                         (readPagedWithOptionalColumn() its paged form, the
- *                         first page deciding).
+ *                         first page deciding); readWithOptionalFilter()
+ *                         writes the same fallback once for a filter on a
+ *                         column a database may not have yet.
  *   fetchPassRequired() — which courses are configured "pass required"
  *                         (0081), fail-soft on a database that has not run
  *                         the migration yet.
@@ -96,6 +98,48 @@ export async function readWithOptionalColumn<T>(
   const first = await read(`${base}, ${column}`);
   if (first.error && isMissingColumn(first.error, column)) return await read(base);
   return first;
+}
+
+/**
+ * Whether a filter on an optional column applies (readWithOptionalFilter):
+ * null until an answer decides, then true on a database that has the column
+ * and false on one without it. One object is shared by every page, chunk and
+ * read of one request (or one sweep run), so the decision is made once and a
+ * database without the column pays one failed read per request. Never kept
+ * between requests: a decision made before a migration is pasted must not
+ * outlive the request that made it.
+ */
+export type OptionalFilterState = { applies: boolean | null };
+
+/**
+ * The fallback for a filter on a column a database may not have yet
+ * (docs/ARCHITECTURE.md principle 6), written once, in the form the tenant
+ * LRS points source first wrote inline (lib/lrs/sweep.ts, xpChunk, which now
+ * reads through it; lib/scoring/context-read.ts binds it to context_kind as
+ * readWithContextFilter): `read(true)` adds the filter. While `state` is undecided, an answer without an error decides
+ * that the filter applies; a missing-column error naming `column`
+ * (isMissingColumn) decides that it does not, and the same read is made once
+ * more with `read(false)`, today's read. Once decided it is never revisited:
+ * every later read is made in the decided form and its error, a
+ * missing-column error included, is returned as it is. Any other error
+ * decides nothing and is returned as it is, so the caller keeps its own
+ * error path and a transient error is never retried without the filter.
+ */
+export async function readWithOptionalFilter<R extends { error: PgError }>(
+  column: string,
+  state: OptionalFilterState,
+  read: (apply: boolean) => PromiseLike<R>
+): Promise<R> {
+  if (state.applies === false) return await read(false);
+  const res = await read(true);
+  if (state.applies === null) {
+    if (!res.error) state.applies = true;
+    else if (isMissingColumn(res.error, column)) {
+      state.applies = false;
+      return await read(false);
+    }
+  }
+  return res;
 }
 
 /**
