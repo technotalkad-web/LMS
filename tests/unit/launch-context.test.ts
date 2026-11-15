@@ -514,11 +514,11 @@ console.log("\n(k) resumeAfterSlotRouting: a journey resume whose open rows slot
   eq("routing abandons nothing: unchanged (the resume takes its row)", ask({ abandon: [] }), "unchanged");
   eq("routing keeps an open official row (own slot, or a retake it never abandons): unchanged", ask({ openOfficialIds: [ATT, A2] }), "unchanged");
   eq("no open official row in the context (it completed meanwhile): unchanged (refused at the row, nothing inserted)", ask({ openOfficialIds: [] }), "unchanged");
-  eq("a completed enrolment: refuse (it opens nothing new)", ask({ enrolmentStatus: "completed" }), "refuse");
-  eq("an unknown enrolment status: refuse", ask({ enrolmentStatus: null }), "refuse");
-  eq("a credited day: refuse (no new official attempt on it)", ask({ dayCredited: true }), "refuse");
-  eq("no day number (a removed day), or not a day number: refuse (a journey row needs it)", [ask({ dayNumber: null }), ask({ dayNumber: 0 })], ["refuse", "refuse"]);
-  eq("a used window (at_row) or a grant: refuse (not a first attempt)", [ask({ candidate: "at_row" }), ask({ candidate: "grant" })], ["refuse", "refuse"]);
+  eq("a completed enrolment: close_then_refuse (it opens nothing new)", ask({ enrolmentStatus: "completed" }), "close_then_refuse");
+  eq("an unknown enrolment status: close_then_refuse", ask({ enrolmentStatus: null }), "close_then_refuse");
+  eq("a credited day: close_then_refuse (no new official attempt on it)", ask({ dayCredited: true }), "close_then_refuse");
+  eq("no day number (a removed day), or not a day number: refuse (a journey row needs it)", [ask({ dayNumber: null }), ask({ dayNumber: 0 })], ["close_then_refuse", "close_then_refuse"]);
+  eq("a used window (at_row) or a grant: refuse (not a first attempt)", [ask({ candidate: "at_row" }), ask({ candidate: "grant" })], ["close_then_refuse", "close_then_refuse"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -763,11 +763,15 @@ export default async function LaunchPage({
   // never closes a real attempt.
   // Step 22, a journey `resume` whose open official rows routing abandons
   // (a deactivated slot): decided before the close (resumeAfterSlotRouting),
-  // from the context's rows evaluate read. `refuse` closes nothing; `open`
-  // lists the rows whose close lets the day's fresh official attempt in at
-  // the row step below, and only the rows this close returns count as closed
-  // (it is fail-soft, and the open-row index is per version).
+  // from the context's rows evaluate read. `open` lists the rows whose close
+  // lets the day's fresh official attempt in at the row step below, and only
+  // the rows this close returns count as closed (it is fail-soft, and the
+  // open-row index is per version). `close_then_refuse` lets the close run
+  // (ADR 0004 rule (3)), then refuses with the retry notice, so the next
+  // launch decides afresh; refusing first would leave the row open and
+  // refuse every later launch.
   let resumeReopens: string[] = [];
+  let refuseAfterClose = false;
   const closedOnDeactivatedSlot = new Set<string>();
   const closeAfterResolution = async (r: Resolution) => {
     if (ctx.kind === "journey") {
@@ -781,7 +785,7 @@ export default async function LaunchPage({
         dayNumber: tags.journey_day,
         candidate: ev.candidate,
       });
-      if (resumeAnswer === "refuse") refuse("journey_resume_row_abandoned");
+      if (resumeAnswer === "close_then_refuse") refuseAfterClose = true;
       if (resumeAnswer === "open") resumeReopens = openOfficialIds;
     }
     if (r.deactivated.length > 0) {
@@ -843,6 +847,7 @@ export default async function LaunchPage({
     }
   };
   await closeAfterResolution(res);
+  if (refuseAfterClose) refuse("journey_resume_row_abandoned");
 
   // The in-progress row on the resolved version: resume by most recent
   // ACTIVITY (not started_at): when historical duplicate attempts exist, the

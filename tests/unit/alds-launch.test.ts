@@ -1052,8 +1052,10 @@ async function pageCases() {
       const closeFailed = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], slotCloseFails: true });
       eq("…when that close fails (it is fail-soft), the fresh attempt does not go in beside the row still open: refused at the row, no insert",
         [closeFailed.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method === "POST").length, refusals()], [RETRY, "in_progress", 0, ["journey_resume_without_row"]]);
-      // Anything else is refused before the close: the row stays open and
-      // nothing is written (a refused launch closes nothing).
+      // Anything else closes the row on the deactivated slot (ADR 0004 rule
+      // (3)), then refuses with the retry notice: no attempt is inserted, and
+      // the next launch decides afresh (refusing before the close would leave
+      // the row open and refuse every later launch).
       const officialDone = own("user", { id: "jw", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "failed", score: 0.2, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID });
       for (const [what, extra] of [
         ["a completed enrolment (it opens nothing new)", { journeyStatus: "completed" }],
@@ -1061,9 +1063,9 @@ async function pageCases() {
         ["a used window (an official attempt completed in the day's context)", { attempts: [onHi(), officialDone] }],
       ] as Array<[string, Partial<Parameters<typeof run>[0]>]>) {
         const r = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], ...extra });
-        eq(`…the same resume on ${what}: refused before the close, the row left open, no attempt or token written`,
-          [r.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method !== "GET").length, reqs.filter((q) => q.path === "/rest/v1/cmi5_launch_tokens").length, refusals()],
-          [RETRY, "in_progress", 0, 0, ["journey_resume_row_abandoned"]]);
+        eq(`…the same resume on ${what}: the row on the deactivated slot is closed, then the launch is refused; no attempt inserted`,
+          [r.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method === "POST").length, reqs.filter((q) => q.method === "PATCH" && q.path === "/rest/v1/cmi5_launch_tokens").length > 0, refusals()],
+          [RETRY, "abandoned", 0, true, ["journey_resume_row_abandoned"]]);
       }
       // P2-6 review (launch F3 (2)): a resume whose open row is on a version
       // routing does not reach inserts nothing beside it (the 0107 open-row

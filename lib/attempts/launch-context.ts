@@ -488,10 +488,14 @@ export function afterSelfEnrol(i: {
  *     completed, so it never counted toward the window). Phase 1's
  *     behaviour: the close, then the day's fresh official attempt in the
  *     same request;
- *   - `refuse`: routing abandons every open official row, and no fresh
- *     official attempt is admitted (a completed enrolment opens nothing new,
- *     a credited day gets no new official attempt, a row needs the day's
- *     number, and a used window or a grant is not a first attempt).
+ *   - `close_then_refuse`: routing abandons every open official row, and no
+ *     fresh official attempt is admitted (a completed enrolment opens nothing
+ *     new, a credited day gets no new official attempt, a row needs the
+ *     day's number, and a used window or a grant is not a first attempt).
+ *     The deactivated-slot close still runs (ADR 0004 rule (3)), then the
+ *     launch refuses with the retry notice and the next launch decides
+ *     afresh. Refusing before the close would leave the row open, so every
+ *     later launch would resolve to `resume` and be refused again.
  */
 export function resumeAfterSlotRouting(i: {
   admission: JourneyAdmission;
@@ -503,7 +507,7 @@ export function resumeAfterSlotRouting(i: {
   dayCredited: boolean;
   dayNumber: number | null;
   candidate: CandidateKind;
-}): "unchanged" | "open" | "refuse" {
+}): "unchanged" | "open" | "close_then_refuse" {
   if (i.admission !== "resume" || i.openOfficialIds.length === 0) return "unchanged";
   const abandoned = new Set(i.abandon.map((id) => id.toLowerCase()));
   if (!i.openOfficialIds.every((id) => abandoned.has(id.toLowerCase()))) return "unchanged";
@@ -514,5 +518,5 @@ export function resumeAfterSlotRouting(i: {
     Number.isInteger(i.dayNumber) &&
     i.dayNumber >= 1 &&
     i.candidate === "first";
-  return fresh ? "open" : "refuse";
+  return fresh ? "open" : "close_then_refuse";
 }
