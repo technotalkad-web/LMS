@@ -1,5 +1,6 @@
-import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
+import { dispatchResend, resendConfigured } from "@/lib/email/resend";
 
 /**
  * White-label auth emails.
@@ -17,6 +18,14 @@ import { notifyBackground } from "@/lib/notifications/send";
  *
  * Password reset stays on its existing custom-OTP flow (already tenant SMTP +
  * Resend fallback via the same pipeline).
+ *
+ * A tenant-branded sign-in link is sent only to a member of that
+ * organisation. "Member" is the rule the tenant pages use to let a signed-in
+ * user in (lib/auth/require-org-access.ts): an organization_members row for
+ * the organisation and the user, whatever its status. Anyone else, and any
+ * lookup that fails, gets the generic platform sign-in email instead (the
+ * global sender, no tenant branding, no tenant SMTP, no row in that
+ * organisation's notification log).
  */
 
 type AuthLinkType = "invite" | "magiclink";
@@ -27,6 +36,50 @@ function svc() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+}
+
+function signInLink(origin: string, tokenHash: string, type: AuthLinkType, next: string): string {
+  const base = origin.replace(/\/$/, "");
+  return (
+    `${base}/auth/callback?token_hash=${encodeURIComponent(tokenHash)}` +
+    `&type=${type}&next=${encodeURIComponent(next)}`
+  );
+}
+
+/** True only when the user holds a membership row in the organisation; false on any error. */
+async function isMember(client: SupabaseClient, organizationId: string, userId: string): Promise<boolean> {
+  const { data, error } = await client
+    .from("organization_members")
+    .select("user_id")
+    .eq("organization_id", organizationId)
+    .eq("user_id", userId)
+    .limit(1);
+  return !error && (data?.length ?? 0) > 0;
+}
+
+/** The generic platform sign-in email (global Resend sender). True when it was sent. */
+async function sendPlatformSignInEmail(email: string, link: string): Promise<boolean> {
+  const res = await dispatchResend({
+    to: email,
+    subject: "Your sign-in link",
+    html: `<p>Click to sign in:</p><p><a href="${link}">Sign in</a></p><p>If you didn't request this, you can ignore this email.</p>`,
+    text: `Sign in: ${link}`,
+  });
+  return res.ok;
+}
+
+/**
+ * Platform sign-in (no organisation): mint a magic link and email it through
+ * the global sender. Silent when the sender is not configured or the address
+ * has no account; the caller answers the same either way.
+ */
+export async function sendPlatformMagicLink(opts: { email: string; origin: string }): Promise<boolean> {
+  if (!resendConfigured()) return false;
+  const { data, error } = await svc().auth.admin.generateLink({ type: "magiclink", email: opts.email });
+  if (error || !data) return false;
+  const tokenHash = (data.properties as { hashed_token?: string }).hashed_token;
+  if (!tokenHash) return false;
+  return sendPlatformSignInEmail(opts.email, signInLink(opts.origin, tokenHash, "magiclink", "/select-org"));
 }
 
 export type SendAuthEmailResult = {
@@ -74,11 +127,21 @@ export async function sendAuthEmail(opts: {
     return { ok: false, sent: false, error: "generateLink returned no token_hash" };
   }
 
-  const next = opts.next ?? "/select-org";
-  const base = opts.origin.replace(/\/$/, "");
-  const link =
-    `${base}/auth/callback?token_hash=${encodeURIComponent(tokenHash)}` +
-    `&type=${opts.type}&next=${encodeURIComponent(next)}`;
+  // A sign-in link goes through the tenant pipeline only for a member of
+  // that organisation; anyone else gets the generic platform email.
+  if (opts.type === "magiclink") {
+    const userId = data.user?.id ?? null;
+    const member = userId ? await isMember(client, opts.organizationId, userId) : false;
+    if (!member) {
+      const sent = await sendPlatformSignInEmail(
+        opts.email,
+        signInLink(opts.origin, tokenHash, "magiclink", "/select-org")
+      );
+      return { ok: true, sent, userId };
+    }
+  }
+
+  const link = signInLink(opts.origin, tokenHash, opts.type, opts.next ?? "/select-org");
 
   const event = opts.type === "invite" ? "account_invite" : "magic_link";
   const res = await notifyBackground({
