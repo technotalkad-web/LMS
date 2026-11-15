@@ -35,18 +35,24 @@
  *       answer, {ok: false}; chunks and pages decided once, a shared state
  *       deciding once for several calls;
  *   (f) learnerCanAccessCourse's journey branch (lib/auth/course-access.ts)
- *       on a stub client: a credited day numbered above the open day stays
- *       open for review when it keeps the course on its credit row, a day
- *       past the open day that holds no credit does not; a credited day
- *       whose course a publish swapped (by id, and by number without 0107)
- *       grants neither the new course nor the old one, and a credit row
- *       without a course grants nothing (step 22's row for
- *       `?journey=E&day=`, section 95's row "A day's course swapped"); a
- *       failed credit read grants nothing, and the caller's own read is used
- *       only when it is ok and covers every enrolment that holds the course
- *       (two enrolments, the read covering one). P2-6 creates
- *       tests/unit/course-access.test.ts with step 23's cases; these stay
- *       here with the twin they test.
+ *       on a stub client. Above the open day (past the ceiling) a credited
+ *       day is granted only for the course on its credit row: it stays open
+ *       for review when it keeps that course, a day there that holds no
+ *       credit does not open, a credited day whose course a publish swapped
+ *       (by id, and by number without 0107) grants neither the new course
+ *       nor the old one, and a credit row whose course is null grants
+ *       nothing (step 22's row for `?journey=E&day=`, section 95's row "A
+ *       day's course swapped"). At or below the ceiling the day's current
+ *       course is granted as before, a credited day whose course a publish
+ *       swapped included, and a completed enrolment grants every course of
+ *       its pinned version: the P2-6 gap (step 22's rows for
+ *       `?journey=E&day=` and for a completed E; step 23), pinned as today's
+ *       behaviour by the cases labelled "P2-6 gap (step 22)", which P2-6 is
+ *       expected to flip. A failed credit read grants nothing, and the
+ *       caller's own read is used only when it is ok and covers every
+ *       enrolment that holds the course (two enrolments, the read covering
+ *       one). P2-6 creates tests/unit/course-access.test.ts with step 23's
+ *       cases; these stay here with the twin they test.
  *
  * Not here, because the twin does not answer them (step 62's row names them
  * for the journey surfaces of later phases): `late` (a credit's column, written
@@ -500,6 +506,8 @@ async function main() {
       dayIds?: Record<string, string>;
       credits?: Credit[];
       enrollments?: string[];
+      /** The enrolments' status ("active" unless given). */
+      status?: "active" | "completed";
     };
     const INSERTED: Array<[number, string | null]> = [[1, "A"], [2, "N"], [3, "B"], [4, "C"], [5, "D"]];
     const INSERTED_IDS = { "1": D(1), "2": NEW, "3": D(2), "4": D(3), "5": D(4) };
@@ -511,7 +519,7 @@ async function main() {
         const rows = (() => {
           switch (r.table) {
             case "journey_enrollments":
-              return (w.enrollments ?? ["e1"]).map((id) => ({ id, version_id: "v1", start_date: "2026-01-01", status: "active", journey_programs: { is_active: true } }));
+              return (w.enrollments ?? ["e1"]).map((id) => ({ id, version_id: "v1", start_date: "2026-01-01", status: w.status ?? "active", journey_programs: { is_active: true } }));
             case "journey_versions":
               return [{ id: "v1", days_total: Math.max(...days.map((d) => d.day)), count_sundays: true, days, unlock_mode: w.mode, day_ids: w.dayIds ?? INSERTED_IDS }];
             case "journey_day_progress": {
@@ -593,6 +601,47 @@ async function main() {
       const kept: World = { ...w, credits: [["e1", D(1), 1, "X"], ["e1", D(3), 3, "B"]] };
       eq("…by number, the credited day 3 that keeps its course B (the course on its row) stays open", (await access(kept, "B")).res, allowed);
     }
+
+    // The P2-6 gap (step 22), pinned as today's behaviour: at or below the
+    // ceiling the day's current course is granted, a credited day whose
+    // course a publish swapped included, and a completed enrolment grants
+    // every course of its pinned version. Step 22's rows for
+    // `?journey=E&day=` and for a completed E grant a credited day only for
+    // the course on its credit row. The grant stays as it is until P2-6
+    // points the done-day links at that course, so P2-6 is expected to flip
+    // each case below; a failure here names it.
+    const gap = (n: string, got: unknown, want: unknown) =>
+      eq(`P2-6 gap (step 22): ${n} [today's behaviour, pinned; P2-6 is expected to flip it: update this case with P2-6]`, got, want);
+    // Credits on d1 (course X) and d2 (course A); a publish swapped d2's
+    // course to B in place, so d2 is still day 2, credited below the open
+    // day 3, the ceiling in both modes.
+    const BELOW: Array<[number, string | null]> = [[1, "X"], [2, "B"], [3, "C"]];
+    const BELOW_IDS = { "1": D(1), "2": D(2), "3": D(3) };
+    const BELOW_CREDITS: Credit[] = [["e1", D(1), 1, "X"], ["e1", D(2), 2, "A"]];
+    for (const mode of ["calendar", "progress"] as const) {
+      const w: World = { mode, days: BELOW, dayIds: BELOW_IDS, credits: BELOW_CREDITS };
+      gap(`${mode}, a credited day below the open day whose course a publish swapped: its current course B is allowed (step 22: only A, the course on its credit row)`,
+        (await access(w, "B")).res, allowed);
+      gap(`${mode}, …the course on its credit row, A, is denied (no course day of the version; step 23 grants it)`, (await access(w, "A")).res, denied);
+    }
+    // Every course day of SWAP credited (d2's row still holds A): the
+    // journey is finished, the ceiling is days_total, so the swapped day 3
+    // grants its current course B, which the SWAP cases above deny while
+    // day 3 is above the open day.
+    const ALL_SWAP: Credit[] = [["e1", D(1), 1, "X"], ["e1", NEW, 2, "N"], ["e1", D(2), 2, "A"], ["e1", D(3), 4, "C"]];
+    for (const mode of ["calendar", "progress"] as const) {
+      gap(`${mode}, every day credited (finished, still active): the swapped day 3's current course B is allowed (step 22: only A, the course on its credit row)`,
+        (await access({ mode, days: SWAP, dayIds: SWAP_IDS, credits: ALL_SWAP }, "B")).res, allowed);
+    }
+    {
+      const done = await access({ mode: "calendar", days: SWAP, dayIds: SWAP_IDS, credits: ALL_SWAP, status: "completed" }, "B");
+      gap("a completed enrolment grants every course of its pinned version: the swapped day 3's current course B is allowed, before any credit read (step 22's row for a completed E: review of the course on the credit row)",
+        [done.res, done.creditReads], [allowed, 0]);
+    }
+    gap("a credit row whose course is null on the credited day 2, below the open day 3: the day's current course B is allowed (step 22: a null course grants nothing)",
+      (await access({ mode: "calendar", days: BELOW, dayIds: BELOW_IDS, credits: [["e1", D(1), 1, "X"], ["e1", D(2), 2, null]] }, "B")).res, allowed);
+    gap("no 0107, the swap by number: the credited day 2, below the open day 3, grants its current course B (step 22: only A, the course on its credit row)",
+      (await access({ mode: "calendar", no0107: true, days: BELOW, credits: BELOW_CREDITS }, "B")).res, allowed);
 
     eq("a failed credit read grants nothing through the journey, the open day included",
       (await access({ mode: "calendar", progressError: { code: "XX000", message: "boom" } }, "N")).res, denied);

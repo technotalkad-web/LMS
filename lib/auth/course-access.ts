@@ -306,20 +306,26 @@ export async function learnerCanAccessCourse(opts: {
             unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
             courseDays: courseDaysOf(v.days, v.days_total),
           });
-          // Launchable: a day up to the one the learner may open now, or a
-          // credited day whose credit row holds this course, for review
-          // (ADR 0024 step 45; step 22's row for `?journey=E&day=`: "the day
-          // is credited and this course is the course on its credit row"). A
-          // re-pin can number a credited day above the open day, so a
-          // credited day is granted by its own credit, never by being under
-          // the ceiling, and only for the course its credit was earned on: a
-          // publish that swapped the day's course does not offer the new
-          // course inside the journey (section 95's row "A day's course
-          // swapped"), and a credit row without a course grants nothing.
+          // Launchable (ADR 0024 step 45): a course day at or below the
+          // ceiling, the day the learner may open now; or, above it, a
+          // credited day whose credit row holds this course, for review.
           // Progress mode has no calendar ceiling, so it keys off
-          // openableDay; calendar keeps the drip ceiling. Step 23's grant
-          // (P2-6) adds the rest: a started day past the ceiling, and the
-          // credit row's own course once the day holds another.
+          // openableDay; calendar keeps the drip ceiling. A re-pin can number
+          // a credited day above the open day. There (past the ceiling) the
+          // day is granted only for the course on its credit row (step 22's
+          // row for `?journey=E&day=`: "the day is credited and this course
+          // is the course on its credit row"), so a publish that swapped its
+          // course does not offer the new course (section 95's row "A day's
+          // course swapped"), and a credit row whose course is null grants
+          // nothing. At or below the ceiling the day's current course is
+          // granted as before, a credited day whose course a publish swapped
+          // included, and a completed enrolment (above) grants every course
+          // of its pinned version. Both are the P2-6 gap: step 22's rows for
+          // `?journey=E&day=` and for a completed E, and step 23's grant,
+          // which also adds a started day past the ceiling and the credit
+          // row's own course once the day holds another (granted nowhere
+          // today). tests/unit/journey-state.test.ts (f) pins today's
+          // behaviour, each case labelled "P2-6 gap (step 22)".
           const ceiling =
             v.unlock_mode === "progress"
               ? state.finished

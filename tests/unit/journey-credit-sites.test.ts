@@ -44,11 +44,13 @@
  *       the two journey_reminder_counts readers (REMINDER_FILES), on a const
  *       taken from reminderCountsFrom's countOf, so a failed read never
  *       reaches it as "nothing done".
- *   (6) every creditedDaysFor call takes the reader's answers: its first
- *       argument an object literal whose `day_ids` is a `<credits>.dayIdsOf(...)`
- *       call, its second a `<credits>.rowsOf(...)` call or a const bound to
- *       one. So no caller passes `day_ids: null` (by number on a database
- *       with 0107) or rows of its own.
+ *   (6) every creditedDaysFor and creditCoursesFor call (the two matchings
+ *       of credits to course days, by their imported names or an alias)
+ *       takes the reader's answers: its first argument an object literal
+ *       whose `day_ids` is a `<credits>.dayIdsOf(...)` call, its second a
+ *       `<credits>.rowsOf(...)` call or a const bound to one. So no caller
+ *       passes `day_ids: null` (by number on a database with 0107) or rows
+ *       of its own. creditCoursesFor is no source of `creditedDays` (rule 1).
  *
  * Not counts, and left as they are (named in the ADR's P2-4 report): the
  * journey page's streak and the Report Card's days in the period and "last
@@ -80,6 +82,8 @@ const SCAN_DIRS = ["app", "lib", "components"];
 const EXCLUDED = ["lib/journey/"];
 const TWIN = "computeJourneyState";
 const SOURCES = new Set(["creditedDaysFor", "reminderCreditedDays"]);
+/** The matchings of credits to course days that rule (6) holds to the reader's answers. */
+const MATCHERS = new Set(["creditedDaysFor", "creditCoursesFor"]);
 const TABLE = "journey_day_progress";
 const READER_MODULE = /(^|\/)lib\/journey\/credits-read$|^@\/lib\/journey\/credits-read$|(^|\/)journey\/credits-read$/;
 
@@ -161,8 +165,9 @@ type FileScan = {
   carriesCreditedDays: boolean[];
   /** Rules (5) and (6): each a line and its problem. */
   countProblems: Array<{ line: number; problem: string }>;
-  /** The creditedDaysFor and reminderCreditedDays calls rules (6) and (5c) checked. */
+  /** The creditedDaysFor, creditCoursesFor and reminderCreditedDays calls rules (6) and (5c) checked. */
   creditedCalls: number;
+  creditCourseCalls: number;
   reminderCalls: number;
 };
 
@@ -177,7 +182,7 @@ const isFn = (n: ts.Node): n is ts.FunctionLikeDeclaration =>
 function scanFile(file: string, text: string, carrierSources: (f: string) => boolean[] = () => []): FileScan {
   const sf = parse(file, text);
   const twinNames = new Set<string>();
-  const sourceNames = new Map<string, string>(); // local name → imported name (creditedDaysFor / reminderCreditedDays)
+  const sourceNames = new Map<string, string>(); // local name → imported name (creditedDaysFor / creditCoursesFor / reminderCreditedDays)
   let importsReader = false;
   let importsReadJourneyCredits = false;
   for (const st of sf.statements) {
@@ -189,7 +194,7 @@ function scanFile(file: string, text: string, carrierSources: (f: string) => boo
       for (const el of named.elements) {
         const imported = (el.propertyName ?? el.name).text;
         if (imported === TWIN) twinNames.add(el.name.text);
-        if (SOURCES.has(imported)) sourceNames.set(el.name.text, imported);
+        if (SOURCES.has(imported) || MATCHERS.has(imported)) sourceNames.set(el.name.text, imported);
         if (imported === "readJourneyCredits" && READER_MODULE.test(mod)) importsReadJourneyCredits = true;
       }
     }
@@ -201,7 +206,8 @@ function scanFile(file: string, text: string, carrierSources: (f: string) => boo
     return false;
   };
   const isTwin = (c: ts.CallExpression) => calleeIs(c, (n) => n === TWIN || twinNames.has(n));
-  const isSource = (c: ts.CallExpression) => calleeIs(c, (n) => SOURCES.has(n) || sourceNames.has(n));
+  // A source of creditedDays (rule 1): an alias resolves to its imported name, so creditCoursesFor never is one.
+  const isSource = (c: ts.CallExpression) => calleeIs(c, (n) => SOURCES.has(sourceNames.get(n) ?? n));
   const containsSource = (n: ts.Node): boolean => {
     let found = false;
     const v = (x: ts.Node) => {
@@ -253,7 +259,7 @@ function scanFile(file: string, text: string, carrierSources: (f: string) => boo
   const out: FileScan = {
     twinCalls: [], tableSites: [], dayNumberSites: [],
     importsReader, importsReadJourneyCredits, callsCreditedDaysFor: false, carriesCreditedDays: [], countProblems: [],
-    creditedCalls: 0, reminderCalls: 0,
+    creditedCalls: 0, creditCourseCalls: 0, reminderCalls: 0,
   };
 
   // Rules (5) and (6).
@@ -280,7 +286,14 @@ function scanFile(file: string, text: string, carrierSources: (f: string) => boo
     if (isMethodCall(v, "rowsOf")) return true;
     return ts.isIdentifier(v) && constWhose(v.text, at, (init) => isMethodCall(unparen(init), "rowsOf"));
   };
-  const isCreditedDaysFor = (c: ts.CallExpression) => calleeIs(c, (k) => k === "creditedDaysFor" || sourceNames.get(k) === "creditedDaysFor");
+  /** The matching a call names (creditedDaysFor or creditCoursesFor, by its imported name), or null. */
+  const matcherOf = (c: ts.CallExpression): string | null => {
+    const e = c.expression;
+    const k = ts.isIdentifier(e) ? e.text : ts.isPropertyAccessExpression(e) ? e.name.text : null;
+    if (k === null) return null;
+    const imported = sourceNames.get(k) ?? k;
+    return MATCHERS.has(imported) ? imported : null;
+  };
   const isReminderCreditedDays = (c: ts.CallExpression) => calleeIs(c, (k) => k === "reminderCreditedDays" || sourceNames.get(k) === "reminderCreditedDays");
   const countRules = (n: ts.Node) => {
     const line = () => lineOf(sf, n);
@@ -308,9 +321,11 @@ function scanFile(file: string, text: string, carrierSources: (f: string) => boo
         out.countProblems.push({ line: line(), problem: "reminderCreditedDays on a row that is not a const taken from reminderCountsFrom's countOf" });
       }
     }
-    // (6) creditedDaysFor takes the reader's answers
-    if (ts.isCallExpression(n) && isCreditedDaysFor(n)) {
-      out.creditedCalls++;
+    // (6) creditedDaysFor and creditCoursesFor take the reader's answers
+    const fn = ts.isCallExpression(n) ? matcherOf(n) : null;
+    if (ts.isCallExpression(n) && fn) {
+      if (fn === "creditedDaysFor") out.creditedCalls++;
+      else out.creditCourseCalls++;
       const [a0, a1] = n.arguments;
       const v0 = a0 ? unparen(a0) : undefined;
       const dayIds = v0 && ts.isObjectLiteralExpression(v0)
@@ -318,10 +333,10 @@ function scanFile(file: string, text: string, carrierSources: (f: string) => boo
         : undefined;
       const spread = v0 && ts.isObjectLiteralExpression(v0) && v0.properties.some((p) => ts.isSpreadAssignment(p));
       if (!dayIds || spread || !isMethodCall(unparen(dayIds.initializer), "dayIdsOf")) {
-        out.countProblems.push({ line: line(), problem: "creditedDaysFor's day_ids is not `<credits>.dayIdsOf(...)` in an object literal" });
+        out.countProblems.push({ line: line(), problem: `${fn}'s day_ids is not \`<credits>.dayIdsOf(...)\` in an object literal` });
       }
       if (!a1 || !isRows(a1, n)) {
-        out.countProblems.push({ line: line(), problem: "creditedDaysFor's rows are not `<credits>.rowsOf(...)` or a const bound to it" });
+        out.countProblems.push({ line: line(), problem: `${fn}'s rows are not \`<credits>.rowsOf(...)\` or a const bound to it` });
       }
     }
   };
@@ -397,11 +412,13 @@ console.log("\n(a) the repository");
   eq("the callers of computeJourneyState, by file and count (P2-N3's twelve calls and the dashboard's)", callers, CALLERS);
   const problems = [...scans].flatMap(([f, s]) => problemsOf(f, s));
   eq("rules (1) to (6) hold in every file", problems, []);
-  // Non-vacuous: rule (6) saw every creditedDaysFor call and (5c) both reminder calls.
-  const seen = (k: "creditedCalls" | "reminderCalls") =>
+  // Non-vacuous: rule (6) saw every creditedDaysFor call and course-access's
+  // creditCoursesFor call, and (5c) both reminder calls.
+  const seen = (k: "creditedCalls" | "creditCourseCalls" | "reminderCalls") =>
     Object.fromEntries([...scans].filter(([, s]) => s[k] > 0).map(([f, s]) => [f, s[k]]).sort(([a], [b]) => String(a).localeCompare(String(b))));
   eq("rule (6) checked the creditedDaysFor call of every file that reads credits", Object.keys(seen("creditedCalls")),
     [...scans].filter(([, s]) => s.importsReadJourneyCredits).map(([f]) => f).sort((a, b) => a.localeCompare(b)));
+  eq("rule (6) checked the one creditCoursesFor call, course-access's", seen("creditCourseCalls"), { "lib/auth/course-access.ts": 1 });
   eq("rule (5c) checked the two reminder readers' calls", seen("reminderCalls"), Object.fromEntries([...REMINDER_FILES].sort().map((f) => [f, 1])));
   for (const [f, n] of Object.entries(NOT_CREDIT_READERS)) {
     eq(`${f}: exactly ${n.sites} read of ${TABLE}, not a credit count (${n.why})`, scans.get(f)?.tableSites.length ?? 0, n.sites);
@@ -428,7 +445,7 @@ console.log("\n(a) the repository");
 console.log("\n(b) planted cases");
 {
   const F = "app/planted/page.tsx";
-  const IMPORTS = `import { computeJourneyState, creditedDaysFor, reminderCreditedDays } from "@/lib/journey/journey";\nimport { readJourneyCredits } from "@/lib/journey/credits-read";\n`;
+  const IMPORTS = `import { computeJourneyState, creditCoursesFor, creditedDaysFor, reminderCreditedDays } from "@/lib/journey/journey";\nimport { readJourneyCredits } from "@/lib/journey/credits-read";\n`;
   const run = (body: string, file = F) => problemsOf(file, scanFile(file, `${IMPORTS}${body}`));
   const ARGS = "startDate: s, today: t, daysTotal: 5, countSundays: false, courseDays: cd";
   // creditedDaysFor as the reader answers it (rule 6).
@@ -501,6 +518,17 @@ console.log("\n(b) planted cases");
     why(run(`const c = creditedDaysFor({ ...v, day_ids: credits.dayIdsOf(id) }, credits.rowsOf(e.id));`)).length, 1);
   eq("…the rows as a const bound to rowsOf pass",
     run(`function f() { const progress = credits.rowsOf(e.id); return creditedDaysFor({ days: v.days, days_total: 5, day_ids: credits.dayIdsOf(e.version_id) }, progress); }`), []);
+  eq("…creditCoursesFor is held to the same contract: day_ids: null is flagged, by its name",
+    why(run(`const m = creditCoursesFor({ days: v.days, days_total: 5, day_ids: null }, credits.rowsOf(e.id));`)),
+    ["creditCoursesFor's day_ids is not `<credits>.dayIdsOf(...)` in an object literal"]);
+  eq("…creditCoursesFor as the reader answers it passes",
+    run(`const m = creditCoursesFor({ days: v.days, days_total: 5, day_ids: credits.dayIdsOf(e.version_id) }, credits.rowsOf(e.id));`), []);
+  eq("…an aliased import of creditCoursesFor is followed (a version passed whole, rows of its own)",
+    why(problemsOf(F, scanFile(F, `import { creditCoursesFor as ccf } from "@/lib/journey/journey";\nconst m = ccf(v, rows);`))),
+    ["creditCoursesFor's day_ids is not `<credits>.dayIdsOf(...)` in an object literal", "creditCoursesFor's rows are not `<credits>.rowsOf(...)` or a const bound to it"]);
+  eq("(1) creditCoursesFor is no source of creditedDays",
+    why(run(`computeJourneyState({ ${ARGS}, creditedDays: creditCoursesFor({ days: v.days, days_total: 5, day_ids: credits.dayIdsOf(e.version_id) }, credits.rowsOf(e.id)) });`)),
+    ["creditedDays: `creditCoursesFor({ days: v.days, days_total: 5, day_ids: credits.dayIdsOf(e.version_id) }, credits.rowsOf(e.id))` is not from creditedDaysFor or reminderCreditedDays"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
