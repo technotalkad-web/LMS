@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
 
 /**
  *   POST /api/auth/change-password
@@ -56,6 +57,10 @@ export async function POST(request: Request) {
   if (pwErr) {
     return NextResponse.json({ error: pwErr.message }, { status: 400 });
   }
+
+  // A changed password ends an impersonation this user started on this
+  // browser; they can start a new one. Never throws.
+  await endImpersonationForSessionChange();
 
   // Clear the must_change_password flag with service-role.
   const svc = createServiceClient(

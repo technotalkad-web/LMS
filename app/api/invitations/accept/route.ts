@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
 
 /**
  *   POST /api/invitations/accept
@@ -136,6 +137,9 @@ export async function POST(request: Request) {
     .eq("id", invitation.id);
 
   // 5) Sign the user in (cookie-bound) so the next page sees the session.
+  // This browser may be signed in as someone else: end an impersonation
+  // first, while its owner may still be signed in. Never throws.
+  await endImpersonationForSessionChange();
   const supabase = await createClient();
   const { error: signInError } = await supabase.auth.signInWithPassword({
     email,

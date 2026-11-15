@@ -1,8 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { originFromRequest } from "@/lib/http/origin";
+import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
 
 export async function POST(request: Request) {
+  // End an impersonation first, while the platform owner who started it is
+  // still signed in (the row is stamped only for them). It never throws, so
+  // sign-out always goes ahead.
+  await endImpersonationForSessionChange();
   const supabase = await createClient();
   await supabase.auth.signOut();
   // Public origin from the live headers — behind a proxy request.url holds
