@@ -1,15 +1,16 @@
 /**
- * The sign-in `next` guard (lib/auth/safe-next.ts safeNextPath): a sign-in
- * callback, a magic link and the CRM entry route send a user only to an
- * address on this site.
+ * The sign-in `next` guard (lib/auth/safe-next.ts safeNextPath): the tenant
+ * password sign-in, a sign-in callback, a magic link and the CRM entry route
+ * send a user only to an address on this site.
  *
  *   (a) safeNextPath: an address on this site passes unchanged, query
  *       included; "//host", "/\host", a scheme, a bare host, a control
  *       character and an empty value are refused. Every address it keeps,
  *       appended to a real origin, stays on that origin.
- *   (b) the server routes that redirect to a caller-supplied address read
- *       it through safeNextPath, and no copy of the old one-line guard is
- *       left in them: the auth callback (`next`), the magic-link route
+ *   (b) every sign-in step that redirects to a caller-supplied address
+ *       reads it through safeNextPath, and no copy of the old one-line
+ *       guard is left in them: the tenant password sign-in page (`next`,
+ *       in the browser), the auth callback (`next`), the magic-link route
  *       (`next`, carried into the e-mailed link) and the CRM entry route
  *       (`to`).
  *
@@ -77,8 +78,9 @@ eq("every kept value appended to the origin stays on it",
 eq("every kept value resolved against the origin stays on it",
   kept.every((k) => new URL(safeNextPath(k) ?? "/", ORIGIN).origin === ORIGIN), true);
 
-console.log("\n(b) every server redirect to a caller-supplied address reads it through safeNextPath");
+console.log("\n(b) every sign-in redirect to a caller-supplied address reads it through safeNextPath");
 const CONSUMERS = [
+  "app/[org]/login/branded-login.tsx",
   "app/auth/callback/route.ts",
   "app/api/auth/magic-link/route.ts",
   "app/api/integrations/enter/route.ts",
@@ -88,6 +90,10 @@ for (const f of CONSUMERS) {
   eq(`${f}: imports safeNextPath from lib/auth/safe-next`, /import \{[^}]*\bsafeNextPath\b[^}]*\} from "@\/lib\/auth\/safe-next";/.test(src), true);
   eq(`${f}: no startsWith("//") guard of its own`, /startsWith\(\s*["']\/\/["']\s*\)/.test(src), false);
 }
+eq("the tenant password sign-in falls back to the org dashboard when next is refused",
+  /return safeNextPath\(new URLSearchParams\(window\.location\.search\)\.get\("next"\)\) \?\? `\/\$\{orgSlug\}\/dashboard`;/.test(read("app/[org]/login/branded-login.tsx")), true);
+eq("the tenant password sign-in reads next no other way",
+  (read("app/[org]/login/branded-login.tsx").match(/\.get\("next"\)/g) ?? []).length, 1);
 eq("the callback falls back to /select-org when next is refused",
   /const next = safeNextPath\(searchParams\.get\("next"\)\) \?\? "\/select-org";/.test(read("app/auth/callback/route.ts")), true);
 eq("the callback reads next no other way",
