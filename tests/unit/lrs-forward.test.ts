@@ -172,10 +172,11 @@ const list = (v: string | null) => (v ?? "").replace(/^in\.\(|\)$/g, "").split("
  * An outbox, an LRS and a clock. n rows, s0 to s(n-1), in the order given. `config` answers the org's config read in place of
  * a healthy one; `attemptsAnswer` answers the drain's preview check (course_attempts), every read recorded in `attemptReads`;
  * `parkAnswer` answers each park write, every one recorded in `parkWrites` with the query parameters it filters on (`params`:
- * the fake PATCH honours `id` alone, so any other filter shows there). Every outbox DELETE is recorded in `outboxDeletes`, and a
- * run counts every PostgREST call it makes (`calls`).
+ * the fake PATCH honours `id` alone, so any other filter shows there). `dueAnswer` answers the drain's due read (the outbox
+ * GET): the due rows, or a 500 (the route's dueError). Every outbox DELETE is recorded in `outboxDeletes`, and a run counts
+ * every PostgREST call it makes (`calls`).
  */
-function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer, attemptsAnswer: () => AttemptsAnswer = () => "0107", parkAnswer: () => ParkAnswer = () => "ok") {
+function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => ConfigAnswer, attemptsAnswer: () => AttemptsAnswer = () => "0107", parkAnswer: () => ParkAnswer = () => "ok", dueAnswer: () => "ok" | 500 = () => "ok") {
   const start = Date.parse("2026-01-01T00:00:00.000Z");
   const clock = { now: start };
   const rows: Row[] = specs.map((sp, i) => {
@@ -196,6 +197,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
   const attemptReads: Array<{ ids: string[]; contextKind: string | null }> = [];
   const parkWrites: Array<{ ids: string[]; ok: boolean; params: string[] }> = [];
   const outboxDeletes: string[][] = [];
+  const heartbeats: Array<{ name: string; last_status: string; last_detail: Record<string, unknown> | null }> = [];
   const conflicts = new Set(rows.filter((_, i) => specs[i].conflict).map((r) => r.payload.id));
   const fail500 = new Set(rows.filter((_, i) => specs[i].fail500).map((r) => r.payload.id));
   const stored = new Set<string>();
@@ -226,6 +228,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
     callsThisRun++;
     if (url.pathname === "/rest/v1/lrs_forward_outbox") {
       if (method === "GET") {
+        if (dueAnswer() === 500) return json({ message: "upstream connect error" }, 500);
         const lte = (url.searchParams.get("next_attempt_at") ?? "").replace(/^lte\./, "");
         const due = rows
           .filter((r) => (r.status === "pending" || r.status === "failed") && r.next_attempt_at <= lte)
@@ -281,6 +284,12 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       if (answer === "no endpoint") return json([{ ...cfg(org), endpoint: null }]);
       return json([cfg(org)]);
     }
+    if (url.pathname === "/rest/v1/ops_heartbeats" && method === "POST") {
+      // recordHeartbeat's upsert (lib/ops/heartbeat.ts): one row per run.
+      const beat = JSON.parse(String(init?.body));
+      heartbeats.push(Array.isArray(beat) ? beat[0] : beat);
+      return json([], 201);
+    }
     return json([], 201);
   }) as typeof fetch;
 
@@ -301,6 +310,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
     attemptReads,
     parkWrites,
     outboxDeletes,
+    heartbeats,
     open,
     /**
      * "Resend all history" as lib/lrs/sweep.ts writes it (pinned below): the org's rows whose status is not pending go back to
@@ -311,7 +321,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
         if (r.organization_id === org && r.status !== "pending") Object.assign(r, { status: "pending", attempts: 0, last_error: null, next_attempt_at: new Date(clock.now).toISOString() });
       }
     },
-    /** One cron firing, 5 minutes after the last. Answers the route's body, the posts it made and its PostgREST calls. */
+    /** One cron firing, 5 minutes after the last. Answers the route's HTTP status and body, the posts it made and its PostgREST calls. */
     async run() {
       const { POST } = await import("../../app/api/cron/lrs-forward/route");
       clock.now += CADENCE_MS;
@@ -322,7 +332,7 @@ function world(specs: Spec[], mode: LrsMode = "fake", config?: (org: string) => 
       Math.random = random;
       try {
         const res = await POST(new Request("http://lms.test/api/cron/lrs-forward", { method: "POST", headers: { "x-cron-secret": "stub-cron" } }));
-        return { body: (await res.json()) as Record<string, unknown>, posts: postsThisRun, calls: callsThisRun };
+        return { status: res.status, body: (await res.json()) as Record<string, unknown>, posts: postsThisRun, calls: callsThisRun };
       } finally {
         (globalThis as { Date: unknown }).Date = RealDate;
         Math.random = realRandom;
@@ -719,6 +729,89 @@ async function routeCases() {
     eq("both park writes fail: the body names the first error, counts none parked; nothing posted, every row still due",
       [body.parkError, body.previewsParked, posts, w.rows.filter(isParked).length, w.rows.filter((r) => r.next_attempt_at === "2026-01-01T00:00:00.000Z").length],
       ["first write failed", 0, 0, 0, 200]);
+  }
+
+  console.log("\nthe cron route: a failed preview check or park write makes the heartbeat not-OK (owner, 2026-11-15; ADR 0024)");
+  {
+    /** The run's verdict as the body and the heartbeat carry it: [HTTP status, body ok, body reason, heartbeat name, last_status, last_detail is the body]. */
+    const verdict = (w: ReturnType<typeof world>, r: { status: number; body: Record<string, unknown> }) => {
+      const beat = w.heartbeats[w.heartbeats.length - 1];
+      return [r.status, r.body.ok, r.body.reason ?? null, w.heartbeats.length, beat?.name, beat?.last_status, JSON.stringify(beat?.last_detail) === JSON.stringify(r.body)];
+    };
+    const OK = (beats = 1) => [200, true, null, beats, "lrs-forward", "ok", true];
+    const NOT_OK = (reason: string, beats = 1) => [200, false, reason, beats, "lrs-forward", "error", true];
+
+    const clean = world(rowsOf(4));
+    const c = await clean.run();
+    eq("a clean run (rows that name no attempt): ok, no reason, heartbeat ok", verdict(clean, c), OK());
+    eq("…the body has no reason key", "reason" in c.body, false);
+    const real = world([{ attempt: "att-real" }, {}]);
+    eq("a clean run with a preview check that finds none: ok, heartbeat ok", verdict(real, await real.run()), OK());
+    const empty = world([]);
+    eq("a run with nothing due: ok, heartbeat ok", verdict(empty, await empty.run()), OK());
+
+    const mixed = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}]);
+    eq("a run with a preview parked (a row posted): ok, heartbeat ok", verdict(mixed, await mixed.run()), OK());
+    const onlyPreviews = world([{ attempt: "att-prev", preview: true }, { attempt: "att-prev", preview: true }]);
+    const op = await onlyPreviews.run();
+    eq("a run with only previews, all parked (nothing posted): ok, heartbeat ok", [verdict(onlyPreviews, op), op.body.previewsParked], [OK(), 2]);
+
+    const failedCheck = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => 500);
+    const fc = await failedCheck.run();
+    eq("a failed preview check (a row naming no attempt still posted): not ok, reason names the check and counts the held rows, heartbeat error",
+      verdict(failedCheck, fc), NOT_OK("preview check failed: held 2"));
+    eq("…the error text stays in previewCheckError, not in the reason", [fc.body.previewCheckError, /upstream/.test(String(fc.body.reason))], ["upstream connect error", false]);
+
+    const heldOnly = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }], "fake", undefined, () => 500);
+    const ho = await heldOnly.run();
+    eq("held rows alone (every due row names an attempt and the check fails): not ok, heartbeat error",
+      [verdict(heldOnly, ho), ho.body.processed, ho.body.held, ho.posts], [NOT_OK("preview check failed: held 2"), 0, 2, 0]);
+    for (const answer of ["nodata", "other42703"] as const) {
+      const w = world([{ attempt: "att-a" }], "fake", undefined, () => answer);
+      eq(`a check answered ${answer} (fail-closed): not ok, heartbeat error`, verdict(w, await w.run()), NOT_OK("preview check failed: held 1"));
+    }
+
+    const parkFails = world([{ attempt: "att-real" }, { attempt: "att-prev", preview: true }, {}], "fake", undefined, () => "0107", () => 500);
+    const pf = await parkFails.run();
+    eq("a failed park write (the others posted): not ok, reason counts the rows not parked, heartbeat error",
+      [verdict(parkFails, pf), pf.body.sent], [NOT_OK("park write failed: 1 of 1 not parked"), 2]);
+    eq("…the error text stays in parkError, not in the reason", [pf.body.parkError, /upstream/.test(String(pf.body.reason))], ["upstream connect error", false]);
+
+    const parkFailsOnly = world([{ attempt: "att-prev", preview: true }, { attempt: "att-prev", preview: true }], "fake", undefined, () => "0107", () => 500);
+    eq("a failed park write with nothing else due: not ok, heartbeat error",
+      verdict(parkFailsOnly, await parkFailsOnly.run()), NOT_OK("park write failed: 2 of 2 not parked"));
+
+    let n = 0;
+    const partial = world(rowsOf(200, (i) => ({ attempt: `att-${i}`, preview: true })), "fake", undefined, () => "0107", () => (++n === 1 ? 500 : "ok"));
+    const pp = await partial.run();
+    eq("one of two park writes fails: not ok, 150 of 200 not parked, 50 counted parked",
+      [verdict(partial, pp), pp.body.previewsParked], [NOT_OK("park write failed: 150 of 200 not parked"), 50]);
+    const pp2 = await partial.run();
+    eq("…the next run parks the rest: ok again, heartbeat ok", [verdict(partial, pp2), pp2.body.previewsParked], [OK(2), 150]);
+
+    let answer: AttemptsAnswer = 500;
+    const recovers = world([{ attempt: "att-real" }, {}], "fake", undefined, () => answer);
+    const failing = verdict(recovers, await recovers.run());
+    answer = "0107";
+    const recovered = verdict(recovers, await recovers.run());
+    eq("a failed check, then a clean run: not ok, then ok (the warn clears)", [failing, recovered], [NOT_OK("preview check failed: held 1"), OK(2)]);
+
+    const outage = world(rowsOf(4), 503);
+    const o = await outage.run();
+    eq("every other outcome is unchanged: an LRS outage (every row failed) is still ok", [verdict(outage, o), o.body.failed], [OK(), 4]);
+    const no0107 = world([{ attempt: "att-a" }, { attempt: "att-b", preview: true }], "fake", undefined, () => "no0107");
+    eq("…a database without 0107 is still ok", verdict(no0107, await no0107.run()), OK());
+    const noConfig = world(rowsOf(2), "fake", () => 500);
+    eq("…a failed config read (rows left due) is still ok", verdict(noConfig, await noConfig.run()), OK());
+    for (const answer of ["disabled", "no endpoint"] as const) {
+      const off = world(rowsOf(3), "fake", () => answer);
+      const r = await off.run();
+      eq(`…forwarding off (${answer}; rows dropped, none posted) is still ok`, [verdict(off, r), off.rows.length, r.posts], [OK(), 0, 0]);
+    }
+    const dueFails = world(rowsOf(3), "fake", undefined, undefined, undefined, () => 500);
+    const df = await dueFails.run();
+    eq("…a failed due read (nothing processed, dueError reported) is still ok",
+      [verdict(dueFails, df), df.body.processed, df.body.dueError, dueFails.rows.length, df.posts], [OK(), 0, "upstream connect error", 3, 0]);
   }
 
   console.log("\nthe cron route: the calls the preview check adds to a run (P2-6's subrequest count)");

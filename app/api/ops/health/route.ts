@@ -29,7 +29,8 @@ export const dynamic = "force-dynamic";
  * the worker (true on PROD, where cron.yml fires; staging has no schedule, so
  * heartbeats there are naturally stale and must not page anyone). A stale job
  * of SUBDAILY_STALE_WARN reads WARN instead, up to SUBDAILY_STALE_DEGRADED_MIN;
- * a job never seen reads DEGRADED (lib/ops/health-status.ts).
+ * a job never seen reads DEGRADED; a job of ERRORED_WARN whose last run errored
+ * reads WARN (lib/ops/health-status.ts).
  */
 
 type Check = { status: CheckStatus; latency_ms?: number; detail?: unknown };
@@ -74,6 +75,15 @@ const CRON_CADENCE_MIN: Record<string, number> = {
  */
 const SUBDAILY_STALE_WARN = ["lrs-forward", "gamification-refresh", "journey-nudges"];
 const SUBDAILY_STALE_DEGRADED_MIN = 26 * 60;
+
+/**
+ * The jobs whose errored last run reads "warn" while their heartbeat is fresh
+ * (the owner's decision of 2026-11-15; ADR 0024, the note of that date).
+ * lrs-forward reports not-OK when its preview check or its park write fails
+ * (app/api/cron/lrs-forward/route.ts). Any other job's errored run still
+ * reads "ok", as before. tests/unit/cron-cadence.test.ts checks the list.
+ */
+const ERRORED_WARN = ["lrs-forward"];
 
 const OUTBOX_BACKLOG_WARN = 50; // overdue-but-undelivered statements
 const EMAIL_FAILURES_WARN = 5; // failed sends in the last 24h
@@ -130,6 +140,7 @@ async function checkCrons(expectCrons: boolean): Promise<Check> {
       cadenceMin: CRON_CADENCE_MIN,
       staleWarnOnly: SUBDAILY_STALE_WARN,
       staleDegradedAfterMin: SUBDAILY_STALE_DEGRADED_MIN,
+      erroredWarn: ERRORED_WARN,
       rows: (data ?? []) as HeartbeatRow[],
       nowMs: Date.now(),
       expectCrons,

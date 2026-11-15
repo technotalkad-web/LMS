@@ -4,7 +4,9 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
  * Liveness heartbeat for scheduled jobs. Every /api/cron/* route calls
  * recordHeartbeat(<job name>) at the end of a run (including runs that found
  * no work — a quiet period must still read as "alive"). /api/ops/health then
- * flags any job whose last_run_at is older than its expected cadence.
+ * flags any job whose last_run_at is older than its expected cadence, and a
+ * job of its ERRORED_WARN list whose last run passed ok = false
+ * (lib/ops/health-status.ts).
  *
  * Fully fail-isolated: a missing table (migration 0050 not applied yet) or a
  * transient DB error must never break the cron itself — same contract as

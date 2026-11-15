@@ -14,7 +14,8 @@
  *   - each threshold is longer than its schedule's nominal interval;
  *   - every schedule line has exactly one case arm and every arm a schedule;
  *   - SUBDAILY_STALE_WARN is exactly the cadence entries whose schedule fires
- *     more than once a day, and its ceiling is at least a day.
+ *     more than once a day, and its ceiling is at least a day;
+ *   - ERRORED_WARN names lrs-forward alone, and only cadence entries.
  *
  * A job scheduled outside cron.yml (pg_cron, ADR 0007 step 11) would need its
  * own list here.
@@ -193,7 +194,7 @@ eq(
   []
 );
 {
-  // The route hands exactly these two constants (and the cadence map) to classifyCrons.
+  // The route hands exactly these constants (the cadence map, the two stale ones and ERRORED_WARN) to classifyCrons.
   const file = path.join(root, HEALTH_ROUTE);
   const sf = ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
   const wiring: Record<string, string>[] = [];
@@ -220,6 +221,25 @@ eq(
     wiring.map((w) => [w.cadenceMin, w.staleWarnOnly, w.staleDegradedAfterMin]),
     [["CRON_CADENCE_MIN", "SUBDAILY_STALE_WARN", "SUBDAILY_STALE_DEGRADED_MIN"]]
   );
+  // The owner's decision of 2026-11-15 (ADR 0024, the note of that date): an
+  // errored last run of lrs-forward reads "warn"; any other job's still "ok".
+  eq("…and ERRORED_WARN as erroredWarn", wiring.map((w) => w.erroredWarn), ["ERRORED_WARN"]);
+  const errored: string[][] = [];
+  const visitList = (node: ts.Node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "ERRORED_WARN" && node.initializer) {
+      if (!ts.isArrayLiteralExpression(node.initializer)) throw new Error("ERRORED_WARN is not an array literal");
+      errored.push(
+        node.initializer.elements.map((e) => {
+          if (!ts.isStringLiteral(e)) throw new Error(`unsupported ERRORED_WARN element: ${e.getText()}`);
+          return e.text;
+        })
+      );
+    }
+    ts.forEachChild(node, visitList);
+  };
+  visitList(sf);
+  eq("ERRORED_WARN is declared once and names lrs-forward alone", errored, [["lrs-forward"]]);
+  eq("…every entry is a cadence entry", (errored[0] ?? []).filter((j) => !cadence.has(j)), []);
 }
 
 console.log("\neach cadence entry's route records its heartbeat under that name");

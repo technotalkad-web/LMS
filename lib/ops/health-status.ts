@@ -12,6 +12,12 @@
  *     because GitHub starts only a share of their scheduled runs; past that
  *     age it reads "fail";
  *   - any other stale job reads "fail".
+ *
+ * An errored last run (the owner's decision of 2026-11-15; ADR 0024, the note
+ * of that date): a job in `erroredWarn` whose heartbeat is not stale and whose
+ * last_status is not "ok" reads "warn", on production only. Staleness is read
+ * first and keeps its rules. Any other job's errored last run still reads
+ * "ok"; its state says last-run-errored.
  */
 
 export type CheckStatus = "ok" | "warn" | "fail" | "unknown";
@@ -28,12 +34,14 @@ export function classifyCrons(input: {
   cadenceMin: Record<string, number>;
   staleWarnOnly: readonly string[];
   staleDegradedAfterMin: number;
+  erroredWarn: readonly string[];
   rows: HeartbeatRow[];
   nowMs: number;
   expectCrons: boolean;
 }): { status: "ok" | "warn" | "fail"; jobs: Record<string, CronJobState> } {
   const byName = new Map(input.rows.map((r) => [r.name, r]));
   const warnOnly = new Set(input.staleWarnOnly);
+  const erroredWarn = new Set(input.erroredWarn);
   const jobs: Record<string, CronJobState> = {};
   let failing = 0;
   let warning = 0;
@@ -51,7 +59,11 @@ export function classifyCrons(input: {
       last_run_at: row.last_run_at,
       age_min: ageMin,
     };
-    if (!isStale || !input.expectCrons) continue;
+    if (!input.expectCrons) continue;
+    if (!isStale) {
+      if (erroredWarn.has(name) && row.last_status !== "ok") warning++;
+      continue;
+    }
     if (warnOnly.has(name) && ageMin <= input.staleDegradedAfterMin) warning++;
     else failing++;
   }

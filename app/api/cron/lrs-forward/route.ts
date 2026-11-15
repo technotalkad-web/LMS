@@ -136,7 +136,15 @@ export async function POST(request: Request) {
   // run, checked again, still never posted. A failed check holds every row that
   // names an attempt for the next run, untouched, as a failed config read does,
   // and lets only the rows that name none go out.
+  //
+  // Either failure makes the run not-OK (the owner's decision of 2026-11-15;
+  // ADR 0024, the note of that date): the body and the heartbeat answer
+  // ok: false with a `reason` that names the check and counts rows only (the
+  // error text stays in previewCheckError or parkError), so ops health reads
+  // warn (ERRORED_WARN in app/api/ops/health/route.ts). The HTTP status stays
+  // 200. Every other outcome is OK, as before, a failed due read included.
   const previewCheck: { previewsParked?: number; parkError?: string; held?: number; previewCheckError?: string } = {};
+  let notOk: string | undefined;
   if (rows.some((r) => r.attempt_id)) {
     const check = await previewRowIds(db, rows);
     if ("error" in check) {
@@ -144,6 +152,7 @@ export async function POST(request: Request) {
       rows = rows.filter((r) => !r.attempt_id);
       previewCheck.held = before - rows.length;
       previewCheck.previewCheckError = check.error;
+      notOk = `preview check failed: held ${previewCheck.held}`;
     } else if (check.ids.size > 0) {
       rows = rows.filter((r) => !check.ids.has(r.id));
       let parked = 0;
@@ -156,8 +165,10 @@ export async function POST(request: Request) {
         else parked += part.length;
       }
       previewCheck.previewsParked = parked;
+      if (previewCheck.parkError) notOk = `park write failed: ${check.ids.size - parked} of ${check.ids.size} not parked`;
     }
   }
+  const verdict: { ok: boolean; reason?: string } = notOk ? { ok: false, reason: notOk } : { ok: true };
 
   // 0078: derive LMS events / (re)enqueue history for every enabled org, sized
   // for the Worker budget: `statements` plus ONE rotating source per run, small
@@ -186,8 +197,8 @@ export async function POST(request: Request) {
 
   if (rows.length === 0) {
     const sweepSummary = summarize(await runSweep());
-    const body = { ok: true, processed: 0, ...previewCheck, sweep: sweepSummary, ...(dueError ? { dueError: dueError.message } : {}) };
-    await recordHeartbeat("lrs-forward", body);
+    const body = { ...verdict, processed: 0, ...previewCheck, sweep: sweepSummary, ...(dueError ? { dueError: dueError.message } : {}) };
+    await recordHeartbeat("lrs-forward", body, verdict.ok);
     return NextResponse.json(body);
   }
 
@@ -293,7 +304,7 @@ export async function POST(request: Request) {
   }
 
   const sweepSummary = summarize(await runSweep());
-  const body = { ok: true, processed: rows.length, sent, failed, dead, unsettled, ...previewCheck, sweep: sweepSummary };
-  await recordHeartbeat("lrs-forward", body);
+  const body = { ...verdict, processed: rows.length, sent, failed, dead, unsettled, ...previewCheck, sweep: sweepSummary };
+  await recordHeartbeat("lrs-forward", body, verdict.ok);
   return NextResponse.json(body);
 }
