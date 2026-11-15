@@ -1,4 +1,4 @@
-# Ambak xAPI Analytics Profile (v1.1.0)
+# Ambak xAPI Analytics Profile (v1.2.0)
 
 The contract for every statement the LMS sends to an external Learning
 Record Store (Veracity, Watershed, Learning Locker, SQL LRS …). It is what
@@ -22,7 +22,7 @@ untouched, and the external copy is built read-only from those tables.
 | Namespace | `https://ambak.com/xapi/` on every environment (nothing is served there; identifiers only) |
 | Learner identity | `mbox` = learner's email (one inverse functional identifier, as the spec requires). Learners without an email fall back to `account { homePage: https://ambak.com/xapi/lms, name: <user id> }`. User id and employee id always ride along as extensions. |
 | Retail vs E2E | `learner/segment` = `E2E` when the business vertical is `Fulfillment` (or literally `E2E`), otherwise the vertical as-is. The raw vertical is also sent. |
-| History | The first time an org's forwarding is enabled, all history is sent. "Resend all history" in Settings does it again. Statement ids never change, so an LRS that already holds an id keeps its first copy. |
+| History | The first time an org's forwarding is enabled, all history is sent. "Resend all history" in Settings does it again. Statement ids never change, so an LRS that already holds an id keeps its first copy. A statement already sent is never renumbered or rebuilt (§5, "Learning contexts"). |
 | Per-org format | `tenant_lrs_config.statement_profile`: `ambak-v1` (default, this profile) or `raw` (engine statements verbatim, the pre-0078 behaviour). |
 
 ## 2. Activity IRIs (stable, LMS-owned)
@@ -81,9 +81,9 @@ Context extensions on every statement, when known:
   `content/package-id`, `content/language`, `content/manifest-type`, `content/engine-version`
   (populated for KIVO packages from the build that carries ADR 0017: the launch file's stamp, or
   `unknown` for a KIVO build with no parseable stamp; a non-KIVO package carries nothing)
-- `attempt/id`, `attempt/number` (1 = first attempt on the course), `attempt/scored`
-  (counts under the course's scoring rule; `false` on a revision visit; `true` on a granted
-  retake), `attempt/launch-mode` (`Review` on a revision visit's statements; absent otherwise;
+- `attempt/id`, `attempt/number` (1 = the first attempt in its learning context, since 1.2.0;
+  see "Learning contexts" below), `attempt/scored` (counts under the course's scoring rule
+  within that context; `false` on a revision visit; `true` on a granted retake), `attempt/launch-mode` (`Review` on a revision visit's statements; absent otherwise;
   ADR 0014), `attempt/scoring-basis`, `attempt/scoring-max-attempts`, `attempt/started-at`
 - `statement/result-not-applied` (`true`, absent otherwise; ADR 0017): Ambak received this result
   after the attempt's final fail on a new-engine version and did not apply it; the attempt's
@@ -94,9 +94,41 @@ Context extensions on every statement, when known:
   `learner-summary`.
 - `path/id`, `path/name`, `path/step`, `path/steps-total`
 - `journey/program-id`, `journey/name`, `journey/enrollment-id`, `journey/day`, `journey/days-total`
+- `context/kind` (`individual` | `path` | `journey`), `context/id` (the path id on a path, the
+  journey enrolment id on a journey; absent on Individual), `context/day` (the journey day
+  number the attempt was launched on; journey only). Since 1.2.0 the LMS writes them into the
+  context template of `LMS.LaunchData` on a cmi5 launch made by the ALDS 2.0 launch contract.
+  An engine that uses the template as the base of every statement's context, as cmi5 requires
+  (§10.2.1), sends them on its statements, and the LMS forwards them as the engine sent them.
+  The LMS adds them nowhere else: SCORM statements, LMS-derived statements, the statements of
+  a launch made before 1.2.0 and those of an engine that drops the template's extensions do
+  not carry them. The context of every forwarded attempt statement can also be read from
+  `path/id` and `journey/enrollment-id` (below).
 - `org/id`, `org/slug`
 - event-specific: `assignment/id`, `assignment/assignee-type`, `assignment/due-at`,
   `xp/rule`, `xp/amount`, `badge/id`, `rating/stars`
+
+**Learning contexts (1.2.0).** A learner can take the same course on its own (Individual), as a
+step of a learning path and on a journey day. Each is its own learning context, with its own
+attempts and its own official attempt. From 1.2.0 `attempt/number` counts the attempts of the
+statement's context, and `attempt/scored` follows that number. The context is Individual when
+the statement carries neither `path/id` nor `journey/enrollment-id`, the path when it carries
+`path/id`, and one journey day when it carries `journey/enrollment-id` (`journey/day` is that
+day's number when the attempt was launched). Revision visits, previews and abandoned attempts
+are never counted, as before. Example: one learner's attempts on one course, in the order they
+were started, Individual, path, Individual, journey day 3: 1.1.0 numbered them 1, 2, 3, 4, and
+1.2.0 numbers them 1, 1, 2, 1. On a database without migration `0107` there is one context per
+learner and course, so the number is the per-course one.
+
+Nothing already sent is renumbered. The outbox keeps the first copy of every statement id,
+"Resend all history" sends that stored copy again, and an LRS keeps the first copy it holds. So
+an attempt that was in progress when 1.2.0 was deployed can carry both numbers: the statements
+forwarded before carry the per-course number and `profile-version` 1.1.0, the later ones the
+per-context number and 1.2.0. Read `attempt/number` together with `profile-version`: up to
+1.1.0 it always counts per course; from 1.2.0 it counts per learning context, which is the
+same count as per course wherever the learning contexts do not exist yet (no migration `0107`).
+A statement that was never sent (for example one whose outbox row was dropped while forwarding
+was switched off) is built again with the number of the version that builds it.
 
 Activity definition extensions on sub-activities: `content/unit-kind`
 (`slide` | `question` | `unit`), `content/unit-id`, `content/slide-id`,
@@ -116,7 +148,7 @@ branch, designation or vertical apply from then on.
 | Exercise types learners struggle with | `answered` success rate by `definition.interactionType` |
 | Retail vs E2E | any measure split by `learner/segment` |
 | Struggle across modules, paths, journeys | grouping activities (`…/path/…`, `…/journey/…`) |
-| Slower learners / groups | `launched → completed` elapsed time, `attempt/number`, split by `learner/groups`, `learner/teams`, `learner/line-manager-id` |
+| Slower learners / groups | `launched → completed` elapsed time, `attempt/number` (per learning context from 1.2.0), split by `learner/groups`, `learner/teams`, `learner/line-manager-id` |
 
 ## 7. Still needed from the KIVO engine (small, coordinated)
 

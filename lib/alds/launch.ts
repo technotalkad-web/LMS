@@ -16,8 +16,9 @@
  * (ADR 0024 step 22, P2-5), which every preview insert names whatever the
  * flag: 0107's shape check ties is_preview to context_kind = 'preview'.
  *
- * Privacy: the LaunchData document carries ids and the slot language only,
- * never a name or an email.
+ * Privacy: the LaunchData document carries ids and the slot language only
+ * (from ADR 0024 step 26 also the launch's context kind and journey day
+ * number), never a name or an email.
  *
  * Grading: nothing here is read by scoring, completion, the Report Card,
  * CRM or journeys (ADR 0005 D1). is_preview and launch_mode are written on
@@ -30,7 +31,9 @@ import {
   auActivityId,
   CMI5_SESSION_EXT,
   courseFamily,
+  E,
   EXT,
+  type AldsContextTemplate,
   type AldsLaunchData,
   type LaunchMode,
   type RegistrationKind,
@@ -146,7 +149,54 @@ export function servedLanguageFor(language: string | null | undefined): string {
   return attemptServedLanguage(language) ?? "und";
 }
 
-/** The cmi5 LMS.LaunchData body (cmi5 §10.1; registration = attempt id, ADR 0002). */
+/**
+ * The launch's learning context in LMS.LaunchData (ADR 0024 step 26): three
+ * additive context-template extensions. An engine that bases every
+ * statement's context on the template, as cmi5 §10.2.1 and the ALDS rule S1
+ * require, sends them as it sends the others. Kept here, outside the hashed
+ * rules tree: adding them to EXT (lib/alds/types.ts) would move the rules
+ * bundle hash. No rule holds a closed list of extension keys: S1 compares
+ * only the template keys a statement carries, so a statement without them
+ * passes as before. The tenant LRS profile lists the same IRIs
+ * (lib/lrs/profile.ts, ext.contextKind, ext.contextId, ext.contextDay).
+ */
+export const LAUNCH_CONTEXT_EXT = {
+  kind: `${E}context/kind`,
+  id: `${E}context/id`,
+  day: `${E}context/day`,
+} as const;
+
+/**
+ * The context buildLaunchData stamps: `kind` is the attempt row's
+ * context_kind (individual, path, journey or preview); `id` the row's
+ * learning_path_id on a path, its journey_enrollment_id on a journey, else
+ * null; `day` the row's journey_day (the day number the attempt was launched
+ * on) on a journey, else null. Taken from the launched row, whose context
+ * columns never change (0107's immutability trigger), so a relaunch writes
+ * the same values and rule S1 finds no template value changed.
+ */
+export type LaunchDataContext = { kind: string; id: string | null; day: number | null };
+
+/**
+ * The context extensions of LaunchData: `context/kind` when a kind is given,
+ * `context/id` and `context/day` only when they hold a value (an id; a day
+ * number of 1 or more), never null. Ids and a number only: no name.
+ */
+export function launchContextExtensions(c: LaunchDataContext | null | undefined): Record<string, string | number> {
+  const kind = typeof c?.kind === "string" ? c.kind.trim() : "";
+  if (!c || !kind) return {};
+  const out: Record<string, string | number> = { [LAUNCH_CONTEXT_EXT.kind]: kind };
+  const id = typeof c.id === "string" ? c.id.trim() : "";
+  if (id) out[LAUNCH_CONTEXT_EXT.id] = id;
+  if (typeof c.day === "number" && Number.isInteger(c.day) && c.day >= 1) out[LAUNCH_CONTEXT_EXT.day] = c.day;
+  return out;
+}
+
+/**
+ * The cmi5 LMS.LaunchData body (cmi5 §10.1; registration = attempt id, ADR 0002).
+ * `context` (ADR 0024 step 26) adds launchContextExtensions after the seven
+ * template keys; a call without it builds exactly the document it built before.
+ */
 export function buildLaunchData(i: {
   attemptId: string;
   packageId: string;
@@ -159,7 +209,20 @@ export function buildLaunchData(i: {
   courseUlid?: string | null;
   masteryScore?: number | null;
   returnURL?: string | null;
+  context?: LaunchDataContext | null;
 }): AldsLaunchData {
+  // Built apart, then assigned: AldsContextTemplate's extensions type lists the
+  // seven keys of the frozen types file, and the context keys are additive.
+  const extensions: AldsContextTemplate["extensions"] & Record<string, string | number> = {
+    [CMI5_SESSION_EXT]: i.sessionId,
+    [EXT.attemptId]: i.attemptId,
+    [EXT.registrationKind]: i.registrationKind,
+    [EXT.attemptIndex]: 1,
+    [EXT.packageId]: i.packageId,
+    [EXT.versionId]: i.versionId,
+    [EXT.language]: i.servedLanguage,
+    ...launchContextExtensions(i.context),
+  };
   return {
     contextTemplate: {
       registration: i.attemptId,
@@ -169,15 +232,7 @@ export function buildLaunchData(i: {
           ...(i.courseUlid ? [{ id: courseFamily(i.courseUlid) }] : []),
         ],
       },
-      extensions: {
-        [CMI5_SESSION_EXT]: i.sessionId,
-        [EXT.attemptId]: i.attemptId,
-        [EXT.registrationKind]: i.registrationKind,
-        [EXT.attemptIndex]: 1,
-        [EXT.packageId]: i.packageId,
-        [EXT.versionId]: i.versionId,
-        [EXT.language]: i.servedLanguage,
-      },
+      extensions,
     },
     launchMode: i.launchMode,
     moveOn: "CompletedOrPassed",

@@ -18,11 +18,22 @@
  */
 
 export const XAPI_NS = "https://ambak.com/xapi/";
+// 1.2.0 (ADR 0024 step 26): attempt/number counts the attempts of one learning
+// context (Individual, one learning path, one journey day), and attempt/scored
+// follows that number, on a database with migration 0107; without it every
+// attempt of a learner on a course is one context, as in 1.1.0. Lists the
+// context/kind, context/id and context/day extensions, which the LMS puts in
+// LMS.LaunchData's context template; an engine that bases every statement's
+// context on the template (cmi5 §10.2.1) sends them. No IRI changed. A
+// statement already sent keeps the number it was sent with: the outbox keeps
+// the first copy of every statement id, and an LRS keeps the first copy it
+// holds. The first profile-changing pull request after the v1.4.0 tag (ADR 0016
+// step 14's rule); the later phases of ADR 0024 do not bump it again.
 // 1.1.0 (ADR 0014 step 7): adds attempt/launch-mode (`Review` on a revision
 // visit's statements) and attempt/scored = false on them. ADR 0016 step 14 lists
 // the `responded` verb and ADR 0017 step 18 the statement/result-not-applied
 // extension under the same version. Additions, so no LRS history splits.
-export const PROFILE_VERSION = "1.1.0";
+export const PROFILE_VERSION = "1.2.0";
 /** Category context activity that tags every enriched statement. */
 export const PROFILE_ACTIVITY_ID = `${XAPI_NS}profile/v1`;
 /** The account homePage used only when a learner has no email. */
@@ -161,6 +172,10 @@ export const ext = {
 
   // Attempt
   attemptId: `${E}attempt/id`,
+  /**
+   * 1 = the first attempt in its learning context (since 1.2.0, on a database
+   * with 0107; per course before). Set by the forwarder only (lib/lrs/context.ts).
+   */
   attemptNumber: `${E}attempt/number`,
   attemptScored: `${E}attempt/scored`,
   /**
@@ -186,6 +201,18 @@ export const ext = {
   journeyEnrollmentId: `${E}journey/enrollment-id`,
   journeyDay: `${E}journey/day`,
   journeyDaysTotal: `${E}journey/days-total`,
+
+  // Learning context (ADR 0024 step 26; since 1.2.0). The LMS writes these in
+  // LMS.LaunchData's context template (lib/alds/launch.ts, LAUNCH_CONTEXT_EXT,
+  // the same IRIs); an engine that bases every statement's context on the
+  // template (cmi5 §10.2.1) sends them, and the forwarder keeps them as sent.
+  // The forwarder does not add them itself.
+  /** individual | path | journey (preview statements are never forwarded). */
+  contextKind: `${E}context/kind`,
+  /** The path id of a path context, the journey enrolment id of a journey context; absent on Individual. */
+  contextId: `${E}context/id`,
+  /** The journey day number the attempt was launched on; journey context only. */
+  contextDay: `${E}context/day`,
 
   // Organisation
   orgId: `${E}org/id`,

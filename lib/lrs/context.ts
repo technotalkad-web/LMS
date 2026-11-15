@@ -104,7 +104,20 @@ async function readOrMissing<T>(p: PromiseLike<any>, column: string): Promise<{ 
  * same tier once without it (readWithContextFilter; production today:
  * is_revision there, context_kind not); a missing is_revision still falls
  * back to today's select, and any other error still throws.
+ *
+ * ADR 0024 step 26 (P2-6 item 6): the filtered form also names
+ * `context_key` (SIBLING_COLUMNS_0107), so attemptOrdinals() numbers each
+ * learning context on its own. The form without the filter, which a
+ * database without 0107 reads, names no 0107 column (SIBLING_COLUMNS), so
+ * its rows carry no key and the ordinal there is the 1.1.0 one, per (user,
+ * course). The first tier of loadAttemptContexts always runs first and
+ * decides `previews`, so on a database without 0107 this read is made in
+ * the unfiltered form and never fails on the key.
  */
+const SIBLING_COLUMNS = "id, user_id, started_at, status, is_revision, course_versions!inner(course_id)";
+/** SIBLING_COLUMNS and `context_key` (0107), after is_revision: a database without 0103 names is_revision first. */
+const SIBLING_COLUMNS_0107 = "id, user_id, started_at, status, is_revision, context_key, course_versions!inner(course_id)";
+
 async function loadSiblings(
   svc: SupabaseClient,
   userIds: string[],
@@ -116,7 +129,7 @@ async function loadSiblings(
       withoutPreviews(
         svc
           .from("course_attempts")
-          .select("id, user_id, started_at, status, is_revision, course_versions!inner(course_id)")
+          .select(apply ? SIBLING_COLUMNS_0107 : SIBLING_COLUMNS)
           .in("user_id", userIds)
           .in("course_versions.course_id", courseIds)
           .neq("status", "abandoned")
@@ -136,6 +149,37 @@ async function loadSiblings(
       .in("course_versions.course_id", courseIds)
       .neq("status", "abandoned")
   );
+}
+
+/**
+ * attempt/number (ADR 0024 step 26, PROFILE_VERSION 1.2.0): each sibling's
+ * 1-based place among the siblings of the same (user, course, learning
+ * context), by started_at, then id for stability. The context is the row's
+ * `context_key` (individual, path:<path id> or journey:<enrolment id>:<day
+ * id>; previews never reach here). A row without a key, which every row is
+ * on a database without 0107 (loadSiblings names the column only there),
+ * groups by (user, course) alone: the 1.1.0 ordinal. Pure.
+ */
+export function attemptOrdinals(siblings: Row[]): Map<string, number> {
+  const ordinal = new Map<string, number>();
+  const byContext = new Map<string, Row[]>();
+  for (const s of siblings) {
+    const cid = str((one(s.course_versions as Row | Row[]) ?? {}).course_id);
+    if (!cid) continue;
+    const contextKey = str(s.context_key);
+    const key = contextKey ? `${s.user_id}:${cid}:${contextKey}` : `${s.user_id}:${cid}`;
+    byContext.set(key, [...(byContext.get(key) ?? []), s]);
+  }
+  for (const list of byContext.values()) {
+    list
+      .sort((a, b) => {
+        const ta = String(a.started_at ?? "");
+        const tb = String(b.started_at ?? "");
+        return ta < tb ? -1 : ta > tb ? 1 : String(a.id).localeCompare(String(b.id));
+      })
+      .forEach((row, i) => ordinal.set(String(row.id), i + 1));
+  }
+  return ordinal;
 }
 
 export type LearnerDims = AttemptContext["learner"];
@@ -367,7 +411,7 @@ export async function loadAttemptContexts(
         )
       : null,
     resolvePolicies(svc, courseIds).catch(() => new Map()),
-    // Every non-abandoned, non-revision attempt of these users on these courses → ordinal.
+    // Every non-abandoned, non-revision attempt of these users on these courses → ordinal (per context with 0107).
     loadSiblings(svc, userIds, courseIds, previews),
     // ADR 0014 step 7: `scored` is grant-aware (a grant retake is scored).
     // Fail-soft: the mirror is not a chain renderer (ADR 0014:188's strict
@@ -408,24 +452,7 @@ export async function loadAttemptContexts(
   const enrollmentBy = new Map<string, Row>();
   for (const e of enrollments ?? []) enrollmentBy.set(String(e.id), e);
 
-  // Attempt ordinal per (user, course), by started_at then id for stability.
-  const ordinal = new Map<string, number>();
-  const byUserCourse = new Map<string, Row[]>();
-  for (const s of siblings ?? []) {
-    const cid = str((one(s.course_versions as Row | Row[]) ?? {}).course_id);
-    if (!cid) continue;
-    const key = `${s.user_id}:${cid}`;
-    byUserCourse.set(key, [...(byUserCourse.get(key) ?? []), s]);
-  }
-  for (const list of byUserCourse.values()) {
-    list
-      .sort((a, b) => {
-        const ta = String(a.started_at ?? "");
-        const tb = String(b.started_at ?? "");
-        return ta < tb ? -1 : ta > tb ? 1 : String(a.id).localeCompare(String(b.id));
-      })
-      .forEach((row, i) => ordinal.set(String(row.id), i + 1));
-  }
+  const ordinal = attemptOrdinals(siblings ?? []);
 
   const environment = currentEnvironment();
 

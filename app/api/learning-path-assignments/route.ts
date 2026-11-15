@@ -8,13 +8,15 @@ import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
 import { resolveManyGroups } from "@/lib/org/groups";
+import { convertSelfEnrolments } from "@/lib/assignments/direct";
 
 /**
  *   POST /api/learning-path-assignments
  *   body: { orgSlug, pathId, assignToOrg?, userIds?, teamIds?, groupIds?, dueAt? }
  *
  * After successful inserts, expands each row to the affected learners and
- * fires path_assignment notifications in the background.
+ * fires path_assignment notifications in the background. A learner's own
+ * self-enrolment (source 'self', ADR 0024 step 24) becomes an assignment.
  */
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
@@ -180,6 +182,8 @@ export async function POST(request: Request) {
   }
 
   const inserted: unknown[] = [];
+  /** Learners whose direct row was already there: each may be their own self-enrolment (converted below). */
+  const alreadyUserIds: string[] = [];
   for (const row of rows) {
     const { data, error } = await supabase
       .from("learning_path_assignments")
@@ -189,7 +193,24 @@ export async function POST(request: Request) {
     if (data) inserted.push(data);
     else if (error && error.code !== "23505") {
       return NextResponse.json({ error: error.message }, { status: 400 });
+    } else if (error && row.assignee_type === "user" && row.user_id) {
+      alreadyUserIds.push(row.user_id);
     }
+  }
+
+  // ADR 0024 step 24 (P2-6 item 2): a learner who only pressed Start on an
+  // "Everyone" path holds a self row; this assignment converts it (source
+  // 'admin', assigned_by this admin, the due date given here). Any other
+  // existing row stays as it is (the 23505 is a no-op, as before), and
+  // without 0107's column so does every row. The notification block below is
+  // unchanged: it runs when a row was inserted and reaches every named row.
+  const conversion = await convertSelfEnrolments(
+    supabase, "learning_path_assignments",
+    { orgId: org.id, column: "path_id", id: body.pathId, userIds: alreadyUserIds },
+    { assignedBy: user.id, ...(dueAt ? { dueAt } : {}) }
+  );
+  if (conversion.error) {
+    return NextResponse.json({ error: conversion.error.message ?? "Could not convert a self-enrolment" }, { status: 400 });
   }
 
   // Fire path_assignment notifications in the background.

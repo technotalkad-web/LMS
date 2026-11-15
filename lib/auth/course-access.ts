@@ -4,13 +4,13 @@ import { resolveUserGroupIds } from "@/lib/org/groups";
 import {
   computeJourneyState,
   courseDaysOf,
-  creditCoursesFor,
   creditedDaysFor,
   parseVersionDays,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
 import { readJourneyCredits, type JourneyCredits } from "@/lib/journey/credits-read";
+import { readWithContextFilter, type ContextFilterState } from "@/lib/scoring/context-read";
 
 export type CourseAccess = {
   allowed: boolean;
@@ -43,9 +43,16 @@ export type CourseAccess = {
  * — with ONE deliberate exception: Yoddha-journey days (0058) are launchable
  * for enrolled learners but surface only on the /journey page, never as
  * dashboard course cards. Do not "fix" that by removing the journey branch.
+ * Its grants are the journey row of ADR 0024 step 22 as step 23 states it
+ * for this check (see the branch below): the open day's course, the course
+ * on a credit row, and the course of an open official journey attempt.
  * It closes an IDOR where any org member could open a PRIVATE, UNASSIGNED
  * course just by visiting its URL — the course detail/launch pages previously
  * checked only `organization_id`.
+ *
+ * Since ADR 0024 P2-6 (P2-N5) the launch page decides its own launches
+ * through resolveLaunchContext and no longer calls this function; the
+ * learner course page is its caller.
  *
  * Pass the caller's RLS-scoped client so visibility matches the dashboard
  * (non-admins can't read pure team-assignment rows — same as the dashboard).
@@ -66,10 +73,11 @@ export async function learnerCanAccessCourse(opts: {
   visibility?: string | null;
   /**
    * The caller's own journey credit read (readJourneyCredits, same client)
-   * and the enrolment ids it covers, so one render reads the credits once
-   * (the launch page's journey block). Used only when it is ok and covers
-   * every active enrolment that holds the course; otherwise the credits are
-   * read here.
+   * and the enrolment ids it covers, so one render reads the credits once.
+   * Used only when it is ok and covers every enrolment the journey branch
+   * reads (active or completed, on an active program); otherwise the
+   * credits are read here. No caller passes it since P2-6 (the launch page
+   * was the one that did).
    */
   journeyCredits?: { ids: ReadonlySet<string>; credits: JourneyCredits };
 }): Promise<CourseAccess> {
@@ -214,11 +222,35 @@ export async function learnerCanAccessCourse(opts: {
     }
   }
 
-  // Yoddha-journey entitlement (0058): a course scheduled as a journey day
-  // is launchable up to the learner's unlocked day (completed days stay
-  // reviewable; future days remain locked even by direct URL — the drip is
-  // the whole point). Journeys grant no course_assignments rows, mirroring
-  // the learning-path grant above.
+  // Yoddha-journey entitlement (0058; ADR 0024 steps 22, 23 and 93): a
+  // course is reachable through a journey enrolment of the learner that is
+  // active or completed, on an active program, in three ways, the journey
+  // row of step 22 as step 23 states it for this check:
+  //   (a) review: a credit row of the enrolment holds the course, whatever
+  //       the pinned version holds on that day now and whatever the ceiling
+  //       (the course the learner completed; after a publish swapped the
+  //       day's course, its review opens the course on the credit row, and
+  //       a credited day never offers the new course; section 95's row "A
+  //       day's course swapped"). A credit row whose course is null (the
+  //       course deleted) grants nothing;
+  //   (b) open, an active enrolment only: the open day (the lowest required
+  //       day without a credit, when the unlock rule opens it) holds the
+  //       course in the pinned version. No other day opens: future days stay
+  //       locked even by direct URL (the drip is the whole point), and a
+  //       credited day grants only by (a);
+  //   (c) resume: the enrolment holds an open official journey attempt of
+  //       the course (context_kind 'journey', in progress, not a revision
+  //       row), whatever the day's place in the pinned version now: a started
+  //       day removed, swapped or moved past the ceiling by a publish, and a
+  //       completed enrolment's attempt that was open when a publish
+  //       completed it (step 93).
+  // A completed enrolment grants (a) and (c) only (step 22: review, and the
+  // resume of an attempt that was open when a publish completed it; never a
+  // new official attempt). An inactive program grants nothing, a completed
+  // enrolment's review included (the owner's O5 answer), as the launch's
+  // resolver refuses it (journey_unavailable). Journeys grant no
+  // course_assignments rows, mirroring the learning-path grant above. The
+  // launch's resolver still decides which admission a `?journey=` launch is.
   const { data: enrRows } = await supabase
     .from("journey_enrollments")
     .select(
@@ -237,112 +269,96 @@ export async function learnerCanAccessCourse(opts: {
     const p = Array.isArray(e.journey_programs)
       ? e.journey_programs[0]
       : e.journey_programs;
-    // A paused program suspends launching (completed alumni keep review).
-    return e.status === "completed" || p?.is_active !== false;
+    // A paused (inactive) program closes the journey to every learner,
+    // completed or not (O5): no review, no resume, no open day.
+    return p?.is_active !== false;
   });
   if (enrollments.length > 0) {
-    // Curriculum + rules come from each enrollment's PINNED version.
-    const { data: verRows } = await supabase
-      .from("journey_versions")
-      .select("id, days_total, count_sundays, days, unlock_mode")
-      .in("id", enrollments.map((e) => e.version_id));
-    const versions = new Map(
-      ((verRows ?? []) as Array<{
-        id: string;
-        days_total: number;
-        count_sundays: boolean;
-        days: unknown;
-        unlock_mode?: string | null;
-      }>).map((v) => [v.id, v])
-    );
-    const { data: gsRow } = await supabase
-      .from("gamification_settings")
-      .select("timezone")
-      .eq("organization_id", orgId)
-      .maybeSingle();
-    const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
-    type Version = NonNullable<ReturnType<typeof versions.get>>;
-    const holding: Array<{ enr: (typeof enrollments)[number]; v: Version; courseDays: number[] }> = [];
-    for (const enr of enrollments) {
-      const v = versions.get(enr.version_id);
-      if (!v) continue;
-      const courseDays = [...parseVersionDays(v.days).values()]
-        .filter((d) => d.course_id === courseId)
-        .map((d) => d.day);
-      if (courseDays.length === 0) continue;
-      if (enr.status === "completed") {
-        // Yoddha alumni keep review access to their journey modules.
+    // The credits of every enrolment above, in one read by day id (ADR 0024
+    // step 45), never a count per enrolment. A failed read grants nothing
+    // through a journey: it is never "no credits", which would open the
+    // first course day, and no grant of this branch is made on a guess. The
+    // caller's own read is used when it covers every enrolment here.
+    const given = opts.journeyCredits;
+    const credits =
+      given && given.credits.ok && enrollments.every((e) => given.ids.has(e.id))
+        ? given.credits
+        : await readJourneyCredits(
+            supabase,
+            enrollments.map((e) => ({ id: e.id, version_id: e.version_id }))
+          );
+    if (!credits.ok) {
+      console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "course_access", code: credits.error?.code ?? null }));
+    } else {
+      // (a) review: a credit row for the course.
+      if (enrollments.some((e) => credits.rowsOf(e.id).some((r) => sameCourse(r.course_id, courseId)))) {
         return { allowed: true, upcomingAt: null };
       }
-      holding.push({ enr, v, courseDays });
-    }
-    if (holding.length > 0) {
-      // The credits of every active enrolment that holds the course, in one
-      // read by day id (ADR 0024 step 45), never a count per enrolment. A
-      // failed read grants nothing through a journey: it is never "no
-      // credits", which would open the first course day. The caller's own
-      // read is used when it covers every enrolment here.
-      const given = opts.journeyCredits;
-      const credits =
-        given && given.credits.ok && holding.every((h) => given.ids.has(h.enr.id))
-          ? given.credits
-          : await readJourneyCredits(
-              supabase,
-              holding.map((h) => ({ id: h.enr.id, version_id: h.enr.version_id }))
+
+      // (b) open: an active enrolment whose pinned version holds the course
+      // on its open day. Curriculum and rules come from each enrolment's
+      // PINNED version.
+      const active = enrollments.filter((e) => e.status === "active");
+      if (active.length > 0) {
+        const { data: verRows } = await supabase
+          .from("journey_versions")
+          .select("id, days_total, count_sundays, days, unlock_mode")
+          .in("id", active.map((e) => e.version_id));
+        const versions = new Map(
+          ((verRows ?? []) as Array<{
+            id: string;
+            days_total: number;
+            count_sundays: boolean;
+            days: unknown;
+            unlock_mode?: string | null;
+          }>).map((v) => [v.id, v])
+        );
+        type Version = NonNullable<ReturnType<typeof versions.get>>;
+        const holding: Array<{ enr: (typeof active)[number]; v: Version; courseDays: number[] }> = [];
+        for (const enr of active) {
+          const v = versions.get(enr.version_id);
+          if (!v) continue;
+          const courseDays = [...parseVersionDays(v.days).values()]
+            .filter((d) => d.course_id === courseId)
+            .map((d) => d.day);
+          if (courseDays.length > 0) holding.push({ enr, v, courseDays });
+        }
+        if (holding.length > 0) {
+          const { data: gsRow } = await supabase
+            .from("gamification_settings")
+            .select("timezone")
+            .eq("organization_id", orgId)
+            .maybeSingle();
+          const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+          for (const { enr, v, courseDays } of holding) {
+            const credited = creditedDaysFor(
+              { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+              credits.rowsOf(enr.id)
             );
-      if (!credits.ok) {
-        console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "course_access", code: credits.error?.code ?? null }));
-      } else {
-        for (const { enr, v, courseDays } of holding) {
-          const rows = credits.rowsOf(enr.id);
-          const credited = creditedDaysFor(
-            { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
-            rows
-          );
-          // The course on each credited day's credit row, matched as above.
-          const creditCourse = creditCoursesFor(
-            { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
-            rows
-          );
-          const state = computeJourneyState({
-            startDate: enr.start_date,
-            today: todayStr(tz),
-            creditedDays: credited,
-            daysTotal: v.days_total,
-            countSundays: v.count_sundays === true,
-            unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
-            courseDays: courseDaysOf(v.days, v.days_total),
-          });
-          // Launchable (ADR 0024 step 45): a course day at or below the
-          // ceiling, the day the learner may open now; or, above it, a
-          // credited day whose credit row holds this course, for review.
-          // Progress mode has no calendar ceiling, so it keys off
-          // openableDay; calendar keeps the drip ceiling. A re-pin can number
-          // a credited day above the open day. There (past the ceiling) the
-          // day is granted only for the course on its credit row (step 22's
-          // row for `?journey=E&day=`: "the day is credited and this course
-          // is the course on its credit row"), so a publish that swapped its
-          // course does not offer the new course (section 95's row "A day's
-          // course swapped"), and a credit row whose course is null grants
-          // nothing. At or below the ceiling the day's current course is
-          // granted as before, a credited day whose course a publish swapped
-          // included, and a completed enrolment (above) grants every course
-          // of its pinned version. Both are the P2-6 gap: step 22's rows for
-          // `?journey=E&day=` and for a completed E, and step 23's grant,
-          // which also adds a started day past the ceiling and the credit
-          // row's own course once the day holds another (granted nowhere
-          // today). tests/unit/journey-state.test.ts (f) pins today's
-          // behaviour, each case labelled "P2-6 gap (step 22)".
-          const ceiling =
-            v.unlock_mode === "progress"
-              ? state.finished
-                ? v.days_total
-                : state.openableDay
-              : Math.min(state.allowedDay, state.currentDay);
-          if (courseDays.some((d) => d <= ceiling || (credited.includes(d) && creditCourse.get(d) === courseId))) {
-            return { allowed: true, upcomingAt: null };
+            const state = computeJourneyState({
+              startDate: enr.start_date,
+              today: todayStr(tz),
+              creditedDays: credited,
+              daysTotal: v.days_total,
+              countSundays: v.count_sundays === true,
+              unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
+              courseDays: courseDaysOf(v.days, v.days_total),
+            });
+            // openableDay is the open day while the unlock rule opens it
+            // (calendar: reached by the counted days; progress: started), 0
+            // otherwise and once every course day is credited. It is never a
+            // credited day, so a credited day whose course a publish swapped
+            // offers neither course here: its review is (a)'s.
+            if (state.openableDay > 0 && courseDays.includes(state.openableDay)) {
+              return { allowed: true, upcomingAt: null };
+            }
           }
         }
+      }
+
+      // (c) resume: a started day, made only when (a) and (b) did not grant.
+      if (await holdsOpenJourneyAttempt(supabase, userId, courseId, enrollments.map((e) => e.id))) {
+        return { allowed: true, upcomingAt: null };
       }
     }
   }
@@ -353,4 +369,51 @@ export async function learnerCanAccessCourse(opts: {
     (a, b) => new Date(a).getTime() - new Date(b).getTime()
   )[0];
   return { allowed: false, upcomingAt };
+}
+
+/** Two course ids name the same course (ids compare in lower case). */
+function sameCourse(a: string | null | undefined, b: string): boolean {
+  return typeof a === "string" && a !== "" && a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * Whether one of `enrollmentIds` holds an open official journey attempt of
+ * the course (ADR 0024 steps 23 and 93): the learner's own course_attempts
+ * row tagged to the enrolment, in progress, not a revision row, and of the
+ * journey context (`context_kind = 'journey'`, 0107), on any version of
+ * the course. One read, limit 1, with its own abort signal.
+ *
+ * Deploy-safe in both orders (docs/ARCHITECTURE.md principle 6), through the
+ * one fallback for a context_kind filter (readWithContextFilter, a state of
+ * this call only): on a database without 0107 the first answer is a
+ * missing-column error naming context_kind, and the same read is made once
+ * without that filter. The rows tagged to a journey enrolment are then the
+ * journey rows, which is today's reading. Any other error grants nothing
+ * from this arm and is logged.
+ */
+async function holdsOpenJourneyAttempt(
+  supabase: SupabaseClient,
+  userId: string,
+  courseId: string,
+  enrollmentIds: string[]
+): Promise<boolean> {
+  if (enrollmentIds.length === 0) return false;
+  const state: ContextFilterState = { applies: null };
+  const { data, error } = await readWithContextFilter(state, (apply) => {
+    let q = supabase
+      .from("course_attempts")
+      .select("id, course_versions!inner(course_id)")
+      .eq("user_id", userId)
+      .eq("course_versions.course_id", courseId)
+      .in("journey_enrollment_id", enrollmentIds)
+      .eq("status", "in_progress")
+      .eq("is_revision", false);
+    if (apply) q = q.eq("context_kind", "journey");
+    return q.limit(1).abortSignal(new AbortController().signal);
+  });
+  if (error) {
+    console.warn(JSON.stringify({ event: "journey_open_attempt_unreadable", where: "course_access", code: error.code ?? null }));
+    return false;
+  }
+  return Array.isArray(data) && data.length > 0;
 }

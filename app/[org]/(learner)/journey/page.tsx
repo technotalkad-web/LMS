@@ -16,6 +16,7 @@ import { JourneyIcon } from "@/components/ui/journey-icon";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditCoursesFor,
   creditedDaysFor,
   dateOfDay,
   effectiveJourneyCopy,
@@ -27,8 +28,26 @@ import {
   type Milestone,
 } from "@/lib/journey/journey";
 import { readJourneyCredits } from "@/lib/journey/credits-read";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 
 export const dynamic = "force-dynamic";
+
+/** The pinned version's columns on every database; `day_ids` (0107) is read beside them with the fallback. */
+const VERSION_COLUMNS =
+  "id, name, icon, days_total, count_sundays, milestones, completion_title, days, unlock_mode";
+type VersionRow = {
+  id: string;
+  name: string;
+  icon: string;
+  days_total: number;
+  count_sundays: boolean;
+  milestones: unknown;
+  completion_title: string;
+  days: unknown;
+  unlock_mode?: string | null;
+  /** 0107: {"<day number>": "<day id>"}; undefined on a database without the column. */
+  day_ids?: unknown;
+};
 
 /**
  * The learner's Yoddha Journey home: DAY X/N, today's mission, the milestone
@@ -151,15 +170,23 @@ export default async function JourneyPage({
 
   // The learner's credits by day id (ADR 0024 step 45), through the one
   // reader, which falls back to the day number on a database without 0107.
+  // The pinned version is read with its day_ids (0107) for the launch links
+  // (step 22: a link made by the app carries the day id), through the
+  // narrower-select fallback: on a database without the column it is read
+  // without it, and every link carries the day's number, which the launch
+  // resolves through the pinned version.
   const [{ data: verRow }, credits, { data: gsRow }] =
     await Promise.all([
-      supabase
-        .from("journey_versions")
-        .select(
-          "id, name, icon, days_total, count_sundays, milestones, completion_title, days, unlock_mode"
-        )
-        .eq("id", enrollment.version_id)
-        .maybeSingle(),
+      readWithOptionalColumn<VersionRow>(
+        "day_ids",
+        (columns) =>
+          supabase
+            .from("journey_versions")
+            .select(columns)
+            .eq("id", enrollment.version_id)
+            .maybeSingle(),
+        VERSION_COLUMNS
+      ),
       readJourneyCredits(supabase, [{ id: enrollment.id, version_id: enrollment.version_id }]),
       supabase
         .from("gamification_settings")
@@ -168,17 +195,7 @@ export default async function JourneyPage({
         .maybeSingle(),
     ]);
 
-  const version = verRow as {
-    id: string;
-    name: string;
-    icon: string;
-    days_total: number;
-    count_sundays: boolean;
-    milestones: unknown;
-    completion_title: string;
-    days: unknown;
-    unlock_mode?: string | null;
-  } | null;
+  const version = verRow;
   if (!version) {
     return (
       <div className="max-w-2xl mx-auto text-center py-16 text-muted text-sm">
@@ -209,7 +226,12 @@ export default async function JourneyPage({
     version.milestones = liveProg.milestones; // null = org reset to defaults
   }
 
-  const dayByNumber = parseVersionDays(version.days);
+  // Each entry carries its day id when the version has day_ids (0107).
+  const dayByNumber = parseVersionDays(version.days, version.day_ids);
+  // A launch link's `day`: the day's id (step 22), or its number on a
+  // database without day_ids, which the launch resolves through the pinned
+  // version (an old link's number keeps working, P2-6 item 1).
+  const dayParam = (d: number): string => dayByNumber.get(d)?.dayId ?? String(d);
   const courseDays = courseDaysOf(version.days, version.days_total);
   const courseDaySet = new Set(courseDays);
   const progress = credits.rowsOf(enrollment.id);
@@ -219,6 +241,16 @@ export default async function JourneyPage({
   // Each day is marked done by its own credit, never by position: the
   // numbers, in the pinned version, of the days whose id holds a credit.
   const creditedDays = creditedDaysFor(
+    { days: version.days, days_total: version.days_total, day_ids: credits.dayIdsOf(enrollment.version_id) },
+    progress
+  );
+  // The course on each credited day's credit row, by the same matching: a
+  // credited day's review opens that course, the one the learner completed,
+  // even after a publish swapped the day's course (ADR 0024 step 22, section
+  // 95's row "A day's course swapped"); the day's new course is never
+  // offered on a credited day. Null when that course was deleted: the day
+  // shows as done with nothing to review.
+  const creditCourse = creditCoursesFor(
     { days: version.days, days_total: version.days_total, day_ids: credits.dayIdsOf(enrollment.version_id) },
     progress
   );
@@ -248,21 +280,30 @@ export default async function JourneyPage({
   // ---- Completed: the unlock celebration ----
   if (enrollment.status === "completed") {
     const final = milestones[milestones.length - 1];
-    // Alumni keep review access to every journey module (course-access
-    // grants it) — give them the links, batched titles in one query.
-    const missionDays = [...dayByNumber.values()]
-      .filter((d) => d.course_id)
-      .sort((a, b) => a.day - b.day);
-    const { data: courseRows } = await supabase
-      .from("courses")
-      .select("id, title")
-      .in("id", missionDays.map((d) => d.course_id as string));
-    const titleOf = new Map(
-      ((courseRows ?? []) as Array<{ id: string; title: string }>).map((c) => [
-        c.id,
-        c.title,
-      ])
-    );
+    // A completed enrolment reviews each credited day on the course on its
+    // credit row (ADR 0024 step 22's row for a completed E; course-access
+    // grants the same course): the pinned version's mission days that hold
+    // a credit whose course still exists, each with that course. A day
+    // without a credit has nothing to review, and a completed enrolment
+    // opens no new official attempt. An inactive program closes the review
+    // too (the owner's O5 answer), so the list is not offered then. Titles
+    // are batched in one query.
+    const missionDays = programActive
+      ? [...dayByNumber.values()]
+          .flatMap((d) => {
+            const reviewCourse = creditCourse.get(d.day);
+            return d.course_id && reviewCourse ? [{ ...d, reviewCourse }] : [];
+          })
+          .sort((a, b) => a.day - b.day)
+      : [];
+    const titleOf = new Map<string, string>();
+    if (missionDays.length > 0) {
+      const { data: courseRows } = await supabase
+        .from("courses")
+        .select("id, title")
+        .in("id", [...new Set(missionDays.map((d) => d.reviewCourse))]);
+      for (const c of (courseRows ?? []) as Array<{ id: string; title: string }>) titleOf.set(c.id, c.title);
+    }
     return (
       <div className="max-w-3xl mx-auto space-y-6">
         {journeySwitcher}
@@ -288,8 +329,8 @@ export default async function JourneyPage({
         </section>
         <MilestonePath milestones={milestones} completed={version.days_total} />
 
-        {/* Alumni revision — journey modules stay open forever. Plain launch
-            links (no journey tag): reviews never touch progress or XP. */}
+        {/* Alumni revision: each credited day's module stays open for
+            review while the program is active. */}
         {missionDays.length > 0 && (
           <section className="bg-paper border border-line rounded-2xl p-5">
             <h3 className="text-sm font-semibold">📚 Revisit your missions</h3>
@@ -298,27 +339,33 @@ export default async function JourneyPage({
               module, any time.
             </p>
             <div className="grid sm:grid-cols-2 gap-2">
-              {missionDays.map((d) => (
-                <div key={d.day} className="flex items-center gap-1.5">
-                  <Link
-                    // ?journey= without &day= never tags the attempt (reviews
-                    // stay progress/XP-neutral); it only brings "Exit course"
-                    // back here instead of the dashboard.
-                    href={`/${orgSlug}/courses/${d.course_id}/launch?journey=${enrollment.id}`}
-                    className="flex flex-1 min-w-0 items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
-                  >
-                    <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
-                      Day {d.day}
-                    </span>
-                    <span className="min-w-0 line-clamp-2">
-                      {d.mission_title ??
-                        titleOf.get(d.course_id as string) ??
-                        "Module"}
-                    </span>
-                  </Link>
-                  <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={d.course_id as string} day={d.day} />
-                </div>
-              ))}
+              {missionDays.map((d) => {
+                const reviewCourse = d.reviewCourse;
+                return (
+                  <div key={d.day} className="flex items-center gap-1.5">
+                    <Link
+                      // ?journey=E&day=<day id> (step 22): the launch admits
+                      // it as the review of the course on the day's credit
+                      // row, a revision visit that never touches progress or
+                      // XP, and "Exit course" comes back here.
+                      href={`/${orgSlug}/courses/${reviewCourse}/launch?journey=${enrollment.id}&day=${dayParam(d.day)}`}
+                      className="flex flex-1 min-w-0 items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
+                    >
+                      <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
+                        Day {d.day}
+                      </span>
+                      <span className="min-w-0 line-clamp-2">
+                        {/* The day's mission title names the day's own course; a
+                            swapped day shows the course the learner completed. */}
+                        {(reviewCourse === d.course_id ? d.mission_title : null) ??
+                          titleOf.get(reviewCourse) ??
+                          "Module"}
+                      </span>
+                    </Link>
+                    <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={reviewCourse} day={d.day} />
+                  </div>
+                );
+              })}
             </div>
           </section>
         )}
@@ -386,10 +433,12 @@ export default async function JourneyPage({
     { length: weekEnd - weekStart + 1 },
     (_, i) => weekStart + i
   );
+  // The days' own courses, and each credited day's credit-row course (the
+  // one a done day shows and reviews).
   const weekCourseIds = [
     ...new Set(
       weekDayNums
-        .map((d) => dayByNumber.get(d)?.course_id)
+        .flatMap((d) => [dayByNumber.get(d)?.course_id, creditCourse.get(d)])
         .filter((id): id is string => !!id)
     ),
   ];
@@ -405,6 +454,13 @@ export default async function JourneyPage({
   }
   const titleForDay = (d: number): string => {
     const entry = dayByNumber.get(d);
+    // A credited day shows the course the learner completed (step 22): after
+    // a publish swapped the day's course, the day's mission title names the
+    // new course, so the credit row's course title is shown instead.
+    const credited = creditCourse.get(d);
+    if (credited && credited !== entry?.course_id) {
+      return weekTitles.get(credited) ?? `Day ${d} mission`;
+    }
     return (
       entry?.mission_title ??
       (entry?.course_id ? weekTitles.get(entry.course_id) : undefined) ??
@@ -561,7 +617,7 @@ export default async function JourneyPage({
             {state.todayUnlocked ? (
               <>
                 <Link
-                  href={`/${orgSlug}/courses/${mission.course_id}/launch?journey=${enrollment.id}&day=${state.currentDay}`}
+                  href={`/${orgSlug}/courses/${mission.course_id}/launch?journey=${enrollment.id}&day=${dayParam(state.currentDay)}`}
                   className="mt-4 w-full sm:max-w-md mx-auto flex items-center justify-center gap-2 px-6 py-3.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-semibold shadow-sm"
                 >
                   <PlayCircle className="w-5 h-5" />{" "}
@@ -612,27 +668,40 @@ export default async function JourneyPage({
               );
             }
             if (done && entry?.course_id) {
+              // The review opens the course on the day's credit row (step
+              // 22), never the day's current course after a swap; a credit
+              // whose course was deleted shows the day as done, no link.
+              const reviewCourse = creditCourse.get(d) ?? null;
+              const doneBody = (
+                <>
+                  <span className="h-7 w-7 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0" aria-hidden>
+                    <Check className="w-4 h-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium line-clamp-2">
+                      Day {d}: {titleForDay(d)}
+                    </span>
+                    <span className="block text-xs text-emerald-700">Completed</span>
+                  </span>
+                </>
+              );
               return (
                 <div key={d} className="flex items-center hover:bg-canvas transition">
-                  <Link
-                    href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${d}`}
-                    className="flex flex-1 min-w-0 items-center gap-3 px-5 py-3"
-                    aria-label={`Revise day ${d}`}
-                  >
-                    <span className="h-7 w-7 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0" aria-hidden>
-                      <Check className="w-4 h-4" />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-sm font-medium line-clamp-2">
-                        Day {d}: {titleForDay(d)}
+                  {reviewCourse ? (
+                    <Link
+                      href={`/${orgSlug}/courses/${reviewCourse}/launch?journey=${enrollment.id}&day=${dayParam(d)}`}
+                      className="flex flex-1 min-w-0 items-center gap-3 px-5 py-3"
+                      aria-label={`Revise day ${d}`}
+                    >
+                      {doneBody}
+                      <span className="text-xs font-medium text-indigo-700 shrink-0">
+                        Revise
                       </span>
-                      <span className="block text-xs text-emerald-700">Completed</span>
-                    </span>
-                    <span className="text-xs font-medium text-indigo-700 shrink-0">
-                      Revise
-                    </span>
-                  </Link>
-                  <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={entry.course_id} day={d} className="mr-5" />
+                    </Link>
+                  ) : (
+                    <div className="flex flex-1 min-w-0 items-center gap-3 px-5 py-3">{doneBody}</div>
+                  )}
+                  <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={reviewCourse ?? entry.course_id} day={d} className="mr-5" />
                 </div>
               );
             }
@@ -658,7 +727,7 @@ export default async function JourneyPage({
                   </span>
                   {state.todayUnlocked && entry?.course_id && (
                     <Link
-                      href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${d}`}
+                      href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${dayParam(d)}`}
                       className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shrink-0"
                     >
                       {missionInProgress ? "Continue" : "Start"}
@@ -748,14 +817,15 @@ export default async function JourneyPage({
                 {ms ? <span className="text-[11px]">{ms.icon}</span> : rest ? "·" : d}
               </div>
             );
-            // Completed missions stay open for revision — relaunch is
-            // untagged (validated server-side), so it can never re-credit
-            // the day, earn XP, or advance the journey.
-            const dayCourseId = dayByNumber.get(d)?.course_id;
-            return done && dayCourseId ? (
+            // Completed missions stay open for revision: the link opens the
+            // course on the day's credit row (step 22), and the launch admits
+            // it as a review, a revision visit that never re-credits the
+            // day, earns XP or advances the journey.
+            const reviewCourse = done ? creditCourse.get(d) : null;
+            return done && reviewCourse ? (
               <Link
                 key={d}
-                href={`/${orgSlug}/courses/${dayCourseId}/launch?journey=${enrollment.id}&day=${d}`}
+                href={`/${orgSlug}/courses/${reviewCourse}/launch?journey=${enrollment.id}&day=${dayParam(d)}`}
                 aria-label={`Revise day ${d}`}
               >
                 {cell}

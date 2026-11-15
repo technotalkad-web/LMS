@@ -16,7 +16,8 @@ import {
  *   header: x-cron-secret: <CRON_SECRET env var>
  *
  * Hourly scheduled task. For each course with reminders enabled:
- *   - Resolve every learner currently assigned (user/team/org).
+ *   - Resolve every learner currently assigned (user/team/org/group). A
+ *     self-enrolment row (source 'self') is no assignment (decision A22).
  *   - Skip learners who have already completed/passed the course.
  *   - Skip learners whose first_assigned_at is older than cap_days.
  *   - Skip learners whose last_nudge_at is newer than cadence_days ago.
@@ -44,6 +45,8 @@ type Assignment = {
   team_id: string | null;
   group_id?: string | null;
   release_at: string | null;
+  /** 0107 (ADR 0024 D15): 'admin' or 'self'; absent on a database without it. */
+  source?: string | null;
 };
 
 export async function POST(request: Request) {
@@ -103,7 +106,13 @@ export async function POST(request: Request) {
     .from("course_assignments")
     .select("*")
     .in("course_id", courseIds);
-  const assignments = (assignmentRows ?? []) as Assignment[];
+  // Decision A22 (ADR 0024 step 49's reminders row, P2-6 item 2): a learner's
+  // own self-enrolment (source 'self', written when they pressed Start on an
+  // "Everyone" course) is no assignment and reminds nobody. The row, not the
+  // learner: a team, group or org row still reminds them. select("*") is the
+  // missing-column fallback: without 0107 no row has a source and none is
+  // skipped, today's run.
+  const assignments = ((assignmentRows ?? []) as Assignment[]).filter((a) => a.source !== "self");
 
   // Teams used by assignments
   const teamIds = Array.from(

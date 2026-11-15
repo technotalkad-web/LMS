@@ -17,8 +17,9 @@
  *       call; or `<x>.credited_days` in a file of CARRIED, whose source file
  *       assigns `credited_days:` from a creditedDaysFor call (the journey
  *       admin page builds the client's rows on the server). The callers are
- *       pinned by file and count (P2-N3's twelve and the dashboard's), so a
- *       new caller is listed here and held to the rule.
+ *       pinned by file and count (P2-N3's twelve and the dashboard's, less
+ *       the launch page's, which P2-6 removed: the launch decides through
+ *       launch_context), so a new caller is listed here and held to the rule.
  *   (2) the string "journey_day_progress" in code (a `.from(...)`, a helper's
  *       table argument, anything) names a read of the credits; outside
  *       lib/journey/ only NOT_CREDIT_READERS may hold one, each pinned to its
@@ -87,12 +88,17 @@ const MATCHERS = new Set(["creditedDaysFor", "creditCoursesFor"]);
 const TABLE = "journey_day_progress";
 const READER_MODULE = /(^|\/)lib\/journey\/credits-read$|^@\/lib\/journey\/credits-read$|(^|\/)journey\/credits-read$/;
 
-/** The callers of computeJourneyState, by file and count (P2-N3, and the dashboard's banner since P2-4). */
+/**
+ * The callers of computeJourneyState, by file and count (P2-N3, and the
+ * dashboard's banner since P2-4). The launch page left the list in P2-6: its
+ * own journey block is gone, and the launch is decided by launch_context's
+ * facts and the resolver (lib/attempts/launch-context.ts), which reads no
+ * credit rows and calls no twin.
+ */
 const CALLERS: Record<string, number> = {
   "app/[org]/(admin)/analytics/page.tsx": 1,
   "app/[org]/(admin)/journey-admin/journey-client.tsx": 2,
   "app/[org]/(admin)/journey-admin/page.tsx": 1,
-  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": 1,
   "app/[org]/(learner)/dashboard/page.tsx": 1,
   "app/[org]/(learner)/journey/page.tsx": 1,
   "app/api/cron/journey-nudges/route.ts": 1,
@@ -409,16 +415,18 @@ for (const [f, t] of texts) scans.set(f, scanFile(f, t, carrierSources));
 console.log("\n(a) the repository");
 {
   const callers = Object.fromEntries([...scans].filter(([, s]) => s.twinCalls.length).map(([f, s]) => [f, s.twinCalls.length]).sort(([a], [b]) => String(a).localeCompare(String(b))));
-  eq("the callers of computeJourneyState, by file and count (P2-N3's twelve calls and the dashboard's)", callers, CALLERS);
+  eq("the callers of computeJourneyState, by file and count (P2-N3's twelve calls and the dashboard's, less the launch page's since P2-6)", callers, CALLERS);
   const problems = [...scans].flatMap(([f, s]) => problemsOf(f, s));
   eq("rules (1) to (6) hold in every file", problems, []);
-  // Non-vacuous: rule (6) saw every creditedDaysFor call and course-access's
-  // creditCoursesFor call, and (5c) both reminder calls.
+  // Non-vacuous: rule (6) saw every creditedDaysFor call and the journey
+  // page's creditCoursesFor call (since P2-6 the done-day links open the
+  // credit row's course; course-access grants on the credit rows themselves
+  // and no longer matches them to course days), and (5c) both reminder calls.
   const seen = (k: "creditedCalls" | "creditCourseCalls" | "reminderCalls") =>
     Object.fromEntries([...scans].filter(([, s]) => s[k] > 0).map(([f, s]) => [f, s[k]]).sort(([a], [b]) => String(a).localeCompare(String(b))));
   eq("rule (6) checked the creditedDaysFor call of every file that reads credits", Object.keys(seen("creditedCalls")),
     [...scans].filter(([, s]) => s.importsReadJourneyCredits).map(([f]) => f).sort((a, b) => a.localeCompare(b)));
-  eq("rule (6) checked the one creditCoursesFor call, course-access's", seen("creditCourseCalls"), { "lib/auth/course-access.ts": 1 });
+  eq("rule (6) checked the one creditCoursesFor call, the journey page's", seen("creditCourseCalls"), { "app/[org]/(learner)/journey/page.tsx": 1 });
   eq("rule (5c) checked the two reminder readers' calls", seen("reminderCalls"), Object.fromEntries([...REMINDER_FILES].sort().map((f) => [f, 1])));
   for (const [f, n] of Object.entries(NOT_CREDIT_READERS)) {
     eq(`${f}: exactly ${n.sites} read of ${TABLE}, not a credit count (${n.why})`, scans.get(f)?.tableSites.length ?? 0, n.sites);

@@ -137,7 +137,7 @@ async function main() {
       const src = fs.readFileSync(path.resolve(__dirname, "../../lib/lrs/profile.ts"), "utf8");
       return src.indexOf("attemptScored:") < src.indexOf("resultNotApplied:") && src.indexOf("resultNotApplied:") < src.indexOf("attemptLaunchMode:");
     })(), true);
-    eq("PROFILE_VERSION stays until the merge-time reading", PROFILE_VERSION, "1.1.0");
+    eq("PROFILE_VERSION is this build's (1.2.0 since ADR 0024 step 26; the marker is listed since 1.1.0)", PROFILE_VERSION, "1.2.0");
 
     console.log("\na database with 0104");
     {

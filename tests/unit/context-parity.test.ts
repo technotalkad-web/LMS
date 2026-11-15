@@ -426,8 +426,8 @@ console.log("\n(g) H1: the cases both sides run, pinned per pair; the one-sided 
   const pinned = BOTH_SIDED as Record<string, number>;
   ok("each pair's both-sided count is the pinned BOTH_SIDED", [...new Set([...Object.keys(counts), ...Object.keys(pinned)])].sort()
     .flatMap((p) => (counts[p] === pinned[p] ? [] : [`${p}: ${counts[p] ?? "no file"} cases on both sides, pinned ${pinned[p] ?? "none"}`])));
-  ok("the pinned counts, as 2026-11-14 left them (official 17, path 27, journey 17, launch 36 with the owner's O5 cases)",
-    JSON.stringify(pinned) === JSON.stringify({ official: 17, path: 27, journey: 17, launch: 36 }) ? [] : [`BOTH_SIDED is ${JSON.stringify(pinned)}`]);
+  ok("the pinned counts (official 17, path 27, journey 17; launch 36 with the owner's O5 cases on 2026-11-14, 37 with P2-6's ruling A3 case)",
+    JSON.stringify(pinned) === JSON.stringify({ official: 17, path: 27, journey: 17, launch: 37 }) ? [] : [`BOTH_SIDED is ${JSON.stringify(pinned)}`]);
   const oneSided = [...docs.values()].flatMap((d) => d.cases.filter((c) => c.sides.length === 1).map((c) => `${d.pair} ${c.sides[0]} ${c.name}`)).sort();
   const listed = Object.entries(ONE_SIDED as Record<string, Record<string, { side: string }>>)
     .flatMap(([pair, cases]) => Object.entries(cases).map(([name, v]) => `${pair} ${v.side} ${name}`)).sort();

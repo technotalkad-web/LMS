@@ -22,7 +22,13 @@
  *   - ADR 0024 P2-5: the launch page's preview insert (context_kind
  *     'preview', preview_kind 'course', previewAttemptColumns, no official
  *     tag) and the close of an open legacy_role row before it (note N4)
- *     carry theirs.
+ *     carry theirs;
+ *   - ADR 0024 P2-6 (step 23): the journey re-tag of a resumed row is gone
+ *     (a row's context is fixed at its insert); both Start inserts name
+ *     context_kind with the tags; consume_grant is called in its nine-argument
+ *     day-id form, and the seven-argument record_revision_visit (its context
+ *     key) is listed by hand beside it, with its plain-insert fallback naming
+ *     context_key; every close of a Start takes the launch's context key.
  *
  * A receiver is resolved lexically with the TypeScript parser: the binding
  * or parameter of that name in scope at the write (the enclosing functions'
@@ -208,10 +214,11 @@ const ATTEMPT_WRITES: Record<string, Site> = {
   // grant-retake reset moved into consume_grant (listed by hand below).
   // ADR 0024 P2-5 item 3: a Preview by mode adds two writes, the close of an
   // open legacy_role row of the version (note N4) and the preview insert.
+  // ADR 0024 P2-6 (step 23): the journey re-tag of a resumed row is deleted.
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
-    receivers: ["svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt"],
+    receivers: ["svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt"],
     what:
-      "deactivated-slot close, stale-revision close, journey tag, the preview's legacy_role close (ADR 0024 note N4), " +
+      "deactivated-slot close, stale-revision close, the preview's legacy_role close (ADR 0024 note N4), " +
       "the preview insert (ADR 0024 P2-5), the 0100 columns after consume_grant opened, " +
       "flagged-row close of a first launch, attempt insert, attempt insert retry without the 0100 columns (ADR 0006 note (c) of 2026-10-19), " +
       "the SCORM revision seed",
@@ -323,7 +330,9 @@ console.log("\ncourse_attempts: parameter pass-throughs receive a service client
 console.log("\ncourse_attempts: the 0103 functions that write attempt rows, listed by hand (ADR 0014 step 3)");
 {
   const LAUNCH = "app/[org]/(learner)/courses/[courseId]/launch/page.tsx";
-  for (const fn of ["consume_grant", "flag_revision_attempt"]) {
+  // ADR 0024 P2-6: record_revision_visit (it writes revision_visits, beside
+  // the attempt rows) is listed with them in its seven-argument form.
+  for (const fn of ["consume_grant", "flag_revision_attempt", "record_revision_visit"]) {
     const re = new RegExp(`\\.rpc\\(\\s*["'\`]${fn}["'\`]`, "g");
     const sites: Array<{ file: string; receiver: string; at: number }> = [];
     for (const [file, src] of sources) {
@@ -333,22 +342,39 @@ console.log("\ncourse_attempts: the 0103 functions that write attempt rows, list
     eq(`${fn}: on svcAttempt, the service client in scope`,
       sites.map((s) => [s.receiver, isServiceReceiver(s.file, s.receiver, s.at)]), [["svcAttempt", true]]);
   }
+  // The forms PostgREST picks by the argument names (ADR 0024 step 10 and
+  // step 23): consume_grant's nine, with p_journey_day_id, so the call never
+  // reaches the eight-argument wrapper; record_revision_visit's seven, with
+  // p_context_key, so the visit's 10 s dedupe is per context.
+  const src = sources.get(LAUNCH) ?? "";
+  const argNames = (fn: string, bodyRe: RegExp) => {
+    const at = src.indexOf(`.rpc("${fn}"`);
+    const m = at >= 0 ? bodyRe.exec(src.slice(at)) : null;
+    return m ? [...m[1].matchAll(/\b(p_[a-z_]+):/g)].map((x) => x[1]) : null;
+  };
+  eq("consume_grant: the nine-argument (day-id) form, every argument named",
+    argNames("consume_grant", /^\.rpc\("consume_grant", \{([\s\S]*?)\}\);/),
+    ["p_grant_id", "p_user_id", "p_course_id", "p_version_id", "p_org_id", "p_learning_path_id", "p_journey_enrollment_id", "p_journey_day", "p_journey_day_id"]);
+  eq("…its tags are the launch's (tags.<column>)",
+    /p_learning_path_id: tags\.learning_path_id,\s*p_journey_enrollment_id: tags\.journey_enrollment_id,\s*p_journey_day: tags\.journey_day,\s*p_journey_day_id: tags\.journey_day_id,/.test(src), true);
+  eq("record_revision_visit: the seven-argument form, p_context_key the launch's key",
+    [/const visit = \{\s*p_org: org\.id,\s*p_user: user\.id,\s*p_course: c\.id,\s*p_version: v\.id,\s*p_attempt: visitAttemptId,\s*p_kind: v\.manifest_type,\s*p_context_key: ctxKey,\s*\};/.test(src),
+      /\.rpc\("record_revision_visit", visit\)/.test(src)], [true, true]);
+  eq("…its plain-insert fallback names context_key",
+    /\.from\("revision_visits"\)\.insert\(\{[\s\S]*?launch_kind: visit\.p_kind,\s*context_key: visit\.p_context_key,\s*\}\)/.test(src), true);
 }
 
 console.log("\ncourse_attempts: the moved writes carry their explicit filters (ADR 0009 steps 2-4)");
 {
   const launch = attemptWrites.get("app/[org]/(learner)/courses/[courseId]/launch/page.tsx") ?? [];
-  // ADR 0014 step 3: other svcAttempt updates precede the journey tag now
-  // (the closes, the P4 update after opened), so the tag is found by its row.
-  const tag = launch.find((w) => w.receiver === "svcAttempt" && w.method === "update" && /\.eq\("id", existing\.id\)/.test(w.stmt));
+  // ADR 0024 P2-6 (step 23): the journey re-tag of a resumed row is deleted:
+  // no write by the resumed row's id (existing.id) is left on the page.
+  eq("no journey re-tag: no write by existing.id, and no update names journey_enrollment_id",
+    launch.filter((w) => /\.eq\("id", existing\.id\)/.test(w.stmt) || (w.method === "update" && /journey_enrollment_id/.test(w.stmt))).length, 0);
   // ADR 0024 P2-5: the preview insert (context_kind 'preview') is checked on
   // its own below; `ins` and `inserts` are the Start's.
   const isPreviewInsert = (w: { stmt: string }) => /context_kind: "preview"/.test(w.stmt);
   const ins = launch.find((w) => w.receiver === "svcAttempt" && w.method === "insert" && !isPreviewInsert(w));
-  eq("journey tag: .eq(id) .eq(user_id) .eq(organization_id)", !!tag &&
-    /\.eq\("id", existing\.id\)/.test(tag.stmt) &&
-    /\.eq\("user_id", user\.id\)/.test(tag.stmt) &&
-    /\.eq\("organization_id", org\.id\)/.test(tag.stmt), true);
   eq("attempt insert: user_id = session user, organization_id = org", !!ins &&
     /\buser_id: user\.id\b/.test(ins.stmt) &&
     /\borganization_id: org\.id\b/.test(ins.stmt) &&
@@ -382,6 +408,21 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
   // ADR 0014 step 3 (I-3, I-4): both name is_revision only when it was named.
   eq("attempt insert + retry: both carry the same is_revision spread",
     inserts.map((w) => /\.\.\.\(namedIsRevision \? \{ is_revision: true \} : \{\}\)/.test(w.stmt)), [true, true]);
+  // ADR 0024 P2-6 (step 23): both name the launch's context and its tags,
+  // the same six keys, from the resolver's context (attempt-insert-sites
+  // section (e) holds the scan's reading of them).
+  eq("attempt insert + retry: both name context_kind and the five tags (tags.<column>), no conditional journey spread",
+    inserts.map((w) =>
+      /context_kind: tags\.context_kind,\s*learning_path_id: tags\.learning_path_id,\s*journey_enrollment_id: tags\.journey_enrollment_id,\s*journey_day: tags\.journey_day,\s*journey_day_id: tags\.journey_day_id,\s*journey_version_id: tags\.journey_version_id,/.test(w.stmt) &&
+      !/journeyCtx|pathContextId/.test(w.stmt)), [true, true]);
+  // Every close of a Start takes the launch's context key (inLaunchContext;
+  // a preview's takes its course previews).
+  const launchSrc = sources.get("app/[org]/(learner)/courses/[courseId]/launch/page.tsx") ?? "";
+  eq("the deactivated-slot, stale-revision and flagged-row closes each run through inLaunchContext (3 of the page's 4 abandons; the 4th is N4's legacy_role close)",
+    [(launchSrc.match(/await inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)/g) ?? []).length,
+      (launchSrc.match(/\.update\(\{ status: "abandoned" \}\)/g) ?? []).length], [3, 4]);
+  eq("…inLaunchContext: a Start's rows by the launch's context key, a preview's by its course previews",
+    /function inLaunchContext<Q>\(query: Q\): Q \{[\s\S]{0,120}if \(!preview\) return q\.eq\("context_key", ctxKey\);[\s\S]{0,160}\.eq\("preview_kind", "course"\);\s*\}/.test(launchSrc), true);
   // ADR 0014 step 3: the new writes on attempt rows and their filters.
   const byStmt = (re: RegExp) => launch.filter((w) => re.test(w.stmt));
   eq("deactivated-slot close: .in(id) .eq(user_id) .eq(status, in_progress)",

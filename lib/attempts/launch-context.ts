@@ -30,7 +30,10 @@
  *   4. `?lp=P`: P found and active, else `path_unavailable`; a recorded
  *      enrolment, or P is "Everyone in this org" (self-enrolment, step 24),
  *      else `not_enrolled`; the course a step of P, else `not_a_step`; the
- *      step released, else the `upcoming` redirect; in strict order every
+ *      step released, else the `upcoming` redirect; then, for a learner not
+ *      enrolled yet on an "Everyone" path, "enrol first" (ruling A3:
+ *      v_path_step_status holds enrolled learners only, so the order is read
+ *      from the second call, after the page's insert); in strict order every
  *      earlier step done by the path rule as launch_context reads it from
  *      v_path_step_status, else the `locked` redirect;
  *   5. `?journey=E&day=D` (D a day id, or a number from an old link that the
@@ -42,11 +45,17 @@
  *      day's credit names this course: the course the learner completed, even
  *      when a publish swapped the day's course since), and for an active E
  *      only `open` (the day is the lowest uncredited required day, it holds
- *      this course in the pinned version, and the unlock rule opens it at
- *      `now` in the organisation's timezone); a completed E is otherwise
- *      `review_only`; an active E whose day holds this course but is not open
- *      yet goes to the `journey_locked` redirect; anything else is
- *      `day_not_open`;
+ *      this course in the pinned version, its context holds no open official
+ *      attempt of another course, and the unlock rule opens it at `now` in
+ *      the organisation's timezone); a completed E is otherwise
+ *      `review_only`; for an active E, an uncredited day that holds this
+ *      course while its context holds an open official attempt of another
+ *      course (the day's course swapped after the learner started it) goes
+ *      to the `journey` redirect into the same day on that started course,
+ *      whose launch is the `resume` above (step 93: the launch of the day
+ *      resumes it and does not open the day's current course beside it);
+ *      an active E whose day holds this course but is not open yet goes to
+ *      the `journey_locked` redirect; anything else is `day_not_open`;
  *   6. no product parameter: a released direct enrolment launches the
  *      Individual product; an "Everyone in this org" course self-enrols
  *      (step 24); otherwise exactly one holder (a path the learner is on, or
@@ -68,6 +77,11 @@
  *
  * The refusal reasons are names for tests and logs; the page keeps today's
  * redirects and notices. Ids in a decision are lower case.
+ *
+ * Beside the resolver (phase 2, P2-6): refusalWithoutFacts(), the rows that
+ * answer before any fact (the page makes no launch_context call for them),
+ * and afterSelfEnrol(), the P2-Q2 (i-a) decision after the page's
+ * self-enrolment insert and its second launch_context call.
  *
  * Pure: no next/* and no Supabase runtime import (the house shape of
  * lib/attempts/launch-kind.ts); `now` is an input, so the journey's "today"
@@ -192,6 +206,13 @@ export type LaunchDecision =
       pathId?: string;
       enrollmentId?: string;
       dayId?: string;
+      /**
+       * A `journey` redirect from the journey row only: the course started on
+       * that day (its open official attempt), relaunched in place of the
+       * day's current course (steps 22 and 93). Absent on a holder redirect,
+       * which relaunches the same course.
+       */
+      courseId?: string;
     }
   | {
       kind: "refused";
@@ -208,7 +229,7 @@ export type LaunchDecision =
         | "preview_not_allowed";
     };
 
-type Refusal = Extract<LaunchDecision, { kind: "refused" }>["reason"];
+export type Refusal = Extract<LaunchDecision, { kind: "refused" }>["reason"];
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DIGITS = /^[0-9]{1,6}$/;
@@ -253,20 +274,35 @@ export function journeyOpenDayIsOpen(
   return j.unlock_mode === "progress" ? allowedDay >= 1 : j.next_day <= allowedDay;
 }
 
+/**
+ * The rows that refuse before any fact is read (rows 1 and 2's run): both
+ * product parameters (`context_conflict`), and a run, with or without the
+ * mode (`preview_not_allowed`, phase P). The launch page calls this before
+ * its course read and its launch_context call, so neither row costs a
+ * request; resolveLaunchContext() answers the same from the same rule. Null
+ * when neither row applies.
+ */
+export function refusalWithoutFacts(params: Pick<LaunchParams, "lp" | "journey" | "run">): Refusal | null {
+  if (param(params.lp) !== null && param(params.journey) !== null) return "context_conflict";
+  if (param(params.run) !== null) return "preview_not_allowed";
+  return null;
+}
+
 /** The launch's context decision (ADR 0024 step 22; the order is in the header). */
 export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
   const lp = param(i.params.lp);
   const journey = param(i.params.journey);
   const day = param(i.params.day);
 
-  // 1. Both product parameters: refused, no checks.
-  if (lp !== null && journey !== null) return refused("context_conflict");
+  // 1. Both product parameters: refused, no checks. 2. A run is phase P's:
+  //    refused, with or without the mode, so it never becomes an official
+  //    launch (refusalWithoutFacts, the page's own pre-check).
+  const early = refusalWithoutFacts(i.params);
+  if (early !== null) return refused(early);
 
-  // 2. The preview rows. A run is phase P's: refused, with or without the
-  //    mode, so it never becomes an official launch. `?mode=preview` is a
-  //    report-viewing role's course preview (step 22's preview row), decided
-  //    before any fact: no launch_context call is made for it.
-  if (param(i.params.run) !== null) return refused("preview_not_allowed");
+  // 2. The preview row: `?mode=preview` is a report-viewing role's course
+  //    preview (step 22's preview row), decided before any fact: no
+  //    launch_context call is made for it.
   if (i.params.mode === "preview") {
     if (!canViewReports(i.role)) return refused("preview_not_allowed");
     return { kind: "launch", selfEnrol: null, context: { kind: "preview", previewKind: "course", runId: null, dayId: null } };
@@ -299,6 +335,13 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
     const step = p.steps.find((s) => s.step_number === p.course_step && sameId(s.course_id, i.courseId));
     if (!step) return refused("not_a_step");
     if (afterNow(step.release_at, i.now)) return { kind: "redirect", to: "upcoming", pathId };
+    // A3: an "Everyone" path learner with no enrolment row reads every
+    // earlier step as not done (v_path_step_status holds enrolled learners
+    // only), so "enrol first", before the strict order is read. The page
+    // inserts the self row, calls launch_context once more and resolves
+    // again; that second answer applies the order. A course that is no step
+    // of P, or a step not released yet, is answered above and enrols nobody.
+    if (selfEnrol !== null) return { kind: "launch", selfEnrol, context: { kind: "path", pathId } };
     if (p.sequence_mode !== "random" && p.steps.some((s) => s.step_number < step.step_number && !s.done)) {
       return { kind: "redirect", to: "locked", pathId };
     }
@@ -337,9 +380,22 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
     if (j.status !== "active") return refused("review_only");
 
     const holdsCourse = j.day.in_version && !j.day.removed && sameId(j.day.course_id, i.courseId);
+    // A day whose context holds an open official attempt of another course
+    // (the day's course swapped after the learner started it): the launch of
+    // that day resumes the started attempt and never opens the day's current
+    // course beside it (steps 22 and 93; section 95's row "A day's course
+    // swapped", R13). The day's own link names its current course, so the
+    // launch goes into the same day on the started course, whose launch
+    // answers `resume` above (launch_context orders the attempt of p_course
+    // first), so it cannot loop. Never on a credited day: its review is the
+    // credit row's course.
+    const started = j.day_open_attempt?.course_id ?? null;
+    if (holdsCourse && !j.day_credit && started !== null && UUID.test(started)) {
+      return { kind: "redirect", to: "journey", enrollmentId, dayId, courseId: started.toLowerCase() };
+    }
     // A credited day whose course a publish swapped is reviewed on the
     // credit row's course; its new course is not offered (step 22).
-    if (!holdsCourse || j.day_credit) return refused("day_not_open");
+    if (!holdsCourse || j.day_credit || j.day_open_attempt) return refused("day_not_open");
     if (sameId(j.next_day_id, dayId) && journeyOpenDayIsOpen(j, i.now)) return launch("open");
     return { kind: "redirect", to: "journey_locked", enrollmentId, dayId };
   }
@@ -363,4 +419,52 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
   if (holders.length > 1) return { kind: "redirect", to: "chooser" };
   if (course.individual.upcoming_at !== null) return { kind: "redirect", to: "upcoming" };
   return refused("not_enrolled");
+}
+
+/**
+ * What the page's self-enrolment insert (step 24) answered: a new row; a
+ * 23505, read as "already enrolled" (a self row or an admin's direct row of
+ * the learner exists); any other error.
+ */
+export type SelfEnrolInsert = "inserted" | "already_enrolled" | "failed";
+
+export type SelfEnrolOutcome =
+  /** Act on the second decision as on any first one: a launch (never a further self-enrolment), a redirect or a refusal. */
+  | { kind: "go_on"; decision: LaunchDecision }
+  /** P2-Q2 (i-a): the learner's own direct assignment is not released yet: today's `/dashboard?upcoming=<course>`, no attempt written. */
+  | { kind: "upcoming" }
+  /** The retry notice, no attempt written. */
+  | { kind: "retry"; reason: string };
+
+/**
+ * After the self-enrolment insert and the second launch_context call (step
+ * 24; ruling A3; P2-Q2, option (i-a)). Pure: the page passes the insert's
+ * answer and the resolver's second decision (null when no second call was
+ * made, which is the case after a failed insert).
+ *
+ *   - any other insert error: the retry notice, nothing more written (the
+ *     page makes no second call);
+ *   - the second decision launches with no self-enrolment (the insert made
+ *     the learner enrolled, or a 23505 met a concurrent Start's row): go on;
+ *   - a 23505, then `selfEnrol: "course"` again: the row that answered
+ *     23505 is the learner's own direct assignment, not released yet (a
+ *     team, org-wide or group date never holds an "Everyone" course back):
+ *     `upcoming`, and the insert is never tried again. Course only;
+ *   - any other second self-enrolment (a path's, or a course's after an
+ *     insert that succeeded): the retry notice, never a loop of inserts;
+ *   - a redirect or a refusal (A3's second answer may be the strict lock):
+ *     go on, so the page sends it to its notice.
+ */
+export function afterSelfEnrol(i: {
+  selfEnrol: "course" | "path";
+  insert: SelfEnrolInsert;
+  second: LaunchDecision | null;
+}): SelfEnrolOutcome {
+  if (i.insert === "failed") return { kind: "retry", reason: `self_enrol_${i.selfEnrol}_insert_failed` };
+  if (i.second === null) return { kind: "retry", reason: "self_enrol_no_second_answer" };
+  if (i.second.kind === "launch" && i.second.selfEnrol !== null) {
+    if (i.insert === "already_enrolled" && i.selfEnrol === "course" && i.second.selfEnrol === "course") return { kind: "upcoming" };
+    return { kind: "retry", reason: `self_enrol_${i.second.selfEnrol}_not_recorded` };
+  }
+  return { kind: "go_on", decision: i.second };
 }
