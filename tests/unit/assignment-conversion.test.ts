@@ -102,6 +102,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json(inList.split(",").filter(Boolean).map((u) => ({ user_id: u, business_vertical: null, department: null })));
   }
   if (table === "courses") return json([{ id: COURSE, organization_id: ORG, title: "Course K", is_active: true }]);
+  // The path belongs to the org (the route checks it before any write).
+  if (table === "learning_paths") return json([{ id: PATH, organization_id: ORG, name: "Path P" }]);
   if (table === "teams") return json([{ id: "t-1" }]);
   if (table === "content_scopes") return json([]);
   if ((table === "course_assignments" || table === "learning_path_assignments") && method === "POST") {

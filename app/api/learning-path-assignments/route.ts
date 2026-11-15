@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { loadOrgGovernance } from "@/lib/org/field-options";
 import { checkScopeTarget, ensureScopeGroup } from "@/lib/org/scope-groups";
 import { describeScopes, loadScopesFor, scopeLabel, scopesCover, type ScopePair } from "@/lib/content/scopes";
-import { createClient } from "@/lib/supabase/server";
+import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -13,6 +13,12 @@ import { convertSelfEnrolments } from "@/lib/assignments/direct";
 /**
  *   POST /api/learning-path-assignments
  *   body: { orgSlug, pathId, assignToOrg?, userIds?, teamIds?, groupIds?, dueAt? }
+ *
+ * Admin-only: requireOrgAdminApi checks the caller's role before any write
+ * and before the service-role notification pass. The path and every named
+ * user, team and group must belong to the org (ids from elsewhere are
+ * refused or dropped, as in POST /api/assignments). A failed check read
+ * answers 503 and writes nothing, so no named assignee is dropped silently.
  *
  * After successful inserts, expands each row to the affected learners and
  * fires path_assignment notifications in the background. A learner's own
@@ -36,20 +42,52 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireOrgAdminApi(body.orgSlug);
+  if ("error" in auth) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
   }
+  const { supabase, org, userId } = auth;
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name, slug")
-    .eq("slug", body.orgSlug)
+  // Tenant guard: the path and the named assignees must belong to this org.
+  // The notification pass below reads and emails with the service role, so
+  // an id from another org must never reach the rows.
+  const checkFailed = () =>
+    NextResponse.json(
+      { error: "Could not check the path and its assignees. Nothing was assigned; try again." },
+      { status: 503 }
+    );
+  const { data: path, error: pathErr } = await supabase
+    .from("learning_paths")
+    .select("id")
+    .eq("id", body.pathId)
+    .eq("organization_id", org.id)
     .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  if (pathErr) return checkFailed();
+  if (!path) {
+    return NextResponse.json({ error: "Learning path not found" }, { status: 404 });
+  }
+  const reqUserIds = (body.userIds ?? []).filter(Boolean);
+  const reqTeamIds = (body.teamIds ?? []).filter(Boolean);
+  let validUserIds: string[] = [];
+  let validTeamIds: string[] = [];
+  if (reqUserIds.length) {
+    const { data: m, error: mErr } = await supabase
+      .from("organization_members")
+      .select("user_id")
+      .eq("organization_id", org.id)
+      .in("user_id", reqUserIds);
+    if (mErr) return checkFailed();
+    validUserIds = ((m ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
+  }
+  if (reqTeamIds.length) {
+    const { data: t, error: tErr } = await supabase
+      .from("teams")
+      .select("id")
+      .eq("organization_id", org.id)
+      .in("id", reqTeamIds);
+    if (tErr) return checkFailed();
+    validTeamIds = ((t ?? []) as Array<{ id: string }>).map((r) => r.id);
+  }
 
   const dueAt =
     body.dueAt && body.dueAt.trim() ? new Date(body.dueAt).toISOString() : null;
@@ -58,11 +96,12 @@ export async function POST(request: Request) {
   const requestedGroupIds = (body.groupIds ?? []).filter(Boolean);
   let validGroupIds: string[] = [];
   if (requestedGroupIds.length > 0) {
-    const { data: groupRows } = await supabase
+    const { data: groupRows, error: gErr } = await supabase
       .from("org_groups")
       .select("id")
       .eq("organization_id", org.id)
       .in("id", requestedGroupIds);
+    if (gErr) return checkFailed();
     validGroupIds = ((groupRows ?? []) as Array<{ id: string }>).map((g) => g.id);
     if (validGroupIds.length !== requestedGroupIds.length) {
       return NextResponse.json(
@@ -88,7 +127,7 @@ export async function POST(request: Request) {
       scopeTargets.push(t.pair);
     }
     for (const pair of scopeTargets) {
-      const g = await ensureScopeGroup(supabase, org.id, pair, user.id);
+      const g = await ensureScopeGroup(supabase, org.id, pair, userId);
       if ("error" in g) {
         const msg = /system_key|does not exist|schema cache/.test(g.error) ? "Assigning to a vertical / department needs migration 0096" : g.error;
         return NextResponse.json({ error: msg }, { status: 400 });
@@ -102,7 +141,7 @@ export async function POST(request: Request) {
       for (const pair of scopeTargets) {
         if (!scopesCover(mapping, pair)) warnings.push(`${scopeLabel(pair)} is outside this learning path's mapping (${describeScopes(mapping)}).`);
       }
-      const namedIds = (body.userIds ?? []).filter(Boolean);
+      const namedIds = validUserIds;
       if (namedIds.length) {
         const { data: mm } = await supabase
           .from("organization_members")
@@ -137,10 +176,10 @@ export async function POST(request: Request) {
       user_id: null,
       team_id: null,
       due_at: dueAt,
-      assigned_by: user.id,
+      assigned_by: userId,
     });
   }
-  for (const uid of body.userIds ?? []) {
+  for (const uid of validUserIds) {
     rows.push({
       path_id: body.pathId,
       organization_id: org.id,
@@ -148,10 +187,10 @@ export async function POST(request: Request) {
       user_id: uid,
       team_id: null,
       due_at: dueAt,
-      assigned_by: user.id,
+      assigned_by: userId,
     });
   }
-  for (const tid of body.teamIds ?? []) {
+  for (const tid of validTeamIds) {
     rows.push({
       path_id: body.pathId,
       organization_id: org.id,
@@ -159,7 +198,7 @@ export async function POST(request: Request) {
       user_id: null,
       team_id: tid,
       due_at: dueAt,
-      assigned_by: user.id,
+      assigned_by: userId,
     });
   }
   for (const gid of validGroupIds) {
@@ -171,7 +210,7 @@ export async function POST(request: Request) {
       team_id: null,
       group_id: gid,
       due_at: dueAt,
-      assigned_by: user.id,
+      assigned_by: userId,
     });
   }
   if (rows.length === 0) {
@@ -207,7 +246,7 @@ export async function POST(request: Request) {
   const conversion = await convertSelfEnrolments(
     supabase, "learning_path_assignments",
     { orgId: org.id, column: "path_id", id: body.pathId, userIds: alreadyUserIds },
-    { assignedBy: user.id, ...(dueAt ? { dueAt } : {}) }
+    { assignedBy: userId, ...(dueAt ? { dueAt } : {}) }
   );
   if (conversion.error) {
     return NextResponse.json({ error: conversion.error.message ?? "Could not convert a self-enrolment" }, { status: 400 });
