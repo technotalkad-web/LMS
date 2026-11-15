@@ -11,7 +11,8 @@
  * same-file `const x = {...}`, or a spread of one) and fails on a context it
  * cannot resolve. The number of call sites is pinned so a missed one shows.
  * It also checks the named keys of NotificationContext and the key list of
- * ops/notification-log-credential-purge.sql against the same allow-list.
+ * ops/notification-log-credential-purge.sql against the same allow-list, and
+ * the script's credential-key lists against CREDENTIAL_KEYS.
  *
  * No database, no network.
  *
@@ -263,6 +264,9 @@ function main() {
     const lists = [...sql.matchAll(/\/\* stored keys \*\/\s*array\[([^\]]*)\]/g)].map((m) => [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort());
     eq("the script names the stored-key list", lists.length > 0, true);
     eq("…every copy equals STORED_CONTEXT_KEYS", lists.every((l) => JSON.stringify(l) === JSON.stringify(stored)), true);
+    const credentialLists = [...sql.matchAll(/\/\* credential keys \*\/\s*array\[([^\]]*)\]/g)].map((m) => [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort());
+    eq("the script names the credential keys it looks for in custom subjects", credentialLists.length, 1);
+    eq("…every copy equals the credential keys", credentialLists.every((l) => JSON.stringify(l) === JSON.stringify([...CREDENTIAL_KEYS].sort())), true);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);
