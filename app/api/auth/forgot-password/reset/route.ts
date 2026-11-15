@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { hashResetToken, safeHashEqual } from "@/lib/auth/password-reset";
+import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
 
 /**
  *   POST /api/auth/forgot-password/reset
@@ -129,6 +130,13 @@ export async function POST(request: Request) {
     .from("password_reset_otps")
     .update({ used_at: new Date().toISOString() })
     .eq("id", row.id);
+
+  // The client signs in with the new password next: end this browser's
+  // impersonation first, after the token is spent. The cookie always goes.
+  // The row is stamped ended only when the owner who started it is still
+  // signed in here once the password is set; otherwise it runs to its
+  // expiry. Never throws.
+  await endImpersonationForSessionChange();
 
   return NextResponse.json({ ok: true, email });
 }
