@@ -284,16 +284,30 @@ console.log("\nthe launch page's two props (step 8)");
 console.log("\nthe continue page (steps 1 and 2)");
 {
   const src = code(CONTINUE_PAGE);
-  eq("reads pass_required strictly from courses", /\.from\("courses"\)\s*\.select\("pass_required"\)\s*\.eq\("id", fromCourseId\)\s*\.maybeSingle\(\);\s*if \(courseErr \|\| !courseRow\) readError\(\);/.test(src), true);
-  eq("…and the grants from attempt_requests, strictly", /\.from\("attempt_requests"\)\s*\.select\("used_attempt_id"\)[\s\S]*?if \(grantErr\) readError\(\);/.test(src), true);
+  // ADR 0024 P2-7 (step 27 as build note O1-k makes it exact): the step's
+  // rule from the steps read (the step's own, else the course's), the wait
+  // through readContextResult in the path's context (attempts and grants,
+  // strictly), the step's done from the path rule (pathStepStatus) with the
+  // fact read once, only when the rule alone does not decide.
+  eq("reads each step's course activity and rule with the step's own rule (the narrower-select fallback), and resolves the rule", [
+    /readWithOptionalColumn<unknown\[\]>\(\s*"pass_required",[\s\S]*?\.from\("learning_path_courses"\)[\s\S]*?"course_id, step_number, courses\(is_active, pass_required\)"\s*\)/.test(src),
+    /const passRequired = resolvedStepRule\(fromStep\.pass_required, courseOf\(fromStep\)\?\.pass_required\);/.test(src),
+  ], [true, true]);
   eq("…never through the fail-soft helpers", [src.includes("fetchPassRequired("), src.includes("fetchGrantRetakeIds(")], [false, false]);
   eq("the versions read: an error or no rows ends as the timeout target", /if \(verErr \|\| versionIds\.length === 0\) readError\(\);/.test(src), true);
-  eq("the attempts read names is_revision with the narrower-select fallback, an error ends the wait", [
-    /readWithOptionalColumn<unknown\[\]>\(\s*"is_revision",/.test(src),
-    /if \(rowsErr\) readError\(\);/.test(src),
+  eq("the wait reads through readContextResult in the path's context; a failed read ends the wait", [
+    /const key = contextKeyOf\(\{ kind: "path", pathId \}\);/.test(src),
+    /const r = await readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds \}\);\s*if \(!r\.ok\) readError\(\);/.test(src),
   ], [true, true]);
-  eq("the wait ends only on a stored result whose verdict is not pending (officialResultStored), then done through officialDone with the course's pass_required",
-    /if \(officialResultStored\(scoring, attempts, passRequired\)\) \{\s*stored = true;\s*done = officialDone\(scoring, passRequired\);\s*break;\s*\}/.test(src), true);
+  eq("the wait ends only on a stored result whose verdict is not pending (officialResultStored over the context's rows)",
+    /if \(officialResultStored\(r\.result\.scoring, r\.result\.rows, passRequired\)\) \{\s*stored = r;\s*break;\s*\}/.test(src), true);
+  eq("the step's done is the path rule's answer on the same read; the fact is read once, only when the rule alone does not decide, and a failed read ends as the timeout target", [
+    /let step = pathStepStatus\(\{ pathId, step: stepInput, attempts: stored\.result\.rows, grants: stored\.grants, fact: null, now \}\);/.test(src),
+    /if \(!step\.passed_by_rule\) \{\s*const facts = await readPathStepFacts\(supabase, user\.id, \[pathId\]\);\s*if \(!facts\.ok\) readError\(\);/.test(src),
+    /redirect\(target\(\{ timedOut: false, stored: true, done: step\.done \}\)\);/.test(src),
+    // never contextResult's done, officialDone or computeScoring (O1-k)
+    [/\bofficialDone\(/, /\bcomputeScoring\(/, /\.result\.done\b/].some((re) => re.test(src)),
+  ], [true, true, true, false]);
   eq("…officialResultStored imported from lib/learner/continue, the only conclude test in the loop; resultStored and verdictPending no longer called here", [
     /import \{[^}]*\bofficialResultStored\b[^}]*\} from "@\/lib\/learner\/continue";/.test(src),
     count(src, "officialResultStored("),
@@ -305,7 +319,7 @@ console.log("\nthe continue page (steps 1 and 2)");
     /\.(insert|update|upsert|delete)\(/.test(src),
     /\.rpc\(/.test(src),
   ], [false, false, false]);
-  eq("the four log events, ids only", ["continue_not_a_step", "continue_read_error", "continue_timeout", "continue_not_done"].map((e) => src.includes(`"${e}"`)), [true, true, true, true]);
+  eq("the five log events, ids only", ["continue_not_a_step", "continue_inactive", "continue_read_error", "continue_timeout", "continue_not_done"].map((e) => src.includes(`"${e}"`)), [true, true, true, true, true]);
   eq("…in the house shape", /console\.warn\(JSON\.stringify\(\{ event, path_id: pathId, course_id: fromCourseId, user_id: user\.id \}\)\)/.test(src), true);
   eq("no redirect inside a try", /\btry\s*\{/.test(src), false);
   const loading = code(CONTINUE_LOADING);
@@ -337,22 +351,28 @@ console.log("\nthe status route (ADR 0019, note of 2026-11-11)");
     /\.(insert|update|upsert|delete)\(/.test(src),
     /\.rpc\(/.test(src),
   ], [false, false, false, false]);
-  eq("the learner's own attempt: id and user_id, maybeSingle; an error is 503, no row is 404", [
-    /\.from\("course_attempts"\)\s*\.select\("id, course_version_id, course_versions\(course_id\)"\)\s*\.eq\("id", attemptId\)\s*\.eq\("user_id", user\.id\)\s*\.maybeSingle\(\);\s*if \(ownErr\) return unreadable\(\);\s*if \(!own\) return answer\(\{\}, 404\);/.test(src),
+  eq("the learner's own attempt: id and user_id, maybeSingle, its context_key through the narrower-select fallback; an error is 503, no row is 404", [
+    /readWithOptionalColumn<Record<string, unknown>>\(\s*"context_key",\s*\(columns\) =>\s*supabase\s*\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.eq\("id", attemptId\)\s*\.eq\("user_id", user\.id\)\s*\.maybeSingle\(\),\s*OWN_COLUMNS\s*\);\s*if \(ownErr\) return unreadable\(\);\s*if \(!own\) return answer\(\{\}, 404\);/.test(src),
     /if \(typeof courseId !== "string"\) return unreadable\(\);/.test(src),
   ], [true, true]);
-  eq("the continue page's strict reads: pass_required, the versions, the grants, the attempts", [
-    /\.from\("courses"\)\s*\.select\("pass_required"\)\s*\.eq\("id", courseId\)\s*\.maybeSingle\(\);\s*if \(courseErr \|\| !courseRow\) return unreadable\(\);/.test(src),
+  // ADR 0024 P2-7 (step 27): the attempt's own context only; a Preview's
+  // attempt and inactive content answer stored false (O5-d).
+  eq("the context is the attempt's key, `individual` without 0107; a Preview's attempt answers stored false unscored", [
+    /const key = ownKey \?\? "individual";/.test(src),
+    /if \(kind === "preview"\) return answer\(\{ stored: false \}, 200\);/.test(src),
+  ], [true, true]);
+  eq("the continue page's strict reads: the course (rule and activity), a path attempt's path and step, the versions, the context", [
+    /\.from\("courses"\)\s*\.select\("pass_required, is_active"\)\s*\.eq\("id", courseId\)\s*\.maybeSingle\(\);\s*if \(courseErr \|\| !courseRow\) return unreadable\(\);/.test(src),
+    /if \(course\.is_active !== true\) return answer\(\{ stored: false \}, 200\);/.test(src),
+    /if \(!pathRow \|\| \(pathRow as \{ is_active\?: boolean \| null \}\)\.is_active === false\) return answer\(\{ stored: false \}, 200\);/.test(src),
+    /const passRequired = resolvedStepRule\(stepRule, course\.pass_required\);/.test(src),
     /if \(verErr \|\| versionIds\.length === 0\) return unreadable\(\);/.test(src),
-    /\.from\("attempt_requests"\)\s*\.select\("used_attempt_id"\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("course_id", courseId\)\s*\.eq\("status", "approved"\)\s*\.not\("used_attempt_id", "is", null\);\s*if \(grantErr\) return unreadable\(\);/.test(src),
-    /const policy = await resolvePolicy\(supabase, courseId\);/.test(src),
-    // ADR 0024 P2-5 item 5b: the list drops previews through the one fallback.
-    /readWithOptionalColumn<unknown\[\]>\(\s*"is_revision",[\s\S]*?readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\([\s\S]*?\.eq\("user_id", user\.id\)\s*\.in\("course_version_id", versionIds\),\s*apply\s*\)\s*\),\s*ATTEMPT_COLUMNS\s*\);\s*if \(rowsErr\) return unreadable\(\);/.test(src),
-  ], [true, true, true, true, true]);
-  eq("…never through the fail-soft helpers", [src.includes("fetchPassRequired("), src.includes("fetchGrantRetakeIds(")], [false, false]);
-  eq("the answer: officialResultStored, once, over computeScoring of those rows", [
+    /const read = await readContextResult\(supabase, \{ userId: user\.id, courseId, key, passRequired, versionIds \}\);\s*if \(!read\.ok\) return unreadable\(\);/.test(src),
+  ], [true, true, true, true, true, true]);
+  eq("…never through the fail-soft helpers, and no direct scoring", [src.includes("fetchPassRequired("), src.includes("fetchGrantRetakeIds("), src.includes("computeScoring"), src.includes("resolvePolicy")], [false, false, false, false]);
+  eq("the answer: officialResultStored, once, over the context's rows", [
     count(src, "officialResultStored("),
-    /const scoring = computeScoring\(attempts, policy, retakeIds\);\s*return answer\(\{ stored: officialResultStored\(scoring, attempts, passRequired\) \}, 200\);/.test(src),
+    /return answer\(\{ stored: officialResultStored\(read\.result\.scoring, read\.result\.rows, passRequired\) \}, 200\);/.test(src),
   ], [1, true]);
   eq("every answer carries Cache-Control: no-store, through one helper", [
     /const NO_STORE = \{ "Cache-Control": "no-store" \};/.test(src),

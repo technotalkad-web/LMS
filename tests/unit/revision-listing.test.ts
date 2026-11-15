@@ -207,10 +207,23 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     calls: ["computeScoring(list)", "computeScoring(my)", "hasLiveGrantedRetake(my)"],
     feeds: [STAR_FEED],
   },
+  // ADR 0024 P2-7: the path page reads the path's rows through
+  // readPathAttempts (lib/paths/facts-read.ts: status and is_revision with
+  // the fallback) and scores through pathProgress (contextResult per step);
+  // it calls no helper itself.
   "app/[org]/(learner)/paths/[pathId]/page.tsx": {
-    calls: ["computeScoring(list)", "computeScoring(list)"],
+    calls: [],
     feeds: [
-      ["the explicit select names status and adds is_revision with the fallback", /readWithOptionalColumn<unknown\[\]>\(\s*"is_revision",[\s\S]*?\.from\("course_attempts"\)\s*\.select\(columns\)[\s\S]*?"id, course_version_id, status, [^"]*"\s*\)/],
+      ["the path's rows are read through readPathAttempts", /readPathAttempts\(supabase, \{ userId: user\.id, pathIds: \[pathId\], versions \}\)/],
+      ["…and judged by pathProgress", /const progress = pathProgress\(\{/],
+    ],
+  },
+  // ADR 0024 P2-7: the path rule's reader; its course_attempts select names
+  // status and adds is_revision with the fallback (no helper call).
+  "lib/paths/facts-read.ts": {
+    calls: [],
+    feeds: [
+      ["the read adds is_revision with the fallback over the context columns", /readWithOptionalColumn<Array<Record<string, unknown>>>\(\s*"is_revision",[\s\S]*?\.from\("course_attempts"\)\s*\.select\(columns\)[\s\S]*?`\$\{CONTEXT_ATTEMPT_COLUMNS\}, learning_path_id`\s*\)/],
     ],
   },
   "app/api/attempt-requests/[id]/route.ts": {
@@ -289,15 +302,23 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
       ["the course_attempts select takes the column list", /\.from\("course_attempts"\)\.select\(columns\)/],
     ],
   },
-  // ADR 0019: the continue address scores the learner's own attempts on the course it waits on.
+  // ADR 0019 and ADR 0024 P2-7 (step 27): the continue address reads the
+  // learner's rows in the path's context through readContextResult (its
+  // select names status and is_revision) and calls no helper itself.
   "app/[org]/(learner)/continue/page.tsx": {
-    calls: ["computeScoring(attempts)"],
-    feeds: columnsFeeds(),
+    calls: [],
+    feeds: [
+      ["the wait reads through readContextResult in the path's context", /const r = await readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds \}\);/],
+    ],
   },
-  // ADR 0019, note of 2026-11-11: the bar's status route scores the same reads as the continue address.
+  // ADR 0019, note of 2026-11-11, and ADR 0024 P2-7: the bar's status route
+  // reads the attempt's own context through readContextResult, as the
+  // continue address does.
   "app/api/attempts/[attemptId]/result-stored/route.ts": {
-    calls: ["computeScoring(attempts)"],
-    feeds: columnsFeeds(),
+    calls: [],
+    feeds: [
+      ["the attempt's context is read through readContextResult", /const read = await readContextResult\(supabase, \{ userId: user\.id, courseId, key, passRequired, versionIds \}\);/],
+    ],
   },
   // The learning-path surfaces: no helper call; their selects carry the flag.
   "app/[org]/(admin)/learning-paths/[pathId]/learners/page.tsx": { calls: [], feeds: columnsFeeds() },
@@ -327,7 +348,11 @@ console.log("\n(i) every scoring helper's call site reads status and is_revision
   const outside = callers.filter((f) => !(f in SCOPED));
   eq("every caller is in SCOPED: PENDING_1B is empty (PR 1b)", outside, PENDING_1B);
   eq("PENDING_1B is the empty list", PENDING_1B, []);
-  eq("non-vacuous: the scan finds the listed callers", callers.filter((f) => f in SCOPED).length >= 20, true);
+  // The floor is the count of SCOPED files that still call a helper: 22
+  // before ADR 0024 P2-7, 19 since it moved the continue page, the path
+  // page and the status route onto readContextResult and pathProgress (each
+  // stays listed with calls: []).
+  eq("non-vacuous: the scan finds the listed callers (19 since P2-7)", callers.filter((f) => f in SCOPED).length >= 19, true);
   // The paged fallback's callers are listed too (the eight paged
   // attempts reads and attempt-kind.ts's paged grant reader), each in SCOPED
   // with its pagedFeed, so a new paged read cannot slip in unlisted.
@@ -539,16 +564,17 @@ const PENDING_0024: string[] = [
   "app/[org]/(admin)/analytics/page.tsx",
   "app/[org]/(admin)/attempt-requests/page.tsx",
   "app/[org]/(admin)/library/[courseId]/learners/page.tsx",
-  "app/[org]/(learner)/continue/page.tsx",
-  // The launch page left in P2-6: it reads through readContextResult.
+  // The launch page left in P2-6: it reads through readContextResult. The
+  // continue page, the path page and the status route left in P2-7 (the
+  // continue page and the status route read through readContextResult, the
+  // path page through pathProgress); the dashboard stays for its course
+  // cards until phase 6.
   "app/[org]/(learner)/courses/[courseId]/page.tsx",
   "app/[org]/(learner)/courses/page.tsx",
   "app/[org]/(learner)/dashboard/page.tsx",
-  "app/[org]/(learner)/paths/[pathId]/page.tsx",
   "app/api/attempt-requests/[id]/route.ts",
   "app/api/attempt-requests/bulk/route.ts",
   "app/api/attempt-requests/route.ts",
-  "app/api/attempts/[attemptId]/result-stored/route.ts",
   "app/api/integrations/learner-summary/route.ts",
   "lib/attempts/force-restart.ts",
   "lib/attempts/grant.ts",
@@ -572,10 +598,11 @@ console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult
     [new Set(PENDING_0024).size === PENDING_0024.length, PENDING_0024.includes(RULE_OWNER), PENDING_0024.includes(DEFINITION)], [true, false, false]);
   // The bound is the list's length after the last slice that removed a file
   // (20 on 2026-11-14; 19 since P2-6 took the launch page off on
-  // 2026-11-15). Each later slice that removes a file lowers it to the new
-  // length in the same pull request, so a new direct caller cannot take a
-  // removed file's place on the list.
-  eq("PENDING_0024 never grows: at most its 19 files since P2-6 (2026-11-15)", PENDING_0024.length <= 19, true);
+  // 2026-11-15; 16 since P2-7 took the continue page, the path page and the
+  // status route off). Each later slice that removes a file lowers it to the
+  // new length in the same pull request, so a new direct caller cannot take
+  // a removed file's place on the list.
+  eq("PENDING_0024 never grows: at most its 16 files since P2-7", PENDING_0024.length <= 16, true);
 
   // H3 (the ADR's note of 2026-11-14): the forms that call computeScoring
   // under another name, which the scan by name above cannot see, are refused

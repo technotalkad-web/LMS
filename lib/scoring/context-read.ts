@@ -42,6 +42,7 @@
  */
 import {
   isMissingColumn,
+  isMissingRelation,
   isSchemaMissing,
   readWithOptionalFilter,
   type OptionalFilterState,
@@ -167,6 +168,13 @@ export type ContextRead =
       result: ContextResult<ReadContextAttempt, ReadContextGrant>;
       /** false: a database without 0107, read as one undivided context (the header). */
       contextColumns: boolean;
+      /**
+       * The approved grants of the (learner, course) the result was scored
+       * with, every context, as read: a caller that judges the same rows by
+       * another rule (Continue's path step through pathStepStatus; ADR 0024
+       * O1-k) takes them from here, never from a second read.
+       */
+      grants: ReadContextGrant[];
     }
   | { ok: false; reason: ContextReadFailure; code: string | null };
 
@@ -263,7 +271,7 @@ export async function readContextResult(
     let grants: ContextGrant[] = [];
     if (contextColumns) {
       const g = await readGrants(`${GRANT_COLUMNS}, context_key`);
-      const missing = g.error && (isMissingColumn(g.error, "context_key") || g.error.code === "42P01" || g.error.code === "PGRST205");
+      const missing = g.error && (isMissingColumn(g.error, "context_key") || isMissingRelation(g.error, "attempt_requests"));
       if (missing && !attemptsRead) {
         // No attempts read decided the schema, and the grants have no
         // context_key (or no table, before 0083): a database without 0107.
@@ -292,7 +300,7 @@ export async function readContextResult(
       passRequired: opts.passRequired,
       now,
     });
-    return { ok: true, result, contextColumns };
+    return { ok: true, result, contextColumns, grants };
   } catch (e) {
     // A thrown read (a network failure) or a row the rule refuses.
     return fail(e instanceof ContextKeyError ? "rule" : "attempts_read");

@@ -1,10 +1,11 @@
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
-import { computeScoring, officialDone, type ScorableAttempt } from "@/lib/scoring/policy";
-import { resolvePolicy } from "@/lib/scoring/resolve";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
-import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
+import { readContextResult, type ContextRead } from "@/lib/scoring/context-read";
+import { contextKeyOf } from "@/lib/scoring/context";
+import { pathStepStatus, resolvedStepRule } from "@/lib/paths/progress";
+import { readPathStepFacts } from "@/lib/paths/facts-read";
 import {
   CONTINUE_POLL_MS,
   CONTINUE_WAIT_MS,
@@ -23,22 +24,58 @@ import {
  * is written by the statements and commit routes as today. It waits, one
  * read a second until a deadline CONTINUE_WAIT_MS after its first read (it
  * answers after the read at the deadline), for the module's official result
- * to be stored (on a
- * pass_required course, with its pass or fail: verdictPending), then moves
- * the learner on only when that result completes the step under the course's
- * pass_required setting. The launch page keeps its own gates (release dates,
- * the strict lock, assignment) for the next launch; nothing here repeats them.
+ * to be stored (on a pass-required step, with its pass or fail:
+ * verdictPending), then moves the learner on only when the step is done by
+ * the path rule. The launch page keeps its own gates (release dates, the
+ * strict lock, assignment) for the next launch; nothing here repeats them.
  * loading.tsx shows "Saving your result" while this page waits.
+ *
+ * ADR 0024 step 27, as build note O1-k makes it exact (P2-7):
+ *   - the wait reads through readContextResult in the path's context
+ *     (`path:<lp>`), with the step's resolved rule (the step's own
+ *     pass_required, else the course's; step 8). That read decides only
+ *     whether the result is stored and whether its verdict is pending
+ *     (officialResultStored over the context's rows). Each read carries its
+ *     own abort signal (step 25: without one, reads 2 to 7 returned the first
+ *     read's rows, spec 63 (b2)). A Preview is another context, so it never
+ *     reads as the stored result. On a database without 0107 each read of the
+ *     wait makes one failed read first and then reads today's undivided rows
+ *     (readContextResult's own fallback);
+ *   - the step's done is the path rule's per-step answer (pathStepStatus),
+ *     fed with that read's rows and grants, the resolved rule and the step's
+ *     stored fact: never contextResult's `done`. So a step passed earlier
+ *     (D14) or done by its fact continues to the next step after a failed
+ *     granted retake, instead of `?failed=1`;
+ *   - the fact row is read once, through readPathStepFacts, after the wait
+ *     has ended on a stored result, and only when the step is not done by
+ *     the rule on those rows (only then can a fact change the answer); a
+ *     failed facts read takes the read-error exit, never `?failed=1`.
+ *
+ * O5-d and the owner's P2-Q1 answer: an inactive path goes to the dashboard;
+ * a step whose course is inactive is left out of the path page, so a `from`
+ * step whose course is inactive goes to the plain path page without a wait,
+ * and a stored, done result whose next step's course is inactive goes to the
+ * plain path page too (not `?end=1`, and nothing is skipped). A wait that
+ * times out still goes to `?saving=1`, and a stored result that is not done
+ * to `?failed=1`.
  *
  * Every refusal is a redirect() outside any try (redirect throws).
  *
  * Every caller waits, whatever their role (ADR 0024 step 23, P2-5 item 4): a
  * staff member's launch without `?mode=preview` is a real attempt, and a
- * Preview carries no `?lp=`, so it never reaches this address. The wait's read
- * drops `context_kind = 'preview'` rows (item 5b), so a Preview of the module
- * beside the caller's real attempt never reads as the stored result.
+ * Preview carries no `?lp=`, so it never reaches this address.
  */
-const ATTEMPT_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, status";
+type StepRow = {
+  course_id: string;
+  step_number: number;
+  /** The step's own rule (0107); absent on a database without it. */
+  pass_required?: boolean | null;
+  courses: { is_active: boolean | null; pass_required: boolean | null } | Array<{ is_active: boolean | null; pass_required: boolean | null }> | null;
+};
+
+const courseOf = (s: StepRow) => (Array.isArray(s.courses) ? (s.courses[0] ?? null) : s.courses);
+/** The step's course is active (O5-d); a course row the learner cannot read reads as not active. */
+const isActiveStep = (s: StepRow) => courseOf(s)?.is_active === true;
 
 export default async function ContinuePage({
   params,
@@ -70,36 +107,45 @@ export default async function ContinuePage({
     redirect(`/${orgSlug}/dashboard`);
   }
 
-  const { data: stepRows, error: stepErr } = await supabase
-    .from("learning_path_courses")
-    .select("course_id, step_number")
-    .eq("path_id", pathId)
-    .order("step_number", { ascending: true });
+  // The steps in order, each with its course's activity and rule, and the
+  // step's own rule (a 0107 column: the narrower-select fallback reads the
+  // steps without it on a database that lacks it, and the course's rule
+  // decides).
+  const { data: stepRows, error: stepErr } = await readWithOptionalColumn<unknown[]>(
+    "pass_required",
+    (columns) =>
+      supabase
+        .from("learning_path_courses")
+        .select(columns)
+        .eq("path_id", pathId)
+        .order("step_number", { ascending: true }),
+    "course_id, step_number, courses(is_active, pass_required)"
+  );
   if (stepErr) redirect(`/${orgSlug}/dashboard`);
-  const steps = (stepRows ?? []) as Array<{ course_id: string; step_number: number }>;
-  if (!steps.some((s) => s.course_id === fromCourseId)) {
+  const steps = (stepRows ?? []) as StepRow[];
+  const fromStep = steps.find((s) => s.course_id === fromCourseId);
+  if (!fromStep) {
     log("continue_not_a_step");
     redirect(`/${orgSlug}/paths/${pathId}`);
   }
+  if (!isActiveStep(fromStep)) {
+    log("continue_inactive");
+    redirect(`/${orgSlug}/paths/${pathId}`);
+  }
   const next = nextStepAfter(steps, fromCourseId);
+  const nextStep = next === null ? null : (steps.find((s) => s.course_id === next) ?? null);
+  const nextHidden = nextStep !== null && !isActiveStep(nextStep);
+  const passRequired = resolvedStepRule(fromStep.pass_required, courseOf(fromStep)?.pass_required);
   const target = (t: { timedOut: boolean; stored: boolean; done: boolean }) =>
-    continueTarget({ orgSlug, pathId, timedOut: t.timedOut, stored: t.stored, done: t.done, next });
+    continueTarget({ orgSlug, pathId, timedOut: t.timedOut, stored: t.stored, done: t.done, next, nextHidden });
 
-  // Before the wait, once, strictly: a read error ends as the timeout target,
-  // never as "not required" or "no grants" (the fail-soft helpers would read
-  // that and move a learner on wrongly).
+  // A read error ends as the timeout target, never as "not required", "no
+  // grants" or "not done" (a fail-soft read would move a learner on wrongly,
+  // or send them to the failed banner).
   const readError: () => never = () => {
     log("continue_read_error");
     redirect(target({ timedOut: true, stored: false, done: false }));
   };
-
-  const { data: courseRow, error: courseErr } = await supabase
-    .from("courses")
-    .select("pass_required")
-    .eq("id", fromCourseId)
-    .maybeSingle();
-  if (courseErr || !courseRow) readError();
-  const passRequired = (courseRow as { pass_required?: boolean | null }).pass_required === true;
 
   const { data: verRows, error: verErr } = await supabase
     .from("course_versions")
@@ -108,79 +154,46 @@ export default async function ContinuePage({
   const versionIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
   if (verErr || versionIds.length === 0) readError();
 
-  // The learner's own consumed grants on this course (0083 policy "learners
-  // read their own attempt requests"): the ids computeScoring takes.
-  const { data: grantRows, error: grantErr } = await supabase
-    .from("attempt_requests")
-    .select("used_attempt_id")
-    .eq("user_id", user.id)
-    .eq("course_id", fromCourseId)
-    .eq("status", "approved")
-    .not("used_attempt_id", "is", null);
-  if (grantErr) readError();
-  const retakeIds = new Set(
-    ((grantRows ?? []) as Array<{ used_attempt_id: string | null }>)
-      .map((r) => r.used_attempt_id)
-      .filter((id): id is string => typeof id === "string")
-  );
-
-  // Fail-soft to the default policy, accepted (ADR 0019 step 2): under one
-  // official attempt with extra attempts only by grant, the default and a read
-  // policy choose the same official attempt once the grant ids are passed.
-  const policy = await resolvePolicy(supabase, fromCourseId);
-
-  // The wait: one read of the learner's attempts on this course per
+  // The wait: one read of the learner's rows in the path's context per
   // CONTINUE_POLL_MS, until a deadline CONTINUE_WAIT_MS after the first read
   // starts (decision 2: 6 s total), at most seven reads; the last one starts
   // at the deadline at the latest, so slow reads shorten the sleeps rather
-  // than stretch the wait. The sleep costs no CPU.
-  // It ends only on a stored result whose verdict is not pending: on a
-  // pass_required course a completed row without its pass or fail keeps it
-  // going, and at the bound the learner lands on the saving banner.
-  // Every read carries its own abort signal: Next memoizes identical GET
-  // fetches within one server render, and without a signal reads 2 to 7
-  // returned the first read's rows, so a result stored during the wait was
-  // never seen (spec 63 (b2)). A signal opts the request out of that cache.
-  // A Preview never counts (ADR 0024 P2-5 item 5b): each read drops
-  // `context_kind = 'preview'` rows, and one decision serves every read of the
-  // wait, so on a database without 0107 the first read's missing-column error
-  // reads today's select once (readWithContextFilter). P2-7 replaces this with
-  // the path context's own read.
-  const previews: ContextFilterState = { applies: null };
+  // than stretch the wait. The sleep costs no CPU. It ends only on a stored
+  // result whose verdict is not pending: on a pass-required step a completed
+  // row without its pass or fail keeps it going, and at the bound the learner
+  // lands on the saving banner.
+  const key = contextKeyOf({ kind: "path", pathId });
   const maxReads = Math.floor(CONTINUE_WAIT_MS / CONTINUE_POLL_MS) + 1;
   const deadline = Date.now() + CONTINUE_WAIT_MS;
-  let stored = false;
-  let done = false;
+  let stored: Extract<ContextRead, { ok: true }> | null = null;
   for (let read = 0; read < maxReads; read++) {
-    const { data: rows, error: rowsErr } = await readWithOptionalColumn<unknown[]>(
-      "is_revision",
-      (columns) =>
-        readWithContextFilter(previews, (apply) =>
-          withoutPreviews(
-            supabase
-              .from("course_attempts")
-              .select(columns)
-              .eq("user_id", user.id)
-              .in("course_version_id", versionIds),
-            apply
-          ).abortSignal(new AbortController().signal)
-        ),
-      ATTEMPT_COLUMNS
-    );
-    if (rowsErr) readError();
-    const attempts = (rows ?? []) as ScorableAttempt[];
-    const scoring = computeScoring(attempts, policy, retakeIds);
-    if (officialResultStored(scoring, attempts, passRequired)) {
-      stored = true;
-      done = officialDone(scoring, passRequired);
+    const r = await readContextResult(supabase, { userId: user.id, courseId: fromCourseId, key, passRequired, versionIds });
+    if (!r.ok) readError();
+    if (officialResultStored(r.result.scoring, r.result.rows, passRequired)) {
+      stored = r;
       break;
     }
     const left = deadline - Date.now();
     if (read === maxReads - 1 || left <= 0) break;
-    await new Promise((r) => setTimeout(r, Math.min(CONTINUE_POLL_MS, left)));
+    await new Promise((res) => setTimeout(res, Math.min(CONTINUE_POLL_MS, left)));
+  }
+  if (stored === null) {
+    log("continue_timeout");
+    redirect(target({ timedOut: true, stored: false, done: false }));
   }
 
-  if (!stored) log("continue_timeout");
-  else if (!done) log("continue_not_done");
-  redirect(target({ timedOut: !stored, stored, done }));
+  // The step's done (O1-k): the path rule's answer for this step on the
+  // same read, then, only when the rule alone does not make it done, the
+  // step's stored fact.
+  const now = new Date().toISOString();
+  const stepInput = { course_id: fromCourseId, step_number: fromStep.step_number, release_at: null, pass_required: passRequired };
+  let step = pathStepStatus({ pathId, step: stepInput, attempts: stored.result.rows, grants: stored.grants, fact: null, now });
+  if (!step.passed_by_rule) {
+    const facts = await readPathStepFacts(supabase, user.id, [pathId]);
+    if (!facts.ok) readError();
+    const fact = facts.facts.find((f) => f.course_id.toLowerCase() === fromCourseId.toLowerCase()) ?? null;
+    if (fact) step = pathStepStatus({ pathId, step: stepInput, attempts: stored.result.rows, grants: stored.grants, fact, now });
+  }
+  if (!step.done) log("continue_not_done");
+  redirect(target({ timedOut: false, stored: true, done: step.done }));
 }

@@ -159,13 +159,12 @@ console.log("\n(b) every engagement fold and open-row pick under app/ and lib/ s
       { kind: "pick", guard: /const inProgress = myAttempts\.filter\([\s\S]{0,200}a\.status !== "abandoned" &&\s*!isRevisionAttempt\(a\)\s*\)[\s\S]*const openWithProgress = myAttempts\.filter\([\s\S]{0,200}a\.status !== "abandoned" &&\s*!isRevisionAttempt\(a\) &&/ }),
     S("app/[org]/(learner)/courses/[courseId]/page.tsx", 'attempt.completion_status === "in_progress" &&',
       { kind: "pick", guard: /const attemptRows = attempts\.filter\(\(a\) => !isRevisionAttempt\(a\)\);/, why: "the per-row progress badge of 'My attempts', whose list excludes revision rows" }),
-    // The path page's step state and the dashboard path tile's started test:
-    // an open revision visit's row never marks
-    // a step in progress or starts a path.
-    S("app/[org]/(learner)/paths/[pathId]/page.tsx", '} else if (list.some((a) => a.completion_status === "in_progress" && a.status !== "abandoned" && !isRevisionAttempt(a))) {',
-      { kind: "pick", guard: /\} else if \(list\.some\(\(a\) => a\.completion_status === "in_progress" && a\.status !== "abandoned" && !isRevisionAttempt\(a\)\)\) \{\s*inProgressCourseIds\.add\(cid\);/, why: "a path step's in-progress state test: an open revision visit's row never marks a step in progress" }),
-    S("app/[org]/(learner)/dashboard/page.tsx", 'a.learning_path_id === p.id && a.completion_status !== "completed" && a.status !== "abandoned" && !isRevisionAttempt(a)',
-      { kind: "pick", guard: /const started =\s*done > 0 \|\|\s*attempts\.some\(\s*\(a\) =>\s*a\.learning_path_id === p\.id && a\.completion_status !== "completed" && a\.status !== "abandoned" && !isRevisionAttempt\(a\)\s*\);/, why: "the path tile's started test: an open revision visit's row never starts a path" }),
+    // The path page's step state and the dashboard path tile's started test
+    // left this list in ADR 0024 P2-7: both read pathProgress()
+    // (lib/paths/progress.ts), whose open_attempt and status read the
+    // context's official rows (contextResult drops abandoned and revision
+    // rows first), so an open revision visit's row never marks a step in
+    // progress or starts a path (tests/unit/revision-ui-copy.test.ts).
 
     // ---- not an attempt-row engagement fold or pick (each with its reason) ----
     S("lib/courses/slot-routing.ts", 'const activityOf = (a: SlotAttempt) => a.last_activity_at ?? a.started_at ?? "";',

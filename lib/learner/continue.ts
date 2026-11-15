@@ -8,10 +8,15 @@
  * unit-tested (tests/unit/continue.test.ts).
  *
  * Deliberately free of next/*, lib/alds/* and Supabase runtime imports so unit
- * tests can load it (the lib/attempts/launch-kind.ts shape). The "done" verdict
- * comes in from lib/scoring/policy.ts officialDone(). There is no staff branch
- * (ADR 0024 step 23, P2-5 item 4): every caller of the address waits for a
- * stored result, and a Preview never reaches it (it carries no `?lp=`).
+ * tests can load it (the lib/attempts/launch-kind.ts shape). The "done"
+ * verdict comes in from the path rule: the per-step answer of pathProgress()
+ * (lib/paths/progress.ts pathStepStatus) for the step the learner came from,
+ * fed with the rows of the wait's own read in the path's context, the step's
+ * resolved rule and its stored fact (ADR 0024 step 27 as build note O1-k
+ * makes it exact), never contextResult's `done`, officialDone or
+ * computeScoring. There is no staff branch (ADR 0024 step 23, P2-5 item 4):
+ * every caller of the address waits for a stored result, and a Preview never
+ * reaches it (it carries no `?lp=`).
  */
 import { courseStatus, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
 
@@ -89,6 +94,9 @@ export function verdictPending(scoring: ScoringResult, passRequired: boolean): b
  *     ready from the first paint when it is already true;
  *   - the status route (app/api/attempts/[attemptId]/result-stored) answers
  *     `{stored}` with it, which the bar polls while it waits.
+ * Since ADR 0024 P2-7 the continue address and the status route read in the
+ * attempt's own context (readContextResult) and pass its rows; the launch
+ * page passes its context's rows (P2-6).
  */
 export function officialResultStored(scoring: ScoringResult, attempts: ScorableAttempt[], passRequired: boolean): boolean {
   return resultStored(scoring, attempts) && !verdictPending(scoring, passRequired);
@@ -103,9 +111,20 @@ export type ContinueInput = {
    */
   timedOut: boolean;
   stored: boolean;
-  /** officialDone(scoring, passRequired); read only when `stored`. */
+  /**
+   * The step is done by the path rule (pathStepStatus's `done`, which is
+   * `passed_ever`: an earlier pass, D14, and a stored fact count); read only
+   * when `stored`.
+   */
   done: boolean;
+  /** The next step's course in path order (nextStepAfter), whatever its activity. */
   next: string | null;
+  /**
+   * The next step's course is inactive, so the path page leaves the step out
+   * (the owner's P2-Q1 answer): a stored, done result goes to the plain path
+   * page, never to that step, never on past it and never to `?end=1`.
+   */
+  nextHidden: boolean;
 };
 
 /**
@@ -113,9 +132,12 @@ export type ContinueInput = {
  * staff row, which skipped the wait, is gone with ADR 0024 step 23):
  *   1. timed out (nothing stored, or the verdict still pending): the path
  *      page's neutral saving banner;
- *   2. stored and not done (a failed result on a pass-required course): the
- *      path page's failed banner, never the next launch;
- *   3. stored and done: the next launch, or the path page's end banner;
+ *   2. stored and not done (a failed result on a pass-required step that was
+ *      never passed and holds no stored fact): the path page's failed
+ *      banner, never the next launch;
+ *   3. stored and done: the next launch; the plain path page when the next
+ *      step's course is inactive (P2-Q1, nothing skipped); or, on the last
+ *      step, the path page's end banner;
  *   4. otherwise (a state the page never produces): the path page.
  * The launch page keeps its own gates (release dates, the strict lock,
  * assignment) for every next launch.
@@ -125,6 +147,9 @@ export function continueTarget(i: ContinueInput): string {
   const nextLaunch = (next: string) => `/${i.orgSlug}/courses/${next}/launch?lp=${i.pathId}`;
   if (i.timedOut) return `${path}?saving=1`;
   if (i.stored && !i.done) return `${path}?failed=1`;
-  if (i.stored && i.done) return i.next ? nextLaunch(i.next) : `${path}?end=1`;
+  if (i.stored && i.done) {
+    if (i.next === null) return `${path}?end=1`;
+    return i.nextHidden ? path : nextLaunch(i.next);
+  }
   return path;
 }
