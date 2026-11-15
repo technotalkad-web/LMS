@@ -3,18 +3,20 @@ import { redirect } from "next/navigation";
 import {
   ArrowLeft,
   BookOpen,
+  Eye,
   PlayCircle,
   ChevronRight,
 } from "lucide-react";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { canManage } from "@/lib/auth/permissions";
+import { canManage, canViewReports } from "@/lib/auth/permissions";
 import { learnerCanAccessCourse } from "@/lib/auth/course-access";
 import { createClient } from "@/lib/supabase/server";
 import { languageDisplay } from "@/lib/i18n/languages";
 import { computeScoring, hasLiveGrantedRetake, isRevisionAttempt, latestResetRetake } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { grantSnapshotFor, fetchPassRequired, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import {
   officialHistory,
   officialRetakeState,
@@ -93,8 +95,15 @@ export default async function CourseDetailPage({
 }) {
   const { org: orgSlug, courseId } = await params;
   const { switch: switchParam, retry: retryParam } = await searchParams;
-  const { org, user, role } = await requireOrgAccess(orgSlug);
+  const { org, user, role, impersonation } = await requireOrgAccess(orgSlug);
+  // ADR 0024 step 23 (D7, the owner's R6 answer): the role no longer decides
+  // who may start this course. Without the mode every role is a learner with
+  // real rows; Preview is a mode the report-viewing roles choose, through a
+  // link that carries `?mode=preview` (tests/unit/preview-mode-sites.test.ts).
+  // `isAdmin` stays for what an admin sees about the course: the attempts
+  // section when it is hidden from learners, its badge and the Library link.
   const isAdmin = canManage(role);
+  const canPreview = canViewReports(role);
 
   const supabase = await createClient();
   // select("*") for 0072 deploy safety (show_attempts_history).
@@ -105,27 +114,41 @@ export default async function CourseDetailPage({
     .eq("organization_id", org.id)
     .maybeSingle();
   if (!course) redirect(`/${orgSlug}/dashboard`);
-  // Inactive courses are still reachable by admins (they can preview), but
-  // hidden from learners.
-  if (
-    (course as { is_active?: boolean }).is_active === false &&
-    !isAdmin
-  ) {
+  // An inactive course is hidden from every role: the launch refuses it in
+  // either mode, so there is nothing to start or preview here (ADR 0024 P2-5
+  // item 4 moved this off the role).
+  if ((course as { is_active?: boolean }).is_active === false) {
     redirect(`/${orgSlug}/dashboard`);
   }
   const c = course as Course;
 
   // Entitlement: only assigned (direct/org/team) or org_public courses are
-  // viewable by learners — closes the private/unassigned-course IDOR. Admins
-  // preview freely.
+  // viewable by learners — closes the private/unassigned-course IDOR. The
+  // same rule holds for every role (ADR 0024 step 23): no role opens a
+  // course it is not enrolled in. A report-viewing role is refused here and
+  // offered a preview instead (step 23, "Buttons"); everyone else goes to
+  // the dashboard's notices as before.
+  //
+  // Impersonation (P2-5 item 3c): requireOrgAccess reads the organisation
+  // under the caller's own session before its impersonation branch, so a
+  // platform owner who is not a member of this organisation is sent to
+  // /select-org first. In practice the impersonation answer here is for a
+  // platform owner who is also a member, enrolled or not. The launch refuses
+  // that caller's Start, so the page offers the preview only, with its own
+  // line (never "not enrolled").
   const access = await learnerCanAccessCourse({
     supabase,
     orgId: org.id,
     userId: user.id,
     courseId: c.id,
-    isAdmin,
+    // This page has no mode: it shows the caller's own record, so it never
+    // passes without an entitlement (the launch alone takes ?mode=preview).
+    preview: false,
   });
-  if (!access.allowed) {
+  const previewOnly = !access.allowed || impersonation !== null;
+  // A role that may not preview goes to the dashboard's notices before any
+  // further read.
+  if (previewOnly && !canPreview) {
     redirect(
       access.upcomingAt
         ? `/${orgSlug}/dashboard?upcoming=${c.id}`
@@ -164,6 +187,67 @@ export default async function CourseDetailPage({
   }>;
   const activePkgs = allPkgs.filter((p) => p.is_active === true);
   const noActiveLanguage = allPkgs.length > 0 && activePkgs.length === 0;
+
+  // The preview-only card (not enrolled, not released yet, or an
+  // impersonation). Its "Preview instead" is gated like the Preview beside
+  // Start: a version to run and an active language. Without them the launch
+  // would send the viewer straight back here, so the card says why instead.
+  if (previewOnly) {
+    return (
+      <div className="max-w-4xl mx-auto space-y-6">
+        <Link
+          href={`/${orgSlug}/dashboard`}
+          className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink"
+        >
+          <ArrowLeft className="w-4 h-4" /> Back to dashboard
+        </Link>
+        <div
+          className="bg-paper border border-line rounded-2xl shadow-sm p-7 sm:p-9 space-y-4"
+          data-testid={impersonation ? "impersonation-preview-only" : "not-enrolled"}
+        >
+          <h1 className="text-2xl font-semibold leading-tight">{c.title}</h1>
+          {/* A preview's refusal and its "Back to course" land here
+              (no ?lp= or ?journey= to return to), so the retry notice
+              shows on this card too. */}
+          {retryParam && (
+            <p
+              className="text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2"
+              role="alert"
+              data-testid="launch-retry-notice"
+            >
+              Could not open the course. Please try again.
+            </p>
+          )}
+          <p className="text-sm text-ink">
+            {impersonation
+              ? "You're impersonating, so this course opens as a preview only."
+              : access.upcomingAt
+                ? "This course is not released to you yet."
+                : "You're not enrolled in this course."}
+          </p>
+          {canPreview && current && !noActiveLanguage ? (
+            <>
+              <Link
+                href={`/${orgSlug}/courses/${c.id}/launch?mode=preview`}
+                data-testid="preview-instead"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-paper border border-line hover:border-ink text-ink px-5 py-3 rounded-xl text-sm font-medium transition-colors"
+              >
+                <Eye className="w-4 h-4" /> Preview instead
+              </Link>
+              <p className="text-xs text-muted">A preview is not an official record.</p>
+            </>
+          ) : (
+            <p className="text-sm text-muted" data-testid="preview-unavailable">
+              {current
+                ? "Not available right now: every language of this course is hidden."
+                : "This course doesn't have a version yet."}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const languageOptions: ChangeLanguageOption[] = activePkgs.map((p) => ({
     id: p.id,
     language: p.language,
@@ -186,14 +270,27 @@ export default async function CourseDetailPage({
     savedLanguage = (prefRow?.language as string | undefined) ?? null;
   }
 
+  // ADR 0024 P2-5: one person can now hold a preview row and a real row of
+  // this course (a Preview by mode, or a staff member's by-role row since the
+  // 0107 paste). This page is the caller's own record, so the read drops
+  // `context_kind = 'preview'` rows: the official result, the Start label and
+  // the "Request another attempt" button follow the real attempts only (step
+  // 23: the button follows the attempt's context, not the role). On a
+  // database without 0107 the filter's missing-column error reads today's
+  // select once (readWithContextFilter; step 72's fallback, no preview split).
+  const previews: ContextFilterState = { applies: null };
   const attemptsResp = versionIds.length
-    ? await supabase
-        .from("course_attempts")
-        // select("*") for 0075 deploy safety (progress_pct).
-        .select("*")
-        .eq("user_id", user.id)
-        .in("course_version_id", versionIds)
-        .order("started_at", { ascending: false })
+    ? await readWithContextFilter(previews, (apply) =>
+        withoutPreviews(
+          supabase
+            .from("course_attempts")
+            // select("*") for 0075 deploy safety (progress_pct).
+            .select("*")
+            .eq("user_id", user.id)
+            .in("course_version_id", versionIds),
+          apply
+        ).order("started_at", { ascending: false })
+      )
     : { data: [] as Attempt[] };
   const attempts = (attemptsResp.data ?? []) as Attempt[];
   const versionById = new Map(list.map((v) => [v.id, v]));
@@ -284,9 +381,11 @@ export default async function CourseDetailPage({
   // With the history unavailable the page cannot tell whether a retake is
   // live, so the button is hidden for this render (the route stays the
   // backstop). ADR 0014 step 9 retired the block rule, so nothing refuses a
-  // launch here any more.
+  // launch here any more. ADR 0024 step 23: the button follows the
+  // attempt's context, not the role. `attempts` holds no preview row, so an
+  // admin's or analyst's real attempt can ask for another one, as any
+  // learner's can.
   const canRequestAttempt =
-    !isAdmin &&
     !historyUnavailable &&
     requestDecision({ scoring, attempts }) === "ok" &&
     (attemptRequestState === "none" || attemptRequestState === "rejected");
@@ -612,6 +711,19 @@ export default async function CourseDetailPage({
               <span className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-amber-100 text-amber-800 border border-amber-200">
                 Revision
               </span>
+            )}
+            {/* ADR 0024 step 23: Preview for the report-viewing roles, beside
+                Start. It opens the course on its own (no product parameter)
+                and writes no official record. */}
+            {canPreview && current && !noActiveLanguage && (
+              <Link
+                href={`/${orgSlug}/courses/${c.id}/launch?mode=preview`}
+                data-testid="preview-launch"
+                title="Opens the course as a preview: not an official record"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-paper border border-line hover:border-ink text-ink px-5 py-3 rounded-xl text-sm font-medium transition-colors"
+              >
+                <Eye className="w-4 h-4" /> Preview
+              </Link>
             )}
             {canRequestAttempt && (
               <RequestAttemptButton orgSlug={orgSlug} courseId={c.id} standingResult={standingResult} />

@@ -23,8 +23,9 @@ export type CourseAccess = {
 };
 
 /**
- * Whether a learner may open a course. Allowed when the caller is an org
- * admin/analyst (preview), the course is `org_public`, the learner is
+ * Whether a learner may open a course. Allowed for a Preview (`preview`: the
+ * caller decided it from the mode, never from the role alone), when the course
+ * is `org_public`, the learner is
  * assigned — directly, org-wide, or via a team they're on — or the course is a
  * step in a learning path the learner is entitled to (assigned, or an
  * org_public path). Assignment rows and path steps whose release_at is still
@@ -54,7 +55,13 @@ export async function learnerCanAccessCourse(opts: {
   orgId: string;
   userId: string;
   courseId: string;
-  isAdmin: boolean;
+  /**
+   * A Preview by mode (ADR 0024 step 23, P2-5 item 4): true only when the
+   * caller may view reports (canViewReports(role)) and asked for
+   * `?mode=preview`. Without the mode every role is a learner and needs an
+   * entitlement below. Required, so a caller cannot skip the decision.
+   */
+  preview: boolean;
   /** Pass `courses.visibility` if already loaded to skip a query. */
   visibility?: string | null;
   /**
@@ -66,8 +73,8 @@ export async function learnerCanAccessCourse(opts: {
    */
   journeyCredits?: { ids: ReadonlySet<string>; credits: JourneyCredits };
 }): Promise<CourseAccess> {
-  const { supabase, orgId, userId, courseId, isAdmin } = opts;
-  if (isAdmin) return { allowed: true, upcomingAt: null };
+  const { supabase, orgId, userId, courseId, preview } = opts;
+  if (preview) return { allowed: true, upcomingAt: null };
 
   let visibility = opts.visibility;
   if (visibility === undefined) {

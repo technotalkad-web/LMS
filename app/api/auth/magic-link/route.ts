@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
+import { safeNextPath } from "@/lib/auth/safe-next";
 import { sendAuthEmail } from "@/lib/auth/auth-email";
 import { dispatchResend, resendConfigured } from "@/lib/email/resend";
 
@@ -14,8 +15,10 @@ import { dispatchResend, resendConfigured } from "@/lib/email/resend";
  *
  * `next` (optional) is a same-app path to land on after sign-in — used by
  * deep links (e.g. QR-code scans of a course) so the emailed link returns the
- * learner to the exact page they scanned, not the dashboard. Validated to a
- * single leading "/" so it can't become an open redirect.
+ * learner to the exact page they scanned, not the dashboard. It keeps its
+ * query (a launch's Preview mode, path, journey day and language) and goes
+ * through lib/auth/safe-next.ts's open-redirect guard: one leading "/", no
+ * scheme or host, no backslash or control character.
  *
  * Always returns { ok: true } so the form can't be used to enumerate accounts.
  */
@@ -29,10 +32,7 @@ export async function POST(request: Request) {
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return NextResponse.json({ error: "A valid email is required" }, { status: 400 });
   }
-  const safeNext =
-    body.next && body.next.startsWith("/") && !body.next.startsWith("//")
-      ? body.next
-      : null;
+  const safeNext = safeNextPath(body.next);
 
   const origin = (await originFromRequest()) || "";
 

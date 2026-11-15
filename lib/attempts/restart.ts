@@ -11,17 +11,6 @@
 export const RESTART_REASON_MAX = 500;
 
 /**
- * Staff role classes (ADR 0003 step 10, the 0098 delete guard): a user who
- * holds one of these in the attempt's organisation. Every other role, and no
- * membership at all (a former member), reads as a learner.
- */
-export const STAFF_ROLES: ReadonlySet<string> = new Set(["super_owner", "admin", "data_analyst"]);
-
-export function isStaffRole(role: string | null | undefined): boolean {
-  return !!role && STAFF_ROLES.has(role);
-}
-
-/**
  * `dry_run` is optional; when present it must be a JSON boolean. Anything
  * else ("true", 1, null) is refused rather than read as a real run, because
  * a real run cannot be undone.
@@ -79,21 +68,50 @@ export function restartRefusal(args: {
 }
 
 export type RestartAttempt = { id: string; user_id: string; organization_id: string };
+/**
+ * The dry run's two classes, under the keys the dialog reads. ADR 0024 step 23
+ * (P2-5 item 4): `staff` counts the Previews (`context_kind = 'preview'`: a
+ * Preview by mode, or a by-role row the 0107 paste labelled), and `learner`
+ * every other row, a staff member's real attempt included. The member's role
+ * no longer decides.
+ */
 export type ByRole = { learner: number; staff: number };
 
-/** Key of a staff membership: the role class is judged in the attempt's organisation. */
-export function memberKey(organizationId: string, userId: string): string {
-  return `${organizationId}:${userId}`;
+/**
+ * The selection's Previews: every selected id that the route's context-filtered
+ * read (readWithContextFilter over withoutPreviews, by id) did not keep. On a
+ * database without 0107 that read keeps every id, so nothing is a Preview: no
+ * preview split (ADR 0024 step 23, step 72's fallback-safe readers).
+ */
+export function previewIdsOf(selectedIds: readonly string[], keptIds: Iterable<string>): Set<string> {
+  const kept = new Set(keptIds);
+  return new Set(selectedIds.filter((id) => !kept.has(id)));
 }
 
-/** Attempts per role class (one in-progress attempt per user per version, 0062). */
-export function byRoleClass(attempts: RestartAttempt[], staffKeys: ReadonlySet<string>): ByRole {
+/** Attempts per class (one in-progress attempt per user per version and context): a Preview, or a learner's row. */
+export function byRoleClass(attempts: RestartAttempt[], previewIds: ReadonlySet<string>): ByRole {
   const out: ByRole = { learner: 0, staff: 0 };
   for (const a of attempts) {
-    if (staffKeys.has(memberKey(a.organization_id, a.user_id))) out.staff++;
+    if (previewIds.has(a.id)) out.staff++;
     else out.learner++;
   }
   return out;
+}
+
+/** The answer's `by_role`: the same keys (ADR 0024 A23); `staff` is null when Previews could not be told apart. */
+export type ByRoleAnswer = { learner: number; staff: number | null };
+
+/**
+ * What the route answers under `by_role` (ADR 0024 P2-5, the review's reads
+ * F2). `split` is the preview filter's decision for the request
+ * (ContextFilterState.applies). false is a database without 0107: no row
+ * could be told a Preview, so `staff` is null ("previews not counted" in the
+ * dialog) rather than a 0 that would read as "no previews", and `learner`
+ * holds every row. true (the filter applied) or null (no read was needed:
+ * nothing selected) keeps the count.
+ */
+export function byRoleAnswer(byRole: ByRole, split: boolean | null): ByRoleAnswer {
+  return split === false ? { learner: byRole.learner + byRole.staff, staff: null } : byRole;
 }
 
 /**
@@ -105,7 +123,7 @@ export function byRoleClass(attempts: RestartAttempt[], staffKeys: ReadonlySet<s
 export function planRestart(
   inProgress: RestartAttempt[],
   grantRetakeIds: ReadonlySet<string>,
-  staffKeys: ReadonlySet<string>
+  previewIds: ReadonlySet<string>
 ): { selected: RestartAttempt[]; attemptIds: string[]; excludedGrantRetakeIds: string[]; byRole: ByRole } {
   const seen = new Set<string>();
   const unique = inProgress.filter((a) => (seen.has(a.id) ? false : (seen.add(a.id), true)));
@@ -118,6 +136,6 @@ export function planRestart(
     selected,
     attemptIds: selected.map((a) => a.id),
     excludedGrantRetakeIds,
-    byRole: byRoleClass(selected, staffKeys),
+    byRole: byRoleClass(selected, previewIds),
   };
 }

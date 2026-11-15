@@ -543,8 +543,9 @@ async function checkRevisitStep5(step: string, run: string, fl: FrameLocator, of
   check(step, "progress restored (the revision's progress figure = the official bookmark's completed slides)", pctOf(dom.progressText) !== null && pctOf(dom.progressText) === offPct, { revisionProgressText: dom.progressText, officialBookmarkPct: offPct, officialCompleted: Array.isArray(offBm?.completed) ? offBm.completed.length : null, slides: nSlides, officialOnScreenBeforeExit: S.officialA?.progressText ?? null });
   const resumeSeen = modals.filter((m) => /welcome back|resume|start over/i.test(m));
   check(step, "no Resume click (no Welcome-back / Resume prompt shown; the test clicks none)", resumeSeen.length === 0, { modalsSeen: modals });
-  // lib/alds/launch.ts launchModeFor: `return { isPreview: false, launchMode: i.revision ? "Review" : "Normal" };`
-  // and registrationKindFor: `if (i.revision) return "retake";` (no grant is consumed on this launch). The
+  // lib/alds/launch.ts launchModeFor: a launch without ?mode=preview is a learner's, `Review` on a revision row
+  // (ADR 0024 P2-5: the mode decides, not the role), and registrationKindFor: `if (i.revision) return "retake";`
+  // (no grant is consumed on this launch). The
   // document names the revision attempt as its registration (registration = attempt id).
   const ldGets = wireOf(run).filter((w) => w.method === "GET" && w.stateId === "LMS.LaunchData");
   check(step, "the LaunchData read exercised (the wire log shows the GET: launchMode Review, registration/kind retake, the revision registration)", ldGets.length >= 1 && ldGets.some((w) => w.status === 200 && (w.body as any)?.launchMode === "Review" && (w.body as any)?.registrationKind === "retake" && (w.body as any)?.registration === revision), { gets: ldGets.map((w) => ({ status: w.status, reg: w.reg, body: w.body })), revision });

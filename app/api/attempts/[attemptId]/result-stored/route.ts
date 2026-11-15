@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { isUuid, officialResultStored } from "@/lib/learner/continue";
 
 /**
@@ -33,6 +34,13 @@ import { isUuid, officialResultStored } from "@/lib/learner/continue";
  *   404 {}                      no such attempt of this learner (absent and
  *                               another learner's alike);
  *   200 { stored }              otherwise.
+ *
+ * A Preview never counts (ADR 0024 P2-5 item 5b): the attempts read drops
+ * `context_kind = 'preview'` rows, as the continue address's wait does, so a
+ * Preview of the course beside the learner's real attempt never reads as the
+ * stored result. On a database without 0107 the filter's missing-column error
+ * reads today's select once (readWithContextFilter). P2-7 replaces this with
+ * the path context's own read.
  */
 const ATTEMPT_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, status";
 
@@ -109,14 +117,20 @@ export async function GET(
   // reason (ADR 0019 step 2).
   const policy = await resolvePolicy(supabase, courseId);
 
+  const previews: ContextFilterState = { applies: null };
   const { data: rows, error: rowsErr } = await readWithOptionalColumn<unknown[]>(
     "is_revision",
     (columns) =>
-      supabase
-        .from("course_attempts")
-        .select(columns)
-        .eq("user_id", user.id)
-        .in("course_version_id", versionIds),
+      readWithContextFilter(previews, (apply) =>
+        withoutPreviews(
+          supabase
+            .from("course_attempts")
+            .select(columns)
+            .eq("user_id", user.id)
+            .in("course_version_id", versionIds),
+          apply
+        )
+      ),
     ATTEMPT_COLUMNS
   );
   if (rowsErr) return unreadable();

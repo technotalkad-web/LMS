@@ -35,7 +35,11 @@
  * request is approved instead, only when the learner's official result does
  * not stand; when it stands it stays pending for the queue's confirmation
  * box. On a database without 0103 every re-issue fails closed. The learner
- * is notified of each re-issue through the injected notifier.
+ * is notified of each re-issue through the injected notifier. ADR 0024 P2-5:
+ * that official result is the learner's real attempts only; the read drops
+ * `context_kind = 'preview'` rows (readWithContextFilter and withoutPreviews,
+ * one decision for the run's re-issues), and on a database without 0107 the
+ * filter's missing-column error reads today's select once.
  *
  * Classification (classifyForceRestart, ADR 0011 step 4, ADR 0014 step 8):
  *   (a) selection failed                    → failed, expected unknown
@@ -61,6 +65,7 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { DEFAULT_GRANT_EXPIRY_DAYS } from "@/lib/attempts/constants";
 import { computeScoring, DEFAULT_POLICY, officialDone, type ScorableAttempt } from "@/lib/scoring/policy";
 import { grantSnapshotFor, isMissingColumn, isSchemaMissing } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 /**
  * `.in()` lists stay at 150 ids and every read is paged at 1000 rows ordered
@@ -523,14 +528,17 @@ const ATTEMPT_RESULT_COLUMNS = "id, status, completion_status, success_status, s
  * The 23505 path (ADR 0014 step 8): the learner has a pending request. Approve
  * it only when their official result does not stand, decided from
  * error-checked reads (an unreadable result counts as standing: the request
- * stays pending and the failure names the queue).
+ * stays pending and the failure names the queue). A Preview is never that
+ * result (ADR 0024 P2-5): the attempts read drops `context_kind = 'preview'`
+ * rows through `previews`, the run's one decision of the filter (the header).
  */
 async function approvePendingRequest(
   svc: SupabaseClient,
   args: ForceRestartArgs,
   link: GrantLink,
   note: string,
-  expiresAt: string | null
+  expiresAt: string | null,
+  previews: ContextFilterState
 ): Promise<"approved" | "pending" | "failed"> {
   try {
     const { data: vers, error: versErr } = await svc.from("course_versions").select("id").eq("course_id", link.course_id);
@@ -539,7 +547,9 @@ async function approvePendingRequest(
     let attempts: ScorableAttempt[] = [];
     if (verIds.length > 0) {
       const read = (columns: string) =>
-        svc.from("course_attempts").select(columns).eq("user_id", link.user_id).in("course_version_id", verIds);
+        readWithContextFilter(previews, (apply) =>
+          withoutPreviews(svc.from("course_attempts").select(columns).eq("user_id", link.user_id).in("course_version_id", verIds), apply)
+        );
       let { data: rows, error: rowsErr } = await read(`${ATTEMPT_RESULT_COLUMNS}, is_revision`);
       if (rowsErr && isMissingColumn(rowsErr, "is_revision")) ({ data: rows, error: rowsErr } = await read(ATTEMPT_RESULT_COLUMNS));
       if (rowsErr || rows == null) return "failed";
@@ -586,6 +596,8 @@ async function approvePendingRequest(
 async function reissueGrants(svc: SupabaseClient, args: ForceRestartArgs, resetIds: string[], links: GrantLinks): Promise<Regrant> {
   const out: Regrant = { reissued: 0, reissueFailed: 0, reissuePending: 0, notices: [] };
   const note = `re-issued by forced restart of version ${args.versionNumber}`;
+  // The preview filter's one decision for this run's 23505 reads (never kept between runs).
+  const previews: ContextFilterState = { applies: null };
   for (const id of resetIds) {
     const link = links.byAttempt.get(id);
     if (!link) continue;
@@ -629,7 +641,7 @@ async function reissueGrants(svc: SupabaseClient, args: ForceRestartArgs, resetI
     }
     const code = codeOf(error);
     if (code === "23505") {
-      const r = await approvePendingRequest(svc, args, link, note, expiresAt);
+      const r = await approvePendingRequest(svc, args, link, note, expiresAt, previews);
       if (r === "approved") {
         out.reissued++;
         out.notices.push({ userId: link.user_id, note, expiresAt });

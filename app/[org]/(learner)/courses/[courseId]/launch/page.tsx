@@ -2,8 +2,9 @@ import { redirect } from "next/navigation";
 import { originFromRequest } from "@/lib/http/origin";
 import { randomBytes } from "crypto";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { canManage } from "@/lib/auth/permissions";
+import { canViewReports } from "@/lib/auth/permissions";
 import { learnerCanAccessCourse } from "@/lib/auth/course-access";
+import { resolveLaunchContext } from "@/lib/attempts/launch-context";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { ScormRuntime } from "./scorm-runtime";
@@ -24,6 +25,7 @@ import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
 import { grantSnapshotFor, isMissingColumn, isSchemaMissing, type GrantSnapshot } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
@@ -35,10 +37,12 @@ import {
   lmsAuActivityId,
   newSessionId,
   p4AttemptColumns,
+  previewAttemptColumns,
   recordLearningSession,
   registrationKindFor,
   servedLanguageFor,
   writeLaunchData,
+  type LaunchModeParam,
 } from "@/lib/alds/launch";
 import { LMS_LAUNCH_DATA_STATE_ID, LMS_OFFICIAL_RESULT_STATE_ID } from "@/lib/alds/rpc";
 import {
@@ -99,17 +103,69 @@ export default async function LaunchPage({
     journey?: string;
     day?: string;
     back?: string;
+    /** A repeated parameter arrives as a list: its first value is read. */
+    mode?: string | string[];
+    run?: string | string[];
   }>;
 }) {
   const { org: orgSlug, courseId } = await params;
   const {
     lang: langParam,
-    lp: lpParam,
-    journey: journeyParam,
-    day: dayParam,
+    lp: lpRaw,
+    journey: journeyRaw,
+    day: dayRaw,
     back: backParam,
+    mode: modeRaw,
+    run: runRaw,
   } = await searchParams;
-  const { user, org, role } = await requireOrgAccess(orgSlug);
+  const { user, org, role, impersonation } = await requireOrgAccess(orgSlug);
+
+  // ADR 0024 step 23 (Start and Preview, the owner's R6 answer): the launch's
+  // mode comes from ?mode=preview, never from the role. Without it every
+  // role is a learner: a Start, with a real attempt.
+  const firstOf = (v: string | string[] | undefined): string | null => (Array.isArray(v) ? (v[0] ?? null) : (v ?? null));
+  const mode: LaunchModeParam = firstOf(modeRaw) === "preview" ? "preview" : null;
+
+  // P2-5 item 3c, ruled (a): while requireOrgAccess answers an impersonation
+  // (super_owner), a Start is refused, before any read, so an impersonation
+  // writes no official attempt. requireOrgAccess reads the organisation
+  // under the caller's own session before its impersonation branch, so a
+  // platform owner who is not a member is sent to /select-org first: in
+  // practice this refuses an impersonating platform owner who is also a
+  // member of this organisation, whose own Start would otherwise be real.
+  if (impersonation && mode !== "preview") {
+    console.warn(JSON.stringify({ event: "launch_refused", reason: "impersonation_start", course_id: courseId, user_id: user.id }));
+    redirect(`/${orgSlug}/dashboard?denied=1`);
+  }
+
+  // P2-5 item 3b: the page itself refuses a preview to a role that may not
+  // have one, through the resolver's preview row (step 22: canViewReports),
+  // before the access call and before any read of attempts. The row answers
+  // before any fact is read, so no launch_context call is made (facts:
+  // null). A refused preview (a plain user, a run, both product parameters)
+  // goes to today's ?denied=1 and writes nothing; it never falls through to a
+  // Start.
+  if (mode === "preview") {
+    const decision = resolveLaunchContext({
+      courseId,
+      role,
+      params: { lp: lpRaw ?? null, journey: journeyRaw ?? null, day: dayRaw ?? null, mode, run: firstOf(runRaw) },
+      facts: null,
+      now: new Date().toISOString(),
+    });
+    if (decision.kind !== "launch" || decision.context.kind !== "preview" || decision.context.previewKind !== "course") {
+      const reason = decision.kind === "refused" ? decision.reason : decision.kind;
+      console.warn(JSON.stringify({ event: "launch_refused", reason, course_id: courseId, user_id: user.id }));
+      redirect(`/${orgSlug}/dashboard?denied=1`);
+    }
+  }
+  const preview = mode === "preview";
+  // A preview opens the course outside every path and journey (step 23, the
+  // owner's A21 answer): its ?lp=, ?journey= and day are not read, so it
+  // carries no path or journey tag, no Continue and no path or journey exit.
+  const lpParam = preview ? undefined : lpRaw;
+  const journeyParam = preview ? undefined : journeyRaw;
+  const dayParam = preview ? undefined : dayRaw;
 
   const supabase = await createClient();
   const { data: course } = await supabase
@@ -249,13 +305,16 @@ export default async function LaunchPage({
   // Entitlement gate (closes the private/unassigned-course IDOR): a learner may
   // only launch an assigned (direct/org/team) or org_public course whose
   // assignment is released, or a journey day up to their unlocked day.
-  // Admins preview freely. Mirrors the dashboard so launchable == visible.
+  // Mirrors the dashboard so launchable == visible. A Start is a learner's
+  // launch for every role (ADR 0024 step 23); only a Preview by mode by a
+  // report-viewing role (the resolver's preview row above) passes without an
+  // entitlement, because it is not an enrolment and writes no official row.
   const access = await learnerCanAccessCourse({
     supabase,
     orgId: org.id,
     userId: user.id,
     courseId: c.id,
-    isAdmin: canManage(role),
+    preview: canViewReports(role) && preview,
     journeyCredits,
   });
   if (!access.allowed) {
@@ -303,6 +362,25 @@ export default async function LaunchPage({
   // (refuse(), the one refusal, is defined above the journey block, whose
   // credit read refuses with it too.)
 
+  // P2-5 item 5b: one person can now hold a preview row and a real row of the
+  // same course, so every attempts read and close of this render takes the
+  // launch's own rows. A Start leaves out every preview (withoutPreviews,
+  // through readWithContextFilter: on a database without 0107 the read is
+  // made once without the filter, today's read; ADR 0024 step 72). A preview
+  // takes only the caller's course previews (context_kind = 'preview',
+  // preview_kind = 'course'), whatever `apply` says: on a database without
+  // 0107 the read fails and the preview refuses before any write, because
+  // its insert has no fallback either (an A19 write). An open legacy_role row
+  // never routes or resumes a preview; N4 closes it before the insert. One
+  // decision per request, never at module level. P2-6 replaces these
+  // exclusions with the launch's context filter.
+  const previews: ContextFilterState = { applies: null };
+  function inLaunchContext<Q>(query: Q, apply: boolean): Q {
+    if (!preview) return withoutPreviews(query, apply);
+    const q = query as unknown as { eq: (column: string, value: string) => { eq: (column: string, value: string) => Q } };
+    return q.eq("context_kind", "preview").eq("preview_kind", "course");
+  }
+
   // The learner's approved grants on this course, read in one strict select
   // per decision (grantSnapshotFor): a failed read refuses; a database
   // without attempt_requests has none.
@@ -320,12 +398,12 @@ export default async function LaunchPage({
   // kind (lib/attempts/launch-kind.ts): `first` while the window has a free
   // slot, `grant` when an unused grant is consumed on this launch, otherwise
   // `at_row` (the row decides: a granted retake resumes, anything else is a
-  // revision visit). Admins preview freely.
+  // revision visit). Every role's Start runs it (ADR 0024 step 23: the role
+  // short-circuit is gone); a Preview by mode never does (below).
   type MyAttempt = ScorableAttempt & { course_version_id: string; cmi_data: CmiData | null; status?: string };
   type Evaluation = { my: MyAttempt[]; scoring: ScoringResult | null; candidate: CandidateKind };
   const MY_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, course_version_id, cmi_data, status";
   const evaluate = async (grantsNow: GrantSnapshot, consumeGrants: boolean): Promise<Evaluation> => {
-    if (canManage(role)) return { my: [], scoring: null, candidate: "first" };
     const policy = await resolvePolicy(supabase, c.id);
     const { data: verRows, error: verErr } = await supabase
       .from("course_versions")
@@ -338,14 +416,19 @@ export default async function LaunchPage({
       // is_revision (0103) with the narrower-select fallback. Its own abort
       // signal: Next memoizes identical GET fetches within one render, and
       // evaluate runs again after consume_grant, when a concurrent launch may
-      // have closed rows and opened its retake.
+      // have closed rows and opened its retake. A Start's attempt rule never
+      // counts a preview (P2-5 item 5b).
       const readMy = (columns: string) =>
-        supabase
-          .from("course_attempts")
-          .select(columns)
-          .eq("user_id", user.id)
-          .in("course_version_id", vIds)
-          .abortSignal(new AbortController().signal);
+        readWithContextFilter(previews, (apply) =>
+          withoutPreviews(
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .eq("user_id", user.id)
+              .in("course_version_id", vIds),
+            apply
+          ).abortSignal(new AbortController().signal)
+        );
       let { data: myRows, error: myErr } = await readMy(`${MY_COLUMNS}, is_revision`);
       if (myErr && isMissingColumn(myErr, "is_revision")) ({ data: myRows, error: myErr } = await readMy(MY_COLUMNS));
       if (myErr) refuse("attempts_read_failed");
@@ -366,8 +449,12 @@ export default async function LaunchPage({
     // for a used window (normalizePolicy clamps every rule to the default).
     return { my, scoring, candidate };
   };
-  let grants = await readGrants();
-  let ev = await evaluate(grants, true);
+  // P2-5 item 3: a Preview by mode reads no grant and runs no attempt rule.
+  // Its row is never official, never a grant's retake and never seeded, so
+  // nothing below consumes, scores or seeds for it; these stand-ins only keep
+  // the shared steps (routing, the runtime) typed.
+  let grants: GrantSnapshot = preview ? { retakeIds: new Set<string>(), unusedGrant: null, rows: [] } : await readGrants();
+  let ev: Evaluation = preview ? { my: [], scoring: null, candidate: "first" } : await evaluate(grants, true);
 
   // ---------------------------------------------------------------
   // Multi-language resolution (Phase 2 + Phase 3 of #158)
@@ -425,6 +512,7 @@ export default async function LaunchPage({
           orgSlug={orgSlug}
           courseId={courseId}
           courseTitle={c.title}
+          preview={preview}
           packages={activePackages.map((p) => ({
             id: p.id,
             language: p.language,
@@ -484,13 +572,21 @@ export default async function LaunchPage({
       const allVersionIds = [...packageOfVersion.keys()];
       let inProgress: SlotAttempt[] = [];
       if (allVersionIds.length) {
+        // The launch's own open rows (P2-5 items 3 and 5b): a preview never
+        // routes onto, confirms over or closes a real attempt, and an open
+        // preview never reroutes or bounces a Start.
         const readIp = (columns: string) =>
-          supabase
-            .from("course_attempts")
-            .select(columns)
-            .eq("user_id", user.id)
-            .in("course_version_id", allVersionIds)
-            .eq("status", "in_progress");
+          readWithContextFilter(previews, (apply) =>
+            inLaunchContext(
+              supabase
+                .from("course_attempts")
+                .select(columns)
+                .eq("user_id", user.id)
+                .in("course_version_id", allVersionIds)
+                .eq("status", "in_progress"),
+              apply
+            )
+          );
         let { data: ipRows, error: ipErr } = await readIp(`${IP_COLUMNS}, is_revision`);
         if (ipErr && isMissingColumn(ipErr, "is_revision")) ({ data: ipRows, error: ipErr } = await readIp(IP_COLUMNS));
         if (ipErr) refuse("routing_read_failed");
@@ -510,9 +606,13 @@ export default async function LaunchPage({
           })
         : ({ kind: "continue", abandon: [] } as const);
 
-      if (decision.kind === "confirm-switch") {
+      if (decision.kind === "confirm-switch" && !preview) {
         // (1) Back to the course page, which opens the existing confirm for
         // this language (a confirmed switch resets the other slot's progress).
+        // A preview never goes there: the switch it confirms resets the
+        // learner's rows on the other slot whatever their context, a real
+        // attempt included. It runs the language asked for, and its preview
+        // on the other slot stays open (nothing is closed).
         redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
       }
       // (3) is carried out below, only once every launch gate has passed: a
@@ -535,6 +635,9 @@ export default async function LaunchPage({
     // here and the learner starts fresh on the new version. No learner-facing
     // choice or notice either way. A revision visit's row never routes
     // (is_revision = false, with the filter dropped on a database without it).
+    // The launch's own rows only (P2-5 items 3 and 5b): a Start is never
+    // pinned to a preview's version, and a preview with no open preview of
+    // its own runs the chosen slot's current version.
     if (candidate !== "grant" && packageId) {
       const { data: pkgVers, error: pkgVersErr } = await supabase
         .from("course_versions")
@@ -543,16 +646,20 @@ export default async function LaunchPage({
       if (pkgVersErr) refuse("routing_read_failed");
       const pkgVerIds = ((pkgVers ?? []) as Array<{ id: string }>).map((r) => r.id);
       if (pkgVerIds.length > 0) {
-        const readGrandfather = (withFlagFilter: boolean) => {
-          let q = supabase
-            .from("course_attempts")
-            .select("course_version_id")
-            .eq("user_id", user.id)
-            .in("course_version_id", pkgVerIds)
-            .eq("status", "in_progress");
-          if (withFlagFilter) q = q.eq("is_revision", false);
-          return q.order("started_at", { ascending: false }).limit(1).maybeSingle();
-        };
+        const readGrandfather = (withFlagFilter: boolean) =>
+          readWithContextFilter(previews, (apply) => {
+            let q = inLaunchContext(
+              supabase
+                .from("course_attempts")
+                .select("course_version_id")
+                .eq("user_id", user.id)
+                .in("course_version_id", pkgVerIds)
+                .eq("status", "in_progress"),
+              apply
+            );
+            if (withFlagFilter) q = q.eq("is_revision", false);
+            return q.order("started_at", { ascending: false }).limit(1).maybeSingle();
+          });
         let { data: ip, error: gfErr } = await readGrandfather(true);
         if (gfErr && isMissingColumn(gfErr, "is_revision")) ({ data: ip, error: gfErr } = await readGrandfather(false));
         if (gfErr) refuse("routing_read_failed");
@@ -589,9 +696,10 @@ export default async function LaunchPage({
 
   // ALDS P4 launch contract (ADR 0006 §C, notes (a)–(c) of 2026-10-19),
   // behind ALDS_P4 (default off). With the flag off nothing below that
-  // names `p4` runs and this launch is today's. Staff launches are previews
-  // (is_preview, launch_mode 'Browse'); a revision visit's row is 'Review'
-  // (ADR 0014 step 3); the served language is the attempt's slot (by the
+  // names `p4` runs and this launch is today's. A Start's row is 'Normal',
+  // a revision visit's row 'Review' (ADR 0014 step 3); a Preview by mode
+  // names its own columns, flag or not (previewAttemptColumns, ADR 0024
+  // P2-5); the served language is the attempt's slot (by the
   // version's package, which also covers a cross-slot resume): the attempt
   // column stores null for the unlabeled legacy slot (as the 0100 backfill
   // does), the LaunchData says "und". Never read by scoring (ADR 0005 D1).
@@ -602,11 +710,15 @@ export default async function LaunchPage({
   // to, every earlier step in that path must be completed first — UNLESS
   // the path's sequence_mode is 'random', in which case the prereq lock
   // is intentionally skipped per admin choice. The check itself is gated
-  // by the per-path sequence_mode lookup further down (#188).
-  const { data: pathStepRows } = await supabase
-    .from("learning_path_courses")
-    .select("path_id, step_number, release_at")
-    .eq("course_id", courseId);
+  // by the per-path sequence_mode lookup further down (#188). A preview
+  // opens the course outside every path (ADR 0024 step 23): it reads no
+  // path step, so neither the release gate nor the lock applies to it.
+  const { data: pathStepRows } = preview
+    ? { data: [] }
+    : await supabase
+        .from("learning_path_courses")
+        .select("path_id, step_number, release_at")
+        .eq("course_id", courseId);
   const stepInPaths = (pathStepRows ?? []) as Array<{
     path_id: string;
     step_number: number;
@@ -676,9 +788,10 @@ export default async function LaunchPage({
     );
     // SCHEDULED-RELEASE GATE: a step with a future release_at blocks launch
     // while ANY enforced path (assigned or org_public) containing this course
-    // is unreleased — regardless of sequence_mode. Admins bypass for QA.
+    // is unreleased — regardless of sequence_mode and of the role: a Start is
+    // a learner's for every role (ADR 0024 step 23), and a preview, which
+    // skips this gate, never reaches this block (no path step is read for it).
     if (
-      !canManage(role) &&
       stepInPaths.some(
         (s) =>
           enforcedPathIds.has(s.path_id) &&
@@ -730,12 +843,18 @@ export default async function LaunchPage({
           )
         );
         const verIds = Array.from(verToCourse.keys());
+        // A preview of an earlier step unlocks nothing (P2-5 item 5b).
         const { data: aRows } = verIds.length
-          ? await supabase
-              .from("course_attempts")
-              .select("course_version_id, completion_status, success_status")
-              .eq("user_id", user.id)
-              .in("course_version_id", verIds)
+          ? await readWithContextFilter(previews, (apply) =>
+              withoutPreviews(
+                supabase
+                  .from("course_attempts")
+                  .select("course_version_id, completion_status, success_status")
+                  .eq("user_id", user.id)
+                  .in("course_version_id", verIds),
+                apply
+              )
+            )
           : { data: [] };
         const doneCourseIds = new Set<string>();
         for (const a of (aRows ?? []) as Array<{
@@ -762,7 +881,10 @@ export default async function LaunchPage({
 
   // The closes of a resolution, run only once every launch gate has passed
   // (a launch that is then refused closes nothing), conditional on
-  // status = 'in_progress' and the learner's own rows, fail-soft.
+  // status = 'in_progress' and the learner's own rows, fail-soft. Each takes
+  // the launch's own rows only (P2-5 items 3 and 5b), as the reads that
+  // listed them did: a preview never closes a real attempt, a Start never a
+  // preview.
   const closeAfterResolution = async (r: Resolution) => {
     if (r.deactivated.length > 0) {
       // (3) The slot was deactivated by an admin: this attempt can never be
@@ -784,13 +906,17 @@ export default async function LaunchPage({
             );
       if (grantErr && !grantMissing) console.warn("[launch] grant re-check failed; nothing closed:", grantErr.message);
       if (closable.length > 0) {
-        const { data: abRows, error: abErr } = await svcAttempt
-          .from("course_attempts")
-          .update({ status: "abandoned" })
-          .in("id", closable)
-          .eq("user_id", user.id)
-          .eq("status", "in_progress")
-          .select("id");
+        const { data: abRows, error: abErr } = await readWithContextFilter(previews, (apply) =>
+          inLaunchContext(
+            svcAttempt
+              .from("course_attempts")
+              .update({ status: "abandoned" })
+              .in("id", closable)
+              .eq("user_id", user.id)
+              .eq("status", "in_progress"),
+            apply
+          ).select("id")
+        );
         if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
         const closedIds = ((abRows ?? []) as Array<{ id: string }>).map((row) => row.id);
         const tokErr = await expireLaunchTokens(svcAttempt, closedIds);
@@ -804,14 +930,18 @@ export default async function LaunchPage({
       // a non-current version of the chosen package closes here, so the next
       // revisit opens on the current version (revision rows only; nothing is
       // lost, every revisit re-seeds from the official attempt).
-      const { data: stRows, error: stErr } = await svcAttempt
-        .from("course_attempts")
-        .update({ status: "abandoned" })
-        .in("id", r.staleRevisionIds)
-        .eq("user_id", user.id)
-        .eq("status", "in_progress")
-        .eq("is_revision", true)
-        .select("id");
+      const { data: stRows, error: stErr } = await readWithContextFilter(previews, (apply) =>
+        inLaunchContext(
+          svcAttempt
+            .from("course_attempts")
+            .update({ status: "abandoned" })
+            .in("id", r.staleRevisionIds)
+            .eq("user_id", user.id)
+            .eq("status", "in_progress")
+            .eq("is_revision", true),
+          apply
+        ).select("id")
+      );
       if (stErr && !isMissingColumn(stErr, "is_revision")) console.warn("[launch] stale revision close failed:", stErr.message);
       const staleIds = ((stRows ?? []) as Array<{ id: string }>).map((row) => row.id);
       const tokErr = await expireLaunchTokens(svcAttempt, staleIds);
@@ -835,7 +965,9 @@ export default async function LaunchPage({
   // resuming the other one is exactly the "lost my place" bug (0062 also
   // makes new duplicates impossible via a partial unique index). The row's
   // own flag decides the kind (is_revision, with the fallback); a failed
-  // read refuses.
+  // read refuses. The launch's own rows only (P2-5 items 3 and 5b): a
+  // Start's lookup leaves out every preview; a preview's is the open row of
+  // its key, `preview`, with preview_kind = 'course'.
   type LaunchRowFull = { id: string; cmi_data: CmiData | null; is_revision?: boolean | null; status?: string };
   const ROW_COLUMNS = "id, cmi_data, status";
   // Each read has its own abort signal: Next memoizes identical GET fetches
@@ -843,17 +975,22 @@ export default async function LaunchPage({
   // insert; without it the re-read returned the first "no row" answer.
   const lookupRow = async (versionId: string): Promise<LaunchRowFull | null> => {
     const read = (columns: string) =>
-      supabase
-        .from("course_attempts")
-        .select(columns)
-        .eq("course_version_id", versionId)
-        .eq("user_id", user.id)
-        .eq("status", "in_progress")
-        .order("last_activity_at", { ascending: false, nullsFirst: false })
-        .order("started_at", { ascending: false })
-        .limit(1)
-        .abortSignal(new AbortController().signal)
-        .maybeSingle();
+      readWithContextFilter(previews, (apply) =>
+        inLaunchContext(
+          supabase
+            .from("course_attempts")
+            .select(columns)
+            .eq("course_version_id", versionId)
+            .eq("user_id", user.id)
+            .eq("status", "in_progress"),
+          apply
+        )
+          .order("last_activity_at", { ascending: false, nullsFirst: false })
+          .order("started_at", { ascending: false })
+          .limit(1)
+          .abortSignal(new AbortController().signal)
+          .maybeSingle()
+      );
     let { data: found, error: rowErr } = await read(`${ROW_COLUMNS}, is_revision`);
     if (rowErr && isMissingColumn(rowErr, "is_revision")) ({ data: found, error: rowErr } = await read(ROW_COLUMNS));
     if (rowErr) refuse("row_read_failed");
@@ -909,6 +1046,65 @@ export default async function LaunchPage({
   // The grant consumed on THIS launch (consume_grant answered `opened`).
   let openedGrantId: string | null = null;
 
+  // P2-5 item 3, a Preview by mode's row: no evaluate, no grant, no
+  // self-enrolment, no revision visit, no path or journey tag. The open
+  // course preview of the resolved version resumes. Otherwise the launch
+  // first closes an open legacy_role row of that version (note N4: both rows
+  // carry the key `preview`, so the insert would meet 23505 under the
+  // open-row index), then inserts the row with context_kind = 'preview',
+  // preview_kind = 'course', is_preview true and launch_mode 'Normal'
+  // (decision A32) and no official tag. The close sends no "abandoned"
+  // statement (a preview never reaches a tenant LRS) and expires the closed
+  // row's launch tokens. The close and the insert are not one transaction, so
+  // a 23505 (a concurrent launch's preview, or a legacy_role row opened
+  // between them) re-reads, and with no course preview there runs the close
+  // and the insert once more. An A19 write: it names 0107 columns and has no
+  // fallback; on a database without 0107 the lookup refuses first, before
+  // any write.
+  if (preview) {
+    let open = await lookupRow(v.id);
+    for (let tries = 0; !open && attemptId === null && tries < 2; tries++) {
+      const { data: lrRows, error: lrErr } = await svcAttempt
+        .from("course_attempts")
+        .update({ status: "abandoned" })
+        .eq("course_version_id", v.id)
+        .eq("user_id", user.id)
+        .eq("status", "in_progress")
+        .eq("context_kind", "preview")
+        .eq("preview_kind", "legacy_role")
+        .select("id");
+      if (lrErr) console.warn(JSON.stringify({ event: "preview_legacy_close_failed", course_id: c.id, user_id: user.id, code: lrErr.code ?? null }));
+      const lrIds = ((lrRows ?? []) as Array<{ id: string }>).map((row) => row.id);
+      if (lrIds.length > 0) {
+        const tokErr = await expireLaunchTokens(svcAttempt, lrIds);
+        if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
+      }
+      const { data: created, error: insErr } = await svcAttempt
+        .from("course_attempts")
+        .insert({
+          course_version_id: v.id,
+          user_id: user.id,
+          organization_id: org.id,
+          status: "in_progress",
+          cmi_data: {},
+          context_kind: "preview",
+          preview_kind: "course",
+          ...previewAttemptColumns({ language: packageOfServed(v)?.language }),
+        })
+        .select("id")
+        .single();
+      if (created) attemptId = created.id;
+      else if (insErr?.code === "23505") open = await lookupRow(v.id);
+      else refuse(isSchemaMissing(insErr) ? "schema_missing" : "preview_insert_failed");
+    }
+    if (attemptId === null) {
+      if (!open) refuse("preview_row_missing");
+      attemptId = open.id;
+      cmi = (open.cmi_data ?? {}) as CmiData;
+      rowAct = "resume_first";
+    }
+  }
+
   // I-1, the grant path, ONE transaction (ADR 0014 step 3; 0103
   // consume_grant): the grant row is locked, every open row of the learner
   // on the course closed, the fresh unseeded retake inserted and the grant
@@ -956,7 +1152,7 @@ export default async function LaunchPage({
       if (p4) {
         const { error: p4Err } = await svcAttempt
           .from("course_attempts")
-          .update(p4AttemptColumns({ role, revision: false, language: packageOfServed(v)?.language }))
+          .update(p4AttemptColumns({ revision: false, language: packageOfServed(v)?.language }))
           .eq("id", retakeId)
           .eq("user_id", user.id)
           .eq("organization_id", org.id);
@@ -984,16 +1180,21 @@ export default async function LaunchPage({
     // H: a `first` launch first closes any open flagged row on the resolved
     // version (conditional on in_progress and is_revision; nothing is lost,
     // the next revisit re-seeds), then looks up unflagged rows. Fail-soft: a
-    // row left open is refused by the kind rule below.
+    // row left open is refused by the kind rule below. Never a preview's row
+    // (P2-5 item 5b; a preview never reaches this block).
     if (ev.candidate === "first") {
-      const { data: flRows, error: flErr } = await svcAttempt
-        .from("course_attempts")
-        .update({ status: "abandoned" })
-        .eq("course_version_id", v.id)
-        .eq("user_id", user.id)
-        .eq("status", "in_progress")
-        .eq("is_revision", true)
-        .select("id");
+      const { data: flRows, error: flErr } = await readWithContextFilter(previews, (apply) =>
+        withoutPreviews(
+          svcAttempt
+            .from("course_attempts")
+            .update({ status: "abandoned" })
+            .eq("course_version_id", v.id)
+            .eq("user_id", user.id)
+            .eq("status", "in_progress")
+            .eq("is_revision", true),
+          apply
+        ).select("id")
+      );
       if (flErr && !isMissingColumn(flErr, "is_revision")) console.warn("[launch] flagged-row close failed:", flErr.message);
       const flIds = ((flRows ?? []) as Array<{ id: string }>).map((row) => row.id);
       if (flIds.length > 0) {
@@ -1036,7 +1237,7 @@ export default async function LaunchPage({
             : {}),
           ...(namedIsRevision ? { is_revision: true } : {}),
           // The 0100 columns, only with ALDS_P4 on (ADR 0006 note (c)).
-          ...(p4 ? p4AttemptColumns({ role, revision: namedIsRevision, language: packageOfServed(v)?.language }) : {}),
+          ...(p4 ? p4AttemptColumns({ revision: namedIsRevision, language: packageOfServed(v)?.language }) : {}),
         })
         .select("id")
         .single();
@@ -1175,8 +1376,10 @@ export default async function LaunchPage({
   }
 
   // Row-driven decisions (ADR 0014 step 3): the launch mode follows the
-  // row's flag; staff and data_analyst launches are previews.
-  const launch = launchModeFor({ role, revision: rowIsRevision });
+  // launch's mode and the row's flag (ADR 0024 step 23): a Preview by mode
+  // is a preview in Normal; every role's Start is Normal, or Review on a
+  // revision visit's row.
+  const launch = launchModeFor({ mode, revision: rowIsRevision });
   const servedLanguage = servedLanguageFor(packageOfServed(v)?.language);
 
   // L: the revision visit record (ADR 0014 step 3), written once the launch
@@ -1232,16 +1435,17 @@ export default async function LaunchPage({
 
   // ADR 0019 step 8: the bar's Continue goes to the continue address only on a
   // Learning Path launch this course really is a step of (pathContextId), and
-  // never on a journey launch. The title stays in the bar unless the version's
-  // cached engine stamp says it is a KIVO build, which shows its own title.
+  // never on a journey launch. A preview carries no ?lp= (read as none above),
+  // so it has no Continue (ADR 0024 step 23, the owner's A21 answer). The
+  // title stays in the bar unless the version's cached engine stamp says it
+  // is a KIVO build, which shows its own title.
   const continueHref =
     pathContextId && !journeyParam
       ? `/${orgSlug}/continue?lp=${encodeURIComponent(pathContextId)}&from=${encodeURIComponent(courseId)}`
       : null;
   const showTitle = !isKivoStamped(v.manifest_data);
   // ADR 0019, note of 2026-11-11: Continue waits until the module's official
-  // result is stored. Ready at once for a preview (the roles the continue
-  // address moves on without a wait) or when the page's own scoring of the
+  // result is stored. Ready at once when the page's own scoring of the
   // learner's attempts on the course already reads stored, through the
   // continue address's own test (a revision visit, a relaunch after a
   // result). Waiting on a first launch (its new row is not in ev.my, and no
@@ -1249,11 +1453,13 @@ export default async function LaunchPage({
   // reads in_progress), on a pass_required course whose verdict is pending,
   // and on the launch that has just opened a granted retake (openedGrantId):
   // ev was read before consume_grant inserted the retake, so ev.my still
-  // reads the earlier result as stored.
+  // reads the earlier result as stored. The preview term is gone with the
+  // preview's Continue (ADR 0024 step 23).
   const continueReady =
     continueHref !== null &&
-    (launch.isPreview ||
-      (openedGrantId === null && ev.scoring !== null && officialResultStored(ev.scoring, ev.my, passRequired)));
+    openedGrantId === null &&
+    ev.scoring !== null &&
+    officialResultStored(ev.scoring, ev.my, passRequired);
   // The status the bar polls while it waits (a learner-owned GET, the caller's session).
   const continueStatusHref =
     continueHref !== null ? `/api/attempts/${encodeURIComponent(attemptId)}/result-stored` : null;
@@ -1330,6 +1536,7 @@ export default async function LaunchPage({
         backLabel={backLabel}
         preloadUrls={preloadUrls}
         revision={rowIsRevision}
+        preview={launch.isPreview}
         showTitle={showTitle}
         continueHref={continueHref}
         continueReady={continueReady}
@@ -1493,6 +1700,7 @@ export default async function LaunchPage({
       backLabel={backLabel}
       preloadUrls={preloadUrls}
       revision={rowIsRevision}
+      preview={launch.isPreview}
       showTitle={showTitle}
       continueHref={continueHref}
       continueReady={continueReady}

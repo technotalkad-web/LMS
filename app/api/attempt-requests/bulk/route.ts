@@ -11,6 +11,7 @@ import {
   type GrantSnapshot,
   type PgError,
 } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { bulkEligibility } from "@/lib/attempts/request-decision";
 import { resolveEmails } from "@/lib/users/emails";
 import {
@@ -33,6 +34,16 @@ import {
  * here: they ask from the course page and the admin approves with the
  * confirmation. Every read is error-checked (the versions, the attempts, the
  * grants, the open requests): any error answers 503 and nothing is inserted.
+ *
+ * ADR 0024 P2-5: a Preview is never an official result. The attempts read
+ * drops `context_kind = 'preview'` rows (readWithContextFilter and
+ * withoutPreviews, one decision for every page), as the queue page does, so
+ * a staff member whose only failed row is a Preview is not a failed learner,
+ * one who passed for real is never granted on a failed Preview, and
+ * `attempts_used` counts real attempts only. On a database without 0107 the
+ * filter's missing-column error reads today's select once; any other error
+ * answers 503 as before. Phase 4 (step 37) moves this read to
+ * readContextResult.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -113,18 +124,18 @@ export async function POST(request: Request) {
   // readPagedWithOptionalColumn: the first page decides the column list for
   // the rest), so an abandoned or a revision visit's row never counts and a
   // live retake is seen. Any failed page, or a page with neither rows nor an
-  // error, answers 503.
+  // error, answers 503. Previews are dropped (the header), one decision for
+  // every page of this request.
   type Att = ScorableAttempt & { user_id: string };
+  const previews: ContextFilterState = { applies: null };
   const attemptsRead = await readPagedWithOptionalColumn<Att>(
     "is_revision",
     (cols, from, to) =>
-      s
-        .from("course_attempts")
-        .select(cols)
-        .eq("organization_id", org.id)
-        .in("course_version_id", verIds)
-        .order("id")
-        .range(from, to) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
+      readWithContextFilter(previews, (apply) =>
+        withoutPreviews(s.from("course_attempts").select(cols).eq("organization_id", org.id).in("course_version_id", verIds), apply)
+          .order("id")
+          .range(from, to)
+      ) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
     ATTEMPT_COLUMNS,
     { nullIsError: true }
   );

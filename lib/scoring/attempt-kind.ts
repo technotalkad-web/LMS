@@ -1,5 +1,9 @@
 import { computeScoring, DEFAULT_POLICY, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
+// A cycle by design: context-read.ts builds its fallback on readWithOptionalFilter
+// below, and classifyAttempt's list reads through context-read's preview filter.
+// Neither file uses the other at module level, only inside functions.
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 /**
  * Server-side helpers for the revision rule (Phase 1; ADR 0014):
@@ -9,7 +13,8 @@ import { resolvePolicy } from "@/lib/scoring/resolve";
  *                         paths to decide what a completion may change:
  *                         journey days, XP and the CRM webhook follow
  *                         official attempts only. A revision visit's row
- *                         (is_revision, 0103) is never official.
+ *                         (is_revision, 0103) is never official. The list
+ *                         it scores drops Previews (ADR 0024 P2-5 item 5b).
  *   grantSnapshotFor()  — the learner's approved grants on a course, read
  *                         once and STRICTLY (ADR 0014 step 3): the launch
  *                         page and the forced restart decide from it, so a
@@ -223,7 +228,20 @@ const KIND_ATTEMPT_COLUMNS = "id, user_id, organization_id, course_version_id, c
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing. */
 const KIND_LIST_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, status";
 
-export async function classifyAttempt(svc: AnyClient, attemptId: string): Promise<AttemptKind | null> {
+/**
+ * `previews` is the decision of the preview filter on the list read (ADR 0024
+ * P2-5 item 5b): the list drops `context_kind = 'preview'` rows, so a Preview
+ * beside the learner's real attempts never takes a place in the ordinal that
+ * decides `official`; on a database without 0107 the filter's missing-column
+ * error reads today's list once (readWithContextFilter). A sweep passes one
+ * decision for its whole run (lib/integrations/webhook-hold.ts); a route's
+ * single call takes a fresh one. Phase 3's writer replaces this read.
+ */
+export async function classifyAttempt(
+  svc: AnyClient,
+  attemptId: string,
+  previews: ContextFilterState = { applies: null }
+): Promise<AttemptKind | null> {
   // ADR 0014 step 6: the attempt's own flag, with the narrower-select
   // fallback on a database without 0103 (the flag then reads as false).
   const readAttempt = (columns: string) =>
@@ -252,12 +270,17 @@ export async function classifyAttempt(svc: AnyClient, attemptId: string): Promis
   // drops abandoned and revision rows, so an abandoned-but-completed row no
   // longer takes a place in the ordinal that decides `official` (0099's
   // after-apply count #3 expects zero such rows on both environments).
-  const listFor = (columns: string) =>
-    svc
-      .from("course_attempts")
-      .select(columns)
-      .eq("user_id", a.user_id)
-      .in("course_version_id", verIds.length ? verIds : [a.course_version_id]);
+  const listFor = (columns: string): Promise<{ data: unknown; error: PgError }> =>
+    readWithContextFilter(previews, (apply) =>
+      withoutPreviews(
+        svc
+          .from("course_attempts")
+          .select(columns)
+          .eq("user_id", a.user_id)
+          .in("course_version_id", verIds.length ? verIds : [a.course_version_id]),
+        apply
+      )
+    );
   let { data: rows, error: rowsErr } = await listFor(`${KIND_LIST_COLUMNS}, is_revision`);
   if (rowsErr && isMissingColumn(rowsErr, "is_revision")) {
     ({ data: rows, error: rowsErr } = await listFor(KIND_LIST_COLUMNS));

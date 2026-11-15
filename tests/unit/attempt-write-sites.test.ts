@@ -18,7 +18,11 @@
  *   - ADR 0014 step 3: the launch page's new writes (the closes, the 0100
  *     columns after consume_grant, the SCORM seed) carry theirs, and the two
  *     0103 functions that write attempt rows (consume_grant,
- *     flag_revision_attempt) are listed by hand with their receiver.
+ *     flag_revision_attempt) are listed by hand with their receiver;
+ *   - ADR 0024 P2-5: the launch page's preview insert (context_kind
+ *     'preview', preview_kind 'course', previewAttemptColumns, no official
+ *     tag) and the close of an open legacy_role row before it (note N4)
+ *     carry theirs.
  *
  * A receiver is resolved lexically with the TypeScript parser: the binding
  * or parameter of that name in scope at the write (the enclosing functions'
@@ -202,10 +206,13 @@ type Site = { receivers: string[]; params?: string[]; what: string };
 const ATTEMPT_WRITES: Record<string, Site> = {
   // ADR 0014 step 3: one service client for every launch write; the
   // grant-retake reset moved into consume_grant (listed by hand below).
+  // ADR 0024 P2-5 item 3: a Preview by mode adds two writes, the close of an
+  // open legacy_role row of the version (note N4) and the preview insert.
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
-    receivers: ["svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt"],
+    receivers: ["svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt", "svcAttempt"],
     what:
-      "deactivated-slot close, stale-revision close, journey tag, the 0100 columns after consume_grant opened, " +
+      "deactivated-slot close, stale-revision close, journey tag, the preview's legacy_role close (ADR 0024 note N4), " +
+      "the preview insert (ADR 0024 P2-5), the 0100 columns after consume_grant opened, " +
       "flagged-row close of a first launch, attempt insert, attempt insert retry without the 0100 columns (ADR 0006 note (c) of 2026-10-19), " +
       "the SCORM revision seed",
   },
@@ -334,7 +341,10 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
   // ADR 0014 step 3: other svcAttempt updates precede the journey tag now
   // (the closes, the P4 update after opened), so the tag is found by its row.
   const tag = launch.find((w) => w.receiver === "svcAttempt" && w.method === "update" && /\.eq\("id", existing\.id\)/.test(w.stmt));
-  const ins = launch.find((w) => w.receiver === "svcAttempt" && w.method === "insert");
+  // ADR 0024 P2-5: the preview insert (context_kind 'preview') is checked on
+  // its own below; `ins` and `inserts` are the Start's.
+  const isPreviewInsert = (w: { stmt: string }) => /context_kind: "preview"/.test(w.stmt);
+  const ins = launch.find((w) => w.receiver === "svcAttempt" && w.method === "insert" && !isPreviewInsert(w));
   eq("journey tag: .eq(id) .eq(user_id) .eq(organization_id)", !!tag &&
     /\.eq\("id", existing\.id\)/.test(tag.stmt) &&
     /\.eq\("user_id", user\.id\)/.test(tag.stmt) &&
@@ -346,7 +356,22 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
   // ADR 0006 note (c) of 2026-10-19: the retry without the 0100 columns is
   // the same row (same user, organisation and version); only the first
   // insert names the P4 columns.
-  const inserts = launch.filter((w) => w.receiver === "svcAttempt" && w.method === "insert");
+  const allInserts = launch.filter((w) => w.receiver === "svcAttempt" && w.method === "insert");
+  const previewInserts = allInserts.filter(isPreviewInsert);
+  const inserts = allInserts.filter((w) => !isPreviewInsert(w));
+  // ADR 0024 P2-5 item 3 (step 22's preview row): exactly one preview insert,
+  // the caller's own row on the resolved version, context_kind 'preview' and
+  // preview_kind 'course' named literally, the 0100 columns through
+  // previewAttemptColumns (is_preview true, launch_mode 'Normal'), and no
+  // official tag: no path or journey tag and no revision flag.
+  eq("the preview insert: one, own row on this version, preview/course, previewAttemptColumns, no official tag",
+    previewInserts.map((w) =>
+      /\buser_id: user\.id\b/.test(w.stmt) &&
+      /\borganization_id: org\.id\b/.test(w.stmt) &&
+      /\bcourse_version_id: v\.id\b/.test(w.stmt) &&
+      /\bpreview_kind: "course"/.test(w.stmt) &&
+      /\.\.\.previewAttemptColumns\(/.test(w.stmt) &&
+      !/\b(learning_path_id|journey_enrollment_id|journey_day|is_revision)\b/.test(w.stmt)), [true]);
   eq("attempt insert + retry: both carry user_id, organization_id and course_version_id", inserts.length === 2 &&
     inserts.every((w) =>
       /\buser_id: user\.id\b/.test(w.stmt) &&
@@ -364,8 +389,19 @@ console.log("\ncourse_attempts: the moved writes carry their explicit filters (A
   eq("stale-revision close: own rows, in progress, flagged only",
     byStmt(/\.in\("id", r\.staleRevisionIds\)/).map((w) =>
       /\.eq\("user_id", user\.id\)/.test(w.stmt) && /\.eq\("status", "in_progress"\)/.test(w.stmt) && /\.eq\("is_revision", true\)/.test(w.stmt)), [true]);
+  // ADR 0024 note N4: before a preview insert, the close of an open
+  // legacy_role row of the version (both rows carry the key `preview`). It is
+  // the only write that names preview_kind 'legacy_role'; it closes previews
+  // only, never a real attempt, and sends no "abandoned" statement
+  // (tests/unit/lrs-abandon-sites.test.ts holds that).
+  const isLegacyClose = (w: { stmt: string }) => /\.eq\("preview_kind", "legacy_role"\)/.test(w.stmt);
+  eq("the preview's legacy_role close (N4): this version, own rows, in progress, previews only",
+    byStmt(/\.eq\("preview_kind", "legacy_role"\)/).map((w) =>
+      w.method === "update" && /\.update\(\{ status: "abandoned" \}\)/.test(w.stmt) &&
+      /\.eq\("course_version_id", v\.id\)/.test(w.stmt) && /\.eq\("user_id", user\.id\)/.test(w.stmt) &&
+      /\.eq\("status", "in_progress"\)/.test(w.stmt) && /\.eq\("context_kind", "preview"\)/.test(w.stmt)), [true]);
   eq("flagged-row close (a first launch): this version, own rows, in progress, flagged only",
-    byStmt(/\.eq\("course_version_id", v\.id\)/).filter((w) => w.method === "update").map((w) =>
+    byStmt(/\.eq\("course_version_id", v\.id\)/).filter((w) => w.method === "update" && !isLegacyClose(w)).map((w) =>
       /\.eq\("user_id", user\.id\)/.test(w.stmt) && /\.eq\("status", "in_progress"\)/.test(w.stmt) && /\.eq\("is_revision", true\)/.test(w.stmt)), [true]);
   eq("the P4 update after opened: by the retake's id, user and organisation",
     byStmt(/\.update\(p4AttemptColumns\(/).map((w) =>

@@ -17,7 +17,12 @@
  *   - no write: every REST call is a GET but the policy RPC (resolvePolicy's
  *     effective_attempt_policies, a read-only function called by POST);
  *   - the reads' filters: the learner's own rows only; the attempts read names
- *     status and is_revision, and a 42703 on is_revision retries without it.
+ *     status and is_revision, and a 42703 on is_revision retries without it;
+ *   - ADR 0024 P2-5 item 5b: the attempts read drops Previews (`context_kind
+ *     = neq.preview`, honoured by the stub), so a completed Preview beside an
+ *     in-progress real attempt does not read as stored; on a database without
+ *     0107 the filter's 42703 is read once more without it, alone or with the
+ *     is_revision fallback in either order of the two errors.
  *
  * No database, no network.
  *
@@ -39,6 +44,7 @@ const USER = { id: "u1", aud: "authenticated", role: "authenticated", email: "le
 const SESSION = JSON.stringify({ access_token: "stub-token", refresh_token: "r", token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: USER });
 const ATTEMPT = "0f8fad5b-d9cb-469f-a165-70867728950e";
 const NO_COLUMN = { code: "42703", message: "column course_attempts.is_revision does not exist" };
+const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
 const BOOM = { code: "XX000", message: "the read failed" };
 
 let signedIn = true;
@@ -66,6 +72,10 @@ type World = {
   attempts: Row[];
   attemptsError: boolean;
   columnMissing: boolean;
+  /** A database without 0107: a read filtered on context_kind answers 42703. */
+  contextMissing: boolean;
+  /** Which missing column a read naming both answers first. */
+  contextFirst: boolean;
 };
 const base = (): World => ({
   own: { id: ATTEMPT, course_version_id: "v1", course_versions: { course_id: "c1" } },
@@ -78,6 +88,8 @@ const base = (): World => ({
   attempts: [],
   attemptsError: false,
   columnMissing: false,
+  contextMissing: false,
+  contextFirst: false,
 });
 let world: World = base();
 let requests: Req[] = [];
@@ -99,8 +111,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       return json(world.own ? [world.own] : []);
     }
     if (world.attemptsError) return json(BOOM, 500);
-    if (world.columnMissing && select.includes("is_revision")) return json(NO_COLUMN, 400);
-    return json(world.attempts);
+    const filtered = url.searchParams.get("context_kind") === "neq.preview";
+    const noFlag = world.columnMissing && select.includes("is_revision");
+    const noContext = world.contextMissing && filtered;
+    if (noFlag && noContext) return json(world.contextFirst ? NO_CONTEXT : NO_COLUMN, 400);
+    if (noFlag) return json(NO_COLUMN, 400);
+    if (noContext) return json(NO_CONTEXT, 400);
+    return json(world.attempts.filter((r) => !filtered || r.context_kind !== "preview"));
   }
   if (p === "/rest/v1/courses") {
     if (world.courseError) return json(BOOM, 500);
@@ -223,6 +240,32 @@ async function main() {
       narrow.status, narrow.body, narrow.attemptsReads.length,
       narrow.attemptsReads[0]?.select.includes("is_revision"), narrow.attemptsReads[1]?.select.includes("is_revision"),
     ], [200, { stored: true }, 2, true, false]);
+
+    console.log("\na Preview never counts (ADR 0024 P2-5 item 5b)");
+    // The Preview started BEFORE the real attempt: unfiltered, it would be the official attempt and read as stored.
+    const PREVIEW_DONE = done("pv", "passed", 1, "2026-11-10T08:20:00Z", { context_kind: "preview", started_at: "2026-11-10T08:00:00Z" });
+    const REAL_LIVE = row("a1", { context_kind: "individual" });
+    const beside = await run({ attempts: [PREVIEW_DONE, REAL_LIVE] });
+    eq("a completed Preview beside an in-progress real attempt → 200 { stored: false }", [beside.status, beside.body], [200, { stored: false }]);
+    eq("…the attempts read carries context_kind neq.preview, once", beside.attemptsReads.map((q) => q.query.get("context_kind")), ["neq.preview"]);
+    const realDone = await run({ attempts: [PREVIEW_DONE, done("a1", "passed", 0.9, undefined, { context_kind: "individual" })] });
+    eq("…and the real attempt completed beside it → { stored: true }", realDone.body, { stored: true });
+    const previewOnly = await run({ attempts: [PREVIEW_DONE] });
+    eq("a completed Preview alone → { stored: false }", previewOnly.body, { stored: false });
+
+    const noContext = await run({ contextMissing: true, attempts: [done("a1", "passed", 0.9)] });
+    eq("without 0107: the filter's 42703 is read once more without the filter, and today's rows answer", [
+      noContext.status, noContext.body, noContext.attemptsReads.map((q) => q.query.get("context_kind")),
+    ], [200, { stored: true }, ["neq.preview", null]]);
+    for (const contextFirst of [false, true]) {
+      const both = await run({ contextMissing: true, columnMissing: true, contextFirst, attempts: [done("a1", "passed", 0.9)] });
+      eq(`without 0103 and 0107 (the ${contextFirst ? "context" : "flag"} error first): both fallbacks, today's narrowest read answers`, [
+        both.status, both.body,
+        both.attemptsReads.at(-1)?.select.includes("is_revision"), both.attemptsReads.at(-1)?.query.get("context_kind"),
+      ], [200, { stored: true }, false, null]);
+    }
+    const other = await run({ attemptsError: true });
+    eq("any other error is never retried without the filter: one attempts read, 503", [other.status, other.attemptsReads.length], [503, 1]);
 
     eq("the stub answered every request the route made", unmatched, []);
   } finally {

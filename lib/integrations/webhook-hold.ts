@@ -65,6 +65,18 @@
  *               + HELD_MAX_SCANNED * (classifyCost + 2) <= 0.5 * WORKERS_SUBREQUEST_BUDGET
  * The 2 is the refresh RPC and the heartbeat; the `+ 2` per row is
  * classifyAttempt's narrower-select fallback on a database without 0103.
+ * The preview filter (ADR 0024 P2-5 item 5b: the selection and classifyAttempt's
+ * list drop `context_kind = 'preview'` rows) costs nothing on a database with
+ * 0107. On one without it the first read of a run answers a missing-column
+ * error and is made once more without the filter (readWithContextFilter); every
+ * run passes one decision to its pages and to every classify, so that is one
+ * read per run, not one per row. With 0103 and without 0107 (production until
+ * the 0107 sitting) the sweep's healthy path is then 2 + 2 + 3 x 5 + 2 x 8 = 35
+ * and the provider's 2 + 3 x 5 = 17. A database without 0103 has no 0107
+ * either, so the rule's own sum gains that read there: 41 for the sweep, one
+ * over 0.8 of the budget and within it; 23 for the provider, under its half.
+ * No environment runs without 0103 any more. tests/unit/webhook-hold-route.test.ts
+ * (v) measures each of these figures under its stub's no-0107 mode.
  * SWEEP_MAX_FIRES counts fire calls whatever they answer, because a call that
  * loses the latch has already made every subrequest but the POST. The
  * provider runs inside the admin page's request beside the other providers,
@@ -99,6 +111,8 @@
  * classifyAttempt.
  */
 import type { AttentionItem, AttentionPriority } from "@/lib/attention/types";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
+import type { PgError } from "@/lib/scoring/attempt-kind";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = any;
@@ -207,8 +221,12 @@ function errorText(e: unknown): string {
  * [fromIso, olderThanIso), on a cmi5 or xAPI version (the `!inner` embed lets
  * the type bound filter the parent row). With `after`, the keyset predicate
  * goes in a second `or` parameter, which PostgREST ANDs with the first. Names
- * no 0100 or 0103 column. Any error, a database without 0082 included (the
- * latch column is named), answers no rows and the error.
+ * no 0100 or 0103 column. A Preview is never selected (ADR 0024 P2-5 item 5b):
+ * the read drops `context_kind = 'preview'` rows through readWithContextFilter,
+ * with `opts.previews` the run's one decision (a fresh one when none is
+ * passed), so on a database without 0107 the run reads today's selection after
+ * one missing-column error. Any other error, a database without 0082 included
+ * (the latch column is named), answers no rows and the error.
  */
 export async function heldWebhookPage(
   svc: AnyClient,
@@ -223,27 +241,35 @@ export async function heldWebhookPage(
     pageSize?: number;
     /** Default WEBHOOK_HOLD_SWEEP_FROM; passed only by the read-only staging probe. */
     fromIso?: string;
+    /** The run's decision of the preview filter; a fresh one when absent. */
+    previews?: ContextFilterState;
   }
 ): Promise<{ rows: HeldRow[]; error: string | null }> {
   try {
-    let q = svc
-      .from("course_attempts")
-      .select("id, completed_at, course_versions!inner(manifest_type)")
-      .or("completion_status.eq.completed,success_status.eq.passed")
-      .neq("status", "abandoned")
-      .is("completion_webhook_at", null)
-      .lt("completed_at", opts.olderThanIso)
-      .gte("completed_at", opts.fromIso ?? WEBHOOK_HOLD_SWEEP_FROM)
-      .in("course_versions.manifest_type", ["cmi5", "xapi"]);
-    if (opts.orgId) q = q.eq("organization_id", opts.orgId);
-    const c = opts.after;
-    if (c) {
-      q = q.or(`completed_at.lt."${c.completed_at}",and(completed_at.eq."${c.completed_at}",id.lt."${c.id}")`);
-    }
-    const { data, error } = await q
-      .order("completed_at", { ascending: false })
-      .order("id", { ascending: false })
-      .limit(opts.pageSize ?? HELD_PAGE_SIZE);
+    const previews = opts.previews ?? { applies: null };
+    const { data, error } = await readWithContextFilter(previews, (apply): PromiseLike<{ data: unknown; error: PgError }> => {
+      let q = withoutPreviews(
+        svc
+          .from("course_attempts")
+          .select("id, completed_at, course_versions!inner(manifest_type)")
+          .or("completion_status.eq.completed,success_status.eq.passed")
+          .neq("status", "abandoned")
+          .is("completion_webhook_at", null)
+          .lt("completed_at", opts.olderThanIso)
+          .gte("completed_at", opts.fromIso ?? WEBHOOK_HOLD_SWEEP_FROM)
+          .in("course_versions.manifest_type", ["cmi5", "xapi"]),
+        apply
+      );
+      if (opts.orgId) q = q.eq("organization_id", opts.orgId);
+      const c = opts.after;
+      if (c) {
+        q = q.or(`completed_at.lt."${c.completed_at}",and(completed_at.eq."${c.completed_at}",id.lt."${c.id}")`);
+      }
+      return q
+        .order("completed_at", { ascending: false })
+        .order("id", { ascending: false })
+        .limit(opts.pageSize ?? HELD_PAGE_SIZE);
+    });
     if (error) return { rows: [], error: errorText(error) };
     const rows = ((data ?? []) as Array<{ id: string; completed_at: string }>).map((r) => ({
       id: r.id,
@@ -260,8 +286,12 @@ export async function heldWebhookPage(
 export type SweepDeps = {
   /** fireCompletionWebhookForAttempt: true = this call took the latch and dispatched. */
   fire: (attemptId: string, attemptNumber: number | null) => Promise<boolean>;
-  /** classifyAttempt. */
-  classify: (svc: AnyClient, attemptId: string) => Promise<{ official: boolean; attemptNumber: number | null } | null>;
+  /** classifyAttempt; `previews` is the run's one decision of the preview filter (ADR 0024 P2-5 item 5b). */
+  classify: (
+    svc: AnyClient,
+    attemptId: string,
+    previews?: ContextFilterState
+  ) => Promise<{ official: boolean; attemptNumber: number | null } | null>;
   now?: () => Date;
 };
 
@@ -283,7 +313,8 @@ export type SweepOpts = { pageSize?: number; maxFires?: number; maxScanned?: num
  * numbers it, a grant retake included: official with no number means
  * classifyAttempt's versions or list read failed, and that answer cannot tell a
  * row beyond the scored window from one inside it. One log line per run, ids
- * and counts only.
+ * and counts only. One decision of the preview filter serves the run's pages
+ * and every classify (the header's rule).
  */
 export async function sweepHeldWebhooks(svc: AnyClient, deps: SweepDeps, opts?: SweepOpts): Promise<SweepResult> {
   const pageSize = opts?.pageSize ?? HELD_PAGE_SIZE;
@@ -292,11 +323,12 @@ export async function sweepHeldWebhooks(svc: AnyClient, deps: SweepDeps, opts?: 
   const now = deps.now ? deps.now() : new Date();
   const olderThanIso = new Date(now.getTime() - WEBHOOK_HOLD_MINUTES * 60_000).toISOString();
   const result: SweepResult = { scanned: 0, fired: [], skipped: [], unfired: [] };
+  const previews: ContextFilterState = { applies: null };
   let calls = 0;
   let after: HeldCursor | null = null;
   while (result.scanned < maxScanned && calls < maxFires) {
     const want = Math.min(pageSize, maxScanned - result.scanned);
-    const page = await heldWebhookPage(svc, { olderThanIso, after, pageSize: want });
+    const page = await heldWebhookPage(svc, { olderThanIso, after, pageSize: want, previews });
     if (page.error !== null) {
       result.error = page.error;
       break;
@@ -307,7 +339,7 @@ export async function sweepHeldWebhooks(svc: AnyClient, deps: SweepDeps, opts?: 
       result.scanned++;
       let kind: { official: boolean; attemptNumber: number | null } | null = null;
       try {
-        kind = await deps.classify(svc, row.id);
+        kind = await deps.classify(svc, row.id, previews);
       } catch {
         kind = null;
       }
@@ -352,7 +384,8 @@ type HeldSummary = { count: number; oldestCompletedAt: string | null; truncated:
  * counts up to HELD_MAX_COUNT of them within `maxScanned` rows scanned.
  * `truncated` is true when either bound
  * stopped the scan (the count is then a floor). Any error answers count 0,
- * not truncated, and the error.
+ * not truncated, and the error. One decision of the preview filter serves the
+ * scan's pages and every classify, as in the sweep.
  */
 export async function heldWebhookSummary(
   svc: AnyClient,
@@ -368,20 +401,21 @@ export async function heldWebhookSummary(
   let count = 0;
   let oldest: string | null = null;
   let after: HeldCursor | null = null;
+  const previews: ContextFilterState = { applies: null };
   try {
     for (;;) {
       if (count >= HELD_MAX_COUNT || scanned >= maxScanned) {
         return { count, oldestCompletedAt: oldest, truncated: true, error: null };
       }
       const want = Math.min(pageSize, maxScanned - scanned);
-      const page = await heldWebhookPage(svc, { olderThanIso, orgId, after, pageSize: want });
+      const page = await heldWebhookPage(svc, { olderThanIso, orgId, after, pageSize: want, previews });
       if (page.error !== null) return { count: 0, oldestCompletedAt: null, truncated: false, error: page.error };
       const rows = page.rows.slice(0, want);
       let i = 0;
       for (; i < rows.length && count < HELD_MAX_COUNT; i++) {
         const row = rows[i];
         scanned++;
-        const kind = await deps.classify(svc, row.id);
+        const kind = await deps.classify(svc, row.id, previews);
         if (kind?.official && kind.attemptNumber !== null) {
           count++;
           if (oldest === null || Date.parse(row.completed_at) < Date.parse(oldest)) oldest = row.completed_at;

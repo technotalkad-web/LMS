@@ -7,6 +7,7 @@ import {
   resolveOrgSlugByDomain,
   tenantRewritePath,
 } from "@/lib/domains/resolve";
+import { signInNext } from "@/lib/auth/safe-next";
 
 // Per-tenant branded login pages live at /<org-slug>/login. They must be
 // reachable without a session — they're the entry point. We match this
@@ -117,6 +118,9 @@ export async function updateSession(request: NextRequest) {
 
   if (!user && !isPublic) {
     const url = request.nextUrl.clone();
+    // The login page reads `next` only. The caller's own query goes inside
+    // `next` (below), so it is not also left on the login address.
+    url.search = "";
     // Tenant-aware redirect: if the user was trying to reach an org-scoped
     // route (/[org]/something), bounce them to THAT org's branded login
     // (/[org]/login) instead of the generic platform login. Welcome emails
@@ -148,14 +152,17 @@ export async function updateSession(request: NextRequest) {
       url.pathname = "/login";
       const cleanNext = effectivePath.replace(new RegExp(`^/${customSlug}`), "") || "/";
       if (cleanNext !== "/" && !cleanNext.startsWith("/login")) {
-        url.searchParams.set("next", cleanNext);
+        url.searchParams.set("next", signInNext(cleanNext, request.nextUrl.searchParams));
       }
     } else {
       url.pathname = isTenantPath ? `/${firstSegment}/login` : "/login";
       // Preserve where they were headed so post-login the app can return
       // them to that exact page instead of dumping them on the dashboard.
+      // The query comes too (ADR 0024 P2-5): a launch's mode, path, journey
+      // day and language are in it, and a launch without its Preview mode
+      // is a Start. Built from the parsed URL, never from request.url.
       if (path !== "/" && !path.startsWith("/login")) {
-        url.searchParams.set("next", path);
+        url.searchParams.set("next", signInNext(path, request.nextUrl.searchParams));
       }
     }
     return NextResponse.redirect(url);

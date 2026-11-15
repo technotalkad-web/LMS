@@ -559,7 +559,7 @@ async function main() {
     const access = async (w: World, courseId: string, journeyCredits?: { ids: ReadonlySet<string>; credits: JourneyCredits }) => {
       const s = stub(w);
       const res = await learnerCanAccessCourse({
-        supabase: s.client as never, orgId: "org-1", userId: "u1", courseId, isAdmin: false, visibility: "private", journeyCredits,
+        supabase: s.client as never, orgId: "org-1", userId: "u1", courseId, preview: false, visibility: "private", journeyCredits,
       });
       return { res, creditReads: s.reqs.filter((q) => q.table === "journey_day_progress").length };
     };

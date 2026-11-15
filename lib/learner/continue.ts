@@ -8,9 +8,10 @@
  * unit-tested (tests/unit/continue.test.ts).
  *
  * Deliberately free of next/*, lib/alds/* and Supabase runtime imports so unit
- * tests can load it (the lib/attempts/launch-kind.ts shape). The staff verdict
- * comes in from lib/alds/launch.ts launchModeFor(); the "done" verdict from
- * lib/scoring/policy.ts officialDone().
+ * tests can load it (the lib/attempts/launch-kind.ts shape). The "done" verdict
+ * comes in from lib/scoring/policy.ts officialDone(). There is no staff branch
+ * (ADR 0024 step 23, P2-5 item 4): every caller of the address waits for a
+ * stored result, and a Preview never reaches it (it carries no `?lp=`).
  */
 import { courseStatus, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
 
@@ -96,8 +97,6 @@ export function officialResultStored(scoring: ScoringResult, attempts: ScorableA
 export type ContinueInput = {
   orgSlug: string;
   pathId: string;
-  /** launchModeFor({ role, revision: false }).isPreview: super_owner, admin, data_analyst. */
-  isStaff: boolean;
   /**
    * The wait ended without a stored result (nothing stored, or a pass-required
    * course's verdict still pending, verdictPending), or a read failed.
@@ -110,21 +109,20 @@ export type ContinueInput = {
 };
 
 /**
- * Where the route sends the learner, in this order (ADR 0019 step 3):
- *   1. staff: the next launch, or the path page's end banner;
- *   2. timed out (nothing stored, or the verdict still pending): the path
+ * Where the route sends the learner, in this order (ADR 0019 step 3; its
+ * staff row, which skipped the wait, is gone with ADR 0024 step 23):
+ *   1. timed out (nothing stored, or the verdict still pending): the path
  *      page's neutral saving banner;
- *   3. stored and not done (a failed result on a pass-required course): the
+ *   2. stored and not done (a failed result on a pass-required course): the
  *      path page's failed banner, never the next launch;
- *   4. stored and done: the next launch, or the path page's end banner;
- *   5. otherwise (a state the page never produces): the path page.
+ *   3. stored and done: the next launch, or the path page's end banner;
+ *   4. otherwise (a state the page never produces): the path page.
  * The launch page keeps its own gates (release dates, the strict lock,
  * assignment) for every next launch.
  */
 export function continueTarget(i: ContinueInput): string {
   const path = `/${i.orgSlug}/paths/${i.pathId}`;
   const nextLaunch = (next: string) => `/${i.orgSlug}/courses/${next}/launch?lp=${i.pathId}`;
-  if (i.isStaff) return i.next ? nextLaunch(i.next) : `${path}?end=1`;
   if (i.timedOut) return `${path}?saving=1`;
   if (i.stored && !i.done) return `${path}?failed=1`;
   if (i.stored && i.done) return i.next ? nextLaunch(i.next) : `${path}?end=1`;

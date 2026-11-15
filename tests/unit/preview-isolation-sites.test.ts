@@ -53,6 +53,16 @@
  *   (e) step 81: only lib/preview/purge.ts may name purge_preview_data (no
  *       application file names it today), and no workflow names it.
  *   (f) planted sources: the scanner flags what it must.
+ *   (g) P2-5 item 5b and item 4 (one person can hold a preview row and a
+ *       real row of a course): the listed reads outside the launch page
+ *       drop previews through the one fallback, each by its key; the
+ *       launch page's own sites are pinned in tests/unit/alds-launch.test.ts
+ *       (section 7: its preview branch reads through inLaunchContext, which
+ *       this scanner does not follow). The P2-5 review added the grant
+ *       decisions (the request, the approval, the bulk and ticket grants,
+ *       the forced restart's 23505 path) and the language switch's
+ *       in-progress read: none was ever exempt; each is listed here with
+ *       its filter, and phase 4 (step 37) and P2-9 replace them.
  *
  * Phase P adds its Preview Reports scans here (no file outside lib/preview/,
  * the launch page, the two preview routes and Preview Reports reads
@@ -422,6 +432,8 @@ const READERS: Array<[string, string]> = [
   ["app/[org]/(admin)/learning-paths/[pathId]/reports/page.tsx :: PathReportsPage :: preview", "item 1c: the official-verdict read"],
   ["app/api/learning-paths/[id]/learners/export/route.ts :: GET :: preview", "item 1c: the path learners CSV"],
   ["lib/attention/collect.ts :: ignoredPassItems :: preview", "item 1c: the Attention Center's ignored-pass items"],
+  // P2-5 item 5b: the held-webhook sweep and the Attention count built on it; phase 3's writer replaces it.
+  ["lib/integrations/webhook-hold.ts :: heldWebhookPage :: preview", "P2-5 item 5b: the hold sweep's and the Attention Center's held selection (one decision per run)"],
   // Phase 1 (step 49): the Individual product's reads; a preview is not Individual.
   ["app/[org]/(admin)/library/[courseId]/learners/page.tsx :: LearnersPage :: individual", "phase 1: the Individual context only"],
   ["app/api/courses/[courseId]/learners/export/route.ts :: GET :: individual", "phase 1: the Individual context only"],
@@ -430,8 +442,6 @@ const READERS: Array<[string, string]> = [
 const EXEMPT: Array<[string, string]> = [
   ["lib/integrations/webhook.ts :: fireCompletionWebhookForAttempt :: none",
     "the completion webhook of one attempt, not a feed: P2-5 item 5 (step 60) keeps the write routes from calling it for a preview, and phase 3 fires it from the writer's official claim (step 80's webhook row)"],
-  ["lib/integrations/webhook-hold.ts :: heldWebhookPage :: none",
-    "the held-webhook sweep and the Attention count built on it: P2-5 item 5b adds the preview filter (the entry then moves to READERS); phase 3's writer replaces it"],
   ["lib/interactions/labels.ts :: readChunk :: none",
     "question labels only: the text a stored statement gives a question id, through an attempts embed by version; no learner identity, no count and no date (no phase: not a learner record)"],
 ];
@@ -440,7 +450,7 @@ const EXEMPT: Array<[string, string]> = [
   const want = [...READERS, ...EXEMPT].map(([k]) => k).sort();
   eq("every course_attempts read in scope, with its filter: READERS and EXEMPT, nothing else", raw.map(key).sort(), want);
   eq("no listed reader reads without a filter", READERS.filter(([k]) => k.endsWith(":: none")).map(([k]) => k), []);
-  eq("non-vacuous: the scan found the plan's item 1 and 1c readers", raw.filter((s) => s.filter === "preview").length, 15);
+  eq("non-vacuous: the scan found the plan's item 1 and 1c readers and P2-5's held selection", raw.filter((s) => s.filter === "preview").length, 16);
   const writes = allSites.filter((s) => s.kind === "write" && RAW_SCOPE(s.file)).map((s) => `${s.file} :: ${s.fn}`);
   eq("the only write in scope is the webhook latch (not a read)", writes, ["lib/integrations/webhook.ts :: fireCompletionWebhookForAttempt"]);
   // The progress route shares one decision for the pre-selection and every batch.
@@ -457,7 +467,10 @@ console.log("\n(c) the interim limits recorded by P2-3 (item 1c), each with the 
 /**
  * INTERIM_0024 (2026-11-15, ADR 0024 P2-3 item 1c): until their own phases,
  * an enrolled staff member's Preview still counts as their own record here.
- * Each entry leaves this list in the pull request of its phase.
+ * Each entry leaves this list in the pull request of its phase. (P2-5 took
+ * one learner page off it early: the learner course page's own attempts read
+ * drops previews, item 4's "Request another attempt" rule; see (g). The page
+ * stays on PENDING_0024 because it still calls computeScoring itself.)
  *   - the reminders cron's completed-pairs read: a staff member who
  *     previewed an assigned course to completion gets no reminder for it;
  *     phase 7 moves the cron to the Individual rule (step 49's reminders row);
@@ -547,6 +560,63 @@ console.log("\n(e) step 81: only lib/preview/purge.ts may name purge_preview_dat
   const yml = fs.existsSync(wf) ? fs.readdirSync(wf).filter((f) => /\.ya?ml$/.test(f) && fs.readFileSync(path.join(wf, f), "utf8").includes("purge_preview_data")) : [];
   eq("no workflow names it (nothing deletes Preview data on a schedule)", yml, []);
   eq("today no application file names it at all (lib/preview/ comes in phase P)", naming, []);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview beside a real row");
+{
+  /** Each read P2-5 filters outside the launch page, by its scanner key; each must read `preview`. */
+  const FIVE_B: Array<[string, string]> = [
+    ["app/[org]/(learner)/continue/page.tsx :: ContinuePage :: preview", "item 5b: Continue's wait read (P2-7 replaces it)"],
+    ["app/api/attempts/[attemptId]/result-stored/route.ts :: GET :: preview", "item 5b: the status route's list read (P2-7 replaces it)"],
+    ["lib/scoring/attempt-kind.ts :: listFor :: preview", "item 5b: the list classifyAttempt scores (phase 3's writer replaces it)"],
+    ["app/api/scorm/[attemptId]/commit/route.ts :: POST :: preview", "item 5b: the commit route's path-completion read (phase 3's writer replaces it)"],
+    ["app/[org]/(learner)/courses/[courseId]/page.tsx :: CourseDetailPage :: preview", "item 4: the course page's own record ('Request another attempt' follows the attempt's context)"],
+    ["lib/courses/learner-history.ts :: countLearnerAttempts :: preview", "item 4: the record-protection count, by context_kind"],
+    ["app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts :: POST :: preview", "item 4: the restart's classes, by context_kind"],
+    // The P2-5 review (gate F2, writes F1): a Preview beside a real attempt.
+    ["app/api/attempt-requests/route.ts :: POST :: preview", "the request: the official result it checks and attempts_used (phase 4, step 37, moves it to readContextResult)"],
+    ["app/api/attempt-requests/[id]/route.ts :: PATCH :: preview", "the approval rule: whether the result stands (phase 4, step 37)"],
+    ["app/api/attempt-requests/bulk/route.ts :: POST :: preview", "the bulk grant: who failed, one decision for every page (phase 4, step 37)"],
+    ["lib/attempts/grant.ts :: grantExtraAttempts :: preview", "the ticket grant: who failed, one decision for every page (phase 4, step 37)"],
+    ["lib/attempts/force-restart.ts :: read :: preview", "the forced restart's 23505 path: whether the result stands, one decision per run (phase 4, step 37)"],
+    ["app/api/courses/[courseId]/language-preference/route.ts :: readInProgress :: preview", "the language switch: a Start's count, cmi5 hold and abandon leave previews out (P2-9 reads it per context)"],
+  ];
+  const files = new Set(FIVE_B.map(([k]) => k.split(" :: ")[0]));
+  const found = reads.filter((s) => files.has(s.file)).map(key);
+  eq("every listed read is found, filtered", FIVE_B.map(([k]) => k).filter((k) => !found.includes(k)), []);
+  // The files' other reads, none in item 5b's list: the commit route's bound
+  // row and its completion-email row (both by the attempt's id), the status
+  // route's own attempt, classifyAttempt's own row, the restart's selection
+  // (fetchAll by version: every open row is restarted, and the listed read
+  // splits the classes), and officialFailedAttemptId, the attempt page's
+  // ignored-pass remedy line (a learner's list on the course, read for an
+  // ignored pass the writer refused; the attempt page's phase moves it), and
+  // the forced restart's selection and its re-read by id (as the restart
+  // route's selection: every open row on the older versions is restarted;
+  // the re-read checks the selected ids). A new unfiltered read in these
+  // files fails here until it is decided.
+  eq("…and the files' unfiltered reads are exactly the known single-row or selection reads", found.filter((k) => k.endsWith(":: none")).sort(), [
+    "app/api/attempts/[attemptId]/result-stored/route.ts :: GET :: none",
+    "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts :: select :: none",
+    "app/api/scorm/[attemptId]/commit/route.ts :: POST :: none",
+    "app/api/scorm/[attemptId]/commit/route.ts :: POST :: none",
+    "lib/attempts/force-restart.ts :: readSelection :: none",
+    "lib/attempts/force-restart.ts :: rereadShortfall :: none",
+    "lib/scoring/attempt-kind.ts :: officialFailedAttemptId :: none",
+    "lib/scoring/attempt-kind.ts :: readAttempt :: none",
+  ]);
+  // The grant sites decide once per request (or per forced-restart run): a
+  // fresh state inside the handler, never a module-level one ((d) holds that
+  // for every file); the forced restart hands the run's state to each 23505
+  // read.
+  const fr = read("lib/attempts/force-restart.ts");
+  eq("the forced restart: one state per re-issue run, handed to every 23505 read",
+    /const previews: ContextFilterState = \{ applies: null \};[\s\S]*?approvePendingRequest\(svc, args, link, note, expiresAt, previews\)/.test(fr) &&
+      /expiresAt: string \| null,\s*previews: ContextFilterState\s*\)/.test(fr), true);
+  const lang = read("app/api/courses/[courseId]/language-preference/route.ts");
+  eq("the language switch: the abandon takes the read's decision of the filter (a write, so not a scanner site)",
+    /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)[\s\S]*?,\s*apply\s*\)\.select\("id"\)/.test(lang), true);
 }
 
 // ---------------------------------------------------------------------------

@@ -4,17 +4,18 @@ import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import {
+  byRoleAnswer,
   byRoleClass,
-  isStaffRole,
-  memberKey,
   parseDryRun,
   parseRestartReason,
   planRestart,
+  previewIdsOf,
   restartRefusal,
   type RestartAttempt,
 } from "@/lib/attempts/restart";
 import { fetchAll } from "@/lib/db/chunked";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 
 /**
  *   POST /api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart
@@ -25,8 +26,13 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
  * version at their next launch. Learners on any other version, completed /
  * passed / failed / abandoned attempts and grant retakes are never touched.
  *
- * - dry_run: true → the per-attempt list (ids and role classes only); writes
- *   nothing, no audit row. `reason` is not needed.
+ * - dry_run: true → the per-attempt list (ids and classes only); writes
+ *   nothing, no audit row. `reason` is not needed. `by_role.staff` counts the
+ *   Previews (`context_kind = 'preview'`) and `by_role.learner` every other
+ *   row, a staff member's real attempt included (ADR 0024 step 23, P2-5).
+ *   On a database without 0107 no row can be told a Preview: `by_role.staff`
+ *   is then null (not 0) and `by_role.learner` counts every row, in both
+ *   modes (byRoleAnswer; the keys keep their names, A23).
  * - real run → `reason` required (trimmed, 1–500 chars); conditional update
  *   (id in the selection, this version, still in progress, so a completion
  *   that lands first wins), launch tokens expired, the tenant LRS
@@ -37,7 +43,7 @@ import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
  * package is allowed. Admin-only, tenant-guarded like the activate route.
  * 400 `invalid_dry_run` when dry_run is present but not a boolean (a real
  * run cannot be undone, so "true" or 1 is never read as one). 503, nothing
- * changed, when the grant or membership lookup fails.
+ * changed, when the grant lookup or the Preview read fails.
  *
  * Response: { dry_run, version_id, attempt_ids, excluded_grant_retake_ids,
  *             by_role: { learner, staff }, restarted? } — `attempt_ids` is
@@ -163,37 +169,34 @@ export async function POST(
     }
   }
 
-  // Role classes (ids only): staff = super_owner / admin / data_analyst in
-  // the attempt's organisation; anyone else, or a former member, is a learner.
-  const staffKeys = new Set<string>();
-  const usersByOrg = new Map<string, Set<string>>();
-  for (const a of inProgress) {
-    (usersByOrg.get(a.organization_id) ?? usersByOrg.set(a.organization_id, new Set()).get(a.organization_id)!).add(a.user_id);
-  }
-  for (const [orgId, users] of usersByOrg) {
-    const list = [...users];
-    for (let i = 0; i < list.length; i += 150) {
-      const { data: mems, error: memErr } = await svc
-        .from("organization_members")
-        .select("user_id, role")
-        .eq("organization_id", orgId)
-        .in("user_id", list.slice(i, i + 150));
-      if (memErr) {
-        // The role classes are what the owner approves on the dry run: never
-        // report staff as learners because a read failed.
-        console.error("[restart] membership lookup failed:", memErr.message);
-        return NextResponse.json(
-          { error: "Could not read the learners' roles; nothing was restarted. Try again." },
-          { status: 503 }
-        );
-      }
-      for (const m of (mems ?? []) as Array<{ user_id: string; role: string | null }>) {
-        if (isStaffRole(m.role)) staffKeys.add(memberKey(orgId, m.user_id));
-      }
+  // The classes (ids only; ADR 0024 step 23, P2-5 item 4): a Preview is told
+  // by its context, `context_kind = 'preview'`, not by its member's role, so a
+  // staff member's real attempt counts as a learner's. One read per 150 ids
+  // keeps the selected rows that are not Previews (withoutPreviews); every
+  // other selected id is a Preview (previewIdsOf). One decision serves every
+  // chunk: on a database without 0107 the filter's missing-column error reads
+  // today's select once (readWithContextFilter), every id is kept and nothing
+  // is a Preview (no preview split, step 72's fallback-safe readers).
+  const previews: ContextFilterState = { applies: null };
+  const keptIds: string[] = [];
+  for (let i = 0; i < ids.length; i += 150) {
+    const { data: kept, error: keptErr } = await readWithContextFilter(previews, (apply) =>
+      withoutPreviews(svc.from("course_attempts").select("id").in("id", ids.slice(i, i + 150)), apply)
+    );
+    if (keptErr) {
+      // The classes are what the owner approves on the dry run: never report
+      // Previews as learners because a read failed.
+      console.error("[restart] preview lookup failed:", keptErr.message);
+      return NextResponse.json(
+        { error: "Could not tell previews from learners' attempts; nothing was restarted. Try again." },
+        { status: 503 }
+      );
     }
+    for (const r of (kept ?? []) as Array<{ id: string }>) keptIds.push(r.id);
   }
+  const previewIds = previewIdsOf(ids, keptIds);
 
-  const plan = planRestart(inProgress, grantRetakeIds, staffKeys);
+  const plan = planRestart(inProgress, grantRetakeIds, previewIds);
 
   if (dryRun) {
     return NextResponse.json({
@@ -201,7 +204,7 @@ export async function POST(
       version_id: versionId,
       attempt_ids: plan.attemptIds,
       excluded_grant_retake_ids: plan.excludedGrantRetakeIds,
-      by_role: plan.byRole,
+      by_role: byRoleAnswer(plan.byRole, previews.applies),
     });
   }
 
@@ -260,7 +263,7 @@ export async function POST(
       version_id: versionId,
       attempt_ids: restartedIds,
       excluded_grant_retake_ids: plan.excludedGrantRetakeIds,
-      by_role: byRoleClass(plan.selected.filter((a) => restartedSet.has(a.id)), staffKeys),
+      by_role: byRoleAnswer(byRoleClass(plan.selected.filter((a) => restartedSet.has(a.id)), previewIds), previews.applies),
       restarted: restartedIds.length,
       // ADR 0014 step 8: of those, revision visits' rows ("revision visits closed").
       revision_closed: restartedIds.filter((id) => revisionRowIds.has(id)).length,

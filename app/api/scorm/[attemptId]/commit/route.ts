@@ -5,6 +5,7 @@ import { outcomeFinalVerdict, type OutcomeFinalVerdict } from "@/lib/courses/eng
 import { attemptAbandonedResponse } from "@/lib/attempts/abandon";
 import { fetchReferenceCodes } from "@/lib/reference-codes";
 import { classifyAttempt } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import {
   commitRuntimeRefusal,
   deriveAttemptStatus,
@@ -75,6 +76,14 @@ import { fireCompletionWebhook } from "@/lib/integrations/webhook";
  * classification and both RPCs run as for any commit. Under any other verdict the
  * one-time upgrade stays, logged, and on `unknown` or `unreadable` also recorded.
  * The `is_revision` branch comes first.
+ *
+ * ADR 0024 step 60 (phase 2, P2-5 item 5): a Preview's row (`context_kind =
+ * 'preview'`) is written as any learner's row is, and is never official: the
+ * commit ends after the write, before classification, so no RPC (points, streak,
+ * journey credit), no completion email, no CRM webhook and no path completion is
+ * made for it. The row comes from the select("*") above, so on a database
+ * without 0107 the key is absent and every row reads as today's. Phase 3's
+ * writer replaces the check with its own answer, which says the same.
  */
 export async function POST(
   request: NextRequest,
@@ -126,6 +135,8 @@ export async function POST(
         is_revision?: boolean | null;
         /** 0104 (ADR 0017); undefined on a database without it. */
         ignored_pass?: unknown;
+        /** 0107 (ADR 0024); undefined on a database without it. */
+        context_kind?: string | null;
         course_version_id?: string;
         course_versions?: {
           id: string;
@@ -346,6 +357,20 @@ export async function POST(
     });
   }
 
+  // ADR 0024 step 60 (P2-5 item 5): a Preview is never official, so its commit
+  // ends here, after its own row is written: no classification, no RPC, no
+  // milestone, no webhook, no email, no path completion. The answer is the
+  // write's, as for any learner.
+  if (a.context_kind === "preview") {
+    return NextResponse.json({
+      ok: true,
+      completion_status,
+      success_status,
+      status,
+      score,
+    });
+  }
+
   // 0081 revision rule: once the attempt is complete, decide whether it is
   // the learner's OFFICIAL attempt (inside the scoring window) or a revision
   // run. Only official completions move journey days, XP and the CRM
@@ -559,14 +584,25 @@ export async function POST(
           )
         );
         const verIds = Array.from(verToCourse.keys());
+        // ADR 0024 P2-5 item 5b: a Preview never completes a path step, so the
+        // read drops `context_kind = 'preview'` rows (a by-role row the 0107
+        // paste labelled keeps its path tag). On a database without 0107 the
+        // filter's missing-column error reads today's select once
+        // (readWithContextFilter). Phase 3's writer replaces this read.
+        const previews: ContextFilterState = { applies: null };
         const { data: aRows } = verIds.length
-          ? await svc
-              .from("course_attempts")
-              .select(
-                "course_version_id, completion_status, success_status, learning_path_id"
+          ? await readWithContextFilter(previews, (apply) =>
+              withoutPreviews(
+                svc
+                  .from("course_attempts")
+                  .select(
+                    "course_version_id, completion_status, success_status, learning_path_id"
+                  )
+                  .eq("user_id", user.id)
+                  .in("course_version_id", verIds),
+                apply
               )
-              .eq("user_id", user.id)
-              .in("course_version_id", verIds)
+            )
           : { data: [] };
         // Path completion counts ONLY attempts launched from WITHIN the path
         // (learning_path_id === that path). A standalone completion of the same

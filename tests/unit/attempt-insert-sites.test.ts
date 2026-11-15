@@ -468,9 +468,12 @@ function scanSource(file: string, text: string): Site[] {
 // ---------------------------------------------------------------------------
 /** Files whose inserts may stay open until a named slice; each pinned to its exact count of open inserts. */
 const PENDING: Record<string, { since: string; until: string; sites: number }> = {
+  // The Start's two inserts (the insert and its retry without the 0100
+  // columns). The preview insert of P2-5 already names context_kind
+  // 'preview' and preview_kind, so it is not open and not on this entry.
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
     since: "2026-11-14",
-    until: "emptied by P2-6 (ADR 0024 step 23: both launch inserts name context_kind with the tags)",
+    until: "emptied by P2-6 (ADR 0024 step 23: both Start inserts name context_kind with the tags)",
     sites: 2,
   },
 };
@@ -484,7 +487,8 @@ const REFUSED: Record<string, { receiver: string; sites: number; why: string }> 
 };
 /** Floors: the sites the plan names (P2-2 item 1), so a scan that silently finds less fails. */
 const FLOORS: Record<string, number> = {
-  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": 2,
+  // The Start's insert and its retry (P2-2), and the preview insert (P2-5 item 3).
+  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": 3,
   "tests/bot/lifecycle/32-language-switch.spec.ts": 1,
   "tests/bot/lifecycle/34-version-modes.spec.ts": 2,
   "tests/bot/lifecycle/45-lrs-analytics.spec.ts": 1,

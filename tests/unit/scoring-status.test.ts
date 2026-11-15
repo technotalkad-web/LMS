@@ -334,8 +334,12 @@ console.log("\nthe learner course page (source check; no React rig)");
     /const history = officialHistory\(attempts, snapshot\?\.rows \?\? \[\]\);\s*const retakeState = officialRetakeState\(history\);/.test(src), true);
   // (5) step 11 (1): one rule for the page and the route
   const canReq = between("const canRequestAttempt =", ";");
-  eq("(5) canRequestAttempt names historyUnavailable and calls requestDecision(…) === \"ok\"",
-    /!isAdmin &&\s*!historyUnavailable &&\s*requestDecision\(\{ scoring, attempts \}\) === "ok" &&\s*\(attemptRequestState === "none" \|\| attemptRequestState === "rejected"\)/.test(canReq), true);
+  // ADR 0024 step 23 (P2-5 item 4): the button follows the attempt's context,
+  // not the role, so the expression names no role (the page's attempts read
+  // drops previews; tests/unit/preview-mode-sites.test.ts (d)).
+  eq("(5) canRequestAttempt names historyUnavailable and calls requestDecision(…) === \"ok\", and no role",
+    /=\s*!historyUnavailable &&\s*requestDecision\(\{ scoring, attempts \}\) === "ok" &&\s*\(attemptRequestState === "none" \|\| attemptRequestState === "rejected"\)/.test(canReq) &&
+      !/\b(isAdmin|role|canManage|canViewReports)\b/.test(canReq), true);
   eq("…officialFailed is gone (a pass is not a refusal)", /\bofficialFailed\b/.test(src), false);
   eq("…the standing result is resultStands(scoring, passRequired) and reaches the modal",
     /resultStands\(scoring, passRequired\)/.test(src) && /<RequestAttemptButton orgSlug=\{orgSlug\} courseId=\{c\.id\} standingResult=\{standingResult\} \/>/.test(src), true);
@@ -478,8 +482,9 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
       ["the error rule: any error throws, as fetchByIds does", /if \(res\.error\) throw new Error\(`course_attempts: \$\{res\.error\.message \?\? ""\}`\);/],
     ],
     "app/api/attempt-requests/bulk/route.ts": [
-      ["the call: the course's versions, in id order, an empty answer an error",
-        /readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*s\s*\.from\("course_attempts"\)\s*\.select\(cols\)\s*\.eq\("organization_id", org\.id\)\s*\.in\("course_version_id", verIds\)\s*\.order\("id"\)\s*\.range\(from, to\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
+      // ADR 0024 P2-5 (review, gate F2): the preview filter inside, one decision for every page.
+      ["the call: the course's versions, in id order, an empty answer an error, previews dropped",
+        /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(cols\)\.eq\("organization_id", org\.id\)\.in\("course_version_id", verIds\), apply\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
       ["the error rule: 503 before any insert", /if \(attemptsRead\.error\) return unreadable\("attempts"\);/],
     ],
     "app/[org]/(admin)/attempt-requests/page.tsx": [
@@ -489,8 +494,9 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
       ["the error rule: the rows read so far, and the history unavailable", /if \(attemptsRead\.error\) \{\s*historyUnavailable = true;/],
     ],
     "lib/attempts/grant.ts": [
-      ["the call: the named learners on the course's versions, in id order, an empty answer an error",
-        /readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*svc\s*\.from\("course_attempts"\)\s*\.select\(cols\)\s*\.eq\("organization_id", args\.orgId\)\s*\.in\("user_id", ids\)\s*\.in\("course_version_id", verIds\)\s*\.order\("id"\)\s*\.range\(from, to\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
+      // ADR 0024 P2-5 (review, gate F2): the preview filter inside, one decision for every page.
+      ["the call: the named learners on the course's versions, in id order, an empty answer an error, previews dropped",
+        /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\.from\("course_attempts"\)\.select\(cols\)\.eq\("organization_id", args\.orgId\)\.in\("user_id", ids\)\.in\("course_version_id", verIds\),\s*apply\s*\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);/],
       ["the error rule: every learner failed, nothing inserted", /if \(attemptsRead\.error\) return unreadable\("attempts"\);/],
     ],
     // ADR 0020 (the lead's ruling of 2026-11-11): the enrolled set in chunks

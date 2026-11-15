@@ -6,15 +6,25 @@
  *
  * Built in phase 1 without its preview rows (section O): the conflict row,
  * the path row, the journey row, the Individual row and the redirect row of
- * step 22. The `?mode=preview` row is phase 2's and the test-run row phase
- * P's; until they are built, a launch that asks for a preview or names a run
- * is refused (`preview_not_allowed`) and never falls through to an official
+ * step 22. Phase 2 (P2-5 item 2) adds the `?mode=preview` row; the test-run
+ * row is phase P's, and until it is built a launch that names a run is
+ * refused (`preview_not_allowed`) and never falls through to an official
  * context.
  *
  * Order of the checks:
  *   1. both `?lp=` and `?journey=`: refused, `context_conflict`, before any
  *      fact is read (the page makes no call for it);
- *   2. a preview or a run: refused (above);
+ *   2. a run: refused (phase P), with or without the mode; `?mode=preview`:
+ *      a report-viewing role (canViewReports: super_owner, admin,
+ *      data_analyst) launches the `preview` context with the preview kind
+ *      `course`, any other role is refused (`preview_not_allowed`). The row
+ *      answers before any fact is read, so a preview launch makes no
+ *      launch_context call and `facts` may be null (P2-5 item 3b); the page
+ *      has already bounded the course to the organisation. A preview opens
+ *      the course outside every path and journey: past the conflict row its
+ *      `?lp=`, `?journey=` and `day` are not read. The kind and the preview
+ *      kind are this result's own fields; the attempt's columns are the
+ *      launch page's;
  *   3. not an active member: `not_member`; the course not found in the
  *      organisation or inactive: `course_unavailable`;
  *   4. `?lp=P`: P found and active, else `path_unavailable`; a recorded
@@ -63,6 +73,7 @@
  * lib/attempts/launch-kind.ts); `now` is an input, so the journey's "today"
  * is computed with todayStrAt (twins contract A12).
  */
+import { canViewReports } from "@/lib/auth/permissions";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { countedDaysElapsed, DEFAULT_JOURNEY_TZ, todayStrAt } from "@/lib/journey/journey";
 
@@ -151,10 +162,13 @@ export type LaunchContextFacts = {
 
 export type ResolveInput = {
   courseId: string;
-  /** Read by the preview row, which phase 2 builds. */
+  /** Read by the preview row (P2-5 item 2). */
   role: OrgRole;
   params: LaunchParams;
-  /** launch_context's answer; null only when no call was made, which is the conflict row's case. */
+  /**
+   * launch_context's answer; null only when no call was made: the conflict
+   * row's case, and a `?mode=preview` launch's, whose row needs no fact.
+   */
   facts: LaunchContextFacts | null;
   /** ISO */
   now: string;
@@ -248,9 +262,15 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
   // 1. Both product parameters: refused, no checks.
   if (lp !== null && journey !== null) return refused("context_conflict");
 
-  // 2. The preview rows are phases 2 and P; until then a preview never
-  //    becomes an official launch.
-  if (i.params.mode === "preview" || param(i.params.run) !== null) return refused("preview_not_allowed");
+  // 2. The preview rows. A run is phase P's: refused, with or without the
+  //    mode, so it never becomes an official launch. `?mode=preview` is a
+  //    report-viewing role's course preview (step 22's preview row), decided
+  //    before any fact: no launch_context call is made for it.
+  if (param(i.params.run) !== null) return refused("preview_not_allowed");
+  if (i.params.mode === "preview") {
+    if (!canViewReports(i.role)) return refused("preview_not_allowed");
+    return { kind: "launch", selfEnrol: null, context: { kind: "preview", previewKind: "course", runId: null, dayId: null } };
+  }
 
   const facts = i.facts;
   if (facts === null) throw new TypeError("resolveLaunchContext: launch_context's facts are required past the conflict row");

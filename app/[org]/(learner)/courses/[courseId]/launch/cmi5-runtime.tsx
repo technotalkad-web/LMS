@@ -23,6 +23,7 @@ export function Cmi5Runtime({
   backLabel = "Exit course",
   preloadUrls = [],
   revision = false,
+  preview = false,
   showTitle = true,
   continueHref = null,
   continueReady = false,
@@ -37,13 +38,15 @@ export function Cmi5Runtime({
   preloadUrls?: string[];
   /** A revision visit (ADR 0014): review only; this launch never changes the official result. */
   revision?: boolean;
+  /** A Preview by mode (ADR 0024 step 23): the bar's preview line and no Continue. */
+  preview?: boolean;
   /** The course title in the bar (ADR 0019 step 8): false for a KIVO build, which shows its own. */
   showTitle?: boolean;
   /** The continue address on a Learning Path launch (ADR 0019 step 8); null hides Continue. */
   continueHref?: string | null;
   /**
    * Continue starts active (ADR 0019, note of 2026-11-11): the official result
-   * is already stored, or the launch is a preview. False, the safe default,
+   * is already stored (a preview has no Continue). False, the safe default,
    * keeps it waiting until the status route answers stored.
    */
   continueReady?: boolean;
@@ -65,6 +68,7 @@ export function Cmi5Runtime({
         continueHref={continueHref}
         continueReady={continueReady}
         continueStatusHref={continueStatusHref}
+        preview={preview}
         continuePoll={true}
       />
       <div className="relative flex-1 min-h-0 bg-white">

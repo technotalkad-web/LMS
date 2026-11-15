@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { originFromRequest } from "@/lib/http/origin";
+import { safeNextPath } from "@/lib/auth/safe-next";
 import type { EmailOtpType } from "@supabase/supabase-js";
 
 /**
@@ -40,7 +41,11 @@ export async function GET(request: Request) {
   const code = searchParams.get("code");
   const tokenHash = searchParams.get("token_hash");
   const type = searchParams.get("type") as EmailOtpType | null;
-  const next = searchParams.get("next") ?? "/select-org";
+  // The whole address, its query included (a launch's Preview mode, path,
+  // journey day and language), through the one open-redirect guard
+  // (lib/auth/safe-next.ts): a `next` that could leave this site is dropped
+  // for the default, never appended to the origin.
+  const next = safeNextPath(searchParams.get("next")) ?? "/select-org";
   const org = orgFromNext(next);
   const loginPath = org ? `/${org}/login` : "/login";
 
