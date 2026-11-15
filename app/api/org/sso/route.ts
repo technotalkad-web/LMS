@@ -16,7 +16,10 @@ import {
  * Manages this tenant's SAML SSO:
  *   action: "configure" → register/replace the Supabase SAML provider from IdP
  *           metadata (metadataUrl | metadataXml) + domains; enable SSO. When
- *           the row does not record the new provider, it is removed again.
+ *           the row does not record the new provider, it is removed again;
+ *           a provider the row does record is never removed (an update can
+ *           be saved and still answer an error, so that case reads the row
+ *           again first and keeps the provider when it cannot tell).
  *   action: "disable"   → remove the provider and turn SSO off.
  *
  * Strict provisioning is unchanged: SSO never creates membership.
@@ -120,7 +123,7 @@ export async function POST(request: Request) {
       })
       .eq("id", org.id)
       .select("id");
-    if (error || !updated?.length) {
+    if (!error && !updated?.length) {
       // The row does not record the new provider: remove it (best-effort) so
       // it does not hold the domains and block the next attempt.
       try {
@@ -128,8 +131,29 @@ export async function POST(request: Request) {
       } catch {
         /* best-effort */
       }
-      if (error) return NextResponse.json({ error: error.message }, { status: 400 });
       return NextResponse.json({ error: NOT_SAVED }, { status: 403 });
+    }
+    if (error) {
+      // An error does not prove the update was not saved (the reply can be
+      // lost after the commit). Sign-in uses the provider the row records,
+      // so read the row again and remove the new provider only when the row
+      // does not hold it; when the read fails too, keep it.
+      const { data: now, error: nowErr } = await supabase
+        .from("organizations")
+        .select("sso_provider_id")
+        .eq("id", org.id)
+        .abortSignal(new AbortController().signal)
+        .maybeSingle();
+      const saved = !nowErr && (now?.sso_provider_id ?? null) === provider.id;
+      if (!saved && !nowErr) {
+        try {
+          await deleteSamlProvider(provider.id);
+        } catch {
+          /* best-effort */
+        }
+      }
+      if (!saved) return NextResponse.json({ error: error.message }, { status: 400 });
+      // Saved after all: answer as a successful configure.
     }
 
     return NextResponse.json({

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { isOrgAdminCaller } from "@/lib/auth/api-admin";
+import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -14,8 +14,8 @@ import { resolveManyGroups } from "@/lib/org/groups";
  *   PATCH  /api/learning-paths/{id}/courses   body: { courseId, releaseAt }
  *
  * POST appends the course at the next step_number. It checks the caller's
- * role in the path's org explicitly (admins only) before the insert and the
- * service-role notify_update pass.
+ * role in the path's org explicitly (admins only; a failed role read answers
+ * 503) before the insert and the service-role notify_update pass.
  * PUT resets the entire step ordering.
  * PATCH sets/clears a step's scheduled release (releaseAt: ISO string or null);
  * steps are addressed by (path_id, course_id) — the table has no surrogate id.
@@ -94,8 +94,10 @@ export async function POST(
     .maybeSingle();
   if (!path) return NextResponse.json({ error: "Path not found" }, { status: 404 });
   const pathOrgId = (path as { organization_id: string }).organization_id;
-  if (!(await isOrgAdminCaller(supabase, pathOrgId, user.id))) {
-    return NextResponse.json({ error: "Forbidden: admins only" }, { status: 403 });
+  const admin = await isOrgAdminCaller(supabase, pathOrgId, user.id);
+  if (!admin) {
+    const refused = notAdminAnswer(admin);
+    return NextResponse.json({ error: refused.error }, { status: refused.status });
   }
   const { data: course } = await supabase
     .from("courses")
