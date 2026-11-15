@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { originFromRequest } from "@/lib/http/origin";
+import { safeNextPath } from "@/lib/auth/safe-next";
 
 /**
  * Embedded-mode entry (0071). The sso-link target routes through here when
@@ -16,7 +17,8 @@ export async function GET(request: Request) {
   const to = url.searchParams.get("to") ?? "/";
   const returnUrl = url.searchParams.get("return_url") ?? "";
 
-  const safeTo = to.startsWith("/") && !to.startsWith("//") ? to : "/";
+  // Only an address on this site (lib/auth/safe-next.ts), else "/".
+  const safeTo = safeNextPath(to) ?? "/";
   const safeReturn =
     /^https:\/\//i.test(returnUrl) ||
     /^http:\/\/(127\.0\.0\.1|localhost)(:|\/)/i.test(returnUrl)

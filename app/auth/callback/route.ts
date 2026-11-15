@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { originFromRequest } from "@/lib/http/origin";
 import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
+import { safeNextPath } from "@/lib/auth/safe-next";
 import type { EmailOtpType } from "@supabase/supabase-js";
 
 /**
@@ -41,7 +42,9 @@ export async function GET(request: Request) {
   const code = searchParams.get("code");
   const tokenHash = searchParams.get("token_hash");
   const type = searchParams.get("type") as EmailOtpType | null;
-  const next = searchParams.get("next") ?? "/select-org";
+  // Only an address on this site (lib/auth/safe-next.ts); anything else,
+  // or no next at all, lands on /select-org.
+  const next = safeNextPath(searchParams.get("next")) ?? "/select-org";
   const org = orgFromNext(next);
   const loginPath = org ? `/${org}/login` : "/login";
 
