@@ -1,10 +1,10 @@
 import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
-import { launchModeFor } from "@/lib/alds/launch";
 import { createClient } from "@/lib/supabase/server";
 import { computeScoring, officialDone, type ScorableAttempt } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import {
   CONTINUE_POLL_MS,
   CONTINUE_WAIT_MS,
@@ -31,6 +31,12 @@ import {
  * loading.tsx shows "Saving your result" while this page waits.
  *
  * Every refusal is a redirect() outside any try (redirect throws).
+ *
+ * Every caller waits, whatever their role (ADR 0024 step 23, P2-5 item 4): a
+ * staff member's launch without `?mode=preview` is a real attempt, and a
+ * Preview carries no `?lp=`, so it never reaches this address. The wait's read
+ * drops `context_kind = 'preview'` rows (item 5b), so a Preview of the module
+ * beside the caller's real attempt never reads as the stored result.
  */
 const ATTEMPT_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, status";
 
@@ -47,7 +53,7 @@ export default async function ContinuePage({
   const pathId: string = lp;
   const fromCourseId: string = from;
 
-  const { user, org, role } = await requireOrgAccess(orgSlug);
+  const { user, org } = await requireOrgAccess(orgSlug);
   const supabase = await createClient();
   const log = (event: string) =>
     console.warn(JSON.stringify({ event, path_id: pathId, course_id: fromCourseId, user_id: user.id }));
@@ -76,13 +82,8 @@ export default async function ContinuePage({
     redirect(`/${orgSlug}/paths/${pathId}`);
   }
   const next = nextStepAfter(steps, fromCourseId);
-  const target = (t: { timedOut: boolean; stored: boolean; done: boolean; isStaff?: boolean }) =>
-    continueTarget({ orgSlug, pathId, isStaff: t.isStaff ?? false, timedOut: t.timedOut, stored: t.stored, done: t.done, next });
-
-  // Staff and data analysts launch previews, which record no official result
-  // (the launch page's own test), so a wait could never end early: go now.
-  const isStaff = launchModeFor({ role, revision: false }).isPreview;
-  if (isStaff) redirect(target({ isStaff: true, timedOut: false, stored: false, done: false }));
+  const target = (t: { timedOut: boolean; stored: boolean; done: boolean }) =>
+    continueTarget({ orgSlug, pathId, timedOut: t.timedOut, stored: t.stored, done: t.done, next });
 
   // Before the wait, once, strictly: a read error ends as the timeout target,
   // never as "not required" or "no grants" (the fail-soft helpers would read
@@ -140,6 +141,12 @@ export default async function ContinuePage({
   // fetches within one server render, and without a signal reads 2 to 7
   // returned the first read's rows, so a result stored during the wait was
   // never seen (spec 63 (b2)). A signal opts the request out of that cache.
+  // A Preview never counts (ADR 0024 P2-5 item 5b): each read drops
+  // `context_kind = 'preview'` rows, and one decision serves every read of the
+  // wait, so on a database without 0107 the first read's missing-column error
+  // reads today's select once (readWithContextFilter). P2-7 replaces this with
+  // the path context's own read.
+  const previews: ContextFilterState = { applies: null };
   const maxReads = Math.floor(CONTINUE_WAIT_MS / CONTINUE_POLL_MS) + 1;
   const deadline = Date.now() + CONTINUE_WAIT_MS;
   let stored = false;
@@ -148,12 +155,16 @@ export default async function ContinuePage({
     const { data: rows, error: rowsErr } = await readWithOptionalColumn<unknown[]>(
       "is_revision",
       (columns) =>
-        supabase
-          .from("course_attempts")
-          .select(columns)
-          .eq("user_id", user.id)
-          .in("course_version_id", versionIds)
-          .abortSignal(new AbortController().signal),
+        readWithContextFilter(previews, (apply) =>
+          withoutPreviews(
+            supabase
+              .from("course_attempts")
+              .select(columns)
+              .eq("user_id", user.id)
+              .in("course_version_id", versionIds),
+            apply
+          ).abortSignal(new AbortController().signal)
+        ),
       ATTEMPT_COLUMNS
     );
     if (rowsErr) readError();

@@ -4,9 +4,19 @@
  * course's verdict is still pending (verdictPending, the lead's ruling of
  * 2026-11-11), the page's wait mirrored over a sequence of reads, the branch
  * table of the continue target, the two officialDone readings the page feeds
- * it, the page's staff test (launchModeFor) and the uuid check. The page
- * itself cannot run in a unit test; its wiring is checked by the source scans
- * in tests/unit/launch-bar-copy.test.ts.
+ * it and the uuid check. Its wiring is checked by the source scans in
+ * tests/unit/launch-bar-copy.test.ts.
+ *
+ * ADR 0024 step 23 and P2-5 items 4 and 5b: the staff branch is gone (no
+ * role skips the wait), and the wait's attempts read drops Previews. The real
+ * page runs at the end under a stubbed fetch (the precedent of
+ * attempt-page-official-sentence.test.ts; next/headers stubbed through
+ * Module._load, redirect() caught by its digest, the one-second sleeps made
+ * immediate): an admin with a completed Preview beside an in-progress real
+ * attempt waits the whole bound and lands on the saving banner, the same
+ * rows read for a learner do too, a completed real attempt moves on at the
+ * first read, and a database without 0107 reads today's rows after one
+ * failed read.
  *
  * ADR 0019, note of 2026-11-11 (Continue waits for the stored result):
  * officialResultStored, the one conclude test the continue address, the
@@ -40,7 +50,7 @@ import {
   shouldPoll,
 } from "../../lib/learner/continue-state";
 import { computeScoring, DEFAULT_POLICY, officialDone, type ScorableAttempt } from "../../lib/scoring/policy";
-import { launchModeFor } from "../../lib/alds/launch";
+import Module from "node:module";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -130,7 +140,7 @@ console.log("\nresultStored over every row mix");
         break;
       }
     }
-    return { reads: taken, target: continueTarget({ orgSlug: "acme", pathId: "p1", isStaff: false, timedOut: !isStored, stored: isStored, done: isDone, next }) };
+    return { reads: taken, target: continueTarget({ orgSlug: "acme", pathId: "p1", timedOut: !isStored, stored: isStored, done: isDone, next }) };
   };
   console.log("\nthe wait over a sequence of reads (the page's loop)");
   eq("pass_required: 'completed' on one read, 'passed' on the next → moves on at the second read",
@@ -151,24 +161,17 @@ console.log("\nresultStored over every row mix");
 
 console.log("\ncontinueTarget, in the order of step 3");
 {
-  const base: ContinueInput = { orgSlug: "acme", pathId: "p1", isStaff: false, timedOut: false, stored: false, done: false, next: "c2" };
+  const base: ContinueInput = { orgSlug: "acme", pathId: "p1", timedOut: false, stored: false, done: false, next: "c2" };
   const t = (o: Partial<ContinueInput>) => continueTarget({ ...base, ...o });
-  eq("1. staff with a next step → the next launch at once", t({ isStaff: true }), "/acme/courses/c2/launch?lp=p1");
-  eq("1. staff on the last step → the end banner", t({ isStaff: true, next: null }), "/acme/paths/p1?end=1");
-  eq("1. staff wins over every other input", t({ isStaff: true, timedOut: true, stored: true, done: false }), "/acme/courses/c2/launch?lp=p1");
-  eq("2. timed out → the saving banner", t({ timedOut: true }), "/acme/paths/p1?saving=1");
-  eq("2. timed out on the last step → the saving banner", t({ timedOut: true, next: null }), "/acme/paths/p1?saving=1");
-  eq("3. stored and not done → the failed banner, even with a next step", t({ stored: true, done: false }), "/acme/paths/p1?failed=1");
-  eq("3. stored and not done on the last step → the failed banner", t({ stored: true, done: false, next: null }), "/acme/paths/p1?failed=1");
-  eq("4. stored and done with a next step → the next launch", t({ stored: true, done: true }), "/acme/courses/c2/launch?lp=p1");
-  eq("4. stored and done without a next step → the end banner", t({ stored: true, done: true, next: null }), "/acme/paths/p1?end=1");
-  eq("5. not staff, not timed out, nothing stored → the path page", t({}), "/acme/paths/p1");
+  eq("1. timed out → the saving banner", t({ timedOut: true }), "/acme/paths/p1?saving=1");
+  eq("1. timed out on the last step → the saving banner", t({ timedOut: true, next: null }), "/acme/paths/p1?saving=1");
+  eq("2. stored and not done → the failed banner, even with a next step", t({ stored: true, done: false }), "/acme/paths/p1?failed=1");
+  eq("2. stored and not done on the last step → the failed banner", t({ stored: true, done: false, next: null }), "/acme/paths/p1?failed=1");
+  eq("3. stored and done with a next step → the next launch", t({ stored: true, done: true }), "/acme/courses/c2/launch?lp=p1");
+  eq("3. stored and done without a next step → the end banner", t({ stored: true, done: true, next: null }), "/acme/paths/p1?end=1");
+  eq("4. not timed out, nothing stored → the path page", t({}), "/acme/paths/p1");
+  eq("no input skips the wait: ContinueInput has no staff field (ADR 0024 step 23)", Object.keys(base).sort(), ["done", "next", "orgSlug", "pathId", "stored", "timedOut"]);
 }
-
-console.log("\nthe page's staff test: launchModeFor's preview verdict (decision 3)");
-eq("data_analyst is a preview → no wait", launchModeFor({ role: "data_analyst", revision: false }).isPreview, true);
-eq("admin and super_owner are previews → no wait", [launchModeFor({ role: "admin", revision: false }).isPreview, launchModeFor({ role: "super_owner", revision: false }).isPreview], [true, true]);
-eq("user is not → the wait", launchModeFor({ role: "user", revision: false }).isPreview, false);
 
 console.log("\nisUuid");
 eq("a lower-case uuid", isUuid("0f8fad5b-d9cb-469f-a165-70867728950e"), true);
@@ -263,5 +266,142 @@ eq("…200 {} → null; 200 \"<html>\" → null (a followed redirect); 200 null 
 eq("…302, 401, 404 and 503 → null, whatever the body", [302, 401, 404, 503].map((s) => parseStoredAnswer(s, { stored: true })), [null, null, null, null]);
 eq("…0 (a signed-out check's unfollowed redirect, redirect: \"manual\") → null", parseStoredAnswer(0, null), null);
 
-console.log(`\n${pass} passed, ${fail} failed`);
-if (fail > 0) process.exit(1);
+/* ---------------- the real page under a stubbed fetch (ADR 0024 P2-5 items 4 and 5b) ---------------- */
+type Row = Record<string, unknown>;
+type Req = { method: string; path: string; select: string; query: URLSearchParams };
+const SUPABASE = "http://stub.supabase.test";
+const USER = { id: "u1", aud: "authenticated", role: "authenticated", email: "staff@example.test" };
+const SESSION = JSON.stringify({ access_token: "stub-token", refresh_token: "r", token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: USER });
+const PATH = "11111111-1111-4111-8111-111111111111";
+const C1 = "22222222-2222-4222-8222-222222222222";
+const C2 = "33333333-3333-4333-8333-333333333333";
+const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+
+// The page's only cookie-bound imports (the server client and the impersonation cookie). Everything below them is the real code.
+const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
+(Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
+  if (request === "next/headers") {
+    return {
+      cookies: async () => ({ getAll: () => [{ name: "sb-stub-auth-token", value: SESSION }], get: () => undefined, set() {} }),
+      headers: async () => new Headers({ host: "lms.test" }),
+    };
+  }
+  return load.call(this, request, ...rest);
+};
+
+type World = { role: string; attempts: Row[]; no0107: boolean };
+let world: World = { role: "admin", attempts: [], no0107: false };
+let requests: Req[] = [];
+const unmatched: string[] = [];
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+const filtersPreviews = (q: URLSearchParams) => q.get("context_kind") === "neq.preview";
+
+const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+  const select = url.searchParams.get("select") ?? "";
+  const p = url.pathname;
+  requests.push({ method, path: p, select, query: url.searchParams });
+  if (p === "/auth/v1/user") return json(USER);
+  if (p === "/rest/v1/profiles") return json([{ must_change_password: false }]);
+  if (p === "/rest/v1/organizations") return json([{ id: "o1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null }]);
+  if (p === "/rest/v1/organization_members") return json([{ role: world.role }]);
+  if (p === "/rest/v1/learning_paths") return json([{ id: PATH, is_active: true }]);
+  if (p === "/rest/v1/learning_path_courses") return json([{ course_id: C1, step_number: 1 }, { course_id: C2, step_number: 2 }]);
+  if (p === "/rest/v1/courses") return json([{ pass_required: false }]);
+  if (p === "/rest/v1/course_versions") return json([{ id: "v1" }]);
+  if (p === "/rest/v1/attempt_requests") return json([]);
+  if (p === "/rest/v1/rpc/effective_attempt_policies") return json([]);
+  if (p === "/rest/v1/course_attempts") {
+    // A database without 0107 answers the filter with 42703; one with it honours `neq.preview`.
+    if (filtersPreviews(url.searchParams) && world.no0107) return json(NO_CONTEXT, 400);
+    return json(world.attempts.filter((r) => !filtersPreviews(url.searchParams) || r.context_kind !== "preview"));
+  }
+  unmatched.push(`${method} ${p}`);
+  return json([]);
+};
+
+const attempt = (id: string, o: Row = {}): Row => ({
+  id, score: null, started_at: "2026-11-10T09:00:00Z", completed_at: null,
+  completion_status: "in_progress", success_status: "unknown", status: "in_progress", is_revision: false, ...o,
+});
+/** A completed Preview, started BEFORE the real attempt: unfiltered, it would be the official attempt and read as stored. */
+const COMPLETED_PREVIEW = attempt("pv", { context_kind: "preview", started_at: "2026-11-10T08:00:00Z", completed_at: "2026-11-10T08:20:00Z", completion_status: "completed", success_status: "passed", score: 1, status: "completed" });
+const REAL_IN_PROGRESS = attempt("real", { context_kind: "path" });
+const REAL_DONE = attempt("real", { context_kind: "path", completed_at: "2026-11-10T09:30:00Z", completion_status: "completed", success_status: "passed", score: 0.9, status: "completed" });
+
+async function realPage() {
+  console.log("\nthe real continue page under a stubbed fetch (ADR 0024 P2-5 items 4 and 5b)");
+  process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE;
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "stub-anon-key";
+  process.env.SUPABASE_SERVICE_ROLE_KEY = "stub-service-key";
+  const realFetch = globalThis.fetch;
+  const realTimeout = globalThis.setTimeout;
+  const realWarn = console.warn;
+  const realError = console.error;
+  globalThis.fetch = stub as typeof fetch;
+  // The wait's one-second sleeps, made immediate: the reads and their count are what is asserted.
+  globalThis.setTimeout = ((fn: () => void) => realTimeout(fn, 0)) as unknown as typeof setTimeout;
+  let logs: string[] = [];
+  console.warn = (...a: unknown[]) => { logs.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")); };
+  console.error = () => {};
+  try {
+    const page = (await import("../../app/[org]/(learner)/continue/page")).default;
+    const run = async (w: Partial<World>) => {
+      world = { role: "admin", attempts: [], no0107: false, ...w };
+      requests = [];
+      logs = [];
+      let target: string | null = null;
+      try {
+        await page({ params: Promise.resolve({ org: "acme" }), searchParams: Promise.resolve({ lp: PATH, from: C1 }) });
+      } catch (e) {
+        const digest = (e as { digest?: unknown }).digest;
+        if (typeof digest !== "string" || !digest.startsWith("NEXT_REDIRECT;")) throw e;
+        target = digest.split(";").slice(2, -2).join(";");
+      }
+      const reads = requests.filter((q) => q.path === "/rest/v1/course_attempts");
+      return {
+        target,
+        reads: reads.length,
+        filtered: reads.map((q) => filtersPreviews(q.query)),
+        events: logs.filter((l) => l.startsWith("{")).map((l) => (JSON.parse(l) as Row).event),
+      };
+    };
+    const SAVING = `/acme/paths/${PATH}?saving=1`;
+    const NEXT = `/acme/courses/${C2}/launch?lp=${PATH}`;
+
+    const admin = await run({ role: "admin", attempts: [COMPLETED_PREVIEW, REAL_IN_PROGRESS] });
+    eq("an admin with a completed Preview beside an in-progress real attempt: no staff shortcut, the whole wait, then the saving banner",
+      [admin.target, admin.reads, admin.events], [SAVING, 7, ["continue_timeout"]]);
+    eq("…every read of the wait drops Previews", admin.filtered, Array(7).fill(true));
+    for (const role of ["super_owner", "data_analyst", "user"]) {
+      const r = await run({ role, attempts: [COMPLETED_PREVIEW, REAL_IN_PROGRESS] });
+      eq(`…the same rows for ${role}: the same answer (the role decides nothing here)`, [r.target, r.reads], [SAVING, 7]);
+    }
+    const doneRun = await run({ role: "admin", attempts: [COMPLETED_PREVIEW, REAL_DONE] });
+    eq("the admin's real attempt completed beside the Preview: the next launch at the first read", [doneRun.target, doneRun.reads], [NEXT, 1]);
+    const noPreview = await run({ role: "admin", attempts: [REAL_IN_PROGRESS] });
+    eq("an admin with only an in-progress real attempt waits like any learner", [noPreview.target, noPreview.reads], [SAVING, 7]);
+
+    const old = await run({ role: "admin", no0107: true, attempts: [attempt("real", { completed_at: "2026-11-10T09:30:00Z", completion_status: "completed", success_status: "passed", score: 0.9, status: "completed" })] });
+    eq("without 0107: the first read answers 42703 and is made once more without the filter; today's rows move on", [old.target, old.filtered], [NEXT, [true, false]]);
+    const oldWait = await run({ role: "admin", no0107: true, attempts: [attempt("real")] });
+    eq("…and one decision serves the whole wait: one failed read, then seven unfiltered reads", [oldWait.target, oldWait.filtered], [SAVING, [true, ...Array(7).fill(false)]]);
+    eq("the stub answered every request the page made", unmatched, []);
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.setTimeout = realTimeout;
+    console.warn = realWarn;
+    console.error = realError;
+  }
+}
+
+realPage()
+  .catch((e) => {
+    fail++;
+    console.log(`  ✗ the real page threw: ${e instanceof Error ? e.stack : String(e)}`);
+  })
+  .finally(() => {
+    console.log(`\n${pass} passed, ${fail} failed`);
+    if (fail > 0) process.exit(1);
+  });

@@ -151,10 +151,20 @@ export NEXT_TELEMETRY_DISABLED=1
 export NEXT_PUBLIC_SITE_URL="$BASE"
 export E2E_BASE_URL="$BASE"
 # As scripts/e2e-in-runner.sh sets it, because the staging database has 0100.
-# With the flag absent a staff launch stores is_preview false, 0100's delete
-# guards count that row as learner history, and spec 50's admin delete answers
-# 409: a pairing of flag and database that no deployment runs.
+# With the flag absent a Start writes none of the 0100 columns: a pairing of
+# flag and database that no deployment runs. (Since ADR 0024 P2-5 a staff
+# member's launch without ?mode=preview is a real attempt whatever the flag,
+# and a Preview by mode names its own 0100 columns.)
 export ALDS_P4="on"
+# A fresh impersonation secret for each run, never a deployed value, as
+# scripts/e2e-in-runner.sh sets it: under NODE_ENV=production the impersonate
+# route refuses without one, and spec 68's case (3c) impersonates (ADR 0024
+# P2-5 item 3c).
+IMPERSONATION_SECRET="$(node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex"))')"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  echo "::add-mask::$IMPERSONATION_SECRET"
+fi
+export IMPERSONATION_SECRET
 
 # A build that failed only because next/font could not fetch Google Fonts
 # (an unparseable or missing answer from fonts.googleapis.com; seen three

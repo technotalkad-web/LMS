@@ -21,6 +21,11 @@ export type LaunchPickerPackage = {
  *   3. On success: full-page nav to ?lang={code} so the SCORM/cmi5
  *      runtime re-mounts with the chosen package.
  *
+ * A Preview by mode (ADR 0024 step 23, P2-5) skips 1 and 2: it saves no
+ * language preference and resets nothing (the switch route resets the
+ * learner's open rows on the other language, a real attempt included). It
+ * goes straight to ?lang={code}, which keeps ?mode=preview.
+ *
  * Closes #158 Phase 2 + Phase 3 + Phase 4 (confirmation modal).
  */
 export function LaunchLanguagePicker({
@@ -28,11 +33,14 @@ export function LaunchLanguagePicker({
   courseId,
   courseTitle,
   packages,
+  preview = false,
 }: {
   orgSlug: string;
   courseId: string;
   courseTitle: string;
   packages: LaunchPickerPackage[];
+  /** A Preview by mode: pick the language for this launch only. */
+  preview?: boolean;
 }) {
   const [picking, setPicking] = useState<string | null>(null);
   const [confirmFor, setConfirmFor] = useState<{
@@ -46,6 +54,12 @@ export function LaunchLanguagePicker({
   async function pick(language: string, restart = false) {
     setError(null);
     setPicking(language);
+    if (preview) {
+      const next = new URL(window.location.href);
+      next.searchParams.set("lang", language);
+      window.location.href = next.toString();
+      return;
+    }
     const res = await fetch(
       `/api/courses/${courseId}/language-preference`,
       {

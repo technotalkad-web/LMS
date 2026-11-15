@@ -5,8 +5,10 @@
  *
  *   - course DELETE with learner attempts → 409 (route count, decision 3)
  *   - an attempt by a user since removed from the org still blocks
- *   - staff-only attempts do not block (decision 3's definition); from
- *     0107 on, the admin's by-role row blocks (ADR 0024 decision L2)
+ *   - a staff member's real attempt blocks: course C is assigned to the
+ *     admin, whose Start is a real attempt (ADR 0024 P2-5: a launch without
+ *     ?mode=preview is a learner's whatever the role), counted by the route
+ *     like a learner's; a course that holds only previews is spec 75's case
  *   - delete of a course_versions row with learner attempts through an
  *     admin session → learner_history_exists, for a current member's attempt
  *     and for a removed member's attempt (no membership = learner)
@@ -32,7 +34,7 @@
 import { test, expect, type BrowserContext } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, isLifecycleSlug, svc } from "./data";
 import { assignCourse, authedContext, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
-import { NEEDS_0098, has0098, has0107, scormZip, sessionClient, sha256, uploadNew, zipFile } from "./p0-helpers";
+import { NEEDS_0098, getNoFollow, has0098, scormZip, sessionClient, sha256, uploadNew, zipFile } from "./p0-helpers";
 import { cleanupLifecycleData } from "./cleanup";
 
 type User = { id: string; email: string; password: string };
@@ -46,14 +48,14 @@ test.describe.serial("ADR 0003 — record guard", () => {
     leaver?: User;
     courseA?: string; // learner attempt
     courseB?: string; // attempt by a member who is later removed
-    courseC?: string; // staff attempt only
+    courseC?: string; // the admin's real attempt only
   } = {};
 
   test.afterAll(async () => {
     await s.adminCtx?.close().catch(() => {});
   });
 
-  test("seed: three courses; a learner, a leaver and the admin each launch one", async ({ browser, baseURL }) => {
+  test("seed: three courses; a learner, a leaver and the admin each start one", async ({ browser, baseURL }) => {
     const org = await createOrg({ name: "QA Record Guard" });
     const admin = await createAuthUser({ profile: { first_name: "Guard", last_name: "Admin", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
@@ -76,6 +78,9 @@ test.describe.serial("ADR 0003 — record guard", () => {
     [s.courseA, s.courseB, s.courseC] = ids;
     await assignCourse(areq, org.slug, s.courseA!, learner.id);
     await assignCourse(areq, org.slug, s.courseB!, leaver.id);
+    // ADR 0024 P2-5: without ?mode=preview the admin's launch is a learner's,
+    // so course C is assigned to the admin and the Start is a real attempt.
+    await assignCourse(areq, org.slug, s.courseC!, admin.id);
 
     for (const [u, cid] of [[learner, s.courseA!], [leaver, s.courseB!]] as Array<[User, string]>) {
       const ctx = await authedContext(browser, baseURL!, u.email, u.password);
@@ -83,8 +88,11 @@ test.describe.serial("ADR 0003 — record guard", () => {
       expect(r.ok(), `launch → ${r.status()}`).toBeTruthy();
       await ctx.close();
     }
-    const r = await areq.get(`/${org.slug}/courses/${s.courseC}/launch`);
-    expect(r.ok(), `admin preview launch → ${r.status()}`).toBeTruthy();
+    // A served launch, not a redirect followed to the dashboard: no redirect
+    // is followed, and the body carries the course's iframe.
+    const r = await getNoFollow(areq, `/${org.slug}/courses/${s.courseC}/launch`);
+    expect(r.status, "the admin's Start is served").toBe(200);
+    expect(r.body, "the admin's Start renders the course").toMatch(/<iframe[^>]+src="[^"]*\/content\/v\//);
   });
 
   test("course DELETE with a learner attempt → 409, nothing deleted", async () => {
@@ -105,7 +113,7 @@ test.describe.serial("ADR 0003 — record guard", () => {
     expect((await res.json()).attempt_count).toBe(1);
   });
 
-  test("staff-only attempts do not block: course C deletes", async () => {
+  test("a staff member's real attempt blocks: course C → 409, course C kept", async () => {
     // The case only means something if course C really holds the admin's attempt.
     const { data: cVersions } = await svc().from("course_versions").select("id").eq("course_id", s.courseC!);
     const { data: cAttempts } = await svc()
@@ -113,20 +121,18 @@ test.describe.serial("ADR 0003 — record guard", () => {
       .select("user_id")
       .in("course_version_id", ((cVersions ?? []) as Array<{ id: string }>).map((v) => v.id));
     expect(((cAttempts ?? []) as Array<{ user_id: string }>).map((a) => a.user_id), "course C holds exactly the admin's attempt").toEqual([s.admin!.id]);
+    // ADR 0024 step 62 and P2-5: the admin's Start is a real attempt, not a
+    // preview, so it is learner history whatever the admin's role. The route's
+    // count tells previews by context_kind (on a database without 0107 it
+    // makes no preview split and counts every row), and the delete guard
+    // refuses a real row too; either way the answer is 409 and course C stays.
+    // attempt_count is not pinned: the route's count gives 1, the guard's
+    // refusal after a count of 0 gives null.
     const res = await s.adminCtx!.request.delete(`/api/courses/${s.courseC}`);
-    if (await has0107()) {
-      // ADR 0024 step 62 (decision L2, conflicts row 15): with 0107 the
-      // admin's row reads legacy_role, a by-role row that is never deleted.
-      // The route's own count still leaves staff out, the recreated delete
-      // guard refuses, and the route answers 409; course C stays.
-      expect(res.status(), await res.text()).toBe(409);
-      const { data: still } = await svc().from("courses").select("id").eq("id", s.courseC!).maybeSingle();
-      expect(still, "course C still exists").toBeTruthy();
-      return;
-    }
-    expect(res.status(), await res.text()).toBe(200);
-    const { data } = await svc().from("courses").select("id").eq("id", s.courseC!).maybeSingle();
-    expect(data).toBeNull();
+    expect(res.status(), await res.text()).toBe(409);
+    expect((await res.json()).error).toMatch(/Cannot delete: .* learner attempts exist .*Deactivate instead/);
+    const { data: still } = await svc().from("courses").select("id").eq("id", s.courseC!).maybeSingle();
+    expect(still, "course C still exists").toBeTruthy();
   });
 
   test("deleting a version with learner attempts through an admin session → learner_history_exists", async ({ browser, baseURL }) => {

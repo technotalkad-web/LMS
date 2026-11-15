@@ -451,9 +451,14 @@ export default async function AdminCourseDetailPage({
             >
               View as learner
             </Link>
+            {/* ADR 0024 step 23: an admin's launch is a learner's unless it
+                names the mode, so the Library's preview carries
+                ?mode=preview (not an official record). */}
             {current && (
               <Link
-                href={`/${orgSlug}/courses/${c.id}/launch`}
+                href={`/${orgSlug}/courses/${c.id}/launch?mode=preview`}
+                data-testid="library-preview"
+                title="Opens the course as a preview: not an official record"
                 className="px-5 py-2.5 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 transition-opacity"
               >
                 Preview launch

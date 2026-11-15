@@ -6,6 +6,13 @@
  * record, the retry, classification and the RPC calls. The pure functions have their
  * own cases in scorm-commit-decision.test.ts.
  *
+ * ADR 0024 step 60 (P2-5 item 5): a Preview's row (`context_kind = 'preview'`) is
+ * written and never official: no classification, no RPC, no milestone (email,
+ * webhook, path completion); a row without the key (a database without 0107) and an
+ * Individual row keep today's behaviour. Item 5b: the path-completion read drops
+ * Previews, so a path-tagged by-role Preview (legacy_role) of the other step does not
+ * complete the path; without 0107 the filter's 42703 is read once more without it.
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/scorm-commit-route.test.ts   (or npm run test:unit)
@@ -21,7 +28,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 type Row = Record<string, unknown>;
-type Req = { method: string; path: string; select: string; body: string };
+type Req = { method: string; path: string; select: string; body: string; query: URLSearchParams };
 
 const SUPABASE = "http://stub.supabase.test";
 const A1 = "2026.10.28";
@@ -52,6 +59,12 @@ let manifest: Row = {};
 let columnMissing = false;
 let outages = 0;
 let storageDriver: string | null = null;
+/** The milestone block's world (ADR 0024 P2-5): off, its first read answers nothing and the block returns, as before. */
+let pathWorld = false;
+let pathAttempts: Row[] = [];
+let no0107 = false;
+const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+const PATH_READ = "course_version_id,completion_status,success_status,learning_path_id";
 const unmatched: string[] = [];
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -62,7 +75,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const body = typeof init?.body === "string" ? init.body : "";
   const select = url.searchParams.get("select") ?? "";
   const p = url.pathname;
-  requests.push({ method, path: p, select, body });
+  requests.push({ method, path: p, select, body, query: url.searchParams });
   if (p === "/auth/v1/user") return json(USER);
   if (p === "/rest/v1/course_attempts") {
     if (method === "PATCH") {
@@ -77,7 +90,23 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (select.startsWith("*,course_versions(")) {
       return json([{ ...row, course_versions: { id: "v1", manifest_type: "scorm12", manifest_data: manifest, launch_url: "index_lms.html", storage_prefix: "p/", storage_driver: storageDriver } }]);
     }
+    if (pathWorld && select.startsWith("organization_id,course_version_id")) {
+      return json([{ organization_id: "o1", course_version_id: "v1", course_versions: { course_id: "c1", courses: { title: "Step one" } }, score: 1 }]);
+    }
+    if (pathWorld && select === PATH_READ) {
+      const filtered = url.searchParams.get("context_kind") === "neq.preview";
+      if (filtered && no0107) return json(NO_CONTEXT, 400);
+      return json(pathAttempts.filter((r) => !filtered || r.context_kind !== "preview"));
+    }
     return json([]);
+  }
+  if (pathWorld) {
+    // Path p1 holds c1 (this commit's course, on v1) and c2 (on v2); the learner is assigned to it directly.
+    if (p === "/rest/v1/learning_path_courses") return json(select === "path_id" ? [{ path_id: "p1" }] : [{ path_id: "p1", course_id: "c1" }, { path_id: "p1", course_id: "c2" }]);
+    if (p === "/rest/v1/learning_path_assignments") return json([{ path_id: "p1", assignee_type: "user", user_id: "u1", team_id: null }]);
+    if (p === "/rest/v1/course_versions" && select === "id,course_id") return json([{ id: "v1", course_id: "c1" }, { id: "v2", course_id: "c2" }]);
+    if (p === "/rest/v1/learning_paths") return json([{ id: "p1", name: "Path one" }]);
+    if (p === "/rest/v1/organizations") return json([{ name: "Org", slug: "org" }]);
   }
   if (p.startsWith("/rest/v1/rpc/")) return json(null);
   if (p.startsWith("/rest/v1/")) return json([]);
@@ -231,6 +260,57 @@ async function main() {
       const capped = await run(PASSING, true, failedRow({ ignored_pass: full }), { engineVersion: A1 });
       eq("the row's values, last_activity_at only", [capped.body, capped.keys], [ECHO, [["last_activity_at"]]]);
       eq("pass_ignored, with the flag", capped.lines.map(sorted), [{ attempt_id: "a1", capped: true, engine_version: A1, event: "pass_ignored", runtime: "scorm12", statement_id: null }]);
+    }
+
+    console.log("\n(k) ADR 0024 step 60 (P2-5 item 5): a Preview is never official");
+    {
+      const fresh = (extra: Row = {}): Row => ({
+        id: "a1", user_id: "u1", organization_id: "o1", status: "in_progress", completion_status: "in_progress", success_status: "unknown",
+        score: null, completed_at: null, course_version_id: "v1", cmi_data: {}, progress_pct: null, is_revision: false, ...extra,
+      });
+      const pathReads = () => requests.filter((q) => q.path === "/rest/v1/course_attempts" && q.select === PATH_READ);
+      const side = () => ({
+        emails: requests.filter((q) => q.path === "/rest/v1/notification_settings").length,
+        webhook: requests.some((q) => q.path === "/rest/v1/org_integration_settings"),
+        pathDone: requests.some((q) => q.path === "/rest/v1/learning_paths"),
+      });
+      const NOTHING = { emails: 0, webhook: false, pathDone: false };
+      pathWorld = true;
+      // The path's other step (c2, on v2) holds a completed, path-tagged by-role Preview (legacy_role, context_kind 'preview').
+      const LEGACY_PREVIEW_V2: Row = { course_version_id: "v2", completion_status: "completed", success_status: "passed", learning_path_id: "p1", context_kind: "preview" };
+      const REAL_V1: Row = { course_version_id: "v1", completion_status: "completed", success_status: "passed", learning_path_id: "p1", context_kind: "path" };
+      pathAttempts = [REAL_V1, LEGACY_PREVIEW_V2];
+
+      const k = await run(PASSING, true, fresh({ context_kind: "preview" }), {});
+      eq("a Preview's passing commit: 200, written as any learner's (status, completion, success, score, completed_at)",
+        [k.status, k.body.success_status, k.patches[0]?.status, k.patches[0]?.completion_status, k.patches[0]?.score, typeof k.patches[0]?.completed_at],
+        [200, "passed", "passed", "completed", 1, "string"]);
+      eq("…no classification, no RPC (points, streak, journey credit)", [k.classified, k.rpcs], [false, []]);
+      eq("…no milestone: no email, no webhook, no path read, no path completion", [k.milestone, side(), pathReads().length], [false, NOTHING, 0]);
+      const kMid = await run({ "cmi.core.lesson_status": "incomplete" }, false, fresh({ context_kind: "preview" }), {});
+      eq("a Preview's mid-course commit: written, no RPC (a learner's calls both on every commit)", [kMid.status, kMid.patches.length, kMid.rpcs], [200, 1, []]);
+      const learnerMid = await run({ "cmi.core.lesson_status": "incomplete" }, false, fresh({ context_kind: "individual" }), {});
+      eq("…the same commit on an Individual row calls both RPCs", learnerMid.rpcs, BOTH);
+
+      const l = await run(PASSING, true, fresh({ context_kind: "path" }), {});
+      eq("a learner's passing commit: classified, both RPCs, the milestone runs", [l.classified, l.rpcs, l.milestone], [true, BOTH, true]);
+      eq("…the path read drops Previews: one read, context_kind neq.preview", pathReads().map((q) => q.query.get("context_kind")), ["neq.preview"]);
+      eq("…so the path-tagged by-role Preview of step 2 does not complete the path: one email (the course's), no path completion", side(), { emails: 1, webhook: true, pathDone: false });
+
+      pathAttempts = [REAL_V1, { ...LEGACY_PREVIEW_V2, context_kind: "path" }];
+      const l2 = await run(PASSING, true, fresh({ context_kind: "path" }), {});
+      eq("the same path with a real attempt on step 2: the path completes (two emails, the path's name read)", [l2.milestone, side()], [true, { emails: 2, webhook: true, pathDone: true }]);
+
+      console.log("\n(k') a database without 0107");
+      no0107 = true;
+      pathAttempts = [{ ...REAL_V1, context_kind: undefined }, { ...LEGACY_PREVIEW_V2, context_kind: undefined }];
+      const m = await run(PASSING, true, fresh(), {});
+      eq("a row without the key: today's commit (classified, both RPCs, the milestone)", [m.status, m.classified, m.rpcs, m.milestone], [200, true, BOTH, true]);
+      eq("…the path read: the filter's 42703, then today's read once without it (every row counts, as today)",
+        [pathReads().map((q) => q.query.get("context_kind")), side()], [["neq.preview", null], { emails: 2, webhook: true, pathDone: true }]);
+      no0107 = false;
+      pathWorld = false;
+      pathAttempts = [];
     }
 
     eq("no request left the stub", unmatched, []);

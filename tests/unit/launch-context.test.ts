@@ -4,7 +4,12 @@
  * rows phase 1 builds.
  *
  *   (a) the conflict row: both parameters refused before any fact;
- *   (b) a preview or a run: refused until phases 2 and P build those rows;
+ *   (b) the preview row (phase 2, P2-5 item 2; step 22's `?mode=preview`
+ *       row): a report-viewing role (super_owner, admin, data_analyst)
+ *       launches the `preview` context with the preview kind `course` and
+ *       no official tag, decided before any fact (no launch_context call);
+ *       a plain user is refused, an enrolled one included (P2-5 item 3b);
+ *       a run is still refused (phase P), with or without the mode;
  *   (c) membership and the course;
  *   (d) the path row: an unassigned ?lp= refused, an inactive path refused,
  *       an unreleased step redirected, the strict lock from the path rule's
@@ -27,8 +32,7 @@
  *       as before. assert-0107-launch.sql (48) shows launch_context's facts
  *       flipping back with the stored rows unchanged.
  *
- * The preview row (phase 2) and the test-run row (phase P) add their cases
- * here when they are built.
+ * The test-run row (phase P) adds its cases here when it is built.
  *
  * Run:  npx tsx tests/unit/launch-context.test.ts   (or npm run test:unit)
  */
@@ -135,12 +139,44 @@ console.log("\n(a) the conflict row");
   eq("no facts past the conflict row is a caller's error: it throws", threw, true);
 }
 
-console.log("\n(b) a preview or a run: refused until phases 2 and P");
+console.log("\n(b) the preview row: report-viewing roles preview the course; a plain user and a run are refused (P2-5 items 2 and 3b)");
 {
+  const PREVIEW = { kind: "launch", selfEnrol: null, context: { kind: "preview", previewKind: "course", runId: null, dayId: null } };
+  const enrolledFacts = facts({ course: { found: true, is_active: true, visibility: "org_public", individual: { enrolled: true, upcoming_at: null } } });
+  for (const role of ["super_owner", "admin", "data_analyst"] as OrgRole[]) {
+    eq(`?mode=preview as ${role}: the preview context, kind course`, resolve({ mode: "preview" }, enrolledFacts, { role }), PREVIEW);
+    eq(`…as ${role} with no facts read (no launch_context call is made for a preview)`, resolve({ mode: "preview" }, null, { role }), PREVIEW);
+    eq(`…as ${role}, not enrolled at all: still the preview (a preview is not an enrolment)`, resolve({ mode: "preview" }, facts(), { role }), PREVIEW);
+  }
+  eq("?mode=preview as a plain user: refused, with no facts read", resolve({ mode: "preview" }, null, { role: "user" }), refused("preview_not_allowed"));
+  eq("…a plain user enrolled on the course: refused, never an unscored run of it (the owner's revision policy)",
+    resolve({ mode: "preview" }, enrolledFacts, { role: "user" }), refused("preview_not_allowed"));
+  eq("…whatever product parameter the user adds", [
+    resolve({ mode: "preview", lp: PATH }, facts({ path: pathFacts() }), { role: "user" }),
+    resolve({ mode: "preview", journey: ENR, day: DAY4 }, facts({ journey: journeyFacts() }), { role: "user" }),
+  ], [refused("preview_not_allowed"), refused("preview_not_allowed")]);
+  eq("a preview carries no official tag: a step's ?lp= is not read (no path context, no self-enrolment)",
+    resolve({ mode: "preview", lp: PATH }, facts({ path: pathFacts({ enrolled: false, visibility: "org_public" }) }), { role: "admin" }), PREVIEW);
+  eq("…nor a day's ?journey=", resolve({ mode: "preview", journey: ENR, day: DAY4 }, null, { role: "data_analyst" }), PREVIEW);
+  eq("…nor a locked or unreleased strict step (a preview opens the course outside the path)",
+    resolve({ mode: "preview", lp: PATH }, facts({ path: pathFacts({ steps: [
+      { course_id: C1, step_number: 1, release_at: null, done: false },
+      { course_id: COURSE, step_number: 2, release_at: "2999-01-01T00:00:00Z", done: false },
+    ] }) }), { role: "super_owner" }), PREVIEW);
+  eq("the context's kind and preview kind are the result's own fields",
+    Object.keys((resolve({ mode: "preview" }, null, { role: "admin" }) as { context: object }).context).sort(), ["dayId", "kind", "previewKind", "runId"]);
+  eq("both product parameters with the mode: the conflict row first", resolve({ mode: "preview", lp: PATH, journey: ENR }, null, { role: "admin" }), refused("context_conflict"));
   for (const role of ["super_owner", "admin", "data_analyst", "user"] as OrgRole[]) {
-    eq(`?mode=preview as ${role}: refused, never an official launch`, resolve({ mode: "preview" }, facts({ course: { found: true, is_active: true, visibility: "org_public", individual: { enrolled: true, upcoming_at: null } } }), { role }), refused("preview_not_allowed"));
+    eq(`a run with the mode as ${role}: refused (phase P), with no facts read`, resolve({ mode: "preview", run: uid("f", 7) }, null, { role }), refused("preview_not_allowed"));
   }
   eq("a run named without the mode: refused", resolve({ run: uid("f", 7), lp: PATH }, facts({ path: pathFacts() })), refused("preview_not_allowed"));
+  eq("…an empty ?run= is no run: the preview", resolve({ mode: "preview", run: "  " }, null, { role: "admin" }), PREVIEW);
+  eq("without the mode every role is a learner: an enrolled admin's Start is the Individual row",
+    resolve({}, enrolledFacts, { role: "admin" }), { kind: "launch", selfEnrol: null, context: { kind: "individual" } });
+  eq("…and an unenrolled admin's Start is refused as a learner's is", resolve({}, facts(), { role: "admin" }), refused("not_enrolled"));
+  let threw = false;
+  try { resolve({}, null, { role: "admin" }); } catch { threw = true; }
+  eq("…and needs the facts (only the preview row answers without them)", threw, true);
 }
 
 console.log("\n(c) membership and the course");

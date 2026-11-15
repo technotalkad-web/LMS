@@ -4,6 +4,7 @@ import { ScopePicker, type ScopeOptions } from "../_components/scope-picker";
 import type { ContentScopes } from "@/lib/content/scopes";
 
 import { useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Plus, RotateCcw, Swords, Upload, X } from "lucide-react";
 import { useToast } from "@/components/ui/toast";
@@ -576,18 +577,35 @@ function CurriculumTab({
                 </button>
               </span>
             </span>
-            <select
-              value={r.course_id ?? ""}
-              onChange={(e) => set(r.day_number, { course_id: e.target.value || null })}
-              className="px-2 py-1.5 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink min-w-0"
-            >
-              <option value="">— no module —</option>
-              {courses.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.title}
-                </option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2 min-w-0">
+              <select
+                value={r.course_id ?? ""}
+                onChange={(e) => set(r.day_number, { course_id: e.target.value || null })}
+                className="flex-1 px-2 py-1.5 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink min-w-0"
+              >
+                <option value="">— no module —</option>
+                {courses.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.title}
+                  </option>
+                ))}
+              </select>
+              {/* ADR 0024 step 23: the day's module on its own, as a preview
+                  (?mode=preview, no ?journey=): not an official record and
+                  outside every journey. A new tab keeps unsaved edits. */}
+              {r.course_id && (
+                <Link
+                  href={`/${orgSlug}/courses/${r.course_id}/launch?mode=preview`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="journey-editor-preview"
+                  title="Preview this module in a new tab: not an official record, and outside the journey"
+                  className="shrink-0 text-xs px-2 py-1 border border-line rounded-lg hover:border-ink"
+                >
+                  Preview
+                </Link>
+              )}
+            </div>
             <input
               type="text"
               value={r.mission_title ?? ""}

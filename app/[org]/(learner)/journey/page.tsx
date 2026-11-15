@@ -1,6 +1,7 @@
 import Link from "next/link";
 import {
   Check,
+  Eye,
   Hourglass,
   Lock,
   PauseCircle,
@@ -9,6 +10,7 @@ import {
   Target,
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { canViewReports } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { JourneyIcon } from "@/components/ui/journey-icon";
 import {
@@ -45,7 +47,11 @@ export default async function JourneyPage({
 }) {
   const { org: orgSlug } = await params;
   const sp = (await searchParams) ?? {};
-  const { user, org } = await requireOrgAccess(orgSlug);
+  const { user, org, role } = await requireOrgAccess(orgSlug);
+  // ADR 0024 step 23 ("Buttons"): each day offers the report-viewing roles a
+  // Preview of its module (DayPreview). It opens the course outside the
+  // journey (no ?journey= or &day=), so it is never a journey attempt.
+  const canPreview = canViewReports(role);
   const supabase = await createClient();
 
   // ALL the learner's journeys (multi-journey, 0063) with their programs
@@ -293,23 +299,25 @@ export default async function JourneyPage({
             </p>
             <div className="grid sm:grid-cols-2 gap-2">
               {missionDays.map((d) => (
-                <Link
-                  key={d.day}
-                  // ?journey= without &day= never tags the attempt (reviews
-                  // stay progress/XP-neutral); it only brings "Exit course"
-                  // back here instead of the dashboard.
-                  href={`/${orgSlug}/courses/${d.course_id}/launch?journey=${enrollment.id}`}
-                  className="flex items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
-                >
-                  <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
-                    Day {d.day}
-                  </span>
-                  <span className="min-w-0 line-clamp-2">
-                    {d.mission_title ??
-                      titleOf.get(d.course_id as string) ??
-                      "Module"}
-                  </span>
-                </Link>
+                <div key={d.day} className="flex items-center gap-1.5">
+                  <Link
+                    // ?journey= without &day= never tags the attempt (reviews
+                    // stay progress/XP-neutral); it only brings "Exit course"
+                    // back here instead of the dashboard.
+                    href={`/${orgSlug}/courses/${d.course_id}/launch?journey=${enrollment.id}`}
+                    className="flex flex-1 min-w-0 items-center gap-2 px-3 py-2 border border-line rounded-lg text-sm hover:border-indigo-400 hover:bg-indigo-50/40"
+                  >
+                    <span className="text-[11px] font-bold text-indigo-700 tabular-nums shrink-0 w-14">
+                      Day {d.day}
+                    </span>
+                    <span className="min-w-0 line-clamp-2">
+                      {d.mission_title ??
+                        titleOf.get(d.course_id as string) ??
+                        "Module"}
+                    </span>
+                  </Link>
+                  <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={d.course_id as string} day={d.day} />
+                </div>
               ))}
             </div>
           </section>
@@ -605,25 +613,27 @@ export default async function JourneyPage({
             }
             if (done && entry?.course_id) {
               return (
-                <Link
-                  key={d}
-                  href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${d}`}
-                  className="flex items-center gap-3 px-5 py-3 hover:bg-canvas transition"
-                  aria-label={`Revise day ${d}`}
-                >
-                  <span className="h-7 w-7 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0" aria-hidden>
-                    <Check className="w-4 h-4" />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium line-clamp-2">
-                      Day {d}: {titleForDay(d)}
+                <div key={d} className="flex items-center hover:bg-canvas transition">
+                  <Link
+                    href={`/${orgSlug}/courses/${entry.course_id}/launch?journey=${enrollment.id}&day=${d}`}
+                    className="flex flex-1 min-w-0 items-center gap-3 px-5 py-3"
+                    aria-label={`Revise day ${d}`}
+                  >
+                    <span className="h-7 w-7 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0" aria-hidden>
+                      <Check className="w-4 h-4" />
                     </span>
-                    <span className="block text-xs text-emerald-700">Completed</span>
-                  </span>
-                  <span className="text-xs font-medium text-indigo-700 shrink-0">
-                    Revise
-                  </span>
-                </Link>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-medium line-clamp-2">
+                        Day {d}: {titleForDay(d)}
+                      </span>
+                      <span className="block text-xs text-emerald-700">Completed</span>
+                    </span>
+                    <span className="text-xs font-medium text-indigo-700 shrink-0">
+                      Revise
+                    </span>
+                  </Link>
+                  <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={entry.course_id} day={d} className="mr-5" />
+                </div>
               );
             }
             if (isCurrent) {
@@ -654,6 +664,9 @@ export default async function JourneyPage({
                       {missionInProgress ? "Continue" : "Start"}
                     </Link>
                   )}
+                  {entry?.course_id && (
+                    <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={entry.course_id} day={d} />
+                  )}
                 </div>
               );
             }
@@ -670,6 +683,9 @@ export default async function JourneyPage({
                     {d === nextCourseDayAfterCurrent ? "Up next" : `Day ${d} mission`}
                   </span>
                 </span>
+                {entry?.course_id && (
+                  <DayPreview canPreview={canPreview} orgSlug={orgSlug} courseId={entry.course_id} day={d} />
+                )}
                 <Lock className="w-3.5 h-3.5 shrink-0" aria-hidden />
               </div>
             );
@@ -759,6 +775,40 @@ export default async function JourneyPage({
       </section>
     </div>
   );
+}
+
+/**
+ * A journey day's Preview (ADR 0024 step 23, "Buttons"), for the
+ * report-viewing roles only: the day's module on its own, `?mode=preview`
+ * and no product parameter (no ?journey= or &day=), so it is never a journey
+ * attempt, credits nothing and has no Continue. Shown on every day that
+ * holds a module, open or not: a preview runs outside the journey's
+ * calendar (step 22's preview row).
+ */
+function DayPreview({
+  canPreview,
+  orgSlug,
+  courseId,
+  day,
+  className = "",
+}: {
+  canPreview: boolean;
+  orgSlug: string;
+  courseId: string;
+  day: number;
+  className?: string;
+}) {
+  return canPreview ? (
+    <Link
+      href={`/${orgSlug}/courses/${courseId}/launch?mode=preview`}
+      data-testid="day-preview"
+      aria-label={`Preview day ${day}`}
+      title="Opens this module on its own as a preview: not an official record, and not part of your journey"
+      className={`inline-flex items-center gap-1 px-2.5 py-1 border border-line rounded-lg text-[11px] font-medium text-muted hover:text-ink hover:border-ink shrink-0 ${className}`}
+    >
+      <Eye className="w-3 h-3" aria-hidden /> Preview
+    </Link>
+  ) : null;
 }
 
 /** Course-title fallback lookup for the mission card (RLS members read). */

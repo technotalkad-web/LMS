@@ -20,7 +20,11 @@
  *   (v)   the budget: classifyCost and fireCost measured under the stub, the two
  *         inequalities of the header of lib/integrations/webhook-hold.ts asserted
  *         with the exported constants, and the provider's sequential round-trip
- *         count printed;
+ *         count printed. ADR 0024 P2-5 item 5b: the held selection and
+ *         classifyAttempt's list drop previews (`context_kind=neq.preview`); the
+ *         stub's `no0107` mode answers that filter with the missing-column
+ *         error, so the one failed read per run on a database without 0107 is
+ *         counted, with and without 0103;
  *   (vi)  the keyset URL: heldWebhookPage called directly with a cursor, its
  *         decoded query asserted. The cron route never sends a cursor while the
  *         caps are at or below HELD_PAGE_SIZE, so this is the only proof of how
@@ -61,7 +65,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 type Row = Record<string, unknown>;
 type Req = { method: string; url: URL; path: string; select: string; body: string; headers: Headers };
 type Failure =
-  | "bound" | "after" | "afterThrow" | "payload" | "settings" | "held" | "refresh" | "classifyRead" | "classifyVersions" | "classifyList" | "no0103"
+  | "bound" | "after" | "afterThrow" | "payload" | "settings" | "held" | "refresh" | "classifyRead" | "classifyVersions" | "classifyList" | "no0103" | "no0107"
   | "orgRead" | "memberRead" | "memberAbsent" | "profileRead" | "codeRead";
 
 // The exact select strings (supabase-js strips the spaces of the code's own). An
@@ -87,6 +91,7 @@ const NO_LATCH_COLUMN = { code: "42703", message: "column course_attempts.comple
 const NO_LATCH_COLUMN_ON_WRITE = { code: "PGRST204", message: "Could not find the 'completion_webhook_at' column of 'course_attempts' in the schema cache" };
 const NO_OTHER_COLUMN = { code: "42703", message: "column course_attempts.some_other_column does not exist" };
 const NO_FLAG_COLUMN = { code: "42703", message: "column course_attempts.is_revision does not exist" };
+const NO_CONTEXT_COLUMN = { code: "42703", message: "column course_attempts.context_kind does not exist" };
 // engineVersion null: a third-party AU, so the fail-then-pass cases keep the one-time upgrade (ADR 0017 step 3).
 const VERSION_EMBED = { id: "v1", manifest_data: { raw: { auId: AU }, unitCount: 4, engineVersion: null }, package_id: null };
 const HOOK_SETTINGS: Row = { webhook_url: HOOK, webhook_secret: null };
@@ -186,8 +191,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
         course_versions: { course_id: "c1", courses: { title: "Stub course" } },
       }]);
     }
+    // ADR 0024 P2-5 item 5b: the preview filter, on a database without 0107.
+    // Postgres names the select list's missing column before the filter's, so
+    // the is_revision answers below come first.
+    const noContext = fails.has("no0107") && url.searchParams.has("context_kind");
     if (select === HELD_SELECT) {
       if (fails.has("held")) return json(NO_LATCH_COLUMN, 400);
+      if (noContext) return json(NO_CONTEXT_COLUMN, 400);
       // Newest first is the order of `held`; the keyset cursor, when there is one, is honoured.
       const keyset = url.searchParams.getAll("or")[1];
       const cursorId = keyset ? /id\.lt\."([^"]+)"/.exec(keyset)?.[1] : undefined;
@@ -209,6 +219,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     }
     if (select === `${LIST_BASE},is_revision` || select === LIST_BASE) {
       if (select !== LIST_BASE && fails.has("no0103")) return json(NO_FLAG_COLUMN, 400);
+      if (noContext) return json(NO_CONTEXT_COLUMN, 400);
       if (fails.has("classifyList")) return json(PG_TIMEOUT, 500);
       // The version filter is honoured, so a failed versions read's narrowing is visible.
       const versions = (url.searchParams.get("course_version_id") ?? "").replace(/^in\.\(|\)$/g, "").split(",");
@@ -1106,6 +1117,22 @@ async function main() {
     fails.delete("no0103");
     eq("…also without 0103", kindOld?.official, true);
     eq("the rule's + 2 covers the narrower-select fallback on a database without 0103", classifyCostWithout0103 <= classifyCost + 2, true);
+    // ADR 0024 P2-5 item 5b: the list drops previews. On a database without
+    // 0107 a fresh decision pays one failed read; a decision the run already
+    // made pays nothing (the sweep and the provider pass one per run).
+    fails.add("no0107");
+    mark = requests.length;
+    const kindNo0107 = await classifyAttempt(svc, "m1");
+    const classifyCostFreshWithout0107 = requests.length - mark;
+    const runDecision: { applies: boolean | null } = { applies: null };
+    await classifyAttempt(svc, "m1", runDecision);
+    mark = requests.length;
+    const kindDecided = await classifyAttempt(svc, "m1", runDecision);
+    const classifyCostDecidedWithout0107 = requests.length - mark;
+    fails.delete("no0107");
+    eq("without 0107: the same answer; a fresh decision pays one failed read, a run's decision none",
+      [kindNo0107?.official, kindDecided?.official, classifyCostFreshWithout0107 - classifyCost, classifyCostDecidedWithout0107 - classifyCost, runDecision.applies],
+      [true, true, 1, 0, false]);
     mark = requests.length;
     const took = await fireCompletionWebhookForAttempt("m1", 1);
     const fireCost = requests.length - mark;
@@ -1124,7 +1151,10 @@ async function main() {
       // scanned, fire calls up to the cap, the non-official rows first. They
       // lie beyond the scored window (their learner has an earlier official
       // attempt), which needs no is_revision column.
-      const worstCaseRun = async (without0103: boolean) => {
+      // ADR 0024 P2-5 item 5b: a database without 0107 (production until the
+      // 0107 sitting) pays one failed read per run, the first page's; a
+      // database without 0103 has no 0107 either, so its run pays both.
+      const worstCaseRun = async (without0103: boolean, without0107 = without0103) => {
         const skipped = Array.from({ length: SWEEP_MAX_SCANNED - SWEEP_MAX_FIRES }, (_, i) => `n${i}`);
         const official = Array.from({ length: SWEEP_MAX_FIRES }, (_, i) => `o${i}`);
         reset(
@@ -1134,15 +1164,26 @@ async function main() {
         );
         held = [...skipped, ...official];
         if (without0103) fails.add("no0103");
+        if (without0107) fails.add("no0107");
         const out = await cronBody(await cronPost());
-        eq(`the worst case${without0103 ? " without 0103" : ""} reaches both caps`,
+        const shape = without0103 ? " without 0103 (and 0107)" : without0107 ? " with 0103, without 0107" : "";
+        eq(`the worst case${shape} reaches both caps`,
           [out.webhook_sweep.scanned, out.webhook_sweep.fired.length], [SWEEP_MAX_SCANNED, SWEEP_MAX_FIRES]);
         return requests.length;
       };
-      const worst = await worstCaseRun(false);
-      const worstWithout0103 = await worstCaseRun(true);
-      console.log(`  a whole cron request at the caps: ${worst} subrequests (${worstWithout0103} without 0103), the rule's sum ${sweepSum}`);
-      eq("a whole cron request at the caps makes no more subrequests than the rule's sum", Math.max(worst, worstWithout0103) <= sweepSum, true);
+      const worst = await worstCaseRun(false, false);
+      const worstWithout0107 = await worstCaseRun(false, true);
+      const worstWithout0103 = await worstCaseRun(true, true);
+      console.log(`  a whole cron request at the caps: ${worst} subrequests with 0107, ${worstWithout0107} with 0103 and without 0107 (production's shape until the 0107 sitting), ${worstWithout0103} without 0103; the rule's sum ${sweepSum}`);
+      eq("with 0107 and on production's shape (0103, no 0107), a whole cron request at the caps makes no more subrequests than the rule's sum, within 0.8 of the budget",
+        [worst <= sweepSum, worstWithout0107 <= sweepSum, sweepSum <= 0.8 * WORKERS_SUBREQUEST_BUDGET], [true, true, true]);
+      eq("…the preview filter costs one failed read per run without 0107, not one per row", worstWithout0107 - worst, 1);
+      // Recorded, not hidden (ADR 0024 P2-5): on a database without 0103,
+      // which has no 0107 either and which no environment runs any more
+      // (production and staging have 0103), the run is the rule's sum plus
+      // that one read: one over 0.8 of the budget, and within the budget.
+      eq("without 0103 (and so without 0107): the rule's sum plus the one failed read, within the budget",
+        [worstWithout0103 - sweepSum, worstWithout0103 <= WORKERS_SUBREQUEST_BUDGET], [1, true]);
     }
 
     {
@@ -1151,7 +1192,14 @@ async function main() {
       held = ids;
       const summary = await heldWebhookSummary(svc, "o1", { classify: classifyAttempt });
       eq("the provider classifies every row at its cap", summary.count, HELD_MAX_SCANNED);
-      console.log(`  the provider's sequential round trips at HELD_MAX_SCANNED (${HELD_MAX_SCANNED} rows, each classified): ${requests.length}`);
+      const providerTrips = requests.length;
+      console.log(`  the provider's sequential round trips at HELD_MAX_SCANNED (${HELD_MAX_SCANNED} rows, each classified): ${providerTrips}`);
+      reset(...ids.map((id) => heldRow(id)));
+      held = ids;
+      fails.add("no0107");
+      const summaryNo0107 = await heldWebhookSummary(svc, "o1", { classify: classifyAttempt });
+      eq("…without 0107: the same count, one failed read more for the whole scan, within 0.5 of the budget",
+        [summaryNo0107.count, requests.length - providerTrips, providerSum + 1 <= 0.5 * WORKERS_SUBREQUEST_BUDGET], [HELD_MAX_SCANNED, 1, true]);
     }
 
     /* ---------------- (vi) the keyset URL ---------------- */

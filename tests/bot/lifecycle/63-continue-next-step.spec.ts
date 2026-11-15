@@ -33,7 +33,10 @@
  *   (g)  a revision visit: Continue is ready (href to the continue address)
  *        and moves on at once; the badge and Continue show together;
  *   (h)  refusals: from not a step, lp not a uuid, another organisation's path;
- *   (i)  staff: an admin's Continue skips the wait and writes no row;
+ *   (i)  a preview has no Continue (ADR 0024 P2-5): an admin's ?mode=preview
+ *        launch of step 1, with and without ?lp=, shows "Preview: not an
+ *        official record" and no Continue, and holds one preview row with no
+ *        path tag (the continue page's staff branch is deleted);
  *   (j)  widths and a 120-character title: Exit, Revision Mode and Continue
  *        visible and never overlapping at 320, 390, 640, 768 and 1280 px; the
  *        bar about 41 px high below sm and 49 px from sm;
@@ -549,13 +552,37 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     expect(redirectedExactly(foreign, `/${slug()}/dashboard`), describe(foreign)).toBe(true);
   });
 
-  test("(i) staff: an admin's Continue skips the wait and writes no row", async () => {
-    const r = await noFollow(s.previewCtx!.request, continueUrl(s.c1!));
-    expectPrompt(r);
-    expect(redirectedExactly(r, launchUrl(s.c2!)), describe(r)).toBe(true);
-    const { data, error } = await svc().from("course_attempts").select("id").eq("user_id", s.previewer!.id);
-    expect(error).toBeNull();
-    expect((data ?? []).length, "the continue address wrote no attempt").toBe(0);
+  test("(i) a preview has no Continue: the bar reads Preview, no continue-next, one preview row with no path tag", async () => {
+    // The admin is on no path and holds no assignment: a preview needs neither
+    // (ADR 0024 P2-5, the access bypass is canViewReports(role) and the mode).
+    // A step's Preview link carries no ?lp= (step 23); the second launch adds
+    // one anyway, and a preview still ignores it: no Continue, no path tag.
+    const previewUrl = `/${slug()}/courses/${s.c1}/launch?mode=preview`;
+    for (const url of [previewUrl, `${previewUrl}&lp=${s.pathId}`]) {
+      const page = await launchPage(s.previewCtx!, url);
+      const html = (await page.content()).replace(/<!-- -->/g, "");
+      expect(html, `${url}: the preview's bar`).toContain("Preview: not an official record");
+      expect(html, `${url}: the preview badge`).toContain('data-testid="preview-badge"');
+      expect(html, `${url}: no Continue`).not.toContain('data-testid="continue-next"');
+      expect(html, `${url}: no Revision Mode badge`).not.toContain('data-testid="practice-badge"');
+      await page.close();
+    }
+    const { data, error } = await svc()
+      .from("course_attempts")
+      .select("id, course_version_id, context_kind, preview_kind, is_preview, launch_mode, learning_path_id, status")
+      .eq("user_id", s.previewer!.id);
+    expect(error, `attempts read: ${error?.message}`).toBeNull();
+    const rows = (data ?? []) as Array<Record<string, unknown>>;
+    expect(rows.length, "one preview row, resumed by the second launch").toBe(1);
+    expect(rows[0]).toMatchObject({
+      course_version_id: s.v1,
+      context_kind: "preview",
+      preview_kind: "course",
+      is_preview: true,
+      launch_mode: "Normal",
+      learning_path_id: null,
+      status: "in_progress",
+    });
   });
 
   test("(j) widths and the 120-character title: Exit, Revision Mode and Continue visible and apart; a thinner bar below sm", async () => {

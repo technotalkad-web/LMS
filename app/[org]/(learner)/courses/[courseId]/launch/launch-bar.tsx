@@ -46,6 +46,10 @@ import {
  * - Below `sm` the bar is thinner (`py-0.5`, 36 px controls) so the module
  *   gets the room; from `sm` it is unchanged (`sm:py-1`, 40 px controls).
  * - `children` sits in the centre beside the badge (the SCORM sync status).
+ * - A Preview by mode (ADR 0024 step 23, P2-5 item 3) reads "Preview: not an
+ *   official record" in the centre (`data-testid="preview-badge"`, only under
+ *   `preview`). It has no Continue: the launch page gives a preview no
+ *   `continueHref`, and the bar renders none under `preview` either.
  */
 export function LaunchBar({
   backHref,
@@ -53,7 +57,8 @@ export function LaunchBar({
   title,
   showTitle,
   revision,
-  continueHref,
+  preview = false,
+  continueHref: continueHrefIn,
   continueReady,
   continueStatusHref,
   continuePoll,
@@ -65,8 +70,10 @@ export function LaunchBar({
   title: string;
   showTitle: boolean;
   revision: boolean;
+  /** A Preview by mode: the preview line, and never a Continue. */
+  preview?: boolean;
   continueHref: string | null;
-  /** The official result is already stored (or the launch is a preview): Continue starts active. */
+  /** The official result is already stored: Continue starts active. */
   continueReady: boolean;
   /** The status route the bar asks while it waits; null on a launch that is not a path launch. */
   continueStatusHref: string | null;
@@ -76,6 +83,7 @@ export function LaunchBar({
   continueRecheck?: number;
   children?: ReactNode;
 }) {
+  const continueHref = preview ? null : continueHrefIn;
   const { ready, check } = useContinueReady({
     statusHref: continueHref ? continueStatusHref : null,
     initialReady: continueReady,
@@ -135,6 +143,15 @@ export function LaunchBar({
             data-testid="practice-badge"
           >
             Revision Mode
+          </span>
+        )}
+        {preview && (
+          <span
+            className="truncate min-w-0 px-2 py-0.5 rounded-full border border-sky-300/60 bg-sky-400/15 text-sky-200 text-xs font-semibold"
+            title="A preview: nothing here counts as a learner's result"
+            data-testid="preview-badge"
+          >
+            Preview: not an official record
           </span>
         )}
         {children}

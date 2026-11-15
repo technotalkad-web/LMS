@@ -10,8 +10,10 @@ import {
   List as ListIcon,
   Award,
   AlertTriangle,
+  Eye,
 } from "lucide-react";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { canViewReports } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
 import { isReleased } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
@@ -73,7 +75,11 @@ export default async function LearningPathDetailPage({
   const sp = await searchParams;
   const continueBanner: "failed" | "saving" | "end" | null =
     sp.failed === "1" ? "failed" : sp.saving === "1" ? "saving" : sp.end === "1" ? "end" : null;
-  const { user, org } = await requireOrgAccess(orgSlug);
+  const { user, org, role } = await requireOrgAccess(orgSlug);
+  // ADR 0024 step 23 ("Buttons"): each step offers the report-viewing roles
+  // a Preview beside Start. It opens the course outside this path (no
+  // ?lp=), so it has no Continue and leaves the path's record alone.
+  const canPreview = canViewReports(role);
   const supabase = await createClient();
 
   // 1) Path metadata (must be active).
@@ -458,6 +464,7 @@ export default async function LearningPathDetailPage({
                   inProgress={inProgressCourseIds.has(s.course_id)}
                   score={scoreByCourse.get(s.course_id) ?? null}
                   pathId={pathId}
+                  canPreview={canPreview}
                 />
               ))}
             </div>
@@ -491,6 +498,7 @@ function StepCard({
   inProgress,
   score,
   pathId,
+  canPreview,
 }: {
   step: StepView;
   isLast: boolean;
@@ -498,6 +506,8 @@ function StepCard({
   inProgress: boolean;
   score: number | null;
   pathId: string;
+  /** canViewReports(role): the step offers a Preview (ADR 0024 step 23). */
+  canPreview: boolean;
 }) {
   void isLast;
   const isCompleted = step.state === "completed";
@@ -630,6 +640,18 @@ function StepCard({
             >
               <PlayCircle className="w-4 h-4" />
               {inProgress ? "Resume" : "Launch"}
+            </Link>
+          )}
+          {/* Any step, locked or not: a preview runs outside the path's
+              order and release dates (ADR 0024 step 22's preview row). */}
+          {canPreview && (
+            <Link
+              href={`/${orgSlug}/courses/${step.course_id}/launch?mode=preview`}
+              data-testid="step-preview"
+              title="Opens this course on its own as a preview: not an official record, and not part of this path"
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 bg-paper border border-line hover:border-ink text-muted hover:text-ink px-4 py-1.5 rounded-lg text-xs font-medium transition-colors"
+            >
+              <Eye className="w-3.5 h-3.5" /> Preview
             </Link>
           )}
         </div>

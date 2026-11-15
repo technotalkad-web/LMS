@@ -2187,3 +2187,19 @@ The round 3 days per phase, before any addition (the Days column of step 72's ta
   **5. F1 and F2**
 
   Neither blocks phase 2. F1's `SCORM_LATCH_FROM` is set in phase 3's last commit and confirmed before phase 3 is built; F2 was built in phase 1.
+
+- **Note 2026-11-15 (P2-5: the preview launch's measured subrequest count).** The count P2-5's gate asks for ("A preview launch's subrequest count is measured and recorded"), and the hold sweep's cost of item 5b. Counts only; no decision of this record changes.
+
+  **How it was measured.** `tests/unit/alds-launch.test.ts` section 8 renders the real launch page under a stubbed `fetch` (only `next/headers` is stubbed; a redirect is caught) and counts every PostgREST and auth request the page makes, one course with one active package. It was not measured by a meter on a local production build, and the middleware and the learner layout are not in it; their figures are ADR 0019's estimates (middleware 1, learner layout about 12), added as step 70 adds them.
+
+  | Branch | Requests in the page | With ADR 0019's estimates |
+  |---|---|---|
+  | First cmi5 preview, `ALDS_P4` off | 16 (`requireOrgAccess` 4, course 1, packages 1, routing 6, row 3, launch token 1) | about 29 |
+  | Resumed preview | 14 | about 27 |
+  | First SCORM preview | 15 (no launch token) | about 28 |
+  | First cmi5 preview, `ALDS_P4` on | 19 (with the manifest read, LaunchData and the session) | about 32 |
+  | Refused preview (a plain user, a run, both product parameters) and an impersonating Start | `requireOrgAccess` only, then the redirect; no attempts read and no write | — |
+
+  Not measured: the saved-language read (+1 with two or more active packages and no `?lang=`); the 23505 retry of the preview insert (+2 to +4); the token expiry after an N4 close of a `legacy_role` row (+1); a preview's close on a deactivated slot (the grant re-check, the close, the token expiry). Every measured branch is under 40, P2-6's gate figure; P2-6 measures its own launch.
+
+  **The hold sweep (item 5b).** `heldWebhookPage` and `classifyAttempt`'s list drop previews through one decision per run, so a database without 0107 pays one failed read per run, not one per row (`tests/unit/webhook-hold-route.test.ts` (v), with its stub's no-0107 mode). A whole cron request at the caps: 34 subrequests with 0107; 35 with 0103 and without 0107 (production's shape until the sitting); 41 on a database without 0103, which has no 0107 either. That last figure is one over the 0.8 rule of `lib/integrations/webhook-hold.ts` and within the budget of 50; no environment runs without 0103. The Attention Center's provider at its cap makes one read more without 0107 (23 by the rule, under its half).

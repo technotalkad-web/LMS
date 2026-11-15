@@ -7,6 +7,7 @@ import type { ContentScopes } from "@/lib/content/scopes";
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type {
   PathRow,
@@ -864,6 +865,20 @@ export function LearningPathsClient({
                                 {s.title}
                               </span>
                               <span className="flex items-center gap-1">
+                                {/* ADR 0024 step 23: the step's course on its own, as a
+                                    preview (?mode=preview, no ?lp=): not an official
+                                    record and outside this path. A new tab keeps the
+                                    editor open. */}
+                                <Link
+                                  href={`/${orgSlug}/courses/${s.course_id}/launch?mode=preview`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  data-testid="path-editor-preview"
+                                  title="Preview this course in a new tab: not an official record, and outside this path"
+                                  className="text-xs px-2 py-0.5 border border-line rounded hover:border-ink mr-1"
+                                >
+                                  Preview
+                                </Link>
                                 <label className="flex items-center gap-1 text-[11px] text-muted mr-1">
                                   Releases
                                   <input

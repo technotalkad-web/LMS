@@ -1,21 +1,27 @@
 /**
  * Unit test for the per-version restart rules (ADR 0008 decision A, steps
  * 1–4): the reason bound, the 409 refusals, grant-retake exclusion and the
- * learner/staff role classes.
+ * two classes of the dry run's by_role. Since ADR 0024 step 23 (P2-5 item 4)
+ * a row is "staff" when it is a Preview (`context_kind = 'preview'`, read by
+ * the route through the context filter) and "learner" otherwise, a staff
+ * member's real attempt included; the member's role no longer decides. The
+ * route's read itself is pinned at the end by a source scan.
  *
  * Run:  npx tsx tests/unit/version-restart.test.ts   (or npm run test:unit)
  * (No DB.)
  */
+import fs from "node:fs";
+import path from "node:path";
 import {
   RESTART_REASON_MAX,
   byRoleClass,
-  isStaffRole,
-  memberKey,
   parseDryRun,
   parseRestartReason,
   planRestart,
+  previewIdsOf,
   restartRefusal,
 } from "../../lib/attempts/restart";
+import * as restart from "../../lib/attempts/restart";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -58,40 +64,64 @@ eq("failed → 409 version_not_ready (even on an inactive package)",
 eq("refusals are 409",
   restartRefusal({ versionId: V, uploadStatus: "ready", packageCurrentVersionId: V, packageActive: true })?.status, 409);
 
-console.log("\nrole classes (step 4; ADR 0003 step 10)");
-eq("super_owner is staff", isStaffRole("super_owner"), true);
-eq("admin is staff", isStaffRole("admin"), true);
-eq("data_analyst is staff", isStaffRole("data_analyst"), true);
-eq("user is a learner", isStaffRole("user"), false);
-eq("member (legacy) is a learner", isStaffRole("member"), false);
-eq("owner (legacy) is a learner, as in the 0098 guard", isStaffRole("owner"), false);
-eq("no membership is a learner", isStaffRole(null), false);
+console.log("\nclasses by context (step 4; ADR 0024 step 23)");
+// The route keeps the selected ids its context-filtered read answers (the
+// rows whose context_kind is not 'preview'); every other selected id is a Preview.
+eq("ids the filtered read did not keep are Previews", [...previewIdsOf(["a1", "a2", "a3"], ["a1", "a3"])], ["a2"]);
+eq("a database without 0107 keeps every id: no preview split", [...previewIdsOf(["a1", "a2"], ["a1", "a2"])], []);
+eq("an id kept but not selected adds nothing", [...previewIdsOf(["a1"], ["a1", "zz"])], []);
+eq("nothing selected → no Preview", [...previewIdsOf([], ["a1"])], []);
+eq("the role helpers are gone: no export decides by the member's role",
+  ["STAFF_ROLES", "isStaffRole", "memberKey"].filter((n) => n in restart), []);
 
 console.log("\nselection (step 3)");
 const O = "org-1";
 const att = (id: string, user: string, org = O) => ({ id, user_id: user, organization_id: org });
-const staff = new Set([memberKey(O, "u-admin")]);
+// a2 is the admin's Preview; a5 is the same admin's real attempt (a Start).
+const previews = new Set(["a2"]);
 {
   const p = planRestart(
     [att("a3", "u-learner3"), att("a1", "u-learner1"), att("a2", "u-admin"), att("a4", "u-retake"), att("a1", "u-learner1")],
     new Set(["a4"]),
-    staff
+    previews
   );
   eq("grant retake excluded, others selected, sorted, de-duplicated", p.attemptIds, ["a1", "a2", "a3"]);
   eq("excluded grant retake ids", p.excludedGrantRetakeIds, ["a4"]);
-  eq("by role", p.byRole, { learner: 2, staff: 1 });
+  eq("by role: the Preview is staff, the rest learners", p.byRole, { learner: 2, staff: 1 });
   eq("selected rows carry user + org", p.selected.map((a) => a.user_id), ["u-learner1", "u-admin", "u-learner3"]);
 }
 {
-  const p = planRestart([], new Set(["zzz"]), staff);
+  const p = planRestart([att("a2", "u-admin"), att("a5", "u-admin")], new Set(), previews);
+  eq("a staff member's real attempt is a learner's; only their Preview is staff", p.byRole, { learner: 1, staff: 1 });
+}
+{
+  const p = planRestart([att("a2", "u-admin"), att("a5", "u-admin")], new Set(), previewIdsOf(["a2", "a5"], ["a2", "a5"]));
+  eq("without 0107 (every id kept) the admin's rows are both learners'", p.byRole, { learner: 2, staff: 0 });
+}
+{
+  const p = planRestart([], new Set(["zzz"]), previews);
   eq("nothing in progress → empty plan", [p.attemptIds, p.excludedGrantRetakeIds, p.byRole], [[], [], { learner: 0, staff: 0 }]);
 }
 {
-  const p = planRestart([att("a1", "u1")], new Set(["a1"]), staff);
+  const p = planRestart([att("a1", "u1")], new Set(["a1"]), previews);
   eq("only a grant retake → nothing selected", [p.attemptIds, p.excludedGrantRetakeIds], [[], ["a1"]]);
 }
-eq("staff judged in the attempt's organisation",
-  byRoleClass([att("a1", "u-admin", "org-2")], staff), { learner: 1, staff: 0 });
+eq("a Preview is told by its id, whatever its organisation or user",
+  byRoleClass([att("a2", "u-learner", "org-2"), att("a9", "u-admin")], previews), { learner: 1, staff: 1 });
+
+console.log("\nthe route's read (source scan)");
+{
+  const ROUTE = "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts";
+  const src = fs.readFileSync(path.join(__dirname, "../..", ROUTE), "utf8");
+  eq("no membership read and no role test", [src.includes('from("organization_members")'), /isStaffRole|memberKey|\.role\b/.test(src)], [false, false]);
+  eq("one decision for every chunk, declared once, fresh", (src.match(/const previews: ContextFilterState = \{ applies: null \};/g) ?? []).length, 1);
+  eq("the Preview read: the selected ids, through readWithContextFilter over withoutPreviews",
+    /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(svc\.from\("course_attempts"\)\.select\("id"\)\.in\("id", ids\.slice\(i, i \+ 150\)\), apply\)\s*\)/.test(src), true);
+  eq("a failed read answers 503 and restarts nothing (it comes before the dry run's answer and every write)",
+    /if \(keptErr\) \{[\s\S]*?status: 503[\s\S]*?\}/.test(src) && src.indexOf("if (keptErr)") < src.indexOf("if (dryRun)") && src.indexOf("if (keptErr)") < src.indexOf('.update({ status: "abandoned" })'), true);
+  eq("the plan and the real run's by_role both use the Preview ids",
+    [/planRestart\(inProgress, grantRetakeIds, previewIds\)/.test(src), /byRoleClass\(plan\.selected\.filter\(\(a\) => restartedSet\.has\(a\.id\)\), previewIds\)/.test(src)], [true, true]);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

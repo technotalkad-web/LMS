@@ -334,8 +334,12 @@ console.log("\nthe learner course page (source check; no React rig)");
     /const history = officialHistory\(attempts, snapshot\?\.rows \?\? \[\]\);\s*const retakeState = officialRetakeState\(history\);/.test(src), true);
   // (5) step 11 (1): one rule for the page and the route
   const canReq = between("const canRequestAttempt =", ";");
-  eq("(5) canRequestAttempt names historyUnavailable and calls requestDecision(…) === \"ok\"",
-    /!isAdmin &&\s*!historyUnavailable &&\s*requestDecision\(\{ scoring, attempts \}\) === "ok" &&\s*\(attemptRequestState === "none" \|\| attemptRequestState === "rejected"\)/.test(canReq), true);
+  // ADR 0024 step 23 (P2-5 item 4): the button follows the attempt's context,
+  // not the role, so the expression names no role (the page's attempts read
+  // drops previews; tests/unit/preview-mode-sites.test.ts (d)).
+  eq("(5) canRequestAttempt names historyUnavailable and calls requestDecision(…) === \"ok\", and no role",
+    /=\s*!historyUnavailable &&\s*requestDecision\(\{ scoring, attempts \}\) === "ok" &&\s*\(attemptRequestState === "none" \|\| attemptRequestState === "rejected"\)/.test(canReq) &&
+      !/\b(isAdmin|role|canManage|canViewReports)\b/.test(canReq), true);
   eq("…officialFailed is gone (a pass is not a refusal)", /\bofficialFailed\b/.test(src), false);
   eq("…the standing result is resultStands(scoring, passRequired) and reaches the modal",
     /resultStands\(scoring, passRequired\)/.test(src) && /<RequestAttemptButton orgSlug=\{orgSlug\} courseId=\{c\.id\} standingResult=\{standingResult\} \/>/.test(src), true);

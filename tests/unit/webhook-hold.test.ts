@@ -12,7 +12,12 @@
  *         with the real classifyAttempt (step 9 (iii)), and classifyAttempt
  *         itself with its versions read failing;
  *   (iv)  WEBHOOK_HOLD_SWEEP_FROM's format, and that it is not in the future;
- *   (v)   the caps never exceed ADR 0015's ceilings.
+ *   (v)   the caps never exceed ADR 0015's ceilings;
+ *   (vi)  ADR 0024 P2-5 item 5b: a completed cmi5 Preview is never selected by
+ *         the sweep or the provider (a fake that honours the preview filter),
+ *         one decision of the filter per run shared by its pages and every
+ *         classify, and on a database without 0107 one failed read per run,
+ *         then today's selection.
  * No DB: the recording fake of failed-uploads.test.ts (with `or` and `gte`
  * recorded too) stands in for supabase-js; fire and classify are injected.
  * The budget rule itself is asserted where the per-row costs are measured,
@@ -690,6 +695,112 @@ async function main() {
     eq("HELD_MAX_COUNT <= 200", HELD_MAX_COUNT <= 200, true);
     eq("HELD_MAX_SCANNED <= 1000", HELD_MAX_SCANNED <= 1000, true);
     eq("HELD_PAGE_SIZE <= 200", HELD_PAGE_SIZE <= 200, true);
+  }
+
+  /* ---------------- (vi) a Preview is never selected ---------------- */
+  console.log("\n(vi) a Preview is never selected (ADR 0024 P2-5 item 5b)");
+  {
+    type Held = Row & { context_kind?: string };
+    const NO_CONTEXT_COLUMN = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+    const isPreviewFilter = (args: unknown[]) => args[0] === "context_kind" && args[1] === "preview";
+    const filtered = (q: Query | undefined) => all(q, "neq").some(isPreviewFilter);
+    /** Serves the rows in order (each request at its recorded limit, after the keyset's last id), honouring the preview filter; without 0107 a filtered select answers 42703. */
+    const previewAware = (rows: Held[], o: { no0107?: boolean } = {}): Responder => (q) => {
+      if (filtered(q) && o.no0107) return { error: NO_CONTEXT_COLUMN };
+      const keyset = all(q, "or")[1]?.[0];
+      const afterId = typeof keyset === "string" ? /id\.lt\."([^"]+)"/.exec(keyset)?.[1] : undefined;
+      const from = afterId ? rows.findIndex((r) => r.id === afterId) + 1 : 0;
+      const limit = Number(arg(q, "limit")?.[0] ?? rows.length);
+      const visible = rows.slice(from).filter((r) => !filtered(q) || r.context_kind !== "preview");
+      return { data: visible.slice(0, limit).map((r) => ({ id: r.id, completed_at: r.completed_at, course_versions: { manifest_type: "cmi5" } })) };
+    };
+    const o1: Held = { ...row("o1", "2026-11-04T11:30:00.000Z"), context_kind: "individual" };
+    const pv: Held = { ...row("pv", "2026-11-04T11:20:00.000Z"), context_kind: "preview" };
+    const o2: Held = { ...row("o2", "2026-11-04T11:10:00.000Z"), context_kind: "path" };
+    /** classify that records the state each call was handed. */
+    const stateDeps = () => {
+      const states: unknown[] = [];
+      const rec = recordingDeps({ o1: OFFICIAL(1), pv: OFFICIAL(1), o2: OFFICIAL(1) });
+      const deps: SweepDeps = {
+        ...rec.deps,
+        classify: async (svc, id, previews) => {
+          states.push(previews);
+          return rec.deps.classify(svc, id);
+        },
+      };
+      return { deps, states, classified: rec.classified, fires: rec.fires };
+    };
+
+    {
+      const { client, queries } = fakeClient(previewAware([o1, pv, o2]));
+      const { deps, classified, fires, states } = stateDeps();
+      const { value: res } = await captureWarn(() => sweepHeldWebhooks(client, deps, BIG));
+      eq("the sweep: a completed cmi5 Preview between two held official rows is never classified or fired", [classified, fires.map(([id]) => id)], [["o1", "o2"], ["o1", "o2"]]);
+      eq("…the result names it nowhere", [res.scanned, res.fired, res.skipped, res.unfired], [2, ["o1", "o2"], [], []]);
+      eq("…the selection carries neq context_kind preview beside neq status abandoned", all(queries[0], "neq"), [["status", "abandoned"], ["context_kind", "preview"]]);
+      eq("…every classify is handed the run's one decision, decided by the page (the filter applies)",
+        [states.every((s) => s === states[0]), (states[0] as { applies: boolean | null })?.applies], [true, true]);
+    }
+    {
+      const { client, queries } = fakeClient(previewAware([o1, pv, o2]));
+      const { deps, classified } = stateDeps();
+      await captureWarn(() => sweepHeldWebhooks(client, deps, { pageSize: 1, maxFires: 10, maxScanned: 10 }));
+      eq("{pageSize 1}: every page carries the filter, and the Preview is never on one", [queries.map(filtered), classified], [[true, true, true], ["o1", "o2"]]);
+    }
+    {
+      const { client, queries } = fakeClient(previewAware([o1, pv, o2]));
+      const { deps, classified } = stateDeps();
+      const s = await heldWebhookSummary(client, "org-1", { classify: deps.classify, now: deps.now }, { maxScanned: 10 });
+      eq("the provider: the Preview is never classified nor counted", [classified, s.count, s.oldestCompletedAt], [["o1", "o2"], 2, o2.completed_at]);
+      eq("…its selection carries the filter", filtered(queries[0]), true);
+    }
+    {
+      // A database without 0107: no Preview by mode can exist there, and the run reads today's selection after one failed read.
+      const { client, queries } = fakeClient(previewAware([o1, o2], { no0107: true }));
+      const { deps, classified, states } = stateDeps();
+      const { value: res } = await captureWarn(() => sweepHeldWebhooks(client, deps, { pageSize: 1, maxFires: 10, maxScanned: 10 }));
+      eq("without 0107: the first select answers 42703 and is made once more without the filter; every later page is unfiltered",
+        queries.map(filtered), [true, false, false, false]);
+      eq("…one failed read for the whole run, then today's rows", [res.error, classified], [undefined, ["o1", "o2"]]);
+      eq("…every classify is handed the same decision: the filter does not apply",
+        [states.every((s) => s === states[0]), (states[0] as { applies: boolean | null })?.applies], [true, false]);
+    }
+    {
+      const { client, queries } = fakeClient(previewAware([o1, o2], { no0107: true }));
+      const { deps } = stateDeps();
+      const s = await heldWebhookSummary(client, "org-1", { classify: deps.classify, now: deps.now }, { maxScanned: 10 });
+      eq("the provider without 0107: one failed read, then today's count", [queries.map(filtered), s.count, s.error], [[true, false], 2, null]);
+    }
+    {
+      // No state passed: each call decides afresh (no decision outlives its call).
+      const { client, queries } = fakeClient(previewAware([o1], { no0107: true }));
+      await heldWebhookPage(client, { olderThanIso: SWEEP_LT });
+      await heldWebhookPage(client, { olderThanIso: SWEEP_LT });
+      eq("heldWebhookPage without a state: each call tries the filter first", queries.map(filtered), [true, false, true, false]);
+      const other = fakeClient(() => ({ error: { code: "57014", message: "canceling statement due to statement timeout" } }));
+      const failed = await heldWebhookPage(other.client, { olderThanIso: SWEEP_LT });
+      eq("…any other error is returned as it is, never retried without the filter", [failed, other.queries.length], [{ rows: [], error: "canceling statement due to statement timeout" }, 1]);
+    }
+    {
+      // The real classifyAttempt, as the cron route and the Attention collector pass it: its list read carries the run's decision.
+      const listQueries: Query[] = [];
+      const { client } = fakeClient((q) => {
+        if (q.table === "course_versions") return { data: [{ id: "v1" }] };
+        if (q.table === "course_attempts" && String(arg(q, "select")?.[0] ?? "").includes("course_versions!inner(manifest_type)")) return previewAware([o1, pv])(q);
+        if (q.table === "course_attempts" && arg(q, "eq", "id")) {
+          return { data: { id: "o1", user_id: "u1", organization_id: "o1", course_version_id: "v1", course_versions: { course_id: "c1" }, is_revision: false } };
+        }
+        if (q.table === "course_attempts" && arg(q, "eq", "user_id")) {
+          listQueries.push(q);
+          return { data: [{ id: "o1", score: 0.8, started_at: "2026-11-03T00:00:00.000Z", completed_at: o1.completed_at, completion_status: "completed", success_status: "unknown", status: "completed", is_revision: false }] };
+        }
+        return { data: [] };
+      });
+      const fires: Array<[string, number | null]> = [];
+      const res = (await captureWarn(() => sweepHeldWebhooks(client, { classify: classifyAttempt, fire: async (id, n) => { fires.push([id, n]); return true; } }, BIG))).value;
+      eq("the real classifyAttempt in the sweep: the Preview is not selected, the official row fires as number 1", [res.fired, fires], [["o1"], [["o1", 1]]]);
+      eq("…its list read carries the preview filter", listQueries.map(filtered), [true]);
+    }
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

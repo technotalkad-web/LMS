@@ -14,11 +14,13 @@
  *   - the title renders only under `showTitle`, capped and truncated;
  *   - the launch page computes continueHref from pathContextId and
  *     !journeyParam, and showTitle from isKivoStamped, for both runtimes;
- *   - the continue page decides staff through launchModeFor, reads
- *     pass_required and the grants strictly (never through the fail-soft
- *     helpers), ends the wait only on a stored result whose verdict is not
- *     pending (officialResultStored), uses no service client and writes
- *     nothing.
+ *   - the continue page reads pass_required and the grants strictly (never
+ *     through the fail-soft helpers), ends the wait only on a stored result
+ *     whose verdict is not pending (officialResultStored), uses no service
+ *     client and writes nothing. Its staff test is gone (ADR 0024 P2-5 item
+ *     4: a preview carries no ?lp=, so it never reaches the continue
+ *     address); tests/unit/preview-mode-sites.test.ts holds that it has no
+ *     staff branch.
  *
  * ADR 0019, note of 2026-11-11 (Continue waits for the stored result):
  *   - the bar renders Continue in two states, `data-state="waiting"` (no
@@ -32,8 +34,14 @@
  *     continueRecheck only after a commit the server answered ok with a
  *     terminal status that differs from the last one checked;
  *   - the launch page computes continueReady through officialResultStored
- *     (never on the launch that has just opened a granted retake) and
- *     continueStatusHref from attemptId, for both runtimes;
+ *     (never on the launch that has just opened a granted retake; no preview
+ *     term since ADR 0024 P2-5) and continueStatusHref from attemptId, for
+ *     both runtimes;
+ *
+ * ADR 0024 step 23 (P2-5 item 3): a Preview by mode's bar reads "Preview:
+ * not an official record" (`data-testid="preview-badge"`, only under
+ * `preview`) and has no Continue; both runtimes pass `preview` through, and
+ * the launch page passes launch.isPreview.
  *   - the status route: a uuid check before any read, the caller's cookie
  *     client, no service role, no write, the continue page's strict reads,
  *     officialResultStored once, Cache-Control: no-store.
@@ -79,6 +87,7 @@ for (const f of [CMI5, SCORM]) {
   eq(`${f}: the iframe keeps title={courseTitle} (screen readers)`, /<iframe[\s\S]*?title=\{courseTitle\}/.test(src), true);
   eq(`${f}: showTitle defaults to true and continueHref to null`, [/showTitle = true,/.test(src), /continueHref = null,/.test(src)], [true, true]);
   eq(`${f}: continueReady defaults to false (the safe default) and continueStatusHref to null`, [/continueReady = false,/.test(src), /continueStatusHref = null,/.test(src)], [true, true]);
+  eq(`${f}: preview defaults to false and is passed to the bar once (ADR 0024 P2-5)`, [/preview = false,/.test(src), count(src, "preview={preview}")], [true, 1]);
   eq(`${f}: passes the bar continueReady and continueStatusHref, once each`, [
     count(src, "continueReady={continueReady}"),
     count(src, "continueStatusHref={continueStatusHref}"),
@@ -219,6 +228,16 @@ console.log("\nthe bar (step 6)");
   eq("…hidden below sm, truncated and capped at 28vw", ["hidden", "sm:inline", "truncate", "min-w-0", "max-w-[28vw]"].map((c) => (title?.[1] ?? "").split(/\s+/).includes(c)), [true, true, true, true, true]);
   eq("…inside a left cell that clips (min-w-0 overflow-hidden)", /<div className="flex items-center gap-2 min-w-0 overflow-hidden">\s*<Link/.test(src), true);
   eq("the centre cell holds the badge and the children", /<div className="flex items-center justify-center gap-2 min-w-0">\s*\{revision && \([\s\S]*?\)\}\s*\{children\}\s*<\/div>/.test(src), true);
+  // ADR 0024 step 23 (P2-5 item 3): the preview line, and no Continue on a preview.
+  eq("preview-badge: exactly one, reading \"Preview: not an official record\", only under `preview`, in the centre beside the revision badge", [
+    count(src, 'data-testid="preview-badge"'),
+    /\{preview && \(\s*<span[^>]*data-testid="preview-badge"\s*>\s*Preview: not an official record\s*<\/span>\s*\)\}/.test(src),
+    /data-testid="practice-badge"[\s\S]*?<\/span>\s*\)\}\s*\{preview && \(/.test(src),
+  ], [1, true, true]);
+  eq("…preview is optional and false by default", /preview = false,/.test(src) && /preview\?: boolean;/.test(src), true);
+  eq("a preview has no Continue: the bar reads continueHref as null under `preview`, so neither the button, the status region nor the status check exists",
+    [/continueHref: continueHrefIn,/.test(src), /const continueHref = preview \? null : continueHrefIn;/.test(src),
+      src.indexOf("const continueHref = preview ? null : continueHrefIn;") < src.indexOf("useContinueReady({")], [true, true, true]);
 }
 
 console.log("\nthe launch page's two props (step 8)");
@@ -240,8 +259,11 @@ console.log("\nthe launch page's two props (step 8)");
     /\.from\("courses"\)\s*\.select\("id, organization_id, current_version_id, title, is_active, pass_required"\)/.test(src),
     /const passRequired = c\.pass_required === true;/.test(src),
   ], [true, true]);
-  eq("continueReady: a path launch, and a preview or (no grant opened on this launch and) the page's own scoring reads the result stored through officialResultStored",
-    /const continueReady =\s*continueHref !== null &&\s*\(launch\.isPreview \|\|\s*\(openedGrantId === null && ev\.scoring !== null && officialResultStored\(ev\.scoring, ev\.my, passRequired\)\)\);/.test(src), true);
+  eq("continueReady: a path launch, no grant opened on this launch, and the page's own scoring reads the result stored through officialResultStored (no preview term: a preview has no Continue, ADR 0024 P2-5)",
+    /const continueReady =\s*continueHref !== null &&\s*openedGrantId === null &&\s*ev\.scoring !== null &&\s*officialResultStored\(ev\.scoring, ev\.my, passRequired\);/.test(src), true);
+  eq("…and no isPreview anywhere in it", /const continueReady =[^;]*isPreview/.test(src), false);
+  eq("a preview carries no ?lp= (read as none), so its continueHref is null", /const lpParam = preview \? undefined : lpRaw;/.test(src), true);
+  eq("both runtimes get preview={launch.isPreview}", count(src, "preview={launch.isPreview}"), 2);
   eq("…officialResultStored imported from lib/learner/continue, called once", [
     /import \{ officialResultStored \} from "@\/lib\/learner\/continue";/.test(src),
     count(src, "officialResultStored("),
@@ -259,7 +281,6 @@ console.log("\nthe launch page's two props (step 8)");
 console.log("\nthe continue page (steps 1 and 2)");
 {
   const src = code(CONTINUE_PAGE);
-  eq("isStaff from launchModeFor, the launch page's own preview test", /const isStaff = launchModeFor\(\{ role, revision: false \}\)\.isPreview;/.test(src), true);
   eq("reads pass_required strictly from courses", /\.from\("courses"\)\s*\.select\("pass_required"\)\s*\.eq\("id", fromCourseId\)\s*\.maybeSingle\(\);\s*if \(courseErr \|\| !courseRow\) readError\(\);/.test(src), true);
   eq("…and the grants from attempt_requests, strictly", /\.from\("attempt_requests"\)\s*\.select\("used_attempt_id"\)[\s\S]*?if \(grantErr\) readError\(\);/.test(src), true);
   eq("…never through the fail-soft helpers", [src.includes("fetchPassRequired("), src.includes("fetchGrantRetakeIds(")], [false, false]);
@@ -322,7 +343,8 @@ console.log("\nthe status route (ADR 0019, note of 2026-11-11)");
     /if \(verErr \|\| versionIds\.length === 0\) return unreadable\(\);/.test(src),
     /\.from\("attempt_requests"\)\s*\.select\("used_attempt_id"\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("course_id", courseId\)\s*\.eq\("status", "approved"\)\s*\.not\("used_attempt_id", "is", null\);\s*if \(grantErr\) return unreadable\(\);/.test(src),
     /const policy = await resolvePolicy\(supabase, courseId\);/.test(src),
-    /readWithOptionalColumn<unknown\[\]>\(\s*"is_revision",[\s\S]*?\.eq\("user_id", user\.id\)\s*\.in\("course_version_id", versionIds\),\s*ATTEMPT_COLUMNS\s*\);\s*if \(rowsErr\) return unreadable\(\);/.test(src),
+    // ADR 0024 P2-5 item 5b: the list drops previews through the one fallback.
+    /readWithOptionalColumn<unknown\[\]>\(\s*"is_revision",[\s\S]*?readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\([\s\S]*?\.eq\("user_id", user\.id\)\s*\.in\("course_version_id", versionIds\),\s*apply\s*\)\s*\),\s*ATTEMPT_COLUMNS\s*\);\s*if \(rowsErr\) return unreadable\(\);/.test(src),
   ], [true, true, true, true, true]);
   eq("…never through the fail-soft helpers", [src.includes("fetchPassRequired("), src.includes("fetchGrantRetakeIds(")], [false, false]);
   eq("the answer: officialResultStored, once, over computeScoring of those rows", [

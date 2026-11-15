@@ -9,9 +9,12 @@
  * Everything here runs only behind ALDS_P4 (lib/alds/flag.ts) except
  * isLaunchDataStateId(), which the State route's read-only guard uses
  * unconditionally (cmi5 §10.1: LMS.LaunchData and, from ADR 0014,
- * LMS.OfficialResult are LMS-owned), and launchModeFor(), whose isPreview
+ * LMS.OfficialResult are LMS-owned), launchModeFor(), whose isPreview
  * the launch page also reads outside the flag to decide the revision visit
- * record (ADR 0014 step 3: staff previews record no visit).
+ * record and the bar's preview line (ADR 0014 step 3: a preview records no
+ * visit), and previewAttemptColumns(), the 0100 columns of a Preview by mode
+ * (ADR 0024 step 22, P2-5), which every preview insert names whatever the
+ * flag: 0107's shape check ties is_preview to context_kind = 'preview'.
  *
  * Privacy: the LaunchData document carries ids and the slot language only,
  * never a name or an email.
@@ -38,8 +41,8 @@ import {
   LMS_LAUNCH_DATA_STATE_ID,
   LMS_OFFICIAL_RESULT_STATE_ID,
 } from "@/lib/alds/rpc";
-import { canManage } from "@/lib/auth/permissions";
-import type { OrgRole } from "@/lib/auth/require-org-access";
+/** The launch's `?mode=` parameter as the launch page reads it: `preview`, or none. */
+export type LaunchModeParam = "preview" | null;
 
 /** The LMS-issued AU id of a package (BLUEPRINT §1.2; one AU per package, U7). */
 export function lmsAuActivityId(packageId: string): string {
@@ -47,36 +50,63 @@ export function lmsAuActivityId(packageId: string): string {
 }
 
 /**
- * The launch mode, decided by the row (ADR 0014 step 3, "Row-driven
- * decisions"; replaces previewLaunch): staff launches are previews (ADR
- * 0006 step 17, BLUEPRINT §10.4: the same roles as the 0100 backfill),
- * `Browse`; otherwise a revision visit's row (is_revision) is `Review`;
- * else `Normal`. Every launch from the launch page; there is no
- * learner-view exception. No grading code reads the mode: every gate reads
- * is_revision.
+ * The launch mode, decided by the launch's mode and the row (ADR 0024 step
+ * 23 and P2-5 item 1, the owner's R6 answer of 2026-11-13; ADR 0014 step 3,
+ * "Row-driven decisions"): `?mode=preview` is a preview in `Normal`
+ * (decision A32), so the module behaves as it does for a learner; without
+ * the mode every role is a learner with a real row, and a revision visit's
+ * row (is_revision) is `Review`, else `Normal`. The role decides nothing
+ * here: who may preview is the launch-context resolver's preview row
+ * (canViewReports). No grading code reads the mode: every gate reads
+ * is_revision and context_kind.
  */
-export function launchModeFor(i: { role: OrgRole; revision: boolean }): { isPreview: boolean; launchMode: LaunchMode } {
-  if (canManage(i.role) || i.role === "data_analyst") return { isPreview: true, launchMode: "Browse" };
+export function launchModeFor(i: { mode: LaunchModeParam; revision: boolean }): { isPreview: boolean; launchMode: LaunchMode } {
+  if (i.mode === "preview") return { isPreview: true, launchMode: "Normal" };
   return { isPreview: false, launchMode: i.revision ? "Review" : "Normal" };
 }
 
 /**
- * The three 0100 columns of a launch's attempt row (ADR 0006 note (c); ADR
+ * The three 0100 columns of a Start's attempt row (ADR 0006 note (c); ADR
  * 0014 step 3), for the launch page's insert and for its update after
  * consume_grant opens a retake. Only with ALDS_P4 on: the page calls it
- * under `p4`. The attempt column stores the raw slot language (null when
- * unlabeled), never the LaunchData "und".
+ * under `p4`. A Start is never a preview (ADR 0024 step 23: without the mode
+ * every role is a learner), so is_preview is false and the mode follows the
+ * row; a preview's row names previewAttemptColumns instead. The attempt
+ * column stores the raw slot language (null when unlabeled), never the
+ * LaunchData "und".
  */
-export function p4AttemptColumns(i: { role: OrgRole; revision: boolean; language: string | null | undefined }): {
+export function p4AttemptColumns(i: { revision: boolean; language: string | null | undefined }): {
   served_language: string | null;
   launch_mode: LaunchMode;
   is_preview: boolean;
 } {
-  const mode = launchModeFor({ role: i.role, revision: i.revision });
+  const mode = launchModeFor({ mode: null, revision: i.revision });
   return {
     served_language: attemptServedLanguage(i.language),
     launch_mode: mode.launchMode,
     is_preview: mode.isPreview,
+  };
+}
+
+/**
+ * The 0100 columns of a Preview by mode's row (ADR 0024 step 22's preview
+ * row, P2-5 item 3): is_preview true and launch_mode `Normal` (decision
+ * A32), with the slot language as p4AttemptColumns stores it. Not behind
+ * ALDS_P4: the preview insert also names context_kind = 'preview' and
+ * preview_kind (0107), whose shape check requires is_preview on that row,
+ * and a database with 0107 has 0100. The page names context_kind and
+ * preview_kind on the insert itself.
+ */
+export function previewAttemptColumns(i: { language: string | null | undefined }): {
+  served_language: string | null;
+  launch_mode: LaunchMode;
+  is_preview: true;
+} {
+  const mode = launchModeFor({ mode: "preview", revision: false });
+  return {
+    served_language: attemptServedLanguage(i.language),
+    launch_mode: mode.launchMode,
+    is_preview: true,
   };
 }
 

@@ -20,7 +20,10 @@
  * learners on this version" closes the in-progress attempts of ONE version
  * only — never another version, a grant retake or a completed attempt —
  * with a dry run first, a required reason, token expiry and an audit row;
- * afterwards the reset attempt is not in progress on any surface.
+ * afterwards the reset attempt is not in progress on any surface. The
+ * "staff" row is an admin's preview (a by-role `legacy_role` row): from ADR
+ * 0024 P2-5 the counts tell staff by `context_kind = 'preview'`, not by the
+ * member's role, so an admin's real attempt counts as a learner's.
  */
 import { test, expect, type BrowserContext } from "@playwright/test";
 import fs from "node:fs";
@@ -417,7 +420,10 @@ test.describe.serial("per-version restart (ADR 0008 A)", () => {
     const L = s.learners;
     s.att = {
       reset: await seedAttempt(s.v1, L.reset.id, org.id),
-      staff: await seedAttempt(s.v1, s.admin.id, org.id),
+      // The admin's row is a preview (ADR 0024 P2-5): the restart helper and
+      // the route's count tell staff by context_kind = 'preview', not by the
+      // member's role, so a by-role row (legacy_role) is what reads as staff.
+      staff: await seedAttempt(s.v1, s.admin.id, org.id, { is_preview: true }),
       v2: await seedAttempt(s.v2, L.v2.id, org.id),
       retake: await seedAttempt(s.v1, L.retake.id, org.id),
       done: await seedAttempt(s.v1, L.done.id, org.id, {

@@ -41,6 +41,15 @@ import { buildOfficialResult } from "@/lib/attempts/revision-seed";
  * ADR 0017 step 19: when a request changes an official attempt's success_status or
  * score, LMS.OfficialResult is upserted for its own registration, last and fail-soft
  * (log `official_result_write_failed`). A result the guard held changes neither.
+ *
+ * ADR 0024 step 60 (phase 2, P2-5 item 5): a Preview's row (`context_kind =
+ * 'preview'`, read from the same select("*") row) is never official. Its
+ * statements are stored and derived as any learner's are, and the request ends
+ * after the batch: no classification, no RPC (points, streak, journey credit), no
+ * webhook decision, no tenant LRS mirror (which drops a Preview's statements
+ * anyway, P2-3) and no LMS.OfficialResult. On a database without 0107 the key is
+ * absent and every row reads as today's. Phase 3's writer replaces the check
+ * with its own answer, which says the same.
  */
 export async function POST(request: Request) {
   // P4: an abandoned attempt (or its expired token) → 410 before any write.
@@ -84,6 +93,8 @@ export async function POST(request: Request) {
     score?: number | null;
     completion_webhook_at?: string | null;
     is_revision?: boolean | null;
+    /** 0107 (ADR 0024); undefined on a database without it. */
+    context_kind?: string | null;
   };
   // ADR 0015 step 3: the row before the batch, for the webhook decision below.
   // `webhookAt` is null on a 0082 database when not latched and undefined when
@@ -302,6 +313,10 @@ export async function POST(request: Request) {
 
     ids.push(statementId);
   }
+
+  // ADR 0024 step 60 (P2-5 item 5): a Preview is never official, so the
+  // request ends with its statements stored: nothing below runs for it.
+  if (row.context_kind === "preview") return NextResponse.json(ids, { status: 200 });
 
   // 0081 revision rule: once complete, only an OFFICIAL attempt (inside the
   // scoring window) moves journey days, XP and the CRM webhook; a revision
