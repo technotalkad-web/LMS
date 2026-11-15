@@ -169,9 +169,10 @@ export async function sendNotification(args: SendArgs): Promise<SendResult> {
   if (cfg?.email_paused && !isBroadcast) {
     await logAttempt({
       organizationId,
+      orgName,
       event,
       to,
-      subject: "(paused)",
+      subjectTemplate: "(paused)",
       status: "paused",
       error: "Email sending is paused at the org level.",
       context,
@@ -181,9 +182,10 @@ export async function sendNotification(args: SendArgs): Promise<SendResult> {
   if (cfg?.event_paused?.[event] && !isBroadcast) {
     await logAttempt({
       organizationId,
+      orgName,
       event,
       to,
-      subject: "(paused)",
+      subjectTemplate: "(paused)",
       status: "paused",
       error: `Event "${event}" is paused.`,
       context,
@@ -290,9 +292,10 @@ export async function sendNotification(args: SendArgs): Promise<SendResult> {
 
   await logAttempt({
     organizationId,
+    orgName,
     event,
     to,
-    subject,
+    subjectTemplate: tpl.subject,
     status,
     error: errorMessage,
     context,
@@ -301,15 +304,60 @@ export async function sendNotification(args: SendArgs): Promise<SendResult> {
   return { status, error: errorMessage, to: to.email };
 }
 
+/**
+ * The only context keys stored in notification_log.context. Sign-in links,
+ * reset codes and passwords are never stored in the notification log: every
+ * key not listed here (direct_link, portal_url, otp_code, password, the
+ * learner's name and email, and any key a caller adds later) is dropped
+ * before the insert. The email itself is unchanged; it is rendered from the
+ * full context. No reader of the table needs a context key (the admin pages
+ * and the health checks read its own columns); these stay as a plain record
+ * of what the email was about.
+ *
+ * tests/unit/notification-context-keys.test.ts classifies every key passed
+ * at every call site, so a new key fails until it is placed on one side.
+ */
+export const STORED_CONTEXT_KEYS = [
+  "course_id",
+  "course_name",
+  "path_id",
+  "path_name",
+  "journey_name",
+  "org_name",
+  "due_date",
+  "deadline_date",
+  "score",
+  "otp_minutes",
+] as const;
+
+/** The part of a notification's context that may be stored (STORED_CONTEXT_KEYS). */
+export function storedContext(context: NotificationContext): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of STORED_CONTEXT_KEYS) {
+    const value = context[key];
+    if (typeof value === "string") out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Writes the audit row. Its subject is rendered from the stored context
+ * only, never from the full one: a template whose subject names a
+ * credential token ({Password}, {OTP_Code}, {Direct_Link}) is logged with
+ * the token left literal, while the emailed subject carries the value.
+ */
 async function logAttempt(args: {
   organizationId: string;
+  orgName: string;
   event: NotificationEvent;
   to: { user_id?: string | null; email: string };
-  subject: string;
+  subjectTemplate: string;
   status: "sent" | "failed" | "queued" | "paused";
   error?: string;
   context: NotificationContext;
 }) {
+  const context = storedContext(args.context);
+  const subject = substitute(args.subjectTemplate, { org_name: args.orgName, ...context });
   await svc()
     .from("notification_log")
     .insert({
@@ -318,14 +366,14 @@ async function logAttempt(args: {
       channel: "email",
       to_user_id: args.to.user_id ?? null,
       to_address: args.to.email,
-      subject: args.subject,
+      subject,
       status:
         // The DB check constraint only allows sent/failed/queued; paused
         // is an app-level meta-status, mapped to failed for the audit log
         // so admins still see it but the constraint stays satisfied.
         args.status === "paused" ? "failed" : args.status,
       error: args.error ?? null,
-      context: args.context as unknown as Record<string, unknown>,
+      context,
     });
 }
 
