@@ -16,8 +16,10 @@
  *     out, and still signs out when ending it fails;
  *   - the other server routes that change the browser's sign-in end it too:
  *     the sign-in callback in each shape (?token_hash=, ?code= for Google and
- *     PKCE links, and the fragment hand-off), invitation accept and password
- *     change; a source check keeps every such route on the one shared helper.
+ *     PKCE links, and the fragment hand-off), invitation accept, password
+ *     change and the forgot-password reset (the owner resetting their own
+ *     password, signed in or not, and another account's); a source check
+ *     keeps every such route on the one shared helper.
  *
  * No database, no network.
  *
@@ -27,6 +29,7 @@ import Module from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
+import { hashResetToken } from "../../lib/auth/password-reset";
 
 let pass = 0, fail = 0;
 /** `todo`, when given, is printed under a failure: what to change to pass. */
@@ -46,12 +49,15 @@ type Req = { method: string; path: string; query: URLSearchParams; body: string 
 const SUPABASE = "http://stub.supabase.test";
 const AUTH_COOKIE = "sb-stub-auth-token";
 const IMP_COOKIE = "lms_impersonation";
-const OWNER: User = { id: "owner-1", aud: "authenticated", role: "authenticated", email: "owner@example.test", email_confirmed_at: "2026-01-01T00:00:00Z" };
-const MEMBER: User = { id: "member-1", aud: "authenticated", role: "authenticated", email: "member@example.test", email_confirmed_at: "2026-01-01T00:00:00Z" };
+// The ids are UUID-shaped: auth.admin.updateUserById checks them.
+const OWNER: User = { id: "6c1e0a6e-0000-4000-8000-00000000a001", aud: "authenticated", role: "authenticated", email: "owner@example.test", email_confirmed_at: "2026-01-01T00:00:00Z" };
+const MEMBER: User = { id: "6c1e0a6e-0000-4000-8000-00000000b001", aud: "authenticated", role: "authenticated", email: "member@example.test", email_confirmed_at: "2026-01-01T00:00:00Z" };
 const TOKENS: Record<string, User> = { "tok-owner": OWNER, "tok-member": MEMBER };
 const ORG = { id: "org-1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null };
 const session = (token: string) =>
   ({ access_token: token, refresh_token: `r-${token}`, token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: TOKENS[token] });
+// The forgot-password reset token the /verify step handed this browser.
+const RESET_TOKEN = "reset-token-1";
 
 // ---- the browser: one cookie jar for every request of a case ----
 const browser = new Map<string, string>();
@@ -66,9 +72,11 @@ const jar = {
   },
   delete: (name: string) => { deleted.push(name); browser.delete(name); },
 };
+// Sign-ins the auth server has ended (see the admin password PUT below).
+const revoked = new Set<string>();
 const signIn = (token: string | null) => {
   for (const k of [...browser.keys()]) if (k.startsWith(AUTH_COOKIE)) browser.delete(k);
-  if (token) browser.set(AUTH_COOKIE, JSON.stringify(session(token)));
+  if (token) { revoked.delete(token); browser.set(AUTH_COOKIE, JSON.stringify(session(token))); }
 };
 
 // The code under test reaches the request only through next/headers.
@@ -86,6 +94,7 @@ let nextId = 1;
 let ignoreActorFilter = false;
 let authDown = false;
 let passwordUpdateFails = false;
+let adminPasswordUpdateFails = false;
 const roles: Record<string, string> = {};
 let requests: Req[] = [];
 let errors: string[] = [];
@@ -107,7 +116,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
 
   if (p === "/auth/v1/user" && method === "GET") {
     if (authDown) throw new TypeError("fetch failed");
-    const u = TOKENS[bearer(headers)];
+    const token = bearer(headers);
+    if (revoked.has(token)) return json({ code: 403, error_code: "session_not_found", msg: "Session from session_id claim in JWT does not exist" }, 403);
+    const u = TOKENS[token];
     return u ? json(u) : json({ code: 401, error_code: "bad_jwt", msg: "invalid JWT" }, 401);
   }
   if (p === "/auth/v1/user" && method === "PUT") {
@@ -118,7 +129,18 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/verify") return json(session("tok-member"));
   if (p === "/auth/v1/token" && q.get("grant_type") === "password") return json(session("tok-member"));
   if (p === "/auth/v1/token" && q.get("grant_type") === "pkce") return json(session("tok-member"));
-  if (p === "/auth/v1/admin/users") return json({ users: [MEMBER], aud: "authenticated" });
+  if (p === "/auth/v1/admin/users") return json({ users: [MEMBER, OWNER], aud: "authenticated" });
+  if (p.startsWith("/auth/v1/admin/users/") && method === "PUT") {
+    if (adminPasswordUpdateFails) return json({ code: 422, error_code: "weak_password", msg: "Password is known to be weak." }, 422);
+    const u = [MEMBER, OWNER].find((x) => p === `/auth/v1/admin/users/${x.id}`);
+    // Modelled as the hosted auth server is believed to behave, not checked
+    // here: a password set with the service role ends all of that user's
+    // sign-ins (a user's own updateUser keeps the caller's).
+    if (u && "password" in (JSON.parse(body || "{}") as Row)) {
+      for (const [t, x] of Object.entries(TOKENS)) if (x.id === u.id) revoked.add(t);
+    }
+    return u ? json(u) : json({ code: 404, error_code: "user_not_found", msg: "User not found" }, 404);
+  }
 
   if (p === "/rest/v1/platform_impersonation_sessions") {
     if (method === "POST") {
@@ -142,6 +164,11 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       return new Response(null, { status: 204 });
     }
   }
+  if (p === "/rest/v1/password_reset_otps") {
+    if (method !== "GET") return new Response(null, { status: 204 });
+    const otp = { id: "otp-1", reset_token_hash: hashResetToken(RESET_TOKEN), reset_token_expires: new Date(Date.now() + 600_000).toISOString(), used_at: null };
+    return json(object ? otp : [otp]);
+  }
   if (p === "/rest/v1/profiles") return method === "GET" ? json([{ must_change_password: false }]) : new Response(null, { status: 204 });
   if (p === "/rest/v1/organizations") return json([ORG]);
   if (p === "/rest/v1/organization_members") {
@@ -162,9 +189,10 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
 const fresh = () => {
   browser.clear();
   rows.clear();
+  revoked.clear();
   for (const k of Object.keys(roles)) delete roles[k];
   requests = []; deleted = []; errors = [];
-  ignoreActorFilter = false; authDown = false; passwordUpdateFails = false;
+  ignoreActorFilter = false; authDown = false; passwordUpdateFails = false; adminPasswordUpdateFails = false;
 };
 const writes = () => requests.filter((r) => r.path === "/rest/v1/platform_impersonation_sessions" && r.method === "PATCH");
 const indexOf = (pred: (r: Req) => boolean) => requests.findIndex(pred);
@@ -186,6 +214,7 @@ async function main() {
     const callbackRoute = await import("../../app/auth/callback/route");
     const acceptRoute = await import("../../app/api/invitations/accept/route");
     const passwordRoute = await import("../../app/api/auth/change-password/route");
+    const resetRoute = await import("../../app/api/auth/forgot-password/reset/route");
 
     /** The owner signs in on a fresh browser and starts an impersonation of ORG. */
     const ownerStarts = async () => {
@@ -394,6 +423,65 @@ async function main() {
       const ok = await passwordRoute.POST(new Request("http://lms.test/api/auth/change-password", { method: "POST", body: JSON.stringify({ new_password: "Another-Pass-1" }) }));
       eq("password changed: 200, the row ended and the cookie deleted", [ok.status, typeof rows.get(id)?.ended_at, browser.has(IMP_COOKIE)], [200, "string", false]);
     }
+    // The forgot-password reset sets the password with the service role and
+    // spends the reset token; then the browser signs in with the password.
+    const reset = (who: User = OWNER) => {
+      requests = []; deleted = [];
+      return resetRoute.POST(new Request("http://lms.test/api/auth/forgot-password/reset", { method: "POST", body: JSON.stringify({ email: who.email, reset_token: RESET_TOKEN, new_password: "Another-Pass-1" }) }));
+    };
+    const adminPut = (who: User = OWNER) => indexOf((r) => r.path === `/auth/v1/admin/users/${who.id}` && r.method === "PUT");
+    const tokenSpent = () => indexOf((r) => r.path === "/rest/v1/password_reset_otps" && r.method === "PATCH");
+    // The reset route makes no sign-in check of its own: this one is the helper's.
+    const userCheck = () => indexOf((r) => r.path === "/auth/v1/user" && r.method === "GET");
+    {
+      // The owner, still signed in and impersonating, resets their own
+      // password on the same browser (by a direct POST or from another tab:
+      // the page sends a signed-in user on). The password set ends the
+      // owner's sign-ins (the stub's model), so the row can no longer be
+      // shown to be theirs: the cookie goes and the row runs to its expiry.
+      const id = await ownerStarts();
+      adminPasswordUpdateFails = true;
+      const bad = await reset();
+      eq("forgot-password reset refused: 400, the impersonation stands", [bad.status, adminPut() >= 0, rows.get(id)?.ended_at, browser.has(IMP_COOKIE), writes().length], [400, true, null, true, 0]);
+      adminPasswordUpdateFails = false;
+      const ok = await reset();
+      const put = adminPut();
+      const sent = (put >= 0 ? JSON.parse(requests[put].body) : {}) as Row;
+      eq("forgot-password reset: 200, the owner's password set", [ok.status, ((await ok.json()) as Row).ok, sent.password], [200, true, "Another-Pass-1"]);
+      eq("…the impersonation is ended after the password is set and the token spent, and the cookie deleted",
+        [put >= 0 && tokenSpent() > put, userCheck() > tokenSpent(), deleted.includes(IMP_COOKIE), browser.has(IMP_COOKIE)], [true, true, true, false]);
+      eq("…the owner's sign-in ended with the password set, so the row runs to its expiry", [rows.get(id)?.ended_at, writes().length], [null, 0]);
+      signIn("tok-owner");
+      const back = await read();
+      eq("…the owner signing back in with the new password has no impersonation, and no request is made", [back.s, back.calls.length], [null, 0]);
+    }
+    {
+      // The owner's sign-in lapsed while impersonating, and they reset their
+      // own password on the same browser. With no one signed in the row
+      // cannot be shown to be theirs, so it is left to expire (as sign-out
+      // leaves another user's); the cookie goes.
+      const id = await ownerStarts();
+      signIn(null);
+      const ok = await reset();
+      eq("forgot-password reset with the owner's sign-in lapsed: 200, the cookie deleted", [ok.status, deleted.includes(IMP_COOKIE), browser.has(IMP_COOKIE)], [200, true, false]);
+      eq("…the row is left to expire, not ended by a signed-out request", [rows.get(id)?.ended_at, writes().length], [null, 0]);
+      signIn("tok-owner");
+      const back = await read();
+      eq("…the owner signing back in with the new password has no impersonation, and no request is made", [back.s, back.calls.length], [null, 0]);
+    }
+    {
+      // The owner, signed in and impersonating, resets another account's
+      // password on the same browser. The owner's sign-in is untouched, so
+      // the row is shown to be theirs and stamped ended.
+      const id = await ownerStarts();
+      const ok = await reset(MEMBER);
+      const put = adminPut(MEMBER);
+      const end = indexOf((r) => r.path === "/rest/v1/platform_impersonation_sessions" && r.method === "PATCH");
+      eq("forgot-password reset of another account by the signed-in owner: 200, that account's password set", [ok.status, put >= 0, adminPut(OWNER)], [200, true, -1]);
+      eq("…the owner's row is stamped ended after the password is set and the token spent, and the cookie deleted",
+        [typeof rows.get(id)?.ended_at, put >= 0 && tokenSpent() > put && end > tokenSpent(), writes().map((w) => eqParam(w.query, "id")), deleted.includes(IMP_COOKIE), browser.has(IMP_COOKIE)],
+        ["string", true, [id], true, false]);
+    }
 
     console.log("\nsource check: every server route that changes the sign-in uses the shared helper");
     {
@@ -410,21 +498,29 @@ async function main() {
       walk(path.join(root, "app"), files);
       walk(path.join(root, "lib"), files);
       // Calls on a Supabase auth client (`<x>.auth.<method>(...)`), parsed, so a
-      // comment naming one does not count.
+      // comment naming one does not count. A password change is
+      // `<x>.auth.updateUser(attrs)` or, with the service role,
+      // `<x>.auth.admin.updateUserById(id, attrs)`, when attrs may set one.
       const SIGN_IN_OUT = new Set(["signOut", "signInWithPassword", "signInWithIdToken", "exchangeCodeForSession", "verifyOtp", "setSession"]);
       const HELPER = "endImpersonationForSessionChange";
       // The server routes that change the browser's sign-in, each with a
       // behavioural case above.
       const KNOWN = [
         "app/api/auth/change-password/route.ts",
+        "app/api/auth/forgot-password/reset/route.ts",
         "app/api/invitations/accept/route.ts",
         "app/auth/callback/route.ts",
         "app/auth/sign-out/route.ts",
       ];
-      const ADD = `call ${HELPER}() from @/lib/auth/impersonation before the sign-in or sign-out (after a password change), add a behavioural case above, then add the file to KNOWN in this test`;
+      // The scan cannot tell this browser's password from another user's. A
+      // route that sets another user's password (an admin action that leaves
+      // this browser's sign-in alone) must not call the helper: it would end
+      // the acting owner's own impersonation.
+      const OTHERS = `if it only sets another user's password and this browser's sign-in does not change, do not call ${HELPER}() (it would end the acting owner's own impersonation): exempt the file from this check, with the reason, instead`;
+      const ADD = `call ${HELPER}() from @/lib/auth/impersonation before the sign-in or sign-out (after a password change), add a behavioural case above, then add the file to KNOWN in this test; ${OTHERS}`;
 
-      /** May this updateUser argument set a password? An object literal only
-       *  when it has a password key; anything the check cannot read (a
+      /** May these updateUser / updateUserById attributes set a password? An
+       *  object literal only when it has a password key; anything the check cannot read (a
        *  variable, a spread, a computed key) counts, so it fails closed. */
       const setsPassword = (arg: ts.Expression | undefined) => {
         if (!arg) return false;
@@ -456,6 +552,10 @@ async function main() {
               if (SIGN_IN_OUT.has(callee.name.text)) changes.push(n.getStart(sf));
               if (callee.name.text === "updateUser" && setsPassword(n.arguments[0])) passwords.push(n.getStart(sf));
             }
+            if (ts.isPropertyAccessExpression(callee) && callee.name.text === "updateUserById"
+              && ts.isPropertyAccessExpression(callee.expression) && callee.expression.name.text === "admin"
+              && ts.isPropertyAccessExpression(callee.expression.expression) && callee.expression.expression.name.text === "auth"
+              && setsPassword(n.arguments[1])) passwords.push(n.getStart(sf));
           }
           ts.forEachChild(n, visit);
         };
@@ -469,6 +569,9 @@ async function main() {
       eq("scan: an updateUser that sets only metadata is not a password change", [count("await s.auth.updateUser({ data: { name } });"), count("await s.auth.updateUser({ email });")], [0, 0]);
       eq("scan: a password key counts, written plain, shorthand or quoted", [count("s.auth.updateUser({ password: pw })"), count("s.auth.updateUser({ password })"), count(`s.auth.updateUser({ "password": pw, data: {} })`)], [1, 1, 1]);
       eq("scan: an updateUser argument it cannot read counts (a variable, a spread)", [count("s.auth.updateUser(attrs)"), count("s.auth.updateUser({ ...attrs })")], [1, 1]);
+      eq("scan: a service-role auth.admin.updateUserById that sets a password counts; one that only confirms the email does not",
+        [count("await svc.auth.admin.updateUserById(id, { password: pw })"), count("await a.svc.auth.admin.updateUserById(id, { password })"), count("await svc.auth.admin.updateUserById(id, { email_confirm: true })")], [1, 1, 0]);
+      eq("scan: updateUserById attributes it cannot read count (a variable, a spread)", [count("svc.auth.admin.updateUserById(id, attrs)"), count("svc.auth.admin.updateUserById(id, { ...attrs })")], [1, 1]);
       const bare = probe("// s.auth.signOut()\nawait s.auth.signOut();");
       eq("scan: a sign-out with no helper call is found; a comment naming one is not", [bare.changes.length, bare.helper.length, bare.imported], [1, 0, false]);
       eq("scan: browser code is skipped", scan("probe.tsx", `"use client";\nawait s.auth.signOut();`), null);
@@ -480,16 +583,16 @@ async function main() {
         const rel = path.relative(root, f).split(path.sep).join("/");
         sites.push(rel);
         eq(`${rel}: imports ${HELPER} from @/lib/auth/impersonation`, r.imported, true,
-          `${rel}: import ${HELPER} from @/lib/auth/impersonation and call it before the sign-in or sign-out (after a password change)`);
+          `${rel}: import ${HELPER} from @/lib/auth/impersonation and call it before the sign-in or sign-out (after a password change)${r.passwords.length > 0 ? `; ${OTHERS}` : ""}`);
         if (r.changes.length > 0) {
           eq(`${rel}: ${HELPER}() is called earlier in the source than each sign-in or sign-out (position only; the cases above check the run-time order)`,
             r.changes.every((c) => r.helper.some((h) => h < c)), true,
             `${rel}: call ${HELPER}() before the sign-in or sign-out change, while the current user is still signed in`);
         }
         if (r.passwords.length > 0) {
-          eq(`${rel}: ${HELPER}() is called later in the source than each updateUser that may set a password`,
+          eq(`${rel}: ${HELPER}() is called later in the source than each updateUser or updateUserById that may set a password`,
             r.passwords.every((u) => r.helper.some((h) => h > u)), true,
-            `${rel}: call ${HELPER}() after the password change succeeds`);
+            `${rel}: call ${HELPER}() after the password change succeeds; ${OTHERS}`);
         }
         eq(`${rel}: is on the known list of server routes that change the sign-in`, KNOWN.includes(rel), true,
           `${rel} changes the sign-in on the server: ${ADD}`);
