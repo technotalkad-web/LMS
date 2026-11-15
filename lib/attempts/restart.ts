@@ -98,6 +98,22 @@ export function byRoleClass(attempts: RestartAttempt[], previewIds: ReadonlySet<
   return out;
 }
 
+/** The answer's `by_role`: the same keys (ADR 0024 A23); `staff` is null when Previews could not be told apart. */
+export type ByRoleAnswer = { learner: number; staff: number | null };
+
+/**
+ * What the route answers under `by_role` (ADR 0024 P2-5, the review's reads
+ * F2). `split` is the preview filter's decision for the request
+ * (ContextFilterState.applies). false is a database without 0107: no row
+ * could be told a Preview, so `staff` is null ("previews not counted" in the
+ * dialog) rather than a 0 that would read as "no previews", and `learner`
+ * holds every row. true (the filter applied) or null (no read was needed:
+ * nothing selected) keeps the count.
+ */
+export function byRoleAnswer(byRole: ByRole, split: boolean | null): ByRoleAnswer {
+  return split === false ? { learner: byRole.learner + byRole.staff, staff: null } : byRole;
+}
+
 /**
  * Step 3: of the version's in-progress attempts, grant retakes (approved
  * attempt_requests whose used_attempt_id is the attempt) are excluded by id;

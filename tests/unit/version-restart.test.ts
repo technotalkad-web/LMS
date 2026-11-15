@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   RESTART_REASON_MAX,
+  byRoleAnswer,
   byRoleClass,
   parseDryRun,
   parseRestartReason,
@@ -109,6 +110,14 @@ const previews = new Set(["a2"]);
 eq("a Preview is told by its id, whatever its organisation or user",
   byRoleClass([att("a2", "u-learner", "org-2"), att("a9", "u-admin")], previews), { learner: 1, staff: 1 });
 
+// The answer's by_role (P2-5 review, reads F2): without 0107 no row can be
+// told a Preview, so staff is null ("previews not counted"), never a 0 that
+// reads as "no previews"; the keys keep their names (A23).
+eq("with 0107 (the filter applied): the counts as they are", byRoleAnswer({ learner: 2, staff: 1 }, true), { learner: 2, staff: 1 });
+eq("no read was needed (nothing selected): the counts as they are", byRoleAnswer({ learner: 0, staff: 0 }, null), { learner: 0, staff: 0 });
+eq("without 0107: staff null, learner every row", byRoleAnswer({ learner: 3, staff: 0 }, false), { learner: 3, staff: null });
+eq("…the same keys, nothing else", Object.keys(byRoleAnswer({ learner: 3, staff: 0 }, false)), ["learner", "staff"]);
+
 console.log("\nthe route's read (source scan)");
 {
   const ROUTE = "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts";
@@ -121,6 +130,11 @@ console.log("\nthe route's read (source scan)");
     /if \(keptErr\) \{[\s\S]*?status: 503[\s\S]*?\}/.test(src) && src.indexOf("if (keptErr)") < src.indexOf("if (dryRun)") && src.indexOf("if (keptErr)") < src.indexOf('.update({ status: "abandoned" })'), true);
   eq("the plan and the real run's by_role both use the Preview ids",
     [/planRestart\(inProgress, grantRetakeIds, previewIds\)/.test(src), /byRoleClass\(plan\.selected\.filter\(\(a\) => restartedSet\.has\(a\.id\)\), previewIds\)/.test(src)], [true, true]);
+  eq("both answers' by_role go through byRoleAnswer with the request's filter decision (null staff without 0107)",
+    [/by_role: byRoleAnswer\(plan\.byRole, previews\.applies\),/.test(src),
+      /by_role: byRoleAnswer\(byRoleClass\(plan\.selected\.filter\(\(a\) => restartedSet\.has\(a\.id\)\), previewIds\), previews\.applies\),/.test(src),
+      /by_role: (plan\.byRole|byRoleClass\()/.test(src)],
+    [true, true, false]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

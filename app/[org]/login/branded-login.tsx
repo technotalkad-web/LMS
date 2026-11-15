@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { FullScreenLoader, handOff, usePreloadBrandLoader } from "@/components/ui/brand-loader";
+import { safeNextPath } from "@/lib/auth/safe-next";
 
 export type BrandedLoginProps = {
   orgSlug: string;
@@ -30,16 +31,16 @@ export type BrandedLoginProps = {
 type Mode = "password" | "magic";
 
 /**
- * Where to land after a successful password sign-in. Honors a host-relative
- * `next` (set by the middleware auth gate — e.g. a clean /dashboard on a
- * white-label domain), falling back to the tenant dashboard. Guards against
- * open redirects (must start with a single "/").
+ * Where to land after a successful sign-in. Honors a host-relative `next`
+ * (set by the middleware auth gate — e.g. a clean /dashboard on a
+ * white-label domain), query included (a launch's Preview mode, path,
+ * journey day and language), falling back to the tenant dashboard. The
+ * open-redirect guard is lib/auth/safe-next.ts's: one leading "/", no
+ * scheme or host, no backslash or control character.
  */
 function safeNext(orgSlug: string): string {
   if (typeof window === "undefined") return `/${orgSlug}/dashboard`;
-  const n = new URLSearchParams(window.location.search).get("next");
-  if (n && n.startsWith("/") && !n.startsWith("//")) return n;
-  return `/${orgSlug}/dashboard`;
+  return safeNextPath(new URLSearchParams(window.location.search).get("next")) ?? `/${orgSlug}/dashboard`;
 }
 
 export function BrandedLogin({

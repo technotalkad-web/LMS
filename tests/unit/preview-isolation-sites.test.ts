@@ -58,7 +58,11 @@
  *       drop previews through the one fallback, each by its key; the
  *       launch page's own sites are pinned in tests/unit/alds-launch.test.ts
  *       (section 7: its preview branch reads through inLaunchContext, which
- *       this scanner does not follow).
+ *       this scanner does not follow). The P2-5 review added the grant
+ *       decisions (the request, the approval, the bulk and ticket grants,
+ *       the forced restart's 23505 path) and the language switch's
+ *       in-progress read: none was ever exempt; each is listed here with
+ *       its filter, and phase 4 (step 37) and P2-9 replace them.
  *
  * Phase P adds its Preview Reports scans here (no file outside lib/preview/,
  * the launch page, the two preview routes and Preview Reports reads
@@ -570,6 +574,13 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
     ["app/[org]/(learner)/courses/[courseId]/page.tsx :: CourseDetailPage :: preview", "item 4: the course page's own record ('Request another attempt' follows the attempt's context)"],
     ["lib/courses/learner-history.ts :: countLearnerAttempts :: preview", "item 4: the record-protection count, by context_kind"],
     ["app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts :: POST :: preview", "item 4: the restart's classes, by context_kind"],
+    // The P2-5 review (gate F2, writes F1): a Preview beside a real attempt.
+    ["app/api/attempt-requests/route.ts :: POST :: preview", "the request: the official result it checks and attempts_used (phase 4, step 37, moves it to readContextResult)"],
+    ["app/api/attempt-requests/[id]/route.ts :: PATCH :: preview", "the approval rule: whether the result stands (phase 4, step 37)"],
+    ["app/api/attempt-requests/bulk/route.ts :: POST :: preview", "the bulk grant: who failed, one decision for every page (phase 4, step 37)"],
+    ["lib/attempts/grant.ts :: grantExtraAttempts :: preview", "the ticket grant: who failed, one decision for every page (phase 4, step 37)"],
+    ["lib/attempts/force-restart.ts :: read :: preview", "the forced restart's 23505 path: whether the result stands, one decision per run (phase 4, step 37)"],
+    ["app/api/courses/[courseId]/language-preference/route.ts :: readInProgress :: preview", "the language switch: a Start's count, cmi5 hold and abandon leave previews out (P2-9 reads it per context)"],
   ];
   const files = new Set(FIVE_B.map(([k]) => k.split(" :: ")[0]));
   const found = reads.filter((s) => files.has(s.file)).map(key);
@@ -580,16 +591,32 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
   // (fetchAll by version: every open row is restarted, and the listed read
   // splits the classes), and officialFailedAttemptId, the attempt page's
   // ignored-pass remedy line (a learner's list on the course, read for an
-  // ignored pass the writer refused; the attempt page's phase moves it). A
-  // new unfiltered read in these files fails here until it is decided.
+  // ignored pass the writer refused; the attempt page's phase moves it), and
+  // the forced restart's selection and its re-read by id (as the restart
+  // route's selection: every open row on the older versions is restarted;
+  // the re-read checks the selected ids). A new unfiltered read in these
+  // files fails here until it is decided.
   eq("…and the files' unfiltered reads are exactly the known single-row or selection reads", found.filter((k) => k.endsWith(":: none")).sort(), [
     "app/api/attempts/[attemptId]/result-stored/route.ts :: GET :: none",
     "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts :: select :: none",
     "app/api/scorm/[attemptId]/commit/route.ts :: POST :: none",
     "app/api/scorm/[attemptId]/commit/route.ts :: POST :: none",
+    "lib/attempts/force-restart.ts :: readSelection :: none",
+    "lib/attempts/force-restart.ts :: rereadShortfall :: none",
     "lib/scoring/attempt-kind.ts :: officialFailedAttemptId :: none",
     "lib/scoring/attempt-kind.ts :: readAttempt :: none",
   ]);
+  // The grant sites decide once per request (or per forced-restart run): a
+  // fresh state inside the handler, never a module-level one ((d) holds that
+  // for every file); the forced restart hands the run's state to each 23505
+  // read.
+  const fr = read("lib/attempts/force-restart.ts");
+  eq("the forced restart: one state per re-issue run, handed to every 23505 read",
+    /const previews: ContextFilterState = \{ applies: null \};[\s\S]*?approvePendingRequest\(svc, args, link, note, expiresAt, previews\)/.test(fr) &&
+      /expiresAt: string \| null,\s*previews: ContextFilterState\s*\)/.test(fr), true);
+  const lang = read("app/api/courses/[courseId]/language-preference/route.ts");
+  eq("the language switch: the abandon takes the read's decision of the filter (a write, so not a scanner site)",
+    /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)[\s\S]*?,\s*apply\s*\)\.select\("id"\)/.test(lang), true);
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import { isSupportedLanguage } from "@/lib/i18n/languages";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
 import { isMissingColumn } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { finishCheckAttemptIds, languageSwitchDecision, resettableSwitchRows, type SwitchRow } from "@/lib/courses/slot-routing";
 import { VERBS } from "@/lib/xapi/types";
 
@@ -49,6 +50,16 @@ import { VERBS } from "@/lib/xapi/types";
  *    selects it widens, answer 503 on an error and write nothing.
  *  - The decision itself is lib/courses/slot-routing.ts
  *    languageSwitchDecision() (unit-tested).
+ *  - ADR 0024 P2-5: a switch is a Start's, never a Preview's (decision 3: a
+ *    Preview saves no preference and resets nothing; the launch picker
+ *    skips this route for one). The in-progress read and the abandon drop
+ *    the caller's `context_kind = 'preview'` rows (readWithContextFilter and
+ *    withoutPreviews, one decision per request), so an open Preview on the
+ *    other language is never counted, never holds the switch with
+ *    requires_finish and is never abandoned. On a database without 0107 the
+ *    filter's missing-column error reads today's select once. A body that
+ *    names the preview context (`context: { kind: "preview" }`, the field
+ *    step 27 plans and P2-9 builds) answers 400 before any read or write.
  *
  * Auth: any org member can call for their own preference (RLS handles
  * the per-user scope on course_language_preferences).
@@ -64,7 +75,14 @@ export async function PUT(
     orgSlug?: string;
     language?: string;
     restart_if_in_progress?: boolean;
+    /** ADR 0024 step 27 (P2-9 builds it); only the preview kind is read here, and refused. */
+    context?: { kind?: unknown } | null;
   };
+  // ADR 0024 P2-5: a Preview never reaches this route (decision 3); if a
+  // caller names the preview context, nothing is read and nothing is written.
+  if (typeof body.context === "object" && body.context !== null && body.context.kind === "preview") {
+    return NextResponse.json({ error: "A preview saves no language preference and resets nothing." }, { status: 400 });
+  }
   if (!body.orgSlug) return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
   if (!body.language) return NextResponse.json({ error: "language required" }, { status: 400 });
   if (!isSupportedLanguage(body.language)) {
@@ -127,19 +145,26 @@ export async function PUT(
   // resumable in its own language, so it is neither counted as "progress you
   // will lose" nor reset below. A revision visit's row (ADR 0014 step 3)
   // neither: `is_revision = false`, the filter dropped on a database without
-  // the column (where no row can be flagged).
+  // the column (where no row can be flagged). Nor a Preview (ADR 0024 P2-5,
+  // the header): the read drops `context_kind = 'preview'`, and the abandon
+  // below takes the same decision.
+  const previews: ContextFilterState = { applies: null };
   let ipRowsRead: SwitchRow[] = [];
   if (otherLangVerIds.length > 0) {
-    const readInProgress = (withFlagFilter: boolean) => {
-      let q = svc
-        .from("course_attempts")
-        .select("id, course_version_id")
-        .eq("user_id", user.id)
-        .in("course_version_id", otherLangVerIds)
-        .eq("status", "in_progress");
-      if (withFlagFilter) q = q.eq("is_revision", false);
-      return q;
-    };
+    const readInProgress = (withFlagFilter: boolean) =>
+      readWithContextFilter(previews, (apply) => {
+        let q = withoutPreviews(
+          svc
+            .from("course_attempts")
+            .select("id, course_version_id")
+            .eq("user_id", user.id)
+            .in("course_version_id", otherLangVerIds)
+            .eq("status", "in_progress"),
+          apply
+        );
+        if (withFlagFilter) q = q.eq("is_revision", false);
+        return q;
+      });
     let { data: ipRows, error: ipErr } = await readInProgress(true);
     if (ipErr && isMissingColumn(ipErr, "is_revision")) ({ data: ipRows, error: ipErr } = await readInProgress(false));
     if (ipErr) return unreadable("in-progress attempts", ipErr.message);
@@ -237,14 +262,19 @@ export async function PUT(
   let abandoned = 0;
   if (body.restart_if_in_progress && resettableIds.length > 0) {
     // Exactly the attempts evaluated above (grant retakes already excluded),
-    // still in progress, still this learner's.
-    const { data: abRows, error: abErr } = await svc
-      .from("course_attempts")
-      .update({ status: "abandoned" })
-      .in("id", resettableIds)
-      .eq("user_id", user.id)
-      .eq("status", "in_progress")
-      .select("id");
+    // still in progress, still this learner's, never a Preview (the read's
+    // decision of the filter).
+    const { data: abRows, error: abErr } = await readWithContextFilter(previews, (apply) =>
+      withoutPreviews(
+        svc
+          .from("course_attempts")
+          .update({ status: "abandoned" })
+          .in("id", resettableIds)
+          .eq("user_id", user.id)
+          .eq("status", "in_progress"),
+        apply
+      ).select("id")
+    );
     if (abErr) {
       return NextResponse.json(
         { error: `Saved preference but failed to reset progress: ${abErr.message}` },

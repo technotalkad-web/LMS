@@ -399,8 +399,12 @@ async function pageCases() {
       eq(`${what}: refused to ${DENIED}, nothing read from attempts or written`, [r.redirect, attemptReqs().length, writes().length], [DENIED, 0, 0]);
     }
 
-    // (b) P2-5 item 3c: an impersonating platform owner (super_owner, no
-    // membership row) is refused a Start; Preview stays allowed.
+    // (b) P2-5 item 3c: while requireOrgAccess answers an impersonation
+    // (super_owner), a Start is refused; Preview stays allowed. The stub
+    // answers the organisation read for any viewer, so the gate runs here
+    // for a viewer with no membership row. In the app that read is under
+    // the caller's own session and the organisations policy admits members
+    // only, so the caller who reaches the gate is a member impersonating.
     {
       const r = await run({ viewer: "platform", impersonating: true, assigned: true });
       eq("impersonating, no ?mode=preview: refused to ?denied=1", r.redirect, DENIED);

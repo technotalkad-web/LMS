@@ -14,6 +14,13 @@
  *   - grantExtraAttempts (lib/attempts/grant.ts, the ticket grant) run
  *     under tsx against a by-table fake: its reads fail closed.
  *
+ * ADR 0024 P2-5: the three routes and grantExtraAttempts drop Previews from
+ * the attempts they score (readWithContextFilter and withoutPreviews, the
+ * missing-column fallback). The routes now also run for real under a stubbed
+ * fetch in tests/unit/attempt-requests-routes.test.ts; here the source checks
+ * name the filter, and grantExtraAttempts' fake honours `neq` and answers the
+ * filter with the missing-column error on a database without 0107.
+ *
  * Run:  npx tsx tests/unit/attempt-requests.test.ts   (or npm run test:unit)
  * (No DB.)
  */
@@ -191,6 +198,8 @@ console.log("\nPOST /api/attempt-requests: the page's rule, strict reads, before
   eq("the attempts columns name status", /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src), true);
   eq("the attempts read adds is_revision through the narrower-select fallback",
     /readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",[\s\S]*?\.from\("course_attempts"\)[\s\S]*?ATTEMPT_COLUMNS\s*\)/.test(src), true);
+  eq("ADR 0024 P2-5: the query sits in the preview filter, one fresh decision for the request",
+    /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attRows, error: attErr \} = await readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",\s*\(columns\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(columns\)\.eq\("user_id", user\.id\)\.in\("course_version_id", vIds\), apply\)/.test(src), true);
   eq("versions, attempts and grants are error-checked inside one try: grantSnapshotFor, then computeScoring",
     inOrder(src, ["try {", 'from("course_versions")', "if (verErr || !verRows) throw", "if (attErr || !attRows) throw", "grantSnapshotFor(s, user.id, course.id)", "computeScoring(attempts, policy, snapshot.retakeIds)", "} catch (e) {", '{ error: "records_unreadable" }, { status: 503 }']), true);
   eq("requestDecision( and both 409s come before the insert",
@@ -208,6 +217,8 @@ console.log("\nPATCH /api/attempt-requests/{id}: the approval rule, the override
   eq("the body names override_passed", /override_passed\?: boolean;/.test(src) && /overridePassed: body\.override_passed === true/.test(src), true);
   eq("the non-override note keeps today's cut to 2000; the untruncated trimmed note is kept beside it",
     /const noteFull = \(body\.note \?\? ""\)\.trim\(\);\s*const note = noteFull\.slice\(0, 2000\) \|\| null;/.test(src), true);
+  eq("ADR 0024 P2-5: the attempts query sits in the preview filter, one fresh decision for the request",
+    /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attRows, error: attErr \} = await readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",\s*\(columns\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(columns\)\.eq\("user_id", reqRow\.user_id\)\.in\("course_version_id", vIds\), apply\)/.test(src), true);
   eq("the strict reads run for approve only, after the pending check, in one try answering 503",
     inOrder(src, ['reqRow.status !== "pending"', 'if (body.action === "approve") {', "try {", 'from("course_versions")', "grantSnapshotFor(s, reqRow.user_id, reqRow.course_id)", 'select("pass_required")', "computeScoring(attempts, policy, snapshot.retakeIds)", "} catch (e) {", '{ error: "records_unreadable" }, { status: 503 }']), true);
   eq("the pass mark read is error-checked: a missing column reads false, any other error throws",
@@ -232,7 +243,8 @@ console.log("\nPOST /api/attempt-requests/bulk: fail closed, skip a live retake 
   eq("authenticates through the cookie-bound server client", /from "@\/lib\/supabase\/server"/.test(src), true);
   eq("the attempts columns name status, and the read adds is_revision through readPagedWithOptionalColumn (the first page decides)",
     /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src) &&
-      /readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*s\s*\.from\("course_attempts"\)\s*\.select\(cols\)[\s\S]*?\.order\("id"\)\s*\.range\(from, to\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) return unreadable\("attempts"\);/.test(src), true);
+      // ADR 0024 P2-5: the query sits in the preview filter, one decision for every page.
+      /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(cols\)[\s\S]*?, apply\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) return unreadable\("attempts"\);/.test(src), true);
   eq("…a failed page or an empty answer still answers 503 (nullIsError), and no local copy of the first-page closure remains",
     [/\{ nullIsError: true \}/.test(src), /= used;|readWithOptionalColumn\b/.test(src)], [true, false]);
   eq("eligibility is bulkEligibility(…) === \"grant\"; a live retake is counted in skipped_live_retake",
@@ -325,6 +337,7 @@ function fakeDb(tables: Record<string, FRow[]>, fault: Fault = () => null) {
     const [col, v] = o.args as [unknown, unknown];
     if (typeof col !== "string" || col.includes(".") || !(col in r)) return true;
     if (o.op === "eq") return r[col] === v;
+    if (o.op === "neq") return r[col] !== v;
     if (o.op === "in") return (v as unknown[]).includes(r[col]);
     if (o.op === "is") return r[col] === v;
     return true;
@@ -517,6 +530,49 @@ async function ticketCases() {
     const f = fakeDb(TABLES(), (q) => (q.table === "attempt_requests" && q.ops.some((o) => o.op === "update") ? BOOM : null));
     const out = await ticket(f.db);
     eq("the expiry sweep stays fail-soft: a failing sweep still grants u1", byUid(out).u1, "granted");
+  }
+
+  console.log("\ngrantExtraAttempts: a Preview is never the official result (ADR 0024 P2-5)");
+  // u4: only a failed Preview; u5: an earlier passed Preview, a later failed
+  // real attempt; u6: an earlier failed Preview, a later passed real attempt.
+  const withPreviews = (keyed: boolean): Record<string, FRow[]> => {
+    const t = TABLES();
+    const k = (kind: string): FRow => (keyed ? { context_kind: kind } : {});
+    t.course_attempts = [
+      ...t.course_attempts.map((r) => ({ ...r, ...k("individual") })),
+      attemptRow("p4", "u4", 1, "failed", k("preview")),
+      attemptRow("p5", "u5", 1, "passed", k("preview")),
+      attemptRow("a5", "u5", 2, "failed", k("individual")),
+      attemptRow("p6", "u6", 1, "failed", k("preview")),
+      attemptRow("a6", "u6", 2, "passed", k("individual")),
+    ];
+    return t;
+  };
+  const ticketOf = (db: SupabaseClient) =>
+    grantExtraAttempts(db, { orgId: ORG, orgName: "Org", orgSlug: "org", origin: "", decidedBy: "admin-1", source: "ticket", courseId: COURSE, userIds: ["u1", "u4", "u5", "u6"], expiresInDays: 30 });
+  const filterOf = (q: FQ) => q.ops.find((o) => o.op === "neq" && o.args[0] === "context_kind")?.args[1] ?? null;
+  const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+  {
+    const f = fakeDb(withPreviews(true));
+    const out = await ticketOf(f.db);
+    eq("with 0107: only the learners who failed for real are granted; a Preview alone or a failed Preview beside a real pass is not a failure",
+      byUid(out), { u1: "granted", u4: "skipped: has not failed this module", u5: "granted", u6: "skipped: has not failed this module" });
+    eq("…attempts_used counts the real attempt only", f.inserts.map((i) => [(i.payload as FRow).user_id, (i.payload as FRow).attempts_used]), [["u1", 1], ["u5", 1]]);
+    eq("…one attempts read, with context_kind neq preview", f.queries.filter(isAttempts).map(filterOf), ["preview"]);
+  }
+  {
+    // A database without 0107: the filter answers 42703 naming context_kind.
+    const f = fakeDb(withPreviews(false), (q) => (isAttempts(q) && filterOf(q) !== null ? NO_CONTEXT : null));
+    const out = await ticketOf(f.db);
+    eq("without 0107: the filter's 42703, then today's read once without it", f.queries.filter(isAttempts).map(filterOf), ["preview", null]);
+    eq("…today's outcome: the earliest completed row is the official result, whatever it was",
+      byUid(out), { u1: "granted", u4: "granted", u5: "skipped: has not failed this module", u6: "granted" });
+  }
+  {
+    const f = fakeDb(withPreviews(true), (q) => (isAttempts(q) && filterOf(q) !== null ? BOOM : null));
+    const out = await ticketOf(f.db);
+    eq("any other error on the filtered read: every named learner failed, after one attempts read, nothing inserted",
+      [Object.values(byUid(out)).every((v) => v === "failed: could not read the learner's records"), f.queries.filter(isAttempts).length, f.inserts.length], [true, 1, 0]);
   }
 }
 

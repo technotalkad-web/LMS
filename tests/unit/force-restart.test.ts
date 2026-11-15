@@ -28,7 +28,13 @@
  *         PublishedButRestartFailedError on that 500;
  *   (viii) the Library's Replace dialog passes that error's restart to
  *         onReplaced, which picks the banner (a source check: the repo has
- *         no React test rig, so the banner itself is not rendered here).
+ *         no React test rig, so the banner itself is not rendered here);
+ *   (ix)  ADR 0014 step 8, the re-grant and its 23505 rule; ADR 0024 P2-5:
+ *         that rule's official result drops Previews (an earlier passed
+ *         Preview beside a later failed real attempt approves the pending
+ *         request; the reverse keeps it pending), one decision of the
+ *         filter per run, today's reading on a database without 0107, and
+ *         any other error counted as standing.
  *
  * No database, no storage, no network: a recording fake stands in for the
  * supabase-js query builder (the failed-uploads.test.ts shape, built on a
@@ -1168,6 +1174,103 @@ async function regrant() {
     });
     const r = await forceRestartOlderVersions(client, runArgs());
     eq("23505, the approval matches zero rows → a failure (rule (g))", [r.status, r.reissue_failed], ["failed", 1]);
+  }
+  // ADR 0024 P2-5: the 23505 path's official result is the real attempts
+  // only. The read drops `context_kind = 'preview'` rows, one decision of
+  // the filter per run; on a database without 0107 it reads as today.
+  {
+    const done = (id: string, user: string, ss: "passed" | "failed", day: number, kind?: string) => ({
+      id, user_id: user, status: ss, completion_status: "completed", success_status: ss, score: ss === "passed" ? 0.9 : 0.4,
+      started_at: `2026-10-0${day}T09:00:00Z`, completed_at: `2026-10-0${day}T09:30:00Z`, ...(kind === undefined ? {} : { context_kind: kind }),
+    });
+    const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+    /** The 23505 path's attempts read over `rows`, honouring the preview filter; `log` records each read's filter. */
+    const withContext = (rows: Array<Record<string, unknown>>, o: { no0107?: boolean; filteredError?: unknown; log: Array<string | null> }) => (q: Query): Answer | undefined => {
+      if (q.table === "course_attempts" && String(sel(q)).startsWith("id, status, completion_status")) {
+        const f = arg(q, "neq", "context_kind")?.[1] as string | undefined;
+        o.log.push(f ?? null);
+        if (f !== undefined && o.no0107) return { error: NO_CONTEXT };
+        if (f !== undefined && o.filteredError) return { error: o.filteredError };
+        const user = arg(q, "eq", "user_id")?.[1];
+        return { data: rows.filter((x) => x.user_id === user && (f === undefined || x.context_kind !== f)) };
+      }
+      return pendingPath()(q);
+    };
+    const approveOrPending = (q: Query) => (has(q, "insert") ? dup : has(q, "update") ? { data: [{ id: "p1" }] } : undefined);
+    {
+      const log: Array<string | null> = [];
+      const { client, queries } = attemptsWorld(regrantRows(), {
+        links: () => ({ data: [linkRow()] }),
+        requests: approveOrPending,
+        other: withContext([done("pv", "u1", "passed", 1, "preview"), done("real", "u1", "failed", 2, "individual")], { log }),
+      });
+      const r = await forceRestartOlderVersions(client, runArgs());
+      eq("23505, an earlier passed Preview beside a later failed real attempt: the real result does not stand, the request is approved",
+        [r.status, r.reissued, r.reissue_pending, requestUpdates(queries).length], ["ok", 1, 0, 1]);
+      eq("…the attempts read names context_kind neq preview, once", log, ["preview"]);
+    }
+    {
+      const log: Array<string | null> = [];
+      const { client, queries } = attemptsWorld(regrantRows(), {
+        links: () => ({ data: [linkRow()] }),
+        requests: approveOrPending,
+        other: withContext([done("pv", "u1", "failed", 1, "preview"), done("real", "u1", "passed", 2, "individual")], { log }),
+      });
+      const r = await forceRestartOlderVersions(client, runArgs());
+      eq("23505, an earlier failed Preview beside a later passed real attempt: the real pass stands, the request stays pending",
+        [r.status, r.reissue_pending, requestUpdates(queries).length], ["ok", 1, 0]);
+    }
+    {
+      // A learner whose only completed row is a Preview has no official
+      // result, and ADR 0014 step 8 approves when the result does not stand
+      // (the rule is unchanged here; 0107's consume_grant judges the grant at
+      // launch in context).
+      const log: Array<string | null> = [];
+      const { client, queries } = attemptsWorld(regrantRows(), {
+        links: () => ({ data: [linkRow()] }),
+        requests: approveOrPending,
+        other: withContext([done("pv", "u1", "passed", 1, "preview")], { log }),
+      });
+      const r = await forceRestartOlderVersions(client, runArgs());
+      eq("23505, a passed Preview the only completed row: no official result, so it does not stand and the request is approved (not kept pending as a pass)",
+        [r.status, r.reissued, r.reissue_pending, requestUpdates(queries).length, log], ["ok", 1, 0, 1, ["preview"]]);
+    }
+    {
+      const log: Array<string | null> = [];
+      const { client, queries } = attemptsWorld(regrantRows(), {
+        links: () => ({ data: [linkRow()] }),
+        requests: approveOrPending,
+        other: withContext([done("pv", "u1", "passed", 1), done("real", "u1", "failed", 2)], { no0107: true, log }),
+      });
+      const r = await forceRestartOlderVersions(client, runArgs());
+      eq("without 0107: the filter's 42703, then today's read once without it", log, ["preview", null]);
+      eq("…today's outcome: the earlier passed row is the official result, so the request stays pending",
+        [r.status, r.reissue_pending, requestUpdates(queries).length], ["ok", 1, 0]);
+    }
+    {
+      const log: Array<string | null> = [];
+      const { client, queries } = attemptsWorld(regrantRows(), {
+        links: () => ({ data: [linkRow()] }),
+        requests: approveOrPending,
+        other: withContext([done("real", "u1", "failed", 2, "individual")], { filteredError: { code: "57014", message: "timeout" }, log }),
+      });
+      const r = await forceRestartOlderVersions(client, runArgs());
+      eq("any other error on the filtered read counts as standing: not approved, one attempts read, a failure that names the queue",
+        [r.status, r.reissue_failed, requestUpdates(queries).length, log.length, /Attempt Requests/.test(r.message)], ["failed", 1, 0, 1, true]);
+    }
+    {
+      // Two reset retakes of two learners, each with a pending request, on a
+      // database without 0107: the run decides the filter once.
+      const log: Array<string | null> = [];
+      const { client } = attemptsWorld(regrantRows(), {
+        links: () => ({ data: [linkRow(), linkRow({ id: "g2", user_id: "u2", used_attempt_id: "a2" })] }),
+        requests: approveOrPending,
+        other: withContext([done("x1", "u1", "failed", 1), done("x2", "u2", "failed", 1)], { no0107: true, log }),
+      });
+      const r = await forceRestartOlderVersions(client, runArgs());
+      eq("two learners' 23505 reads on a database without 0107: one failed read for the run, then today's reads",
+        [r.reissued, log], [2, ["preview", null, null]]);
+    }
   }
   {
     notifyCalls = [];

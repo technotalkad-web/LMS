@@ -16,6 +16,7 @@ import {
 import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { grantSnapshotFor, isMissingColumn, readWithOptionalColumn, type PgError } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { resolveEmails } from "@/lib/users/emails";
 
 /**
@@ -36,6 +37,14 @@ import { resolveEmails } from "@/lib/users/emails";
  * whole in decision_note, and the same update sets override_confirmed (the
  * marker consume_grant's `stands` refusal reads); a database without that
  * column refuses with 503, never an approval without the marker.
+ *
+ * ADR 0024 P2-5: the official result is the learner's real attempts only.
+ * The attempts read drops `context_kind = 'preview'` rows
+ * (readWithContextFilter and withoutPreviews), as the course page and the
+ * queue page do, so an earlier Preview never decides whether the result
+ * stands. On a database without 0107 the filter's missing-column error
+ * reads today's select once; any other error answers 503 as before. Phase 4
+ * (step 37) moves this read to readContextResult.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, status";
@@ -124,10 +133,14 @@ export async function PATCH(
       if (verErr || !verRows) throw new Error("versions");
       const vIds = (verRows as Array<{ id: string }>).map((v) => v.id);
       if (vIds.length > 0) {
+        // One decision of the preview filter for this request, never kept between requests.
+        const previews: ContextFilterState = { applies: null };
         const { data: attRows, error: attErr } = await readWithOptionalColumn<ScorableAttempt[]>(
           "is_revision",
           (columns) =>
-            s.from("course_attempts").select(columns).eq("user_id", reqRow.user_id).in("course_version_id", vIds) as unknown as PromiseLike<{
+            readWithContextFilter(previews, (apply) =>
+              withoutPreviews(s.from("course_attempts").select(columns).eq("user_id", reqRow.user_id).in("course_version_id", vIds), apply)
+            ) as unknown as PromiseLike<{
               data: ScorableAttempt[] | null;
               error: PgError;
             }>,

@@ -12,15 +12,25 @@
  * launch_mode 'Normal', with no official tag, and is never official.
  *
  *   (r1-r3) an enrolled admin, super owner and data analyst each press Preview
- *         first and Start second: two rows; the bar reads "Preview: not an
- *         official record" on the preview only; a second Preview resumes the
- *         preview; the Start leaves the preview row as it was; the real
- *         attempt, passed on its own token, is the official one (its
- *         LMS.OfficialResult note) and the preview row is still untouched;
- *         the preview, finished afterwards, gets no note and no XP and leaves
- *         the real attempt as it was (the other order would hide a mixed
- *         read: a Start that resumed the preview, or a real row read as a
- *         revision); the learner course page offers each role a Preview link;
+ *         first and Start second (item 7); a second Preview resumes the
+ *         preview. Item 5b's two mixed reads need two orders, so the roles
+ *         split them:
+ *         (r1, r3) the preview is COMPLETED before the Start (passed for the
+ *         admin, failed for the analyst), which an attempt list that counted
+ *         previews would read as the official attempt: the Start would be a
+ *         revision visit and the real attempt a second, non-official run. So
+ *         the Start must be a first official attempt (a new row, no Revision
+ *         Mode badge, is_revision false) and the real attempt, passed on its
+ *         own token, gets the LMS.OfficialResult note, while the preview gets
+ *         none and no XP;
+ *         (r2) the preview stays OPEN during the Start, which a routing read
+ *         that counted previews would resume or close: the Start writes a new
+ *         row beside it; the preview, finished after the real attempt, gets no
+ *         note and no XP and leaves the real attempt as it was.
+ *         Every role: two rows; the bar reads "Preview: not an official
+ *         record" on the preview only; the preview row is deep-equal across
+ *         the Start and the real attempt's result (the real attempt is scored
+ *         alone); the learner course page offers each role a Preview link;
  *   (run) a preview that names a run is refused (phase P): ?denied=1, no row;
  *   (3b)  a plain enrolled learner's ?mode=preview: ?denied=1 and no
  *         course_attempts row written, before and after a Start of their own;
@@ -28,7 +38,9 @@
  *   (3c)  impersonation: a platform owner who is a plain member, enrolled,
  *         impersonating the organisation (requireOrgAccess answers
  *         super_owner): a Start is refused with ?denied=1 and writes nothing,
- *         the course page offers "Preview instead", a Preview is served and
+ *         the course page says "You're impersonating, so this course opens
+ *         as a preview only." (never "not enrolled": the member is enrolled)
+ *         and offers "Preview instead", a Preview is served and
  *         writes one preview row; once the
  *         impersonation ends the member's own role answers (Preview refused,
  *         Start served). A platform owner with no membership: the Start is
@@ -44,13 +56,24 @@
  *   (5b)  one person holds a preview row and a real row of one course:
  *         (a) a Start opens the course's current version while the preview
  *             is open on the retired one;
- *         (b) an open preview on another language neither bounces an explicit
- *             ?lang= Start to the switch confirm (c) nor reroutes a Start
- *             chosen by the saved preference onto its language;
+ *         (b) an open preview on another language does not bounce an explicit
+ *             ?lang= Start to the switch confirm;
+ *         (c) through the launch's language picker (no ?lang=, no saved
+ *             preference), in a browser whose module content never loads:
+ *             the Preview's pick saves no preference and opens Hindi; with
+ *             that preview open and holding a stored assessment result (a
+ *             failed statement on a sub-activity, so it stays in progress),
+ *             the Start's pick of English is neither sent to the confirm nor
+ *             held (the switch route answers 200, not 409), runs English and
+ *             not the preview's Hindi, and closes nothing;
  *         (d) a completed preview of step 1 leaves step 2 of a strict path
  *             locked for a Start, and step 2's own Preview is still served
  *             (a preview runs outside the path's order); the path page offers
  *             a Preview link on each step, with no ?lp=;
+ *         (e) an open preview on another language does not reroute a Start
+ *             chosen by the saved preference onto its language (the picker of
+ *             (c) always ends in an explicit ?lang=, so it never reaches this
+ *             routing);
  *   (m)   a preview launch's subrequest count, measured on a local build: the
  *         server-side fetch() calls of a first preview, a resumed preview and
  *         a first Start, counted inside the app server by
@@ -67,7 +90,7 @@
  * namespace; the two platform-owner marks are removed in afterAll. Logs carry
  * ids and counts only.
  */
-import { test, expect, type APIRequestContext, type BrowserContext } from "@playwright/test";
+import { test, expect, type APIRequestContext, type BrowserContext, type Page } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { addMember, createAuthUser, createOrg, markPlatformOwner, rand, svc } from "./data";
@@ -227,6 +250,83 @@ async function finish(req: APIRequestContext, u: User, attemptId: string, outcom
   expect(res.status(), await res.text()).toBe(200);
 }
 
+/**
+ * A scored answer inside the AU, as an assessment block sends it: a failed
+ * statement whose object is a sub-activity. It is stored on the attempt (the
+ * switch route's hold looks for a stored passed or failed), and the attempt
+ * stays in progress (only the AU's own outcome completes it).
+ */
+async function assessInside(req: APIRequestContext, u: User, attemptId: string) {
+  const auth = await authTokenFor(req, attemptId);
+  const res = await req.post("/api/xapi/statements", {
+    headers: { ...XAPI_HEADERS, Authorization: auth },
+    data: [
+      statement(u, "initialized", attemptId),
+      statement(u, "failed", attemptId, {
+        object: { objectType: "Activity", id: `${AU}/assessment` },
+        result: { success: false, score: { scaled: 0.3 } },
+      }),
+    ],
+  });
+  expect(res.status(), await res.text()).toBe(200);
+}
+
+async function outcomeStatements(attemptId: string): Promise<number> {
+  const { count, error } = await svc()
+    .from("xapi_statements")
+    .select("statement_id", { count: "exact", head: true })
+    .eq("attempt_id", attemptId)
+    .in("verb", [VERB("passed"), VERB("failed")]);
+  expect(error, `statements read: ${error?.message}`).toBeNull();
+  return count ?? 0;
+}
+
+async function savedLanguage(userId: string, courseId: string): Promise<string | null> {
+  const { data, error } = await svc()
+    .from("course_language_preferences")
+    .select("language")
+    .eq("user_id", userId)
+    .eq("course_id", courseId)
+    .maybeSingle();
+  expect(error, `preference read: ${error?.message}`).toBeNull();
+  return (data as { language?: string } | null)?.language ?? null;
+}
+
+// ── the launch's language picker, in a browser (5b-c) ───────────────────────
+type Sent = { method: string; url: string };
+
+/**
+ * A launch that renders the language picker (no ?lang=, no saved preference),
+ * in a page whose module content never loads (spec 63's launchPage), so no
+ * fixture spends an attempt's fetch token. `sent` lists the page's requests.
+ */
+async function pickerPage(ctx: BrowserContext, url: string): Promise<{ page: Page; sent: Sent[] }> {
+  const page = await ctx.newPage();
+  await page.route(/\/content\//, (r) => r.abort());
+  const sent: Sent[] = [];
+  page.on("request", (r) => sent.push({ method: r.method(), url: r.url() }));
+  const res = await page.goto(url, { timeout: 120_000 });
+  expect(res?.status(), `${url} → ${res?.status()}`).toBe(200);
+  await expect(page.getByRole("heading", { name: "Choose your language" }), `${url}: the launch's language picker`).toBeVisible({
+    timeout: 60_000,
+  });
+  return { page, sent };
+}
+
+/**
+ * Picks `code` on the picker. The click is retried until hydration has
+ * attached the handler, and never once `handled()` says the handler ran (it
+ * sent its request): the buttons are then disabled and the page navigates.
+ */
+async function pick(page: Page, code: string, handled: () => boolean) {
+  const button = page.getByRole("button").filter({ has: page.locator("code", { hasText: new RegExp(`^${code}$`) }) });
+  await expect(button, `the picker offers ${code}`).toHaveCount(1);
+  await expect(async () => {
+    if (!handled()) await button.click({ timeout: 5_000 });
+    expect(handled(), `the pick of ${code} reached the picker's handler`).toBe(true);
+  }).toPass({ timeout: 30_000 });
+}
+
 // ── the meter (./subrequest-meter.cjs) ──────────────────────────────────────
 type Metered = { path: string; status: number; fetches: number; supabase: number; other: number };
 
@@ -373,11 +473,12 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
     expect(pae, `path assignment: ${pae?.message}`).toBeNull();
 
     // Enrolment: every role-case user, the learner, the metered admin and the
-    // member platform owner on K; the admin on V; the analyst and the super
-    // owner on L. The analyst holds nothing on the path (case 4).
+    // member platform owner on K; the admin on V; the analyst (5b-b), the
+    // super owner (5b-c) and the admin (5b-e) on L. The analyst holds nothing
+    // on the path (case 4).
     for (const u of [admin, owner, analyst, learner, meter, imp]) await assignCourse(areq, org.slug, s.k, u.id);
     await assignCourse(areq, org.slug, s.v, admin.id);
-    for (const u of [analyst, owner]) await assignCourse(areq, org.slug, lId, u.id);
+    for (const u of [analyst, owner, admin]) await assignCourse(areq, org.slug, lId, u.id);
 
     for (const key of Object.keys(s.users) as Array<keyof typeof s.users>) {
       const u = s.users[key]!;
@@ -385,12 +486,18 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
     }
   });
 
-  for (const [n, key, label] of [
-    ["r1", "admin", "admin"],
-    ["r2", "owner", "super owner"],
-    ["r3", "analyst", "data analyst"],
+  // Item 5b's two mixed reads need two orders (header, r1-r3). "completed": the
+  // preview is finished before the Start, so an attempt list that counted it
+  // would make the Start a revision visit and the real attempt a second,
+  // non-official run. "open": the preview is open during the Start, so a
+  // routing read that counted it would resume or close it.
+  for (const [n, key, label, order, previewOutcome, previewScore] of [
+    ["r1", "admin", "admin", "completed", "passed", 0.9],
+    ["r2", "owner", "super owner", "open", "failed", 0.2],
+    ["r3", "analyst", "data analyst", "completed", "failed", 0.3],
   ] as const) {
-    test(`(${n}) an enrolled ${label}: Preview first, then Start; two rows, the preview untouched, the real attempt scored alone`, async () => {
+    const how = order === "completed" ? "the preview completed, then Start" : "then Start with the preview open";
+    test(`(${n}) an enrolled ${label}: Preview first, ${how}; a first official attempt beside the preview, scored alone`, async () => {
       const u = s.users[key]!;
       const req = s.ctx[key]!.request;
       expect(await rowsOf(u.id, s.vK), "nothing before the Preview").toEqual([]);
@@ -411,9 +518,18 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
       expectPreviewBar((await served(req, previewUrl(s.k!))).html, "Preview again");
       rows = await rowsOf(u.id, s.vK);
       expect(rows.map((r) => r.id), "the second Preview resumes the preview").toEqual([previewId]);
+
+      if (order === "completed") {
+        // The preview's own result, before the Start: never official.
+        await finish(req, u, previewId, previewOutcome, previewScore);
+        const done = await fullRow(previewId);
+        expect([done.completion_status, done.success_status], "the preview is complete before the Start").toEqual(["completed", previewOutcome]);
+        expect(await noteStatus(previewId), "no official note for the preview").toBeNull();
+        expect(await xpCount(previewId), "no XP for the preview").toBe(0);
+      }
       const previewBefore = await fullRow(previewId);
 
-      // Start: a real attempt beside the preview, which the Start leaves alone.
+      // Start: a new real row beside the preview, a first official attempt.
       const st = await served(req, startUrl(s.k!));
       expect(st.src).toContain(`/content/v/${s.vK}/`);
       expectStartBar(st.html, "Start");
@@ -421,26 +537,35 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
       expect(rows.length, "two rows: the preview and the real attempt").toBe(2);
       const real = realOf(rows);
       expect(real.length, "one real row").toBe(1);
-      expect(real[0]).toMatchObject({ ...REAL_ROW, status: "in_progress" });
-      expect([null, "Normal"], "a learner's launch mode (Normal with ALDS_P4 on)").toContain(real[0].launch_mode);
-      expect(await fullRow(previewId), "the Start left the preview row as it was").toEqual(previewBefore);
+      expect(real[0].id, "a new row: the Start never resumes the preview").not.toBe(previewId);
+      expect(real[0], "a first attempt, not a revision visit").toMatchObject({ ...REAL_ROW, status: "in_progress" });
+      expect([null, "Normal"], "a learner's launch mode (Normal with ALDS_P4 on), never Review").toContain(real[0].launch_mode);
+      expect(
+        await fullRow(previewId),
+        order === "completed" ? "the Start left the completed preview as it was" : "the Start left the open preview as it was: not resumed, not closed"
+      ).toEqual(previewBefore);
 
-      // The real attempt, passed on its own token, is the official one.
+      // The real attempt, passed on its own token, is the official one: had the
+      // completed preview been counted, it would hold the official slot and
+      // this row would get no note.
       await finish(req, u, real[0].id, "passed", 0.8);
       const realAfter = await fullRow(real[0].id);
       expect([realAfter.status, realAfter.success_status, realAfter.score]).toEqual(["passed", "passed", 0.8]);
       expect(await noteStatus(real[0].id), "the official result note on the real attempt").toBe("passed");
       expect(await fullRow(previewId), "the preview is still as it was").toEqual(previewBefore);
       expect(await noteStatus(previewId), "no note on the preview").toBeNull();
-
-      // The preview, finished afterwards: never official; the real attempt stays.
-      await finish(req, u, previewId, "failed", 0.2);
-      const previewDone = await fullRow(previewId);
-      expect([previewDone.completion_status, previewDone.success_status], "the preview's own result").toEqual(["completed", "failed"]);
-      expect(await noteStatus(previewId), "no official note for the preview").toBeNull();
       expect(await xpCount(previewId), "no XP for the preview").toBe(0);
-      expect(await fullRow(real[0].id), "the real attempt is as its own result left it").toEqual(realAfter);
-      expect(await noteStatus(real[0].id), "the real attempt's note is unchanged").toBe("passed");
+
+      if (order === "open") {
+        // The preview, finished afterwards: never official; the real attempt stays.
+        await finish(req, u, previewId, previewOutcome, previewScore);
+        const previewDone = await fullRow(previewId);
+        expect([previewDone.completion_status, previewDone.success_status], "the preview's own result").toEqual(["completed", previewOutcome]);
+        expect(await noteStatus(previewId), "no official note for the preview").toBeNull();
+        expect(await xpCount(previewId), "no XP for the preview").toBe(0);
+        expect(await fullRow(real[0].id), "the real attempt is as its own result left it").toEqual(realAfter);
+        expect(await noteStatus(real[0].id), "the real attempt's note is unchanged").toBe("passed");
+      }
       expect((await rowsOf(u.id, s.vK)).length, "still two rows").toBe(2);
     });
   }
@@ -544,26 +669,76 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
     expect(await fullRow(pv.id), "the preview is as it was").toEqual(previewBefore);
   });
 
-  test("(5b-c) an open preview on Hindi does not reroute a Start chosen by the saved preference (English)", async () => {
+  test("(5b-c) through the launch's language picker, an open assessed preview on Hindi neither confirms nor holds a Start of English, which runs English, not the preview's Hindi", async () => {
     const u = s.users.owner!;
-    const req = s.ctx.owner!.request;
+    const ctx = s.ctx.owner!;
     const L = s.l!;
-    // The preference first: with a preview open on Hindi the preference route
-    // would count it as progress elsewhere and answer its confirm (409).
-    const pref = await req.put(`/api/courses/${L.courseId}/language-preference`, { data: { orgSlug: slug(), language: "en" } });
-    expect(pref.status(), await pref.text()).toBe(200);
-    expect((await served(req, previewUrl(L.courseId, "&lang=hi"))).src).toContain(`/content/v/${L.hiVersion}/`);
+    const launchPath = `/${slug()}/courses/${L.courseId}/launch`;
+    const prefPath = `/api/courses/${L.courseId}/language-preference`;
+    const isPut = (r: Sent) => r.method === "PUT" && new URL(r.url).pathname === prefPath;
+    expect(await savedLanguage(u.id, L.courseId), "no saved language: the launch shows its picker").toBeNull();
+    expect(await rowsOf(u.id, L.enVersion), "nothing on English yet").toEqual([]);
+    expect(await rowsOf(u.id, L.hiVersion), "nothing on Hindi yet").toEqual([]);
+
+    // The Preview: the picker's Hindi opens the preview, with no PUT.
+    const p = await pickerPage(ctx, previewUrl(L.courseId));
+    const toHi = (x: URL) => x.pathname === launchPath && x.searchParams.get("lang") === "hi" && x.searchParams.get("mode") === "preview";
+    await pick(p.page, "hi", () => p.sent.some((r) => r.method === "GET" && toHi(new URL(r.url))));
+    await p.page.waitForURL(toHi, { timeout: 120_000 });
+    await expect(p.page.getByTestId("launch-bar"), "the Hindi preview runs").toBeVisible({ timeout: 60_000 });
+    await expect(p.page.getByTestId("preview-badge"), "the preview's bar").toHaveCount(1);
+    expect(await p.page.locator("iframe").first().getAttribute("src"), "Hindi runs").toContain(`/content/v/${L.hiVersion}/`);
+    expect(p.sent.filter(isPut).length, "a Preview's pick sends no switch").toBe(0);
+    await p.page.close();
+    expect(await savedLanguage(u.id, L.courseId), "a Preview saves no language preference").toBeNull();
     const [pv] = await rowsOf(u.id, L.hiVersion);
     expect(pv).toMatchObject({ ...PREVIEW_ROW, status: "in_progress" });
-    const previewBefore = await fullRow(pv.id);
 
-    const st = await served(req, startUrl(L.courseId));
-    expect(st.src, "the preference's language runs, not the preview's").toContain(`/content/v/${L.enVersion}/`);
+    // An answer inside the preview's assessment: a switch route that counted
+    // the preview would hold the Start (requires_finish), and without it would
+    // send the Start to its confirm (requires_confirm).
+    await assessInside(ctx.request, u, pv.id);
+    expect(await outcomeStatements(pv.id), "the preview holds a stored assessment result").toBe(1);
+    const previewBefore = await fullRow(pv.id);
+    expect(previewBefore.status, "the preview is still open").toBe("in_progress");
+    expect(previewBefore.completion_status, "a sub-activity's result does not complete it").not.toBe("completed");
+
+    // The Start: the picker's English goes through the switch route.
+    const st = await pickerPage(ctx, startUrl(L.courseId));
+    const put = st.page.waitForResponse((r) => r.request().method() === "PUT" && new URL(r.url()).pathname === prefPath, {
+      timeout: 60_000,
+    });
+    // If the pick fails first, its own error is the case's; the wait's later
+    // timeout must not land on another case.
+    put.catch(() => {});
+    await pick(st.page, "en", () => st.sent.some(isPut));
+    const putRes = await put;
+    const putStatus = putRes.status();
+    const putBody = putStatus === 200 ? "" : await putRes.text().catch(() => "");
+    expect(putStatus, `the picker's switch is neither sent to the confirm nor held (409): ${putBody}`).toBe(200);
+    await expect(st.page.getByTestId("launch-bar"), "the Start runs (not the switch confirm, not the picker's message)").toBeVisible({
+      timeout: 120_000,
+    });
+    const at = new URL(st.page.url());
+    expect([at.pathname, at.searchParams.get("lang"), at.searchParams.has("mode")], "the launch of English, not a preview").toEqual([
+      launchPath,
+      "en",
+      false,
+    ]);
+    await expect(st.page.getByTestId("preview-badge"), "not a preview").toHaveCount(0);
+    await expect(st.page.getByTestId("practice-badge"), "not a revision visit").toHaveCount(0);
+    expect(await st.page.locator("iframe").first().getAttribute("src"), "English runs, not the preview's Hindi").toContain(
+      `/content/v/${L.enVersion}/`
+    );
+    expect(st.sent.filter(isPut).length, "one switch request").toBe(1);
+    await st.page.close();
+
+    expect(await savedLanguage(u.id, L.courseId), "the Start's pick saved English").toBe("en");
     const en = await rowsOf(u.id, L.enVersion);
     expect(en.length, "one real attempt in English").toBe(1);
     expect(en[0]).toMatchObject({ ...REAL_ROW, status: "in_progress" });
     expect((await rowsOf(u.id, L.hiVersion)).map((x) => x.id), "Hindi holds only the preview").toEqual([pv.id]);
-    expect(await fullRow(pv.id), "the preview is as it was").toEqual(previewBefore);
+    expect(await fullRow(pv.id), "the preview is as it was: open, not closed by the switch").toEqual(previewBefore);
   });
 
   test("(5b-d) a completed preview of step 1 leaves step 2 of a strict path locked for a Start", async () => {
@@ -594,6 +769,31 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
     const onP2 = await rowsOf(u.id, s.vP2);
     expect(onP2.length).toBe(1);
     expect(onP2[0]).toMatchObject({ ...PREVIEW_ROW, status: "in_progress" });
+  });
+
+  test("(5b-e) an open preview on Hindi does not reroute a Start chosen by the saved preference (English)", async () => {
+    const u = s.users.admin!;
+    const req = s.ctx.admin!.request;
+    const L = s.l!;
+    expect(await rowsOf(u.id, L.enVersion), "nothing on English yet").toEqual([]);
+    // The preference first, so the Start below is chosen by it (the picker of
+    // (5b-c) always ends in an explicit ?lang=). (5b-c) holds the switch
+    // route's own answer with a preview open.
+    const pref = await req.put(`/api/courses/${L.courseId}/language-preference`, { data: { orgSlug: slug(), language: "en" } });
+    expect(pref.status(), await pref.text()).toBe(200);
+    expect((await served(req, previewUrl(L.courseId, "&lang=hi"))).src).toContain(`/content/v/${L.hiVersion}/`);
+    const [pv] = await rowsOf(u.id, L.hiVersion);
+    expect(pv).toMatchObject({ ...PREVIEW_ROW, status: "in_progress" });
+    const previewBefore = await fullRow(pv.id);
+
+    const st = await served(req, startUrl(L.courseId));
+    expect(st.src, "the preference's language runs, not the preview's").toContain(`/content/v/${L.enVersion}/`);
+    expectStartBar(st.html, "Start");
+    const en = await rowsOf(u.id, L.enVersion);
+    expect(en.length, "one real attempt in English").toBe(1);
+    expect(en[0]).toMatchObject({ ...REAL_ROW, status: "in_progress" });
+    expect((await rowsOf(u.id, L.hiVersion)).map((x) => x.id), "Hindi holds only the preview").toEqual([pv.id]);
+    expect(await fullRow(pv.id), "the preview is as it was").toEqual(previewBefore);
   });
 
   test("(m) a preview launch's subrequest count, measured on a local build", async () => {
@@ -630,10 +830,17 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
     try {
       const active = await ctx.request.get("/api/super/impersonate");
       expect(await active.text(), "the impersonation is active for this organisation").toContain(s.org!.id);
-      // The course page offers an impersonator the preview only.
+      // The course page offers an impersonator the preview only, with its own
+      // line: the member is enrolled in K, so never "not enrolled". (The
+      // asserted copy has no apostrophe: React escapes one in served HTML.)
       const cp = await ctx.request.get(`/${slug()}/courses/${s.k}`, { timeout: 120_000 });
       expect(cp.ok(), `course page → ${cp.status()}`).toBeTruthy();
-      expect(await cp.text(), "Preview instead, for an impersonator").toContain('data-testid="preview-instead"');
+      const cpHtml = text(await cp.text());
+      expect(cpHtml, "the impersonation card").toContain('data-testid="impersonation-preview-only"');
+      expect(cpHtml, "the impersonation line").toContain("impersonating, so this course opens as a preview only.");
+      expect(cpHtml, "no not-enrolled card for an enrolled impersonator").not.toContain('data-testid="not-enrolled"');
+      expect(cpHtml, "no not-enrolled line for an enrolled impersonator").not.toContain("not enrolled in this course");
+      expect(cpHtml, "Preview instead, for an impersonator").toContain('data-testid="preview-instead"');
 
       const r = await noFollow(ctx.request, startUrl(s.k!));
       expect(redirectTarget(r), describe(r)).toBe(denied());

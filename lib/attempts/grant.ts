@@ -8,6 +8,7 @@ import {
   type GrantSnapshot,
   type PgError,
 } from "@/lib/scoring/attempt-kind";
+import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from "./requests";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
@@ -28,6 +29,15 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * grants or open-request read reports every named learner `failed` ("could
  * not read the learner's records") and inserts nothing; the expiry sweep
  * stays fail-soft.
+ *
+ * ADR 0024 P2-5: a Preview is never an official result. The attempts read
+ * drops `context_kind = 'preview'` rows (readWithContextFilter and
+ * withoutPreviews, one decision for every page of the call), as the queue
+ * page does, so a learner whose only failed row is a Preview is skipped as
+ * not failed and `attempts_used` counts real attempts only. On a database
+ * without 0107 the filter's missing-column error reads today's select once;
+ * any other error reports every learner failed, as before. Phase 4 (step 37)
+ * moves this read to readContextResult.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -67,18 +77,19 @@ export async function grantExtraAttempts(
     // The rows carry `is_revision` (the narrower-select fallback,
     // readPagedWithOptionalColumn: the first page decides the column list
     // for the rest). Any failed page, or a page with neither rows nor an
-    // error, reports every learner failed.
+    // error, reports every learner failed. Previews are dropped (the header).
+    const previews: ContextFilterState = { applies: null };
     const attemptsRead = await readPagedWithOptionalColumn<Att>(
       "is_revision",
       (cols, from, to) =>
-        svc
-          .from("course_attempts")
-          .select(cols)
-          .eq("organization_id", args.orgId)
-          .in("user_id", ids)
-          .in("course_version_id", verIds)
-          .order("id")
-          .range(from, to) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
+        readWithContextFilter(previews, (apply) =>
+          withoutPreviews(
+            svc.from("course_attempts").select(cols).eq("organization_id", args.orgId).in("user_id", ids).in("course_version_id", verIds),
+            apply
+          )
+            .order("id")
+            .range(from, to)
+        ) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
       ATTEMPT_COLUMNS,
       { nullIsError: true }
     );

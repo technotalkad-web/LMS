@@ -40,8 +40,22 @@
  *       continue page has no staff branch (no isStaff, no launchModeFor)
  *       and lib/learner/continue.ts no isStaff; the restart helper, the
  *       restart route's count and the history check name no role set and
- *       read no membership role (they tell a preview by `context_kind`).
- *   (f) planted sources: the scanner flags what it must.
+ *       read no membership role (they tell a preview by `context_kind`);
+ *       the restart dialog calls the dry run's `by_role.staff` previews.
+ *   (f) planted sources: the scanner flags what it must, a negated or
+ *       wrong-branch canPreview included, and two mutants of the real
+ *       sources (the journey's DayPreview and the course page's card with
+ *       the condition inverted) are flagged.
+ *   (g) the sign-in bounce (lib/supabase/middleware.ts): a signed-out
+ *       Preview link comes back with its mode. Each `next` the middleware
+ *       sets is signInNext(<path>, request.nextUrl.searchParams), the path
+ *       and its query (tests/unit/sign-in-next.test.ts runs it), never the
+ *       path alone, which would open a Start.
+ *
+ * (b)'s canPreview condition is positive: the bare name, or an `&&` chain
+ * with the bare name as one operand, on the side that shows the link
+ * (`&&`'s right, `?:`'s true branch, `if`'s then). A negation, `||`, a
+ * comparison or the false branch does not count.
  *
  * Run:  npx tsx tests/unit/preview-mode-sites.test.ts   (or npm run test:unit)
  */
@@ -74,7 +88,7 @@ const sources = new Map<string, string>(files.map((f) => [rel(f), fs.readFileSyn
 
 /** Every Preview address in the tree, by file (step 23's buttons). */
 const SITES: Record<string, { count: number; what: string }> = {
-  "app/[org]/(learner)/courses/[courseId]/page.tsx": { count: 2, what: "Preview beside Start, and \"Preview instead\" when the role is not enrolled" },
+  "app/[org]/(learner)/courses/[courseId]/page.tsx": { count: 2, what: "Preview beside Start, and \"Preview instead\" on the preview-only card (not enrolled, not released, or impersonating)" },
   "app/[org]/(learner)/paths/[pathId]/page.tsx": { count: 1, what: "each step (StepCard)" },
   "app/[org]/(learner)/journey/page.tsx": { count: 1, what: "each day (DayPreview)" },
   "app/[org]/(admin)/library/[courseId]/page.tsx": { count: 1, what: "the Library course page's \"Preview launch\"" },
@@ -121,15 +135,48 @@ function textOf(el: ts.JsxOpeningElement | ts.JsxSelfClosingElement): string {
   for (const c of (el.parent as ts.JsxElement).children) visit(c);
   return parts.join(" ").replace(/\s+/g, " ").trim();
 }
-/** Whether `n` sits under a condition that names `canPreview` (`&&`, `?:` or `if`). */
-function underCanPreview(n: ts.Node): boolean {
-  const names = (x: ts.Node) => /\bcanPreview\b/.test(x.getText());
-  for (let c: ts.Node = n, p = n.parent; p; c = p, p = p.parent) {
-    if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && p.right === c && names(p.left)) return true;
-    if (ts.isConditionalExpression(p) && p.whenTrue === c && names(p.condition)) return true;
-    if (ts.isIfStatement(p) && p.thenStatement === c && names(p.expression)) return true;
+/**
+ * Whether a condition holds only when `canPreview` does: the bare name, or an
+ * `&&` chain with the bare name as one operand. `!canPreview`,
+ * `canPreview || x`, `canPreview === false` and the like do not.
+ */
+function requiresCanPreview(x: ts.Expression): boolean {
+  while (ts.isParenthesizedExpression(x)) x = x.expression;
+  if (ts.isIdentifier(x)) return x.text === "canPreview";
+  if (ts.isBinaryExpression(x) && x.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+    return requiresCanPreview(x.left) || requiresCanPreview(x.right);
   }
   return false;
+}
+/** The nearest condition `n` sits under, on the side that shows it (`&&`, `?:` or `if`), or null. */
+function guardOf(n: ts.Node): ts.Expression | null {
+  for (let c: ts.Node = n, p = n.parent; p; c = p, p = p.parent) {
+    if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && p.right === c) return p.left;
+    if (ts.isConditionalExpression(p) && p.whenTrue === c) return p.condition;
+    if (ts.isIfStatement(p) && p.thenStatement === c) return p.expression;
+  }
+  return null;
+}
+/** Whether `n` sits under a positive canPreview condition (`&&`, `?:` or `if`; see requiresCanPreview). */
+function underCanPreview(n: ts.Node): boolean {
+  for (let c: ts.Node = n, p = n.parent; p; c = p, p = p.parent) {
+    if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && p.right === c && requiresCanPreview(p.left)) return true;
+    if (ts.isConditionalExpression(p) && p.whenTrue === c && requiresCanPreview(p.condition)) return true;
+    if (ts.isIfStatement(p) && p.thenStatement === c && requiresCanPreview(p.expression)) return true;
+  }
+  return false;
+}
+/** Each Preview address's nearest condition, as text (spaces collapsed). */
+function previewGuards(file: string, src: string): string[] {
+  const sf = parse(file, src);
+  const out: string[] = [];
+  const visit = (n: ts.Node) => {
+    const shape = ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) || ts.isTemplateExpression(n) ? shapeOf(n) : null;
+    if (shape !== null && /mode=preview/.test(shape)) out.push(guardOf(n)?.getText(sf).replace(/\s+/g, " ") ?? "(none)");
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
 }
 
 type Site = { file: string; line: number; shape: string; problems: string[] };
@@ -370,6 +417,29 @@ function roleSets(file: string, src: string): string[] {
   return problems;
 }
 
+/**
+ * (g) the sign-in bounce: every `next` the middleware sets (a `.set` or
+ * `.append` whose first argument is "next"), with what is wrong with it.
+ * Right is `signInNext(<path>, request.nextUrl.searchParams)`: the path and
+ * the query of the request's parsed URL.
+ */
+function signInBounceSites(file: string, src: string): Array<{ line: number; problems: string[] }> {
+  const sf = parse(file, src);
+  const out: Array<{ line: number; problems: string[] }> = [];
+  for (const c of [...callsOf(sf, "set"), ...callsOf(sf, "append")]) {
+    const [key, value] = c.arguments;
+    if (!key || shapeOf(key) !== "next") continue;
+    const problems: string[] = [];
+    if (!value || !ts.isCallExpression(value) || calleeName(value) !== "signInNext") {
+      problems.push(`next is not signInNext(…): ${value?.getText(sf) ?? "(none)"}`);
+    } else if (value.arguments[1]?.getText(sf) !== "request.nextUrl.searchParams") {
+      problems.push(`signInNext is not given the request's query: ${value.getText(sf)}`);
+    }
+    out.push({ line: line(sf, c), problems });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 console.log("\n(a) every Preview address is a listed site, a bare launch address with the mode and no product parameter");
 const allSites: Site[] = [];
@@ -398,6 +468,28 @@ console.log("\n(b) each one is a link that says Preview; on a learner page, only
   const journey = sources.get("app/[org]/(learner)/journey/page.tsx") ?? "";
   eq("the journey page offers DayPreview on each day it lists: the revisit list and the completed, current and not-yet-open week rows",
     (journey.match(/<DayPreview canPreview=\{canPreview\}/g) ?? []).length, 4);
+  const COURSE_PAGE = "app/[org]/(learner)/courses/[courseId]/page.tsx";
+  const coursePage = sources.get(COURSE_PAGE) ?? "";
+  eq("the course page: the card's \"Preview instead\" is gated like the Preview beside Start (a version and an active language)",
+    previewGuards(COURSE_PAGE, coursePage), ["canPreview && current && !noActiveLanguage", "canPreview && current && !noActiveLanguage"]);
+  {
+    const at = (s: string) => coursePage.indexOf(s);
+    const order = [
+      at("if (previewOnly && !canPreview) {"),
+      at('.from("course_versions")'),
+      at('.from("course_packages")'),
+      at("const noActiveLanguage ="),
+      at("if (previewOnly) {"),
+    ];
+    eq("…a role that may not preview is sent away before the version and language reads; the card comes after them",
+      order.every((x, i) => x > -1 && (i === 0 || x > order[i - 1])), true);
+  }
+  eq("the course page: an impersonation has its own line on the card, never \"not enrolled\"",
+    [/data-testid=\{impersonation \? "impersonation-preview-only" : "not-enrolled"\}/.test(coursePage),
+      /\{impersonation\s*\?\s*"You're impersonating, so this course opens as a preview only\."\s*:\s*access\.upcomingAt\s*\?\s*"This course is not released to you yet\."\s*:\s*"You're not enrolled in this course\."\s*\}/.test(coursePage)],
+    [true, true]);
+  eq("…and the card without a version or an active language says why, with no link",
+    /\) : \(\s*<p className="text-sm text-muted" data-testid="preview-unavailable">\s*\{current\s*\?\s*"Not available right now: every language of this course is hidden\."\s*:\s*"This course doesn't have a version yet\."\s*\}\s*<\/p>\s*\)\}/.test(coursePage), true);
   const pathPage = sources.get("app/[org]/(learner)/paths/[pathId]/page.tsx") ?? "";
   eq("the path page hands canPreview to every StepCard", /<StepCard[\s\S]{0,400}?canPreview=\{canPreview\}[\s\S]{0,40}?\/>/.test(pathPage), true);
   eq("the path page's step Preview sits outside the Start/Locked/Coming soon choice (every step)",
@@ -442,9 +534,18 @@ console.log("\n(e) the other D7 sites of step 23 decide by the mode or the row's
       callsOf(routeSf, "previewIdsOf").length === 1 &&
         callsOf(routeSf, "planRestart").every((c) => c.arguments[2]?.getText(routeSf) === "previewIds"),
       contextSplitReads("lib/courses/learner-history.ts", sources.get("lib/courses/learner-history.ts") ?? "") >= 1], [true, true, true]);
+  // The API keeps the key `by_role.staff`; what it counts is previews, so the
+  // dialog the admin approves says "previews" (spec 34 reads the sentence).
+  const DIALOG = "app/[org]/(admin)/library/[courseId]/version-actions.tsx";
+  const dialog = sources.get(DIALOG) ?? "";
+  eq("the restart dialog calls by_role.staff previews, never staff",
+    [/data-testid="restart-counts">[\s\S]{0,200}?\{previewCount\(plan\.by_role\.staff\)\};/.test(dialog),
+      /const previewCount = \(n: number \| null\) =>\s*typeof n === "number" \? plural\(n, "preview", "previews"\) : "previews not counted";/.test(dialog),
+      /\bstaff;/.test(dialog.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, ""))],
+    [true, true, false]);
   eq("non-vacuous: every scanned D7 file exists", [
     "lib/alds/launch.ts", launch, "app/[org]/(learner)/continue/page.tsx", "lib/learner/continue.ts",
-    "lib/attempts/restart.ts", RESTART_ROUTE, "lib/courses/learner-history.ts",
+    "lib/attempts/restart.ts", RESTART_ROUTE, "lib/courses/learner-history.ts", DIALOG,
   ].filter((f) => !sources.has(f)), []);
 }
 
@@ -475,6 +576,33 @@ console.log("\n(f) planted sources");
     problemsOf(L, "const x = <div>{isAdmin && (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>)}</div>;"), [["not under a canPreview condition"]]);
   eq("…canPreview on the wrong side of `?:` is flagged",
     problemsOf(L, "const x = canPreview ? null : (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>);"), [["not under a canPreview condition"]]);
+  eq("…a negated canPreview before `&&` is flagged",
+    problemsOf(L, "const x = <div>{!canPreview && (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>)}</div>;"), [["not under a canPreview condition"]]);
+  eq("…a negated canPreview in `?:` is flagged (the link on the true branch)",
+    problemsOf(L, "function P({ canPreview }) { return !canPreview ? (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>) : null; }"), [["not under a canPreview condition"]]);
+  eq("…a negated canPreview inside an `&&` chain is flagged",
+    problemsOf(L, "const x = <div>{!canPreview && current && (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>)}</div>;"), [["not under a canPreview condition"]]);
+  eq("…canPreview under `||`, or compared, is flagged",
+    [problemsOf(L, "const x = <div>{(canPreview || isAdmin) && (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>)}</div>;"),
+      problemsOf(L, "const x = canPreview === false ? (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>) : null;"),
+      problemsOf(L, "function P() { if (!canPreview) { return (<Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview</Link>); } return null; }")],
+    [[["not under a canPreview condition"]], [["not under a canPreview condition"]], [["not under a canPreview condition"]]]);
+  eq("…a positive `&&` chain on `?:`'s true branch, in a fragment, passes",
+    problemsOf(L, "const x = <div>{canPreview && current && !noActiveLanguage ? (<><Link href={`/${o}/courses/${c}/launch?mode=preview`}>Preview instead</Link><p>x</p></>) : (<p>Not available</p>)}</div>;"), [[]]);
+  // Mutants of the real sources, fed to the scanner in memory (no file is
+  // changed): each inverted condition must be flagged.
+  {
+    const J = "app/[org]/(learner)/journey/page.tsx";
+    const journeySrc = sources.get(J) ?? "";
+    const journeyMutant = journeySrc.replace("return canPreview ? (", "return !canPreview ? (");
+    eq("mutant: the journey's DayPreview with `return !canPreview ? (` is flagged",
+      [journeyMutant !== journeySrc, problemsOf(J, journeyMutant).flat()], [true, ["not under a canPreview condition"]]);
+    const CP = "app/[org]/(learner)/courses/[courseId]/page.tsx";
+    const courseSrc = sources.get(CP) ?? "";
+    const cardMutant = courseSrc.replace("{canPreview && current && !noActiveLanguage ? (", "{!canPreview && current && !noActiveLanguage ? (");
+    eq("mutant: the course page's card with `!canPreview && current && …` is flagged",
+      [cardMutant !== courseSrc, problemsOf(CP, cardMutant).flat()], [true, ["not under a canPreview condition"]]);
+  }
   eq("a Preview-labelled launch link without the mode is flagged (the Library's link before P2-5)",
     unmarkedPreviewLinks(A, "const x = <Link href={`/${o}/courses/${c.id}/launch`}>Preview launch</Link>;"), ["app/[org]/(admin)/planted/page.tsx:1 \"Preview launch\" → /${}/courses/${}/launch"]);
   eq("…a Start link without the mode is not",
@@ -557,6 +685,30 @@ console.log("\n(f) planted sources");
   eq("…context_kind named only in a comment, or a filter on another table, counts nothing",
     [contextSplitReads("planted.ts", "// the read drops context_kind = 'preview' rows\nconst r = await svc.from(\"course_attempts\").select(\"id\");"),
       contextSplitReads("planted.ts", "const r = await readWithContextFilter(p, (apply) => withoutPreviews(svc.from(\"courses\").select(\"id\"), apply));")], [0, 0]);
+  eq("(g) planted: a bounce that sets next from the path alone is flagged; signInNext with the request's query passes",
+    signInBounceSites("planted.ts", [
+      "url.searchParams.set(\"next\", path);",
+      "url.searchParams.set(\"next\", signInNext(path, request.nextUrl.searchParams));",
+      "url.searchParams.append(\"next\", cleanNext);",
+      "url.searchParams.set(\"next\", signInNext(path, new URLSearchParams()));",
+      "response.cookies.set(name, value);",
+    ].join("\n")).sort((a, b) => a.line - b.line).map((s) => `${s.line}: ${s.problems.join("; ") || "ok"}`), [
+      "1: next is not signInNext(…): path",
+      "2: ok",
+      "3: next is not signInNext(…): cleanNext",
+      "4: signInNext is not given the request's query: signInNext(path, new URLSearchParams())",
+    ]);
+}
+
+console.log("\n(g) the sign-in bounce keeps the Preview mode: each next the middleware sets is the path and its query");
+{
+  const MW = "lib/supabase/middleware.ts";
+  const mw = sources.get(MW) ?? "";
+  const bounces = signInBounceSites(MW, mw);
+  eq("lib/supabase/middleware.ts sets next twice (the org or platform login, and a white-label domain's /login)", bounces.length, 2);
+  eq("…each through signInNext(<path>, request.nextUrl.searchParams), never the path alone",
+    bounces.flatMap((b) => b.problems.map((p) => `${b.line}: ${p}`)), []);
+  eq("…imported from lib/auth/safe-next", /import \{[^}]*\bsignInNext\b[^}]*\} from "@\/lib\/auth\/safe-next";/.test(mw), true);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

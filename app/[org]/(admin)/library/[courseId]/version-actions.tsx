@@ -129,10 +129,18 @@ export function ActivateVersionButton({
 type RestartPlan = {
   attempt_ids: string[];
   excluded_grant_retake_ids: string[];
-  by_role: { learner: number; staff: number };
+  /**
+   * The API keeps the key names. Since ADR 0024 P2-5 `staff` counts the
+   * previews (context_kind = 'preview') and `learner` every other row, a
+   * staff member's real attempt included, so the dialog says "previews".
+   * null: the count could not tell previews apart, so none is shown.
+   */
+  by_role: { learner: number; staff: number | null };
 };
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+const previewCount = (n: number | null) =>
+  typeof n === "number" ? plural(n, "preview", "previews") : "previews not counted";
 
 /**
  * "Restart learners on this version" (ADR 0008 step 6): for a ready version
@@ -261,7 +269,7 @@ export function RestartVersionButton({
             <>
               <p className="mt-1 text-sm text-ink leading-relaxed" data-testid="restart-counts">
                 {plural(total, "in-progress attempt", "in-progress attempts")}:{" "}
-                {plural(plan.by_role.learner, "learner", "learners")}, {plan.by_role.staff} staff;{" "}
+                {plural(plan.by_role.learner, "learner", "learners")}, {previewCount(plan.by_role.staff)};{" "}
                 {plural(excluded, "grant retake", "grant retakes")} excluded.
               </p>
               <p className="mt-2 text-xs text-muted leading-relaxed">

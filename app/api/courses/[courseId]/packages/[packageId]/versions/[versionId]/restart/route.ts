@@ -4,6 +4,7 @@ import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { auditLog } from "@/lib/auth/require-platform-owner";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import {
+  byRoleAnswer,
   byRoleClass,
   parseDryRun,
   parseRestartReason,
@@ -29,6 +30,9 @@ import { readWithContextFilter, withoutPreviews, type ContextFilterState } from 
  *   nothing, no audit row. `reason` is not needed. `by_role.staff` counts the
  *   Previews (`context_kind = 'preview'`) and `by_role.learner` every other
  *   row, a staff member's real attempt included (ADR 0024 step 23, P2-5).
+ *   On a database without 0107 no row can be told a Preview: `by_role.staff`
+ *   is then null (not 0) and `by_role.learner` counts every row, in both
+ *   modes (byRoleAnswer; the keys keep their names, A23).
  * - real run → `reason` required (trimmed, 1–500 chars); conditional update
  *   (id in the selection, this version, still in progress, so a completion
  *   that lands first wins), launch tokens expired, the tenant LRS
@@ -200,7 +204,7 @@ export async function POST(
       version_id: versionId,
       attempt_ids: plan.attemptIds,
       excluded_grant_retake_ids: plan.excludedGrantRetakeIds,
-      by_role: plan.byRole,
+      by_role: byRoleAnswer(plan.byRole, previews.applies),
     });
   }
 
@@ -259,7 +263,7 @@ export async function POST(
       version_id: versionId,
       attempt_ids: restartedIds,
       excluded_grant_retake_ids: plan.excludedGrantRetakeIds,
-      by_role: byRoleClass(plan.selected.filter((a) => restartedSet.has(a.id)), previewIds),
+      by_role: byRoleAnswer(byRoleClass(plan.selected.filter((a) => restartedSet.has(a.id)), previewIds), previews.applies),
       restarted: restartedIds.length,
       // ADR 0014 step 8: of those, revision visits' rows ("revision visits closed").
       revision_closed: restartedIds.filter((id) => revisionRowIds.has(id)).length,

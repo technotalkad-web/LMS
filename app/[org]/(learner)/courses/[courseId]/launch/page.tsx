@@ -126,9 +126,13 @@ export default async function LaunchPage({
   const firstOf = (v: string | string[] | undefined): string | null => (Array.isArray(v) ? (v[0] ?? null) : (v ?? null));
   const mode: LaunchModeParam = firstOf(modeRaw) === "preview" ? "preview" : null;
 
-  // P2-5 item 3c, ruled (a): while requireOrgAccess answers an impersonating
-  // platform owner (super_owner with no membership row), a Start is refused,
-  // so no official attempt is written for a non-member. Before any read.
+  // P2-5 item 3c, ruled (a): while requireOrgAccess answers an impersonation
+  // (super_owner), a Start is refused, before any read, so an impersonation
+  // writes no official attempt. requireOrgAccess reads the organisation
+  // under the caller's own session before its impersonation branch, so a
+  // platform owner who is not a member is sent to /select-org first: in
+  // practice this refuses an impersonating platform owner who is also a
+  // member of this organisation, whose own Start would otherwise be real.
   if (impersonation && mode !== "preview") {
     console.warn(JSON.stringify({ event: "launch_refused", reason: "impersonation_start", course_id: courseId, user_id: user.id }));
     redirect(`/${orgSlug}/dashboard?denied=1`);

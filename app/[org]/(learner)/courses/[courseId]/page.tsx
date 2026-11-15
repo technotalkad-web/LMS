@@ -127,9 +127,15 @@ export default async function CourseDetailPage({
   // same rule holds for every role (ADR 0024 step 23): no role opens a
   // course it is not enrolled in. A report-viewing role is refused here and
   // offered a preview instead (step 23, "Buttons"); everyone else goes to
-  // the dashboard's notices as before. An impersonating platform owner
-  // holds no membership, and the launch refuses their Start (P2-5 item 3c),
-  // so the page offers them the preview only.
+  // the dashboard's notices as before.
+  //
+  // Impersonation (P2-5 item 3c): requireOrgAccess reads the organisation
+  // under the caller's own session before its impersonation branch, so a
+  // platform owner who is not a member of this organisation is sent to
+  // /select-org first. In practice the impersonation answer here is for a
+  // platform owner who is also a member, enrolled or not. The launch refuses
+  // that caller's Start, so the page offers the preview only, with its own
+  // line (never "not enrolled").
   const access = await learnerCanAccessCourse({
     supabase,
     orgId: org.id,
@@ -139,47 +145,10 @@ export default async function CourseDetailPage({
     // passes without an entitlement (the launch alone takes ?mode=preview).
     preview: false,
   });
-  if (!access.allowed || impersonation) {
-    if (canPreview) {
-      return (
-        <div className="max-w-4xl mx-auto space-y-6">
-          <Link
-            href={`/${orgSlug}/dashboard`}
-            className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink"
-          >
-            <ArrowLeft className="w-4 h-4" /> Back to dashboard
-          </Link>
-          <div className="bg-paper border border-line rounded-2xl shadow-sm p-7 sm:p-9 space-y-4" data-testid="not-enrolled">
-            <h1 className="text-2xl font-semibold leading-tight">{c.title}</h1>
-            {/* A preview's refusal and its "Back to course" land here
-                (no ?lp= or ?journey= to return to), so the retry notice
-                shows on this card too. */}
-            {retryParam && (
-              <p
-                className="text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2"
-                role="alert"
-                data-testid="launch-retry-notice"
-              >
-                Could not open the course. Please try again.
-              </p>
-            )}
-            <p className="text-sm text-ink">
-              {access.upcomingAt
-                ? "This course is not released to you yet."
-                : "You're not enrolled in this course."}
-            </p>
-            <Link
-              href={`/${orgSlug}/courses/${c.id}/launch?mode=preview`}
-              data-testid="preview-instead"
-              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-paper border border-line hover:border-ink text-ink px-5 py-3 rounded-xl text-sm font-medium transition-colors"
-            >
-              <Eye className="w-4 h-4" /> Preview instead
-            </Link>
-            <p className="text-xs text-muted">A preview is not an official record.</p>
-          </div>
-        </div>
-      );
-    }
+  const previewOnly = !access.allowed || impersonation !== null;
+  // A role that may not preview goes to the dashboard's notices before any
+  // further read.
+  if (previewOnly && !canPreview) {
     redirect(
       access.upcomingAt
         ? `/${orgSlug}/dashboard?upcoming=${c.id}`
@@ -218,6 +187,67 @@ export default async function CourseDetailPage({
   }>;
   const activePkgs = allPkgs.filter((p) => p.is_active === true);
   const noActiveLanguage = allPkgs.length > 0 && activePkgs.length === 0;
+
+  // The preview-only card (not enrolled, not released yet, or an
+  // impersonation). Its "Preview instead" is gated like the Preview beside
+  // Start: a version to run and an active language. Without them the launch
+  // would send the viewer straight back here, so the card says why instead.
+  if (previewOnly) {
+    return (
+      <div className="max-w-4xl mx-auto space-y-6">
+        <Link
+          href={`/${orgSlug}/dashboard`}
+          className="inline-flex items-center gap-1.5 text-sm text-muted hover:text-ink"
+        >
+          <ArrowLeft className="w-4 h-4" /> Back to dashboard
+        </Link>
+        <div
+          className="bg-paper border border-line rounded-2xl shadow-sm p-7 sm:p-9 space-y-4"
+          data-testid={impersonation ? "impersonation-preview-only" : "not-enrolled"}
+        >
+          <h1 className="text-2xl font-semibold leading-tight">{c.title}</h1>
+          {/* A preview's refusal and its "Back to course" land here
+              (no ?lp= or ?journey= to return to), so the retry notice
+              shows on this card too. */}
+          {retryParam && (
+            <p
+              className="text-xs text-red-900 bg-red-50 border border-red-200 rounded-lg px-3 py-2"
+              role="alert"
+              data-testid="launch-retry-notice"
+            >
+              Could not open the course. Please try again.
+            </p>
+          )}
+          <p className="text-sm text-ink">
+            {impersonation
+              ? "You're impersonating, so this course opens as a preview only."
+              : access.upcomingAt
+                ? "This course is not released to you yet."
+                : "You're not enrolled in this course."}
+          </p>
+          {canPreview && current && !noActiveLanguage ? (
+            <>
+              <Link
+                href={`/${orgSlug}/courses/${c.id}/launch?mode=preview`}
+                data-testid="preview-instead"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-paper border border-line hover:border-ink text-ink px-5 py-3 rounded-xl text-sm font-medium transition-colors"
+              >
+                <Eye className="w-4 h-4" /> Preview instead
+              </Link>
+              <p className="text-xs text-muted">A preview is not an official record.</p>
+            </>
+          ) : (
+            <p className="text-sm text-muted" data-testid="preview-unavailable">
+              {current
+                ? "Not available right now: every language of this course is hidden."
+                : "This course doesn't have a version yet."}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const languageOptions: ChangeLanguageOption[] = activePkgs.map((p) => ({
     id: p.id,
     language: p.language,

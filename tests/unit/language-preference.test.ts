@@ -20,6 +20,12 @@
  *   3. The launch picker, by source (no React rig): the !restart 409 branch
  *      reads the body once and shows `message`, never "HTTP 409".
  *
+ * ADR 0024 P2-5: the route itself now also runs under a stubbed fetch in
+ * tests/unit/language-preference-route.test.ts (an open Preview on the other
+ * language is never counted, never holds the switch and is never abandoned;
+ * the database without 0107; the preview context refused). The source
+ * checks below name the filter.
+ *
  * Run:  npx tsx tests/unit/language-preference.test.ts   (or npm run test:unit)
  */
 import fs from "node:fs";
@@ -118,6 +124,11 @@ console.log("\nthe route (source check; no unit rig for the cookie-bound client)
       at('.from("course_language_preferences").upsert('),
       at('.update({ status: "abandoned" })'),
     ].every((v, i, arr) => v > 0 && (i === 0 || v > arr[i - 1])), true);
+  eq("ADR 0024 P2-5: the in-progress read sits in the preview filter, one decision for the request",
+    /const previews: ContextFilterState = \{ applies: null \};[\s\S]*?readWithContextFilter\(previews, \(apply\) => \{\s*let q = withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\("id, course_version_id"\)/.test(src), true);
+  eq("…the abandon takes the same decision", /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)/.test(src), true);
+  eq("…a body naming the preview context answers 400 before the session read",
+    src.indexOf('body.context.kind === "preview"') > 0 && src.indexOf('body.context.kind === "preview"') < src.indexOf("supabase.auth.getUser()"), true);
   eq("the decision gets restart_if_in_progress as given (both values reach the finish check)",
     /restartIfInProgress: Boolean\(body\.restart_if_in_progress\),/.test(src), true);
   eq("the requires_finish 409 body: { requires_finish, error, message }",

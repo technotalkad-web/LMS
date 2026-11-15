@@ -549,7 +549,8 @@ test.describe.serial("per-version restart (ADR 0008 A)", () => {
     await v1Row.getByRole("button", { name: "Restart learners on this version" }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByTestId("restart-counts")).toHaveText(
-      "2 in-progress attempts: 1 learner, 1 staff; 1 grant retake excluded.",
+      // by_role.staff counts previews since ADR 0024 P2-5; the dialog says so.
+      "2 in-progress attempts: 1 learner, 1 preview; 1 grant retake excluded.",
       { timeout: 30_000 }
     );
     const go = dialog.getByRole("button", { name: "Restart 2 attempts" });
