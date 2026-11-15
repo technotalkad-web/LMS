@@ -422,7 +422,10 @@ test("real SQL LRS end-to-end: live forward, drainer, sweeper, idempotency, outa
       await db.from("course_packages").update({ current_version_id: version!.id }).eq("id", pkg!.id);
       await db.from("learning_path_assignments").insert({ organization_id: org.id, path_id: path!.id, assignee_type: "user", user_id: learner.id });
       const learnerCtx = await authedContext(browser, baseURL!, learner.email, learner.password);
-      const launch = await learnerCtx.request.get(`/${org.slug}/courses/${course!.id}/launch`);
+      // Through the path (ADR 0024 P2-6): the passed attempt above is the
+      // path's (path context), and the learner holds the course through the
+      // path only, so a launch with no ?lp= is first sent into the path.
+      const launch = await learnerCtx.request.get(`/${org.slug}/courses/${course!.id}/launch?lp=${path!.id}`);
       await learnerCtx.close();
       const { data: flagged } = await db.from("course_attempts").select("id").eq("organization_id", org.id).eq("user_id", learner.id).eq("is_revision", true);
       rec("S9a a revisit after the pass opens one flagged row", launch.ok() && flagged?.length === 1, { status: launch.status(), flagged: flagged?.length ?? null });

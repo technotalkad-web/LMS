@@ -64,8 +64,15 @@
  * by-role kind, legacy_role, with no official tag and no day id, or throws
  * (rule 3; step 6: a new preview never carries an official tag, though the
  * check admits one on a legacy_role row). A row whose kind is computed (not
- * a string literal) is held to (1), (2) and (4) by this scan; P2-6 states
- * how the launch page's computed kinds are read.
+ * a string literal) is held to (1), (2) and (4) by this scan: a computed
+ * `context_kind` counts as named, and a non-literal-null
+ * `journey_enrollment_id` makes the row a journey row for rules (2) and (4).
+ * That is how the launch page's two Start inserts are read (ADR 0024 P2-6):
+ * each names `context_kind` and all five tags from the resolver's context
+ * (tags.context_kind, learning_path_id, journey_enrollment_id, journey_day,
+ * journey_day_id, journey_version_id), so both are journey rows by rule (2)
+ * and name journey_day_id and journey_version_id; section (e) asserts the
+ * six keys on both, and that the preview insert's kind stays the literal.
  *
  * Known limits (forms not followed; none exists in the tree today): a
  * builder or URL passed in as a parameter, returned by a function with a
@@ -78,9 +85,10 @@
  * the database's own guards cover.
  *
  * Exceptions, each listed with its date and reason:
- *   - PENDING: the launch page, until P2-6 names the context on both of its
- *     inserts. Pinned to exactly its two open inserts; the test fails when a
- *     pending file no longer needs the entry.
+ *   - PENDING: empty since P2-6 (the launch page's two Start inserts name
+ *     the context with the tags). Kept as the mechanism: an entry is pinned
+ *     to its exact count of open inserts, and the test fails when a pending
+ *     file no longer needs it.
  *   - REFUSED: spec 55's two inserts made on a learner's own session, which
  *     the database must refuse; they are not fixtures (step 64) and stay as
  *     they are. Pinned to exactly that receiver and count.
@@ -467,16 +475,10 @@ function scanSource(file: string, text: string): Site[] {
 // Exceptions.
 // ---------------------------------------------------------------------------
 /** Files whose inserts may stay open until a named slice; each pinned to its exact count of open inserts. */
-const PENDING: Record<string, { since: string; until: string; sites: number }> = {
-  // The Start's two inserts (the insert and its retry without the 0100
-  // columns). The preview insert of P2-5 already names context_kind
-  // 'preview' and preview_kind, so it is not open and not on this entry.
-  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
-    since: "2026-11-14",
-    until: "emptied by P2-6 (ADR 0024 step 23: both Start inserts name context_kind with the tags)",
-    sites: 2,
-  },
-};
+// Emptied by P2-6 (ADR 0024 step 23): the launch page's two Start inserts
+// (the insert and its retry without the 0100 columns), pending since
+// 2026-11-14, name context_kind with the tags. P2-10 asserts this list empty.
+const PENDING: Record<string, { since: string; until: string; sites: number }> = {};
 /** Inserts the database must refuse, on a learner's own session: not fixtures (ADR 0024 step 64). */
 const REFUSED: Record<string, { receiver: string; sites: number; why: string }> = {
   "tests/bot/lifecycle/55-attempt-row-guard.spec.ts": {
@@ -910,6 +912,40 @@ console.log("\n(d) every journey_versions fixture insert in tests/ and scripts/ 
   atLeast("journey_versions fixture inserts found (specs 46 and 55)", versionInserts.length, 2);
   eq("each names a non-empty day_ids map and day_ids_source 'editor'",
     versionInserts.filter((v) => !v.ok).map((v) => `${v.file}:${v.line}`), []);
+}
+
+// ---------------------------------------------------------------------------
+// (e) How the launch page's computed kinds are read (ADR 0024 P2-6, step 23).
+// ---------------------------------------------------------------------------
+console.log("\n(e) the launch page's Start inserts name the resolver's context and its tags (ADR 0024 P2-6)");
+{
+  const LAUNCH = "app/[org]/(learner)/courses/[courseId]/launch/page.tsx";
+  const launchSites = sites.filter((s) => s.file === LAUNCH);
+  eq("the launch page: three inserts (the Start's, its retry, the preview's), none open",
+    [launchSites.length, launchSites.filter((s) => s.problems.length > 0).length], [3, 0]);
+  const src = sources.get(LAUNCH) ?? "";
+  const sf = ts.createSourceFile(LAUNCH, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const rows: ts.ObjectLiteralExpression[] = [];
+  const visit = (n: ts.Node) => {
+    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === "insert" &&
+      /\.from\("course_attempts"\)/.test(n.expression.expression.getText(sf)) && n.arguments[0] && ts.isObjectLiteralExpression(n.arguments[0])) {
+      rows.push(n.arguments[0]);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  const valueOf = (o: ts.ObjectLiteralExpression, k: string) => {
+    const p = o.properties.find((x) => ts.isPropertyAssignment(x) && propName(x.name) === k) as ts.PropertyAssignment | undefined;
+    return p ? p.initializer.getText(sf) : null;
+  };
+  const TAGS = ["context_kind", "learning_path_id", "journey_enrollment_id", "journey_day", "journey_day_id", "journey_version_id"];
+  const start = rows.filter((o) => valueOf(o, "context_kind") !== '"preview"');
+  eq("both Start inserts name context_kind and the five tags, each from the resolver's context (tags.<column>)",
+    start.map((o) => TAGS.map((k) => valueOf(o, k))), start.map(() => TAGS.map((k) => `tags.${k}`)));
+  eq("…exactly two of them, and the preview insert keeps its literal kind",
+    [start.length, rows.filter((o) => valueOf(o, "context_kind") === '"preview"').length], [2, 1]);
+  eq("…the tags are the resolver's: context_kind is ctx.kind, a journey row's version the enrolment's pinned one (launch_context's version_id)",
+    [/context_kind: ctx\.kind,/.test(src), /journey_version_id: ctx\.kind === "journey" \? \(jf\?\.version_id \?\? null\) : null,/.test(src)], [true, true]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -71,8 +71,13 @@ export type AttemptContext = {
     launchedIds: string[];
   };
   path: { id: string; name: string | null; step: number | null; steps: number | null } | null;
+  /**
+   * Set on every attempt whose row carries a journey enrolment: enrollmentId and
+   * day come from the row; programId, name and daysTotal only when the
+   * enrolment was read (lib/lrs/context.ts).
+   */
   journey: {
-    programId: string;
+    programId: string | null;
     name: string | null;
     enrollmentId: string;
     day: number | null;
@@ -164,7 +169,7 @@ export function contextExtensions(ctx: AttemptContext, timestamp?: string): Obj 
   }
   // Journey
   if (ctx.journey) {
-    e[ext.journeyProgramId] = ctx.journey.programId;
+    setIf(e, ext.journeyProgramId, ctx.journey.programId);
     setIf(e, ext.journeyName, ctx.journey.name);
     e[ext.journeyEnrollmentId] = ctx.journey.enrollmentId;
     setIf(e, ext.journeyDay, ctx.journey.day);
@@ -197,14 +202,17 @@ export function groupingActivities(ctx: AttemptContext): Obj[] {
       });
     }
   }
-  if (ctx.journey) {
+  // The journey's IRIs need its program id; without it (the enrolment was not
+  // read) the statement keeps journey/enrollment-id and has no journey grouping.
+  const programId = ctx.journey?.programId;
+  if (ctx.journey && programId) {
     const def: Obj = { type: activityType.journey };
     if (ctx.journey.name) def.name = langMap(ctx.journey.name);
-    g.push({ objectType: "Activity", id: activity.journey(ctx.journey.programId), definition: def });
+    g.push({ objectType: "Activity", id: activity.journey(programId), definition: def });
     if (typeof ctx.journey.day === "number") {
       g.push({
         objectType: "Activity",
-        id: activity.journeyDay(ctx.journey.programId, ctx.journey.day),
+        id: activity.journeyDay(programId, ctx.journey.day),
         definition: { type: activityType.journeyDay, name: langMap(`Day ${ctx.journey.day}`) },
       });
     }

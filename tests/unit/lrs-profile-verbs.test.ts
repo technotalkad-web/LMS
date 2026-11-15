@@ -40,8 +40,11 @@ const ANSWERED = "http://adlnet.gov/expapi/verbs/answered";
 const ACTIVITY = "urn:elearning-engine:profile-verbs-test";
 const COURSE = "44444444-5555-4666-8777-888888888888";
 
-/** The version this build carries. ADR 0016 step 14: PROFILE_VERSION moves once per release. */
-const THIS_BUILD_PROFILE_VERSION = "1.1.0";
+/**
+ * The version this build carries. ADR 0016 step 14: PROFILE_VERSION moves once per
+ * release; ADR 0024 step 26 (P2-6) moved it to 1.2.0, the first profile change after v1.4.0.
+ */
+const THIS_BUILD_PROFILE_VERSION = "1.2.0";
 
 // Every field of AttemptContext: the compiler holds this fixture to the type.
 const ctx: AttemptContext = {

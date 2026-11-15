@@ -8,6 +8,7 @@ import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
 import { resolveManyGroups } from "@/lib/org/groups";
+import { convertSelfEnrolments } from "@/lib/assignments/direct";
 
 /**
  *   POST /api/assignments
@@ -21,7 +22,8 @@ import { resolveManyGroups } from "@/lib/org/groups";
  * is visible to the learner as "Coming soon" but can't be launched until then.
  * Clients send a full ISO string (converted from the admin's local time in the
  * browser). Re-assigning an existing assignee UPDATES due_at/release_at rather
- * than silently no-op'ing on the unique-index conflict.
+ * than silently no-op'ing on the unique-index conflict, and a learner's own
+ * self-enrolment (source 'self', ADR 0024 step 24) becomes an assignment.
  */
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
@@ -256,6 +258,8 @@ export async function POST(request: Request) {
 
   const inserted: unknown[] = [];
   let rescheduled = 0;
+  /** Learners whose direct row was already there: each may be their own self-enrolment (converted below). */
+  const alreadyUserIds: string[] = [];
   // select("*") for 0069 deploy safety (group_id).
   const SELECT_COLS = "*";
   for (const row of rows) {
@@ -272,6 +276,7 @@ export async function POST(request: Request) {
     if (error.code !== "23505") {
       return NextResponse.json({ error: error.message }, { status: 400 });
     }
+    if (row.assignee_type === "user" && row.user_id) alreadyUserIds.push(row.user_id);
     // Already assigned (unique index). Re-assigning is how an admin changes
     // the schedule, so apply the new dates instead of silently doing nothing.
     // No notification: the learner was already told about this assignment.
@@ -291,6 +296,20 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: updErr.message }, { status: 400 });
     }
     rescheduled += updated?.length ?? 0;
+  }
+
+  // ADR 0024 step 24 (P2-6 item 2): a learner who only pressed Start on an
+  // "Everyone" course holds a self row; this assignment converts it (source
+  // 'admin', assigned_by this admin; the dates were written above). An admin
+  // row is untouched. Without 0107's column today's handling above was all
+  // of it. No email: the learner is told of rows inserted now, as before.
+  const conversion = await convertSelfEnrolments(
+    supabase, "course_assignments",
+    { orgId: org.id, column: "course_id", id: course.id, userIds: alreadyUserIds },
+    { assignedBy: user.id }
+  );
+  if (conversion.error) {
+    return NextResponse.json({ error: conversion.error.message ?? "Could not convert a self-enrolment" }, { status: 400 });
   }
 
   // Fire assignment notifications in the background.

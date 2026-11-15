@@ -228,15 +228,16 @@ export function creditedDaysFor(
  * The course on each credited day's credit row, by the day's number in the
  * pinned version: the days of creditedDaysFor, matched by the same rule (by
  * id; by number only when the reader fell back), each with its row's
- * `course_id` (null when that course was deleted). learnerCanAccessCourse
- * reads it above the open day (past its ceiling): there a credited day is
- * granted only for the course on its credit row, and a null course grants
- * nothing (ADR 0024 step 22's row for `?journey=E&day=`, section 95's row
- * "A day's course swapped"). At or below the ceiling the day's current
- * course is granted as before, a credited day whose course a publish swapped
- * included, and a completed enrolment grants every course of its pinned
- * version. Both are the P2-6 gap (step 22's rows for `?journey=E&day=` and
- * for a completed E; step 23).
+ * `course_id` (null when that course was deleted). The journey page reads it
+ * for each credited day's review link and label: a credited day reviews the
+ * course on its credit row, the one the learner completed, wherever the day
+ * sits against the open day and whether or not a publish swapped the day's
+ * course since, and a null course offers no review (ADR 0024 step 22's rows
+ * for `?journey=E&day=` and for a completed E, section 95's row "A day's
+ * course swapped"). learnerCanAccessCourse grants the same course from the
+ * credit rows themselves (step 23: a credit row for the course, whatever the
+ * pinned version), so a credit on a day no longer in the version, which this
+ * matching leaves out, still opens its course.
  */
 export function creditCoursesFor(
   version: CreditVersion,

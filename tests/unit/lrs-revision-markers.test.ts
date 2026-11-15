@@ -18,7 +18,9 @@
  *     the source not done (the next run retries the chunk);
  *   - the siblings tier: 42703 → today's unfiltered
  *     select; any other error → ContextReadError, no statement;
- *   - PROFILE_VERSION is 1.1.0 and the profile-version extension carries it;
+ *   - PROFILE_VERSION is this build's, 1.2.0 (the markers are listed since
+ *     1.1.0; ADR 0024 step 26 moved it), and the profile-version extension
+ *     carries it;
  *   - ADR 0024 P2-3 (item 1b): a staff member's preview before a real attempt
  *     moves neither the real attempt's attempt/number nor its attempt/scored,
  *     and the sweep forwards nothing of the preview; on a database without
@@ -210,7 +212,7 @@ async function main() {
       markers(launchedOf(statements, A1)), { scored: true, launchMode: "(absent)", number: 1 });
     eq("the grant retake: attempt/scored = true although its ordinal is 2 (revision rows out of the ordinal)",
       markers(launchedOf(statements, R1)), { scored: true, launchMode: "(absent)", number: 2 });
-    eq("the profile-version extension carries 1.1.0", launchedOf(statements, A1)[ext.profileVersion], "1.1.0");
+    eq("the profile-version extension carries 1.2.0", launchedOf(statements, A1)[ext.profileVersion], "1.2.0");
     const first = f.queries.find(isFirstTier);
     const sib = f.queries.find(isSiblings);
     eq("the first tier selects is_revision", sel(first!).includes("is_revision"), true);
@@ -365,7 +367,7 @@ async function main() {
   }
 
   console.log("\nthe profile version");
-  eq("PROFILE_VERSION is 1.1.0 (ADR 0014 step 7: the first profile-changing PR after the tag)", PROFILE_VERSION, "1.1.0");
+  eq("PROFILE_VERSION is 1.2.0 (ADR 0024 step 26: the first profile-changing PR after the v1.4.0 tag; ADR 0014 step 7's markers are listed since 1.1.0)", PROFILE_VERSION, "1.2.0");
   eq("the launch-mode extension IRI", ext.attemptLaunchMode, "https://ambak.com/xapi/ext/attempt/launch-mode");
 
   eq("nothing posted to an LRS", fetched, 0);

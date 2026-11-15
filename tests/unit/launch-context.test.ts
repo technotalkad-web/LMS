@@ -19,8 +19,10 @@
  *       numeric day from an old link; a completed enrolment admits review
  *       and resume only; step 23's five cases (a removed day, a swapped
  *       course, a day moved past the calendar ceiling, a completed
- *       enrolment's resume, the swapped day's review); the unlock rule at
- *       `now` in the organisation's timezone;
+ *       enrolment's resume, the swapped day's review); a day started on
+ *       another course never opens its current course beside it: its launch
+ *       goes into the same day on the started course, which resumes (steps
+ *       22 and 93); the unlock rule at `now` in the organisation's timezone;
  *   (f) no product parameter: the Individual row, the self-enrol branch for
  *       an "Everyone" course, and the redirect row (one holder, several,
  *       none with an upcoming assignment, none);
@@ -30,15 +32,33 @@
  *       learner's resume or launch, in every product; made active again,
  *       the same facts (the saved progress, untouched) give the same launch
  *       as before. assert-0107-launch.sql (48) shows launch_context's facts
- *       flipping back with the stored rows unchanged.
+ *       flipping back with the stored rows unchanged;
+ *   (i) refusalWithoutFacts (P2-6 item 1): the conflict row and a run,
+ *       answered by the page with no launch_context call;
+ *   (j) afterSelfEnrol (P2-6 item 2, P2-Q2 option (i-a)): the four cases
+ *       the plan names (inserted then enrolled; 23505 then enrolled; 23505
+ *       then self-enrol again, upcoming; any other insert error, retry), and
+ *       A3's second answer (the strict lock after the path's insert);
+ *   (k) resumeAfterSlotRouting (P2-6 review, launch F4): a journey resume
+ *       whose open official rows slot routing abandons opens the day fresh
+ *       on an active enrolment's uncredited day with a free window, and
+ *       otherwise answers close_then_refuse: the page lets its close run
+ *       (the row on the deactivated slot is abandoned), then refuses with
+ *       journey_resume_row_abandoned.
+ *   Ruling A3 is in (d): an "Everyone" path learner with no enrolment row
+ *   launching a later step is told "enrol first", not locked.
  *
  * The test-run row (phase P) adds its cases here when it is built.
  *
  * Run:  npx tsx tests/unit/launch-context.test.ts   (or npm run test:unit)
  */
 import {
+  afterSelfEnrol,
   journeyOpenDayIsOpen,
+  refusalWithoutFacts,
   resolveLaunchContext,
+  resumeAfterSlotRouting,
+  type JourneyAdmission,
   type JourneyFacts,
   type LaunchContextFacts,
   type LaunchDecision,
@@ -194,6 +214,26 @@ console.log("\n(d) the path row (?lp=P)");
   eq("…an individually entitled learner is still refused on the path", resolve({ lp: PATH }, facts({ course: { found: true, is_active: true, visibility: "org_public", individual: { enrolled: true, upcoming_at: null } }, path: pathFacts({ enrolled: false }) })), refused("not_enrolled"));
   eq("an \"Everyone\" path, not enrolled yet: the launch self-enrols on the path (step 24)", resolve({ lp: PATH }, facts({ path: pathFacts({ enrolled: false, visibility: "org_public" }) })), { kind: "launch", selfEnrol: "path", context: { kind: "path", pathId: PATH } });
   eq("…a self-enrolled learner (the self row recorded) is enrolled: no second self-enrolment", resolve({ lp: PATH }, facts({ path: pathFacts({ enrolled: true, self_row: true, visibility: "org_public" }) })), { kind: "launch", selfEnrol: null, context: { kind: "path", pathId: PATH } });
+  // Ruling A3 (P2-6 item 2): v_path_step_status holds enrolled learners
+  // only, so for this learner every earlier step reads not done. "Enrol
+  // first", before the strict order; the second call's answer applies it.
+  const notEnrolledYet = pathFacts({ enrolled: false, visibility: "org_public", steps: [
+    { course_id: C1, step_number: 1, release_at: null, done: false },
+    { course_id: COURSE, step_number: 2, release_at: null, done: false },
+  ] });
+  eq("A3: an \"Everyone\" path, not enrolled, launching step 2 (step 1 reads not done): enrol first, not locked",
+    resolve({ lp: PATH }, facts({ path: notEnrolledYet })), { kind: "launch", selfEnrol: "path", context: { kind: "path", pathId: PATH } });
+  eq("…the second call, enrolled now, step 1 really not done: the locked redirect",
+    resolve({ lp: PATH }, facts({ path: pathFacts({ ...notEnrolledYet, enrolled: true, self_row: true } as FoundPath) })), { kind: "redirect", to: "locked", pathId: PATH });
+  eq("…the second call, step 1 done by the path rule: path:P, no further self-enrolment",
+    resolve({ lp: PATH }, facts({ path: pathFacts({ enrolled: true, self_row: true, visibility: "org_public" }) })), { kind: "launch", selfEnrol: null, context: { kind: "path", pathId: PATH } });
+  eq("…a course that is no step of P enrols nobody: refused first",
+    resolve({ lp: PATH }, facts({ path: pathFacts({ ...notEnrolledYet, course_step: null } as FoundPath) })), refused("not_a_step"));
+  eq("…an unreleased step enrols nobody: the upcoming redirect first",
+    resolve({ lp: PATH }, facts({ path: pathFacts({ ...notEnrolledYet, steps: [
+      { course_id: C1, step_number: 1, release_at: null, done: false },
+      { course_id: COURSE, step_number: 2, release_at: "2999-01-01T00:00:00Z", done: false },
+    ] } as FoundPath) })), { kind: "redirect", to: "upcoming", pathId: PATH });
   eq("an inactive path: refused", resolve({ lp: PATH }, facts({ path: pathFacts({ is_active: false }) })), refused("path_unavailable"));
   eq("a path not found in the organisation: refused", resolve({ lp: PATH }, facts({ path: { found: false } })), refused("path_unavailable"));
   eq("no path facts for a ?lp= launch: refused", resolve({ lp: PATH }, facts()), refused("path_unavailable"));
@@ -250,7 +290,31 @@ console.log("\n(e) the journey row (?journey=E&day=D)");
   eq("a credited day is a review in context", resolve({ journey: ENR, day: DAY4 }, j({ day_credit: { course_id: COURSE, attempt_id: ATT, credit_kind: "attempt", day_number: 4 }, next_day: 5, next_day_id: DAY9 })), launchJourney("review"));
   eq("…a legacy cross-context credit too", resolve({ journey: ENR, day: DAY4 }, j({ day_credit: { course_id: COURSE, attempt_id: null, credit_kind: "legacy_cross_context", day_number: 4 }, next_day: 5, next_day_id: DAY9 })), launchJourney("review"));
   eq("an open official attempt of this course on the day: resume", resolve({ journey: ENR, day: DAY4 }, j({ day_open_attempt: { attempt_id: ATT, course_id: COURSE }, resumable_day_ids: [DAY4] })), launchJourney("resume"));
-  eq("…an open attempt of another course on the day is not this launch's resume", resolve({ journey: ENR, day: DAY4 }, j({ day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), launchJourney("open"));
+  // Steps 22, 93 and 95 (R13): the open day whose course a publish swapped
+  // after the learner started it holds the started course's open attempt.
+  // The launch of that day resumes it: the day's own link (its current
+  // course) goes into the same day on the started course, and the day's
+  // current course is not opened beside it (P2-6: the open row used to
+  // answer `open` here, a second official attempt in the day's context).
+  const startedOther = { kind: "redirect", to: "journey", enrollmentId: ENR, dayId: DAY4, courseId: OTHER };
+  eq("…an open attempt of another course on the open day: into the same day on the started course, not the day's current course", resolve({ journey: ENR, day: DAY4 }, j({ day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), startedOther);
+  eq("…an upper-case started course id gives the lower-case id", resolve({ journey: ENR, day: DAY4 }, j({ day_open_attempt: { attempt_id: ATT, course_id: OTHER.toUpperCase() } })), startedOther);
+  eq("…and the started course resumes on that day (the redirect's target: no loop)", resolve({ journey: ENR, day: DAY4 }, j({ day_open_attempt: { attempt_id: ATT, course_id: OTHER } }), { courseId: OTHER }), launchJourney("resume"));
+  eq("…in progress mode too", resolve({ journey: ENR, day: DAY4 }, j({ unlock_mode: "progress", day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), startedOther);
+  eq("…on a day past the open one too (the started attempt resumes wherever the day sits)",
+    resolve({ journey: ENR, day: DAY4 }, j({ next_day: 3, next_day_id: DAY3, day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), startedOther);
+  eq("…a day that does not hold the launched course is still refused, an open attempt of another course or not",
+    resolve({ journey: ENR, day: DAY4 }, j({ day: { id: DAY4, number: 4, in_version: true, removed: false, course_id: C3 }, day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), refused("day_not_open"));
+  eq("…a completed enrolment opens nothing new: review_only, no redirect",
+    resolve({ journey: ENR, day: DAY4 }, j({ status: "completed", next_day: null, next_day_id: null, day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), refused("review_only"));
+  // Never on a credited day (P2-6 review, launch F3): its review is the
+  // credit row's course, so the day's current course is refused there, even
+  // with an open attempt of another course in the day's context.
+  for (const [what, creditCourse] of [["the started course", OTHER], ["a third course", C1]] as Array<[string, string]>) {
+    eq(`…a credited day (its credit on ${what}) with an open attempt of another course, launched with the day's current course: day_not_open, never the redirect`,
+      resolve({ journey: ENR, day: DAY4 }, j({ day_credit: { course_id: creditCourse, attempt_id: ATT, credit_kind: "attempt", day_number: 4 }, day_open_attempt: { attempt_id: uid("a", 2), course_id: OTHER }, next_day: 5, next_day_id: DAY9 })),
+      refused("day_not_open"));
+  }
 
   // Step 23's five cases.
   eq("step 23 (1): a started day that was removed: resume", resolve({ journey: ENR, day: DAY9 }, j({
@@ -389,6 +453,74 @@ console.log("\n(h) O5: inactive content is closed to every learner; reactivation
   eq("no product parameter, an inactive course with holders in the facts: refused before any holder is read",
     resolve({}, facts({ course: course(false, false), holders: { paths: [{ path_id: PATH, step_number: 1 }], journey_days: [{ enrollment_id: ENR, day_id: DAY4, day_number: 4, credited: true }] } })),
     refused("course_unavailable"));
+}
+
+console.log("\n(i) refusalWithoutFacts: the rows the page answers with no launch_context call (P2-6 item 1)");
+{
+  eq("both product parameters: context_conflict", refusalWithoutFacts({ lp: PATH, journey: ENR, run: null }), "context_conflict");
+  eq("…trimmed, an empty one counted as absent", [refusalWithoutFacts({ lp: " ", journey: ENR, run: null }), refusalWithoutFacts({ lp: PATH, journey: "", run: null })], [null, null]);
+  eq("a run with no mode: preview_not_allowed (phase P)", refusalWithoutFacts({ lp: null, journey: null, run: uid("f", 7) }), "preview_not_allowed");
+  eq("…the conflict row first", refusalWithoutFacts({ lp: PATH, journey: ENR, run: uid("f", 7) }), "context_conflict");
+  eq("one product parameter, or none: null (the call is made)",
+    [refusalWithoutFacts({ lp: PATH, journey: null, run: null }), refusalWithoutFacts({ lp: null, journey: ENR, run: null }), refusalWithoutFacts({ lp: null, journey: null, run: null })], [null, null, null]);
+  eq("the resolver answers the same rows from the same rule",
+    [resolve({ lp: PATH, journey: ENR }, null), resolve({ run: uid("f", 7) }, null)], [refused("context_conflict"), refused("preview_not_allowed")]);
+}
+
+console.log("\n(j) afterSelfEnrol: P2-Q2 option (i-a) after the self-enrolment insert and the second call (step 24, A3)");
+{
+  const individual: LaunchDecision = { kind: "launch", selfEnrol: null, context: { kind: "individual" } };
+  const selfCourse: LaunchDecision = { kind: "launch", selfEnrol: "course", context: { kind: "individual" } };
+  const selfPath: LaunchDecision = { kind: "launch", selfEnrol: "path", context: { kind: "path", pathId: PATH } };
+  const onPath: LaunchDecision = { kind: "launch", selfEnrol: null, context: { kind: "path", pathId: PATH } };
+  // The four cases P2-6 item 2 names.
+  eq("(1) inserted, then enrolled: go on and launch", afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: individual }), { kind: "go_on", decision: individual });
+  eq("(2) 23505, then enrolled (a concurrent Start's row): go on and launch", afterSelfEnrol({ selfEnrol: "course", insert: "already_enrolled", second: individual }), { kind: "go_on", decision: individual });
+  eq("(3) 23505, then self-enrol again: the learner's own direct row is not released: upcoming, no second insert",
+    afterSelfEnrol({ selfEnrol: "course", insert: "already_enrolled", second: selfCourse }), { kind: "upcoming" });
+  eq("(4) any other insert error: the retry notice (no second call is made)",
+    afterSelfEnrol({ selfEnrol: "course", insert: "failed", second: null }), { kind: "retry", reason: "self_enrol_course_insert_failed" });
+  // Beside them.
+  eq("the upcoming answer is the course's only: a path's 23505 then self-enrol again is the retry notice",
+    afterSelfEnrol({ selfEnrol: "path", insert: "already_enrolled", second: selfPath }), { kind: "retry", reason: "self_enrol_path_not_recorded" });
+  eq("…an insert that succeeded and still reads not enrolled: the retry notice, never a loop of inserts",
+    afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: selfCourse }), { kind: "retry", reason: "self_enrol_course_not_recorded" });
+  eq("…a path insert that failed: the retry notice", afterSelfEnrol({ selfEnrol: "path", insert: "failed", second: null }), { kind: "retry", reason: "self_enrol_path_insert_failed" });
+  eq("A3: the path inserted, then the strict lock from the second call: go on with the locked redirect",
+    afterSelfEnrol({ selfEnrol: "path", insert: "inserted", second: { kind: "redirect", to: "locked", pathId: PATH } }),
+    { kind: "go_on", decision: { kind: "redirect", to: "locked", pathId: PATH } });
+  eq("A3: the path inserted, then step 1 done: go on and launch path:P", afterSelfEnrol({ selfEnrol: "path", insert: "inserted", second: onPath }), { kind: "go_on", decision: onPath });
+  eq("a refusal on the second call (the course made inactive between the calls): go on with it",
+    afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: refused("course_unavailable") as LaunchDecision }), { kind: "go_on", decision: refused("course_unavailable") });
+  eq("no second answer after an insert that did not fail: the retry notice", afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: null }), { kind: "retry", reason: "self_enrol_no_second_answer" });
+}
+
+console.log("\n(k) resumeAfterSlotRouting: a journey resume whose open rows slot routing abandons (P2-6 review, launch F4), decided before the close, acted on after it");
+{
+  type Ask = Parameters<typeof resumeAfterSlotRouting>[0];
+  const base: Ask = {
+    admission: "resume",
+    openOfficialIds: [ATT],
+    abandon: [ATT],
+    enrolmentStatus: "active",
+    dayCredited: false,
+    dayNumber: 4,
+    candidate: "first",
+  };
+  const ask = (o: Partial<Ask> = {}) => resumeAfterSlotRouting({ ...base, ...o });
+  const A2 = uid("a", 2);
+  eq("routing abandons the only open official row, an active enrolment, an uncredited day with a number, a free window: open (the close, then the fresh official attempt)", ask(), "open");
+  eq("…ids compared without case", ask({ abandon: [ATT.toUpperCase()] }), "open");
+  eq("…every open official row abandoned (two, both on deactivated slots): open", ask({ openOfficialIds: [ATT, A2], abandon: [A2, ATT] }), "open");
+  eq("not a resume (open, review): unchanged, whatever routing abandons", (["open", "review"] as JourneyAdmission[]).map((admission) => ask({ admission })), ["unchanged", "unchanged"]);
+  eq("routing abandons nothing: unchanged (the resume takes its row)", ask({ abandon: [] }), "unchanged");
+  eq("routing keeps an open official row (own slot, or a retake it never abandons): unchanged", ask({ openOfficialIds: [ATT, A2] }), "unchanged");
+  eq("no open official row in the context (it completed meanwhile): unchanged (refused at the row, nothing inserted)", ask({ openOfficialIds: [] }), "unchanged");
+  eq("a completed enrolment: close_then_refuse (it opens nothing new)", ask({ enrolmentStatus: "completed" }), "close_then_refuse");
+  eq("an unknown enrolment status: close_then_refuse", ask({ enrolmentStatus: null }), "close_then_refuse");
+  eq("a credited day: close_then_refuse (no new official attempt on it)", ask({ dayCredited: true }), "close_then_refuse");
+  eq("no day number (a removed day), or not a day number: refuse (a journey row needs it)", [ask({ dayNumber: null }), ask({ dayNumber: 0 })], ["close_then_refuse", "close_then_refuse"]);
+  eq("a used window (at_row) or a grant: refuse (not a first attempt)", [ask({ candidate: "at_row" }), ask({ candidate: "grant" })], ["close_then_refuse", "close_then_refuse"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

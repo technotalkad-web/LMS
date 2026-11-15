@@ -11,6 +11,7 @@ import { isReleased, laterOf } from "@/lib/learner/release";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 import { JourneyIcon } from "@/components/ui/journey-icon";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { everyonePathStart } from "@/lib/auth/course-access";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
@@ -432,6 +433,11 @@ export default async function DashboardPage({
       pathDueAt.set(r.id, null);
     }
   }
+  // Kept apart for the path-only cards' Start (10 below): the paths the
+  // learner has an assignment row on, and the "Everyone" paths. After the
+  // fold above pathSrcRank no longer tells them apart.
+  const assignedPathIds = new Set(myPathAssigns.map((a) => a.path_id));
+  const everyonePathIds = new Set(((orgPublicPathRows ?? []) as Array<{ id: string }>).map((r) => r.id));
 
   const myPathIds = Array.from(pathSrcRank.keys());
 
@@ -868,6 +874,7 @@ export default async function DashboardPage({
   for (const a of mineGroups) pushCard(a, "team");
   for (const a of orgWide) pushCard(a, "org");
   // Include path-only courses (no direct course assignment).
+  const sequenceModeByPath = new Map(pathsList.map((p) => [p.id, p.sequence_mode]));
   for (const [cid, pathName] of pathNameByCourseId) {
     if (seen.has(cid)) continue;
     const course = courseById.get(cid);
@@ -877,6 +884,33 @@ export default async function DashboardPage({
     if (releaseAt && status !== "completed" && status !== "passed") {
       status = "upcoming";
     }
+    // A course the learner reaches only through an "Everyone" path with no
+    // row of theirs: its Start carries that path's ?lp= (ADR 0024 ruling A3
+    // enrols them at the launch; a plain Start is refused not_enrolled), and
+    // the badge names the same path. No direct assignment reaches this card
+    // (those have theirs above), and `paths` holds active paths only. Of
+    // several "Everyone" paths, one whose step can launch now: the step
+    // states above (9), the step's position and the path's order rank them
+    // (no further read).
+    const startPathId = everyonePathStart({
+      courseIsEveryone: orgPublicCourseIds.includes(cid),
+      directlyHeld: false,
+      steps: paths.flatMap((p) =>
+        p.steps
+          .filter((s) => s.course_id === cid)
+          .map((s) => ({
+            pathId: p.id,
+            everyone: everyonePathIds.has(p.id),
+            enrolled: assignedPathIds.has(p.id),
+            releaseAt: s.releaseAt,
+            position: s.step_number,
+            sequenceMode: sequenceModeByPath.get(p.id) ?? null,
+            state: s.state,
+          }))
+      ),
+      now: nowMs,
+    });
+    const startPathName = startPathId ? paths.find((p) => p.id === startPathId)?.name : undefined;
     cards.push({
       course_id: course.id,
       title: course.title,
@@ -888,7 +922,8 @@ export default async function DashboardPage({
       dueAt: null,
       bestScore: officialScoreForCourse(cid),
       ...attemptsLeftProps(cid),
-      pathName,
+      pathName: startPathName ?? pathName,
+      startPathId,
       thumbnail_url: course.thumbnail_url,
       thumbnail_fit: course.thumbnail_fit,
       thumbnail_pos_x: course.thumbnail_pos_x,

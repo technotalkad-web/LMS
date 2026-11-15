@@ -32,20 +32,22 @@
  *       attempt of (h) and on the learner's xAPI attempt → 409
  *       wrong_runtime with the type echoed, and the service-role re-read is
  *       unchanged; the SCORM commit of (h) answered 200.
- *   (j) the journey launches as the server (every run): relaunching an
- *       untagged in-progress attempt through ?journey=<enrollment>&day=1
- *       resumes the same row, which keeps no journey tag (0107's
- *       immutability trigger refuses the old launch's re-tag, ADR 0024 step
- *       60); a first launch through a journey inserts the attempt with the
- *       tag (ADR 0009 steps 2-3; spec 02-journeys, which step 14 names,
- *       never launches through a journey). Two extra SCORM courses, so no
- *       other case's attempt is tagged. The journey launch is read without
- *       following redirects and must serve the resumed row (its id in the
- *       launch page), so a refused launch, which leaves the row untouched,
- *       fails the case. Since ADR 0024 P2-2 the case needs 0107: its
- *       journey_versions insert names day_ids, so on a database without
- *       0107 it fails at that insert (the pre-0107 branch, a resume that
- *       re-tags the row, is gone).
+ *   (j) the journey launches as the server (every run), in the journey's own
+ *       context (ADR 0024 P2-6, step 22): with an untagged Individual
+ *       attempt in progress on the course, a launch through
+ *       ?journey=<enrollment>&day=1 (an old link's day number, resolved
+ *       through the pinned version) opens a journey row BESIDE it, which the
+ *       launch serves; the Individual row is not resumed, closed or
+ *       re-tagged (the old resume re-tag is deleted). A first launch through
+ *       a journey by the day's id (the app's link) inserts the attempt with
+ *       context_kind 'journey', the enrolment, the day's number and id and
+ *       the pinned version (ADR 0009 steps 2-3; spec 02-journeys, which step
+ *       14 names, never launches through a journey). Two extra SCORM
+ *       courses, so no other case's attempt is tagged. The journey launch is
+ *       read without following redirects and must serve the journey row (its
+ *       id in the launch page), so a refused launch fails the case. Needs
+ *       0107: its journey_versions insert names day_ids, and every launch
+ *       reads launch_context (from P2-6).
  *
  * Branches, decided by has0099() (a real select of
  * v_course_attempt_summary.live_attempt_count):
@@ -244,7 +246,7 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     s.adminDb = await sessionClient(admin);
   });
 
-  test("(j) journey launches tag the attempt as the server: the resume tag and the tagged insert (every run)", async () => {
+  test("(j) journey launches tag the attempt as the server: a journey row beside the Individual one, and the tagged insert by day id (every run)", async () => {
     const areq = s.adminCtx!.request;
     const lreq = s.learnerCtx!.request;
     const db = svc();
@@ -270,6 +272,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
     // count_sundays: day 1 must be open on any weekday, Sundays included.
     const start = todayStr();
     const enrollments: Record<"resume" | "fresh", string> = {} as never;
+    const dayIds: Record<"resume" | "fresh", string> = {} as never;
+    const versions: Record<"resume" | "fresh", string> = {} as never;
     for (const key of ["resume", "fresh"] as const) {
       const { data: program, error: pErr } = await db
         .from("journey_programs")
@@ -305,6 +309,8 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
         .select("id")
         .single();
       expect(vErr, `journey version: ${vErr?.message}`).toBeNull();
+      dayIds[key] = (day1 as { id: string }).id;
+      versions[key] = (jv as { id: string }).id;
       await db.from("journey_programs").update({ current_version_id: jv!.id }).eq("id", program!.id);
       const { data: enr, error: eErr } = await db
         .from("journey_enrollments")
@@ -315,53 +321,85 @@ test.describe.serial("ADR 0009 — attempt rows are written only by the server",
       enrollments[key] = (enr as { id: string }).id;
     }
 
-    // (i) the resume: a plain launch leaves an untagged in-progress attempt;
-    // the journey launch of the same course resumes it untagged (0107).
+    // (i) beside: a plain launch leaves an untagged Individual attempt in
+    // progress; the journey launch of the same course, through an old link's
+    // day number, opens the journey's own row beside it (ADR 0024 P2-6: the
+    // launch reads the journey context's rows only, and the old resume re-tag
+    // is deleted). The open-row key is (learner, version, context), 0107.
     const plain = await lreq.get(`/${orgA.slug}/courses/${courses.resume.course}/launch`);
     expect(plain.ok(), `plain launch → ${plain.status()}`).toBeTruthy();
-    const resumeAttempt = await inProgressAttempt(learner.id, courses.resume.version);
-    const untagged = await row(resumeAttempt);
-    expect(untagged).toMatchObject({ journey_enrollment_id: null, journey_day: null });
-    // Not followed: a refused launch redirects to the course page (a 3xx, or
-    // a marker in a 200 body once the launch's loading boundary has
-    // streamed), and a refusal leaves the row as it was, so the row checks
-    // below cannot tell it from a resume. Only a served launch renders the
-    // runtime with the row's id, so the id in the body proves the launch
-    // took this row.
-    const viaJourney = await getNoFollow(lreq, `/${orgA.slug}/courses/${courses.resume.course}/launch?journey=${enrollments.resume}&day=1`);
-    expect(viaJourney.redirectedTo("?retry=1"), "journey launch (resume): no retry notice").toBe(false);
-    expect(viaJourney.status, "journey launch (resume)").toBe(200);
-    expect(viaJourney.body, "the journey launch serves the resumed attempt").toContain(resumeAttempt);
-    expect(await inProgressAttempt(learner.id, courses.resume.version), "the same attempt is resumed").toBe(resumeAttempt);
-    // 0107's course_attempts_context_immutable (ADR 0024 step 60) refuses
-    // the old launch's re-tag; the launch logs it and resumes the row (served
-    // above), which stays the learner's Individual attempt.
-    const resumed = await row(resumeAttempt);
-    expect(resumed, "0107: the re-tag is refused; the resumed attempt keeps no journey tag").toMatchObject({
+    const plainRows = await rowsFor(learner.id, courses.resume.version);
+    expect(plainRows, "the plain launch's one row").toHaveLength(1);
+    const individual = plainRows[0];
+    expect(individual, "the plain launch is the Individual product").toMatchObject({
+      context_kind: "individual",
       journey_enrollment_id: null,
       journey_day: null,
-      context_kind: "individual",
+      status: "in_progress",
+    });
+    // What the journey launch must leave as it was (not resumed, closed or re-tagged).
+    const kept = (r: Row | null) => {
+      const x = (r ?? {}) as Row;
+      const pick = ["status", "completion_status", "success_status", "context_kind", "context_key", "learning_path_id", "journey_enrollment_id", "journey_day", "journey_day_id", "is_revision"];
+      return Object.fromEntries(pick.map((k) => [k, x[k] ?? null]));
+    };
+    // Not followed: a refused launch redirects (a 3xx, or a marker in a 200
+    // body once the launch's loading boundary has streamed) and writes
+    // nothing. Only a served launch renders the runtime with the row's id, so
+    // the id in the body proves the launch took the journey row.
+    const viaJourney = await getNoFollow(lreq, `/${orgA.slug}/courses/${courses.resume.course}/launch?journey=${enrollments.resume}&day=1`);
+    expect(viaJourney.redirectedTo("?retry=1"), "journey launch (old day number): no retry notice").toBe(false);
+    expect(viaJourney.redirectedTo("?denied=1"), "journey launch (old day number): not refused").toBe(false);
+    expect(viaJourney.status, "journey launch (old day number)").toBe(200);
+    const besideRows = await rowsFor(learner.id, courses.resume.version);
+    expect(besideRows, "two rows: the Individual one and the journey's").toHaveLength(2);
+    const journeyRow = besideRows.find((r) => r.id !== individual.id)!;
+    expect(journeyRow, "the journey's own row, by the day's id resolved from the number").toMatchObject({
+      context_kind: "journey",
+      context_key: `journey:${enrollments.resume}:${dayIds.resume}`,
+      journey_enrollment_id: enrollments.resume,
+      journey_day: 1,
+      journey_day_id: dayIds.resume,
+      journey_version_id: versions.resume,
+      learning_path_id: null,
+      is_revision: false,
       user_id: learner.id,
       organization_id: orgA.id,
       status: "in_progress",
     });
+    expect(viaJourney.body, "the journey launch serves the journey row").toContain(String(journeyRow.id));
+    expect(kept(await row(String(individual.id))), "the Individual row as it was: not resumed, closed or re-tagged").toEqual(kept(individual));
 
-    // (ii) the tagged insert: a first launch through the journey.
+    // (ii) the tagged insert: a first launch through the journey, by the
+    // day's id (the link the journey page makes).
     expect(await rowsFor(learner.id, courses.fresh.version), "never launched").toHaveLength(0);
-    const first = await lreq.get(`/${orgA.slug}/courses/${courses.fresh.course}/launch?journey=${enrollments.fresh}&day=1`);
-    expect(first.ok(), `journey launch (fresh) → ${first.status()}`).toBeTruthy();
+    const first = await getNoFollow(lreq, `/${orgA.slug}/courses/${courses.fresh.course}/launch?journey=${enrollments.fresh}&day=${dayIds.fresh}`);
+    expect(first.redirectedTo("?retry=1"), "journey launch (day id): no retry notice").toBe(false);
+    expect(first.status, "journey launch (day id)").toBe(200);
     const freshRows = await rowsFor(learner.id, courses.fresh.version);
     expect(freshRows, "one attempt created by the launch").toHaveLength(1);
-    expect(freshRows[0], "the inserted attempt carries the journey tag").toMatchObject({
+    expect(freshRows[0], "the inserted attempt names the journey context, the day's id and the pinned version").toMatchObject({
+      context_kind: "journey",
       journey_enrollment_id: enrollments.fresh,
       journey_day: 1,
+      journey_day_id: dayIds.fresh,
+      journey_version_id: versions.fresh,
+      learning_path_id: null,
+      is_revision: false,
       user_id: learner.id,
       organization_id: orgA.id,
       status: "in_progress",
     });
+    expect(first.body, "the journey launch serves the inserted row").toContain(String(freshRows[0].id));
     test.info().annotations.push({
       type: "case j",
-      description: JSON.stringify({ resumeAttempt, insertAttempt: String(freshRows[0].id), enrollments, org: orgA.id }),
+      description: JSON.stringify({
+        individualAttempt: String(individual.id),
+        journeyAttempt: String(journeyRow.id),
+        insertAttempt: String(freshRows[0].id),
+        enrollments,
+        org: orgA.id,
+      }),
     });
   });
 

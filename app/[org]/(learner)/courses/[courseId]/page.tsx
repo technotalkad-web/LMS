@@ -683,7 +683,10 @@ export default async function CourseDetailPage({
               </button>
             ) : current ? (
               <Link
-                href={`/${orgSlug}/courses/${c.id}/launch`}
+                // A plain Start, or `?lp=` of the "Everyone" path that alone
+                // grants the course (lib/auth/course-access.ts
+                // everyonePathStart; ADR 0024 ruling A3 enrols the learner).
+                href={`/${orgSlug}/courses/${c.id}/launch${access.startPathId ? `?lp=${encodeURIComponent(access.startPathId)}` : ""}`}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3.5 rounded-xl font-semibold transition shadow-sm"
               >
                 <PlayCircle className="w-5 h-5" />

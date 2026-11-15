@@ -57,7 +57,25 @@ export type GridCard = {
   thumbnail_fit?: string | null;
   thumbnail_pos_x?: number | null;
   thumbnail_pos_y?: number | null;
+  /**
+   * Course cards: the "Everyone" path whose `?lp=` the Start carries, set by
+   * the dashboard from lib/auth/course-access.ts everyonePathStart (ADR 0024
+   * ruling A3). Null or absent: a plain Start.
+   */
+  startPathId?: string | null;
 };
+
+/**
+ * A course card's button target: the course page once the course is
+ * completed or passed ("View details"), else the launch with
+ * `?back=dashboard`, and `&lp=` when the card names an "Everyone" path to
+ * start in (startPathId). Every other card's Start stays plain.
+ */
+export function courseCardHref(orgSlug: string, card: Pick<GridCard, "course_id" | "status" | "startPathId">): string {
+  if (card.status === "completed" || card.status === "passed") return `/${orgSlug}/courses/${card.course_id}`;
+  const lp = card.startPathId ? `&lp=${encodeURIComponent(card.startPathId)}` : "";
+  return `/${orgSlug}/courses/${card.course_id}/launch?back=dashboard${lp}`;
+}
 
 type Filter = "all" | "in_progress" | "not_started" | "completed";
 
@@ -616,9 +634,7 @@ function Card({ card, orgSlug }: { card: GridCard; orgSlug: string }) {
             </button>
           ) : (
             <Link
-              href={`/${orgSlug}/courses/${card.course_id}${
-                isCompleted ? "" : "/launch?back=dashboard"
-              }`}
+              href={courseCardHref(orgSlug, card)}
               className={`w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                 isCompleted
                   ? "bg-canvas hover:bg-canvas/70 text-ink border border-line"

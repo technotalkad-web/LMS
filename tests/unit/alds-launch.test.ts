@@ -37,25 +37,43 @@
  *      refusal path, no refusal inside a try, the strict grant read, the
  *      narrower-select fallbacks, the cutover's `=== 1`, consume_grant with
  *      no fallback writes and the same-request re-run, the token expiry
- *      after `opened`, the P4 update, the closes, the visit record.
- *   7. ADR 0024 P2-5 by source: the preview gate (3b) and the impersonation
- *      ruling (3c) before any attempts read, no role check, the preview's
- *      reads and closes on the caller's course previews and the Start's
- *      without previews (5b, one fallback decision per request), the
- *      preview row (N4's legacy_role close, then one insert with no
+ *      after `opened`, the P4 update, the closes (every call of
+ *      closeAfterResolution followed at once by the close_then_refuse
+ *      refusal, the rerun's included), the visit record.
+ *   7. ADR 0024 P2-5 and P2-6 by source: the impersonation ruling (3c), the
+ *      preview row (3b, no launch_context call) and the conflict row
+ *      (refusalWithoutFacts) before the course read; then one
+ *      launch_context call, the resolver, and evaluate in that order; no
+ *      access call and no role check (P2-N5); the page's own journey and
+ *      path blocks gone; the context filter on every attempts read and close
+ *      in place of the interim preview exclusions (O2); the resume re-tag
+ *      gone; the preview row (N4's legacy_role close, then one insert with no
  *      official tag).
  *   8. The real page run under a stubbed fetch (next/headers stubbed, as
- *      tests/unit/attempt-page-official-sentence.test.ts does): a plain
- *      user's ?mode=preview is refused with no course_attempts request at
- *      all; an impersonating platform owner's Start is refused; each
- *      report-viewing role's preview inserts one preview row and no Continue;
- *      the resume, N4, the 23505 retry and the database without 0107; two
- *      languages (the picker told it is a preview, no language confirm for a
- *      preview, an open preview that never bounces a Start); an admin's
- *      Start is a learner's and leaves previews out; the strict lock's read,
- *      the deactivated-slot close and the stale-revision close, each also on
- *      a database without 0107 (one decision per request). The preview
- *      launch's subrequests are counted (P2-5's gate).
+ *      tests/unit/attempt-page-official-sentence.test.ts does; launch_context
+ *      answered from a small world by 0107's rules): a plain user's
+ *      ?mode=preview is refused with no course_attempts request at all; an
+ *      impersonating platform owner's Start is refused before the call; each
+ *      report-viewing role's preview inserts one preview row and no Continue,
+ *      with no launch_context call; the resume, N4, the 23505 retry and the
+ *      database without 0107; two languages; a Start makes one call (two
+ *      with a self-enrolment), names the context on its insert, and reads and
+ *      closes its context's rows only; a failed call, or a database without
+ *      0107, refuses with the retry notice and writes nothing; the conflict
+ *      row and a run make no call; a day of digits goes as p_day and a uuid
+ *      as p_day_id; the path context (the strict lock of P only, the holder
+ *      redirect); the deactivated-slot and stale-revision closes;
+ *      self-enrolment (P2-Q2's cases, A3); the worst path of step 70 (a
+ *      self-enrolling learner's grant consumed in path:P) and consume_grant's
+ *      stale rerun; the journey context (the open day, the locked day, a
+ *      credited day's review as a revision visit, on an active enrolment
+ *      with an unused grant in the day's context too; a resume whose only
+ *      open row sits on a deactivated slot, opened fresh, or the row closed
+ *      and then the launch refused; a resume whose row routing does not
+ *      reach, refused at the row; one journey-day holder relaunched into its day); the launch's
+ *      context in LMS.LaunchData (an Individual, a path and a journey
+ *      launch). The subrequests of each branch are counted (P2-5's and
+ *      P2-6's gates; step 70).
  *
  * Intentionally unconditional deltas (live in every deploy, flag or not;
  * none changes what a learner sees or how an attempt is graded):
@@ -84,6 +102,7 @@ import {
   attemptServedLanguage,
   buildLaunchData,
   isLaunchDataStateId,
+  LAUNCH_CONTEXT_EXT,
   launchModeFor,
   lmsAuActivityId,
   newSessionId,
@@ -184,6 +203,19 @@ const IMP_SECRET = "stub-impersonation-secret";
 const PREV_COURSE = "c0000000-0000-4000-8000-000000000002";
 const PKG_PREV = "b0000000-0000-4000-8000-000000000003";
 const V_PREV = "e0000000-0000-4000-8000-000000000004";
+/** (j): a journey enrolment of the viewer, its program, its pinned version, and the pinned version's days. */
+const ENR_ID = "a1000000-0000-4000-8000-000000000001";
+const JPROG_ID = "a2000000-0000-4000-8000-000000000001";
+const JVER_ID = "a3000000-0000-4000-8000-000000000001";
+const DAY1 = "a4000000-0000-4000-8000-000000000001";
+const DAY2 = "a4000000-0000-4000-8000-000000000002";
+const DAY3 = "a4000000-0000-4000-8000-000000000003";
+const JOURNEY_DAY_IDS = { "1": DAY1, "2": DAY2, "3": DAY3 } as const;
+const JOURNEY_DAYS = [
+  { day: 1, course_id: PREV_COURSE },
+  { day: 2, course_id: COURSE_ID },
+  { day: 3, course_id: PREV_COURSE },
+];
 
 async function pageCases() {
   console.log("\nlaunch/page.tsx run for real: the preview gate, the impersonation ruling, the preview row and the Start's exclusions (ADR 0024 P2-5)");
@@ -201,7 +233,35 @@ async function pageCases() {
   let insertConflicts = 0;
   let courseRow: Row = {};
   let attempts: Row[] = [];
+  /** course_assignments rows (a fixture's, or the page's self-enrolment POST). */
   let assignments: Row[] = [];
+  /** learning_path_assignments rows of PATH_ID. */
+  let pathAssignments: Row[] = [];
+  /** Approved attempt_requests rows (each with its context_key). */
+  let grants: Row[] = [];
+  /**
+   * The self-enrolment insert's answer: a new row; a 23505 against the
+   * learner's own row already there; a 23505 because a concurrent Start's
+   * self row committed a moment ago (the stub adds it); another error.
+   */
+  let selfInsert: "ok" | "conflict" | "race" | "error" = "ok";
+  /** launch_context answers a database error (not a missing function). */
+  let lcFails = false;
+  /** consume_grant's outcome (0107, nine-argument form). */
+  let cgOutcome = "opened";
+  /** The SCORM seed's read of the official attempt's cmi_data answers a database error. */
+  let cmiReadFails = false;
+  /** The journey world of (j): which days are credited (by day id), with the credit row's course. */
+  let journeyCredits: Record<string, { course_id: string; attempt_id: string | null; credit_kind: string; day_number: number }> = {};
+  let journeyStatus = "active";
+  /** launch_context's holders.journey_days (the redirect row's journey holders). */
+  let journeyHolders: Array<{ enrollment_id: string; day_id: string | null; day_number: number; credited: boolean }> = [];
+  /** The legacy no-package course: no course_packages row, every version's package_id null (no slot routing). */
+  let noPackages = false;
+  /** The deactivated-slot close (the PATCH by id with no is_revision filter) answers a database error. */
+  let slotCloseFails = false;
+  /** The page's console.warn lines of one run (its launch_refused reasons). */
+  let warned: string[] = [];
   let reqs: PageReq[] = [];
   let seq = 0;
   const userRow = () => ({ id: NAV_USERS[viewer].id, aud: "authenticated", role: "authenticated", email: `${viewer}@example.test` });
@@ -242,23 +302,93 @@ async function pageCases() {
       if (op === "gt") return true;
       return true;
     });
+  /** The generated column course_attempts.context_key (0107 step 5). */
+  const keyOf = (r: Row): string => {
+    switch (r.context_kind) {
+      case "path": return `path:${String(r.learning_path_id)}`;
+      case "journey": return `journey:${String(r.journey_enrollment_id)}:${String(r.journey_day_id)}`;
+      case "preview": return "preview";
+      default: return "individual";
+    }
+  };
   const versions: Row[] = [
     { id: V_OLD, course_id: COURSE_ID, package_id: PKG_ID, manifest_type: "cmi5", launch_url: "index.html", manifest_data: { raw: { auId: "urn:au" } } },
     { id: V_CUR, course_id: COURSE_ID, package_id: PKG_ID, manifest_type: "cmi5", launch_url: "index.html", manifest_data: { raw: { auId: "urn:au" } } },
     { id: V_HI, course_id: COURSE_ID, package_id: PKG_HI, manifest_type: "cmi5", launch_url: "index.html", manifest_data: { raw: { auId: "urn:au" } } },
-    // Another course's version: every course_versions read names a course, a package or an id, so it shows only in (e)'s prerequisite read.
+    // Another course's version: every course_versions read names a course, a package or an id, so it shows only where a case names it.
     { id: V_PREV, course_id: PREV_COURSE, package_id: PKG_PREV, manifest_type: "cmi5", launch_url: "index.html", manifest_data: { raw: { auId: "urn:au" } } },
   ];
   // One language (en) unless a case asks for two (en and hi).
   let twoLanguages = false;
   // (f): the Hindi package exists and is deactivated (slot routing's rule (3)).
   let hiInactive = false;
-  // (e): the course is step 2 of a strict path the viewer is assigned to; PREV_COURSE is step 1.
+  // (e): the course is step 2 of a strict path, PREV_COURSE step 1.
   let strictPath = false;
-  const packages = () => [
+  let pathVisibility = "private";
+  const packages = () => noPackages ? [] : [
     { id: PKG_ID, language: "en", display_name: null, current_version_id: V_CUR, is_active: true },
     ...(twoLanguages || hiInactive ? [{ id: PKG_HI, language: "hi", display_name: null, current_version_id: V_HI, is_active: !hiInactive }] : []),
   ];
+  const courseOfVersion = (vid: unknown) => versions.find((x) => x.id === vid)?.course_id ?? null;
+  const done = (r: Row) => r.completion_status === "completed" || r.success_status === "passed";
+
+  /** launch_context's answer (0107 section 6p) from the world: enough of its rules for the page's branches. */
+  const launchFacts = (a: Row) => {
+    const uid = NAV_USERS[viewer].id;
+    const nowMs = Date.now();
+    const own = assignments.filter((r) => r.user_id === uid);
+    const enrolled = own.some((r) => !r.release_at || Date.parse(String(r.release_at)) <= nowMs);
+    const future = own.map((r) => r.release_at).filter((x): x is string => typeof x === "string" && Date.parse(x) > nowMs).sort();
+    const pathEnrolled = pathAssignments.some((r) => r.user_id === uid);
+    let path: unknown = null;
+    if (a.p_path) {
+      path = strictPath && a.p_path === PATH_ID
+        ? {
+            found: true, is_active: true, visibility: pathVisibility, sequence_mode: "strict",
+            enrolled: pathEnrolled, self_row: pathAssignments.some((r) => r.user_id === uid && r.source === "self"),
+            course_step: 2,
+            steps: [
+              // v_path_step_status holds enrolled learners only (ruling A3).
+              { course_id: PREV_COURSE, step_number: 1, release_at: null, done: pathEnrolled && attempts.some((r) => r.course_version_id === V_PREV && r.context_key === `path:${PATH_ID}` && done(r)) },
+              { course_id: COURSE_ID, step_number: 2, release_at: null, done: false },
+            ],
+          }
+        : { found: false };
+    }
+    let journey: unknown = null;
+    if (a.p_enrollment) {
+      if (a.p_enrollment !== ENR_ID) journey = { found: false };
+      else {
+        const dayId = (a.p_day_id as string | null) ?? (a.p_day != null ? (JOURNEY_DAY_IDS as Record<string, string>)[String(a.p_day)] ?? null : null);
+        const number = dayId ? Number(Object.entries(JOURNEY_DAY_IDS).find(([, id]) => id === dayId)?.[0] ?? NaN) : NaN;
+        const dayNo = Number.isFinite(number) ? number : null;
+        const entry = JOURNEY_DAYS.find((d) => d.day === dayNo) ?? null;
+        const open = attempts.find((r) => r.journey_enrollment_id === ENR_ID && r.context_kind === "journey" && r.journey_day_id === dayId && r.status === "in_progress" && r.is_revision !== true);
+        const required = JOURNEY_DAYS.filter((d) => d.course_id);
+        const next = required.find((d) => !journeyCredits[(JOURNEY_DAY_IDS as Record<string, string>)[String(d.day)]]) ?? null;
+        journey = {
+          found: true, status: journeyStatus, program_id: JPROG_ID, program_is_active: true, start_date: "2026-01-01", version_id: JVER_ID,
+          unlock_mode: "calendar", count_sundays: true, days_total: 30, timezone: "UTC",
+          day: { id: dayId, number: dayNo, in_version: dayNo !== null, removed: false, course_id: entry?.course_id ?? null },
+          day_credit: dayId ? journeyCredits[dayId] ?? null : null,
+          day_open_attempt: open ? { attempt_id: open.id, course_id: courseOfVersion(open.course_version_id) } : null,
+          required_days: required.length, credited_days: Object.keys(journeyCredits).length,
+          next_day: next?.day ?? null, next_day_id: next ? (JOURNEY_DAY_IDS as Record<string, string>)[String(next.day)] : null,
+          resumable_day_ids: [],
+        };
+      }
+    }
+    return {
+      v: 1,
+      member: { active: NAV_USERS[viewer].role !== null },
+      course: { found: true, is_active: courseRow.is_active !== false, visibility: courseRow.visibility, individual: { enrolled, upcoming_at: future[0] ?? null } },
+      path,
+      journey,
+      holders: { paths: strictPath && pathEnrolled ? [{ path_id: PATH_ID, step_number: 2 }] : [], journey_days: journeyHolders },
+      run: null,
+    };
+  };
+
   const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
@@ -270,6 +400,7 @@ async function pageCases() {
     if (typeof init?.body === "string") { try { body = JSON.parse(init.body); } catch { body = init.body; } }
     reqs.push({ method, path: p, select, query: url.searchParams, body, accept });
     const one = (row: Row) => (accept.includes("vnd.pgrst.object") ? json(row) : json([row]));
+    const fnMissing = () => json({ code: "PGRST202", message: "Could not find the function in the schema cache" }, 404);
     if (p === "/auth/v1/user") return json(userRow());
     if (p === "/rest/v1/profiles") return json([{ must_change_password: false }]);
     if (p === "/rest/v1/organizations") return json([{ id: ORG_ID, name: "Org", slug: "org", logo_url: null, brand_color: null, brand_font: null, custom_domain: null }]);
@@ -280,24 +411,55 @@ async function pageCases() {
     if (p === "/rest/v1/platform_owners") return json([]);
     if (p === "/rest/v1/courses") return json([courseRow]);
     if (p === "/rest/v1/course_packages") return json(packages());
-    if (p === "/rest/v1/course_versions") return json(versions.filter((r) => (r.package_id !== PKG_HI || twoLanguages || hiInactive) && matches(r, url.searchParams)));
-    if (p === "/rest/v1/course_assignments") return json(assignments);
-    if (p === "/rest/v1/learning_path_courses") {
-      const steps = [
-        { path_id: PATH_ID, course_id: PREV_COURSE, step_number: 1, release_at: null },
-        { path_id: PATH_ID, course_id: COURSE_ID, step_number: 2, release_at: null },
-      ];
-      return json(strictPath ? steps.filter((r) => matches(r, url.searchParams)) : []);
+    if (p === "/rest/v1/course_versions") {
+      return json(versions.filter((r) => (r.package_id !== PKG_HI || twoLanguages || hiInactive) && matches(r, url.searchParams)).map((r) => (noPackages ? { ...r, package_id: null } : r)));
     }
-    if (p === "/rest/v1/learning_path_assignments") {
-      return json(strictPath ? [{ path_id: PATH_ID, assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null }] : []);
+    if (p === "/rest/v1/journey_versions") return json([{ id: JVER_ID, days: JOURNEY_DAYS }]);
+    if (p === "/rest/v1/rpc/launch_context") {
+      if (no0107) return fnMissing();
+      if (lcFails) return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
+      return json(launchFacts(body as Row));
     }
-    if (p === "/rest/v1/learning_paths") return json(strictPath ? [{ id: PATH_ID, sequence_mode: "strict", visibility: "private" }] : []);
+    if (p === "/rest/v1/rpc/consume_grant") {
+      if (no0107) return fnMissing();
+      const a = body as Row;
+      if (cgOutcome !== "opened") return json([{ outcome: cgOutcome, attempt_id: null, abandoned_ids: [] }]);
+      const g = grants.find((x) => x.id === a.p_grant_id);
+      const row: Row = {
+        id: `retake-${++seq}`, user_id: a.p_user_id, course_version_id: a.p_version_id, status: "in_progress", completion_status: "in_progress", success_status: "unknown",
+        cmi_data: {}, is_revision: false, started_at: new Date().toISOString(), completed_at: null, score: null,
+        context_kind: a.p_journey_enrollment_id ? "journey" : a.p_learning_path_id ? "path" : "individual",
+        learning_path_id: a.p_journey_enrollment_id ? null : a.p_learning_path_id, journey_enrollment_id: a.p_journey_enrollment_id,
+        journey_day: a.p_journey_day, journey_day_id: a.p_journey_day_id, journey_version_id: a.p_journey_enrollment_id ? JVER_ID : null,
+      };
+      row.context_key = keyOf(row);
+      attempts.push(row);
+      if (g) Object.assign(g, { used_at: new Date().toISOString(), used_attempt_id: row.id });
+      return json([{ outcome: "opened", attempt_id: row.id, abandoned_ids: [] }]);
+    }
+    if (p.startsWith("/rest/v1/rpc/")) return no0107 && p === "/rest/v1/rpc/record_revision_visit" ? fnMissing() : json(true);
+    if (p === "/rest/v1/course_assignments" || p === "/rest/v1/learning_path_assignments") {
+      if (method === "POST") {
+        if (no0107 && "source" in (body as Row)) return json({ code: "PGRST204", message: "Could not find the 'source' column in the schema cache" }, 400);
+        if (selfInsert === "conflict") return json({ code: "23505", message: "duplicate key value violates unique constraint" }, 409);
+        if (selfInsert === "race") {
+          (p === "/rest/v1/course_assignments" ? assignments : pathAssignments).push({ ...(body as Row) });
+          return json({ code: "23505", message: "duplicate key value violates unique constraint" }, 409);
+        }
+        if (selfInsert === "error") return json({ code: "XX000", message: "internal error" }, 500);
+        (p === "/rest/v1/course_assignments" ? assignments : pathAssignments).push({ ...(body as Row) });
+        return new Response(null, { status: 201 });
+      }
+      return json(p === "/rest/v1/course_assignments" ? assignments : pathAssignments);
+    }
+    if (p === "/rest/v1/attempt_requests") return json(grants.filter((r) => matches(r, url.searchParams)));
     if (p === "/rest/v1/course_attempts") {
       const names = `${select} ${[...url.searchParams.keys()].join(" ")}`;
-      if (no0107 && /context_kind|preview_kind/.test(names)) return missing("context_kind");
+      if (no0107 && /context_kind|context_key|preview_kind/.test(names)) return missing("context_kind");
+      if (method === "GET" && select === "cmi_data" && cmiReadFails) return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
       if (method === "GET") return json(attempts.filter((r) => matches(r, url.searchParams)));
       if (method === "PATCH") {
+        if (slotCloseFails && url.searchParams.has("id") && !url.searchParams.has("is_revision")) return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
         const hit = attempts.filter((r) => matches(r, url.searchParams));
         for (const r of hit) Object.assign(r, body as Row);
         return json(hit.map((r) => ({ id: r.id })));
@@ -307,11 +469,14 @@ async function pageCases() {
         if (no0107 && ("context_kind" in row || "preview_kind" in row)) return missing("context_kind");
         if (insertConflicts > 0) {
           insertConflicts--;
-          // A concurrent launch's course preview, committed a moment ago.
-          attempts.push({ id: `race-${++seq}`, user_id: row.user_id, course_version_id: row.course_version_id, status: "in_progress", context_kind: "preview", preview_kind: "course", cmi_data: {}, is_revision: false });
+          // A concurrent launch's row of the same context, committed a moment ago.
+          const raced: Row = { id: `race-${++seq}`, user_id: row.user_id, course_version_id: row.course_version_id, status: "in_progress", context_kind: row.context_kind, preview_kind: row.preview_kind ?? null, learning_path_id: row.learning_path_id ?? null, journey_enrollment_id: row.journey_enrollment_id ?? null, journey_day_id: row.journey_day_id ?? null, cmi_data: {}, is_revision: false };
+          raced.context_key = keyOf(raced);
+          attempts.push(raced);
           return json({ code: "23505", message: "duplicate key value violates unique constraint" }, 409);
         }
-        const created = { id: `new-${++seq}`, ...row };
+        const created: Row = { id: `new-${++seq}`, completion_status: "in_progress", success_status: "unknown", started_at: new Date().toISOString(), is_revision: false, ...row };
+        created.context_key = keyOf(created);
         attempts.push(created);
         return one({ id: created.id });
       }
@@ -332,6 +497,8 @@ async function pageCases() {
       search?: Record<string, string>;
       attempts?: Row[];
       assigned?: boolean;
+      /** The learner's own direct assignment, released at this date (P2-Q2). */
+      ownRelease?: string;
       impersonating?: boolean;
       no0107?: boolean;
       insertConflicts?: number;
@@ -341,6 +508,18 @@ async function pageCases() {
       twoLanguages?: boolean;
       hiInactive?: boolean;
       strictPath?: boolean;
+      pathVisibility?: string;
+      pathAssigned?: boolean;
+      grants?: Row[];
+      selfInsert?: "ok" | "conflict" | "race" | "error";
+      lcFails?: boolean;
+      cgOutcome?: string;
+      journeyCredits?: typeof journeyCredits;
+      journeyStatus?: string;
+      journeyHolders?: typeof journeyHolders;
+      noPackages?: boolean;
+      slotCloseFails?: boolean;
+      cmiReadFails?: boolean;
     }): Promise<Outcome> => {
       viewer = o.viewer;
       if (o.p4) process.env.ALDS_P4 = "on";
@@ -349,14 +528,29 @@ async function pageCases() {
       twoLanguages = o.twoLanguages ?? false;
       hiInactive = o.hiInactive ?? false;
       strictPath = o.strictPath ?? false;
+      pathVisibility = o.pathVisibility ?? "private";
       impersonating = o.impersonating ?? false;
       no0107 = o.no0107 ?? false;
       insertConflicts = o.insertConflicts ?? 0;
-      attempts = (o.attempts ?? []).map((r) => ({ ...r }));
-      assignments = o.assigned ? [{ assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null, release_at: null, course_id: COURSE_ID, organization_id: ORG_ID }] : [];
+      selfInsert = o.selfInsert ?? "ok";
+      lcFails = o.lcFails ?? false;
+      cgOutcome = o.cgOutcome ?? "opened";
+      journeyCredits = { ...(o.journeyCredits ?? {}) };
+      journeyStatus = o.journeyStatus ?? "active";
+      journeyHolders = (o.journeyHolders ?? []).map((h) => ({ ...h }));
+      noPackages = o.noPackages ?? false;
+      slotCloseFails = o.slotCloseFails ?? false;
+      cmiReadFails = o.cmiReadFails ?? false;
+      attempts = (o.attempts ?? []).map((r) => ({ ...r, context_key: keyOf(r) }));
+      grants = (o.grants ?? []).map((r) => ({ ...r }));
+      assignments = o.assigned || o.ownRelease
+        ? [{ assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null, release_at: o.ownRelease ?? null, course_id: COURSE_ID, organization_id: ORG_ID, source: "admin" }]
+        : [];
+      pathAssignments = o.pathAssigned ? [{ path_id: PATH_ID, assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null, source: "admin" }] : [];
       courseRow = { id: COURSE_ID, organization_id: ORG_ID, current_version_id: V_CUR, title: "Home loans", is_active: true, pass_required: false, visibility: o.visibility ?? "private" };
       reqs = [];
-      console.warn = () => {};
+      warned = [];
+      console.warn = (...a: unknown[]) => { warned.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")); };
       console.error = () => {};
       try {
         const el = (await page({ params: Promise.resolve({ org: "org", courseId: COURSE_ID }), searchParams: Promise.resolve(o.search ?? {}) })) as { props: Record<string, unknown> };
@@ -371,11 +565,23 @@ async function pageCases() {
       }
     };
     const attemptReqs = () => reqs.filter((r) => r.path === "/rest/v1/course_attempts");
-    /** Table writes (an RPC is a POST too; rpcs() lists those: the Start's policy read is one). */
+    /** Table writes (an RPC is a POST too; rpcs() lists those). */
     const writes = () => reqs.filter((r) => r.method !== "GET" && r.method !== "HEAD" && r.path.startsWith("/rest/v1/") && !r.path.startsWith("/rest/v1/rpc/"));
     const rpcs = () => reqs.filter((r) => r.path.startsWith("/rest/v1/rpc/"));
+    const lcCalls = () => reqs.filter((r) => r.path === "/rest/v1/rpc/launch_context");
+    /** The launch_refused reasons the run logged, in order. */
+    const refusals = () => warned.flatMap((l) => {
+      try { const e = JSON.parse(l) as { event?: string; reason?: string }; return e.event === "launch_refused" ? [String(e.reason)] : []; } catch { return []; }
+    });
     const DENIED = "/org/dashboard?denied=1";
-    const own = (u: NavUser, extra: Row): Row => ({ user_id: NAV_USERS[u].id, status: "in_progress", cmi_data: {}, is_revision: false, ...extra });
+    const RETRY = `/org/courses/${COURSE_ID}?retry=1`;
+    const own = (u: NavUser, extra: Row): Row => ({ user_id: NAV_USERS[u].id, status: "in_progress", cmi_data: {}, is_revision: false, context_kind: "individual", preview_kind: null, ...extra });
+    const shape = () => reqs.map((q) => `${q.method} ${q.path.replace("/rest/v1/", "")}`).join(", ");
+    /** Step 70's count, branch by branch: every request the page makes (both clients), the middleware and the learner layout excluded. */
+    const budget = (what: string, want: number) => {
+      console.log(`  budget: ${what} makes ${reqs.length} requests in the page: ${shape()}`);
+      eq(`budget: ${what} makes ${want} requests in the page`, reqs.length, want);
+    };
 
     // (a) P2-5 item 3b: a plain user's ?mode=preview is refused before the
     // access call and before any read of attempts, and writes nothing.
@@ -388,8 +594,8 @@ async function pageCases() {
       const r = await run({ viewer: "user", search, assigned, visibility: what.includes("Everyone") ? "org_public" : "private" });
       eq(`${what}, ?mode=preview: refused to ${DENIED}`, r.redirect, DENIED);
       eq(`${what}: no course_attempts request of any kind, no write, no RPC (no launch_context call)`, [attemptReqs().length, writes().length, rpcs().length], [0, 0, 0]);
-      eq(`${what}: refused before the access check reads anything (no assignment, team or path read)`,
-        reqs.filter((q) => ["/rest/v1/course_assignments", "/rest/v1/team_members", "/rest/v1/learning_path_courses", "/rest/v1/attempt_requests"].includes(q.path)).length, 0);
+      eq(`${what}: refused before anything else is read (no course, assignment, path or grant read)`,
+        reqs.filter((q) => ["/rest/v1/courses", "/rest/v1/course_assignments", "/rest/v1/team_members", "/rest/v1/learning_path_courses", "/rest/v1/attempt_requests"].includes(q.path)).length, 0);
     }
     for (const [what, search] of [
       ["an admin's ?mode=preview naming a run (phase P)", { mode: "preview", run: PATH_ID }],
@@ -405,17 +611,21 @@ async function pageCases() {
     // for a viewer with no membership row. In the app that read is under
     // the caller's own session and the organisations policy admits members
     // only, so the caller who reaches the gate is a member impersonating.
+    // P2-6 (O2): the refusal stays first, before the launch_context call,
+    // whose not_member reads the impersonator's own membership.
     {
       const r = await run({ viewer: "platform", impersonating: true, assigned: true });
       eq("impersonating, no ?mode=preview: refused to ?denied=1", r.redirect, DENIED);
-      eq("…before any read of the course or the attempts, nothing written", [reqs.filter((q) => q.path === "/rest/v1/courses").length, attemptReqs().length, writes().length], [0, 0, 0]);
+      eq("…before any read of the course or the attempts, no launch_context call, nothing written",
+        [reqs.filter((q) => q.path === "/rest/v1/courses").length, attemptReqs().length, lcCalls().length, writes().length], [0, 0, 0, 0]);
       const pv = await run({ viewer: "platform", impersonating: true, search: { mode: "preview" } });
-      eq("impersonating, ?mode=preview: the preview runs (role super_owner)", [pv.redirect, pv.error, pv.element?.props.preview], [null, null, true]);
+      eq("impersonating, ?mode=preview: the preview runs (role super_owner), with no launch_context call", [pv.redirect, pv.error, pv.element?.props.preview, lcCalls().length], [null, null, true, 0]);
     }
 
     // (c) The preview launch: no evaluate, no grant, no path read, no
-    // revision visit; one insert with context_kind 'preview', preview_kind
-    // 'course', is_preview true, launch_mode 'Normal' and no official tag.
+    // revision visit, no launch_context call; one insert with context_kind
+    // 'preview', preview_kind 'course', is_preview true, launch_mode 'Normal'
+    // and no official tag.
     const previewRow = (r: PageReq | undefined) => (r?.body ?? {}) as Row;
     for (const viewerRole of ["admin", "analyst", "owner"] as NavUser[]) {
       const r = await run({ viewer: viewerRole, search: { mode: "preview" } });
@@ -429,12 +639,12 @@ async function pageCases() {
         [row.context_kind, row.preview_kind, row.is_preview, row.launch_mode, row.course_version_id, row.user_id], ["preview", "course", true, "Normal", V_CUR, NAV_USERS[viewerRole].id]);
       eq(`${viewerRole}: no official tag, no revision flag`,
         ["learning_path_id", "journey_enrollment_id", "journey_day", "journey_day_id", "is_revision"].filter((k) => k in row), []);
-      eq(`${viewerRole}: no grant read, no attempt-rule read, no path read, no RPC (no visit, no consume_grant)`,
+      eq(`${viewerRole}: no grant read, no attempt-rule read, no path read, no RPC (no launch_context, visit or consume_grant)`,
         [reqs.filter((q) => q.path === "/rest/v1/attempt_requests").length, attemptReqs().filter((q) => q.select.includes("score")).length,
           reqs.filter((q) => q.path === "/rest/v1/learning_path_courses").length, rpcs().length], [0, 0, 0, 0]);
-      eq(`${viewerRole}: every attempts read (slot routing, grandfather, the row) takes the caller's course previews only`,
-        attemptReqs().filter((q) => q.method === "GET").map((q) => [q.query.get("context_kind"), q.query.get("preview_kind")]),
-        [["eq.preview", "eq.course"], ["eq.preview", "eq.course"], ["eq.preview", "eq.course"]]);
+      eq(`${viewerRole}: every attempts read (the open rows routing and the grandfather read from, the row) takes the caller's course previews only`,
+        attemptReqs().filter((q) => q.method === "GET").map((q) => [q.query.get("context_kind"), q.query.get("preview_kind"), q.query.get("context_key")]),
+        [["eq.preview", "eq.course", null], ["eq.preview", "eq.course", null]]);
     }
     {
       const r = await run({ viewer: "admin", search: { mode: "preview" } });
@@ -444,9 +654,10 @@ async function pageCases() {
         [[`eq.${V_CUR}`, "eq.in_progress", "eq.preview", "eq.legacy_role", "abandoned"]]);
       eq("…and it precedes the insert", reqs.findIndex((q) => q.method === "PATCH" && q.path === "/rest/v1/course_attempts") < reqs.findIndex((q) => q.method === "POST" && q.path === "/rest/v1/course_attempts"), true);
       eq("the back target is the course page (no path or journey exit)", r.element?.props.backHref, `/org/courses/${COURSE_ID}`);
-      const total = reqs.length;
-      console.log(`  budget: a first preview launch (cmi5, ALDS_P4 off) makes ${total} requests in the page: ${reqs.map((q) => `${q.method} ${q.path.replace("/rest/v1/", "")}`).join(", ")}`);
-      eq("budget: a first preview launch makes 16 requests in the page (requireOrgAccess 4, course 1, packages 1, routing 6, row 3, token 1)", total, 16);
+      // P2-6 (step 70): the course's versions are read once, routing reads no
+      // packages or versions again, and the grandfather routing decides from
+      // the open rows slot routing read: 16 at P2-5, 13 now.
+      budget("a first preview launch (cmi5, ALDS_P4 off; requireOrgAccess 4, course 1, packages 1, versions 1, routing 2 (the open rows, the version), row 3 (lookup, N4's close, insert), token 1)", 13);
     }
     {
       const r = await run({ viewer: "admin", search: { mode: "preview", lp: PATH_ID, back: "dashboard" } });
@@ -460,8 +671,7 @@ async function pageCases() {
       const r = await run({ viewer: "admin", search: { mode: "preview" }, attempts: [open] });
       eq("an open course preview on the version resumes: no close, no insert", [r.redirect, attemptReqs().filter((q) => q.method !== "GET").length], [null, 0]);
       eq("…its row is the one launched", String(r.element?.props.iframeSrc ?? "").includes("registration=pv-1"), true);
-      console.log(`  budget: a resumed preview launch makes ${reqs.length} requests in the page`);
-      eq("budget: a resumed preview launch makes 14 requests in the page", reqs.length, 14);
+      budget("a resumed preview launch", 11);
     }
     {
       const legacy = own("admin", { id: "lr-1", course_version_id: V_CUR, context_kind: "preview", preview_kind: "legacy_role" });
@@ -475,8 +685,8 @@ async function pageCases() {
       // The caller's real attempts: one in progress on the retired version,
       // one on the current version. A preview never routes onto, confirms
       // over or closes either.
-      const realOld = own("admin", { id: "real-1", course_version_id: V_OLD, context_kind: "individual", preview_kind: null });
-      const realCur = own("admin", { id: "real-2", course_version_id: V_CUR, context_kind: "individual", preview_kind: null });
+      const realOld = own("admin", { id: "real-1", course_version_id: V_OLD });
+      const realCur = own("admin", { id: "real-2", course_version_id: V_CUR });
       const r = await run({ viewer: "admin", search: { mode: "preview", lang: "en" }, attempts: [realOld, realCur] });
       const row = previewRow(attemptReqs().find((q) => q.method === "POST"));
       eq("a preview beside the caller's real attempts: runs the current version, inserts its own row",
@@ -492,8 +702,7 @@ async function pageCases() {
       const r = await run({ viewer: "admin", search: { mode: "preview" }, manifest: "scorm12" });
       eq("a SCORM preview: the SCORM runtime, a preview with no Continue, served in normal mode (no review/no-credit keys)",
         [r.redirect, r.element?.props.preview, r.element?.props.continueHref, (r.element?.props.initialCmi as Row | undefined)?.["cmi.core.lesson_mode"]], [null, true, null, undefined]);
-      console.log(`  budget: a first SCORM preview launch makes ${reqs.length} requests in the page`);
-      eq("budget: a first SCORM preview launch makes 15 requests in the page (no launch token)", reqs.length, 15);
+      budget("a first SCORM preview launch (no launch token)", 12);
     }
     {
       const r = await run({ viewer: "admin", search: { mode: "preview" }, p4: true });
@@ -502,14 +711,13 @@ async function pageCases() {
       const session = reqs.find((q) => q.method === "POST" && q.path === "/rest/v1/learning_sessions")?.body as Row | undefined;
       eq("ALDS_P4 on: the same preview row (its columns are not the flag's), and the module runs in Normal (LaunchData, the session; A32)",
         [r.redirect, row.context_kind, row.is_preview, row.launch_mode, ld?.content?.launchMode, session?.launch_mode], [null, "preview", true, "Normal", "Normal", "Normal"]);
-      console.log(`  budget: a first preview launch with ALDS_P4 on (cmi5) makes ${reqs.length} requests in the page`);
-      eq("budget: with ALDS_P4 on, a first cmi5 preview launch makes 19 requests in the page (+ the manifest read, LaunchData, the session)", reqs.length, 19);
+      budget("a first cmi5 preview launch with ALDS_P4 on (+ the manifest read, LaunchData, the session)", 16);
       delete process.env.ALDS_P4;
     }
     {
       const r = await run({ viewer: "admin", search: { mode: "preview" }, no0107: true });
       eq("a database without 0107: the preview refuses with the retry notice and writes nothing (an A19 write, no fallback)",
-        [r.redirect, attemptReqs().filter((q) => q.method !== "GET").length], [`/org/courses/${COURSE_ID}?retry=1`, 0]);
+        [r.redirect, attemptReqs().filter((q) => q.method !== "GET").length], [RETRY, 0]);
     }
 
     // (c2) Two languages: the picker, the language confirm (P2-5 items 3 and 5b).
@@ -522,15 +730,19 @@ async function pageCases() {
       const row = previewRow(attemptReqs().find((q) => q.method === "POST"));
       eq("a preview with ?lang=hi beside its own open preview in en: no language confirm; it runs hi and leaves the en preview open",
         [sw.redirect, row.course_version_id, row.context_kind, attempts.find((a) => a.id === "pv-en")?.status], [null, V_HI, "preview", "in_progress"]);
-      const enReal = own("admin", { id: "real-en", course_version_id: V_CUR, context_kind: "individual", preview_kind: null });
+      const enReal = own("admin", { id: "real-en", course_version_id: V_CUR });
       const pr = await run({ viewer: "admin", search: { mode: "preview", lang: "hi" }, twoLanguages: true, attempts: [enReal] });
       eq("…beside the caller's real attempt in en: the same, the real attempt never routed onto, confirmed over or closed",
         [pr.redirect, previewRow(attemptReqs().find((q) => q.method === "POST")).course_version_id, attempts.find((a) => a.id === "real-en")?.status], [null, V_HI, "in_progress"]);
       const st = await run({ viewer: "admin", search: { lang: "hi" }, twoLanguages: true, assigned: true, attempts: [enPreview] });
-      eq("an admin's Start with ?lang=hi beside an open preview in en: no confirm (the preview is not the Start's), it runs hi",
+      eq("an admin's Start with ?lang=hi beside an open preview in en: no confirm (the preview is not the Start's context), it runs hi",
         [st.redirect, previewRow(attemptReqs().find((q) => q.method === "POST")).course_version_id, attempts.find((a) => a.id === "pv-en")?.status], [null, V_HI, "in_progress"]);
       const sr = await run({ viewer: "admin", search: { lang: "hi" }, twoLanguages: true, assigned: true, attempts: [enReal] });
       eq("…beside its own real attempt in en: today's confirm on the course page, nothing written", [sr.redirect, writes().length], [`/org/courses/${COURSE_ID}?switch=hi`, 0]);
+      const pathEn = own("admin", { id: "path-en", course_version_id: V_CUR, context_kind: "path", learning_path_id: PATH_ID });
+      const ip = await run({ viewer: "admin", search: { lang: "hi" }, twoLanguages: true, assigned: true, attempts: [pathEn] });
+      eq("…beside an open attempt of another product (a path's) in en: no confirm, the Individual Start runs hi and the path's attempt stays open (step 27)",
+        [ip.redirect, previewRow(attemptReqs().find((q) => q.method === "POST")).course_version_id, attempts.find((a) => a.id === "path-en")?.status], [null, V_HI, "in_progress"]);
     }
     {
       const picker = fs.readFileSync(path.join(root, "app/[org]/(learner)/courses/[courseId]/launch/launch-language-picker.tsx"), "utf8");
@@ -538,76 +750,111 @@ async function pageCases() {
         /async function pick\(language: string, restart = false\) \{\s*setError\(null\);\s*setPicking\(language\);\s*if \(preview\) \{\s*const next = new URL\(window\.location\.href\);\s*next\.searchParams\.set\("lang", language\);\s*window\.location\.href = next\.toString\(\);\s*return;\s*\}\s*const res = await fetch\(/.test(picker), true);
     }
 
-    // (d) A Start for every role (no mode): a learner's launch.
+    // (d) A Start for every role (no mode): a learner's launch, decided by one
+    // launch_context call and the resolver (ADR 0024 P2-6 items 1 and 3).
     {
       const r = await run({ viewer: "admin", assigned: false });
-      eq("an admin's Start, not enrolled: refused as a learner is, to ?denied=1, nothing written", [r.redirect, writes().length], [DENIED, 0]);
+      eq("an admin's Start, not enrolled: the resolver refuses as a learner's, to ?denied=1, nothing written", [r.redirect, writes().length], [DENIED, 0]);
+      eq("…one launch_context call, and no attempts read", [lcCalls().length, attemptReqs().length], [1, 0]);
       const openPreview = own("admin", { id: "pv-old", course_version_id: V_OLD, context_kind: "preview", preview_kind: "course" });
       const s = await run({ viewer: "admin", assigned: true, attempts: [openPreview] });
       const ins = attemptReqs().filter((q) => q.method === "POST");
-      eq("an enrolled admin's Start beside an open preview on a retired version: the current version, a real row (not a preview)",
-        [s.redirect, s.error, s.element?.props.preview, ins.length, previewRow(ins[0]).course_version_id, "context_kind" in previewRow(ins[0]), "is_preview" in previewRow(ins[0])],
-        [null, null, false, 1, V_CUR, false, false]);
-      eq("…the attempt rule ran (the grants read, the attempts read)", [reqs.some((q) => q.path === "/rest/v1/attempt_requests"), attemptReqs().some((q) => q.select.includes("score"))], [true, true]);
-      eq("…every attempts read and close of the Start leaves previews out (context_kind=neq.preview): readMy, slot routing, grandfather, the flagged-row close, the row",
-        attemptReqs().filter((q) => q.method !== "POST").map((q) => `${q.method} ${q.query.get("context_kind")}`),
-        ["GET neq.preview", "GET neq.preview", "GET neq.preview", "PATCH neq.preview", "GET neq.preview"]);
+      eq("an enrolled admin's Start beside an open preview on a retired version: the current version, a real Individual row",
+        [s.redirect, s.error, s.element?.props.preview, ins.length, previewRow(ins[0]).course_version_id, previewRow(ins[0]).context_kind, "is_preview" in previewRow(ins[0])],
+        [null, null, false, 1, V_CUR, "individual", false]);
+      eq("…the insert names the context and its five tags, null for an Individual row",
+        ["learning_path_id", "journey_enrollment_id", "journey_day", "journey_day_id", "journey_version_id"].map((k) => [k in previewRow(ins[0]), previewRow(ins[0])[k]]),
+        [[true, null], [true, null], [true, null], [true, null], [true, null]]);
+      eq("…launch_context: one call, all seven arguments named, the session's user and the organisation, no product parameter",
+        [lcCalls().length, lcCalls()[0]?.body], [1, { p_user: NAV_USERS.admin.id, p_org: ORG_ID, p_course: COURSE_ID, p_path: null, p_enrollment: null, p_day_id: null, p_day: null }]);
+      eq("…the attempt rule ran in context (the grants read, the context's attempts read)",
+        [reqs.some((q) => q.path === "/rest/v1/attempt_requests" && q.select.includes("context_key")), attemptReqs().some((q) => q.select.includes("score") && q.query.get("context_key") === "eq.individual")], [true, true]);
+      eq("…every attempts read and close of the Start takes its context key (context_key=eq.individual): the context read, the open rows (slot routing and the grandfather), the flagged-row close, the row",
+        attemptReqs().filter((q) => q.method !== "POST").map((q) => `${q.method} ${q.query.get("context_key")}`),
+        ["GET eq.individual", "GET eq.individual", "PATCH eq.individual", "GET eq.individual"]);
+      eq("…no read names the preview filter any more (the context filter replaced it, O2)", attemptReqs().some((q) => q.query.has("context_kind")), false);
+      eq("…the order: launch_context, then the context read, then the insert",
+        [reqs.findIndex((q) => q.path === "/rest/v1/rpc/launch_context") < reqs.findIndex((q) => q.path === "/rest/v1/course_attempts" && q.select.includes("score")),
+          reqs.findIndex((q) => q.select.includes("score")) < reqs.findIndex((q) => q.method === "POST" && q.path === "/rest/v1/course_attempts")], [true, true]);
       eq("…and the open preview is untouched", attempts.find((a) => a.id === "pv-old")?.status, "in_progress");
+      budget("a first Individual Start (cmi5, ALDS_P4 off; requireOrgAccess 4, course 1, packages 1, launch_context 1, versions 1, context read 2, routing 2, flagged close 1, row 1, insert 1, token 1)", 16);
       const t = await run({ viewer: "admin", assigned: true, no0107: true });
-      eq("…on a database without 0107 the Start reads today's rows (the fallback) and launches",
-        [t.redirect, t.error, attemptReqs().filter((q) => q.method === "POST").length], [null, null, 1]);
-      eq("…one decision for the request: only the first attempts read names the filter (answered 42703); its retry and every later read and close name no context_kind",
-        attemptReqs().map((q) => `${q.method} ${q.query.get("context_kind") ?? "-"}`),
-        ["GET neq.preview", "GET -", "GET -", "GET -", "PATCH -", "GET -", "POST -"]);
+      eq("…on a database without 0107 the Start is refused at the launch_context call with the retry notice: no attempts request, nothing written (an A19 launch)",
+        [t.redirect, attemptReqs().length, writes().length, lcCalls().length], [RETRY, 0, 0, 1]);
+      const f = await run({ viewer: "admin", assigned: true, lcFails: true });
+      eq("a failed launch_context call refuses with the retry notice and writes nothing", [f.redirect, attemptReqs().length, writes().length], [RETRY, 0, 0]);
     }
 
-    // (e) P2-5 item 5b, the strict lock's attempts read: the course is step 2
-    // of a strict path the admin is assigned to, PREV_COURSE step 1. A
-    // preview of step 1 unlocks nothing for a Start (spec 68 (5b-d) on staging).
+    // (d2) The rows answered with no call, and the call's arguments (P2-6 item 1).
+    {
+      const both = await run({ viewer: "user", assigned: true, search: { lp: PATH_ID, journey: ENR_ID, day: DAY2 } });
+      eq("both ?lp= and ?journey=: ?denied=1 with no launch_context call and no course read", [both.redirect, lcCalls().length, reqs.filter((q) => q.path === "/rest/v1/courses").length, writes().length], [DENIED, 0, 0, 0]);
+      const run7 = await run({ viewer: "user", assigned: true, search: { run: PATH_ID } });
+      eq("a run without the mode: ?denied=1 with no call", [run7.redirect, lcCalls().length, writes().length], [DENIED, 0, 0]);
+      const empty = await run({ viewer: "user", assigned: true, search: { lp: "  ", journey: "" } });
+      eq("…empty product parameters are absent: the Individual Start", [empty.redirect, empty.error, previewRow(attemptReqs().find((q) => q.method === "POST")).context_kind], [null, null, "individual"]);
+      await run({ viewer: "user", assigned: true, search: { journey: ENR_ID, day: "2" } });
+      eq("a day of digits goes as p_day, never p_day_id", [lcCalls()[0]?.body && (lcCalls()[0].body as Row).p_day, (lcCalls()[0]?.body as Row | undefined)?.p_day_id, (lcCalls()[0]?.body as Row | undefined)?.p_enrollment], [2, null, ENR_ID]);
+      await run({ viewer: "user", assigned: true, search: { journey: ENR_ID, day: DAY2 } });
+      eq("a uuid day goes as p_day_id, never p_day", [(lcCalls()[0]?.body as Row | undefined)?.p_day_id, (lcCalls()[0]?.body as Row | undefined)?.p_day], [DAY2, null]);
+      const forged = await run({ viewer: "user", assigned: true, search: { lp: "12" } });
+      eq("a ?lp= that is no uuid is sent as null (no failed cast) and refused by the resolver", [(lcCalls()[0]?.body as Row | undefined)?.p_path, forged.redirect, writes().length], [null, DENIED, 0]);
+      const notMine = await run({ viewer: "user", assigned: true, strictPath: true, search: { lp: PATH_ID } });
+      eq("a forged ?lp= (a private path the learner is not on), individually entitled: refused, nothing written", [notMine.redirect, writes().length], [DENIED, 0]);
+    }
+
+    // (e) The path context (?lp=P): the release gate and the strict lock of P
+    // only, from launch_context's steps (step 22; D2).
     {
       const stepOne = (extra: Row): Row =>
         own("admin", { id: "s1", course_version_id: V_PREV, status: "completed", completion_status: "completed", success_status: "passed", ...extra });
-      const lockRead = () => attemptReqs().find((q) => q.select.replace(/\s/g, "") === "course_version_id,completion_status,success_status");
-      const locked = await run({ viewer: "admin", assigned: true, strictPath: true, attempts: [stepOne({ context_kind: "preview", preview_kind: "course" })] });
+      const locked = await run({ viewer: "admin", strictPath: true, pathAssigned: true, search: { lp: PATH_ID }, attempts: [stepOne({ context_kind: "preview", preview_kind: "course" })] });
       eq("a Start of step 2 beside a completed preview of step 1: locked (?locked=), nothing written",
         [locked.redirect, writes().length], [`/org/dashboard?locked=${COURSE_ID}`, 0]);
-      eq("…the strict lock's read leaves previews out", [lockRead()?.query.get("course_version_id"), lockRead()?.query.get("context_kind")], [`in.(${V_PREV})`, "neq.preview"]);
-      const done = await run({ viewer: "admin", assigned: true, strictPath: true, attempts: [stepOne({ context_kind: "individual", preview_kind: null })] });
-      eq("…a completed real attempt of step 1 unlocks it: the Start launches",
-        [done.redirect, done.error, attemptReqs().filter((q) => q.method === "POST").length], [null, null, 1]);
-      const old = await run({ viewer: "admin", assigned: true, strictPath: true, no0107: true, attempts: [stepOne({})] });
-      eq("…on a database without 0107: the lock reads today's rows (no context_kind, the request's one decision) and the Start launches",
-        [old.redirect, old.error, lockRead()?.query.has("context_kind"), attemptReqs().filter((q) => q.method === "POST").length], [null, null, false, 1]);
+      const indiv = await run({ viewer: "admin", strictPath: true, pathAssigned: true, search: { lp: PATH_ID }, attempts: [stepOne({})] });
+      eq("…a completed Individual attempt of step 1 does not unlock the path's step 2 either (the path rule reads the path's context)",
+        [indiv.redirect, writes().length], [`/org/dashboard?locked=${COURSE_ID}`, 0]);
+      const done = await run({ viewer: "admin", strictPath: true, pathAssigned: true, search: { lp: PATH_ID }, attempts: [stepOne({ context_kind: "path", learning_path_id: PATH_ID })] });
+      const row = previewRow(attemptReqs().find((q) => q.method === "POST"));
+      eq("…step 1 done in the path: the Start launches a path row",
+        [done.redirect, done.error, row.context_kind, row.learning_path_id, row.journey_enrollment_id], [null, null, "path", PATH_ID, null]);
+      eq("…its reads take the path's key, its exit is the path and its Continue the continue address",
+        [attemptReqs().filter((q) => q.method === "GET").every((q) => q.query.get("context_key") === `eq.path:${PATH_ID}`), done.element?.props.backHref, done.element?.props.continueHref],
+        [true, `/org/paths/${PATH_ID}`, `/org/continue?lp=${PATH_ID}&from=${COURSE_ID}`]);
+      eq("…the next step comes from launch_context's steps (no learning_path_courses read)", reqs.filter((q) => q.path === "/rest/v1/learning_path_courses").length, 0);
+      const holder = await run({ viewer: "admin", strictPath: true, pathAssigned: true, attempts: [stepOne({ context_kind: "path", learning_path_id: PATH_ID })] });
+      eq("no ?lp=, not individually entitled, one path holds the course: the launch again inside that path, nothing written",
+        [holder.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?lp=${PATH_ID}`, 0]);
+      const old = await run({ viewer: "admin", strictPath: true, pathAssigned: true, no0107: true, search: { lp: PATH_ID }, attempts: [stepOne({})] });
+      eq("…on a database without 0107: refused with the retry notice, nothing written", [old.redirect, writes().length], [RETRY, 0]);
     }
 
-    // (f) P2-5 items 3 and 5b, the deactivated-slot close (slot routing's
-    // rule (3)): the Hindi package is deactivated, and the admin holds an
-    // open real attempt and an open course preview on its version. Each
-    // launch closes its own row there and never the other.
+    // (f) The deactivated-slot close (slot routing's rule (3)): the Hindi
+    // package is deactivated, and the admin holds an open real attempt and an
+    // open course preview on its version. Each launch closes its own row
+    // there and never the other.
     {
-      const realHi = () => own("admin", { id: "real-hi", course_version_id: V_HI, context_kind: "individual", preview_kind: null });
+      const realHi = () => own("admin", { id: "real-hi", course_version_id: V_HI });
       const pvHi = () => own("admin", { id: "pv-hi", course_version_id: V_HI, context_kind: "preview", preview_kind: "course" });
+      const pathHi = () => own("admin", { id: "path-hi", course_version_id: V_HI, context_kind: "path", learning_path_id: PATH_ID });
       const statusOf = (id: string) => attempts.find((a) => a.id === id)?.status;
       /** The deactivated-slot close is the one update by id without an is_revision filter. */
       const slotClose = () => attemptReqs().filter((q) => q.method === "PATCH" && q.query.has("id") && !q.query.has("is_revision"));
-      await run({ viewer: "admin", assigned: true, hiInactive: true, attempts: [realHi(), pvHi()] });
-      eq("a Start: its own open attempt on the deactivated slot is closed, the preview there is not",
-        [statusOf("real-hi"), statusOf("pv-hi")], ["abandoned", "in_progress"]);
-      eq("…the close leaves previews out", slotClose().map((q) => [q.query.get("id"), q.query.get("context_kind")]), [[`in.(real-hi)`, "neq.preview"]]);
+      await run({ viewer: "admin", assigned: true, hiInactive: true, attempts: [realHi(), pvHi(), pathHi()] });
+      eq("a Start: its own open attempt on the deactivated slot is closed; the preview and the path's attempt there are not",
+        [statusOf("real-hi"), statusOf("pv-hi"), statusOf("path-hi")], ["abandoned", "in_progress", "in_progress"]);
+      eq("…the close takes the launch's context key", slotClose().map((q) => [q.query.get("id"), q.query.get("context_key")]), [[`in.(real-hi)`, "eq.individual"]]);
       const pv = await run({ viewer: "admin", search: { mode: "preview" }, hiInactive: true, attempts: [realHi(), pvHi()] });
       eq("a preview: its own open preview on the deactivated slot is closed, the real attempt there is not; the preview launches",
         [pv.redirect, pv.error, statusOf("real-hi"), statusOf("pv-hi")], [null, null, "in_progress", "abandoned"]);
       eq("…the close takes the caller's course previews only", slotClose().map((q) => [q.query.get("id"), q.query.get("context_kind"), q.query.get("preview_kind")]),
         [[`in.(pv-hi)`, "eq.preview", "eq.course"]]);
-      await run({ viewer: "admin", assigned: true, hiInactive: true, no0107: true, attempts: [own("admin", { id: "real-hi", course_version_id: V_HI })] });
-      eq("…on a database without 0107 the Start's close names no context_kind and closes today's row",
-        [statusOf("real-hi"), slotClose().map((q) => q.query.has("context_kind"))], ["abandoned", [false]]);
     }
 
-    // (g) P2-5 item 5b, the stale-revision close: after a completed official
-    // attempt on the retired version, a revision visit's row left open there
-    // is closed by the next Start (ADR 0014 step 3), through the Start's
-    // filter; the preview open beside it is left alone.
+    // (g) The stale-revision close: after a completed official attempt on the
+    // retired version, a revision visit's row left open there is closed by
+    // the next Start (ADR 0014 step 3), through the context's key; the
+    // preview open beside it is left alone.
     {
       const official = (extra: Row) =>
         own("admin", { id: "off-1", course_version_id: V_OLD, status: "completed", completion_status: "completed", success_status: "passed", score: 0.9, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", ...extra });
@@ -615,15 +862,268 @@ async function pageCases() {
       const statusOf = (id: string) => attempts.find((a) => a.id === id)?.status;
       /** The stale-revision close is the one update by id with an is_revision filter. */
       const staleClose = () => attemptReqs().filter((q) => q.method === "PATCH" && q.query.has("id") && q.query.has("is_revision"));
-      const ctx = { context_kind: "individual", preview_kind: null };
       const pvOld = own("admin", { id: "pv-old", course_version_id: V_OLD, context_kind: "preview", preview_kind: "course" });
-      await run({ viewer: "admin", assigned: true, attempts: [official(ctx), revision(ctx), pvOld] });
+      const r = await run({ viewer: "admin", assigned: true, attempts: [official({}), revision({}), pvOld] });
       eq("a Start after the official attempt: the stale revision row is closed, the open preview on the same version is not",
         [statusOf("rev-1"), statusOf("pv-old")], ["abandoned", "in_progress"]);
-      eq("…the close leaves previews out", staleClose().map((q) => [q.query.get("id"), q.query.get("is_revision"), q.query.get("context_kind")]), [[`in.(rev-1)`, "eq.true", "neq.preview"]]);
-      await run({ viewer: "admin", assigned: true, no0107: true, attempts: [official({}), revision({})] });
-      eq("…on a database without 0107 the close names no context_kind and closes today's row",
-        [statusOf("rev-1"), staleClose().map((q) => q.query.has("context_kind"))], ["abandoned", [false]]);
+      eq("…the close takes the launch's context key", staleClose().map((q) => [q.query.get("id"), q.query.get("is_revision"), q.query.get("context_key")]), [[`in.(rev-1)`, "eq.true", "eq.individual"]]);
+      const visit = rpcs().find((q) => q.path === "/rest/v1/rpc/record_revision_visit");
+      eq("…the launch is a revision visit: its row is flagged, and the visit names the context key (the seven-argument form)",
+        [r.element?.props.revision, (visit?.body as Row | undefined)?.p_context_key, Object.keys((visit?.body as Row | undefined) ?? {}).length], [true, "individual", 7]);
+      budget("a revision visit (cmi5, ALDS_P4 off: + the stale close, the seed's state read, LMS.OfficialResult, the visit)", 21);
+      // The SCORM seed (ADR 0014 step 3, K) from the context's official
+      // attempt: its cmi_data is read by id (the context's rows carry none).
+      const offCmi = { "cmi.suspend_data": "s=7", "cmi.core.lesson_location": "slide-7", "cmi.core.score.raw": "90" };
+      const sc = await run({ viewer: "admin", assigned: true, manifest: "scorm12", attempts: [official({ cmi_data: offCmi }), revision({})] });
+      const cmiReads = attemptReqs().filter((q) => q.method === "GET" && q.select === "cmi_data");
+      const served = (sc.element?.props.initialCmi ?? {}) as Row;
+      eq("SCORM revision visit: the served cmi is the official attempt's (copied keys), in review / no-credit",
+        [sc.redirect, sc.error, served["cmi.suspend_data"], served["cmi.core.lesson_location"], served["cmi.core.lesson_mode"], served["cmi.core.credit"]],
+        [null, null, "s=7", "slide-7", "review", "no-credit"]);
+      eq("…one cmi_data read, by the official attempt's id and the learner", cmiReads.map((q) => [q.query.get("id"), q.query.get("user_id")]), [["eq.off-1", `eq.${NAV_USERS.admin.id}`]]);
+      eq("…and the row's cmi_data is rebuilt by the conditional seed update",
+        attemptReqs().filter((q) => q.method === "PATCH" && q.query.get("is_revision") === "eq.true" && (q.body as Row)?.cmi_data !== undefined).map((q) => ((q.body as Row).cmi_data as Row)["cmi.core.lesson_location"]), ["slide-7"]);
+      const scf = await run({ viewer: "admin", assigned: true, manifest: "scorm12", cmiReadFails: true, attempts: [official({ cmi_data: offCmi }), revision({})] });
+      const servedf = (scf.element?.props.initialCmi ?? {}) as Row;
+      eq("…a failed cmi_data read is logged and the launch goes on: the runtime, a review with no copied key",
+        [scf.redirect, scf.error, scf.element?.props.revision, servedf["cmi.suspend_data"], servedf["cmi.core.lesson_mode"]], [null, null, true, undefined, "review"]);
+    }
+
+    // (h) Self-enrolment on Start (step 24; ruling A3; P2-Q2 option (i-a)).
+    {
+      const r = await run({ viewer: "user", visibility: "org_public" });
+      const enrol = reqs.filter((q) => q.method === "POST" && q.path === "/rest/v1/course_assignments");
+      eq("an \"Everyone\" course, not enrolled: one plain insert (no upsert), the learner's own user row, source 'self', assigned by the learner, no due date, naming the organisation",
+        [enrol.length, enrol[0]?.query.has("on_conflict"), enrol[0]?.body], [1, false, { course_id: COURSE_ID, organization_id: ORG_ID, assignee_type: "user", user_id: NAV_USERS.user.id, due_at: null, assigned_by: NAV_USERS.user.id, source: "self" }]);
+      eq("…then a second launch_context call, and the Individual Start", [lcCalls().length, r.redirect, r.error, previewRow(attemptReqs().find((q) => q.method === "POST")).context_kind], [2, null, null, "individual"]);
+      eq("…the enrolment before any attempt is read or written",
+        reqs.findIndex((q) => q.path === "/rest/v1/course_assignments") < reqs.findIndex((q) => q.path === "/rest/v1/course_attempts"), true);
+      budget("a self-enrolling Individual Start (+ the insert and the second call)", 18);
+      const again = await run({ viewer: "user", visibility: "org_public", assigned: true });
+      eq("…a second Start: enrolled now, no insert, one call", [again.redirect, reqs.filter((q) => q.method === "POST" && q.path === "/rest/v1/course_assignments").length, lcCalls().length], [null, 0, 1]);
+      // P2-Q2 (i-a)'s two page cases.
+      const raced = await run({ viewer: "user", visibility: "org_public", selfInsert: "race" });
+      eq("23505 and the second call reads enrolled (a concurrent Start's self row): the launch goes on, one insert tried",
+        [raced.redirect, raced.error, lcCalls().length, reqs.filter((q) => q.method === "POST" && q.path === "/rest/v1/course_assignments").length, attemptReqs().filter((q) => q.method === "POST").length], [null, null, 2, 1, 1]);
+      const held = await run({ viewer: "user", visibility: "org_public", selfInsert: "conflict", ownRelease: "2999-01-01T00:00:00Z" });
+      eq("the learner's own future-dated assignment on an \"Everyone\" course: 23505, still self-enrol: /dashboard?upcoming=<course>, no attempt written",
+        [held.redirect, lcCalls().length, attemptReqs().filter((q) => q.method !== "GET").length], [`/org/dashboard?upcoming=${COURSE_ID}`, 2, 0]);
+      const failed = await run({ viewer: "user", visibility: "org_public", selfInsert: "error" });
+      eq("any other insert error: the retry notice, no second call, no attempt read or written", [failed.redirect, lcCalls().length, attemptReqs().length], [RETRY, 1, 0]);
+      // A3: an "Everyone" path, not enrolled, launching step 2.
+      const a3 = await run({ viewer: "user", strictPath: true, pathVisibility: "org_public", search: { lp: PATH_ID } });
+      const penrol = reqs.filter((q) => q.method === "POST" && q.path === "/rest/v1/learning_path_assignments");
+      eq("A3: an \"Everyone\" path, not enrolled, step 2: enrol first (one insert, source 'self'), then the second call applies the strict order: locked, no attempt",
+        [penrol.length, (penrol[0]?.body as Row | undefined)?.source, (penrol[0]?.body as Row | undefined)?.path_id, lcCalls().length, a3.redirect, attemptReqs().length],
+        [1, "self", PATH_ID, 2, `/org/dashboard?locked=${COURSE_ID}`, 0]);
+      const stepOneInPath = own("user", { id: "s1", course_version_id: V_PREV, status: "completed", completion_status: "completed", success_status: "passed", context_kind: "path", learning_path_id: PATH_ID });
+      const a3ok = await run({ viewer: "user", strictPath: true, pathVisibility: "org_public", search: { lp: PATH_ID }, attempts: [stepOneInPath] });
+      eq("A3: step 1 done in the path (read once enrolled): the second call admits path:P and the Start launches a path row",
+        [a3ok.redirect, a3ok.error, lcCalls().length, previewRow(attemptReqs().find((q) => q.method === "POST")).context_kind], [null, null, 2, "path"]);
+      budget("A3's first self-enrolling Start of step 2 (no grant)", 18);
+    }
+
+    // (i) The worst path of step 70: a self-enrolling learner's first
+    // strict-path launch that consumes a grant (an official failed attempt
+    // already in path:P, an approved unused grant in path:P), branch by branch.
+    {
+      const failedInPath = () => own("user", { id: "f2", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "failed", score: 0.2, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "path", learning_path_id: PATH_ID });
+      const stepOneInPath = () => own("user", { id: "s1", course_version_id: V_PREV, status: "completed", completion_status: "completed", success_status: "passed", started_at: "2026-10-01T00:00:00Z", completed_at: "2026-10-01T01:00:00Z", context_kind: "path", learning_path_id: PATH_ID });
+      const grant = (extra: Row = {}): Row => ({ id: "g-path", user_id: NAV_USERS.user.id, course_id: COURSE_ID, status: "approved", context_key: `path:${PATH_ID}`, used_attempt_id: null, used_at: null, expires_at: null, created_at: "2026-11-02T00:00:00Z", ...extra });
+      const worst = { viewer: "user" as NavUser, strictPath: true, pathVisibility: "org_public", search: { lp: PATH_ID } };
+      const r = await run({ ...worst, attempts: [stepOneInPath(), failedInPath()], grants: [grant()] });
+      const cg = rpcs().find((q) => q.path === "/rest/v1/rpc/consume_grant");
+      eq("the worst path: self-enrolled, the grant consumed in path:P, the retake launched", [r.redirect, r.error, String(r.element?.props.iframeSrc ?? "").includes("registration=retake-")], [null, null, true]);
+      eq("…consume_grant in its day-id form: nine named arguments, the path's tags", cg?.body,
+        { p_grant_id: "g-path", p_user_id: NAV_USERS.user.id, p_course_id: COURSE_ID, p_version_id: V_CUR, p_org_id: ORG_ID, p_learning_path_id: PATH_ID, p_journey_enrollment_id: null, p_journey_day: null, p_journey_day_id: null });
+      eq("…the earlier failed attempt's launch tokens expired (in context), no Continue yet (a grant opened on this launch)",
+        [reqs.filter((q) => q.method === "PATCH" && q.path === "/rest/v1/cmi5_launch_tokens").length, r.element?.props.continueReady], [1, false]);
+      budget("the worst path, ALDS_P4 off (requireOrgAccess 4, course 1, packages 1, launch_context 2, the self insert 1, versions 1, context read 2, consume_grant 1, token expiry 1, version 1, launch token 1)", 16);
+      await run({ ...worst, attempts: [stepOneInPath(), failedInPath()], grants: [grant()], p4: true });
+      budget("the worst path, ALDS_P4 on (+ the retake's 0100 columns, the manifest read, LaunchData, the session)", 20);
+      delete process.env.ALDS_P4;
+      // consume_grant's other answers: the context read again (its own abort
+      // signals, step 25) and the kind rule without consuming.
+      const stale = await run({ ...worst, attempts: [stepOneInPath(), failedInPath()], grants: [grant()], cgOutcome: "stale" });
+      const ctxReads = attemptReqs().filter((q) => q.method === "GET" && q.select.includes("score"));
+      eq("consume_grant answers stale: the context's attempts and grants are read again, and the launch is a revision visit (no second consume)",
+        [stale.redirect, stale.error, ctxReads.length, reqs.filter((q) => q.path === "/rest/v1/attempt_requests").length, rpcs().filter((q) => q.path === "/rest/v1/rpc/consume_grant").length, stale.element?.props.revision],
+        [null, null, 2, 2, 1, true]);
+      budget("the worst path when consume_grant answers stale (the context read again, the open rows, the row, a revision insert, the seed's state read, LMS.OfficialResult, the visit; the version read once)", 23);
+      await run({ ...worst, attempts: [stepOneInPath(), failedInPath()], grants: [grant()], cgOutcome: "stale", p4: true });
+      budget("…the same with ALDS_P4 on", 26);
+      delete process.env.ALDS_P4;
+      // The heaviest branch measured: the same, with a revision visit's row
+      // left open in path:P on the retired version, which the rerun's routing
+      // closes (the stale close, its token expiry, the abandoned queue's read).
+      const staleRev = () => own("user", { id: "rv-p", course_version_id: V_OLD, is_revision: true, started_at: "2026-11-03T00:00:00Z", context_kind: "path", learning_path_id: PATH_ID });
+      await run({ ...worst, attempts: [stepOneInPath(), failedInPath(), staleRev()], grants: [grant()], cgOutcome: "stale", p4: true });
+      eq("…the open revision row of the context is closed by the rerun", attempts.find((a) => a.id === "rv-p")?.status, "abandoned");
+      budget("the heaviest Start measured: self-enrolling, consume_grant stale, the rerun closing an open stale revision row, ALDS_P4 on", 29);
+      await run({ ...worst, pathAssigned: true, attempts: [stepOneInPath(), failedInPath(), staleRev()], grants: [grant()], cgOutcome: "stale", p4: true });
+      budget("…the same for a learner already enrolled (one launch_context call, no insert)", 27);
+      delete process.env.ALDS_P4;
+      const indiv = await run({ viewer: "user", assigned: true, attempts: [own("user", { id: "f3", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "failed", completed_at: "2026-11-01T01:00:00Z" })], grants: [grant()] });
+      eq("a path grant is never consumed by an Individual launch: no consume_grant call, a revision visit",
+        [indiv.redirect, rpcs().filter((q) => q.path === "/rest/v1/rpc/consume_grant").length, indiv.element?.props.revision], [null, 0, true]);
+    }
+
+    // (j) The journey context (?journey=E&day=<id>), from launch_context's
+    // journey facts: the open day, the locked day, a credited day's review.
+    {
+      const grant2 = (): Row => ({ id: "g-j", user_id: NAV_USERS.user.id, course_id: COURSE_ID, status: "approved", context_key: `journey:${ENR_ID}:${DAY2}`, used_attempt_id: null, used_at: null, expires_at: null, created_at: "2026-11-02T00:00:00Z" });
+      const credited1 = { [DAY1]: { course_id: PREV_COURSE, attempt_id: "j1", credit_kind: "attempt", day_number: 1 } };
+      const open = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1 });
+      const row = previewRow(attemptReqs().find((q) => q.method === "POST"));
+      eq("the open day: a journey row naming the enrolment, the day's number and id, and the pinned version",
+        [open.redirect, open.error, row.context_kind, row.journey_enrollment_id, row.journey_day, row.journey_day_id, row.journey_version_id, row.learning_path_id],
+        [null, null, "journey", ENR_ID, 2, DAY2, JVER_ID, null]);
+      eq("…its reads take the day's key, its exit is the journey, no Continue",
+        [attemptReqs().filter((q) => q.method === "GET").every((q) => q.query.get("context_key") === `eq.journey:${ENR_ID}:${DAY2}`), open.element?.props.backHref, open.element?.props.continueHref],
+        [true, `/org/journey?j=${ENR_ID}`, null]);
+      eq("…the next day is warmed from the pinned version's entries (one journey_versions read)",
+        [reqs.filter((q) => q.path === "/rest/v1/journey_versions").length, (open.element?.props.preloadUrls as string[] | undefined)?.length], [1, 1]);
+      budget("a journey day's first Start (+ the pinned version's days for warming, the next course and its version)", 19);
+      const old = await run({ viewer: "user", search: { journey: ENR_ID, day: "2" }, journeyCredits: credited1 });
+      eq("…an old link's day number: the same day, by p_day", [old.redirect, previewRow(attemptReqs().find((q) => q.method === "POST")).journey_day_id], [null, DAY2]);
+      const openRow = own("user", { id: "jr-1", course_version_id: V_CUR, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z" });
+      const resume = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, attempts: [openRow] });
+      /** Writes on attempt rows other than the first launch's conditional close of flagged rows (is_revision = true). */
+      const rowWrites = () => attemptReqs().filter((q) => q.method === "POST" || (q.method === "PATCH" && q.query.get("is_revision") !== "eq.true"));
+      eq("the day's open official attempt: resumed (the same registration), no insert and no update of the row (no re-tag)",
+        [resume.redirect, resume.error, String(resume.element?.props.iframeSrc ?? "").includes("registration=jr-1"), rowWrites().length, resume.element?.props.revision,
+          attempts.find((a) => a.id === "jr-1")?.status],
+        [null, null, true, 0, false, "in_progress"]);
+      const resumeLater = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, attempts: [openRow] });
+      eq("…the same when the day is no longer the open one (the resume is admitted before the unlock rule, step 93)",
+        [resumeLater.redirect, String(resumeLater.element?.props.iframeSrc ?? "").includes("registration=jr-1"), rowWrites().length], [null, true, 0]);
+      // Steps 22 and 93: the open day 2 now holds this course, and its
+      // context holds an open official attempt of the course the learner
+      // started there before a publish swapped it (step 1's course here).
+      // The day's link names its current course; the launch goes into the
+      // same day on the started course and writes nothing.
+      const startedRow = own("user", { id: "jr-s", course_version_id: V_PREV, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-09T00:00:00Z" });
+      const swapped = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, attempts: [startedRow] });
+      eq("a day started on another course: into the same day on the started course (one launch_context call), nothing read or written on attempts",
+        [swapped.redirect, lcCalls().length, attemptReqs().length, writes().length],
+        [`/org/courses/${PREV_COURSE}/launch?journey=${ENR_ID}&day=${DAY2}`, 1, 0, 0]);
+      const lockedDay = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 } });
+      eq("a later day than the open one: today's /journey?locked=<day>, nothing written", [lockedDay.redirect, writes().length], ["/org/journey?locked=2", 0]);
+      const credited2 = { ...credited1, [DAY2]: { course_id: COURSE_ID, attempt_id: null, credit_kind: "legacy_cross_context", day_number: 2 } };
+      const review = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited2 });
+      const rrow = previewRow(attemptReqs().find((q) => q.method === "POST"));
+      eq("a credited day whose context holds no official attempt (a cross-context credit): the review is a revision visit, never a new official attempt",
+        [review.redirect, review.error, rrow.context_kind, rrow.is_revision, review.element?.props.revision], [null, null, "journey", true, true]);
+      const done = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited2, journeyStatus: "completed",
+        attempts: [own("user", { id: "jd", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "passed", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2 })],
+        grants: [grant2()] });
+      eq("a completed enrolment's review: a revision visit, and its grant is never consumed", [done.redirect, done.element?.props.revision, rpcs().filter((q) => q.path === "/rest/v1/rpc/consume_grant").length], [null, true, 0]);
+
+      // P2-6 review (launch F3 (1)): a credited day's review on an ACTIVE
+      // enrolment with an unused approved grant in the day's context. The
+      // review is a revision visit, never a grant's retake (noNewOfficial's
+      // reviewOnly term; the stub's consume_grant would answer `opened`).
+      const inContextOfficial = own("user", { id: "jo", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "passed", score: 0.9, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID });
+      for (const [what, credits, rows] of [
+        ["a cross-context credit (no official attempt in the day's context)", credited2, []],
+        ["the day credited by its own official attempt", { ...credited1, [DAY2]: { course_id: COURSE_ID, attempt_id: "jo", credit_kind: "attempt", day_number: 2 } }, [inContextOfficial]],
+      ] as Array<[string, typeof journeyCredits, Row[]]>) {
+        const rv = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credits, attempts: rows, grants: [grant2()] });
+        const ins = attemptReqs().filter((q) => q.method === "POST");
+        eq(`an active enrolment's review, ${what}, an unused grant in the day's context: no consume_grant call, one revision row in the day's context`,
+          [rv.redirect, rv.error, rpcs().filter((q) => q.path === "/rest/v1/rpc/consume_grant").length, ins.length, previewRow(ins[0]).is_revision, previewRow(ins[0]).journey_day_id, rv.element?.props.revision, grants.find((g) => g.id === "g-j")?.used_attempt_id],
+          [null, null, 0, 1, true, DAY2, true, null]);
+      }
+
+      // P2-6 review (launch F4 = writes F3): a resume whose only open row
+      // slot routing abandons (the Hindi slot, deactivated since the learner
+      // started day 2). On an active enrolment's uncredited day with a free
+      // window the admission becomes the day's open: the close, then the
+      // fresh official attempt in this request (phase 1's behaviour).
+      const onHi = (extra: Row = {}) => own("user", { id: "jh", course_version_id: V_HI, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z", ...extra });
+      const statusOf = (id: string) => attempts.find((a) => a.id === id)?.status;
+      const reopened = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()] });
+      const fresh = attemptReqs().filter((q) => q.method === "POST");
+      eq("a resume whose only open row sits on a deactivated slot: that row is closed and the day's fresh official attempt opens in the same request (no retry notice)",
+        [reopened.redirect, reopened.error, statusOf("jh"), fresh.length, previewRow(fresh[0]).course_version_id, previewRow(fresh[0]).context_kind, previewRow(fresh[0]).journey_day, previewRow(fresh[0]).journey_day_id, "is_revision" in previewRow(fresh[0]),
+          String(reopened.element?.props.iframeSrc ?? "").includes("registration=new-"), reopened.element?.props.revision, refusals()],
+        [null, null, "abandoned", 1, V_CUR, "journey", 2, DAY2, false, true, false, []]);
+      eq("…the close precedes the insert, and the closed row's launch tokens expire",
+        [reqs.findIndex((q) => q.method === "PATCH" && q.path === "/rest/v1/course_attempts" && q.query.get("id") === "in.(jh)") < reqs.findIndex((q) => q.method === "POST" && q.path === "/rest/v1/course_attempts"),
+          reqs.filter((q) => q.method === "PATCH" && q.path === "/rest/v1/cmi5_launch_tokens").length > 0], [true, true]);
+      const closeFailed = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], slotCloseFails: true });
+      eq("…when that close fails (it is fail-soft), the fresh attempt does not go in beside the row still open: refused at the row, no insert",
+        [closeFailed.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method === "POST").length, refusals()], [RETRY, "in_progress", 0, ["journey_resume_without_row"]]);
+      // Anything else closes the row on the deactivated slot (ADR 0004 rule
+      // (3)), then refuses with the retry notice: no attempt is inserted, and
+      // the next launch decides afresh (refusing before the close would leave
+      // the row open and refuse every later launch).
+      const officialDone = own("user", { id: "jw", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "failed", score: 0.2, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID });
+      for (const [what, extra] of [
+        ["a completed enrolment (it opens nothing new)", { journeyStatus: "completed" }],
+        ["a credited day (no new official attempt on it)", { journeyCredits: credited2 }],
+        ["a used window (an official attempt completed in the day's context)", { attempts: [onHi(), officialDone] }],
+      ] as Array<[string, Partial<Parameters<typeof run>[0]>]>) {
+        const r = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], ...extra });
+        eq(`…the same resume on ${what}: the row on the deactivated slot is closed, then the launch is refused; no attempt inserted`,
+          [r.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method === "POST").length, reqs.filter((q) => q.method === "PATCH" && q.path === "/rest/v1/cmi5_launch_tokens").length > 0, refusals()],
+          [RETRY, "abandoned", 0, true, ["journey_resume_row_abandoned"]]);
+      }
+      // P2-6 review (launch F3 (2)): a resume whose open row is on a version
+      // routing does not reach inserts nothing beside it (the 0107 open-row
+      // index is per version, so nothing else would stop a second official
+      // attempt in the day's context).
+      const onOld = own("user", { id: "jl", course_version_id: V_OLD, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z" });
+      const legacy = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, noPackages: true, attempts: [onOld] });
+      eq("a resume on the legacy no-package course whose open row is on a retired version (no routing): refused at the row, no insert, the row left open",
+        [legacy.redirect, attemptReqs().filter((q) => q.method === "POST").length, statusOf("jl"), refusals()], [RETRY, 0, "in_progress", ["journey_resume_without_row"]]);
+      const retakeGrant = { ...grant2(), id: "g-jh", used_attempt_id: "jh", used_at: "2026-11-09T00:00:00Z" };
+      const retake = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], grants: [retakeGrant] });
+      eq("a resume whose open row is a grant's retake on a deactivated slot (routing never abandons a retake): refused at the row, no insert, the retake left open",
+        [retake.redirect, attemptReqs().filter((q) => q.method === "POST").length, statusOf("jh"), refusals()], [RETRY, 0, "in_progress", ["journey_resume_without_row"]]);
+
+      // P2-6 review (launch F3 (3)): one journey-day holder relaunches the
+      // course inside that day (targetOf's journey-holder branch).
+      const holder = { enrollment_id: ENR_ID, day_id: DAY2, day_number: 2, credited: false };
+      const viaHolder = await run({ viewer: "user", search: { back: "dashboard" }, journeyHolders: [holder] });
+      eq("no product parameter, not entitled, one journey day holds the course: the launch again in that day (?journey=E&day=<id>), nothing read or written on attempts",
+        [viaHolder.redirect, lcCalls().length, attemptReqs().length, writes().length],
+        [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=${DAY2}&back=dashboard`, 1, 0, 0]);
+      const viaNumber = await run({ viewer: "user", journeyHolders: [{ ...holder, day_id: null }] });
+      eq("…a holder whose day has no id goes by the day's number", [viaNumber.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=2`, 0]);
+      const two = await run({ viewer: "user", journeyHolders: [holder, { ...holder, day_id: DAY3, day_number: 3 }] });
+      eq("…two holders: the dashboard until phase 6's chooser", [two.redirect, writes().length], ["/org/dashboard", 0]);
+    }
+
+    // (l) P2-6 item 6 (writes F4): the launch passes its context into
+    // LMS.LaunchData (ALDS_P4 on, cmi5): context/kind, context/id and
+    // context/day, from the launched row.
+    {
+      const ldExt = (): Row | null => {
+        const body = reqs.find((q) => q.method === "POST" && q.path === "/rest/v1/xapi_state" && (q.body as Row | null)?.state_id === LMS_LAUNCH_DATA_STATE_ID)?.body as { content?: AldsLaunchData } | undefined;
+        return (body?.content?.contextTemplate.extensions ?? null) as Row | null;
+      };
+      const ctxOf = (ext: Row | null) => (ext ? [ext[LAUNCH_CONTEXT_EXT.kind], LAUNCH_CONTEXT_EXT.id in ext ? ext[LAUNCH_CONTEXT_EXT.id] : "(none)", LAUNCH_CONTEXT_EXT.day in ext ? ext[LAUNCH_CONTEXT_EXT.day] : "(none)"] : null);
+      const indiv = await run({ viewer: "user", assigned: true, p4: true });
+      eq("an Individual Start's LaunchData: context/kind individual, no context/id, no context/day", [indiv.redirect, ctxOf(ldExt())], [null, ["individual", "(none)", "(none)"]]);
+      const stepOne = own("user", { id: "s1", course_version_id: V_PREV, status: "completed", completion_status: "completed", success_status: "passed", context_kind: "path", learning_path_id: PATH_ID });
+      const onPath = await run({ viewer: "user", strictPath: true, pathAssigned: true, search: { lp: PATH_ID }, attempts: [stepOne], p4: true });
+      eq("a path Start's LaunchData: context/kind path, context/id the path, no context/day", [onPath.redirect, ctxOf(ldExt())], [null, ["path", PATH_ID, "(none)"]]);
+      const credited1 = { [DAY1]: { course_id: PREV_COURSE, attempt_id: "j1", credit_kind: "attempt", day_number: 1 } };
+      const day = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, p4: true });
+      eq("a journey day's first Start: context/kind journey, context/id the enrolment, context/day the day's number", [day.redirect, ctxOf(ldExt())], [null, ["journey", ENR_ID, 2]]);
+      const launchedOn7 = own("user", { id: "j7", course_version_id: V_CUR, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 7, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z" });
+      const resumed = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, attempts: [launchedOn7], p4: true });
+      eq("…a resumed journey row keeps the day number it was launched on (7), not the day's number now (2)",
+        [resumed.redirect, String(resumed.element?.props.iframeSrc ?? "").includes("registration=j7"), ctxOf(ldExt())], [null, true, ["journey", ENR_ID, 7]]);
+      delete process.env.ALDS_P4;
+    }
+
+    // (k) Fail-closed on the source: no refusal inside a try; the resolver
+    // runs in a try whose refusal sits outside it.
+    {
+      const src = fs.readFileSync(path.join(root, PAGE), "utf8");
+      eq("the resolver's throw is caught and refused outside the try", /try \{\s*d = resolveLaunchContext\(\{[\s\S]{0,160}\}\);\s*\} catch \{\s*d = null;\s*\}\s*if \(d === null\) refuse\("launch_context_unreadable"\);/.test(src), true);
     }
   } finally {
     globalThis.fetch = realFetch;
@@ -1219,7 +1719,10 @@ async function main() {
     eq("…its source is scoring.officialAttempt, never the latest completed row",
       /const official = \(ev\.scoring\?\.officialAttempt \?\? null\) as MyAttempt \| null;/.test(src) && !/myCompleted|revisionSource/.test(src), true);
     eq("SCORM: the served cmi is rebuilt from the official attempt, by an update conditional on the row's flag",
-      /cmi = buildRevisionCmi\(official\);\s*const \{ error: seedErr \} = await svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ cmi_data: cmi \}\)\s*\.eq\("id", attemptId\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("is_revision", true\)\s*\.eq\("status", "in_progress"\);/.test(src), true);
+      /cmi = buildRevisionCmi\(official \? \{ cmi_data: officialCmi \} : null\);\s*const \{ error: seedErr \} = await svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ cmi_data: cmi \}\)\s*\.eq\("id", attemptId\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("is_revision", true\)\s*\.eq\("status", "in_progress"\);/.test(src), true);
+    eq("…the official attempt's cmi_data is read by its id on the SCORM revision branch only (the context's rows carry none); a failed read is logged and the launch goes on",
+      /if \(seed\.scorm\) \{[\s\S]*?if \(official\) \{\s*const \{ data: offRow, error: offErr \} = await supabase\s*\.from\("course_attempts"\)\s*\.select\("cmi_data"\)\s*\.eq\("id", official\.id\)\s*\.eq\("user_id", user\.id\)\s*\.maybeSingle\(\);\s*if \(offErr\) \{\s*console\.warn\(JSON\.stringify\(\{ event: "revision_seed_failed", attempt_id: attemptId, official_attempt_id: official\.id, step: "official_cmi_read" \}\)\);\s*\}/.test(src) &&
+        !/refuse\("official_cmi_read_failed"\)/.test(src), true);
     eq("LMS.OfficialResult: buildOfficialResult for the revision registration, not P4-gated",
       /state_id: LMS_OFFICIAL_RESULT_STATE_ID,\s*content: buildOfficialResult\(/.test(src) &&
         !gatedByP4(all.find((n) => ts.isIdentifier(n) && n.text === "buildOfficialResult" && ts.isCallExpression(n.parent))!), true);
@@ -1242,38 +1745,78 @@ async function main() {
         return false;
       });
       eq("no refusal sits inside a try block (redirect() throws)", [refuseCalls.length > 10, inTry.length], [true, 0]);
-      eq("the grants: one strict grantSnapshotFor(svcAttempt, user.id, c.id) read, a failure refuses",
-        (src.match(/grantSnapshotFor\(/g) ?? []).length === 1 && /grantSnapshotFor\(svcAttempt, user\.id, c\.id\)[\s\S]{0,260}\?\? refuse\("grant_read_failed"\)/.test(src), true);
-      eq("the attempts and versions reads refuse on error",
-        /if \(verErr\) refuse\("versions_read_failed"\);/.test(src) && /if \(myErr\) refuse\("attempts_read_failed"\);/.test(src), true);
-      eq("every new is_revision read has the narrower-select fallback (attempts, routing, grandfather, row)",
+      // ADR 0024 P2-6 (step 23): the grants and the attempts are read in the
+      // launch's context through readContextResult, strictly; no
+      // grantSnapshotFor, no resolvePolicy and no computeScoring on the page.
+      eq("the attempt rule: one readContextResult(svcAttempt, …) in the launch's key, a failure refuses; no grantSnapshotFor, resolvePolicy or computeScoring",
+        [(src.match(/readContextResult\(/g) ?? []).length,
+          /const read = await readContextResult\(svcAttempt, \{ userId: user\.id, courseId: c\.id, key: ctxKey, passRequired, versionIds \}\);\s*if \(!read\.ok\) refuse\(`context_read_\$\{read\.reason\}`\);/.test(src),
+          /\bgrantSnapshotFor\(|\bresolvePolicy\(|\bcomputeScoring\(/.test(src)],
+        [1, true, false]);
+      eq("the course's versions are read once, before evaluate, and a failure refuses",
+        [(src.match(/\.from\("course_versions"\)\s*\.select\("id, package_id"\)/g) ?? []).length, /if \(verErr\) refuse\("versions_read_failed"\);/.test(src)], [1, true]);
+      eq("every is_revision read left on the page has the narrower-select fallback (the open rows, the row)",
         [
-          /readMy\(`\$\{MY_COLUMNS\}, is_revision`\)[\s\S]{0,40}if \(myErr && isMissingColumn\(myErr, "is_revision"\)\)/.test(src),
           /readIp\(`\$\{IP_COLUMNS\}, is_revision`\)[\s\S]{0,40}if \(ipErr && isMissingColumn\(ipErr, "is_revision"\)\)/.test(src),
-          /if \(withFlagFilter\) q = q\.eq\("is_revision", false\);[\s\S]*?if \(gfErr && isMissingColumn\(gfErr, "is_revision"\)\) \(\{ data: ip, error: gfErr \} = await readGrandfather\(false\)\);/.test(src),
           /read\(`\$\{ROW_COLUMNS\}, is_revision`\)[\s\S]{0,40}if \(rowErr && isMissingColumn\(rowErr, "is_revision"\)\)/.test(src),
-        ], [true, true, true, true]);
-      eq("the routing reads and the row lookup refuse on any other error",
-        (src.match(/refuse\("routing_read_failed"\)/g) ?? []).length >= 3 && /if \(rowErr\) refuse\("row_read_failed"\);/.test(src), true);
+        ], [true, true]);
+      eq("the grandfather routing decides from the open rows (no second attempts read): the newest started non-revision row of the chosen package",
+        [/readGrandfather/.test(src), /const grandfather = inProgress\s*\.filter\(\(a\) => packageOfVersion\.get\(a\.course_version_id\) === chosen && a\.is_revision !== true\)/.test(src)], [false, true]);
+      eq("the routing read and the row lookup refuse on any other error",
+        (src.match(/refuse\("routing_read_failed"\)/g) ?? []).length === 1 && /if \(rowErr\) refuse\("row_read_failed"\);/.test(src), true);
+      eq("step 25: the open-rows read and the row lookup each carry their own abort signal (both run again after consume_grant)",
+        [/\.eq\("status", "in_progress"\)\s*\)\.abortSignal\(new AbortController\(\)\.signal\);/.test(src), /\.limit\(1\)\s*\.abortSignal\(new AbortController\(\)\.signal\)\s*\.maybeSingle\(\);/.test(src)], [true, true]);
       // The cutover rule: flag_revision_attempt proceeds only on exactly 1.
       eq("one .rpc(\"flag_revision_attempt\"), and only a result of exactly 1 resumes",
         (src.match(/\.rpc\("flag_revision_attempt"/g) ?? []).length === 1 &&
           /\.rpc\("flag_revision_attempt", \{ p_attempt_id: existing\.id \}\);\s*if \(flagErr\) refuse\([^;]+\);\s*if \(flagged !== 1\) refuse\("flag_not_applied"\);/.test(src), true);
       // consume_grant: one call, every argument by name, no fallback writes.
       const cgAt = src.indexOf('.rpc("consume_grant"');
-      const rerunAt = src.indexOf("grants = await readGrants();", cgAt);
-      eq("one .rpc(\"consume_grant\") with its eight named arguments",
+      const rerunAt = src.indexOf("inCtx = await readInContext();", cgAt);
+      eq("one .rpc(\"consume_grant\") in its day-id form: nine named arguments, the tags the launch's context (ADR 0024 step 10)",
         (src.match(/\.rpc\("consume_grant"/g) ?? []).length === 1 &&
-          /\.rpc\("consume_grant", \{\s*p_grant_id: grantId,\s*p_user_id: user\.id,\s*p_course_id: c\.id,\s*p_version_id: v\.id,\s*p_org_id: org\.id,\s*p_learning_path_id: pathContextId,\s*p_journey_enrollment_id: journeyCtx\?\.enrollmentId \?\? null,\s*p_journey_day: journeyCtx\?\.day \?\? null,\s*\}\);/.test(src), true);
+          /\.rpc\("consume_grant", \{\s*p_grant_id: grantId,\s*p_user_id: user\.id,\s*p_course_id: c\.id,\s*p_version_id: v\.id,\s*p_org_id: org\.id,\s*p_learning_path_id: tags\.learning_path_id,\s*p_journey_enrollment_id: tags\.journey_enrollment_id,\s*p_journey_day: tags\.journey_day,\s*p_journey_day_id: tags\.journey_day_id,\s*\}\);/.test(src), true);
       eq("…no fallback insert, abandon or grant stamp on the grant path",
         cgAt > 0 && rerunAt > cgAt && !/\.insert\(|status: "abandoned"/.test(src.slice(cgAt, rerunAt)) &&
           !/\.from\("attempt_requests"\)\s*\.update\(/.test(src), true);
       eq("…a raised error or a missing function refuses; the outcome goes through afterConsumeGrant",
         /if \(cgErr\) refuse\(isSchemaMissing\(cgErr\) \? "schema_missing" : /.test(src) &&
           /const next = afterConsumeGrant\(cg\?\.outcome\);\s*if \(next === "refuse"\) refuse\(/.test(src), true);
-      eq("…the rerun re-reads, re-evaluates without consuming and resolves again in this request",
-        /grants = await readGrants\(\);\s*ev = await evaluate\(grants, false\);\s*res = await resolveVersion\(ev\.candidate, grants\);\s*v = res\.v;\s*await closeAfterResolution\(res\);/.test(src) &&
+      eq("…the rerun re-reads the context (readContextResult's own abort signals), re-evaluates without consuming and resolves again in this request",
+        /inCtx = await readInContext\(\);\s*grants = grantsOf\(inCtx\);\s*ev = evaluate\(inCtx, false\);\s*res = await resolveVersion\(ev\.candidate, grants\);\s*v = res\.v;\s*await closeAfterResolution\(res\);/.test(src) &&
           !/redirect\([^)]*\/launch/.test(src), true);
+      // P2-6 re-review A3: resumeAfterSlotRouting's close_then_refuse is
+      // acted on after EVERY close of a resolution, the first call's and
+      // consume_grant's rerun's: each `await closeAfterResolution(…);` is
+      // followed at once, in its own block, by the refusal on the flag.
+      const closeEscapes = (text: string): string[] => {
+        const f = ts.createSourceFile(PAGE, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+        const out: string[] = [];
+        let calls = 0;
+        const walk = (n: ts.Node) => {
+          if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "closeAfterResolution") {
+            calls++;
+            const stmt = ts.isAwaitExpression(n.parent) && ts.isExpressionStatement(n.parent.parent) ? n.parent.parent : null;
+            const block = stmt?.parent;
+            const list = block && (ts.isBlock(block) || ts.isSourceFile(block)) ? block.statements : null;
+            const next = stmt && list ? list[list.indexOf(stmt) + 1] : undefined;
+            const refuses = !!next && ts.isIfStatement(next) && !next.elseStatement && next.expression.getText(f) === "refuseAfterClose" &&
+              next.thenStatement.getText(f) === 'refuse("journey_resume_row_abandoned");';
+            if (!refuses) out.push(`the call at line ${f.getLineAndCharacterOfPosition(n.getStart(f)).line + 1} is not followed by the refusal`);
+          }
+          ts.forEachChild(n, walk);
+        };
+        walk(f);
+        if (calls < 2) out.push(`${calls} call(s) of closeAfterResolution, owed 2 (the first resolution, consume_grant's rerun)`);
+        return out;
+      };
+      eq("A3: every closeAfterResolution call (the first resolution's, consume_grant's rerun's) is followed at once by if (refuseAfterClose) refuse(\"journey_resume_row_abandoned\")",
+        closeEscapes(src), []);
+      const lastRefusal = src.lastIndexOf('if (refuseAfterClose) refuse("journey_resume_row_abandoned");');
+      const plantedRerun = lastRefusal < 0 ? src : src.slice(0, lastRefusal) + src.slice(lastRefusal + 'if (refuseAfterClose) refuse("journey_resume_row_abandoned");'.length);
+      eq("…planted: the rerun's refusal dropped is flagged (one call escapes)", closeEscapes(plantedRerun).length, 1);
+      const plantedThird = src.replace("await closeAfterResolution(res);", "await closeAfterResolution(res);\n  await closeAfterResolution(res);");
+      eq("…planted: a further bare call is flagged", closeEscapes(plantedThird).length, 1);
       // The token expiry after opened.
       eq("after opened: expireLaunchTokens(…, tokenExpiryTargets(…)) for every non-revision attempt, then the LRS abandoned queue",
         /const tokErr = await expireLaunchTokens\(\s*svcAttempt,\s*tokenExpiryTargets\(\{ attempts: ev\.my, abandonedIds, newAttemptId: retakeId \}\)\s*\);[\s\S]{0,200}await enqueueAbandonedStatements\(svcAttempt, abandonedIds\);/.test(src), true);
@@ -1289,14 +1832,14 @@ async function main() {
         /const decision = rowAction\(\{ candidate: ev\.candidate, limitReached, row: existing, retakeIds: grants\.retakeIds \}\);/.test(src), true);
       eq("I-3: the insert names is_revision only for insert_revision and checks the invariant",
         /const namedIsRevision = decision\.action === "insert_revision";\s*if \(namedIsRevision !== insertIsRevision\(limitReached, null\)\) refuse\("kind_mismatch"\);/.test(src), true);
-      eq("H: a first launch closes open flagged rows on the resolved version first (conditional, tokens, LRS; never a preview's, P2-5 item 5b)",
-        /if \(ev\.candidate === "first"\) \{\s*const \{ data: flRows, error: flErr \} = await readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.eq\("course_version_id", v\.id\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("is_revision", true\),\s*apply\s*\)\.select\("id"\)/.test(src) &&
+      eq("H: a first launch closes open flagged rows of its context on the resolved version first (conditional, tokens, LRS)",
+        /if \(ev\.candidate === "first"\) \{\s*const \{ data: flRows, error: flErr \} = await inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.eq\("course_version_id", v\.id\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("is_revision", true\)\s*\)\.select\("id"\)/.test(src) &&
           src.indexOf('if (ev.candidate === "first") {') < src.indexOf("const existing = await lookupRow(v.id);"), true);
       eq("G: the stale-revision close is conditional on the flag, own rows, in progress",
         /\.in\("id", r\.staleRevisionIds\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("is_revision", true\)/.test(src), true);
       // The visit record.
-      eq("one .rpc(\"record_revision_visit\") with p_kind = the version's manifest_type",
-        (src.match(/\.rpc\("record_revision_visit"/g) ?? []).length === 1 && /p_kind: v\.manifest_type,/.test(src), true);
+      eq("one .rpc(\"record_revision_visit\") with p_kind = the version's manifest_type and p_context_key = the launch's key (the seven-argument form)",
+        (src.match(/\.rpc\("record_revision_visit"/g) ?? []).length === 1 && /p_kind: v\.manifest_type,\s*p_context_key: ctxKey,/.test(src), true);
       eq("…a plain insert when the function fails for another reason, revision_visit_failed when that fails",
         /if \(isSchemaMissing\(visitErr\)\) \{[\s\S]*?return;\s*\}\s*const \{ error: plainErr \} = await svcAttempt\.from\("revision_visits"\)\.insert\(/.test(src) &&
           /if \(plainErr\) console\.warn\(JSON\.stringify\(\{ event: "revision_visit_failed", attempt_id: visitAttemptId \}\)\);/.test(src), true);
@@ -1319,44 +1862,56 @@ async function main() {
       eq("3c: while requireOrgAccess answers an impersonation, a launch without the mode goes to ?denied=1, before the course read",
         /if \(impersonation && mode !== "preview"\) \{[\s\S]{0,260}redirect\(`\/\$\{orgSlug\}\/dashboard\?denied=1`\);\s*\}/.test(src) &&
           at("if (impersonation && mode") > -1 && at("if (impersonation && mode") < at('.from("courses")'), true);
-      eq("3b: resolveLaunchContext is called once, for ?mode=preview only, with no facts (no launch_context call)",
-        [(src.match(/resolveLaunchContext\(\{/g) ?? []).length, /if \(mode === "preview"\) \{\s*const decision = resolveLaunchContext\(\{[\s\S]{0,260}facts: null,/.test(src), /\.rpc\(\s*["'`]launch_context/.test(src)],
-        [1, true, false]);
-      eq("…before the course read, the access call and every attempts read; anything but the course preview goes to ?denied=1",
-        at("resolveLaunchContext({") < at('.from("courses")') && at("resolveLaunchContext({") < at("learnerCanAccessCourse({") && at("resolveLaunchContext({") < firstAttemptsRead &&
+      eq("3b: the preview row's resolver call has no facts, and the launch_context call is the Start's only (P2-6 item 1)",
+        [/if \(mode === "preview"\) \{\s*const decision = resolveLaunchContext\(\{[\s\S]{0,260}facts: null,/.test(src),
+          (src.match(/\.rpc\("launch_context"/g) ?? []).length, /if \(!preview\) \{\s*facts = await readLaunchContext\(\);/.test(src)],
+        [true, 1, true]);
+      eq("…the preview row answers before the course read and every attempts read; anything but the course preview goes to ?denied=1",
+        at("resolveLaunchContext({") < at('.from("courses")') && at("resolveLaunchContext({") < firstAttemptsRead &&
           /if \(decision\.kind !== "launch" \|\| decision\.context\.kind !== "preview" \|\| decision\.context\.previewKind !== "course"\) \{[\s\S]{0,260}redirect\(`\/\$\{orgSlug\}\/dashboard\?denied=1`\);\s*\}/.test(src), true);
+      eq("P2-6 item 1: the conflict row and a run answer with no call (refusalWithoutFacts), before the course read",
+        /if \(!preview\) \{\s*const early = refusalWithoutFacts\(\{ lp: lpArg, journey: journeyArg, run: firstOf\(runRaw\) \}\);\s*if \(early !== null\) \{[\s\S]{0,200}redirect\(`\/\$\{orgSlug\}\/dashboard\?denied=1`\);/.test(src) &&
+          at("refusalWithoutFacts({") < at('.from("courses")'), true);
+      eq("P2-6 item 1: the order is the impersonation refusal, the preview row, the conflict row, the course read, the call, the resolver, then evaluate",
+        [at("if (impersonation && mode"), at("if (mode === \"preview\") {"), at("refusalWithoutFacts({"), at('.from("courses")'), at('.rpc("launch_context"'), at("facts = await readLaunchContext();"), at("let ev: Evaluation")]
+          .every((x, i, xs) => x > 0 && (i === 0 || xs[i - 1] < x)), true);
+      eq("P2-N5: the page calls no learnerCanAccessCourse and no canViewReports (the resolver decides both); P2-N6: the service client is created before the call",
+        [/learnerCanAccessCourse/.test(src), /\bcanViewReports\(/.test(src), at("const svcAttempt = createServiceClient(") < at('.rpc("launch_context"')], [false, false, true]);
+      eq("…the call: seven named arguments, the session's user and requireOrgAccess's organisation, a day of digits as p_day and a uuid as p_day_id, its own abort signal (step 25: the second call is the enrolment re-read), never { get: true }",
+        [/\.rpc\("launch_context", \{\s*p_user: user\.id,\s*p_org: org\.id,\s*p_course: c\.id,\s*p_path: [^,]+,\s*p_enrollment: [^,]+,\s*p_day_id: [^\n]+UUID_RE\.test\(dayArg\) \? dayArg : null,\s*p_day: [^\n]+DIGITS_RE\.test\(dayArg\) \? Number\(dayArg\) : null,\s*\}\)(?:\s*\/\/[^\n]*)*\s*\.abortSignal\(new AbortController\(\)\.signal\);/.test(src), /get:\s*true/.test(src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, ""))], [true, false]);
+      eq("…a failed call refuses with the retry notice; the self-enrolment's second call follows the insert; afterSelfEnrol decides",
+        [/if \(error\) refuse\(isSchemaMissing\(error\) \? "schema_missing" : `launch_context_\$\{error\.code \?\? "error"\}`\);/.test(src),
+          /const insert = await enrolSelf\([\s\S]{0,200}if \(insert !== "failed"\) \{\s*facts = await readLaunchContext\(\);\s*second = decide\(facts\);\s*\}\s*const after = afterSelfEnrol\(\{ selfEnrol, insert, second \}\);/.test(src)], [true, true]);
       eq("a preview reads no ?lp=, ?journey= or day (no tag, no Continue, no path or journey exit)",
         [/const lpParam = preview \? undefined : lpRaw;/, /const journeyParam = preview \? undefined : journeyRaw;/, /const dayParam = preview \? undefined : dayRaw;/].map((re) => re.test(src)), [true, true, true]);
-      eq("item 4: no role decides a launch: canManage is gone; the access bypass is canViewReports(role) && preview",
-        [/\bcanManage\b/.test(src), /preview: canViewReports\(role\) && preview,/.test(src)], [false, true]);
-      eq("item 4 (:318): evaluate has no role short-circuit; a preview runs neither the grant read nor evaluate",
-        [/const evaluate = async \(grantsNow: GrantSnapshot, consumeGrants: boolean\): Promise<Evaluation> => \{\s*const policy = await resolvePolicy\(supabase, c\.id\);/.test(src),
-          /let grants: GrantSnapshot = preview \? \{ retakeIds: new Set<string>\(\), unusedGrant: null, rows: \[\] \} : await readGrants\(\);/.test(src),
-          /let ev: Evaluation = preview \? \{ my: \[\], scoring: null, candidate: "first" \} : await evaluate\(grants, true\);/.test(src)],
+      eq("item 4: no role decides a launch: canManage is gone",
+        /\bcanManage\b/.test(src), false);
+      eq("item 4: evaluate has no role short-circuit; a preview reads no context and runs no attempt rule",
+        [/const evaluate = \(r: InContext, consumeGrants: boolean\): Evaluation => \{\s*\/\/[^\n]*\n[^\n]*\n\s*const my = r\.rows;/.test(src),
+          /let inCtx: InContext \| null = preview \? null : await readInContext\(\);/.test(src),
+          /let ev: Evaluation = inCtx \? evaluate\(inCtx, true\) : \{ my: \[\], scoring: null, candidate: "first" \};/.test(src)],
         [true, true, true]);
-      eq("item 4 (:671): a preview reads no path step, so the release gate and the lock never apply to it; the gate has no role term",
-        [/const \{ data: pathStepRows \} = preview\s*\? \{ data: \[\] \}\s*: await supabase\s*\.from\("learning_path_courses"\)/.test(src), /if \(\s*stepInPaths\.some\(/.test(src)], [true, true]);
+      eq("P2-6 item 1: the page's own journey block, path block and pathContextId are gone (the resolver's context gives the tags; the release gate and the lock are P's only, D2)",
+        [/computeJourneyState|readJourneyCredits|learning_path_courses|enforcedPathIds|pathContextId|journeyCtx|journeyNextCourseId|myGroupIdsServer|team_members/.test(src)], [false]);
       eq("a preview never goes to the language confirm (the switch it confirms resets real rows)", /if \(decision\.kind === "confirm-switch" && !preview\) \{/.test(src), true);
-      // 5b: one decision per request, and every attempts read and close goes through it.
-      eq("5b: one ContextFilterState, declared in the component, { applies: null }",
-        [(src.match(/const previews: ContextFilterState = \{ applies: null \};/g) ?? []).length, /^const previews/m.test(src)], [1, false]);
-      eq("5b: inLaunchContext: a Start drops every preview (withoutPreviews); a preview takes the caller's course previews only",
-        /function inLaunchContext<Q>\(query: Q, apply: boolean\): Q \{\s*if \(!preview\) return withoutPreviews\(query, apply\);[\s\S]{0,200}return q\.eq\("context_kind", "preview"\)\.eq\("preview_kind", "course"\);\s*\}/.test(src), true);
-      const viaFilter = (re: RegExp) => re.test(src);
-      eq("5b: readMy, the strict lock and the flagged-row close (Start only) read through readWithContextFilter + withoutPreviews", [
-        viaFilter(/const readMy = \(columns: string\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(/),
-        viaFilter(/\? await readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*supabase\s*\.from\("course_attempts"\)\s*\.select\("course_version_id, completion_status, success_status"\)/),
-        viaFilter(/if \(ev\.candidate === "first"\) \{\s*const \{ data: flRows, error: flErr \} = await readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)/),
-      ], [true, true, true]);
-      eq("5b: readIp, readGrandfather, lookupRow and the two resolution closes read through readWithContextFilter + inLaunchContext", [
-        viaFilter(/const readIp = \(columns: string\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*inLaunchContext\(/),
-        viaFilter(/const readGrandfather = \(withFlagFilter: boolean\) =>\s*readWithContextFilter\(previews, \(apply\) => \{\s*let q = inLaunchContext\(/),
-        viaFilter(/const read = \(columns: string\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*inLaunchContext\(/),
-        viaFilter(/await readWithContextFilter\(previews, \(apply\) =>\s*inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.in\("id", closable\)/),
-        viaFilter(/await readWithContextFilter\(previews, \(apply\) =>\s*inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.in\("id", r\.staleRevisionIds\)/),
+      // O2 (P2-6): the interim preview exclusions are replaced by the launch's
+      // context filter; a preview keeps its own course-preview filter.
+      eq("O2: no interim preview exclusion is left (no ContextFilterState, readWithContextFilter or withoutPreviews on the page)",
+        /ContextFilterState|readWithContextFilter|withoutPreviews/.test(src), false);
+      eq("O2: inLaunchContext: a Start takes its context key; a preview the caller's course previews only",
+        /function inLaunchContext<Q>\(query: Q\): Q \{[\s\S]{0,120}if \(!preview\) return q\.eq\("context_key", ctxKey\);\s*return \(q\.eq\("context_kind", "preview"\)[\s\S]{0,80}\)\.eq\("preview_kind", "course"\);\s*\}/.test(src), true);
+      const viaContext = (re: RegExp) => re.test(src);
+      eq("O2: the open rows (slot routing and the grandfather), the row lookup and the three closes each take inLaunchContext", [
+        viaContext(/const readIp = \(columns: string\) =>\s*inLaunchContext\(/),
+        viaContext(/const read = \(columns: string\) =>\s*inLaunchContext\(/),
+        viaContext(/await inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.in\("id", closable\)/),
+        viaContext(/await inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.in\("id", r\.staleRevisionIds\)/),
+        viaContext(/await inLaunchContext\(\s*svcAttempt\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.eq\("course_version_id", v\.id\)/),
       ], [true, true, true, true, true]);
-      eq("5b: every course_attempts read and close is inside readWithContextFilter (8 sites); the preview's N4 close and insert are its A19 writes",
-        (src.match(/readWithContextFilter\(previews,/g) ?? []).length, 8);
+      eq("…5 course_attempts sites through inLaunchContext; the preview's N4 close and insert and the Start's inserts are the A19 writes",
+        (src.match(/inLaunchContext\(\s*(?:supabase|svcAttempt)\s*\.from\("course_attempts"\)/g) ?? []).length, 5);
+      eq("step 23: the resume re-tag is deleted (takeRow takes no tagJourney)",
+        [/tagJourney/.test(src), /const takeRow = async \(decision: RowDecision, existing: LaunchRowFull\): Promise<Taken> => \{/.test(src)], [false, true]);
       // Item 3: the preview row.
       const pvStart = src.search(/ {2}if \(preview\) \{\s*let open = await lookupRow\(v\.id\);/);
       const pvEnd = at("// I-1, the grant path");

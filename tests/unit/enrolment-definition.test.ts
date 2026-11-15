@@ -26,10 +26,13 @@
  *       their "path" label is what no read direct row reaches, and read the
  *       attempts and profiles of the enrolled set in chunks of 150, paged
  *       (lib/db/chunked.ts);
- *   (d) the launch page's hold-back gate is still there. 0105's view
- *       copied it (ADR 0020 rule 2); from 0107 the view has no hold-back
- *       (ADR 0024 decision D2), and the gate stays on the launch page until
- *       phase 2's resolver replaces it (ADR 0024 step 22);
+ *   (d) the launch page's hold-back gate is gone. 0105's view copied it
+ *       (ADR 0020 rule 2); from 0107 the view has no hold-back (ADR 0024
+ *       decision D2), and from phase 2's P2-6 the launch page decides
+ *       through launch_context and the resolver (step 22), whose release
+ *       gate and strict lock apply to the path named in ?lp= only: the page
+ *       computes no enforcedPathIds and reads no learning_path_courses of its
+ *       own, and the upcoming answer keeps its dashboard?upcoming= target;
  *   (e) ADR 0024 step 49: the three attempts reads over the enrolled set (the
  *       loader behind the course card and Reports tab, the learners table,
  *       its CSV) are the Individual product, so each goes through
@@ -199,11 +202,13 @@ console.log("\n(c) the four readers read the enrolled set from the view");
   }
 }
 
-console.log("\n(d) the launch page's hold-back gate is still there (until ADR 0024 phase 2's resolver, step 22)");
+console.log("\n(d) the launch page's hold-back gate is gone: the resolver's release gate and strict lock apply to ?lp= only (ADR 0024 D2, step 22, P2-6)");
 {
   const launch = read("app/[org]/(learner)/courses/[courseId]/launch/page.tsx");
-  eq("launch/page.tsx redirects to dashboard?upcoming=", launch.includes("dashboard?upcoming="), true);
-  eq("launch/page.tsx computes enforcedPathIds", launch.includes("enforcedPathIds"), true);
+  eq("launch/page.tsx decides through launch_context (one .rpc, the resolver's facts)", launch.includes(`.rpc("launch_context"`), true);
+  eq("…and computes no enforcedPathIds (the other-path hold-back)", launch.includes("enforcedPathIds"), false);
+  eq("…and reads no learning_path_courses of its own (the path block is the resolver's)", launch.includes(`.from("learning_path_courses")`), false);
+  eq("…the resolver's upcoming answer keeps today's target, dashboard?upcoming=", launch.includes("dashboard?upcoming="), true);
 }
 
 console.log("\n(e) the Individual product's attempts reads take the Individual context when 0107 is there (ADR 0024 step 49)");

@@ -12,8 +12,10 @@
  *   - Continue is a plain <a> (a full navigation), rendered only under
  *     `continueHref`; Exit is the bar's one next/link, to `backHref`;
  *   - the title renders only under `showTitle`, capped and truncated;
- *   - the launch page computes continueHref from pathContextId and
- *     !journeyParam, and showTitle from isKivoStamped, for both runtimes;
+ *   - the launch page computes continueHref from the launch's context (a
+ *     path context only, its path id; ADR 0024 P2-6: the resolver's context
+ *     replaced pathContextId and !journeyParam), and showTitle from
+ *     isKivoStamped, for both runtimes;
  *   - the continue page reads pass_required and the grants strictly (never
  *     through the fail-soft helpers), ends the wait only on a stored result
  *     whose verdict is not pending (officialResultStored), uses no service
@@ -243,8 +245,9 @@ console.log("\nthe bar (step 6)");
 console.log("\nthe launch page's two props (step 8)");
 {
   const src = code(LAUNCH_PAGE);
-  eq("continueHref from pathContextId and !journeyParam, to the continue address",
-    /const continueHref =\s*pathContextId && !journeyParam\s*\?\s*`\/\$\{orgSlug\}\/continue\?lp=\$\{encodeURIComponent\(pathContextId\)\}&from=\$\{encodeURIComponent\(courseId\)\}`\s*:\s*null;/.test(src), true);
+  eq("continueHref from the launch's path context only (the resolver's path id), to the continue address",
+    /const continueHref =\s*ctx\.kind === "path"\s*\?\s*`\/\$\{orgSlug\}\/continue\?lp=\$\{encodeURIComponent\(ctx\.pathId\)\}&from=\$\{encodeURIComponent\(courseId\)\}`\s*:\s*null;/.test(src), true);
+  eq("…and the request's own ?lp= no longer feeds it (no pathContextId)", src.includes("pathContextId"), false);
   eq("showTitle from the cached stamp only", /const showTitle = !isKivoStamped\(v\.manifest_data\);/.test(src), true);
   eq("…imported from lib/courses/engine-version, and the page never calls ensureEngineVersion", [
     /import \{ isKivoStamped \} from "@\/lib\/courses\/engine-version";/.test(src),

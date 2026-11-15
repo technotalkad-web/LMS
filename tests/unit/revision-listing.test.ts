@@ -129,12 +129,14 @@ const pagedFeed = (re: RegExp): [string, RegExp] => ["the first page decides the
  * three learning-path surfaces with calls: []).
  */
 const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }> = {
+  // ADR 0024 P2-6 (step 23): the launch page scores through
+  // readContextResult (contextResult over the context's rows, its select
+  // naming status and is_revision); it calls no helper itself.
   "app/[org]/(learner)/courses/[courseId]/launch/page.tsx": {
-    calls: ["computeScoring(my)"],
+    calls: [],
     feeds: [
-      ["MY_COLUMNS names status", /const MY_COLUMNS = "[^"]*\bstatus\b[^"]*";/],
-      ["the read adds is_revision with the fallback", /readMy\(`\$\{MY_COLUMNS\}, is_revision`\);\s*if \(myErr && isMissingColumn\(myErr, "is_revision"\)\) \(\{ data: myRows, error: myErr \} = await readMy\(MY_COLUMNS\)\);/],
-      ["computeScoring gets those rows", /my = \(myRows \?\? \[\]\) as unknown as MyAttempt\[\];[\s\S]*?computeScoring\(my, policy, grantsNow\.retakeIds\)/],
+      ["the attempts are read in the launch's context through readContextResult", /const read = await readContextResult\(svcAttempt, \{ userId: user\.id, courseId: c\.id, key: ctxKey, passRequired, versionIds \}\);/],
+      ["…and scored from its answer (r.rows, r.scoring)", /const my = r\.rows;\s*const scoring = r\.scoring;/],
     ],
   },
   "lib/scoring/attempt-kind.ts": {
@@ -446,8 +448,17 @@ console.log("\n(v) the lib/lrs/context.ts reads behind the markers select is_rev
     /const flagged = await readOrMissing<Row\[\]>\(\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\(\s*"[^"]*\bstatus, is_revision, "/.test(src), true);
   eq("…and a failed first tier throws ContextReadError (only a missing column falls back)",
     /if \("failed" in flagged\) throw new ContextReadError\("attempts"\);/.test(src), true);
-  eq("the siblings tier names is_revision and filters is_revision = false through readOrMissing (the preview filter inside)",
-    /readOrMissing<Row\[\]>\(\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\("[^"]*\bis_revision\b[^"]*"\)[\s\S]*?\.eq\("is_revision", false\),\s*apply\s*\)\s*\),\s*"is_revision"\s*\)/.test(src), true);
+  // ADR 0024 P2-6 (step 26): the siblings select is one of two constants,
+  // chosen by the same `apply` as the preview filter, so the form a database
+  // without 0107 reads names no 0107 column and the filtered form adds
+  // context_key (the per-context attempt/number) after is_revision (a
+  // database without 0103 still names is_revision first and falls back).
+  eq("the siblings tier names is_revision and filters is_revision = false through readOrMissing (the preview filter inside, the select by `apply`)",
+    /readOrMissing<Row\[\]>\(\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\(apply \? SIBLING_COLUMNS_0107 : SIBLING_COLUMNS\)[\s\S]*?\.eq\("is_revision", false\),\s*apply\s*\)\s*\),\s*"is_revision"\s*\)/.test(src), true);
+  eq("…SIBLING_COLUMNS names is_revision and no context_key",
+    [/const SIBLING_COLUMNS = "[^"]*\bis_revision\b[^"]*";/.test(src), /const SIBLING_COLUMNS = "[^"]*\bcontext_key\b[^"]*";/.test(src)], [true, false]);
+  eq("…SIBLING_COLUMNS_0107 names is_revision, then context_key",
+    /const SIBLING_COLUMNS_0107 = "[^"]*\bis_revision, context_key\b[^"]*";/.test(src), true);
   eq("…and a failed siblings tier throws ContextReadError",
     /if \("failed" in flagged\) throw new ContextReadError\("siblings"\);/.test(src), true);
   eq("readOrMissing answers missing only on isMissingColumn",
@@ -529,7 +540,7 @@ const PENDING_0024: string[] = [
   "app/[org]/(admin)/attempt-requests/page.tsx",
   "app/[org]/(admin)/library/[courseId]/learners/page.tsx",
   "app/[org]/(learner)/continue/page.tsx",
-  "app/[org]/(learner)/courses/[courseId]/launch/page.tsx",
+  // The launch page left in P2-6: it reads through readContextResult.
   "app/[org]/(learner)/courses/[courseId]/page.tsx",
   "app/[org]/(learner)/courses/page.tsx",
   "app/[org]/(learner)/dashboard/page.tsx",
@@ -559,7 +570,12 @@ console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult
     callers.filter((f) => f !== RULE_OWNER), [...PENDING_0024].sort());
   eq("PENDING_0024 has no duplicate and never names the rule's owner or the definition",
     [new Set(PENDING_0024).size === PENDING_0024.length, PENDING_0024.includes(RULE_OWNER), PENDING_0024.includes(DEFINITION)], [true, false, false]);
-  eq("PENDING_0024 never grows: at most its 20 files of 2026-11-14", PENDING_0024.length <= 20, true);
+  // The bound is the list's length after the last slice that removed a file
+  // (20 on 2026-11-14; 19 since P2-6 took the launch page off on
+  // 2026-11-15). Each later slice that removes a file lowers it to the new
+  // length in the same pull request, so a new direct caller cannot take a
+  // removed file's place on the list.
+  eq("PENDING_0024 never grows: at most its 19 files since P2-6 (2026-11-15)", PENDING_0024.length <= 19, true);
 
   // H3 (the ADR's note of 2026-11-14): the forms that call computeScoring
   // under another name, which the scan by name above cannot see, are refused

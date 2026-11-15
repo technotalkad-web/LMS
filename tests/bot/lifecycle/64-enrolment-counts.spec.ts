@@ -65,9 +65,12 @@
  *   7. P2 reaches L1 as a path learner only: C2 stays {} (P2's path set gains
  *      L1); the Organisation Reports tiles still do not move;
  *   8. after P1's step is released C3 is still {L4}. The launch assertions do
- *      not branch: the old launch code holds L4 and L5 back on ?lp=P1 until
- *      phase 2, so in this window the launch no longer agrees with the view
- *      for L4.
+ *      not branch, and their targets are unchanged: from ADR 0024 P2-6 a
+ *      ?lp=P1 launch is the path product, held back by P1's own step's
+ *      release date (step 22: the release gate and the lock apply to the
+ *      ?lp= path only; D2 drops the other-path hold-back), so L4 and L5 go
+ *      to dashboard?upcoming= until the step is released, whatever their
+ *      direct rows say.
  * Cases 2, 4, 5 and 9 hold on both schemas (4 and 5 compare with the view as
  * it reads; 9's sets are the same either way).
  *
@@ -508,7 +511,7 @@ test.describe.serial("ADR 0020: course enrolment counts path and group learners 
       const { error } = await svc().from("learning_path_courses").update({ release_at: aMinuteAgo() }).eq("path_id", s.paths.get(1)!).eq("course_id", c3);
       expect(error).toBeNull();
       // From 0107 on the view counts only L4's direct row, released or not
-      // (ADR 0024 step 18); the launch assertions are the old launch code's.
+      // (ADR 0024 step 18); the ?lp=P1 launch reads P1's own step (P2-6).
       if (await has0107()) expect(await viewSet(3), "0107: C3 holds its direct learner only").toEqual(want(4));
       else expect(await viewSet(3)).toEqual(want(3, 4, 5, 6, 7, 8, 9, 10));
       const now = await l4.request.get(`/${s.org!.slug}/courses/${c3}/launch?lp=${s.paths.get(1)}`, { maxRedirects: 0 });
