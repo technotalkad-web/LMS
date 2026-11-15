@@ -6,6 +6,7 @@ import {
   afterSelfEnrol,
   refusalWithoutFacts,
   resolveLaunchContext,
+  resumeAfterSlotRouting,
   type JourneyFacts,
   type LaunchContextFacts,
   type LaunchDecision,
@@ -760,7 +761,29 @@ export default async function LaunchPage({
   // the launch's own rows only (step 23; P2-5 item 3), as the reads that
   // listed them did: a Start closes rows of its context only, a preview
   // never closes a real attempt.
+  // Step 22, a journey `resume` whose open official rows routing abandons
+  // (a deactivated slot): decided before the close (resumeAfterSlotRouting),
+  // from the context's rows evaluate read. `refuse` closes nothing; `open`
+  // lists the rows whose close lets the day's fresh official attempt in at
+  // the row step below, and only the rows this close returns count as closed
+  // (it is fail-soft, and the open-row index is per version).
+  let resumeReopens: string[] = [];
+  const closedOnDeactivatedSlot = new Set<string>();
   const closeAfterResolution = async (r: Resolution) => {
+    if (ctx.kind === "journey") {
+      const openOfficialIds = ev.my.filter((a) => a.status === "in_progress" && a.is_revision !== true).map((a) => a.id);
+      const resumeAnswer = resumeAfterSlotRouting({
+        admission: ctx.admission,
+        openOfficialIds,
+        abandon: r.deactivated,
+        enrolmentStatus: jf?.status ?? null,
+        dayCredited: (jf?.day_credit ?? null) !== null,
+        dayNumber: tags.journey_day,
+        candidate: ev.candidate,
+      });
+      if (resumeAnswer === "refuse") refuse("journey_resume_row_abandoned");
+      if (resumeAnswer === "open") resumeReopens = openOfficialIds;
+    }
     if (r.deactivated.length > 0) {
       // (3) The slot was deactivated by an admin: this attempt can never be
       // resumed from the picker again.
@@ -791,6 +814,7 @@ export default async function LaunchPage({
         ).select("id");
         if (abErr) console.warn("[launch] deactivated-slot close failed:", abErr.message);
         const closedIds = ((abRows ?? []) as Array<{ id: string }>).map((row) => row.id);
+        for (const id of closedIds) closedOnDeactivatedSlot.add(id.toLowerCase());
         const tokErr = await expireLaunchTokens(svcAttempt, closedIds);
         if (tokErr) console.warn("[launch] token expiry failed:", tokErr.message);
         // Tenant LRS: queue "abandoned" (fail-soft; nothing when forwarding is off).
@@ -1071,8 +1095,12 @@ export default async function LaunchPage({
       const namedIsRevision = decision.action === "insert_revision";
       if (namedIsRevision !== insertIsRevision(limitReached, null)) refuse("kind_mismatch");
       // Step 22: a journey resume resumes the day's open attempt and never
-      // inserts beside it; a journey row needs its day's number.
-      if (ctx.kind === "journey" && ctx.admission === "resume") refuse("journey_resume_without_row");
+      // inserts beside it, except after resumeAfterSlotRouting's `open`
+      // once the close above returned every one of the context's open
+      // official rows (phase 1's fresh attempt); a journey row needs its
+      // day's number.
+      const resumeReopened = resumeReopens.length > 0 && resumeReopens.every((id) => closedOnDeactivatedSlot.has(id.toLowerCase()));
+      if (ctx.kind === "journey" && ctx.admission === "resume" && !resumeReopened) refuse("journey_resume_without_row");
       if (tags.context_kind === "journey" && tags.journey_day === null) refuse("journey_day_unknown");
       // ADR 0024 step 23: both inserts name the launch's context and its
       // tags (the resolver's context: a path's id, a journey's enrolment, day

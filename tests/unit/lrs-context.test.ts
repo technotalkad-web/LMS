@@ -13,6 +13,11 @@
  *     Postgres reports them): one failed read, and the number is the 1.1.0
  *     one, per (user, course); a database without 0103 either still reaches
  *     today's select through the is_revision fallback;
+ *   - the learning context is the attempt row's: when the fail-soft
+ *     journey_enrollments read fails or finds no row, a journey attempt still
+ *     carries journey/enrollment-id and journey/day (no program id, name,
+ *     days total or journey grouping), so it never reads as Individual; a
+ *     failed path lookup keeps path/id; with 0107 and without it;
  *   - LMS.LaunchData gains context/kind, context/id and context/day through
  *     buildLaunchData's optional `context`; a call without it builds exactly
  *     the document it built before; the IRIs are the profile's and are not
@@ -39,7 +44,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { LrsConfig } from "../../lib/lrs/config";
 import { attemptOrdinals, loadAttemptContexts } from "../../lib/lrs/context";
 import { enrichStatement } from "../../lib/lrs/enrich";
-import { ext, PROFILE_VERSION, verb } from "../../lib/lrs/profile";
+import { activity, ext, PROFILE_VERSION, verb } from "../../lib/lrs/profile";
 import { runSource, sweepOrg } from "../../lib/lrs/sweep";
 import { uuid5 } from "../../lib/lrs/uuid5";
 import { buildLaunchData, LAUNCH_CONTEXT_EXT, launchContextExtensions, writeLaunchData } from "../../lib/alds/launch";
@@ -110,9 +115,10 @@ const itemKey = (item: string) => item.split("(")[0].split("!")[0].trim();
  * filters. A select answers only the columns and embeds it names (`*` all).
  * Honours eq / neq / in / gte / not-is-null on top-level columns a row
  * carries (embedded "a.b" filters are ignored), order and limit. Writes are
- * recorded with their options.
+ * recorded with their options. `broken` lists tables whose every read answers
+ * a statement timeout (57014), not a missing column: a transient failure.
  */
-function fakeDb(tables: Record<string, Row[]>, missing: string[] = []) {
+function fakeDb(tables: Record<string, Row[]>, missing: string[] = [], broken: string[] = []) {
   const queries: Q[] = [];
   const failed: Array<{ table: string; column: string }> = [];
   const updates: Array<{ table: string; payload: Row }> = [];
@@ -146,6 +152,9 @@ function fakeDb(tables: Record<string, Row[]>, missing: string[] = []) {
     let single = false;
     let written: unknown = null;
     const answer = () => {
+      if (broken.includes(table)) {
+        return { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } };
+      }
       const col = missingNamed(q);
       if (col) {
         failed.push({ table, column: col });
@@ -273,6 +282,15 @@ const launchedOf = (statements: XapiStatement[], attemptId: string) => {
   const s = statements.find((x) => x.verb?.id === verb.launched && x.context?.registration === attemptId);
   return ((s?.context as { extensions?: Row } | undefined)?.extensions ?? {}) as Row;
 };
+const groupingOf = (statements: XapiStatement[], attemptId: string) => {
+  const s = statements.find((x) => x.verb?.id === verb.launched && x.context?.registration === attemptId);
+  const ca = (s?.context as { contextActivities?: { grouping?: Array<{ id: string }> } } | undefined)?.contextActivities;
+  return (ca?.grouping ?? []).map((g) => g.id);
+};
+const JOURNEY_KEYS = [ext.journeyProgramId, ext.journeyName, ext.journeyEnrollmentId, ext.journeyDay, ext.journeyDaysTotal];
+const PATH_KEYS = [ext.pathId, ext.pathName, ext.pathStep, ext.pathSteps];
+/** Each key's value, or "absent" when the statement does not carry the key at all. */
+const pick = (x: Row, keys: string[]) => keys.map((k) => (k in x ? x[k] : "absent"));
 
 const cfg = (over: Partial<LrsConfig> & Row = {}): LrsConfig =>
   ({
@@ -371,6 +389,63 @@ async function main() {
     eq("…the launched id is uuid5(\"launched:\" + attempt id)", statements.find((s) => s.context?.registration === P1 && s.verb?.id === verb.launched)?.id, uuid5(`launched:${P1}`));
   }
 
+  console.log("\nthe context is the attempt row's: a failed lookup never makes a journey or path attempt read as Individual");
+  {
+    const ok = fakeDb(tables(attempts0107()));
+    const good = await runSource(ok.db, "attempts", ORG);
+    eq("the enrolments read answered: J1 carries program id, name, enrolment id, day and days total",
+      pick(launchedOf(good.statements, J1), JOURNEY_KEYS), [PROGRAM, "QA journey", ENR, 3, 10]);
+    eq("…and the journey and journey-day grouping",
+      groupingOf(good.statements, J1).filter((id) => id.includes("/activities/journey/")), [activity.journey(PROGRAM), activity.journeyDay(PROGRAM, 3)]);
+
+    const cases: Array<[string, () => ReturnType<typeof fakeDb>]> = [
+      ["the journey_enrollments read fails (a statement timeout)", () => fakeDb(tables(attempts0107()), [], ["journey_enrollments"])],
+      ["the journey_enrollments read finds no row", () => fakeDb({ ...tables(attempts0107()), journey_enrollments: [] })],
+    ];
+    for (const [label, make] of cases) {
+      const f = make();
+      const ctxs = await loadAttemptContexts(f.db, ALL);
+      eq(`${label}: J1's journey comes from its row (enrolment id, day); no program id, name or days total`,
+        ctxs.get(J1)?.journey ?? null, { programId: null, name: null, enrollmentId: ENR, day: 3, daysTotal: null });
+      eq(`${label}: the numbers per context are unchanged`, numbers(ctxs, [I1, P1, I2, J1, P2, RV, AB]), [1, 1, 2, 1, 2, null, null]);
+      const { statements } = await runSource(make().db, "attempts", ORG);
+      eq(`${label}: J1's launched still carries journey/enrollment-id and journey/day; program id, name and days total are absent, never null`,
+        pick(launchedOf(statements, J1), JOURNEY_KEYS), ["absent", "absent", ENR, 3, "absent"]);
+      eq(`${label}: …so J1 (number 1, scored) reads as its journey day, not as a second Individual attempt 1 beside I1`,
+        [I1, J1].map((id) => {
+          const x = launchedOf(statements, id);
+          return [x[ext.attemptNumber], x[ext.attemptScored], x[ext.pathId] ?? null, x[ext.journeyEnrollmentId] ?? null];
+        }),
+        [[1, true, null, null], [1, true, null, ENR]]);
+      eq(`${label}: …and no journey grouping without a program id (never …/journey/null)`,
+        groupingOf(statements, J1).filter((id) => id.includes("/activities/journey/")), []);
+      eq(`${label}: the path branch is unchanged (P1: path id, name, step, steps total)`,
+        pick(launchedOf(statements, P1), PATH_KEYS), [PATH, "QA path", 2, 1]);
+    }
+
+    const pf = fakeDb(tables(attempts0107()), [], ["learning_paths", "learning_path_courses"]);
+    const pctx = await loadAttemptContexts(pf.db, ALL);
+    eq("the path lookups fail: P1 keeps its path id from the row, the name, step and steps total are dropped (as before)",
+      pctx.get(P1)?.path ?? null, { id: PATH, name: null, step: null, steps: null });
+    eq("…and its numbers are unchanged", numbers(pctx, [P1, P2]), [1, 2]);
+    const prun = await runSource(fakeDb(tables(attempts0107()), [], ["learning_paths", "learning_path_courses"]).db, "attempts", ORG);
+    eq("…its launched carries path/id; name, step and steps total are absent, never null",
+      pick(launchedOf(prun.statements, P1), PATH_KEYS), [PATH, "absent", "absent", "absent"]);
+    eq("…and the path grouping stays (it needs only the path id), with no step activity",
+      groupingOf(prun.statements, P1).filter((id) => id.includes("/activities/path/")), [activity.path(PATH)]);
+
+    const n = fakeDb(tables(attemptsWithout0107()), COLS_0107, ["journey_enrollments"]);
+    const nctx = await loadAttemptContexts(n.db, ALL.filter((id) => id !== PV));
+    eq("without 0107 and a failed enrolments read: the 1.1.0 number per (user, course), unchanged",
+      numbers(nctx, [I1, P1, I2, J1, P2]), [1, 2, 3, 4, 5]);
+    eq("…J1 still carries its enrolment id and day from the row",
+      nctx.get(J1)?.journey ?? null, { programId: null, name: null, enrollmentId: ENR, day: 3, daysTotal: null });
+    eq("…one failed missing-column read for the call, as before", n.failed, [{ table: "course_attempts", column: "context_kind" }]);
+    const nrun = await runSource(fakeDb(tables(attemptsWithout0107()), COLS_0107, ["journey_enrollments"]).db, "attempts", ORG);
+    eq("…and its launched carries number 4 with journey/enrollment-id and journey/day",
+      [launchedOf(nrun.statements, J1)[ext.attemptNumber], ...pick(launchedOf(nrun.statements, J1), JOURNEY_KEYS)], [4, "absent", "absent", ENR, 3, "absent"]);
+  }
+
   console.log("\nLMS.LaunchData: context/kind, context/id, context/day");
   {
     const base = {
@@ -444,6 +519,10 @@ async function main() {
     eq("§5 lists the three context extensions",
       ["`context/kind` (`individual` | `path` | `journey`)", "`context/id` (the path id on a path", "`context/day` (the journey day"].map((t) => doc.includes(t)), [true, true, true]);
     eq("§5 says nothing sent is renumbered", doc.includes("Nothing already sent is renumbered."), true);
+    eq("§5 says path/id and journey/enrollment-id come from the attempt, and the looked-up keys are left out when the lookup fails",
+      [/`path\/id` and `journey\/enrollment-id` \(with `journey\/day` when the attempt records its day\) come\s+from the attempt itself/,
+        /a journey\s+statement can carry `journey\/enrollment-id` and\s+`journey\/day` without `journey\/program-id`/,
+        /The path grouping\s+activity \(§3\) needs only the path id and stays/].map((r) => r.test(doc)), [true, true, true]);
     const src = read("lib/lrs/profile.ts");
     eq("profile.ts states the 1.2.0 change above 1.1.0's", src.indexOf("// 1.2.0 (ADR 0024 step 26)") >= 0 && src.indexOf("// 1.2.0") < src.indexOf("// 1.1.0"), true);
   }

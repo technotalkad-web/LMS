@@ -10,8 +10,9 @@
 # Two jobs, one after the other (ADR 0024 step 73: split before new specs
 # join, never side by side on the one staging database): `lifecycle` runs
 # that subset (DEFAULT_SPECS); `lifecycle-products` then runs PRODUCT_SPECS,
-# the ADR 0024 specs (68 onward) as each joins, and runs even when the first
-# job failed (!cancelled()). With PRODUCT_SPECS empty, or a dispatch that
+# the ADR 0024 specs (68 onward) as each joins (68 since ADR 0024 P2-6), and
+# runs even when the first job failed (!cancelled()). With PRODUCT_SPECS
+# empty, or a dispatch that
 # names specs (they run in the first job), the second job's selection step
 # says so and the job passes without installing or building. A green night
 # is both jobs green. Timing: GitHub starts the 22:41 schedule late (runs

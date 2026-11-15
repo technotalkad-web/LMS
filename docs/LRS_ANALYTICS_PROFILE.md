@@ -94,6 +94,15 @@ Context extensions on every statement, when known:
   `learner-summary`.
 - `path/id`, `path/name`, `path/step`, `path/steps-total`
 - `journey/program-id`, `journey/name`, `journey/enrollment-id`, `journey/day`, `journey/days-total`
+- `path/id` and `journey/enrollment-id` (with `journey/day` when the attempt records its day) come
+  from the attempt itself: every statement of a path attempt carries `path/id`, and every statement
+  of a journey attempt carries `journey/enrollment-id`. The other path and journey keys are looked
+  up separately and are left out, never sent empty, when that lookup fails. The path grouping
+  activity (§3) needs only the path id and stays, without its name or step; the journey and
+  journey-day grouping activities need the program id and are left out with it. So a journey
+  statement can carry `journey/enrollment-id` and
+  `journey/day` without `journey/program-id`, `journey/name`, `journey/days-total` or a journey
+  grouping activity.
 - `context/kind` (`individual` | `path` | `journey`), `context/id` (the path id on a path, the
   journey enrolment id on a journey; absent on Individual), `context/day` (the journey day
   number the attempt was launched on; journey only). Since 1.2.0 the LMS writes them into the
@@ -114,7 +123,8 @@ attempts and its own official attempt. From 1.2.0 `attempt/number` counts the at
 statement's context, and `attempt/scored` follows that number. The context is Individual when
 the statement carries neither `path/id` nor `journey/enrollment-id`, the path when it carries
 `path/id`, and one journey day when it carries `journey/enrollment-id` (`journey/day` is that
-day's number when the attempt was launched). Revision visits, previews and abandoned attempts
+day's number when the attempt was launched). Both keys come from the attempt itself, so a path or
+journey attempt's statement never lacks them. Revision visits, previews and abandoned attempts
 are never counted, as before. Example: one learner's attempts on one course, in the order they
 were started, Individual, path, Individual, journey day 3: 1.1.0 numbered them 1, 2, 3, 4, and
 1.2.0 numbers them 1, 1, 2, 1. On a database without migration `0107` there is one context per

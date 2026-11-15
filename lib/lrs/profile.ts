@@ -195,7 +195,10 @@ export const ext = {
   pathStep: `${E}path/step`,
   pathSteps: `${E}path/steps-total`,
 
-  // Journey
+  // Journey. enrollment-id comes from the attempt row, so every statement of a
+  // journey attempt carries it (1.2.0 reads the journey context from it), with
+  // day when the row records it; program-id, name and days-total need the
+  // enrolment lookup and are left out when it fails (lib/lrs/context.ts).
   journeyProgramId: `${E}journey/program-id`,
   journeyName: `${E}journey/name`,
   journeyEnrollmentId: `${E}journey/enrollment-id`,

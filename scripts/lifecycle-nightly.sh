@@ -57,8 +57,9 @@ set -euo pipefail
 DEFAULT_SPECS="00 32 33 34 43 47 48 49 50 51 52 53 54 55 63 64 65 66"
 # The second job's list: the specs of ADR 0024 (68 onward) join here, each
 # after one green run by hand on staging. A spec number is in one list only
-# (tests/unit/lifecycle-nightly-lists.test.ts).
-PRODUCT_SPECS=""
+# (tests/unit/lifecycle-nightly-lists.test.ts). Spec 68 joined with ADR 0024
+# P2-6, after its green hand run of 2026-11-15 (the P2-6 gate).
+PRODUCT_SPECS="68"
 PORT="${LIFECYCLE_PORT:-3100}"
 STAGING_REF="zeaclbapadosqqttexxh"
 

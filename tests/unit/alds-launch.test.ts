@@ -64,8 +64,14 @@
  *      self-enrolment (P2-Q2's cases, A3); the worst path of step 70 (a
  *      self-enrolling learner's grant consumed in path:P) and consume_grant's
  *      stale rerun; the journey context (the open day, the locked day, a
- *      credited day's review as a revision visit). The subrequests of each
- *      branch are counted (P2-5's and P2-6's gates; step 70).
+ *      credited day's review as a revision visit, on an active enrolment
+ *      with an unused grant in the day's context too; a resume whose only
+ *      open row sits on a deactivated slot, opened fresh or refused before
+ *      the close; a resume whose row routing does not reach, refused at the
+ *      row; one journey-day holder relaunched into its day); the launch's
+ *      context in LMS.LaunchData (an Individual, a path and a journey
+ *      launch). The subrequests of each branch are counted (P2-5's and
+ *      P2-6's gates; step 70).
  *
  * Intentionally unconditional deltas (live in every deploy, flag or not;
  * none changes what a learner sees or how an attempt is graded):
@@ -94,6 +100,7 @@ import {
   attemptServedLanguage,
   buildLaunchData,
   isLaunchDataStateId,
+  LAUNCH_CONTEXT_EXT,
   launchModeFor,
   lmsAuActivityId,
   newSessionId,
@@ -245,6 +252,14 @@ async function pageCases() {
   /** The journey world of (j): which days are credited (by day id), with the credit row's course. */
   let journeyCredits: Record<string, { course_id: string; attempt_id: string | null; credit_kind: string; day_number: number }> = {};
   let journeyStatus = "active";
+  /** launch_context's holders.journey_days (the redirect row's journey holders). */
+  let journeyHolders: Array<{ enrollment_id: string; day_id: string | null; day_number: number; credited: boolean }> = [];
+  /** The legacy no-package course: no course_packages row, every version's package_id null (no slot routing). */
+  let noPackages = false;
+  /** The deactivated-slot close (the PATCH by id with no is_revision filter) answers a database error. */
+  let slotCloseFails = false;
+  /** The page's console.warn lines of one run (its launch_refused reasons). */
+  let warned: string[] = [];
   let reqs: PageReq[] = [];
   let seq = 0;
   const userRow = () => ({ id: NAV_USERS[viewer].id, aud: "authenticated", role: "authenticated", email: `${viewer}@example.test` });
@@ -308,7 +323,7 @@ async function pageCases() {
   // (e): the course is step 2 of a strict path, PREV_COURSE step 1.
   let strictPath = false;
   let pathVisibility = "private";
-  const packages = () => [
+  const packages = () => noPackages ? [] : [
     { id: PKG_ID, language: "en", display_name: null, current_version_id: V_CUR, is_active: true },
     ...(twoLanguages || hiInactive ? [{ id: PKG_HI, language: "hi", display_name: null, current_version_id: V_HI, is_active: !hiInactive }] : []),
   ];
@@ -367,7 +382,7 @@ async function pageCases() {
       course: { found: true, is_active: courseRow.is_active !== false, visibility: courseRow.visibility, individual: { enrolled, upcoming_at: future[0] ?? null } },
       path,
       journey,
-      holders: { paths: strictPath && pathEnrolled ? [{ path_id: PATH_ID, step_number: 2 }] : [], journey_days: [] },
+      holders: { paths: strictPath && pathEnrolled ? [{ path_id: PATH_ID, step_number: 2 }] : [], journey_days: journeyHolders },
       run: null,
     };
   };
@@ -394,7 +409,9 @@ async function pageCases() {
     if (p === "/rest/v1/platform_owners") return json([]);
     if (p === "/rest/v1/courses") return json([courseRow]);
     if (p === "/rest/v1/course_packages") return json(packages());
-    if (p === "/rest/v1/course_versions") return json(versions.filter((r) => (r.package_id !== PKG_HI || twoLanguages || hiInactive) && matches(r, url.searchParams)));
+    if (p === "/rest/v1/course_versions") {
+      return json(versions.filter((r) => (r.package_id !== PKG_HI || twoLanguages || hiInactive) && matches(r, url.searchParams)).map((r) => (noPackages ? { ...r, package_id: null } : r)));
+    }
     if (p === "/rest/v1/journey_versions") return json([{ id: JVER_ID, days: JOURNEY_DAYS }]);
     if (p === "/rest/v1/rpc/launch_context") {
       if (no0107) return fnMissing();
@@ -440,6 +457,7 @@ async function pageCases() {
       if (method === "GET" && select === "cmi_data" && cmiReadFails) return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
       if (method === "GET") return json(attempts.filter((r) => matches(r, url.searchParams)));
       if (method === "PATCH") {
+        if (slotCloseFails && url.searchParams.has("id") && !url.searchParams.has("is_revision")) return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
         const hit = attempts.filter((r) => matches(r, url.searchParams));
         for (const r of hit) Object.assign(r, body as Row);
         return json(hit.map((r) => ({ id: r.id })));
@@ -496,6 +514,9 @@ async function pageCases() {
       cgOutcome?: string;
       journeyCredits?: typeof journeyCredits;
       journeyStatus?: string;
+      journeyHolders?: typeof journeyHolders;
+      noPackages?: boolean;
+      slotCloseFails?: boolean;
       cmiReadFails?: boolean;
     }): Promise<Outcome> => {
       viewer = o.viewer;
@@ -514,6 +535,9 @@ async function pageCases() {
       cgOutcome = o.cgOutcome ?? "opened";
       journeyCredits = { ...(o.journeyCredits ?? {}) };
       journeyStatus = o.journeyStatus ?? "active";
+      journeyHolders = (o.journeyHolders ?? []).map((h) => ({ ...h }));
+      noPackages = o.noPackages ?? false;
+      slotCloseFails = o.slotCloseFails ?? false;
       cmiReadFails = o.cmiReadFails ?? false;
       attempts = (o.attempts ?? []).map((r) => ({ ...r, context_key: keyOf(r) }));
       grants = (o.grants ?? []).map((r) => ({ ...r }));
@@ -523,7 +547,8 @@ async function pageCases() {
       pathAssignments = o.pathAssigned ? [{ path_id: PATH_ID, assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null, source: "admin" }] : [];
       courseRow = { id: COURSE_ID, organization_id: ORG_ID, current_version_id: V_CUR, title: "Home loans", is_active: true, pass_required: false, visibility: o.visibility ?? "private" };
       reqs = [];
-      console.warn = () => {};
+      warned = [];
+      console.warn = (...a: unknown[]) => { warned.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")); };
       console.error = () => {};
       try {
         const el = (await page({ params: Promise.resolve({ org: "org", courseId: COURSE_ID }), searchParams: Promise.resolve(o.search ?? {}) })) as { props: Record<string, unknown> };
@@ -542,6 +567,10 @@ async function pageCases() {
     const writes = () => reqs.filter((r) => r.method !== "GET" && r.method !== "HEAD" && r.path.startsWith("/rest/v1/") && !r.path.startsWith("/rest/v1/rpc/"));
     const rpcs = () => reqs.filter((r) => r.path.startsWith("/rest/v1/rpc/"));
     const lcCalls = () => reqs.filter((r) => r.path === "/rest/v1/rpc/launch_context");
+    /** The launch_refused reasons the run logged, in order. */
+    const refusals = () => warned.flatMap((l) => {
+      try { const e = JSON.parse(l) as { event?: string; reason?: string }; return e.event === "launch_refused" ? [String(e.reason)] : []; } catch { return []; }
+    });
     const DENIED = "/org/dashboard?denied=1";
     const RETRY = `/org/courses/${COURSE_ID}?retry=1`;
     const own = (u: NavUser, extra: Row): Row => ({ user_id: NAV_USERS[u].id, status: "in_progress", cmi_data: {}, is_revision: false, context_kind: "individual", preview_kind: null, ...extra });
@@ -987,6 +1016,103 @@ async function pageCases() {
         attempts: [own("user", { id: "jd", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "passed", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2 })],
         grants: [grant2()] });
       eq("a completed enrolment's review: a revision visit, and its grant is never consumed", [done.redirect, done.element?.props.revision, rpcs().filter((q) => q.path === "/rest/v1/rpc/consume_grant").length], [null, true, 0]);
+
+      // P2-6 review (launch F3 (1)): a credited day's review on an ACTIVE
+      // enrolment with an unused approved grant in the day's context. The
+      // review is a revision visit, never a grant's retake (noNewOfficial's
+      // reviewOnly term; the stub's consume_grant would answer `opened`).
+      const inContextOfficial = own("user", { id: "jo", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "passed", score: 0.9, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID });
+      for (const [what, credits, rows] of [
+        ["a cross-context credit (no official attempt in the day's context)", credited2, []],
+        ["the day credited by its own official attempt", { ...credited1, [DAY2]: { course_id: COURSE_ID, attempt_id: "jo", credit_kind: "attempt", day_number: 2 } }, [inContextOfficial]],
+      ] as Array<[string, typeof journeyCredits, Row[]]>) {
+        const rv = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credits, attempts: rows, grants: [grant2()] });
+        const ins = attemptReqs().filter((q) => q.method === "POST");
+        eq(`an active enrolment's review, ${what}, an unused grant in the day's context: no consume_grant call, one revision row in the day's context`,
+          [rv.redirect, rv.error, rpcs().filter((q) => q.path === "/rest/v1/rpc/consume_grant").length, ins.length, previewRow(ins[0]).is_revision, previewRow(ins[0]).journey_day_id, rv.element?.props.revision, grants.find((g) => g.id === "g-j")?.used_attempt_id],
+          [null, null, 0, 1, true, DAY2, true, null]);
+      }
+
+      // P2-6 review (launch F4 = writes F3): a resume whose only open row
+      // slot routing abandons (the Hindi slot, deactivated since the learner
+      // started day 2). On an active enrolment's uncredited day with a free
+      // window the admission becomes the day's open: the close, then the
+      // fresh official attempt in this request (phase 1's behaviour).
+      const onHi = (extra: Row = {}) => own("user", { id: "jh", course_version_id: V_HI, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z", ...extra });
+      const statusOf = (id: string) => attempts.find((a) => a.id === id)?.status;
+      const reopened = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()] });
+      const fresh = attemptReqs().filter((q) => q.method === "POST");
+      eq("a resume whose only open row sits on a deactivated slot: that row is closed and the day's fresh official attempt opens in the same request (no retry notice)",
+        [reopened.redirect, reopened.error, statusOf("jh"), fresh.length, previewRow(fresh[0]).course_version_id, previewRow(fresh[0]).context_kind, previewRow(fresh[0]).journey_day, previewRow(fresh[0]).journey_day_id, "is_revision" in previewRow(fresh[0]),
+          String(reopened.element?.props.iframeSrc ?? "").includes("registration=new-"), reopened.element?.props.revision, refusals()],
+        [null, null, "abandoned", 1, V_CUR, "journey", 2, DAY2, false, true, false, []]);
+      eq("…the close precedes the insert, and the closed row's launch tokens expire",
+        [reqs.findIndex((q) => q.method === "PATCH" && q.path === "/rest/v1/course_attempts" && q.query.get("id") === "in.(jh)") < reqs.findIndex((q) => q.method === "POST" && q.path === "/rest/v1/course_attempts"),
+          reqs.filter((q) => q.method === "PATCH" && q.path === "/rest/v1/cmi5_launch_tokens").length > 0], [true, true]);
+      const closeFailed = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], slotCloseFails: true });
+      eq("…when that close fails (it is fail-soft), the fresh attempt does not go in beside the row still open: refused at the row, no insert",
+        [closeFailed.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method === "POST").length, refusals()], [RETRY, "in_progress", 0, ["journey_resume_without_row"]]);
+      // Anything else is refused before the close: the row stays open and
+      // nothing is written (a refused launch closes nothing).
+      const officialDone = own("user", { id: "jw", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "failed", score: 0.2, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID });
+      for (const [what, extra] of [
+        ["a completed enrolment (it opens nothing new)", { journeyStatus: "completed" }],
+        ["a credited day (no new official attempt on it)", { journeyCredits: credited2 }],
+        ["a used window (an official attempt completed in the day's context)", { attempts: [onHi(), officialDone] }],
+      ] as Array<[string, Partial<Parameters<typeof run>[0]>]>) {
+        const r = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], ...extra });
+        eq(`…the same resume on ${what}: refused before the close, the row left open, no attempt or token written`,
+          [r.redirect, statusOf("jh"), attemptReqs().filter((q) => q.method !== "GET").length, reqs.filter((q) => q.path === "/rest/v1/cmi5_launch_tokens").length, refusals()],
+          [RETRY, "in_progress", 0, 0, ["journey_resume_row_abandoned"]]);
+      }
+      // P2-6 review (launch F3 (2)): a resume whose open row is on a version
+      // routing does not reach inserts nothing beside it (the 0107 open-row
+      // index is per version, so nothing else would stop a second official
+      // attempt in the day's context).
+      const onOld = own("user", { id: "jl", course_version_id: V_OLD, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z" });
+      const legacy = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, noPackages: true, attempts: [onOld] });
+      eq("a resume on the legacy no-package course whose open row is on a retired version (no routing): refused at the row, no insert, the row left open",
+        [legacy.redirect, attemptReqs().filter((q) => q.method === "POST").length, statusOf("jl"), refusals()], [RETRY, 0, "in_progress", ["journey_resume_without_row"]]);
+      const retakeGrant = { ...grant2(), id: "g-jh", used_attempt_id: "jh", used_at: "2026-11-09T00:00:00Z" };
+      const retake = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, hiInactive: true, attempts: [onHi()], grants: [retakeGrant] });
+      eq("a resume whose open row is a grant's retake on a deactivated slot (routing never abandons a retake): refused at the row, no insert, the retake left open",
+        [retake.redirect, attemptReqs().filter((q) => q.method === "POST").length, statusOf("jh"), refusals()], [RETRY, 0, "in_progress", ["journey_resume_without_row"]]);
+
+      // P2-6 review (launch F3 (3)): one journey-day holder relaunches the
+      // course inside that day (targetOf's journey-holder branch).
+      const holder = { enrollment_id: ENR_ID, day_id: DAY2, day_number: 2, credited: false };
+      const viaHolder = await run({ viewer: "user", search: { back: "dashboard" }, journeyHolders: [holder] });
+      eq("no product parameter, not entitled, one journey day holds the course: the launch again in that day (?journey=E&day=<id>), nothing read or written on attempts",
+        [viaHolder.redirect, lcCalls().length, attemptReqs().length, writes().length],
+        [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=${DAY2}&back=dashboard`, 1, 0, 0]);
+      const viaNumber = await run({ viewer: "user", journeyHolders: [{ ...holder, day_id: null }] });
+      eq("…a holder whose day has no id goes by the day's number", [viaNumber.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=2`, 0]);
+      const two = await run({ viewer: "user", journeyHolders: [holder, { ...holder, day_id: DAY3, day_number: 3 }] });
+      eq("…two holders: the dashboard until phase 6's chooser", [two.redirect, writes().length], ["/org/dashboard", 0]);
+    }
+
+    // (l) P2-6 item 6 (writes F4): the launch passes its context into
+    // LMS.LaunchData (ALDS_P4 on, cmi5): context/kind, context/id and
+    // context/day, from the launched row.
+    {
+      const ldExt = (): Row | null => {
+        const body = reqs.find((q) => q.method === "POST" && q.path === "/rest/v1/xapi_state" && (q.body as Row | null)?.state_id === LMS_LAUNCH_DATA_STATE_ID)?.body as { content?: AldsLaunchData } | undefined;
+        return (body?.content?.contextTemplate.extensions ?? null) as Row | null;
+      };
+      const ctxOf = (ext: Row | null) => (ext ? [ext[LAUNCH_CONTEXT_EXT.kind], LAUNCH_CONTEXT_EXT.id in ext ? ext[LAUNCH_CONTEXT_EXT.id] : "(none)", LAUNCH_CONTEXT_EXT.day in ext ? ext[LAUNCH_CONTEXT_EXT.day] : "(none)"] : null);
+      const indiv = await run({ viewer: "user", assigned: true, p4: true });
+      eq("an Individual Start's LaunchData: context/kind individual, no context/id, no context/day", [indiv.redirect, ctxOf(ldExt())], [null, ["individual", "(none)", "(none)"]]);
+      const stepOne = own("user", { id: "s1", course_version_id: V_PREV, status: "completed", completion_status: "completed", success_status: "passed", context_kind: "path", learning_path_id: PATH_ID });
+      const onPath = await run({ viewer: "user", strictPath: true, pathAssigned: true, search: { lp: PATH_ID }, attempts: [stepOne], p4: true });
+      eq("a path Start's LaunchData: context/kind path, context/id the path, no context/day", [onPath.redirect, ctxOf(ldExt())], [null, ["path", PATH_ID, "(none)"]]);
+      const credited1 = { [DAY1]: { course_id: PREV_COURSE, attempt_id: "j1", credit_kind: "attempt", day_number: 1 } };
+      const day = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, p4: true });
+      eq("a journey day's first Start: context/kind journey, context/id the enrolment, context/day the day's number", [day.redirect, ctxOf(ldExt())], [null, ["journey", ENR_ID, 2]]);
+      const launchedOn7 = own("user", { id: "j7", course_version_id: V_CUR, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 7, journey_day_id: DAY2, journey_version_id: JVER_ID, started_at: "2026-11-10T00:00:00Z" });
+      const resumed = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 }, journeyCredits: credited1, attempts: [launchedOn7], p4: true });
+      eq("…a resumed journey row keeps the day number it was launched on (7), not the day's number now (2)",
+        [resumed.redirect, String(resumed.element?.props.iframeSrc ?? "").includes("registration=j7"), ctxOf(ldExt())], [null, true, ["journey", ENR_ID, 7]]);
+      delete process.env.ALDS_P4;
     }
 
     // (k) Fail-closed on the source: no refusal inside a try; the resolver

@@ -2,7 +2,7 @@
  * ADR 0024 (three independent learning products), spec 68
  * `three-product-independence` (step 62). Phase 2 slice P2-5 creates it with
  * the Start and Preview cases (R6, decision A32); P2-6 adds the launch on
- * launch_context in four blocks of their own (below the P2-5 block, each
+ * launch_context in five blocks of their own (below the P2-5 block, each
  * with its own organisation and seed, so a red case hides only its own
  * block); P2-7 onward add grants per context, webhooks and emails.
  *
@@ -112,7 +112,8 @@
  *   (p4)  a launch with no parameter of a course R holds only through path Q
  *         goes into Q's launch (?lp=Q), which then opens it in Q's context;
  *         through two paths, to the dashboard; neither redirect writes;
- *   (p5)  the journey page links today's mission by the day's id (item 7).
+ *   (p5)  the journey page links today's mission by the day's id (item 7;
+ *         its review links are the block "journey review links" below).
  *
  *   Block "PostgREST forms" (service role only, no app request):
  *   (rv)  record_revision_visit, six names (key 'individual') and seven
@@ -142,7 +143,13 @@
  *   (q2a) a learner whose own assignment of an "Everyone" course is dated in
  *         the future: ?upcoming=, no attempt, the admin's row unchanged;
  *   (q2b) a learner whose team holds the dated assignment starts at once,
- *         with a source='self' row of their own; the team row unchanged.
+ *         with a source='self' row of their own; the team row unchanged;
+ *   (f2)  a learner not enrolled on an "Everyone" strict path presses the
+ *         Start of step 1 on the dashboard's path-only card, and another on
+ *         the course page: each link, read from the served page and followed
+ *         through any redirect inside the course's launch (never ?denied=1),
+ *         launches step 1 in the path's context with a source='self' path
+ *         row (ruling A3) and no course row (the review's F2, 2026-11-15).
  *
  *   Block "grants in context" (fixture rows through the service role):
  *   (st)  a stale path grant: consume_grant expires it in the render, the
@@ -163,10 +170,26 @@
  *         take a few milliseconds, spec 53 (5)'s disclosure). Last in its
  *         block, so a red there skips neither (w) nor (m2).
  *
+ *   Block "journey review links" (item 7, step 22; learner J holds two
+ *   two-day journeys whose pinned versions put course B on both days, and
+ *   day 1 of each is credited on course A: the state a publish leaves after
+ *   it swapped day 1's course from A to B; fixture rows through the service
+ *   role):
+ *   (rl1) an active enrolment: the done day's row and its cell in the day
+ *         grid (the two "Revise day 1" links) each open A, the course on the
+ *         day's credit row, by day 1's id; no link opens day 1 on B or names a
+ *         day by its number; followed, the link is a revision visit on A in
+ *         the day's context, recorded under that key;
+ *   (rl2) a completed enrolment: "Revisit your missions" links day 1 to A and
+ *         day 2 (credited on B) to B, each by its day's id, and nothing else
+ *         of the enrolment; day 1's link is a revision visit in its context.
+ *
  * Needs 0107 on the target database: every seed FAILS without it. By hand on
  * staging after the code is deployed, never while another lifecycle run is in
- * progress; after one green run it joins PRODUCT_SPECS in
- * scripts/lifecycle-nightly.sh (step 73). Data stays in the lifecycle-*
+ * progress. It joined PRODUCT_SPECS in scripts/lifecycle-nightly.sh (step 73)
+ * with P2-6, after its green hand run of 2026-11-15 (36 of 36); (f2) and the
+ * block "journey review links" came after that run, from the slice's review,
+ * and were type-checked only when they joined. Data stays in the lifecycle-*
  * namespace; the two platform-owner marks are removed in afterAll. Logs carry
  * ids and counts only.
  */
@@ -975,7 +998,7 @@ test.describe.serial("ADR 0024 P2-5 — Start and Preview by mode", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// P2-6: the launch on launch_context (ADR 0024 phase 2, item 8). Four blocks,
+// P2-6: the launch on launch_context (ADR 0024 phase 2, item 8). Five blocks,
 // each with its own organisation and seed: a failed test restarts the worker
 // and skips the rest of its own block only, and no block reads another's seed.
 // ════════════════════════════════════════════════════════════════════════════
@@ -1296,6 +1319,172 @@ async function pathGrant(o: { orgId: string; courseId: string; userId: string; p
 function expectRevisionBar(html: string, what: string) {
   expect(html, `${what}: not a preview`).not.toContain(PREVIEW_COPY);
   expect(html, `${what}: a revision visit's badge`).toContain('data-testid="practice-badge"');
+}
+
+/** A served page's <a> tags: each opening tag with its href (entities decoded). */
+function anchors(html: string): Array<{ tag: string; href: string }> {
+  return [...html.matchAll(/<a\b[^>]*>/g)].flatMap((m) => {
+    const href = /\shref="([^"]*)"/.exec(m[0])?.[1];
+    return href === undefined ? [] : [{ tag: m[0], href: href.replace(/&amp;/g, "&") }];
+  });
+}
+
+/** A link's path and query, parsed (null for one that is no URL). */
+function linkUrl(href: string): URL | null {
+  try {
+    return new URL(href, "http://x.invalid");
+  } catch {
+    return null;
+  }
+}
+
+/** The distinct links of a served page to one course's launch (path and query), its Preview links left out. */
+function launchLinks(html: string, launchPath: string): string[] {
+  const out = new Set<string>();
+  for (const a of anchors(html)) {
+    const u = linkUrl(a.href);
+    if (u && u.pathname === launchPath && u.searchParams.get("mode") !== "preview") out.add(u.pathname + u.search);
+  }
+  return [...out];
+}
+
+/**
+ * A launch link followed as a browser follows it, one redirect at a time (at
+ * most three, each inside the same course's launch: a holder's relaunch with
+ * ?lp= or ?journey=), to a served launch; never ?denied=1. Returns the hops
+ * (paths and queries: ids only) and the served launch's iframe src and HTML.
+ */
+async function followLaunch(req: APIRequestContext, url: string, launchPath: string): Promise<{ hops: string[]; src: string; html: string }> {
+  const hops = [url];
+  let r = await noFollow(req, url);
+  for (let t = redirectTarget(r); t !== null; t = redirectTarget(r)) {
+    hops.push(t);
+    const trail = hops.join(" → ");
+    expect(t.includes("denied=1"), `never ?denied=1: ${trail}`).toBe(false);
+    expect(linkUrl(t)?.pathname, `each redirect stays in the course's launch: ${trail}`).toBe(launchPath);
+    expect(hops.length, `at most three redirects: ${trail}`).toBeLessThanOrEqual(4);
+    r = await noFollow(req, t);
+  }
+  const trail = hops.join(" → ");
+  expect(r.status, `${trail}: ${describe(r)}`).toBe(200);
+  const m = /<iframe[^>]+src="([^"]+)"/.exec(r.body);
+  expect(m, `${trail}: the launch renders the course iframe`).toBeTruthy();
+  return { hops, src: m![1].replace(/&amp;/g, "&"), html: text(r.body) };
+}
+
+/** A two-day journey's ids: the program, its pinned version and its days' ids by number. */
+type TwoDayJourney = { programId: string; versionId: string; dayIds: { 1: string; 2: string } };
+
+/**
+ * A two-day journey whose days 1 and 2 both hold `courseId` in the pinned
+ * version, open today in either unlock mode (count_sundays): spec 55 (j)'s
+ * shape, the day rows before the version, which names the days' ids itself
+ * (day_ids, source 'editor'; ADR 0024 step 64, P2-N9). With a credit of day
+ * 1 on another course (creditDay), it is the state a publish leaves after it
+ * swapped day 1's course: the day keeps its id and its credit row keeps the
+ * course the learner completed (ADR 0024 step 22, section 95's row "A day's
+ * course swapped").
+ */
+async function twoDayJourney(orgId: string, name: string, courseId: string): Promise<TwoDayJourney> {
+  const db = svc();
+  const { data: program, error: pErr } = await db
+    .from("journey_programs")
+    .insert({ organization_id: orgId, name, days_total: 2, count_sundays: true })
+    .select("id")
+    .single();
+  expect(pErr, `program ${name}: ${pErr?.message}`).toBeNull();
+  const programId = (program as { id: string }).id;
+  const { data: days, error: dErr } = await db
+    .from("journey_days")
+    .insert([1, 2].map((n) => ({ program_id: programId, organization_id: orgId, day_number: n, course_id: courseId, mission_title: `${name} day ${n}` })))
+    .select("id, day_number");
+  expect(dErr, `journey days ${name}: ${dErr?.message}`).toBeNull();
+  const dayRows = (days ?? []) as Array<{ id: string; day_number: number }>;
+  const day1 = dayRows.find((d) => d.day_number === 1)?.id;
+  const day2 = dayRows.find((d) => d.day_number === 2)?.id;
+  expect([typeof day1, typeof day2], `journey days ${name}: both written`).toEqual(["string", "string"]);
+  const { data: jv, error: vErr } = await db
+    .from("journey_versions")
+    .insert({
+      program_id: programId,
+      organization_id: orgId,
+      version_number: 1,
+      name,
+      days_total: 2,
+      count_sundays: true,
+      completion_title: "Yoddha",
+      days: [
+        { day: 1, course_id: courseId, mission_title: `${name} day 1` },
+        { day: 2, course_id: courseId, mission_title: `${name} day 2` },
+      ],
+      day_ids: { "1": day1, "2": day2 },
+      day_ids_source: "editor",
+    })
+    .select("id")
+    .single();
+  expect(vErr, `journey version ${name}: ${vErr?.message}`).toBeNull();
+  const versionId = (jv as { id: string }).id;
+  const { error: cErr } = await db.from("journey_programs").update({ current_version_id: versionId }).eq("id", programId);
+  expect(cErr, `program version ${name}: ${cErr?.message}`).toBeNull();
+  return { programId, versionId, dayIds: { 1: day1!, 2: day2! } };
+}
+
+/** A journey enrolment, active or completed, starting today (fixture row through the service role). */
+async function enrolJourneyAs(j: TwoDayJourney, orgId: string, userId: string, status: "active" | "completed"): Promise<string> {
+  const { data, error } = await svc()
+    .from("journey_enrollments")
+    .insert({
+      program_id: j.programId,
+      version_id: j.versionId,
+      organization_id: orgId,
+      user_id: userId,
+      start_date: todayStr(),
+      status,
+      completed_at: status === "completed" ? new Date().toISOString() : null,
+    })
+    .select("id")
+    .single();
+  expect(error, `journey enrolment (${status}): ${error?.message}`).toBeNull();
+  return (data as { id: string }).id;
+}
+
+/**
+ * A journey day's credit earned on `course` (fixture rows through the
+ * service role): the passed official attempt in the day's context and the
+ * credit row that names it and its course, spec 46's columns.
+ */
+async function creditDay(o: { orgId: string; userId: string; enr: string; day: 1 | 2; dayId: string; course: Course }): Promise<void> {
+  const db = svc();
+  const doneAt = hoursAgo(1);
+  const { data, error } = await db
+    .from("course_attempts")
+    .insert({
+      course_version_id: o.course.v,
+      user_id: o.userId,
+      organization_id: o.orgId,
+      status: "passed",
+      completion_status: "completed",
+      success_status: "passed",
+      score: 0.9,
+      started_at: new Date(Date.parse(doneAt) - 600_000).toISOString(),
+      completed_at: doneAt,
+      cmi_data: {},
+      ...fixtureAttemptContext({ journey_enrollment_id: o.enr, journey_day: o.day, journey_day_id: o.dayId }),
+    })
+    .select("id")
+    .single();
+  expect(error, `journey day ${o.day} attempt: ${error?.message}`).toBeNull();
+  const { error: pErr } = await db.from("journey_day_progress").insert({
+    enrollment_id: o.enr,
+    organization_id: o.orgId,
+    user_id: o.userId,
+    day_number: o.day,
+    day_id: o.dayId,
+    course_id: o.course.id,
+    attempt_id: (data as { id: string }).id,
+    completed_at: doneAt,
+  });
+  expect(pErr, `journey day ${o.day} credit: ${pErr?.message}`).toBeNull();
 }
 
 test.describe.serial("ADR 0024 P2-6 — one learner through three products at launch; refusals and holders", () => {
@@ -1734,8 +1923,9 @@ test.describe.serial("ADR 0024 P2-6 — self-enrolment on an Everyone course and
     e2?: Course;
     pe?: string;
     team?: string;
-    users: Partial<Record<"s1" | "s2" | "s3" | "q1" | "q2", User>>;
-    ctx: Partial<Record<"s1" | "s2" | "s3" | "q1" | "q2", BrowserContext>>;
+    /** fd, fc: (f2)'s learners, made in that case (not by the seed). */
+    users: Partial<Record<"s1" | "s2" | "s3" | "q1" | "q2" | "fd" | "fc", User>>;
+    ctx: Partial<Record<"s1" | "s2" | "s3" | "q1" | "q2" | "fd" | "fc", BrowserContext>>;
   } = { users: {}, ctx: {} };
   const slug = () => s.org!.slug;
   const startUrl = (courseId: string, q = "") => `/${slug()}/courses/${courseId}/launch${q}`;
@@ -1925,6 +2115,63 @@ test.describe.serial("ADR 0024 P2-6 — self-enrolment on an Everyone course and
     expect(att[0]).toMatchObject({ ...REAL_ROW, status: "in_progress" });
     expect(registrationOf(st.src)).toBe(att[0].id);
     expect(await teamRows(), "the team's row unchanged").toEqual(teamBefore);
+  });
+
+  test("(f2) a learner not enrolled on an Everyone strict path: the Start of step 1 on the dashboard's path-only card, and on the course page, launches it in path:PE with a source='self' path row (A3), never ?denied=1", async ({
+    browser,
+    baseURL,
+  }) => {
+    // The review's F2 (2026-11-15): the dashboard lists every "Everyone"
+    // path's steps as path-only cards, and the course page offers Start on a
+    // step that only such a path grants, so each Start must reach the path's
+    // launch. The links are read from the served pages, never built here,
+    // and followed through any redirect inside the course's launch (a holder's
+    // relaunch with ?lp=), so the case holds whichever side carries the path.
+    // One fresh learner per surface: after the first Start the learner is
+    // enrolled, and a second surface would prove nothing.
+    test.setTimeout(300_000);
+    const PE = s.pe!;
+    const E1 = s.e1!;
+    const launchPath = `/${slug()}/courses/${E1.id}/launch`;
+    for (const [key, surface, page] of [
+      ["fd", "the dashboard's path-only card", `/${slug()}/dashboard`],
+      ["fc", "the course page", `/${slug()}/courses/${E1.id}`],
+    ] as const) {
+      const u = await newLearner(s.org!.id, key);
+      s.users[key] = u;
+      const ctx = await authedContext(browser, baseURL!, u.email, u.password);
+      s.ctx[key] = ctx;
+      expect(await enrolmentIds(u.id), `${surface}: no enrolment before the Start`).toEqual([]);
+      expect(await pathFacts(u.id, s.org!.id, E1.id, PE), `${surface}: not enrolled on PE, step 1`).toMatchObject({
+        found: true,
+        visibility: "org_public",
+        enrolled: false,
+        self_row: false,
+        course_step: 1,
+      });
+
+      const res = await ctx.request.get(page, { timeout: 120_000 });
+      expect(res.ok(), `${surface} → ${res.status()}`).toBeTruthy();
+      const links = launchLinks(await res.text(), launchPath);
+      expect(links.length, `${surface}: offers a Start of step 1`).toBeGreaterThan(0);
+      let attemptId: string | null = null;
+      for (const link of links) {
+        const st = await followLaunch(ctx.request, link, launchPath);
+        expectStartBar(st.html, `${surface}: ${st.hops.join(" → ")}`);
+        const att = await ctxRows(u.id, E1.v);
+        expect(att.length, `${surface}: one attempt on step 1`).toBe(1);
+        expect(att[0]).toMatchObject({ context_kind: "path", context_key: `path:${PE}`, learning_path_id: PE, is_revision: false, status: "in_progress" });
+        expect(registrationOf(st.src), `${surface}: the launch runs that attempt`).toBe(att[0].id);
+        attemptId ??= att[0].id;
+        expect(att[0].id, `${surface}: every Start link launches the one attempt`).toBe(attemptId);
+      }
+      const rows = await pathEnrolments(PE, u.id);
+      expect(rows.length, `${surface}: one path enrolment row, written by the Start`).toBe(1);
+      expect(rows[0]).toMatchObject({ assignee_type: "user", user_id: u.id, team_id: null, source: "self", assigned_by: u.id, due_at: null, organization_id: s.org!.id });
+      expect(await courseEnrolments(E1.id, u.id), `${surface}: no course row (E1 is no "Everyone" course)`).toEqual([]);
+      expect((await ctxRows(u.id)).map((x) => x.id), `${surface}: no other attempt`).toEqual([attemptId]);
+      console.log(`[spec 68] (f2) ${key}: ${links.length} Start link(s), ${links.map((l) => linkUrl(l)?.searchParams.has("lp") ? "with ?lp=" : "without ?lp=").join(", ")}`);
+    }
   });
 });
 
@@ -2196,5 +2443,154 @@ test.describe.serial("ADR 0024 P2-6 — grants in context: the rerun after used 
     const g = await grantRow(grantId);
     expect([g.status, g.used_attempt_id, g.used_at !== null], "the grant spent once, on the retake").toEqual(["approved", retake.id, true]);
     expect(await fullRow(official), "the official attempt as it was").toEqual(officialBefore);
+  });
+});
+
+test.describe.serial("ADR 0024 P2-6 — the journey page's review links open the credit row's course by the day's id (item 7)", () => {
+  const s: {
+    org?: { id: string; slug: string };
+    adminCtx?: BrowserContext;
+    j?: User;
+    jCtx?: BrowserContext;
+    /** A: the course day 1 was credited on, before the swap (launched). */
+    a?: Course;
+    /** B: day 1's course after the swap, and day 2's (fixture; never launched). */
+    b?: Course;
+    /** J's active enrolment: day 1 credited on A, day 2 not yet. */
+    active?: { journey: TwoDayJourney; enr: string };
+    /** J's completed enrolment: day 1 credited on A, day 2 on B. */
+    done?: { journey: TwoDayJourney; enr: string };
+  } = {};
+  const slug = () => s.org!.slug;
+  const launchOf = (courseId: string, enr: string, dayId: string) => `/${slug()}/courses/${courseId}/launch?journey=${enr}&day=${dayId}`;
+
+  test.afterAll(async () => {
+    await s.jCtx?.close().catch(() => {});
+    await s.adminCtx?.close().catch(() => {});
+  });
+
+  test("seed: course A (uploaded) and B (fixture); two two-day journeys on B; learner J active on one with day 1 credited on A, completed on the other with day 1 credited on A and day 2 on B", async ({
+    browser,
+    baseURL,
+  }) => {
+    test.setTimeout(600_000);
+    expect(await has0107(), "0107 is not applied on this database: the links carry day ids").toBe(true);
+    const org = await createOrg({ name: "Lifecycle Journey Review Links" });
+    s.org = org;
+    const admin = (await createAuthUser({ profile: { first_name: "Contexts", last_name: "Admin", must_change_password: false } })) as User;
+    await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
+    s.adminCtx = await authedContext(browser, baseURL!, admin.email, admin.password);
+    s.a = await cmi5Course(s.adminCtx.request, org.slug, rand(6), "a", "QA Review Links A");
+    s.b = await bareCourse(org.id, "QA Review Links B");
+    const j = await newLearner(org.id, "J");
+    s.j = j;
+
+    const active = await twoDayJourney(org.id, "Review Links Active", s.b.id);
+    const activeEnr = await enrolJourneyAs(active, org.id, j.id, "active");
+    await creditDay({ orgId: org.id, userId: j.id, enr: activeEnr, day: 1, dayId: active.dayIds[1], course: s.a });
+    s.active = { journey: active, enr: activeEnr };
+
+    const done = await twoDayJourney(org.id, "Review Links Done", s.b.id);
+    const doneEnr = await enrolJourneyAs(done, org.id, j.id, "completed");
+    await creditDay({ orgId: org.id, userId: j.id, enr: doneEnr, day: 1, dayId: done.dayIds[1], course: s.a });
+    await creditDay({ orgId: org.id, userId: j.id, enr: doneEnr, day: 2, dayId: done.dayIds[2], course: s.b });
+    s.done = { journey: done, enr: doneEnr };
+    s.jCtx = await authedContext(browser, baseURL!, j.email, j.password);
+  });
+
+  test("(rl1) an active enrolment: the done day's row and its grid cell link the launch of A, day 1's credit course, by day 1's id, never B; the link serves a revision visit in the day's context", async () => {
+    const j = s.j!;
+    const A = s.a!;
+    const { journey, enr } = s.active!;
+    const day1 = journey.dayIds[1];
+    const want = launchOf(A.id, enr, day1);
+    const res = await s.jCtx!.request.get(`/${slug()}/journey?j=${enr}`, { timeout: 120_000 });
+    expect(res.ok(), `journey page → ${res.status()}`).toBeTruthy();
+    const links = anchors(await res.text());
+
+    // The week's done row and the day grid's cell, both labelled "Revise day 1".
+    const revise = links.filter((a) => a.tag.includes('aria-label="Revise day 1"'));
+    expect(revise.map((a) => a.href), "the done day's row and its grid cell each open A by day 1's id").toEqual([want, want]);
+    // No link of the page opens day 1 on another course, or names a day by its number.
+    const ofThisJourney = links.flatMap((a) => {
+      const u = linkUrl(a.href);
+      return u && u.searchParams.get("journey") === enr ? [{ path: u.pathname, day: u.searchParams.get("day") }] : [];
+    });
+    expect(
+      ofThisJourney.filter((l) => l.day === day1).map((l) => l.path),
+      "every link of day 1 opens A, the course on its credit row (B, the day's course now, never)"
+    ).toEqual([`/${slug()}/courses/${A.id}/launch`, `/${slug()}/courses/${A.id}/launch`]);
+    expect(
+      ofThisJourney.filter((l) => l.day !== day1 && l.day !== journey.dayIds[2]).map((l) => l.day),
+      "every launch link names a day of the pinned version by its id"
+    ).toEqual([]);
+
+    // Followed, the link is the review of the credited day: a revision visit
+    // on A in the day's context, recorded under that key.
+    const attemptsBefore = await attemptIds(j.id);
+    const visit = await served(s.jCtx!.request, want);
+    expectRevisionBar(visit.html, "day 1's Revise link");
+    const fresh = (await ctxRows(j.id)).filter((x) => !attemptsBefore.includes(x.id));
+    expect(fresh.length, "one row written: the revision visit").toBe(1);
+    expect(fresh[0]).toMatchObject({
+      course_version_id: A.v,
+      context_kind: "journey",
+      context_key: `journey:${enr}:${day1}`,
+      journey_enrollment_id: enr,
+      journey_day: 1,
+      journey_day_id: day1,
+      journey_version_id: journey.versionId,
+      is_preview: false,
+      is_revision: true,
+      status: "in_progress",
+    });
+    expect(registrationOf(visit.src), "the Revise link runs the revision visit").toBe(fresh[0].id);
+    expect(await visitsOf(j.id, A.id), "one visit, recorded under the day's key").toEqual([{ context_key: `journey:${enr}:${day1}`, attempt_id: fresh[0].id }]);
+  });
+
+  test("(rl2) a completed enrolment: 'Revisit your missions' links day 1 to A and day 2 to B, the courses on their credit rows, each by its day's id; day 1's link serves a revision visit in its context", async () => {
+    const j = s.j!;
+    const A = s.a!;
+    const B = s.b!;
+    const { journey, enr } = s.done!;
+    const res = await s.jCtx!.request.get(`/${slug()}/journey?j=${enr}`, { timeout: 120_000 });
+    expect(res.ok(), `journey page → ${res.status()}`).toBeTruthy();
+    const html = await res.text();
+    // The list's heading as rendered markup (the page's RSC payload carries
+    // the same words as JSON, with no <h3> tag).
+    const heading = /<h3\b[^>]*>[^<]*Revisit your missions<\/h3>/.exec(html);
+    expect(heading, "the completed enrolment's Revisit list").toBeTruthy();
+    const at = heading!.index;
+    const end = html.indexOf("</section>", at);
+    expect(end, "the Revisit list's section ends").toBeGreaterThan(at);
+    const listed = anchors(html.slice(at, end)).map((a) => a.href);
+    const day1 = launchOf(A.id, enr, journey.dayIds[1]);
+    const day2 = launchOf(B.id, enr, journey.dayIds[2]);
+    expect(listed, "day 1 on A (its credit course, B never), day 2 on B, each by its day's id").toEqual([day1, day2]);
+    expect(
+      anchors(html).filter((a) => linkUrl(a.href)?.searchParams.get("journey") === enr).map((a) => a.href),
+      "no other launch link of this enrolment on the page"
+    ).toEqual([day1, day2]);
+
+    const attemptsBefore = await attemptIds(j.id);
+    const visit = await served(s.jCtx!.request, day1);
+    expectRevisionBar(visit.html, "day 1's Revisit link");
+    const fresh = (await ctxRows(j.id)).filter((x) => !attemptsBefore.includes(x.id));
+    expect(fresh.length, "one row written: the revision visit").toBe(1);
+    expect(fresh[0]).toMatchObject({
+      course_version_id: A.v,
+      context_kind: "journey",
+      context_key: `journey:${enr}:${journey.dayIds[1]}`,
+      journey_enrollment_id: enr,
+      journey_day: 1,
+      journey_day_id: journey.dayIds[1],
+      is_revision: true,
+      status: "in_progress",
+    });
+    expect(registrationOf(visit.src), "the Revisit link runs the revision visit").toBe(fresh[0].id);
+    expect(await visitsOf(j.id, A.id), "the visit recorded under the day's key").toContainEqual({
+      context_key: `journey:${enr}:${journey.dayIds[1]}`,
+      attempt_id: fresh[0].id,
+    });
   });
 });

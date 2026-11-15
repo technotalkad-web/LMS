@@ -12,6 +12,11 @@
  * 18). Any other error throws ContextReadError, because a forwarded statement
  * is write-once and must not leave with a revision row read as unflagged, or an
  * ignored pass read as applied.
+ *
+ * What identifies the learning context (path/id, journey/enrollment-id,
+ * journey/day; ADR 0024 step 26) comes from the attempt row itself, never from
+ * a fail-soft lookup: a failed lookup can drop a name or the journey's program
+ * id, but never makes a path or journey attempt read as an Individual one.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { launchedActivityIds } from "@/lib/xapi/process-statement";
@@ -537,16 +542,20 @@ export async function loadAttemptContexts(
             steps: pathSteps.get(pathId) ?? null,
           }
         : null,
-      journey:
-        enrollmentId && enrollment
-          ? {
-              programId: String(enrollment.program_id),
-              name: str(program?.name) ?? str(jversion?.name),
-              enrollmentId,
-              day: num(a.journey_day),
-              daysTotal: num(jversion?.days_total),
-            }
-          : null,
+      // The learning context comes from the attempt row, as the path's does:
+      // a journey attempt carries journey/enrollment-id and journey/day even
+      // when the fail-soft enrolments read failed or found no row, so it never
+      // leaves looking like an Individual attempt (1.2.0 numbers per context).
+      // The program id, name and day count need that read.
+      journey: enrollmentId
+        ? {
+            programId: enrollment ? str(enrollment.program_id) : null,
+            name: str(program?.name) ?? str(jversion?.name),
+            enrollmentId,
+            day: num(a.journey_day),
+            daysTotal: num(jversion?.days_total),
+          }
+        : null,
       environment,
     });
   }

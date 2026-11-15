@@ -6,14 +6,17 @@
  * first, never beside it, with its own timeout.
  *
  *   - each list is two-digit spec numbers, each with exactly one spec file,
- *     and no number is in both lists;
+ *     and no number is in both lists; PRODUCT_SPECS holds spec 68 (ADR 0024
+ *     P2-6's gate);
  *   - the workflow: the first job's timeout is 90 minutes; the second job
  *     needs the first, runs unless the run was cancelled, has a 60-minute
  *     timeout, selects its list in a step that holds no secret, and every
  *     later step runs only when that step says so;
  *   - the script's selection, run in bash: both early exits (no product
  *     specs yet; specs given by a dispatch) come before anything is built,
- *     before the secrets are checked, and write run=false for the workflow.
+ *     before the secrets are checked, and write run=false for the workflow;
+ *     the empty-list exit runs on a copy of the script with an empty
+ *     PRODUCT_SPECS, now that the real list is not empty.
  *
  * Run:  npx tsx tests/unit/lifecycle-nightly-lists.test.ts   (or npm run test:unit)
  * (No DB, no build.)
@@ -57,6 +60,10 @@ for (const [name, l] of [["DEFAULT_SPECS", DEFAULT], ["PRODUCT_SPECS", PRODUCTS]
 }
 eq("DEFAULT_SPECS is not empty", DEFAULT.length > 0, true);
 eq("no spec number is in both lists", DEFAULT.filter((n) => PRODUCTS.includes(n)), []);
+// ADR 0024 P2-6's gate ("then spec 68 joins PRODUCT_SPECS after one green
+// hand run"): it joined after its green hand run of 2026-11-15, and leaves
+// neither list without a change here.
+eq("PRODUCT_SPECS holds spec 68 (ADR 0024 P2-6's gate, 2026-11-15)", PRODUCTS.includes("68"), true);
 
 // ── the workflow ─────────────────────────────────────────────────────────────
 console.log("\n.github/workflows/lifecycle-nightly.yml: two jobs, one after the other");
@@ -144,32 +151,46 @@ if (probe.status !== 0) {
   eq("plan, second job with given specs: skipped, run=false", [r.status, r.stdout, r.output], [0, "lifecycle-nightly: skipped: specs given (they run in the first job)", "run=false"]);
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products" });
   eq(
-    "plan, second job: PRODUCT_SPECS, or 'no product specs yet' while it is empty",
+    "plan, second job: runs PRODUCT_SPECS",
     [r.status, r.stdout, r.output],
-    PRODUCTS.length
-      ? [0, `lifecycle-nightly: list 'products' will run: ${PRODUCTS.join(" ")}`, "run=true"]
-      : [0, "lifecycle-nightly: no product specs yet", "run=false"]
+    [0, `lifecycle-nightly: list 'products' will run: ${PRODUCTS.join(" ")}`, "run=true"]
   );
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products", LIFECYCLE_SPECS: " \t " });
-  eq("blank given specs count as none in the second job", r.output, PRODUCTS.length ? "run=true" : "run=false");
+  eq("blank given specs count as none in the second job: it runs PRODUCT_SPECS", r.output, "run=true");
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_SPECS: " \t " });
   eq("blank given specs count as none in the first job", [r.status, r.stdout], [0, defaultLine]);
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "everything" });
   eq("an unknown list is refused (exit 2)", [r.status, r.output], [2, ""]);
 
-  // A copy of the script with a product list, to run the non-empty branch.
-  const copy = path.join(tmp, "lifecycle-nightly.sh");
-  fs.writeFileSync(copy, src.replace(/^PRODUCT_SPECS=""$/m, 'PRODUCT_SPECS="68 69"'));
-  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products" }, copy);
-  eq("with a product list, plan, second job: runs it", [r.status, r.stdout, r.output], [0, "lifecycle-nightly: list 'products' will run: 68 69", "run=true"]);
+  // Copies of the script with another product list, so both branches run
+  // whatever the real list holds. Each copy differs from the script on the
+  // PRODUCT_SPECS line only (a replace that matched nothing would test the
+  // script itself).
+  const srcLines = src.split("\n");
+  const withProducts = (value: string): string => {
+    const text = src.replace(/^PRODUCT_SPECS="[^"]*"$/m, `PRODUCT_SPECS="${value}"`);
+    const changed = text.split("\n").flatMap((l, i) => (l === srcLines[i] ? [] : [l]));
+    eq(`the copy with PRODUCT_SPECS="${value}" differs on that line only`, changed, [`PRODUCT_SPECS="${value}"`]);
+    const copy = path.join(tmp, `lifecycle-nightly-${value.replace(/\s+/g, "-") || "empty"}.sh`);
+    fs.writeFileSync(copy, text);
+    return copy;
+  };
+  const twoSpecs = withProducts("68 69");
+  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products" }, twoSpecs);
+  eq("with another product list, plan, second job: runs it", [r.status, r.stdout, r.output], [0, "lifecycle-nightly: list 'products' will run: 68 69", "run=true"]);
+  const empty = withProducts("");
+  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products" }, empty);
+  eq("with an empty product list, plan, second job: 'no product specs yet', run=false", [r.status, r.stdout, r.output], [0, "lifecycle-nightly: no product specs yet", "run=false"]);
+  r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products", LIFECYCLE_SPECS: " \t " }, empty);
+  eq("with an empty product list, blank given specs count as none: run=false", r.output, "run=false");
 
   // Not plan-only: the early exits still come before the secrets check.
   r = run({ LIFECYCLE_LIST: "products", LIFECYCLE_SPECS: "32" });
   eq("second job with given specs passes before the secrets check", [r.status, r.stdout], [0, "lifecycle-nightly: skipped: specs given (they run in the first job)"]);
-  if (!PRODUCTS.length) {
-    r = run({ LIFECYCLE_LIST: "products" });
-    eq("second job with no product specs passes before the secrets check", [r.status, r.stdout], [0, "lifecycle-nightly: no product specs yet"]);
-  }
+  r = run({ LIFECYCLE_LIST: "products" }, empty);
+  eq("second job with no product specs passes before the secrets check", [r.status, r.stdout], [0, "lifecycle-nightly: no product specs yet"]);
+  r = run({ LIFECYCLE_LIST: "products" });
+  eq("the second job with its list and without secrets stops at the secrets check (exit 2)", [r.status, r.stdout], [2, "lifecycle-nightly: NEXT_PUBLIC_SUPABASE_URL is not set"]);
   r = run({});
   eq("the first job without secrets still stops at the secrets check (exit 2)", [r.status, r.stdout], [2, "lifecycle-nightly: NEXT_PUBLIC_SUPABASE_URL is not set"]);
 }

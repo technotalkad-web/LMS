@@ -79,14 +79,17 @@
  * redirects and notices. Ids in a decision are lower case.
  *
  * Beside the resolver (phase 2, P2-6): refusalWithoutFacts(), the rows that
- * answer before any fact (the page makes no launch_context call for them),
- * and afterSelfEnrol(), the P2-Q2 (i-a) decision after the page's
- * self-enrolment insert and its second launch_context call.
+ * answer before any fact (the page makes no launch_context call for them);
+ * afterSelfEnrol(), the P2-Q2 (i-a) decision after the page's self-enrolment
+ * insert and its second launch_context call; and resumeAfterSlotRouting(),
+ * the page's answer, before any close, for a journey `resume` whose open row
+ * slot routing abandons.
  *
  * Pure: no next/* and no Supabase runtime import (the house shape of
  * lib/attempts/launch-kind.ts); `now` is an input, so the journey's "today"
  * is computed with todayStrAt (twins contract A12).
  */
+import type { CandidateKind } from "@/lib/attempts/launch-kind";
 import { canViewReports } from "@/lib/auth/permissions";
 import type { OrgRole } from "@/lib/auth/require-org-access";
 import { countedDaysElapsed, DEFAULT_JOURNEY_TZ, todayStrAt } from "@/lib/journey/journey";
@@ -467,4 +470,49 @@ export function afterSelfEnrol(i: {
     return { kind: "retry", reason: `self_enrol_${i.second.selfEnrol}_not_recorded` };
   }
   return { kind: "go_on", decision: i.second };
+}
+
+/**
+ * A journey `resume` whose open official attempt slot routing abandons
+ * (ADR 0004 rule (3): it sits on a language slot an admin deactivated after
+ * the learner started the day). The resolver cannot see language slots, so
+ * the page asks this after routing and before any close, and a refused
+ * launch closes nothing:
+ *
+ *   - `unchanged`: not a resume, or routing leaves an open official row of
+ *     the day's context open (the resume takes its row, or is refused at
+ *     the row with nothing inserted beside it);
+ *   - `open`: routing abandons every open official row of the day's
+ *     context, on an active enrolment, an uncredited day with a number, and
+ *     a free window (candidate `first`: an abandoned row was never
+ *     completed, so it never counted toward the window). Phase 1's
+ *     behaviour: the close, then the day's fresh official attempt in the
+ *     same request;
+ *   - `refuse`: routing abandons every open official row, and no fresh
+ *     official attempt is admitted (a completed enrolment opens nothing new,
+ *     a credited day gets no new official attempt, a row needs the day's
+ *     number, and a used window or a grant is not a first attempt).
+ */
+export function resumeAfterSlotRouting(i: {
+  admission: JourneyAdmission;
+  /** The day's context's open official rows (in progress, not a revision visit's), on every version of the course. */
+  openOfficialIds: readonly string[];
+  /** Slot routing's abandon list (rule (3)). */
+  abandon: readonly string[];
+  enrolmentStatus: string | null;
+  dayCredited: boolean;
+  dayNumber: number | null;
+  candidate: CandidateKind;
+}): "unchanged" | "open" | "refuse" {
+  if (i.admission !== "resume" || i.openOfficialIds.length === 0) return "unchanged";
+  const abandoned = new Set(i.abandon.map((id) => id.toLowerCase()));
+  if (!i.openOfficialIds.every((id) => abandoned.has(id.toLowerCase()))) return "unchanged";
+  const fresh =
+    i.enrolmentStatus === "active" &&
+    !i.dayCredited &&
+    typeof i.dayNumber === "number" &&
+    Number.isInteger(i.dayNumber) &&
+    i.dayNumber >= 1 &&
+    i.candidate === "first";
+  return fresh ? "open" : "refuse";
 }

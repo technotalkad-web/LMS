@@ -20,7 +20,74 @@ export type CourseAccess = {
    * "coming soon" instead of "not assigned". Null otherwise.
    */
   upcomingAt: string | null;
+  /**
+   * The "Everyone" path whose `?lp=` the course page's Start carries
+   * (everyonePathStart below): set only when the grant is a released step of
+   * an active "Everyone" path the learner has no assignment row on, and
+   * nothing else holds the course for a plain Start. Absent or null: a
+   * plain Start.
+   */
+  startPathId?: string | null;
 };
+
+/**
+ * The "Everyone" path a Start carries in its `?lp=` (ADR 0024 ruling A3).
+ * Since P2-6 a Start with no product parameter is decided by the launch's
+ * resolver, whose path holders are the paths the learner has an assignment
+ * row on (launch_context reads v_path_enrollments_expanded, which has no
+ * visibility arm). A learner who reaches a course only through an active
+ * "Everyone" (org_public) path with no row of theirs is refused
+ * (`not_enrolled`) by a plain Start; with `?lp=` the resolver's path row
+ * enrols them first (A3) and then applies the path's release and order.
+ *
+ * Pure. A path id only when all of these hold; otherwise null and the Start
+ * stays plain:
+ *   - the course is not "Everyone" itself (a plain Start self-enrols on it,
+ *     step 24);
+ *   - no direct assignment row reaches the learner, released or not (a
+ *     plain Start launches a released one as Individual, and a future-dated
+ *     one answers "not yet released"; the dashboard shows that course's own
+ *     card as Coming soon);
+ *   - no step in `steps` is on a path the learner has an assignment row on
+ *     (a plain Start is admitted, or redirected into that path, by the
+ *     resolver);
+ *   - a released step of an "Everyone" path holds the course.
+ * Of several such paths, the lowest path id (launch_context orders its
+ * holders by path id), so the dashboard and the course page name the same
+ * path whatever order their reads answer in.
+ *
+ * `steps`: each step of an ACTIVE path of the organisation that holds the
+ * course (launch_context's holders keep active paths only).
+ *
+ * Not read: a day of the learner's active journey that holds the course
+ * (launch_context's other holder). Such a learner's plain Start goes into
+ * that day; with `?lp=` it goes into the path instead (the course page would
+ * need a further read to tell).
+ */
+export function everyonePathStart(i: {
+  /** courses.visibility is org_public. */
+  courseIsEveryone: boolean;
+  /** A direct assignment row (own, team, org-wide or Custom Group), released or not, reaches the learner. */
+  directlyHeld: boolean;
+  steps: ReadonlyArray<{
+    pathId: string;
+    /** learning_paths.visibility is org_public. */
+    everyone: boolean;
+    /** The learner has an assignment row on the path (own, team, org-wide or Custom Group). */
+    enrolled: boolean;
+    releaseAt: string | null;
+  }>;
+  now: number;
+}): string | null {
+  if (i.courseIsEveryone || i.directlyHeld) return null;
+  if (i.steps.some((s) => s.enrolled)) return null;
+  let pick: string | null = null;
+  for (const s of i.steps) {
+    if (!s.everyone || !isReleased(s.releaseAt, i.now)) continue;
+    if (pick === null || s.pathId.toLowerCase() < pick.toLowerCase()) pick = s.pathId;
+  }
+  return pick;
+}
 
 /**
  * Whether a learner may open a course. Allowed for a Preview (`preview`: the
@@ -214,10 +281,39 @@ export async function learnerCanAccessCourse(opts: {
         )
         .map((a) => a.path_id)
     );
+    // Two passes, the same grant as one: a step is entitled when the learner
+    // has a row on its path or the path is "Everyone". First the paths with a
+    // row: a released step there grants with a plain Start (the launch's
+    // resolver admits it, or redirects into that path).
     for (const s of steps) {
-      const entitled = myPathIds.has(s.path_id) || s.path?.visibility === "org_public";
-      if (!entitled) continue;
+      if (!myPathIds.has(s.path_id)) continue;
       if (isReleased(s.release_at, now)) return { allowed: true, upcomingAt: null };
+      if (s.release_at) pending.push(s.release_at);
+    }
+    // Then the "Everyone" paths with no row of the learner: a released step
+    // grants, and the Start carries the path's `?lp=` when nothing else holds
+    // the course (everyonePathStart; ruling A3 enrols the learner at the
+    // launch). The course is not "Everyone" (returned above); a direct row
+    // left here is future-dated, and keeps the Start plain.
+    for (const s of steps) {
+      if (myPathIds.has(s.path_id) || s.path?.visibility !== "org_public") continue;
+      if (isReleased(s.release_at, now)) {
+        return {
+          allowed: true,
+          upcomingAt: null,
+          startPathId: everyonePathStart({
+            courseIsEveryone: false,
+            directlyHeld: mine.length > 0,
+            steps: steps.map((x) => ({
+              pathId: x.path_id,
+              everyone: x.path?.visibility === "org_public",
+              enrolled: myPathIds.has(x.path_id),
+              releaseAt: x.release_at,
+            })),
+            now,
+          }),
+        };
+      }
       if (s.release_at) pending.push(s.release_at);
     }
   }

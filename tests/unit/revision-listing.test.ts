@@ -570,7 +570,12 @@ console.log("\n(vii) ADR 0024 step 41: computeScoring is called by contextResult
     callers.filter((f) => f !== RULE_OWNER), [...PENDING_0024].sort());
   eq("PENDING_0024 has no duplicate and never names the rule's owner or the definition",
     [new Set(PENDING_0024).size === PENDING_0024.length, PENDING_0024.includes(RULE_OWNER), PENDING_0024.includes(DEFINITION)], [true, false, false]);
-  eq("PENDING_0024 never grows: at most its 20 files of 2026-11-14", PENDING_0024.length <= 20, true);
+  // The bound is the list's length after the last slice that removed a file
+  // (20 on 2026-11-14; 19 since P2-6 took the launch page off on
+  // 2026-11-15). Each later slice that removes a file lowers it to the new
+  // length in the same pull request, so a new direct caller cannot take a
+  // removed file's place on the list.
+  eq("PENDING_0024 never grows: at most its 19 files since P2-6 (2026-11-15)", PENDING_0024.length <= 19, true);
 
   // H3 (the ADR's note of 2026-11-14): the forms that call computeScoring
   // under another name, which the scan by name above cannot see, are refused

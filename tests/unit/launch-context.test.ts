@@ -38,7 +38,11 @@
  *   (j) afterSelfEnrol (P2-6 item 2, P2-Q2 option (i-a)): the four cases
  *       the plan names (inserted then enrolled; 23505 then enrolled; 23505
  *       then self-enrol again, upcoming; any other insert error, retry), and
- *       A3's second answer (the strict lock after the path's insert).
+ *       A3's second answer (the strict lock after the path's insert);
+ *   (k) resumeAfterSlotRouting (P2-6 review, launch F4): a journey resume
+ *       whose open official rows slot routing abandons opens the day fresh
+ *       on an active enrolment's uncredited day with a free window, and is
+ *       refused before any close otherwise.
  *   Ruling A3 is in (d): an "Everyone" path learner with no enrolment row
  *   launching a later step is told "enrol first", not locked.
  *
@@ -51,6 +55,8 @@ import {
   journeyOpenDayIsOpen,
   refusalWithoutFacts,
   resolveLaunchContext,
+  resumeAfterSlotRouting,
+  type JourneyAdmission,
   type JourneyFacts,
   type LaunchContextFacts,
   type LaunchDecision,
@@ -299,6 +305,14 @@ console.log("\n(e) the journey row (?journey=E&day=D)");
     resolve({ journey: ENR, day: DAY4 }, j({ day: { id: DAY4, number: 4, in_version: true, removed: false, course_id: C3 }, day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), refused("day_not_open"));
   eq("…a completed enrolment opens nothing new: review_only, no redirect",
     resolve({ journey: ENR, day: DAY4 }, j({ status: "completed", next_day: null, next_day_id: null, day_open_attempt: { attempt_id: ATT, course_id: OTHER } })), refused("review_only"));
+  // Never on a credited day (P2-6 review, launch F3): its review is the
+  // credit row's course, so the day's current course is refused there, even
+  // with an open attempt of another course in the day's context.
+  for (const [what, creditCourse] of [["the started course", OTHER], ["a third course", C1]] as Array<[string, string]>) {
+    eq(`…a credited day (its credit on ${what}) with an open attempt of another course, launched with the day's current course: day_not_open, never the redirect`,
+      resolve({ journey: ENR, day: DAY4 }, j({ day_credit: { course_id: creditCourse, attempt_id: ATT, credit_kind: "attempt", day_number: 4 }, day_open_attempt: { attempt_id: uid("a", 2), course_id: OTHER }, next_day: 5, next_day_id: DAY9 })),
+      refused("day_not_open"));
+  }
 
   // Step 23's five cases.
   eq("step 23 (1): a started day that was removed: resume", resolve({ journey: ENR, day: DAY9 }, j({
@@ -477,6 +491,34 @@ console.log("\n(j) afterSelfEnrol: P2-Q2 option (i-a) after the self-enrolment i
   eq("a refusal on the second call (the course made inactive between the calls): go on with it",
     afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: refused("course_unavailable") as LaunchDecision }), { kind: "go_on", decision: refused("course_unavailable") });
   eq("no second answer after an insert that did not fail: the retry notice", afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: null }), { kind: "retry", reason: "self_enrol_no_second_answer" });
+}
+
+console.log("\n(k) resumeAfterSlotRouting: a journey resume whose open rows slot routing abandons (P2-6 review, launch F4), decided before any close");
+{
+  type Ask = Parameters<typeof resumeAfterSlotRouting>[0];
+  const base: Ask = {
+    admission: "resume",
+    openOfficialIds: [ATT],
+    abandon: [ATT],
+    enrolmentStatus: "active",
+    dayCredited: false,
+    dayNumber: 4,
+    candidate: "first",
+  };
+  const ask = (o: Partial<Ask> = {}) => resumeAfterSlotRouting({ ...base, ...o });
+  const A2 = uid("a", 2);
+  eq("routing abandons the only open official row, an active enrolment, an uncredited day with a number, a free window: open (the close, then the fresh official attempt)", ask(), "open");
+  eq("…ids compared without case", ask({ abandon: [ATT.toUpperCase()] }), "open");
+  eq("…every open official row abandoned (two, both on deactivated slots): open", ask({ openOfficialIds: [ATT, A2], abandon: [A2, ATT] }), "open");
+  eq("not a resume (open, review): unchanged, whatever routing abandons", (["open", "review"] as JourneyAdmission[]).map((admission) => ask({ admission })), ["unchanged", "unchanged"]);
+  eq("routing abandons nothing: unchanged (the resume takes its row)", ask({ abandon: [] }), "unchanged");
+  eq("routing keeps an open official row (own slot, or a retake it never abandons): unchanged", ask({ openOfficialIds: [ATT, A2] }), "unchanged");
+  eq("no open official row in the context (it completed meanwhile): unchanged (refused at the row, nothing inserted)", ask({ openOfficialIds: [] }), "unchanged");
+  eq("a completed enrolment: refuse (it opens nothing new)", ask({ enrolmentStatus: "completed" }), "refuse");
+  eq("an unknown enrolment status: refuse", ask({ enrolmentStatus: null }), "refuse");
+  eq("a credited day: refuse (no new official attempt on it)", ask({ dayCredited: true }), "refuse");
+  eq("no day number (a removed day), or not a day number: refuse (a journey row needs it)", [ask({ dayNumber: null }), ask({ dayNumber: 0 })], ["refuse", "refuse"]);
+  eq("a used window (at_row) or a grant: refuse (not a first attempt)", [ask({ candidate: "at_row" }), ask({ candidate: "grant" })], ["refuse", "refuse"]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
