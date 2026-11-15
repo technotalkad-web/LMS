@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { originFromRequest } from "@/lib/http/origin";
 import { safeNextPath } from "@/lib/auth/safe-next";
+import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
 import type { EmailOtpType } from "@supabase/supabase-js";
 
 /**
@@ -48,6 +49,11 @@ export async function GET(request: Request) {
   const next = safeNextPath(searchParams.get("next")) ?? "/select-org";
   const org = orgFromNext(next);
   const loginPath = org ? `/${org}/login` : "/login";
+
+  // An email link signs this browser in afresh, possibly as another user:
+  // end an impersonation first, while its owner may still be signed in.
+  // Never throws; no cookie, no request.
+  await endImpersonationForSessionChange();
 
   const supabase = await createClient();
 

@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { createClient } from "@/lib/supabase/server";
 import crypto from "crypto";
 
 /**
@@ -14,6 +15,12 @@ import crypto from "crypto";
  *  - Every page load that calls getImpersonation() re-validates the
  *    HMAC AND checks the DB row is still active (not revoked, not
  *    past expires_at, not ended_at).
+ *  - The session applies only to the platform owner who started it:
+ *    getImpersonation() reads the signed-in user itself and answers
+ *    null to anyone else, so no caller can skip that check.
+ *  - Sign-out, and the server routes that sign a different user in or
+ *    change the password, end the session first through
+ *    endImpersonationForSessionChange().
  *  - require-org-access reads getImpersonation() and overrides the
  *    role to "super_owner" when the impersonation targets the current
  *    org. The banner reads it too so we can show "Impersonating …".
@@ -83,9 +90,32 @@ export type ImpersonationSession = {
 };
 
 /**
+ * The signed-in user's id, verified by the auth server (getUser, never the
+ * unverified getSession), or null when signed out or when the check fails.
+ */
+async function signedInUserId(): Promise<string | null> {
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser();
+    if (error || !user) return null;
+    return user.id;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Read the impersonation session from the request cookies, validating
  * the HMAC and re-checking the DB row. Returns null if missing,
- * forged, expired, or revoked.
+ * forged, expired, ended or revoked, and null unless the signed-in user
+ * is the platform owner who started it (actor_user_id).
+ *
+ * Read-only: it never writes a cookie, because Server Components call it
+ * and their cookies cannot be changed. A cookie it ignores is removed by
+ * the end paths below or by its own 60-minute expiry.
  */
 export async function getImpersonation(): Promise<ImpersonationSession | null> {
   const jar = await cookies();
@@ -93,6 +123,10 @@ export async function getImpersonation(): Promise<ImpersonationSession | null> {
   if (!raw) return null;
   const id = unpack(raw);
   if (!id) return null;
+
+  // Only a well-signed cookie costs the user check and the row read.
+  const userId = await signedInUserId();
+  if (!userId) return null;
 
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -106,6 +140,7 @@ export async function getImpersonation(): Promise<ImpersonationSession | null> {
       "id, actor_user_id, target_org_id, target_user_id, started_at, expires_at, ended_at, revoked_at"
     )
     .eq("id", id)
+    .eq("actor_user_id", userId)
     .maybeSingle();
 
   if (!row) return null;
@@ -119,6 +154,8 @@ export async function getImpersonation(): Promise<ImpersonationSession | null> {
     ended_at: string | null;
     revoked_at: string | null;
   };
+  // The query filters on the user too; this comparison is what decides.
+  if (r.actor_user_id !== userId) return null;
   if (r.ended_at || r.revoked_at) return null;
   if (new Date(r.expires_at).getTime() < Date.now()) return null;
 
@@ -183,12 +220,18 @@ export async function startImpersonation(args: {
 
 /**
  * End the active impersonation: stamp ended_at on the DB row and
- * delete the cookie.
+ * delete the cookie. The row is stamped only when the signed-in user
+ * started it (getImpersonation's check); the cookie is deleted in every
+ * case, even when the read throws. Route handlers and server actions only.
  */
 export async function endImpersonation(): Promise<void> {
-  const session = await getImpersonation();
   const jar = await cookies();
-  jar.delete(COOKIE_NAME);
+  let session: ImpersonationSession | null;
+  try {
+    session = await getImpersonation();
+  } finally {
+    jar.delete(COOKIE_NAME);
+  }
 
   if (!session) return;
   const svc = createServiceClient(
@@ -200,4 +243,27 @@ export async function endImpersonation(): Promise<void> {
     .from("platform_impersonation_sessions")
     .update({ ended_at: new Date().toISOString() })
     .eq("id", session.id);
+}
+
+/**
+ * End this browser's impersonation before its sign-in changes: sign-out,
+ * a server route that signs a user in, a password change. Call it while
+ * the current user is still signed in, so the owner's row can be stamped.
+ *
+ * Route handlers and server actions only (it deletes a cookie). It never
+ * throws: the caller's own work (signing out, signing in) goes ahead
+ * whatever happens here. Without the cookie it does nothing and makes no
+ * request.
+ */
+export async function endImpersonationForSessionChange(): Promise<void> {
+  try {
+    const jar = await cookies();
+    if (!jar.get(COOKIE_NAME)) return;
+    await endImpersonation();
+  } catch (e) {
+    console.error(
+      "[impersonation] could not end the session before the sign-in changed:",
+      e instanceof Error ? e.message : String(e)
+    );
+  }
 }

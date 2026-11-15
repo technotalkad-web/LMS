@@ -32,8 +32,14 @@ export async function requireOrgAccess(slug: string) {
 
   if (!org) redirect("/select-org");
 
+  // getImpersonation() answers only the platform owner who started the
+  // session; the actor comparison here repeats that check at the use site.
   const impersonation = await getImpersonation();
-  if (impersonation && impersonation.target_org_id === org.id) {
+  if (
+    impersonation &&
+    impersonation.actor_user_id === user.id &&
+    impersonation.target_org_id === org.id
+  ) {
     return {
       user,
       org,
