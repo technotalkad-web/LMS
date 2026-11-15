@@ -58,7 +58,8 @@ import {
 } from "@/lib/attempts/launch-kind";
 import { buildOfficialResult, buildRevisionCmi } from "@/lib/attempts/revision-seed";
 import { isKivoStamped } from "@/lib/courses/engine-version";
-import { officialResultStored } from "@/lib/learner/continue";
+import { isUuid, officialResultStored } from "@/lib/learner/continue";
+import { resolvedStepRule } from "@/lib/paths/progress";
 
 type Course = {
   id: string;
@@ -67,6 +68,8 @@ type Course = {
   title: string;
   is_active?: boolean;
   pass_required?: boolean | null;
+  /** A path Start's step row of the ?lp= path (embedded; absent otherwise). */
+  learning_path_courses?: Array<{ path_id?: string | null; pass_required?: boolean | null }> | null;
 };
 
 type Version = {
@@ -188,12 +191,29 @@ export default async function LaunchPage({
   }
 
   const supabase = await createClient();
-  const { data: course } = await supabase
-    .from("courses")
-    .select("id, organization_id, current_version_id, title, is_active, pass_required")
-    .eq("id", courseId)
-    .eq("organization_id", org.id)
-    .maybeSingle();
+  // A path Start's course read embeds the step row of the ?lp= path, so the
+  // bar judges the step under its resolved rule, as the continue address and
+  // the status route do (ADR 0024 P2-7, the review's F3), with no request
+  // more. The step's pass_required is a 0107 column: on a database without
+  // it the read answers 42703 and is made once without the embed (a path
+  // Start is refused there anyway, at the launch_context call). A Preview,
+  // an Individual and a journey Start embed nothing.
+  const COURSE_COLUMNS = "id, organization_id, current_version_id, title, is_active, pass_required";
+  const stepPathId = !preview && isUuid(lpArg) ? lpArg.toLowerCase() : null;
+  const readCourse = (embedStep: boolean) => {
+    const q = supabase
+      .from("courses")
+      .select(embedStep ? `${COURSE_COLUMNS}, learning_path_courses(path_id, pass_required)` : COURSE_COLUMNS)
+      .eq("id", courseId)
+      .eq("organization_id", org.id);
+    return (embedStep && stepPathId !== null ? q.eq("learning_path_courses.path_id", stepPathId) : q).maybeSingle();
+  };
+  let courseAnswer = await readCourse(stepPathId !== null);
+  if (stepPathId !== null && courseAnswer.error && isMissingColumn(courseAnswer.error, "pass_required")) {
+    courseAnswer = await readCourse(false);
+  }
+  // A dynamic select string has no typed row; the shape is Course's.
+  const course = courseAnswer.data as unknown as Course | null;
 
   if (!course) {
     redirect(`/${orgSlug}/courses/${courseId}`);
@@ -203,8 +223,13 @@ export default async function LaunchPage({
   }
   const c = course as Course;
   // The bar's Continue state (ADR 0019, note of 2026-11-11): the continue
-  // address's own reading of the course's setting.
-  const passRequired = c.pass_required === true;
+  // address's own reading of the rule. On a path Start the step's resolved
+  // rule (resolvedStepRule: the step's own pass_required, else the
+  // course's); otherwise, and when the path has no step row for the course
+  // (or the database has no step rule), the course's.
+  const stepRows = stepPathId !== null && Array.isArray(c.learning_path_courses) ? c.learning_path_courses : [];
+  const stepRow = stepRows.find((r) => typeof r?.path_id === "string" && r.path_id.toLowerCase() === stepPathId) ?? null;
+  const passRequired = resolvedStepRule(stepRow?.pass_required, c.pass_required);
 
   // ADR 0014 step 3, fail closed: every read that feeds the launch verdict or
   // the row choice refuses on error, and so does every disagreement between

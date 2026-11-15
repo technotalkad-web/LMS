@@ -4,7 +4,8 @@ import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 import { readContextResult } from "@/lib/scoring/context-read";
 import { contextKindOfKey } from "@/lib/scoring/context";
 import { resolvedStepRule } from "@/lib/paths/progress";
-import { isUuid, officialResultStored } from "@/lib/learner/continue";
+import { readPathStepFacts } from "@/lib/paths/facts-read";
+import { isUuid, pathStepDone, waitRead } from "@/lib/learner/continue";
 
 /**
  *   GET /api/attempts/{attemptId}/result-stored
@@ -33,6 +34,15 @@ import { isUuid, officialResultStored } from "@/lib/learner/continue";
  * course's (step 8), as the continue address reads it. On a database without
  * 0107 the attempt carries no key and the read is `individual`, which
  * readContextResult answers with today's undivided rows of the course.
+ *
+ * The answer is the continue address's: waitRead's `stored` answers true and
+ * `not_stored` false. On `verdict_pending` (a pass-required step completed
+ * without its pass or fail yet), a path attempt answers whether the path
+ * rule already makes the step done (pathStepDone: an earlier pass, D14, or,
+ * read only then, the step's stored fact), because no verdict can undo that
+ * and the continue address moves such a learner on (the P2-7 review, F1);
+ * any other attempt answers false. A failed facts read is 503. Without 0107
+ * the key is `individual` and this case answers false, as before.
  *
  * `{ stored: false }` without scoring (the result would turn Continue on
  * toward content the learner may not open, or is no official result):
@@ -118,6 +128,7 @@ export async function GET(
   if (course.is_active !== true) return answer({ stored: false }, 200);
 
   let stepRule: boolean | null = null;
+  let stepNumber: number | null = null;
   if (pathId !== null) {
     const { data: pathRow, error: pathErr } = await supabase
       .from("learning_paths")
@@ -135,10 +146,11 @@ export async function GET(
           .eq("path_id", pathId)
           .eq("course_id", courseId)
           .maybeSingle(),
-      "course_id"
+      "course_id, step_number"
     );
     if (stepErr) return unreadable();
     stepRule = typeof stepRow?.pass_required === "boolean" ? stepRow.pass_required : null;
+    stepNumber = typeof stepRow?.step_number === "number" ? stepRow.step_number : null;
   }
   const passRequired = resolvedStepRule(stepRule, course.pass_required);
 
@@ -151,5 +163,20 @@ export async function GET(
 
   const read = await readContextResult(supabase, { userId: user.id, courseId, key, passRequired, versionIds });
   if (!read.ok) return unreadable();
-  return answer({ stored: officialResultStored(read.result.scoring, read.result.rows, passRequired) }, 200);
+  const w = waitRead(read.result.scoring, read.result.rows, passRequired);
+  if (w !== "verdict_pending" || kind !== "path" || pathId === null || stepNumber === null) {
+    return answer({ stored: w === "stored" }, 200);
+  }
+  // The verdict is pending on a path step: stored when the path rule already
+  // makes the step done (the continue address's own test, F1).
+  const step = await pathStepDone({
+    pathId,
+    step: { course_id: courseId, step_number: stepNumber, release_at: null, pass_required: passRequired },
+    attempts: read.result.rows,
+    grants: read.grants,
+    now: new Date().toISOString(),
+    loadFacts: () => readPathStepFacts(supabase, user.id, [pathId]),
+  });
+  if (!step.ok) return unreadable();
+  return answer({ stored: step.done }, 200);
 }

@@ -258,17 +258,25 @@ console.log("\nthe launch page's two props (step 8)");
   eq("the format label is no longer passed", src.includes("standard="), false);
 
   // ADR 0019, note of 2026-11-11: the bar's state.
-  eq("the course read selects pass_required; passRequired is the continue address's reading", [
-    /\.from\("courses"\)\s*\.select\("id, organization_id, current_version_id, title, is_active, pass_required"\)/.test(src),
-    /const passRequired = c\.pass_required === true;/.test(src),
-  ], [true, true]);
+  // ADR 0024 P2-7, the review's F3: on a path Start the course read embeds
+  // the ?lp= path's step row, and passRequired is the step's resolved rule,
+  // the continue address's and the status route's reading.
+  eq("the course read selects pass_required and, on a path Start, embeds the step row of the ?lp= path; passRequired is the step's resolved rule", [
+    /const COURSE_COLUMNS = "id, organization_id, current_version_id, title, is_active, pass_required";/.test(src),
+    /const stepPathId = !preview && isUuid\(lpArg\) \? lpArg\.toLowerCase\(\) : null;/.test(src),
+    /\.from\("courses"\)\s*\.select\(embedStep \? `\$\{COURSE_COLUMNS\}, learning_path_courses\(path_id, pass_required\)` : COURSE_COLUMNS\)/.test(src),
+    /q\.eq\("learning_path_courses\.path_id", stepPathId\)/.test(src),
+    /if \(stepPathId !== null && courseAnswer\.error && isMissingColumn\(courseAnswer\.error, "pass_required"\)\) \{\s*courseAnswer = await readCourse\(false\);\s*\}/.test(src),
+    /const passRequired = resolvedStepRule\(stepRow\?\.pass_required, c\.pass_required\);/.test(src),
+    /c\.pass_required === true/.test(src),
+  ], [true, true, true, true, true, true, false]);
   eq("continueReady: a path launch, no grant opened on this launch, and the page's own scoring reads the result stored through officialResultStored (no preview term: a preview has no Continue, ADR 0024 P2-5)",
     /const continueReady =\s*continueHref !== null &&\s*openedGrantId === null &&\s*ev\.scoring !== null &&\s*officialResultStored\(ev\.scoring, ev\.my, passRequired\);/.test(src), true);
   eq("…and no isPreview anywhere in it", /const continueReady =[^;]*isPreview/.test(src), false);
   eq("a preview carries no ?lp= (read as none), so its continueHref is null", /const lpParam = preview \? undefined : lpRaw;/.test(src), true);
   eq("both runtimes get preview={launch.isPreview}", count(src, "preview={launch.isPreview}"), 2);
   eq("…officialResultStored imported from lib/learner/continue, called once", [
-    /import \{ officialResultStored \} from "@\/lib\/learner\/continue";/.test(src),
+    /import \{ isUuid, officialResultStored \} from "@\/lib\/learner\/continue";/.test(src),
     count(src, "officialResultStored("),
   ], [true, 1]);
   eq("continueStatusHref: the attempt's status route on a path launch, else null",
@@ -287,8 +295,10 @@ console.log("\nthe continue page (steps 1 and 2)");
   // ADR 0024 P2-7 (step 27 as build note O1-k makes it exact): the step's
   // rule from the steps read (the step's own, else the course's), the wait
   // through readContextResult in the path's context (attempts and grants,
-  // strictly), the step's done from the path rule (pathStepStatus) with the
-  // fact read once, only when the rule alone does not decide.
+  // strictly; the later reads reuse the first answer's decision and grants,
+  // the review's F5), the step's done from the path rule (pathStepDone) with
+  // the fact read at most once, only when the rule alone does not decide; a
+  // step done while its verdict is pending ends the wait (the review's F1).
   eq("reads each step's course activity and rule with the step's own rule (the narrower-select fallback), and resolves the rule", [
     /readWithOptionalColumn<unknown\[\]>\(\s*"pass_required",[\s\S]*?\.from\("learning_path_courses"\)[\s\S]*?"course_id, step_number, courses\(is_active, pass_required\)"\s*\)/.test(src),
     /const passRequired = resolvedStepRule\(fromStep\.pass_required, courseOf\(fromStep\)\?\.pass_required\);/.test(src),
@@ -297,23 +307,27 @@ console.log("\nthe continue page (steps 1 and 2)");
   eq("the versions read: an error or no rows ends as the timeout target", /if \(verErr \|\| versionIds\.length === 0\) readError\(\);/.test(src), true);
   eq("the wait reads through readContextResult in the path's context; a failed read ends the wait", [
     /const key = contextKeyOf\(\{ kind: "path", pathId \}\);/.test(src),
-    /const r = await readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds \}\);\s*if \(!r\.ok\) readError\(\);/.test(src),
+    /const r = await readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds, reuse \}\);\s*if \(!r\.ok\) readError\(\);\s*reuse = \{ contextColumns: r\.contextColumns, grants: r\.grants \};/.test(src),
   ], [true, true]);
-  eq("the wait ends only on a stored result whose verdict is not pending (officialResultStored over the context's rows)",
-    /if \(officialResultStored\(r\.result\.scoring, r\.result\.rows, passRequired\)\) \{\s*stored = r;\s*break;\s*\}/.test(src), true);
-  eq("the step's done is the path rule's answer on the same read; the fact is read once, only when the rule alone does not decide, and a failed read ends as the timeout target", [
-    /let step = pathStepStatus\(\{ pathId, step: stepInput, attempts: stored\.result\.rows, grants: stored\.grants, fact: null, now \}\);/.test(src),
-    /if \(!step\.passed_by_rule\) \{\s*const facts = await readPathStepFacts\(supabase, user\.id, \[pathId\]\);\s*if \(!facts\.ok\) readError\(\);/.test(src),
-    /redirect\(target\(\{ timedOut: false, stored: true, done: step\.done \}\)\);/.test(src),
+  eq("the wait ends on a stored result whose verdict is not pending, or on a pending verdict when the step is done already (waitRead over the context's rows)", [
+    /const w = waitRead\(r\.result\.scoring, r\.result\.rows, passRequired\);\s*if \(w === "stored"\) \{\s*done = await stepDone\(r\);\s*break;\s*\}/.test(src),
+    /if \(w === "verdict_pending" && \(await stepDone\(r\)\)\) \{\s*done = true;\s*break;\s*\}/.test(src),
+  ], [true, true]);
+  eq("the step's done is the path rule's answer on the same read (pathStepDone); the facts are read at most once, and a failed read ends as the timeout target", [
+    /const d = await pathStepDone\(\{ pathId, step: stepInput, attempts: r\.result\.rows, grants: r\.grants, now: new Date\(\)\.toISOString\(\), loadFacts \}\);\s*if \(!d\.ok\) readError\(\);/.test(src),
+    /if \(factsRead === null\) factsRead = readPathStepFacts\(supabase, user\.id, \[pathId\]\);/.test(src),
+    /redirect\(target\(\{ timedOut: false, stored: true, done \}\)\);/.test(src),
     // never contextResult's done, officialDone or computeScoring (O1-k)
     [/\bofficialDone\(/, /\bcomputeScoring\(/, /\.result\.done\b/].some((re) => re.test(src)),
   ], [true, true, true, false]);
-  eq("…officialResultStored imported from lib/learner/continue, the only conclude test in the loop; resultStored and verdictPending no longer called here", [
-    /import \{[^}]*\bofficialResultStored\b[^}]*\} from "@\/lib\/learner\/continue";/.test(src),
+  eq("…waitRead and pathStepDone imported from lib/learner/continue, the only conclude test in the loop; officialResultStored, resultStored and verdictPending not called here", [
+    /import \{[^}]*\bwaitRead\b[^}]*\} from "@\/lib\/learner\/continue";/.test(src),
+    /import \{[^}]*\bpathStepDone\b[^}]*\} from "@\/lib\/learner\/continue";/.test(src),
+    count(src, "waitRead("),
     count(src, "officialResultStored("),
     count(src, "resultStored("),
     count(src, "verdictPending("),
-  ], [true, 1, 0, 0]);
+  ], [true, true, 1, 0, 0, 0]);
   eq("no service client, no write", [
     src.includes("SUPABASE_SERVICE_ROLE_KEY"),
     /\.(insert|update|upsert|delete)\(/.test(src),
@@ -370,10 +384,13 @@ console.log("\nthe status route (ADR 0019, note of 2026-11-11)");
     /const read = await readContextResult\(supabase, \{ userId: user\.id, courseId, key, passRequired, versionIds \}\);\s*if \(!read\.ok\) return unreadable\(\);/.test(src),
   ], [true, true, true, true, true, true]);
   eq("…never through the fail-soft helpers, and no direct scoring", [src.includes("fetchPassRequired("), src.includes("fetchGrantRetakeIds("), src.includes("computeScoring"), src.includes("resolvePolicy")], [false, false, false, false]);
-  eq("the answer: officialResultStored, once, over the context's rows", [
+  eq("the answer: waitRead, once, over the context's rows; a pending verdict on a path step asks pathStepDone (the review's F1), a failed facts read is 503", [
+    count(src, "waitRead("),
     count(src, "officialResultStored("),
-    /return answer\(\{ stored: officialResultStored\(read\.result\.scoring, read\.result\.rows, passRequired\) \}, 200\);/.test(src),
-  ], [1, true]);
+    /const w = waitRead\(read\.result\.scoring, read\.result\.rows, passRequired\);\s*if \(w !== "verdict_pending" \|\| kind !== "path" \|\| pathId === null \|\| stepNumber === null\) \{\s*return answer\(\{ stored: w === "stored" \}, 200\);\s*\}/.test(src),
+    /loadFacts: \(\) => readPathStepFacts\(supabase, user\.id, \[pathId\]\),/.test(src),
+    /if \(!step\.ok\) return unreadable\(\);\s*return answer\(\{ stored: step\.done \}, 200\);/.test(src),
+  ], [1, 0, true, true, true]);
   eq("every answer carries Cache-Control: no-store, through one helper", [
     /const NO_STORE = \{ "Cache-Control": "no-store" \};/.test(src),
     /NextResponse\.json\(body, \{ status, headers: NO_STORE \}\)/.test(src),

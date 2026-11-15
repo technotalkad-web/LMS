@@ -15,7 +15,8 @@
  * beside an in-progress real attempt waits the whole bound and lands on the
  * saving banner, the same rows read for a learner do too, a completed real
  * attempt moves on at the first read, and a database without 0107 reads
- * today's rows after one failed read per read of the wait.
+ * today's rows after one failed read at the first read of the wait (the
+ * later reads reuse its decision and its grants: the P2-7 review, F5).
  *
  * ADR 0024 P2-7 (step 27 as build note O1-k makes it exact): the wait reads
  * through readContextResult in the path's context, and the step's done is
@@ -28,8 +29,11 @@
  * P2-Q1 answer: a stored, done result whose next step's course is inactive
  * goes to the plain path page, a stored, failed one in the same position to
  * ?failed=1. O5-d: a `from` step whose course is inactive, and an inactive
- * path, for a completed and an in-progress learner. The page's request
- * counts are pinned at the end.
+ * path, for a completed and an in-progress learner. The P2-7 review, F1
+ * (waitRead, cases (e) to (e7)): a step done by the path rule (its stored
+ * fact, or an earlier pass) while its verdict is still pending ends the wait
+ * and moves on; with no fact the verdict wait is as before. The page's
+ * request counts are pinned at the end.
  *
  * ADR 0019, note of 2026-11-11 (Continue waits for the stored result):
  * officialResultStored, the one conclude test the continue address, the
@@ -51,6 +55,7 @@ import {
   officialResultStored,
   resultStored,
   verdictPending,
+  waitRead,
   type ContinueInput,
 } from "../../lib/learner/continue";
 import {
@@ -135,6 +140,13 @@ console.log("\nresultStored over every row mix");
   eq("no official attempt (an in-progress row only) → false", pending([row("a")], true), false);
   eq("a completed granted retake without a verdict beside a failed first attempt → true (the retake is the official)", pending([done("a", "failed", 0.4), done("g", "unknown", null, "2026-11-10T11:30:00Z")], true, ["g"]), true);
   eq("a revision visit's completed row without a verdict beside a passed official → false", pending([done("a", "passed", 0.9), done("r", "unknown", null, "2026-11-10T10:30:00Z", { is_revision: true })], true), false);
+
+  console.log("\nwaitRead: one read of the wait, classified (the P2-7 review, F1)");
+  const classify = (rows: ScorableAttempt[], passRequired: boolean) => waitRead(computeScoring(rows, DEFAULT_POLICY, []), rows, passRequired);
+  eq("nothing stored, stored, and stored with the verdict pending", [
+    classify([row("a")], true), classify([done("a", "passed", 0.9)], true), classify([done("a", "failed", 0.4)], true),
+    classify([done("a", "unknown", null)], true), classify([done("a", "unknown", null)], false),
+  ], ["not_stored", "stored", "stored", "verdict_pending", "stored"]);
 
   // The page's wait, mirrored over a sequence of reads (the page cannot run
   // here; launch-bar-copy.test.ts pins the page to this exact conclude test):
@@ -458,10 +470,14 @@ async function realPage() {
     const old = await run({ no0107: true, attempts: [REAL_DONE] });
     eq("the first attempts read answers 42703 and is made once more without the context; today's rows move on", [old.target, old.inContext], [NEXT, [true, false]]);
     const oldWait = await run({ no0107: true, attempts: [REAL_IN_PROGRESS] });
-    eq("…each read of the wait makes its one failed read first (no decision is carried between reads): seven pairs, then the saving banner",
-      [oldWait.target, oldWait.inContext], [SAVING, Array(7).fill([true, false]).flat()]);
+    eq("…only the first read of the wait makes its failed read; the later six reuse its decision (the P2-7 review, F5), then the saving banner",
+      [oldWait.target, oldWait.inContext], [SAVING, [true, false, ...Array(6).fill(false)]]);
+    eq("…and its grants: one grants read in the whole wait", requests.filter((q) => q.path === "/rest/v1/attempt_requests").length, 1);
     const oldRule = await run({ no0107: true, steps: [{ course: C1, n: 1, courseRule: true }, { course: C2, n: 2 }], attempts: [finished("real", "failed", 0.4)] });
     eq("…the step read falls back without the step's own rule, and the course's rule decides (a failed result on a pass-required course)", [oldRule.target, oldRule.factReads], [FAILED, 1]);
+    const oldVerdict = await run({ no0107: true, steps: [{ course: C1, n: 1, courseRule: true }, { course: C2, n: 2 }], attempts: [finished("real", "unknown", null)] });
+    eq("…a verdict that never comes on a pass-required course: the facts read once (no table: no fact), the whole wait (8 attempts reads, the first failed), the saving banner",
+      [oldVerdict.target, oldVerdict.reads, oldVerdict.factReads], [SAVING, 8, 1]);
 
     console.log("\n…O1-k: the step's done is the path rule's answer (cases (a) to (d))");
     // Step 1 is pass-required by its own rule (a 0107 column) over a course without one; the learner
@@ -489,7 +505,35 @@ async function realPage() {
     const live = await run({ steps: tightened, attempts: [finished("a1", "passed", 0.9), attempt("a2", { started_at: "2026-11-11T09:00:00Z" })], grants: [grantFor("a2")] });
     eq("…while that retake is live the result is not stored: the saving banner", [live.target, live.reads], [SAVING, 7]);
     const verdict = await run({ steps: tightened, attempts: [finished("a1", "unknown", null)] });
-    eq("the step's own rule decides the verdict wait: completed without a verdict on a pass-required step waits the bound", [verdict.target, verdict.reads], [SAVING, 7]);
+    eq("the step's own rule decides the verdict wait: completed without a verdict on a pass-required step waits the bound; its fact read once finds none",
+      [verdict.target, verdict.reads, verdict.factReads], [SAVING, 7, 1]);
+
+    console.log("\n…the P2-7 review, F1: a step done by the path rule while its verdict is pending ends the wait");
+    // One official row, completed with no pass or fail (SCORM 1.2 "completed", a cmi5 AU that sends
+    // only completed); the step was done under a rule that needed no pass, its fact was recorded, and
+    // then its rule was tightened.
+    const onlyCompleted = [finished("a1", "unknown", null)];
+    const f1 = await run({ steps: tightened, attempts: onlyCompleted, facts: [factOn(C1)] });
+    eq("(e) the step's own rule tightened after it was done: the next launch after one read, the fact read once",
+      [f1.target, f1.reads, f1.factReads, f1.events], [NEXT, 1, 1, []]);
+    const f1Course = await run({ steps: [{ course: C1, n: 1, courseRule: true }, { course: C2, n: 2 }], attempts: onlyCompleted, facts: [factOn(C1)] });
+    eq("(e2) the course's rule tightened (the step has none of its own): the same", [f1Course.target, f1Course.reads, f1Course.factReads], [NEXT, 1, 1]);
+    const f1Last = await run({ steps: [{ course: C1, n: 1 }, { course: C2, n: 2, stepRule: true }], attempts: onlyCompleted, facts: [factOn(C2)] }, C2);
+    eq("(e3) the same on the last step: ?end=1", [f1Last.target, f1Last.reads], [END, 1]);
+    const f1Other = await run({ steps: tightened, attempts: onlyCompleted, facts: [factOn(C2)] });
+    eq("(e4) the control, a fact of another step only: the whole wait, the fact read once, then the saving banner",
+      [f1Other.target, f1Other.reads, f1Other.factReads], [SAVING, 7, 1]);
+    const f1Err = await run({ steps: tightened, attempts: onlyCompleted, factsError: true });
+    eq("(e5) the facts read fails while the verdict is pending: the read-error exit at once", [f1Err.target, f1Err.reads, f1Err.events], [SAVING, 1, ["continue_read_error"]]);
+    const f1d14 = await run({
+      steps: tightened,
+      attempts: [finished("a1", "passed", 0.9), finished("a2", "unknown", null, { started_at: "2026-11-11T09:00:00Z", completed_at: "2026-11-11T09:30:00Z" })],
+      grants: [grantFor("a2")],
+    });
+    eq("(e6) D14, passed earlier and a granted retake completed with its verdict pending: the next launch after one read, no facts read",
+      [f1d14.target, f1d14.reads, f1d14.factReads], [NEXT, 1, 0]);
+    const f1Late = await run({ steps: tightened, attempts: onlyCompleted, facts: [] });
+    eq("(e7) no fact: the verdict wait as before (the saving banner after the bound)", [f1Late.target, f1Late.reads], [SAVING, 7]);
 
     console.log("\n…P2-Q1 and O5-d: Continue never targets a hidden step or inactive content");
     const hiddenNext: StepCfg[] = [{ course: C1, n: 1 }, { course: C2, n: 2, active: false }, { course: C3, n: 3 }];
@@ -509,13 +553,16 @@ async function realPage() {
     }
 
     console.log("\n…the request count of one Continue, in the page (requireOrgAccess included; no layout, no middleware)");
-    // requireOrgAccess 4, the path 1, the steps 1, the versions 1, then per read of the wait the
-    // attempts and the grants (readContextResult), and the facts read when the rule alone does not decide.
-    eq("with 0107: a result stored at the first read 9; a wait to the bound 21 (7 reads of 2); a stored result that needs its fact read 10",
-      [doneRun.all, admin.all, a.all], [9, 21, 10]);
-    // The step read and each attempts read fall back once; the grants read follows the attempts read's decision.
-    eq("without 0107: a result stored at the first read 11; a wait to the bound 29 (7 reads of 3)",
-      [old.all, oldWait.all], [11, 29]);
+    // requireOrgAccess 4, the path 1, the steps 1, the versions 1, then the first read of the wait
+    // (the attempts and the grants, readContextResult), each later read the attempts only (F5), and
+    // the facts read when the rule alone does not decide, at most once.
+    eq("with 0107: a result stored at the first read 9; a wait to the bound 15 (7 attempts reads, 1 grants read); a stored result that needs its fact read 10",
+      [doneRun.all, admin.all, a.all], [9, 15, 10]);
+    eq("…a verdict that never comes 16 (the fact read once); a step done by its fact while the verdict is pending 10",
+      [verdict.all, f1.all], [16, 10]);
+    // The step read and the first attempts read fall back once; the grants read follows that decision.
+    eq("without 0107: a result stored at the first read 11; a wait to the bound 17 (one failed read, 7 attempts reads, 1 grants read); a verdict that never comes 18 (the facts read once)",
+      [old.all, oldWait.all, oldVerdict.all], [11, 17, 18]);
     eq("the stub answered every request the page made", unmatched, []);
   } finally {
     globalThis.fetch = realFetch;

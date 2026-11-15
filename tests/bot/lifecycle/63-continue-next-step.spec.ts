@@ -136,8 +136,12 @@ async function recordCompletion(attemptId: string) {
   expect(error, `record_learning_activity: ${error?.code} ${error?.message}`).toBeNull();
 }
 
-/** An approved, unused grant of one retake in a path's context (spec 68's pathGrant); its id. */
-async function pathGrant(o: { orgId: string; courseId: string; userId: string; pathId: string; decidedBy: string; decidedAt: string }): Promise<string> {
+/**
+ * An approved, unused grant of one retake in a path's context (spec 68's pathGrant); its id.
+ * A retake over a result that stands (a pass) needs the admin's post-pass confirmation,
+ * or consume_grant answers 'stands' and the launch opens a revision visit (0107, step 7).
+ */
+async function pathGrant(o: { orgId: string; courseId: string; userId: string; pathId: string; decidedBy: string; decidedAt: string; overrideConfirmed?: boolean }): Promise<string> {
   const { data, error } = await svc()
     .from("attempt_requests")
     .insert({
@@ -150,6 +154,7 @@ async function pathGrant(o: { orgId: string; courseId: string; userId: string; p
       decided_at: o.decidedAt,
       context_kind: "path",
       learning_path_id: o.pathId,
+      override_confirmed: o.overrideConfirmed ?? false,
     })
     .select("id")
     .single();
@@ -727,7 +732,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       await getOk(f.ctx, launchUrl(s.c2!));
       const [first] = await attemptsOn(f.user.id, s.v2!);
       await finish(freq, f.user, first.id, "passed", 0.9);
-      const g = await pathGrant({ orgId: s.org!.id, courseId: s.c2!, userId: f.user.id, pathId: s.pathId!, decidedBy: s.adminId!, decidedAt: await grantDecidedAfter(first.id) });
+      const g = await pathGrant({ orgId: s.org!.id, courseId: s.c2!, userId: f.user.id, pathId: s.pathId!, decidedBy: s.adminId!, decidedAt: await grantDecidedAfter(first.id), overrideConfirmed: true });
       // The relaunch consumes the path grant: a granted retake in the path's context.
       await getOk(f.ctx, launchUrl(s.c2!));
       const retake = (await attemptsOn(f.user.id, s.v2!)).find((x) => x.id !== first.id && x.status === "in_progress");
@@ -798,7 +803,13 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const [cStep3] = await attemptsOn(s.c!.id, s.v3!);
     expect(cStep3?.status, "C's step 3 is in progress (case (k))").toBe("in_progress");
     const [cStep2] = (await attemptsOn(s.c!.id, s.v2!)).filter((x) => x.success_status === "passed");
+    // B's stored, passed step-3 attempt (case (f)): the status route answers it stored while the course
+    // is active, so the {stored: false} below can come only from the inactive-course check.
+    const [bStep3] = (await attemptsOn(s.b!.id, s.v3!)).filter((x) => x.success_status === "passed" && x.learning_path_id === s.pathId);
+    expect(bStep3, "B's passed step-3 attempt in the path (case (f))").toBeTruthy();
+    expect(await (await s.bCtx!.request.get(statusUrl(bStep3.id))).json(), "the control: B's step 3 is stored while its course is active").toEqual({ stored: true });
     const STEP3 = "QA Continue Step Three";
+    let restoreErrors: Array<string | null> = [];
     try {
       const { error: ce } = await svc().from("courses").update({ is_active: false }).eq("id", s.c3!);
       expect(ce, `deactivate the course: ${ce?.message}`).toBeNull();
@@ -820,6 +831,9 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       const st = await s.cCtx!.request.get(statusUrl(cStep3.id));
       expect(st.status(), await st.text()).toBe(200);
       expect(await st.json(), "the status route never turns Continue on toward an inactive course").toEqual({ stored: false });
+      const bSt = await s.bCtx!.request.get(statusUrl(bStep3.id));
+      expect(bSt.status(), await bSt.text()).toBe(200);
+      expect(await bSt.json(), "B's stored step 3, its course inactive: { stored: false } (the inactive-course check)").toEqual({ stored: false });
       expect(await getOk(s.cCtx!, `/${slug()}/dashboard`), "C's dashboard names no card for the inactive course").not.toContain(STEP3);
 
       const { error: pe } = await svc().from("learning_paths").update({ is_active: false }).eq("id", s.pathId!);
@@ -833,13 +847,17 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       const st2 = await s.cCtx!.request.get(statusUrl(cStep2.id));
       expect(await st2.json(), "the status route, the path inactive").toEqual({ stored: false });
     } finally {
-      await svc().from("learning_paths").update({ is_active: true }).eq("id", s.pathId!);
-      await svc().from("courses").update({ is_active: true }).eq("id", s.c3!);
+      const { error: pr } = await svc().from("learning_paths").update({ is_active: true }).eq("id", s.pathId!);
+      const { error: cr } = await svc().from("courses").update({ is_active: true }).eq("id", s.c3!);
+      restoreErrors = [pr?.message ?? null, cr?.message ?? null];
     }
+    // Checked after the block, so a failure inside it is never masked.
+    expect(restoreErrors, "the path and the course reactivated").toEqual([null, null]);
     // Active again: the step is back in its place with its saved state.
     const again = await getOk(s.bCtx!, pathUrl());
     expect(again, "B: the step is back").toContain(STEP3);
     expect(await (await s.cCtx!.request.get(statusUrl(cStep2.id))).json(), "the status route answers again").toEqual({ stored: true });
+    expect(await (await s.bCtx!.request.get(statusUrl(bStep3.id))).json(), "…and for B's step 3, its course active again").toEqual({ stored: true });
   });
 
   test("(b2) a result stored during the wait: Continue moves on to step 2 before the bound", async ({ browser, baseURL }) => {

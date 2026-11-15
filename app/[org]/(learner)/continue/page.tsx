@@ -2,9 +2,9 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
-import { readContextResult, type ContextRead } from "@/lib/scoring/context-read";
+import { readContextResult, type ContextRead, type ReadContextGrant } from "@/lib/scoring/context-read";
 import { contextKeyOf } from "@/lib/scoring/context";
-import { pathStepStatus, resolvedStepRule } from "@/lib/paths/progress";
+import { resolvedStepRule } from "@/lib/paths/progress";
 import { readPathStepFacts } from "@/lib/paths/facts-read";
 import {
   CONTINUE_POLL_MS,
@@ -12,7 +12,8 @@ import {
   continueTarget,
   isUuid,
   nextStepAfter,
-  officialResultStored,
+  pathStepDone,
+  waitRead,
 } from "@/lib/learner/continue";
 
 /**
@@ -38,18 +39,23 @@ import {
  *     (officialResultStored over the context's rows). Each read carries its
  *     own abort signal (step 25: without one, reads 2 to 7 returned the first
  *     read's rows, spec 63 (b2)). A Preview is another context, so it never
- *     reads as the stored result. On a database without 0107 each read of the
- *     wait makes one failed read first and then reads today's undivided rows
- *     (readContextResult's own fallback);
- *   - the step's done is the path rule's per-step answer (pathStepStatus),
- *     fed with that read's rows and grants, the resolved rule and the step's
- *     stored fact: never contextResult's `done`. So a step passed earlier
- *     (D14) or done by its fact continues to the next step after a failed
- *     granted retake, instead of `?failed=1`;
- *   - the fact row is read once, through readPathStepFacts, after the wait
- *     has ended on a stored result, and only when the step is not done by
- *     the rule on those rows (only then can a fact change the answer); a
- *     failed facts read takes the read-error exit, never `?failed=1`.
+ *     reads as the stored result. On a database without 0107 the first read
+ *     of the wait makes one failed read first and then reads today's
+ *     undivided rows (readContextResult's own fallback); the later reads
+ *     reuse its schema decision and its grants (the P2-7 review, F5);
+ *   - the step's done is the path rule's per-step answer (pathStepDone over
+ *     pathStepStatus), fed with that read's rows and grants, the resolved
+ *     rule and the step's stored fact: never contextResult's `done`. So a
+ *     step passed earlier (D14) or done by its fact continues to the next
+ *     step after a failed granted retake, instead of `?failed=1`;
+ *   - the fact row is read at most once, through readPathStepFacts, only
+ *     when the step is not done by the rule on a read's rows (only then can
+ *     a fact change the answer): after the wait has ended on a stored
+ *     result, or at the first read whose verdict is still pending on a
+ *     pass-required step. A step done while its verdict is pending (by the
+ *     rule or by its fact) ends the wait, because no verdict can undo it
+ *     (the P2-7 review, F1; verdictPending's exception). A failed facts read
+ *     takes the read-error exit, never `?failed=1`.
  *
  * O5-d and the owner's P2-Q1 answer: an inactive path goes to the dashboard;
  * a step whose course is inactive is left out of the path page, so a `from`
@@ -154,46 +160,60 @@ export default async function ContinuePage({
   const versionIds = ((verRows ?? []) as Array<{ id: string }>).map((r) => r.id);
   if (verErr || versionIds.length === 0) readError();
 
+  // The step's done (O1-k): the path rule's answer for this step on one read
+  // of the wait (pathStepDone), then, only when the rule alone does not make
+  // it done, the step's stored fact. The facts are read at most once in the
+  // request: the first answer, a failed one included, is kept.
+  const stepInput = { course_id: fromCourseId, step_number: fromStep.step_number, release_at: null, pass_required: passRequired };
+  let factsRead: ReturnType<typeof readPathStepFacts> | null = null;
+  const loadFacts = () => {
+    if (factsRead === null) factsRead = readPathStepFacts(supabase, user.id, [pathId]);
+    return factsRead;
+  };
+  const stepDone = async (r: Extract<ContextRead, { ok: true }>): Promise<boolean> => {
+    const d = await pathStepDone({ pathId, step: stepInput, attempts: r.result.rows, grants: r.grants, now: new Date().toISOString(), loadFacts });
+    if (!d.ok) readError();
+    return d.done;
+  };
+
   // The wait: one read of the learner's rows in the path's context per
   // CONTINUE_POLL_MS, until a deadline CONTINUE_WAIT_MS after the first read
   // starts (decision 2: 6 s total), at most seven reads; the last one starts
   // at the deadline at the latest, so slow reads shorten the sleeps rather
-  // than stretch the wait. The sleep costs no CPU. It ends only on a stored
-  // result whose verdict is not pending: on a pass-required step a completed
-  // row without its pass or fail keeps it going, and at the bound the learner
-  // lands on the saving banner.
+  // than stretch the wait. The sleep costs no CPU. It ends on a stored result
+  // whose verdict is not pending (waitRead `stored`). On a pass-required step
+  // a completed row without its pass or fail keeps it going, and at the bound
+  // the learner lands on the saving banner, unless the step is already done
+  // by the path rule (an earlier pass, D14, or its stored fact): no verdict
+  // can undo that, so the wait ends there and the learner moves on (the P2-7
+  // review, F1). The first read's schema decision and grants are reused by
+  // the later reads (`reuse`), so each later read is the attempts read only.
   const key = contextKeyOf({ kind: "path", pathId });
   const maxReads = Math.floor(CONTINUE_WAIT_MS / CONTINUE_POLL_MS) + 1;
   const deadline = Date.now() + CONTINUE_WAIT_MS;
-  let stored: Extract<ContextRead, { ok: true }> | null = null;
+  let reuse: { contextColumns: boolean; grants: ReadContextGrant[] } | undefined;
+  let done: boolean | null = null;
   for (let read = 0; read < maxReads; read++) {
-    const r = await readContextResult(supabase, { userId: user.id, courseId: fromCourseId, key, passRequired, versionIds });
+    const r = await readContextResult(supabase, { userId: user.id, courseId: fromCourseId, key, passRequired, versionIds, reuse });
     if (!r.ok) readError();
-    if (officialResultStored(r.result.scoring, r.result.rows, passRequired)) {
-      stored = r;
+    reuse = { contextColumns: r.contextColumns, grants: r.grants };
+    const w = waitRead(r.result.scoring, r.result.rows, passRequired);
+    if (w === "stored") {
+      done = await stepDone(r);
+      break;
+    }
+    if (w === "verdict_pending" && (await stepDone(r))) {
+      done = true;
       break;
     }
     const left = deadline - Date.now();
     if (read === maxReads - 1 || left <= 0) break;
     await new Promise((res) => setTimeout(res, Math.min(CONTINUE_POLL_MS, left)));
   }
-  if (stored === null) {
+  if (done === null) {
     log("continue_timeout");
     redirect(target({ timedOut: true, stored: false, done: false }));
   }
-
-  // The step's done (O1-k): the path rule's answer for this step on the
-  // same read, then, only when the rule alone does not make it done, the
-  // step's stored fact.
-  const now = new Date().toISOString();
-  const stepInput = { course_id: fromCourseId, step_number: fromStep.step_number, release_at: null, pass_required: passRequired };
-  let step = pathStepStatus({ pathId, step: stepInput, attempts: stored.result.rows, grants: stored.grants, fact: null, now });
-  if (!step.passed_by_rule) {
-    const facts = await readPathStepFacts(supabase, user.id, [pathId]);
-    if (!facts.ok) readError();
-    const fact = facts.facts.find((f) => f.course_id.toLowerCase() === fromCourseId.toLowerCase()) ?? null;
-    if (fact) step = pathStepStatus({ pathId, step: stepInput, attempts: stored.result.rows, grants: stored.grants, fact, now });
-  }
-  if (!step.done) log("continue_not_done");
-  redirect(target({ timedOut: false, stored: true, done: step.done }));
+  if (!done) log("continue_not_done");
+  redirect(target({ timedOut: false, stored: true, done }));
 }

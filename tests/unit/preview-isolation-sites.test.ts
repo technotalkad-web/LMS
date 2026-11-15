@@ -619,7 +619,7 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
     [reads.filter((s) => s.file === CONTINUE).map(key), reads.filter((s) => s.file === STATUS).map(key)],
     [[], [`${STATUS} :: GET :: none`]]);
   eq("…both read the rows through readContextResult, in the attempt's context", [
-    /readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds \}\)/.test(read(CONTINUE)),
+    /readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds, reuse \}\)/.test(read(CONTINUE)),
     /readContextResult\(supabase, \{ userId: user\.id, courseId, key, passRequired, versionIds \}\)/.test(read(STATUS)),
   ], [true, true]);
   eq("…and the status route's own read is the attempt by its id and the learner",

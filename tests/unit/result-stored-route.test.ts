@@ -24,6 +24,12 @@
  *   - O5-d: the attempt's course inactive, or its path inactive or not
  *     readable, answers `{ stored: false }`, for a completed and an
  *     in-progress learner;
+ *   - the P2-7 review, F1: a path attempt whose verdict is pending on a
+ *     pass-required step answers `{ stored: true }` when the path rule makes
+ *     the step done already (its stored fact, read only then, or an earlier
+ *     pass), as the continue address moves such a learner on; with no fact,
+ *     and for any other attempt, `{ stored: false }` as before; a failed
+ *     facts read is 503;
  *   - a database without 0107: the attempt carries no key, the read is
  *     `individual` and readContextResult answers today's undivided rows; the
  *     path tag still decides the path's activity; a database without 0103 and
@@ -94,6 +100,9 @@ type World = {
   contextMissing: boolean;
   /** Which missing column a read naming both answers first. */
   contextFirst: boolean;
+  /** The learner's learning_path_step_completions rows (0107). */
+  facts: Row[];
+  factsError: boolean;
 };
 const individualOwn = (o: Row = {}): Row => ({ id: ATTEMPT, course_version_id: "v1", learning_path_id: null, course_versions: { course_id: "c1" }, context_key: "individual", ...o });
 const pathOwn = (o: Row = {}): Row => individualOwn({ learning_path_id: PATH, context_key: PKEY, ...o });
@@ -104,7 +113,7 @@ const base = (): World => ({
   courseError: false,
   path: { is_active: true },
   pathError: false,
-  step: { course_id: "c1", pass_required: null },
+  step: { course_id: "c1", step_number: 1, pass_required: null },
   stepError: false,
   versions: [{ id: "v1" }, { id: "v2" }],
   grants: [],
@@ -114,6 +123,8 @@ const base = (): World => ({
   columnMissing: false,
   contextMissing: false,
   contextFirst: false,
+  facts: [],
+  factsError: false,
 });
 let world: World = base();
 let requests: Req[] = [];
@@ -159,7 +170,12 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/learning_path_courses") {
     if (world.stepError) return json(BOOM, 500);
     if (world.contextMissing && select.includes("pass_required")) return json(NO_STEP_RULE, 400);
-    return json(world.step ? [world.contextMissing ? { course_id: world.step.course_id } : world.step] : []);
+    return json(world.step ? [world.contextMissing ? { course_id: world.step.course_id, step_number: world.step.step_number } : world.step] : []);
+  }
+  if (p === "/rest/v1/learning_path_step_completions") {
+    if (world.factsError) return json(BOOM, 500);
+    if (world.contextMissing) return json({ code: "PGRST205", message: "Could not find the table 'public.learning_path_step_completions' in the schema cache" }, 404);
+    return json(world.facts);
   }
   if (p === "/rest/v1/course_versions") return json(world.versions);
   if (p === "/rest/v1/attempt_requests") {
@@ -209,6 +225,7 @@ async function main() {
         rpcs: rest.filter((q) => q.path.startsWith("/rest/v1/rpc/")).map((q) => `${q.method} ${q.path.slice("/rest/v1/rpc/".length)}`),
         ownReads: rest.filter((q) => q.path === "/rest/v1/course_attempts" && isOwnRead(q.query)),
         attemptsReads: rest.filter((q) => q.path === "/rest/v1/course_attempts" && !isOwnRead(q.query)),
+        factReads: rest.filter((q) => q.path === "/rest/v1/learning_path_step_completions").length,
         lines: logs.filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as Row),
       };
     };
@@ -243,6 +260,7 @@ async function main() {
       ["the attempts read errors", { attemptsError: true }],
       ["a path attempt's path read errors", { own: pathOwn(), pathError: true }],
       ["a path attempt's step read errors", { own: pathOwn(), stepError: true }],
+      ["a path attempt's facts read errors while its verdict is pending (F1)", { own: pathOwn(), step: { course_id: "c1", step_number: 1, pass_required: true }, attempts: [onPath(done("a1", "unknown", null))], factsError: true }],
       ["the key is not one the generated column can hold", { own: individualOwn({ context_key: "path:NOT-A-UUID" }) }],
     ] as Array<[string, Partial<World>]>) {
       const r = await run(w);
@@ -298,6 +316,31 @@ async function main() {
     eq("…the course no longer a step of the path: the course's rule",
       (await run({ own: pathOwn(), course: { pass_required: true, is_active: true }, step: null, attempts: verdictless })).body, NOT_STORED);
 
+    console.log("\nthe P2-7 review, F1: a pending verdict on a step the path rule makes done already");
+    const tightenedStep = { course_id: "c1", step_number: 1, pass_required: true };
+    const fact = { path_id: PATH, course_id: "c1", done_at: "2026-11-10T10:00:00Z", rule_pass_required: false };
+    const f1 = await run({ own: pathOwn(), step: tightenedStep, attempts: verdictless, facts: [fact] });
+    eq("a path attempt completed without a verdict, the step's rule tightened after its fact was recorded: { stored: true }, the facts read once",
+      [f1.status, f1.body, f1.factReads], [200, { stored: true }, 1]);
+    const f1Course = await run({ own: pathOwn(), course: { pass_required: true, is_active: true }, attempts: verdictless, facts: [fact] });
+    eq("…the course's rule tightened (the step has none of its own): { stored: true }", [f1Course.body, f1Course.factReads], [{ stored: true }, 1]);
+    const f1None = await run({ own: pathOwn(), step: tightenedStep, attempts: verdictless, facts: [] });
+    eq("…no fact: { stored: false } (the verdict wait), the facts read once", [f1None.body, f1None.factReads], [NOT_STORED, 1]);
+    const f1Other = await run({ own: pathOwn(), step: tightenedStep, attempts: verdictless, facts: [{ ...fact, path_id: "22222222-2222-4222-8222-222222222222" }] });
+    eq("…a fact of another path: { stored: false }", f1Other.body, NOT_STORED);
+    const f1Both = await run({ own: pathOwn(), step: tightenedStep, attempts: verdictless, facts: [{ ...fact, path_id: "22222222-2222-4222-8222-222222222222" }, fact] });
+    eq("…another path's fact of the course answered first, then this path's: this path's decides, { stored: true }", f1Both.body, { stored: true });
+    const f1d14 = await run({
+      own: pathOwn(), step: tightenedStep,
+      grants: [grant("a2", PKEY)],
+      attempts: [onPath(done("a1", "passed", 0.9)), onPath(done("a2", "unknown", null, "2026-11-10T11:30:00Z", { started_at: "2026-11-10T11:00:00Z" }))],
+    });
+    eq("D14, passed earlier and a granted retake completed with its verdict pending: { stored: true }, no facts read", [f1d14.body, f1d14.factReads], [{ stored: true }, 0]);
+    const f1Ind = await run({ course: { pass_required: true, is_active: true }, attempts: [done("a1", "unknown", null)], facts: [fact] });
+    eq("an Individual attempt with its verdict pending: { stored: false }, no facts read (a fact belongs to a path step)", [f1Ind.body, f1Ind.factReads], [NOT_STORED, 0]);
+    const f1Stored = await run({ own: pathOwn(), step: tightenedStep, attempts: [onPath(done("a1", "failed", 0.4))], facts: [fact] });
+    eq("a stored verdict answers as before, with no facts read", [f1Stored.body, f1Stored.factReads], [{ stored: true }, 0]);
+
     console.log("\nO5-d: never turns Continue on toward inactive content");
     for (const [who, rows, pathRows] of [
       ["a completed learner", [done("a1", "passed", 0.9)], [onPath(done("a1", "passed", 0.9))]],
@@ -333,7 +376,7 @@ async function main() {
     ], ["eq.u1", "eq.c1", "eq.approved", true]);
     const [, , pathQ, stepQ] = pathRead.rest;
     eq("the path read: its activity, by the key's path id", [pathQ.select, pathQ.query.get("id")], ["is_active", `eq.${PATH}`]);
-    eq("the step read: the step's own rule, by the path and the course", [stepQ.select, stepQ.query.get("path_id"), stepQ.query.get("course_id")], ["course_id,pass_required", `eq.${PATH}`, "eq.c1"]);
+    eq("the step read: its number and its own rule, by the path and the course", [stepQ.select, stepQ.query.get("path_id"), stepQ.query.get("course_id")], ["course_id,step_number,pass_required", `eq.${PATH}`, "eq.c1"]);
 
     console.log("\na database without 0107 (and without 0103)");
     const noContext = await run({ contextMissing: true, attempts: [done("a1", "passed", 0.9)] });
@@ -347,7 +390,7 @@ async function main() {
     const taggedRule = await run({ contextMissing: true, own: pathOwn(), course: { pass_required: true, is_active: true }, attempts: [onPath(done("a1", "unknown", null))] });
     eq("…the step read falls back without the step's rule, and the course's decides", [
       taggedRule.body, taggedRule.rest.filter((q) => q.path === "/rest/v1/learning_path_courses").map((q) => q.select),
-    ], [NOT_STORED, ["course_id,pass_required", "course_id"]]);
+    ], [NOT_STORED, ["course_id,step_number,pass_required", "course_id,step_number"]]);
     for (const contextFirst of [false, true]) {
       const both = await run({ contextMissing: true, columnMissing: true, contextFirst, attempts: [done("a1", "passed", 0.9)] });
       eq(`without 0103 and 0107 (the ${contextFirst ? "context" : "flag"} error first): both fallbacks, today's narrowest read answers`, [
@@ -359,7 +402,7 @@ async function main() {
     eq("any other error is never retried without the context: one attempts read, 503", [other.status, other.attemptsReads.length], [503, 1]);
 
     console.log("\nthe request count of one answer (auth included; no middleware)");
-    eq("with 0107: an Individual attempt 6, a path attempt 8", [ok.all, pathRead.all], [6, 8]);
+    eq("with 0107: an Individual attempt 6, a path attempt 8, a path attempt whose verdict is pending 9 (the facts read)", [ok.all, pathRead.all, f1.all], [6, 8, 9]);
     eq("without 0107: an Individual attempt 8 (the own read and the attempts read fall back once each), a path-tagged attempt 11 (and the step read)",
       [noContext.all, taggedRule.all], [8, 11]);
     eq("the stub answered every request the route made", unmatched, []);

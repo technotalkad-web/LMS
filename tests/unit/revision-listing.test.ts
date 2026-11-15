@@ -308,7 +308,7 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
   "app/[org]/(learner)/continue/page.tsx": {
     calls: [],
     feeds: [
-      ["the wait reads through readContextResult in the path's context", /const r = await readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds \}\);/],
+      ["the wait reads through readContextResult in the path's context", /const r = await readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds, reuse \}\);/],
     ],
   },
   // ADR 0019, note of 2026-11-11, and ADR 0024 P2-7: the bar's status route
