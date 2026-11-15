@@ -14,9 +14,10 @@
  *   - GET /api/super/impersonate answers the session to its owner only;
  *   - sign-out ends the session (row stamped, cookie deleted) before it signs
  *     out, and still signs out when ending it fails;
- *   - the other server routes that change the browser's sign-in (the email
- *     link callback, invitation accept, password change) end it too, and a
- *     source check keeps every such route on the one shared helper.
+ *   - the other server routes that change the browser's sign-in end it too:
+ *     the sign-in callback in each shape (?token_hash=, ?code= for Google and
+ *     PKCE links, and the fragment hand-off), invitation accept and password
+ *     change; a source check keeps every such route on the one shared helper.
  *
  * No database, no network.
  *
@@ -28,9 +29,14 @@ import path from "node:path";
 import ts from "typescript";
 
 let pass = 0, fail = 0;
-const eq = (n: string, got: unknown, want: unknown) => {
+/** `todo`, when given, is printed under a failure: what to change to pass. */
+const eq = (n: string, got: unknown, want: unknown, todo?: string) => {
   const ok = JSON.stringify(got) === JSON.stringify(want);
-  if (ok) { pass++; console.log(`  ✓ ${n}`); } else { fail++; console.log(`  ✗ ${n} — got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`); }
+  if (ok) { pass++; console.log(`  ✓ ${n}`); } else {
+    fail++;
+    console.log(`  ✗ ${n} — got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+    if (todo) console.log(`      what to do: ${todo}`);
+  }
 };
 
 type Row = Record<string, unknown>;
@@ -111,6 +117,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/logout") return new Response(null, { status: 204 });
   if (p === "/auth/v1/verify") return json(session("tok-member"));
   if (p === "/auth/v1/token" && q.get("grant_type") === "password") return json(session("tok-member"));
+  if (p === "/auth/v1/token" && q.get("grant_type") === "pkce") return json(session("tok-member"));
   if (p === "/auth/v1/admin/users") return json({ users: [MEMBER], aud: "authenticated" });
 
   if (p === "/rest/v1/platform_impersonation_sessions") {
@@ -323,13 +330,50 @@ async function main() {
     }
 
     console.log("\nother server routes that change the browser's sign-in end it too");
+    const NEXT = `/${ORG.slug}/dashboard`;
+    const callback = (query: string) => {
+      const qs = new URLSearchParams(query);
+      qs.set("next", NEXT);
+      return callbackRoute.GET(new Request(`http://lms.test/auth/callback?${qs}`));
+    };
+    const location = (res: Response) => [res.status >= 300 && res.status < 400, res.headers.get("location") ?? ""] as const;
     {
       const id = await ownerStarts();
-      const res = await callbackRoute.GET(new Request(`http://lms.test/auth/callback?token_hash=abc&type=magiclink&next=${encodeURIComponent(`/${ORG.slug}/dashboard`)}`));
+      const res = await callback("token_hash=abc&type=magiclink");
       const end = indexOf((r) => r.path === "/rest/v1/platform_impersonation_sessions" && r.method === "PATCH");
       const verify = indexOf((r) => r.path === "/auth/v1/verify");
-      eq("email link callback: redirects to next", [res.status >= 300 && res.status < 400, (res.headers.get("location") ?? "").endsWith(`/${ORG.slug}/dashboard`)], [true, true]);
-      eq("…the owner's row is ended before the link's sign-in", [typeof rows.get(id)?.ended_at, end >= 0 && end < verify], ["string", true]);
+      const [redirected, to] = location(res);
+      eq("email link callback (?token_hash=): redirects to next", [redirected, to.endsWith(NEXT)], [true, true]);
+      eq("…the owner's row is ended before the link's sign-in", [typeof rows.get(id)?.ended_at, verify >= 0, end >= 0 && end < verify], ["string", true, true]);
+      eq("…the cookie is deleted", browser.has(IMP_COOKIE), false);
+    }
+    {
+      // The PKCE shape: a Google sign-in or a PKCE email link. The browser
+      // holds the code verifier its sign-in started with.
+      const id = await ownerStarts();
+      browser.set(`${AUTH_COOKIE}-code-verifier`, JSON.stringify("verifier-1"));
+      const res = await callback("code=code-1");
+      const end = indexOf((r) => r.path === "/rest/v1/platform_impersonation_sessions" && r.method === "PATCH");
+      const exchange = indexOf((r) => r.path === "/auth/v1/token" && r.query.get("grant_type") === "pkce");
+      const sent = (exchange >= 0 ? JSON.parse(requests[exchange].body) : {}) as Row;
+      const [redirected, to] = location(res);
+      eq("callback with ?code= (Google, PKCE link): exchanges the code and redirects to next", [exchange >= 0, sent.auth_code, sent.code_verifier, redirected, to.endsWith(NEXT)], [true, "code-1", "verifier-1", true, true]);
+      eq("…the owner's row is ended before the code exchange", [typeof rows.get(id)?.ended_at, end >= 0 && end < exchange], ["string", true]);
+      eq("…the cookie is deleted", browser.has(IMP_COOKIE), false);
+    }
+    {
+      // Neither shape: the tokens are in the URL fragment, and /auth/finish
+      // signs in from the browser, where the HttpOnly cookie is out of reach,
+      // so the hand-off is the server's last chance to end the session.
+      const id = await ownerStarts();
+      const realWarn = console.warn;
+      console.warn = () => {};
+      let res: Response;
+      try { res = await callback(""); } finally { console.warn = realWarn; }
+      const [redirected, to] = location(res);
+      const signIns = requests.filter((r) => r.path === "/auth/v1/token" || r.path === "/auth/v1/verify").length;
+      eq("callback with neither code nor token_hash: hands off to /auth/finish with next", [redirected, to.endsWith(`/auth/finish?next=${encodeURIComponent(NEXT)}`)], [true, true]);
+      eq("…the owner's row is ended on the way, with no sign-in request on the server", [typeof rows.get(id)?.ended_at, signIns], ["string", 0]);
       eq("…the cookie is deleted", browser.has(IMP_COOKIE), false);
     }
     {
@@ -369,14 +413,36 @@ async function main() {
       // comment naming one does not count.
       const SIGN_IN_OUT = new Set(["signOut", "signInWithPassword", "signInWithIdToken", "exchangeCodeForSession", "verifyOtp", "setSession"]);
       const HELPER = "endImpersonationForSessionChange";
-      const sites: string[] = [];
-      for (const f of files) {
-        const src = fs.readFileSync(f, "utf8");
-        const sf = ts.createSourceFile(f, src, ts.ScriptTarget.Latest, true, f.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
-        // Browser code cannot reach the HttpOnly cookie; the read's user check covers it.
+      // The server routes that change the browser's sign-in, each with a
+      // behavioural case above.
+      const KNOWN = [
+        "app/api/auth/change-password/route.ts",
+        "app/api/invitations/accept/route.ts",
+        "app/auth/callback/route.ts",
+        "app/auth/sign-out/route.ts",
+      ];
+      const ADD = `call ${HELPER}() from @/lib/auth/impersonation before the sign-in or sign-out (after a password change), add a behavioural case above, then add the file to KNOWN in this test`;
+
+      /** May this updateUser argument set a password? An object literal only
+       *  when it has a password key; anything the check cannot read (a
+       *  variable, a spread, a computed key) counts, so it fails closed. */
+      const setsPassword = (arg: ts.Expression | undefined) => {
+        if (!arg) return false;
+        if (!ts.isObjectLiteralExpression(arg)) return true;
+        return arg.properties.some((p) => {
+          if (ts.isSpreadAssignment(p) || (p.name && ts.isComputedPropertyName(p.name))) return true;
+          return (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p))
+            && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === "password";
+        });
+      };
+      /** Source positions of the sign-in changes, password changes and helper
+       *  calls in one file; null for browser code ("use client"), which cannot
+       *  reach the HttpOnly cookie (the read's user check covers it). */
+      const scan = (file: string, src: string) => {
+        const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
         const first = sf.statements[0];
-        if (first && ts.isExpressionStatement(first) && ts.isStringLiteral(first.expression) && first.expression.text === "use client") continue;
-        const changes: number[] = [], updates: number[] = [], helper: number[] = [];
+        if (first && ts.isExpressionStatement(first) && ts.isStringLiteral(first.expression) && first.expression.text === "use client") return null;
+        const changes: number[] = [], passwords: number[] = [], helper: number[] = [];
         let imported = false;
         const visit = (n: ts.Node) => {
           if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) && n.moduleSpecifier.text === "@/lib/auth/impersonation") {
@@ -388,25 +454,50 @@ async function main() {
             if (ts.isIdentifier(callee) && callee.text === HELPER) helper.push(n.getStart(sf));
             if (ts.isPropertyAccessExpression(callee) && ts.isPropertyAccessExpression(callee.expression) && callee.expression.name.text === "auth") {
               if (SIGN_IN_OUT.has(callee.name.text)) changes.push(n.getStart(sf));
-              if (callee.name.text === "updateUser") updates.push(n.getStart(sf));
+              if (callee.name.text === "updateUser" && setsPassword(n.arguments[0])) passwords.push(n.getStart(sf));
             }
           }
           ts.forEachChild(n, visit);
         };
         visit(sf);
-        if (changes.length === 0 && updates.length === 0) continue;
+        return { imported, changes, passwords, helper };
+      };
+
+      // The scan itself, on small sources.
+      const probe = (src: string) => scan("probe.ts", src)!;
+      const count = (src: string) => probe(src).passwords.length;
+      eq("scan: an updateUser that sets only metadata is not a password change", [count("await s.auth.updateUser({ data: { name } });"), count("await s.auth.updateUser({ email });")], [0, 0]);
+      eq("scan: a password key counts, written plain, shorthand or quoted", [count("s.auth.updateUser({ password: pw })"), count("s.auth.updateUser({ password })"), count(`s.auth.updateUser({ "password": pw, data: {} })`)], [1, 1, 1]);
+      eq("scan: an updateUser argument it cannot read counts (a variable, a spread)", [count("s.auth.updateUser(attrs)"), count("s.auth.updateUser({ ...attrs })")], [1, 1]);
+      const bare = probe("// s.auth.signOut()\nawait s.auth.signOut();");
+      eq("scan: a sign-out with no helper call is found; a comment naming one is not", [bare.changes.length, bare.helper.length, bare.imported], [1, 0, false]);
+      eq("scan: browser code is skipped", scan("probe.tsx", `"use client";\nawait s.auth.signOut();`), null);
+
+      const sites: string[] = [];
+      for (const f of files) {
+        const r = scan(f, fs.readFileSync(f, "utf8"));
+        if (!r || (r.changes.length === 0 && r.passwords.length === 0)) continue;
         const rel = path.relative(root, f).split(path.sep).join("/");
         sites.push(rel);
-        eq(`${rel}: imports the helper from lib/auth/impersonation`, imported, true);
-        eq(`${rel}: ends the impersonation before each sign-in or sign-out`, changes.every((c) => helper.some((h) => h < c)), true);
-        eq(`${rel}: ends it after each password change`, updates.every((u) => helper.some((h) => h > u)), true);
+        eq(`${rel}: imports ${HELPER} from @/lib/auth/impersonation`, r.imported, true,
+          `${rel}: import ${HELPER} from @/lib/auth/impersonation and call it before the sign-in or sign-out (after a password change)`);
+        if (r.changes.length > 0) {
+          eq(`${rel}: ${HELPER}() is called earlier in the source than each sign-in or sign-out (position only; the cases above check the run-time order)`,
+            r.changes.every((c) => r.helper.some((h) => h < c)), true,
+            `${rel}: call ${HELPER}() before the sign-in or sign-out change, while the current user is still signed in`);
+        }
+        if (r.passwords.length > 0) {
+          eq(`${rel}: ${HELPER}() is called later in the source than each updateUser that may set a password`,
+            r.passwords.every((u) => r.helper.some((h) => h > u)), true,
+            `${rel}: call ${HELPER}() after the password change succeeds`);
+        }
+        eq(`${rel}: is on the known list of server routes that change the sign-in`, KNOWN.includes(rel), true,
+          `${rel} changes the sign-in on the server: ${ADD}`);
       }
-      eq("the server sites are the four known routes", sites.sort(), [
-        "app/api/auth/change-password/route.ts",
-        "app/api/invitations/accept/route.ts",
-        "app/auth/callback/route.ts",
-        "app/auth/sign-out/route.ts",
-      ]);
+      for (const k of KNOWN) {
+        eq(`${k}: on the known list and still changes the sign-in`, sites.includes(k), true,
+          `${k} no longer signs in, signs out or sets a password on the server: remove it from KNOWN in this test, or update its path if it moved`);
+      }
     }
 
     eq("the stub answered every request the code made", unmatched, []);
