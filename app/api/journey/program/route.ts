@@ -11,7 +11,11 @@ import { resolveManyGroups } from "@/lib/org/groups";
  *   DELETE /api/journey/program { orgSlug, program_id, confirm_name }
  *
  * Admin-only; the caller-bound client runs under RLS (admins manage journey
- * tables), so RLS is the final authority on every write.
+ * tables), so RLS is the final authority on every write it makes. The one
+ * exception is the publish's re-pin with apply_to=all (ADR 0024 step 47): a
+ * service-role call of journey_repin_enrollments, whose authority is ctx()'s
+ * role check, the program read scoped to the caller's organisation and the
+ * function's own check that the version is the program's current one.
  */
 
 async function ctx(orgSlug: string | undefined) {
@@ -46,9 +50,9 @@ export async function POST(request: Request) {
     action?: string;
     program_id?: string;
     /** "new" (default): version applies to new enrollments only.
-     *  "all": ALSO re-pin every ACTIVE enrollment to the new version —
-     *  progress is preserved (completed-mission count carries over; the
-     *  learner continues at the new curriculum's next mission). */
+     *  "all": ALSO re-pin the ACTIVE enrollments to the new version through
+     *  journey_repin_enrollments (ADR 0024 step 47): credits stay with their
+     *  day by identity, so nobody repeats a day they completed. */
     apply_to?: string;
   };
   const c = await ctx(body.orgSlug);
@@ -125,57 +129,69 @@ export async function POST(request: Request) {
     if (uErr) return NextResponse.json({ error: uErr.message }, { status: 400 });
 
     // ---- Optional force-update: move ACTIVE learners onto the new version.
-    // Progress rows stay untouched — completed-mission COUNT carries over,
-    // so each learner resumes at the new curriculum's next mission. If a
-    // learner has already completed as many missions as the new curriculum
-    // holds, they're marked complete (badge included) rather than stranded.
-    let migrated = 0;
-    let completedNow = 0;
+    // ADR 0024 step 47: one call of journey_repin_enrollments (0107) names
+    // the version just made current and, in one transaction, re-pins the
+    // program's active enrolments (step 94's gate keeps some on their
+    // version), writes the credits a relaxed rule earns and completes every
+    // enrolment whose required days are all credited by day id, badge
+    // included. Completed and reset enrolments are never selected. No
+    // attempt or credit row is updated or deleted, and no email is sent
+    // (decision A20). Service role only. The version insert, the pointer
+    // update and this call stay three requests: if the call fails after the
+    // pointer moved, the version stands for new enrolments. The admin's
+    // retry ("Publish again with apply to all") publishes once more, a new
+    // version of the same draft, and this call re-pins to that one. That is
+    // safe because the function selects active enrolments only and inserts
+    // credits without updating or deleting any credit or attempt; it is not
+    // the same call repeated.
     if (body.apply_to === "all") {
-      const { data: activeEnrs, error: aErr } = await c.supabase
-        .from("journey_enrollments")
-        .update({ version_id: version.id })
-        .eq("program_id", body.program_id)
-        .eq("status", "active")
-        .select("id, user_id");
-      if (aErr) return NextResponse.json({ error: aErr.message }, { status: 400 });
-      const enrs = (activeEnrs ?? []) as Array<{ id: string; user_id: string }>;
-      migrated = enrs.length;
-
-      const missionCount = days.filter((d) => d.course_id).length;
-      if (enrs.length > 0 && missionCount > 0) {
-        const svc = createServiceClient(
-          process.env.NEXT_PUBLIC_SUPABASE_URL!,
-          process.env.SUPABASE_SERVICE_ROLE_KEY!,
-          { auth: { persistSession: false } }
-        );
-        for (const enr of enrs) {
-          const { count } = await svc
-            .from("journey_day_progress")
-            .select("id", { count: "exact", head: true })
-            .eq("enrollment_id", enr.id);
-          if ((count ?? 0) >= missionCount) {
-            await svc
-              .from("journey_enrollments")
-              .update({ status: "completed", completed_at: new Date().toISOString() })
-              .eq("id", enr.id);
-            // Permanent badge — duplicate-insert errors mean "already has it".
-            await svc.from("user_badges").insert({
-              organization_id: c.org.id,
-              user_id: enr.user_id,
-              badge_slug: "yoddha",
-              metadata: { source: "journey_force_update", version: version.version_number },
-            });
-            completedNow++;
-          }
-        }
+      const svc = createServiceClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!,
+        { auth: { persistSession: false } }
+      );
+      const { data: repin, error: rErr } = await svc.rpc("journey_repin_enrollments", {
+        p_program_id: body.program_id,
+        p_version_id: version.id,
+        p_draft: null,
+        p_dry_run: false,
+      });
+      if (rErr && rErr.code === "PGRST202") {
+        // A database without 0107 (decision A19): the function is missing,
+        // so this publish completes and re-pins nobody. It stands for new
+        // enrolments; nothing else is written.
+        console.warn(JSON.stringify({ event: "journey_repin_unavailable", program_id: body.program_id, version_id: version.id }));
+        return NextResponse.json({
+          ok: true,
+          version_number: version.version_number,
+          repinned: 0,
+          completed_now: 0,
+        });
       }
+      const counts = repin as Record<string, unknown> | null;
+      if (rErr || !counts || typeof counts !== "object" || typeof counts.completed_now !== "number") {
+        console.error(JSON.stringify({ event: "journey_repin_failed", program_id: body.program_id, version_id: version.id, code: rErr?.code ?? null }));
+        return NextResponse.json(
+          {
+            error: `Published v${version.version_number} for new enrollments, but moving the active learners failed. Publish again with "apply to all" to retry.`,
+            version_number: version.version_number,
+          },
+          { status: 400 }
+        );
+      }
+      // The function's counts, as it answers them (step 47).
+      const { dry_run: _dryRun, ...repinCounts } = counts;
+      void _dryRun;
+      return NextResponse.json({
+        ok: true,
+        version_number: version.version_number,
+        ...repinCounts,
+      });
     }
 
     return NextResponse.json({
       ok: true,
       version_number: version.version_number,
-      ...(body.apply_to === "all" ? { migrated, completed_now: completedNow } : {}),
     });
   }
 

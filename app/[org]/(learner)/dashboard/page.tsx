@@ -28,7 +28,15 @@ import {
   DEFAULT_WELCOME_MESSAGE,
   effectiveScoreLabel,
 } from "@/lib/gamification/board-copy";
-import { effectiveJourneyCopy } from "@/lib/journey/journey";
+import {
+  computeJourneyState,
+  courseDaysOf,
+  creditedDaysFor,
+  effectiveJourneyCopy,
+  todayStr,
+  DEFAULT_JOURNEY_TZ,
+} from "@/lib/journey/journey";
+import { readJourneyCredits } from "@/lib/journey/credits-read";
 import { DashboardBackground } from "@/components/dashboard/dashboard-background";
 import {
   normalizeBackground,
@@ -136,6 +144,17 @@ export default async function DashboardPage({
     user.email ||
     "";
 
+  // The organisation's gamification_settings row, read once: 0.15's journey
+  // day maths takes its timezone and 0.2 its welcome line. select("*") on
+  // purpose (house rule): naming per-migration columns here (0057
+  // welcome_message, 0066 score_label) would error the whole query on a
+  // database that hasn't run that migration yet.
+  const { data: gsw } = await supabase
+    .from("gamification_settings")
+    .select("*")
+    .eq("organization_id", org.id)
+    .maybeSingle();
+
   // 0.15) Yoddha journey banner data (0058) — fail-soft: pre-migration the
   // select errors, journey stays null, banner hidden.
   let journey: {
@@ -159,7 +178,7 @@ export default async function DashboardPage({
         // instantly); days_total pinned to the enrollment's version. `*` on
         // the program keeps this deploy-safe across program-column
         // migrations (0063's priority etc. arrive as undefined before it).
-        "id, start_date, journey_versions!inner(days_total), journey_programs!inner(*)"
+        "id, version_id, start_date, journey_versions!inner(days_total, days, count_sundays, unlock_mode), journey_programs!inner(*)"
       )
       .eq("organization_id", org.id)
       .eq("user_id", user.id)
@@ -175,10 +194,12 @@ export default async function DashboardPage({
       focus_enabled?: boolean;
       focus_pinned?: unknown;
     };
+    type JVer = { days_total: number; days: unknown; count_sundays: boolean; unlock_mode?: string | null };
     type JRow = {
       id: string;
+      version_id: string;
       start_date: string;
-      journey_versions: { days_total: number } | Array<{ days_total: number }>;
+      journey_versions: JVer | JVer[];
       journey_programs: JProg | JProg[];
     };
     // Highest-priority RUNNING journey (rank 1 first) leads the banner when
@@ -211,33 +232,45 @@ export default async function DashboardPage({
         ? j.journey_versions[0]
         : j.journey_versions;
       const jc = effectiveJourneyCopy(jProg?.copy);
-      const { count } = await supabase
-        .from("journey_day_progress")
-        .select("id", { count: "exact", head: true })
-        .eq("enrollment_id", j.id);
-      journey = {
-        id: j.id,
-        day: Math.min(ver?.days_total ?? 90, (count ?? 0) + 1),
-        total: ver?.days_total ?? 90,
-        name: jProg?.name ?? "90-Day Yoddha Journey",
-        icon: jProg?.icon ?? "🏹",
-        line: jc.banner_line,
-      };
+      // The banner's day is the twin's open day (ADR 0024 step 45), the day
+      // the journey page shows, read from the credits by day id; never the
+      // row count plus one. A failed read hides the banner rather than show
+      // a day on a guess.
+      const credits = ver ? await readJourneyCredits(supabase, [{ id: j.id, version_id: j.version_id }]) : null;
+      if (credits && !credits.ok) {
+        console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "dashboard", code: credits.error?.code ?? null }));
+      }
+      if (ver && credits?.ok) {
+        const tz = (gsw as { timezone?: string | null } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+        const state = computeJourneyState({
+          startDate: j.start_date,
+          today: todayStr(tz),
+          creditedDays: creditedDaysFor(
+            { days: ver.days, days_total: ver.days_total, day_ids: credits.dayIdsOf(j.version_id) },
+            credits.rowsOf(j.id)
+          ),
+          daysTotal: ver.days_total,
+          countSundays: ver.count_sundays === true,
+          unlockMode: ver.unlock_mode === "progress" ? "progress" : "calendar",
+          courseDays: courseDaysOf(ver.days, ver.days_total),
+        });
+        journey = {
+          id: j.id,
+          day: state.currentDay,
+          total: ver.days_total,
+          name: jProg?.name ?? "90-Day Yoddha Journey",
+          icon: jProg?.icon ?? "🏹",
+          line: jc.banner_line,
+        };
+      }
     }
   }
 
   // 0.2) Org-editable welcome line (migration 0057; members can read their
   // org's gamification_settings under RLS). Fail-soft to the default — a
   // pre-0057 database errors this select and we just keep the default.
+  // (The settings row itself is read once, before 0.15.)
   let welcomeMessage = DEFAULT_WELCOME_MESSAGE;
-  // select("*") on purpose (house rule): naming per-migration columns here
-  // (0057 welcome_message, 0066 score_label) would error the whole query on
-  // a database that hasn't run that migration yet.
-  const { data: gsw } = await supabase
-    .from("gamification_settings")
-    .select("*")
-    .eq("organization_id", org.id)
-    .maybeSingle();
   const gswRow = gsw as {
     welcome_message?: string | null;
     score_label?: string | null;

@@ -4,10 +4,13 @@ import { resolveUserGroupIds } from "@/lib/org/groups";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditCoursesFor,
+  creditedDaysFor,
   parseVersionDays,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import { readJourneyCredits, type JourneyCredits } from "@/lib/journey/credits-read";
 
 export type CourseAccess = {
   allowed: boolean;
@@ -54,6 +57,14 @@ export async function learnerCanAccessCourse(opts: {
   isAdmin: boolean;
   /** Pass `courses.visibility` if already loaded to skip a query. */
   visibility?: string | null;
+  /**
+   * The caller's own journey credit read (readJourneyCredits, same client)
+   * and the enrolment ids it covers, so one render reads the credits once
+   * (the launch page's journey block). Used only when it is ok and covers
+   * every active enrolment that holds the course; otherwise the credits are
+   * read here.
+   */
+  journeyCredits?: { ids: ReadonlySet<string>; credits: JourneyCredits };
 }): Promise<CourseAccess> {
   const { supabase, orgId, userId, courseId, isAdmin } = opts;
   if (isAdmin) return { allowed: true, upcomingAt: null };
@@ -243,6 +254,8 @@ export async function learnerCanAccessCourse(opts: {
       .eq("organization_id", orgId)
       .maybeSingle();
     const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
+    type Version = NonNullable<ReturnType<typeof versions.get>>;
+    const holding: Array<{ enr: (typeof enrollments)[number]; v: Version; courseDays: number[] }> = [];
     for (const enr of enrollments) {
       const v = versions.get(enr.version_id);
       if (!v) continue;
@@ -254,30 +267,75 @@ export async function learnerCanAccessCourse(opts: {
         // Yoddha alumni keep review access to their journey modules.
         return { allowed: true, upcomingAt: null };
       }
-      const { count } = await supabase
-        .from("journey_day_progress")
-        .select("id", { count: "exact", head: true })
-        .eq("enrollment_id", enr.id);
-      const state = computeJourneyState({
-        startDate: enr.start_date,
-        today: todayStr(tz),
-        completedCount: count ?? 0,
-        daysTotal: v.days_total,
-        countSundays: v.count_sundays === true,
-        unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
-        courseDays: courseDaysOf(v.days, v.days_total),
-      });
-      // Launchable day = the day the learner may open now, plus earlier
-      // (completed) days for revision. Progress mode has no calendar ceiling,
-      // so it keys off openableDay; calendar keeps the drip ceiling.
-      const ceiling =
-        v.unlock_mode === "progress"
-          ? state.finished
-            ? v.days_total
-            : state.openableDay
-          : Math.min(state.allowedDay, state.currentDay);
-      if (courseDays.some((d) => d <= ceiling)) {
-        return { allowed: true, upcomingAt: null };
+      holding.push({ enr, v, courseDays });
+    }
+    if (holding.length > 0) {
+      // The credits of every active enrolment that holds the course, in one
+      // read by day id (ADR 0024 step 45), never a count per enrolment. A
+      // failed read grants nothing through a journey: it is never "no
+      // credits", which would open the first course day. The caller's own
+      // read is used when it covers every enrolment here.
+      const given = opts.journeyCredits;
+      const credits =
+        given && given.credits.ok && holding.every((h) => given.ids.has(h.enr.id))
+          ? given.credits
+          : await readJourneyCredits(
+              supabase,
+              holding.map((h) => ({ id: h.enr.id, version_id: h.enr.version_id }))
+            );
+      if (!credits.ok) {
+        console.warn(JSON.stringify({ event: "journey_credits_unreadable", where: "course_access", code: credits.error?.code ?? null }));
+      } else {
+        for (const { enr, v, courseDays } of holding) {
+          const rows = credits.rowsOf(enr.id);
+          const credited = creditedDaysFor(
+            { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+            rows
+          );
+          // The course on each credited day's credit row, matched as above.
+          const creditCourse = creditCoursesFor(
+            { days: v.days, days_total: v.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+            rows
+          );
+          const state = computeJourneyState({
+            startDate: enr.start_date,
+            today: todayStr(tz),
+            creditedDays: credited,
+            daysTotal: v.days_total,
+            countSundays: v.count_sundays === true,
+            unlockMode: v.unlock_mode === "progress" ? "progress" : "calendar",
+            courseDays: courseDaysOf(v.days, v.days_total),
+          });
+          // Launchable (ADR 0024 step 45): a course day at or below the
+          // ceiling, the day the learner may open now; or, above it, a
+          // credited day whose credit row holds this course, for review.
+          // Progress mode has no calendar ceiling, so it keys off
+          // openableDay; calendar keeps the drip ceiling. A re-pin can number
+          // a credited day above the open day. There (past the ceiling) the
+          // day is granted only for the course on its credit row (step 22's
+          // row for `?journey=E&day=`: "the day is credited and this course
+          // is the course on its credit row"), so a publish that swapped its
+          // course does not offer the new course (section 95's row "A day's
+          // course swapped"), and a credit row whose course is null grants
+          // nothing. At or below the ceiling the day's current course is
+          // granted as before, a credited day whose course a publish swapped
+          // included, and a completed enrolment (above) grants every course
+          // of its pinned version. Both are the P2-6 gap: step 22's rows for
+          // `?journey=E&day=` and for a completed E, and step 23's grant,
+          // which also adds a started day past the ceiling and the credit
+          // row's own course once the day holds another (granted nowhere
+          // today). tests/unit/journey-state.test.ts (f) pins today's
+          // behaviour, each case labelled "P2-6 gap (step 22)".
+          const ceiling =
+            v.unlock_mode === "progress"
+              ? state.finished
+                ? v.days_total
+                : state.openableDay
+              : Math.min(state.allowedDay, state.currentDay);
+          if (courseDays.some((d) => d <= ceiling || (credited.includes(d) && creditCourse.get(d) === courseId))) {
+            return { allowed: true, upcomingAt: null };
+          }
+        }
       }
     }
   }

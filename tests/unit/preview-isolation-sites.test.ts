@@ -448,7 +448,8 @@ const EXEMPT: Array<[string, string]> = [
   eq("the CRM progress route: one decision for the request, passed to the pre-selection and every buildProgress call",
     /const previews: ContextFilterState = \{ applies: null \};/.test(route) &&
       /usersMatchingAttempts\(svc, orgId, f, previews\)/.test(route) &&
-      (route.match(/buildProgress\([^;]*, f, tz, previews\)/g) ?? []).length === 2, true);
+      // (P2-4 adds the journey credit read's own decision after it.)
+      (route.match(/buildProgress\([^;]*, f, tz, previews, journeyCredits\)/g) ?? []).length === 2, true);
 }
 
 // ---------------------------------------------------------------------------

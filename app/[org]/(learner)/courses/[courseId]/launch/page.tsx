@@ -14,10 +14,12 @@ import type { CmiData } from "@/lib/scorm/types";
 import {
   computeJourneyState,
   courseDaysOf,
+  creditedDaysFor,
   parseVersionDays,
   todayStr,
   DEFAULT_JOURNEY_TZ,
 } from "@/lib/journey/journey";
+import { readJourneyCredits, type JourneyCredits } from "@/lib/journey/credits-read";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/scoring/policy";
@@ -128,6 +130,16 @@ export default async function LaunchPage({
   // address's own reading of the course's setting.
   const passRequired = c.pass_required === true;
 
+  // ADR 0014 step 3, fail closed: every read that feeds the launch verdict or
+  // the row choice refuses on error, and so does every disagreement between
+  // the launch kind and the row. One refusal for all of them: back to the
+  // course page with the retry notice, nothing written. redirect() throws, so
+  // no refusal may sit inside a try that would swallow it.
+  const refuse: (reason: string) => never = (reason) => {
+    console.warn(JSON.stringify({ event: "launch_refused", reason, course_id: c.id, user_id: user.id }));
+    redirect(`/${orgSlug}/courses/${courseId}?retry=1`);
+  };
+
   // ---- Yoddha journey context (?journey=<enrollmentId>&day=<n>) ----
   // Runs BEFORE the generic entitlement gate: a locked journey day must
   // bounce to the friendly journey?locked notice, not to the generic
@@ -141,6 +153,9 @@ export default async function LaunchPage({
   // The next journey day's course — warmed in the background by the runtime
   // while the learner works through today's mission (never launched here).
   let journeyNextCourseId: string | null = null;
+  // The block's credit read, handed to the access check below so the render
+  // reads the same credits once (ADR 0024 P2-4).
+  let journeyCredits: { ids: ReadonlySet<string>; credits: JourneyCredits } | undefined;
   if (journeyParam && dayParam) {
     const dayN = parseInt(dayParam, 10);
     // Rules and curriculum come from the enrollment's PINNED VERSION —
@@ -148,7 +163,7 @@ export default async function LaunchPage({
     const { data: enrRow } = await supabase
       .from("journey_enrollments")
       .select(
-        "id, start_date, status, journey_versions!inner(days_total, count_sundays, days, unlock_mode), journey_programs!inner(is_active)"
+        "id, version_id, start_date, status, journey_versions!inner(days_total, count_sundays, days, unlock_mode), journey_programs!inner(is_active)"
       )
       .eq("id", journeyParam)
       .eq("user_id", user.id)
@@ -158,6 +173,7 @@ export default async function LaunchPage({
       .maybeSingle();
     const enr = enrRow as {
       id: string;
+      version_id: string;
       start_date: string;
       status: string;
       journey_versions:
@@ -184,18 +200,18 @@ export default async function LaunchPage({
     ) {
       const dayEntry = parseVersionDays(prog.days).get(dayN);
       if (dayEntry?.course_id === courseId) {
-        const { data: doneRows } = await supabase
-          .from("journey_day_progress")
-          .select("day_number")
-          .eq("enrollment_id", enr.id);
-        // Completed DAY NUMBERS, not just a count — with rest days in the
-        // curriculum the two differ, and the old `dayN > count` comparison
-        // wrongly bounced reviews of finished missions to the locked notice.
-        const doneDays = new Set(
-          ((doneRows ?? []) as Array<{ day_number: number }>).map(
-            (r) => r.day_number
-          )
+        // The credited days by day id (ADR 0024 step 45): the numbers, in the
+        // pinned version, of the days whose id holds a credit; never a count
+        // and never a credit's own number. A failed read refuses with the
+        // retry notice and writes nothing (ADR 0014 step 3, fail closed).
+        const credits = await readJourneyCredits(supabase, [{ id: enr.id, version_id: enr.version_id }]);
+        if (!credits.ok) refuse("journey_credits_unreadable");
+        journeyCredits = { ids: new Set([enr.id]), credits };
+        const creditedDays = creditedDaysFor(
+          { days: prog.days, days_total: prog.days_total, day_ids: credits.dayIdsOf(enr.version_id) },
+          credits.rowsOf(enr.id)
         );
+        const doneDays = new Set(creditedDays);
         const { data: gsRow } = await supabase
           .from("gamification_settings")
           .select("timezone")
@@ -206,7 +222,7 @@ export default async function LaunchPage({
         const state = computeJourneyState({
           startDate: enr.start_date,
           today: todayStr(tz),
-          completedCount: doneDays.size,
+          creditedDays,
           daysTotal: prog.days_total,
           countSundays: prog.count_sundays === true,
           unlockMode: prog.unlock_mode === "progress" ? "progress" : "calendar",
@@ -240,6 +256,7 @@ export default async function LaunchPage({
     userId: user.id,
     courseId: c.id,
     isAdmin: canManage(role),
+    journeyCredits,
   });
   if (!access.allowed) {
     redirect(
@@ -283,15 +300,8 @@ export default async function LaunchPage({
     { auth: { persistSession: false } }
   );
 
-  // ADR 0014 step 3, fail closed: every read that feeds the launch verdict or
-  // the row choice refuses on error, and so does every disagreement between
-  // the launch kind and the row. One refusal for all of them: back to the
-  // course page with the retry notice, nothing written. redirect() throws, so
-  // no refusal may sit inside a try that would swallow it.
-  const refuse: (reason: string) => never = (reason) => {
-    console.warn(JSON.stringify({ event: "launch_refused", reason, course_id: c.id, user_id: user.id }));
-    redirect(`/${orgSlug}/courses/${courseId}?retry=1`);
-  };
+  // (refuse(), the one refusal, is defined above the journey block, whose
+  // credit read refuses with it too.)
 
   // The learner's approved grants on this course, read in one strict select
   // per decision (grantSnapshotFor): a failed read refuses; a database
