@@ -22,19 +22,29 @@
  *   (d) a session update or delete that changes no row (RLS refused it) is
  *       an error, never ok, a delete that removed nothing sends no
  *       notification, and an SSO provider the row did not record is removed
- *       again;
+ *       again; a delete that finds the row gone by then (it crossed another
+ *       one) answers 404, and 503 when that second read fails;
  *   (e) POST /api/learning-path-assignments keeps the path and the named
  *       users and teams inside the caller's org;
  *   (f) the role counted is the one in the org the call acts on: an admin
  *       of another org who is a plain member of this one is refused;
- *   (g) a failed read of the path, members or teams the assignees are
- *       checked against answers 503 and writes nothing (POST
+ *   (g) a failed read of the path, members, teams or groups the assignees
+ *       are checked against answers 503 and writes nothing (POST
  *       /api/learning-path-assignments and POST /api/assignments), so no
  *       named assignee is dropped silently; a failed read of the row a
  *       delete removes answers 503, not the 404 the admin pages take as
  *       already removed;
  *   (h) branding validates every field (the learner theme too) before any
- *       Cloudflare call.
+ *       Cloudflare call;
+ *   (i) a failed read of the caller's role answers 503 "try again", not
+ *       403, and a failed org read in requireOrgAdminApi 503, not 404, with
+ *       no service-key, Cloudflare or write request;
+ *   (j) an SSO configure whose organizations update answers an error
+ *       removes the new provider only when a fresh read shows the row does
+ *       not hold it: saved after all, it answers ok; unreadable, it keeps
+ *       the provider;
+ *   (k) the admin pages take only a 404 from an assignment delete as
+ *       already removed (source check): 403 and 503 still show the error.
  *
  * The stub models RLS: a session write by a non-admin changes no row
  * (update / delete answer []) or fails (insert answers 42501). next/headers
@@ -43,7 +53,9 @@
  *
  * Run:  npx tsx tests/unit/org-admin-routes.test.ts   (or npm run test:unit)
  */
+import fs from "node:fs";
 import Module from "node:module";
+import path from "node:path";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -79,6 +91,19 @@ let otherRole: string | null = null;
 let zeroRows = false;
 /** A table whose reads fail (the caller's own role read excepted). */
 let failRead: string | null = null;
+/** The caller's own role read fails. */
+let failRole = false;
+/** After a 0-row assignment delete, the row is gone (another delete crossed it) or its read fails. */
+let afterDelete: "gone" | "fails" | null = null;
+let deletedAway: "gone" | "fails" | null = null;
+/**
+ * An admin's organizations update answers an error: "error" (not saved),
+ * "lost-reply" (saved, the reply lost), "lost-reply-unreadable" (saved, and
+ * the row's reads fail after it).
+ */
+let orgUpdate: "error" | "lost-reply" | "lost-reply-unreadable" | null = null;
+let orgSaved: Row | null = null;
+let orgUpdated = false;
 const unmatched: string[] = [];
 const isAdmin = () => role === "super_owner" || role === "owner" || role === "admin";
 
@@ -176,7 +201,15 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   // RLS on the admin-only tables: a non-admin session update / delete changes
   // no row and answers no error; an insert fails.
   if (method === "PATCH" || method === "DELETE") {
-    if (session && (!isAdmin() || zeroRows)) return json([]);
+    if (session && isAdmin() && orgUpdate && method === "PATCH" && p === "/rest/v1/organizations") {
+      if (orgUpdate !== "error") orgSaved = body as Row;
+      orgUpdated = true;
+      return json({ code: "08006", message: "stub connection lost" }, 500);
+    }
+    if (session && (!isAdmin() || zeroRows)) {
+      if (method === "DELETE" && afterDelete) deletedAway = afterDelete;
+      return json([]);
+    }
     const id = (q.get("id") ?? "eq.x").replace(/^eq\./, "");
     return json([{ id }]);
   }
@@ -187,8 +220,16 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return asObject ? json(out[0], 201) : json(out, 201);
   }
 
-  if (failRead && p === `/rest/v1/${failRead}` && select !== "role") return json({ code: "XX000", message: "stub read failure" }, 500);
-  if (p === "/rest/v1/organizations") return list([orgRow()].filter((r) => matches(r, q)));
+  const readFailure = () => json({ code: "XX000", message: "stub read failure" }, 500);
+  if (failRead && p === `/rest/v1/${failRead}` && select !== "role") return readFailure();
+  if (failRole && p === "/rest/v1/organization_members" && select === "role") return readFailure();
+  if (deletedAway && (p === "/rest/v1/course_assignments" || p === "/rest/v1/learning_path_assignments")) {
+    return deletedAway === "fails" ? readFailure() : list([]);
+  }
+  if (p === "/rest/v1/organizations") {
+    if (orgUpdate === "lost-reply-unreadable" && orgUpdated) return readFailure();
+    return list([{ ...orgRow(), ...(orgSaved ?? {}) }].filter((r) => matches(r, q)));
+  }
   if (p === "/rest/v1/organization_members") {
     if (select === "role") {
       // The caller's own membership rows, filtered as asked (org and user).
@@ -270,13 +311,22 @@ async function main() {
         run: () => pathCourses.POST(post(`/api/learning-paths/${PATH}/courses`, { courseId: COURSE, notify_update: true }), params(PATH)) },
     ];
 
-    const world = (o: { role?: string | null; otherRole?: string | null; signedIn?: boolean; zeroRows?: boolean; failRead?: string }) => {
+    const world = (o: {
+      role?: string | null; otherRole?: string | null; signedIn?: boolean; zeroRows?: boolean; failRead?: string;
+      failRole?: boolean; afterDelete?: "gone" | "fails"; orgUpdate?: "error" | "lost-reply" | "lost-reply-unreadable";
+    }) => {
       requests = [];
       role = o.role === undefined ? "user" : o.role;
       otherRole = o.otherRole ?? null;
       signedIn = o.signedIn ?? true;
       zeroRows = o.zeroRows ?? false;
       failRead = o.failRead ?? null;
+      failRole = o.failRole ?? false;
+      afterDelete = o.afterDelete ?? null;
+      deletedAway = null;
+      orgUpdate = o.orgUpdate ?? null;
+      orgSaved = null;
+      orgUpdated = false;
     };
     const call = async (c: Call, o: Parameters<typeof world>[0]) => {
       world(o);
@@ -360,6 +410,18 @@ async function main() {
       else eq("…the update was attempted once", sessionWrites(c.table, c.verb).length, 1);
       if (c === CALLS[0]) eq("…and the new provider the row did not record is removed again", ssoAdmin(), ["DELETE /prov-old", "POST /", "DELETE /prov-new"]);
     }
+    for (const c of [CALLS[4], CALLS[5]]) {
+      {
+        const out = await call(c, { role: "admin", zeroRows: true, afterDelete: "gone" });
+        eq(`${c.name}, 0 rows changed and the row gone by then (a crossed delete): 404, the delete tried once, no notification pass`,
+          [out.status, typeof out.body.error, out.body.ok ?? null, sessionWrites(c.table, "DELETE").length, serviceCalls().length], [404, "string", null, 1, 0]);
+      }
+      {
+        const out = await call(c, { role: "admin", zeroRows: true, afterDelete: "fails" });
+        eq(`${c.name}, 0 rows changed and the second read fails: 503, no notification pass`,
+          [out.status, typeof out.body.error, out.body.ok ?? null, serviceCalls().length], [503, "string", null, 0]);
+      }
+    }
 
     console.log("\n(e) POST /api/learning-path-assignments keeps the path and the assignees inside the org");
     {
@@ -403,10 +465,14 @@ async function main() {
           () => pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, assignToOrg: true, userIds: ["u-2"] }))],
         ["POST /api/learning-path-assignments", "teams",
           () => pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, assignToOrg: true, teamIds: ["t1"] }))],
+        ["POST /api/learning-path-assignments", "org_groups",
+          () => pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, assignToOrg: true, groupIds: ["g1"] }))],
         ["POST /api/assignments", "organization_members",
           () => assignCourse.POST(post("/api/assignments", { orgSlug: "org", courseId: COURSE, assignToOrg: true, userIds: ["u-2"] }))],
         ["POST /api/assignments", "teams",
           () => assignCourse.POST(post("/api/assignments", { orgSlug: "org", courseId: COURSE, assignToOrg: true, teamIds: ["t1"] }))],
+        ["POST /api/assignments", "org_groups",
+          () => assignCourse.POST(post("/api/assignments", { orgSlug: "org", courseId: COURSE, assignToOrg: true, groupIds: ["g1"] }))],
         ["DELETE /api/assignments/{id}", "course_assignments",
           () => assignment.DELETE(del("/api/assignments/a1"), params("a1"))],
         ["DELETE /api/learning-path-assignments/{id}", "learning_path_assignments",
@@ -427,6 +493,53 @@ async function main() {
       const res = await branding.POST(post("/api/org/branding", { orgSlug: "org", custom_domain: "learn.acme.test", learner_theme: "no-such-theme" }));
       eq("a domain change sent with an unknown learner theme: 400, no Cloudflare request, no write",
         [res.status, cloudflare(), writes().length], [400, [], 0]);
+    }
+
+    console.log("\n(i) a failed read of the caller's role answers 503, not 403");
+    for (const c of CALLS) {
+      const out = await call(c, { role: "admin", failRole: true });
+      eq(`${c.name}, the role read fails: 503 with an error, no service-key / Cloudflare / write request`,
+        [out.status, typeof out.body.error, out.body.ok ?? null, serviceCalls().length, external().length, writes().length],
+        [503, "string", null, 0, 0, 0]);
+    }
+    for (const c of [CALLS[0], CALLS[1], CALLS[2], CALLS[3], CALLS[6]]) {
+      const out = await call(c, { role: "admin", failRead: "organizations" });
+      eq(`${c.name}, the org read fails (requireOrgAdminApi): 503 with an error, no service-key / Cloudflare / write request`,
+        [out.status, typeof out.body.error, out.body.ok ?? null, serviceCalls().length, external().length, writes().length],
+        [503, "string", null, 0, 0, 0]);
+    }
+
+    console.log("\n(j) an SSO configure whose update answers an error removes the new provider only when the row does not hold it");
+    {
+      const out = await call(CALLS[0], { role: "admin", orgUpdate: "error" });
+      eq("not saved: 400 with an error, and the new provider is removed again",
+        [out.status, typeof out.body.error, out.body.ok ?? null, ssoAdmin()], [400, "string", null, ["DELETE /prov-old", "POST /", "DELETE /prov-new"]]);
+    }
+    {
+      const out = await call(CALLS[0], { role: "admin", orgUpdate: "lost-reply" });
+      eq("saved, the reply lost: 200 ok with the new provider, which is kept",
+        [out.status, out.body.ok, out.body.providerId, ssoAdmin()], [200, true, "prov-new", ["DELETE /prov-old", "POST /"]]);
+    }
+    {
+      const out = await call(CALLS[0], { role: "admin", orgUpdate: "lost-reply-unreadable" });
+      eq("saved, and the row cannot be read again: 400 with an error, and the provider is kept",
+        [out.status, typeof out.body.error, out.body.ok ?? null, ssoAdmin()], [400, "string", null, ["DELETE /prov-old", "POST /"]]);
+    }
+
+    console.log("\n(k) the admin pages take only a 404 from an assignment delete as already removed (source check)");
+    for (const [file, api] of [
+      ["app/[org]/(admin)/library/[courseId]/assign-section.tsx", "/api/assignments/"],
+      ["app/[org]/(admin)/learning-paths/learning-paths-client.tsx", "/api/learning-path-assignments/"],
+    ] as const) {
+      const src = fs.readFileSync(path.join(__dirname, "../..", file), "utf8").replace(/\r\n/g, "\n");
+      const start = src.indexOf("async function unassign(");
+      const body = start < 0 ? "" : src.slice(start, src.indexOf("\n  }\n", start));
+      const statusTests = body.match(/res\.status\s*[!=]==?\s*\d+/g) ?? [];
+      const arm404 = /if \(res\.status === 404\) \{\s*router\.refresh\(\);\s*return;\s*\}/.exec(body);
+      const notOk = body.indexOf("if (!res.ok)");
+      eq(`${file}: unassign() calls DELETE ${api}{id}; its only status test is === 404, whose arm refreshes and returns with no toast, before a !res.ok arm that shows the error`,
+        [body.includes(`fetch(\`${api}\${id}\``), statusTests, !!arm404, !!arm404 && notOk > arm404.index, notOk >= 0 && /toast\.error\(/.test(body.slice(notOk))],
+        [true, ["res.status === 404"], true, true, true]);
     }
 
     eq("no request left the stub", unmatched, []);

@@ -381,8 +381,9 @@ export function LearningPathsClient({
     const res = await fetch(`/api/learning-path-assignments/${id}`, {
       method: "DELETE",
     });
-    // 404: the assignment is already gone (another tab or a second click);
-    // refresh so the list matches, with no error.
+    // 404 only: the assignment is already gone (another tab, a second click
+    // or another admin); refresh so the list matches, with no error. Every
+    // other refusal (403, 503) shows its error below.
     if (res.status === 404) {
       router.refresh();
       return;

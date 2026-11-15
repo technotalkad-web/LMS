@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { isOrgAdminCaller } from "@/lib/auth/api-admin";
+import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -14,8 +14,9 @@ import { resolveManyGroups } from "@/lib/org/groups";
  * read many assignment rows, and an RLS-refused delete removes nothing
  * without an error). Looks up the row before deleting so we can fire an
  * asset_unassignment notification to the affected learners; a delete that
- * removes no row is an error, never ok. An id with no visible row answers
- * 404; a failed read answers 503.
+ * removes no row is an error, never ok, unless the row is gone by then (a
+ * delete that crossed another one): 404. An id with no visible row answers
+ * 404; a failed read, the role read included, answers 503.
  */
 export async function DELETE(
   _request: Request,
@@ -48,8 +49,10 @@ export async function DELETE(
     return NextResponse.json({ error: "Assignment not found" }, { status: 404 });
   }
   const orgId = (row as { organization_id: string }).organization_id;
-  if (!(await isOrgAdminCaller(supabase, orgId, user.id))) {
-    return NextResponse.json({ error: "Forbidden: admins only" }, { status: 403 });
+  const admin = await isOrgAdminCaller(supabase, orgId, user.id);
+  if (!admin) {
+    const refused = notAdminAnswer(admin);
+    return NextResponse.json({ error: refused.error }, { status: refused.status });
   }
 
   const { data: deleted, error } = await supabase
@@ -59,6 +62,25 @@ export async function DELETE(
     .select("id");
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
   if (!deleted?.length) {
+    // No row changed. A delete that crossed another one (two tabs, two
+    // admins) finds the row already gone: read it again, fresh, and answer
+    // 404 then, which the admin pages take as removed. A row still there
+    // was not removed: 403.
+    const { data: still, error: againErr } = await supabase
+      .from("course_assignments")
+      .select("id")
+      .eq("id", id)
+      .abortSignal(new AbortController().signal)
+      .maybeSingle();
+    if (againErr) {
+      return NextResponse.json(
+        { error: "Could not confirm the assignment was removed; try again." },
+        { status: 503 }
+      );
+    }
+    if (!still) {
+      return NextResponse.json({ error: "Assignment not found" }, { status: 404 });
+    }
     return NextResponse.json(
       { error: "The assignment was not removed." },
       { status: 403 }
