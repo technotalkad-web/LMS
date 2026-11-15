@@ -59,11 +59,7 @@ export async function POST(request: Request) {
       if (user) {
         const code = generateOtpCode();
         const codeHash = hashOtp(code);
-        // DEV ONLY: log the code so you can verify the flow end-to-end
-        // even without SMTP set up. Strip this for production.
-        if (process.env.NODE_ENV !== "production") {
-          console.log(`\n[forgot-password] DEV CODE for ${email}: ${code}\n`);
-        }
+        // The code is never printed: a reset code reaches only the email.
         const expiresAt = new Date(
           Date.now() + OTP_TTL_MINUTES * 60_000
         ).toISOString();
