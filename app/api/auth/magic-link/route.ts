@@ -2,16 +2,18 @@ import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { safeNextPath } from "@/lib/auth/safe-next";
-import { sendAuthEmail } from "@/lib/auth/auth-email";
-import { dispatchResend, resendConfigured } from "@/lib/email/resend";
+import { sendAuthEmail, sendPlatformMagicLink } from "@/lib/auth/auth-email";
 
 /**
  *   POST /api/auth/magic-link   body: { email, orgSlug?, next? }
  *
  * White-label magic-link sign-in. Mints the link via the Admin API (no Supabase
  * auto-send) and emails it:
- *   - tenant context (orgSlug) → the tenant's branded SMTP (Resend fallback)
- *   - platform login (no orgSlug) → global Resend sender
+ *   - tenant context (orgSlug) → the tenant's branded SMTP (Resend fallback),
+ *     only when the address belongs to a member of that organisation
+ *     (lib/auth/auth-email.ts states the rule); anyone else gets the generic
+ *     platform email
+ *   - platform login (no orgSlug, or an unknown one) → global Resend sender
  *
  * `next` (optional) is a same-app path to land on after sign-in — used by
  * deep links (e.g. QR-code scans of a course) so the emailed link returns the
@@ -63,28 +65,6 @@ export async function POST(request: Request) {
   }
 
   // Platform path (no org context): generic link via global Resend.
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-  const { data, error } = await svc.auth.admin.generateLink({
-    type: "magiclink",
-    email,
-  });
-  if (!error && data && resendConfigured()) {
-    const tokenHash = (data.properties as { hashed_token?: string }).hashed_token;
-    if (tokenHash) {
-      const link =
-        `${origin.replace(/\/$/, "")}/auth/callback?token_hash=${encodeURIComponent(tokenHash)}` +
-        `&type=magiclink&next=${encodeURIComponent("/select-org")}`;
-      await dispatchResend({
-        to: email,
-        subject: "Your sign-in link",
-        html: `<p>Click to sign in:</p><p><a href="${link}">Sign in</a></p><p>If you didn't request this, you can ignore this email.</p>`,
-        text: `Sign in: ${link}`,
-      });
-    }
-  }
+  await sendPlatformMagicLink({ email, origin });
   return NextResponse.json({ ok: true });
 }
