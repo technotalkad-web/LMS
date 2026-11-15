@@ -44,10 +44,21 @@
 --   - Subjects are not changed by this script. Part 1 counts the rows of the
 --     sign-in and account events whose subject holds a token_hash, and the
 --     password-reset rows whose subject holds six digits in a row.
+--   - A password or link named in a custom subject. An organisation's own
+--     template (notification_templates) can name a credential placeholder
+--     ({Password}, {OTP_Code}, {Direct_Link} or {Portal_URL}) in its
+--     subject, and older rows sent with it hold that value in the subject.
+--     Part 1 counts the custom subjects that name one today (active or not)
+--     and the log rows of those organisations and events. A template can
+--     have changed since a row was sent, so the row figure is an
+--     indication, not an exact count. Passwords found this way belong to
+--     the accounts counted in section 3.
 --
 -- The key list appears in each statement, marked /* stored keys */.
 -- tests/unit/notification-context-keys.test.ts checks every copy against
--- STORED_CONTEXT_KEYS.
+-- STORED_CONTEXT_KEYS. The credential keys Part 1 looks for in custom
+-- subjects are marked /* credential keys */, and the same test checks that
+-- list against its own list of credential keys.
 
 -- ======================================================================
 -- Part 1: counts only (one grid)
@@ -70,6 +81,15 @@ password_rows as (
   left join public.profiles p on p.id = l.to_user_id
   where jsonb_typeof(l.context) = 'object'
     and l.context ? 'password'
+),
+credential_subjects as (
+  select t.organization_id, t.event_type
+  from public.notification_templates t
+  where exists (
+    select 1
+    from unnest(/* credential keys */ array['password', 'otp_code', 'direct_link', 'portal_url']) as c(key_name)
+    where strpos(lower(t.subject), '{' || c.key_name || '}') > 0
+  )
 )
 select '1 rows to rewrite, total' as measure, count(*) as n from other_keys
 union all
@@ -96,6 +116,14 @@ where l.event_type in ('password_reset', 'magic_link', 'account_invite', 'accoun
     or (l.event_type = 'password_reset' and l.subject ~ '[0-9]{6}')
   )
 group by l.event_type
+union all
+select '5 custom subjects naming a credential placeholder', count(*) from credential_subjects
+union all
+select '5 log rows of those organisations and events', count(*)
+from public.notification_log l
+join credential_subjects cs
+  on cs.organization_id = l.organization_id
+ and cs.event_type = l.event_type
 order by measure;
 
 -- ======================================================================
