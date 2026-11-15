@@ -676,9 +676,11 @@ export default async function LaunchPage({
         // on the other slot stays open (nothing is closed).
         redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
       }
-      // (3) is carried out below, only once every launch gate has passed: a
-      // launch that is then refused (no version, prerequisite lock, scheduled
-      // release) closes nothing.
+      // (3) is carried out below (closeAfterResolution), only once every
+      // launch gate has passed: a launch a gate refuses (no version,
+      // prerequisite lock, scheduled release) closes nothing. A journey
+      // resume answered `close_then_refuse` is refused after its close (see
+      // closeAfterResolution).
       deactivated = [...decision.abandon];
       if (decision.kind === "cross-slot") {
         // (2) Grandfather across slots: run the attempt the learner already has.
@@ -756,7 +758,7 @@ export default async function LaunchPage({
   const packageOfServed = (ver: Version) => allPackages.find((p) => p.id === ver.package_id);
 
   // The closes of a resolution, run only once every launch gate has passed
-  // (a launch that is then refused closes nothing), conditional on
+  // (a launch a gate refuses closes nothing), conditional on
   // status = 'in_progress' and the learner's own rows, fail-soft. Each takes
   // the launch's own rows only (step 23; P2-5 item 3), as the reads that
   // listed them did: a Start closes rows of its context only, a preview
@@ -766,10 +768,14 @@ export default async function LaunchPage({
   // from the context's rows evaluate read. `open` lists the rows whose close
   // lets the day's fresh official attempt in at the row step below, and only
   // the rows this close returns count as closed (it is fail-soft, and the
-  // open-row index is per version). `close_then_refuse` lets the close run
-  // (ADR 0004 rule (3)), then refuses with the retry notice, so the next
+  // open-row index is per version). `close_then_refuse` lets the whole close
+  // run (ADR 0004 rule (3): the deactivated-slot close, and the stale-revision
+  // close below with it); the page then refuses right after each call of
+  // it, with the retry notice (journey_resume_row_abandoned), so the next
   // launch decides afresh; refusing first would leave the row open and
-  // refuse every later launch.
+  // refuse every later launch. A launch refused later at the row step
+  // (journey_resume_without_row) may also have closed something here or in
+  // the `first` flagged-row close (ADR 0024's P2-6 note, Left open).
   let resumeReopens: string[] = [];
   let refuseAfterClose = false;
   const closedOnDeactivatedSlot = new Set<string>();
@@ -1048,13 +1054,16 @@ export default async function LaunchPage({
       // own abort signals, step 25) and run the kind rule again in THIS
       // request, without consuming (never a self-redirect); routing runs in
       // full now (the grant resolution skipped it). The launch's context and
-      // its gates do not depend on the version and are not repeated.
+      // its gates do not depend on the version and are not repeated. As
+      // after the first resolution, a `close_then_refuse` answer of this
+      // close refuses once the close has run.
       inCtx = await readInContext();
       grants = grantsOf(inCtx);
       ev = evaluate(inCtx, false);
       res = await resolveVersion(ev.candidate, grants);
       v = res.v;
       await closeAfterResolution(res);
+      if (refuseAfterClose) refuse("journey_resume_row_abandoned");
     }
   }
 

@@ -874,6 +874,7 @@ export default async function DashboardPage({
   for (const a of mineGroups) pushCard(a, "team");
   for (const a of orgWide) pushCard(a, "org");
   // Include path-only courses (no direct course assignment).
+  const sequenceModeByPath = new Map(pathsList.map((p) => [p.id, p.sequence_mode]));
   for (const [cid, pathName] of pathNameByCourseId) {
     if (seen.has(cid)) continue;
     const course = courseById.get(cid);
@@ -887,7 +888,10 @@ export default async function DashboardPage({
     // row of theirs: its Start carries that path's ?lp= (ADR 0024 ruling A3
     // enrols them at the launch; a plain Start is refused not_enrolled), and
     // the badge names the same path. No direct assignment reaches this card
-    // (those have theirs above), and `paths` holds active paths only.
+    // (those have theirs above), and `paths` holds active paths only. Of
+    // several "Everyone" paths, one whose step can launch now: the step
+    // states above (9), the step's position and the path's order rank them
+    // (no further read).
     const startPathId = everyonePathStart({
       courseIsEveryone: orgPublicCourseIds.includes(cid),
       directlyHeld: false,
@@ -899,6 +903,9 @@ export default async function DashboardPage({
             everyone: everyonePathIds.has(p.id),
             enrolled: assignedPathIds.has(p.id),
             releaseAt: s.releaseAt,
+            position: s.step_number,
+            sequenceMode: sequenceModeByPath.get(p.id) ?? null,
+            state: s.state,
           }))
       ),
       now: nowMs,

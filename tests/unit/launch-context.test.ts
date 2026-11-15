@@ -41,8 +41,10 @@
  *       A3's second answer (the strict lock after the path's insert);
  *   (k) resumeAfterSlotRouting (P2-6 review, launch F4): a journey resume
  *       whose open official rows slot routing abandons opens the day fresh
- *       on an active enrolment's uncredited day with a free window, and is
- *       refused before any close otherwise.
+ *       on an active enrolment's uncredited day with a free window, and
+ *       otherwise answers close_then_refuse: the page lets its close run
+ *       (the row on the deactivated slot is abandoned), then refuses with
+ *       journey_resume_row_abandoned.
  *   Ruling A3 is in (d): an "Everyone" path learner with no enrolment row
  *   launching a later step is told "enrol first", not locked.
  *
@@ -493,7 +495,7 @@ console.log("\n(j) afterSelfEnrol: P2-Q2 option (i-a) after the self-enrolment i
   eq("no second answer after an insert that did not fail: the retry notice", afterSelfEnrol({ selfEnrol: "course", insert: "inserted", second: null }), { kind: "retry", reason: "self_enrol_no_second_answer" });
 }
 
-console.log("\n(k) resumeAfterSlotRouting: a journey resume whose open rows slot routing abandons (P2-6 review, launch F4), decided before any close");
+console.log("\n(k) resumeAfterSlotRouting: a journey resume whose open rows slot routing abandons (P2-6 review, launch F4), decided before the close, acted on after it");
 {
   type Ask = Parameters<typeof resumeAfterSlotRouting>[0];
   const base: Ask = {

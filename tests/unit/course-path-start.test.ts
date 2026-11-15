@@ -14,14 +14,22 @@
  *   (a) the picker: an Everyone-only course gets its path; an individually
  *       held course, an "Everyone" course, a course also on a path the
  *       learner has a row on (released or not), a path that is not
- *       "Everyone", and an unreleased step get none; of several, the lowest
- *       path id whatever the input order;
+ *       "Everyone", and an unreleased step get none; of several (the P2-6
+ *       re-review, A2), one whose step can launch now: a random path's, or
+ *       a step the dashboard marks current, before a strict step of unknown
+ *       state, before one it marks locked; then the lowest step position, a
+ *       path that is not strict, the lowest path id, whatever the input
+ *       order (two strict paths, the course step 2 of the lower id and step
+ *       1 of the other: the other);
  *   (b) the course page's access check (learnerCanAccessCourse) on a stub
  *       client: startPathId in exactly that case; never for a course with a
  *       direct assignment row (released, or future-dated: the resolver's
  *       "not yet released" stays), an assigned path or its own "Everyone"
  *       visibility; an inactive or another organisation's path is no
- *       candidate;
+ *       candidate; of two "Everyone" paths, the lowest step position, then
+ *       a path that is not strict, from the step_number and sequence_mode
+ *       its one step read names (the stub answers only the columns the
+ *       select names), with no further read;
  *   (c) `allowed` and `upcomingAt` are unchanged by the two-pass path loop:
  *       every combination of five step kinds and three direct-assignment
  *       states, in both orders, against today's one-pass rule;
@@ -30,9 +38,10 @@
  *   (e) source scans with planted cases: the grid's only launch href is
  *       courseCardHref's; the dashboard calls the picker once, in the
  *       path-only card loop, from the assigned-path set read before the
- *       "Everyone" fold, and only that loop's card carries startPathId; the
- *       course page's Start reads access.startPathId and its Preview links
- *       carry no `lp`.
+ *       "Everyone" fold, with each step's position, its state from the path
+ *       view and its path's order, and only that loop's card carries
+ *       startPathId; the course page's Start reads access.startPathId and
+ *       its Preview links carry no `lp`.
  *
  * No database, no network.
  *
@@ -60,8 +69,15 @@ const FUTURE = "2999-01-01T00:00:00Z";
 
 function pickerCases() {
   console.log("\n(a) everyonePathStart");
-  const step = (pathId: string, o: { everyone?: boolean; enrolled?: boolean; releaseAt?: string | null } = {}) => ({
+  type State = "completed" | "current" | "locked" | "unreleased";
+  const step = (
+    pathId: string,
+    o: { everyone?: boolean; enrolled?: boolean; releaseAt?: string | null; position?: number; mode?: "strict" | "random"; state?: State } = {}
+  ) => ({
     pathId, everyone: o.everyone ?? true, enrolled: o.enrolled ?? false, releaseAt: o.releaseAt ?? null,
+    ...(o.position !== undefined ? { position: o.position } : {}),
+    ...(o.mode !== undefined ? { sequenceMode: o.mode } : {}),
+    ...(o.state !== undefined ? { state: o.state } : {}),
   });
   const pick = (steps: ReturnType<typeof step>[], o: { courseIsEveryone?: boolean; directlyHeld?: boolean } = {}) =>
     everyonePathStart({ courseIsEveryone: o.courseIsEveryone ?? false, directlyHeld: o.directlyHeld ?? false, steps, now: NOW });
@@ -76,17 +92,48 @@ function pickerCases() {
   eq("an unreleased Everyone step: none", pick([step("pe", { releaseAt: FUTURE })]), null);
   eq("a private path with no row: none", pick([step("pp", { everyone: false })]), null);
   eq("no step at all: none", pick([]), null);
-  eq("two Everyone paths: the lowest path id", pick([step("p-b"), step("p-a")]), "p-a");
+  eq("two Everyone paths, nothing else to rank them by: the lowest path id", pick([step("p-b"), step("p-a")]), "p-a");
   eq("…in either input order", pick([step("p-a"), step("p-b")]), "p-a");
   eq("…compared in lower case, the id returned as given", pick([step("P-B"), step("p-c"), step("P-A")]), "P-A");
   eq("…an unreleased lower id is skipped for a released one", pick([step("p-a", { releaseAt: FUTURE }), step("p-b")]), "p-b");
+
+  // The P2-6 re-review, A2: two strict "Everyone" paths, pe-1 (the lower id)
+  // holding [Y, X] and pe-2 holding [X]. The lowest id sent the learner into
+  // pe-1, enrolled them there (A3) and answered locked, every later plain
+  // Start too, while pe-2 launches X at once.
+  const pe1Locked = step("pe-1", { position: 2, mode: "strict", state: "locked" });
+  const pe2Current = step("pe-2", { position: 1, mode: "strict", state: "current" });
+  eq("A2, the dashboard: X is step 2 of pe-1 (locked there, Y not done) and step 1 of pe-2 (current): pe-2, not the lower id",
+    pick([pe1Locked, pe2Current]), "pe-2");
+  eq("…in either input order", pick([pe2Current, pe1Locked]), "pe-2");
+  eq("A2, the course page (no state known): the lowest step position, pe-2",
+    [pick([step("pe-1", { position: 2, mode: "strict" }), step("pe-2", { position: 1, mode: "strict" })]),
+     pick([step("pe-2", { position: 1, mode: "strict" }), step("pe-1", { position: 2, mode: "strict" })])], ["pe-2", "pe-2"]);
+  eq("a random path's step launches now whatever its position: before a strict step of unknown state (the course page)",
+    pick([step("pe-1", { position: 2, mode: "strict" }), step("pe-2", { position: 3, mode: "random" })]), "pe-2");
+  eq("…on the dashboard, a random path's later step (its view marks it locked) before a strict path's locked step",
+    pick([step("pe-1", { position: 2, mode: "strict", state: "locked" }), step("pe-2", { position: 3, mode: "random", state: "locked" })]), "pe-2");
+  eq("…a strict step marked current at a lower position before a random path's step",
+    pick([step("pe-1", { position: 2, mode: "random", state: "locked" }), step("pe-2", { position: 1, mode: "strict", state: "current" })]), "pe-2");
+  eq("…a strict step of unknown state before one the dashboard marks locked, whatever the positions",
+    pick([step("pe-1", { position: 1, mode: "strict", state: "locked" }), step("pe-2", { position: 5, mode: "strict" })]), "pe-2");
+  eq("positions tie: the path whose order is not strict",
+    pick([step("pe-1", { position: 1, mode: "strict", state: "current" }), step("pe-2", { position: 1, mode: "random", state: "current" })]), "pe-2");
+  eq("…and the order ties too: the lowest id",
+    pick([step("pe-2", { position: 1, mode: "strict" }), step("pe-1", { position: 1, mode: "strict" })]), "pe-1");
+  eq("a mode left out is strict (as the resolver reads anything but 'random')",
+    pick([step("pe-1", { position: 2 }), step("pe-2", { position: 2, mode: "random" })]), "pe-2");
+  eq("the only Everyone path's locked step is still named (ruling A3's one-path case, disclosed)",
+    pick([step("pe-1", { position: 2, mode: "strict", state: "locked" })]), "pe-1");
+  eq("an unreleased step at a lower position is skipped",
+    pick([step("pe-1", { position: 1, mode: "strict", releaseAt: FUTURE }), step("pe-2", { position: 2, mode: "strict" })]), "pe-2");
 }
 
 /* ---------------- (b), (c) the course page's access check on a stub client ---------------- */
 
 const ORG = "org-1";
 const USER = "u1";
-type StepRow = { path: string; everyone: boolean; release?: string | null; active?: boolean; org?: string };
+type StepRow = { path: string; everyone: boolean; release?: string | null; active?: boolean; org?: string; pos?: number; mode?: "strict" | "random" };
 type Direct = { type: "user" | "team" | "org"; release?: string | null; user?: string };
 type PathRow = { path: string; type: "user" | "team" | "org"; user?: string };
 type World = { steps?: StepRow[]; direct?: Direct[]; pathRows?: PathRow[]; visibility?: string };
@@ -102,11 +149,19 @@ function stub(w: World) {
           assignee_type: d.type, user_id: d.type === "user" ? d.user ?? USER : null, team_id: d.type === "team" ? "t1" : null,
           group_id: null, release_at: d.release ?? null,
         }));
-      case "learning_path_courses":
+      case "learning_path_courses": {
+        // Only the columns the select names: a read that drops step_number
+        // or the path's sequence_mode gets neither.
+        const cols = String(ops.find(([o]) => o === "select")?.[1][0] ?? "");
         return (w.steps ?? []).map((s) => ({
           path_id: s.path, release_at: s.release ?? null,
-          learning_paths: { id: s.path, is_active: s.active !== false, visibility: s.everyone ? "org_public" : "private", organization_id: s.org ?? ORG },
+          ...(/\bstep_number\b/.test(cols) ? { step_number: s.pos ?? 1 } : {}),
+          learning_paths: {
+            id: s.path, is_active: s.active !== false, visibility: s.everyone ? "org_public" : "private", organization_id: s.org ?? ORG,
+            ...(/\bsequence_mode\b/.test(cols) ? { sequence_mode: s.mode ?? "strict" } : {}),
+          },
         }));
+      }
       case "learning_path_assignments": {
         const ids = (ops.find(([o, a]) => o === "in" && a[0] === "path_id")?.[1][1] ?? []) as string[];
         return (w.pathRows ?? []).filter((r) => ids.includes(r.path)).map((r) => ({
@@ -171,11 +226,23 @@ async function accessCases() {
     (await access({ steps: [{ path: "pe", everyone: true }], pathRows: [{ path: "pe", type: "org" }] })).startPathId, null);
   eq("another learner's own row on the Everyone path does not count as the learner's",
     (await access({ steps: [{ path: "pe", everyone: true }], pathRows: [{ path: "pe", type: "user", user: "u2" }] })).startPathId, "pe");
-  eq("two Everyone paths: the lowest id, in either row order",
+  eq("two Everyone paths at the same step position, both strict: the lowest id, in either row order",
     [(await access({ steps: [{ path: "p-b", everyone: true }, { path: "p-a", everyone: true }] })).startPathId,
      (await access({ steps: [{ path: "p-a", everyone: true }, { path: "p-b", everyone: true }] })).startPathId], ["p-a", "p-a"]);
   eq("…the unreleased one skipped",
     (await access({ steps: [{ path: "p-a", everyone: true, release: FUTURE }, { path: "p-b", everyone: true }] })).startPathId, "p-b");
+  // The P2-6 re-review, A2, on the course page.
+  const twoStrict = await access({ steps: [{ path: "pe-1", everyone: true, pos: 2 }, { path: "pe-2", everyone: true, pos: 1 }] });
+  eq("A2: two strict Everyone paths, the course step 2 of pe-1 (the lower id) and step 1 of pe-2: the Start names pe-2",
+    [twoStrict.allowed, twoStrict.startPathId], [true, "pe-2"]);
+  eq("…in the other row order too",
+    (await access({ steps: [{ path: "pe-2", everyone: true, pos: 1 }, { path: "pe-1", everyone: true, pos: 2 }] })).startPathId, "pe-2");
+  eq("…with no further read (the position and the order ride on the one step read)",
+    twoStrict.tables, ["team_members", "course_assignments", "learning_path_courses", "learning_path_assignments"]);
+  eq("…a random path's step 3 before a strict path's step 2",
+    (await access({ steps: [{ path: "pe-1", everyone: true, pos: 2 }, { path: "pe-2", everyone: true, pos: 3, mode: "random" }] })).startPathId, "pe-2");
+  eq("…positions tie: the random path",
+    (await access({ steps: [{ path: "pe-1", everyone: true, pos: 2 }, { path: "pe-2", everyone: true, pos: 2, mode: "random" }] })).startPathId, "pe-2");
   const inactive = await access({ steps: [{ path: "pe", everyone: true, active: false }] });
   eq("an inactive Everyone path grants nothing and names nothing", [inactive.allowed, inactive.startPathId], [false, null]);
   const other = await access({ steps: [{ path: "pe", everyone: true, org: "org-2" }] });
@@ -284,6 +351,7 @@ function dashboardProblems(src: string): string[] {
   const calls: ts.CallExpression[] = [];
   const pushes: Array<{ obj: ts.ObjectLiteralExpression; loop: string | null; fn: string | null }> = [];
   let assignedInit: string | null = null;
+  let sequenceInit: string | null = null;
   each(sf, (n) => {
     if (ts.isCallExpression(n) && n.expression.getText() === "everyonePathStart") calls.push(n);
     if (ts.isCallExpression(n) && n.expression.getText() === "cards.push" && n.arguments[0] && ts.isObjectLiteralExpression(n.arguments[0])) {
@@ -291,6 +359,7 @@ function dashboardProblems(src: string): string[] {
       pushes.push({ obj: n.arguments[0], loop: loop ? loop.expression.getText() : null, fn: fnName(n) });
     }
     if (ts.isVariableDeclaration(n) && n.name.getText() === "assignedPathIds") assignedInit = n.initializer?.getText() ?? null;
+    if (ts.isVariableDeclaration(n) && n.name.getText() === "sequenceModeByPath") sequenceInit = n.initializer?.getText() ?? null;
   });
   if (calls.length !== 1) problems.push(`everyonePathStart called ${calls.length} time(s), owed 1`);
   for (const c of calls) {
@@ -300,6 +369,12 @@ function dashboardProblems(src: string): string[] {
     if (!/enrolled:\s*assignedPathIds\.has\(/.test(arg)) problems.push("the picker's enrolled is not read from assignedPathIds");
     if (!/everyone:\s*everyonePathIds\.has\(/.test(arg)) problems.push("the picker's everyone is not read from everyonePathIds");
     if (!/courseIsEveryone:\s*orgPublicCourseIds\.includes\(/.test(arg)) problems.push("the picker's courseIsEveryone is not read from orgPublicCourseIds");
+    if (!/position:\s*s\.step_number\b/.test(arg)) problems.push("the picker's position is not the step's step_number");
+    if (!/state:\s*s\.state\b/.test(arg)) problems.push("the picker's state is not the step's state from the path view");
+    if (!/sequenceMode:\s*sequenceModeByPath\.get\(p\.id\)/.test(arg)) problems.push("the picker's sequenceMode is not the path's");
+  }
+  if (sequenceInit === null || !/^new Map\(pathsList\.map\(\(p\) => \[p\.id, p\.sequence_mode\]\)\)$/.test(sequenceInit)) {
+    problems.push(`sequenceModeByPath is not built from pathsList's sequence_mode (got ${sequenceInit})`);
   }
   if (assignedInit === null || !/^new Set\(myPathAssigns\./.test(assignedInit)) problems.push(`assignedPathIds is not built from myPathAssigns (got ${assignedInit})`);
   const has = (o: ts.ObjectLiteralExpression, name: string) => o.properties.some((p) => p.name?.getText() === name);
@@ -352,6 +427,10 @@ function scanCases() {
   eq("planted: startPathId on pushCard's card is flagged", dashboardProblems(onPushCard).some((p) => p.startsWith("a card outside the path-only loop")), true);
   const afterFold = dash.replace("new Set(myPathAssigns.map((a) => a.path_id))", "new Set(myPathIds)");
   eq("planted: the assigned set built after the Everyone fold is flagged", dashboardProblems(afterFold).some((p) => p.startsWith("assignedPathIds is not built")), true);
+  const noState = dash.replace(/\n\s*state: s\.state,\r?\n/, "\n");
+  eq("planted: the picker without the step's state (A2) is flagged", dashboardProblems(noState).includes("the picker's state is not the step's state from the path view"), true);
+  const noPosition = dash.replace(/\n\s*position: s\.step_number,\r?\n/, "\n");
+  eq("planted: the picker without the step's position is flagged", dashboardProblems(noPosition).includes("the picker's position is not the step's step_number"), true);
   const badge = dash.replace("pathName: startPathName ?? pathName,", "pathName,");
   eq("planted: a badge that may name another path is flagged", dashboardProblems(badge).includes("the path-only card's badge does not name the picked path"), true);
   const plain = course.replace(/\$\{access\.startPathId \? `\?lp=\$\{encodeURIComponent\(access\.startPathId\)\}` : ""\}/, "");

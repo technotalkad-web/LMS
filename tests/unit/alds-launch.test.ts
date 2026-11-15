@@ -37,7 +37,9 @@
  *      refusal path, no refusal inside a try, the strict grant read, the
  *      narrower-select fallbacks, the cutover's `=== 1`, consume_grant with
  *      no fallback writes and the same-request re-run, the token expiry
- *      after `opened`, the P4 update, the closes, the visit record.
+ *      after `opened`, the P4 update, the closes (every call of
+ *      closeAfterResolution followed at once by the close_then_refuse
+ *      refusal, the rerun's included), the visit record.
  *   7. ADR 0024 P2-5 and P2-6 by source: the impersonation ruling (3c), the
  *      preview row (3b, no launch_context call) and the conflict row
  *      (refusalWithoutFacts) before the course read; then one
@@ -66,9 +68,9 @@
  *      stale rerun; the journey context (the open day, the locked day, a
  *      credited day's review as a revision visit, on an active enrolment
  *      with an unused grant in the day's context too; a resume whose only
- *      open row sits on a deactivated slot, opened fresh or refused before
- *      the close; a resume whose row routing does not reach, refused at the
- *      row; one journey-day holder relaunched into its day); the launch's
+ *      open row sits on a deactivated slot, opened fresh, or the row closed
+ *      and then the launch refused; a resume whose row routing does not
+ *      reach, refused at the row; one journey-day holder relaunched into its day); the launch's
  *      context in LMS.LaunchData (an Individual, a path and a journey
  *      launch). The subrequests of each branch are counted (P2-5's and
  *      P2-6's gates; step 70).
@@ -1783,6 +1785,38 @@ async function main() {
       eq("…the rerun re-reads the context (readContextResult's own abort signals), re-evaluates without consuming and resolves again in this request",
         /inCtx = await readInContext\(\);\s*grants = grantsOf\(inCtx\);\s*ev = evaluate\(inCtx, false\);\s*res = await resolveVersion\(ev\.candidate, grants\);\s*v = res\.v;\s*await closeAfterResolution\(res\);/.test(src) &&
           !/redirect\([^)]*\/launch/.test(src), true);
+      // P2-6 re-review A3: resumeAfterSlotRouting's close_then_refuse is
+      // acted on after EVERY close of a resolution, the first call's and
+      // consume_grant's rerun's: each `await closeAfterResolution(…);` is
+      // followed at once, in its own block, by the refusal on the flag.
+      const closeEscapes = (text: string): string[] => {
+        const f = ts.createSourceFile(PAGE, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+        const out: string[] = [];
+        let calls = 0;
+        const walk = (n: ts.Node) => {
+          if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "closeAfterResolution") {
+            calls++;
+            const stmt = ts.isAwaitExpression(n.parent) && ts.isExpressionStatement(n.parent.parent) ? n.parent.parent : null;
+            const block = stmt?.parent;
+            const list = block && (ts.isBlock(block) || ts.isSourceFile(block)) ? block.statements : null;
+            const next = stmt && list ? list[list.indexOf(stmt) + 1] : undefined;
+            const refuses = !!next && ts.isIfStatement(next) && !next.elseStatement && next.expression.getText(f) === "refuseAfterClose" &&
+              next.thenStatement.getText(f) === 'refuse("journey_resume_row_abandoned");';
+            if (!refuses) out.push(`the call at line ${f.getLineAndCharacterOfPosition(n.getStart(f)).line + 1} is not followed by the refusal`);
+          }
+          ts.forEachChild(n, walk);
+        };
+        walk(f);
+        if (calls < 2) out.push(`${calls} call(s) of closeAfterResolution, owed 2 (the first resolution, consume_grant's rerun)`);
+        return out;
+      };
+      eq("A3: every closeAfterResolution call (the first resolution's, consume_grant's rerun's) is followed at once by if (refuseAfterClose) refuse(\"journey_resume_row_abandoned\")",
+        closeEscapes(src), []);
+      const lastRefusal = src.lastIndexOf('if (refuseAfterClose) refuse("journey_resume_row_abandoned");');
+      const plantedRerun = lastRefusal < 0 ? src : src.slice(0, lastRefusal) + src.slice(lastRefusal + 'if (refuseAfterClose) refuse("journey_resume_row_abandoned");'.length);
+      eq("…planted: the rerun's refusal dropped is flagged (one call escapes)", closeEscapes(plantedRerun).length, 1);
+      const plantedThird = src.replace("await closeAfterResolution(res);", "await closeAfterResolution(res);\n  await closeAfterResolution(res);");
+      eq("…planted: a further bare call is flagged", closeEscapes(plantedThird).length, 1);
       // The token expiry after opened.
       eq("after opened: expireLaunchTokens(…, tokenExpiryTargets(…)) for every non-revision attempt, then the LRS abandoned queue",
         /const tokErr = await expireLaunchTokens\(\s*svcAttempt,\s*tokenExpiryTargets\(\{ attempts: ev\.my, abandonedIds, newAttemptId: retakeId \}\)\s*\);[\s\S]{0,200}await enqueueAbandonedStatements\(svcAttempt, abandonedIds\);/.test(src), true);

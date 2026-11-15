@@ -52,12 +52,30 @@ export type CourseAccess = {
  *     (a plain Start is admitted, or redirected into that path, by the
  *     resolver);
  *   - a released step of an "Everyone" path holds the course.
- * Of several such paths, the lowest path id (launch_context orders its
- * holders by path id), so the dashboard and the course page name the same
- * path whatever order their reads answer in.
+ * Of several such paths, one whose step can launch now (the P2-6 re-review,
+ * A2: the resolver enrols the learner on the path the Start names, and a
+ * strict path's later step then answers locked, every later plain Start
+ * too, while another path could launch the course at once). In this order:
+ *   1. a step that launches now: a step of a path whose order is not strict
+ *      (sequence_mode 'random'; launch_context's strict lock never applies
+ *      to it), or one the dashboard's path view marks `current`; then a step
+ *      of a strict path whose state the caller does not know (the course
+ *      page reads no other step of the path); last a step the dashboard
+ *      marks `locked` (an earlier step of the strict path is not done);
+ *   2. then the lowest step position (on the course page, the step likeliest
+ *      to come first in its path);
+ *   3. then a path whose order is not strict;
+ *   4. then the lowest path id, compared in lower case (launch_context
+ *      orders its holders by path id).
+ * Each page names the same path whatever order its reads answer in. The two
+ * pages differ only where the dashboard knows a strict step is `current` or
+ * `locked` and the course page goes by position.
  *
  * `steps`: each step of an ACTIVE path of the organisation that holds the
- * course (launch_context's holders keep active paths only).
+ * course (launch_context's holders keep active paths only). `position`,
+ * `sequenceMode` and `state` are optional: a step without a position ties
+ * on it, one without a mode is strict (as the dashboard and the resolver
+ * read anything but 'random'), and one without a state is not known.
  *
  * Not read: a day of the learner's active journey that holds the course
  * (launch_context's other holder). Such a learner's plain Start goes into
@@ -76,17 +94,36 @@ export function everyonePathStart(i: {
     /** The learner has an assignment row on the path (own, team, org-wide or Custom Group). */
     enrolled: boolean;
     releaseAt: string | null;
+    /** learning_path_courses.step_number. */
+    position?: number | null;
+    /** learning_paths.sequence_mode: 'random', or strict. */
+    sequenceMode?: string | null;
+    /** The dashboard only: the step's state in its path view. */
+    state?: "completed" | "current" | "locked" | "unreleased" | null;
   }>;
   now: number;
 }): string | null {
   if (i.courseIsEveryone || i.directlyHeld) return null;
   if (i.steps.some((s) => s.enrolled)) return null;
-  let pick: string | null = null;
+  type Step = (typeof i.steps)[number];
+  const rank = (s: Step): [number, number, number, string] => {
+    const random = s.sequenceMode === "random";
+    return [
+      random || s.state === "current" ? 0 : s.state === "locked" ? 2 : 1,
+      typeof s.position === "number" && Number.isFinite(s.position) ? s.position : Number.POSITIVE_INFINITY,
+      random ? 0 : 1,
+      s.pathId.toLowerCase(),
+    ];
+  };
+  const before = (a: ReturnType<typeof rank>, b: ReturnType<typeof rank>): boolean =>
+    a[0] !== b[0] ? a[0] < b[0] : a[1] !== b[1] ? a[1] < b[1] : a[2] !== b[2] ? a[2] < b[2] : a[3] < b[3];
+  let pick: { pathId: string; key: ReturnType<typeof rank> } | null = null;
   for (const s of i.steps) {
     if (!s.everyone || !isReleased(s.releaseAt, i.now)) continue;
-    if (pick === null || s.pathId.toLowerCase() < pick.toLowerCase()) pick = s.pathId;
+    const key = rank(s);
+    if (pick === null || before(key, pick.key)) pick = { pathId: s.pathId, key };
   }
-  return pick;
+  return pick?.pathId ?? null;
 }
 
 /**
@@ -233,22 +270,25 @@ export async function learnerCanAccessCourse(opts: {
 
   // Learning-path entitlement: assigning a path doesn't create course
   // assignments, so a path chapter is reachable purely through its path.
+  // step_number and sequence_mode ride on the same read: everyonePathStart
+  // ranks several "Everyone" paths by them (no further read).
   const { data: stepRows } = await supabase
     .from("learning_path_courses")
     .select(
-      "path_id, release_at, learning_paths!inner(id, is_active, visibility, organization_id)"
+      "path_id, step_number, release_at, learning_paths!inner(id, is_active, visibility, organization_id, sequence_mode)"
     )
     .eq("course_id", courseId);
+  type PathOfStep = { id: string; is_active: boolean; visibility: string | null; organization_id: string; sequence_mode?: string | null };
   type StepRow = {
     path_id: string;
+    step_number?: number | null;
     release_at: string | null;
-    learning_paths:
-      | { id: string; is_active: boolean; visibility: string | null; organization_id: string }
-      | Array<{ id: string; is_active: boolean; visibility: string | null; organization_id: string }>;
+    learning_paths: PathOfStep | PathOfStep[];
   };
   const steps = ((stepRows ?? []) as StepRow[])
     .map((s) => ({
       path_id: s.path_id,
+      step_number: s.step_number ?? null,
       release_at: s.release_at,
       path: Array.isArray(s.learning_paths) ? s.learning_paths[0] : s.learning_paths,
     }))
@@ -309,6 +349,8 @@ export async function learnerCanAccessCourse(opts: {
               everyone: x.path?.visibility === "org_public",
               enrolled: myPathIds.has(x.path_id),
               releaseAt: x.release_at,
+              position: x.step_number,
+              sequenceMode: x.path?.sequence_mode ?? null,
             })),
             now,
           }),

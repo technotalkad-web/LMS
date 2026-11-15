@@ -82,8 +82,8 @@
  * answer before any fact (the page makes no launch_context call for them);
  * afterSelfEnrol(), the P2-Q2 (i-a) decision after the page's self-enrolment
  * insert and its second launch_context call; and resumeAfterSlotRouting(),
- * the page's answer, before any close, for a journey `resume` whose open row
- * slot routing abandons.
+ * the page's answer, decided before its close runs, for a journey `resume`
+ * whose open row slot routing abandons.
  *
  * Pure: no next/* and no Supabase runtime import (the house shape of
  * lib/attempts/launch-kind.ts); `now` is an input, so the journey's "today"
@@ -476,8 +476,11 @@ export function afterSelfEnrol(i: {
  * A journey `resume` whose open official attempt slot routing abandons
  * (ADR 0004 rule (3): it sits on a language slot an admin deactivated after
  * the learner started the day). The resolver cannot see language slots, so
- * the page asks this after routing and before any close, and a refused
- * launch closes nothing:
+ * the page asks this after routing and before its close runs, and acts on
+ * the answer: `open` at the row step, `close_then_refuse` right after the
+ * close (the page refuses after every call of its close, the rerun after
+ * consume_grant included). A grant candidate skips slot routing, so the page
+ * meets a grant only as `unchanged`. The answers:
  *
  *   - `unchanged`: not a resume, or routing leaves an open official row of
  *     the day's context open (the resume takes its row, or is refused at
@@ -492,10 +495,12 @@ export function afterSelfEnrol(i: {
  *     fresh official attempt is admitted (a completed enrolment opens nothing
  *     new, a credited day gets no new official attempt, a row needs the
  *     day's number, and a used window or a grant is not a first attempt).
- *     The deactivated-slot close still runs (ADR 0004 rule (3)), then the
- *     launch refuses with the retry notice and the next launch decides
- *     afresh. Refusing before the close would leave the row open, so every
- *     later launch would resolve to `resume` and be refused again.
+ *     The close still runs (ADR 0004 rule (3): the row on the deactivated
+ *     slot is abandoned, and the stale-revision close of the same call runs
+ *     too), then the launch refuses with the retry notice
+ *     (`journey_resume_row_abandoned`) and the next launch decides afresh.
+ *     Refusing before the close would leave the row open, so every later
+ *     launch would resolve to `resume` and be refused again.
  */
 export function resumeAfterSlotRouting(i: {
   admission: JourneyAdmission;
