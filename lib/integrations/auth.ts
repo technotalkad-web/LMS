@@ -80,8 +80,23 @@ export async function authenticateApiKey(
 }
 
 /**
+ * An address as a LIKE pattern that matches only itself: `%`, `_` and the
+ * escape character `\` are escaped, so no character of the address is a
+ * wildcard.
+ */
+function literalLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+/**
  * Resolve an org member by the CRM's identifiers. employee_id is the
  * canonical join key; email is the fallback. Active members only.
+ *
+ * An email finds only the profile whose address is exactly that text,
+ * ignoring case: no character of it acts as a wildcard. The pattern is
+ * escaped, and the row that comes back must carry the same address; that
+ * second check also covers `*`, which PostgREST reads as `%` in a like
+ * filter and which escaping cannot reach.
  */
 export async function resolveMember(
   svc: SupabaseClient,
@@ -100,13 +115,15 @@ export async function resolveMember(
     return m ? { userId: m.user_id, role: m.role, employeeId: m.employee_id } : null;
   }
   if (q.email) {
+    const wanted = q.email.trim();
     const { data: prof } = await svc
       .from("profiles")
-      .select("id")
-      .ilike("email", q.email.trim())
+      .select("id, email")
+      .ilike("email", literalLikePattern(wanted))
       .maybeSingle();
-    const userId = (prof as { id: string } | null)?.id;
-    if (!userId) return null;
+    const found = prof as { id: string; email: string | null } | null;
+    if (!found?.id || (found.email ?? "").toLowerCase() !== wanted.toLowerCase()) return null;
+    const userId = found.id;
     const { data } = await svc
       .from("organization_members")
       .select("user_id, role, employee_id")
