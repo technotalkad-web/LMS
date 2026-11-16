@@ -12,8 +12,9 @@
  *       per-slot resume wins; attempts on other slots are left alone.
  *   (1) the package came from an explicit ?lang= (or the picker, which
  *       navigates to ?lang=) and an in-progress attempt exists on another
- *       ACTIVE package → back to the course page with the existing
- *       language-switch confirm. Nothing is abandoned.
+ *       ACTIVE package → the launch page's own picker, in the launch's
+ *       context, with the language-switch confirm (ADR 0024 P2-9:
+ *       languageSwitchLaunchUrl below). Nothing is abandoned.
  *   (2) the package came from the saved preference or the single-active-
  *       package rule and such an attempt exists → launch that attempt's
  *       version (grandfather across slots).
@@ -27,6 +28,12 @@
  * reroutes, and is never abandoned here, so a revision visit resolves to
  * the current version of the chosen slot (the launch page closes a stale
  * one on the chosen package itself).
+ *
+ * Since ADR 0024 P2-6 the launch hands these rules the open rows of its own
+ * product context only (step 23), and since P2-9 the switch route counts and
+ * abandons in one context too (step 27). The helpers at the end of the file
+ * are P2-9's: the body's context, the launch address of the picker, the
+ * confirm's words and the audit row.
  */
 
 export type SlotSource = "explicit" | "preference" | "single";
@@ -115,6 +122,16 @@ export function decideSlotRouting(input: SlotRoutingInput): SlotRoutingDecision 
 export const REQUIRES_FINISH_MESSAGE =
   "You have already taken an assessment in this course attempt. Continue it in its language, or end it with Finish now, before switching language.";
 
+/**
+ * ADR 0024 P2-9 (review F1): the answer when the switch would close a
+ * journey day's open attempt and the day would open no new official attempt
+ * afterwards (a completed enrolment, a removed or credited day, a day whose
+ * course was swapped, a day that is not the open day): contextEntitlement()'s
+ * `freshAfterClose` is false. The same 409 shape as step 18's.
+ */
+export const RESTART_NOT_ADMITTED_MESSAGE =
+  "Your attempt in progress on this day of your journey cannot start again in another language, because the day would not open a new attempt. Continue it in its language.";
+
 /** One in-progress row on the other language's versions, as the route reads it. */
 export type SwitchRow = { id: string; course_version_id: string; is_revision?: boolean | null };
 
@@ -146,8 +163,12 @@ export type LanguageSwitchDecision =
 
 /**
  * The switch's answer, in the route's order: step 18's check runs once the
- * resettable set is known, before the requires_confirm 409 and before the
- * preference upsert, on both values of restart_if_in_progress.
+ * resettable set is known, then P2-9's (a close the context could not start
+ * again after), both before the requires_confirm 409 and before the
+ * preference upsert, on both values of restart_if_in_progress. Neither
+ * refuses a switch that would close nothing (the target is the open
+ * attempt's own language, or only a granted retake is open), so the learner
+ * can always save the language they are in and continue.
  */
 export function languageSwitchDecision(i: {
   rows: SwitchRow[];
@@ -155,14 +176,233 @@ export function languageSwitchDecision(i: {
   /** Attempt ids among finishCheckAttemptIds() with a stored passed or failed statement (full verb IRIs). */
   assessedAttemptIds: ReadonlySet<string>;
   restartIfInProgress: boolean;
+  /**
+   * ADR 0024 P2-9 (review F1): would the context open a fresh official
+   * attempt once the resettable rows are closed? contextEntitlement()'s
+   * `freshAfterClose` for a path or a journey day; true for the Individual
+   * course.
+   */
+  restartAdmitted: boolean;
 }): LanguageSwitchDecision {
   const resettable = resettableSwitchRows(i.rows, i.retakeIds);
   if (resettable.some((r) => i.assessedAttemptIds.has(r.id))) {
     return { kind: "requires_finish", message: REQUIRES_FINISH_MESSAGE };
+  }
+  if (resettable.length > 0 && !i.restartAdmitted) {
+    return { kind: "requires_finish", message: RESTART_NOT_ADMITTED_MESSAGE };
   }
   if (resettable.length > 0 && !i.restartIfInProgress) {
     return { kind: "requires_confirm", inProgressAttempts: resettable.length };
   }
   const keptRetakes = i.rows.filter((r) => r.is_revision !== true && i.retakeIds.has(r.id)).length;
   return { kind: "proceed", resettableIds: resettable.map((r) => r.id), keptRetakes };
+}
+
+// ---------------------------------------------------------------------------
+// The language switch per product context (ADR 0024 step 27, slice P2-9;
+// decisions A24 and A37). The route, the launch page, its picker and the
+// course page's menu call these; whether a learner holds a path or journey
+// context is lib/attempts/launch-context.ts contextEntitlement()'s.
+// ---------------------------------------------------------------------------
+
+/** The route body's `context` (step 27) as a caller sends it: the day by its id (section U). */
+export type SwitchContextBody =
+  | { kind: "individual" }
+  | { kind: "path"; path_id: string }
+  | { kind: "journey"; journey_enrollment_id: string; day_id: string };
+
+/** A parsed context: lower-case ids, the shape of lib/scoring/context.ts's ContextRef. */
+export type SwitchContext =
+  | { kind: "individual" }
+  | { kind: "path"; pathId: string }
+  | { kind: "journey"; enrollmentId: string; dayId: string };
+
+export type SwitchContextParse =
+  | { ok: true; context: SwitchContext }
+  /** `preview`: a Preview saves no preference and resets nothing (P2-5). `malformed`: not one of the three forms. */
+  | { ok: false; reason: "preview" | "malformed" };
+
+const SWITCH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The body's `context` (step 27). Absent or null is the Individual course,
+ * which is how every caller before P2-9 reads. Otherwise exactly one of
+ * three forms, with no other key: `{kind: "individual"}`, `{kind: "path",
+ * path_id}`, `{kind: "journey", journey_enrollment_id, day_id}`, each id a
+ * uuid (a journey day by its id, never its number: section U). `{kind:
+ * "preview"}`, whatever else it carries, is the preview refusal; anything
+ * else is malformed. Whether the learner holds the context is not decided
+ * here (contextEntitlement(), for a path or a journey).
+ */
+export function parseSwitchContext(raw: unknown): SwitchContextParse {
+  if (raw === undefined || raw === null) return { ok: true, context: { kind: "individual" } };
+  if (typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "malformed" };
+  const o = raw as Record<string, unknown>;
+  if (o.kind === "preview") return { ok: false, reason: "preview" };
+  const keys = Object.keys(o).sort().join(",");
+  const id = (v: unknown): string | null => (typeof v === "string" && SWITCH_ID.test(v) ? v.toLowerCase() : null);
+  if (o.kind === "individual" && keys === "kind") return { ok: true, context: { kind: "individual" } };
+  if (o.kind === "path" && keys === "kind,path_id") {
+    const pathId = id(o.path_id);
+    if (pathId) return { ok: true, context: { kind: "path", pathId } };
+  }
+  if (o.kind === "journey" && keys === "day_id,journey_enrollment_id,kind") {
+    const enrollmentId = id(o.journey_enrollment_id);
+    const dayId = id(o.day_id);
+    if (enrollmentId && dayId) return { ok: true, context: { kind: "journey", enrollmentId, dayId } };
+  }
+  return { ok: false, reason: "malformed" };
+}
+
+/** The body form of a context: what the launch's picker sends for its launch's context. */
+export function switchContextBody(c: SwitchContext): SwitchContextBody {
+  switch (c.kind) {
+    case "individual":
+      return { kind: "individual" };
+    case "path":
+      return { kind: "path", path_id: c.pathId };
+    case "journey":
+      return { kind: "journey", journey_enrollment_id: c.enrollmentId, day_id: c.dayId };
+  }
+}
+
+/**
+ * The `?switch=` value that opens the launch's picker with no language chosen
+ * yet: "Change language" on a path step or a journey day (step 27 (c)).
+ */
+export const SWITCH_CHOOSE = "choose";
+
+/**
+ * The launch address of the language switch in one context: where rule (1)
+ * sends a launch (step 27 (b)), and where "Change language" on a path step or
+ * a journey day goes (step 27 (c), with SWITCH_CHOOSE). It is the launch page
+ * itself, with the launch's context (`?lp=`, or `?journey=` and `day`) and
+ * `?switch=<language>`: the page renders its own picker there, which opens the
+ * confirm for that language at once (for SWITCH_CHOOSE, the picker alone).
+ * `?lang=` is never carried (the launch would meet rule (1) again);
+ * `?back=dashboard` is. The course page is no longer the target: its menu
+ * switches the Individual course only, so for a path or a journey it would
+ * confirm a switch of the wrong product, and the launch would loop.
+ */
+export function languageSwitchLaunchUrl(i: {
+  orgSlug: string;
+  courseId: string;
+  /** The day as the launch reads it: its id (a number only from a link made without 0107). */
+  context: SwitchContext;
+  /** A language code, or SWITCH_CHOOSE. */
+  switchTo: string;
+  back?: string | null;
+}): string {
+  const q = new URLSearchParams();
+  if (i.context.kind === "path") q.set("lp", i.context.pathId);
+  if (i.context.kind === "journey") {
+    q.set("journey", i.context.enrollmentId);
+    q.set("day", i.context.dayId);
+  }
+  q.set("switch", i.switchTo);
+  if (i.back === "dashboard") q.set("back", "dashboard");
+  return `/${i.orgSlug}/courses/${encodeURIComponent(i.courseId)}/launch?${q.toString()}`;
+}
+
+/** One open attempt of the switch's product, as its confirm reads it (revision rows left out). */
+export type InProgressAttemptLang = {
+  /** Package language of the attempt's version (null = legacy/unknown). */
+  language: string | null;
+  /** A consumed admin grant (official retake): never reset by a switch. */
+  grantedRetake: boolean;
+};
+
+const PRODUCT_WORDS: Record<SwitchContext["kind"], { here: string; elsewhere: string }> = {
+  individual: {
+    here: "on this course",
+    elsewhere: "in a learning path or a journey",
+  },
+  path: {
+    here: "on this step of the path",
+    elsewhere: "on this course outside this path, in another path or in a journey",
+  },
+  journey: {
+    here: "on this day of your journey",
+    elsewhere: "on this course outside this journey day, in a learning path or on another day",
+  },
+};
+
+/**
+ * The words of the switch's confirm (step 27 (d), decision A37), for the
+ * course page's menu (the Individual course) and the launch's picker (the
+ * launch's product). `inProgress` is that product's open attempts only, as
+ * the route counts them. It says what the route does: only this product's
+ * open attempt is reset (an extra attempt an admin granted never is), other
+ * products keep their attempts in their own language, and nothing completed
+ * changes. Before P2-9 the copy promised a reset in every case.
+ */
+export function switchConfirmText(i: {
+  product: SwitchContext["kind"];
+  target: string;
+  targetLabel: string;
+  inProgress: InProgressAttemptLang[];
+  labelOf: (language: string | null) => string;
+}): string {
+  const words = PRODUCT_WORDS[i.product];
+  const others = i.inProgress.filter((a) => a.language !== i.target);
+  const kept = others.find((a) => a.grantedRetake);
+  const continuesRetake = i.inProgress.some((a) => a.grantedRetake && a.language === i.target);
+  const resets = others.some((a) => !a.grantedRetake);
+  const freshInTarget = !i.inProgress.some((a) => a.language === i.target);
+  const parts: string[] = [];
+  if (!kept && !continuesRetake) {
+    if (resets) parts.push(`Your attempt in progress ${words.here} will be reset, and the course starts again from the beginning in ${i.targetLabel}.`);
+    else if (freshInTarget) parts.push(`You have no attempt in progress ${words.here}, so nothing is reset. The course opens in ${i.targetLabel}.`);
+    else parts.push(`Your attempt in progress in ${i.targetLabel} continues. Nothing is reset.`);
+  } else {
+    if (continuesRetake) parts.push(`Switching to ${i.targetLabel} lets you continue your extra attempt.`);
+    if (kept) parts.push(`Your extra attempt in progress is kept: it stays in ${i.labelOf(kept.language)}, and you can continue it by switching back.`);
+    if (resets) parts.push(`Other progress you have ${words.here} in another language will be reset.`);
+    if (freshInTarget) parts.push(`In ${i.targetLabel} the course starts from the beginning.`);
+  }
+  parts.push(`Attempts you have open ${words.elsewhere} keep their language and progress, and completed results are not changed.`);
+  return parts.join(" ");
+}
+
+/** The audit row's action (decision A37 (a)); platform_audit_log.action is free text, so it needs no schema change. */
+export const LANGUAGE_SWITCHED_ACTION = "course.language_switched";
+
+/**
+ * The audit row of a switch that closed attempts (decision A37 (a)), for
+ * auditLog: written only when the abandon returned at least one row, naming
+ * the rows it returned. Ids and language codes only: the course, the
+ * organisation, the context (its kind, ids and key), the languages the
+ * closed rows were on, the language chosen, and the closed attempt ids. No
+ * name, no email, no score or result.
+ */
+export function languageSwitchAudit(i: {
+  courseId: string;
+  organizationId: string;
+  context: SwitchContext;
+  contextKey: string;
+  toLanguage: string;
+  closed: Array<{ id: string; language: string | null }>;
+}): { action: typeof LANGUAGE_SWITCHED_ACTION; targetType: "course"; targetId: string; metadata: Record<string, unknown> } {
+  const c = i.context;
+  const context =
+    c.kind === "path"
+      ? { kind: "path", pathId: c.pathId }
+      : c.kind === "journey"
+        ? { kind: "journey", journeyEnrollmentId: c.enrollmentId, dayId: c.dayId }
+        : { kind: "individual" };
+  const fromLanguages = [...new Set(i.closed.map((r) => r.language).filter((l): l is string => typeof l === "string" && l !== ""))].sort();
+  return {
+    action: LANGUAGE_SWITCHED_ACTION,
+    targetType: "course",
+    targetId: i.courseId,
+    metadata: {
+      courseId: i.courseId,
+      organizationId: i.organizationId,
+      context,
+      contextKey: i.contextKey,
+      fromLanguages,
+      toLanguage: i.toLanguage,
+      attemptIds: i.closed.map((r) => r.id).sort(),
+    },
+  };
 }

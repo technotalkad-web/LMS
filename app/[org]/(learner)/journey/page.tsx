@@ -2,6 +2,7 @@ import Link from "next/link";
 import {
   Check,
   Eye,
+  Globe,
   Hourglass,
   Lock,
   PauseCircle,
@@ -29,6 +30,7 @@ import {
 } from "@/lib/journey/journey";
 import { readJourneyCredits } from "@/lib/journey/credits-read";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { languageSwitchLaunchUrl, SWITCH_CHOOSE } from "@/lib/courses/slot-routing";
 
 export const dynamic = "force-dynamic";
 
@@ -409,15 +411,51 @@ export default async function JourneyPage({
   // mission (tagged in-progress attempt) — coming back mid-module resumes
   // from their bookmark, and the button should say so.
   let missionInProgress = false;
+  // ADR 0024 P2-9 (review F2): the course of the day's open attempt, read
+  // with it. A publish that swapped the day's course after the learner
+  // started it leaves that attempt open on the started course (0107's
+  // re-pin keeps it), and the launch of the day goes on into that course,
+  // so "Change language" names it and counts its languages. Picked as
+  // launch_context picks the day's open attempt: the mission's course
+  // first, else the oldest.
+  let missionStartedCourseId: string | null = null;
   if (mission?.course_id && state.todayUnlocked) {
     const { data: ipRows } = await supabase
       .from("course_attempts")
-      .select("id")
+      .select("id, course_versions(course_id)")
       .eq("journey_enrollment_id", enrollment.id)
       .eq("journey_day", state.currentDay)
       .eq("status", "in_progress")
-      .limit(1);
-    missionInProgress = (ipRows ?? []).length > 0;
+      .order("started_at", { ascending: true })
+      .limit(10);
+    // A to-one embed: an object at run time (the client's types read a list).
+    type Started = { course_id: string | null } | Array<{ course_id: string | null }> | null;
+    const open = (ipRows ?? []) as unknown as Array<{ id: string; course_versions: Started }>;
+    missionInProgress = open.length > 0;
+    const courseOf = (v: Started) => (Array.isArray(v) ? v[0]?.course_id : v?.course_id) ?? null;
+    const started = open.map((r) => courseOf(r.course_versions)).filter((id): id is string => !!id);
+    missionStartedCourseId = started.find((id) => id === mission.course_id) ?? started[0] ?? null;
+  }
+  // ADR 0024 P2-9 (step 27 (c)): today's mission whose course has two or
+  // more active languages offers "Change language", which opens the launch's
+  // own picker in this day's context (the course page's menu switches the
+  // Individual course only). A day whose open attempt is on another course
+  // (the day's course swapped after the learner started it, review F2) shows
+  // no link: the switch would close that attempt and the day would not open a
+  // new one there, so the route refuses every other language (review F1).
+  // One count of the mission course's active packages, only when the mission
+  // can be launched; display only, so a failed read shows no link.
+  const swappedDay = missionStartedCourseId !== null && missionStartedCourseId !== mission?.course_id;
+  const switchCourseId = swappedDay ? null : (mission?.course_id ?? null);
+  let missionMultiLanguage = false;
+  if (switchCourseId && state.todayUnlocked) {
+    const { count, error: pkgErr } = await supabase
+      .from("course_packages")
+      .select("id", { count: "exact", head: true })
+      .eq("course_id", switchCourseId)
+      .eq("is_active", true);
+    if (pkgErr) console.warn(JSON.stringify({ event: "journey_languages_unreadable", enrollment_id: enrollment.id, code: pkgErr.code ?? null }));
+    missionMultiLanguage = !pkgErr && (count ?? 0) >= 2;
   }
   const achieved = milestones.filter((m) => state.completedCount >= m.day);
   const latestAchieved = achieved[achieved.length - 1];
@@ -623,6 +661,20 @@ export default async function JourneyPage({
                   <PlayCircle className="w-5 h-5" />{" "}
                   {missionInProgress ? copy.cta_resume : copy.cta_start} →
                 </Link>
+                {missionMultiLanguage && switchCourseId && (
+                  <Link
+                    href={languageSwitchLaunchUrl({
+                      orgSlug,
+                      courseId: switchCourseId,
+                      context: { kind: "journey", enrollmentId: enrollment.id, dayId: dayParam(state.currentDay) },
+                      switchTo: SWITCH_CHOOSE,
+                    })}
+                    data-testid="mission-change-language"
+                    className="mt-2 inline-flex items-center justify-center gap-1.5 text-xs font-medium text-muted hover:text-ink"
+                  >
+                    <Globe className="w-3.5 h-3.5" /> Change language
+                  </Link>
+                )}
                 {state.pendingDays > 1 && (
                   <p className="mt-2 text-xs text-amber-700">
                     You&apos;re {state.behindDays} day{state.behindDays === 1 ? "" : "s"} behind —

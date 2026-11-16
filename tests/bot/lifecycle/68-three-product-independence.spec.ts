@@ -184,6 +184,31 @@
  *         day 2 (credited on B) to B, each by its day's id, and nothing else
  *         of the enrolment; day 1's link is a revision visit in its context.
  *
+ * P2-9, the language switch per context (step 27, decisions A24 and A37,
+ * criterion 23). Block "language contexts" (learner W holds bilingual cmi5
+ * course L directly, in path P and on day 1 of a journey):
+ *   (ls2) three Starts in English, one open row per product; the Library's
+ *         row takes a scored answer inside the AU (the cmi5 hold of ADR 0014
+ *         step 18), the path's row a statement;
+ *   (ls3) rule (1) inside each product: ?lang=hi goes to the launch's own
+ *         picker with the launch's context (?lp=, or ?journey= and the day's
+ *         id, also from an old link's number) and ?switch=hi; nothing
+ *         written;
+ *   (ls4) the path's switch on that picker in a browser: Cancel sends
+ *         nothing; OK sends the path's context, closes the path's English
+ *         row only (status abandoned, its data and statements kept), leaves
+ *         the Library's (assessed) and the day's open rows as they were,
+ *         saves the one preference, goes on to the path's launch in Hindi,
+ *         and writes one audit row, ids and language codes only;
+ *   (ls5) the Library's switch is held by its own assessed row (409
+ *         requires_finish, nothing written); the day's switch is not held by
+ *         it, counts and closes the day's row only, with its audit row;
+ *   (ls6) a context W does not hold, a preview context and a malformed one:
+ *         400, nothing saved, closed or audited;
+ *   (ls7) "Change language" on the path page's step and the journey page's
+ *         mission link the launch's own picker in that context
+ *         (?switch=choose), which renders and writes nothing.
+ *
  * Needs 0107 on the target database: every seed FAILS without it. By hand on
  * staging after the code is deployed, never while another lifecycle run is in
  * progress. It joined PRODUCT_SPECS in scripts/lifecycle-nightly.sh (step 73)
@@ -2592,5 +2617,305 @@ test.describe.serial("ADR 0024 P2-6 — the journey page's review links open the
       context_key: `journey:${enr}:${journey.dayIds[1]}`,
       attempt_id: fresh[0].id,
     });
+  });
+});
+/** A platform_audit_log row of the language switch (ADR 0024 decision A37), as the service role reads it. */
+type SwitchAudit = { actor_user_id: string | null; action: string; target_type: string | null; target_id: string | null; metadata: Row | null };
+
+async function switchAudits(courseId: string): Promise<SwitchAudit[]> {
+  const { data, error } = await svc()
+    .from("platform_audit_log")
+    .select("actor_user_id, action, target_type, target_id, metadata")
+    .eq("action", "course.language_switched")
+    .eq("target_id", courseId)
+    .order("at");
+  expect(error, `audit read: ${error?.message}`).toBeNull();
+  return (data ?? []) as SwitchAudit[];
+}
+
+/** Every statement stored on an attempt (a switch deletes none; criterion 23). */
+async function statementCount(attemptId: string): Promise<number> {
+  const { count, error } = await svc().from("xapi_statements").select("statement_id", { count: "exact", head: true }).eq("attempt_id", attemptId);
+  expect(error, `statements read: ${error?.message}`).toBeNull();
+  return count ?? 0;
+}
+
+/** `&` as Next's flight data escapes it inside a streamed body: a backslash, then u0026. */
+const FLIGHT_AMP = String.fromCharCode(92) + "u0026";
+
+/**
+ * Where a response redirects, as a comparable value: the path and the
+ * parameters, whatever escaping it carried. A 3xx Location; or Next's marker
+ * in a streamed 200 body, where `&` may arrive as `&amp;` (an attribute) or
+ * as FLIGHT_AMP (the flight data), at which redirectTarget()'s pattern
+ * stops. Null for a page that rendered.
+ */
+function redirectParts(r: NoFollow): { path: string; params: Record<string, string> } | null {
+  let target: string | null = null;
+  if (r.status >= 300 && r.status < 400) target = r.location;
+  else if (r.status === 200) {
+    const body = r.body.split(FLIGHT_AMP).join("&").replace(/&amp;/g, "&");
+    target = /NEXT_REDIRECT;(?:replace|push);(.+?);30[0-9];/.exec(body)?.[1] ?? null;
+  }
+  if (target === null) return null;
+  const u = new URL(target, "http://x.invalid");
+  return { path: u.pathname, params: Object.fromEntries([...u.searchParams.entries()].sort()) };
+}
+
+test.describe.serial("ADR 0024 P2-9 — the language switch in one product (criterion 23)", () => {
+  const s: {
+    org?: { id: string; slug: string };
+    adminCtx?: BrowserContext;
+    w?: User;
+    wCtx?: BrowserContext;
+    /** L: English and Hindi. */
+    l?: { id: string; en: string; hi: string };
+    /** P: W's private path, L its only step. X: a private path on L that W is not on. */
+    p?: string;
+    x?: string;
+    j?: Journey;
+    enr?: string;
+    /** W's three open English rows of L, one per product (ls2). */
+    ind?: string;
+    inPath?: string;
+    inDay?: string;
+  } = {};
+  const slug = () => s.org!.slug;
+  const launch = (q: string) => `/${slug()}/courses/${s.l!.id}/launch${q}`;
+  const putSwitch = (data: Record<string, unknown>) =>
+    s.wCtx!.request.put(`/api/courses/${s.l!.id}/language-preference`, { data: { orgSlug: slug(), language: "hi", ...data } });
+  /** W's rows of L in English, every context, by id. */
+  const statusById = async () => Object.fromEntries((await ctxRows(s.w!.id, s.l!.en)).map((r) => [r.id, r.status]));
+  /** The fields a switch must not touch on the row it closes: everything but the status. */
+  const kept = (r: Row) => {
+    const { status: _status, ...rest } = r;
+    void _status;
+    return Object.fromEntries(
+      Object.entries(rest).filter(([k]) =>
+        ["id", "course_version_id", "context_key", "completion_status", "success_status", "score", "started_at", "completed_at", "cmi_data", "is_revision"].includes(k)
+      )
+    );
+  };
+
+  test.afterAll(async () => {
+    await s.wCtx?.close().catch(() => {});
+    await s.adminCtx?.close().catch(() => {});
+  });
+
+  test("(ls1) seed: bilingual cmi5 course L; a private path P on L and another, X, on L; a one-day journey on L; learner W on L directly, on P and on the journey", async ({
+    browser,
+    baseURL,
+  }) => {
+    test.setTimeout(600_000);
+    expect(await has0107(), "0107 is not applied on this database: P2-9's switch reads context_key").toBe(true);
+    const org = await createOrg({ name: "Lifecycle Language Contexts" });
+    s.org = org;
+    const admin = (await createAuthUser({ profile: { first_name: "Switch", last_name: "Admin", must_change_password: false } })) as User;
+    await addMember({ organizationId: org.id, userId: admin.id, role: "admin" });
+    s.adminCtx = await authedContext(browser, baseURL!, admin.email, admin.password);
+    const areq = s.adminCtx.request;
+    s.w = await newLearner(org.id, "W");
+
+    // L in English and Hindi (the P2-5 block's seed, inline).
+    const tag = rand(6);
+    const lZip = await cmi5Zip({ courseId: `urn:qa:langctx:${tag}:l`, title: "QA Language Contexts L" });
+    const up = await uploadNew(areq, org.slug, "l.zip", lZip);
+    expect(up.ok(), `upload → ${up.status()}: ${await up.text()}`).toBeTruthy();
+    const lId = (await up.json()).courseId as string;
+    const { data: l0 } = await svc().from("course_packages").select("id, current_version_id").eq("course_id", lId).single();
+    const enPkg = (l0 as { id: string }).id;
+    const promote = await areq.patch(`/api/courses/${lId}/packages/${enPkg}`, { data: { orgSlug: org.slug, language: "en", display_name: "English" } });
+    expect(promote.ok(), `promote → ${promote.status()}: ${await promote.text()}`).toBeTruthy();
+    const addHi = await areq.post(`/api/courses/${lId}/packages`, {
+      multipart: { orgSlug: org.slug, language: "hi", display_name: "Hindi", file: zipFile("l.zip", lZip) },
+      timeout: GUARDIAN_ROUTE_TIMEOUT_MS,
+    });
+    expect(addHi.ok(), `add hi → ${addHi.status()}: ${await addHi.text()}`).toBeTruthy();
+    const { data: hi } = await svc().from("course_packages").select("current_version_id").eq("course_id", lId).eq("language", "hi").single();
+    s.l = { id: lId, en: (l0 as { current_version_id: string }).current_version_id, hi: (hi as { current_version_id: string }).current_version_id };
+
+    s.p = await newPath(org.id, "Language P", { visibility: "private", sequence: "random" }, [lId]);
+    s.x = await newPath(org.id, "Language X", { visibility: "private", sequence: "random" }, [lId]);
+    await assignCourse(areq, org.slug, lId, s.w.id);
+    await assignPath(org.id, s.p, s.w.id);
+    s.j = await oneDayJourney(org.id, "Language Journey", lId);
+    s.enr = await enrolJourney(s.j, org.id, s.w.id);
+    s.wCtx = await authedContext(browser, baseURL!, s.w.email, s.w.password);
+  });
+
+  test("(ls2) three Starts in English, one per product: the Library, the path and the journey day each open their own row", async () => {
+    const w = s.w!;
+    const req = s.wCtx!.request;
+    for (const q of ["?lang=en", `?lp=${s.p}&lang=en`, `?journey=${s.enr}&day=${s.j!.dayId}&lang=en`]) {
+      const r = await served(req, launch(q));
+      expect(r.src, `${q}: English`).toContain(`/content/v/${s.l!.en}/`);
+    }
+    const rows = await ctxRows(w.id, s.l!.en);
+    expect(rows.map((r) => [r.context_key, r.status]).sort(), "three open English rows, one per context").toEqual(
+      [["individual", "in_progress"], [`journey:${s.enr}:${s.j!.dayId}`, "in_progress"], [`path:${s.p}`, "in_progress"]].sort()
+    );
+    s.ind = rows.find((r) => r.context_key === "individual")!.id;
+    s.inPath = rows.find((r) => r.context_kind === "path")!.id;
+    s.inDay = rows.find((r) => r.context_kind === "journey")!.id;
+    // The Individual attempt takes a scored answer inside the AU (it stays in
+    // progress): the cmi5 hold of ADR 0014 step 18 for that product only. The
+    // path's attempt sends a statement too, so its statements can be counted
+    // after the switch closes it.
+    await assessInside(req, w, s.ind);
+    const auth = await authTokenFor(req, s.inPath);
+    const st = await req.post("/api/xapi/statements", {
+      headers: { ...XAPI_HEADERS, Authorization: auth },
+      data: [statement(w, "initialized", s.inPath)],
+    });
+    expect(st.status(), await st.text()).toBe(200);
+    expect(await statementCount(s.inPath), "the path's attempt holds a statement").toBeGreaterThan(0);
+    expect(await savedLanguage(w.id, s.l!.id), "no saved language yet").toBeNull();
+  });
+
+  test("(ls3) rule (1) inside each product: ?lang=hi goes to the launch's own picker with the launch's context and ?switch=hi, and writes nothing", async () => {
+    const req = s.wCtx!.request;
+    const before = await statusById();
+    const want = (params: Record<string, string>) => ({ path: `/${slug()}/courses/${s.l!.id}/launch`, params: Object.fromEntries(Object.entries(params).sort()) });
+    for (const [what, q, params] of [
+      ["the Library", "?lang=hi", { switch: "hi" }],
+      ["the path", `?lp=${s.p}&lang=hi`, { lp: s.p!, switch: "hi" }],
+      ["the journey day, by its id", `?journey=${s.enr}&day=${s.j!.dayId}&lang=hi`, { journey: s.enr!, day: s.j!.dayId, switch: "hi" }],
+      ["the journey day, by an old link's number (the redirect names the id)", `?journey=${s.enr}&day=1&lang=hi`, { journey: s.enr!, day: s.j!.dayId, switch: "hi" }],
+    ] as const) {
+      const r = await noFollow(req, launch(q));
+      expect(redirectParts(r), `${what}: ${describe(r)}`).toEqual(want(params));
+      expect(r.body, `${what}: no Hindi module served`).not.toContain(`/content/v/${s.l!.hi}/`);
+    }
+    expect(await statusById(), "nothing closed or opened").toEqual(before);
+    expect((await ctxRows(s.w!.id, s.l!.hi)).length, "no Hindi row").toBe(0);
+  });
+
+  test("(ls4) the path's switch on the launch's own picker: Cancel changes nothing; OK closes the path's open attempt only, keeps its data and statements, and writes one audit row with ids only", async () => {
+    const w = s.w!;
+    const before = { ind: await fullRow(s.ind!), inDay: await fullRow(s.inDay!), inPath: await fullRow(s.inPath!), statements: await statementCount(s.inPath!) };
+    const audits = (await switchAudits(s.l!.id)).length;
+
+    // Cancel: the confirm opens at once for Hindi, in the path's words, and nothing is sent.
+    const first = await pickerPage(s.wCtx!, launch(`?lp=${s.p}&switch=hi`));
+    await expect(first.page.getByRole("heading", { name: "Change Course Language?" })).toBeVisible({ timeout: 30_000 });
+    await expect(first.page.getByTestId("language-switch-copy")).toContainText("on this step of the path will be reset");
+    await expect(first.page.getByTestId("language-switch-copy")).toContainText("completed results are not changed");
+    await first.page.getByRole("button", { name: "Cancel" }).click();
+    await expect(first.page.getByRole("heading", { name: "Change Course Language?" })).toHaveCount(0);
+    expect(first.sent.filter((r) => r.method === "PUT").length, "Cancel sends no switch").toBe(0);
+    await first.page.close();
+    expect((await fullRow(s.inPath!)).status, "the path's attempt is still open after Cancel").toBe("in_progress");
+    expect(await savedLanguage(w.id, s.l!.id), "no language saved by Cancel").toBeNull();
+
+    // OK: one switch, naming the path's context.
+    const second = await pickerPage(s.wCtx!, launch(`?lp=${s.p}&switch=hi`));
+    await expect(second.page.getByRole("heading", { name: "Change Course Language?" })).toBeVisible({ timeout: 30_000 });
+    const switched = second.page.waitForResponse((r) => r.url().includes("/language-preference") && r.request().method() === "PUT");
+    await second.page.getByRole("button", { name: "OK, Switch Language" }).click();
+    const res = await switched;
+    expect(res.request().postDataJSON(), "the picker sends the launch's own context").toMatchObject({ language: "hi", restart_if_in_progress: true, context: { kind: "path", path_id: s.p } });
+    // The status only: the picker navigates at once, so the body may be gone
+    // (5b-c's pattern); the rows and the audit row below carry what it closed.
+    const status = res.status();
+    expect(status, `the switch: ${status === 200 ? "" : await res.text().catch(() => "")}`).toBe(200);
+    // The picker goes on to the path's launch in Hindi, ?switch= dropped.
+    await second.page.waitForURL((u) => u.searchParams.get("lang") === "hi" && !u.searchParams.has("switch") && u.searchParams.get("lp") === s.p, { timeout: 60_000 });
+    await second.page.close();
+
+    // Criterion 23: the path's English attempt is closed, not deleted; its data
+    // and statements stay; the other products' attempts are as they were.
+    const closed = await fullRow(s.inPath!);
+    expect(closed.status, "the path's English attempt is abandoned").toBe("abandoned");
+    expect(kept(closed), "…its row and data kept").toEqual(kept(before.inPath));
+    expect(await statementCount(s.inPath!), "…its statements kept").toBe(before.statements);
+    expect(await fullRow(s.ind!), "the Library's open (assessed) attempt is untouched").toEqual(before.ind);
+    expect(await fullRow(s.inDay!), "the journey day's open attempt is untouched").toEqual(before.inDay);
+    expect(await savedLanguage(w.id, s.l!.id), "the one saved language per learner and course").toBe("hi");
+    const hiRows = await ctxRows(w.id, s.l!.hi);
+    expect(hiRows.map((r) => [r.context_key, r.status]), "the path's launch in Hindi opened a new path row").toEqual([[`path:${s.p}`, "in_progress"]]);
+
+    // Decision A37: one audit row, ids and language codes only.
+    const rows = await switchAudits(s.l!.id);
+    expect(rows.length, "one audit row more").toBe(audits + 1);
+    const a = rows[rows.length - 1];
+    expect([a.actor_user_id, a.target_type, a.target_id]).toEqual([w.id, "course", s.l!.id]);
+    expect(a.metadata).toEqual({
+      courseId: s.l!.id,
+      organizationId: s.org!.id,
+      context: { kind: "path", pathId: s.p },
+      contextKey: `path:${s.p}`,
+      fromLanguages: ["en"],
+      toLanguage: "hi",
+      attemptIds: [s.inPath],
+    });
+    expect(JSON.stringify(a), "no email in the audit row").not.toContain(w.email);
+  });
+
+  test("(ls5) the Library's switch is held by its own assessed attempt; the journey day's switch is not, and closes the day's attempt only", async () => {
+    const w = s.w!;
+    const before = { ind: await fullRow(s.ind!), audits: (await switchAudits(s.l!.id)).length };
+    const held = await putSwitch({ restart_if_in_progress: true });
+    expect(held.status(), await held.text()).toBe(409);
+    expect((await held.json()).requires_finish, "the Library's assessed attempt holds the Library's switch").toBe(true);
+    expect(await fullRow(s.ind!), "nothing changed on it").toEqual(before.ind);
+    expect((await switchAudits(s.l!.id)).length, "no audit row").toBe(before.audits);
+
+    const confirm = await putSwitch({ context: { kind: "journey", journey_enrollment_id: s.enr, day_id: s.j!.dayId } });
+    expect(confirm.status(), await confirm.text()).toBe(409);
+    expect((await confirm.json()).in_progress_attempts, "the day's switch counts the day's attempt only").toBe(1);
+    const day = await putSwitch({ restart_if_in_progress: true, context: { kind: "journey", journey_enrollment_id: s.enr, day_id: s.j!.dayId } });
+    expect(day.status(), await day.text()).toBe(200);
+    expect(await day.json()).toEqual({ ok: true, abandoned: 1, kept_grant_retakes: 0 });
+    expect((await fullRow(s.inDay!)).status, "the day's English attempt is abandoned").toBe("abandoned");
+    expect(await fullRow(s.ind!), "the Library's attempt is still as it was").toEqual(before.ind);
+    const rows = await switchAudits(s.l!.id);
+    expect(rows.length, "one audit row more").toBe(before.audits + 1);
+    expect(rows[rows.length - 1].metadata).toMatchObject({
+      context: { kind: "journey", journeyEnrollmentId: s.enr, dayId: s.j!.dayId },
+      contextKey: `journey:${s.enr}:${s.j!.dayId}`,
+      attemptIds: [s.inDay],
+    });
+    expect(rows[rows.length - 1].actor_user_id).toBe(w.id);
+  });
+
+  test("(ls6) a context W does not hold, a preview context and a malformed one: 400, nothing saved, closed or audited", async () => {
+    const before = { rows: await statusById(), hi: (await ctxRows(s.w!.id, s.l!.hi)).map((r) => [r.id, r.status]), audits: (await switchAudits(s.l!.id)).length };
+    for (const [what, context] of [
+      ["a path W is not on", { kind: "path", path_id: s.x }],
+      ["a path id no path has", { kind: "path", path_id: randomUUID() }],
+      ["a day id that is no day of W's enrolment", { kind: "journey", journey_enrollment_id: s.enr, day_id: randomUUID() }],
+      ["an enrolment id no enrolment has", { kind: "journey", journey_enrollment_id: randomUUID(), day_id: s.j!.dayId }],
+      ["a preview", { kind: "preview" }],
+      ["a path with no id", { kind: "path" }],
+      ["a journey day by its number", { kind: "journey", journey_enrollment_id: s.enr, day_id: "1" }],
+    ] as const) {
+      const r = await putSwitch({ language: "en", restart_if_in_progress: true, context });
+      expect(r.status(), `${what}: ${await r.text()}`).toBe(400);
+    }
+    expect(await statusById(), "no English row changed").toEqual(before.rows);
+    expect((await ctxRows(s.w!.id, s.l!.hi)).map((r) => [r.id, r.status]), "no Hindi row changed").toEqual(before.hi);
+    expect(await savedLanguage(s.w!.id, s.l!.id), "the saved language is still Hindi").toBe("hi");
+    expect((await switchAudits(s.l!.id)).length, "no audit row").toBe(before.audits);
+  });
+
+  test("(ls7) \"Change language\" on the path's step and on the journey's mission opens the launch's own picker in that context", async () => {
+    const req = s.wCtx!.request;
+    const decoded = async (url: string) => {
+      const res = await req.get(url, { timeout: 120_000 });
+      expect(res.ok(), `${url} → ${res.status()}`).toBeTruthy();
+      return (await res.text()).replace(/&amp;/g, "&");
+    };
+    const pathLink = `/${slug()}/courses/${s.l!.id}/launch?lp=${s.p}&switch=choose`;
+    expect(await decoded(`/${slug()}/paths/${s.p}`), "the path page's step offers it").toContain(pathLink);
+    const dayLink = `/${slug()}/courses/${s.l!.id}/launch?journey=${s.enr}&day=${s.j!.dayId}&switch=choose`;
+    expect(await decoded(`/${slug()}/journey`), "the journey page's mission offers it").toContain(dayLink);
+    const before = await statusById();
+    for (const link of [pathLink, dayLink]) {
+      const r = await noFollow(req, link);
+      expect([r.status, redirectTarget(r)], `${link}: the picker renders`).toEqual([200, null]);
+      expect(text(r.body), `${link}: the picker, no module`).toContain("Choose your language");
+      expect(r.body, `${link}: no module served`).not.toMatch(/<iframe[^>]+\/content\/v\//);
+    }
+    expect(await statusById(), "opening the picker writes nothing").toEqual(before);
   });
 });

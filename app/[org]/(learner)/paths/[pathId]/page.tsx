@@ -4,6 +4,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   ArrowLeft,
   BookOpen,
+  Globe,
   Clock,
   PlayCircle,
   CheckCircle2,
@@ -19,6 +20,7 @@ import { createClient } from "@/lib/supabase/server";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { languageSwitchLaunchUrl, SWITCH_CHOOSE } from "@/lib/courses/slot-routing";
 import {
   PATH_STEP_LABEL_TEXT,
   pathDisplay,
@@ -80,6 +82,8 @@ type StepView = {
   manifestType: string | null;
   /** The words beside a done step's result (pathStepLabel, the owner's O4 answer), or null. */
   label: string | null;
+  /** The step's course has two or more active languages: the card offers "Change language" (ADR 0024 P2-9). */
+  multiLanguage: boolean;
 };
 
 /**
@@ -263,8 +267,30 @@ export default async function LearningPathDetailPage({
         description: course?.description ?? null,
         manifestType: manifestTypeOf(step.course_id, course?.current_version_id) || null,
         label: label === null ? null : PATH_STEP_LABEL_TEXT[label],
+        multiLanguage: false,
       };
     });
+    // ADR 0024 P2-9 (step 27 (c)): a step the learner can launch whose course
+    // has two or more active languages offers "Change language", which opens
+    // the launch's own picker in this path's context (the course page's menu
+    // switches the Individual course only). One read of the active packages
+    // of those steps' courses, only when there is such a step; display only,
+    // so a failed read shows no link and nothing else changes.
+    const launchable = views.filter((v) => v.step.state === "current").map((v) => v.step.course_id);
+    if (launchable.length > 0) {
+      const { data: pkgRows, error: pkgErr } = await supabase
+        .from("course_packages")
+        .select("course_id")
+        .in("course_id", launchable)
+        .eq("is_active", true);
+      if (pkgErr) console.warn(JSON.stringify({ event: "path_languages_unreadable", path_id: pathId, code: pkgErr.code ?? null }));
+      const active = new Map<string, number>();
+      for (const r of (pkgErr ? [] : (pkgRows ?? [])) as Array<{ course_id: string }>) {
+        const k = r.course_id.toLowerCase();
+        active.set(k, (active.get(k) ?? 0) + 1);
+      }
+      views = views.map((v) => ({ ...v, multiLanguage: (active.get(v.step.course_id.toLowerCase()) ?? 0) >= 2 }));
+    }
     done = display.done;
     total = display.total;
     completed = progress.completed;
@@ -624,6 +650,18 @@ function StepCard({
               className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 bg-paper border border-line hover:border-ink text-muted hover:text-ink px-4 py-1.5 rounded-lg text-xs font-medium transition-colors"
             >
               <Eye className="w-3.5 h-3.5" /> Preview
+            </Link>
+          )}
+          {/* ADR 0024 P2-9: the language switch of this step, in this
+              path's context (the launch's own picker); a switch closes this
+              step's open attempt only. */}
+          {!isUnreleased && !isLocked && !isCompleted && view.multiLanguage && (
+            <Link
+              href={languageSwitchLaunchUrl({ orgSlug, courseId: step.course_id, context: { kind: "path", pathId }, switchTo: SWITCH_CHOOSE })}
+              data-testid="step-change-language"
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 bg-paper border border-line hover:border-ink text-muted hover:text-ink px-4 py-1.5 rounded-lg text-xs font-medium transition-colors"
+            >
+              <Globe className="w-3.5 h-3.5" /> Change language
             </Link>
           )}
         </div>

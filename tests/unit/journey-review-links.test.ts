@@ -32,7 +32,15 @@
  *   (d) the planted cases: the same checks run over trees built from a
  *       wrong page (a done-day link on the day's current course, a link
  *       without `&day=`, a link with the number where the id is owed), and
- *       each check flags it, so (a) to (c) cannot pass vacuously.
+ *       each check flags it, so (a) to (c) cannot pass vacuously;
+ *   (e) ADR 0024 P2-9's "Change language" under today's mission
+ *       (data-testid mission-change-language; the review's F2 and F3): shown
+ *       for a course with two active packages, absent for one, linking the
+ *       launch's own picker in the day's context (?switch=choose); on a day
+ *       whose open attempt is on another course only (the day's course
+ *       swapped after the learner started it) no link is shown, whatever
+ *       either course's languages; with the mission's course open too, the
+ *       link names the mission's course.
  *
  * No database, no network.
  *
@@ -78,13 +86,17 @@ type World = {
   credits: Credit[];
   /** A database without 0107: a select naming day_ids or day_id answers 42703. */
   no0107: boolean;
+  /** Active packages per course (none when absent): the "Change language" count. */
+  packages?: Record<string, number>;
+  /** The learner's open journey attempts, oldest first: their day's number and course. */
+  open?: Array<{ day: number; course: string }>;
 };
 type Req = { table: string; select: string; ops: Array<[string, unknown[]]> };
 
 /** A recording query builder answering from `w`. */
 function stubClient(w: World) {
   const reqs: Req[] = [];
-  const answer = (r: Req, single: boolean): { data: unknown; error: PgErr | null } => {
+  const answer = (r: Req, single: boolean): { data: unknown; error: PgErr | null; count?: number } => {
     const range = r.ops.find(([o]) => o === "range")?.[1] as [number, number] | undefined;
     const rows = ((): unknown[] | PgErr => {
       switch (r.table) {
@@ -118,11 +130,19 @@ function stubClient(w: World) {
           const ids = (r.ops.find(([o, a]) => o === "in" && a[0] === "id")?.[1][1] ?? []) as string[];
           return ids.map((id) => ({ id, title: `Course ${id.slice(-2)}` }));
         }
+        case "course_attempts": {
+          const day = r.ops.find(([o, a]) => o === "eq" && a[0] === "journey_day")?.[1][1];
+          return (w.open ?? []).filter((a) => a.day === day).map((a, i) => ({ id: `open-${i}`, course_versions: { course_id: a.course } }));
+        }
         default:
           return [];
       }
     })();
     if (!Array.isArray(rows)) return { data: null, error: rows };
+    if (r.table === "course_packages") {
+      const course = r.ops.find(([o, a]) => o === "eq" && a[0] === "course_id")?.[1][1] as string | undefined;
+      return { data: null, error: null, count: (course && w.packages?.[course]) || 0 };
+    }
     return { data: single ? rows[0] ?? null : rows, error: null };
   };
   const from = (table: string) => {
@@ -317,6 +337,45 @@ async function main() {
     eq("planted: a Revisit list on the day's current course, or without &day=, is flagged",
       [revisitProblems([link(A, D1, null, false), link(B, D2, null, false)], [[A, D1], [P, D2]]).length > 0,
        revisitProblems([link(A, D1, null, false), link(P, null, null, false)], [[A, D1], [P, D2]]).length > 0], [true, true]);
+  }
+
+  console.log("\n(e) P2-9: \"Change language\" under today's mission (the review's F2 and F3)");
+  {
+    /** The tree's "Change language" links (data-testid mission-change-language). */
+    const switchLinks = (node: unknown, out: string[] = []): string[] => {
+      if (node === null || node === undefined || typeof node !== "object") return out;
+      if (Array.isArray(node)) {
+        for (const n of node) switchLinks(n, out);
+        return out;
+      }
+      const props = (node as { props?: Record<string, unknown> }).props;
+      if (!props) return out;
+      if (props["data-testid"] === "mission-change-language" && typeof props.href === "string") out.push(props.href);
+      switchLinks(props.children, out);
+      return out;
+    };
+    const runTree = async (w: World) => {
+      const s = stubClient(w);
+      client = s.client;
+      const tree = await page({ params: Promise.resolve({ org: "o" }), searchParams: Promise.resolve({}) });
+      return { links: switchLinks(tree), reqs: s.reqs };
+    };
+    const base: World = { status: "active", programActive: true, credits: CREDITS, no0107: false };
+    /** The course day 3 held when the learner started it, before a publish swapped it to C. */
+    const S = "c0000000-0000-4000-8000-0000000000ab";
+    const picker = (course: string) => `/o/courses/${course}/launch?journey=${ENR}&day=${D3}&switch=choose`;
+    const two = await runTree({ ...base, packages: { [C]: 2 } });
+    eq("today's mission (day 3, course C) with two active packages: one link, the launch's own picker in day 3's context",
+      two.links, [picker(C)]);
+    eq("…one count of C's active packages", two.reqs.filter((q) => q.table === "course_packages").map((q) => q.ops.find(([o, a]) => o === "eq" && a[0] === "course_id")?.[1][1]), [C]);
+    eq("one active package: no link", (await runTree({ ...base, packages: { [C]: 1 } })).links, []);
+    eq("F2: day 3 started on S before a publish swapped it to C; S has two languages, C one: no link (the day would not reopen S, so every other language is refused)",
+      (await runTree({ ...base, packages: { [C]: 1, [S]: 2 }, open: [{ day: 3, course: S }] })).links, []);
+    eq("F2: …both S and C have two languages: still no link (a swapped day never offers the switch)",
+      (await runTree({ ...base, packages: { [C]: 2, [S]: 2 }, open: [{ day: 3, course: S }] })).links, []);
+    eq("…open attempts of S (older) and of C on day 3: the mission's course first, as launch_context picks it",
+      (await runTree({ ...base, packages: { [C]: 2, [S]: 2 }, open: [{ day: 3, course: S }, { day: 3, course: C }] })).links, [picker(C)]);
+    eq("…an open attempt of today's own course: the link names it", (await runTree({ ...base, packages: { [C]: 2 }, open: [{ day: 3, course: C }] })).links, [picker(C)]);
   }
 
   console.warn = quiet;

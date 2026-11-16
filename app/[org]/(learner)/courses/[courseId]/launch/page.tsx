@@ -26,7 +26,14 @@ import { contextKeyOf, type ContextResult } from "@/lib/scoring/context";
 import { readContextResult, type ReadContextAttempt, type ReadContextGrant } from "@/lib/scoring/context-read";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
 import { enqueueAbandonedStatements } from "@/lib/lrs/abandoned";
-import { decideSlotRouting, type SlotAttempt, type SlotSource } from "@/lib/courses/slot-routing";
+import {
+  decideSlotRouting,
+  languageSwitchLaunchUrl,
+  switchContextBody,
+  type SlotAttempt,
+  type SlotSource,
+  type SwitchContext,
+} from "@/lib/courses/slot-routing";
 import { launchFallback } from "@/lib/courses/default-rule";
 import { aldsP4Enabled, isAldsSchemaMissing, logAldsSkip } from "@/lib/alds/flag";
 import {
@@ -107,6 +114,13 @@ export default async function LaunchPage({
     /** A repeated parameter arrives as a list: its first value is read. */
     mode?: string | string[];
     run?: string | string[];
+    /**
+     * ADR 0024 P2-9 (step 27 (b) and (c)): the language switch in this
+     * launch's context. A language code opens the picker's confirm for it
+     * (rule (1)'s redirect); SWITCH_CHOOSE opens the picker alone ("Change
+     * language" on a path step or a journey day).
+     */
+    switch?: string | string[];
   }>;
 }) {
   const { org: orgSlug, courseId } = await params;
@@ -118,6 +132,7 @@ export default async function LaunchPage({
     back: backParam,
     mode: modeRaw,
     run: runRaw,
+    switch: switchRaw,
   } = await searchParams;
   const { user, org, role, impersonation } = await requireOrgAccess(orgSlug);
 
@@ -177,6 +192,10 @@ export default async function LaunchPage({
   const lpArg = given(lpParam);
   const journeyArg = given(journeyParam);
   const dayArg = given(dayParam);
+  // ADR 0024 P2-9: a Start's language switch in its own context. A preview
+  // never confirms a switch (it saves no preference and resets nothing), so
+  // ?switch= is not read for one.
+  const switchArg = preview ? null : given(switchRaw);
 
   // ADR 0024 P2-6 item 1: the rows that refuse before any fact (the
   // resolver's own rule, refusalWithoutFacts): both product parameters
@@ -333,10 +352,16 @@ export default async function LaunchPage({
   // started on another course (the day's course swapped after the learner
   // started it): the launch of the same day on the started course, which
   // resumes it (steps 22 and 93; the resolver's journey row, whose answer for
-  // that course is `resume`, so it cannot loop either).
+  // that course is `resume`, so it cannot loop either). A language switch
+  // asked of this launch (?switch=, ADR 0024 P2-9) goes with it, so the
+  // launch it lands on renders its picker in that context ("Change language"
+  // on a day whose course was swapped reaches the started course's picker:
+  // review F2); ?lang= is then not carried, as languageSwitchLaunchUrl never
+  // carries it.
   const launchInto = (product: { lp: string } | { journey: string; day: string }, courseOf: string = c.id): string => {
     const q = new URLSearchParams(product);
-    if (langParam && isSupportedLanguage(langParam)) q.set("lang", langParam);
+    if (switchArg !== null) q.set("switch", switchArg);
+    else if (langParam && isSupportedLanguage(langParam)) q.set("lang", langParam);
     if (backParam === "dashboard") q.set("back", "dashboard");
     return `/${orgSlug}/courses/${encodeURIComponent(courseOf)}/launch?${q.toString()}`;
   };
@@ -547,6 +572,52 @@ export default async function LaunchPage({
   let grants: Grants = inCtx ? grantsOf(inCtx) : { retakeIds: new Set<string>(), unusedGrant: null };
   let ev: Evaluation = inCtx ? evaluate(inCtx, true) : { my: [], scoring: null, candidate: "first" };
 
+  // ADR 0024 P2-9 (step 27): the launch's context as the language switch
+  // reads it, from the resolver's ids (a journey day by its id, even when the
+  // link named its number): what the picker sends to the switch route and
+  // where rule (1) redirects. Null for a preview, which never switches.
+  const switchCtx: SwitchContext | null =
+    ctx.kind === "preview"
+      ? null
+      : ctx.kind === "path"
+        ? { kind: "path", pathId: ctx.pathId }
+        : ctx.kind === "journey"
+          ? { kind: "journey", enrollmentId: ctx.enrollmentId, dayId: ctx.dayId }
+          : { kind: "individual" };
+  // The picker: a Start's sends its launch's context and words its confirm
+  // from this context's open rows (revision rows left out, a granted retake
+  // marked), the rows the switch route counts; a preview's sends nothing.
+  const languagePicker = (initialSwitch: string | null) => {
+    const languageOfPackage = new Map(allPackages.map((p) => [p.id, p.language]));
+    const packageOfVersionId = new Map(courseVersions.map((v) => [v.id, v.package_id]));
+    const openHere = (inCtx?.rows ?? [])
+      .filter((a) => a.status === "in_progress" && a.is_revision !== true)
+      .map((a) => ({
+        language: languageOfPackage.get(packageOfVersionId.get(a.course_version_id) ?? "") ?? null,
+        grantedRetake: grants.retakeIds.has(a.id),
+      }));
+    return (
+      <LaunchLanguagePicker
+        orgSlug={orgSlug}
+        courseId={courseId}
+        courseTitle={c.title}
+        preview={preview}
+        context={switchCtx ? switchContextBody(switchCtx) : null}
+        inProgress={openHere}
+        initialSwitch={initialSwitch}
+        packages={activePackages.map((p) => ({
+          id: p.id,
+          language: p.language,
+          display_label:
+            p.display_name ??
+            languageDisplay(p.language, "native") ??
+            p.language ??
+            "Default",
+        }))}
+      />
+    );
+  };
+
   // ---------------------------------------------------------------
   // Multi-language resolution (Phase 2 + Phase 3 of #158)
   //
@@ -574,6 +645,15 @@ export default async function LaunchPage({
     resolvedVersionId = activePackages[0].current_version_id;
     chosenPackageId = activePackages[0].id;
   } else {
+    // ADR 0024 P2-9 (step 27 (b) and (c)): ?switch= on a Start renders the
+    // picker in this launch's context, a saved preference or ?lang=
+    // notwithstanding: rule (1)'s redirect lands here with the language to
+    // confirm, and "Change language" on a path step or a journey day with
+    // SWITCH_CHOOSE. The picker's switch closes only this context's open
+    // attempt, and its navigation drops ?switch=. Nothing is written here.
+    if (switchArg !== null && switchCtx !== null) {
+      return languagePicker(activePackages.some((p) => p.language === switchArg) ? switchArg : null);
+    }
     // Pick from explicit ?lang= if it matches an active package.
     let chosen: PackageRow | null = null;
     if (langParam && isSupportedLanguage(langParam)) {
@@ -598,23 +678,7 @@ export default async function LaunchPage({
     }
     if (!chosen) {
       // Render picker — learner has no signal we can use.
-      return (
-        <LaunchLanguagePicker
-          orgSlug={orgSlug}
-          courseId={courseId}
-          courseTitle={c.title}
-          preview={preview}
-          packages={activePackages.map((p) => ({
-            id: p.id,
-            language: p.language,
-            display_label:
-              p.display_name ??
-              languageDisplay(p.language, "native") ??
-              p.language ??
-              "Default",
-          }))}
-        />
-      );
+      return languagePicker(null);
     }
     resolvedVersionId = chosen.current_version_id;
     chosenPackageId = chosen.id;
@@ -692,14 +756,20 @@ export default async function LaunchPage({
           })
         : ({ kind: "continue", abandon: [] } as const);
 
-      if (decision.kind === "confirm-switch" && !preview) {
-        // (1) Back to the course page, which opens the existing confirm for
-        // this language (a confirmed switch resets the other slot's progress).
-        // A preview never goes there: the switch it confirms resets the
-        // learner's rows on the other slot whatever their context, a real
-        // attempt included. It runs the language asked for, and its preview
-        // on the other slot stays open (nothing is closed).
-        redirect(`/${orgSlug}/courses/${courseId}?switch=${encodeURIComponent(langParam ?? "")}`);
+      if (decision.kind === "confirm-switch" && switchCtx !== null) {
+        // (1) To this launch's own picker, in this launch's context, which
+        // opens the confirm for this language (ADR 0024 P2-9, step 27 (b):
+        // a confirmed switch resets this context's open attempt on the other
+        // slot, and no other product's). Not the course page: its menu
+        // switches the Individual course only, so for a path or a journey it
+        // would confirm a switch of the wrong product and the launch would
+        // loop. ?lang= is dropped and ?switch= carried, and the page renders
+        // the picker for ?switch= before this rule, so it cannot loop either.
+        // A preview never goes there: it runs the language asked for, and its
+        // preview on the other slot stays open (nothing is closed).
+        redirect(
+          languageSwitchLaunchUrl({ orgSlug, courseId, context: switchCtx, switchTo: langParam ?? "", back: backParam ?? null })
+        );
       }
       // (3) is carried out below (closeAfterResolution), only once every
       // launch gate has passed: a launch a gate refuses (no version,

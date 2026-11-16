@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { Globe, ChevronDown, Check } from "lucide-react";
 import { languageDisplay } from "@/lib/i18n/languages";
+import { switchConfirmText, type InProgressAttemptLang } from "@/lib/courses/slot-routing";
 
 /** Fixed-position coordinates for the portaled options menu. */
 type MenuCoords = {
@@ -30,18 +31,20 @@ export type ChangeLanguageOption = {
   display_label: string;
 };
 
-export type InProgressAttemptLang = {
-  /** Package language of the attempt's version (null = legacy/unknown). */
-  language: string | null;
-  /** A consumed admin grant (official retake) — never reset by a switch. */
-  grantedRetake: boolean;
-};
+export type { InProgressAttemptLang };
 
 /**
  * Compact "Change language" dropdown on the learner course detail
  * page (#158 Phase 3). Reuses the PUT /api/courses/:courseId/language-preference
  * endpoint and the same 409 + requires_confirm dance as the
  * full-screen LaunchLanguagePicker.
+ *
+ * ADR 0024 P2-9 (step 27 (d)): the course page is the Individual course, so
+ * the menu sends `context: { kind: "individual" }`, its `inProgress` holds
+ * the Individual course's open attempts only, and its confirm says that
+ * only that attempt is reset: attempts open in a learning path or a journey
+ * keep their language and progress, and nothing completed changes. A path
+ * step or a journey day switches on the launch page's own picker.
  *
  * Renders nothing unless there are 2+ options.
  */
@@ -58,18 +61,18 @@ export function ChangeLanguageMenu({
   options: ChangeLanguageOption[];
   currentLanguage: string | null;
   /**
-   * ADR 0004 step 9 (1): the launch page redirected here because the learner
-   * chose this language while progress is open in another one. Opens the
-   * same confirmation as picking it from the menu; nothing changes until the
-   * learner confirms.
+   * ?switch=<lang> on the course page: opens the same confirmation as picking
+   * it from the menu; nothing changes until the learner confirms. (ADR 0004
+   * step 9 (1)'s launch redirect came here before ADR 0024 P2-9; it now goes
+   * to the launch page's own picker, in the launch's context.)
    */
   initialSwitch?: string | null;
   /**
-   * The learner's in-progress attempts on this course, by package language.
-   * A switch resets the ones in other languages EXCEPT an extra attempt an
-   * admin granted (ALDS Decision 9). When such an attempt is involved the
-   * copy is chosen per target language; otherwise the original confirmation
-   * text is shown unchanged.
+   * The learner's in-progress attempts of the Individual course (ADR 0024
+   * P2-9: no path's, journey day's or preview's), by package language. A
+   * switch resets the ones in other languages EXCEPT an extra attempt an
+   * admin granted (ALDS Decision 9); switchConfirmText words the confirm
+   * from them.
    */
   inProgress?: InProgressAttemptLang[];
 }) {
@@ -157,22 +160,15 @@ export function ChangeLanguageMenu({
   const currentOption =
     options.find((o) => o.language === currentLanguage) ?? null;
 
-  // What a confirmed switch to `target` does to the in-progress attempts
-  // (mirrors PUT /language-preference): attempts in other languages are
-  // reset, except an admin-granted extra attempt, which is kept.
-  function switchSummary(target: string) {
-    const labelOf = (lang: string | null) =>
-      options.find((o) => o.language === lang)?.display_label ??
-      languageDisplay(lang, "english");
-    const others = inProgress.filter((a) => a.language !== target);
-    const kept = others.find((a) => a.grantedRetake);
-    return {
-      keptRetakeLabel: kept ? labelOf(kept.language) : null,
-      continuesRetake: inProgress.some((a) => a.grantedRetake && a.language === target),
-      resets: others.some((a) => !a.grantedRetake),
-      freshInTarget: !inProgress.some((a) => a.language === target),
-    };
-  }
+  // What a confirmed switch to a language does to the Individual course's
+  // in-progress attempts (mirrors PUT /language-preference): attempts in
+  // other languages are reset, except an admin-granted extra attempt, which
+  // is kept; no other product's attempt is touched.
+  const labelOf = (lang: string | null) =>
+    options.find((o) => o.language === lang)?.display_label ??
+    languageDisplay(lang, "english") ??
+    lang ??
+    "";
 
   // Switching away from the current language resets in-progress work (except
   // an admin-granted extra attempt), so it requires explicit confirmation
@@ -199,6 +195,8 @@ export function ChangeLanguageMenu({
         // Confirmed by the learner — reset any in-progress attempt and start
         // fresh in the new language.
         restart_if_in_progress: true,
+        // ADR 0024 P2-9: the course page is the Individual course.
+        context: { kind: "individual" },
       }),
     });
     if (!res.ok) {
@@ -297,29 +295,15 @@ export function ChangeLanguageMenu({
         >
           <div className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4">
             <h3 className="serif text-2xl">Change Course Language?</h3>
-            {(() => {
-              const s = switchSummary(confirmFor.language);
-              if (!s.keptRetakeLabel && !s.continuesRetake) {
-                return (
-                  <p className="text-sm text-ink leading-relaxed">
-                    Changing the language will reset your current progress and start the
-                    course from the beginning in the new language.
-                  </p>
-                );
-              }
-              return (
-                <p className="text-sm text-ink leading-relaxed">
-                  {s.continuesRetake
-                    ? `Switching to ${confirmFor.label} lets you continue your extra attempt. `
-                    : ""}
-                  {s.keptRetakeLabel
-                    ? `Your extra attempt in progress is kept: it stays in ${s.keptRetakeLabel}, and you can continue it by switching back. `
-                    : ""}
-                  {s.resets ? "Other progress you have in another language will be reset. " : ""}
-                  {s.freshInTarget ? `In ${confirmFor.label} the course starts from the beginning.` : ""}
-                </p>
-              );
-            })()}
+            <p className="text-sm text-ink leading-relaxed" data-testid="language-switch-copy">
+              {switchConfirmText({
+                product: "individual",
+                target: confirmFor.language,
+                targetLabel: confirmFor.label,
+                inProgress,
+                labelOf,
+              })}
+            </p>
             <div className="flex justify-end gap-2 pt-2">
               <button
                 type="button"
