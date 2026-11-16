@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 /**
  * Helpers for the OTP-based password-reset flow. All comparisons are
@@ -59,4 +60,37 @@ export function mintResetToken(): string {
 /** SHA-256 of the reset token (we never store the raw token). */
 export function hashResetToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
+}
+
+/**
+ * Counts one guess on an active code row BEFORE the code is compared.
+ *
+ * One compare-and-set through PostgREST: the row's attempts move from
+ * `row.attempts` to `row.attempts + 1` only while the row still holds
+ * `row.attempts`, is unused and has not expired, and the update returns the
+ * row it changed. Of any number of overlapping guesses that read the same
+ * count, exactly one gets the row back. Only that caller may compare, and
+ * only against the hash this call returned.
+ *
+ * Returns the code hash when this guess took the slot; null when it did not
+ * (the limit is reached, another guess took the slot, the row closed, or the
+ * call failed). On null the caller answers the failure and compares nothing.
+ */
+export async function countGuess(
+  svc: SupabaseClient,
+  row: { id: string; attempts: number }
+): Promise<string | null> {
+  if (!(row.attempts >= 0) || row.attempts >= MAX_VERIFY_ATTEMPTS) return null;
+  const { data, error } = await svc
+    .from("password_reset_otps")
+    .update({ attempts: row.attempts + 1 })
+    .eq("id", row.id)
+    .eq("attempts", row.attempts)
+    .is("used_at", null)
+    .gt("expires_at", new Date().toISOString())
+    .select("id, code_hash");
+  if (error || !Array.isArray(data) || data.length !== 1) return null;
+  const hit = data[0] as { id?: unknown; code_hash?: unknown };
+  if (hit.id !== row.id || typeof hit.code_hash !== "string") return null;
+  return hit.code_hash;
 }
