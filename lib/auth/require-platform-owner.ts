@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
@@ -35,8 +36,18 @@ async function secondFactorShortfall(
  *   2. They are not in the must-change-password state.
  *   3. Their auth.users.id is in public.platform_owners.
  *   4. (Phase 10c) They are at AAL2 if mfa_required is true.
+ *
+ * The platform page rule (tests/unit/platform-page-guards.test.ts): the
+ * platform layout and every platform page await this as their first
+ * statement. A page never relies on its layout alone: a navigation inside
+ * the console renders the page without re-running the layout.
+ *
+ * React's cache() makes it one run per server render: the layout and the
+ * page of one request share it, so the check, and its last_mfa_check_at
+ * write, happen once. A render of the page alone runs it once from the page.
+ * Outside a render (route handlers, scripts) every call runs in full.
  */
-export async function requirePlatformOwner() {
+export const requirePlatformOwner = cache(async () => {
   const supabase = await createClient();
 
   const {
@@ -74,7 +85,7 @@ export async function requirePlatformOwner() {
   }
 
   return { user };
-}
+});
 
 /** The level a platform API handler requires; see requirePlatformOwnerApi. */
 export type PlatformOwnerApiLevel = "full" | "end";
