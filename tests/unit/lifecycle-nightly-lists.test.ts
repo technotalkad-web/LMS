@@ -181,7 +181,7 @@ if (probe.status !== 0) {
     fs.writeFileSync(copy, text);
     return copy;
   };
-  // Another list than the real one ("68 69" since P2-8), so the copy differs.
+  // Another list than the real one ("68 69 78" since the 0112 gate), so the copy differs.
   const twoSpecs = withProducts("68");
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products" }, twoSpecs);
   eq("with another product list, plan, second job: runs it", [r.status, r.stdout, r.output], [0, "lifecycle-nightly: list 'products' will run: 68", "run=true"]);
