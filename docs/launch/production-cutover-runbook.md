@@ -95,7 +95,7 @@ The `--no-verify-jwt` flag is required (the function does its own bearer check a
 - [ ] Deploy succeeded.
 - [ ] Smoke-test it directly (proves the function is reachable on prod):
   ```
-  node scripts/test-send-smtp.mjs --url https://alkfrcglmseksweqhwzq.supabase.co --service-key PROD_SERVICE_KEY --host smtp.gmail.com --port 465 --secure true --user adarsh.agrahari@ambak.com --pass "qfid qqjj iaux zywh" --from "Mentora <adarsh.agrahari@ambak.com>" --to agrawaladarsh910@gmail.com
+  node scripts/test-send-smtp.mjs --url https://alkfrcglmseksweqhwzq.supabase.co --service-key PROD_SERVICE_KEY --host smtp.gmail.com --port 465 --secure true --user <SMTP_USER> --pass "<GMAIL_APP_PASSWORD>" --from "Mentora <SMTP_USER>" --to <TEST_RECIPIENT>
   ```
   Expect: `HTTP 200` + `{"ok":true}` + email arrives.
 
