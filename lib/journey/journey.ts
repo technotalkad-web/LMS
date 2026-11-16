@@ -153,6 +153,69 @@ export function parseVersionDays(days: unknown, dayIds?: unknown): Map<number, J
   return map;
 }
 
+/** A draft day as the publish and its dry run read it (journey_days; ADR 0024 P2-8). */
+export type DraftDayRow = {
+  id: string;
+  /** null for a removed day (0107: a removed day keeps no number). */
+  day_number: number | null;
+  course_id: string | null;
+  mission_title: string | null;
+  /** The day's own rule (0107); absent on a database without the column. */
+  pass_required?: boolean | null;
+};
+
+/** One entry of a version's `days` as the publish freezes it. */
+export type FrozenVersionDay = {
+  day: number;
+  course_id: string | null;
+  mission_title: string | null;
+  /** Present only when the draft row holds a rule of its own (P2-N8). */
+  pass_required?: boolean;
+};
+
+/**
+ * The draft frozen into a version (ADR 0024 steps 46, 47 and 92; P2-8 item
+ * 4): the one helper the publish and the publish dry run both use, so the
+ * dry run compares each enrolment with exactly what the publish will pin.
+ *
+ *   - days: the draft rows whose day_number is a whole number from 1 to
+ *     days_total, ascending (a removed row has no number; a row above the
+ *     journey's length is not part of it); course_id and mission_title as
+ *     the row holds them; pass_required copied only when it is a boolean, and
+ *     never dropped when it is (P2-N8; 0107 reads the key only as a JSON
+ *     boolean);
+ *   - day_ids: {"<day number>": "<journey_days id>"} for every frozen day,
+ *     rest days included (0107 maps every entry of a version's days).
+ *
+ * A number held by two rows (the database's unique key forbids it) is frozen
+ * once, from the first row.
+ */
+export function freezeVersionDays(
+  rows: ReadonlyArray<DraftDayRow>,
+  daysTotal: number
+): { days: FrozenVersionDay[]; day_ids: Record<string, string> } {
+  const kept = new Map<number, DraftDayRow>();
+  for (const r of rows) {
+    const n = r.day_number;
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > daysTotal) continue;
+    if (typeof r.id !== "string" || !r.id || kept.has(n)) continue;
+    kept.set(n, r);
+  }
+  const days: FrozenVersionDay[] = [];
+  const day_ids: Record<string, string> = {};
+  for (const n of [...kept.keys()].sort((a, b) => a - b)) {
+    const r = kept.get(n)!;
+    days.push({
+      day: n,
+      course_id: r.course_id,
+      mission_title: r.mission_title,
+      ...(typeof r.pass_required === "boolean" ? { pass_required: r.pass_required } : {}),
+    });
+    day_ids[String(n)] = r.id;
+  }
+  return { days, day_ids };
+}
+
 /** One credit row as the twin reads it (journey_day_progress; lib/journey/credits-read.ts). */
 export type JourneyCreditRow = {
   /** The credited day's id (0107); null on a database without the column. */

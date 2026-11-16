@@ -22,6 +22,25 @@ import {
   DEFAULT_MILESTONES,
   type JourneyCopy,
 } from "@/lib/journey/journey";
+import {
+  afterSave,
+  applyMoveInstead,
+  clearDay,
+  editorFromRows,
+  insertDayAt,
+  moveDay,
+  moveInsteadPairs,
+  pendingChanges,
+  removeDay,
+  saveMayHaveLanded,
+  savePayload,
+  setDay,
+  slotsOf,
+  type EditorDay,
+  type EditorState,
+  type LoadedDayRow,
+  type MoveInsteadPair,
+} from "@/lib/journey/editor-ops";
 
 export type ProgramRow = {
   id: string;
@@ -58,10 +77,18 @@ export type ProgramRow = {
 };
 export type ProgramSummary = { id: string; name: string; icon: string; priority: number };
 export type FunnelRow = { day_number: number; learners: number };
+/**
+ * A saved draft day as the admin page loads it (ADR 0024 step 92, P2-8 item
+ * 2): its id, so the editor keeps the day's identity, and its own rule, sent
+ * back unchanged on every save (P2-N8). A removed day is never loaded.
+ */
 export type DayRow = {
+  id: string;
   day_number: number;
   course_id: string | null;
   mission_title: string | null;
+  /** The day's own pass rule; null = the course's rule (and on a database without 0107). */
+  pass_required: boolean | null;
 };
 export type EnrollmentRow = {
   id: string;
@@ -141,25 +168,50 @@ export function JourneyAdminClient({
   const [publishing, setPublishing] = useState(false);
   const [tab, setTab] = useState<TabKey>("curriculum");
 
+  const [dryRun, setDryRun] = useState<{ counts: DryRunCounts; resolve: (ok: boolean) => void } | null>(null);
+
   async function publish(applyTo: "new" | "all") {
     if (!program) return;
-    const ok = await confirmPublish(
-      applyTo === "all"
-        ? {
-            title: "Publish and update current learners?",
-            message:
-              "Publishing freezes the last SAVED draft as a new version (save unsaved edits first). EVERY active learner is then moved onto it immediately. Nobody's progress is reset: completed missions stay counted and each learner simply continues at the new curriculum's next mission. Anyone who has already completed as many missions as the new curriculum holds is marked complete and gets the badge.",
-            confirmText: "Publish & update everyone",
-            destructive: true,
-          }
-        : {
-            title: "Publish this journey?",
-            message:
-              "Publishing freezes the last SAVED draft as a new version. Unsaved edits in the Curriculum or Settings tabs are NOT included — save them first. New enrollments use the new version; everyone already on the journey keeps theirs.",
-            confirmText: "Publish",
-          }
-    );
-    if (!ok) return;
+    if (applyTo === "all") {
+      // ADR 0024 step 47 (P2-8 item 5): the dry run first. The route freezes
+      // the SAVED draft as the publish will and asks journey_repin_enrollments
+      // what it would do, writing nothing; the confirmation shows the owner's
+      // promise and those counts. No counts, no publish to all.
+      let counts: DryRunCounts | null = null;
+      setPublishing(true);
+      try {
+        const res = await fetch("/api/journey/program", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ orgSlug, action: "dry_run", program_id: program.id }),
+        });
+        const j = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        if (!res.ok || !isDryRunAnswer(j)) {
+          toast.error(
+            typeof j.error === "string" ? j.error : "Could not work out the effect on current learners. Nothing was published."
+          );
+          return;
+        }
+        counts = j;
+      } catch {
+        toast.error("Could not work out the effect on current learners. Nothing was published — check your connection.");
+        return;
+      } finally {
+        setPublishing(false);
+      }
+      const found = counts;
+      const ok = await new Promise<boolean>((resolve) => setDryRun({ counts: found, resolve }));
+      setDryRun(null);
+      if (!ok) return;
+    } else {
+      const ok = await confirmPublish({
+        title: "Publish this journey?",
+        message:
+          "Publishing freezes the last SAVED draft as a new version. Unsaved edits in the Curriculum or Settings tabs are NOT included — save them first. New enrollments use the new version; everyone already on the journey keeps theirs.",
+        confirmText: "Publish",
+      });
+      if (!ok) return;
+    }
     setPublishing(true);
     try {
       const res = await fetch("/api/journey/program", {
@@ -334,9 +386,10 @@ export function JourneyAdminClient({
   }
 
   // Only days inside the current journey length count (shrinking days_total
-  // leaves harmless stale rows beyond it that publish also ignores).
+  // leaves harmless stale rows beyond it that publish also ignores). A whole
+  // number from 1, never a bare `<=` on a number that may be null.
   const filledDays = days.filter(
-    (d) => d.course_id && d.day_number <= program.days_total
+    (d) => d.course_id && Number.isInteger(d.day_number) && d.day_number >= 1 && d.day_number <= program.days_total
   ).length;
 
   return (
@@ -374,6 +427,7 @@ export function JourneyAdminClient({
               type="button"
               onClick={() => publish("new")}
               disabled={publishing}
+              data-testid="journey-publish"
               className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50"
             >
               {publishing
@@ -387,8 +441,9 @@ export function JourneyAdminClient({
                 type="button"
                 onClick={() => publish("all")}
                 disabled={publishing}
+                data-testid="journey-publish-all"
                 className="px-4 py-2.5 border border-indigo-300 text-indigo-700 hover:bg-indigo-50 rounded-lg text-sm font-semibold disabled:opacity-50"
-                title="Also move every active learner onto the new version — progress preserved"
+                title="Also move every active learner onto the new version. You see what it changes for them before anything is published."
               >
                 Publish &amp; update everyone
               </button>
@@ -396,7 +451,7 @@ export function JourneyAdminClient({
           </div>
           <p className="text-[11px] text-muted mt-1 max-w-md ml-auto">
             {currentVersion
-              ? `v${currentVersion.version_number} live · Name, icon, milestones & messages apply to everyone on Save. Curriculum & schedule need a publish: "Publish changes" = new enrollments only · "update everyone" = current learners too, progress kept.`
+              ? `v${currentVersion.version_number} live · Name, icon, milestones & messages apply to everyone on Save. Curriculum & schedule need a publish: "Publish changes" = new enrollments only · "update everyone" = current learners too: nobody repeats a day they completed or loses a day they started.`
               : "Not published yet — publish before enrolling anyone"}
           </p>
         </div>
@@ -458,6 +513,129 @@ export function JourneyAdminClient({
           scopeOptions={scopeOptions}
         />
       </div>
+      {dryRun && (
+        <PublishAllDialog
+          counts={dryRun.counts}
+          onCancel={() => dryRun.resolve(false)}
+          onConfirm={() => dryRun.resolve(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------- Publish to all: the dry run's confirmation ---------------- */
+
+/** The seven counts of journey_repin_enrollments (ADR 0024 step 47), as the dry run answers them. */
+const DRY_RUN_KEYS = [
+  "repinned",
+  "kept_on_version",
+  "completed_now",
+  "sent_back",
+  "started_days_kept",
+  "credits_now_history",
+  "credited_by_rule_change",
+] as const;
+type DryRunCounts = Record<(typeof DRY_RUN_KEYS)[number], number>;
+
+/** A dry run's answer: ok, marked dry_run, and all seven counts whole numbers. Anything else offers no publish. */
+function isDryRunAnswer(j: Record<string, unknown>): j is Record<string, unknown> & DryRunCounts {
+  return j.ok === true && j.dry_run === true && DRY_RUN_KEYS.every((k) => Number.isInteger(j[k]));
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/** One line per count, in the admin's words (step 47's counts). */
+const DRY_RUN_LINES: Record<(typeof DRY_RUN_KEYS)[number], (n: number) => string> = {
+  repinned: (n) => `${plural(n, "active learner moves", "active learners move")} onto the new version.`,
+  kept_on_version: (n) =>
+    `${plural(n, "learner stays", "learners stay")} on their current version: they enrolled before this editor and are already past the first change. To move one, reset and re-enrol them under Enrollments.`,
+  completed_now: (n) => `${plural(n, "learner completes", "learners complete")} the journey now: every day the new version requires is already done.`,
+  sent_back: (n) => `${plural(n, "learner's", "learners'")} next open day moves to an earlier day, because a day was inserted or moved before it.`,
+  started_days_kept: (n) => `${plural(n, "started module stays", "started modules stay")} open to finish on a day that moved, changed module or was removed.`,
+  credits_now_history: (n) => `${plural(n, "completed day stays", "completed days stay")} in the learners' history but no longer counts: the new version does not require ${n === 1 ? "it" : "them"}.`,
+  credited_by_rule_change: (n) => `${plural(n, "day is", "days are")} credited now because the new version's pass rule is less strict.`,
+};
+
+function PublishAllDialog({
+  counts,
+  onCancel,
+  onConfirm,
+}: {
+  counts: DryRunCounts;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <EditorDialog
+      testId="journey-dry-run"
+      title="Publish and update current learners?"
+      actions={
+        <>
+          <button
+            type="button"
+            onClick={onCancel}
+            data-testid="journey-dry-run-cancel"
+            className="px-4 py-2 rounded-lg border border-line text-sm text-muted hover:text-ink hover:border-ink"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            data-testid="journey-dry-run-confirm"
+            className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700"
+          >
+            Publish &amp; update everyone
+          </button>
+        </>
+      }
+    >
+      <p>
+        Publishing freezes the last SAVED curriculum as a new version (unsaved edits are not included) and moves every
+        active learner onto it. Nobody repeats a day they completed, nobody loses a day they started, and learners who
+        have not completed a changed day get the new version of it.
+      </p>
+      <p className="font-medium text-ink">What this publish does, counted now:</p>
+      <ul className="list-disc pl-5 space-y-1">
+        {DRY_RUN_KEYS.map((k) => (
+          <li key={k} data-testid={`journey-dry-run-${k}`} data-count={counts[k]}>
+            {DRY_RUN_LINES[k](counts[k])}
+          </li>
+        ))}
+      </ul>
+    </EditorDialog>
+  );
+}
+
+/** A dialog of this page (the shared confirm takes a string message only). */
+function EditorDialog({
+  testId,
+  title,
+  children,
+  actions,
+}: {
+  testId: string;
+  title: string;
+  children: React.ReactNode;
+  actions: React.ReactNode;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-[110] flex items-center justify-center p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={`${testId}-title`}
+      data-testid={testId}
+    >
+      <div className="absolute inset-0 bg-ink/40 backdrop-blur-[1px]" />
+      <div className="relative w-full max-w-lg rounded-2xl border border-line bg-paper p-6 shadow-2xl">
+        <h2 id={`${testId}-title`} className="serif text-lg text-ink">
+          {title}
+        </h2>
+        <div className="mt-2 text-sm text-muted leading-relaxed space-y-2">{children}</div>
+        <div className="mt-6 flex flex-wrap justify-end gap-2">{actions}</div>
+      </div>
     </div>
   );
 }
@@ -477,51 +655,129 @@ function CurriculumTab({
 }) {
   const router = useRouter();
   const toast = useToast();
-  const [rows, setRows] = useState<DayRow[]>(() => {
-    const byDay = new Map(days.map((d) => [d.day_number, d]));
-    return Array.from({ length: program.days_total }, (_, i) => {
-      const n = i + 1;
-      return byDay.get(n) ?? { day_number: n, course_id: null, mission_title: null };
-    });
-  });
+  const confirm = useConfirm();
+  // The editor by day identity (ADR 0024 step 92, P2-8; lib/journey/editor-ops):
+  // every saved row of the program with its id, the rows above days_total
+  // included (P2-N7 rule (3)). `baseline` is the program as last loaded or
+  // saved: what "Move instead?" (R17) and the unsaved count compare with.
+  const [state, setState] = useState<EditorState>(() => editorFromRows(days as LoadedDayRow[]));
+  const [baseline, setBaseline] = useState<EditorState>(() => editorFromRows(days as LoadedDayRow[]));
   const [busy, setBusy] = useState(false);
-  const gaps = rows.filter((r) => !r.course_id).length;
+  /**
+   * Set when a save may have landed without this page learning the saved
+   * rows' ids (no answer, an unconfirmed read-back, a 409): a further save
+   * would send the new rows again without them (P2-N7 rule (1)), so Save
+   * stays off until the page is reloaded.
+   */
+  const [needsReload, setNeedsReload] = useState<string | null>(null);
+  const [ask, setAsk] = useState<{ pair: MoveInsteadPair; resolve: (a: "move" | "keep" | "cancel") => void } | null>(null);
+  // The slots follow days_total on every render (a Settings change of the
+  // length refreshes the prop; the editor's rows stay as they are).
+  const daysTotal = program.days_total;
+  const { slots, beyond } = slotsOf(state, daysTotal);
+  const gaps = slots.filter((r) => !r.course_id).length;
+  const pending = pendingChanges(baseline, state, daysTotal);
+  const locked = busy || needsReload !== null;
+  const titleOf = (id: string | null) => courses.find((c) => c.id === id)?.title ?? "this module";
 
-  const set = (n: number, patch: Partial<DayRow>) =>
-    setRows((rs) => rs.map((r) => (r.day_number === n ? { ...r, ...patch } : r)));
-
-  // Reorder: swap a day's content (module + mission title) with a neighbor.
-  const swap = (n: number, dir: -1 | 1) =>
-    setRows((rs) => {
-      const a = rs.find((r) => r.day_number === n);
-      const b = rs.find((r) => r.day_number === n + dir);
-      if (!a || !b) return rs;
-      return rs.map((r) =>
-        r.day_number === n
-          ? { ...r, course_id: b.course_id, mission_title: b.mission_title }
-          : r.day_number === n + dir
-            ? { ...r, course_id: a.course_id, mission_title: a.mission_title }
-            : r
+  const insertAt = (n: number) => {
+    const r = insertDayAt(state, n, daysTotal);
+    if (!r.ok) {
+      toast.error(r.reason);
+      return;
+    }
+    setState(r.state);
+    if (r.pushedBeyond > 0) {
+      toast.info(
+        `Day ${daysTotal} moved past the journey's length (${daysTotal} days), so it is not part of the next publish. Raise the length in Settings to keep it.`
       );
-    });
+    }
+  };
+
+  async function removeAt(r: EditorDay) {
+    if (r.id) {
+      const ok = await confirm({
+        title: `Remove day ${r.day_number}?`,
+        message:
+          "The later days move up one. Once you save, a removed day cannot be brought back; learners who completed it keep it in their history, and it stops counting at the next publish.",
+        confirmText: "Remove day",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    setState((s) => removeDay(s, r.day_number, daysTotal));
+  }
 
   async function saveAll() {
+    if (needsReload) {
+      toast.error(needsReload);
+      return;
+    }
+    // R17: a module cleared on one saved day and chosen on another.
+    let next = state;
+    for (const pair of moveInsteadPairs(baseline, state)) {
+      const answer = await new Promise<"move" | "keep" | "cancel">((resolve) => setAsk({ pair, resolve }));
+      setAsk(null);
+      if (answer === "cancel") return;
+      if (answer === "move") next = applyMoveInstead(next, pair);
+    }
+    if (next !== state) setState(next);
+    if (pendingChanges(baseline, next, daysTotal) === 0) {
+      toast.info("Nothing to save: the curriculum is as saved.");
+      return;
+    }
     setBusy(true);
     try {
       const res = await fetch("/api/journey/program", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ orgSlug, program_id: program.id, days: rows }),
+        body: JSON.stringify({ orgSlug, program_id: program.id, days: savePayload(next, daysTotal) }),
       });
-      const j = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok) {
-        toast.error(j.error ?? "Save failed");
+      // A body that is not a JSON object (a gateway's page, an empty answer)
+      // reads as {}: no error of the route's, so saveMayHaveLanded decides.
+      const parsed: unknown = await res.json().catch(() => null);
+      const j = (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) as {
+        ok?: boolean;
+        error?: string;
+        reload?: boolean;
+        saved?: number;
+        inserted?: number;
+        removed?: number;
+        renumbered?: number;
+        days?: LoadedDayRow[];
+      };
+      if (!res.ok || j.ok !== true || !Array.isArray(j.days)) {
+        const error = typeof j.error === "string" ? j.error : null;
+        if (saveMayHaveLanded(res.status, j)) {
+          // The save may have landed without this page learning the new
+          // rows' ids: Save stays off until a reload (P2-8 note, item 10).
+          const why = error ?? "The save may have gone through, but this page could not read the answer. Reload the page before saving again.";
+          setNeedsReload(why);
+          toast.error(why);
+          return;
+        }
+        toast.error(error ?? "Save failed");
         return;
       }
-      toast.success("Curriculum saved — publish to roll it out to new enrollments");
+      // P2-N7 rule (1): the editor is rebuilt from the save's read-back, so it
+      // holds the id of every saved row before the next save.
+      const fresh = afterSave(j.days);
+      setState(fresh);
+      setBaseline(fresh);
+      const parts = [
+        j.inserted ? `${j.inserted} added` : "",
+        j.removed ? `${j.removed} removed` : "",
+        j.renumbered ? `${j.renumbered} moved` : "",
+      ].filter(Boolean);
+      toast.success(
+        `Curriculum saved${parts.length ? ` (${parts.join(", ")})` : ""} — publish to roll it out`
+      );
       router.refresh();
     } catch {
-      toast.error("Save failed — check your connection and try again");
+      // The request may have reached the server and saved: this page cannot
+      // know the new rows' ids, so it asks for a reload first.
+      setNeedsReload("The save may have gone through, but this page did not get the answer. Reload the page before saving again.");
+      toast.error("Save failed — check your connection, then reload the page");
     } finally {
       setBusy(false);
     }
@@ -533,54 +789,100 @@ function CurriculumTab({
         <p className="text-sm text-muted">
           Assign one module per day. The same module may repeat; days without a
           module show learners &ldquo;mission being prepared&rdquo; and don&apos;t
-          block completion.
+          block completion. Moving a day keeps it the same day for learners who
+          completed it.
           {gaps > 0 && (
             <span className="text-amber-700 font-medium"> {gaps} day{gaps === 1 ? "" : "s"} still empty.</span>
           )}
         </p>
-        <button
-          type="button"
-          onClick={saveAll}
-          disabled={busy}
-          className="px-5 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
-        >
-          {busy ? "Saving…" : "Save curriculum"}
-        </button>
+        <div className="flex items-center gap-3">
+          {pending > 0 && needsReload === null && (
+            <span className="text-xs text-amber-700 font-medium" data-testid="journey-unsaved" data-count={pending}>
+              {pending} unsaved change{pending === 1 ? "" : "s"}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={saveAll}
+            disabled={locked}
+            data-testid="journey-save"
+            className="px-5 py-2 bg-ink text-canvas rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-50"
+          >
+            {busy ? "Saving…" : "Save curriculum"}
+          </button>
+        </div>
       </div>
+      {needsReload !== null && (
+        <p className="text-sm text-red-700 font-medium" role="alert" data-testid="journey-needs-reload">
+          {needsReload}
+        </p>
+      )}
 
       <div className="border border-line rounded-2xl bg-paper divide-y divide-line max-h-[560px] overflow-y-auto">
-        {rows.map((r) => (
+        {slots.map((r) => (
           <div
             key={r.day_number}
-            className="grid grid-cols-[96px_1fr] sm:grid-cols-[96px_1fr_1fr] gap-2 items-center px-3 py-2"
+            data-testid={`journey-day-${r.day_number}`}
+            data-day-id={r.id ?? ""}
+            className="grid grid-cols-[132px_1fr] sm:grid-cols-[132px_1fr_1fr] gap-2 items-center px-3 py-2"
           >
             <span className="text-xs font-bold text-muted inline-flex items-center gap-1">
               Day {r.day_number}
               <span className="inline-flex flex-col leading-none">
                 <button
                   type="button"
-                  onClick={() => swap(r.day_number, -1)}
-                  disabled={r.day_number === 1}
-                  title="Move this module one day earlier"
+                  onClick={() => setState((s) => moveDay(s, r.day_number, -1, daysTotal))}
+                  disabled={locked || r.day_number === 1}
+                  title="Move this day one day earlier (it stays the same day for learners)"
+                  aria-label={`Move day ${r.day_number} up`}
+                  data-testid={`journey-day-${r.day_number}-up`}
                   className="text-muted hover:text-ink disabled:opacity-30 text-[10px]"
                 >
                   ▲
                 </button>
                 <button
                   type="button"
-                  onClick={() => swap(r.day_number, 1)}
-                  disabled={r.day_number === rows.length}
-                  title="Move this module one day later"
+                  onClick={() => setState((s) => moveDay(s, r.day_number, 1, daysTotal))}
+                  disabled={locked || r.day_number === daysTotal}
+                  title="Move this day one day later (it stays the same day for learners)"
+                  aria-label={`Move day ${r.day_number} down`}
+                  data-testid={`journey-day-${r.day_number}-down`}
                   className="text-muted hover:text-ink disabled:opacity-30 text-[10px]"
                 >
                   ▼
                 </button>
               </span>
+              <button
+                type="button"
+                onClick={() => insertAt(r.day_number)}
+                disabled={locked}
+                title="Insert a day here: a new, empty day takes this number and the later days move down one"
+                aria-label={`Insert a day before day ${r.day_number}`}
+                data-testid={`journey-day-${r.day_number}-insert`}
+                className="text-muted hover:text-ink disabled:opacity-30 text-[11px] px-1"
+              >
+                +
+              </button>
+              <button
+                type="button"
+                onClick={() => void removeAt(r)}
+                disabled={locked}
+                title="Remove this day: the later days move up one"
+                aria-label={`Remove day ${r.day_number}`}
+                data-testid={`journey-day-${r.day_number}-remove`}
+                className="text-muted hover:text-red-700 disabled:opacity-30 text-[11px] px-1"
+              >
+                ×
+              </button>
             </span>
             <div className="flex items-center gap-2 min-w-0">
               <select
                 value={r.course_id ?? ""}
-                onChange={(e) => set(r.day_number, { course_id: e.target.value || null })}
+                onChange={(e) =>
+                  setState((s) => (e.target.value ? setDay(s, r.day_number, { course_id: e.target.value }) : clearDay(s, r.day_number)))
+                }
+                disabled={locked}
+                data-testid={`journey-day-${r.day_number}-module`}
                 className="flex-1 px-2 py-1.5 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink min-w-0"
               >
                 <option value="">— no module —</option>
@@ -609,14 +911,82 @@ function CurriculumTab({
             <input
               type="text"
               value={r.mission_title ?? ""}
-              onChange={(e) => set(r.day_number, { mission_title: e.target.value || null })}
+              onChange={(e) => setState((s) => setDay(s, r.day_number, { mission_title: e.target.value || null }))}
+              disabled={locked}
               placeholder="Mission title (optional — defaults to module name)"
               maxLength={120}
+              data-testid={`journey-day-${r.day_number}-title`}
               className="px-2 py-1.5 border border-line rounded-lg bg-canvas text-sm outline-none focus:border-ink min-w-0 col-span-2 sm:col-span-1"
             />
           </div>
         ))}
       </div>
+
+      {beyond.length > 0 && (
+        <div className="border border-dashed border-line rounded-2xl p-3 text-sm text-muted" data-testid="journey-days-beyond">
+          <p className="text-xs font-semibold">
+            Beyond the journey&apos;s length ({daysTotal} days): not part of a publish. Raise the length in Settings to
+            include {beyond.length === 1 ? "it" : "them"}.
+          </p>
+          <ul className="mt-1 space-y-0.5">
+            {beyond.map((r) => (
+              <li key={r.day_number} data-testid={`journey-beyond-${r.day_number}`} data-day-id={r.id ?? ""}>
+                Day {r.day_number}: {r.course_id ? titleOf(r.course_id) : "no module"}
+                {r.mission_title ? ` — ${r.mission_title}` : ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {ask && (
+        <EditorDialog
+          testId="journey-move-instead"
+          title="Move instead?"
+          actions={
+            <>
+              <button
+                type="button"
+                onClick={() => ask.resolve("cancel")}
+                data-testid="journey-move-instead-cancel"
+                className="px-4 py-2 rounded-lg border border-line text-sm text-muted hover:text-ink hover:border-ink"
+              >
+                Cancel the save
+              </button>
+              <button
+                type="button"
+                onClick={() => ask.resolve("keep")}
+                data-testid="journey-move-instead-keep"
+                className="px-4 py-2 rounded-lg border border-line text-sm text-ink hover:border-ink"
+              >
+                Keep it as a new day
+              </button>
+              <button
+                type="button"
+                onClick={() => ask.resolve("move")}
+                data-testid="journey-move-instead-accept"
+                className="px-4 py-2 rounded-lg bg-ink text-canvas text-sm font-semibold hover:opacity-90"
+              >
+                Move instead
+              </button>
+            </>
+          }
+        >
+          <p>
+            You cleared &ldquo;{titleOf(ask.pair.course_id)}&rdquo; on day {ask.pair.from} and chose it on day{" "}
+            {ask.pair.to}.
+          </p>
+          <p>
+            <strong className="text-ink">Move instead</strong> moves day {ask.pair.from} itself to day {ask.pair.to}{" "}
+            with the module, so learners who completed it are not asked to do it again; day {ask.pair.from} becomes a
+            rest day. The days show as you set them either way.
+          </p>
+          <p>
+            If you keep it as a new day, learners who completed &ldquo;{titleOf(ask.pair.course_id)}&rdquo; on day{" "}
+            {ask.pair.from} will meet it again, as a new day, on day {ask.pair.to}.
+          </p>
+        </EditorDialog>
+      )}
     </div>
   );
 }
@@ -833,7 +1203,11 @@ function EnrollmentsTab({
                     </span>
                   </td>
                   <td className="px-4 py-3 tabular-nums text-muted">{e.start_date}</td>
-                  <td className="px-4 py-3 tabular-nums">
+                  <td
+                    className="px-4 py-3 tabular-nums"
+                    data-testid={`journey-enrollment-credited-${e.id}`}
+                    data-count={st.completedCount}
+                  >
                     {st.completedCount}/{e.days_total}
                     {e.status === "active" && typeof e.current_day === "number" && (
                       <span className="block text-[11px] text-muted">

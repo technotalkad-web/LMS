@@ -1016,6 +1016,9 @@ console.log("\nthe routes fixed for this rule: an effect, and a role check befor
     ["app/api/learning-path-assignments/[id]/route.ts", "DELETE"],
     ["app/api/learning-path-assignments/route.ts", "POST"],
     ["app/api/learning-paths/[id]/courses/route.ts", "POST"],
+    // ADR 0024 P2-8: ctx() checks the role with isOrgAdminCaller before the
+    // publish's re-pin and the publish dry run.
+    ["app/api/journey/program/route.ts", "POST"],
   ];
   for (const [f, method] of FIXED) {
     const h = all.find((x) => x.file === f && x.method === method);
@@ -1026,6 +1029,17 @@ console.log("\nthe routes fixed for this rule: an effect, and a role check befor
   const del = all.find((x) => x.file === "app/api/assignments/[id]/route.ts")!;
   eq("…the assignment delete's effects include the notification log's service-role insert",
     del.events.some((e) => e.what === "service-role insert on notification_log"), true);
+  const jp = all.filter((x) => x.file === "app/api/journey/program/route.ts");
+  const jpPost = jp.find((x) => x.method === "POST");
+  eq("…the journey program POST: its effects are the two service-role calls of journey_repin_enrollments (the publish's re-pin and the dry run), each after the role check",
+    (jpPost?.events ?? []).filter((e) => e.kind === "effect" || e.kind === "safe-effect").map((e) => `${e.kind} ${e.what}`),
+    ["safe-effect service-role rpc journey_repin_enrollments", "safe-effect service-role rpc journey_repin_enrollments"]);
+  eq("…its PUT (the curriculum save), PATCH and DELETE write on the caller's session only",
+    verdict(jp.filter((x) => x.method !== "POST")), ["PUT:no-effect", "PATCH:no-effect", "DELETE:no-effect"]);
+  const jpSrc = fs.readFileSync(path.join(root, "app/api/journey/program/route.ts"), "utf8");
+  const jpNoCheck = jpSrc.replace(/\s*const admin = await isOrgAdminCaller\([\s\S]*?return \{ error: refused\.error, status: refused\.status \};\s*\}/, "");
+  eq("…planted: the same route with ctx()'s role check taken out is flagged (the check is what guards it)",
+    [jpNoCheck !== jpSrc, verdict(plant(jpNoCheck)).filter((v) => v.startsWith("POST:"))], [true, ["POST:FLAGGED"]]);
 }
 
 console.log("\nthe detectors see what a text search sees in lib/ (no blind spot on fetch / auth.admin)");
