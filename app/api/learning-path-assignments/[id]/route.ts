@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -8,7 +9,14 @@ import { resolveManyGroups } from "@/lib/org/groups";
 /**
  *   DELETE /api/learning-path-assignments/{id}
  *
- * Snapshots the row first so we can fire path_unassignment, then deletes.
+ * Admin-only: the caller's role in the row's org is checked explicitly
+ * before the delete and the service-role notification pass (members can
+ * read many path assignment rows, and an RLS-refused delete removes nothing
+ * without an error). Snapshots the row first so we can fire
+ * path_unassignment, then deletes; a delete that removes no row is an
+ * error, never ok, unless the row is gone by then (a delete that crossed
+ * another one): 404. An id with no visible row answers 404; a failed read,
+ * the role read included, answers 503.
  */
 export async function DELETE(
   _request: Request,
@@ -16,20 +24,68 @@ export async function DELETE(
 ) {
   const { id } = await params;
   const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   // select("*") + separate name lookups would cost extra round trips; keep the
   // embed but request group_id via the wildcard on the parent table only.
-  const { data: row } = await supabase
+  const { data: row, error: readErr } = await supabase
     .from("learning_path_assignments")
     .select("*, learning_paths(name), organizations(name)")
     .eq("id", id)
     .maybeSingle();
+  // A failed read is not "gone": the admin pages treat 404 as already removed.
+  if (readErr) {
+    return NextResponse.json(
+      { error: "Could not load the assignment. Nothing was removed; try again." },
+      { status: 503 }
+    );
+  }
+  if (!row) {
+    return NextResponse.json({ error: "Assignment not found" }, { status: 404 });
+  }
+  const orgId = (row as { organization_id: string }).organization_id;
+  const admin = await isOrgAdminCaller(supabase, orgId, user.id);
+  if (!admin) {
+    const refused = notAdminAnswer(admin);
+    return NextResponse.json({ error: refused.error }, { status: refused.status });
+  }
 
-  const { error } = await supabase
+  const { data: deleted, error } = await supabase
     .from("learning_path_assignments")
     .delete()
-    .eq("id", id);
+    .eq("id", id)
+    .select("id");
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  if (!deleted?.length) {
+    // No row changed. A delete that crossed another one (two tabs, two
+    // admins) finds the row already gone: read it again, fresh, and answer
+    // 404 then, which the admin pages take as removed. A row still there
+    // was not removed: 403.
+    const { data: still, error: againErr } = await supabase
+      .from("learning_path_assignments")
+      .select("id")
+      .eq("id", id)
+      .abortSignal(new AbortController().signal)
+      .maybeSingle();
+    if (againErr) {
+      return NextResponse.json(
+        { error: "Could not confirm the assignment was removed; try again." },
+        { status: 503 }
+      );
+    }
+    if (!still) {
+      return NextResponse.json({ error: "Assignment not found" }, { status: 404 });
+    }
+    return NextResponse.json(
+      { error: "The assignment was not removed." },
+      { status: 403 }
+    );
+  }
 
   if (row) {
     await (async () => {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import {
   cloudflareSaasConfigured,
   createCustomHostname,
@@ -19,8 +19,10 @@ import {
  *     name?, logo_url?, brand_color?, brand_font?, custom_domain?
  *   }
  *
- * Admin-only. Updates organization branding fields. Password-free — RLS
- * enforces admin via is_org_admin.
+ * Admin-only. Updates organization branding fields. requireOrgAdminApi
+ * checks the caller's role before any Cloudflare call, and every field is
+ * validated before one too; the update is also RLS-checked (is_org_admin),
+ * and an update that changes no row is an error.
  */
 
 const VALID_FONTS = ["sans", "serif", "mono", "inter", "system"] as const;
@@ -45,17 +47,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
   }
 
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  // The role check comes first: every member can read the organizations row,
+  // so that read is not a guard for the Cloudflare calls below.
+  const auth = await requireOrgAdminApi(body.orgSlug);
+  if ("error" in auth) {
+    return NextResponse.json({ error: auth.error }, { status: auth.status });
   }
+  const supabase = auth.supabase;
   const { data: org } = await supabase
     .from("organizations")
     .select("id, custom_domain, cf_hostname_id")
-    .eq("slug", body.orgSlug)
+    .eq("id", auth.org.id)
     .maybeSingle();
   if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
 
@@ -98,6 +100,45 @@ export async function POST(request: Request) {
     }
     update.brand_font = f || null;
   }
+  // Learner theme (0060): preset id, "custom", or null/"" = default look.
+  // Validated before the custom-domain block: a refused save must not have
+  // changed the Cloudflare hostname already.
+  if (body.learner_theme !== undefined) {
+    const t = body.learner_theme?.trim() || null;
+    if (t !== null && t !== "custom" && !isLearnerThemeId(t)) {
+      return NextResponse.json(
+        { error: "Unknown learner_theme" },
+        { status: 400 }
+      );
+    }
+    if (t === "custom") {
+      // A custom selection must come with (or already carry) a full palette;
+      // validate whatever is being saved alongside it.
+      const c = customThemeFrom(body.learner_theme_custom);
+      if (!c) {
+        return NextResponse.json(
+          {
+            error:
+              "Custom theme needs all six colors (canvas, paper, ink, muted, line, accent) as hex values.",
+          },
+          { status: 400 }
+        );
+      }
+      update.learner_theme_custom = c;
+    }
+    update.learner_theme = t;
+  } else if (body.learner_theme_custom !== undefined) {
+    // Palette tweak without switching selection — still validated.
+    const c = customThemeFrom(body.learner_theme_custom);
+    if (!c) {
+      return NextResponse.json(
+        { error: "Invalid custom theme palette." },
+        { status: 400 }
+      );
+    }
+    update.learner_theme_custom = c;
+  }
+
   // Carries provisioning info back to the client (CNAME target + cert
   // validation records) when a domain is (re)registered.
   let domainProvisioning:
@@ -179,52 +220,22 @@ export async function POST(request: Request) {
       ? body.login_hero_subtitle.trim()
       : null;
   }
-  // Learner theme (0060): preset id, "custom", or null/"" = default look.
-  if (body.learner_theme !== undefined) {
-    const t = body.learner_theme?.trim() || null;
-    if (t !== null && t !== "custom" && !isLearnerThemeId(t)) {
-      return NextResponse.json(
-        { error: "Unknown learner_theme" },
-        { status: 400 }
-      );
-    }
-    if (t === "custom") {
-      // A custom selection must come with (or already carry) a full palette;
-      // validate whatever is being saved alongside it.
-      const c = customThemeFrom(body.learner_theme_custom);
-      if (!c) {
-        return NextResponse.json(
-          {
-            error:
-              "Custom theme needs all six colors (canvas, paper, ink, muted, line, accent) as hex values.",
-          },
-          { status: 400 }
-        );
-      }
-      update.learner_theme_custom = c;
-    }
-    update.learner_theme = t;
-  } else if (body.learner_theme_custom !== undefined) {
-    // Palette tweak without switching selection — still validated.
-    const c = customThemeFrom(body.learner_theme_custom);
-    if (!c) {
-      return NextResponse.json(
-        { error: "Invalid custom theme palette." },
-        { status: 400 }
-      );
-    }
-    update.learner_theme_custom = c;
-  }
-
   if (Object.keys(update).length === 0) {
     return NextResponse.json({ ok: true, noop: true });
   }
 
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("organizations")
     .update(update)
-    .eq("id", org.id);
+    .eq("id", org.id)
+    .select("id");
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  if (!updated?.length) {
+    return NextResponse.json(
+      { error: "The branding settings were not saved." },
+      { status: 403 }
+    );
+  }
   return NextResponse.json({
     ok: true,
     ...(domainProvisioning ? { domain: domainProvisioning } : {}),

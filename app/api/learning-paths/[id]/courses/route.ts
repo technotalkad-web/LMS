@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -12,7 +13,9 @@ import { resolveManyGroups } from "@/lib/org/groups";
  *   PUT    /api/learning-paths/{id}/courses   body: { orderedCourseIds: string[] }
  *   PATCH  /api/learning-paths/{id}/courses   body: { courseId, releaseAt }
  *
- * POST appends the course at the next step_number.
+ * POST appends the course at the next step_number. It checks the caller's
+ * role in the path's org explicitly (admins only; a failed role read answers
+ * 503) before the insert and the service-role notify_update pass.
  * PUT resets the entire step ordering.
  * PATCH sets/clears a step's scheduled release (releaseAt: ISO string or null);
  * steps are addressed by (path_id, course_id) — the table has no surrogate id.
@@ -72,6 +75,12 @@ export async function POST(
   }
 
   const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   // Tenant guard: the course must belong to the SAME org as the path. RLS lets
   // a path's admin write learning_path_courses but doesn't check the course's
@@ -84,11 +93,17 @@ export async function POST(
     .eq("id", pathId)
     .maybeSingle();
   if (!path) return NextResponse.json({ error: "Path not found" }, { status: 404 });
+  const pathOrgId = (path as { organization_id: string }).organization_id;
+  const admin = await isOrgAdminCaller(supabase, pathOrgId, user.id);
+  if (!admin) {
+    const refused = notAdminAnswer(admin);
+    return NextResponse.json({ error: refused.error }, { status: refused.status });
+  }
   const { data: course } = await supabase
     .from("courses")
     .select("id")
     .eq("id", courseId)
-    .eq("organization_id", (path as { organization_id: string }).organization_id)
+    .eq("organization_id", pathOrgId)
     .maybeSingle();
   if (!course) {
     return NextResponse.json(

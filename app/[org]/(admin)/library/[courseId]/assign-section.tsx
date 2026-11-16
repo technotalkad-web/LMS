@@ -150,6 +150,13 @@ export function AssignSection({
   async function unassign(id: string) {
     if (!await confirm("Remove this assignment?")) return;
     const res = await fetch(`/api/assignments/${id}`, { method: "DELETE" });
+    // 404 only: the assignment is already gone (another tab, a second click
+    // or another admin); refresh so the list matches, with no error. Every
+    // other refusal (403, 503) shows its error below.
+    if (res.status === 404) {
+      router.refresh();
+      return;
+    }
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       toast.error(j.error ?? "Failed");
