@@ -73,6 +73,9 @@
 -- After 0109 this file itself is never pasted again: 0109 recreates the two
 -- refresh functions, and a re-paste of this file would strip its matviews
 -- and its snapshot from them (ADR 0024 step 21).
+-- After 0112, any paste of this file is followed by 0112 (this file's
+-- refresh bodies run the sweep without a time box, ADR 0024 note of
+-- 2026-11-16); on production this file is never pasted again after 0112.
 --
 -- FIRST PASTE AND RE-PASTE (ADR 0024 step 4). The file is idempotent and
 -- retry-safe: a second paste changes nothing. One transaction: on a lock

@@ -208,6 +208,11 @@ async function stepApply(db, s) {
         ) && allOk;
       if (!r.ok) info(`refusal: ${r.code} ${r.message}`);
       if (!(await runSqlFile(db, refuse.then))) return "stop";
+      // `times: 0` (added for 0112): the refusal and the reset only
+      if (times === 0) continue;
+    } else if (times === 0) {
+      allOk = check(false, `${s.label}: ${f}: "times": 0 is for a refusal only (refuseFirst)`) && allOk;
+      continue;
     }
     const results = [];
     for (let i = 0; i < times; i += 1) results.push(await applyMigration(db, f));

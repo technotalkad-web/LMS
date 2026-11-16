@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
+import {
+  REPORT_DRAIN_MAX_CALLS,
+  completionSweepFailure,
+  drainCompletionSweep,
+} from "@/lib/ops/completion-sweep";
 
 /**
  *   POST /api/cron/refresh-report-views
@@ -28,36 +33,42 @@ function unauthorized() {
   return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 }
 
-/**
- * ADR 0024 step 81, with step 16: from migration 0107 the function runs the
- * completion sweep first and appends its entry last, {view:
- * "completion_sweep", ms, rows, error, sweep}. The sweep is the only retry of
- * the fail-closed completion writer, so a sweep that failed must not pass
- * unseen: when that entry carries an error the route answers 500 and the
- * heartbeat reads "error". Only the sweep's own error counts. A row that
- * failed inside the sweep is counted in sweep.failed and retried by the next
- * run; it is not an error of the refresh. Every other entry keeps today's
- * behaviour (a view's error is reported in its entry and the route answers
- * 200), and a database without 0107 has no such entry. The answer has no
- * entry for Preview data: nothing deletes it on a schedule (step 81).
+/*
+ * ADR 0024 step 81, with step 16, as the note of 2026-11-16 restates them
+ * (items 4 and 5; lib/ops/completion-sweep.ts). Before the refresh the route
+ * drains the completion sweep in calls of its own: up to
+ * REPORT_DRAIN_MAX_CALLS (8) sequential calls of 0112's
+ * sweep_completion_side_effects_timed(200, 5000), each its own statement and
+ * commit; the daily backstop of the 15-minute gamification route. Its
+ * summary is `completion_sweep_drain` in the body and the heartbeat (counts
+ * and one word, no ids); a database without 0112 answers PGRST202, "no
+ * drain". The refresh runs in every case; `total_ms` stays its time.
+ *
+ * From 0107 the function also runs the sweep itself (with a 1.5 s box from
+ * 0112) and appends its entry last, {view: "completion_sweep", ms, rows,
+ * error, sweep}. The sweep is the only retry of the fail-closed completion
+ * writer, so a sweep that failed must not pass unseen: the route answers
+ * 500 and the heartbeat reads "error" when a drain call answered an error,
+ * when that entry carries its own error, when the drain read PGRST202 while
+ * the entry's sweep carries `stopped` (0112 is there and the Data API does
+ * not see its function), or when the drain stopped on two consecutive
+ * stalled calls (the note's D-S4). A row that failed inside the sweep is
+ * counted in `failed` and retried by the next run; it is not an error of the
+ * refresh. Every other entry keeps today's behaviour (a view's error is
+ * reported in its entry and the route answers 200), and a database without
+ * 0107 has no such entry. The answer has no entry for Preview data: nothing
+ * deletes it on a schedule (step 81).
  */
-function completionSweepError(data: unknown): string | null {
-  if (!Array.isArray(data)) return null;
-  for (const entry of data) {
-    if (entry && typeof entry === "object" && (entry as { view?: unknown }).view === "completion_sweep") {
-      const err = (entry as { error?: unknown }).error;
-      return err === null || err === undefined ? null : String(err);
-    }
-  }
-  return null;
-}
-
 async function run() {
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+
+  // ADR 0024 step 16 (note of 2026-11-16): the drain first, in calls of its own.
+  const sweepRun = await drainCompletionSweep(svc, REPORT_DRAIN_MAX_CALLS);
+  const completion_sweep_drain = sweepRun.drain;
 
   const t0 = Date.now();
   const { data, error } = await svc.rpc("refresh_report_views");
@@ -68,14 +79,16 @@ async function run() {
       ok: false,
       total_ms,
       error: error.message,
+      completion_sweep_drain,
     };
   }
 
-  const sweepError = completionSweepError(data);
+  const sweepError = completionSweepFailure(sweepRun, data);
   return {
     ok: sweepError === null,
     total_ms,
     ...(data as Record<string, unknown>),
+    completion_sweep_drain,
     ...(sweepError === null ? {} : { error: `completion_sweep: ${sweepError}` }),
   };
 }

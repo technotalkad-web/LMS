@@ -15,7 +15,10 @@
  *         the 503 before any insert;
  *   (ii)  the cron route: `webhook_sweep` in the body and the heartbeat, `ok`
  *         decided by the refresh alone, the fail isolation, and a row whose read
- *         or latch update failed retried by the next run;
+ *         or latch update failed retried by the next run; from ADR 0024's note
+ *         of 2026-11-16 the route drains the completion sweep first
+ *         (lib/ops/completion-sweep.ts), so the order is the drain call, the
+ *         refresh, the held-row select, the heartbeat;
  *   (iii) one unscored row across both routes: held, swept, re-fired;
  *   (v)   the budget: classifyCost and fireCost measured under the stub, the two
  *         inequalities of the header of lib/integrations/webhook-hold.ts asserted
@@ -24,7 +27,15 @@
  *         classifyAttempt's list drop previews (`context_kind=neq.preview`); the
  *         stub's `no0107` mode answers that filter with the missing-column
  *         error, so the one failed read per run on a database without 0107 is
- *         counted, with and without 0103;
+ *         counted, with and without 0103. The drain (ADR 0024 note of
+ *         2026-11-16, "Subrequests"): the stub answers
+ *         rpc/sweep_completion_side_effects_timed 'done' by default, 'time' on
+ *         every call for the worst case with 0107 (GAMIFICATION_DRAIN_MAX_CALLS
+ *         calls), and PGRST202 in its no-0107 and no-0103 modes (such a
+ *         database has no 0112), or when told to on a database with 0107. The
+ *         drain calls are counted in the rule's per-row `+ 2`, which holds
+ *         while GAMIFICATION_DRAIN_MAX_CALLS is at most 2 x SWEEP_MAX_SCANNED
+ *         (pinned below); the rule's formula does not change;
  *   (vi)  the keyset URL: heldWebhookPage called directly with a cursor, its
  *         decoded query asserted. The cron route never sends a cursor while the
  *         caps are at or below HELD_PAGE_SIZE, so this is the only proof of how
@@ -54,6 +65,7 @@ import {
   type SweepResult,
 } from "../../lib/integrations/webhook-hold";
 import { classifyAttempt } from "../../lib/scoring/attempt-kind";
+import { GAMIFICATION_DRAIN_MAX_CALLS } from "../../lib/ops/completion-sweep";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -107,6 +119,8 @@ let settings: Row | null = HOOK_SETTINGS;
 let storedRaw = new Map<string, unknown>();
 let retakeIds: string[] = [];
 let warnThrowsOn: string | null = null;
+/** The drain's answer (ADR 0024 note of 2026-11-16) on a database with 0107; without 0107 or 0103 it is always PGRST202. */
+let drainMode: "done" | "time" | "absent" = "done";
 
 const reset = (...rows: Row[]) => {
   requests = [];
@@ -119,6 +133,7 @@ const reset = (...rows: Row[]) => {
   storedRaw = new Map();
   retakeIds = [];
   warnThrowsOn = null;
+  drainMode = "done";
 };
 
 const json = (body: unknown, status = 200) =>
@@ -262,6 +277,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/attempt_requests") return json(retakeIds.map((used_attempt_id) => ({ used_attempt_id })));
   if (p === "/rest/v1/tenant_lrs_config") return json([{ organization_id: "o1", enabled: false, endpoint: null }]);
   if (p === "/rest/v1/ops_heartbeats") return json([], 201);
+  if (p === "/rest/v1/rpc/sweep_completion_side_effects_timed" && method === "POST") {
+    // 0112 needs 0107 (and so 0103): a database without either has no drain
+    if (drainMode === "absent" || fails.has("no0107") || fails.has("no0103")) {
+      return json({ code: "PGRST202", message: "Could not find the function public.sweep_completion_side_effects_timed(p_budget_ms, p_limit) in the schema cache" }, 404);
+    }
+    return json({ candidates: drainMode === "time" ? 50 : 0, handled: drainMode === "time" ? 50 : 0, failed: 0, errors: [], stopped: drainMode, ms: drainMode === "time" ? 5001 : 3 });
+  }
   if (p === "/rest/v1/rpc/refresh_gamification_views") {
     return fails.has("refresh") ? json({ code: "XX000", message: "refresh failed" }, 500) : json({ mv_leaderboard: "refreshed" });
   }
@@ -857,9 +879,10 @@ async function main() {
     const cronSource = fs.readFileSync(path.resolve(__dirname, "../../app/api/cron/gamification-refresh/route.ts"), "utf8");
     eq("total_ms stays the refresh's time: it is taken before the sweep starts",
       cronSource.indexOf("const total_ms = Date.now() - t0;") > 0 && cronSource.indexOf("const total_ms = Date.now() - t0;") < cronSource.indexOf("sweepHeldWebhooks(svc"), true);
-    eq("the refresh, then the sweep, then the heartbeat",
-      [firstAt((r) => r.path.endsWith("/refresh_gamification_views")), firstAt((r) => r.select === HELD_SELECT), firstAt((r) => r.path === "/rest/v1/ops_heartbeats")],
-      [0, 1, 2]);
+    eq("the completion sweep's drain call, then the refresh, then the held-row select, then the heartbeat",
+      [firstAt((r) => r.path.endsWith("/sweep_completion_side_effects_timed")), firstAt((r) => r.path.endsWith("/refresh_gamification_views")),
+       firstAt((r) => r.select === HELD_SELECT), firstAt((r) => r.path === "/rest/v1/ops_heartbeats")],
+      [0, 1, 2, 3]);
     eq("one webhook_sweep log line, ids and counts only", events("webhook_sweep"), [{ event: "webhook_sweep", scanned: 0, fired: [], skipped: [], unfired: [] }]);
 
     console.log("\n  one held official row");
@@ -1154,7 +1177,11 @@ async function main() {
       // ADR 0024 P2-5 item 5b: a database without 0107 (production until the
       // 0107 sitting) pays one failed read per run, the first page's; a
       // database without 0103 has no 0107 either, so its run pays both.
-      const worstCaseRun = async (without0103: boolean, without0107 = without0103) => {
+      // ADR 0024 note of 2026-11-16: with 0107 the drain makes
+      // GAMIFICATION_DRAIN_MAX_CALLS calls answering 'time' (the worst case),
+      // or one PGRST202 call (0107 without 0112); without 0107 it makes one
+      // PGRST202 call.
+      const worstCaseRun = async (without0103: boolean, without0107 = without0103, drain: "time" | "absent" = "time") => {
         const skipped = Array.from({ length: SWEEP_MAX_SCANNED - SWEEP_MAX_FIRES }, (_, i) => `n${i}`);
         const official = Array.from({ length: SWEEP_MAX_FIRES }, (_, i) => `o${i}`);
         reset(
@@ -1165,25 +1192,39 @@ async function main() {
         held = [...skipped, ...official];
         if (without0103) fails.add("no0103");
         if (without0107) fails.add("no0107");
+        drainMode = drain;
         const out = await cronBody(await cronPost());
         const shape = without0103 ? " without 0103 (and 0107)" : without0107 ? " with 0103, without 0107" : "";
         eq(`the worst case${shape} reaches both caps`,
           [out.webhook_sweep.scanned, out.webhook_sweep.fired.length], [SWEEP_MAX_SCANNED, SWEEP_MAX_FIRES]);
-        return requests.length;
+        const drainCalls = requests.filter((r) => r.path === "/rest/v1/rpc/sweep_completion_side_effects_timed").length;
+        return { total: requests.length, drainCalls };
       };
-      const worst = await worstCaseRun(false, false);
-      const worstWithout0107 = await worstCaseRun(false, true);
-      const worstWithout0103 = await worstCaseRun(true, true);
-      console.log(`  a whole cron request at the caps: ${worst} subrequests with 0107, ${worstWithout0107} with 0103 and without 0107 (production's shape until the 0107 sitting), ${worstWithout0103} without 0103; the rule's sum ${sweepSum}`);
-      eq("with 0107 and on production's shape (0103, no 0107), a whole cron request at the caps makes no more subrequests than the rule's sum, within 0.8 of the budget",
+      const w = await worstCaseRun(false, false, "time");
+      const w0107Absent = await worstCaseRun(false, false, "absent");
+      const w0107Out = await worstCaseRun(false, true);
+      const w0103Out = await worstCaseRun(true, true);
+      const [worst, worstWith0107NoDrain, worstWithout0107, worstWithout0103] = [w.total, w0107Absent.total, w0107Out.total, w0103Out.total];
+      console.log(`  a whole cron request at the caps: ${worst} subrequests with 0107 and 0112 (${w.drainCalls} drain calls answering 'time'), ${worstWith0107NoDrain} with 0107 and without 0112, ${worstWithout0107} with 0103 and without 0107 (production's shape until the sitting), ${worstWithout0103} without 0103; the rule's sum ${sweepSum}`);
+      eq("the drain calls made: GAMIFICATION_DRAIN_MAX_CALLS answering 'time', one PGRST202 call otherwise",
+        [w.drainCalls, w0107Absent.drainCalls, w0107Out.drainCalls, w0103Out.drainCalls], [GAMIFICATION_DRAIN_MAX_CALLS, 1, 1, 1]);
+      eq("with 0107 and 0112 (every drain call 'time') and on production's shape (0103, no 0107), a whole cron request at the caps makes no more subrequests than the rule's sum, within 0.8 of the budget",
         [worst <= sweepSum, worstWithout0107 <= sweepSum, sweepSum <= 0.8 * WORKERS_SUBREQUEST_BUDGET], [true, true, true]);
-      eq("…the preview filter costs one failed read per run without 0107, not one per row", worstWithout0107 - worst, 1);
-      // Recorded, not hidden (ADR 0024 P2-5): on a database without 0103,
-      // which has no 0107 either and which no environment runs any more
-      // (production and staging have 0103), the run is the rule's sum plus
-      // that one read: one over 0.8 of the budget, and within the budget.
-      eq("without 0103 (and so without 0107): the rule's sum plus the one failed read, within the budget",
-        [worstWithout0103 - sweepSum, worstWithout0103 <= WORKERS_SUBREQUEST_BUDGET], [1, true]);
+      eq("…the figures of the ADR 0024 note of 2026-11-16: 38 with the drain's worst case, 36 on production's shape", [worst, worstWithout0107], [38, 36]);
+      eq("…the preview filter costs one failed read per run without 0107, not one per row (two runs with the same one PGRST202 drain call)",
+        worstWithout0107 - worstWith0107NoDrain, 1);
+      // Recorded, not hidden (ADR 0024 P2-5; note of 2026-11-16): on a
+      // database without 0103, which has no 0107 either and which no
+      // environment runs any more (production and staging have 0103), the run
+      // is the rule's sum plus that one read and the one PGRST202 drain call:
+      // two over 0.8 of the budget, and within the budget.
+      eq("without 0103 (and so without 0107 or 0112): the rule's sum plus the one failed read and the one drain call, within the budget",
+        [worstWithout0103 - sweepSum, worstWithout0103 <= WORKERS_SUBREQUEST_BUDGET], [2, true]);
+      // The condition of the note's "Subrequests": the drain calls ride the
+      // rule's per-row + 2, an allowance of 2 x SWEEP_MAX_SCANNED spent only
+      // without 0103, where the drain makes one call.
+      eq("the gamification route's drain makes at most 2 x SWEEP_MAX_SCANNED calls (GAMIFICATION_DRAIN_MAX_CALLS)",
+        GAMIFICATION_DRAIN_MAX_CALLS <= 2 * SWEEP_MAX_SCANNED, true);
     }
 
     {

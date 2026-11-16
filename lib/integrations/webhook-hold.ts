@@ -65,6 +65,17 @@
  *               + HELD_MAX_SCANNED * (classifyCost + 2) <= 0.5 * WORKERS_SUBREQUEST_BUDGET
  * The 2 is the refresh RPC and the heartbeat; the `+ 2` per row is
  * classifyAttempt's narrower-select fallback on a database without 0103.
+ * The completion sweep's drain (ADR 0024 step 16, note of 2026-11-16;
+ * lib/ops/completion-sweep.ts) adds up to GAMIFICATION_DRAIN_MAX_CALLS (4)
+ * calls before the refresh. They are counted in the per-row `+ 2`, not in
+ * the 2: that allowance, 2 x SWEEP_MAX_SCANNED = 6, is spent only on a
+ * database without 0103, and the drain makes more than one call only on a
+ * database with 0112, which requires 0107 and so 0103. The condition, pinned
+ * by tests/unit/webhook-hold-route.test.ts against the helper's exported
+ * constant: GAMIFICATION_DRAIN_MAX_CALLS <= 2 x SWEEP_MAX_SCANNED. A
+ * database without 0112 pays one drain call (it answers PGRST202, "no
+ * drain"). So the formula, the caps and ADR 0015's recorded sums do not
+ * change.
  * The preview filter (ADR 0024 P2-5 item 5b: the selection and classifyAttempt's
  * list drop `context_kind = 'preview'` rows) costs nothing on a database with
  * 0107. On one without it the first read of a run answers a missing-column
@@ -72,11 +83,15 @@
  * run passes one decision to its pages and to every classify, so that is one
  * read per run, not one per row. With 0103 and without 0107 (production until
  * the 0107 sitting) the sweep's healthy path is then 2 + 2 + 3 x 5 + 2 x 8 = 35
- * and the provider's 2 + 3 x 5 = 17. A database without 0103 has no 0107
- * either, so the rule's own sum gains that read there: 41 for the sweep, one
- * over 0.8 of the budget and within it; 23 for the provider, under its half.
- * No environment runs without 0103 any more. tests/unit/webhook-hold-route.test.ts
- * (v) measures each of these figures under its stub's no-0107 mode.
+ * and the provider's 2 + 3 x 5 = 17, and the whole cron request 36 with the
+ * drain's one PGRST202 call. With 0107 and 0112 it is 34 without the drain,
+ * and 38 with four drain calls, inside the rule's 40. A database without
+ * 0103 has no 0107 either, so the rule's own sum gains that read and the one
+ * drain call there: 42 for the whole request, two over 0.8 of the budget and
+ * within it; 23 for the provider, under its half. No environment runs
+ * without 0103 any more. tests/unit/webhook-hold-route.test.ts (v) measures
+ * each of these figures under its stub (its drain modes: 'done', 'time' on
+ * every call, and PGRST202 in its no-0107 and no-0103 modes).
  * SWEEP_MAX_FIRES counts fire calls whatever they answer, because a call that
  * loses the latch has already made every subrequest but the POST. The
  * provider runs inside the admin page's request beside the other providers,

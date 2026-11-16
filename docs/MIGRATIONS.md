@@ -57,3 +57,36 @@ Which role needs what: browser and server components use the signed-in
 user's session (`authenticated`); pre-login pages use `anon`; API routes,
 cron jobs and matview readers use `service_role`. When in doubt, grant
 `authenticated` and `service_role` and let RLS do the restricting.
+
+## Paste order across files (ADR 0024)
+
+Each file's header is the full rule; this is the cross-file summary.
+
+- Production sitting (ADR 0024 step 74, with the note of 2026-11-16, D-S2,
+  recommended and awaiting the owner's answer): 0105, 0106,
+  `0107_learning_contexts.sql`, `0112_sweep_time_box.sql`, the release tag,
+  `0108_drop_context_derive.sql`, 0109. 0112 goes directly after 0107, so
+  no deployed route meets 0107's refresh bodies (the sweep with no time box)
+  with learners.
+- **0112** (the completion sweep's time box and its own calls; five
+  functions, no relation, no row write): written and rehearsed
+  (`scripts/migration-rehearsal`, scenarios `0107-then-0112` and
+  `0107-0112-then-0107-then-0112`); **not yet pasted on staging or
+  production** (2026-11-16). Staging paste: the owner, in the SQL editor, as
+  soon as its pull request is merged, with the read-only reads before and
+  after that its header lists (the note's S3); record the date here.
+  Reverse: `ops/0112-reverse.sql`, staging only (`ops/0107-reverse.sql`
+  drops 0112's two functions too); if the staging job of the note's D-S3 was
+  scheduled, `select cron.unschedule('completion-sweep');` comes first,
+  before `ops/0112-reverse.sql` or `ops/0107-reverse.sql`, in the same
+  sitting.
+- After 0112, every later paste of 0107 (staging, until 0109) is followed by
+  0112, and by 0108 if 0108 was pasted: 0107's refresh bodies run the sweep
+  without the time box. On production 0107 is never pasted again after
+  0112.
+- 0112 refuses after 0109 (it would strip 0109's views from the refresh
+  functions). After 0109 neither 0107 nor 0112 is pasted again. 0109 (not
+  written yet) recreates both refresh functions calling
+  `sweep_completion_side_effects_timed(200, 1500)`, asserts it in its
+  after-check, lists 0112 among its never-paste files, and its reverse
+  restores 0112's refresh bodies.
