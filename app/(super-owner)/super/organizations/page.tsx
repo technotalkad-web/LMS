@@ -8,6 +8,7 @@ import {
   Plus,
 } from "lucide-react";
 import { OrganizationsTable, type TenantRow } from "./organizations-table";
+import { requirePlatformOwner } from "@/lib/auth/require-platform-owner";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +28,7 @@ type OrgRow = {
 };
 
 export default async function OrganizationsPage() {
+  await requirePlatformOwner();
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
