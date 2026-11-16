@@ -43,6 +43,9 @@
 -- changes nothing. If 0107 is pasted again after this file (possible on
 -- staging until 0109), that paste recreates context_derive_log, the derive
 -- trigger and the day_ids trigger: paste this file again after it.
+-- After 0112, any paste of 0107 is followed by 0112 (0107's refresh bodies
+-- run the sweep without a time box, ADR 0024 note of 2026-11-16); on
+-- production 0107 is never pasted again after 0112.
 --
 -- NEVER PASTE AGAIN after this file: nothing new. 0107 stays pasteable on
 -- staging until 0109 (step 4), as said above.

@@ -1,17 +1,19 @@
 /**
  * Unit test for the ADR 0024 note of 2026-11-14, ruling A4 ("The
- * gamification refresh route and the sweep's error"), on the real route:
+ * gamification refresh route and the sweep's error"), as the note of
+ * 2026-11-16 restates it (items 4 to 6, step S5), on the real route:
  * app/api/cron/gamification-refresh runs for real under a stubbed PostgREST
  * fetch (the form of refresh-report-views-route.test.ts), so the real answer,
- * status and heartbeat upsert are what is asserted.
+ * status, heartbeat upsert and request count are what is asserted.
  *
  *   (i)   from 0107 refresh_gamification_views()'s answer ends with the
  *         sweep's entry, {view: "completion_sweep", ms, rows, error, sweep}
- *         (step 16): with its error null the route answers 200, ok true,
- *         `views` the whole answer, and the heartbeat reads "ok";
- *   (ii)  with its error set the route answers 500, ok false, an `error`
- *         naming the sweep, `views` still the whole answer, and the heartbeat
- *         reads "error" with the whole body as its detail;
+ *         (step 16): with its error null and a drain that answers 'done' the
+ *         route answers 200, ok true, `views` the whole answer,
+ *         `completion_sweep_drain` its summary, and the heartbeat reads "ok";
+ *   (ii)  with the entry's error set the route answers 500, ok false, an
+ *         `error` naming the sweep, `views` still the whole answer, and the
+ *         heartbeat reads "error" with the whole body as its detail;
  *   (iii) everything else keeps today's behaviour: a view entry's error
  *         (200), rows that failed inside the sweep with the sweep's own error
  *         null (200: counted in sweep.failed and retried by the next run), an
@@ -20,8 +22,16 @@
  *         missing secret (401, no RPC, no heartbeat); GET is POST;
  *   (iv)  the held-webhook sweep (ADR 0015 step 5) runs in every case, after
  *         the refresh and before the heartbeat, stays in the body as
- *         `webhook_sweep`, and never decides `ok`: its own failure leaves a
- *         good refresh at 200 and a failed completion sweep at 500.
+ *         `webhook_sweep`, and never decides `ok`;
+ *   (v)   the drain (the note's items 4 and 5): it runs first, before the
+ *         refresh and before total_ms's clock starts; 'done', 'busy', 'time'
+ *         and 'limit' up to GAMIFICATION_DRAIN_MAX_CALLS, failed rows, and
+ *         PGRST202 beside a refresh of 0107 read green; a drain error (57014
+ *         included), PGRST202 beside a refresh whose sweep carries `stopped`,
+ *         and two stalled calls in a row (D-S4) read red, and the refresh and
+ *         the held-webhook sweep still run after a red drain; the route
+ *         imports the helper and keeps no copy of the rule; the request
+ *         count, measured, is held to 40.
  *
  * No database, no network.
  *
@@ -30,6 +40,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { NextRequest } from "next/server";
+import { GAMIFICATION_DRAIN_MAX_CALLS, STALL_READS_RED } from "../../lib/ops/completion-sweep";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -42,20 +53,33 @@ const SECRET = "stub-cron-secret";
 
 type Req = { method: string; path: string; body: string };
 let requests: Req[] = [];
-/** What the stubbed RPC answers next: a body (200) or an error (500). */
+/** What the stubbed refresh RPC answers next: a body (200) or an error (500). */
 let answer: { body: unknown } | { error: { code: string; message: string } } = { body: [] };
 /** Whether the held-webhook sweep's read fails (its own error, fail-isolated). */
 let heldFails = false;
+/** What the drain calls answer, in order; when the list runs out, 'done' with nothing. */
+type DrainAnswer = { body: Record<string, unknown> } | { error: { code: string; message: string }; status: number };
+let drainScript: DrainAnswer[] = [];
 const unmatched: string[] = [];
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+const drainAnswer = (stopped: string, handled = 0, failed = 0): DrainAnswer => ({
+  body: { candidates: handled + failed, handled, failed, errors: [], stopped, ms: stopped === "time" ? 5002 : 40 },
+});
+const DRAIN_ABSENT: DrainAnswer = { error: { code: "PGRST202", message: "Could not find the function public.sweep_completion_side_effects_timed(p_budget_ms, p_limit) in the schema cache" }, status: 404 };
+const DRAIN_TIMEOUT: DrainAnswer = { error: { code: "57014", message: "canceling statement due to statement timeout" }, status: 500 };
 
 const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const body = typeof init?.body === "string" ? init.body : "";
   requests.push({ method, path: url.pathname, body });
+  if (url.pathname === "/rest/v1/rpc/sweep_completion_side_effects_timed" && method === "POST") {
+    const a = drainScript.shift() ?? drainAnswer("done");
+    return "error" in a ? json(a.error, a.status) : json(a.body);
+  }
   if (url.pathname === "/rest/v1/rpc/refresh_gamification_views") {
     return "error" in answer ? json(answer.error, 500) : json(answer.body);
   }
@@ -79,8 +103,11 @@ const sweepEntry = (error: string | null, sweep: Record<string, unknown> | null 
   error,
   sweep: error ? null : sweep,
 });
+/** The same entry from 0112's bodies: the six-key answer of the timed sweep. */
+const timedEntry = (stopped = "time") => sweepEntry(null, { candidates: 18, handled: 18, failed: 0, errors: [], stopped, ms: 1503 });
 
-type Body = Record<string, unknown> & { ok: boolean; total_ms: number; error?: string; views?: unknown; webhook_sweep?: Record<string, unknown> };
+type Drain = { calls: number; candidates: number; handled: number; failed: number; stalled: number; stopped: string; ms: number };
+type Body = Record<string, unknown> & { ok: boolean; total_ms: number; error?: string; views?: unknown; webhook_sweep?: Record<string, unknown>; completion_sweep_drain?: Drain };
 type Heartbeat = { name: string; last_status: string; last_detail: Body | null };
 
 async function main() {
@@ -104,21 +131,30 @@ async function main() {
       const body = (await res.json()) as Body;
       const beats = requests.filter((r) => r.path === "/rest/v1/ops_heartbeats" && r.method === "POST").map((r) => JSON.parse(r.body) as Heartbeat);
       const rpcs = requests.filter((r) => r.path === "/rest/v1/rpc/refresh_gamification_views").length;
+      const drains = requests.filter((r) => r.path === "/rest/v1/rpc/sweep_completion_side_effects_timed").length;
       const order = requests.map((r) =>
-        r.path.endsWith("/refresh_gamification_views") ? "refresh" : r.path === "/rest/v1/course_attempts" ? "held" : r.path === "/rest/v1/ops_heartbeats" ? "heartbeat" : r.path);
-      return { status: res.status, body, beats, rpcs, order };
+        r.path.endsWith("/sweep_completion_side_effects_timed") ? "drain"
+          : r.path.endsWith("/refresh_gamification_views") ? "refresh"
+          : r.path === "/rest/v1/course_attempts" ? "held"
+          : r.path === "/rest/v1/ops_heartbeats" ? "heartbeat" : r.path);
+      return { status: res.status, body, beats, rpcs, drains, order, count: requests.length };
     };
     const NOTHING_HELD = { scanned: 0, fired: [], skipped: [], unfired: [] };
 
-    console.log("\n(i) 0107's answer, the sweep's error null: 200, ok, heartbeat ok");
+    console.log("\n(i) 0107's answer, the sweep's error null, the drain 'done': 200, ok, heartbeat ok");
     {
       heldFails = false;
+      drainScript = [drainAnswer("done", 3)];
       answer = { body: [...VIEWS, sweepEntry(null)] };
       const r = await call();
       eq("200, ok true, no error key", [r.status, r.body.ok, "error" in r.body], [200, true, false]);
       eq("views is the whole answer, the sweep's entry last", r.body.views, [...VIEWS, sweepEntry(null)]);
       eq("one RPC call, one heartbeat named gamification-refresh reading ok", [r.rpcs, r.beats.map((b) => [b.name, b.last_status])], [1, [["gamification-refresh", "ok"]]]);
-      eq("the body keeps today's keys: ok, total_ms, views, webhook_sweep", Object.keys(r.body).sort(), ["ok", "total_ms", "views", "webhook_sweep"]);
+      eq("the body's keys: ok, total_ms, views, completion_sweep_drain, webhook_sweep", Object.keys(r.body).sort(), ["completion_sweep_drain", "ok", "total_ms", "views", "webhook_sweep"]);
+      const d = r.body.completion_sweep_drain!;
+      eq("completion_sweep_drain: one call, its counts, stopped done, no ids",
+        [d.calls, d.candidates, d.handled, d.failed, d.stalled, d.stopped, typeof d.ms, Object.keys(d).sort()],
+        [1, 3, 3, 0, 0, "done", "number", ["calls", "candidates", "failed", "handled", "ms", "stalled", "stopped"]]);
       eq("the heartbeat's detail is the body", r.beats[0]?.last_detail, r.body);
     }
 
@@ -169,14 +205,14 @@ async function main() {
       const r = await call();
       eq("an RPC error: 500, ok false, its message, heartbeat error (today's rule)",
         [r.status, r.body.ok, r.body.error, r.beats.map((b) => b.last_status)], [500, false, "canceling statement due to statement timeout", ["error"]]);
-      eq("…the held-webhook sweep still ran and is in the body", r.body.webhook_sweep, NOTHING_HELD);
+      eq("…the held-webhook sweep still ran and is in the body, and so is the drain's summary", [r.body.webhook_sweep, r.body.completion_sweep_drain?.stopped], [NOTHING_HELD, "done"]);
     }
     {
       answer = { body: [...VIEWS, sweepEntry(null)] };
       const wrong = await call("not-the-secret");
       const none = await call(null);
-      eq("a wrong or missing secret: 401, no RPC, no heartbeat",
-        [wrong.status, wrong.rpcs, wrong.beats.length, none.status, none.rpcs, none.beats.length], [401, 0, 0, 401, 0, 0]);
+      eq("a wrong or missing secret: 401, no RPC, no drain, no heartbeat",
+        [wrong.status, wrong.rpcs, wrong.drains, wrong.beats.length, none.status, none.rpcs, none.drains, none.beats.length], [401, 0, 0, 0, 401, 0, 0, 0]);
     }
     {
       answer = { body: [...VIEWS, sweepEntry("boom")] };
@@ -189,7 +225,7 @@ async function main() {
       heldFails = false;
       answer = { body: [...VIEWS, sweepEntry(null)] };
       const r = await call();
-      eq("the refresh, then the held-webhook sweep, then the heartbeat", r.order, ["refresh", "held", "heartbeat"]);
+      eq("the drain, then the refresh, then the held-webhook sweep, then the heartbeat", r.order, ["drain", "refresh", "held", "heartbeat"]);
     }
     {
       heldFails = true;
@@ -206,11 +242,85 @@ async function main() {
         [r.status, r.body.ok, r.body.error, typeof r.body.webhook_sweep?.error], [500, false, "completion_sweep: boom", "string"]);
       heldFails = false;
     }
+
+    console.log("\n(v) the drain (ADR 0024 note of 2026-11-16, items 4 and 5)");
+    {
+      drainScript = [drainAnswer("time", 60), drainAnswer("busy")];
+      answer = { body: [...VIEWS, timedEntry("busy")] };
+      const r = await call();
+      eq("'time' then 'busy': two drain calls, 200, ok, stopped busy", [r.drains, r.status, r.body.ok, r.body.completion_sweep_drain?.stopped, r.body.completion_sweep_drain?.handled], [2, 200, true, "busy", 60]);
+    }
+    {
+      drainScript = Array.from({ length: GAMIFICATION_DRAIN_MAX_CALLS + 1 }, (_, i) => drainAnswer(i % 2 ? "limit" : "time", 50));
+      answer = { body: [...VIEWS, timedEntry("time")] };
+      const r = await call();
+      eq(`'time' and 'limit' on every call: ${GAMIFICATION_DRAIN_MAX_CALLS} drain calls (GAMIFICATION_DRAIN_MAX_CALLS), 200, ok`,
+        [r.drains, r.status, r.body.ok, r.body.completion_sweep_drain?.calls, r.body.completion_sweep_drain?.handled], [GAMIFICATION_DRAIN_MAX_CALLS, 200, true, GAMIFICATION_DRAIN_MAX_CALLS, 50 * GAMIFICATION_DRAIN_MAX_CALLS]);
+      eq("…then the refresh, the held-webhook sweep and the heartbeat, once each",
+        r.order, [...Array(GAMIFICATION_DRAIN_MAX_CALLS).fill("drain"), "refresh", "held", "heartbeat"]);
+      console.log(`  measured: the worst healthy request (${GAMIFICATION_DRAIN_MAX_CALLS} drain calls, nothing held) makes ${r.count} subrequests`);
+      eq("the request count, measured, is held to 40 (the held-webhook rule's 0.8 of the Workers budget)", r.count <= 40, true);
+      drainScript = [];
+    }
+    {
+      drainScript = [drainAnswer("time", 40, 3), drainAnswer("done", 5, 1)];
+      answer = { body: [...VIEWS, timedEntry("done")] };
+      const r = await call();
+      eq("failed rows beside handled rows: 200, ok, counted", [r.status, r.body.ok, r.body.completion_sweep_drain?.failed], [200, true, 4]);
+    }
+    {
+      drainScript = [DRAIN_ABSENT];
+      answer = { body: [...VIEWS, sweepEntry(null)] };
+      const r = await call();
+      eq("PGRST202 (a database without 0112) beside 0107's refresh: one drain call, 200, ok, stopped absent",
+        [r.drains, r.status, r.body.ok, r.body.completion_sweep_drain?.stopped], [1, 200, true, "absent"]);
+      drainScript = [DRAIN_ABSENT];
+      answer = { body: VIEWS };
+      const r2 = await call();
+      eq("PGRST202 beside an answer without the entry (production today): 200, ok", [r2.status, r2.body.ok], [200, true]);
+    }
+    {
+      drainScript = [DRAIN_ABSENT];
+      answer = { body: [...VIEWS, timedEntry("time")] };
+      const r = await call();
+      eq("PGRST202 beside a refresh whose sweep carries stopped (0112 there, its function not visible): 500, red",
+        [r.status, r.body.ok, r.body.error, r.beats.map((b) => b.last_status)], [500, false, "completion_sweep: drain function not visible", ["error"]]);
+    }
+    {
+      drainScript = [DRAIN_TIMEOUT];
+      heldFails = false;
+      answer = { body: [...VIEWS, timedEntry("time")] };
+      const r = await call();
+      eq("a drain call answering 57014: 500, red, its message", [r.status, r.body.ok, r.body.error, r.beats.map((b) => b.last_status)],
+        [500, false, "completion_sweep: canceling statement due to statement timeout", ["error"]]);
+      eq("…the drain stopped at that call; the refresh and the held-webhook sweep still ran", [r.drains, r.rpcs, r.order, r.body.webhook_sweep, r.body.views],
+        [1, 1, ["drain", "refresh", "held", "heartbeat"], NOTHING_HELD, [...VIEWS, timedEntry("time")]]);
+    }
+    {
+      drainScript = [drainAnswer("time", 0, 5), drainAnswer("time", 0, 5), drainAnswer("done", 9)];
+      answer = { body: [...VIEWS, timedEntry("time")] };
+      const r = await call();
+      eq("two stalled calls in a row: the drain stops at the second", [r.drains, r.body.completion_sweep_drain?.stopped, r.body.completion_sweep_drain?.stalled], [2, "stalled", 2]);
+      eq(`…${STALL_READS_RED ? "500, red (D-S4 built as recommended)" : "200 (D-S4 answered no)"}`,
+        [r.status, r.body.ok, r.body.error ?? null],
+        STALL_READS_RED ? [500, false, "completion_sweep: stalled (10 failed, 0 handled, 2 calls)"] : [200, true, null]);
+      drainScript = [];
+    }
+    {
+      drainScript = [drainAnswer("time", 0, 5), drainAnswer("done", 4)];
+      answer = { body: [...VIEWS, timedEntry("done")] };
+      const r = await call();
+      eq("one stalled call, then a call that handles rows: 200, ok, stalled 1", [r.status, r.body.ok, r.body.completion_sweep_drain?.stalled, r.drains], [200, true, 1, 2]);
+    }
     {
       const src = fs.readFileSync(path.resolve(__dirname, "../../app/api/cron/gamification-refresh/route.ts"), "utf8");
       const twin = fs.readFileSync(path.resolve(__dirname, "../../app/api/cron/refresh-report-views/route.ts"), "utf8");
-      const fn = (s: string) => /function completionSweepError\(data: unknown\): string \| null \{[\s\S]*?\n\}/.exec(s)?.[0] ?? null;
-      eq("the route's completionSweepError is the report route's, line for line (one rule in two routes)", fn(src) !== null && fn(src) === fn(twin), true);
+      const imports = (s: string) => /from "@\/lib\/ops\/completion-sweep";/.test(s) && /\bcompletionSweepFailure\(sweepRun, data\)/.test(s) && /\bdrainCompletionSweep\(svc, /.test(s);
+      eq("both routes import the helper and call its drain and its rule (one rule, one file: the note's item 6)", [imports(src), imports(twin)], [true, true]);
+      eq("neither route keeps its own copy of completionSweepError", [/function completionSweepError/.test(src), /function completionSweepError/.test(twin)], [false, false]);
+      eq("the drain runs before total_ms's clock starts, and the held-webhook sweep after it stops",
+        src.indexOf("drainCompletionSweep(svc") > 0 && src.indexOf("drainCompletionSweep(svc") < src.indexOf("const t0 = Date.now();")
+          && src.indexOf("const total_ms = Date.now() - t0;") < src.indexOf("sweepHeldWebhooks(svc"), true);
       eq("the route never names purge_preview_data", src.includes("purge_preview_data"), false);
     }
     eq("every request the route made was stubbed", unmatched, []);

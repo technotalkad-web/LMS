@@ -167,6 +167,19 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   echo "::add-mask::$IMPERSONATION_SECRET"
 fi
 export IMPERSONATION_SECRET
+# A fresh cron secret for each run, never a deployed value, as
+# scripts/e2e-in-runner.sh sets it: spec 78 (ADR 0024 note of 2026-11-16,
+# S6) POSTs the two refresh routes of the app this script starts. The app
+# reads CRON_SECRET; the spec reads LIFECYCLE_CRON_SECRET, because the
+# lifecycle config loads the env files with override: true and a
+# CRON_SECRET of theirs would replace this one. Only the secret is new here:
+# the script runs no drain of the completion sweep (the note's S6).
+CRON_SECRET="$(node -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex"))')"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  echo "::add-mask::$CRON_SECRET"
+fi
+LIFECYCLE_CRON_SECRET="$CRON_SECRET"
+export CRON_SECRET LIFECYCLE_CRON_SECRET
 
 # A build that failed only because next/font could not fetch Google Fonts
 # (an unparseable or missing answer from fonts.googleapis.com; seen three

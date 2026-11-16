@@ -10,7 +10,12 @@
 -- A code rollback needs neither this script nor ops/0109-reverse.sql: the
 -- readers tolerate the new columns (step 61). After 0109 this script
 -- refuses: paste ops/0109-reverse.sql first (it restores 0107's bodies of
--- the two refresh functions, step 61).
+-- the two refresh functions, step 61). If 0112 was pasted and the staging
+-- job of its note's D-S3 is scheduled, unschedule it first, in the same
+-- sitting: it calls the timed sweep, which part 3 drops (pg_cron keeps the
+-- command as text, so the drop succeeds and every later run of the job
+-- fails with 42883):
+--   select cron.unschedule('completion-sweep');
 --
 -- WHAT IT DOES, one transaction, in step 61's five parts:
 --   (1) Refuses, and prints every count, while any of these holds: 0109 is
@@ -50,7 +55,9 @@
 --       exists, functions before the views and tables they read, a view
 --       before the views and tables it reads, and each append-only trigger
 --       function after its table: the seven-argument record_revision_visit,
---       launch_context, sweep_completion_side_effects, both forms of
+--       launch_context, sweep_completion_side_effects (and, where 0112 was
+--       pasted, its sweep_completion_side_effects_timed and
+--       completion_sweep_backlog; ADR 0024 note of 2026-11-16), both forms of
 --       record_learning_activity, journey_complete_enrollment,
 --       journey_complete_enrollments, journey_complete_enrollments_core,
 --       journey_credit_state, official_attempt_in_context,
@@ -1680,6 +1687,10 @@ comment on column public.user_badges.period is null;
 drop function if exists public.record_revision_visit(uuid, uuid, uuid, uuid, uuid, text, text);
 drop function if exists public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer);
 drop function if exists public.sweep_completion_side_effects(integer);
+-- 0112's timed sweep and backlog read, where 0112 was pasted (ADR 0024 note
+-- of 2026-11-16)
+drop function if exists public.sweep_completion_side_effects_timed(integer, integer);
+drop function if exists public.completion_sweep_backlog();
 drop function if exists public.record_learning_activity(uuid, boolean);
 drop function if exists public.record_learning_activity(uuid);
 drop function if exists public.journey_complete_enrollment(uuid);
@@ -1968,6 +1979,7 @@ begin
       'public.journey_complete_enrollments(uuid)', 'public.gamification_record_activity_core(uuid, boolean, boolean)',
       'public.record_learning_activity(uuid, boolean)', 'public.record_learning_activity(uuid)',
       'public.sweep_completion_side_effects(integer)',
+      'public.sweep_completion_side_effects_timed(integer, integer)', 'public.completion_sweep_backlog()',
       'public.purge_preview_data(uuid, jsonb, text, uuid, boolean, text)',
       'public.launch_context(uuid, uuid, uuid, uuid, uuid, uuid, integer)']) f
    where to_regprocedure(f) is not null;
