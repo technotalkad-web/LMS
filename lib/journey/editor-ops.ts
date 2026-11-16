@@ -252,6 +252,31 @@ export function pendingChanges(baseline: EditorState, state: EditorState, daysTo
   return n;
 }
 
+/**
+ * Whether a save that did not come back as a confirmed success may still
+ * have landed, so the editor keeps Save off until the page is reloaded
+ * (P2-N7 rule (1); ADR 0024 P2-8 note, item 10): the editor cannot know the
+ * new rows' ids, and a resend would name their numbers again.
+ *
+ *   - the answer says so (`reload: true`: an unconfirmed save, a read-back
+ *     that failed or did not match);
+ *   - a 409 (the curriculum changed since the page was loaded);
+ *   - a 2xx this page cannot read as a save's answer;
+ *   - a 5xx without a readable error (a gateway's or the platform's page, or
+ *     a body that is not the route's JSON): the route may have run and saved.
+ *
+ * Every other refusal (400, 401, 403, 404, and a 5xx the route answered with
+ * its own error and no `reload`, such as a failed check before the call or
+ * a refusal the database raised) wrote nothing, and Save stays on. A fetch
+ * that rejects is the caller's catch, which also keeps Save off.
+ */
+export function saveMayHaveLanded(status: number, body: { reload?: unknown; error?: unknown }): boolean {
+  if (body.reload === true) return true;
+  if (status === 409) return true;
+  if (status >= 200 && status < 300) return true;
+  return status >= 500 && typeof body.error !== "string";
+}
+
 /** One "Move instead?" question (R17). */
 export type MoveInsteadPair = {
   course_id: string;

@@ -4,7 +4,8 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { CHECK_FAILED, isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { DEFAULT_MILESTONES, freezeVersionDays, type DraftDayRow } from "@/lib/journey/journey";
 import { MAX_DAY_NUMBER, type SaveEntry } from "@/lib/journey/editor-ops";
-import { readWithOptionalColumn, isSchemaMissing } from "@/lib/scoring/attempt-kind";
+import { isSchemaMissing } from "@/lib/scoring/attempt-kind";
+import { readDraftDays } from "@/lib/journey/draft-read";
 import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
@@ -76,10 +77,11 @@ const NEEDS_UPDATE = "needs a database update that is not on this server yet";
 /**
  * The program, scoped to the caller's organisation, and its draft days, read
  * on the caller's session for the publish and the dry run. The days are read
- * with their id and pass_required (P2-N8; the narrower-select fallback
- * without 0107, though the write that follows fails there anyway); a removed
- * day has no number and is never read. A failed read answers 503, never
- * "not found" or "no days".
+ * through readDraftDays (lib/journey/draft-read.ts), the journey admin
+ * page's reader too: with their id and pass_required (P2-N8; the
+ * narrower-select fallback without 0107, though the write that follows fails
+ * there anyway); a removed day has no number and is never read. A failed
+ * read answers 503, never "not found" or "no days".
  */
 async function readDraft(
   c: Ctx,
@@ -96,21 +98,11 @@ async function readDraft(
     return { ok: false, res: NextResponse.json({ error: `Could not load the journey. ${what}; try again.` }, { status: 503 }) };
   }
   if (!prog) return { ok: false, res: NextResponse.json({ error: "Program not found" }, { status: 404 }) };
-  const { data: dayRows, error: dErr } = await readWithOptionalColumn<unknown[]>(
-    "pass_required",
-    (columns) =>
-      c.supabase
-        .from("journey_days")
-        .select(columns)
-        .eq("program_id", programId)
-        .not("day_number", "is", null)
-        .order("day_number", { ascending: true }),
-    "id, day_number, course_id, mission_title"
-  );
-  if (dErr) {
+  const draft = await readDraftDays(c.supabase, programId);
+  if (draft.error) {
     return { ok: false, res: NextResponse.json({ error: `Could not load the curriculum. ${what}; try again.` }, { status: 503 }) };
   }
-  return { ok: true, prog: prog as Record<string, unknown>, rows: (dayRows ?? []) as DraftDayRow[] };
+  return { ok: true, prog: prog as Record<string, unknown>, rows: draft.data };
 }
 
 export async function POST(request: Request) {
@@ -762,6 +754,9 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const STALE_EDITOR =
   "The curriculum editor has changed since this page was loaded. Nothing was saved; reload the page and make your changes again.";
 
+/** A code the database gives (a SQLSTATE: five digits or capital letters) or PostgREST gives (PGRST and three digits). */
+const DB_CODE = /^(?:[0-9A-Z]{5}|PGRST\d{3})$/;
+
 /**
  * The curriculum save's entries, checked and normalised before any call
  * (ADR 0024 step 92, P2-8 item 3): each an object in the full shape
@@ -897,8 +892,22 @@ export async function PUT(request: Request) {
     p_days: entries,
   });
   if (error) {
-    // One transaction: a refused save wrote nothing.
-    const code = error.code ?? null;
+    // An error without a database code (DB_CODE) is not the database's
+    // answer: the request failed on the way or a gateway answered in the
+    // database's place (the client library gives such an error an empty
+    // code or none; a gateway's JSON may carry a code of its own). The call
+    // may have committed, so this is never "nothing was saved": the editor
+    // reloads before its next save (ADR 0024 P2-8 note, items 8 and 10).
+    const code = typeof error.code === "string" && DB_CODE.test(error.code) ? error.code : null;
+    if (code === null) {
+      console.error(JSON.stringify({ event: "journey_save_unconfirmed", program_id: programId }));
+      return NextResponse.json(
+        { error: "The save may have gone through, but its answer did not arrive. Reload the page to see what was saved before editing again.", saved_unconfirmed: true, reload: true },
+        { status: 503 }
+      );
+    }
+    // An error with a code is a refusal PostgREST or the database raised:
+    // the one transaction rolled back, so the save wrote nothing.
     if (code === "PGRST202") {
       console.warn(JSON.stringify({ event: "journey_save_unavailable", program_id: programId }));
       return NextResponse.json({ error: `Saving the curriculum ${NEEDS_UPDATE}. Nothing was saved.` }, { status: 503 });

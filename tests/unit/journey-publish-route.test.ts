@@ -33,17 +33,31 @@
  *     member and a data analyst 403, a failed organisation or role read 503,
  *     each with no write and no call; the program is read within the caller's
  *     organisation, and one outside it answers 404 with no call; an unknown
- *     POST action is refused, never read as "create a journey";
+ *     POST action is refused, never read as "create a journey"; a failed
+ *     last-version read answers 503 with no version insert. The stub applies
+ *     an organization_id filter as the database does, so a filter taken out
+ *     of the route fails the outside-program and other-module cases;
  *   - the curriculum PUT: one call of journey_save_days on the admin's own
  *     session with the entries in the full shape; the refusals before any
  *     call (empty days, an entry without its id or pass_required key, a
  *     removed entry without an id, an id twice, two days on one number, a
  *     module of another organisation); the error mapping (PGRST202 503, 22023
- *     and 23505 409 with reload, 23514 400, 42501 403); the read-back carries
- *     its own abort signal and becomes `days` in the answer, with the counts
- *     taken from it; an answer without the counts, or a read-back missing a
- *     sent day, is never "saved"; 3 days and 90 days make the same request
- *     list (no request per day);
+ *     and 23505 409 with reload, 23514 400, 42501 403, any other code 500
+ *     "nothing was saved"); an error without a database code (the request
+ *     failed on the way, a gateway's page, JSON without a code or with a
+ *     code of its own) answers 503 "may have gone through", reload; the
+ *     read-back carries its own abort signal and
+ *     becomes `days` in the answer, with the counts taken from it; an answer
+ *     without the counts, or a read-back missing a sent day, holding a
+ *     removed day or missing a new one, is never "saved"; an unchanged
+ *     resend answers ok (the disclosed limit); 3 days and 90 days make the
+ *     same request list (no request per day);
+ *   - readDraftDays (lib/journey/draft-read.ts), the journey admin page's
+ *     and the publish's draft read: each row's own rule with 0107, the
+ *     narrower select and every rule null without it (A19), any other error
+ *     returned; a source scan holds the page and the route to it, with
+ *     planted cases; another holds the editor's save branch to
+ *     saveMayHaveLanded (OPS-1);
  *   - no email (decision A20, step 62): the route imports nothing that sends
  *     one (lib/notifications/, lib/email/, resend), read from its source,
  *     with planted cases.
@@ -56,6 +70,8 @@ import Module from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import { readDraftDays } from "../../lib/journey/draft-read";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -108,16 +124,23 @@ const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._loa
 
 type Answer = { status: number; body: unknown };
 /**
- * `inOrg: false`: the program is not in the caller's organisation, so the
- * org-scoped read finds no row. `no0107`: a database without 0107 (a select
- * naming pass_required answers 42703, the version insert PGRST204, either rpc
- * PGRST202). `save`: the answer of journey_save_days (null: the stub applies
- * the sent entries to `draft`, as the function would, and answers its counts).
+ * The stub holds rows of two organisations and applies an organization_id
+ * filter as the database would: the program belongs to org-1, or to org-2
+ * when `inOrg` is false, and the FOREIGN course to org-2. A read with the
+ * filter sees the caller's organisation's rows only; a read without it would
+ * see both, so a filter taken out of the route turns a refusal into a 200.
+ * `no0107`: a database without 0107 (a select naming pass_required answers
+ * 42703, the version insert PGRST204, either rpc PGRST202). `save`: the
+ * answer of journey_save_days (null: the stub applies the sent entries to
+ * `draft`, as the function would, and answers its counts). `saveRaw`: an
+ * answer that is not the database's: "throw" (the request fails on the way)
+ * or a raw status and body (a gateway's page, or JSON without a code).
  */
 type World = {
   role: string;
   rpc: Answer;
   save: Answer | null;
+  saveRaw: "throw" | { status: number; body: string; type: string } | null;
   inOrg: boolean;
   no0107: boolean;
   fail: string[];
@@ -135,7 +158,7 @@ const COUNTS = {
   credits_now_history: 4,
   credited_by_rule_change: 0,
 };
-const base = (): World => ({ role: "admin", rpc: { status: 200, body: COUNTS }, save: null, inOrg: true, no0107: false, fail: [], draft: DRAFT.map((r) => ({ ...r })), lose: null });
+const base = (): World => ({ role: "admin", rpc: { status: 200, body: COUNTS }, save: null, saveRaw: null, inOrg: true, no0107: false, fail: [], draft: DRAFT.map((r) => ({ ...r })), lose: null });
 let world: World = base();
 let requests: Req[] = [];
 let logs: string[] = [];
@@ -179,10 +202,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/user") return json(USER);
   if (p === "/rest/v1/organizations") return failing("org") ? pgError("XX000", "stub failure", 500) : json([{ id: "org-1" }]);
   if (p === "/rest/v1/organization_members") return failing("role") ? pgError("XX000", "stub failure", 500) : json([{ role: world.role }]);
+  // An organization_id filter, applied as the database applies it: a row of another organisation is not returned.
+  const inScope = (org: string) => { const f = url.searchParams.get("organization_id"); return f === null || f === `eq.${org}`; };
   if (p === "/rest/v1/journey_programs" && method === "GET") {
     if (failing("program")) return pgError("XX000", "stub failure", 500);
-    if (!world.inOrg) return json([]);
-    return json([{ id: PROGRAM, organization_id: "org-1", name: "Yoddha", icon: "🏹", days_total: 3, count_sundays: false, unlock_mode: "calendar", milestones: null, copy: null, completion_title: "Yoddha" }]);
+    const org = world.inOrg ? "org-1" : "org-2";
+    if (!inScope(org)) return json([]);
+    return json([{ id: PROGRAM, organization_id: org, name: "Yoddha", icon: "🏹", days_total: 3, count_sundays: false, unlock_mode: "calendar", milestones: null, copy: null, completion_title: "Yoddha" }]);
   }
   if (p === "/rest/v1/journey_programs" && method === "PATCH") return new Response(null, { status: 204 });
   if (p === "/rest/v1/journey_days" && method === "GET") {
@@ -198,9 +224,12 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/courses") {
     if (failing("courses")) return pgError("XX000", "stub failure", 500);
     const asked = (url.searchParams.get("id") ?? "").replace(/^in\.\(|\)$/g, "").split(",").filter(Boolean);
-    return json(asked.filter((c) => c !== FOREIGN).map((id) => ({ id })));
+    return json(asked.filter((c) => inScope(c === FOREIGN ? "org-2" : "org-1")).map((id) => ({ id })));
   }
-  if (p === "/rest/v1/journey_versions" && method === "GET") return json([{ version_number: 1 }]);
+  if (p === "/rest/v1/journey_versions" && method === "GET") {
+    if (failing("versions")) return pgError("XX000", "stub failure", 500);
+    return json([{ version_number: 1 }]);
+  }
   if (p === "/rest/v1/journey_versions" && method === "POST") {
     if (world.no0107) return pgError("PGRST204", "Could not find the 'day_ids' column of 'journey_versions' in the schema cache");
     const row = { id: VERSION, version_number: 2 };
@@ -212,6 +241,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   }
   if (p === "/rest/v1/rpc/journey_save_days") {
     if (world.no0107) return pgError("PGRST202", "Could not find the function public.journey_save_days(p_days, p_program_id) in the schema cache", 404);
+    if (world.saveRaw === "throw") throw new TypeError("fetch failed");
+    if (world.saveRaw) return new Response(world.saveRaw.body, { status: world.saveRaw.status, headers: { "content-type": world.saveRaw.type } });
     if (world.save) return json(world.save.body, world.save.status);
     return json(applySave(((body as Row | null)?.p_days ?? []) as Row[]));
   }
@@ -384,6 +415,9 @@ async function main() {
       all.rest.filter((q) => q.method === "GET" && q.path === "/rest/v1/journey_programs").map((q) => /(^|[?&])organization_id=eq\.org-1(&|$)/.test(q.query)), [true]);
     const daysFail = await run({ fail: ["days"] });
     eq("a failed draft read: 503, never \"add at least one day\", nothing written", [daysFail.status, daysFail.writes], [503, []]);
+    const versionsFail = await run({ fail: ["versions"] });
+    eq("a failed last-version read: 503, never read as \"no earlier version\"; no version insert, no pointer update, no call",
+      [versionsFail.status, versionsFail.writes, versionsFail.rpcs.length], [503, [], 0]);
     const unknown = await call("POST", {}, { action: "dry-run" });
     eq("an unknown action: 400, nothing written (never read as \"create a journey\")", [unknown.status, unknown.writes], [400, []]);
 
@@ -418,6 +452,13 @@ async function main() {
     eq("…seven requests: the session, the org, the role, the program, the modules, the call, the read-back", put.all, [
       "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET journey_programs", "GET courses", "POST rpc/journey_save_days", "GET journey_days",
     ]);
+    // The tenant boundary of the save (P2-8 note, item 7): the program and the
+    // modules are both read within the caller's organisation. The stub applies
+    // the filter as the database does, so without it the outside program and
+    // the other organisation's module cases below would answer 200.
+    const orgScoped = (r: Run, table: string) =>
+      r.rest.filter((q) => q.method === "GET" && q.path === `/rest/v1/${table}`).map((q) => /(^|[?&])organization_id=eq\.org-1(&|$)/.test(q.query));
+    eq("…the save's program read and module read are each within the caller's organisation", [orgScoped(put, "journey_programs"), orgScoped(put, "courses")], [[true], [true]]);
     const removal = [
       entry(1, D1, C1, { pass_required: true }),
       { id: D2, day_number: null, course_id: null, mission_title: null, pass_required: null, removed: true },
@@ -464,6 +505,24 @@ async function main() {
     eq("23505 (a number held by a day the page does not show): 409, reload", await mapped("23505"), [409, undefined, true, false, false]);
     eq("23514: 400", await mapped("23514"), [400, undefined, null, false, false]);
     eq("42501: 403", await mapped("42501"), [403, undefined, null, false, false]);
+    const raised = await call("PUT", { save: { status: 500, body: { code: "XX000", message: "stub", details: null, hint: null } } }, { days: [entry(1, D1, C1)] });
+    eq("any other code the database raised (XX000): 500 \"Nothing was saved\", no reload (Save stays on)",
+      [raised.status, raised.body.ok, raised.body.reload ?? null, /Nothing was saved/.test(String(raised.body.error)), "days" in raised.body], [500, undefined, null, true, false]);
+
+    console.log("\n…an error without a code: the database's answer never came, so the save may have landed (OPS-1)");
+    const unconfirmed = async (w: Partial<World>) => {
+      const r = await call("PUT", w, { days: [entry(1, D1, C1)] });
+      return [r.status, r.body.ok, r.body.reload ?? null, r.body.saved_unconfirmed ?? null, "days" in r.body, /Nothing was saved/.test(String(r.body.error)), r.saves.length, r.all.includes("GET journey_days"), r.lines];
+    };
+    const UNCONFIRMED = [503, undefined, true, true, false, false, 1, false, [{ event: "journey_save_unconfirmed", program_id: PROGRAM }]];
+    eq("the request fails on the way (the client library's error carries an empty code): 503, may have saved, reload, never \"Nothing was saved\"",
+      await unconfirmed({ saveRaw: "throw" }), UNCONFIRMED);
+    eq("a gateway's page in the database's place (not JSON, no code): the same",
+      await unconfirmed({ saveRaw: { status: 502, body: "<html><body>Bad gateway</body></html>", type: "text/html" } }), UNCONFIRMED);
+    eq("JSON without a code (a gateway's timeout): the same",
+      await unconfirmed({ saveRaw: { status: 504, body: JSON.stringify({ message: "upstream request timeout" }), type: "application/json" } }), UNCONFIRMED);
+    eq("JSON whose code is not a database code (a platform's own numeric code): the same",
+      await unconfirmed({ saveRaw: { status: 500, body: JSON.stringify({ code: 1102, message: "resource limit" }), type: "application/json" } }), UNCONFIRMED);
     const p0save = await call("PUT", { no0107: true }, { days: [entry(1, D1, C1)] });
     eq("…a database without 0107: the rpc's PGRST202 answers 503 with one log line", [p0save.status, p0save.writes, p0save.lines], [503, ["POST rpc/journey_save_days"], [{ event: "journey_save_unavailable", program_id: PROGRAM }]]);
 
@@ -478,6 +537,53 @@ async function main() {
     eq("a read-back whose day does not hold what was sent (the call changed nothing): 500", [unchanged.status, unchanged.body.ok], [500, undefined]);
     const backFails = await call("PUT", { fail: ["days"] }, { days: [entry(1, D1, C1, { pass_required: true })] });
     eq("a failed read-back: 503, the save unconfirmed, reload", [backFails.status, backFails.body.ok, backFails.body.saved_unconfirmed, backFails.body.reload], [503, undefined, true, true]);
+
+    // Condition 2's other two arms (TESTS-5). Each save names every active
+    // draft row exactly as the draft holds it, plus one entry the function
+    // claims to have applied and did not (the `save` override applies
+    // nothing), so that entry's arm is the only one that can refuse.
+    const AS_HELD = [
+      entry(1, D1, C1, { pass_required: true }),
+      entry(2, D2, null),
+      entry(3, D3, C3, { mission_title: "Three", pass_required: false }),
+    ];
+    const DROP_D4 = { id: D4, day_number: null, course_id: null, mission_title: null, pass_required: null, removed: true };
+    const ONE_MISMATCH = [{ event: "journey_save_mismatch", program_id: PROGRAM, mismatched: 1 }];
+    const keptRemoved = await call("PUT", { save: { status: 200, body: { saved: 4, renumbered: 0, removed: 1, inserted: 0 } } }, { days: [...AS_HELD, DROP_D4] });
+    eq("a removal the read-back does not show (the day still active): 500, reload, no `days`, one mismatch",
+      [keptRemoved.status, keptRemoved.body.ok, keptRemoved.body.reload, "days" in keptRemoved.body, keptRemoved.lines], [500, undefined, true, false, ONE_MISMATCH]);
+    const removedApplied = await call("PUT", {}, { days: [...AS_HELD, DROP_D4] });
+    eq("…control: the same save applied answers 200 with removed 1", [removedApplied.status, removedApplied.body.ok, removedApplied.body.removed], [200, true, 1]);
+    const notInserted = await call("PUT", { save: { status: 200, body: { saved: 5, renumbered: 0, removed: 0, inserted: 1 } } }, { days: [...AS_HELD, entry(4, D4, C4), entry(5, null, C1)] });
+    eq("a new day the read-back does not show: 500, reload, no `days`, one mismatch",
+      [notInserted.status, notInserted.body.ok, notInserted.body.reload, "days" in notInserted.body, notInserted.lines], [500, undefined, true, false, ONE_MISMATCH]);
+    const insertApplied = await call("PUT", {}, { days: [...AS_HELD, entry(4, D4, C4), entry(5, null, C1)] });
+    eq("…control: the same save applied answers 200 with inserted 1", [insertApplied.status, insertApplied.body.ok, insertApplied.body.inserted], [200, true, 1]);
+    const same = await call("PUT", {}, { days: [...AS_HELD, entry(4, D4, C4)] });
+    eq("the disclosed limit (P2-8 note, item 9): a resend of the curriculum as saved answers ok, nothing added, removed or moved (the editor never sends one: \"Nothing to save\")",
+      [same.status, same.body.ok, same.body.saved, same.body.inserted, same.body.removed, same.body.renumbered], [200, true, 4, 0, 0, 0]);
+
+    console.log("\nthe draft-days reader (readDraftDays): the journey admin page's read and the publish's (A19, P2-N8)");
+    const direct = async (w: Partial<World>) => {
+      world = { ...base(), ...w };
+      requests = []; logs = [];
+      const client = createSupabaseClient(SUPABASE, ANON, { auth: { persistSession: false } });
+      const r = await readDraftDays(client, PROGRAM);
+      return { r, selects: requests.filter((q) => q.path === "/rest/v1/journey_days").map((q) => q.select) };
+    };
+    const FULL = "id,day_number,course_id,mission_title,pass_required";
+    const NARROW = "id,day_number,course_id,mission_title";
+    const with0107 = await direct({});
+    eq("with 0107: one read naming pass_required; each active row with its own rule (true, null, false, null); the removed row left out by the query",
+      [with0107.selects, with0107.r.error, with0107.r.data?.map((x) => [x.id, x.day_number, x.pass_required])],
+      [[FULL], null, [[D1, 1, true], [D2, 2, null], [D3, 3, false], [D4, 4, null]]]);
+    const without0107 = await direct({ no0107: true });
+    eq("without 0107 (42703 on pass_required): the narrower select once, no error, every row's rule null, so journey admin renders",
+      [without0107.selects, without0107.r.error, without0107.r.data?.map((x) => [x.id, x.pass_required])],
+      [[FULL, NARROW], null, [[D1, null], [D2, null], [D3, null], [D4, null]]]);
+    const readFails = await direct({ fail: ["days"] });
+    eq("any other error is returned, never rows, never retried (the page throws, the route answers 503)",
+      [readFails.r.data, readFails.r.error?.code, readFails.selects], [null, "XX000", [FULL]]);
 
     eq("the stub answered every request the route made", unmatched, []);
   } finally {
@@ -516,6 +622,52 @@ async function main() {
       senders("p.ts", `import a from "../../../lib/notifications/templates";\nexport { b } from "@/lib/email/resend";\nimport { Resend } from "resend";`),
       ["../../../lib/notifications/templates", "@/lib/email/resend", "resend"]);
     eq("planted: other modules pass", senders("p.ts", `import { DEFAULT_MILESTONES } from "@/lib/journey/journey";`), []);
+  }
+
+  console.log("\nthe draft days are read through readDraftDays only: the journey admin page and the publish (A19; TESTS-2, SCANS-1)");
+  {
+    // Sources with comments blanked (strings kept), so a comment naming the
+    // reader is not a call. Production has no 0107: the page renders there
+    // only while its read keeps the fallback the reader cases above run.
+    const blank = (raw: string) =>
+      raw.replace(/\r\n/g, "\n").replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " ")).replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+    const source = (rel: string) => blank(fs.readFileSync(path.resolve(__dirname, "../..", rel), "utf8"));
+    const PAGE = "app/[org]/(admin)/journey-admin/page.tsx";
+    const ROUTE_FILE = "app/api/journey/program/route.ts";
+    const READER = "lib/journey/draft-read.ts";
+    const PAGE_CALL = /readDraftDays\(supabase, program\.id\)/;
+    /** The caller reads the draft through readDraftDays and makes `own` journey_days reads of its own. */
+    const throughReader = (src: string, call: RegExp, own: number) =>
+      call.test(src) && (src.match(/\.from\(\s*["'`]journey_days["'`]\s*\)/g) ?? []).length === own;
+    const page = source(PAGE);
+    eq(`${PAGE}: the draft days through readDraftDays(supabase, program.id), no journey_days read of its own`, throughReader(page, PAGE_CALL, 0), true);
+    eq("…a failed read throws (never an empty editor); the rows go to the editor as the reader gives them",
+      [/if \(draft\.error\) throw new Error\(/.test(page), /days = draft\.data;/.test(page)], [true, true]);
+    eq(`${ROUTE_FILE}: the publish's and the dry run's draft through readDraftDays(c.supabase, programId); its one journey_days read is the save's read-back`,
+      throughReader(source(ROUTE_FILE), /const draft = await readDraftDays\(c\.supabase, programId\);/, 1), true);
+    const reader = source(READER);
+    eq(`${READER}: pass_required through readWithOptionalColumn, over a base of columns every database has (pass_required not in it)`, [
+      /readWithOptionalColumn<unknown\[\]>\(\s*"pass_required",\s*\(columns\) =>\s*client\s*\.from\("journey_days"\)\s*\.select\(columns\)[\s\S]*?,\s*DRAFT_DAY_BASE\s*\)/.test(reader),
+      /export const DRAFT_DAY_BASE = "id, day_number, course_id, mission_title";/.test(reader),
+      /typeof r\.pass_required === "boolean" \? r\.pass_required : null/.test(reader),
+    ], [true, true, true]);
+    const direct = page.replace(PAGE_CALL, `supabase.from("journey_days").select("id, day_number, course_id, mission_title, pass_required").eq("program_id", program.id)`);
+    eq("planted: the page selecting pass_required on its own read (no fallback) is flagged",
+      [direct !== page, throughReader(direct, PAGE_CALL, 0)], [true, false]);
+    const both = page.replace(PAGE_CALL, (m) => `${m}, supabase.from("journey_days").select("id, day_number, course_id, mission_title, pass_required")`);
+    eq("planted: a second journey_days read beside the reader is flagged", [both !== page, throughReader(both, PAGE_CALL, 0)], [true, false]);
+
+    // OPS-1, the editor's half: saveMayHaveLanded is table-tested in
+    // journey-editor-ops.test.ts; this holds the save branch to it.
+    const CLIENT = "app/[org]/(admin)/journey-admin/journey-client.tsx";
+    const OLD_RULE = /j\.reload \|\| res\.status === 409 \|\| res\.ok/;
+    const wired = (src: string) =>
+      /if \(saveMayHaveLanded\(res\.status, j\)\) \{[\s\S]{0,400}?setNeedsReload\(/.test(src) && !OLD_RULE.test(src);
+    const client = source(CLIENT);
+    eq(`${CLIENT}: a save that is not a confirmed success asks saveMayHaveLanded(res.status, j) and keeps Save off on it; the old three-way condition is gone`,
+      wired(client), true);
+    const oldRule = client.replace(/saveMayHaveLanded\(res\.status, j\)/, "j.reload || res.status === 409 || res.ok");
+    eq("planted: the editor back on the old condition (a gateway's 5xx page would leave Save on) is flagged", [oldRule !== client, wired(oldRule)], [true, false]);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

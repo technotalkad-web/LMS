@@ -9,6 +9,7 @@ import { courseDaysOf, todayStr, DEFAULT_JOURNEY_TZ } from "@/lib/journey/journe
 import { fetchScoringRule } from "@/lib/scoring/resolve";
 import { computeJourneyState, creditedDaysFor, parseVersionDays } from "@/lib/journey/journey";
 import { readJourneyCredits } from "@/lib/journey/credits-read";
+import { readDraftDays } from "@/lib/journey/draft-read";
 import { courseProgress } from "@/lib/courses/progress-view";
 import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
@@ -64,24 +65,15 @@ export default async function JourneyAdminPage({
   let currentVersion: { id: string; version_number: number; published_at: string } | null = null;
   if (program) {
     // The draft days with their ids and pass_required (ADR 0024 step 92,
-    // P2-8 item 2): the editor keeps each row's identity and sends its rule
-    // back unchanged (P2-N8). A removed day has no number and is not read.
-    // On a database without 0107 the column is absent and the read falls
-    // back without it (every row then reads pass_required null). A failed
-    // read throws: an empty editor, saved, would insert every slot again.
-    const [{ data: dayRows, error: dayErr }, { data: enrRows }, { data: verRows }] =
+    // P2-8 item 2), through readDraftDays, the publish's reader too: the
+    // editor keeps each row's identity and sends its rule back unchanged
+    // (P2-N8). A removed day has no number and is not read. On a database
+    // without 0107 the column is absent and the read falls back without it
+    // (every row then reads pass_required null, A19). A failed read throws:
+    // an empty editor, saved, would insert every slot again.
+    const [draft, { data: enrRows }, { data: verRows }] =
       await Promise.all([
-        readWithOptionalColumn<unknown[]>(
-          "pass_required",
-          (columns) =>
-            supabase
-              .from("journey_days")
-              .select(columns)
-              .eq("program_id", program.id)
-              .not("day_number", "is", null)
-              .order("day_number", { ascending: true }),
-          "id, day_number, course_id, mission_title"
-        ),
+        readDraftDays(supabase, program.id),
         svc
           .from("journey_enrollments")
           .select("id, user_id, version_id, start_date, status, completed_at, created_at")
@@ -98,13 +90,11 @@ export default async function JourneyAdminPage({
     const enrList = (enrRows ?? []) as Array<{ id: string; version_id: string }>;
     const credits = await readJourneyCredits(svc, enrList.map((e) => ({ id: e.id, version_id: e.version_id })));
     if (!credits.ok) throw new Error(`journey credits read failed: ${credits.error?.message ?? "no answer"}`);
-    if (dayErr) throw new Error(`journey days read failed: ${dayErr.message ?? "no answer"}`);
+    if (draft.error) throw new Error(`journey days read failed: ${draft.error.message ?? "no answer"}`);
     // The query keeps only numbered (active) days; the editor checks each
-    // number again (editorFromRows).
-    days = ((dayRows ?? []) as Array<Omit<DayRow, "pass_required"> & { pass_required?: boolean | null }>).map((d) => ({
-      ...d,
-      pass_required: typeof d.pass_required === "boolean" ? d.pass_required : null,
-    }));
+    // number again (editorFromRows). Each row's pass_required is already
+    // true, false or null (readDraftDays).
+    days = draft.data;
     const versions = (verRows ?? []) as Array<{
       id: string;
       version_number: number;

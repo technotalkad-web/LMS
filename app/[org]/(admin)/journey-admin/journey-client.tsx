@@ -32,6 +32,7 @@ import {
   moveInsteadPairs,
   pendingChanges,
   removeDay,
+  saveMayHaveLanded,
   savePayload,
   setDay,
   slotsOf,
@@ -732,7 +733,10 @@ function CurriculumTab({
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ orgSlug, program_id: program.id, days: savePayload(next, daysTotal) }),
       });
-      const j = (await res.json().catch(() => ({}))) as {
+      // A body that is not a JSON object (a gateway's page, an empty answer)
+      // reads as {}: no error of the route's, so saveMayHaveLanded decides.
+      const parsed: unknown = await res.json().catch(() => null);
+      const j = (parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}) as {
         ok?: boolean;
         error?: string;
         reload?: boolean;
@@ -743,10 +747,16 @@ function CurriculumTab({
         days?: LoadedDayRow[];
       };
       if (!res.ok || j.ok !== true || !Array.isArray(j.days)) {
-        if (j.reload || res.status === 409 || res.ok) {
-          setNeedsReload(j.error ?? "Reload the page before saving the curriculum again.");
+        const error = typeof j.error === "string" ? j.error : null;
+        if (saveMayHaveLanded(res.status, j)) {
+          // The save may have landed without this page learning the new
+          // rows' ids: Save stays off until a reload (P2-8 note, item 10).
+          const why = error ?? "The save may have gone through, but this page could not read the answer. Reload the page before saving again.";
+          setNeedsReload(why);
+          toast.error(why);
+          return;
         }
-        toast.error(j.error ?? "Save failed");
+        toast.error(error ?? "Save failed");
         return;
       }
       // P2-N7 rule (1): the editor is rebuilt from the save's read-back, so it

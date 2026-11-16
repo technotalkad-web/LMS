@@ -39,9 +39,13 @@
  *   (b1)  two saves in one page session, the second after "Insert a day
  *         here" and a move: both 200; the first save's rows keep their ids;
  *         one new row per save; the numbers as the editor shows them, the row
- *         pushed past the journey's length included (P2-N7);
+ *         pushed past the journey's length included (P2-N7); the day seeded
+ *         with a pass rule of its own keeps it through both saves, and no
+ *         other day gains one (P2-N8: the page loads each rule and the
+ *         editor sends it back unchanged);
  *   (b2)  "Move instead?" accepted: the day whose module was cleared now
- *         holds the module at its new number (R17).
+ *         holds the module at its new number (R17), each day with its own
+ *         rule.
  *
  *   Block "republish" (C, A27; one program, one learner and one publish per
  *   edit): each learner completed days 1 to 3 through the app and holds
@@ -67,13 +71,19 @@
  *              learner then finishes every day: one completion, one badge,
  *              one claim (origin learner);
  *   (C-swap)   two completed days swapped by Move down: repinned 1, every
- *              other count 0 (credits follow their days);
+ *              other count 0 (credits follow their days); the learner then
+ *              finishes the journey: one completion, one badge, one claim
+ *              (origin learner);
  *   (C-course) the open day's module changed in place: started_days_kept 1;
  *              the day's link on the new module goes into the started module
- *              and resumes it; no attempt on the new module;
+ *              and resumes it; no attempt on the new module; the day credited
+ *              by the started module counts, and the learner then finishes
+ *              the journey (one completion, one badge, one claim);
  *   (C-rem)    the open day removed: started_days_kept 1; its attempt
  *              resumes by its link (no ?denied=1) and its completion writes a
- *              history credit that counts towards nothing;
+ *              history credit that counts towards nothing; the learner then
+ *              finishes the remaining day and the enrolment completes (one
+ *              badge, one claim, origin learner);
  *   (C-pub)    the learner's only uncredited required day, open, removed: the
  *              publish completes the enrolment (completed_now 1,
  *              started_days_kept 1; the dry run said the same), with one
@@ -87,6 +97,13 @@
  * overdue (7, 8), two concurrent completions (phase 3's writer), a credited
  * swapped day's course, code and score on journey admin and the CRM (6, 7,
  * 9a), and a stricter pass rule (the phase 6 day editor).
+ *
+ * Held back, its phase not yet ruled: step 64's "a republish that moves a
+ * failed day keeps its failed result and opens no new official attempt
+ * without a grant". Not built in P2-8 (P2-8's note lists it under "Left
+ * open"); the review reads it as phase 2 scope, among the gate's republish
+ * cases, and the lead's ruling decides where it is built. It is not
+ * dropped.
  *
  * Needs 0107 on the target database: every seed fails without it. By hand on
  * staging after the code is deployed, never while another lifecycle run or
@@ -207,9 +224,9 @@ async function activeDays(programId: string): Promise<DayRowRead[]> {
 
 const idsByNumber = (rows: DayRowRead[]) => Object.fromEntries(rows.map((r) => [r.day_number, r.id])) as Record<number, string>;
 
-/** A full-shape save entry (journey_save_days reads a key left out as null). */
-const entry = (n: number, id: string | null, course: string | null) =>
-  ({ id, day_number: n, course_id: course, mission_title: null, pass_required: null, removed: false });
+/** A full-shape save entry (journey_save_days reads a key left out as null); `rule` is the day's own pass rule. */
+const entry = (n: number, id: string | null, course: string | null, rule: boolean | null = null) =>
+  ({ id, day_number: n, course_id: course, mission_title: null, pass_required: rule, removed: false });
 
 /**
  * A journey built and published (v1, new enrolments only) through the
@@ -767,8 +784,11 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — the journey editor keeps each da
     s.programId = (await made.json()).program_id as string;
     const set = await areq.patch(PROGRAM_API, { data: { orgSlug: org.slug, program_id: s.programId, days_total: 4, count_sundays: true, unlock_mode: "progress" } });
     expect(set.ok(), await set.text()).toBeTruthy();
-    const put = await areq.put(PROGRAM_API, { data: { orgSlug: org.slug, program_id: s.programId, days: s.k.map((c, i) => entry(i + 1, null, c)) } });
+    // K2's day (2) holds a pass rule of its own, so the editor's saves are
+    // seen to send each loaded rule back unchanged (P2-N8).
+    const put = await areq.put(PROGRAM_API, { data: { orgSlug: org.slug, program_id: s.programId, days: s.k.map((c, i) => entry(i + 1, null, c, i === 1 ? true : null)) } });
     expect(put.status(), await put.text()).toBe(200);
+    expect((await activeDays(s.programId)).map((r) => [r.day_number, r.pass_required]), "K2's day holds a rule of its own").toEqual([[1, null], [2, true], [3, null]]);
     s.page = await editorPage(s.adminCtx, org.slug, s.programId);
   });
 
@@ -808,6 +828,8 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — the journey editor keeps each da
     expect(await page.getByTestId("journey-days-beyond").isVisible(), "the row past the length is listed apart").toBe(true);
     const rows = await activeDays(s.programId!);
     expect(rows.map((r) => [r.day_number, r.course_id]), "the modules as set").toEqual([[1, k2], [2, k1], [3, k3], [4, k1], [5, k3]]);
+    expect(rows.map((r) => [r.id, r.pass_required]), "K2's day keeps its own rule through both saves and no other day gains one (P2-N8)")
+      .toEqual(rows.map((r) => [r.id, r.id === d0[2] ? true : null]));
   });
 
   test("(b2) \"Move instead?\" accepted: the day whose module was cleared now holds it at its new number", async () => {
@@ -826,6 +848,7 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — the journey editor keeps each da
     const at = (n: number) => rows.find((r) => r.day_number === n)!;
     expect([at(3).id, at(3).course_id], "K2's day (its id) now on day 3, with K2").toEqual([x, k2]);
     expect([at(1).id, at(1).course_id], "the other day takes day 1, a rest day").toEqual([y, null]);
+    expect([at(3).pass_required, at(1).pass_required], "each day keeps its own rule: K2's day true, the other none (P2-N8)").toEqual([true, null]);
     await expect(page.getByTestId("journey-day-3-module"), "the editor shows K2 on day 3").toHaveValue(k2);
   });
 });
@@ -900,6 +923,19 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — republish by day identity: the d
     }
   }
 
+  /**
+   * The learner finished every remaining day: the enrolment completed once
+   * (status and completed_at), one badge, one claim (origin learner), and
+   * journey admin counts every required day of the pinned version.
+   */
+  async function expectCompleted(w: Awaited<ReturnType<typeof world>>, total: number) {
+    const done = await enrolment(w.enr);
+    expect([done.status, typeof done.completed_at], "completed").toEqual(["completed", "string"]);
+    expect((await badgesOf([w.enr])).length, "one badge").toBe(1);
+    expect((await claimsOf([w.enr])).map((x) => x.origin), "one claim, origin learner").toEqual(["learner"]);
+    expect(await adminCredited(s.adminCtx!.request, slug(), w.programId, w.enr), "journey admin counts every required day").toBe(total);
+  }
+
   test("(C-ins) a day inserted before the open day: sent back, the started day kept; the learner then finishes the journey", async ({ browser, baseURL }) => {
     test.setTimeout(600_000);
     const c = s.c!;
@@ -956,6 +992,10 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — republish by day identity: the d
     await expectResume(w.req, w.u, launchUrl(slug(), c.D, w.enr, w.days[4]), w.open, w.bookmark, "the open day by its launch link");
     await scormCommit(w.req, w.open, PASSED, true);
     expect((await creditsOf([w.enr])).find((x) => x.attempt_id === w.open)?.day_id, "its completion credits its own day id").toBe(w.days[4]);
+    // Then the last required day (E): the enrolment completes.
+    expect((await enrolment(w.enr)).status, "not complete before the last day").toBe("active");
+    await passDay(w.req, w.u, slug(), c.E, w.enr, w.days[5]);
+    await expectCompleted(w, 5);
   });
 
   test("(C-course) the open day's module changed in place: the started module resumes and credits the day; the new one is not opened beside it", async ({ browser, baseURL }) => {
@@ -981,6 +1021,11 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — republish by day identity: the d
     expect([credit?.attempt_id, credit?.course_id], "the day is credited by the started module").toEqual([w.open, c.D]);
     const onF = (await attemptsOf(w.u.id)).filter((r) => r.context_key === ctxKey(w.enr, w.days[4]) && r.id !== w.open);
     expect(onF, "no attempt on the new module beside it").toEqual([]);
+    // The day credited by the started module counts: 4 of 5, today's mission is E.
+    await learnerSees(w, { credited: 4, total: 5, todayCourse: c.E, todayDay: w.days[5] });
+    expect((await enrolment(w.enr)).status, "not complete before the last day").toBe("active");
+    await passDay(w.req, w.u, slug(), c.E, w.enr, w.days[5]);
+    await expectCompleted(w, 5);
   });
 
   test("(C-rem) the open day removed: its attempt resumes by its link and its completion is a history credit", async ({ browser, baseURL }) => {
@@ -1006,6 +1051,9 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — republish by day identity: the d
     expect((await creditsOf([w.enr])).find((x) => x.attempt_id === w.open)?.day_id, "a credit on the removed day's id").toBe(w.days[4]);
     await learnerSees(w, { credited: 3, total: 4, todayCourse: c.E, todayDay: w.days[5] });
     expect((await enrolment(w.enr)).status, "it counts towards nothing").toBe("active");
+    // The remaining day (E, now day 4) completes the enrolment; the history credit is not counted.
+    await passDay(w.req, w.u, slug(), c.E, w.enr, w.days[5]);
+    await expectCompleted(w, 4);
   });
 
   test("(C-pub) the only uncredited required day, open, removed: the publish completes the enrolment; the started day still resumes", async ({ browser, baseURL }) => {

@@ -33,6 +33,11 @@
  *       for every frozen day with rest days included, pass_required copied
  *       only when it is a boolean.
  *
+ *   (g) saveMayHaveLanded, the editor's test for keeping Save off until a
+ *       reload: an answer with reload, a 409, an unreadable 2xx and a 5xx
+ *       without the route's error may have saved; every other refusal
+ *       (the route's own 5xx included) leaves Save on.
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/journey-editor-ops.test.ts   (or npm run test:unit)
@@ -47,6 +52,7 @@ import {
   moveInsteadPairs,
   pendingChanges,
   removeDay,
+  saveMayHaveLanded,
   savePayload,
   setDay,
   slotsOf,
@@ -496,6 +502,37 @@ console.log("\n(f) freezeVersionDays: what the publish and its dry run freeze");
   eq("day_ids: every frozen day, the rest day included; no \"null\" key and nothing above the length", f.day_ids, { "1": id(1), "2": id(2), "3": id(3) });
   eq("a row without the column (a database without 0107) freezes without the key", freezeVersionDays([{ id: id(1), day_number: 1, course_id: CA, mission_title: null }], 1).days, [{ day: 1, course_id: CA, mission_title: null }]);
   eq("nothing frozen from no rows", freezeVersionDays([], 3), { days: [], day_ids: {} });
+}
+
+// ---------------------------------------------------------------------------
+// (g) Save stays off when a save may have landed (P2-8 note, item 10).
+// ---------------------------------------------------------------------------
+console.log("\n(g) saveMayHaveLanded: when the editor keeps Save off until a reload");
+{
+  type Body = { reload?: unknown; error?: unknown; [k: string]: unknown };
+  const cases: Array<[string, number, Body, boolean]> = [
+    ["the route's unconfirmed save (503, reload)", 503, { error: "The save may have gone through.", reload: true, saved_unconfirmed: true }, true],
+    ["a read-back that did not match (500, reload)", 500, { error: "The curriculum did not come back as it was sent.", reload: true }, true],
+    ["the curriculum changed since the page loaded (409)", 409, { error: "The curriculum has changed.", reload: true }, true],
+    ["a 409 without a body the page can read", 409, {}, true],
+    ["a 200 the page cannot read as a save's answer", 200, {}, true],
+    ["a platform 5xx page (not JSON, read as {})", 503, {}, true],
+    ["a gateway 502 (not JSON)", 502, {}, true],
+    ["a gateway 504 with JSON but no error of the route's", 504, { message: "upstream timeout" }, true],
+    ["a 5xx whose error is not text", 500, { error: { code: "x" } }, true],
+    ["a refusal the database raised, nothing saved (500, its error, no reload)", 500, { error: "Could not save the curriculum. Nothing was saved; try again.", code: "XX000" }, false],
+    ["a failed check before the call (503, its error, no reload)", 503, { error: "Could not check the modules. Nothing was saved; try again." }, false],
+    ["a database without 0107 (503, its error, no reload)", 503, { error: "Saving the curriculum needs a database update that is not on this server yet. Nothing was saved." }, false],
+    ["a refused entry (400)", 400, { error: "Two days of the save are numbered 2" }, false],
+    ["a 400 without a body the page can read", 400, {}, false],
+    ["signed out (401)", 401, { error: "Unauthorized" }, false],
+    ["not an admin (403)", 403, { error: "Forbidden" }, false],
+    ["a program outside the organisation (404)", 404, { error: "Journey not found" }, false],
+    ["a `reload` that is not true", 500, { error: "x", reload: "yes" }, false],
+  ];
+  for (const [what, status, body, want] of cases) {
+    eq(`${what}: ${want ? "Save off until a reload" : "Save stays on"}`, saveMayHaveLanded(status, body), want);
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
