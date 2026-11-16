@@ -49,8 +49,8 @@
  *
  *   Block "republish" (C, A27; one program, one learner and one publish per
  *   edit): each learner completed days 1 to 3 through the app and holds
- *   day 4 open with a SCORM bookmark (C-pub: days 1 and 2, day 3 open). Each
- *   case runs the same steps:
+ *   day 4 open with a SCORM bookmark (C-pub: days 1 and 2, day 3 open;
+ *   C-fail: day 1, then day 2 failed). Each case runs the same steps:
  *     (i)   the edit through the editor and Save; snapshot S0; "Publish &
  *           update everyone" runs the dry run, whose counts the dialog shows;
  *     (ii)  before confirming, snapshot S1 equals S0: the dry run wrote
@@ -63,7 +63,8 @@
  *     (iv)  the learner: no completed day is offered as today's mission; the
  *           open attempt resumes by its launch link with its bookmark (the
  *           same attempt id) and its completion credits its own day id; the
- *           journey page and journey admin show the same credited count.
+ *           journey page and journey admin show the same credited count
+ *           (C-fail holds no open attempt: its (iv) is in its entry below).
  *   The expected counts come from 0107 section 6f's definitions:
  *   (C-ins)    a day with a module inserted before the open day: repinned 1,
  *              sent_back 1 (the open day is now the inserted day 2), and
@@ -89,21 +90,34 @@
  *              started_days_kept 1; the dry run said the same), with one
  *              badge and one claim (origin publish); the removed day's attempt
  *              still resumes and its completion writes a history credit and
- *              nothing else (R13).
+ *              nothing else (R13);
+ *   (C-fail)   step 64's "a republish that moves a failed day keeps its
+ *              failed result and opens no new official attempt without a
+ *              grant": the day's course requires a pass (pass_required true,
+ *              set through the course route) and the learner failed it by a
+ *              SCORM commit (no credit, the context's verdict failed, no
+ *              attempt request). Move up takes the failed day from 2 to 1,
+ *              so it is still the open day and its launch reaches the
+ *              attempt rule (after a move down the next day would be open
+ *              first, and the failed day's link would only meet the
+ *              journey_locked redirect): repinned 1, sent_back 1 (the open
+ *              day moves from 2 to 1). After the publish the failed attempt
+ *              row is unchanged field by field, its day has no credit and the
+ *              context's verdict is still failed by that row; the journey
+ *              page and journey admin count 1 of 3 with the failed day as
+ *              today's mission; its launch link opens no new official attempt
+ *              (the learner's official attempts on the course are the same
+ *              before and after, and a new row is a revision visit in the
+ *              day's context, as the launch serves it); no grant exists and
+ *              the enrolment stays active.
  *
  * Not in phase 2 (each comes with its phase): every email (phase 3), the CRM
  * days[] (9a), the dashboard card and the "Started earlier" list (6), a
- * failed day, blocked, granted and credited (4), the deadline edit and
- * overdue (7, 8), two concurrent completions (phase 3's writer), a credited
- * swapped day's course, code and score on journey admin and the CRM (6, 7,
- * 9a), and a stricter pass rule (the phase 6 day editor).
- *
- * Held back, its phase not yet ruled: step 64's "a republish that moves a
- * failed day keeps its failed result and opens no new official attempt
- * without a grant". Not built in P2-8 (P2-8's note lists it under "Left
- * open"); the review reads it as phase 2 scope, among the gate's republish
- * cases, and the lead's ruling decides where it is built. It is not
- * dropped.
+ * failed day blocked, then granted and credited (4; C-fail covers only a
+ * failed day that a republish moves), the deadline edit and overdue (7, 8),
+ * two concurrent completions (phase 3's writer), a credited swapped day's
+ * course, code and score on journey admin and the CRM (6, 7, 9a), and a
+ * stricter pass rule (the phase 6 day editor).
  *
  * Needs 0107 on the target database: every seed fails without it. By hand on
  * staging after the code is deployed, never while another lifecycle run or
@@ -138,6 +152,8 @@ const ZERO: Counts = { repinned: 0, kept_on_version: 0, completed_now: 0, sent_b
 const countsOf = (j: Row): Counts => Object.fromEntries(REPIN_KEYS.map((k) => [k, j[k]])) as Counts;
 
 const PASSED = { "cmi.core.lesson_status": "passed", "cmi.core.score.raw": "90" };
+/** A finished SCORM 1.2 result that fails (C-fail): the commit route records success_status failed, completion completed. */
+const FAILED = { "cmi.core.lesson_status": "failed", "cmi.core.score.raw": "40" };
 
 // ── HTTP helpers (spec 68's, copied; spec 68 stays unchanged) ───────────────
 type NoFollow = { status: number; location: string; body: string };
@@ -303,6 +319,49 @@ async function attemptsOf(userId: string): Promise<JAtt[]> {
 
 const ctxKey = (enr: string, dayId: string) => `journey:${enr}:${dayId}`;
 const officialIn = (rows: JAtt[], key: string) => rows.filter((r) => r.context_key === key && r.is_revision !== true);
+
+/** An attempt's result and tags, every field the official result reads, for a field-by-field comparison (C-fail). */
+const RESULT_COLUMNS =
+  "id, status, completion_status, success_status, score, completed_at, is_revision, context_kind, context_key, journey_enrollment_id, journey_day, journey_day_id, journey_version_id";
+
+async function resultRow(attemptId: string): Promise<Row> {
+  const { data, error } = await svc().from("course_attempts").select(RESULT_COLUMNS).eq("id", attemptId).single();
+  expect(error, `attempt ${attemptId}: ${error?.message}`).toBeNull();
+  return data as Row;
+}
+
+/** The learner's official attempts (not revision visits) on one course, in every context, by id. */
+async function officialOnCourse(userId: string, courseId: string): Promise<string[]> {
+  const { data: vers, error: ve } = await svc().from("course_versions").select("id").eq("course_id", courseId);
+  expect(ve, `versions of ${courseId}: ${ve?.message}`).toBeNull();
+  const { data, error } = await svc()
+    .from("course_attempts")
+    .select("id, is_revision")
+    .eq("user_id", userId)
+    .in("course_version_id", ((vers ?? []) as Array<{ id: string }>).map((v) => v.id))
+    .order("id");
+  expect(error, `attempts on ${courseId}: ${error?.message}`).toBeNull();
+  return ((data ?? []) as Array<{ id: string; is_revision: boolean | null }>).filter((r) => r.is_revision !== true).map((r) => r.id);
+}
+
+/** One context's official verdict (0107's v_context_attempt_summary, over the rows that are not revision visits). */
+async function contextVerdict(userId: string, courseId: string, key: string): Promise<Row[]> {
+  const { data, error } = await svc()
+    .from("v_context_attempt_summary")
+    .select("official_status, official_attempt_id, attempt_count")
+    .eq("user_id", userId)
+    .eq("course_id", courseId)
+    .eq("context_key", key);
+  expect(error, `verdict: ${error?.message}`).toBeNull();
+  return (data ?? []) as Row[];
+}
+
+/** The learner's attempt requests on one course, granted or not (attempt_requests, 0083). */
+async function requestsOn(userId: string, courseId: string): Promise<Row[]> {
+  const { data, error } = await svc().from("attempt_requests").select("id, status").eq("user_id", userId).eq("course_id", courseId);
+  expect(error, `attempt requests: ${error?.message}`).toBeNull();
+  return (data ?? []) as Row[];
+}
 
 type Credit = { id: string; enrollment_id: string; day_id: string | null; day_number: number | null; course_id: string | null; attempt_id: string | null; credit_kind: string | null };
 
@@ -890,8 +949,9 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — republish by day identity: the d
 
   /**
    * One case's world: a journey (A, B, C, D, E and a rest day 6; C-pub: A, B,
-   * C), a fresh learner who completed days 1 to `done` through the app and
-   * holds the next day open with a bookmark, and the editor on the program.
+   * C; C-fail: A, G, C), a fresh learner who completed days 1 to `done`
+   * through the app and holds the next day open with a bookmark (C-fail then
+   * fails that day), and the editor on the program.
    */
   async function world(browser: Browser, baseURL: string, name: string, courses: Array<string | null>, done: number) {
     const areq = s.adminCtx!.request;
@@ -1083,5 +1143,70 @@ test.describe.serial("ADR 0024 P2-8 spec 69 — republish by day identity: the d
     expect((await badgesOf([w.enr])).length, "still one badge").toBe(1);
     expect((await claimsOf([w.enr])).map((x) => x.origin), "still one claim").toEqual(["publish"]);
     expect((await enrolment(w.enr)).status).toBe("completed");
+  });
+
+  test("(C-fail) a failed day moved by the publish keeps its failed result; its launch opens no new official attempt without a grant", async ({ browser, baseURL }) => {
+    test.setTimeout(600_000);
+    const c = s.c!;
+    const areq = s.adminCtx!.request;
+    // G: a course of this case only, whose rule requires a pass, set through the course route.
+    const g = await scormCourse(areq, slug(), `QA Journey G ${rand(4)}`);
+    const rule = await areq.patch(`/api/courses/${g}`, { data: { pass_required: true } });
+    expect(rule.ok(), `G pass_required → ${rule.status()}: ${await rule.text()}`).toBeTruthy();
+    const { data: gRow, error: ge } = await svc().from("courses").select("pass_required").eq("id", g).single();
+    expect(ge, `course G: ${ge?.message}`).toBeNull();
+    expect((gRow as { pass_required: boolean | null }).pass_required, "G requires a pass").toBe(true);
+
+    // Day 1 (A) passed; day 2 (G) started, then failed through the SCORM commit route.
+    const w = await world(browser, baseURL!, "Fail", [c.A, g, c.C], 1);
+    const failedDay = w.days[2];
+    const key = ctxKey(w.enr, failedDay);
+    await scormCommit(w.req, w.open, FAILED, true);
+    const failedRow = await resultRow(w.open);
+    expect([failedRow.status, failedRow.success_status, failedRow.completion_status, failedRow.is_revision], "the day's official attempt failed")
+      .toEqual(["failed", "failed", "completed", false]);
+    const creditedDays = async () => (await creditsOf([w.enr])).map((x) => x.day_id);
+    expect(await creditedDays(), "the failed day is not credited (G requires a pass)").toEqual([w.days[1]]);
+    const verdict = [{ official_status: "failed", official_attempt_id: w.open, attempt_count: 1 }];
+    expect(await contextVerdict(w.u.id, g, key), "the day's context: failed, by that attempt").toEqual(verdict);
+    expect(await requestsOn(w.u.id, g), "no attempt request and no grant").toEqual([]);
+
+    // Move up: the failed day goes from 2 to 1 and is still the open day, so
+    // its launch reaches the attempt rule (after a move down, C's day would
+    // be open first and the failed day's link would only meet the
+    // journey_locked redirect).
+    await republish({
+      page: w.page,
+      programId: w.programId,
+      learner: w.u,
+      edit: async () => {
+        await w.page.getByTestId("journey-day-2-up").click();
+        await w.page.getByTestId("journey-save").click();
+      },
+      expected: { ...ZERO, repinned: 1, sent_back: 1 },
+    });
+    const now = idsByNumber(await activeDays(w.programId));
+    expect([now[1], now[2], now[3]], "the failed day moved to 1 by identity").toEqual([failedDay, w.days[1], w.days[3]]);
+    expect(await resultRow(w.open), "the failed attempt is unchanged, field by field").toEqual(failedRow);
+    expect(await contextVerdict(w.u.id, g, key), "the day's context is still failed, by the same attempt").toEqual(verdict);
+    expect(await creditedDays(), "still no credit on the failed day").toEqual([w.days[1]]);
+
+    // (iv) today's mission is the failed day; its launch link opens no new official attempt.
+    await learnerSees(w, { credited: 1, total: 3, todayCourse: g, todayDay: failedDay });
+    const officialBefore = await officialOnCourse(w.u.id, g);
+    expect(officialBefore, "G's one official attempt is the failed one").toEqual([w.open]);
+    const before = await attemptsOf(w.u.id);
+    const { html, hops } = await followLaunch(w.req, launchUrl(slug(), g, w.enr, failedDay));
+    expect(await officialOnCourse(w.u.id, g), `no new official attempt on G (${hops.join(" → ")})`).toEqual(officialBefore);
+    const rows = await attemptsOf(w.u.id);
+    expect(officialIn(rows, key).map((r) => r.id), "the day's context holds the failed attempt only").toEqual([w.open]);
+    const fresh = rows.filter((r) => !before.some((b) => b.id === r.id));
+    for (const r of fresh) expect([r.is_revision, r.context_key], "a new row is a revision visit in the day's context").toEqual([true, key]);
+    expect(html, "the launch serves a revision visit").toContain('data-testid="practice-badge"');
+    expect(await resultRow(w.open), "the failed attempt is still unchanged").toEqual(failedRow);
+    expect(await contextVerdict(w.u.id, g, key), "the day's context is still failed, by the same attempt").toEqual(verdict);
+    expect(await creditedDays(), "the launch credits nothing").toEqual([w.days[1]]);
+    expect(await requestsOn(w.u.id, g), "still no grant").toEqual([]);
+    expect((await enrolment(w.enr)).status, "the journey waits on the failed day").toBe("active");
   });
 });
