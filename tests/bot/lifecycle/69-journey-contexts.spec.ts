@@ -160,7 +160,9 @@ function redirectTarget(r: NoFollow): string | null {
     }
   }
   if (r.status === 200) {
-    const m = /NEXT_REDIRECT;(?:replace|push);([^;"\\]+);/.exec(r.body);
+    // The marker sits in the HTML, so its "&" arrives as "&amp;"; decode it
+    // first, or the match stops at that ";" and drops the rest of the query.
+    const m = /NEXT_REDIRECT;(?:replace|push);([^;"\\]+);/.exec(r.body.replace(/&amp;/g, "&"));
     if (m) return m[1];
   }
   return null;
