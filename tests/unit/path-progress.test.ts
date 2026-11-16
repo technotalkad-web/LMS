@@ -20,7 +20,16 @@
  *       same name in lib/courses/progress-view.ts is deprecated (a pointer to
  *       step 43), its importers under app/, lib/ and components/ are exactly
  *       the three files of the dated list OLD_PATH_PROGRESS_IMPORTERS, and
- *       no file imports both functions.
+ *       no file imports both functions;
+ *   (f) pathDisplay (ADR 0024 P2-7; the owner's P2-Q1 answer, "Leave the
+ *       step out", ruled in section 2 of the phase 2 plan): a hidden middle
+ *       step in strict order (the later step locked, 1 of 2); a hidden last
+ *       step (2 of 2, not completed, in progress); a completed path with a
+ *       hidden step (still completed); reactivated (the step back with its
+ *       state); the shown steps numbered without a gap; a step locked only by
+ *       a hidden step carries the plain "Locked" (no reason); the lock is the
+ *       launch's rule (strict and random order, release dates, D14);
+ *   (g) resolvedStepRule: the step's own rule, else the course's (step 8).
  *
  * No database. The SQL twin is asserted on the same readings in the
  * rehearsal (assert-0107-*.sql).
@@ -29,7 +38,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { pathProgress, pathStepStatus, type PathAttempt, type PathGrant, type PathProgressInput, type PathStepFact, type PathStepInput } from "../../lib/paths/progress";
+import { pathDisplay, pathProgress, pathStepStatus, resolvedStepRule, type PathAttempt, type PathGrant, type PathProgressInput, type PathStepFact, type PathStepInput } from "../../lib/paths/progress";
 import { contextKindOfKey } from "../../lib/scoring/context";
 
 let pass = 0, fail = 0;
@@ -426,6 +435,77 @@ console.log(`\n(e) ruling A5: the old pathProgress (lib/courses/progress-view.ts
     ],
     [true, true, true, true, true, false, false, false, false]);
 }
+
+console.log("\n(f) pathDisplay: the owner's P2-Q1 answer, \"Leave the step out\"");
+{
+  const THREE = [step(C1, 1), step(C2, 2), step(C3, 3)];
+  const view = (d: ReturnType<typeof pathDisplay>) => ({
+    shown: d.steps.map((s) => [s.course_id, s.position, s.state, s.lockedByVisibleStep]),
+    done: d.done,
+    total: d.total,
+  });
+  // A hidden middle step in strict order: step 1 passed, step 2's course inactive (not done), step 3 waiting.
+  const middle = run({ steps: THREE, attempts: [row(1, C1, P, "passed", 1)] });
+  eq("a hidden middle step, strict order: not rendered; the later step locked with no reason; 1 of 2",
+    view(pathDisplay(middle, [C1, C3], "strict")), { shown: [[C1, 1, "completed", false], [C3, 2, "locked", false]], done: 1, total: 2 });
+  eq("…pathProgress is not changed by it: it still counts every step (1 of 3, next step 2)",
+    [middle.steps_total, middle.steps_done, middle.next_step], [3, 1, 2]);
+  // A step locked by a shown step keeps the hint; only a hidden step in the way gives the plain "Locked".
+  eq("a step locked by a shown step that is not done: lockedByVisibleStep true",
+    view(pathDisplay(run({ steps: THREE }), [C1, C2, C3], "strict")).shown, [[C1, 1, "current", false], [C2, 2, "locked", true], [C3, 3, "locked", true]]);
+  eq("…a step behind a shown step not done and a hidden one: the shown one gives the hint",
+    view(pathDisplay(run({ steps: THREE }), [C1, C3], "strict")).shown, [[C1, 1, "current", false], [C3, 2, "locked", true]]);
+  // A hidden last step: every shown step done, no completion row.
+  const last = run({ steps: THREE, attempts: [row(1, C1, P, "passed", 1), row(2, C2, P, "passed", 2)] });
+  eq("a hidden last step: 2 of 2 shown, the path not completed and in progress (no reason given)",
+    [view(pathDisplay(last, [C1, C2], "strict")), last.completed, last.status],
+    [{ shown: [[C1, 1, "completed", false], [C2, 2, "completed", false]], done: 2, total: 2 }, false, "in_progress"]);
+  // A completed path with a hidden step stays completed.
+  const done = run({ steps: THREE, attempts: [row(1, C1, P, "passed", 1), row(2, C2, P, "passed", 2), row(3, C3, P, "passed", 3)], completion: { completed_at: "2026-02-05T00:00:00Z" } });
+  eq("a completed path with a hidden step: still completed (the stored completion, not the shown count)",
+    [view(pathDisplay(done, [C1, C3], "strict")), done.completed, done.status],
+    [{ shown: [[C1, 1, "completed", false], [C3, 2, "completed", false]], done: 2, total: 2 }, true, "completed"]);
+  const addedLater = run({ steps: THREE, attempts: [row(1, C1, P, "passed", 1)], completion: { completed_at: "2026-02-05T00:00:00Z" } });
+  eq("…and one completed before its other steps were added, with one of them hidden: completed, 1 of 2",
+    [view(pathDisplay(addedLater, [C1, C3], "strict")), addedLater.completed],
+    [{ shown: [[C1, 1, "completed", false], [C3, 2, "locked", false]], done: 1, total: 2 }, true]);
+  // Reactivated: the same rows, the course active again; the step is back in its place with its saved state.
+  eq("reactivated: the step back in its place with its state (done rows read done, no reset)",
+    view(pathDisplay(last, [C1, C2, C3], "strict")),
+    { shown: [[C1, 1, "completed", false], [C2, 2, "completed", false], [C3, 3, "current", false]], done: 2, total: 3 });
+  eq("…a reactivated step done by its stored fact reads done again (its fact never left)",
+    view(pathDisplay(run({ steps: THREE, attempts: [row(1, C1, P, "passed", 1), row(2, C2, P, "completed", 2)], facts: [fact(C2)] }), [C1, C2, C3], "strict")).shown.map((s) => s[2]),
+    ["completed", "completed", "current"]);
+  // Numbering: the shown steps by their place among themselves, whatever the step numbers.
+  eq("the shown steps are numbered 1, 2 with no gap, whatever the step numbers",
+    pathDisplay(run({ steps: [step(C1, 10), step(C2, 20), step(C3, 30)] }), [C1, C3], "random").steps.map((s) => [s.step_number, s.position]),
+    [[10, 1], [30, 2]]);
+  // The lock is the launch's rule.
+  eq("random order: no step is locked; every released step not done is current",
+    view(pathDisplay(run({ steps: THREE }), [C1, C2, C3], "random")).shown.map((s) => s[2]), ["current", "current", "current"]);
+  eq("…a hidden step locks nothing in random order",
+    view(pathDisplay(run({ steps: THREE }), [C1, C3], "random")).shown.map((s) => s[2]), ["current", "current"]);
+  eq("…a sequence_mode that is null reads strict, as the launch does",
+    view(pathDisplay(run({ steps: TWO }), [C1, C2], null)).shown.map((s) => s[2]), ["current", "locked"]);
+  const dated = run({ steps: [step(C1, 1, true, "2999-01-01T00:00:00Z"), step(C2, 2)] });
+  eq("a step not released yet reads unreleased, and in strict order the step after it is locked by it",
+    view(pathDisplay(dated, [C1, C2], "strict")).shown, [[C1, 1, "unreleased", false], [C2, 2, "locked", true]]);
+  eq("…a done step whose release date moved later still reads completed",
+    pathDisplay(run({ steps: [step(C1, 1, true, "2999-01-01T00:00:00Z")], attempts: [row(1, C1, P, "passed", 1)] }), [C1], "strict").steps[0].state, "completed");
+  // D14: a pass, then a failed granted retake: done, and the next step stays unlocked.
+  const d14 = run({ steps: TWO, attempts: [row(1, C1, P, "passed", 1), row(2, C1, P, "failed", 3)], grants: [grant(1, C1, P, A(2), 2)] });
+  eq("D14: a passed step whose granted retake failed reads completed, and the next step is current",
+    view(pathDisplay(d14, [C1, C2], "strict")).shown.map((s) => s[2]), ["completed", "current"]);
+  eq("ids compare whatever their case", pathDisplay(middle, [C1.toUpperCase(), C3], "strict").total, 2);
+  eq("no shown step: an empty display (the dashboard leaves the path off; its page shows no steps)",
+    view(pathDisplay(middle, [], "strict")), { shown: [], done: 0, total: 0 });
+}
+
+console.log("\n(g) resolvedStepRule: the step's own rule, else the course's (step 8)");
+eq("a step's true over a course's false, and false over true",
+  [resolvedStepRule(true, false), resolvedStepRule(false, true)], [true, false]);
+eq("no step rule (null, or absent without 0107): the course's; a course's null reads false",
+  [resolvedStepRule(null, true), resolvedStepRule(undefined, true), resolvedStepRule(null, null), resolvedStepRule(undefined, undefined)], [true, true, false, false]);
 
 // The fact rows are a required input with no default (O1-i): leaving them out
 // is a type error, so no caller judges every step by today's rule by accident.

@@ -251,6 +251,8 @@ async function pageCases() {
   let cgOutcome = "opened";
   /** The SCORM seed's read of the official attempt's cmi_data answers a database error. */
   let cmiReadFails = false;
+  /** The ?lp= path's step row for the course: its own pass_required (0107), or no row (undefined). */
+  let stepRule: boolean | null | undefined = undefined;
   /** The journey world of (j): which days are credited (by day id), with the credit row's course. */
   let journeyCredits: Record<string, { course_id: string; attempt_id: string | null; credit_kind: string; day_number: number }> = {};
   let journeyStatus = "active";
@@ -409,7 +411,13 @@ async function pageCases() {
     }
     if (p === "/rest/v1/organization_members") return json(NAV_USERS[viewer].role ? [{ role: NAV_USERS[viewer].role }] : []);
     if (p === "/rest/v1/platform_owners") return json([]);
-    if (p === "/rest/v1/courses") return json([courseRow]);
+    if (p === "/rest/v1/courses") {
+      // A path Start embeds the ?lp= path's step row (ADR 0024 P2-7, the review's F3).
+      if (!select.includes("learning_path_courses(")) return json([courseRow]);
+      if (no0107) return json({ code: "42703", message: "column learning_path_courses_1.pass_required does not exist" }, 400);
+      const onPath = url.searchParams.get("learning_path_courses.path_id") === `eq.${PATH_ID}` && stepRule !== undefined;
+      return json([{ ...courseRow, learning_path_courses: onPath ? [{ path_id: PATH_ID, pass_required: stepRule }] : [] }]);
+    }
     if (p === "/rest/v1/course_packages") return json(packages());
     if (p === "/rest/v1/course_versions") {
       return json(versions.filter((r) => (r.package_id !== PKG_HI || twoLanguages || hiInactive) && matches(r, url.searchParams)).map((r) => (noPackages ? { ...r, package_id: null } : r)));
@@ -520,6 +528,10 @@ async function pageCases() {
       noPackages?: boolean;
       slotCloseFails?: boolean;
       cmiReadFails?: boolean;
+      /** The ?lp= path's step row: its own rule (null: none of its own); absent: no step row. */
+      stepRule?: boolean | null;
+      /** The course's pass_required (false by default). */
+      courseRule?: boolean;
     }): Promise<Outcome> => {
       viewer = o.viewer;
       if (o.p4) process.env.ALDS_P4 = "on";
@@ -541,13 +553,14 @@ async function pageCases() {
       noPackages = o.noPackages ?? false;
       slotCloseFails = o.slotCloseFails ?? false;
       cmiReadFails = o.cmiReadFails ?? false;
+      stepRule = "stepRule" in o ? o.stepRule : undefined;
       attempts = (o.attempts ?? []).map((r) => ({ ...r, context_key: keyOf(r) }));
       grants = (o.grants ?? []).map((r) => ({ ...r }));
       assignments = o.assigned || o.ownRelease
         ? [{ assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null, release_at: o.ownRelease ?? null, course_id: COURSE_ID, organization_id: ORG_ID, source: "admin" }]
         : [];
       pathAssignments = o.pathAssigned ? [{ path_id: PATH_ID, assignee_type: "user", user_id: NAV_USERS[viewer].id, team_id: null, group_id: null, source: "admin" }] : [];
-      courseRow = { id: COURSE_ID, organization_id: ORG_ID, current_version_id: V_CUR, title: "Home loans", is_active: true, pass_required: false, visibility: o.visibility ?? "private" };
+      courseRow = { id: COURSE_ID, organization_id: ORG_ID, current_version_id: V_CUR, title: "Home loans", is_active: true, pass_required: o.courseRule ?? false, visibility: o.visibility ?? "private" };
       reqs = [];
       warned = [];
       console.warn = (...a: unknown[]) => { warned.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")); };
@@ -827,6 +840,39 @@ async function pageCases() {
         [holder.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?lp=${PATH_ID}`, 0]);
       const old = await run({ viewer: "admin", strictPath: true, pathAssigned: true, no0107: true, search: { lp: PATH_ID }, attempts: [stepOne({})] });
       eq("…on a database without 0107: refused with the retry notice, nothing written", [old.redirect, writes().length], [RETRY, 0]);
+      eq("…its course read is made with the step row, answers 42703, and is made once more without it",
+        reqs.filter((q) => q.path === "/rest/v1/courses").map((q) => q.select.includes("learning_path_courses(")), [true, false]);
+    }
+
+    // (e2) ADR 0024 P2-7, the review's F3: the bar's first paint judges a
+    // path step under its resolved rule (the step's own pass_required, else
+    // the course's), as the continue address and the status route do. A
+    // relaunch of step 2 whose official path attempt is completed with no
+    // pass or fail: a revision visit, and Continue is ready from the first
+    // paint only when the resolved rule needs no verdict.
+    {
+      const stepOneInPath = own("user", { id: "s1", course_version_id: V_PREV, status: "completed", completion_status: "completed", success_status: "passed", started_at: "2026-10-01T00:00:00Z", completed_at: "2026-10-01T01:00:00Z", context_kind: "path", learning_path_id: PATH_ID });
+      const verdictless = own("user", { id: "c2", course_version_id: V_CUR, status: "completed", completion_status: "completed", success_status: "unknown", score: null, started_at: "2026-11-01T00:00:00Z", completed_at: "2026-11-01T01:00:00Z", context_kind: "path", learning_path_id: PATH_ID });
+      const relaunch = (o: { stepRule?: boolean | null; courseRule?: boolean }) =>
+        run({ viewer: "user", strictPath: true, pathAssigned: true, search: { lp: PATH_ID }, attempts: [stepOneInPath, verdictless], ...o });
+      for (const [what, o, ready] of [
+        ["the step's own rule needs a pass, the course's does not: waiting (the step's rule decides)", { stepRule: true, courseRule: false }, false],
+        ["the step's own rule needs none, the course's does: ready (the step's rule decides)", { stepRule: false, courseRule: true }, true],
+        ["the step has no rule of its own, the course's needs a pass: waiting (the course's rule)", { stepRule: null, courseRule: true }, false],
+        ["the step has no rule of its own, the course's needs none: ready", { stepRule: null, courseRule: false }, true],
+        ["no step row for the course, the course's rule needs none: ready", { courseRule: false }, true],
+      ] as Array<[string, { stepRule?: boolean | null; courseRule?: boolean }, boolean]>) {
+        const r = await relaunch(o);
+        eq(`F3: ${what}`, [r.redirect, r.error, r.element?.props.revision, r.element?.props.continueHref, r.element?.props.continueReady],
+          [null, null, true, `/org/continue?lp=${PATH_ID}&from=${COURSE_ID}`, ready]);
+      }
+      await relaunch({ stepRule: true, courseRule: false });
+      const courseReads = reqs.filter((q) => q.path === "/rest/v1/courses");
+      eq("F3: one course read, which embeds the step row of the ?lp= path only (no request more)",
+        [courseReads.length, courseReads[0]?.select.includes("learning_path_courses(path_id,pass_required)"), courseReads[0]?.query.get("learning_path_courses.path_id")],
+        [1, true, `eq.${PATH_ID}`]);
+      await run({ viewer: "user", assigned: true });
+      eq("F3: an Individual Start's course read embeds nothing", reqs.filter((q) => q.path === "/rest/v1/courses").map((q) => q.select.includes("learning_path_courses")), [false]);
     }
 
     // (f) The deactivated-slot close (slot routing's rule (3)): the Hindi
@@ -1892,7 +1938,9 @@ async function main() {
           /let ev: Evaluation = inCtx \? evaluate\(inCtx, true\) : \{ my: \[\], scoring: null, candidate: "first" \};/.test(src)],
         [true, true, true]);
       eq("P2-6 item 1: the page's own journey block, path block and pathContextId are gone (the resolver's context gives the tags; the release gate and the lock are P's only, D2)",
-        [/computeJourneyState|readJourneyCredits|learning_path_courses|enforcedPathIds|pathContextId|journeyCtx|journeyNextCourseId|myGroupIdsServer|team_members/.test(src)], [false]);
+        [/computeJourneyState|readJourneyCredits|enforcedPathIds|pathContextId|journeyCtx|journeyNextCourseId|myGroupIdsServer|team_members/.test(src),
+          // The P2-7 review's F3 embeds the ?lp= step's rule in the course read; the page reads no step table of its own.
+          /\.from\("learning_path_courses"\)/.test(src)], [false, false]);
       eq("a preview never goes to the language confirm (the switch it confirms resets real rows)", /if \(decision\.kind === "confirm-switch" && !preview\) \{/.test(src), true);
       // O2 (P2-6): the interim preview exclusions are replaced by the launch's
       // context filter; a preview keeps its own course-preview filter.

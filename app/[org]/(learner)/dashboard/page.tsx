@@ -53,7 +53,17 @@ import {
   officialDone,
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchPassRequired, fetchGrantRetakeIds } from "@/lib/scoring/attempt-kind";
+import { fetchPassRequired, readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { pathDisplay, pathProgress, resolvedStepRule, type PathDisplayState } from "@/lib/paths/progress";
+import {
+  NO_PATH_TERMS,
+  pathAttemptsOf,
+  readGrantRows,
+  readPathCompletions,
+  readPathStepFacts,
+  readPathTerms,
+  retakeIdsByCourse,
+} from "@/lib/paths/facts-read";
 
 type Course = {
   id: string;
@@ -103,21 +113,35 @@ type Attempt = {
   is_revision?: boolean | null;
 };
 
+/** A shown step of a path (pathDisplay; the owner's P2-Q1 answer): a step whose course is inactive is not one. */
 type PathStepView = {
   course_id: string;
   title: string;
   step_number: number;
-  state: "completed" | "current" | "locked" | "unreleased";
+  /** Null when the path's progress could not be read (the tile is left out then). */
+  state: PathDisplayState | null;
+  done: boolean | null;
   releaseAt: string | null;
+};
+
+/** The tile's numbers, from pathProgress() and pathDisplay(); null when a read failed. */
+type PathTile = {
+  done: number;
+  total: number;
+  /** The stored completion only (P2-Q1), never the shown count. */
+  completed: boolean;
+  started: boolean;
+  /** v_path_enrollment_terms' due date (decision A9); none without 0107. */
+  dueAt: string | null;
 };
 
 type PathSummary = {
   id: string;
   name: string;
   description: string | null;
-  dueAt: string | null;
   thumbnail_url: string | null;
   steps: PathStepView[];
+  tile: PathTile | null;
 };
 
 export default async function DashboardPage({
@@ -396,12 +420,10 @@ export default async function DashboardPage({
     org: 1,
   };
   const pathSrcRank = new Map<string, number>();
-  const pathDueAt = new Map<string, string | null>();
   for (const a of myPathAssigns) {
     const rank = prec[a.assignee_type];
     if ((pathSrcRank.get(a.path_id) ?? 0) < rank) {
       pathSrcRank.set(a.path_id, rank);
-      pathDueAt.set(a.path_id, a.due_at);
     }
   }
 
@@ -430,7 +452,6 @@ export default async function DashboardPage({
   for (const r of (orgPublicPathRows ?? []) as Array<{ id: string }>) {
     if (!pathSrcRank.has(r.id)) {
       pathSrcRank.set(r.id, prec.org);
-      pathDueAt.set(r.id, null);
     }
   }
   // Kept apart for the path-only cards' Start (10 below): the paths the
@@ -457,19 +478,31 @@ export default async function DashboardPage({
     sequence_mode: "strict" | "random" | null;
   }>;
 
-  const { data: stepRows } = myPathIds.length
-    ? await supabase
-        .from("learning_path_courses")
-        .select("path_id, course_id, step_number, release_at, courses!inner(title)")
-        .in("path_id", myPathIds)
-        .order("step_number", { ascending: true })
-    : { data: [] };
+  // Every step, an inactive course's included (the path rule counts it and
+  // pathDisplay leaves it out), with the course's activity and rule and the
+  // step's own rule (a 0107 column: the narrower-select fallback reads the
+  // steps without it on a database that lacks it, and the course's rule
+  // decides).
+  const { data: stepRows, error: stepsErr } = myPathIds.length
+    ? await readWithOptionalColumn<unknown[]>(
+        "pass_required",
+        (columns) =>
+          supabase
+            .from("learning_path_courses")
+            .select(columns)
+            .in("path_id", myPathIds)
+            .order("step_number", { ascending: true }),
+        "path_id, course_id, step_number, release_at, courses!inner(title, is_active, pass_required)"
+      )
+    : { data: [], error: null };
+  type StepCourse = { title: string; is_active: boolean | null; pass_required: boolean | null };
   type StepRaw = {
     path_id: string;
     course_id: string;
     step_number: number;
     release_at: string | null;
-    courses: { title: string } | { title: string }[];
+    pass_required?: boolean | null;
+    courses: StepCourse | StepCourse[];
   };
   const allPathSteps = ((stepRows ?? []) as StepRaw[]).map((s) => {
     const c = Array.isArray(s.courses) ? s.courses[0] : s.courses;
@@ -479,6 +512,8 @@ export default async function DashboardPage({
       step_number: s.step_number,
       release_at: s.release_at,
       title: c?.title ?? "Untitled",
+      isActive: c?.is_active === true,
+      passRequired: resolvedStepRule(s.pass_required, c?.pass_required),
     };
   });
   const pathCourseIds = Array.from(
@@ -557,7 +592,7 @@ export default async function DashboardPage({
   const courseById = new Map(courses.map((c) => [c.id, c]));
 
   // 6) Versions.
-  const { data: versionRows } = await supabase
+  const { data: versionRows, error: versionsErr } = await supabase
     .from("course_versions")
     .select("id, course_id, version_number, manifest_type")
     .in("course_id", allCourseIds);
@@ -566,14 +601,15 @@ export default async function DashboardPage({
 
   // 7) Attempts.
   const versionIds = versions.map((v) => v.id);
-  const { data: attemptRows } = versionIds.length
+  const { data: attemptRows, error: attemptsErr } = versionIds.length
     ? await supabase
         .from("course_attempts")
-        // select("*") for 0075 deploy safety (progress_pct).
+        // select("*") for 0075 deploy safety (progress_pct), and, for the
+        // path tiles, 0107's context_kind where it exists (pathAttemptsOf).
         .select("*")
         .eq("user_id", user.id)
         .in("course_version_id", versionIds)
-    : { data: [] as Attempt[] };
+    : { data: [] as Attempt[], error: null };
   const attempts = (attemptRows ?? []) as Attempt[];
   // 0073 scoring rules per course (one RPC; fail-soft → defaults).
   const policies = await resolvePolicies(supabase, [
@@ -587,14 +623,18 @@ export default async function DashboardPage({
   // is "pass required".
   const passRequired = await fetchPassRequired(supabase, [...new Set(versions.map((v) => v.course_id))]);
   // Consumed extra-attempt grants (Phase 2) widen a learner's official window
-  // so a granted retake is scored and becomes official on every surface.
-  const extraByCourse = await fetchGrantRetakeIds(supabase, user.id, [...new Set(versions.map((v) => v.course_id))]);
+  // so a granted retake is scored and becomes official on every surface. One
+  // read of the learner's approved grants on these courses, as rows: the
+  // path tiles take the rows (pathProgress, strict: a failed read leaves the
+  // tiles out), the course cards their consumed ids, empty on a failed read
+  // as before (fetchGrantRetakeIds's reading).
+  const grantsRead = await readGrantRows(supabase, user.id, [...new Set(versions.map((v) => v.course_id))]);
+  const extraByCourse = grantsRead.ok ? retakeIdsByCourse(grantsRead.grants) : new Map<string, Set<string>>();
   // Completion follows the OFFICIAL attempt (officialDone), exactly as the CRM
   // feeds do — NOT "any attempt in the window", which diverged for a legacy
   // window >= 2 where the official (first) attempt failed but a later scored
   // attempt passed. The official attempt is the one officialDone judges.
   const completedCourseIds = new Set<string>();
-  const officialAttemptByCourse = new Map<string, string>(); // course_id → official attempt id
   {
     const byCourse = new Map<string, typeof attempts>();
     for (const a of attempts) {
@@ -604,23 +644,8 @@ export default async function DashboardPage({
     }
     for (const [cid, list] of byCourse) {
       const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
-      if (s.officialAttempt) officialAttemptByCourse.set(cid, s.officialAttempt.id);
       if (officialDone(s, passRequired.has(cid))) completedCourseIds.add(cid);
     }
-  }
-  // Path step progress counts ONLY path-context attempts (learning_path_id),
-  // per product decision L2 — a standalone completion doesn't advance a path.
-  // The step is done when the course's OFFICIAL attempt both satisfies
-  // officialDone AND was launched inside that path.
-  const pathDoneByPath = new Map<string, Set<string>>();
-  for (const a of attempts) {
-    const v = versionById.get(a.course_version_id);
-    if (!v || !a.learning_path_id) continue;
-    if (!completedCourseIds.has(v.course_id)) continue;
-    if (officialAttemptByCourse.get(v.course_id) !== a.id) continue;
-    const set = pathDoneByPath.get(a.learning_path_id) ?? new Set<string>();
-    set.add(v.course_id);
-    pathDoneByPath.set(a.learning_path_id, set);
   }
 
   // 8.2) Gamification: own stats in one RPC round trip (fail-soft — the
@@ -677,43 +702,91 @@ export default async function DashboardPage({
   }
   dueSoon.sort((a, b) => (a.dueAt > b.dueAt ? 1 : -1));
 
-  // 9) Path summaries. Scheduled release: an unreleased step renders
-  // "unreleased"; in STRICT mode it consumes the "current" slot (learner is
-  // waiting), in RANDOM mode the pointer skips it. Completed always wins.
+  // 9) Path summaries (ADR 0024 P2-7): each path through the path rule,
+  // pathProgress() over the learner's path rows (the attempts above, by
+  // context; pathAttemptsOf), the grant rows, the stored step facts (one
+  // read for every path, O1-i), the stored completion and the enrolment
+  // terms (read with a service client after requireOrgAccess, naming the
+  // organisation and the learner: ruling (a), so a Custom Group's terms
+  // are seen), then pathDisplay() (the owner's P2-Q1 answer and O5-d): a
+  // step whose course is inactive is left out, and a path with no shown step
+  // is left off the dashboard. When any of those reads fails the path keeps
+  // its shown steps (the course cards and the path-only cards need them) but
+  // no state, and its tile is left out rather than shown on a guess, as the
+  // journey banner is on a failed credits read.
+  const pathIds = pathsList.map((p) => p.id);
+  const svcPaths = createServiceClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false } }
+  );
+  const [factsRead, completionsRead, termsRead] = await Promise.all([
+    readPathStepFacts(supabase, user.id, pathIds),
+    readPathCompletions(supabase, user.id, pathIds),
+    readPathTerms(svcPaths, org.id, user.id, pathIds),
+  ]);
+  const pathInputs =
+    !stepsErr && !versionsErr && !attemptsErr && grantsRead.ok && factsRead.ok && completionsRead.ok && termsRead.ok
+      ? {
+          rows: pathAttemptsOf(attempts as unknown as Array<Record<string, unknown>>, new Map(versions.map((v) => [v.id, v.course_id]))),
+          grants: grantsRead.grants,
+          facts: factsRead.facts,
+          completions: completionsRead.byPath,
+          terms: termsRead.byPath,
+        }
+      : null;
+  if (pathIds.length > 0 && pathInputs === null) {
+    console.warn(JSON.stringify({ event: "path_progress_unreadable", where: "dashboard", user_id: user.id }));
+  }
+  const nowIso = new Date(nowMs).toISOString();
   const paths: PathSummary[] = pathsList
     .map((p) => {
       const steps = allPathSteps.filter((s) => s.path_id === p.id);
-      const pathDone = pathDoneByPath.get(p.id) ?? new Set<string>();
-      const strictMode = p.sequence_mode !== "random";
-      let currentSet = false;
-      const stepViews: PathStepView[] = steps.map((s) => {
-        let state: PathStepView["state"];
-        if (pathDone.has(s.course_id)) {
-          state = "completed";
-        } else if (!isReleased(s.release_at, nowMs)) {
-          state = "unreleased";
-          if (strictMode && !currentSet) currentSet = true;
-        } else if (!currentSet) {
-          state = "current";
-          currentSet = true;
-        } else {
-          state = "locked";
-        }
+      const titleOf = new Map(steps.map((s) => [s.course_id.toLowerCase(), s.title]));
+      if (pathInputs === null) {
         return {
-          course_id: s.course_id,
-          title: s.title,
-          step_number: s.step_number,
-          state,
-          releaseAt: s.release_at,
+          id: p.id,
+          name: p.name,
+          description: p.description,
+          thumbnail_url: p.thumbnail_url,
+          steps: steps
+            .filter((s) => s.isActive)
+            .map((s) => ({ course_id: s.course_id, title: s.title, step_number: s.step_number, state: null, done: null, releaseAt: s.release_at })),
+          tile: null,
         };
+      }
+      const key = p.id.toLowerCase();
+      const progress = pathProgress({
+        pathId: p.id,
+        steps: steps.map((s) => ({ course_id: s.course_id, step_number: s.step_number, release_at: s.release_at, pass_required: s.passRequired })),
+        attempts: pathInputs.rows,
+        grants: pathInputs.grants,
+        facts: pathInputs.facts,
+        completion: pathInputs.completions.get(key) ?? null,
+        terms: pathInputs.terms.get(key) ?? NO_PATH_TERMS,
+        now: nowIso,
       });
+      const display = pathDisplay(progress, steps.filter((s) => s.isActive).map((s) => s.course_id), p.sequence_mode);
       return {
         id: p.id,
         name: p.name,
         description: p.description,
-        dueAt: pathDueAt.get(p.id) ?? null,
         thumbnail_url: p.thumbnail_url,
-        steps: stepViews,
+        steps: display.steps.map((d) => ({
+          course_id: d.course_id,
+          title: titleOf.get(d.course_id.toLowerCase()) ?? "Untitled",
+          step_number: d.step_number,
+          state: d.state,
+          done: d.done,
+          releaseAt: d.release_at,
+        })),
+        tile: {
+          done: display.done,
+          total: display.total,
+          completed: progress.completed,
+          started: progress.status !== "not_started",
+          dueAt: progress.due_at,
+        },
       };
     })
     .filter((p) => p.steps.length > 0);
@@ -935,36 +1008,44 @@ export default async function DashboardPage({
   // 11) Learning paths join the course grid as labeled tiles (one card per
   // path) instead of rendering as a separate section above it. They filter
   // and count with everything else.
-  const pathCards: GridCard[] = paths.map((p) => {
-    const total = p.steps.length;
-    const done = p.steps.filter((s) => s.state === "completed").length;
-    // An open revision visit's row never starts a path (ADR 0014 steps 6 and 12).
-    const started =
-      done > 0 ||
-      attempts.some(
-        (a) =>
-          a.learning_path_id === p.id && a.completion_status !== "completed" && a.status !== "abandoned" && !isRevisionAttempt(a)
-      );
-    return {
+  // The tile: "done of total" over the shown steps, "completed" from the
+  // stored completion only (P2-Q1: a learner who finished every shown step
+  // of a path with a hidden step reads "In progress"), started when the path
+  // rule reads anything but not started (an open revision visit's row never
+  // starts a path: pathProgress reads the official rows, ADR 0014 steps 6
+  // and 12). It shows no step's state, so it calls no pathStepLabel (O4).
+  const pathCards: GridCard[] = paths.flatMap((p) => {
+    const t = p.tile;
+    if (t === null) return [];
+    return [{
       course_id: p.id,
       kind: "path" as const,
       title: p.name,
       description: p.description,
       source: "user" as const,
-      status:
-        total > 0 && done >= total
-          ? ("completed" as const)
-          : started
-            ? ("in_progress" as const)
-            : ("not_started" as const),
+      status: t.completed
+        ? ("completed" as const)
+        : t.started
+          ? ("in_progress" as const)
+          : ("not_started" as const),
       isRevised: false,
-      dueAt: p.dueAt,
+      dueAt: t.dueAt,
       bestScore: null,
-      progressDone: done,
-      progressTotal: total,
+      progressDone: t.done,
+      progressTotal: t.total,
       thumbnail_url: p.thumbnail_url,
-    };
+    }];
   });
+  // The ?locked= notice (P2-Q1): "Finish the earlier steps first." only when,
+  // in some path of the learner that holds the course, a shown earlier step
+  // is not done; otherwise (the only step in the way is hidden, or the
+  // paths' progress could not be read) a line that names nothing.
+  const lockedByShownStep = sp.locked
+    ? paths.some((p) => {
+        const at = p.steps.findIndex((s) => s.course_id.toLowerCase() === sp.locked!.toLowerCase());
+        return at > 0 && p.steps.slice(0, at).some((s) => s.done === false);
+      })
+    : false;
 
   const lockedTitle = sp.locked
     ? courseById.get(sp.locked)?.title ?? null
@@ -999,9 +1080,11 @@ export default async function DashboardPage({
           <Lock className="w-4 h-4 mt-0.5 shrink-0" />
           <span>
             <strong>Locked.</strong>{" "}
-            {lockedTitle
-              ? `"${lockedTitle}" is part of a learning path. Finish the earlier steps first.`
-              : "That course is part of a learning path. Finish the earlier steps first."}
+            {!lockedByShownStep
+              ? "That course is not open yet."
+              : lockedTitle
+                ? `"${lockedTitle}" is part of a learning path. Finish the earlier steps first.`
+                : "That course is part of a learning path. Finish the earlier steps first."}
           </span>
         </div>
       )}

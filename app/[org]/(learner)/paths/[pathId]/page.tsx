@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   ArrowLeft,
   BookOpen,
@@ -15,12 +16,25 @@ import {
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canViewReports } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
-import { isReleased } from "@/lib/learner/release";
 import { myGroupIdsServer } from "@/lib/org/groups";
 import { LocalDateTime } from "@/components/ui/local-datetime";
-import { DEFAULT_POLICY, computeScoring, isRevisionAttempt, officialDone } from "@/lib/scoring/policy";
-import { resolvePolicies } from "@/lib/scoring/resolve";
-import { fetchPassRequired, fetchGrantRetakeIds, readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import { readWithOptionalColumn } from "@/lib/scoring/attempt-kind";
+import {
+  PATH_STEP_LABEL_TEXT,
+  pathDisplay,
+  pathProgress,
+  pathStepLabel,
+  resolvedStepRule,
+  type PathDisplayStep,
+} from "@/lib/paths/progress";
+import {
+  NO_PATH_TERMS,
+  readGrantRows,
+  readPathAttempts,
+  readPathCompletions,
+  readPathStepFacts,
+  readPathTerms,
+} from "@/lib/paths/facts-read";
 
 type PathRow = {
   id: string;
@@ -32,16 +46,22 @@ type PathRow = {
   sequence_mode: "strict" | "random" | null;
 };
 
+type CourseRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  current_version_id: string | null;
+  is_active: boolean | null;
+  pass_required: boolean | null;
+};
+
 type StepRow = {
   course_id: string;
   step_number: number;
   release_at: string | null;
-  course: {
-    id: string;
-    title: string;
-    description: string | null;
-    current_version_id: string | null;
-  };
+  /** The step's own rule (0107); absent on a database without it. */
+  pass_required?: boolean | null;
+  courses: CourseRow | CourseRow[] | null;
 };
 
 type AssignmentRow = {
@@ -52,16 +72,37 @@ type AssignmentRow = {
   due_at: string | null;
 };
 
+/** A shown step with what its card needs. */
 type StepView = {
-  course_id: string;
-  step_number: number;
+  step: PathDisplayStep;
   title: string;
   description: string | null;
-  state: "completed" | "current" | "locked" | "unreleased";
-  releaseAt: string | null;
   manifestType: string | null;
+  /** The words beside a done step's result (pathStepLabel, the owner's O4 answer), or null. */
+  label: string | null;
 };
 
+/**
+ * A learner's Learning Path page (ADR 0024 phase 2, P2-7): the path's steps,
+ * each with its state, from the path rule (pathProgress() over the learner's
+ * path rows, grants, stored step facts, the stored completion and the
+ * enrolment terms; build notes O1-i and O1-k), shown through pathDisplay()
+ * (the owner's P2-Q1 answer, "Leave the step out", and O5-d): a step whose
+ * course is inactive is not rendered, the shown steps are numbered and
+ * counted among themselves, a step that only a hidden step holds back reads
+ * the plain "Locked", and "Completed", the end banner and the celebration
+ * come from the stored completion only. A done step that does not stand on
+ * its latest result carries pathStepLabel()'s words (O4).
+ *
+ * Reads: the learner's session for the path, the steps, the versions, the
+ * path rows, the grants, the step facts and the completion; a service client,
+ * created after requireOrgAccess, for the enrolment terms only, naming the
+ * organisation and the learner (ruling (a) of P2-7: a learner's own session
+ * reads no terms row that only a Custom Group reaches). Any failed read
+ * shows a notice instead of the steps: a step is never shown locked or not
+ * done on a guess. On a database without 0107 the facts read as none, and
+ * the terms and the completion read as none (no due date, never Completed).
+ */
 export default async function LearningPathDetailPage({
   params,
   searchParams,
@@ -132,202 +173,107 @@ export default async function LearningPathDetailPage({
   const isOrgPublic = path.visibility === "org_public";
   if (!isAssigned && !isOrgPublic) redirect(`/${orgSlug}/dashboard?denied=path`);
 
-  // Earliest due_at across the user's matching assignments.
-  const myDueDates = assignments
-    .filter(matchesMe)
-    .map((a) => a.due_at)
-    .filter((d): d is string => !!d)
-    .sort();
-  const dueAt = myDueDates[0] ?? null;
-
-  // 3) Ordered courses in this path, joined to course rows.
-  const { data: stepsRaw } = await supabase
-    .from("learning_path_courses")
-    .select(
-      "course_id, step_number, release_at, courses!inner(id, title, description, current_version_id)"
-    )
-    .eq("path_id", pathId)
-    .order("step_number", { ascending: true });
-  const steps = ((stepsRaw ?? []) as unknown as Array<{
-    course_id: string;
-    step_number: number;
-    release_at: string | null;
-    courses:
-      | {
-          id: string;
-          title: string;
-          description: string | null;
-          current_version_id: string | null;
-        }
-      | Array<{
-          id: string;
-          title: string;
-          description: string | null;
-          current_version_id: string | null;
-        }>;
-  }>).map((s) => {
-    const c = Array.isArray(s.courses) ? s.courses[0] : s.courses;
+  // 3) The steps in order, each with its course (the card's fields, its
+  // activity and its rule), and the step's own rule (a 0107 column: the
+  // narrower-select fallback reads the steps without it on a database that
+  // lacks it, and the course's rule decides). Every step is read, an
+  // inactive course's included: the path rule counts it (its lock holds the
+  // later steps back), and pathDisplay leaves it out.
+  const { data: stepsRaw, error: stepsErr } = await readWithOptionalColumn<unknown[]>(
+    "pass_required",
+    (columns) =>
+      supabase
+        .from("learning_path_courses")
+        .select(columns)
+        .eq("path_id", pathId)
+        .order("step_number", { ascending: true }),
+    "course_id, step_number, release_at, courses(id, title, description, current_version_id, is_active, pass_required)"
+  );
+  const steps = ((stepsRaw ?? []) as StepRow[]).map((s) => {
+    const course = (Array.isArray(s.courses) ? s.courses[0] : s.courses) ?? null;
     return {
       course_id: s.course_id,
       step_number: s.step_number,
       release_at: s.release_at,
-      course: c,
-    } as StepRow;
-  });
-
-  // 4) Versions for those courses (to look up manifest type).
-  const courseIds = steps.map((s) => s.course_id);
-  const { data: versionRows } = courseIds.length
-    ? await supabase
-        .from("course_versions")
-        .select("id, course_id, manifest_type")
-        .in("course_id", courseIds)
-    : { data: [] };
-  type V = { id: string; course_id: string; manifest_type: string };
-  const versions = (versionRows ?? []) as V[];
-  const versionById = new Map(versions.map((v) => [v.id, v]));
-  const manifestTypeByCourse = new Map<string, string>();
-  for (const s of steps) {
-    const cv = s.course.current_version_id;
-    const v = cv ? versionById.get(cv) : null;
-    manifestTypeByCourse.set(
-      s.course_id,
-      v?.manifest_type ??
-        versions.find((vv) => vv.course_id === s.course_id)?.manifest_type ??
-        ""
-    );
-  }
-
-  // 5) User attempts for those courses → completion set. Path progress counts
-  // ONLY attempts launched from within this path (learning_path_id === pathId);
-  // a standalone completion of the same module does not advance the path.
-  // (Product decision L2.) Path step links carry ?lp= so launches are tagged.
-  const versionIds = versions.map((v) => v.id);
-  // ALL of the learner's attempts on these modules (any launch context): the
-  // 0073 scoring window counts every completed attempt of a module, whichever
-  // screen launched it. Path PROGRESS below still uses path-context only.
-  type Attempt = {
-    id: string;
-    course_version_id: string;
-    /** ADR 0004 step 11: an abandoned attempt is never official and never in progress. */
-    status: string | null;
-    completion_status: string;
-    success_status: string;
-    score: number | null;
-    started_at: string;
-    completed_at: string | null;
-    learning_path_id: string | null;
-    /** 0103 (ADR 0014): a revision visit's row; absent on a database without 0103 (= false). */
-    is_revision?: boolean | null;
-  };
-  // ADR 0014 steps 7 and 12: the select names is_revision (the narrower-select
-  // fallback on a database without 0103), so computeScoring drops a revision
-  // visit's row; officialDone stays the step gate while a granted retake runs
-  // (ADR 0014 step 10).
-  const { data: attemptRows } = versionIds.length
-    ? await readWithOptionalColumn<unknown[]>(
-        "is_revision",
-        (columns) =>
-          supabase
-            .from("course_attempts")
-            .select(columns)
-            .eq("user_id", user.id)
-            .in("course_version_id", versionIds),
-        "id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, learning_path_id"
-      )
-    : { data: [] };
-  const allAttempts = (attemptRows ?? []) as Attempt[];
-  const attempts = allAttempts.filter((a) => a.learning_path_id === pathId);
-  // Official score per module under its attempt scoring rule (0073), and
-  // which attempts sit inside the scoring window (0081: only OFFICIAL
-  // attempts can complete a step; revision runs never do).
-  const attemptsByCourse = new Map<string, Attempt[]>();
-  for (const a of allAttempts) {
-    const v = versionById.get(a.course_version_id);
-    if (!v) continue;
-    attemptsByCourse.set(v.course_id, [
-      ...(attemptsByCourse.get(v.course_id) ?? []),
-      a,
-    ]);
-  }
-  const policies = await resolvePolicies(supabase, [...attemptsByCourse.keys()]);
-  const passRequired = await fetchPassRequired(supabase, steps.map((s) => s.course_id));
-  // Consumed extra-attempt grants (0083) widen each course's scoring window so
-  // a granted retake is scored and becomes official. Fail-soft (empty) pre-0083.
-  const extraByCourse = await fetchGrantRetakeIds(supabase, user.id, steps.map((s) => s.course_id));
-  // Official SCORE per course uses ALL the learner's attempts (matches the
-  // course page and CRM feeds).
-  const scoreByCourse = new Map<string, number>();
-  for (const [cid, list] of attemptsByCourse) {
-    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
-    if (s.officialScore !== null) scoreByCourse.set(cid, s.officialScore);
-  }
-  // Step COMPLETION (0081): the course's OFFICIAL attempt must satisfy
-  // officialDone, and (L2) it must be a PATH-context attempt. Judged over the
-  // path-scoped attempts only, via officialDone — never "any attempt in the
-  // window", which diverged from the CRM feeds for a legacy window >= 2.
-  const pathAttemptsByCourse = new Map<string, Attempt[]>();
-  for (const a of attempts) {
-    const v = versionById.get(a.course_version_id);
-    if (!v) continue;
-    pathAttemptsByCourse.set(v.course_id, [...(pathAttemptsByCourse.get(v.course_id) ?? []), a]);
-  }
-  // A step is in progress on an open path-context row that is neither
-  // abandoned nor a revision visit's row: an open revision visit never marks
-  // a step "in progress" (ADR 0014 steps 6 and 12).
-  const completedCourseIds = new Set<string>();
-  const inProgressCourseIds = new Set<string>();
-  for (const [cid, list] of pathAttemptsByCourse) {
-    const s = computeScoring(list, policies.get(cid) ?? DEFAULT_POLICY, extraByCourse.get(cid) ?? []);
-    if (officialDone(s, passRequired.has(cid))) {
-      completedCourseIds.add(cid);
-    } else if (list.some((a) => a.completion_status === "in_progress" && a.status !== "abandoned" && !isRevisionAttempt(a))) {
-      inProgressCourseIds.add(cid);
-    }
-  }
-
-  // 6) Compute per-step state (completed | current | locked | unreleased).
-  // Scheduled release: a non-completed step whose release_at is in the future
-  // renders "unreleased". In STRICT mode it also consumes the "current" slot —
-  // the learner is waiting, nothing later unlocks. In RANDOM mode later
-  // released steps stay reachable, so the current pointer skips it.
-  // Completed always wins: a date added after completion never regresses state.
-  const now = Date.now();
-  const sequenceMode = path.sequence_mode === "random" ? "random" : "strict";
-  let currentSet = false;
-  const stepViews: StepView[] = steps.map((s) => {
-    let state: StepView["state"];
-    if (completedCourseIds.has(s.course_id)) {
-      state = "completed";
-    } else if (!isReleased(s.release_at, now)) {
-      state = "unreleased";
-      if (sequenceMode === "strict" && !currentSet) currentSet = true;
-    } else if (!currentSet) {
-      state = "current";
-      currentSet = true;
-    } else {
-      state = "locked";
-    }
-    return {
-      course_id: s.course_id,
-      step_number: s.step_number,
-      title: s.course.title,
-      description: s.course.description,
-      manifestType: manifestTypeByCourse.get(s.course_id) || null,
-      state,
-      releaseAt: s.release_at,
+      pass_required: resolvedStepRule(s.pass_required, course?.pass_required),
+      course,
     };
   });
 
-  const total = stepViews.length;
-  const done = stepViews.filter((s) => s.state === "completed").length;
+  // 4) Versions for those courses (the manifest type, and the version →
+  // course map of the path rows).
+  const courseIds = steps.map((s) => s.course_id);
+  const { data: versionRows, error: versionsErr } = courseIds.length
+    ? await supabase.from("course_versions").select("id, course_id, manifest_type").in("course_id", courseIds)
+    : { data: [], error: null };
+  type V = { id: string; course_id: string; manifest_type: string };
+  const versions = (versionRows ?? []) as V[];
+  const versionById = new Map(versions.map((v) => [v.id, v]));
+  const manifestTypeOf = (courseId: string, currentVersionId: string | null | undefined) => {
+    const v = currentVersionId ? versionById.get(currentVersionId) : null;
+    return v?.manifest_type ?? versions.find((vv) => vv.course_id === courseId)?.manifest_type ?? "";
+  };
+
+  // 5) The path rule's inputs (lib/paths/facts-read.ts), each strict.
+  const svc = createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+    auth: { persistSession: false },
+  });
+  const [rowsRead, grantsRead, factsRead, completionsRead, termsRead] = await Promise.all([
+    readPathAttempts(supabase, { userId: user.id, pathIds: [pathId], versions }),
+    readGrantRows(supabase, user.id, courseIds),
+    readPathStepFacts(supabase, user.id, [pathId]),
+    readPathCompletions(supabase, user.id, [pathId]),
+    readPathTerms(svc, org.id, user.id, [pathId]),
+  ]);
+  const unreadable =
+    !!stepsErr || !!versionsErr || !rowsRead.ok || !grantsRead.ok || !factsRead.ok || !completionsRead.ok || !termsRead.ok;
+
+  let views: StepView[] = [];
+  let done = 0;
+  let total = 0;
+  let completed = false;
+  let dueAt: string | null = null;
+  let overdue = false;
+  if (unreadable) {
+    console.warn(JSON.stringify({ event: "path_progress_unreadable", path_id: pathId, user_id: user.id }));
+  } else {
+    const key = pathId.toLowerCase();
+    const progress = pathProgress({
+      pathId,
+      steps: steps.map((s) => ({ course_id: s.course_id, step_number: s.step_number, release_at: s.release_at, pass_required: s.pass_required })),
+      attempts: rowsRead.attempts,
+      grants: grantsRead.grants,
+      facts: factsRead.facts,
+      completion: completionsRead.byPath.get(key) ?? null,
+      terms: termsRead.byPath.get(key) ?? NO_PATH_TERMS,
+      now: new Date().toISOString(),
+    });
+    const courseById = new Map(steps.map((s) => [s.course_id.toLowerCase(), s.course]));
+    const display = pathDisplay(
+      progress,
+      steps.filter((s) => s.course?.is_active === true).map((s) => s.course_id),
+      path.sequence_mode
+    );
+    views = display.steps.map((step) => {
+      const course = courseById.get(step.course_id.toLowerCase()) ?? null;
+      const label = pathStepLabel(step);
+      return {
+        step,
+        title: course?.title ?? "",
+        description: course?.description ?? null,
+        manifestType: manifestTypeOf(step.course_id, course?.current_version_id) || null,
+        label: label === null ? null : PATH_STEP_LABEL_TEXT[label],
+      };
+    });
+    done = display.done;
+    total = display.total;
+    completed = progress.completed;
+    dueAt = progress.due_at;
+    overdue = progress.overdue;
+  }
+
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
-  const dueLabel = dueAt
-    ? new Date(dueAt).toISOString().slice(0, 10)
-    : null;
-  const overdue = dueAt
-    ? new Date(dueAt).getTime() < Date.now() && done < total
-    : false;
+  const dueLabel = dueAt ? new Date(dueAt).toISOString().slice(0, 10) : null;
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -364,7 +310,9 @@ export default async function LearningPathDetailPage({
           </span>
         </div>
       )}
-      {continueBanner === "end" && (
+      {/* The end banner shows only for a completed path (P2-Q1): Continue's
+          ?end=1 after the last step in order is not a completion. */}
+      {continueBanner === "end" && completed && (
         <div
           data-testid="continue-end-banner"
           className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2"
@@ -405,86 +353,99 @@ export default async function LearningPathDetailPage({
                 {path.description}
               </p>
             )}
-            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-indigo-100 mt-4 font-medium">
-              <span className="flex items-center gap-1.5">
-                <BookOpen className="w-3.5 h-3.5" />
-                {total} {total === 1 ? "course" : "courses"}
-              </span>
-              {dueLabel && (
-                <span
-                  className={`flex items-center gap-1.5 ${
-                    overdue ? "text-red-200 font-semibold" : ""
-                  }`}
-                >
-                  <Clock className="w-3.5 h-3.5" />
-                  {overdue ? `Overdue · ${dueLabel}` : `Due ${dueLabel}`}
+            {!unreadable && (
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-indigo-100 mt-4 font-medium">
+                <span className="flex items-center gap-1.5">
+                  <BookOpen className="w-3.5 h-3.5" />
+                  {total} {total === 1 ? "course" : "courses"}
                 </span>
+                {dueLabel && (
+                  <span
+                    className={`flex items-center gap-1.5 ${
+                      overdue ? "text-red-200 font-semibold" : ""
+                    }`}
+                  >
+                    <Clock className="w-3.5 h-3.5" />
+                    {overdue ? `Overdue · ${dueLabel}` : `Due ${dueLabel}`}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {unreadable ? (
+          <div
+            data-testid="path-progress-unreadable"
+            className="m-7 sm:m-9 border border-amber-200 bg-amber-50 text-amber-900 rounded-xl px-4 py-3 text-sm flex items-start gap-2"
+          >
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>Your progress on this path could not be loaded right now. Refresh the page to try again.</span>
+          </div>
+        ) : (
+          <>
+            {/* Progress bar */}
+            <div className="px-7 sm:px-9 py-5 border-b border-line bg-canvas/40 flex items-center gap-5">
+              <div className="flex-1">
+                <div className="flex justify-between text-[11px] font-bold uppercase tracking-wider text-muted mb-1.5">
+                  <span>Path progress</span>
+                  <span>{pct}% completed</span>
+                </div>
+                <div className="w-full bg-canvas rounded-full h-2.5 overflow-hidden">
+                  <div
+                    className="bg-indigo-600 h-full rounded-full transition-all duration-500"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+              </div>
+              <div className="shrink-0 text-xs text-muted">
+                <span className="font-semibold text-ink">
+                  {done}
+                </span>
+                <span className="opacity-70"> / {total}</span>
+              </div>
+            </div>
+
+            {/* Courses list */}
+            <div className="p-7 sm:p-9 space-y-4">
+              <h2 className="text-lg font-semibold mb-4">Courses in this path</h2>
+              {views.length === 0 ? (
+                <div className="text-sm text-muted">
+                  This path doesn&apos;t have any courses yet.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {views.map((v) => (
+                    <StepCard
+                      key={v.step.course_id}
+                      view={v}
+                      orgSlug={orgSlug}
+                      pathId={pathId}
+                      canPreview={canPreview}
+                    />
+                  ))}
+                </div>
               )}
             </div>
-          </div>
-        </div>
 
-        {/* Progress bar */}
-        <div className="px-7 sm:px-9 py-5 border-b border-line bg-canvas/40 flex items-center gap-5">
-          <div className="flex-1">
-            <div className="flex justify-between text-[11px] font-bold uppercase tracking-wider text-muted mb-1.5">
-              <span>Path progress</span>
-              <span>{pct}% completed</span>
-            </div>
-            <div className="w-full bg-canvas rounded-full h-2.5 overflow-hidden">
-              <div
-                className="bg-indigo-600 h-full rounded-full transition-all duration-500"
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-          </div>
-          <div className="shrink-0 text-xs text-muted">
-            <span className="font-semibold text-ink">
-              {done}
-            </span>
-            <span className="opacity-70"> / {total}</span>
-          </div>
-        </div>
-
-        {/* Courses list */}
-        <div className="p-7 sm:p-9 space-y-4">
-          <h2 className="text-lg font-semibold mb-4">Courses in this path</h2>
-          {stepViews.length === 0 ? (
-            <div className="text-sm text-muted">
-              This path doesn&apos;t have any courses yet.
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {stepViews.map((s, i) => (
-                <StepCard
-                  key={s.course_id}
-                  step={s}
-                  isLast={i === stepViews.length - 1}
-                  orgSlug={orgSlug}
-                  inProgress={inProgressCourseIds.has(s.course_id)}
-                  score={scoreByCourse.get(s.course_id) ?? null}
-                  pathId={pathId}
-                  canPreview={canPreview}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Completed-path celebration */}
-        {pct === 100 && total > 0 && (
-          <div className="mx-7 sm:mx-9 mb-7 sm:mb-9 border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-2xl p-5 flex items-center gap-4">
-            <div className="shrink-0 w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center">
-              <Award className="w-6 h-6 text-emerald-700" />
-            </div>
-            <div>
-              <h3 className="font-semibold">You finished this path 🎉</h3>
-              <p className="text-sm text-emerald-800 mt-0.5">
-                Every course in <strong>{path.name}</strong> is complete. Nice
-                work.
-              </p>
-            </div>
-          </div>
+            {/* Completed-path celebration: the stored completion only (P2-Q1),
+                never the shown count, so a path completed before one of its
+                steps was hidden stays celebrated. */}
+            {completed && (
+              <div className="mx-7 sm:mx-9 mb-7 sm:mb-9 border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-2xl p-5 flex items-center gap-4">
+                <div className="shrink-0 w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center">
+                  <Award className="w-6 h-6 text-emerald-700" />
+                </div>
+                <div>
+                  <h3 className="font-semibold">You finished this path 🎉</h3>
+                  <p className="text-sm text-emerald-800 mt-0.5">
+                    Every course in <strong>{path.name}</strong> is complete. Nice
+                    work.
+                  </p>
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -492,32 +453,31 @@ export default async function LearningPathDetailPage({
 }
 
 function StepCard({
-  step,
-  isLast,
+  view,
   orgSlug,
-  inProgress,
-  score,
   pathId,
   canPreview,
 }: {
-  step: StepView;
-  isLast: boolean;
+  view: StepView;
   orgSlug: string;
-  inProgress: boolean;
-  score: number | null;
   pathId: string;
   /** canViewReports(role): the step offers a Preview (ADR 0024 step 23). */
   canPreview: boolean;
 }) {
-  void isLast;
+  const step = view.step;
   const isCompleted = step.state === "completed";
   const isCurrent = step.state === "current";
   const isLocked = step.state === "locked";
   const isUnreleased = step.state === "unreleased";
+  // An official row of the step's path context is open (an open revision
+  // visit's row never marks a step in progress: pathProgress reads the
+  // official rows only, ADR 0014 steps 6 and 12).
+  const inProgress = step.open_attempt && !isCompleted;
+  const score = step.latest_score;
   // Show the schedule on every future-dated step — including ones that are
   // also prereq-locked — so learners can see the whole upcoming calendar.
   const showsReleaseDate =
-    !isCompleted && step.releaseAt && new Date(step.releaseAt).getTime() > Date.now();
+    !isCompleted && step.release_at && new Date(step.release_at).getTime() > Date.now();
 
   return (
     <div
@@ -530,7 +490,7 @@ function StepCard({
       }`}
     >
       <div className="flex flex-col sm:flex-row sm:items-start gap-4">
-        {/* Step badge */}
+        {/* Step badge: the step's place among the shown steps (P2-Q1). */}
         <div className="shrink-0">
           {isCompleted ? (
             <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center">
@@ -538,11 +498,11 @@ function StepCard({
             </div>
           ) : isCurrent ? (
             <div className="w-10 h-10 rounded-full bg-indigo-600 text-white flex items-center justify-center text-sm font-bold">
-              {step.step_number}
+              {step.position}
             </div>
           ) : (
             <div className="w-10 h-10 rounded-full border border-line text-muted flex items-center justify-center text-sm font-medium">
-              {step.step_number}
+              {step.position}
             </div>
           )}
         </div>
@@ -559,14 +519,22 @@ function StepCard({
                     : "bg-canvas text-muted"
               }`}
             >
-              Step {step.step_number}
+              Step {step.position}
             </span>
             {isCompleted && (
               <span className="text-[10px] uppercase tracking-wide font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-700">
                 Completed
               </span>
             )}
-            {inProgress && !isCompleted && (
+            {isCompleted && view.label && (
+              <span
+                data-testid="path-step-label"
+                className="text-[10px] uppercase tracking-wide font-bold px-2 py-0.5 rounded bg-sky-100 text-sky-800"
+              >
+                {view.label}
+              </span>
+            )}
+            {inProgress && (
               <span className="text-[10px] uppercase tracking-wide font-bold px-2 py-0.5 rounded bg-amber-100 text-amber-800">
                 In progress
               </span>
@@ -574,26 +542,26 @@ function StepCard({
             {showsReleaseDate && (
               <span className="text-[10px] uppercase tracking-wide font-bold px-2 py-0.5 rounded bg-sky-100 text-sky-800 inline-flex items-center gap-1">
                 <Clock className="w-3 h-3" />
-                Releases <LocalDateTime iso={step.releaseAt!} />
+                Releases <LocalDateTime iso={step.release_at!} />
               </span>
             )}
           </div>
           <h3 className="font-semibold text-base sm:text-lg leading-snug">
-            {step.title}
+            {view.title}
           </h3>
-          {step.description && (
+          {view.description && (
             <p className="text-sm text-muted mt-1.5 leading-relaxed line-clamp-3">
-              {step.description}
+              {view.description}
             </p>
           )}
           <div className="flex items-center gap-4 text-xs text-muted mt-3">
             <span className="flex items-center gap-1">
               <BookOpen className="w-3.5 h-3.5" />
-              {step.manifestType === "cmi5"
+              {view.manifestType === "cmi5"
                 ? "cmi5 module"
-                : step.manifestType === "xapi"
+                : view.manifestType === "xapi"
                   ? "xAPI module"
-                  : step.manifestType
+                  : view.manifestType
                     ? "SCORM module"
                     : "Course"}
             </span>
@@ -618,10 +586,14 @@ function StepCard({
               <Clock className="w-4 h-4" /> Coming soon
             </button>
           ) : isLocked ? (
+            // The hint only when a shown earlier step is not done; a step
+            // that only a hidden step holds back reads "Locked", no reason
+            // given (P2-Q1).
             <button
               type="button"
               disabled
-              title="Finish the previous step to unlock"
+              data-testid="step-locked"
+              title={step.lockedByVisibleStep ? "Finish the previous step to unlock" : undefined}
               className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-canvas text-muted border border-line px-5 py-2.5 rounded-lg text-sm font-medium cursor-not-allowed"
             >
               <Lock className="w-4 h-4" /> Locked

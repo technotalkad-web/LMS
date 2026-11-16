@@ -46,6 +46,15 @@
  * owner's O4 answer of 2026-11-14, option (ii)); `PATH_STEP_LABEL_TEXT`
  * holds them, and no page writes them itself.
  *
+ * `pathDisplay()` is what the path page and the dashboard tile show of the
+ * answer (the owner's P2-Q1 answer, "Leave the step out", and O5-d): a step
+ * whose course is inactive is not shown, the shown steps are numbered and
+ * counted among themselves, and each shown step's state follows the
+ * launch's own rule (lib/attempts/launch-context.ts). `pathProgress()` is
+ * not changed by it and still counts every step; "Completed" is the stored
+ * completion (`completed`), never the shown count. `resolvedStepRule()` is a
+ * step's rule as the readers resolve it (step 8).
+ *
  * The fact rows are a required input with no default (O1-i), so a caller
  * cannot leave them out and silently judge every step by today's rule. A
  * phase P test run passes an empty list on purpose. No TypeScript code
@@ -304,6 +313,76 @@ export function pathProgress(i: PathProgressInput): PathProgress {
     completed_at: i.completion ? i.completion.completed_at : null,
     overdue: i.terms.due_at !== null && Number.isFinite(dueMs) && dueMs < ms(i.now) && !completed,
   };
+}
+
+/**
+ * A step's resolved pass rule (ADR 0024 step 8): the step's own
+ * `learning_path_courses.pass_required` when it is set (a 0107 column), else
+ * the course's `courses.pass_required`. On a database without 0107 the
+ * step's value is absent and the course's rule decides, as before.
+ */
+export function resolvedStepRule(stepRule: boolean | null | undefined, courseRule: boolean | null | undefined): boolean {
+  return typeof stepRule === "boolean" ? stepRule : courseRule === true;
+}
+
+/** A shown step's state on the path page and the dashboard tile. */
+export type PathDisplayState = "completed" | "current" | "locked" | "unreleased";
+
+export type PathDisplayStep = PathStepStatus & {
+  /** The step's place among the shown steps, from 1, so no gap reveals a hidden step (P2-Q1). */
+  position: number;
+  state: PathDisplayState;
+  /**
+   * Locked, and a shown earlier step is not done: the page may say to finish
+   * the previous step. False when only hidden steps are in the way (the plain
+   * "Locked", no reason given; P2-Q1) and whenever the step is not locked.
+   */
+  lockedByVisibleStep: boolean;
+};
+
+export type PathDisplay = {
+  /** The shown steps, in path order. */
+  steps: PathDisplayStep[];
+  /** Shown steps that are done ("done of total" and the percentage). */
+  done: number;
+  /** Shown steps. */
+  total: number;
+};
+
+/**
+ * What the path page and the dashboard tile show of one path's answer (the
+ * owner's P2-Q1 answer of 2026-11-14, "Leave the step out", ruled in the ADR
+ * 0024 note of that day, section 2; O5-d). A step whose course is not in
+ * `activeCourseIds` is left out: no row, no name, no link. The shown steps
+ * are numbered by their place among themselves (`position`) and counted
+ * among themselves (`done`, `total`). Each shown step's state is the launch's
+ * own rule (resolveLaunchContext): done reads "completed"; a step whose
+ * release date is still ahead reads "unreleased"; in a path whose order is
+ * not random, a step with any earlier step not done (shown or hidden) reads
+ * "locked"; any other step reads "current" (it can be launched now). In a
+ * random path no step is locked. `sequenceMode` is an argument because
+ * PathProgress carries no order (a departure from the plan's two-argument
+ * form, recorded with P2-7). Pure; the stored completion stays the caller's
+ * to read (`progress.completed`).
+ */
+export function pathDisplay(progress: PathProgress, activeCourseIds: Iterable<string>, sequenceMode: string | null): PathDisplay {
+  const active = new Set<string>();
+  for (const id of activeCourseIds) active.add(lower(id));
+  const shown = (s: PathStepStatus) => active.has(lower(s.course_id));
+  const strict = sequenceMode !== "random";
+  const steps: PathDisplayStep[] = [];
+  for (const s of progress.steps) {
+    if (!shown(s)) continue;
+    const blocking = strict ? progress.steps.filter((e) => e.step_number < s.step_number && !e.done) : [];
+    const state: PathDisplayState = s.done ? "completed" : !s.released ? "unreleased" : blocking.length > 0 ? "locked" : "current";
+    steps.push({
+      ...s,
+      position: steps.length + 1,
+      state,
+      lockedByVisibleStep: state === "locked" && blocking.some(shown),
+    });
+  }
+  return { steps, done: steps.filter((s) => s.done).length, total: steps.length };
 }
 
 /**

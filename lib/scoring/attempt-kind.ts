@@ -30,7 +30,8 @@ import { readWithContextFilter, withoutPreviews, type ContextFilterState } from 
  *                         the Learners page's "retake reset, no grant" label
  *                         reads the strict snapshot instead).
  *   isSchemaMissing()   — a missing relation, column or function (a
- *                         database behind the code); isMissingColumn() is
+ *                         database behind the code); isMissingRelation()
+ *                         a missing table or view only; isMissingColumn() is
  *                         the trigger of the narrower-select fallbacks, and
  *                         readWithOptionalColumn() writes that fallback once
  *                         (readPagedWithOptionalColumn() its paged form, the
@@ -86,6 +87,24 @@ export function isMissingColumn(error: PgError, column: string): boolean {
   if (code !== "42703" && code !== "PGRST204") return false;
   const msg = error.message ?? "";
   return msg === "" || msg.includes(column);
+}
+
+/**
+ * A missing relation, and nothing broader (ADR 0024 P2-7): 42P01 from
+ * Postgres or PGRST205 from PostgREST's schema cache, naming `relation` or
+ * naming nothing. The trigger of the readers that answer "none" for a table
+ * or view a database does not have yet (`docs/ARCHITECTURE.md` principle 6;
+ * the path facts, completions and terms of 0107, and attempt_requests before
+ * 0083). A missing column, function or anything else is not this
+ * (isSchemaMissing is wider on purpose), so a real failure is never read as
+ * an empty list.
+ */
+export function isMissingRelation(error: PgError, relation: string): boolean {
+  if (!error) return false;
+  const code = error.code ?? "";
+  if (code !== "42P01" && code !== "PGRST205") return false;
+  const msg = error.message ?? "";
+  return msg === "" || msg.includes(relation);
 }
 
 /**

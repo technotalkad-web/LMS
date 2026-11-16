@@ -15,7 +15,10 @@
  *     when a learner was skipped for a live retake;
  *   - an open revision visit's row never marks a learning-path
  *     step "in progress" (the learner path page) nor starts a path (the
- *     dashboard path tile), through isRevisionAttempt;
+ *     dashboard path tile): since ADR 0024 P2-7 both read pathProgress(),
+ *     whose rows are the context's official rows (abandoned and revision
+ *     rows dropped first), evaluated here over the rows the pages hand it
+ *     (pathAttemptsOf), with the pages' own source tests pinned;
  *   - the scoring-rules card's copy names no rule precedence,
  *     inheritance or override, and keeps ADR 0014 step 9's words.
  *
@@ -24,7 +27,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { isRevisionAttempt } from "../../lib/scoring/policy";
+import { pathProgress } from "../../lib/paths/progress";
+import { pathAttemptsOf } from "../../lib/paths/facts-read";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -143,33 +147,43 @@ function inOrderIn(src: string, parts: string[]) {
 }
 
 console.log("\nan open revision visit's row is never in progress (ADR 0014 steps 6 and 12)");
-type Row = { learning_path_id: string | null; status: string; completion_status: string; is_revision?: boolean | null };
-const openOfficial: Row = { learning_path_id: "p1", status: "in_progress", completion_status: "in_progress", is_revision: false };
-const openRevision: Row = { learning_path_id: "p1", status: "in_progress", completion_status: "in_progress", is_revision: true };
-const openPre0103: Row = { learning_path_id: "p1", status: "in_progress", completion_status: "in_progress" };
-const abandoned: Row = { learning_path_id: "p1", status: "abandoned", completion_status: "in_progress", is_revision: false };
-const otherPath: Row = { learning_path_id: "p2", status: "in_progress", completion_status: "in_progress", is_revision: false };
+const P1 = "11111111-1111-4111-8111-111111111111";
+const P2 = "22222222-2222-4222-8222-222222222222";
+const COURSE = "33333333-3333-4333-8333-333333333333";
+type Row = Record<string, unknown>;
+const open = (o: Row): Row => ({ id: "a1", course_version_id: "v1", status: "in_progress", completion_status: "in_progress", success_status: "unknown", score: null, started_at: "2026-10-01T09:00:00Z", completed_at: null, learning_path_id: P1, ...o });
+const openOfficial = open({ is_revision: false });
+const openRevision = open({ is_revision: true });
+const openPre0103 = open({});
+const abandoned = open({ status: "abandoned", is_revision: false });
+const otherPath = open({ learning_path_id: P2, is_revision: false });
+/** The path rule over the rows the pages hand it (pathAttemptsOf: the dashboard's select("*"), and readPathAttempts's read). */
+const step1 = (rows: Row[]) =>
+  pathProgress({
+    pathId: P1,
+    steps: [{ course_id: COURSE, step_number: 1, release_at: null, pass_required: false }],
+    attempts: pathAttemptsOf(rows, new Map([["v1", COURSE]])),
+    grants: [],
+    facts: [],
+    completion: null,
+    terms: { due_at: null, enrolled_at: null },
+    now: "2026-10-02T00:00:00Z",
+  });
 {
   const src = code(PATH_PAGE);
-  eq("the learner path page imports isRevisionAttempt from the scoring policy", /import \{[^}]*\bisRevisionAttempt\b[^}]*\} from "@\/lib\/scoring\/policy";/.test(src), true);
-  const m = src.match(/\} else if \(list\.some\((\(a\) => [^\n]*?)\)\) \{\s*inProgressCourseIds\.add\(cid\);/);
-  eq("inProgressCourseIds: the step's predicate skips abandoned and revision rows", m?.[1] ?? null,
-    '(a) => a.completion_status === "in_progress" && a.status !== "abandoned" && !isRevisionAttempt(a)');
-  const pred = m ? (new Function("isRevisionAttempt", `return ${m[1]};`)(isRevisionAttempt) as (a: Row) => boolean) : () => true;
-  eq("…evaluated from the source: an open official row, an open revision row, a pre-0103 open row, an abandoned row",
-    [pred(openOfficial), pred(openRevision), pred(openPre0103), pred(abandoned)], [true, false, true, false]);
-  eq("…a step whose only open row is a revision visit is not in progress", [openRevision].some(pred), false);
+  eq("the learner path page reads a step's in-progress state from the path rule's open_attempt",
+    /const inProgress = step\.open_attempt && !isCompleted;/.test(src), true);
+  eq("…open_attempt over an open official row, an open revision row, a pre-0103 open row, an abandoned row",
+    [openOfficial, openRevision, openPre0103, abandoned].map((r) => step1([r]).steps[0].open_attempt), [true, false, true, false]);
+  eq("…a step whose only open row is a revision visit is not in progress", step1([openRevision]).steps[0].open_attempt, false);
 }
 {
   const src = code(DASHBOARD);
-  const m = src.match(/const started =\s*done > 0 \|\|\s*attempts\.some\(\s*(\(a\) =>\s*[^\n]*?)\s*\);/);
-  eq("the dashboard path tile's started test skips abandoned and revision rows", m?.[1].replace(/\s+/g, " ") ?? null,
-    '(a) => a.learning_path_id === p.id && a.completion_status !== "completed" && a.status !== "abandoned" && !isRevisionAttempt(a)');
-  eq("…and the dashboard imports isRevisionAttempt", /\bisRevisionAttempt,\s/.test(src.slice(0, src.indexOf("export default"))), true);
-  const pred = m ? (new Function("isRevisionAttempt", "p", `return ${m[1]};`)(isRevisionAttempt, { id: "p1" }) as (a: Row) => boolean) : () => true;
-  eq("…evaluated from the source for path p1: open official, open revision, pre-0103 open, abandoned, another path's row",
-    [pred(openOfficial), pred(openRevision), pred(openPre0103), pred(abandoned), pred(otherPath)], [true, false, true, false, false]);
-  eq("…a path whose only open row is a revision visit is not started", [openRevision, abandoned].some(pred), false);
+  eq("the dashboard path tile's started test is the path rule's status", /started: progress\.status !== "not_started",/.test(src), true);
+  const started = (rows: Row[]) => step1(rows).status !== "not_started";
+  eq("…for path p1: open official, open revision, pre-0103 open, abandoned, another path's row",
+    [openOfficial, openRevision, openPre0103, abandoned, otherPath].map((r) => started([r])), [true, false, true, false, false]);
+  eq("…a path whose only open rows are a revision visit and an abandoned row is not started", started([openRevision, { ...abandoned, id: "a2" }]), false);
 }
 
 console.log("\nthe scoring-rules card's copy matches ADR 0014 step 9 (ADR 0014:193)");

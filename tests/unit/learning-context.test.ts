@@ -454,6 +454,37 @@ async function main() {
     eq("a preview key without 0107: {ok: false, no_context_schema}; no second read", [r.ok ? "ok" : r.reason, calls.filter((c) => c.table === "course_attempts").length], ["no_context_schema", 1]);
   }
 
+  console.log("\n(d) readContextResult with an earlier answer reused (Continue's wait; the P2-7 review, F5)");
+  {
+    // Without 0107: the first read decides; a second read handed its decision
+    // and grants makes the attempts read only, with no failed read first.
+    const { client: c1 } = stub(pre0107);
+    const first = await readContextResult(c1, { userId: "u1", courseId: "c1", key: P, passRequired: true, now: NOW, versionIds: [V1] });
+    if (!first.ok) throw new Error("the first read failed");
+    const { client, calls } = stub((c) => (c.table === "course_attempts" ? (c.columns.includes("context") ? MISSING("context_key") : { data: pre, error: null }) : pre0107(c, 2)));
+    const r = await readContextResult(client, { userId: "u1", courseId: "c1", key: P, passRequired: true, now: NOW, versionIds: [V1], reuse: { contextColumns: first.contextColumns, grants: first.grants } });
+    eq("without 0107, reused: one attempts read with today's select and no key filter, no grants read", [
+      r.ok, r.ok && r.contextColumns, calls.map((c) => c.table), calls[0]?.columns.includes("context"), calls[0]?.filters.some((f) => f.startsWith("context_key")), calls[0]?.columns.includes("is_revision"),
+    ], [true, false, ["course_attempts"], false, false, true]);
+    eq("…the same answer as the first read: the rows read as the asked context, the reused grant's retake counts", r.ok ? [r.result.rows.map((x) => x.context_key), r.result.scoring.officialAttempt?.id, r.result.status, r.grants.length] : null,
+      [[P, P, P], A(2), "passed", 1]);
+    const { client: cOld, calls: oldCalls } = stub((c, nth) => (c.table === "course_attempts" ? (nth === 1 ? MISSING("is_revision") : { data: pre, error: null }) : pre0107(c, nth)));
+    const rOld = await readContextResult(cOld, { userId: "u1", courseId: "c1", key: I, passRequired: false, now: NOW, versionIds: [V1], reuse: { contextColumns: false, grants: [] } });
+    eq("…without 0103 as well: the is_revision fallback stays live (two attempts reads, the last without the flag)",
+      [rOld.ok, oldCalls.map((c) => c.table), oldCalls.at(-1)?.columns.includes("is_revision")], [true, ["course_attempts", "course_attempts"], false]);
+    const { client: cPv, calls: pvCalls } = stub(pre0107);
+    const rPv = await readContextResult(cPv, { userId: "u1", courseId: "c1", key: `preview:${RUN}`, passRequired: false, now: NOW, versionIds: [V1], reuse: { contextColumns: false, grants: [] } });
+    eq("…a preview key reused without 0107: {ok: false, no_context_schema}, no read", [rPv.ok ? "ok" : rPv.reason, pvCalls.length], ["no_context_schema", 0]);
+  }
+  {
+    // With 0107: the context read as usual, and the grants are the reused ones.
+    const { client, calls } = stub(clean);
+    const r = await readContextResult(client, { userId: "u1", courseId: "c1", key: P, passRequired: true, now: NOW, versionIds: [V1], reuse: { contextColumns: true, grants: [] } });
+    eq("with 0107, reused: one attempts read in the context, no grants read; the reused grants (none) decide",
+      [r.ok, r.ok && r.contextColumns, calls.map((c) => c.table), calls[0]?.filters.includes(`context_key=${P}`), r.ok && r.result.retakeIds.size, r.ok && r.grants.length],
+      [true, true, ["course_attempts"], true, 0, 0]);
+  }
+
   await individualFilterCases();
 
   console.log(`\n${pass} passed, ${fail} failed`);

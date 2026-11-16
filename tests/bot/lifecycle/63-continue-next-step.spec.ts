@@ -29,7 +29,10 @@
  *   (f)  the SCORM runtime: Continue waits on step 3 and turns ready after the
  *        parent's own passed commit through window.API (the commit gets 60 s;
  *        the bar's one status check follows its answer within 3 s, none
- *        before), then the end banner and the celebration;
+ *        before), then the end banner and the celebration, which since ADR
+ *        0024 P2-7 come from the stored path completion only (P2-Q1): until
+ *        phase 3 calls the completion writer in the request, the case calls
+ *        it as the service role, as the nightly sweep would;
  *   (g)  a revision visit: Continue is ready (href to the continue address)
  *        and moves on at once; the badge and Continue show together;
  *   (h)  refusals: from not a step, lp not a uuid, another organisation's path;
@@ -40,6 +43,26 @@
  *   (j)  widths and a 120-character title: Exit, Revision Mode and Continue
  *        visible and never overlapping at 320, 390, 640, 768 and 1280 px; the
  *        bar about 41 px high below sm and 49 px from sm;
+ *   (l)  D14 (ADR 0024 P2-7, step 27): learner F passes the pass-required
+ *        step 2, a grant in the path's context opens a retake there, and F
+ *        fails it: Continue goes on to step 3's launch (never ?failed=1), the
+ *        path page labels step 2 "Passed Earlier", and the strict lock admits
+ *        step 3;
+ *   (m)  build note O1-k's case (a) (P2-7): on a second path, learner E
+ *        completes step 1 without a pass while none is required; the step's
+ *        rule is then made pass-required (0107's rule-change trigger records
+ *        E's fact); a grant in that path's context opens a retake and E fails
+ *        it: Continue goes on to step 2's launch, and the path page labels
+ *        step 1 "Completed Under the Earlier Rule";
+ *   (n)  the owner's P2-Q1 answer and O5-d (P2-7), for B (who completed the
+ *        path) and C (in progress on step 3): with step 3's course inactive
+ *        the path page leaves the step out (2 of 2; B still finished, C not),
+ *        Continue from step 2 goes to the plain path page and from step 3
+ *        likewise, the status route answers { stored: false } for C's step 3
+ *        attempt, and the dashboard names no card for it; with the path
+ *        inactive the path page and Continue go to the dashboard and the
+ *        status route answers { stored: false }; both are made active again
+ *        whatever happens;
  *   (b2) a result stored during the wait: the address reads it (each read
  *        fresh, not Next's memoized first answer) and moves on to step 2
  *        before the bound (last in the file).
@@ -59,12 +82,14 @@
  * By hand on staging (npm run test:lifecycle), after both staging deployments
  * carry the branch, never while another lifecycle run is in progress. In the
  * nightly subset since its first green staging run, 2026-11-11 (ADR 0019
- * decision 7). Data stays in the lifecycle-* namespace.
+ * decision 7). Data stays in the lifecycle-* namespace. Cases (f), (l), (m)
+ * and (n) need 0107 on the target database (the path completion, the step
+ * facts, the rule-change trigger and grants in a path's context).
  */
-import { test, expect, type APIRequestContext, type BrowserContext, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Browser, type BrowserContext, type Page } from "@playwright/test";
 import { randomUUID } from "node:crypto";
 import { addMember, createAuthUser, createOrg, rand, svc } from "./data";
-import { assignCourse, authedContext, courseHandle } from "./helpers";
+import { assignCourse, authedContext, courseHandle, grantDecidedAfter } from "./helpers";
 import { authTokenFor, cmi5Zip, scormZip, uploadNew, VERB, XAPI_HEADERS } from "./p0-helpers";
 
 type User = { id: string; email: string; password: string };
@@ -97,6 +122,52 @@ const BANNERS = ["continue-saving-banner", "continue-failed-banner", "continue-e
 const WAITING_MESSAGE = "Finish this module to continue";
 /** The bar's status route for one attempt (ADR 0019, note of 2026-11-11). */
 const statusUrl = (attemptId: string) => `/api/attempts/${attemptId}/result-stored`;
+/**
+ * The words beside a done step that does not stand on its latest result (the
+ * owner's O4 answer; lib/paths/progress.ts PATH_STEP_LABEL_TEXT, the one
+ * place the app writes them).
+ */
+const PASSED_EARLIER = "Passed Earlier";
+const UNDER_EARLIER_RULE = "Completed Under the Earlier Rule";
+
+/** The path completion writer of ADR 0024 step 12, completion branch only (as the sweep calls it), until phase 3 calls it in the request. */
+async function recordCompletion(attemptId: string) {
+  const { error } = await svc().rpc("record_learning_activity", { p_attempt_id: attemptId, p_activity: false });
+  expect(error, `record_learning_activity: ${error?.code} ${error?.message}`).toBeNull();
+}
+
+/**
+ * An approved, unused grant of one retake in a path's context (spec 68's pathGrant); its id.
+ * A retake over a result that stands (a pass) needs the admin's post-pass confirmation,
+ * or consume_grant answers 'stands' and the launch opens a revision visit (0107, step 7).
+ */
+async function pathGrant(o: { orgId: string; courseId: string; userId: string; pathId: string; decidedBy: string; decidedAt: string; overrideConfirmed?: boolean }): Promise<string> {
+  const { data, error } = await svc()
+    .from("attempt_requests")
+    .insert({
+      organization_id: o.orgId,
+      course_id: o.courseId,
+      user_id: o.userId,
+      status: "approved",
+      source: "bulk",
+      decided_by: o.decidedBy,
+      decided_at: o.decidedAt,
+      context_kind: "path",
+      learning_path_id: o.pathId,
+      override_confirmed: o.overrideConfirmed ?? false,
+    })
+    .select("id")
+    .single();
+  expect(error, `path grant: ${error?.message}`).toBeNull();
+  return (data as { id: string }).id;
+}
+
+/** The attempt a grant's consume opened (spec 61's check): a retake, never a revision visit. */
+async function usedAttemptOf(grantId: string): Promise<string | null> {
+  const { data, error } = await svc().from("attempt_requests").select("used_attempt_id").eq("id", grantId).single();
+  expect(error, `grant read: ${error?.message}`).toBeNull();
+  return (data as { used_attempt_id: string | null }).used_attempt_id;
+}
 
 /** spec 61's statement(), copied (spec 61 stays unchanged). */
 function statement(learner: User, verb: string, registration: string, extra: Record<string, unknown> = {}) {
@@ -171,6 +242,7 @@ const overlap = (a: Box, b: Box) => a.x < b.x + b.width && b.x < a.x + a.width &
 test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path", () => {
   const s: {
     org?: { id: string; slug: string };
+    adminId?: string;
     adminCtx?: BrowserContext;
     previewer?: User;
     previewCtx?: BrowserContext;
@@ -229,6 +301,7 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     s.org = org;
     const admin = await createAuthUser({ profile: { first_name: "Continue", last_name: "Owner", must_change_password: false } });
     await addMember({ organizationId: org.id, userId: admin.id, role: "super_owner" });
+    s.adminId = admin.id;
     s.adminCtx = await authedContext(browser, baseURL!, admin.email, admin.password);
     const areq = s.adminCtx.request;
 
@@ -518,6 +591,18 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
     const r = await noFollow(breq, continueUrl(s.c3!));
     expectPrompt(r);
     expect(redirectedExactly(r, pathUrl("?end=1")), describe(r)).toBe(true);
+    // The end banner and the celebration come from the stored completion
+    // only (ADR 0024 P2-Q1): before it is written the page shows neither.
+    const before = await getOk(s.bCtx!, pathUrl("?end=1"));
+    const { data: done0 } = await svc().from("learning_path_completions").select("id").eq("path_id", s.pathId!).eq("user_id", s.b!.id);
+    if ((done0 ?? []).length === 0) {
+      expect(before, "no completion row yet: no end banner").not.toContain('data-testid="continue-end-banner"');
+      expect(before, "no completion row yet: no celebration").not.toContain("You finished this path");
+    }
+    // Until phase 3 the routes do not call the writer, so the path
+    // completion is written by the nightly sweep; the case calls the writer
+    // as the service role, as the sweep would.
+    await recordCompletion(b3After.id);
     const path = await getOk(s.bCtx!, pathUrl("?end=1"));
     expect(path).toContain('data-testid="continue-end-banner"');
     expect(path).toContain("You finished this path");
@@ -627,6 +712,152 @@ test.describe.serial("ADR 0019 — Continue to the next step of a Learning Path"
       }
     }
     await page.close();
+  });
+
+  /** A learner of one case's own, on the given path, signed in. */
+  async function caseLearner(browser: Browser, baseURL: string, who: string, pathId: string) {
+    const u = await createAuthUser({ profile: { first_name: "Continue", last_name: who, must_change_password: false } });
+    await addMember({ organizationId: s.org!.id, userId: u.id, role: "member" });
+    const { error } = await svc().from("learning_path_assignments").insert({ organization_id: s.org!.id, path_id: pathId, assignee_type: "user", user_id: u.id });
+    expect(error, `path assignment ${who}: ${error?.message}`).toBeNull();
+    return { user: u as User, ctx: await authedContext(browser, baseURL, u.email, u.password) };
+  }
+
+  test("(l) D14: a pass, then a failed granted retake in the path's context: Continue goes on, Passed Earlier, step 3 unlocked", async ({ browser, baseURL }) => {
+    const f = await caseLearner(browser, baseURL!, "F", s.pathId!);
+    try {
+      const freq = f.ctx.request;
+      await getOk(f.ctx, launchUrl(s.c1!));
+      await finish(freq, f.user, (await attemptsOn(f.user.id, s.v1!))[0].id, "passed", 0.9);
+      await getOk(f.ctx, launchUrl(s.c2!));
+      const [first] = await attemptsOn(f.user.id, s.v2!);
+      await finish(freq, f.user, first.id, "passed", 0.9);
+      const g = await pathGrant({ orgId: s.org!.id, courseId: s.c2!, userId: f.user.id, pathId: s.pathId!, decidedBy: s.adminId!, decidedAt: await grantDecidedAfter(first.id), overrideConfirmed: true });
+      // The relaunch consumes the path grant: a granted retake in the path's context.
+      await getOk(f.ctx, launchUrl(s.c2!));
+      const retake = (await attemptsOn(f.user.id, s.v2!)).find((x) => x.id !== first.id && x.status === "in_progress");
+      expect(retake, "the path grant opened a retake").toBeTruthy();
+      expect(await usedAttemptOf(g), "the open row is the grant's retake, not a revision visit").toBe(retake!.id);
+      expect(retake!.learning_path_id).toBe(s.pathId);
+      await finish(freq, f.user, retake!.id, "failed", 0.4);
+      const r = await noFollow(freq, continueUrl(s.c2!));
+      expectPrompt(r);
+      expect(redirectedExactly(r, launchUrl(s.c3!)), `D14: ${describe(r)}`).toBe(true);
+      const html = await getOk(f.ctx, pathUrl());
+      expect(html, "step 2 labelled beside its latest result").toContain(PASSED_EARLIER);
+      expect(html, "step 3 launches (not locked)").toContain(`href="${launchUrl(s.c3!)}"`);
+      await getOk(f.ctx, launchUrl(s.c3!));
+      const [f3] = await attemptsOn(f.user.id, s.v3!);
+      expect(f3?.learning_path_id, "the strict lock admitted step 3").toBe(s.pathId);
+    } finally {
+      await f.ctx.close();
+    }
+  });
+
+  test("(m) O1-k (a): a step done by its stored fact whose granted retake failed: Continue goes on, Completed Under the Earlier Rule", async ({ browser, baseURL }) => {
+    // A second strict path of its own, so the rule change touches no other case.
+    const { data: p, error: pe } = await svc()
+      .from("learning_paths")
+      .insert({ organization_id: s.org!.id, name: "Continue Path Rule", slug: `qa-cnt-r-${rand(6)}`, sequence_mode: "strict" })
+      .select("id")
+      .single();
+    expect(pe, `path seed: ${pe?.message}`).toBeNull();
+    const ruleId = (p as { id: string }).id;
+    const { error: se } = await svc().from("learning_path_courses").insert([
+      { path_id: ruleId, course_id: s.c1, step_number: 1 },
+      { path_id: ruleId, course_id: s.c2, step_number: 2 },
+    ]);
+    expect(se, `path steps: ${se?.message}`).toBeNull();
+    const e = await caseLearner(browser, baseURL!, "E", ruleId);
+    const lp = (courseId: string) => `/${slug()}/courses/${courseId}/launch?lp=${ruleId}`;
+    try {
+      const ereq = e.ctx.request;
+      await getOk(e.ctx, lp(s.c1!));
+      const [first] = (await attemptsOn(e.user.id, s.v1!)).filter((x) => x.learning_path_id === ruleId);
+      // Step 1 needs no pass: a failed result completes it.
+      await finish(ereq, e.user, first.id, "failed", 0.4);
+      // The step's own rule is tightened; 0107's rule-change trigger records E's fact first.
+      const { error: ue } = await svc().from("learning_path_courses").update({ pass_required: true }).eq("path_id", ruleId).eq("course_id", s.c1!);
+      expect(ue, `tighten: ${ue?.message}`).toBeNull();
+      const { data: facts, error: fe } = await svc().from("learning_path_step_completions").select("course_id, rule_pass_required").eq("path_id", ruleId).eq("user_id", e.user.id);
+      expect(fe, `facts: ${fe?.message}`).toBeNull();
+      expect(facts, "the rule change recorded E's fact").toEqual([{ course_id: s.c1, rule_pass_required: false }]);
+      const g = await pathGrant({ orgId: s.org!.id, courseId: s.c1!, userId: e.user.id, pathId: ruleId, decidedBy: s.adminId!, decidedAt: await grantDecidedAfter(first.id) });
+      await getOk(e.ctx, lp(s.c1!));
+      const retake = (await attemptsOn(e.user.id, s.v1!)).find((x) => x.id !== first.id && x.learning_path_id === ruleId && x.status === "in_progress");
+      expect(retake, "the path grant opened a retake").toBeTruthy();
+      expect(await usedAttemptOf(g), "the open row is the grant's retake, not a revision visit").toBe(retake!.id);
+      await finish(ereq, e.user, retake!.id, "failed", 0.4);
+      const r = await noFollow(ereq, continueUrl(s.c1!, ruleId));
+      expectPrompt(r);
+      expect(redirectedExactly(r, lp(s.c2!)), `O1-k (a): ${describe(r)}`).toBe(true);
+      const html = await getOk(e.ctx, `/${slug()}/paths/${ruleId}`);
+      expect(html, "step 1 labelled: done by its fact, never passed").toContain(UNDER_EARLIER_RULE);
+      expect(html, "step 2 launches").toContain(`href="${lp(s.c2!)}"`);
+    } finally {
+      await e.ctx.close();
+    }
+  });
+
+  test("(n) P2-Q1 and O5-d: step 3's course and then the path inactive, for B (completed) and C (in progress on step 3)", async () => {
+    const [cStep3] = await attemptsOn(s.c!.id, s.v3!);
+    expect(cStep3?.status, "C's step 3 is in progress (case (k))").toBe("in_progress");
+    const [cStep2] = (await attemptsOn(s.c!.id, s.v2!)).filter((x) => x.success_status === "passed");
+    // B's stored, passed step-3 attempt (case (f)): the status route answers it stored while the course
+    // is active, so the {stored: false} below can come only from the inactive-course check.
+    const [bStep3] = (await attemptsOn(s.b!.id, s.v3!)).filter((x) => x.success_status === "passed" && x.learning_path_id === s.pathId);
+    expect(bStep3, "B's passed step-3 attempt in the path (case (f))").toBeTruthy();
+    expect(await (await s.bCtx!.request.get(statusUrl(bStep3.id))).json(), "the control: B's step 3 is stored while its course is active").toEqual({ stored: true });
+    const STEP3 = "QA Continue Step Three";
+    let restoreErrors: Array<string | null> = [];
+    try {
+      const { error: ce } = await svc().from("courses").update({ is_active: false }).eq("id", s.c3!);
+      expect(ce, `deactivate the course: ${ce?.message}`).toBeNull();
+      // React separates an interpolated number from the text after it with an empty comment.
+      const page = async (ctx: BrowserContext) => (await getOk(ctx, pathUrl())).replace(/<!-- -->/g, "");
+      const bHtml = await page(s.bCtx!);
+      expect(bHtml, "B: the step is left out").not.toContain(STEP3);
+      expect(bHtml, "B: no link to it").not.toContain(`/courses/${s.c3}`);
+      expect(bHtml, "B: a completed path stays completed").toContain("You finished this path");
+      const cHtml = await page(s.cCtx!);
+      expect(cHtml, "C: the step is left out").not.toContain(STEP3);
+      expect(cHtml, "C: 2 of 2 shown, nothing to press").toContain("100% completed");
+      expect(cHtml, "C: not completed").not.toContain("You finished this path");
+      expect(cHtml, "C: no launch link to the hidden step").not.toContain(`/courses/${s.c3}`);
+      const fromTwo = await noFollow(s.cCtx!.request, continueUrl(s.c2!));
+      expect(redirectedExactly(fromTwo, pathUrl()), `C from step 2, the next step hidden: ${describe(fromTwo)}`).toBe(true);
+      const fromThree = await noFollow(s.cCtx!.request, continueUrl(s.c3!));
+      expect(redirectedExactly(fromThree, pathUrl()), `C from the hidden step: ${describe(fromThree)}`).toBe(true);
+      const st = await s.cCtx!.request.get(statusUrl(cStep3.id));
+      expect(st.status(), await st.text()).toBe(200);
+      expect(await st.json(), "the status route never turns Continue on toward an inactive course").toEqual({ stored: false });
+      const bSt = await s.bCtx!.request.get(statusUrl(bStep3.id));
+      expect(bSt.status(), await bSt.text()).toBe(200);
+      expect(await bSt.json(), "B's stored step 3, its course inactive: { stored: false } (the inactive-course check)").toEqual({ stored: false });
+      expect(await getOk(s.cCtx!, `/${slug()}/dashboard`), "C's dashboard names no card for the inactive course").not.toContain(STEP3);
+
+      const { error: pe } = await svc().from("learning_paths").update({ is_active: false }).eq("id", s.pathId!);
+      expect(pe, `deactivate the path: ${pe?.message}`).toBeNull();
+      for (const [who, ctx] of [["B", s.bCtx!], ["C", s.cCtx!]] as const) {
+        const off = await noFollow(ctx.request, pathUrl());
+        expect(redirectedExactly(off, `/${slug()}/dashboard`), `${who}'s path page, the path inactive: ${describe(off)}`).toBe(true);
+        const cont = await noFollow(ctx.request, continueUrl(s.c1!));
+        expect(redirectedExactly(cont, `/${slug()}/dashboard`), `${who}'s Continue, the path inactive: ${describe(cont)}`).toBe(true);
+      }
+      const st2 = await s.cCtx!.request.get(statusUrl(cStep2.id));
+      expect(await st2.json(), "the status route, the path inactive").toEqual({ stored: false });
+    } finally {
+      const { error: pr } = await svc().from("learning_paths").update({ is_active: true }).eq("id", s.pathId!);
+      const { error: cr } = await svc().from("courses").update({ is_active: true }).eq("id", s.c3!);
+      restoreErrors = [pr?.message ?? null, cr?.message ?? null];
+    }
+    // Checked after the block, so a failure inside it is never masked.
+    expect(restoreErrors, "the path and the course reactivated").toEqual([null, null]);
+    // Active again: the step is back in its place with its saved state.
+    const again = await getOk(s.bCtx!, pathUrl());
+    expect(again, "B: the step is back").toContain(STEP3);
+    expect(await (await s.cCtx!.request.get(statusUrl(cStep2.id))).json(), "the status route answers again").toEqual({ stored: true });
+    expect(await (await s.bCtx!.request.get(statusUrl(bStep3.id))).json(), "…and for B's step 3, its course active again").toEqual({ stored: true });
   });
 
   test("(b2) a result stored during the wait: Continue moves on to step 2 before the bound", async ({ browser, baseURL }) => {

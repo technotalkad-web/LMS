@@ -10,7 +10,9 @@
  * evaluate() runs twice in one render after consume_grant): the course's
  * versions (skipped when the caller passes them), the learner's rows of the
  * context on those versions, and the learner's approved grants on the course,
- * every context.
+ * every context. A caller that reads the same (learner, course, key) again in
+ * one request passes the earlier answer's schema decision and grants
+ * (`reuse`), and that read is the attempts read only.
  *
  * Deploy-safe in both orders (`docs/ARCHITECTURE.md` principle 6; step 49,
  * "the readers tolerate the absent columns and apply the context filter when
@@ -42,6 +44,7 @@
  */
 import {
   isMissingColumn,
+  isMissingRelation,
   isSchemaMissing,
   readWithOptionalFilter,
   type OptionalFilterState,
@@ -167,6 +170,13 @@ export type ContextRead =
       result: ContextResult<ReadContextAttempt, ReadContextGrant>;
       /** false: a database without 0107, read as one undivided context (the header). */
       contextColumns: boolean;
+      /**
+       * The approved grants of the (learner, course) the result was scored
+       * with, every context, as read: a caller that judges the same rows by
+       * another rule (Continue's path step through pathStepStatus; ADR 0024
+       * O1-k) takes them from here, never from a second read.
+       */
+      grants: ReadContextGrant[];
     }
   | { ok: false; reason: ContextReadFailure; code: string | null };
 
@@ -196,6 +206,15 @@ export async function readContextResult(
     now?: string;
     /** The course's version ids when the caller holds them already (one read fewer). */
     versionIds?: string[];
+    /**
+     * An earlier ok answer's schema decision and grants, for a caller that
+     * reads the same (learner, course, key) again in one request (Continue's
+     * wait; the P2-7 review, F5). The read then makes the attempts read only:
+     * with `contextColumns: false` it reads today's select at once, with no
+     * failed read first, and the grants are these, not read again. The 0103
+     * fallback (no is_revision) stays live.
+     */
+    reuse?: { contextColumns: boolean; grants: ReadContextGrant[] };
   }
 ): Promise<ContextRead> {
   // A key that is not in the generated column's form (an upper-case id, a
@@ -219,7 +238,8 @@ export async function readContextResult(
     }
 
     let attempts: ContextAttempt[] = [];
-    let contextColumns = true;
+    let contextColumns = opts.reuse?.contextColumns ?? true;
+    if (!contextColumns && kind === "preview") return fail("no_context_schema");
     // Whether the attempts read decided the schema; with no version it never
     // runs, and the grants read decides it instead.
     let attemptsRead = false;
@@ -231,12 +251,17 @@ export async function readContextResult(
         if (keyFilter) q = q.eq("context_key", opts.key);
         return q.abortSignal(signal());
       };
-      let res = await read(`${CONTEXT_ATTEMPT_COLUMNS}, is_revision, ${CONTEXT_SELECT}`, true);
+      let res = contextColumns
+        ? await read(`${CONTEXT_ATTEMPT_COLUMNS}, is_revision, ${CONTEXT_SELECT}`, true)
+        : await read(`${CONTEXT_ATTEMPT_COLUMNS}, is_revision`, false);
+      // A database without 0103 when an earlier answer already decided "no
+      // 0107" (reuse): no revision flag (it reads as false).
+      if (!contextColumns && res.error && isMissingColumn(res.error, "is_revision")) res = await read(CONTEXT_ATTEMPT_COLUMNS, false);
       // A database without 0107: a 42703 naming a context column, or naming
       // is_revision, which comes first in the select list and which every
       // database with 0107 has (0107 requires 0103). Today's select, no
       // context filter.
-      if (res.error && (isMissingContextColumn(res.error) || isMissingColumn(res.error, "is_revision"))) {
+      else if (res.error && (isMissingContextColumn(res.error) || isMissingColumn(res.error, "is_revision"))) {
         if (kind === "preview") return fail("no_context_schema", res.error);
         contextColumns = false;
         res = await read(`${CONTEXT_ATTEMPT_COLUMNS}, is_revision`, false);
@@ -261,9 +286,10 @@ export async function readContextResult(
         .eq("status", "approved")
         .abortSignal(signal());
     let grants: ContextGrant[] = [];
-    if (contextColumns) {
+    if (opts.reuse) grants = opts.reuse.grants;
+    else if (contextColumns) {
       const g = await readGrants(`${GRANT_COLUMNS}, context_key`);
-      const missing = g.error && (isMissingColumn(g.error, "context_key") || g.error.code === "42P01" || g.error.code === "PGRST205");
+      const missing = g.error && (isMissingColumn(g.error, "context_key") || isMissingRelation(g.error, "attempt_requests"));
       if (missing && !attemptsRead) {
         // No attempts read decided the schema, and the grants have no
         // context_key (or no table, before 0083): a database without 0107.
@@ -275,7 +301,7 @@ export async function readContextResult(
         grants = g.data.map((r) => toGrant(r));
       }
     }
-    if (!contextColumns) {
+    if (!opts.reuse && !contextColumns) {
       const g = await readGrants(GRANT_COLUMNS);
       // A database without attempt_requests (before 0083) has no grants, as
       // grantSnapshotFor reads it.
@@ -292,7 +318,7 @@ export async function readContextResult(
       passRequired: opts.passRequired,
       now,
     });
-    return { ok: true, result, contextColumns };
+    return { ok: true, result, contextColumns, grants };
   } catch (e) {
     // A thrown read (a network failure) or a row the rule refuses.
     return fail(e instanceof ContextKeyError ? "rule" : "attempts_read");

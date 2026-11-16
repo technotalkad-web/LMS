@@ -62,7 +62,13 @@
  *       decisions (the request, the approval, the bulk and ticket grants,
  *       the forced restart's 23505 path) and the language switch's
  *       in-progress read: none was ever exempt; each is listed here with
- *       its filter, and phase 4 (step 37) and P2-9 replace them.
+ *       its filter, and phase 4 (step 37) and P2-9 replace them. P2-7
+ *       replaced the two it named: Continue's wait and the status route read
+ *       the learner's rows in the attempt's own context through
+ *       readContextResult (lib/scoring/context-read.ts), so a Preview is
+ *       another context's row there; the scan pins that neither file reads
+ *       course_attempts directly any more, but the status route's own row by
+ *       its id.
  *
  * Phase P adds its Preview Reports scans here (no file outside lib/preview/,
  * the launch page, the two preview routes and Preview Reports reads
@@ -567,8 +573,6 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
 {
   /** Each read P2-5 filters outside the launch page, by its scanner key; each must read `preview`. */
   const FIVE_B: Array<[string, string]> = [
-    ["app/[org]/(learner)/continue/page.tsx :: ContinuePage :: preview", "item 5b: Continue's wait read (P2-7 replaces it)"],
-    ["app/api/attempts/[attemptId]/result-stored/route.ts :: GET :: preview", "item 5b: the status route's list read (P2-7 replaces it)"],
     ["lib/scoring/attempt-kind.ts :: listFor :: preview", "item 5b: the list classifyAttempt scores (phase 3's writer replaces it)"],
     ["app/api/scorm/[attemptId]/commit/route.ts :: POST :: preview", "item 5b: the commit route's path-completion read (phase 3's writer replaces it)"],
     ["app/[org]/(learner)/courses/[courseId]/page.tsx :: CourseDetailPage :: preview", "item 4: the course page's own record ('Request another attempt' follows the attempt's context)"],
@@ -597,7 +601,6 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
   // the re-read checks the selected ids). A new unfiltered read in these
   // files fails here until it is decided.
   eq("…and the files' unfiltered reads are exactly the known single-row or selection reads", found.filter((k) => k.endsWith(":: none")).sort(), [
-    "app/api/attempts/[attemptId]/result-stored/route.ts :: GET :: none",
     "app/api/courses/[courseId]/packages/[packageId]/versions/[versionId]/restart/route.ts :: select :: none",
     "app/api/scorm/[attemptId]/commit/route.ts :: POST :: none",
     "app/api/scorm/[attemptId]/commit/route.ts :: POST :: none",
@@ -606,6 +609,22 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
     "lib/scoring/attempt-kind.ts :: officialFailedAttemptId :: none",
     "lib/scoring/attempt-kind.ts :: readAttempt :: none",
   ]);
+  // P2-7 (step 27): Continue's wait and the status route read the learner's
+  // rows through readContextResult in the attempt's own context, so neither
+  // file has a list read of its own any more; the status route keeps its
+  // own row's read by id (one row, its context's key, never a list).
+  const CONTINUE = "app/[org]/(learner)/continue/page.tsx";
+  const STATUS = "app/api/attempts/[attemptId]/result-stored/route.ts";
+  eq("P2-7: the continue page reads no course_attempts directly, and the status route only its own row (by id, unfiltered)",
+    [reads.filter((s) => s.file === CONTINUE).map(key), reads.filter((s) => s.file === STATUS).map(key)],
+    [[], [`${STATUS} :: GET :: none`]]);
+  eq("…both read the rows through readContextResult, in the attempt's context", [
+    /readContextResult\(supabase, \{ userId: user\.id, courseId: fromCourseId, key, passRequired, versionIds, reuse \}\)/.test(read(CONTINUE)),
+    /readContextResult\(supabase, \{ userId: user\.id, courseId, key, passRequired, versionIds \}\)/.test(read(STATUS)),
+  ], [true, true]);
+  eq("…and the status route's own read is the attempt by its id and the learner",
+    /\.from\("course_attempts"\)\s*\.select\(columns\)\s*\.eq\("id", attemptId\)\s*\.eq\("user_id", user\.id\)\s*\.maybeSingle\(\)/.test(read(STATUS)), true);
+
   // The grant sites decide once per request (or per forced-restart run): a
   // fresh state inside the handler, never a module-level one ((d) holds that
   // for every file); the forced restart hands the run's state to each 23505
