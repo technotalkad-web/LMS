@@ -1,9 +1,8 @@
 import { resolveEmails } from "@/lib/users/emails";
 import { NextResponse } from "next/server";
 import { randomBytes } from "node:crypto";
-import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { auditLog } from "@/lib/auth/require-platform-owner";
+import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
 
@@ -18,32 +17,6 @@ function generateTempPassword(): string {
 
 const ADMIN_ROLES = new Set(["super_owner", "admin", "data_analyst"]);
 
-async function assertPlatformOwner(): Promise<
-  { ok: true; userId: string } | { ok: false; res: NextResponse }
-> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return { ok: false, res: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
-  }
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-  const { data: row } = await svc
-    .from("platform_owners")
-    .select("user_id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!row) {
-    return { ok: false, res: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
-  }
-  return { ok: true, userId: user.id };
-}
-
 function svc() {
   return createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -56,8 +29,8 @@ export async function GET(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { id: tenantId } = await params;
   const s = svc();
 
@@ -85,8 +58,8 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { id: tenantId } = await params;
 
   const body = (await request.json().catch(() => ({}))) as {
@@ -203,8 +176,8 @@ export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { id: tenantId } = await params;
   const body = (await request.json().catch(() => ({}))) as {
     user_id?: string;
@@ -236,8 +209,8 @@ export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { id: tenantId } = await params;
   const url = new URL(request.url);
   const userId = url.searchParams.get("user_id");

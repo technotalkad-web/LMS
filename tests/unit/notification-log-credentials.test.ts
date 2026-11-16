@@ -109,7 +109,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (uid) return json(members.has(uid) ? [{ user_id: uid }] : []);
     return json([]);
   }
-  if (p === "/rest/v1/platform_owners") return json([{ user_id: ME.id }]);
+  // A platform owner whose row does not require the second factor (as the e2e
+  // fixtures seed one), so the platform route guard admits this session.
+  if (p === "/rest/v1/platform_owners") return json([{ user_id: ME.id, mfa_required: false }]);
   if (p.startsWith("/rest/v1/rpc/")) return json(null);
   if (method === "GET" || method === "HEAD") return json([]);
   return json([], 201);

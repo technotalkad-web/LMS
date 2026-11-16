@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   startImpersonation,
   endImpersonation,
   getImpersonation,
 } from "@/lib/auth/impersonation";
-import { auditLog } from "@/lib/auth/require-platform-owner";
+import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 
 /**
  *   POST   /api/super/impersonate
@@ -18,37 +17,17 @@ import { auditLog } from "@/lib/auth/require-platform-owner";
  *
  *   GET    /api/super/impersonate
  *     returns the active session (or null) so the banner can render.
+ *
+ * Starting an impersonation requires what the platform pages require
+ * (requirePlatformOwnerApi("full"), the second factor included). Ending one
+ * requires only a signed-in platform owner (level "end"): the exit is never
+ * refused for the second factor. The status read has no guard: it answers
+ * only the signed-in caller's own session, or null, and writes nothing.
  */
 
-async function assertPlatformOwner(): Promise<
-  { ok: true; userId: string } | { ok: false; res: NextResponse }
-> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return { ok: false, res: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
-  }
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-  const { data: row } = await svc
-    .from("platform_owners")
-    .select("user_id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!row) {
-    return { ok: false, res: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
-  }
-  return { ok: true, userId: user.id };
-}
-
 export async function POST(request: Request) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
 
   const body = (await request.json().catch(() => ({}))) as {
     org_id?: string;
@@ -104,8 +83,8 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE() {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("end");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
 
   const active = await getImpersonation();
   await endImpersonation();
