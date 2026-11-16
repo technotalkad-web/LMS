@@ -11,6 +11,21 @@ export const MAX_VERIFY_ATTEMPTS = 5;
 export const MAX_REQUESTS_PER_HOUR = 5;
 export const RESET_TOKEN_TTL_MINUTES = 15;
 
+/**
+ * The one failure answer of the verify step (status 400): the same for a
+ * missing, expired, used or wrong code and for too many attempts. It names
+ * no count and nothing about the account.
+ */
+export const VERIFY_FAILED_MESSAGE =
+  "That code is incorrect or has expired. Request a new one.";
+
+/**
+ * The one failure answer of the reset step before the password is set
+ * (status 400): the same for a missing, expired or wrong reset session.
+ */
+export const RESET_SESSION_INVALID_MESSAGE =
+  "This reset session is no longer valid. Request a new code.";
+
 /** Generate a uniformly random 6-digit code, zero-padded. */
 export function generateOtpCode(): string {
   const n = randomInt(0, 1_000_000); // 0 … 999999 inclusive of 0, exclusive of 1e6
