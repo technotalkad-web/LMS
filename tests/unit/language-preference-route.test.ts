@@ -14,13 +14,17 @@
  *       requires_confirm), does not hold the switch (no requires_finish, even
  *       with a stored passed statement) and is never abandoned, alone or
  *       beside a real open attempt, which keeps today's confirm and abandon;
- *   (b) on a database without 0107 (the stub answers the filter with the
- *       missing-column error naming context_kind): one failed read, then
- *       today's read once without it, and today's answers;
+ *   (b) on a database without 0107 (the stub answers the key filter with
+ *       the missing-column error naming context_key): since P2-9 the switch
+ *       answers 503 after the one failed read and writes nothing (ADR 0024
+ *       A19: no fallback to the course-wide read for a write; before P2-9 it
+ *       read today's select once more and went on);
  *   (c) any other error on the filtered read answers 503 and writes nothing;
  *   (d) a body that names the preview context (`context: { kind: "preview"
- *       }`, the field ADR 0024 step 27 plans) answers 400 before any read or
- *       write.
+ *       }`, ADR 0024 step 27's field) answers 400 before any read or write.
+ *
+ * The cases of P2-9 itself (a path's and a journey day's context, the
+ * entitlement, the audit row) are tests/unit/language-switch-context.test.ts.
  *
  * No database, no network.
  *
@@ -46,7 +50,7 @@ const V_EN = "v-en";
 const V_HI = "v-hi";
 const ME = { id: "u-staff", aud: "authenticated", role: "authenticated", email: "staff@example.test" };
 const SESSION = JSON.stringify({ access_token: "stub-token", refresh_token: "r", token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: ME });
-const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
+const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_key does not exist" };
 const TIMEOUT = { code: "57014", message: "canceling statement due to statement timeout" };
 
 // The route's only cookie-bound import. Everything below it is the real code.
@@ -86,8 +90,8 @@ const matches = (r: Row, q: URLSearchParams) =>
     return true;
   });
 const PACKAGES: Row[] = [
-  { id: PKG_EN, course_id: COURSE, language: "en", is_active: "true" },
-  { id: PKG_HI, course_id: COURSE, language: "hi", is_active: "true" },
+  { id: PKG_EN, course_id: COURSE, language: "en", is_active: true },
+  { id: PKG_HI, course_id: COURSE, language: "hi", is_active: true },
 ];
 const VERSIONS: Row[] = [
   { id: V_EN, course_id: COURSE, package_id: PKG_EN, manifest_type: "cmi5" },
@@ -111,7 +115,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/course_packages") return list(PACKAGES.filter((r) => matches(r, url.searchParams)));
   if (p === "/rest/v1/course_versions") return json(VERSIONS.filter((r) => matches(r, url.searchParams)));
   if (p === "/rest/v1/course_attempts") {
-    if (url.searchParams.has("context_kind")) {
+    if (url.searchParams.has("context_key") || url.searchParams.has("context_kind")) {
       if (no0107) return json(NO_CONTEXT, 400);
       if (filteredError && method === "GET") return json(filteredError, 500);
     }
@@ -135,10 +139,10 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
 };
 
 /* ---------------- rows ---------------- */
-/** An open row of the caller on `version`, its context (undefined: a database without 0107). */
+/** An open row of the caller on `version`, its context (undefined: a database without 0107) and its generated key. */
 const openRow = (id: string, version: string, kind?: string): Row => ({
   id, user_id: ME.id, course_version_id: version, status: "in_progress", is_revision: false,
-  ...(kind === undefined ? {} : { context_kind: kind }),
+  ...(kind === undefined ? {} : { context_kind: kind, context_key: kind }),
 });
 const statusOf = (id: string) => attempts.find((a) => a.id === id)?.status;
 const attemptReqs = () => requests.filter((r) => r.path === "/rest/v1/course_attempts");
@@ -193,7 +197,7 @@ async function main() {
         [r.status, r.body.ok, r.body.requires_finish, r.body.requires_confirm, upserts().length], [200, true, undefined, undefined, 1]);
       eq(`…the Preview is not abandoned (restart ${restart}), no abandon sent, no statements read`,
         [statusOf("pv"), r.body.abandoned, abandons().length, requests.filter((q) => q.path === "/rest/v1/xapi_statements").length], ["in_progress", 0, 0, 0]);
-      eq(`…the in-progress read names context_kind=neq.preview (restart ${restart})`, reads().map((q) => q.query.get("context_kind")), ["neq.preview"]);
+      eq(`…the in-progress read names the Individual key, context_key=eq.individual (restart ${restart})`, reads().map((q) => q.query.get("context_key")), ["eq.individual"]);
     }
     {
       const r = await pick({ rows: [PV] });
@@ -206,8 +210,8 @@ async function main() {
       eq("…nothing written", writes().length, 0);
       const c = await pick({ rows: [PV, REAL], assessed: ["pv"], restart: true });
       eq("…confirmed: the real attempt is abandoned, the Preview is left open", [c.status, c.body.abandoned, statusOf("real"), statusOf("pv")], [200, 1, "abandoned", "in_progress"]);
-      eq("…the abandon names the real id and drops Previews (context_kind=neq.preview)",
-        abandons().map((q) => [q.query.get("id"), q.query.get("context_kind")]), [["in.(real)", "neq.preview"]]);
+      eq("…the abandon names the real id and the Individual key (context_key=eq.individual)",
+        abandons().map((q) => [q.query.get("id"), q.query.get("context_key")]), [["in.(real)", "eq.individual"]]);
     }
     {
       const r = await pick({ rows: [PV, { ...REAL }], assessed: ["real"] });
@@ -215,16 +219,13 @@ async function main() {
     }
 
     /* ---------------- (b) ---------------- */
-    console.log("\n(b) a database without 0107");
-    const bare = (r: Row) => { const { context_kind: _k, ...rest } = r; void _k; return rest; };
-    {
-      const r = await pick({ rows: [bare(PV)], assessed: ["pv"], no0107: true });
-      eq("the filter's 42703, then today's read once without it", reads().map((q) => q.query.get("context_kind")), ["neq.preview", null]);
-      eq("…today's answer: the row (no context column) holds the switch, nothing written", [r.status, r.body.requires_finish, writes().length], [409, true, 0]);
-      const c = await pick({ rows: [bare(PV)], no0107: true });
-      eq("…without a stored outcome, today's confirm", [c.status, c.body.requires_confirm, c.body.in_progress_attempts], [409, true, 1]);
-      const a = await pick({ rows: [bare(PV)], no0107: true, restart: true });
-      eq("…confirmed: today's abandon, with no context_kind filter", [a.status, a.body.abandoned, statusOf("pv"), abandons().map((q) => q.query.has("context_kind"))], [200, 1, "abandoned", [false]]);
+    console.log("\n(b) a database without 0107 (ADR 0024 A19)");
+    const bare = (r: Row) => { const { context_kind: _k, context_key: _c, ...rest } = r; void _k; void _c; return rest; };
+    for (const restart of [false, true]) {
+      const r = await pick({ rows: [bare(REAL)], no0107: true, restart });
+      eq(`the key filter's 42703 answers 503 at once, no second read without it (restart ${restart})`,
+        [r.status, reads().map((q) => q.query.get("context_key"))], [503, ["eq.individual"]]);
+      eq(`…nothing written: no preference, no abandon, the row still open (restart ${restart})`, [writes().length, statusOf("real")], [0, "in_progress"]);
     }
 
     /* ---------------- (c) ---------------- */
@@ -241,7 +242,7 @@ async function main() {
       const r = await pick({ rows: [PV, REAL], restart: true, context: { kind: "preview" } });
       eq("400, before any request (no session read, no attempts read, nothing written)", [r.status, requests.length, statusOf("real"), statusOf("pv")], [400, 0, "in_progress", "in_progress"]);
       const i = await pick({ rows: [REAL], context: { kind: "individual" } });
-      eq("any other context is read as today (P2-9 validates it)", [i.status, i.body.requires_confirm], [409, true]);
+      eq("{kind: individual} reads the Individual context, as an absent context does", [i.status, i.body.requires_confirm], [409, true]);
     }
 
     eq("no request left the stub", unmatched, []);

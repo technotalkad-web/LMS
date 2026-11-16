@@ -4,9 +4,15 @@
  * Seeds a course with two language packages (English + Hindi) and an in-progress
  * English attempt, then drives the learner UI:
  *   - the "Change language" menu offers Hindi
- *   - picking it shows the exact spec confirmation popup
+ *   - picking it shows the confirmation popup, whose words say what happens
+ *     (ADR 0024 P2-9, step 27 (d): only this product's open attempt is reset;
+ *     attempts in a path or a journey and completed results are not changed)
  *   - "OK, Switch Language" resets the English attempt (abandoned) and saves the
  *     Hindi preference; "Cancel" makes no change.
+ *   - an explicit ?lang= with progress open in the other language goes to the
+ *     launch page's own picker (?switch=<lang>), no longer the course page
+ *   - ADR 0024 P2-9: a switch inside a path, on the launch's own picker,
+ *     closes the path's open attempt only and writes one audit row.
  */
 import { test, expect } from "@playwright/test";
 import fs from "node:fs";
@@ -15,6 +21,7 @@ import {
   addMember,
   createAuthUser,
   createOrg,
+  rand,
   svc,
 } from "./data";
 import { authedContext, uploadCourse, assignCourse, GUARDIAN_ROUTE_TIMEOUT_MS } from "./helpers";
@@ -108,7 +115,7 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
     expect(attErr, attErr ? JSON.stringify(attErr) : "").toBeNull();
   });
 
-  test("switch to Hindi shows the exact spec confirmation popup", async ({ browser, baseURL }) => {
+  test("switch to Hindi shows the confirmation popup with what it does", async ({ browser, baseURL }) => {
     const ctx = await authedContext(browser, baseURL!, s.learner!.email, s.learner!.password);
     const page = await ctx.newPage();
     await page.goto(`/${s.org!.slug}/courses/${s.courseId}`);
@@ -117,15 +124,15 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
     await page.getByRole("button", { name: /English/ }).first().click();
     await page.getByRole("menuitem", { name: /Hindi/ }).first().click();
 
-    // Exact spec copy.
+    // The copy (ADR 0024 P2-9, step 27 (d)): the course page is the
+    // Individual course, so only its open attempt is reset.
     await expect(
       page.getByRole("heading", { name: "Change Course Language?" })
     ).toBeVisible({ timeout: 10_000 });
-    await expect(
-      page.getByText(
-        "Changing the language will reset your current progress and start the course from the beginning in the new language."
-      )
-    ).toBeVisible();
+    await expect(page.getByTestId("language-switch-copy")).toHaveText(
+      "Your attempt in progress on this course will be reset, and the course starts again from the beginning in Hindi. " +
+        "Attempts you have open in a learning path or a journey keep their language and progress, and completed results are not changed."
+    );
     await expect(page.getByRole("button", { name: "OK, Switch Language" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
 
@@ -238,20 +245,22 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
   }) => {
     const ctx = await authedContext(browser, baseURL!, s.learner!.email, s.learner!.password);
     // ADR 0004 step 9 (1): with the Hindi attempt in progress, an explicit
-    // ?lang=en no longer launches straight away: it goes back to the course
-    // page with the language-switch confirm, and nothing is abandoned.
+    // ?lang=en no longer launches straight away: it goes to the launch
+    // page's own picker with the language-switch confirm (ADR 0024 P2-9:
+    // ?switch=en, the launch's context kept, ?lang= dropped), and nothing is
+    // abandoned.
     const first = await ctx.request.get(`/${s.org!.slug}/courses/${s.courseId}/launch?lang=en`, { maxRedirects: 0 });
     const location = first.headers()["location"] ?? "";
     const body = first.status() === 200 ? await first.text() : "";
     expect(
-      location.includes(`/courses/${s.courseId}?switch=en`) || body.includes(`/courses/${s.courseId}?switch=en`),
-      `?lang=en with Hindi in progress → the switch confirm (status ${first.status()}, location "${location}")`
+      location.includes(`/courses/${s.courseId}/launch?switch=en`) || body.includes(`/courses/${s.courseId}/launch?switch=en`),
+      `?lang=en with Hindi in progress → the launch's picker with the switch confirm (status ${first.status()}, location "${location}")`
     ).toBeTruthy();
     expect(body).not.toContain(`/content/v/${s.enVersionId}/`);
     expect(await statuses(s.learner!.id, s.hiVersionId!)).toEqual(["in_progress"]);
     // The learner confirms the switch (the dialog's PUT): Hindi resets.
     const confirm = await ctx.request.put(`/api/courses/${s.courseId}/language-preference`, {
-      data: { orgSlug: s.org!.slug, language: "en", restart_if_in_progress: true },
+      data: { orgSlug: s.org!.slug, language: "en", restart_if_in_progress: true, context: { kind: "individual" } },
     });
     expect(confirm.status(), await confirm.text()).toBe(200);
     expect(await statuses(s.learner!.id, s.hiVersionId!)).toEqual(["abandoned"]);
@@ -372,6 +381,107 @@ test.describe.serial("Multi-language — switch confirmation + reset", () => {
     const { data: r2 } = await svc().from("course_attempts").select("status").eq("id", s.retakeId!).single();
     expect((r2 as { status: string }).status).toBe("in_progress");
     await ctx.close();
+  });
+
+  // ---- ADR 0024 P2-9 (step 27, decisions A24 and A37): the switch inside one context.
+  // A learner of their own (the readers above assume one row per learner
+  // and version): the course on its own and as the only step of a path.
+
+  test("a switch inside a path closes the path's open attempt only, on the launch's own picker, with an audit row", async ({ browser, baseURL }) => {
+    const learner3 = await createAuthUser({
+      profile: { first_name: "Lang", last_name: "Pathway", must_change_password: false },
+    });
+    await addMember({ organizationId: s.org!.id, userId: learner3.id, role: "member" });
+    const adminCtx = await authedContext(browser, baseURL!, s.admin!.email, s.admin!.password);
+    await assignCourse(adminCtx.request, s.org!.slug, s.courseId!, learner3.id);
+    await adminCtx.close();
+    const { data: path, error: pathErr } = await svc()
+      .from("learning_paths")
+      .insert({ organization_id: s.org!.id, name: "Lang Path", slug: `qa-lang-${rand(6)}`, sequence_mode: "random", visibility: "private", is_active: true })
+      .select("id")
+      .single();
+    expect(pathErr, pathErr?.message).toBeNull();
+    const pathId = (path as { id: string }).id;
+    const { error: stepErr } = await svc().from("learning_path_courses").insert({ path_id: pathId, course_id: s.courseId!, step_number: 1 });
+    expect(stepErr, stepErr?.message).toBeNull();
+    const { error: paErr } = await svc()
+      .from("learning_path_assignments")
+      .insert({ organization_id: s.org!.id, path_id: pathId, assignee_type: "user", user_id: learner3.id });
+    expect(paErr, paErr?.message).toBeNull();
+
+    // English on its own, then English in the path: two open rows, one per context.
+    const ctx = await authedContext(browser, baseURL!, learner3.email, learner3.password);
+    const base = `/${s.org!.slug}/courses/${s.courseId}`;
+    for (const q of ["?lang=en", `?lp=${pathId}&lang=en`]) {
+      const res = await ctx.request.get(`${base}/launch${q}`);
+      expect(res.ok(), `launch ${q} → ${res.status()}`).toBeTruthy();
+      expect(await res.text()).toContain(`/courses/${s.courseId}/content/v/${s.enVersionId}/index.html`);
+    }
+    const rowsOf = async () =>
+      ((await svc()
+        .from("course_attempts")
+        .select("id, course_version_id, status, context_kind, learning_path_id")
+        .eq("user_id", learner3.id)
+        .order("started_at", { ascending: true })).data ?? []) as Array<{ id: string; course_version_id: string; status: string; context_kind: string; learning_path_id: string | null }>;
+    const two = await rowsOf();
+    expect(two.map((r) => [r.context_kind, r.course_version_id, r.status])).toEqual([
+      ["individual", s.enVersionId, "in_progress"],
+      ["path", s.enVersionId, "in_progress"],
+    ]);
+    const [own, inPath] = two;
+
+    // Rule (1) inside the path: the launch's own picker, the path kept, ?switch=hi, nothing written.
+    const first = await ctx.request.get(`${base}/launch?lp=${pathId}&lang=hi`, { maxRedirects: 0 });
+    const where = `${first.headers()["location"] ?? ""} ${first.status() === 200 ? await first.text() : ""}`
+      .split(String.fromCharCode(92) + "u0026").join("&")
+      .replace(/&amp;/g, "&");
+    expect(where, `?lang=hi in the path → the launch's picker in the path (status ${first.status()})`).toContain(`/courses/${s.courseId}/launch?lp=${pathId}&switch=hi`);
+    expect((await rowsOf()).map((r) => r.status)).toEqual(["in_progress", "in_progress"]);
+
+    // The confirm on that picker, in the path's words; OK sends the path's context.
+    const page = await ctx.newPage();
+    // The module is not needed: the picker is the page, and the launch it
+    // goes on to is checked by its row only.
+    await page.route(/\/content\//, (r) => r.abort());
+    await page.goto(`${base}/launch?lp=${pathId}&switch=hi`);
+    await expect(page.getByRole("heading", { name: "Change Course Language?" })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("language-switch-copy")).toContainText("on this step of the path will be reset");
+    const switched = page.waitForResponse((r) => r.url().includes("/language-preference") && r.request().method() === "PUT");
+    await page.getByRole("button", { name: "OK, Switch Language" }).click();
+    const res = await switched;
+    expect(res.request().postDataJSON()).toMatchObject({ language: "hi", restart_if_in_progress: true, context: { kind: "path", path_id: pathId } });
+    // The status only: the picker navigates at once, so the body may be gone;
+    // the rows and the audit row below carry what it closed.
+    const status = res.status();
+    expect(status, `the switch: ${status === 200 ? "" : await res.text().catch(() => "")}`).toBe(200);
+    await page.waitForURL((u) => u.searchParams.get("lang") === "hi" && !u.searchParams.has("switch"), { timeout: 60_000 });
+    await page.close();
+    await ctx.close();
+
+    // Only the path's English attempt is closed (the row stays); the course's own is untouched.
+    const after = await rowsOf();
+    expect(after.find((r) => r.id === inPath.id)?.status, "the path's English attempt is abandoned, not deleted").toBe("abandoned");
+    expect(after.find((r) => r.id === own.id)?.status, "the course's own English attempt stays open").toBe("in_progress");
+    const { data: pref } = await svc()
+      .from("course_language_preferences")
+      .select("language")
+      .eq("user_id", learner3.id)
+      .eq("course_id", s.courseId!)
+      .maybeSingle();
+    expect(pref?.language).toBe("hi");
+
+    // ADR 0024 decision A37: the audit row names what the switch closed, ids only.
+    const { data: audit, error: auditErr } = await svc()
+      .from("platform_audit_log")
+      .select("actor_user_id, target_type, target_id, metadata")
+      .eq("action", "course.language_switched")
+      .eq("actor_user_id", learner3.id);
+    expect(auditErr, auditErr?.message).toBeNull();
+    expect(audit ?? []).toHaveLength(1);
+    const row = (audit ?? [])[0] as { target_type: string; target_id: string; metadata: Record<string, unknown> };
+    expect([row.target_type, row.target_id]).toEqual(["course", s.courseId]);
+    expect(row.metadata).toMatchObject({ context: { kind: "path", pathId }, attemptIds: [inPath.id], fromLanguages: ["en"], toLanguage: "hi" });
+    expect(JSON.stringify(row)).not.toContain(learner3.email);
   });
 });
 

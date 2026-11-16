@@ -80,6 +80,8 @@ type Attempt = {
   progress_pct?: number | null;
   /** 0103 (ADR 0014): a revision visit's row; undefined before the migration (= false). */
   is_revision?: boolean | null;
+  /** 0107 (ADR 0024): the row's product context; undefined on a database without it. */
+  context_kind?: string | null;
 };
 
 export default async function CourseDetailPage({
@@ -88,7 +90,7 @@ export default async function CourseDetailPage({
 }: {
   params: Promise<{ org: string; courseId: string }>;
   /**
-   * ?switch=<lang>: the launch page sent the learner here to confirm a language switch (ADR 0004 step 9).
+   * ?switch=<lang>: opens the menu's confirm for that language (before ADR 0024 P2-9 the launch page sent rule (1) here; it now goes to the launch's own picker).
    * ?retry=1: the launch page refused this launch (ADR 0014 step 3: fail closed); the learner may retry.
    */
   searchParams: Promise<{ switch?: string; retry?: string }>;
@@ -731,7 +733,10 @@ export default async function CourseDetailPage({
             {canRequestAttempt && (
               <RequestAttemptButton orgSlug={orgSlug} courseId={c.id} standingResult={standingResult} />
             )}
-            {/* Phase 3: Change language — auto-hides if <2 active packages */}
+            {/* Phase 3: Change language — auto-hides if <2 active packages.
+                ADR 0024 P2-9: it switches the Individual course, so its
+                inProgress is the Individual rows only (a null or absent
+                context_kind is a database without 0107: today's reading). */}
             <ChangeLanguageMenu
               orgSlug={orgSlug}
               courseId={c.id}
@@ -740,6 +745,7 @@ export default async function CourseDetailPage({
               initialSwitch={switchParam ?? null}
               inProgress={attempts
                 .filter((a) => a.status === "in_progress" && !isRevisionAttempt(a))
+                .filter((a) => (a.context_kind ?? "individual") === "individual")
                 .map((a) => ({
                   language: packageLanguageOf.get(
                     versionById.get(a.course_version_id)?.package_id ?? ""

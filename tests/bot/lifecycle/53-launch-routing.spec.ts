@@ -4,8 +4,9 @@
  * on one slot (ADR 0014 step 3, I-5):
  *
  *   (0) own-slot resume wins
- *   (1) explicit ?lang= with progress on another active slot → the course
- *       page's language-switch confirm, nothing abandoned
+ *   (1) explicit ?lang= with progress on another active slot → the launch
+ *       page's own language picker with the switch confirm (ADR 0024 P2-9:
+ *       ?switch=<lang>, in the launch's context), nothing abandoned
  *   (2) saved preference with progress on another active slot → that
  *       attempt's version is launched (grandfather across slots)
  *   (3) progress on a DEACTIVATED slot → the course page offers Launch, not
@@ -110,22 +111,34 @@ test.describe.serial("ADR 0004 step 9 — launch routing across language slots",
     await ctx.close();
   });
 
-  test("(1) ?lang=hi while English is in progress → the switch confirm on the course page, nothing abandoned", async ({ browser, baseURL }) => {
+  test("(1) ?lang=hi while English is in progress → the switch confirm on the launch page's own picker, nothing abandoned", async ({ browser, baseURL }) => {
     const ctx = await learnerCtx(browser, baseURL!, "own");
     const base = `/${s.org!.slug}/courses/${s.cmi5!.courseId}`;
     const r = await getNoFollow(ctx.request, `${base}/launch?lang=hi`);
-    expect(r.redirectedTo(`/courses/${s.cmi5!.courseId}?switch=hi`), `redirect to the confirm (status ${r.status})`).toBe(true);
+    // ADR 0024 P2-9 (step 27 (b)): the launch's own picker, in the launch's
+    // context (here the Individual course, so no ?lp= or ?journey=), with
+    // ?switch=hi and without ?lang=; no longer the course page.
+    expect(r.redirectedTo(`/courses/${s.cmi5!.courseId}/launch?switch=hi`), `redirect to the launch's picker (status ${r.status})`).toBe(true);
+    expect(r.redirectedTo(`/courses/${s.cmi5!.courseId}?switch=hi`), "not the course page").toBe(false);
     expect(r.body).not.toContain(`/content/v/${s.cmi5!.hiVersion}/`);
     expect(await attemptStatuses(s.learners.own.id, s.cmi5!.enVersion)).toEqual(["in_progress"]);
     expect(await attemptStatuses(s.learners.own.id, s.cmi5!.hiVersion)).toEqual([]);
 
-    // The course page opens the existing confirmation for Hindi; Cancel changes nothing.
+    // The launch page's picker opens the confirmation for Hindi at once; Cancel changes nothing.
     const page = await ctx.newPage();
-    await page.goto(`${base}?switch=hi`);
+    await page.route(/\/content\//, (route) => route.abort());
+    const sent: string[] = [];
+    page.on("request", (q) => sent.push(q.method()));
+    await page.goto(`${base}/launch?switch=hi`);
+    await expect(page.getByRole("heading", { name: "Choose your language" })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole("heading", { name: "Change Course Language?" })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("language-switch-copy")).toContainText("on this course will be reset");
     await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByRole("heading", { name: "Change Course Language?" })).toHaveCount(0);
     await page.close();
+    expect(sent.filter((m) => m === "PUT").length, "Cancel sends no switch").toBe(0);
     expect(await attemptStatuses(s.learners.own.id, s.cmi5!.enVersion)).toEqual(["in_progress"]);
+    expect(await attemptStatuses(s.learners.own.id, s.cmi5!.hiVersion)).toEqual([]);
     await ctx.close();
   });
 

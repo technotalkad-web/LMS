@@ -1,7 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { languageDisplay } from "@/lib/i18n/languages";
+import {
+  switchConfirmText,
+  type InProgressAttemptLang,
+  type SwitchContextBody,
+} from "@/lib/courses/slot-routing";
 
 export type LaunchPickerPackage = {
   id: string;
@@ -12,14 +17,19 @@ export type LaunchPickerPackage = {
 /**
  * Full-screen language picker shown to learners when a course has more
  * than one active language package AND the learner has no saved
- * preference yet.
+ * preference yet, and (ADR 0024 P2-9) on a Start with ?switch=: rule (1)'s
+ * redirect, which opens the confirm for that language at once, and "Change
+ * language" on a path step or a journey day, which shows the picker alone.
  *
  * On pick:
- *   1. PUT /api/courses/{courseId}/language-preference
+ *   1. PUT /api/courses/{courseId}/language-preference, naming the launch's
+ *      own context (ADR 0024 step 27: the switch closes that product's open
+ *      attempt only)
  *   2. If 409 with requires_confirm: show the progress-reset warning
  *      with a "Switch and reset progress" button.
  *   3. On success: full-page nav to ?lang={code} so the SCORM/cmi5
- *      runtime re-mounts with the chosen package.
+ *      runtime re-mounts with the chosen package (?switch= is dropped, or
+ *      the page would render this picker again).
  *
  * A Preview by mode (ADR 0024 step 23, P2-5) skips 1 and 2: it saves no
  * language preference and resets nothing (the switch route resets the
@@ -34,6 +44,9 @@ export function LaunchLanguagePicker({
   courseTitle,
   packages,
   preview = false,
+  context = null,
+  inProgress = [],
+  initialSwitch = null,
 }: {
   orgSlug: string;
   courseId: string;
@@ -41,15 +54,32 @@ export function LaunchLanguagePicker({
   packages: LaunchPickerPackage[];
   /** A Preview by mode: pick the language for this launch only. */
   preview?: boolean;
+  /** ADR 0024 P2-9: the launch's own context, sent with every switch (null on a preview). */
+  context?: SwitchContextBody | null;
+  /** That context's open attempts by language (the confirm's words). */
+  inProgress?: InProgressAttemptLang[];
+  /** ?switch=<language>: open the confirm for it at once (rule (1)'s redirect). */
+  initialSwitch?: string | null;
 }) {
   const [picking, setPicking] = useState<string | null>(null);
   const [confirmFor, setConfirmFor] = useState<{
     language: string;
     label: string;
-    in_progress_attempts: number;
-    message: string;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const product = context?.kind ?? "individual";
+  const labelOf = (language: string | null) =>
+    packages.find((p) => p.language === language)?.display_label ?? languageDisplay(language, "english") ?? language ?? "";
+
+  // Open the confirm once for rule (1)'s redirect (?switch=<lang>).
+  const initialSwitchDone = useRef(false);
+  useEffect(() => {
+    if (initialSwitchDone.current || !initialSwitch || preview) return;
+    initialSwitchDone.current = true;
+    const target = packages.find((p) => p.language === initialSwitch);
+    if (!target) return;
+    setConfirmFor({ language: initialSwitch, label: target.display_label });
+  }, [initialSwitch, packages, preview]);
 
   async function pick(language: string, restart = false) {
     setError(null);
@@ -69,6 +99,7 @@ export function LaunchLanguagePicker({
           orgSlug,
           language,
           restart_if_in_progress: restart,
+          ...(context ? { context } : {}),
         }),
       }
     );
@@ -86,10 +117,6 @@ export function LaunchLanguagePicker({
           label:
             packages.find((p) => p.language === language)?.display_label ??
             language,
-          in_progress_attempts: j.in_progress_attempts ?? 0,
-          message:
-            j.message ??
-            "Switching languages will reset your progress. Continue?",
         });
         setPicking(null);
         return;
@@ -112,8 +139,10 @@ export function LaunchLanguagePicker({
     // Full-page nav so the server re-evaluates with the new saved pref.
     // Keep the launch context (?journey=&day=, ?lp=, ?back=) — replacing
     // the whole query string here used to untag journey/path launches and
-    // send the exit button to the wrong place.
+    // send the exit button to the wrong place. Drop ?switch= (ADR 0024
+    // P2-9): the page renders this picker for it, so keeping it would loop.
     const next = new URL(window.location.href);
+    next.searchParams.delete("switch");
     next.searchParams.set("lang", language);
     window.location.href = next.toString();
   }
@@ -157,7 +186,11 @@ export function LaunchLanguagePicker({
         </div>
 
         <p className="text-xs text-muted text-center mt-6">
-          You can change your language later from the course detail page.
+          {product === "path"
+            ? "You can change your language later from this step on the path page."
+            : product === "journey"
+              ? "You can change your language later from today's mission on your journey page."
+              : "You can change your language later from the course detail page."}
         </p>
       </div>
 
@@ -169,9 +202,14 @@ export function LaunchLanguagePicker({
         >
           <div className="bg-paper border border-line rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4">
             <h3 className="serif text-2xl">Change Course Language?</h3>
-            <p className="text-sm text-ink leading-relaxed">
-              Changing the language will reset your current progress and start the
-              course from the beginning in the new language.
+            <p className="text-sm text-ink leading-relaxed" data-testid="language-switch-copy">
+              {switchConfirmText({
+                product,
+                target: confirmFor.language,
+                targetLabel: confirmFor.label,
+                inProgress,
+                labelOf,
+              })}
             </p>
             <div className="flex justify-end gap-2 pt-2">
               <button

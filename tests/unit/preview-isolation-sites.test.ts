@@ -68,7 +68,11 @@
  *       readContextResult (lib/scoring/context-read.ts), so a Preview is
  *       another context's row there; the scan pins that neither file reads
  *       course_attempts directly any more, but the status route's own row by
- *       its id.
+ *       its id. P2-9 replaced the language switch's: the route reads and
+ *       abandons the open rows of one context by its key (`context_key`,
+ *       never a preview's: the body's preview context is refused before any
+ *       read), with no fallback on a database without 0107 (A19); the scan
+ *       pins its one read and its abandon to that key.
  *
  * Phase P adds its Preview Reports scans here (no file outside lib/preview/,
  * the launch page, the two preview routes and Preview Reports reads
@@ -584,7 +588,6 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
     ["app/api/attempt-requests/bulk/route.ts :: POST :: preview", "the bulk grant: who failed, one decision for every page (phase 4, step 37)"],
     ["lib/attempts/grant.ts :: grantExtraAttempts :: preview", "the ticket grant: who failed, one decision for every page (phase 4, step 37)"],
     ["lib/attempts/force-restart.ts :: read :: preview", "the forced restart's 23505 path: whether the result stands, one decision per run (phase 4, step 37)"],
-    ["app/api/courses/[courseId]/language-preference/route.ts :: readInProgress :: preview", "the language switch: a Start's count, cmi5 hold and abandon leave previews out (P2-9 reads it per context)"],
   ];
   const files = new Set(FIVE_B.map(([k]) => k.split(" :: ")[0]));
   const found = reads.filter((s) => files.has(s.file)).map(key);
@@ -633,9 +636,27 @@ console.log("\n(g) P2-5 items 4 and 5b: the reads that must not count a preview 
   eq("the forced restart: one state per re-issue run, handed to every 23505 read",
     /const previews: ContextFilterState = \{ applies: null \};[\s\S]*?approvePendingRequest\(svc, args, link, note, expiresAt, previews\)/.test(fr) &&
       /expiresAt: string \| null,\s*previews: ContextFilterState\s*\)/.test(fr), true);
-  const lang = read("app/api/courses/[courseId]/language-preference/route.ts");
-  eq("the language switch: the abandon takes the read's decision of the filter (a write, so not a scanner site)",
-    /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)[\s\S]*?,\s*apply\s*\)\.select\("id"\)/.test(lang), true);
+
+  // P2-9 (step 27): the language switch reads and abandons the open rows of
+  // one context, by its key, with no fallback (A19). Its key is never a
+  // preview's: the body's preview context is refused before any read, and
+  // contextKeyOf gives `individual`, `path:<id>` or `journey:<id>:<id>` for
+  // the three forms parseSwitchContext admits. So the scanner's one read in
+  // the file is unfiltered by context_kind (`:: none`), and these checks pin
+  // it, and the abandon, to the key.
+  const LANG = "app/api/courses/[courseId]/language-preference/route.ts";
+  const lang = read(LANG);
+  eq("P2-9: the language switch has one course_attempts read, in the handler", reads.filter((s) => s.file === LANG).map(key), [`${LANG} :: PUT :: none`]);
+  eq("…it reads the context's open rows by the context's key, revision rows left out",
+    /\.from\("course_attempts"\)\s*\.select\("id, course_version_id"\)\s*\.eq\("user_id", user\.id\)\s*\.in\("course_version_id", otherLangVerIds\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("context_key", contextKey\)\s*\.eq\("is_revision", false\);/.test(lang), true);
+  eq("…the abandon names the same key",
+    /\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)\s*\.in\("id", resettableIds\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("context_key", contextKey\)/.test(lang), true);
+  eq("…the key is the parsed context's (contextKeyOf), and a preview context answers 400 before the session read",
+    /const contextKey = contextKeyOf\(context\);/.test(lang) &&
+      lang.indexOf('parsed.reason === "preview"') > 0 &&
+      lang.indexOf('parsed.reason === "preview"') < lang.indexOf("supabase.auth.getUser()"), true);
+  eq("…and no fallback to a read without the context (no readWithContextFilter, no withoutPreviews in the file)",
+    [/readWithContextFilter|withoutPreviews/.test(lang)], [false]);
 }
 
 // ---------------------------------------------------------------------------

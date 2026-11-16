@@ -15,16 +15,18 @@
  *      server client (`@/lib/supabase/server`), which has no unit rig, so
  *      its wiring is checked on the text (the route-test departure of ADR
  *      0014 step 17, as for the launch page and the SCORM commit route):
- *      the narrower select on a missing column, the 503s, the order of the
- *      check, the full verb IRIs, the 409 body.
+ *      the in-context select, the 503s, the order of the check, the full verb
+ *      IRIs, the 409 body.
  *   3. The launch picker, by source (no React rig): the !restart 409 branch
  *      reads the body once and shows `message`, never "HTTP 409".
  *
  * ADR 0024 P2-5: the route itself now also runs under a stubbed fetch in
  * tests/unit/language-preference-route.test.ts (an open Preview on the other
  * language is never counted, never holds the switch and is never abandoned;
- * the database without 0107; the preview context refused). The source
- * checks below name the filter.
+ * the database without 0107; the preview context refused). ADR 0024 P2-9:
+ * the read and the abandon are one context's, by its key, with no fallback
+ * on a database without 0107 (A19); tests/unit/language-switch-context.test.ts
+ * runs the route in each context. The source checks below name the key.
  *
  * Run:  npx tsx tests/unit/language-preference.test.ts   (or npm run test:unit)
  */
@@ -34,6 +36,7 @@ import {
   finishCheckAttemptIds,
   languageSwitchDecision,
   REQUIRES_FINISH_MESSAGE,
+  RESTART_NOT_ADMITTED_MESSAGE,
   resettableSwitchRows,
   type SwitchRow,
 } from "../../lib/courses/slot-routing";
@@ -52,10 +55,10 @@ const row = (id: string, version: string, extra: Partial<SwitchRow> = {}): Switc
 const none = new Set<string>();
 
 /** The route's flow, on its pure parts: which ids the statements read checks, then the decision. */
-function decide(rows: SwitchRow[], retakeIds: Set<string>, storedOutcomeIds: Set<string>, restart: boolean) {
+function decide(rows: SwitchRow[], retakeIds: Set<string>, storedOutcomeIds: Set<string>, restart: boolean, restartAdmitted = true) {
   const checked = finishCheckAttemptIds(resettableSwitchRows(rows, retakeIds), types);
   const assessed = new Set(checked.filter((id) => storedOutcomeIds.has(id)));
-  return { checked, decision: languageSwitchDecision({ rows, retakeIds, assessedAttemptIds: assessed, restartIfInProgress: restart }) };
+  return { checked, decision: languageSwitchDecision({ rows, retakeIds, assessedAttemptIds: assessed, restartIfInProgress: restart, restartAdmitted }) };
 }
 
 console.log("\nstep 3: a revision visit's row is neither counted nor abandoned");
@@ -98,15 +101,34 @@ console.log("\nstep 18: requires_finish for an official cmi5 attempt that has ta
   eq("no in-progress row → proceed, nothing reset", decide([], none, none, false).decision, { kind: "proceed", resettableIds: [], keptRetakes: 0 });
 }
 
+console.log("\nADR 0024 P2-9 (review F1): a close the context could not start again after");
+{
+  const ip = [row("d1", "scorm-v")];
+  for (const restart of [false, true]) {
+    eq(`a resettable row where no fresh official attempt is admitted after the close, restart_if_in_progress ${restart} → requires_finish with its own message, nothing to abandon`,
+      decide(ip, none, none, restart, false).decision, { kind: "requires_finish", message: RESTART_NOT_ADMITTED_MESSAGE });
+  }
+  eq("the message tells the learner to continue in the attempt's language and promises no restart", RESTART_NOT_ADMITTED_MESSAGE,
+    "Your attempt in progress on this day of your journey cannot start again in another language, because the day would not open a new attempt. Continue it in its language.");
+  eq("an assessed attempt keeps step 18's message (checked first)", decide([row("a1", "cmi5-v")], none, new Set(["a1"]), true, false).decision,
+    { kind: "requires_finish", message: REQUIRES_FINISH_MESSAGE });
+  eq("nothing to close (no row, a revision row, a granted retake): proceed as before, so the attempt's own language can be saved",
+    [decide([], none, none, true, false).decision, decide([row("rev", "cmi5-v", { is_revision: true })], none, none, false, false).decision,
+      decide([row("rt", "cmi5-v")], new Set(["rt"]), none, true, false).decision],
+    [{ kind: "proceed", resettableIds: [], keptRetakes: 0 }, { kind: "proceed", resettableIds: [], keptRetakes: 0 }, { kind: "proceed", resettableIds: [], keptRetakes: 1 }]);
+  eq("admitted: today's confirm, then the abandon", [decide(ip, none, none, false, true).decision, decide(ip, none, none, true, true).decision],
+    [{ kind: "requires_confirm", inProgressAttempts: 1 }, { kind: "proceed", resettableIds: ["d1"], keptRetakes: 0 }]);
+}
+
 console.log("\nthe route (source check; no unit rig for the cookie-bound client)");
 {
   const src = fs.readFileSync(path.join(root, "app/api/courses/[courseId]/language-preference/route.ts"), "utf8");
   eq("the versions select names manifest_type and is error-checked (503)",
     /\.select\("id, package_id, manifest_type"\)/.test(src) && /if \(versionsErr\) return unreadable\("versions", versionsErr\.message\);/.test(src), true);
-  eq("the in-progress select names course_version_id, filters is_revision = false",
-    /\.select\("id, course_version_id"\)[\s\S]{0,200}if \(withFlagFilter\) q = q\.eq\("is_revision", false\);/.test(src), true);
-  eq("…retries without the filter on a missing column only, then errors answer 503",
-    /let \{ data: ipRows, error: ipErr \} = await readInProgress\(true\);\s*if \(ipErr && isMissingColumn\(ipErr, "is_revision"\)\) \(\{ data: ipRows, error: ipErr \} = await readInProgress\(false\)\);\s*if \(ipErr\) return unreadable\(/.test(src), true);
+  eq("the in-progress select names course_version_id, filters the context's key and is_revision = false",
+    /\.select\("id, course_version_id"\)[\s\S]{0,200}\.eq\("context_key", contextKey\)\s*\.eq\("is_revision", false\);/.test(src), true);
+  eq("…a missing context or is_revision column answers 503 with no read without them (ADR 0024 A19), any other error 503",
+    /if \(ipErr\) \{\s*\/\/[^\n]*\n\s*if \(isMissingContextColumn\(ipErr\) \|\| isMissingColumn\(ipErr, "is_revision"\)\) return no0107\("in-progress attempts"\);\s*return unreadable\("in-progress attempts", ipErr\.message\);\s*\}/.test(src), true);
   eq("the statements read: the cmi5 resettable ids, verb passed or failed by the full IRI constants, error → 503",
     /\.from\("xapi_statements"\)\s*\.select\("attempt_id"\)\s*\.in\("attempt_id", finishCheckIds\)\s*\.in\("verb", \[VERBS\.passed, VERBS\.failed\]\);\s*if \(outcomeErr\) return unreadable\(/.test(src), true);
   eq("…VERBS.passed and VERBS.failed are the full IRIs the statements route stores",
@@ -124,11 +146,10 @@ console.log("\nthe route (source check; no unit rig for the cookie-bound client)
       at('.from("course_language_preferences").upsert('),
       at('.update({ status: "abandoned" })'),
     ].every((v, i, arr) => v > 0 && (i === 0 || v > arr[i - 1])), true);
-  eq("ADR 0024 P2-5: the in-progress read sits in the preview filter, one decision for the request",
-    /const previews: ContextFilterState = \{ applies: null \};[\s\S]*?readWithContextFilter\(previews, \(apply\) => \{\s*let q = withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.select\("id, course_version_id"\)/.test(src), true);
-  eq("…the abandon takes the same decision", /readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(\s*svc\s*\.from\("course_attempts"\)\s*\.update\(\{ status: "abandoned" \}\)/.test(src), true);
-  eq("…a body naming the preview context answers 400 before the session read",
-    src.indexOf('body.context.kind === "preview"') > 0 && src.indexOf('body.context.kind === "preview"') < src.indexOf("supabase.auth.getUser()"), true);
+  eq("ADR 0024 P2-9: the abandon names the same context key",
+    /\.update\(\{ status: "abandoned" \}\)\s*\.in\("id", resettableIds\)\s*\.eq\("user_id", user\.id\)\s*\.eq\("status", "in_progress"\)\s*\.eq\("context_key", contextKey\)/.test(src), true);
+  eq("…a body naming the preview context, or a malformed one, answers 400 before the session read",
+    src.indexOf("parseSwitchContext(body.context)") > 0 && src.indexOf("parseSwitchContext(body.context)") < src.indexOf("supabase.auth.getUser()"), true);
   eq("the decision gets restart_if_in_progress as given (both values reach the finish check)",
     /restartIfInProgress: Boolean\(body\.restart_if_in_progress\),/.test(src), true);
   eq("the requires_finish 409 body: { requires_finish, error, message }",

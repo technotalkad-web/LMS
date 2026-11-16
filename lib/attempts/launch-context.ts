@@ -83,7 +83,9 @@
  * afterSelfEnrol(), the P2-Q2 (i-a) decision after the page's self-enrolment
  * insert and its second launch_context call; and resumeAfterSlotRouting(),
  * the page's answer, decided before its close runs, for a journey `resume`
- * whose open row slot routing abandons.
+ * whose open row slot routing abandons. P2-9 adds contextEntitlement(), the
+ * resolver's entitlement rows alone, for a request that names a path or a
+ * journey context (the language switch route).
  *
  * Pure: no next/* and no Supabase runtime import (the house shape of
  * lib/attempts/launch-kind.ts); `now` is an input, so the journey's "today"
@@ -422,6 +424,110 @@ export function resolveLaunchContext(i: ResolveInput): LaunchDecision {
   if (holders.length > 1) return { kind: "redirect", to: "chooser" };
   if (course.individual.upcoming_at !== null) return { kind: "redirect", to: "upcoming" };
   return refused("not_enrolled");
+}
+
+/** A path or journey context a request names (the journey day by its id; ids lower case). */
+export type NamedContext = { kind: "path"; pathId: string } | { kind: "journey"; enrollmentId: string; dayId: string };
+
+export type ContextEntitlement =
+  | {
+      held: true;
+      /**
+       * What holds it: a path's step; a journey day's open official attempt
+       * of the course, its credit, or the pinned version's course on the day.
+       */
+      through: "path_step" | "open_attempt" | "credit" | "day_course";
+      /**
+       * Would the launch of this context open a fresh official attempt of the
+       * course once the context's open attempt of it is closed? A journey
+       * day: the resolver's own journey row, run on the same facts with no
+       * open attempt on the day, answers its open day (`launch`, admission
+       * `open`). A completed enrolment, a credited or removed day, a day
+       * whose course was swapped, and a day that is not the open day (or not
+       * open yet) answer false. A path: true (the path row has no resume of
+       * its own: a resume and a fresh Start pass the same release and order
+       * gates). A request that would close the context's open attempt acts
+       * on it: the language switch refuses when it is false (P2-9 review F1).
+       */
+      freshAfterClose: boolean;
+    }
+  | { held: false; reason: Refusal };
+
+/**
+ * The entitlement part of resolveLaunchContext() (ADR 0024 steps 27 and 37):
+ * does the learner hold this path or journey context on this course, read
+ * from one launch_context call made with that path, or with that enrolment
+ * and day id? It is rows 3 to 5 of the resolver without their gates of time
+ * and order and without self-enrolment: a request that names a context
+ * (the language switch of P2-9; requests and grants in phase 4) acts on
+ * rows the learner already has there, so a release date, the strict order or
+ * a day not yet open does not refuse it, and nothing enrols the learner.
+ *
+ *   - an active member, and the course found and active (an inactive course
+ *     is closed to every product, the owner's O5 answer), else the
+ *     resolver's refusal;
+ *   - a path: found and active, the learner enrolled (a recorded enrolment;
+ *     an "Everyone" path the learner has never started is not held), and the
+ *     course a step of it;
+ *   - a journey: the enrolment found, active or completed, its program
+ *     active, and the day resolved by its id; then held when the day's
+ *     context holds an open official attempt of this course or the day's
+ *     credit names this course (the resolver's resume and review), or, for
+ *     an active enrolment, when the pinned version puts this course on the
+ *     day and the day has neither a credit nor an open attempt of another
+ *     course (the resolver's open day without its unlock rule).
+ *
+ * A held answer also names what holds it and `freshAfterClose` (see the
+ * type). Entitlement has no gate of time or order, but a day held only
+ * through its open attempt may open no new official attempt once that
+ * attempt is closed, so `freshAfterClose` reads the resolver's gates, and
+ * `now` is read for it only.
+ *
+ * The facts must be an answer for this very context (the caller passes
+ * p_path, or p_enrollment and p_day_id, from the same ids). Pure.
+ */
+export function contextEntitlement(i: { courseId: string; context: NamedContext; facts: LaunchContextFacts; now: string }): ContextEntitlement {
+  const no = (reason: Refusal): ContextEntitlement => ({ held: false, reason });
+  const facts = i.facts;
+  if (facts.v !== 1) throw new TypeError("contextEntitlement: an unknown launch_context answer version");
+  if (!facts.member.active) return no("not_member");
+  if (!facts.course.found || !facts.course.is_active) return no("course_unavailable");
+
+  if (i.context.kind === "path") {
+    const p = facts.path;
+    if (!UUID.test(i.context.pathId) || !p || !p.found || !p.is_active) return no("path_unavailable");
+    if (!p.enrolled) return no("not_enrolled");
+    if (p.course_step === null) return no("not_a_step");
+    const step = p.steps.find((s) => s.step_number === p.course_step && sameId(s.course_id, i.courseId));
+    return step ? { held: true, through: "path_step", freshAfterClose: true } : no("not_a_step");
+  }
+
+  const ctx = i.context;
+  const j = facts.journey;
+  if (!UUID.test(ctx.enrollmentId) || !j || !j.found) return no("journey_unavailable");
+  if (j.status !== "active" && j.status !== "completed") return no("journey_unavailable");
+  if (!j.program_is_active) return no("journey_unavailable");
+  if (j.day.id === null || !UUID.test(ctx.dayId) || !sameId(j.day.id, ctx.dayId)) return no("day_not_open");
+  // The resolver's journey row on the same facts with the day's open attempt
+  // gone, as after a close: only its open day opens a fresh official
+  // attempt. No `?mode=`, so the resolver never reads the role.
+  const freshAfterClose = (): boolean => {
+    const after = resolveLaunchContext({
+      courseId: i.courseId,
+      role: "user",
+      params: { lp: null, journey: ctx.enrollmentId, day: ctx.dayId, mode: null, run: null },
+      facts: { ...facts, journey: { ...j, day_open_attempt: null } },
+      now: i.now,
+    });
+    return after.kind === "launch" && after.context.kind === "journey" && after.context.admission === "open";
+  };
+  const held = (through: "open_attempt" | "credit" | "day_course"): ContextEntitlement => ({ held: true, through, freshAfterClose: freshAfterClose() });
+  if (j.day_open_attempt && sameId(j.day_open_attempt.course_id, i.courseId)) return held("open_attempt");
+  if (j.day_credit && sameId(j.day_credit.course_id, i.courseId)) return held("credit");
+  if (j.status !== "active") return no("review_only");
+  const holdsCourse = j.day.in_version && !j.day.removed && sameId(j.day.course_id, i.courseId);
+  if (!holdsCourse || j.day_credit || j.day_open_attempt) return no("day_not_open");
+  return held("day_course");
 }
 
 /**

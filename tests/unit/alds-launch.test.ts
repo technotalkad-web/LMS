@@ -751,7 +751,28 @@ async function pageCases() {
       eq("an admin's Start with ?lang=hi beside an open preview in en: no confirm (the preview is not the Start's context), it runs hi",
         [st.redirect, previewRow(attemptReqs().find((q) => q.method === "POST")).course_version_id, attempts.find((a) => a.id === "pv-en")?.status], [null, V_HI, "in_progress"]);
       const sr = await run({ viewer: "admin", search: { lang: "hi" }, twoLanguages: true, assigned: true, attempts: [enReal] });
-      eq("…beside its own real attempt in en: today's confirm on the course page, nothing written", [sr.redirect, writes().length], [`/org/courses/${COURSE_ID}?switch=hi`, 0]);
+      eq("…beside its own real attempt in en: the confirm on the launch's own picker (P2-9), not the course page; nothing written", [sr.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?switch=hi`, 0]);
+      const back = await run({ viewer: "admin", search: { lang: "hi", back: "dashboard" }, twoLanguages: true, assigned: true, attempts: [enReal] });
+      eq("…?back=dashboard is kept, ?lang= is not", back.redirect, `/org/courses/${COURSE_ID}/launch?switch=hi&back=dashboard`);
+      // P2-9 (step 27 (b)): rule (1) inside a journey day keeps the launch's
+      // context, the day by its id even when the link named its number.
+      const dayEn = own("user", { id: "day-en", course_version_id: V_CUR, context_kind: "journey", journey_enrollment_id: ENR_ID, journey_day: 2, journey_day_id: DAY2, journey_version_id: JVER_ID });
+      for (const day of [DAY2, "2"]) {
+        const jr = await run({ viewer: "user", search: { journey: ENR_ID, day, lang: "hi" }, twoLanguages: true, attempts: [dayEn] });
+        eq(`a journey day's resume with ?lang=hi beside its open row in en (day ${day === "2" ? "by its number" : "by its id"}): the launch's own picker in the day's context, nothing written`,
+          [jr.redirect, writes().length, attempts.find((a) => a.id === "day-en")?.status], [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=${DAY2}&switch=hi`, 0, "in_progress"]);
+      }
+      // ?switch= renders the picker in the launch's context, a saved
+      // preference or ?lang= notwithstanding, and writes nothing.
+      const pk = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2, switch: "hi", lang: "en" }, twoLanguages: true, attempts: [dayEn] });
+      eq("?switch=hi on the day's launch: the picker, with the day's context, the confirm for hi and the day's open row in en; nothing written",
+        [pk.redirect, pk.error, pk.element?.props.context, pk.element?.props.initialSwitch, pk.element?.props.inProgress, pk.element?.props.preview, writes().length],
+        [null, null, { kind: "journey", journey_enrollment_id: ENR_ID, day_id: DAY2 }, "hi", [{ language: "en", grantedRetake: false }], false, 0]);
+      const ch = await run({ viewer: "admin", search: { switch: "choose" }, twoLanguages: true, assigned: true, attempts: [enReal] });
+      eq("?switch=choose on an Individual launch: the picker alone (no confirm), the Individual context",
+        [ch.redirect, ch.element?.props.context, ch.element?.props.initialSwitch], [null, { kind: "individual" }, null]);
+      const pvs = await run({ viewer: "admin", search: { mode: "preview", switch: "hi", lang: "en" }, twoLanguages: true });
+      eq("a preview never reads ?switch=: it runs the language asked for", [pvs.redirect, pvs.element?.props.initialSwitch, previewRow(attemptReqs().find((q) => q.method === "POST")).course_version_id], [null, undefined, V_CUR]);
       const pathEn = own("admin", { id: "path-en", course_version_id: V_CUR, context_kind: "path", learning_path_id: PATH_ID });
       const ip = await run({ viewer: "admin", search: { lang: "hi" }, twoLanguages: true, assigned: true, attempts: [pathEn] });
       eq("…beside an open attempt of another product (a path's) in en: no confirm, the Individual Start runs hi and the path's attempt stays open (step 27)",
@@ -1053,6 +1074,13 @@ async function pageCases() {
       eq("a day started on another course: into the same day on the started course (one launch_context call), nothing read or written on attempts",
         [swapped.redirect, lcCalls().length, attemptReqs().length, writes().length],
         [`/org/courses/${PREV_COURSE}/launch?journey=${ENR_ID}&day=${DAY2}`, 1, 0, 0]);
+      // P2-9 review F2: "Change language" on that day names the day's
+      // current course; the redirect into the started course keeps
+      // ?switch= (and drops ?lang=), so the started course's picker opens.
+      const swappedSwitch = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2, switch: "choose", lang: "en", back: "dashboard" }, journeyCredits: credited1, attempts: [startedRow] });
+      eq("…with ?switch=choose: the redirect keeps ?switch= and ?back=dashboard, drops ?lang=, and writes nothing",
+        [swappedSwitch.redirect, writes().length],
+        [`/org/courses/${PREV_COURSE}/launch?journey=${ENR_ID}&day=${DAY2}&switch=choose&back=dashboard`, 0]);
       const lockedDay = await run({ viewer: "user", search: { journey: ENR_ID, day: DAY2 } });
       eq("a later day than the open one: today's /journey?locked=<day>, nothing written", [lockedDay.redirect, writes().length], ["/org/journey?locked=2", 0]);
       const credited2 = { ...credited1, [DAY2]: { course_id: COURSE_ID, attempt_id: null, credit_kind: "legacy_cross_context", day_number: 2 } };
@@ -1135,6 +1163,9 @@ async function pageCases() {
       eq("no product parameter, not entitled, one journey day holds the course: the launch again in that day (?journey=E&day=<id>), nothing read or written on attempts",
         [viaHolder.redirect, lcCalls().length, attemptReqs().length, writes().length],
         [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=${DAY2}&back=dashboard`, 1, 0, 0]);
+      const holderSwitch = await run({ viewer: "user", search: { switch: "hi", lang: "en" }, journeyHolders: [holder] });
+      eq("…a ?switch= goes with the holder's launch (its picker then switches in that day), ?lang= does not",
+        [holderSwitch.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=${DAY2}&switch=hi`, 0]);
       const viaNumber = await run({ viewer: "user", journeyHolders: [{ ...holder, day_id: null }] });
       eq("…a holder whose day has no id goes by the day's number", [viaNumber.redirect, writes().length], [`/org/courses/${COURSE_ID}/launch?journey=${ENR_ID}&day=2`, 0]);
       const two = await run({ viewer: "user", journeyHolders: [holder, { ...holder, day_id: DAY3, day_number: 3 }] });
@@ -1941,7 +1972,11 @@ async function main() {
         [/computeJourneyState|readJourneyCredits|enforcedPathIds|pathContextId|journeyCtx|journeyNextCourseId|myGroupIdsServer|team_members/.test(src),
           // The P2-7 review's F3 embeds the ?lp= step's rule in the course read; the page reads no step table of its own.
           /\.from\("learning_path_courses"\)/.test(src)], [false, false]);
-      eq("a preview never goes to the language confirm (the switch it confirms resets real rows)", /if \(decision\.kind === "confirm-switch" && !preview\) \{/.test(src), true);
+      eq("a preview never goes to the language confirm (switchCtx is null for a preview only), and a Start's goes to its own launch's picker (P2-9)",
+        [/if \(decision\.kind === "confirm-switch" && switchCtx !== null\) \{/.test(src),
+          /const switchCtx: SwitchContext \| null =\s*ctx\.kind === "preview"\s*\?\s*null/.test(src),
+          /redirect\(\s*languageSwitchLaunchUrl\(\{ orgSlug, courseId, context: switchCtx, switchTo: langParam \?\? "", back: backParam \?\? null \}\)\s*\);/.test(src)],
+        [true, true, true]);
       // O2 (P2-6): the interim preview exclusions are replaced by the launch's
       // context filter; a preview keeps its own course-preview filter.
       eq("O2: no interim preview exclusion is left (no ContextFilterState, readWithContextFilter or withoutPreviews on the page)",

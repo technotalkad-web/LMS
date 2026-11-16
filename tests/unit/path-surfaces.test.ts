@@ -26,7 +26,13 @@
  *       database without 0107 reads the facts as none, and the completion
  *       and the terms as none (the Gate line);
  *   (e) the request counts of each page (in the page; no layout, no
- *       middleware), which do not grow with the number of steps.
+ *       middleware), which do not grow with the number of steps;
+ *   (f) ADR 0024 P2-9 (step 27 (c)): a step the learner can launch whose
+ *       course has two or more active languages offers "Change language",
+ *       the launch's own picker in the path's context (?lp= and
+ *       ?switch=choose); no other step does; one packages read, only when a
+ *       step can be launched; a failed read shows no link and nothing else
+ *       changes.
  *
  * No database, no network.
  *
@@ -88,11 +94,13 @@ type World = {
   no0107: boolean;
   /** Tables whose read answers an error. */
   failing: string[];
+  /** Active language packages per course (1 when not named). */
+  languages: Record<string, number>;
 };
 const STEPS: StepCfg[] = [{ course: C1, n: 1 }, { course: C2, n: 2 }, { course: C3, n: 3 }];
 const fresh = (): World => ({
   pathActive: true, sequence: "strict", steps: STEPS, attempts: [], grants: [], facts: [], completion: null, terms: null,
-  assignmentDue: null, no0107: false, failing: [],
+  assignmentDue: null, no0107: false, failing: [], languages: {},
 });
 let world: World = fresh();
 let requests: Req[] = [];
@@ -141,6 +149,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
         ...(stepRule ? { pass_required: s.stepRule ?? null } : {}),
       })));
     }
+    case "/rest/v1/course_packages":
+      return json(inList(q, "course_id").flatMap((id) => Array.from({ length: world.languages[id] ?? 1 }, () => ({ course_id: id }))));
     case "/rest/v1/course_versions":
       return json(world.steps.map((s) => ({ id: `v-${s.course}`, course_id: s.course, version_number: 1, manifest_type: "cmi5" })));
     case "/rest/v1/courses": {
@@ -393,15 +403,36 @@ async function main() {
     {
       const three = await openPath({ attempts: IN_PROGRESS });
       const six = await openPath({ steps: [...STEPS, { course: "55555555-5555-4555-8555-555555555555", n: 4 }, { course: "66666666-6666-4666-8666-666666666666", n: 5 }, { course: "77777777-7777-4777-8777-777777777777", n: 6 }], attempts: IN_PROGRESS });
-      eq("the path page with 0107: 14, the same for 3 and for 6 steps (13 before P2-7, measured on 8e9c966 with this stub)", [three.all, six.all], [14, 14]);
+      // P2-9 adds one read of the launchable steps' active packages ("Change language").
+      eq("the path page with 0107: 15, the same for 3 and for 6 steps (14 before P2-9, 13 before P2-7, measured on 8e9c966 with this stub)", [three.all, six.all], [15, 15]);
       const old = await openPath({ no0107: true, attempts: IN_PROGRESS });
-      eq("…without 0107: 17 (the step read, the rows read and the grants read fall back once each)", old.all, 17);
+      eq("…without 0107: 18 (the step read, the rows read and the grants read fall back once each)", old.all, 18);
+      const none = await openPath({ attempts: COMPLETED, completion: COMPLETION });
+      eq("…a path with no step to launch makes no packages read: 14", [none.all, requests.filter((r) => r.path === "/rest/v1/course_packages").length], [14, 0]);
       const dash = await openDashboard({ attempts: IN_PROGRESS });
       // P2-7 adds the facts, the completion and the terms reads (3); the grants read replaces the course
       // cards' fail-soft one and the path rows come from the attempts the page already reads (0 more).
       eq("the dashboard with one path: 26 with 0107 (23 before P2-7, measured on 8e9c966 with this stub)", dash.all, 26);
       const dashOld = await openDashboard({ no0107: true, attempts: IN_PROGRESS });
       eq("…without 0107: 28 (the step read and the grants read fall back once each)", dashOld.all, 28);
+    }
+    console.log("\n(f) P2-9: \"Change language\" on a step the learner can launch, in the path's context");
+    {
+      const LINK = `/acme/courses/${C2}/launch?lp=${PATH}&switch=choose`;
+      const two = await openPath({ attempts: IN_PROGRESS, languages: { [C1]: 2, [C2]: 2, [C3]: 2 } });
+      eq("step 2 (in progress) offers it, linked to the launch's picker in the path's context; step 1 (done) and step 3 (locked) do not",
+        [two.html.includes(LINK), (two.html.match(/data-testid="step-change-language"/g) ?? []).length, two.html.includes(`/courses/${C1}/launch?lp=${PATH}&switch=`), two.html.includes(`/courses/${C3}/launch?lp=${PATH}&switch=`)],
+        [true, 1, false, false]);
+      const pk = requests.filter((r) => r.path === "/rest/v1/course_packages");
+      eq("…one packages read, for the launchable step's course, active packages only, on the learner's session",
+        [pk.length, inList(pk[0]?.query ?? new URLSearchParams(), "course_id"), pk[0]?.query.get("is_active"), pk[0]?.apikey === SERVICE_KEY], [1, [C2], "eq.true", false]);
+      const one = await openPath({ attempts: IN_PROGRESS });
+      eq("one active language: no link", one.html.includes('data-testid="step-change-language"'), false);
+      const random = await openPath({ sequence: "random", attempts: IN_PROGRESS, languages: { [C2]: 2, [C3]: 3 } });
+      eq("random order: every step not done offers it (steps 2 and 3)", (random.html.match(/data-testid="step-change-language"/g) ?? []).length, 2);
+      const failed = await openPath({ attempts: IN_PROGRESS, languages: { [C2]: 2 }, failing: ["course_packages"] });
+      eq("a failed packages read: no link, the steps shown as before, one log line",
+        [failed.html.includes('data-testid="step-change-language"'), failed.html.includes("Bravo Module"), failed.html.includes("path-progress-unreadable"), failed.events], [false, true, false, ["path_languages_unreadable"]]);
     }
     eq("the stub answered every request the pages made", unmatched, []);
   } finally {
