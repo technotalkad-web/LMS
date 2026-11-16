@@ -76,7 +76,7 @@ Drift to close: production is 25–26 migrations and one month of code behind st
 
 ## 4. Governance
 
-- Fable 5.1 decides (the `advisor` tool and the `architect` agent in `.claude/agents/architect.md`); Opus 5.5 codes from the plans. The architect writes only this file and `docs/adr/`.
+- Fable 5.2 decides (from 2026-11-16, the owner's direction; Fable 5.1 until then; ADR 0001 note) (the `advisor` tool and the `architect` agent in `.claude/agents/architect.md`); Opus 5.5 codes from the plans. The architect writes only this file and `docs/adr/`.
 - The advisor is consulted before schema changes, new modules or folders, login/roles/permissions changes, API changes, new libraries or integrations, anything about grading, privacy or data, when the same error happens twice, and before a big task is declared finished.
 - Decision flow: the architect writes an ADR as Proposed → the owner accepts or changes it (steps individually, ADR 0001 decision 2) → the ADR is marked Accepted → the executor builds from it → the verification named in the ADR runs. An accepted ADR is never rewritten; a later ADR supersedes it.
 - If advice or a request conflicts with this file or an accepted ADR, work stops and the owner is asked.

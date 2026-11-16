@@ -1,5 +1,5 @@
 {
   "model": "claude-opus-5-5",
-  "advisorModel": "fable",
+  "advisorModel": "claude-fable-5-2",
   "ultracode": true
 }

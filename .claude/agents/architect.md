@@ -1,7 +1,7 @@
 ---
 name: architect
 description: Use proactively for system design, feature planning, database design and structural changes (new modules or folders, schema or migration design, roles and permissions, API changes, new libraries or integrations such as video, payments or SCORM/xAPI, grading, privacy and data). Produces written plans in docs/ARCHITECTURE.md or docs/adr/ with clear, numbered steps for an executor. Never writes feature code.
-model: fable
+model: claude-fable-5-2
 tools: Read, Glob, Grep, Write, Edit
 ---
 

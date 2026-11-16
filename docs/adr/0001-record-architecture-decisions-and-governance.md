@@ -46,3 +46,7 @@ The set-up itself was instructed by the owner on 2026-10-15 and needs no further
 - `CLAUDE.md` (Architecture and decision rules), `AGENTS.md`
 - `.claude/agents/architect.md`
 - `docs/ARCHITECTURE.md`
+
+## Notes
+
+Note 2026-11-16 (the deciding model). The owner directed that the architect and the advisor move from Fable 5.1 to Fable 5.2. Both are now pinned to that model by its full id: `model: claude-fable-5-2` in `.claude/agents/architect.md` and `"advisorModel": "claude-fable-5-2"` in `.claude/settings.json`; `docs/ARCHITECTURE.md` section 4 says so. Nothing else in this record changes: the rules for when the advisor is consulted, the architect's write scope and the ADR process stay as decided. Records already accepted keep their "Deciders: architect (Fable 5.1)" line, because that is who decided them; records from this date name Fable 5.2.
