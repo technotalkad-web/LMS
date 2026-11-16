@@ -78,6 +78,7 @@ export async function GET(request: Request) {
   // setSession() or renders a friendly error UI. The fragment is
   // preserved across this 302 by the browser. We forward `next` so the
   // error UI can route back to the correct tenant login.
-  console.warn("[auth/callback] no code or token_hash — handing off to /auth/finish for fragment parsing:", request.url);
+  // The path only: a sign-in link's query is never printed.
+  console.warn("[auth/callback] no code or token_hash — handing off to /auth/finish for fragment parsing:", new URL(request.url).pathname);
   return NextResponse.redirect(`${origin}/auth/finish?next=${encodeURIComponent(next)}`);
 }
