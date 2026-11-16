@@ -362,6 +362,19 @@ async function main() {
       eq("200 with ok and the email", [ok.status, ok.body.ok, ok.body.email], [200, true, KNOWN]);
       eq("…the password was set and the row spent", [!!put && (JSON.parse(put.body) as Row).password === "Another-Pass-1", typeof row.used_at], [true, "string"]);
     }
+
+    console.log("\nreset: a completed reset closes every open code of the address");
+    {
+      fresh();
+      const older = seed();
+      const other = seed({ email: UNKNOWN });
+      const row = seed({ reset_token_hash: hashResetToken(RESET_TOKEN), reset_token_expires: new Date(Date.now() + 600_000).toISOString() });
+      eq("non-vacuous: an older open code of the address before the reset", [older.used_at, row.used_at], [null, null]);
+      const ok = await reset(KNOWN, RESET_TOKEN);
+      eq("200 with ok", [ok.status, ok.body.ok], [200, true]);
+      eq("…the used code and the older open code are both closed", [typeof row.used_at, typeof older.used_at], ["string", "string"]);
+      eq("…another address's code stays open", other.used_at, null);
+    }
   } finally {
     globalThis.fetch = realFetch;
     (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = load;

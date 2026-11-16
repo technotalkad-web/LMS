@@ -126,11 +126,19 @@ export async function POST(request: Request) {
     .update({ must_change_password: false })
     .eq("id", user.id);
 
-  // Mark this row used so the token can't be replayed.
+  // Mark this row used so the token can't be replayed, and close every other
+  // code of the address that is still open: a completed reset ends them all,
+  // so no older code becomes the newest with guesses of its own.
+  const spentAt = new Date().toISOString();
   await svc
     .from("password_reset_otps")
-    .update({ used_at: new Date().toISOString() })
+    .update({ used_at: spentAt })
     .eq("id", row.id);
+  await svc
+    .from("password_reset_otps")
+    .update({ used_at: spentAt })
+    .eq("email", email)
+    .is("used_at", null);
 
   // The client signs in with the new password next: end this browser's
   // impersonation first, after the token is spent. The cookie always goes.
