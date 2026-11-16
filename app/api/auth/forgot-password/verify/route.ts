@@ -4,6 +4,7 @@ import {
   MAX_VERIFY_ATTEMPTS,
   RESET_TOKEN_TTL_MINUTES,
   VERIFY_FAILED_MESSAGE,
+  countGuess,
   hashOtp,
   hashResetToken,
   mintResetToken,
@@ -19,8 +20,12 @@ import {
  * token expires in 15 minutes — separate from the OTP expiry — so the
  * user has time to choose a password without re-entering the code.
  *
- * After MAX_VERIFY_ATTEMPTS wrong guesses on the same row, the row is
- * marked used and the user must request a fresh code.
+ * Each guess is counted before it is compared: countGuess() moves the row's
+ * attempts up by one in a single compare-and-set and hands back the code
+ * hash only to the guess that took that slot. A guess that did not take a
+ * slot is answered the failure and never compared, so overlapping guesses
+ * cannot compare more than MAX_VERIFY_ATTEMPTS times on one row. A row at
+ * the limit is marked used and the user must request a fresh code.
  *
  * Every failure gets one answer: a missing, expired, used or wrong code and
  * too many attempts all answer 400 with VERIFY_FAILED_MESSAGE. The answer
@@ -51,10 +56,11 @@ export async function POST(request: Request) {
     { auth: { persistSession: false } }
   );
 
-  // Find the most recent active code for this email.
+  // Find the most recent active code for this email. The code hash is not
+  // read here: it comes only from the counted guess below.
   const { data: rowRaw } = await svc
     .from("password_reset_otps")
-    .select("id, code_hash, expires_at, attempts, used_at")
+    .select("id, expires_at, attempts")
     .eq("email", email)
     .is("used_at", null)
     .order("created_at", { ascending: false })
@@ -63,10 +69,8 @@ export async function POST(request: Request) {
   const row = rowRaw as
     | {
         id: string;
-        code_hash: string;
         expires_at: string;
         attempts: number;
-        used_at: string | null;
       }
     | null;
 
@@ -86,14 +90,10 @@ export async function POST(request: Request) {
     return failed();
   }
 
-  const ok = safeHashEqual(row.code_hash, hashOtp(code));
-  if (!ok) {
-    await svc
-      .from("password_reset_otps")
-      .update({ attempts: row.attempts + 1 })
-      .eq("id", row.id);
-    return failed();
-  }
+  // Count the guess first. No slot, no compare.
+  const codeHash = await countGuess(svc, row);
+  if (codeHash === null) return failed();
+  if (!safeHashEqual(codeHash, hashOtp(code))) return failed();
 
   // Mint a reset token. Hash it before storing so a DB dump can't
   // be used to reset arbitrary passwords.

@@ -8,7 +8,12 @@
  *   - reset answers one failure for a missing, expired or wrong reset
  *     session, before any account is read;
  *   - the success paths are unchanged: a correct code mints a reset token,
- *     a valid reset token sets the password and spends the row.
+ *     a valid reset token sets the password and spends the row;
+ *   - every guess is counted before it is compared: the stub serialises the
+ *     compare-and-set as the database does, overlapping guesses compare
+ *     exactly MAX_VERIFY_ATTEMPTS times on one row, and a guess whose count
+ *     returns no row (or fails, or finds the row closed or expired) is never
+ *     compared, even when it carries the right code.
  *
  * No database, no network.
  *
@@ -42,6 +47,9 @@ const RESET_TOKEN = "a".repeat(64);
 
 // The routes reach the request only through next/headers (the reset's
 // session-change helper reads the cookie jar; this browser holds none).
+// The routes' copy of lib/auth/password-reset is wrapped to count how often a
+// code is hashed for a compare: hashOtp runs only on a compare in verify.
+let compares = 0;
 const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
 (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
   if (request === "next/headers") {
@@ -50,6 +58,10 @@ const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._loa
       headers: async () => new Headers({ host: "lms.test" }),
     };
   }
+  if (request === "@/lib/auth/password-reset") {
+    const real = load.call(this, request, ...rest) as typeof import("../../lib/auth/password-reset");
+    return { ...real, hashOtp: (c: string) => { compares++; return real.hashOtp(c); } };
+  }
   return load.call(this, request, ...rest);
 };
 
@@ -57,6 +69,12 @@ const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._loa
 let otps: Row[] = [];
 let requests: Req[] = [];
 let nextId = 1;
+/** Reads of the code row are answered this long after they are taken, so overlapping guesses all read before any of them counts. */
+let readDelayMs = 0;
+/** Runs on the row just before a counting PATCH (one that names attempts) is applied: another writer got there first. */
+let race: ((row: Row) => void) | null = null;
+/** How the counting PATCH answers instead of applying: an error, or a fixed list of rows. */
+let countAnswer: "error" | Row[] | null = null;
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
@@ -105,11 +123,20 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       if ((q.get("order") ?? "").startsWith("created_at.desc")) found = [...found].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
       const limit = Number(q.get("limit") ?? "0");
       if (limit > 0) found = found.slice(0, limit);
+      // The answer is taken now and delivered later: overlapping reads all
+      // see the count as it was before any of them wrote.
       const out = found.map((r) => project(r, q.get("select")));
+      if (readDelayMs > 0) await new Promise((r) => setTimeout(r, readDelayMs));
       return json(object ? out[0] ?? null : out);
     }
     if (method === "PATCH") {
+      // No await from here to the answer: each PATCH is applied whole, one
+      // at a time, as the database applies one update on a locked row.
       const set = JSON.parse(body || "{}") as Row;
+      const counting = q.has("attempts");
+      if (counting && countAnswer === "error") return json({ message: "stub failure" }, 500);
+      if (counting && Array.isArray(countAnswer)) return json(countAnswer);
+      if (counting && race) for (const r of otps.filter((x) => String(x.id) === (q.get("id") ?? "").replace(/^eq\./, ""))) race(r);
       const hit = otps.filter((r) => matches(r, q));
       for (const r of hit) Object.assign(r, set);
       if ((headers.get("prefer") ?? "").includes("return=representation")) return json(hit.map((r) => project(r, q.get("select"))));
@@ -139,7 +166,7 @@ function seed(over: Row = {}): Row {
   otps.push(row);
   return row;
 }
-const fresh = () => { otps = []; requests = []; };
+const fresh = () => { otps = []; requests = []; compares = 0; readDelayMs = 0; race = null; countAnswer = null; };
 
 async function main() {
   process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE;
@@ -210,6 +237,57 @@ async function main() {
       const ok = await verify(KNOWN, CODE);
       eq("200 with ok and a 64-character reset token", [ok.status, ok.body.ok, String(ok.body.reset_token ?? "").length], [200, true, 64]);
       eq("…the row holds that token's hash", row.reset_token_hash, hashResetToken(String(ok.body.reset_token)));
+    }
+
+    console.log("\nverify: overlapping guesses are counted before they are compared");
+    {
+      fresh(); const row = seed();
+      readDelayMs = 5;
+      let sent = 0;
+      const answers = new Set<string>();
+      // Waves of 20 overlapping wrong guesses until a wave changes nothing.
+      for (let wave = 0; wave < 3 * MAX_VERIFY_ATTEMPTS; wave++) {
+        const before = row.attempts;
+        const got = await Promise.all(Array.from({ length: 20 }, () => verify(KNOWN, WRONG)));
+        sent += got.length;
+        for (const g of got) answers.add(JSON.stringify(g));
+        if (row.attempts === before && wave > 0) break;
+      }
+      readDelayMs = 0;
+      eq(`non-vacuous: more guesses were sent (${sent}) than the limit allows`, sent > 2 * MAX_VERIFY_ATTEMPTS, true);
+      eq("the row's attempts end exactly at the limit", row.attempts, MAX_VERIFY_ATTEMPTS);
+      eq("exactly the limit's number of guesses were compared", compares, MAX_VERIFY_ATTEMPTS);
+      eq("every one of them got the one failure answer", [...answers], [JSON.stringify(FAILED)]);
+      compares = 0;
+      const right = await verify(KNOWN, CODE);
+      eq("the right code after that is refused, not compared, and mints nothing", [right, compares, row.reset_token_hash], [FAILED, 0, null]);
+    }
+    {
+      fresh(); const row = seed();
+      readDelayMs = 5;
+      const got = await Promise.all(Array.from({ length: 20 }, () => verify(KNOWN, WRONG)));
+      readDelayMs = 0;
+      eq("one wave of 20 that all read the same count: one guess takes the slot and is compared", [row.attempts, compares], [1, 1]);
+      eq("…the other 19 are answered the failure without a compare", got.filter((g) => JSON.stringify(g) === JSON.stringify(FAILED)).length, 20);
+    }
+
+    console.log("\nverify: a guess that did not take a slot is never compared");
+    {
+      const cases: Array<[string, (row: Row) => void]> = [
+        ["another guess took the slot between the read and the count", () => { race = (r) => { r.attempts = Number(r.attempts) + 1; }; }],
+        ["the row was closed between the read and the count", () => { race = (r) => { r.used_at = new Date().toISOString(); }; }],
+        ["the row expired between the read and the count", () => { race = (r) => { r.expires_at = new Date(Date.now() - 1000).toISOString(); }; }],
+        ["the count returned no row", () => { countAnswer = []; }],
+        ["the count failed", () => { countAnswer = "error"; }],
+        ["the count returned more than one row", (row) => { countAnswer = [{ id: row.id, code_hash: hashOtp(CODE) }, { id: "otp-y", code_hash: hashOtp(CODE) }]; }],
+        ["the count returned another row", () => { countAnswer = [{ id: "otp-other", code_hash: hashOtp(CODE) }]; }],
+      ];
+      for (const [label, arrange] of cases) {
+        fresh(); const row = seed();
+        arrange(row);
+        const got = await verify(KNOWN, CODE);
+        eq(`${label}: the right code gets the failure, no compare, no token`, [got, compares, row.reset_token_hash], [FAILED, 0, null]);
+      }
     }
 
     console.log("\nreset: one failure answer before the password is set");
