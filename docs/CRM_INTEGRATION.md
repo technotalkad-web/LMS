@@ -385,6 +385,12 @@ returns to your URL and ends embedded mode.
   the dashboard. `return_url` must be https.
 - **Admin accounts are refused (403)** — by design, the integration can only
   ever sign in learners.
+- A link is issued only for the employee you named, at their LMS login
+  address. If you name them by `email` rather than `employee_id`, it must be
+  that address (case does not matter); any other address answers `404`.
+- An employee whose LMS account signs in through your organisation's
+  identity provider (SAML single sign-on) gets no link: the answer is the
+  same `404`, and they sign in at the LMS through that provider.
 - Works identically in a mobile app's browser view (top-level navigation, no
   cookie issues), and the same links can power email deep links.
 
@@ -482,10 +488,14 @@ cache-refresh signal, the summary as truth.
 | `/api/integrations/enter` / `exit` | GET | browser | Embedded-mode cookies (used automatically; not called by the CRM) |
 
 **Status codes:** `401` bad/revoked key · `403` admin account refused ·
-`404` no active LMS account for that employee_id · `400` validation
+`404` no active LMS account for that employee_id or email (on `sso-link`, an
+email must be the person's LMS login address, and an account that signs in
+through an identity provider gets no link) · `400` validation
 (governance messages are admin-identical) · `402` user quota reached ·
 `503` `grants_unreadable` on `learner-summary` and `progress` (the records
-behind an official result could not be read; retry).
+behind an official result could not be read; retry) · `503`
+`account_lookup_unavailable` on `sso-link` (the account could not be read
+and no link was minted; retry).
 `warnings: []` on success responses = applied with noted skips.
 
 ## 5. Security model
