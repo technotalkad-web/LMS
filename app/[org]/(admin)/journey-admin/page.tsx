@@ -63,13 +63,25 @@ export default async function JourneyAdminPage({
   let enrollments: EnrollmentRow[] = [];
   let currentVersion: { id: string; version_number: number; published_at: string } | null = null;
   if (program) {
-    const [{ data: dayRows }, { data: enrRows }, { data: verRows }] =
+    // The draft days with their ids and pass_required (ADR 0024 step 92,
+    // P2-8 item 2): the editor keeps each row's identity and sends its rule
+    // back unchanged (P2-N8). A removed day has no number and is not read.
+    // On a database without 0107 the column is absent and the read falls
+    // back without it (every row then reads pass_required null). A failed
+    // read throws: an empty editor, saved, would insert every slot again.
+    const [{ data: dayRows, error: dayErr }, { data: enrRows }, { data: verRows }] =
       await Promise.all([
-        supabase
-          .from("journey_days")
-          .select("day_number, course_id, mission_title")
-          .eq("program_id", program.id)
-          .order("day_number", { ascending: true }),
+        readWithOptionalColumn<unknown[]>(
+          "pass_required",
+          (columns) =>
+            supabase
+              .from("journey_days")
+              .select(columns)
+              .eq("program_id", program.id)
+              .not("day_number", "is", null)
+              .order("day_number", { ascending: true }),
+          "id, day_number, course_id, mission_title"
+        ),
         svc
           .from("journey_enrollments")
           .select("id, user_id, version_id, start_date, status, completed_at, created_at")
@@ -86,7 +98,13 @@ export default async function JourneyAdminPage({
     const enrList = (enrRows ?? []) as Array<{ id: string; version_id: string }>;
     const credits = await readJourneyCredits(svc, enrList.map((e) => ({ id: e.id, version_id: e.version_id })));
     if (!credits.ok) throw new Error(`journey credits read failed: ${credits.error?.message ?? "no answer"}`);
-    days = (dayRows ?? []) as DayRow[];
+    if (dayErr) throw new Error(`journey days read failed: ${dayErr.message ?? "no answer"}`);
+    // The query keeps only numbered (active) days; the editor checks each
+    // number again (editorFromRows).
+    days = ((dayRows ?? []) as Array<Omit<DayRow, "pass_required"> & { pass_required?: boolean | null }>).map((d) => ({
+      ...d,
+      pass_required: typeof d.pass_required === "boolean" ? d.pass_required : null,
+    }));
     const versions = (verRows ?? []) as Array<{
       id: string;
       version_number: number;

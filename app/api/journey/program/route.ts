@@ -1,21 +1,35 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { DEFAULT_MILESTONES } from "@/lib/journey/journey";
+import { CHECK_FAILED, isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
+import { DEFAULT_MILESTONES, freezeVersionDays, type DraftDayRow } from "@/lib/journey/journey";
+import { MAX_DAY_NUMBER, type SaveEntry } from "@/lib/journey/editor-ops";
+import { readWithOptionalColumn, isSchemaMissing } from "@/lib/scoring/attempt-kind";
 import { resolveManyGroups } from "@/lib/org/groups";
 
 /**
  *   POST   /api/journey/program { orgSlug }            create the default program
+ *   POST   /api/journey/program { orgSlug, action: "publish", program_id, apply_to }
+ *   POST   /api/journey/program { orgSlug, action: "dry_run", program_id }
+ *   POST   /api/journey/program { orgSlug, action: "sync_audience", program_id }
  *   PATCH  /api/journey/program { orgSlug, ... }       update settings/milestones
- *   PUT    /api/journey/program { orgSlug, days: [...] } bulk-upsert curriculum
+ *   PUT    /api/journey/program { orgSlug, program_id, days: [...] } save the curriculum
  *   DELETE /api/journey/program { orgSlug, program_id, confirm_name }
  *
- * Admin-only; the caller-bound client runs under RLS (admins manage journey
- * tables), so RLS is the final authority on every write it makes. The one
- * exception is the publish's re-pin with apply_to=all (ADR 0024 step 47): a
- * service-role call of journey_repin_enrollments, whose authority is ctx()'s
- * role check, the program read scoped to the caller's organisation and the
- * function's own check that the version is the program's current one.
+ * Admin-only: ctx() checks the caller's role in the organisation explicitly
+ * (isOrgAdminCaller; a failed org or role read answers 503 "try again", never
+ * 404 or 403) before anything else. The caller-bound client runs under RLS
+ * (admins manage journey tables), so RLS is the final authority on every
+ * write it makes. The two exceptions are the service-role calls of
+ * journey_repin_enrollments (ADR 0024 step 47): the publish's re-pin with
+ * apply_to=all and the publish dry run. Their authority is ctx()'s role
+ * check and the program read scoped to the caller's organisation, both made
+ * before the service client exists, and, for the re-pin, the function's own
+ * check that the version is the program's current one.
+ *
+ * On a database without 0107 (decision A19) the curriculum save, every
+ * publish (its version insert names day_ids) and the dry run fail with a 503
+ * and write nothing; none falls back to the old upsert or to zeros.
  */
 
 async function ctx(orgSlug: string | undefined) {
@@ -25,23 +39,78 @@ async function ctx(orgSlug: string | undefined) {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: "Unauthorized", status: 401 as const };
-  const { data: org } = await supabase
+  const { data: org, error: orgErr } = await supabase
     .from("organizations")
     .select("id")
     .eq("slug", orgSlug)
     .maybeSingle();
+  if (orgErr) return { error: CHECK_FAILED, status: 503 as const };
   if (!org) return { error: "Organization not found", status: 404 as const };
-  const { data: mem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const role = (mem?.role as string) ?? "";
-  if (!["super_owner", "owner", "admin"].includes(role)) {
-    return { error: "Forbidden", status: 403 as const };
+  const admin = await isOrgAdminCaller(supabase, org.id as string, user.id);
+  if (!admin) {
+    const refused = notAdminAnswer(admin);
+    return { error: refused.error, status: refused.status };
   }
   return { supabase, org, userId: user.id };
+}
+
+type Ctx = Exclude<Awaited<ReturnType<typeof ctx>>, { error: string }>;
+
+/** The POST actions; any other action is refused, never read as "create a journey". */
+const POST_ACTIONS = ["publish", "dry_run", "sync_audience"];
+
+/** The seven counts journey_repin_enrollments answers (0107 section 6f), in its order. */
+const REPIN_COUNTS = [
+  "repinned",
+  "kept_on_version",
+  "completed_now",
+  "sent_back",
+  "started_days_kept",
+  "credits_now_history",
+  "credited_by_rule_change",
+] as const;
+
+/** The A19 refusal: a database without 0107 cannot take this write. */
+const NEEDS_UPDATE = "needs a database update that is not on this server yet";
+
+/**
+ * The program, scoped to the caller's organisation, and its draft days, read
+ * on the caller's session for the publish and the dry run. The days are read
+ * with their id and pass_required (P2-N8; the narrower-select fallback
+ * without 0107, though the write that follows fails there anyway); a removed
+ * day has no number and is never read. A failed read answers 503, never
+ * "not found" or "no days".
+ */
+async function readDraft(
+  c: Ctx,
+  programId: string,
+  what: string
+): Promise<{ ok: true; prog: Record<string, unknown>; rows: DraftDayRow[] } | { ok: false; res: NextResponse }> {
+  const { data: prog, error: pErr } = await c.supabase
+    .from("journey_programs")
+    .select("*")
+    .eq("id", programId)
+    .eq("organization_id", c.org.id)
+    .maybeSingle();
+  if (pErr) {
+    return { ok: false, res: NextResponse.json({ error: `Could not load the journey. ${what}; try again.` }, { status: 503 }) };
+  }
+  if (!prog) return { ok: false, res: NextResponse.json({ error: "Program not found" }, { status: 404 }) };
+  const { data: dayRows, error: dErr } = await readWithOptionalColumn<unknown[]>(
+    "pass_required",
+    (columns) =>
+      c.supabase
+        .from("journey_days")
+        .select(columns)
+        .eq("program_id", programId)
+        .not("day_number", "is", null)
+        .order("day_number", { ascending: true }),
+    "id, day_number, course_id, mission_title"
+  );
+  if (dErr) {
+    return { ok: false, res: NextResponse.json({ error: `Could not load the curriculum. ${what}; try again.` }, { status: 503 }) };
+  }
+  return { ok: true, prog: prog as Record<string, unknown>, rows: (dayRows ?? []) as DraftDayRow[] };
 }
 
 export async function POST(request: Request) {
@@ -57,6 +126,73 @@ export async function POST(request: Request) {
   };
   const c = await ctx(body.orgSlug);
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
+  if (body.action !== undefined && body.action !== null && !POST_ACTIONS.includes(body.action)) {
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+  }
+
+  // ---- Dry run of a publish to all (ADR 0024 step 47, P2-8 item 5) ----
+  // What "Publish & update everyone" would do to the active enrolments,
+  // computed by journey_repin_enrollments on the would-be version: the saved
+  // draft frozen by the same helper the publish uses (freezeVersionDays), so
+  // the counts compare each enrolment with what the publish will pin, not
+  // with the current version. It changes nothing: the function's dry-run
+  // form computes every count on one snapshot and writes nothing, and this
+  // branch makes no other write. Service role only; the program read above
+  // the call is scoped to the caller's organisation.
+  if (body.action === "dry_run") {
+    if (!body.program_id) {
+      return NextResponse.json({ error: "program_id required" }, { status: 400 });
+    }
+    const draft = await readDraft(c, body.program_id, "Nothing was published");
+    if (!draft.ok) return draft.res;
+    const daysTotal = draft.prog.days_total as number;
+    const frozen = freezeVersionDays(draft.rows, daysTotal);
+    if (!frozen.days.some((d) => d.course_id)) {
+      return NextResponse.json(
+        { error: "Add at least one day with a module before publishing" },
+        { status: 400 }
+      );
+    }
+    const svc = createServiceClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } }
+    );
+    const { data: dry, error: dErr } = await svc.rpc("journey_repin_enrollments", {
+      p_program_id: body.program_id,
+      p_version_id: null,
+      p_draft: { days: frozen.days, day_ids: frozen.day_ids, days_total: daysTotal },
+      p_dry_run: true,
+    });
+    if (dErr && dErr.code === "PGRST202") {
+      // A database without 0107 (A19): no counts, never zeros (zeros would
+      // tell the admin nobody is affected).
+      console.warn(JSON.stringify({ event: "journey_dry_run_unavailable", program_id: body.program_id }));
+      return NextResponse.json(
+        { error: `Working out the effect on current learners ${NEEDS_UPDATE}. Nothing was published.` },
+        { status: 503 }
+      );
+    }
+    const counts = dry as Record<string, unknown> | null;
+    if (
+      dErr ||
+      !counts ||
+      typeof counts !== "object" ||
+      counts.dry_run !== true ||
+      REPIN_COUNTS.some((k) => !Number.isInteger(counts[k]))
+    ) {
+      console.error(JSON.stringify({ event: "journey_dry_run_failed", program_id: body.program_id, code: dErr?.code ?? null }));
+      return NextResponse.json(
+        { error: "Could not work out the effect on current learners. Nothing was published." },
+        { status: 400 }
+      );
+    }
+    return NextResponse.json({
+      ok: true,
+      dry_run: true,
+      ...Object.fromEntries(REPIN_COUNTS.map((k) => [k, counts[k]])),
+    });
+  }
 
   // ---- Publish: freeze the current draft into an immutable version ----
   // New enrollments pin this version; runs already in flight keep theirs
@@ -65,42 +201,32 @@ export async function POST(request: Request) {
     if (!body.program_id) {
       return NextResponse.json({ error: "program_id required" }, { status: 400 });
     }
-    const { data: prog } = await c.supabase
-      .from("journey_programs")
-      .select("*")
-      .eq("id", body.program_id)
-      .eq("organization_id", c.org.id)
-      .maybeSingle();
-    if (!prog) return NextResponse.json({ error: "Program not found" }, { status: 404 });
-    const { data: dayRows } = await c.supabase
-      .from("journey_days")
-      .select("day_number, course_id, mission_title")
-      .eq("program_id", body.program_id)
-      .order("day_number", { ascending: true });
-    const days = ((dayRows ?? []) as Array<{
-      day_number: number;
-      course_id: string | null;
-      mission_title: string | null;
-    }>)
-      .filter((d) => d.day_number <= (prog.days_total as number))
-      .map((d) => ({
-        day: d.day_number,
-        course_id: d.course_id,
-        mission_title: d.mission_title,
-      }));
+    const draft = await readDraft(c, body.program_id, "Nothing was published");
+    if (!draft.ok) return draft.res;
+    const prog = draft.prog;
+    // The one freeze (ADR 0024 steps 47 and 92): the saved rows numbered 1
+    // to days_total, each day's id in day_ids (rest days included), and a
+    // day's pass_required key kept when the row holds one (P2-N8). The map
+    // is the editor's, so the version is marked 'editor' (step 94's gate
+    // then keeps nobody on an older version by slot).
+    const frozen = freezeVersionDays(draft.rows, prog.days_total as number);
+    const days = frozen.days;
     if (!days.some((d) => d.course_id)) {
       return NextResponse.json(
         { error: "Add at least one day with a module before publishing" },
         { status: 400 }
       );
     }
-    const { data: last } = await c.supabase
+    const { data: last, error: lErr } = await c.supabase
       .from("journey_versions")
       .select("version_number")
       .eq("program_id", body.program_id)
       .order("version_number", { ascending: false })
       .limit(1)
       .maybeSingle();
+    if (lErr) {
+      return NextResponse.json({ error: "Could not read the journey's versions. Nothing was published; try again." }, { status: 503 });
+    }
     const nextVersion = ((last as { version_number?: number } | null)?.version_number ?? 0) + 1;
     const { data: version, error: vErr } = await c.supabase
       .from("journey_versions")
@@ -117,10 +243,17 @@ export async function POST(request: Request) {
         copy: prog.copy,
         completion_title: prog.completion_title,
         days,
+        day_ids: frozen.day_ids,
+        day_ids_source: "editor",
         published_by: c.userId,
       })
       .select("id, version_number")
       .single();
+    if (vErr && isSchemaMissing(vErr)) {
+      // A database without 0107 (A19): the version names day_ids.
+      console.warn(JSON.stringify({ event: "journey_publish_unavailable", program_id: body.program_id, code: vErr.code ?? null }));
+      return NextResponse.json({ error: `Publishing ${NEEDS_UPDATE}. Nothing was published.` }, { status: 503 });
+    }
     if (vErr) return NextResponse.json({ error: vErr.message }, { status: 400 });
     const { error: uErr } = await c.supabase
       .from("journey_programs")
@@ -619,39 +752,139 @@ export async function PATCH(request: Request) {
   return NextResponse.json({ ok: true, defaults: DEFAULT_MILESTONES });
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The refusal for a save sent by a page built before P2-8 (an entry without
+ * its id or its pass_required key): the old editor sends neither, and a
+ * missing pass_required would reset the day's rule (P2-N8).
+ */
+const STALE_EDITOR =
+  "The curriculum editor has changed since this page was loaded. Nothing was saved; reload the page and make your changes again.";
+
+/**
+ * The curriculum save's entries, checked and normalised before any call
+ * (ADR 0024 step 92, P2-8 item 3): each an object in the full shape
+ * journey_save_days reads (a key left out reads null there), so the route
+ * requires every key rather than letting one default. A removed entry is
+ * sent as { id, removed: true } with the rest null. The refusals that the
+ * function would raise for the common mistakes (an id twice, two days on one
+ * number, a new day removed) answer 400 here without a call.
+ */
+function parseSaveEntries(raw: unknown[]): { ok: true; entries: SaveEntry[] } | { ok: false; error: string } {
+  const entries: SaveEntry[] = [];
+  for (const d of raw) {
+    if (!d || typeof d !== "object" || Array.isArray(d)) return { ok: false, error: "Each day must be an object" };
+    const e = d as Record<string, unknown>;
+    if (!("id" in e) || !("pass_required" in e)) return { ok: false, error: STALE_EDITOR };
+    const id = e.id;
+    if (id !== null && (typeof id !== "string" || !UUID_RE.test(id))) return { ok: false, error: "Invalid day id" };
+    const removed = e.removed === undefined ? false : e.removed;
+    if (typeof removed !== "boolean") return { ok: false, error: "removed must be true or false" };
+    if (removed) {
+      if (id === null) return { ok: false, error: "A day that was never saved cannot be removed" };
+      entries.push({ id: id.toLowerCase(), day_number: null, course_id: null, mission_title: null, pass_required: null, removed: true });
+      continue;
+    }
+    if (!("day_number" in e) || !("course_id" in e) || !("mission_title" in e)) {
+      return { ok: false, error: "Each day needs id, day_number, course_id, mission_title and pass_required" };
+    }
+    const n = e.day_number;
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > MAX_DAY_NUMBER) {
+      return { ok: false, error: `Invalid day_number ${String(n)}` };
+    }
+    const courseId = e.course_id;
+    if (courseId !== null && (typeof courseId !== "string" || !UUID_RE.test(courseId))) {
+      return { ok: false, error: `Invalid module on day ${n}` };
+    }
+    const rule = e.pass_required;
+    if (rule !== null && typeof rule !== "boolean") return { ok: false, error: `Invalid pass rule on day ${n}` };
+    const title = typeof e.mission_title === "string" && e.mission_title.trim() ? e.mission_title.trim().slice(0, 120) : null;
+    entries.push({
+      id: id === null ? null : id.toLowerCase(),
+      day_number: n,
+      course_id: courseId === null ? null : courseId.toLowerCase(),
+      mission_title: title,
+      pass_required: rule,
+      removed: false,
+    });
+  }
+  const named = entries.filter((e) => e.id !== null).map((e) => e.id as string);
+  if (new Set(named).size !== named.length) return { ok: false, error: "A day is named twice in the save" };
+  const numbers = entries.filter((e) => !e.removed).map((e) => e.day_number as number);
+  const twice = numbers.find((n, i) => numbers.indexOf(n) !== i);
+  if (twice !== undefined) return { ok: false, error: `Two days of the save are numbered ${twice}` };
+  return { ok: true, entries };
+}
+
+/** A journey_days row as the save's read-back reads it. */
+type SavedDay = { id: string; day_number: number; course_id: string | null; mission_title: string | null; pass_required: boolean | null };
+
+/**
+ * PUT: the curriculum save by day identity (ADR 0024 step 92, P2-8 item 3),
+ * an A19 write. One call of journey_save_days on the admin's own session
+ * (security invoker, so the admin write policy of journey_days decides);
+ * no fallback to the old upsert on (program, day number). Then one read of
+ * the program's active days (its own abort signal), and the answer is built
+ * from that read: "saved" is said only when every sent day is there as sent
+ * and no removed day is still active, and the rows (with the ids of the new
+ * ones) go back to the editor, which rebuilds itself from them (P2-N7 rule
+ * (1)). The route deletes nothing.
+ */
 export async function PUT(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
     orgSlug?: string;
-    program_id?: string;
-    days?: Array<{ day_number?: number; course_id?: string | null; mission_title?: string | null }>;
+    program_id?: unknown;
+    days?: unknown;
   };
   const c = await ctx(body.orgSlug);
   if ("error" in c) return NextResponse.json({ error: c.error }, { status: c.status });
-  if (!body.program_id || !Array.isArray(body.days)) {
+  const programId = body.program_id;
+  if (typeof programId !== "string" || !UUID_RE.test(programId) || !Array.isArray(body.days)) {
     return NextResponse.json({ error: "program_id and days[] required" }, { status: 400 });
   }
-  if (body.days.length > 365) {
+  if (body.days.length === 0) {
+    return NextResponse.json({ error: "Nothing to save" }, { status: 400 });
+  }
+  // Every active day once (at most 365) and each removed saved day once.
+  if (body.days.length > 2 * MAX_DAY_NUMBER) {
     return NextResponse.json({ error: "too many days" }, { status: 400 });
   }
+  const parsed = parseSaveEntries(body.days);
+  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 });
+  const entries = parsed.entries;
+
+  // The program within the caller's organisation (journey_save_days reads
+  // the program in any organisation the session belongs to, and the module
+  // check below is against this one).
+  const { data: prog, error: pErr } = await c.supabase
+    .from("journey_programs")
+    .select("id")
+    .eq("id", programId)
+    .eq("organization_id", c.org.id)
+    .maybeSingle();
+  if (pErr) {
+    return NextResponse.json({ error: "Could not load the journey. Nothing was saved; try again." }, { status: 503 });
+  }
+  if (!prog) return NextResponse.json({ error: "Journey not found" }, { status: 404 });
 
   // Every referenced module must belong to THIS org — otherwise a crafted
   // payload could schedule (and thereby entitle learners to) another
   // tenant's course.
   const wantedCourseIds = Array.from(
-    new Set(body.days.map((d) => d.course_id).filter((x): x is string => !!x))
+    new Set(entries.map((d) => d.course_id).filter((x): x is string => !!x))
   );
-  const ownCourseIds = new Set<string>();
   if (wantedCourseIds.length > 0) {
-    const { data: courseRows } = await c.supabase
+    const { data: courseRows, error: cErr } = await c.supabase
       .from("courses")
       .select("id")
       .eq("organization_id", c.org.id)
       .in("id", wantedCourseIds);
-    for (const row of (courseRows ?? []) as Array<{ id: string }>) {
-      ownCourseIds.add(row.id);
+    if (cErr) {
+      return NextResponse.json({ error: "Could not check the modules. Nothing was saved; try again." }, { status: 503 });
     }
-    const foreign = wantedCourseIds.filter((id) => !ownCourseIds.has(id));
-    if (foreign.length > 0) {
+    const own = new Set(((courseRows ?? []) as Array<{ id: string }>).map((r) => r.id.toLowerCase()));
+    if (wantedCourseIds.some((id) => !own.has(id))) {
       return NextResponse.json(
         { error: "One or more modules don't belong to this organization" },
         { status: 400 }
@@ -659,26 +892,111 @@ export async function PUT(request: Request) {
     }
   }
 
-  const rows = [];
-  for (const d of body.days) {
-    const n = Math.round(Number(d.day_number));
-    if (!Number.isFinite(n) || n < 1 || n > 365) {
-      return NextResponse.json({ error: `Invalid day_number ${d.day_number}` }, { status: 400 });
+  const { data: answer, error } = await c.supabase.rpc("journey_save_days", {
+    p_program_id: programId,
+    p_days: entries,
+  });
+  if (error) {
+    // One transaction: a refused save wrote nothing.
+    const code = error.code ?? null;
+    if (code === "PGRST202") {
+      console.warn(JSON.stringify({ event: "journey_save_unavailable", program_id: programId }));
+      return NextResponse.json({ error: `Saving the curriculum ${NEEDS_UPDATE}. Nothing was saved.` }, { status: 503 });
     }
-    rows.push({
-      program_id: body.program_id,
-      organization_id: c.org.id,
-      day_number: n,
-      course_id: d.course_id || null,
-      mission_title:
-        typeof d.mission_title === "string" && d.mission_title.trim()
-          ? d.mission_title.trim().slice(0, 120)
-          : null,
-    });
+    console.error(JSON.stringify({ event: "journey_save_refused", program_id: programId, code }));
+    if (code === "22023") {
+      return NextResponse.json(
+        { error: "The curriculum has changed since this page was loaded (another tab or admin saved it). Nothing was saved; reload the page and make your changes again.", code, reload: true },
+        { status: 409 }
+      );
+    }
+    if (code === "23505") {
+      return NextResponse.json(
+        { error: "A day's number is taken by a day this page does not show (the curriculum changed since it was loaded). Nothing was saved; reload the page.", code, reload: true },
+        { status: 409 }
+      );
+    }
+    if (code === "23514" || code === "22P02") {
+      return NextResponse.json({ error: "A day's number or id is not valid. Nothing was saved.", code }, { status: 400 });
+    }
+    if (code === "42501") return NextResponse.json({ error: "Forbidden", code }, { status: 403 });
+    return NextResponse.json({ error: "Could not save the curriculum. Nothing was saved; try again.", code }, { status: 500 });
   }
-  const { error } = await c.supabase
+  const counts = answer as Record<string, unknown> | null;
+  if (
+    !counts ||
+    typeof counts !== "object" ||
+    ["saved", "renumbered", "removed", "inserted"].some((k) => !Number.isInteger(counts[k])) ||
+    counts.saved !== entries.length
+  ) {
+    console.error(JSON.stringify({ event: "journey_save_unexpected", program_id: programId }));
+    return NextResponse.json(
+      { error: "The save gave an answer this page does not expect. Reload the page to see what was saved before editing again.", reload: true },
+      { status: 500 }
+    );
+  }
+
+  // The read-back: what the database now holds (a second read of this table
+  // in the request carries its own abort signal, so it is never answered
+  // from the first; ADR 0024's fetch memoization risk).
+  const { data: back, error: bErr } = await c.supabase
     .from("journey_days")
-    .upsert(rows, { onConflict: "program_id,day_number" });
-  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.json({ ok: true, saved: rows.length });
+    .select("id, day_number, course_id, mission_title, pass_required")
+    .eq("program_id", programId)
+    .not("day_number", "is", null)
+    .order("day_number", { ascending: true })
+    .abortSignal(new AbortController().signal);
+  if (bErr) {
+    return NextResponse.json(
+      { error: "The curriculum was saved, but it could not be loaded again. Reload the page before editing it again.", saved_unconfirmed: true, reload: true },
+      { status: 503 }
+    );
+  }
+  const rows = (back ?? []) as SavedDay[];
+  const lc = (x: string | null) => (x === null ? null : x.toLowerCase());
+  const byId = new Map(rows.map((r) => [r.id.toLowerCase(), r]));
+  const byNumber = new Map(rows.map((r) => [r.day_number, r]));
+  const sentIds = new Set(entries.filter((e) => e.id !== null).map((e) => e.id as string));
+  const asSent = (r: SavedDay | undefined, e: SaveEntry) =>
+    !!r &&
+    r.day_number === e.day_number &&
+    lc(r.course_id) === e.course_id &&
+    (r.mission_title ?? null) === e.mission_title &&
+    (r.pass_required ?? null) === e.pass_required;
+  let saved = 0;
+  let inserted = 0;
+  let removed = 0;
+  let mismatch = 0;
+  for (const e of entries) {
+    if (e.removed) {
+      if (byId.has(e.id as string)) mismatch++;
+      else removed++;
+    } else if (e.id !== null) {
+      if (asSent(byId.get(e.id), e)) saved++;
+      else mismatch++;
+    } else {
+      const r = byNumber.get(e.day_number as number);
+      if (r && !sentIds.has(r.id.toLowerCase()) && asSent(r, e)) {
+        saved++;
+        inserted++;
+      } else {
+        mismatch++;
+      }
+    }
+  }
+  if (mismatch > 0) {
+    console.error(JSON.stringify({ event: "journey_save_mismatch", program_id: programId, mismatched: mismatch }));
+    return NextResponse.json(
+      { error: "The curriculum did not come back as it was sent. Reload the page to see it as saved before editing again.", reload: true },
+      { status: 500 }
+    );
+  }
+  return NextResponse.json({
+    ok: true,
+    saved,
+    inserted,
+    removed,
+    renumbered: counts.renumbered,
+    days: rows,
+  });
 }
