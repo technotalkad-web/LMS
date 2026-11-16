@@ -2,6 +2,9 @@ import type { Page } from "@playwright/test";
 import { test, expect } from "../helpers/fixtures";
 import { seedOtp, svc } from "../helpers/supabase";
 
+/** The verify step's one failure answer (lib/auth/password-reset.ts). */
+const VERIFY_FAILED = "That code is incorrect or has expired. Request a new one.";
+
 /**
  * /forgot-password 3-step OTP flow.
  *
@@ -80,7 +83,7 @@ test.describe("/forgot-password", () => {
     expect(rows?.[0]?.used_at).not.toBeNull();
   });
 
-  test("wrong code increments the attempt counter and surfaces an error", async ({
+  test("wrong code increments the attempt counter and shows the one failure message", async ({
     page,
     seededLearner,
   }) => {
@@ -94,9 +97,11 @@ test.describe("/forgot-password", () => {
     await expect(otpInput).toBeVisible({ timeout: 15_000 });
     await otpInput.fill("000000");
 
-    await expect(page.getByText(/invalid|incorrect|expired/i)).toBeVisible({
+    await expect(page.getByText(VERIFY_FAILED)).toBeVisible({
       timeout: 15_000,
     });
+    // The answer names no remaining count.
+    await expect(page.getByText(/remaining/i)).toHaveCount(0);
 
     const { data } = await svc()
       .from("password_reset_otps")
@@ -105,6 +110,23 @@ test.describe("/forgot-password", () => {
       .order("created_at", { ascending: false })
       .limit(1);
     expect(data?.[0]?.attempts ?? 0).toBeGreaterThanOrEqual(1);
+  });
+
+  test("verify answers a wrong code and an address with no account the same way", async ({
+    request,
+    seededLearner,
+  }) => {
+    await seedOtp(seededLearner.email); // real code we won't use
+    const wrong = await request.post("/api/auth/forgot-password/verify", {
+      data: { email: seededLearner.email, code: "000000" },
+    });
+    const ghost = await request.post("/api/auth/forgot-password/verify", {
+      data: { email: "ghost-does-not-exist@example.test", code: "000000" },
+    });
+    expect(wrong.status()).toBe(400);
+    expect(ghost.status()).toBe(400);
+    expect(await wrong.json()).toEqual({ error: VERIFY_FAILED });
+    expect(await ghost.json()).toEqual({ error: VERIFY_FAILED });
   });
 
   test("never reveals whether an email exists (request endpoint always 200)", async ({

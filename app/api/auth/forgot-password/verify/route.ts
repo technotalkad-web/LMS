@@ -3,6 +3,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   MAX_VERIFY_ATTEMPTS,
   RESET_TOKEN_TTL_MINUTES,
+  VERIFY_FAILED_MESSAGE,
   hashOtp,
   hashResetToken,
   mintResetToken,
@@ -20,7 +21,15 @@ import {
  *
  * After MAX_VERIFY_ATTEMPTS wrong guesses on the same row, the row is
  * marked used and the user must request a fresh code.
+ *
+ * Every failure gets one answer: a missing, expired, used or wrong code and
+ * too many attempts all answer 400 with VERIFY_FAILED_MESSAGE. The answer
+ * names no remaining count and does not depend on whether the address has
+ * an account.
  */
+const failed = () =>
+  NextResponse.json({ error: VERIFY_FAILED_MESSAGE }, { status: 400 });
+
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
     email?: string;
@@ -61,31 +70,20 @@ export async function POST(request: Request) {
       }
     | null;
 
-  if (!row) {
-    return NextResponse.json(
-      { error: "No active code. Request a new one." },
-      { status: 400 }
-    );
-  }
+  if (!row) return failed();
   if (new Date(row.expires_at).getTime() < Date.now()) {
     await svc
       .from("password_reset_otps")
       .update({ used_at: new Date().toISOString() })
       .eq("id", row.id);
-    return NextResponse.json(
-      { error: "Code expired. Request a new one." },
-      { status: 400 }
-    );
+    return failed();
   }
   if (row.attempts >= MAX_VERIFY_ATTEMPTS) {
     await svc
       .from("password_reset_otps")
       .update({ used_at: new Date().toISOString() })
       .eq("id", row.id);
-    return NextResponse.json(
-      { error: "Too many wrong attempts. Request a new code." },
-      { status: 429 }
-    );
+    return failed();
   }
 
   const ok = safeHashEqual(row.code_hash, hashOtp(code));
@@ -94,16 +92,7 @@ export async function POST(request: Request) {
       .from("password_reset_otps")
       .update({ attempts: row.attempts + 1 })
       .eq("id", row.id);
-    const left = Math.max(0, MAX_VERIFY_ATTEMPTS - row.attempts - 1);
-    return NextResponse.json(
-      {
-        error:
-          left > 0
-            ? `Incorrect code. ${left} attempt${left === 1 ? "" : "s"} remaining.`
-            : "Incorrect code. Request a new one.",
-      },
-      { status: 400 }
-    );
+    return failed();
   }
 
   // Mint a reset token. Hash it before storing so a DB dump can't
