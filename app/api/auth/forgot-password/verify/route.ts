@@ -24,8 +24,11 @@ import {
  * attempts up by one in a single compare-and-set and hands back the code
  * hash only to the guess that took that slot. A guess that did not take a
  * slot is answered the failure and never compared, so overlapping guesses
- * cannot compare more than MAX_VERIFY_ATTEMPTS times on one row. A row at
- * the limit is marked used and the user must request a fresh code.
+ * cannot compare more than MAX_VERIFY_ATTEMPTS times on one row.
+ *
+ * When the newest active code has expired or reached the limit, every
+ * active code of the address is marked used, not only that one: no older
+ * code takes its place, and the user must request a fresh code.
  *
  * Every failure gets one answer: a missing, expired, used or wrong code and
  * too many attempts all answer 400 with VERIFY_FAILED_MESSAGE. The answer
@@ -75,18 +78,22 @@ export async function POST(request: Request) {
     | null;
 
   if (!row) return failed();
+  // An expired or used-up newest code closes every active code of the
+  // address: no older code stays open behind it.
   if (new Date(row.expires_at).getTime() < Date.now()) {
     await svc
       .from("password_reset_otps")
       .update({ used_at: new Date().toISOString() })
-      .eq("id", row.id);
+      .eq("email", email)
+      .is("used_at", null);
     return failed();
   }
   if (row.attempts >= MAX_VERIFY_ATTEMPTS) {
     await svc
       .from("password_reset_otps")
       .update({ used_at: new Date().toISOString() })
-      .eq("id", row.id);
+      .eq("email", email)
+      .is("used_at", null);
     return failed();
   }
 
