@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { auditLog } from "@/lib/auth/require-platform-owner";
+import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 
 /**
  *   GET    /api/super/broadcasts          — list all broadcasts (incl. inactive)
@@ -12,32 +11,6 @@ import { auditLog } from "@/lib/auth/require-platform-owner";
  * The end-user-facing read (for the banner inside every tenant) lives
  * at /api/broadcasts (no auth gate beyond signed-in).
  */
-async function assertPlatformOwner(): Promise<
-  { ok: true; userId: string } | { ok: false; res: NextResponse }
-> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return { ok: false, res: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
-  }
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-  const { data: row } = await svc
-    .from("platform_owners")
-    .select("user_id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!row) {
-    return { ok: false, res: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
-  }
-  return { ok: true, userId: user.id };
-}
-
 function svc() {
   return createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -60,8 +33,8 @@ type BroadcastInput = {
 };
 
 export async function GET() {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { data } = await svc()
     .from("platform_broadcasts")
     .select("*")
@@ -71,8 +44,8 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const body = (await request.json().catch(() => ({}))) as BroadcastInput;
   if (!body.title?.trim() || !body.body_md?.trim()) {
     return NextResponse.json({ error: "title + body_md required" }, { status: 400 });
@@ -103,8 +76,8 @@ export async function POST(request: Request) {
 }
 
 export async function PATCH(request: Request) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const body = (await request.json().catch(() => ({}))) as BroadcastInput & { id?: string };
   if (!body.id) return NextResponse.json({ error: "id required" }, { status: 400 });
   const update: Record<string, unknown> = {};
@@ -124,8 +97,8 @@ export async function PATCH(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const url = new URL(request.url);
   const id = url.searchParams.get("id");
   if (!id) return NextResponse.json({ error: "id required" }, { status: 400 });
