@@ -13,7 +13,10 @@
  *     compare-and-set as the database does, overlapping guesses compare
  *     exactly MAX_VERIFY_ATTEMPTS times on one row, and a guess whose count
  *     returns no row (or fails, or finds the row closed or expired) is never
- *     compared, even when it carries the right code.
+ *     compared, even when it carries the right code;
+ *   - when the newest active code of an address has expired or reached the
+ *     limit, every active code of that address is closed and no older code
+ *     takes its place. Other addresses' codes are left open.
  *
  * No database, no network.
  *
@@ -288,6 +291,50 @@ async function main() {
         const got = await verify(KNOWN, CODE);
         eq(`${label}: the right code gets the failure, no compare, no token`, [got, compares, row.reset_token_hash], [FAILED, 0, null]);
       }
+    }
+
+    console.log("\nverify: an expired or used-up newest code closes every active code of the address");
+    {
+      const ROWS = 4;
+      const OTHER = "colleague@example.test";
+      fresh();
+      const rows = Array.from({ length: ROWS }, () => seed());
+      const other = seed({ email: OTHER });
+      eq(`non-vacuous: ${ROWS} active codes for one address before the first guess`, otps.filter((r) => r.email === KNOWN && r.used_at === null).length, ROWS);
+      readDelayMs = 5;
+      const answers = new Set<string>();
+      let sent = 0;
+      // A fixed number of waves: enough to use up every row's slots and the
+      // closing call of each, had the rows been closed one at a time.
+      const WAVES = ROWS * (MAX_VERIFY_ATTEMPTS + 1) + 1;
+      for (let wave = 0; wave < WAVES; wave++) {
+        const got = await Promise.all(Array.from({ length: 5 }, () => verify(KNOWN, WRONG)));
+        sent += got.length;
+        for (const g of got) answers.add(JSON.stringify(g));
+      }
+      readDelayMs = 0;
+      eq(`non-vacuous: more guesses were sent (${sent}) than every row's limits together`, sent > ROWS * MAX_VERIFY_ATTEMPTS, true);
+      eq("exactly the limit's number of guesses were compared for the address", compares, MAX_VERIFY_ATTEMPTS);
+      eq("…all on the newest code; no older code was counted", rows.map((r) => r.attempts), [...Array.from({ length: ROWS - 1 }, () => 0), MAX_VERIFY_ATTEMPTS]);
+      eq("every active code of the address is closed", rows.map((r) => typeof r.used_at), Array.from({ length: ROWS }, () => "string"));
+      eq("another address's code stays open", other.used_at, null);
+      eq("every guess got the one failure answer", [...answers], [JSON.stringify(FAILED)]);
+      compares = 0;
+      const right = await verify(KNOWN, CODE);
+      eq("the right code after that is refused, not compared, and mints nothing", [right, compares, rows.filter((r) => r.reset_token_hash !== null).length], [FAILED, 0, 0]);
+    }
+    {
+      const OTHER = "colleague@example.test";
+      fresh();
+      const older = seed();
+      seed({ expires_at: new Date(Date.now() - 1000).toISOString() });
+      const other = seed({ email: OTHER, created_at: new Date(Date.now() - 2000).toISOString() });
+      const first = await verify(KNOWN, CODE);
+      eq("an expired newest code: the failure, no compare", [first, compares], [FAILED, 0]);
+      eq("…every active code of the address is closed, the older open one too", otps.filter((r) => r.email === KNOWN).map((r) => typeof r.used_at), ["string", "string"]);
+      eq("…another address's code stays open", other.used_at, null);
+      const again = await verify(KNOWN, CODE);
+      eq("the right code for the older code is then refused, not compared, and mints nothing", [again, compares, older.reset_token_hash], [FAILED, 0, null]);
     }
 
     console.log("\nreset: one failure answer before the password is set");

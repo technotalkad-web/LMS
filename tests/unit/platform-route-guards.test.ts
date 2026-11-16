@@ -13,14 +13,20 @@
  *     caller's own session and writes nothing.
  *
  * Three parts:
- *   1. The scan (TypeScript's parser, no type checker). The table below names
- *      every exported handler of every route.ts under app/api/super/ with its
- *      level, and names no handler that does not exist. A handler at "full"
- *      or "end" starts with `const guard = await requirePlatformOwnerApi(
+ *   1. The scan (TypeScript's parser, no type checker). It walks all of app/
+ *      and reads every route file Next serves (route.ts, .tsx, .js and .jsx,
+ *      Next's default extensions) whose URL path, with route groups `(x)` and
+ *      parallel slots `@x` dropped as Next drops them, is /api/super or
+ *      /super or lies under either: a platform handler, wherever its folder
+ *      sits. The table below names every exported handler of every such file
+ *      with its level, and names no handler that does not exist. A handler at
+ *      "full" or "end" starts with `const guard = await requirePlatformOwnerApi(
  *      "<level>")`, imported from lib/auth/require-platform-owner, followed
- *      directly by `if ("error" in guard) return ...`. No file under
- *      app/api/super/ keeps its own caller check (no `platform_owners` in its
- *      code, no assertPlatformOwner). Planted cases prove each rule fires.
+ *      directly by `if ("error" in guard) return ...`. No platform route file
+ *      keeps its own caller check (no `platform_owners` in its code, no
+ *      assertPlatformOwner). Planted cases prove each rule fires, and a
+ *      planted tree proves the walk finds a grouped path, a slot, a .js and
+ *      a .jsx handler and a route beside the platform pages.
  *   2. The guard's answers, on the real code under a stubbed Auth and
  *      PostgREST and a stubbed next/headers cookie jar.
  *   3. Every handler at "full", called as the route: an owner at AAL1 whose
@@ -33,6 +39,7 @@
  */
 import Module from "node:module";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import ts from "typescript";
 
@@ -43,12 +50,11 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 const root = path.resolve(__dirname, "../..");
-const rel = (abs: string) => path.relative(root, abs).split(path.sep).join("/");
 
 /* ---------------- 1. the scan ---------------- */
 
 type Level = "full" | "end" | "none";
-/** Every exported handler under app/api/super/, with its level. A new handler is "full" unless a later decision names it here. */
+/** Every exported handler served under /api/super/ or /super/, with its level. A new handler is "full" unless a later decision names it here. */
 const TABLE: Record<string, Level> = {
   "app/api/super/broadcasts/route.ts GET": "full",
   "app/api/super/broadcasts/route.ts POST": "full",
@@ -83,7 +89,9 @@ const skip = (e: ts.Expression): ts.Expression => {
   while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
   return e;
 };
-const parse = (file: string, src: string) => ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+const kindOf = (file: string) =>
+  file.endsWith(".tsx") ? ts.ScriptKind.TSX : file.endsWith(".jsx") ? ts.ScriptKind.JSX : file.endsWith(".js") ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+const parse = (file: string, src: string) => ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, kindOf(file));
 const codeOf = (sf: ts.SourceFile) => ts.createPrinter({ removeComments: true }).printFile(sf);
 
 type Handler = { method: string; body: ts.Block | null };
@@ -203,18 +211,34 @@ function scanFile(file: string, src: string, table: Record<string, Level>): stri
   return out;
 }
 
-function routeFiles(dir: string, out: string[] = []): string[] {
+/** A route handler file under Next's default page extensions (next.config sets none of its own; checked below). */
+const ROUTE_FILE = /^route\.(ts|tsx|js|jsx)$/;
+/** Every route handler file under <base>/app, as "app/..." with forward slashes. */
+function routeFiles(base: string, dir = path.join(base, "app"), out: string[] = []): string[] {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
-    if (e.isDirectory()) routeFiles(p, out);
-    else if (e.name === "route.ts" || e.name === "route.tsx") out.push(rel(p));
+    if (e.isDirectory()) routeFiles(base, p, out);
+    else if (ROUTE_FILE.test(e.name)) out.push(path.relative(base, p).split(path.sep).join("/"));
   }
   return out.sort();
 }
+/** The URL path a route file is served at: route groups `(x)` and parallel slots `@x` are dropped, as Next drops them. */
+function urlPathOf(file: string): string {
+  const segments = file.split("/").slice(1, -1);
+  return "/" + segments.filter((s) => !(s.startsWith("(") && s.endsWith(")")) && !s.startsWith("@")).join("/");
+}
+/** The platform paths: /api/super and /super, and everything under either. */
+const PLATFORM_PATHS = ["/api/super", "/super"];
+const isPlatformPath = (u: string) => PLATFORM_PATHS.some((p) => u === p || u.startsWith(`${p}/`));
+/** Every route file under <base>/app that Next serves at a platform path. */
+const platformRouteFiles = (base: string) => routeFiles(base).filter((f) => isPlatformPath(urlPathOf(f)));
 
-console.log("\nthe scan: every handler under app/api/super/ passes the guard at its level");
+console.log("\nthe scan: every handler served under /api/super/ or /super/ passes the guard at its level");
 {
-  const files = routeFiles(path.join(root, "app/api/super"));
+  const all = routeFiles(root);
+  const files = platformRouteFiles(root);
+  eq(`non-vacuous: the walk covers all of app/ (${all.length} route files, ${files.length} at a platform path)`, all.length > files.length && all.some((f) => /\/\(.+\)\//.test(f)), true);
+  eq("next.config sets no pageExtensions of its own (the walk reads Next's default route extensions)", /pageExtensions/.test(fs.readFileSync(path.join(root, "next.config.ts"), "utf8")), false);
   const found: string[] = [];
   const problems: string[] = [];
   for (const f of files) {
@@ -273,6 +297,53 @@ export { handle as POST };
   eq("…the status read that writes fails", scan(HEAD + good + GET(`  await svc().from("platform_impersonation_sessions").update({ ended_at: "now" }).eq("id", "1");\n  return NextResponse.json({ session: null });`)), [`${F} GET: the status read writes (.update)`]);
   eq("…the status read that refuses fails", scan(HEAD + good + GET(`  return NextResponse.json({ error: "Forbidden" }, { status: 403 });`)), [`${F} GET: the status read refuses (status 403)`]);
   eq("…the status read that calls the guard fails", scan(HEAD + good + GET(`  const guard = await requirePlatformOwnerApi("end");\n  return NextResponse.json({ session: null, guard });`)), [`${F} GET: the status read calls the guard`]);
+}
+
+console.log("\nthe walk: a planted tree (outside the repository)");
+{
+  // Each planted route file has one handler with no guard. Every one Next
+  // serves at a platform path must be read and fail; no other file is read.
+  const SERVED: Array<[string, string, string]> = [
+    ["a plain path", "app/api/super/plain/route.ts", "/api/super/plain"],
+    ["a route group", "app/(super-owner)/api/super/grouped/route.ts", "/api/super/grouped"],
+    ["nested route groups", "app/(a)/(b)/api/super/nested/route.tsx", "/api/super/nested"],
+    ["a parallel slot", "app/@panel/api/super/slot/route.ts", "/api/super/slot"],
+    ["a .js handler", "app/api/super/script/route.js", "/api/super/script"],
+    ["a .jsx handler", "app/api/super/markup/route.jsx", "/api/super/markup"],
+    ["a route beside the platform pages", "app/(super-owner)/super/export/route.ts", "/super/export"],
+    ["a route at /super itself", "app/(super-owner)/super/route.ts", "/super"],
+  ];
+  const ELSEWHERE: Array<[string, string]> = [
+    ["app/api/superb/route.ts", "/api/superb"],
+    ["app/api/org/super/route.ts", "/api/org/super"],
+    ["app/[org]/(admin)/api/super-tools/route.ts", "/[org]/api/super-tools"],
+    ["app/(super-owner)/superstar/route.ts", "/superstar"],
+  ];
+  const NOT_ROUTES = ["app/api/super/plain/page.tsx", "app/api/super/plain/helpers.ts", "app/api/super/plain/route.test.ts"];
+  const TS_SRC = `import { NextResponse } from "next/server";\nexport async function POST(request: Request) {\n  return NextResponse.json({ ok: true, url: request.url });\n}\n`;
+  const JS_SRC = `import { NextResponse } from "next/server";\nexport async function POST(request) {\n  return NextResponse.json({ ok: true, url: request.url });\n}\n`;
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "platform-route-walk-"));
+  try {
+    const plant = (file: string) => {
+      const p = path.join(base, ...file.split("/"));
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, /\.jsx?$/.test(file) ? JS_SRC : TS_SRC);
+    };
+    for (const [, f] of SERVED) plant(f);
+    for (const [f] of ELSEWHERE) plant(f);
+    for (const f of NOT_ROUTES) plant(f);
+    const walked = routeFiles(base);
+    const picked = platformRouteFiles(base);
+    eq("the walk finds every planted route file and no other file", walked, [...SERVED.map(([, f]) => f), ...ELSEWHERE.map(([f]) => f)].sort());
+    for (const [label, f, url] of SERVED) {
+      const got = { url: urlPathOf(f), problems: picked.includes(f) ? scanFile(f, fs.readFileSync(path.join(base, f), "utf8"), {}) : "not read" };
+      eq(`${label} (${f} at ${url}) is read, and its unguarded handler fails`, got, { url, problems: [`${f} POST: not in the level table`] });
+    }
+    eq("…named in the table at full, each one fails for the missing guard", SERVED.flatMap(([, f]) => scanFile(f, fs.readFileSync(path.join(base, f), "utf8"), { [`${f} POST`]: "full" })), SERVED.flatMap(([, f]) => [`${f} POST: ${GUARD} is not imported from ${GUARD_MODULE}`, `${f} POST: the first statement is not \`const guard = await ${GUARD}("full")\``]));
+    eq("a path that is not a platform path is not read", ELSEWHERE.map(([f]) => [urlPathOf(f), picked.includes(f)]), ELSEWHERE.map(([, url]) => [url, false]));
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 }
 
 /* ---------------- 2 and 3: behaviour under a stub ---------------- */
