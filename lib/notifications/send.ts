@@ -3,6 +3,7 @@ import { loadTemplate, mdToHtml, DEFAULT_CTAS } from "./templates";
 import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
 import { dispatchResend, resendConfigured } from "@/lib/email/resend";
+import { dispatchSmtp } from "@/lib/email/smtp-function";
 import type {
   NotificationEvent,
   NotificationContext,
@@ -15,7 +16,7 @@ import type {
 // the `send-smtp` Supabase Edge Function (Deno + denomailer). This
 // file does everything else — templates, branding, pause checks,
 // audit logging — and POSTs the rendered email to that function for
-// the final send.
+// the final send, through dispatchSmtp in lib/email/smtp-function.ts.
 //
 // See: supabase/functions/send-smtp/index.ts
 
@@ -25,73 +26,6 @@ function svc() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
-}
-
-function sendSmtpUrl(): string {
-  // Override allowed for local dev (e.g., `supabase functions serve`)
-  // and for the unusual case of running functions on a different host.
-  const explicit = process.env.SEND_SMTP_FUNCTION_URL;
-  if (explicit) return explicit.replace(/\/$/, "");
-  const base = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  if (!base) {
-    throw new Error(
-      "NEXT_PUBLIC_SUPABASE_URL is required to resolve the send-smtp Edge Function URL."
-    );
-  }
-  return `${base.replace(/\/$/, "")}/functions/v1/send-smtp`;
-}
-
-type SmtpDispatchPayload = {
-  host: string;
-  port: number;
-  secure: boolean;
-  user?: string;
-  pass?: string;
-  from: string;
-  to: string;
-  replyTo?: string;
-  subject: string;
-  html: string;
-  text: string;
-};
-
-/**
- * POST the rendered email to the send-smtp Edge Function. Returns
- * { ok: true } on a successful send, or { ok: false, error: string }
- * when the SMTP conversation fails (bad creds, connection refused,
- * TLS error, etc.). Any infrastructure error (function timeout,
- * function not deployed, network failure) is captured as { ok: false,
- * error } too so callers always get a usable status.
- */
-async function dispatchSmtp(
-  payload: SmtpDispatchPayload
-): Promise<{ ok: boolean; error?: string }> {
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!key) {
-    return { ok: false, error: "SUPABASE_SERVICE_ROLE_KEY missing." };
-  }
-  try {
-    const res = await fetch(sendSmtpUrl(), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify(payload),
-    });
-    if (res.status === 401) {
-      return { ok: false, error: "Edge Function rejected service-role bearer." };
-    }
-    if (!res.ok && res.status !== 200) {
-      return { ok: false, error: `Edge Function returned HTTP ${res.status}.` };
-    }
-    const body = (await res.json()) as { ok?: boolean; error?: string };
-    if (body?.ok === true) return { ok: true };
-    return { ok: false, error: body?.error ?? "Unknown SMTP error." };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Edge Function fetch failed.";
-    return { ok: false, error: msg };
-  }
 }
 
 async function loadSettings(

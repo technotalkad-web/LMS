@@ -80,6 +80,27 @@ ALDS_P4 = "on"
 # is a plain var. Use a verified domain with SPF/DKIM/DMARC.
 # RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 
+# ---- Platform sender (ADR 0029; lib/email/platform-sender.ts) ---------------
+# The platform's own mailbox, for platform mail only: platform owners' and
+# organisation administrators' codes and links, administrator welcomes and
+# SMTP alerts. Never a learner's mail and never a fallback for a tenant's SMTP.
+# Every value is a SECRET, the non-secret ones too, so no address sits in this
+# public repository. This (staging) Worker:
+#   wrangler secret put PLATFORM_SMTP_HOST
+#   wrangler secret put PLATFORM_SMTP_PORT              # 465 for Gmail
+#   wrangler secret put PLATFORM_SMTP_SECURE            # true with 465
+#   wrangler secret put PLATFORM_SMTP_USER
+#   wrangler secret put PLATFORM_SMTP_PASSWORD          # the mailbox's app password
+#   wrangler secret put PLATFORM_SMTP_FROM              # Name <address>
+#   wrangler secret put PLATFORM_EMAIL_ALLOW_DOMAINS    # staging: only a domain the owner controls
+#     (never a public mail provider's domain: every staging account there
+#     could then be mailed; reserved test domains are never mailed anyway)
+# Optional: PLATFORM_EMAIL_REPLY_TO, PLATFORM_EMAIL_DAILY_CEILING (default 375;
+# set it to three quarters of the mailbox's confirmed daily cap) and
+# PLATFORM_EMAIL_ORG_DAILY_LIMIT (default 50). Staging never uses production's
+# credential. Unset, the sender sends nothing and /api/ops/health reads
+# degraded to a caller with the secret. Setup, rotation, limits: ops/RUNBOOK.md §6.3.
+
 # ---- White-label custom domains (tenant own-domain routing) -----------------
 # The code is host-agnostic; this feature stays fully inert until enabled.
 # When you move to proper infra, see docs/INFRA_MIGRATION.md. Then set:
@@ -172,6 +193,11 @@ OPS_EXPECT_CRONS = "1"
 ALDS_P4 = "on"
 # Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
 # RESEND_FROM = "Ambak University <no-reply@ambak.com>"
+# Platform sender (ADR 0029; see the top-level block): every PLATFORM_SMTP_* and
+# PLATFORM_EMAIL_* value is a SECRET, set with
+# `wrangler secret put <NAME> --env production`, never here. Production's
+# PLATFORM_EMAIL_ALLOW_DOMAINS is "*". Set them before the tag that carries the
+# sender: a release without them reads degraded at once (ADR 0029 section M).
 # White-label custom domains (see docs/INFRA_MIGRATION.md). Inert until set.
 # PRIMARY_APP_HOST = "app.your-platform.com"
 # CUSTOM_DOMAINS_ENABLED = "1"

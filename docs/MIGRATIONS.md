@@ -90,3 +90,18 @@ Each file's header is the full rule; this is the cross-file summary.
   `sweep_completion_side_effects_timed(200, 1500)`, asserts it in its
   after-check, lists 0112 among its never-paste files, and its reverse
   restores 0112's refresh bodies.
+
+## Paste order: the platform sender (ADR 0029)
+
+- **0113** (`platform_email_log`, the platform sender's log; one table,
+  deny-all, service role select and insert only): written and rehearsed
+  (`scripts/migration-rehearsal`, scenarios `0113-defaults` and
+  `0113-no-defaults`); **not yet pasted on staging or production**
+  (2026-11-17). Independent of 0107 to 0112: it needs only
+  `public.organizations` and `auth.users`. Pasted **before** the code of
+  ADR 0029 pull request A on each environment (decision 7); code that
+  arrives first sends no platform mail and its health check reads `fail`
+  until the paste. Rows are kept 90 days (the delete statement is in the
+  file's header and `ops/RUNBOOK.md` §6.3). Reverse: `ops/0113-reverse.sql`,
+  after the code is rolled back.
+- 0114 (`tenant_smtp_state`, ADR 0029 pull request B) is not written yet.

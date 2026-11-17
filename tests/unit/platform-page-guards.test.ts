@@ -367,7 +367,7 @@ console.log("\nthe scan: every platform page and layout awaits the guard first")
   eq(`non-vacuous: the walk covers all of app/ (${all.length} segment files, ${t.segments.length} platform)`, all.length > t.segments.length && all.some((f) => f.startsWith("app/[org]/")), true);
   eq("next.config sets no pageExtensions of its own (the walk reads Next's default extensions)", /pageExtensions/.test(fs.readFileSync(path.join(root, "next.config.ts"), "utf8")), false);
   eq("the platform layout is read", t.segments.includes("app/(super-owner)/layout.tsx"), true);
-  for (const p of ["super/page.tsx", "super/admins/page.tsx", "super/audit/page.tsx", "super/broadcasts/page.tsx", "super/organizations/page.tsx", "super/organizations/new/page.tsx", "super/organizations/[id]/page.tsx", "super/plans/page.tsx"]) {
+  for (const p of ["super/page.tsx", "super/admins/page.tsx", "super/audit/page.tsx", "super/broadcasts/page.tsx", "super/email/page.tsx", "super/organizations/page.tsx", "super/organizations/new/page.tsx", "super/organizations/[id]/page.tsx", "super/plans/page.tsx"]) {
     eq(`non-vacuous: ${GROUP_DIR}${p} is read`, pages.includes(`${GROUP_DIR}${p}`), true);
   }
   eq("the multi-factor pages are not platform pages (they must open before the second factor)", t.segments.filter((f) => f.startsWith("app/super-mfa/")), []);

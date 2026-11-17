@@ -51,6 +51,7 @@ Learner ⇄ Cloudflare Worker (Next.js 15 App Router via @opennextjs/cloudflare)
               ├── Supabase Auth (magic link / password / SAML SSO)│ per-env project
               ├── Supabase Storage (packages, public-assets)    ──┘
               ├── Edge Function `send-smtp` (Workers have no TCP → SMTP via Deno fn)
+              │     tenant SMTP (learner mail) and the platform's own mailbox (platform mail, ADR 0029)
               ├── Resend (HTTP email fallback; needs verified domain)
               └── Tenant external LRS (xAPI forwarding: outbox → waitUntil + cron drain)
 GitHub Actions: cron.yml (job scheduler) · ops-watch.yml (watchdog) ·
@@ -79,6 +80,7 @@ drift-safe (`if exists`, `to_regclass()` guards) and probe before releases (§6.
 | Signal | Where | Semantics |
 |---|---|---|
 | **Deep health** | `GET /api/ops/health` (`x-cron-secret` header for detail) | `ok` / `warn` (advisory: LRS backlog, email failures, or a job scheduled more than once a day — `lrs-forward`, `gamification-refresh`, `journey-nudges` — stale with its last run less than 26 h ago, which GitHub's cron starvation causes; or `lrs-forward`'s last run errored because its preview check or its park write failed, §6.5) / `degraded` (storage; a stale daily, weekly or monthly job; a job never seen; a frequent job whose last run is more than 26 h ago) / `down` (DB unreachable, HTTP 503). Heartbeats count on prod only (`OPS_EXPECT_CRONS=1`); ADR 0007, note of 2026-11-14 on decision 4; ADR 0024, note of 2026-11-15 |
+| **Platform sender** | `GET /api/ops/health` with the secret: `email_checks.platform_email` (never under `checks`, so the watchdog's summary never prints it); `/super/email` and the console banner | `fail` (not configured; the log unreadable; the newest send an `auth` or `quota` failure; two failed sends in a row; the daily ceiling) makes the authenticated status `degraded`; one `timeout`, `unreachable` or `unknown` send, or half the ceiling, `warn`. The unauthenticated status never includes it. **`degraded` with every printed check `ok` is the platform sender**: read `email_checks` with the secret, then §6.3. ADR 0029 section H |
 | **Cron heartbeats** | `ops_heartbeats` table (migration 0050); each cron upserts on every run | staleness vs cadence map in the health route; `last_status` `error` reads `warn` for `lrs-forward` only (`ERRORED_WARN`), and is shown, not counted, for every other job |
 | **Watchdog + digest** | GitHub issues labelled `ops-incident` / `ops-digest` | incident lifecycle + daily history |
 | **RLS cross-tenant audit** | `rls-audit.yml` on migration PRs + weekly cron | FAILs policy-less org-scoped tables & runtime leaks |
@@ -141,6 +143,84 @@ blast radius (which tenants/flows) → recommended action → what approval is n
 3. **Resend 403 domain not verified** → fallback can't send for that From domain; verify domain in Resend or fix primary SMTP.
 4. Junk-foldering (delivered but unseen) → SPF/DKIM/DMARC missing on the From domain; align display name; long-term: verified domain + Resend.
 5. Platform auth emails (reset/magic-link) use the same pipeline — a tenant SMTP failure can block password resets for that tenant.
+6. The `email` health check counts only events that a signed-in person or the system starts, so it leaves out `password_reset` and `magic_link` rows (ADR 0029 section H). Read those two in `notification_log` directly.
+
+#### 6.3a The platform sender (ADR 0029; `lib/email/platform-sender.ts`)
+
+The platform's own mailbox: a mailbox of the LMS owner's, opened only by the
+owner, with two-step verification. If it also carries other mail, that mail
+uses the same daily sending cap (step 3). It sends platform mail only
+(platform owners' and organisation administrators' codes and links,
+administrator welcomes, SMTP alerts); never a learner's mail, and it is never
+a fallback for a tenant's SMTP, nor a tenant's SMTP for it. It posts to the
+`send-smtp` function like a tenant send; every send is one row of
+`public.platform_email_log` (migration 0113: user ids, statuses and error
+classes; never an address or message content).
+
+**Setup** (staging first; production in the sitting before the tag that
+carries the sender, ADR 0029 section M):
+1. Migration `0113_platform_email_log.sql` pasted on the database **before**
+   the code (decision 7). Code that arrives first sends nothing and reads
+   `fail` until the paste.
+2. The settings, every one a deployment secret (never in the database, the
+   repository, a page or a chat): `PLATFORM_SMTP_HOST`, `PLATFORM_SMTP_PORT`
+   and `PLATFORM_SMTP_SECURE` (465 and `true` for Gmail), `PLATFORM_SMTP_USER`,
+   `PLATFORM_SMTP_PASSWORD` (the mailbox's app password), `PLATFORM_SMTP_FROM`
+   (`Name <address>`) and `PLATFORM_EMAIL_ALLOW_DOMAINS` (`*` on production; on
+   staging only a domain whose every mailbox the owner controls, never a public
+   mail provider's domain, since every staging account at that provider could
+   then be mailed; reserved test domains are never mailed and need not be
+   listed); optional `PLATFORM_EMAIL_REPLY_TO`,
+   `PLATFORM_EMAIL_DAILY_CEILING` and `PLATFORM_EMAIL_ORG_DAILY_LIMIT`.
+   Workers: `wrangler secret put <NAME>` (`--env production` for production;
+   comments in `wrangler.toml`). Cloud Run: `docs/CLOUD_RUN_STAGING.md` §2.
+   Staging and production never share a credential.
+3. **The ceiling.** `PLATFORM_EMAIL_DAILY_CEILING` is three quarters of the
+   mailbox's confirmed daily sending cap. The cap is not confirmed yet (a paid
+   Workspace mailbox was given as 2,000 per user per rolling 24 hours; a
+   gmail.com mailbox is about 500): read the current figure on the provider's
+   own page for the mailbox type and set the ceiling to three quarters of it.
+   Unset, the sender uses **375**, three quarters of 500, the safe default.
+   Mail the mailbox sends outside the LMS counts against the same cap.
+4. `/super/email` → "Send test to my address": the message arrives and the
+   page reads configured, `ok`. Then `/api/ops/health` with the secret:
+   `email_checks.platform_email` `ok`.
+5. Staging only, once, after step 4: the timing measurement of ADR 0029
+   section G, `node scripts/measure-platform-send.mjs` (its header has the
+   steps). It reports the 95th-percentile send time; a figure above 4 s is
+   reported before ADR 0029 pull request B.
+
+**Rotation:** set `PLATFORM_SMTP_PASSWORD` again (Workers: `wrangler secret
+put`; Cloud Run: a new secret version and a redeploy), then "Send test".
+
+**Dead app password** (`platform_email` `fail` with the newest row `auth`;
+console banner): Google withdraws an app password when the account's password
+changes or two-step verification is reset. Sign in to the mailbox, create a new
+app password, rotate as above, send the test; the delivered test clears the
+check. `quota`: the provider's daily cap is reached; it clears by itself
+within 24 hours; lower the traffic or raise the cap, and keep the ceiling at
+three quarters of the cap. `timeout` once is `warn`: the mail may still have
+arrived (the app waits 8 s, `send-smtp` up to 25 s).
+
+**Limits** (ADR 0029 section G; checked before every send, and a limit that
+cannot be read sends nothing): 5 an hour and 10 a day per account and kind (a
+platform owner's own code and link: the hourly limit only; the test counts only
+the sends that reached the mail server); 50 codes and links
+a day for one organisation's administrators (`PLATFORM_EMAIL_ORG_DAILY_LIMIT`;
+alerts and welcomes are outside it); the daily ceiling for all platform mail
+(a platform owner's own code, link and test are exempt). Nothing is ever sent
+to a reserved test domain (`.test`, `.example`, `.invalid`, `.localhost`,
+`example.com/.net/.org`), and nothing at all while the allow-list is unset.
+
+**Retention:** rows are kept 90 days. Monthly, in the SQL editor with the role
+selector on postgres:
+```sql
+delete from public.platform_email_log where sent_at < now() - interval '90 days';
+```
+
+**Last resort** for a locked-out platform owner or administrator (the sender
+or its log down, or the account's hourly limit reached): the
+owner sets a temporary password for the account in the hosted auth dashboard.
 
 ### 6.4 RLS audit FAILED (P2, security)
 - Usually a **new org-scoped table with RLS on and zero policies** — the audit can't certify isolation (not necessarily a leak: policy-less = deny-all). Fix: migration adding `for select using (is_org_admin(organization_id))`-style policies; apply to staging (audit runs against staging live) then prod. *(Lived: 0044 → fixed by 0045.)*

@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
+  EMAIL_CHECK_IGNORED_EVENTS,
   classifyCrons,
   overallStatus,
   type CheckStatus,
   type HeartbeatRow,
 } from "@/lib/ops/health-status";
+import { readPlatformEmailHealth } from "@/lib/email/platform-health";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +25,16 @@ export const dynamic = "force-dynamic";
  *   storage     list buckets                                  fail → DEGRADED
  *   crons       ops_heartbeats freshness vs expected cadence  stale → DEGRADED*
  *   lrs_outbox  pending/failed backlog + dead letters         breach → WARN
- *   email       notification_log failures in last 24h         breach → WARN
+ *   email       notification_log failures in last 24h,        breach → WARN
+ *               password_reset and magic_link not counted
+ *
+ * Under email_checks, not checks (ADR 0029 section H), with the secret only:
+ *   platform_email  the platform sender (lib/email/platform-health.ts)
+ *                   fail → DEGRADED, warn → WARN
+ * The watchdog's public summary prints checks only, so it never names it.
+ * The unauthenticated { status } is computed without it, and the check is
+ * not run for a caller without the secret: no unauthenticated request moves
+ * the unauthenticated status.
  *
  * *Cron staleness only affects overall status when OPS_EXPECT_CRONS=1 is set on
  * the worker (true on PROD, where cron.yml fires; staging has no schedule, so
@@ -171,6 +182,12 @@ async function checkLrsOutbox(): Promise<Check> {
   });
 }
 
+// The check counts only events that a signed-in person or the system starts
+// (ADR 0029 section H): reset codes and sign-in links, which a request
+// without a session starts, are not counted, so the public status depends on
+// no unauthenticated request. Every other event is counted as before.
+const EMAIL_CHECK_EVENTS_FILTER = `(${EMAIL_CHECK_IGNORED_EVENTS.join(",")})`;
+
 async function checkEmail(): Promise<Check> {
   return timed(async () => {
     const db = svc();
@@ -179,12 +196,14 @@ async function checkEmail(): Promise<Check> {
       .from("notification_log")
       .select("id", { count: "exact", head: true })
       .eq("status", "failed")
+      .not("event_type", "in", EMAIL_CHECK_EVENTS_FILTER)
       .gte("sent_at", sinceIso);
     if (error) return { status: "unknown", detail: error.message };
     const { count: sent } = await db
       .from("notification_log")
       .select("id", { count: "exact", head: true })
       .eq("status", "sent")
+      .not("event_type", "in", EMAIL_CHECK_EVENTS_FILTER)
       .gte("sent_at", sinceIso);
     return {
       status: (failed ?? 0) > EMAIL_FAILURES_WARN ? "warn" : "ok",
@@ -193,39 +212,66 @@ async function checkEmail(): Promise<Check> {
   });
 }
 
+/** The platform sender (ADR 0029 section H); returned under email_checks only. */
+async function checkPlatformEmail(): Promise<Check> {
+  return timed(async () => {
+    const h = await readPlatformEmailHealth(svc());
+    return {
+      status: h.status,
+      detail: {
+        configured: h.configured,
+        missing: h.missing,
+        reasons: h.reasons,
+        last_at: h.newest?.sent_at ?? null,
+        last_status: h.newest?.status ?? null,
+        last_error_code: h.newest?.error_code ?? null,
+        sent_24h: h.sent24h,
+        ceiling: h.ceiling,
+      },
+    };
+  });
+}
+
 export async function GET(request: Request) {
   const expectCrons = process.env.OPS_EXPECT_CRONS === "1";
-  const [db, storage, crons, lrsOutbox, email] = await Promise.all([
+  const authed =
+    !!process.env.CRON_SECRET &&
+    request.headers.get("x-cron-secret") === process.env.CRON_SECRET;
+
+  const [db, storage, crons, lrsOutbox, email, platformEmail] = await Promise.all([
     checkDb(),
     checkStorage(),
     checkCrons(expectCrons),
     checkLrsOutbox(),
     checkEmail(),
+    authed ? checkPlatformEmail() : Promise.resolve(null),
   ]);
 
-  const status = overallStatus({
+  const base = {
     db: db.status,
     storage: storage.status,
     crons: crons.status,
     lrsOutbox: lrsOutbox.status,
     email: email.status,
-  });
+  };
 
-  const authed =
-    !!process.env.CRON_SECRET &&
-    request.headers.get("x-cron-secret") === process.env.CRON_SECRET;
-
-  const httpStatus = status === "down" ? 503 : 200;
-  if (!authed) {
-    return NextResponse.json({ status, ts: new Date().toISOString() }, { status: httpStatus });
+  if (!authed || !platformEmail) {
+    // Without the email_checks: no unauthenticated request moves this status.
+    const status = overallStatus(base);
+    return NextResponse.json(
+      { status, ts: new Date().toISOString() },
+      { status: status === "down" ? 503 : 200 }
+    );
   }
+  const status = overallStatus({ ...base, platformEmail: platformEmail.status });
   return NextResponse.json(
     {
       status,
       ts: new Date().toISOString(),
       expect_crons: expectCrons,
       checks: { db, storage, crons, lrs_outbox: lrsOutbox, email },
+      email_checks: { platform_email: platformEmail },
     },
-    { status: httpStatus }
+    { status: status === "down" ? 503 : 200 }
   );
 }

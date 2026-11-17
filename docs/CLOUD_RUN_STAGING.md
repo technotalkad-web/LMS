@@ -101,6 +101,62 @@ Check the service-role key really is the staging one: it is a long JWT whose
 decoded `ref` is `zeaclbapadosqqttexxh`. The deploy script refuses the
 production project URL unless explicitly overridden.
 
+### The platform sender's secrets (ADR 0029, optional until it is set up)
+
+The platform's own mailbox (`lib/email/platform-sender.ts`): codes and
+sign-in links for platform owners and organisation administrators,
+administrator welcomes and SMTP alerts. It never sends a learner's mail and
+is never a fallback for a tenant's SMTP. Every setting is a secret, the
+non-secret ones too, so no address sits in the repository. Staging uses
+its **own** mailbox credential, never production's, and an allow-list of
+only domains whose every mailbox the owner controls. Never list a public
+mail provider's domain: every staging account at that provider could then
+be mailed. Reserved test domains (`.test`, `example.com` and the like) are
+never mailed, so listing one sends nothing.
+
+```bash
+printf '%s' "<smtp host>"                    | gcloud secrets create lms-platform-smtp-host --data-file=-
+printf '%s' "465"                            | gcloud secrets create lms-platform-smtp-port --data-file=-
+printf '%s' "true"                           | gcloud secrets create lms-platform-smtp-secure --data-file=-
+printf '%s' "<mailbox sign-in name>"         | gcloud secrets create lms-platform-smtp-user --data-file=-
+# the app password at a hidden prompt, so it is in no shell history
+read -rs PW && printf '%s' "$PW" | gcloud secrets create lms-platform-smtp-password --data-file=-; unset PW
+printf '%s' "<Name <address>>"               | gcloud secrets create lms-platform-smtp-from --data-file=-
+printf '%s' "<a domain you control>[,<another>]" | gcloud secrets create lms-platform-email-allow-domains --data-file=-
+# optional: lms-platform-email-reply-to, lms-platform-email-daily-ceiling
+# (default 375), lms-platform-email-org-daily-limit (default 50)
+
+PN=$(gcloud projects describe "$(gcloud config get-value project)" --format='value(projectNumber)')
+# every one the deploy script may mount; an optional one not created is skipped
+for s in lms-platform-smtp-host lms-platform-smtp-port lms-platform-smtp-secure \
+         lms-platform-smtp-user lms-platform-smtp-password lms-platform-smtp-from \
+         lms-platform-email-allow-domains lms-platform-email-reply-to \
+         lms-platform-email-daily-ceiling lms-platform-email-org-daily-limit; do
+  gcloud secrets describe "$s" >/dev/null 2>&1 || continue
+  gcloud secrets add-iam-policy-binding "$s" \
+    --member="serviceAccount:${PN}-compute@developer.gserviceaccount.com" \
+    --role="roles/secretmanager.secretAccessor"
+done
+```
+
+`scripts/cloud-run-deploy.sh` mounts each of these that exists in Secret
+Manager, on every deploy, and prints the names it mounted (never a value);
+one that does not exist is left out, so a deploy before this setup still
+succeeds. A secret it mounts must carry the runtime's `secretAccessor`
+binding, or the deploy fails: run the loop above again after creating an
+optional one later. Until the six required ones (host, port, user, password, From and
+the allow-list) are mounted, the sender sends nothing and `/api/ops/health`
+reads `degraded` to a caller with the secret (`platform_email` under
+`email_checks`). `PLATFORM_EMAIL_SECRETS=0 ./scripts/cloud-run-deploy.sh`
+mounts none of them. Rotation: add a new version of
+`lms-platform-smtp-password` (`read -rs PW && printf '%s' "$PW" | gcloud
+secrets versions add lms-platform-smtp-password --data-file=-; unset PW`),
+redeploy, then press "Send test" on `/super/email`. The ceiling: set `lms-platform-email-daily-ceiling` to three
+quarters of the mailbox's confirmed daily cap; without it the sender uses
+375, three quarters of the smaller cap (about 500 a day) the owner may choose.
+Migration `0113_platform_email_log.sql` goes on the staging database before
+the code (ADR 0029 decision 7). Details: `ops/RUNBOOK.md` §6.3.
+
 ## 3. Build and deploy (first time ≈ 8 min, later ≈ 5 min)
 
 ```bash

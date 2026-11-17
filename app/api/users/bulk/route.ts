@@ -43,7 +43,10 @@ import {
  * For every row:
  *   - If email already exists in auth.users -> existing user_id reused.
  *   - Else if password provided -> createUser (immediate password).
- *   - Else -> inviteUserByEmail (system emails a magic link).
+ *   - Else -> generateLink({ type: "invite" }) mints the activation link and
+ *     Supabase Auth sends nothing; the organisation's own pipeline emails it
+ *     (account_invite, below). The app never asks Supabase Auth to send
+ *     (ADR 0029 section F; tests/unit/auth-mailer-calls.test.ts).
  *   - profile + membership are upserted.
  *
  * Returns { summary, results[] }.

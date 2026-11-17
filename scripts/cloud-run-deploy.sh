@@ -20,8 +20,15 @@
 #                          refused with the PRODUCTION project, even with ALLOW_PROD=1.
 #                          The owner's launcher exports it (docs/CLOUD_RUN_STAGING.md §3).
 #   ALLOW_PROD=1          required to point at the PRODUCTION Supabase project
+#   PLATFORM_EMAIL_SECRETS=0  mount none of the platform sender's secrets (below)
 # Secrets must already exist in Secret Manager (runbook §2):
 #   lms-supabase-service-role-key, lms-cron-secret, lms-impersonation-secret
+# The platform sender's secrets (ADR 0029 section F; runbook §2): every one of
+# PLATFORM_SECRET_MAP below that exists in Secret Manager is mounted, and one
+# that does not exist is left out, so a deploy before the owner's setup still
+# succeeds (the health check's platform_email then reads fail). Detected on
+# every deploy, so a later deploy never drops them (--set-secrets replaces the
+# whole set). Names only are printed, never a value.
 set -euo pipefail
 
 REGION="${REGION:-asia-south1}"
@@ -61,6 +68,41 @@ if [[ "$MODE" == "all" ]]; then
     --substitutions="_TAG=${TAG},_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL},_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY},_SITE_URL=${NEXT_PUBLIC_SITE_URL},_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN:-},_SENTRY_ENV=${NEXT_PUBLIC_SENTRY_ENV:-staging-gcp}"
 fi
 
+# The platform sender's settings (ADR 0029 section F): all of them secrets,
+# the non-secret ones too, so no address sits in this public repository.
+PLATFORM_SECRET_MAP=(
+  "PLATFORM_SMTP_HOST=lms-platform-smtp-host"
+  "PLATFORM_SMTP_PORT=lms-platform-smtp-port"
+  "PLATFORM_SMTP_SECURE=lms-platform-smtp-secure"
+  "PLATFORM_SMTP_USER=lms-platform-smtp-user"
+  "PLATFORM_SMTP_PASSWORD=lms-platform-smtp-password"
+  "PLATFORM_SMTP_FROM=lms-platform-smtp-from"
+  "PLATFORM_EMAIL_ALLOW_DOMAINS=lms-platform-email-allow-domains"
+  "PLATFORM_EMAIL_REPLY_TO=lms-platform-email-reply-to"
+  "PLATFORM_EMAIL_DAILY_CEILING=lms-platform-email-daily-ceiling"
+  "PLATFORM_EMAIL_ORG_DAILY_LIMIT=lms-platform-email-org-daily-limit"
+)
+PLATFORM_REQUIRED=(PLATFORM_SMTP_HOST PLATFORM_SMTP_PORT PLATFORM_SMTP_USER PLATFORM_SMTP_PASSWORD PLATFORM_SMTP_FROM PLATFORM_EMAIL_ALLOW_DOMAINS)
+PLATFORM_SECRETS=""
+PLATFORM_MOUNTED=()
+if [[ "${PLATFORM_EMAIL_SECRETS:-1}" != "0" ]]; then
+  for pair in "${PLATFORM_SECRET_MAP[@]}"; do
+    var="${pair%%=*}"
+    secret="${pair#*=}"
+    if gcloud secrets describe "${secret}" --project "${PROJECT}" >/dev/null 2>&1; then
+      PLATFORM_SECRETS+=",${var}=${secret}:latest"
+      PLATFORM_MOUNTED+=("${var}")
+    fi
+  done
+fi
+echo "▶ platform sender secrets mounted: ${PLATFORM_MOUNTED[*]:-none}"
+for var in "${PLATFORM_REQUIRED[@]}"; do
+  if [[ " ${PLATFORM_MOUNTED[*]:-} " != *" ${var} "* ]]; then
+    echo "! ${var} is not mounted: the platform sender is not configured, and /api/ops/health reads degraded to a caller with the secret (runbook §2)."
+    break
+  fi
+done
+
 echo "▶ deploying ${SERVICE} to Cloud Run (${REGION})"
 gcloud run deploy "${SERVICE}" \
   --image "${IMAGE}" \
@@ -73,7 +115,7 @@ gcloud run deploy "${SERVICE}" \
   --timeout 300 \
   --min-instances "${MIN_INSTANCES:-0}" --max-instances "${MAX_INSTANCES:-3}" \
   --set-env-vars "NODE_ENV=production,NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL},NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY},NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL},NEXT_PUBLIC_SENTRY_ENV=${NEXT_PUBLIC_SENTRY_ENV:-staging-gcp},STORAGE_DRIVER=${STORAGE_DRIVER:-supabase},SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-course-content},OPS_EXPECT_CRONS=${OPS_EXPECT_CRONS:-0}${ALDS_P4:+,ALDS_P4=${ALDS_P4}}" \
-  --set-secrets "SUPABASE_SERVICE_ROLE_KEY=lms-supabase-service-role-key:latest,CRON_SECRET=lms-cron-secret:latest,IMPERSONATION_SECRET=lms-impersonation-secret:latest${RESEND_SECRET:+,RESEND_API_KEY=lms-resend-api-key:latest}"
+  --set-secrets "SUPABASE_SERVICE_ROLE_KEY=lms-supabase-service-role-key:latest,CRON_SECRET=lms-cron-secret:latest,IMPERSONATION_SECRET=lms-impersonation-secret:latest${RESEND_SECRET:+,RESEND_API_KEY=lms-resend-api-key:latest}${PLATFORM_SECRETS}"
 
 URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" --format='value(status.url)')"
 echo "✓ ${SERVICE} is live at ${URL}"

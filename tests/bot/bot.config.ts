@@ -57,6 +57,7 @@ export const roleEntryRoutes: Record<Exclude<BotRole, "anonymous">, string[]> = 
     "/super/broadcasts",
     "/super/audit",
     "/super/admins",
+    "/super/email",
     "/super/organizations/new",
   ],
   admin: [
