@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { hashResetToken, safeHashEqual } from "@/lib/auth/password-reset";
+import {
+  RESET_SESSION_INVALID_MESSAGE,
+  hashResetToken,
+  safeHashEqual,
+} from "@/lib/auth/password-reset";
 import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
 
 /**
@@ -15,8 +19,14 @@ import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
  *
  * Also clears profiles.must_change_password if it was set so the
  * gate doesn't bounce them back to /change-password.
+ *
+ * A missing, expired or wrong reset session gets one answer: 400 with
+ * RESET_SESSION_INVALID_MESSAGE.
  */
 const MIN_LEN = 10;
+
+const failed = () =>
+  NextResponse.json({ error: RESET_SESSION_INVALID_MESSAGE }, { status: 400 });
 
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
@@ -82,22 +92,13 @@ export async function POST(request: Request) {
     | null;
 
   if (!row || !row.reset_token_hash || !row.reset_token_expires) {
-    return NextResponse.json(
-      { error: "No active reset session. Start over." },
-      { status: 400 }
-    );
+    return failed();
   }
   if (new Date(row.reset_token_expires).getTime() < Date.now()) {
-    return NextResponse.json(
-      { error: "Reset window expired. Request a new code." },
-      { status: 400 }
-    );
+    return failed();
   }
   if (!safeHashEqual(row.reset_token_hash, hashResetToken(resetToken))) {
-    return NextResponse.json(
-      { error: "Invalid reset token." },
-      { status: 401 }
-    );
+    return failed();
   }
 
   // Look up the user.
@@ -125,11 +126,19 @@ export async function POST(request: Request) {
     .update({ must_change_password: false })
     .eq("id", user.id);
 
-  // Mark this row used so the token can't be replayed.
+  // Mark this row used so the token can't be replayed, and close every other
+  // code of the address that is still open: a completed reset ends them all,
+  // so no older code becomes the newest with guesses of its own.
+  const spentAt = new Date().toISOString();
   await svc
     .from("password_reset_otps")
-    .update({ used_at: new Date().toISOString() })
+    .update({ used_at: spentAt })
     .eq("id", row.id);
+  await svc
+    .from("password_reset_otps")
+    .update({ used_at: spentAt })
+    .eq("email", email)
+    .is("used_at", null);
 
   // The client signs in with the new password next: end this browser's
   // impersonation first, after the token is spent. The cookie always goes.

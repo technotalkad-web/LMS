@@ -1,10 +1,12 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { Megaphone } from "lucide-react";
 import { BroadcastsManager, type BroadcastRow } from "./broadcasts-manager";
+import { requirePlatformOwner } from "@/lib/auth/require-platform-owner";
 
 export const dynamic = "force-dynamic";
 
 export default async function BroadcastsPage() {
+  await requirePlatformOwner();
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,

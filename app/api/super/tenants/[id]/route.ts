@@ -1,57 +1,24 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { auditLog } from "@/lib/auth/require-platform-owner";
+import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 
 /**
  *   PATCH  /api/super/tenants/[id]   body: { action: "suspend" | "activate" | "restore" | "set_plan", plan_id? }
  *   DELETE /api/super/tenants/[id]   schedules deletion in 30 days (soft delete)
  *
- * Platform-owner-only. Verified by re-querying platform_owners with the
- * service-role client at the top of every handler — we don't trust the
- * client-bound session for this.
+ * Platform-owner-only. Every handler passes requirePlatformOwnerApi("full")
+ * first (lib/auth/require-platform-owner.ts): the owner row is read with the
+ * service role and the second factor is required as on the platform pages.
  */
 
 const GRACE_PERIOD_DAYS = 30;
-
-async function assertPlatformOwner(): Promise<
-  { ok: true; userId: string } | { ok: false; res: NextResponse }
-> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return {
-      ok: false,
-      res: NextResponse.json({ error: "Unauthorized" }, { status: 401 }),
-    };
-  }
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-  const { data: row } = await svc
-    .from("platform_owners")
-    .select("user_id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!row) {
-    return {
-      ok: false,
-      res: NextResponse.json({ error: "Forbidden" }, { status: 403 }),
-    };
-  }
-  return { ok: true, userId: user.id };
-}
 
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { id: tenantId } = await params;
 
   const body = (await request.json().catch(() => ({}))) as {
@@ -256,8 +223,8 @@ export async function DELETE(
   _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const guard = await assertPlatformOwner();
-  if (!guard.ok) return guard.res;
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const { id: tenantId } = await params;
 
   const scheduled = new Date(

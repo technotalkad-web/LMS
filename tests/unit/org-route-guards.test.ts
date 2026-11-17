@@ -32,7 +32,8 @@
  *     tests the caller's role and returns (or throws) on the arm the
  *     refused caller takes, or a call to requirePlatformOwner (it redirects
  *     by itself). The role test is the answer of requireOrgAdminApi /
- *     isOrgAdminCaller, a platform_owners lookup of the caller, or a
+ *     isOrgAdminCaller / requirePlatformOwnerApi, a platform_owners lookup
+ *     of the caller, or a
  *     comparison with a role name (`role === "admin"`,
  *     `[...roles].includes(role)`, canManage(role)…) of a value read from a
  *     lookup of the caller (an organization_members read selecting role
@@ -305,7 +306,7 @@ const WRITE_METHODS = new Set(["insert", "update", "upsert", "delete"]);
 const STORAGE_WRITES = new Set(["upload", "update", "remove", "move", "copy", "createSignedUploadUrl", "uploadToSignedUrl"]);
 const ADAPTER_WRITES = new Set(["upload", "getSignedUploadUrl", "delete", "deletePrefix"]);
 /** lib/auth helpers whose answer is the caller's role test (the route must act on it). */
-const ROLE_GUARD_FNS = new Set(["requireOrgAdminApi", "isOrgAdminCaller"]);
+const ROLE_GUARD_FNS = new Set(["requireOrgAdminApi", "isOrgAdminCaller", "requirePlatformOwnerApi"]);
 /** lib/auth helpers that refuse by themselves (redirect). */
 const SELF_GUARDS = new Set(["requirePlatformOwner"]);
 /** Role tests that guard once the caller's role is known. */
@@ -1235,6 +1236,13 @@ console.log("\nplanted cases");
       const { data: po } = await svc.from("platform_owners").select("user_id").eq("user_id", u.id).maybeSingle();
       if (!po) return NextResponse.json({}, { status: 403 });
       await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
+  eq("requirePlatformOwnerApi acted on (\"error\" in guard → return) is a guard; its answer left untested is not",
+    verdict(plant(SVC_IMPORTS + `import { requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
+    export async function POST() { const guard = await requirePlatformOwnerApi("full");
+      if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
+      const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }
+    export async function DELETE() { const guard = await requirePlatformOwnerApi("full");
+      const svc = ${SVC}; await svc.from("x").delete().eq("id", "1"); return NextResponse.json({ guard }); }`)), ["POST:guarded", "DELETE:FLAGGED"]);
   eq("a role check inside a lib module other than lib/auth is not taken as the route's guard",
     verdict(plant(`import { NextResponse } from "next/server";\nimport { notifyBackground } from "@/lib/notifications/send";\nimport { sendNotification } from "@/lib/notifications/send";\n` +
       `export async function POST() { await sendNotification({} as never); await notifyBackground({} as never); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);

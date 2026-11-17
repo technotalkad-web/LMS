@@ -5,6 +5,7 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { ArrowLeft, Building2 } from "lucide-react";
 import { TenantDetailEditor } from "./tenant-detail-editor";
 import { OverridesEditor } from "./overrides-editor";
+import { requirePlatformOwner } from "@/lib/auth/require-platform-owner";
 
 export const dynamic = "force-dynamic";
 
@@ -15,6 +16,7 @@ export default async function TenantDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
+  await requirePlatformOwner();
   const { id } = await params;
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
