@@ -3,9 +3,8 @@
  * alone. Every page under app/(super-owner)/ awaits the platform-owner page
  * guard itself, requirePlatformOwner() from lib/auth/require-platform-owner.ts
  * (the function the platform layout calls), as its first statement, before
- * any read. A navigation inside the console renders the new page without
- * re-running the layout, and a layout and its page render side by side, so a
- * request that skips or races the layout must still get nothing.
+ * any read. Every platform page refuses a caller on its own, on every render,
+ * whether or not its layout ran.
  *
  * What counts as a platform file: every page, layout, template and default
  * file Next serves (.tsx, .ts, .jsx and .js, Next's default extensions) that
@@ -668,7 +667,7 @@ async function main() {
       eq(`${label}: every platform page and layout redirects to ${want} before sending a request of its own, and writes nothing (${files.length} files)`, wrong, []);
     };
 
-    console.log("\nrefused callers, each page on its own (as when a navigation skips the layout)");
+    console.log("\nrefused callers, each page checked on its own");
     await refusedEverywhere("signed out", "/login", null, () => { asOwner(true); signIn(null); });
     await refusedEverywhere("a signed-in user with no owner row, at AAL2", "/login", MEMBER, () => { asOwner(true); signIn(MEMBER_AAL2); });
     await refusedEverywhere("an owner who must change their password, at AAL2", "/change-password", OWNER, () => { asOwner(true); mustChange.add(OWNER.id); signIn(OWNER_AAL2, VERIFIED_TOTP); });

@@ -39,8 +39,7 @@ async function secondFactorShortfall(
  *
  * The platform page rule (tests/unit/platform-page-guards.test.ts): the
  * platform layout and every platform page await this as their first
- * statement. A page never relies on its layout alone: a navigation inside
- * the console renders the page without re-running the layout.
+ * statement. A page never relies on its layout alone.
  *
  * React's cache() makes it one run per server render: the layout and the
  * page of one request share it, so the check, and its last_mfa_check_at
