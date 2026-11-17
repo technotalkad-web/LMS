@@ -235,11 +235,12 @@ owner sets a temporary password for the account in the hosted auth dashboard.
 5. Ingestion is fail-isolated from forwarding by design — internal LRS keeps recording even when forwarding is broken; learner data is never at risk from a tenant's LRS outage.
 
 ### 6.6 Reports stale / matview refresh failing (P3)
-- `refresh-report-views` heartbeat errored → usually a matview missing on that env (schema drift) or a concurrent-refresh lock. Probe `to_regclass('public.mv_course_performance')` etc.; replay canonical migrations (0031, 0035) if missing. *(Lived: prod had 0035 but not 0031; refresh errored nightly.)*
+- `refresh-report-views` heartbeat errored → usually a matview missing on that env (schema drift) or a concurrent-refresh lock. Probe `to_regclass('public.mv_course_performance')` etc.; replay canonical migrations (0031, 0035) if missing. 0031 is on 0115's never-paste list (6.7): on a database that holds 0115, paste 0115 again directly after it and run `ops/0115-after-checks.sql`. *(Lived: prod had 0035 but not 0031; refresh errored nightly.)*
 
 ### 6.7 Schema drift staging↔prod (P3, release-blocking)
 - Before every prod release: run `to_regclass()`/`to_regprocedure()` probes for objects the release's code reads. Any NULL on prod = apply the missing canonical migrations first (they're idempotent), **then** tag.
 - Write new hand-applied DDL drift-safe so partial states no-op instead of aborting.
+- **Membership rule (ADR 0030, migration 0115).** Idempotent is not the same as safe to paste again: After 0115, none of 0001, 0002, 0006, 0010, 0019, 0026, 0027, 0030, 0031, 0055 and 0056 is pasted again on that database. If one is pasted, 0115 is pasted again directly after it, in the same sitting, and its after-checks are read. Where 0110 is applied and the file was 0027, 0110 follows 0115. A paste of 0105, 0106, 0107, 0108 or 0112 needs nothing from 0115. The after-checks of 0115 are also kept as a read-only block that can be run alone (`ops/0115-after-checks.sql`); it is run after every sitting that pastes a migration, whatever its number. A failed after-check names the helper or policy that lost the rule; paste 0115 again, then run the after-checks again.
 
 ### 6.8 Bad deploy / rollback (P1 path)
 - Prod deploys are tag-driven: **rollback = re-run deploy-prod on the previous good tag** (Actions → deploy-prod → run on tag `vX.Y.(Z-1)`), or `wrangler rollback` for the worker alone.

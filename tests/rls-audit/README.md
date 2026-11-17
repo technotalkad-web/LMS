@@ -94,7 +94,10 @@ Column meanings:
 ## When the runtime check is skipped
 
 The runtime check needs **two organizations that each have at least one
-member**. If your DB only has one org (fresh staging, for example), the
+member**: a live organisation (`deleted_at` null) and a member whose
+`status` is `active`. From migration 0115 (ADR 0030) any other row grants
+no read, so the script picks its two actors from those rows only. If your
+DB only has one org (fresh staging, for example), the
 runtime columns will be `0` and the static checks still run. To prime
 staging, run the e2e suite first — it leaves `qa-*` orgs behind that the
 audit can use:

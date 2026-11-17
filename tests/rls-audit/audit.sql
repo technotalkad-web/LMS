@@ -108,15 +108,27 @@ where p.tablename = a.table_name;
 
 
 -- ---- Step 5: pick two orgs + a user from each (for runtime check) ----------
+-- Actors are active members of live organisations only (ADR 0030): from
+-- migration 0115 a membership row that is not active, or one in a deleted
+-- organisation, grants no read at all, so an actor picked from such a row
+-- would see zero rows of every organisation and the leak check would pass
+-- without testing anything.
 drop table if exists _rls_audit_actors;
 create temp table _rls_audit_actors (
   org_a uuid, org_b uuid, user_a uuid, user_b uuid
 );
 GRANT ALL ON _rls_audit_actors TO authenticated;
 
-with org_members_count as (
+with active_members as (
+  select m.organization_id, m.user_id
+  from public.organization_members m
+  join public.organizations o on o.id = m.organization_id
+  where m.status = 'active'
+    and o.deleted_at is null
+),
+org_members_count as (
   select organization_id, count(*) as members
-  from public.organization_members
+  from active_members
   group by organization_id
   having count(*) > 0
 ),
@@ -129,10 +141,10 @@ insert into _rls_audit_actors (org_a, org_b, user_a, user_b)
 select
   (select organization_id from two_orgs where rn = 1),
   (select organization_id from two_orgs where rn = 2),
-  (select user_id from public.organization_members
+  (select user_id from active_members
     where organization_id = (select organization_id from two_orgs where rn = 1)
     order by user_id limit 1),
-  (select user_id from public.organization_members
+  (select user_id from active_members
     where organization_id = (select organization_id from two_orgs where rn = 2)
     order by user_id limit 1);
 
@@ -148,7 +160,7 @@ declare
 begin
   if v_org_a is null or v_org_b is null then
     raise notice
-      'Skipping runtime check: need 2 orgs with members in organization_members.';
+      'Skipping runtime check: need 2 live orgs with active members in organization_members.';
     return;
   end if;
   for t in select table_name from _rls_audit loop

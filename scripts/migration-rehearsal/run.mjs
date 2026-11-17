@@ -207,7 +207,9 @@ async function stepApply(db, s) {
           `${f}: refused ${refuse.why} (expected ${refuse.code} "${refuse.contains}…")${r.ok ? ": it APPLIED" : ""}`,
         ) && allOk;
       if (!r.ok) info(`refusal: ${r.code} ${r.message}`);
-      if (!(await runSqlFile(db, refuse.then))) return "stop";
+      // `then` may be left out (added for 0115): a refusal that must change
+      // nothing is followed by a fingerprint step, not by a reset
+      if (refuse.then && !(await runSqlFile(db, refuse.then))) return "stop";
       // `times: 0` (added for 0112): the refusal and the reset only
       if (times === 0) continue;
     } else if (times === 0) {
@@ -249,7 +251,7 @@ async function stepScript(db, s) {
         `${s.file}: refused ${refuse.why} (expected ${refuse.code} "${refuse.contains}…")${r.ok ? ": it APPLIED" : ""}`,
       ) && allOk;
     if (!r.ok) info(`refusal: ${r.code} ${r.message}`);
-    if (!(await runSqlFile(db, refuse.then))) return "stop";
+    if (refuse.then && !(await runSqlFile(db, refuse.then))) return "stop";
     if (s.times === 0) return allOk ? "next" : "stop";
   }
   const results = [];
@@ -427,6 +429,85 @@ async function stepCases(db, s) {
     const sql = doc.cases.filter((c) => c.sides.includes("sql")).length;
     check(true, `cases ${f} loaded (${doc.cases.length} cases, ${sql} on the SQL side)`);
   }
+  return "next";
+}
+
+// An assertion file of this folder (`file`), or a read-only script of the
+// repository (`script`, e.g. ops/0115-after-checks.sql), that must fail with
+// a code and a message naming each of `contains` (added for 0115, ADR 0030
+// build prerequisites point 3: after an older file is pasted again,
+// assert-0115.sql must fail and name the object). The failed transaction is
+// rolled back, so the scenario goes on from the state before the file.
+async function stepFails(db, s) {
+  const sql = fs.readFileSync(s.script ? path.join(ROOT, s.script) : path.join(HERE, s.file), "utf8");
+  const name = s.script ?? s.file;
+  let err = null;
+  try {
+    await db.exec(sql);
+  } catch (e) {
+    err = e;
+    try {
+      await db.exec("rollback");
+    } catch {
+      // nothing to roll back
+    }
+  }
+  const code = err?.code ?? "";
+  const message = String(err?.message ?? "").split("\n")[0];
+  const missing = (s.contains ?? []).filter((t) => !message.includes(t));
+  const ok = err !== null && code === s.code && missing.length === 0;
+  check(
+    ok,
+    `${name} fails ${s.why} (expected ${s.code} naming ${(s.contains ?? []).map((t) => `"${t}"`).join(", ")})` +
+      `${err === null ? ": it PASSED" : code !== s.code ? `: ${code}` : ""}` +
+      `${missing.length ? `: the message names none of ${missing.map((t) => `"${t}"`).join(", ")}` : ""}`,
+  );
+  if (err) info(`failure: ${code} ${message.slice(0, 600)}`);
+  return "next";
+}
+
+// A read-only select kept in a migration between two marker lines (added for
+// 0115, ADR 0030 section C point 6: the before-check is one select in the
+// file, section 0b, that the owner runs alone from its line `with` to its
+// `;`). The text between the markers is run as it is in the file; its rows
+// (check_id, item, observed, verdict) are compared: their number, the exact
+// set of rows whose verdict is not ok or info ("check_id | item | verdict"),
+// and named observed values ("check_id | item" -> observed).
+async function stepQuery(db, s) {
+  const [n] = expand([s.file]);
+  const f = byNum.get(n);
+  if (!f) {
+    check(false, `query: migration ${pad(n)} is missing`);
+    return "stop";
+  }
+  const raw = fs.readFileSync(path.join(MIG, f), "utf8").replace(/\r\n/g, "\n");
+  const b = raw.indexOf(`${s.begin}\n`);
+  const e = raw.indexOf(s.end, b + 1);
+  if (b < 0 || e < 0) {
+    check(false, `query: ${f} has no lines "${s.begin}" and "${s.end}"`);
+    return "stop";
+  }
+  let rows;
+  try {
+    rows = (await db.query(raw.slice(b + s.begin.length + 1, e))).rows;
+  } catch (err) {
+    check(false, `${s.label}: the select of ${f} failed: ${err?.code ?? ""} ${String(err?.message ?? err).split("\n")[0]}`);
+    return "next";
+  }
+  const quiet = new Set(s.quiet ?? ["ok", "info"]);
+  const flagged = rows.filter((r) => !quiet.has(r.verdict)).map((r) => `${r.check_id} | ${r.item} | ${r.verdict}`).sort();
+  const want = [...(s.flagged ?? [])].sort();
+  check(
+    rows.length === s.rows && flagged.join("\n") === want.join("\n"),
+    `${s.label}: ${rows.length} rows (expected ${s.rows}); flagged ${flagged.length} (expected ${want.length})` +
+      `${flagged.join("\n") === want.join("\n") ? "" : `: FLAGGED [${flagged.join("; ")}] EXPECTED [${want.join("; ")}]`}`,
+  );
+  const byKey = new Map(rows.map((r) => [`${r.check_id} | ${r.item}`, String(r.observed)]));
+  for (const [k, v] of Object.entries(s.observed ?? {})) {
+    const got = byKey.has(k) ? byKey.get(k) : "(row missing)";
+    check(got === v, `${s.label}: ${k} expected ${v} actual ${got}`);
+  }
+  if (VERBOSE) for (const r of rows) info(`${r.check_id} | ${r.item} | ${String(r.observed).slice(0, 100)} | ${r.verdict}`);
   return "next";
 }
 
@@ -660,6 +741,8 @@ for (const sc of scenarios) {
       else if (kind === "script") next = await stepScript(db, s);
       else if (kind === "fingerprint") next = await stepFingerprint(db, s, prints);
       else if (kind === "cases") next = await stepCases(db, s);
+      else if (kind === "fails") next = await stepFails(db, s);
+      else if (kind === "query") next = await stepQuery(db, s);
       else setupError(`unknown step "${kind}" in scenario ${sc.name}`);
       if (next === "stop") {
         info(`${sc.name}: stopped here`);

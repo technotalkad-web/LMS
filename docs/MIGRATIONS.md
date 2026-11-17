@@ -105,3 +105,38 @@ Each file's header is the full rule; this is the cross-file summary.
   file's header and `ops/RUNBOOK.md` §6.3). Reverse: `ops/0113-reverse.sql`,
   after the code is rolled back.
 - 0114 (`tenant_smtp_state`, ADR 0029 pull request B) is not written yet.
+
+## Paste order: membership status (ADR 0030)
+
+- **0115** (`0115_membership_status_enforced.sql`: the four membership
+  helpers and the seven policies that read `organization_members`
+  themselves count a membership only while its status is `active` and its
+  organisation's `deleted_at` is null; no relation, no row write, nothing
+  removed): written and rehearsed (`scripts/migration-rehearsal`, scenarios
+  `0115-at-0104`, `0107-0112-then-0115`, `0115-then-sitting`,
+  `0115-then-0107-again`, `0115-undone-then-0115`, `0115-extra-policy`,
+  `0115-missing-policy`, `0115-no-analyst-helper` and
+  `0115-with-0110-stand-in`); **not yet pasted on staging or production**
+  (2026-11-18). Before each paste the owner runs its before-check (section
+  0b of the file, one read-only select) and answers every row whose verdict
+  is not `ok` or `info`, and keeps the `B11` rows whole with the record of
+  the sitting (the stored definitions, the reverse's source for an object
+  marked `DIFFERS`); record the date here after each paste.
+- Staging: 0115 first, then the full e2e and lifecycle regression on the
+  older code and lifecycle spec 80's database group by hand
+  (`tests/bot/lifecycle/80-membership-status-access.spec.ts`; it fails, and
+  never skips, on a database without 0115), then the app code (ADR 0030
+  pull request B). Production: 0115
+  in a small sitting of its own once staging is green, ahead of ADR 0024's
+  sitting and without changing it; the code with the next tag. 0115 touches
+  nothing defined after 0056, so it is pasted before or after 0105 to 0114.
+  On production 0110 (ADR 0026) always comes after 0115; whichever of the two
+  is pasted second, `ops/0115-after-checks.sql` is run after it.
+- The re-paste rule: After 0115, none of 0001, 0002, 0006, 0010, 0019, 0026, 0027, 0030, 0031, 0055 and 0056 is pasted again on that database. If one is pasted, 0115 is pasted again directly after it, in the same sitting, and its after-checks are read. Where 0110 is applied and the file was 0027, 0110 follows 0115. A paste of 0105, 0106, 0107, 0108 or 0112 needs nothing from 0115. The after-checks of 0115 are also kept as a read-only block that can be run alone (`ops/0115-after-checks.sql`); it is run after every sitting that pastes a migration, whatever its number.
+  `tests/unit/membership-rule-migrations.test.ts` holds the list of this
+  sentence equal to its own, and fails any other migration that restates a
+  helper or one of the seven policies without the rule, or that adds a
+  function or a view reading `organization_members` with `auth.uid()`
+  without it.
+- Reverse: `ops/0115-reverse.sql`, for a paste that went wrong only (it
+  brings back the old rule). A code rollback needs no reverse.
