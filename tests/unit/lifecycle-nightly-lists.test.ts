@@ -67,6 +67,9 @@ eq("PRODUCT_SPECS holds spec 68 (ADR 0024 P2-6's gate, 2026-11-15)", PRODUCTS.in
 // P2-8's gate ("spec 69's phase 2 cases; spec 55; then spec 69 joins
 // PRODUCT_SPECS"): it joined after its green hand run of 2026-11-16.
 eq("PRODUCT_SPECS holds spec 69 (ADR 0024 P2-8's gate, 2026-11-16)", PRODUCTS.includes("69"), true);
+// The step-16 note's S6: spec 78 joins after one green hand run with 0112 on
+// staging (2026-11-17), in PRODUCT_SPECS and not DEFAULT_SPECS.
+eq("PRODUCT_SPECS holds spec 78 (the 0112 gate, 2026-11-17)", PRODUCTS.includes("78"), true);
 
 // ── the workflow ─────────────────────────────────────────────────────────────
 console.log("\n.github/workflows/lifecycle-nightly.yml: two jobs, one after the other");
@@ -178,7 +181,7 @@ if (probe.status !== 0) {
     fs.writeFileSync(copy, text);
     return copy;
   };
-  // Another list than the real one ("68 69" since P2-8), so the copy differs.
+  // Another list than the real one ("68 69 78" since the 0112 gate), so the copy differs.
   const twoSpecs = withProducts("68");
   r = run({ LIFECYCLE_PLAN_ONLY: "1", LIFECYCLE_LIST: "products" }, twoSpecs);
   eq("with another product list, plan, second job: runs it", [r.status, r.stdout, r.output], [0, "lifecycle-nightly: list 'products' will run: 68", "run=true"]);
