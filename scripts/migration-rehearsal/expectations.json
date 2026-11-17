@@ -4204,6 +4204,40 @@
         { "refresh": { "views": 6 } },
         { "script": { "label": "the 0112 reverse on a database without 0107, refused", "file": "ops/0112-reverse.sql", "times": 0, "refuseFirst": { "why": "by part 1: 0107 is not applied, and 0107's bodies must not come back", "code": "P0001", "contains": "0112 reverse refused: 0107 is not applied (public.record_learning_activity(uuid, boolean) absent)", "then": "repair-0112.sql" } } }
       ]
+    },
+    {
+      "name": "0113-defaults",
+      "title": "ADR 0029 section J (pull request A), with Supabase's default privileges as a worst-case stand-in: the replay through 0071; grants-0107-defaults.sql, so every object created afterwards holds all privileges for anon, authenticated and service_role until the file takes them back; the fingerprint of public; the static rule that 0113 names no address column, no credential and no wider grant; 0113 pasted twice (idempotent; its in-file after-checks pass on the second paste); assert-0113.sql (empty; columns, defaults, checks and set-null foreign keys; the privilege matrix; real 42501 refusals as service_role on update, delete and truncate and as anon and authenticated on every read and write; the deny-all policy with privileges granted; the checks' 23514; the foreign keys' set null); ops/0113-reverse.sql pasted twice, after which public equals the fingerprint from before 0113; 0113 pasted again (a first paste again) and assert-0113.sql again.",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "sql": "grants-0107-defaults.sql" },
+        { "fingerprint": { "take": "before_0113" } },
+        { "static": { "file": "0113", "generatedStored": 0, "mustNotContain": ["to_address", "smtp_", "platform_smtp", "grant update", "grant delete", "grant all"] } },
+        { "apply": { "label": "0113 pasted twice", "files": ["0113"], "times": 2 } },
+        { "sql": "assert-0113.sql" },
+        { "script": { "label": "the 0113 reverse, pasted twice", "file": "ops/0113-reverse.sql", "times": 2 } },
+        { "fingerprint": { "label": "after the 0113 reverse: public as before 0113", "equals": "before_0113" } },
+        { "apply": { "label": "0113 pasted again after its reverse", "files": ["0113"], "times": 1 } },
+        { "sql": "assert-0113.sql" }
+      ]
+    },
+    {
+      "name": "0113-no-defaults",
+      "title": "ADR 0029 section J (pull request A), the other direction: 0113-defaults without grants-0107-defaults.sql, so the select and insert that service_role must hold are held only if 0113 grants them (Supabase stopped granting new public relations by default on 2026-10-30).",
+      "steps": [
+        { "sql": "shim.sql" },
+        { "sql": "shim-dashboard.sql" },
+        { "base": { "through": 71, "skip": [32], "files": 70 } },
+        { "fingerprint": { "take": "before_0113" } },
+        { "apply": { "label": "0113 pasted twice", "files": ["0113"], "times": 2 } },
+        { "sql": "assert-0113.sql" },
+        { "script": { "label": "the 0113 reverse, pasted twice", "file": "ops/0113-reverse.sql", "times": 2 } },
+        { "fingerprint": { "label": "after the 0113 reverse: public as before 0113", "equals": "before_0113" } },
+        { "apply": { "label": "0113 pasted again after its reverse", "files": ["0113"], "times": 1 } },
+        { "sql": "assert-0113.sql" }
+      ]
     }
   ]
 }

@@ -60,6 +60,7 @@ const TABLE: Record<string, Level> = {
   "app/api/super/broadcasts/route.ts POST": "full",
   "app/api/super/broadcasts/route.ts PATCH": "full",
   "app/api/super/broadcasts/route.ts DELETE": "full",
+  "app/api/super/email/test/route.ts POST": "full",
   "app/api/super/plans/route.ts GET": "full",
   "app/api/super/plans/route.ts POST": "full",
   "app/api/super/plans/route.ts PATCH": "full",

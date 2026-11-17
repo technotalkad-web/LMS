@@ -6,8 +6,26 @@ import {
   Activity,
   Users,
   Megaphone,
+  Mail,
+  TriangleAlert,
 } from "lucide-react";
 import { requirePlatformOwner } from "@/lib/auth/require-platform-owner";
+import { platformEmailHealthForRender } from "@/lib/email/platform-health";
+
+/**
+ * Whether the platform sender reads fail (ADR 0029 section H): the console
+ * shows a banner on every page while it does. Read after the guard, with the
+ * service role, once per render (/super/email reuses the same reading); a
+ * read that throws shows no banner rather than breaking the console (the
+ * health check and /super/email still report it).
+ */
+async function platformEmailFailing(): Promise<boolean> {
+  try {
+    return (await platformEmailHealthForRender()).status === "fail";
+  } catch {
+    return false;
+  }
+}
 
 export default async function SuperOwnerLayout({
   children,
@@ -15,6 +33,7 @@ export default async function SuperOwnerLayout({
   children: React.ReactNode;
 }) {
   const { user } = await requirePlatformOwner();
+  const emailFailing = await platformEmailFailing();
 
   return (
     <div data-theme="light" className="min-h-screen flex font-sans text-slate-900 bg-slate-100">
@@ -33,6 +52,7 @@ export default async function SuperOwnerLayout({
             <SidebarLink href="/super/broadcasts" icon={<Megaphone className="w-4 h-4" />} label="Global Broadcasts" />
             <SidebarLink href="/super/audit" icon={<Activity className="w-4 h-4" />} label="System Audit Logs" />
             <SidebarLink href="/super/admins" icon={<Users className="w-4 h-4" />} label="Super Admins" />
+            <SidebarLink href="/super/email" icon={<Mail className="w-4 h-4" />} label="Platform Email" />
           </nav>
         </div>
 
@@ -59,7 +79,24 @@ export default async function SuperOwnerLayout({
         </div>
       </aside>
 
-      <main className="ml-64 flex-1 p-8 min-h-screen">{children}</main>
+      <main className="ml-64 flex-1 p-8 min-h-screen">
+        {emailFailing && (
+          <div
+            role="alert"
+            className="mb-6 flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900"
+          >
+            <TriangleAlert className="w-5 h-5 shrink-0 mt-0.5" />
+            <p>
+              The platform sender reads <strong>fail</strong>: platform owners&apos; and organisation
+              administrators&apos; codes, sign-in links and alerts may not be sent.{" "}
+              <Link href="/super/email" className="underline font-medium">
+                Open Platform Email
+              </Link>
+            </p>
+          </div>
+        )}
+        {children}
+      </main>
     </div>
   );
 }
