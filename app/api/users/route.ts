@@ -17,6 +17,11 @@ import {
   messagesOf,
   validateManagerAssignment,
 } from "@/lib/org/reporting-line";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED,
+} from "@/lib/attempts/abandon";
 
 /**
  *   POST /api/users
@@ -26,6 +31,11 @@ import {
  * If `password` is provided, the account is provisioned immediately.
  * If `password` is blank, the system auto-generates one and sends a
  * Supabase magic-link invitation email so the user can set their own.
+ *
+ * A row written inactive or suspended also closes that person's open course
+ * launches in this organisation (ADR 0030 decision 4). If that fails the
+ * write stands; the answer adds `tokens_expired: false` and a line in
+ * `warnings`.
  */
 
 type CreateUserBody = {
@@ -385,6 +395,18 @@ export async function POST(request: Request) {
     );
   }
 
+  // ADR 0030 decision 4: a row left in a status other than active ends the
+  // person's open launches here, after the row is written.
+  let tokensExpired = true;
+  if (status !== "active") {
+    const tokErr = await expireLaunchTokensForMembers(svc, org.id, [authUserId]);
+    if (tokErr) {
+      tokensExpired = false;
+      logLaunchTokenExpiryFailed("users POST", org.id, [authUserId], tokErr);
+      managerWarnings = [...managerWarnings, LAUNCH_TOKENS_NOT_EXPIRED];
+    }
+  }
+
   // Fire welcome / account-creation email (background, non-blocking).
   if (!priorMem) {
     // Use the request-origin helper (see #146 for the full sweep).
@@ -438,5 +460,6 @@ export async function POST(request: Request) {
     user_id: authUserId,
     invited: didInvite,
     warnings: managerWarnings,
+    ...(tokensExpired ? {} : { tokens_expired: false }),
   });
 }

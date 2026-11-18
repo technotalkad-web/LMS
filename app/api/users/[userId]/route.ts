@@ -15,6 +15,11 @@ import {
   validateManagerAssignment,
   type ManagerAssignment,
 } from "@/lib/org/reporting-line";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED,
+} from "@/lib/attempts/abandon";
 
 /**
  *   PATCH /api/users/[userId]?orgSlug=...
@@ -22,6 +27,11 @@ import {
  *         handled separately for security reasons).
  *
  * Admin-only. Updates profile + membership for an existing org member.
+ *
+ * An edit that sets the status to inactive or suspended also closes that
+ * person's open course launches in this organisation (ADR 0030 decision 4).
+ * If that fails the edit stands; the answer adds `tokens_expired: false`
+ * and a line in `warnings`.
  */
 
 const VALID_LMS_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
@@ -307,6 +317,20 @@ export async function PATCH(
         { error: `Membership update failed: ${mErr.message}` },
         { status: 400 }
       );
+    }
+  }
+
+  // ADR 0030 decision 4: a row left in a status other than active ends the
+  // person's open launches here, after the row is written.
+  if (memFields.status !== undefined && memFields.status !== "active") {
+    const tokErr = await expireLaunchTokensForMembers(svc, org.id as string, [userId]);
+    if (tokErr) {
+      logLaunchTokenExpiryFailed("users/[userId] PATCH", org.id as string, [userId], tokErr);
+      return NextResponse.json({
+        ok: true,
+        warnings: [...managerWarnings, LAUNCH_TOKENS_NOT_EXPIRED],
+        tokens_expired: false,
+      });
     }
   }
 

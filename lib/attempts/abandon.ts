@@ -13,6 +13,7 @@
  * Deliberately free of next/* imports so unit tests can load it.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { chunk, fetchAll } from "@/lib/db/chunked";
 
 export const ATTEMPT_ABANDONED = "attempt_abandoned";
 
@@ -61,3 +62,72 @@ export async function expireLaunchTokens(
   }
   return null;
 }
+
+/**
+ * ADR 0030 decision 4: a deactivation ends that person's open launches.
+ *
+ * Expire every still-live cmi5/xAPI launch token of these people's attempts
+ * in this organisation, whatever the attempt's status. The statement routes
+ * refuse only an abandoned attempt, so a completed attempt with a live token
+ * could still be written to; that is why the tokens are found by being live
+ * and not by the attempt's status. One read of the live tokens, found
+ * through the attempt's user and organisation (user ids in chunks of 200,
+ * each read paged), then the existing expiry above. The attempts are not
+ * touched and nothing is queued.
+ *
+ * Called by each writer that leaves a membership row in a status other than
+ * `active`, in the same request and after that write. Returns the first
+ * error and never throws: the deactivation already happened and stands,
+ * and the caller logs the ids and reports the failure in its answer.
+ */
+export async function expireLaunchTokensForMembers(
+  svc: SupabaseClient,
+  orgId: string,
+  userIds: string[]
+): Promise<{ message: string } | null> {
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (!orgId || ids.length === 0) return null;
+  try {
+    const nowIso = new Date().toISOString();
+    const attemptIds = new Set<string>();
+    for (const part of chunk(ids, 200)) {
+      const live = await fetchAll<{ attempt_id: string }>(
+        svc,
+        "cmi5_launch_tokens",
+        "attempt_id, course_attempts!inner(user_id, organization_id)",
+        (q) =>
+          q
+            .eq("course_attempts.organization_id", orgId)
+            .in("course_attempts.user_id", part)
+            .gt("expires_at", nowIso),
+        "fetch_token"
+      );
+      for (const t of live) if (t.attempt_id) attemptIds.add(t.attempt_id);
+    }
+    return await expireLaunchTokens(svc, [...attemptIds]);
+  } catch (e) {
+    return { message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** The log line of a failed expiry: ids only, never an address. */
+export function logLaunchTokenExpiryFailed(
+  where: string,
+  orgId: string,
+  userIds: string[],
+  err: { message: string }
+): void {
+  console.error(
+    JSON.stringify({
+      event: "launch_token_expiry_failed",
+      where,
+      organization_id: orgId,
+      user_ids: [...new Set(userIds.filter(Boolean))],
+      error: err.message,
+    })
+  );
+}
+
+/** The line a Users form shows when the expiry failed. */
+export const LAUNCH_TOKENS_NOT_EXPIRED =
+  "Saved, but their open course launches could not be closed. Each one stops on its own within 24 hours of its launch.";
