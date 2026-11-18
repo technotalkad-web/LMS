@@ -18,7 +18,7 @@
  *     inactive data analyst, a person whose status is changed in mid-session,
  *     person X (an active learner here), and a platform owner with an
  *     inactive row and one with an active row;
- *   B, live: an active administrator, and X's row, inactive;
+ *   B, live: an active administrator, and X's row (an administrator's), inactive;
  *   D: an active administrator, read before and after D is soft-deleted;
  *   a signed-in person with no membership (the outsider), and a platform
  *   owner with no row in A.
@@ -35,10 +35,22 @@
  *       (decision 5).
  *   (2) a status changed in mid-session is refused at the next request and
  *       restored when set back (page, data API).
- *   (3) X, active in A and inactive in B: /select-org sends X straight to
- *       A; in B a learner page, the folder route and the data API answer as
- *       for the outsider; in A all still work; X reads the profile of a
- *       co-member of A and not of a person who is only in B.
+ *   (3) X, an active learner in A who holds an inactive administrator row in
+ *       B (under the old rule that row still read B, its member rows and
+ *       profiles, and wrote the folder): /select-org sends X straight to A;
+ *       in B a learner page, the folder route and the data API answer as for
+ *       the outsider, and no folder is written; in A all still work, and X is
+ *       no administrator there; X reads their own profile (the control) and
+ *       not the profile of B's administrator. Nothing is asserted of the
+ *       profiles of A's co-members: a learner's session reads no other
+ *       member's profile on any database built from the repository's
+ *       migrations, before 0115 or after it (the profiles policy reads
+ *       organization_members under that table's own row security; on
+ *       staging 0115's before-check B4b listed no other policy on that
+ *       table and its after-check A4 passed). That read is the rehearsal's,
+ *       whose X is an administrator in both
+ *       (scripts/migration-rehearsal/assert-0115.sql; ADR 0030, note
+ *       "Spec 80, first run", 2026-11-18).
  *   (4) the control still reads the inactive learner's membership row and
  *       profile (the rule tests the reader only).
  *   (5) the data analyst: is_org_data_analyst answers true for the active
@@ -224,7 +236,11 @@ test.describe.serial("ADR 0030 spec 80: membership status, the database group (0
         if (status !== "active") await setStatus(org.id, user.id, status);
       }
     }
-    await addMember({ organizationId: s.b.id, userId: u("x").id, role: "user" });
+    // X's row in B is an administrator's, then set inactive. Under the old rule
+    // such a row still passed is_org_admin (B's member rows and profiles, the
+    // folder write), so each refusal of case (3) in B is a test of 0115. An
+    // inactive learner row never passed an administrator test.
+    await addMember({ organizationId: s.b.id, userId: u("x").id, role: "admin" });
     await setStatus(s.b.id, u("x").id, "inactive");
     for (const key of ["poNone", "poInactive", "poActive"]) {
       await markPlatformOwner(u(key).id);
@@ -352,11 +368,13 @@ test.describe.serial("ADR 0030 spec 80: membership status, the database group (0
     expect(await foldersNamed(b.id, n), "no folder in B").toBe(0);
 
     const inA = await reads(s.db.x, a.id, x.id);
-    expect([inA.org, inA.member], "X reads A").toEqual([1, true]);
+    expect([inA.org, inA.member, inA.admin], "X reads A as a member; the administrator row in B gives no administrator right in A").toEqual([1, true, false]);
     expect(inA.courses, "X reads A's course").toBeGreaterThanOrEqual(1);
     expect(await reads(s.db.x, b.id, x.id), "X reads nothing of B").toEqual(await reads(s.db.outsider, b.id, u("outsider").id));
-    expect(await canReadProfile(s.db.x, u("admin").id), "X reads a co-member of A").toBe(true);
-    expect(await canReadProfile(s.db.x, u("adminB").id), "X does not read a person who is only in B").toBe(false);
+    // The control beside the refused read: the profiles table answers X's
+    // session. Nothing is asserted of A's co-members (see the header, case 3).
+    expect(await canReadProfile(s.db.x, x.id), "X reads their own profile (the control)").toBe(true);
+    expect(await canReadProfile(s.db.x, u("adminB").id), "X does not read the profile of B's administrator").toBe(false);
     expect((await reads(s.db.adminB, b.id, u("adminB").id)).org, "B's control reads B").toBe(1);
     expect(await canReadProfile(s.db.adminB, x.id), "B's control still reads X's profile").toBe(true);
   });
