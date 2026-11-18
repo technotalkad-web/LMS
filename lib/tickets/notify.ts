@@ -1,12 +1,18 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { resolveEmails } from "@/lib/users/emails";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 
 /**
  * Ticket emails (Phase 4a). Like the attempt-request mails these go out as
  * `custom_broadcast` with an override subject/body: no new template, not
  * silenced by the org pause toggles, fire-and-forget (a mail hiccup never
  * fails the ticket). Admin roles as in lib/attempts/requests.ts.
+ *
+ * ADR 0030 rule 10: both go only to people whose membership in the org counts
+ * (active, in an organisation that is not deleted). The admins' read filters
+ * the status; the org was found live by the route's own membership check in
+ * the same request. The requester's own membership is read before their mail.
  */
 const ADMIN_READ_ROLES = ["super_owner", "owner", "admin"];
 
@@ -79,6 +85,14 @@ export async function notifyRequesterOfTicket(
 ): Promise<void> {
   try {
     if (!args.requester.email) return;
+    // Rule 10: a requester whose membership does not count gets no mail; a
+    // failed read sends none either.
+    const m = await resolveOrgMembership(svc, { id: args.orgId }, args.requester.id);
+    if (m === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "ticket-requester", org_id: args.orgId }));
+      return;
+    }
+    if (m === "none") return;
     const link = args.origin ? `${args.origin}/${args.orgSlug}/support` : "";
     const body =
       `**${args.headline}** on your ticket **${args.subject}**.` +

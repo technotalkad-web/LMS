@@ -14,10 +14,11 @@
  *               (a frozen list of five; a sixth is a review decision);
  *   subject     other people's rows (a target, a roster, an audience);
  *   recipient   a subject read that chooses who gets the organisation's mail
- *               (rule 10). Each says whether it filters the status in the
- *               query, or is one of the sites step 6 of section I filters
- *               (marked "step-6": the scan lists them and does not yet ask
- *               for the filter; step 6 removes that mark).
+ *               (rule 10). Each filters `status = 'active'` in its query.
+ *               Most sites read no member row of their own: they take the
+ *               org-wide audience and the filter on every other audience
+ *               from countingMemberIds, one read in the resolver (step 6 of
+ *               section I).
  *
  * A read is a `.from("organization_members")` chain with no insert, update,
  * upsert or delete in it, or a fetchByIds / fetchAll call naming the table.
@@ -30,8 +31,7 @@
  *   - a read filtered on the caller's own id (`.eq("user_id", user.id)` and
  *     the like) must be own-access or own-other, unless its entry says why
  *     that id is not the caller (`notCaller`);
- *   - a recipient read marked "query" filters `status = 'active'` in the
- *     query;
+ *   - a recipient read filters `status = 'active'` in the query;
  *   - the resolver's reads select `status` (the member reads) and
  *     `deleted_at` (the organisation reads).
  *
@@ -57,7 +57,7 @@ const RESOLVER = "lib/auth/org-membership.ts";
 /* ---------------- the classification ---------------- */
 
 type Cls = "own-access" | "own-other" | "subject" | "recipient";
-type Entry = { cls: Cls; reason: string; status?: "query" | "step-6"; notCaller?: string };
+type Entry = { cls: Cls; reason: string; status?: "query"; notCaller?: string };
 
 /** The reader's own row read for another purpose: exactly these five (H.2). */
 const OWN_OTHER = [
@@ -82,18 +82,10 @@ const READS: Record<string, Entry> = {
   "lib/org/groups.ts#meQ#1": { cls: "own-other", reason: "one person's row for dynamic group rules (the viewer on learner pages; a subject from the CRM summary and the LRS)" },
 
   // ---- recipients of the organisation's mail (rule 10) ----
-  "app/api/assignments/route.ts#POST#3": { cls: "recipient", status: "step-6", reason: "org-wide audience of asset_assignment" },
-  "app/api/assignments/[id]/route.ts#DELETE#1": { cls: "recipient", status: "step-6", reason: "org-wide audience of asset_unassignment" },
-  "app/api/cron/journey-nudges/route.ts#run#1": { cls: "recipient", status: "step-6", reason: "L1 managers for journey_escalation" },
-  "app/api/cron/reminders/route.ts#POST#1": { cls: "recipient", status: "step-6", reason: "org-wide audience of asset_reminder" },
-  "app/api/learning-path-assignments/route.ts#POST#3": { cls: "recipient", status: "step-6", reason: "org-wide audience of path_assignment" },
-  "app/api/learning-path-assignments/[id]/route.ts#DELETE#1": { cls: "recipient", status: "step-6", reason: "org-wide audience of path_unassignment" },
-  "app/api/learning-paths/[id]/courses/route.ts#resolvePathLearners#1": { cls: "recipient", status: "step-6", reason: "org-wide audience of asset_update (resolvePathLearners)" },
-  "app/api/notifications/broadcast/route.ts#resolveAssignedUserIds#1": { cls: "recipient", status: "step-6", reason: "org-wide branch of a course or path broadcast audience" },
-  "app/api/notifications/broadcast/route.ts#POST#1": { cls: "recipient", status: "step-6", reason: "broadcast audience all" },
-  "app/api/notifications/broadcast/route.ts#POST#2": { cls: "recipient", status: "step-6", reason: "broadcast tenant guard on the final recipient set" },
-  "lib/attempts/requests.ts#notifyAdminsOfRequest#1": { cls: "recipient", status: "step-6", reason: "admin recipients of an attempt request" },
-  "lib/courses/notify-update.ts#resolveAssignedUserIds#1": { cls: "recipient", status: "step-6", reason: "org-wide audience of asset_update" },
+  // The org-wide audiences and the filters of the assignment, path, broadcast,
+  // course-update, reminder and attempt-request mails come from
+  // countingMemberIds above; these two still read rows of their own.
+  "app/api/cron/journey-nudges/route.ts#run#1": { cls: "recipient", status: "query", reason: "the active learners' L1 managers for journey_escalation (the manager is then tested against countingMemberIds)" },
   "lib/tickets/notify.ts#notifyAdminsOfTicket#1": { cls: "recipient", status: "query", reason: "active admins mailed about a ticket, first 25" },
 
   // ---- subjects: other people's rows ----
@@ -263,7 +255,7 @@ function check(found: Scan, table: Record<string, Entry>, ownOther: string[]): s
     if (r.userId && CALLER_ID.test(r.userId) && e.cls !== "own-access" && e.cls !== "own-other" && !e.notCaller) {
       problems.push(`${r.key}: filtered on the caller's own id (${r.userId}) but classified ${e.cls}`);
     }
-    if (e.cls === "recipient" && e.status !== "query" && e.status !== "step-6") problems.push(`${r.key}: a recipient read must say query or step-6`);
+    if (e.cls === "recipient" && e.status !== "query") problems.push(`${r.key}: a recipient read must say query`);
     if (e.cls === "recipient" && e.status === "query" && !r.activeInQuery) problems.push(`${r.key}: a recipient read marked query does not filter status = 'active'`);
     if (e.cls !== "recipient" && e.status) problems.push(`${r.key}: status is for recipient reads only`);
   }
@@ -342,8 +334,9 @@ console.log("\nEvery read of organization_members under app/, lib/ and component
   eq("the reader's own row is read to decide access only in lib/auth/",
     [...new Set(by("own-access").map((r) => r.file))], ["lib/auth/org-membership.ts"]);
   eq("the own row read for another purpose: exactly the five of H.2", by("own-other").map((r) => r.key).sort(), [...OWN_OTHER].sort());
-  const pending = by("recipient").filter((r) => READS[r.key].status === "step-6").length;
-  console.log(`  (${found.reads.length} reads: ${by("own-access").length} own-access, ${by("own-other").length} own-other, ${by("subject").length} subject, ${by("recipient").length} recipient, of which ${pending} wait for step 6's filter)`);
+  console.log(`  (${found.reads.length} reads: ${by("own-access").length} own-access, ${by("own-other").length} own-other, ${by("subject").length} subject, ${by("recipient").length} recipient)`);
+  eq("every recipient read filters status = 'active' in its query",
+    by("recipient").filter((r) => !r.activeInQuery).map((r) => r.key), []);
   eq("the resolver's reads select status (members) and deleted_at (organisations)",
     checkResolver(RESOLVER, fs.readFileSync(path.join(root, RESOLVER), "utf8")), []);
 }
@@ -386,8 +379,8 @@ console.log("\nPlanted cases: each part of the scan fires");
     ["lib/x/notify.ts#notify#1: a recipient read marked query does not filter status = 'active'"]);
   eq("…with the filter it passes",
     check(plant("lib/x/notify.ts", RCP.replace(`.eq("organization_id", o)`, `.eq("organization_id", o).eq("status", "active")`)), { "lib/x/notify.ts#notify#1": { cls: "recipient", status: "query", reason: "r" } }, []), []);
-  eq("a recipient read must say query or step-6",
-    check(rcp, { "lib/x/notify.ts#notify#1": { cls: "recipient", reason: "r" } }, []), ["lib/x/notify.ts#notify#1: a recipient read must say query or step-6"]);
+  eq("a recipient read must say query",
+    check(rcp, { "lib/x/notify.ts#notify#1": { cls: "recipient", reason: "r" } }, []), ["lib/x/notify.ts#notify#1: a recipient read must say query"]);
   eq("writes are not reads",
     [plant("app/api/w/route.ts", `export async function POST() { await svc.from("organization_members").update({ role: "user" }).eq("user_id", u); await svc.from("organization_members").insert({}); }`)].map((s) => [s.reads.length, s.writes]),
     [[0, 2]]);

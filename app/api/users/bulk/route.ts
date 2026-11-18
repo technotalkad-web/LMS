@@ -604,7 +604,10 @@ export async function POST(request: Request) {
     }
 
     // Fire welcome email for new accounts (skip when we just updated metadata).
-    if (!priorMem) {
+    // ADR 0030 rule 10: only when the row just written is active (the org
+    // counted for the caller above), so a row written inactive or suspended
+    // gets no welcome.
+    if (!priorMem && status === "active") {
       const origin = await originFromRequest();
       const learnerName =
         r.first_name!.trim() + (r.last_name ? " " + r.last_name.trim() : "");

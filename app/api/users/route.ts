@@ -408,7 +408,10 @@ export async function POST(request: Request) {
   }
 
   // Fire welcome / account-creation email (background, non-blocking).
-  if (!priorMem) {
+  // ADR 0030 rule 10: only when the row just written is active (the org
+  // counted for the caller above), so a person added as inactive or
+  // suspended gets no welcome.
+  if (!priorMem && status === "active") {
     // Use the request-origin helper (see #146 for the full sweep).
     const origin = await originFromRequest();
     const learnerName =

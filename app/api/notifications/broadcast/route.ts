@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
 import { CHECK_FAILED } from "@/lib/auth/api-admin";
-import { resolveOrgMembership } from "@/lib/auth/org-membership";
+import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendNotification } from "@/lib/notifications/send";
 import { resolveEmails } from "@/lib/users/emails";
@@ -82,6 +82,19 @@ export async function POST(request: Request) {
     { auth: { persistSession: false } }
   );
 
+  // ADR 0030 rule 10: the organisation mails only members that count
+  // (active, in an organisation that is not deleted). One read of them for
+  // this request: the audience "all", the org-wide branch of a course or
+  // path audience, and the tenant guard below. Unreadable: nothing is sent.
+  const countingRead = await countingMemberIds(svc, org.id);
+  if (countingRead === "unreadable") {
+    return NextResponse.json(
+      { error: "Could not read who can receive this. Nothing was sent; try again." },
+      { status: 503 }
+    );
+  }
+  const counting: ReadonlySet<string> = countingRead;
+
   // ---- Audience → recipient user_ids -----------------------------------
   async function resolveAssignedUserIds(
     table: "course_assignments" | "learning_path_assignments",
@@ -122,11 +135,7 @@ export async function POST(request: Request) {
       }
     }
     if (coversOrg) {
-      const { data: om } = await svc
-        .from("organization_members")
-        .select("user_id")
-        .eq("organization_id", org.id);
-      for (const m of om ?? []) out.add(m.user_id as string);
+      for (const uid of counting) out.add(uid);
     }
     return out;
   }
@@ -156,28 +165,16 @@ export async function POST(request: Request) {
     );
     for (const id of ids) recipientIds.add(id);
   } else {
-    const { data: om } = await svc
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", org.id);
-    for (const m of om ?? []) recipientIds.add(m.user_id as string);
+    for (const uid of counting) recipientIds.add(uid);
   }
-  // Tenant guard: restrict recipients to members of THIS org regardless of how
-  // the audience was specified. user_ids/team_id/course_id/path_id come from the
-  // request and are resolved via the service-role client (bypasses RLS), so
-  // without this an admin could email/notify another tenant's users.
-  if (recipientIds.size > 0) {
-    const { data: orgMembers } = await svc
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", org.id)
-      .in("user_id", Array.from(recipientIds));
-    const allowed = new Set(
-      ((orgMembers ?? []) as Array<{ user_id: string }>).map((m) => m.user_id)
-    );
-    for (const id of Array.from(recipientIds)) {
-      if (!allowed.has(id)) recipientIds.delete(id);
-    }
+  // Tenant guard and rule 10: restrict recipients to members of THIS org
+  // whose membership counts, however the audience was specified.
+  // user_ids/team_id/course_id/path_id come from the request and are resolved
+  // via the service-role client (bypasses RLS), so without this an admin
+  // could email/notify another tenant's users, and a direct, team or group
+  // audience would reach a member who is inactive or suspended.
+  for (const id of Array.from(recipientIds)) {
+    if (!counting.has(id)) recipientIds.delete(id);
   }
   if (recipientIds.size === 0) {
     return NextResponse.json(

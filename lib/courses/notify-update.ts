@@ -2,12 +2,14 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 
 /**
  * "This course has a new version" email to every currently assigned learner
- * (direct, team and org-wide assignments). Shared by the legacy multipart
- * upload and the direct-upload finalise step. Never throws: a notification
- * failure must not fail a publish.
+ * (direct, team and org-wide assignments) whose membership counts (ADR 0030
+ * rule 10). Shared by the legacy multipart upload and the direct-upload
+ * finalise step. Never throws: a notification failure must not fail a
+ * publish.
  */
 export async function notifyCourseUpdate(args: {
   org: { id: string; slug: string; name: string };
@@ -27,12 +29,20 @@ export async function notifyCourseUpdate(args: {
       .maybeSingle();
     const courseTitle = (courseRow as { title?: string } | null)?.title ?? "your course";
 
+    // ADR 0030 rule 10: one read of the org's members that count, for this
+    // request: the org-wide audience and the filter on every other one.
+    // Unreadable: no mail.
+    const counting = await countingMemberIds(svc, org.id);
+    if (counting === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "course-update", org_id: org.id }));
+      return;
+    }
     const learnerIds = await resolveAssignedUserIds({
       svc,
-      orgId: org.id,
       table: "course_assignments",
       targetCol: "course_id",
       targetId: courseId,
+      counting,
     });
     if (learnerIds.size === 0) return;
 
@@ -69,17 +79,19 @@ export async function notifyCourseUpdate(args: {
 
 /**
  * Expand a course or path assignment row set into the unique set of
- * learner user_ids. Handles user, team, and org-wide rows.
+ * learner user_ids whose membership counts. Handles user, team, and
+ * org-wide rows: `counting` (the org's members that count, ADR 0030 rule 10)
+ * is the org-wide audience and filters the others.
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export async function resolveAssignedUserIds(args: {
   svc: any;
-  orgId: string;
   table: "course_assignments" | "learning_path_assignments";
   targetCol: "course_id" | "path_id";
   targetId: string;
+  counting: ReadonlySet<string>;
 }): Promise<Set<string>> {
-  const { svc, orgId, table, targetCol, targetId } = args;
+  const { svc, table, targetCol, targetId, counting } = args;
   const out = new Set<string>();
   const { data: rows } = await svc
     .from(table)
@@ -104,11 +116,10 @@ export async function resolveAssignedUserIds(args: {
     for (const m of tm ?? []) out.add(m.user_id as string);
   }
   if (coversOrg) {
-    const { data: om } = await svc
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", orgId);
-    for (const m of om ?? []) out.add(m.user_id as string);
+    for (const uid of counting) out.add(uid);
   }
+  // A person named directly or in a team may hold a row that does not
+  // count: they get no mail.
+  for (const uid of out) if (!counting.has(uid)) out.delete(uid);
   return out;
 }

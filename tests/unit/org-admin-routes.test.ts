@@ -46,7 +46,13 @@
  *       not hold it: saved after all, it answers ok; unreadable, it keeps
  *       the provider;
  *   (k) the admin pages take only a 404 from an assignment delete as
- *       already removed (source check): 403 and 503 still show the error.
+ *       already removed (source check): 403 and 503 still show the error;
+ *   (l) ADR 0030 rule 10 in the four notification passes: an org-wide, a
+ *       direct and a team audience each mail only the members that count
+ *       (an inactive and a suspended member get nothing; the active ones
+ *       get what they got before), from one read of them per request; when
+ *       that read fails the change stands and nothing is sent (the sender
+ *       is not entered).
  *
  * The stub models RLS: a session write by a non-admin changes no row
  * (update / delete answer []) or fails (insert answers 42501). next/headers
@@ -141,13 +147,19 @@ const orgRow = (): Row => ({
   id: ORG, name: "Org", slug: "org", deleted_at: null, sso_provider_id: "prov-old",
   custom_domain: "old.example.test", custom_domain_verified: false, custom_domain_status: "pending", cf_hostname_id: "cf-old",
 });
+/** Every member row the service role reads; u-3 and u-4 hold rows that do not count (ADR 0030). */
 const MEMBERS: Row[] = [
-  { user_id: ME.id, organization_id: ORG },
-  { user_id: "u-2", organization_id: ORG },
-  { user_id: "u-x", organization_id: OTHER_ORG },
+  { user_id: ME.id, organization_id: ORG, role: "user", status: "active" },
+  { user_id: "u-2", organization_id: ORG, role: "user", status: "active" },
+  { user_id: "u-3", organization_id: ORG, role: "user", status: "inactive" },
+  { user_id: "u-4", organization_id: ORG, role: "user", status: "suspended" },
+  { user_id: "u-x", organization_id: OTHER_ORG, role: "user", status: "active" },
 ];
 const TEAMS: Row[] = [{ id: "t1", organization_id: ORG }, { id: "t9", organization_id: OTHER_ORG }];
-const TEAM_MEMBERS: Row[] = [{ team_id: "t1", user_id: "u-2" }, { team_id: "t9", user_id: "u-x" }];
+const TEAM_MEMBERS: Row[] = [
+  { team_id: "t1", user_id: "u-2" }, { team_id: "t1", user_id: "u-3" }, { team_id: "t1", user_id: "u-4" },
+  { team_id: "t9", user_id: "u-x" },
+];
 const PATHS: Row[] = [
   { id: PATH, organization_id: ORG, name: "Path", organizations: { name: "Org", slug: "org" } },
   { id: FOREIGN_PATH, organization_id: OTHER_ORG, name: "Other path", organizations: { name: "Other", slug: "other" } },
@@ -161,7 +173,13 @@ const PATH_ASSIGNMENT: Row = {
   id: "pa1", path_id: PATH, organization_id: ORG, assignee_type: "org", user_id: null, team_id: null, group_id: null,
   learning_paths: { name: "Path" }, organizations: { name: "Org" },
 };
-const PROFILES: Row[] = [{ id: ME.id, email: ME.email }, { id: "u-2", email: "two@example.test" }, { id: "u-x", email: "x@example.test" }];
+/** Team rows (t1: one active, one inactive and one suspended member), for (l). */
+const COURSE_TEAM_ASSIGNMENT: Row = { ...COURSE_ASSIGNMENT, id: "a2", assignee_type: "team", team_id: "t1" };
+const PATH_TEAM_ASSIGNMENT: Row = { ...PATH_ASSIGNMENT, id: "pa2", assignee_type: "team", team_id: "t1" };
+const PROFILES: Row[] = [
+  { id: ME.id, email: ME.email }, { id: "u-2", email: "two@example.test" }, { id: "u-3", email: "three@example.test" },
+  { id: "u-4", email: "four@example.test" }, { id: "u-x", email: "x@example.test" },
+];
 
 const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
@@ -246,8 +264,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     }
     return list(MEMBERS.filter((r) => matches(r, q)));
   }
-  if (p === "/rest/v1/course_assignments") return list([COURSE_ASSIGNMENT].filter((r) => matches(r, q)));
-  if (p === "/rest/v1/learning_path_assignments") return list(session ? [PATH_ASSIGNMENT].filter((r) => matches(r, q)) : []);
+  if (p === "/rest/v1/course_assignments") return list([COURSE_ASSIGNMENT, COURSE_TEAM_ASSIGNMENT].filter((r) => matches(r, q)));
+  // The service role reads it too: the notify_update pass of a path's courses lists the path's audience.
+  if (p === "/rest/v1/learning_path_assignments") return list([PATH_ASSIGNMENT, PATH_TEAM_ASSIGNMENT].filter((r) => matches(r, q)));
   if (p === "/rest/v1/learning_paths") return list(PATHS.filter((r) => matches(r, q)));
   if (p === "/rest/v1/courses") return list([{ id: COURSE, organization_id: ORG }].filter((r) => matches(r, q)));
   if (p === "/rest/v1/teams") return list(TEAMS.filter((r) => matches(r, q)));
@@ -546,6 +565,67 @@ async function main() {
       eq(`${file}: unassign() calls DELETE ${api}{id}; its only status test is === 404, whose arm refreshes and returns with no toast, before a !res.ok arm that shows the error`,
         [body.includes(`fetch(\`${api}\${id}\``), statusTests, !!arm404, !!arm404 && notOk > arm404.index, notOk >= 0 && /toast\.error\(/.test(body.slice(notOk))],
         [true, ["res.status === 404"], true, true, true]);
+    }
+
+    console.log("\n(l) ADR 0030 rule 10: the notification pass mails only members that count");
+    {
+      /** Who the sender logged a mail for (each send writes one notification_log row). */
+      const mailed = () => requests.filter((r) => r.path === "/rest/v1/notification_log" && r.method === "POST")
+        .map((r) => String((r.body as Row).to_user_id)).sort();
+      /** The sender's first read: zero means it was never entered. */
+      const senderEntered = () => requests.some((r) => r.path === "/rest/v1/notification_settings");
+      /** The one read of the members that count (countingMemberIds). */
+      const countingReads = () => requests.filter((r) => r.path === "/rest/v1/organization_members" && r.key === SERVICE_KEY && r.select === "user_id,role,status").length;
+      const ACTIVE = [ME.id, "u-2"].sort();
+      {
+        const out = await call(CALLS[4], { role: "admin" });
+        eq("DELETE /api/assignments/{id}, an org-wide row: the active members are told; the inactive and the suspended member are not",
+          [out.status, mailed()], [200, ACTIVE]);
+        eq("…from one read of the members that count", countingReads(), 1);
+      }
+      {
+        const out = await call(CALLS[5], { role: "admin" });
+        eq("DELETE /api/learning-path-assignments/{id}, an org-wide row: the same", [out.status, mailed(), countingReads()], [200, ACTIVE, 1]);
+      }
+      {
+        world({ role: "admin" });
+        const res = await assignment.DELETE(del("/api/assignments/a2"), params("a2"));
+        eq("DELETE /api/assignments/{id}, a team row of one active, one inactive and one suspended member: only the active one told",
+          [res.status, mailed()], [200, ["u-2"]]);
+      }
+      {
+        world({ role: "admin" });
+        const res = await pathAssignment.DELETE(del("/api/learning-path-assignments/pa2"), params("pa2"));
+        eq("DELETE /api/learning-path-assignments/{id}, the same team row: only the active one told", [res.status, mailed()], [200, ["u-2"]]);
+      }
+      {
+        world({ role: "admin" });
+        const res = await pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, assignToOrg: true }));
+        eq("POST /api/learning-path-assignments, org-wide: the same", [res.status, mailed(), countingReads()], [200, ACTIVE, 1]);
+      }
+      {
+        world({ role: "admin" });
+        const res = await pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, userIds: ["u-2", "u-3", "u-4"] }));
+        const named = sessionWrites("learning_path_assignments", "POST").map((w) => (w.body as Row).user_id);
+        eq("POST /api/learning-path-assignments, three people named directly: all three assigned, only the active one told",
+          [res.status, named, mailed()], [200, ["u-2", "u-3", "u-4"], ["u-2"]]);
+      }
+      {
+        world({ role: "admin" });
+        const res = await pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, teamIds: ["t1"] }));
+        eq("POST /api/learning-path-assignments, a team of one active, one inactive and one suspended member: only the active one told",
+          [res.status, mailed()], [200, ["u-2"]]);
+      }
+      {
+        const out = await call(CALLS[7], { role: "admin" });
+        eq("POST /api/learning-paths/{id}/courses (notify_update), a path assigned org-wide and to that team: the active members only",
+          [out.status, mailed(), countingReads()], [200, ACTIVE, 1]);
+      }
+      for (const c of [CALLS[4], CALLS[5], CALLS[7]]) {
+        const out = await call(c, { role: "admin", failRead: "organization_members" });
+        eq(`${c.name}, the members that count cannot be read: the change stands (200), nothing is sent, the sender is not entered`,
+          [out.status, mailed(), senderEntered()], [200, [], false]);
+      }
     }
 
     eq("no request left the stub", unmatched, []);

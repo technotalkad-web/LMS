@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 import { notifyBackground } from "@/lib/notifications/send";
+import { membershipCounts } from "@/lib/auth/org-membership";
 import { originFromRequest } from "@/lib/http/origin";
 
 function generateTempPassword(): string {
@@ -83,13 +84,13 @@ export async function POST(
 
   const { data: orgRaw } = await s
     .from("organizations")
-    .select("id, name, slug")
+    .select("id, name, slug, deleted_at")
     .eq("id", tenantId)
     .maybeSingle();
   if (!orgRaw) {
     return NextResponse.json({ error: "Org not found" }, { status: 404 });
   }
-  const org = orgRaw as { id: string; name: string; slug: string };
+  const org = orgRaw as { id: string; name: string; slug: string; deleted_at: string | null };
 
   const { data: listed } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
   let user = listed?.users?.find((u) => u.email?.toLowerCase() === email);
@@ -160,7 +161,11 @@ export async function POST(
   }
 
   const origin = await originFromRequest();
-  if (isBrandNew && tempPassword) {
+  // ADR 0030 rule 10: the welcome goes only when the row just written counts.
+  // It is written active, so only a deleted organisation sends none; the add
+  // itself stands (the console staffs any tenant), and the platform owner
+  // still gets the temporary password in this answer.
+  if (isBrandNew && tempPassword && membershipCounts({ status: "active" }, org)) {
     const loginUrl = origin
       ? `${origin}/${org.slug}/login`
       : `/${org.slug}/login`;

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { CHECK_FAILED } from "@/lib/auth/api-admin";
-import { resolveOrgMembership } from "@/lib/auth/org-membership";
+import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
@@ -223,24 +223,32 @@ export async function POST(request: Request) {
   if (insErr) return NextResponse.json({ error: insErr.message }, { status: 400 });
   const grantedIds = ((insertedRows ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
 
-  // Notify each granted learner (background).
-  const [emailMap, origin] = await Promise.all([
+  // Notify each granted learner (background). ADR 0030 rule 10: only those
+  // whose membership counts, read once for all of them; unreadable, no mail.
+  // The grants stand either way.
+  const [emailMap, origin, counting] = await Promise.all([
     resolveEmails(s, grantedIds),
     originFromRequest(),
+    countingMemberIds(s, org.id as string),
   ]);
-  for (const uid of grantedIds) {
-    await notifyLearnerOfDecision(s, {
-      orgId: org.id as string,
-      orgName: (org.name as string) ?? "your org",
-      orgSlug,
-      origin,
-      courseId: course.id as string,
-      courseTitle: (course.title as string) ?? "a course",
-      learner: { id: uid, email: emailMap.get(uid) ?? "" },
-      approved: true,
-      note: null,
-      expiresAt,
-    });
+  if (counting === "unreadable") {
+    console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-requests/bulk", org_id: org.id }));
+  } else {
+    for (const uid of grantedIds) {
+      await notifyLearnerOfDecision(s, {
+        orgId: org.id as string,
+        orgName: (org.name as string) ?? "your org",
+        orgSlug,
+        origin,
+        courseId: course.id as string,
+        courseTitle: (course.title as string) ?? "a course",
+        learner: { id: uid, email: emailMap.get(uid) ?? "" },
+        approved: true,
+        note: null,
+        expiresAt,
+        counting,
+      });
+    }
   }
 
   return NextResponse.json({

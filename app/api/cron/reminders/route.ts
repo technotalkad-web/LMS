@@ -5,6 +5,7 @@ import { resolveEmails } from "@/lib/users/emails";
 import { mapWithConcurrency } from "@/lib/util/concurrency";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { isReleased } from "@/lib/learner/release";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 import {
   fetchActiveMembers,
   resolveGroupMembers,
@@ -18,6 +19,11 @@ import {
  * Hourly scheduled task. For each course with reminders enabled:
  *   - Resolve every learner currently assigned (user/team/org/group). A
  *     self-enrolment row (source 'self') is no assignment (decision A22).
+ *   - ADR 0030 rule 10: only members that count are reminded (active, in
+ *     an organisation that is not deleted). A deleted organisation's
+ *     courses are skipped; each other organisation's members that count
+ *     are read once per run, and an organisation whose read fails is
+ *     skipped for this run (nothing sent, no state written).
  *   - Skip learners who have already completed/passed the course.
  *   - Skip learners whose first_assigned_at is older than cap_days.
  *   - Skip learners whose last_nudge_at is newer than cadence_days ago.
@@ -33,7 +39,7 @@ type ReminderRow = {
     id: string;
     title: string;
     organization_id: string;
-    organizations?: { name?: string; slug?: string } | null;
+    organizations?: { name?: string; slug?: string; deleted_at?: string | null } | null;
   } | null;
 };
 
@@ -72,10 +78,10 @@ export async function POST(request: Request) {
   const { data: settings } = await svc
     .from("course_reminder_settings")
     .select(
-      "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug))"
+      "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug, deleted_at))"
     )
     .eq("enabled", true);
-  const enabledCourses = ((settings ?? []) as unknown[]).map((r) => {
+  const allCourses = ((settings ?? []) as unknown[]).map((r) => {
     const row = r as ReminderRow;
     const c = row.courses;
     const orgSubraw = c?.organizations;
@@ -88,8 +94,26 @@ export async function POST(request: Request) {
       organization_id: c?.organization_id ?? "",
       org_name: orgSub?.name ?? "your org",
       org_slug: orgSub?.slug ?? "",
+      // Rule 10: a deleted organisation is skipped by the run. A course whose
+      // organisation was not read is not taken for live either.
+      org_live: !!orgSub && orgSub.deleted_at === null,
     };
   });
+
+  // ADR 0030 rule 10: the members that count, read once per organisation for
+  // this run. A deleted organisation's courses are dropped before any read;
+  // an organisation whose read fails is dropped for this run and logged with
+  // its id.
+  const countingByOrg = new Map<string, ReadonlySet<string>>();
+  for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
+    const counting = await countingMemberIds(svc, oid);
+    if (counting === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "cron/reminders", org_id: oid }));
+      continue;
+    }
+    countingByOrg.set(oid, counting);
+  }
+  const enabledCourses = allCourses.filter((c) => countingByOrg.has(c.organization_id));
   if (enabledCourses.length === 0) {
     // A successful run with nothing to do must still heartbeat, or the health
     // probe reads reminders as never-seen/stale → false "degraded" (which is
@@ -174,21 +198,9 @@ export async function POST(request: Request) {
     }
   }
 
-  // Org members per org
-  const orgIds = Array.from(new Set(assignments.map((a) => a.organization_id)));
-  const { data: orgMembers } = orgIds.length
-    ? await svc
-        .from("organization_members")
-        .select("organization_id, user_id")
-        .in("organization_id", orgIds)
-    : { data: [] };
-  const orgUserIds = new Map<string, Set<string>>();
-  for (const m of orgMembers ?? []) {
-    const oid = m.organization_id as string;
-    const s = orgUserIds.get(oid) ?? new Set<string>();
-    s.add(m.user_id as string);
-    orgUserIds.set(oid, s);
-  }
+  // Org members per org: an org-wide row reaches the members that count,
+  // read once above (rule 10).
+  const orgUserIds = countingByOrg;
 
   // Completed pairs. `!inner` makes the embedded-column filter actually
   // restrict parent rows to the courses we care about (without it the filter
@@ -255,18 +267,22 @@ export async function POST(request: Request) {
     });
   }
 
-  // Resolve user emails (one bulk call)
+  // Resolve user emails (one bulk call), for members that count only.
   const allUserIds = new Set<string>();
   for (const a of assignments) {
-    if (a.assignee_type === "user" && a.user_id) allUserIds.add(a.user_id);
+    const counting = countingByOrg.get(a.organization_id);
+    const add = (uid: string) => {
+      if (counting?.has(uid)) allUserIds.add(uid);
+    };
+    if (a.assignee_type === "user" && a.user_id) add(a.user_id);
     if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUserIds.get(a.team_id) ?? []) allUserIds.add(uid);
+      for (const uid of teamUserIds.get(a.team_id) ?? []) add(uid);
     }
     if (a.assignee_type === "group" && a.group_id) {
-      for (const uid of groupUserIds.get(a.group_id) ?? []) allUserIds.add(uid);
+      for (const uid of groupUserIds.get(a.group_id) ?? []) add(uid);
     }
     if (a.assignee_type === "org") {
-      for (const uid of orgUserIds.get(a.organization_id) ?? []) allUserIds.add(uid);
+      for (const uid of orgUserIds.get(a.organization_id) ?? []) add(uid);
     }
   }
   // Resolve emails via profiles (indexed, no pagination cap) — listUsers paged
@@ -327,6 +343,16 @@ export async function POST(request: Request) {
       }
       if (a.assignee_type === "org") {
         for (const uid of orgUserIds.get(a.organization_id) ?? []) learnerIds.add(uid);
+      }
+    }
+    // Rule 10: a person named directly, in a team or in a static group may
+    // hold a row that does not count. They are skipped before every other
+    // rule, so no reminder state is written for them either.
+    const counting = countingByOrg.get(course.organization_id);
+    for (const uid of learnerIds) {
+      if (!counting?.has(uid)) {
+        learnerIds.delete(uid);
+        skipped++;
       }
     }
 

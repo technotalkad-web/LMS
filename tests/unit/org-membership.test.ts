@@ -61,7 +61,25 @@
  *       loop, keyed on each person's last written status, in chunks of 200;
  *       a failed expiry leaves the deactivation standing, is logged with
  *       ids only and is reported in the answer (`tokens_expired: false`,
- *       and a line the admin sees).
+ *       and a line the admin sees);
+ *   (k) rule 10, the organisation's mail goes only to memberships that
+ *       count: a welcome only for a row written active (POST /api/users,
+ *       the bulk upload) and never into a deleted organisation (the
+ *       console's add, whose add itself stands); the reminders and journey
+ *       nudges crons, the broadcast route and the course update mail reach
+ *       only members that count, whether by name, a team, a static group or
+ *       the whole organisation, from one read of them for the run or the
+ *       request; a deleted organisation's course or program is skipped
+ *       before any read of it, and a broadcast there is refused as for a
+ *       non-member; a learner whose row does not count is not claimed,
+ *       gets no reminder state (not even a stopped one past the cap) and
+ *       raises no escalation, and an escalation goes only to a manager
+ *       whose row counts; an attempt request reaches the active
+ *       administrators only; an attempt decision and a ticket reply reach
+ *       their one person only while that person's membership counts; when
+ *       the members that count cannot be read, nothing is sent and the
+ *       sender is not entered (a broadcast answers 503), and the log line
+ *       holds the organisation's id and no address.
  *
  * No database, no network.
  *
@@ -950,6 +968,380 @@ async function main() {
         const got = await leave("E-T");
         reportedForT("CRM DELETE, the token read fails", got);
         eq("…no token is expired, and the rest of the answer is as before", [liveTokens(), got.body.ok, got.body.action], [ALL_LIVE, true, "deactivated"]);
+      }
+    }
+    console.log("\n(k) rule 10: the organisation's mail goes only to memberships that count");
+    {
+      /** "<event> <user id>" for every mail the sender logged (each send writes one notification_log row), sorted. */
+      const sentEvents = () => requests.filter((r) => r.table === "notification_log" && r.method === "POST")
+        .map((r) => `${(r.body as Row).event_type} ${(r.body as Row).to_user_id}`).sort();
+
+      // ---- the welcome, on the routes of (h) and (j), under the same stub ----
+      {
+        const usersRoute = await import("../../app/api/users/route");
+        const bulkRoute = await import("../../app/api/users/bulk/route");
+        const adminsRoute = await import("../../app/api/super/tenants/[id]/admins/route");
+        // N has an account and no row here; the session is an active administrator of LIVE.
+        const N: Account = { id: "u-n", email: "newcomer@example.test" };
+        const newcomerWorld = () => world({ accounts: [N], members: [row(LIVE, "admin", "active")] });
+        for (const status of ["inactive", "suspended", "active"]) {
+          newcomerWorld();
+          const res = await usersRoute.POST(new Request("http://lms.test/api/users", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, first_name: "New", email: N.email, employee_id: "E-N", lms_role: "user", node_id: "N1", status }),
+          }));
+          eq(`POST /api/users, a new row written ${status}: 200, the row is ${status}, ${status === "active" ? "and the welcome is sent" : "and no welcome is sent"}`,
+            [res.status, memberOf(LIVE, N.id)?.status, sentEvents()], [200, status, status === "active" ? [`account_creation ${N.id}`] : []]);
+        }
+        const HEADER = "first_name,unique_id,email,lms_role,node_id,status";
+        for (const status of ["inactive", "suspended", "active"]) {
+          newcomerWorld();
+          const res = await bulkRoute.POST(new Request("http://lms.test/api/users/bulk", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, csv: [HEADER, `New,E-N,${N.email},user,N1,${status}`].join("\n") }),
+          }));
+          eq(`bulk, a new row written ${status}: 200, the row is ${status}, ${status === "active" ? "and the welcome is sent" : "and no welcome is sent"}`,
+            [res.status, memberOf(LIVE, N.id)?.status, sentEvents()], [200, status, status === "active" ? [`account_creation ${N.id}`] : []]);
+        }
+        for (const org of [LIVE, GONE]) {
+          world({ platformOwner: true });
+          const res = await adminsRoute.POST(
+            new Request(`http://lms.test/api/super/tenants/${org.id}/admins`, { method: "POST", body: JSON.stringify({ email: "first.admin@example.test", role: "admin" }) }),
+            { params: Promise.resolve({ id: org.id }) }
+          );
+          const j = (await res.json()) as Row;
+          const live = org.deleted_at === null;
+          eq(`console add of a new administrator to ${live ? "a live" : "a deleted"} organisation: 200, the row written active, the password in the answer, ${live ? "and the welcome is sent" : "and no welcome is sent"}`,
+            [res.status, memberOf(org, String(j.user_id))?.status, typeof j.temp_password, sentEvents()],
+            [200, "active", "string", live ? [`account_creation ${j.user_id}`] : []]);
+        }
+      }
+
+      // ---- the mail paths, under a stub that also holds assignments, teams,
+      // groups, courses, journeys and the sender's tables ----
+      const reminders = await import("../../app/api/cron/reminders/route");
+      const nudges = await import("../../app/api/cron/journey-nudges/route");
+      const broadcast = await import("../../app/api/notifications/broadcast/route");
+      const { notifyCourseUpdate } = await import("../../lib/courses/notify-update");
+      const { notifyAdminsOfRequest, notifyLearnerOfDecision } = await import("../../lib/attempts/requests");
+      const { notifyRequesterOfTicket } = await import("../../lib/tickets/notify");
+      const SECRET = "stub-cron-secret";
+      process.env.CRON_SECRET = SECRET;
+
+      // LIVE: the session (an administrator), learners of each status, two
+      // managers (one inactive), two more administrators (one inactive).
+      // SECOND holds a person of another organisation; GONE is deleted and
+      // holds an active learner and an active administrator.
+      const M = (org: { id: string }, user: string, role: string, status: string, extra: Row = {}): Row =>
+        ({ organization_id: org.id, user_id: user, role, status, line_manager_id: null, ...extra });
+      const MEMBERS: Row[] = [
+        M(LIVE, ME.id, "admin", "active"),
+        M(LIVE, "u-act", "user", "active", { line_manager_id: "u-mgr" }),
+        M(LIVE, "u-act2", "user", "active", { line_manager_id: "u-mgr-ina" }),
+        M(LIVE, "u-ina", "user", "inactive", { line_manager_id: "u-mgr" }),
+        M(LIVE, "u-sus", "user", "suspended"),
+        M(LIVE, "u-mgr", "user", "active"),
+        M(LIVE, "u-mgr-ina", "user", "inactive"),
+        M(LIVE, "u-adm", "admin", "active"),
+        M(LIVE, "u-adm-ina", "admin", "inactive"),
+        M(SECOND, "u-out", "user", "active"),
+        M(GONE, "u-g", "user", "active"),
+        M(GONE, "u-g-adm", "admin", "active"),
+      ];
+      /** LIVE's members that count. */
+      const COUNTING = ["u-act", "u-act2", "u-adm", ME.id, "u-mgr"].sort();
+      const orgEmbed = (o: typeof LIVE) => ({ name: o.name, slug: o.slug, deleted_at: o.deleted_at });
+      const START = new Date(Date.now() - 8 * 86400000).toISOString().slice(0, 10);
+      const VERSION = {
+        days: Array.from({ length: 10 }, (_, i) => ({ day: i + 1, course_id: "c-live", mission_title: `Mission ${i + 1}` })),
+        days_total: 10, count_sundays: true, unlock_mode: "calendar",
+      };
+      const enrol = (id: string, user: string, program: string): Row => ({
+        id, user_id: user, program_id: program, status: "active", start_date: START, last_nudged_at: null, last_daily_reminder_on: null, journey_versions: VERSION,
+      });
+      const journeyProgram = (id: string, org: typeof LIVE): Row => ({
+        id, organization_id: org.id, name: `Journey ${id}`, is_active: true, nudge_enabled: true, current_version_id: "jv",
+        nudge_cooldown_days: 3, reminder_hour: 0, deadline_days: null, escalation_enabled: true, escalation_after_days: 1, organizations: orgEmbed(org),
+      });
+      const reminderSetting = (course: string, org: typeof LIVE): Row => ({
+        course_id: course, enabled: true, cadence_days: 1, cap_days: 30,
+        courses: { id: course, title: `Course ${course}`, organization_id: org.id, organizations: orgEmbed(org) },
+      });
+      /** An assignment row of a course (or, with `path`, of a path). */
+      const ca = (course: string, org: { id: string }, type: string, ref: string | null = null, path = false): Row => ({
+        id: `a-${course}-${type}-${ref ?? "all"}`, ...(path ? { path_id: course } : { course_id: course }), organization_id: org.id, assignee_type: type,
+        user_id: type === "user" ? ref : null, team_id: type === "team" ? ref : null, group_id: type === "group" ? ref : null, release_at: null, source: "admin",
+      });
+      const GONE_ROWS = [ca("c-gone", GONE, "org"), ca("c-gone", GONE, "user", "u-g")];
+
+      let mt: Record<string, Row[]> = {};
+      let mFail: (table: string, select: string) => boolean = () => false;
+      let warned: string[] = [];
+      const mailStub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+        const h = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+        const p = url.pathname;
+        const q = url.searchParams;
+        const select = q.get("select") ?? "";
+        const table = p.replace("/rest/v1/", "");
+        const raw = typeof init?.body === "string" ? init.body : "";
+        let body: unknown = null;
+        if (raw) { try { body = JSON.parse(raw); } catch { body = raw; } }
+        if (p.startsWith("/rest/v1/")) requests.push({ method, table, select, query: q, key: h.get("apikey"), body });
+        if (p === "/auth/v1/user") return json(ME);
+        if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
+        if (table === "rpc/journey_reminder_counts") {
+          // Nothing credited yet: every enrolment is behind.
+          const ids = (body as { p_ids?: string[] } | null)?.p_ids ?? [];
+          return json(ids.map((id) => ({ enrollment_id: id, done: 0, done_today: false, credited: [] })));
+        }
+        if (table.startsWith("rpc/")) return json([]);
+        if (method === "GET") {
+          if (mFail(table, select)) return json({ code: "XX000", message: "stub read failure" }, 500);
+          if (table === "profiles") {
+            const id = q.get("id") ?? "";
+            const ids = id.startsWith("in.(") ? id.slice(4, -1).split(",") : id.startsWith("eq.") ? [id.slice(3)] : [];
+            return json(ids.filter(Boolean).map((x) => ({ id: x, email: `${x}@example.test`, first_name: null, last_name: null })));
+          }
+          let rows = (mt[table] ?? []).filter((r) => matches(r, q));
+          if (table === "organization_members") rows = [...rows].sort((a, b) => String(a.user_id).localeCompare(String(b.user_id)));
+          const offset = Number(q.get("offset") ?? 0);
+          const limit = q.has("limit") ? Number(q.get("limit")) : rows.length;
+          const out = rows.slice(offset, offset + limit).map((r) => (select.includes("(") || select.includes("*") ? r : project(r, select)));
+          if ((h.get("accept") ?? "").includes("vnd.pgrst.object")) return json(out[0] ?? null);
+          return json(out);
+        }
+        if (method === "PATCH") {
+          const hit = (mt[table] ?? []).filter((r) => matches(r, q));
+          for (const r of hit) Object.assign(r, body as Row);
+          return json(hit.map((r) => project(r, select)));
+        }
+        // An insert or an upsert: the sender's log row, reminder state, the heartbeat.
+        return json([], 201);
+      };
+      const mailWorld = (o: {
+        assignments?: Row[]; pathAssignments?: Row[]; reminderState?: Row[]; extraMembers?: Row[];
+        fail?: (table: string, select: string) => boolean;
+      } = {}) => {
+        mt = {
+          organizations: [LIVE, SECOND, GONE].map((x) => ({ ...x })),
+          organization_members: [...MEMBERS, ...(o.extraMembers ?? [])].map((r) => ({ ...r })),
+          reminder_state: (o.reminderState ?? []).map((r) => ({ ...r })),
+          team_members: ["u-act", "u-ina", "u-sus"].map((u) => ({ team_id: "t-live", user_id: u })),
+          org_groups: [{ id: "g-live", organization_id: LIVE.id, group_type: "static", rules: {}, is_active: true }],
+          org_group_members: ["u-act", "u-ina", "u-sus"].map((u) => ({ group_id: "g-live", user_id: u })),
+          course_reminder_settings: [reminderSetting("c-live", LIVE), reminderSetting("c-gone", GONE)],
+          course_assignments: (o.assignments ?? []).map((r) => ({ ...r })),
+          learning_path_assignments: (o.pathAssignments ?? []).map((r) => ({ ...r })),
+          courses: [{ id: "c-live", organization_id: LIVE.id, title: "Course L" }, { id: "c-gone", organization_id: GONE.id, title: "Course G" }],
+          journey_programs: [journeyProgram("p-live", LIVE), journeyProgram("p-gone", GONE)],
+          journey_enrollments: [enrol("e-act", "u-act", "p-live"), enrol("e-act2", "u-act2", "p-live"), enrol("e-ina", "u-ina", "p-live"), enrol("e-g", "u-g", "p-gone")],
+        };
+        mFail = o.fail ?? (() => false);
+        requests = [];
+        warned = [];
+      };
+      /** The user ids the sender logged a mail for (for one event, when named), sorted. */
+      const mailed = (event?: string) => requests.filter((r) => r.table === "notification_log" && r.method === "POST")
+        .map((r) => r.body as Row).filter((b) => !event || b.event_type === event).map((b) => String(b.to_user_id)).sort();
+      /** The sender's first read: false means it was never entered. */
+      const senderEntered = () => requests.some((r) => r.table === "notification_settings");
+      /** countingMemberIds' member read. */
+      const COUNTING_READ = (table: string, select: string) => table === "organization_members" && select === "user_id,role,status";
+      const countingReads = () => requests.filter((r) => r.method === "GET" && COUNTING_READ(r.table, r.select)).length;
+      /** Any read of an organisation's row or of its member rows. */
+      const readsOfOrg = (org: { id: string }) => requests.filter((r) => r.method === "GET" && (
+        (r.table === "organization_members" && r.query.get("organization_id") === `eq.${org.id}`) ||
+        (r.table === "organizations" && r.query.get("id") === `eq.${org.id}`))).length;
+      const unreadableLogged = () => warned
+        .map((l) => { try { return JSON.parse(l) as Row; } catch { return null; } })
+        .filter((l): l is Row => l?.event === "mail_recipients_unreadable");
+
+      const realWarn = console.warn;
+      globalThis.fetch = mailStub as typeof fetch;
+      console.warn = (...a: unknown[]) => { warned.push(a.map((x) => (typeof x === "string" ? x : String(x))).join(" ")); };
+      try {
+        // ---- the reminders cron ----
+        const remind = async () =>
+          (await reminders.POST(new Request("http://lms.test/api/cron/reminders", { method: "POST", headers: { "x-cron-secret": SECRET } }))).status;
+        const stateFor = () => requests.filter((r) => r.table === "reminder_state" && r.method === "POST")
+          .flatMap((r) => (r.body as Row[]).map((x) => String(x.user_id))).sort();
+        const AUDIENCES: Array<[string, Row[], string[]]> = [
+          ["to three people by name (active, inactive, suspended)", ["u-act", "u-ina", "u-sus"].map((u) => ca("c-live", LIVE, "user", u)), ["u-act"]],
+          ["to a team of those three", [ca("c-live", LIVE, "team", "t-live")], ["u-act"]],
+          ["to a static group of those three", [ca("c-live", LIVE, "group", "g-live")], ["u-act"]],
+          ["org-wide", [ca("c-live", LIVE, "org")], COUNTING],
+        ];
+        for (const [name, rows, want] of AUDIENCES) {
+          mailWorld({ assignments: [...rows, ...GONE_ROWS] });
+          const status = await remind();
+          eq(`reminders, a course assigned ${name}: only members that count are reminded, and only they get reminder state`,
+            [status, mailed("asset_reminder"), stateFor()], [200, want, want]);
+          eq("…a deleted organisation's course reminds nobody, and none of its rows is read; one read of the members that count",
+            [mailed().includes("u-g"), readsOfOrg(GONE), countingReads()], [false, 0, 1]);
+        }
+        {
+          // Both first assigned 40 days ago, past the 30-day cap: an active
+          // learner's reminders are stopped (written stopped, no mail); a
+          // learner whose row does not count is skipped before that rule.
+          const OLD = new Date(Date.now() - 40 * 86400000).toISOString();
+          const old = (u: string): Row => ({ user_id: u, course_id: "c-live", first_assigned_at: OLD, last_nudge_at: OLD, nudge_count: 3, stopped: false });
+          mailWorld({ assignments: ["u-act", "u-ina"].map((u) => ca("c-live", LIVE, "user", u)), reminderState: [old("u-act"), old("u-ina")] });
+          const status = await remind();
+          const upserts = requests.filter((r) => r.table === "reminder_state" && r.method === "POST")
+            .flatMap((r) => (r.body as Row[]).map((x) => `${x.user_id} stopped=${x.stopped}`)).sort();
+          eq("reminders past the cap: the active learner's state is written stopped and nobody is mailed; nothing is written for the inactive learner",
+            [status, mailed(), upserts], [200, [], ["u-act stopped=true"]]);
+        }
+        mailWorld({ assignments: [ca("c-live", LIVE, "org"), ca("c-live", LIVE, "user", "u-act")], fail: COUNTING_READ });
+        {
+          const status = await remind();
+          eq("reminders, the members that count cannot be read: 200, nobody reminded, the sender not entered, no state written",
+            [status, mailed(), senderEntered(), stateFor()], [200, [], false, []]);
+          eq("…logged once, with the organisation's id and no address",
+            [unreadableLogged().map((l) => [l.site, l.org_id]), warned.some((l) => l.includes("@"))], [[["cron/reminders", LIVE.id]], false]);
+        }
+
+        // ---- the journey nudges cron ----
+        const nudge = async () => {
+          const res = await nudges.POST(new Request("http://lms.test/api/cron/journey-nudges", { method: "POST", headers: { "x-cron-secret": SECRET } }) as never);
+          return { status: res.status, body: (await res.json()) as Row };
+        };
+        const claims = () => requests.filter((r) => r.table === "journey_enrollments" && r.method === "PATCH").map((r) => String(r.query.get("id")));
+        mailWorld();
+        {
+          const r = await nudge();
+          eq("journey nudges: both active learners are reminded; the inactive one is not", [r.status, mailed("journey_nudge")], [200, ["u-act", "u-act2"]]);
+          eq("…an escalation goes to the active manager; the learner whose manager is inactive escalates to nobody, and the inactive learner raises none",
+            mailed("journey_escalation"), ["u-mgr"]);
+          eq("…the inactive learner's enrolment is never claimed or stamped", claims().filter((id) => id === "eq.e-ina"), []);
+          eq("…the managers are read from active rows only", requests.filter((q) => q.table === "organization_members" && q.select === "user_id,line_manager_id").map((q) => q.query.get("status")), ["eq.active"]);
+          eq("…the deleted organisation's program is skipped before any read of it, and counted",
+            [readsOfOrg(GONE), requests.filter((q) => q.table === "journey_enrollments" && q.query.get("program_id") === "eq.p-gone").length, r.body.skipped_org_programs, mailed().includes("u-g")],
+            [0, 0, 1, false]);
+          eq("…one read of the members that count", countingReads(), 1);
+        }
+        mailWorld({ fail: COUNTING_READ });
+        {
+          const r = await nudge();
+          eq("journey nudges, the members that count cannot be read: nobody mailed, the sender not entered, no enrolment claimed",
+            [r.status, mailed(), senderEntered(), claims()], [200, [], false, []]);
+          eq("…logged with the organisation's id", unreadableLogged().map((l) => [l.site, l.org_id]), [["cron/journey-nudges", LIVE.id]]);
+        }
+
+        // ---- the broadcast route (the session is an active administrator of LIVE) ----
+        const cast = async (b: Row) => {
+          const res = await broadcast.POST(new Request("http://lms.test/api/notifications/broadcast", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, subject: "Hello", body_md: "Body", ...b }),
+          }));
+          return { status: res.status, body: (await res.json()) as Row };
+        };
+        const CASTS: Array<[string, Row, { assignments?: Row[]; pathAssignments?: Row[] }, string[]]> = [
+          ["to named people (active, inactive, suspended, and a member of another organisation)", { audience: "users", user_ids: ["u-act", "u-ina", "u-sus", "u-out"] }, {}, ["u-act"]],
+          ["to a team", { audience: "team", team_id: "t-live" }, {}, ["u-act"]],
+          ["to a course's audience of a static group and a suspended person by name", { audience: "course", course_id: "c-live" },
+            { assignments: [ca("c-live", LIVE, "group", "g-live"), ca("c-live", LIVE, "user", "u-sus")] }, ["u-act"]],
+          ["to a course's org-wide audience", { audience: "course", course_id: "c-live" }, { assignments: [ca("c-live", LIVE, "org")] }, COUNTING],
+          ["to a path's team audience", { audience: "path", path_id: "p-1" }, { pathAssignments: [ca("p-1", LIVE, "team", "t-live", true)] }, ["u-act"]],
+          ["to everyone", { audience: "all" }, {}, COUNTING],
+        ];
+        for (const [name, b, w, want] of CASTS) {
+          mailWorld(w);
+          const r = await cast(b);
+          eq(`broadcast ${name}: only members that count, from one read of them`,
+            [r.status, mailed("custom_broadcast"), r.body.total, countingReads()], [200, want, want.length, 1]);
+        }
+        mailWorld();
+        {
+          const r = await cast({ audience: "users", user_ids: ["u-ina", "u-sus"] });
+          eq("broadcast to an inactive and a suspended person only: 400 no recipients, nothing sent", [r.status, mailed(), senderEntered()], [400, [], false]);
+        }
+        mailWorld({ fail: COUNTING_READ });
+        {
+          const r = await cast({ audience: "all" });
+          eq("broadcast, the members that count cannot be read: 503 try again, nothing sent, the sender not entered",
+            [r.status, /try again/.test(String(r.body.error)), mailed(), senderEntered()], [503, true, [], false]);
+        }
+        // The session holds an active administrator row in the deleted organisation.
+        mailWorld({ extraMembers: [M(GONE, ME.id, "admin", "active")] });
+        {
+          const r = await cast({ orgSlug: GONE.slug, audience: "all" });
+          eq("broadcast in a deleted organisation, by an administrator whose row there is active: 404 as for a non-member, nothing sent, the sender not entered, its members not read",
+            [r.status, mailed(), senderEntered(), countingReads()], [404, [], false, 0]);
+        }
+        mailWorld({ extraMembers: [M(GONE, ME.id, "admin", "active")] });
+        {
+          const r = await cast({ audience: "all" });
+          eq("…the control: the same session in the live organisation still reaches every member that counts", [r.status, mailed("custom_broadcast")], [200, COUNTING]);
+        }
+
+        // ---- the course update mail ----
+        const update = (org: typeof LIVE, course: string) => notifyCourseUpdate({ org: { id: org.id, slug: org.slug, name: org.name }, courseId: course });
+        const UPDATES: Array<[string, Row[], string[]]> = [
+          ["to three people by name", ["u-act", "u-ina", "u-sus"].map((u) => ca("c-live", LIVE, "user", u)), ["u-act"]],
+          ["to a team", [ca("c-live", LIVE, "team", "t-live")], ["u-act"]],
+          ["org-wide", [ca("c-live", LIVE, "org")], COUNTING],
+        ];
+        for (const [name, rows, want] of UPDATES) {
+          mailWorld({ assignments: rows });
+          await update(LIVE, "c-live");
+          eq(`course update, assigned ${name}: only members that count`, [mailed("asset_update"), countingReads()], [want, 1]);
+        }
+        mailWorld({ assignments: GONE_ROWS });
+        await update(GONE, "c-gone");
+        eq("course update in a deleted organisation: nobody, the sender not entered", [mailed(), senderEntered()], [[], false]);
+        mailWorld({ assignments: [ca("c-live", LIVE, "org")], fail: COUNTING_READ });
+        await update(LIVE, "c-live");
+        eq("course update, the members that count cannot be read: nobody, the sender not entered", [mailed(), senderEntered()], [[], false]);
+
+        // ---- the attempt request, to the administrators ----
+        const asked = (org: typeof LIVE) => notifyAdminsOfRequest(svc(), {
+          orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: "", courseTitle: "Course L",
+          learnerEmail: "learner@example.test", learnerName: "Learner", reason: null,
+        });
+        mailWorld();
+        await asked(LIVE);
+        eq("an attempt request mails the active administrators only: not the inactive one, not a learner", mailed("custom_broadcast"), ["u-adm", ME.id].sort());
+        mailWorld();
+        await asked(GONE);
+        eq("…in a deleted organisation: nobody, the sender not entered", [mailed(), senderEntered()], [[], false]);
+        mailWorld({ fail: COUNTING_READ });
+        await asked(LIVE);
+        eq("…the administrators that count cannot be read: nobody, the sender not entered", [mailed(), senderEntered()], [[], false]);
+
+        // ---- one person's mail: an attempt decision, a ticket reply ----
+        const decide = (org: typeof LIVE, who: string, counting?: ReadonlySet<string>) => notifyLearnerOfDecision(svc(), {
+          orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: "", courseId: "c-live", courseTitle: "Course L",
+          learner: { id: who, email: `${who}@example.test` }, approved: true, note: null, expiresAt: null, ...(counting ? { counting } : {}),
+        });
+        const reply = (org: typeof LIVE, who: string) => notifyRequesterOfTicket(svc(), {
+          orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: "",
+          requester: { id: who, email: `${who}@example.test` }, subject: "Help", headline: "Reply from your admin", message: "Done",
+        });
+        for (const [kind, send] of [["attempt decision", decide], ["ticket reply", reply]] as const) {
+          for (const [who, org, want] of [["u-act", LIVE, true], ["u-ina", LIVE, false], ["u-sus", LIVE, false], ["u-out", LIVE, false], ["u-g", GONE, false]] as const) {
+            mailWorld();
+            await send(org, who);
+            eq(`${kind} to ${who} (${org === GONE ? "a deleted organisation" : who === "u-out" ? "no row here" : MEMBERS.find((r) => r.user_id === who)?.status}): ${want ? "sent" : "not sent, the sender not entered"}`,
+              [mailed(), senderEntered()], [want ? [who] : [], want]);
+          }
+          mailWorld({ fail: (t) => t === "organization_members" });
+          await send(LIVE, "u-act");
+          eq(`${kind}, the person's membership cannot be read: not sent, the sender not entered, logged with the organisation's id`,
+            [mailed(), senderEntered(), unreadableLogged().map((l) => l.org_id)], [[], false, [LIVE.id]]);
+        }
+        mailWorld();
+        await decide(LIVE, "u-act", new Set(["u-act"]));
+        eq("attempt decision with the org's counting ids passed in (a run of several): sent, and no member row is read",
+          [mailed(), requests.filter((r) => r.table === "organization_members").length], [["u-act"], 0]);
+        mailWorld();
+        await decide(LIVE, "u-act", new Set());
+        eq("…an id not among them: not sent, the sender not entered", [mailed(), senderEntered()], [[], false]);
+      } finally {
+        globalThis.fetch = stub as typeof fetch;
+        console.warn = realWarn;
       }
     }
   } finally {
