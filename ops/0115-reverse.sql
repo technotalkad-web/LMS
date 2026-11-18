@@ -12,7 +12,25 @@
 -- repository's (verdict DIFFERS), run that object's B11 row from the same
 -- printout after this script, with the owner. B11 holds the whole stored
 -- definition as a statement that puts it back; B2 and B3 print it cut
--- short.
+-- short. The same holds for "members can read their orgs" where its B3 row
+-- read RENAMES with a text that differs: the B11 row of its alias
+-- "members_view_their_orgs" (an alter policy on the repository name) is
+-- run after this script, with the owner. The B11 row of the own-row alias
+-- "View own membership" is printed in parts, not as a statement, and is
+-- never written back: the own-row policy keeps the repository's spelling,
+-- which reads the same rows, and the alias's spelling would make the next
+-- paste of 0115 roll back on its A4.
+--
+-- HAND-MADE DATABASES (ADR 0030, note "Hand-made databases, 2026-11-18").
+-- This script adds no statement for 0115's section 0d. It gives no alias its
+-- old name back (a name grants nothing): it writes the repository's earlier
+-- expression under the repository's name, and the own-row policy keeps the
+-- repository's spelling (user_id = auth.uid()). It does not restore the
+-- legacy policy 0115 removed from public.enrollments, because the script
+-- never creates a policy: that policy is written back by hand from its B11
+-- row, on the owner's word only. From then on ops/0115-after-checks.sql,
+-- run alone, fails on that database (A4), as it should, and the next paste
+-- of 0115 marks the policy DROPS again and removes it again.
 --
 -- WHAT IT DOES, one transaction:
 --   (1) refuses while one of the seven policies is absent (the script alters

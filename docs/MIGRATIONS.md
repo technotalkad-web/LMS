@@ -112,23 +112,80 @@ Each file's header is the full rule; this is the cross-file summary.
   helpers and the seven policies that read `organization_members`
   themselves count a membership only while its status is `active` and its
   organisation's `deleted_at` is null; no relation, no row write, nothing
-  removed): written and rehearsed (`scripts/migration-rehearsal`, scenarios
+  removed but one legacy policy, where the database has it): written and
+  rehearsed (`scripts/migration-rehearsal`, scenarios
   `0115-at-0104`, `0107-0112-then-0115`, `0115-then-sitting`,
   `0115-then-0107-again`, `0115-undone-then-0115`, `0115-extra-policy`,
-  `0115-missing-policy`, `0115-no-analyst-helper` and
-  `0115-with-0110-stand-in`); **not yet pasted on staging or production**
-  (2026-11-18). Before each paste the owner runs its before-check (section
+  `0115-missing-policy`, `0115-no-analyst-helper`,
+  `0115-with-0110-stand-in`, `0115-hand-made`, `0115-hand-made-at-0104` and
+  `0115-hand-made-off-list`); **not yet applied on staging or production**
+  (2026-11-18; a first staging paste that day was refused by its section 0c
+  and changed nothing). Before each paste the owner runs its before-check (section
   0b of the file, one read-only select) and answers every row whose verdict
   is not `ok` or `info`, and keeps the `B11` rows whole with the record of
   the sitting (the stored definitions, the reverse's source for an object
-  marked `DIFFERS`); record the date here after each paste.
+  marked `DIFFERS` and for the alias "members_view_their_orgs" marked
+  `RENAMES`, and, in parts and not as statements, the whole text of the
+  alias "View own membership" marked `RENAMES` and of a policy marked
+  `DROPS`); record the date here after each paste.
+- Hand-made databases (ADR 0030, note "Hand-made databases, 2026-11-18").
+  The before-check marks two closed lists. `RENAMES`: "members_view_their_orgs"
+  on `organizations` and "View own membership" on `organization_members`,
+  older names of "members can read their orgs" and "members can read own
+  memberships"; the paste gives them the repository's names (and the
+  second the spelling `(user_id = auth.uid())`), and nobody's access changes
+  by that. Where the B3 row of "members can read their orgs" says its text
+  differs, section 3 writes 0115's text over it: the owner reads that
+  alias's `B11` row whole before the paste (B3 prints it cut short), and
+  where the row says the roles are not the repository's, the policy keeps
+  them under the repository name. `DROPS`: "admins_view_org_enrollments" on
+  `public.enrollments`, a table no migration creates and the app never
+  reads; the paste removes that one policy, so a signed-in session no longer
+  reads that table through it (the service role is not affected, and no
+  row, grant or setting of the table changes); its row says whether row
+  security is on and how many permissive policies for select or all stay,
+  `B11` prints the policy whole in parts, and `B12` prints the table's row
+  security, the select, insert, update and delete grants of `anon` and of
+  `authenticated`, and the names of the other permissive policies on the
+  table, any command (`LIST` where row security is off: a finding of its own
+  for the owner, which the paste neither changes nor waits for). The removal
+  runs only after the table is locked and the policy read again under the
+  lock with the before-check's own tests (that name on that table,
+  permissive, for select, its text naming `organization_members`). Both
+  lists are closed: anything else on such a database still reads `REFUSES`
+  or `UNEXPECTED`, and the paste is refused or rolled back and changes
+  nothing. Expected on staging: no `REFUSES`, no `UNEXPECTED`, three
+  `RENAMES`, one `DROPS`, `B12` as it reads (`info` with row security on),
+  and B7 to B9 as before; any other row that is not `ok` or `info`, but for
+  a `B12` `LIST`, means no paste. The reverse does not rename back and does
+  not restore the removed policy.
+- A standing `DIFFERS` after the paste (a production question only:
+  staging's aliases carry the repository's roles). Where the `RENAMES` row
+  of "members_view_their_orgs" said its roles are not the repository's
+  (`public`), the policy keeps those roles under the repository name, so
+  from that paste on every run of the before-check reads `B3` "members can
+  read their orgs" `DIFFERS` on its roles. That row is expected and is not a
+  failed paste: the after-checks test the policy's command, not its roles,
+  and pass. It goes to the architect, with the `RENAMES` row of the first
+  paste beside it. The own-row alias gets no such row: `B4b` and the
+  after-check A4 compare its text and command, never its roles, so roles
+  other than the repository's stay under the repository name with `B4b`
+  reading `ok`; its `B4b` row prints them on every run, its `RENAMES` row
+  of the first paste says they are not the repository's, and its `B11` row
+  of that paste records them. The line above (any other
+  row means no paste) is about staging's first paste, where this row cannot
+  arise.
 - Staging: 0115 first, then the full e2e and lifecycle regression on the
   older code and lifecycle spec 80's database group by hand
   (`tests/bot/lifecycle/80-membership-status-access.spec.ts`; it fails, and
   never skips, on a database without 0115), then the app code (ADR 0030
   pull request B). Production: 0115
   in a small sitting of its own once staging is green, ahead of ADR 0024's
-  sitting and without changing it; the code with the next tag. 0115 touches
+  sitting and without changing it; the code with the next tag. Before that
+  sitting, besides its before-check, every policy on the tables of ADR 0030
+  section C is listed read-only, as on staging: the before-check lists only
+  the policies, functions and views that read `organization_members`, and a
+  database set up by hand can carry other ones. 0115 touches
   nothing defined after 0056, so it is pasted before or after 0105 to 0114.
   On production 0110 (ADR 0026) always comes after 0115; whichever of the two
   is pasted second, `ops/0115-after-checks.sql` is run after it.
@@ -139,4 +196,14 @@ Each file's header is the full rule; this is the cross-file summary.
   function or a view reading `organization_members` with `auth.uid()`
   without it.
 - Reverse: `ops/0115-reverse.sql`, for a paste that went wrong only (it
-  brings back the old rule). A code rollback needs no reverse.
+  brings back the old rule). A code rollback needs no reverse. It gives no
+  alias its old name back and does not restore the policy removed from
+  `public.enrollments`; that policy is written back by hand from its `B11`
+  row on the owner's word only, and from then on
+  `ops/0115-after-checks.sql` run alone fails on that database (A4) and the
+  next paste of 0115 removes it again. After the reverse, only the `B11` row
+  of "members_view_their_orgs" is run (where its text differed); the `B11`
+  row of "View own membership" is printed in parts, not as a statement, and
+  is never written back (the own-row policy keeps the repository's spelling,
+  and the alias's spelling would make the next paste of 0115 roll back on
+  A4).

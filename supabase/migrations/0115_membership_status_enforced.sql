@@ -13,8 +13,13 @@
 -- never the person a row is about: an active administrator still reads an
 -- inactive member's rows.
 --
--- WHAT IT DOES (one transaction; it creates no relation, writes no row and
--- removes nothing):
+-- WHAT IT DOES (one transaction; it creates no relation, writes no row, and
+-- removes nothing but one legacy policy, where the database has it):
+--   0. on a database set up by hand before the repository's migrations
+--      (section 0d; HAND-MADE DATABASES below): the two known aliases take
+--      the repository's names and the one legacy policy is removed, each
+--      only where the before-check of the same paste marked it RENAMES or
+--      DROPS. Nothing else is ever renamed or removed.
 --   1. create or replace of the four helpers is_org_member, is_org_admin,
 --      is_org_super_owner and is_org_data_analyst: same name, same argument
 --      org_id, same result, same role lists ('owner' kept), plus
@@ -69,10 +74,48 @@
 -- (0021) and all seven policies. Section 0a refuses without a table or a
 -- column, section 0c without a policy (the file alters policies and never
 -- creates one) or with a helper whose argument is not org_id (a replace
--- cannot rename it). A refusal changes nothing.
+-- cannot rename it). A refusal changes nothing. A policy present under its
+-- known alias is not missing: section 0d gives it the repository's name.
 --
 -- RE-PASTE. Idempotent: create or replace and alter policy set the same
--- text each time, and the grants repeat cleanly.
+-- text each time, and the grants repeat cleanly. A second paste finds no
+-- alias and no legacy policy, so section 0d renames and removes nothing.
+--
+-- HAND-MADE DATABASES (ADR 0030, note "Hand-made databases, 2026-11-18").
+-- A database set up by hand before the repository's migrations can carry
+-- other names. Two closed lists, each tested in the before-check select
+-- itself:
+--   the known aliases: "members_view_their_orgs" on public.organizations
+--     for "members can read their orgs", and "View own membership" on
+--     public.organization_members for "members can read own memberships".
+--     A policy is the alias only when the repository name is absent on that
+--     table and the alias is there as a permissive policy for select; the
+--     first must also read organization_members, the second must be exactly
+--     (auth.uid() = user_id) or (user_id = auth.uid()). Section 0d renames
+--     it, keeping its command and roles, and gives the second the
+--     repository's spelling (user_id = auth.uid()), so that A4's exact
+--     comparison holds. Nobody's access changes by that; section 3 then
+--     writes 0115's text over the first, as over a DIFFERS policy.
+--   the legacy policy: exactly "admins_view_org_enrollments" on exactly
+--     public.enrollments (a table no migration creates and the app never
+--     reads), only as a permissive policy for select that names
+--     organization_members. Section 0d removes it: with row security on, a
+--     session no longer reads that table through it, an active
+--     administrator included (one step past the rule, on that one table);
+--     other policies on the table stay, the service role is not affected,
+--     and no row, column, grant or setting of the table is touched. With
+--     row security off the policy was not in force, and the table answers
+--     by its grants whatever this file does: the DROPS row says so, B12
+--     reads LIST with the grants, and that is a finding of its own for the
+--     owner.
+-- Anything else reads as before: both names present, another command, a
+-- restrictive policy, another expression, any other name, or that name on
+-- another table is REFUSES (B3) or UNEXPECTED (B4a, B4b), and the paste is
+-- refused by section 0c or rolled back by A4, changing nothing. The
+-- after-checks do not change for these lists and their expected sets do not
+-- grow, so no alias can stay on a database and pass. An addition to either
+-- list is a dated note under ADR 0030 with its rehearsal, never an edit at
+-- the SQL editor.
 --
 -- NEVER PASTE AGAIN (docs/MIGRATIONS.md and ops/RUNBOOK.md carry the same
 -- rule): After 0115, none of 0001, 0002, 0006, 0010, 0019, 0026, 0027, 0030,
@@ -108,9 +151,12 @@
 --
 -- Row writes: none. Locks: each alter policy takes ACCESS EXCLUSIVE on its
 -- table (organizations, tenant_subscriptions, profiles, course_packages,
--- course_ratings) until commit, so reads of those tables wait for the
--- commit, which follows within the same paste. lock_timeout 5 s: if a lock
--- is not granted the whole file rolls back and can simply be pasted again.
+-- course_ratings; and, where section 0d acts, organization_members for the
+-- rename and enrollments for the legacy policy, locked before its second
+-- read) until commit, so reads of those tables wait for the commit, which
+-- follows within the same paste.
+-- lock_timeout 5 s: if a lock is not granted the whole file rolls back and
+-- can simply be pasted again.
 -- Staging: paste when no spec, CI e2e run or harness is in progress.
 --
 -- Grants: none on a relation (the file creates none, so
@@ -121,40 +167,63 @@
 -- REVERSE: ops/0115-reverse.sql restores the four bodies and the seven
 -- policies as the repository defined them before this file. It is for a
 -- paste that went wrong only: it brings back the old rule. A code rollback
--- needs no reverse.
+-- needs no reverse. It gives no alias its old name back and does not
+-- restore the legacy policy (its header says why, and how the B11 rows are
+-- used).
 --
 -- BEFORE the apply (read-only; role postgres; ids only, never a name or an
--- address). B1 to B11 are ONE select: section 0b below, from its line
+-- address). B1 to B12 are ONE select: section 0b below, from its line
 -- `with` to its `;`. Run it alone in the SQL editor and record every row
 -- (check_id, item, observed, verdict). The paste runs the same select into a
--- temporary table, and section 0c refuses on a row marked REFUSES. Every row
--- whose verdict is not ok or info goes to the owner before the paste.
+-- temporary table; section 0c refuses on a row marked REFUSES, and section
+-- 0d acts on a row marked RENAMES or DROPS, after that refusal and never
+-- before it. Every row whose verdict is not ok or info goes to the owner
+-- before the paste.
 -- Verdicts: ok; info; LIST (who or what loses access, for the owner to
--- read); admitted (one of ADR 0026's two named policies); DIFFERS (a stored
--- definition, command or role list that is not the repository's: the paste
--- writes 0115's text over a helper body or a policy expression and goes on,
--- but its after-check fails, and the paste rolls back, on a command of one
+-- read; in B12, a table that answers by its grants alone, a finding for the
+-- owner that the paste does not change and does not wait for); admitted
+-- (one of ADR 0026's two named policies); DIFFERS (a stored definition,
+-- command or role list that is not the repository's: the paste writes
+-- 0115's text over a helper body or a policy expression and goes on, but
+-- its after-check fails, and the paste rolls back, on a command of one
 -- of the seven policies (A2) and on the expression or command of the two
 -- policies on organization_members (A4)); UNEXPECTED (outside the expected
 -- set: the after-check of this file fails on it); REFUSES (section 0c
--- refuses the paste on it).
+-- refuses the paste on it); RENAMES (one of the two known aliases: section
+-- 0d gives it the repository's name in the paste; nobody's access changes
+-- by that); DROPS (the one legacy policy: section 0d removes it in the
+-- paste). The select reports and does not act: run alone it changes nothing
+-- and says what the paste will do.
 --   B1   which files the database holds, one marker object each: 0099,
 --        0100, 0103 to 0110, 0112 to 0115.
 --   B2   the four helpers: the body as the repository's last definition
 --        before 0115, as 0115, or differs (the stored text is printed);
 --        security definer; the pinned search_path; the argument name.
 --        is_org_data_analyst may be absent (info: this file creates it).
---   B3   the seven policies: absent REFUSES; command, roles and expression
---        compared with the repository's last definition before 0115 and
---        with 0115's. Postgres prints an expression in its own form, and
---        the form can change between versions: a DIFFERS row shows the
---        stored text; compare it with the file named.
+--   B3   the seven policies: absent REFUSES, but RENAMES where its known
+--        alias is there (the row prints the alias, its text, command and
+--        roles; where the alias's text is not the repository's, the row
+--        says that section 3 writes 0115's text over it, and the alias's
+--        whole text is its B11 row, read whole before the paste; where its
+--        roles are not the repository's, the row says so, and the policy
+--        keeps them under the repository name); command, roles and
+--        expression compared with the repository's last definition before
+--        0115 and with 0115's. Postgres prints an expression in its own
+--        form, and the form can change between versions: a DIFFERS row
+--        shows the stored text; compare it with the file named.
 --   B4a  every policy in every schema (storage included) whose using or
---        with check names organization_members. Expected: the seven.
+--        with check names organization_members. Expected: the seven; on a
+--        hand-made database also the first alias (RENAMES, with the name it
+--        takes) and the legacy policy (DROPS, with whether row security is
+--        on for its table, how many other policies the table has, and how
+--        many of those are permissive for select or all, which stay; B12
+--        names every other permissive policy, any command, and reads the
+--        table's grants).
 --   B4b  every policy on public.organization_members itself (their text
 --        does not name the table). Expected: "members can read own
 --        memberships" and "admins read org memberships", with their
---        expressions.
+--        expressions; on a hand-made database the second alias (RENAMES)
+--        in place of the first of them.
 --   B4c  every function whose source names organization_members together
 --        with auth.uid(). Expected: the four helpers, and
 --        get_my_gamification(uuid) and set_gamification_opt_out(uuid,
@@ -184,8 +253,28 @@
 --        pg_get_functiondef prints it) and of each of the seven policies
 --        (as an alter policy statement with its using and with check), not
 --        cut short: the source of ops/0115-reverse.sql for an object that B2
---        or B3 marks DIFFERS. Keep these rows whole with the record of the
+--        or B3 marks DIFFERS. For the first alias,
+--        "members_view_their_orgs", marked RENAMES, its whole stored
+--        expression as an alter policy statement on the repository name
+--        (the name it carries after the paste; run after the reverse where
+--        its text differed). For the own-row alias, "View own membership",
+--        marked RENAMES, and for the DROPS policy, the whole policy in
+--        parts, not as a statement: table, name, permissive, command, roles
+--        and its using (and its with check, where the DROPS policy has
+--        one). The own-row alias's row is a record only and is never
+--        written back (the own-row policy keeps the repository's spelling);
+--        the DROPS policy is written back from its row by hand, on the
+--        owner's word only. Keep these rows whole with the record of the
 --        sitting.
+--   B12  each table of the legacy list that the database holds (on a
+--        repository-built database: none): row security on or off, and
+--        forced or not; for anon and for authenticated, whether each holds
+--        select, insert, update and delete on it; and the names and
+--        commands of the permissive policies (any command) it has beside
+--        the legacy policy, which stay. info with row security on; LIST
+--        with row security off, where the table answers a session by its
+--        grants whatever the paste does: a finding for the owner, which the
+--        paste neither changes nor waits for.
 --
 -- AFTER the apply: section 4 runs inside this file and raises on failure,
 -- which rolls the whole file back. ops/0115-after-checks.sql is the same
@@ -254,7 +343,7 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
--- 0b. Before-checks B1 to B11 (read-only; the header's BEFORE)
+-- 0b. Before-checks B1 to B12 (read-only; the header's BEFORE)
 -- ---------------------------------------------------------------------------
 -- One select, kept in a temporary table for the refusals of section 0c. The
 -- owner's before-check is the same select, run alone. It reads catalogs and
@@ -292,16 +381,52 @@ admitted(tbl, name) as (
   values ('profiles', 'impersonator reads profiles'),
          ('organization_members', 'impersonator reads organization_members')
 ),
+alias(tbl, alias, name, kind, repo_roles) as (
+  values ('organizations',        'members_view_their_orgs', 'members can read their orgs',      'org', 'public'),
+         ('organization_members', 'View own membership',     'members can read own memberships', 'own', 'public')
+),
+legacy(tbl, name) as (
+  values ('enrollments', 'admins_view_org_enrollments')
+),
 policies as (
   select n.nspname::text as sch, c.relname::text as tbl, p.polname::text as name, p.polcmd::text as cmd,
          (select string_agg(q.rn, ',' order by q.rn)
             from (select case when x = 0 then 'public' else pg_get_userbyid(x)::text end as rn
                     from unnest(p.polroles) x) q) as roles,
          coalesce(pg_get_expr(p.polqual, p.polrelid), '') as qual,
-         coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') as chk
+         coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') as chk,
+         p.polpermissive as perm, c.relrowsecurity as rls
   from pg_policy p
   join pg_class c on c.oid = p.polrelid
   join pg_namespace n on n.oid = c.relnamespace
+),
+-- a known alias: the repository name absent on its table, the alias there
+-- as a permissive policy for select; the first reads organization_members,
+-- the second is the reader's own row and nothing else
+renames as (
+  select a.tbl, a.alias, a.name, a.kind, p.cmd, p.qual, p.chk, p.roles as stored_roles,
+         p.roles || case when p.roles <> a.repo_roles
+                         then format(' (not the repository''s %s; kept under the repository name)', a.repo_roles)
+                         else '' end as roles
+  from alias a
+  join policies p on p.sch = 'public' and p.tbl = a.tbl and p.name = a.alias
+  where p.cmd = 'r' and p.perm
+    and not exists (select 1 from policies q where q.sch = 'public' and q.tbl = a.tbl and q.name = a.name)
+    and case a.kind
+          when 'org' then (p.qual || ' ' || p.chk) ~* 'organization_members'
+          else p.qual in ('(auth.uid() = user_id)', '(user_id = auth.uid())') and p.chk = ''
+        end
+),
+-- the one legacy policy: a permissive policy for select that names
+-- organization_members, by that exact name on that exact table
+drops as (
+  select p.tbl, p.name, p.cmd, p.roles, p.qual, p.chk, p.rls,
+         (select count(*) from policies q where q.sch = p.sch and q.tbl = p.tbl and q.name <> p.name) as others,
+         (select count(*) from policies q where q.sch = p.sch and q.tbl = p.tbl and q.name <> p.name
+                                            and q.perm and q.cmd in ('r', '*')) as others_read
+  from legacy l
+  join policies p on p.sch = 'public' and p.tbl = l.tbl and p.name = l.name
+  where p.cmd = 'r' and p.perm and (p.qual || ' ' || p.chk) ~* 'organization_members'
 ),
 fns as (
   select n.nspname::text || '.' || p.proname::text || '(' || oidvectortypes(p.proargtypes) || ')' as sig,
@@ -364,7 +489,15 @@ grid(check_id, item, observed, verdict) as (
   union all
   -- B3: the seven policies
   select 'B3', 'public.' || x.tbl || ': ' || x.name,
-         case when p.name is null then 'absent: this file alters it and never creates it'
+         case when rn.alias is not null then
+                concat_ws('; ', format('absent: the paste gives the alias "%s" this name', rn.alias),
+                  case md5(btrim(regexp_replace(lower(rn.qual || ' | ' || rn.chk), '\s+', ' ', 'g')))
+                    when x.md5_repo then 'as ' || x.origin
+                    when x.md5_0115 then 'as 0115'
+                    else 'text differs (section 3 writes 0115''s text over it; the whole text is the alias''s B11 row): '
+                         || left(btrim(regexp_replace(rn.qual || ' | ' || rn.chk, '\s+', ' ', 'g')), 800) end,
+                  'command ' || rn.cmd, 'roles ' || rn.roles)
+              when p.name is null then 'absent: this file alters it and never creates it'
               else concat_ws('; ',
                 case md5(btrim(regexp_replace(lower(p.qual || ' | ' || p.chk), '\s+', ' ', 'g')))
                   when x.md5_repo then 'as ' || x.origin
@@ -372,27 +505,45 @@ grid(check_id, item, observed, verdict) as (
                   else 'differs: ' || left(btrim(regexp_replace(p.qual || ' | ' || p.chk, '\s+', ' ', 'g')), 800) end,
                 'command ' || p.cmd, 'roles ' || p.roles)
          end,
-         case when p.name is null then 'REFUSES'
+         case when rn.alias is not null then 'RENAMES'
+              when p.name is null then 'REFUSES'
               when p.cmd <> x.cmd or p.roles <> x.roles then 'DIFFERS'
               when md5(btrim(regexp_replace(lower(p.qual || ' | ' || p.chk), '\s+', ' ', 'g')))
                    in (x.md5_repo, x.md5_0115) then 'ok'
               else 'DIFFERS' end
   from pol x
   left join policies p on p.sch = 'public' and p.tbl = x.tbl and p.name = x.name
+  left join renames rn on rn.tbl = x.tbl and rn.name = x.name
   union all
   -- B4a: every policy whose using or with check names organization_members
-  select 'B4a', p.sch || '.' || p.tbl || ': ' || p.name, 'command ' || p.cmd || '; roles ' || p.roles,
+  select 'B4a', p.sch || '.' || p.tbl || ': ' || p.name,
+         case when rn.alias is not null then
+                format('command %s; roles %s; the paste gives it the name "%s"', p.cmd, rn.roles, rn.name)
+              when d.name is not null then
+                format('command %s; roles %s; row security %s; %s other polic%s on the table, permissive for select or all: %s (B12 names every other permissive policy, any command); the paste removes it',
+                       p.cmd, p.roles,
+                       case when d.rls then 'on' else 'OFF (the policy is not in force; the table answers by the select, insert, update and delete grants of anon and authenticated: B12)' end,
+                       d.others, case when d.others = 1 then 'y' else 'ies' end, d.others_read)
+              else 'command ' || p.cmd || '; roles ' || p.roles end,
          case when p.sch = 'public' and exists (select 1 from pol x where x.tbl = p.tbl and x.name = p.name) then 'ok'
               when p.sch = 'public' and exists (select 1 from admitted a where a.tbl = p.tbl and a.name = p.name)
                    and p.cmd = 'r'
                    and (p.qual || ' ' || p.chk) ~* '(is_impersonating|impersonated_org_ids)\s*\('
                    and (p.qual || ' ' || p.chk) !~* 'auth\.uid\s*\(' then 'admitted'
+              when rn.alias is not null then 'RENAMES'
+              when d.name is not null then 'DROPS'
               else 'UNEXPECTED' end
   from policies p
+  left join renames rn on p.sch = 'public' and rn.tbl = p.tbl and rn.alias = p.name
+  left join drops d on p.sch = 'public' and d.tbl = p.tbl and d.name = p.name
   where (p.qual || ' ' || p.chk) ~* 'organization_members'
   union all
   -- B4b: every policy on public.organization_members itself
-  select 'B4b', p.name, 'command ' || p.cmd || '; roles ' || p.roles,
+  select 'B4b', p.name,
+         case when rn.alias is not null then
+                format('command %s; roles %s; the paste gives it the name "%s" and the spelling (user_id = auth.uid())',
+                       p.cmd, rn.roles, rn.name)
+              else 'command ' || p.cmd || '; roles ' || p.roles end,
          case when exists (select 1 from member_pol mp where mp.name = p.name
                             and mp.md5_expr = md5(btrim(regexp_replace(lower(p.qual || ' | ' || p.chk), '\s+', ' ', 'g'))))
                    and p.cmd = 'r' then 'ok'
@@ -401,8 +552,10 @@ grid(check_id, item, observed, verdict) as (
                    and p.cmd = 'r'
                    and (p.qual || ' ' || p.chk) ~* '(is_impersonating|impersonated_org_ids)\s*\('
                    and (p.qual || ' ' || p.chk) !~* 'auth\.uid\s*\(' then 'admitted'
+              when rn.alias is not null then 'RENAMES'
               else 'UNEXPECTED' end
   from policies p
+  left join renames rn on rn.tbl = p.tbl and rn.alias = p.name
   where p.sch = 'public' and p.tbl = 'organization_members'
   union all
   -- B4c: every function whose source names organization_members and auth.uid()
@@ -462,7 +615,9 @@ grid(check_id, item, observed, verdict) as (
   from policies p
   where (p.qual || ' ' || p.chk) ~* 'is_org_(member|admin|super_owner|data_analyst)\s*\('
   union all
-  -- B11: the whole stored definitions, as statements that put them back
+  -- B11: the whole stored definitions; the helpers' and the seven
+  -- policies' as statements that put them back (the aliases and the legacy
+  -- policy below, each as its own comment says)
   select 'B11', 'public.' || h.fn || '(uuid)', pg_get_functiondef(to_regprocedure('public.' || h.fn || '(uuid)')), 'info'
   from helper h
   where to_regprocedure('public.' || h.fn || '(uuid)') is not null
@@ -474,6 +629,63 @@ grid(check_id, item, observed, verdict) as (
          'info'
   from pol x
   join policies p on p.sch = 'public' and p.tbl = x.tbl and p.name = x.name
+  union all
+  -- the first alias, on the name it carries after the paste: the statement
+  -- run after the reverse where its text differed
+  select 'B11', 'public.' || rn.tbl || ': ' || rn.alias,
+         format('alter policy %I on public.%I', rn.name, rn.tbl)
+         || case when rn.qual <> '' then format(' using (%s)', rn.qual) else '' end
+         || case when rn.chk <> '' then format(' with check (%s)', rn.chk) else '' end || ';',
+         'info'
+  from renames rn
+  where rn.kind = 'org'
+  union all
+  -- the own-row alias, whole and in parts (not as a statement): a record
+  -- only, never written back (the own-row policy keeps the repository's
+  -- spelling, which reads the same rows)
+  select 'B11', 'public.' || rn.tbl || ': ' || rn.alias,
+         format('table public.%I; policy %I; permissive; for select; to %s; using (%s)', rn.tbl, rn.alias, rn.stored_roles, rn.qual),
+         'info'
+  from renames rn
+  where rn.kind = 'own'
+  union all
+  -- the legacy policy, whole and in parts (not as a statement): to be written
+  -- back by hand from this row on the owner's word only
+  select 'B11', 'public.' || d.tbl || ': ' || d.name,
+         format('table public.%I; policy %I; permissive; for select; to %s; using (%s)', d.tbl, d.name, d.roles, d.qual)
+         || case when d.chk <> '' then format('; with check (%s)', d.chk) else '' end,
+         'info'
+  from drops d
+  union all
+  -- B12: each table of the legacy list that the database holds: row
+  -- security; the select, insert, update and delete grants of anon and of
+  -- authenticated; and the permissive policies, any command, beside the
+  -- legacy policy, by name. With row security off the table answers a
+  -- session by its grants alone: LIST, a finding for the owner that the
+  -- paste neither changes nor waits for.
+  select 'B12', 'public.' || c.relname::text,
+         concat_ws('; ',
+           'row security ' || case when c.relrowsecurity then 'on' else 'OFF' end
+             || case when c.relforcerowsecurity then ', forced' else ', not forced' end,
+           (select string_agg(g.rol || ': ' || case
+                     when to_regrole(g.rol) is null then 'no such role'
+                     else concat_ws(', ',
+                       'select ' || case when has_any_column_privilege(g.rol::name, c.oid, 'select') then 'granted' else 'not granted' end,
+                       'insert ' || case when has_any_column_privilege(g.rol::name, c.oid, 'insert') then 'granted' else 'not granted' end,
+                       'update ' || case when has_any_column_privilege(g.rol::name, c.oid, 'update') then 'granted' else 'not granted' end,
+                       'delete ' || case when has_table_privilege(g.rol::name, c.oid, 'delete') then 'granted' else 'not granted' end)
+                   end, '; ' order by g.n)
+              from (values (1, 'anon'), (2, 'authenticated')) as g(n, rol)),
+           'permissive policies beside the legacy policy: '
+             || coalesce((select string_agg(format('%I for %s', q.name,
+                                                   case q.cmd when 'r' then 'select' when 'a' then 'insert' when 'w' then 'update'
+                                                              when 'd' then 'delete' else 'all' end), ', ' order by q.name)
+                            from policies q
+                           where q.sch = 'public' and q.tbl = l.tbl and q.name <> l.name and q.perm), 'none')),
+         case when c.relrowsecurity then 'info' else 'LIST' end
+  from legacy l
+  join pg_class c on c.relname = l.tbl and c.relkind in ('r', 'p')
+  join pg_namespace n on n.oid = c.relnamespace and n.nspname = 'public'
 )
 select check_id, item, observed, verdict
 from grid
@@ -495,6 +707,70 @@ begin
     raise exception '0115 refused: %. Nothing changed.', v_refused
       using hint = 'ADR 0030 section C point 3: the file alters the seven policies and never creates one; '
                    'a replace cannot rename a helper''s argument. Answer the before-check rows with the owner first.';
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 0d. A database set up by hand (ADR 0030, note "Hand-made databases,
+--     2026-11-18"): the two known aliases take the repository's names and
+--     the one legacy policy goes, only where section 0b marked them
+-- ---------------------------------------------------------------------------
+-- Four policy statements, written out in full, in two blocks, and before
+-- the removal one lock and one read; none is built from a name read in the
+-- catalogue. Each policy statement runs only where the before-check of this
+-- same paste marked its row: RENAMES on the B4a row of the first alias,
+-- RENAMES on the B4b row of the second (its repository spelling follows its
+-- rename only), DROPS on the B4a row of the legacy policy. A rename keeps
+-- the command and the roles and changes nobody's access; the spelling gives
+-- the same answer for every row. The removal ends a session's read of
+-- public.enrollments through that policy (the service role is not affected;
+-- no row, column, grant or setting of the table is touched); B11 printed it
+-- whole. It runs in a block of its own, only after the table is locked and
+-- the policy read again under the lock with the before-check's own tests.
+-- (A block of its own because tests/unit/membership-rule-migrations.test.ts
+-- reads a block whole from its first policy statement on: in one block, the
+-- spelling's auth.uid() and the read's organization_members would look to
+-- it like a policy without the rule.) A second paste finds no such row here.
+do $$
+begin
+  if exists (select 1 from pg_temp.adr0030_0115_before
+              where check_id = 'B4a' and item = 'public.organizations: members_view_their_orgs'
+                and verdict = 'RENAMES') then
+    alter policy "members_view_their_orgs" on public.organizations rename to "members can read their orgs";
+  end if;
+  if exists (select 1 from pg_temp.adr0030_0115_before
+              where check_id = 'B4b' and item = 'View own membership'
+                and verdict = 'RENAMES') then
+    alter policy "View own membership" on public.organization_members rename to "members can read own memberships";
+    alter policy "members can read own memberships" on public.organization_members using (user_id = auth.uid());
+  end if;
+end
+$$;
+
+do $$
+begin
+  if exists (select 1 from pg_temp.adr0030_0115_before
+              where check_id = 'B4a' and item = 'public.enrollments: admins_view_org_enrollments'
+                and verdict = 'DROPS') then
+    -- The before-check read this table through the catalogue only, which
+    -- holds no lock on it. So the table is locked first, and the policy is
+    -- read again under that lock with the before-check's tests: that name on
+    -- that table, permissive, for select, and its text naming
+    -- organization_members. The removal goes ahead only while all of them
+    -- hold (removing a permissive policy only narrows); otherwise the paste
+    -- stops and changes nothing.
+    lock table public.enrollments in access exclusive mode;
+    if not exists (select 1 from pg_policy p
+                    where p.polrelid = to_regclass('public.enrollments')
+                      and p.polname = 'admins_view_org_enrollments'
+                      and p.polcmd = 'r' and p.polpermissive
+                      and (coalesce(pg_get_expr(p.polqual, p.polrelid), '') || ' '
+                           || coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '')) ~* 'organization_members') then
+      raise exception '0115 refused: the policy "admins_view_org_enrollments" on public.enrollments is no longer the one the before-check marked. Nothing changed.'
+        using hint = 'ADR 0030, note "Hand-made databases, 2026-11-18": run the before-check select again and answer its rows with the owner.';
+    end if;
+    drop policy "admins_view_org_enrollments" on public.enrollments;
   end if;
 end
 $$;

@@ -397,6 +397,20 @@ function stepStatic(s) {
         `${hits.length ? `: FOUND on line${hits.length === 1 ? "" : "s"} ${hits.slice(0, 10).join(", ")}` : ""}`,
     );
   }
+  // `onlyLine` (added for 0115, ADR 0030 note "Hand-made databases,
+  // 2026-11-18"): { token: statement }. Exactly one line of the raw text
+  // holds the token, and that line, trimmed, is the statement; so the
+  // file's prose and strings never hold the token anywhere else.
+  for (const [token, statement] of Object.entries(s.onlyLine ?? {})) {
+    const t = token.toLowerCase();
+    const hits = lines.flatMap((l, i) => (l.includes(t) ? [i + 1] : []));
+    const ok = hits.length === 1 && lines[hits[0] - 1].trim() === statement.toLowerCase();
+    check(
+      ok,
+      `${f}: exactly one line holds "${token}" (raw text, comments included, case-insensitive) and it is ${statement}` +
+        `${hits.length === 1 ? (ok ? "" : `: line ${hits[0]} reads ${lines[hits[0] - 1].trim()}`) : `: FOUND on ${hits.length} lines ${hits.slice(0, 10).join(", ")}`}`,
+    );
+  }
   return "next";
 }
 
