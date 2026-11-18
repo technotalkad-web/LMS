@@ -181,7 +181,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/platform_owners") return json(eqParam(q, "user_id") === OWNER.id ? [{ user_id: OWNER.id }] : []);
   if (p === "/rest/v1/invitations") {
     if (method !== "GET") return new Response(null, { status: 204 });
-    return json([{ id: "inv-1", organization_id: ORG.id, email: MEMBER.email, role: "user", accepted_at: null, expires_at: "2100-01-01T00:00:00Z" }]);
+    // The organisation is embedded, live (the accept route refuses a deleted one).
+    return json([{ id: "inv-1", organization_id: ORG.id, email: MEMBER.email, role: "user", accepted_at: null, expires_at: "2100-01-01T00:00:00Z", organizations: { deleted_at: ORG.deleted_at } }]);
   }
   unmatched.push(`${method} ${p}`);
   return json([]);

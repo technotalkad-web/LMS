@@ -34,12 +34,14 @@ export async function GET(
   const { id: tenantId } = await params;
   const s = svc();
 
+  // Each row's status is returned with it: an administrator whose row is
+  // not active has no access to the tenant, and the console shows that.
   const { data: members } = await s
     .from("organization_members")
-    .select("user_id, role")
+    .select("user_id, role, status")
     .eq("organization_id", tenantId);
 
-  const rows = ((members ?? []) as Array<{ user_id: string; role: string }>).filter(
+  const rows = ((members ?? []) as Array<{ user_id: string; role: string; status: string }>).filter(
     (m) => ADMIN_ROLES.has(m.role)
   );
 
@@ -49,6 +51,7 @@ export async function GET(
     admins: rows.map((r) => ({
       user_id: r.user_id,
       role: r.role,
+      status: r.status,
       email: emailById.get(r.user_id) ?? "(unknown)",
     })),
   });
@@ -110,6 +113,28 @@ export async function POST(
     isBrandNew = true;
   }
 
+  // The add is a deliberate act that sets the row active, so it brings back
+  // a person whose row was inactive or suspended. Read the row it replaces
+  // first, so the audit row can say so. An account made just now has no row.
+  // A failed read is not "no row": nothing is written.
+  let previousStatus: string | null = null;
+  if (!isBrandNew) {
+    const { data: prior, error: priorErr } = await s
+      .from("organization_members")
+      .select("status")
+      .eq("organization_id", tenantId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (priorErr) {
+      return NextResponse.json(
+        { error: "Could not read this person's membership. Please try again." },
+        { status: 503 }
+      );
+    }
+    previousStatus = (prior as { status?: string | null } | null)?.status ?? null;
+  }
+  const reactivated = previousStatus !== null && previousStatus !== "active";
+
   // profiles uses `id` as the FK to auth.users(id) in this DB.
   await s
     .from("profiles")
@@ -127,7 +152,7 @@ export async function POST(
   const { error: memErr } = await s
     .from("organization_members")
     .upsert(
-      { organization_id: tenantId, user_id: user.id, role },
+      { organization_id: tenantId, user_id: user.id, role, status: "active" },
       { onConflict: "organization_id,user_id" }
     );
   if (memErr) {
@@ -160,13 +185,14 @@ export async function POST(
     action: "tenant.add_admin",
     targetType: "organization",
     targetId: tenantId,
-    metadata: { email, role, brand_new: isBrandNew },
+    metadata: { email, role, brand_new: isBrandNew, reactivated, previous_status: previousStatus },
   });
 
   return NextResponse.json({
     ok: true,
     user_id: user.id,
     invited: isBrandNew,
+    reactivated,
     temp_password: tempPassword,
     login_url: `${origin}/${org.slug}/login`,
   });
@@ -189,6 +215,8 @@ export async function PATCH(
       { status: 400 }
     );
   }
+  // The role only. A role change never sets the status: only the add (POST)
+  // brings back a row that is not active.
   const { error } = await svc()
     .from("organization_members")
     .update({ role: body.role })

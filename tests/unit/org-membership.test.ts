@@ -32,7 +32,23 @@
  *       answers false and null;
  *   (g) /select-org lists only organisations that count: one goes straight
  *       there, none shows the no-access text with a sign-out control and no
- *       redirect, and an unreadable list says "try again" and goes nowhere.
+ *       redirect, and an unreadable list says "try again" and goes nowhere;
+ *   (h) rule 9 in the platform console (POST, GET and PATCH of
+ *       /api/super/tenants/[id]/admins): the list returns each row's
+ *       status; the add writes the row active, so an inactive or suspended
+ *       row is active again, and its audit row and answer say it
+ *       reactivated (an active row, or none, is not reactivated); a failed
+ *       read of the row before the add answers 503 and writes nothing; the
+ *       role change writes the role alone and leaves the status;
+ *   (i) rule 9 and rule 8 on an invitation (POST /api/invitations/accept
+ *       and the /invitations/[token] page): an invitation of a deleted
+ *       organisation gets the answer an unknown token gets, also when it is
+ *       expired or accepted, with no account call, no write and no sign-in;
+ *       a failed read answers 503 with none of those; an accepted
+ *       invitation writes the role and never the status, so an inactive or
+ *       suspended row stays as it was, and a new row starts active; the
+ *       page shows a deleted organisation's invitation as not found and
+ *       does not name it.
  *
  * No database, no network.
  *
@@ -52,7 +68,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 type Row = Record<string, unknown>;
-type Req = { method: string; table: string; select: string; query: URLSearchParams; key: string | null };
+type Req = { method: string; table: string; select: string; query: URLSearchParams; key: string | null; body?: unknown };
 
 const SUPABASE = "http://stub.supabase.test";
 const ANON_KEY = "stub-anon-key";
@@ -70,6 +86,12 @@ let failing = new Set<string>();
 let platformOwner = false;
 let requests: Req[] = [];
 let signedIn = true;
+// (h) and (i): the accounts the auth server holds, the invitations, and
+// every call to the auth server other than the session's own user read.
+type Account = { id: string; email: string };
+let accounts: Account[] = [];
+let invitations: Row[] = [];
+let authCalls: string[] = [];
 
 const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
 (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
@@ -111,9 +133,14 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const q = url.searchParams;
   const select = q.get("select") ?? "";
   const table = p.replace("/rest/v1/", "");
-  if (p.startsWith("/rest/v1/")) requests.push({ method, table, select, query: q, key: h.get("apikey") });
+  const raw = typeof init?.body === "string" ? init.body : "";
+  let body: unknown = null;
+  if (raw) { try { body = JSON.parse(raw); } catch { body = raw; } }
+  if (p.startsWith("/rest/v1/")) requests.push({ method, table, select, query: q, key: h.get("apikey"), body });
   if (p === "/auth/v1/user") return signedIn ? json(ME) : json({ message: "no session" }, 401);
-  if (!p.startsWith("/rest/v1/") || method !== "GET") return json({ message: "unexpected" }, 500);
+  if (p.startsWith("/auth/v1/")) return authServer(method, p, body);
+  if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
+  if (method !== "GET") return write(method, table, q, body);
   if (failing.has(table)) return json({ code: "XX000", message: "stub read failure" }, 500);
   const page = (rows: Row[]) => {
     const offset = Number(q.get("offset") ?? 0);
@@ -126,20 +153,73 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return page(rows);
   }
   if (table === "profiles") return json([{ must_change_password: false }]);
-  if (table === "platform_owners") return json(platformOwner ? [{ user_id: ME.id }] : []);
+  // A platform owner whose row does not require the second factor (as the
+  // e2e fixtures seed one), so the platform route guard admits the session.
+  if (table === "platform_owners") return json(platformOwner ? [{ user_id: ME.id, mfa_required: false }] : []);
+  if (table === "invitations") {
+    // The organisation is embedded as PostgREST embeds a to-one relation.
+    return json(invitations.filter((r) => matches(r, q)).map((r) => {
+      const o = orgs.find((x) => x.id === r.organization_id);
+      return { ...r, organizations: o ? { name: o.name, slug: o.slug, deleted_at: o.deleted_at } : null };
+    }));
+  }
   return json([]);
 };
 
-const world = (o: { members?: Row[]; failing?: string[]; platformOwner?: boolean; signedIn?: boolean } = {}) => {
+const userJson = (a: Account) => ({ id: a.id, aud: "authenticated", role: "authenticated", email: a.email, email_confirmed_at: "2026-01-01T00:00:00Z", app_metadata: {}, user_metadata: {}, created_at: "2026-01-01T00:00:00Z" });
+/** The auth server: the admin user list, a new account, and a password sign-in. */
+function authServer(method: string, p: string, body: unknown): Response {
+  authCalls.push(`${method} ${p}`);
+  if (p === "/auth/v1/admin/users" && method === "GET") return json({ users: accounts.map(userJson), aud: "authenticated" });
+  if (p === "/auth/v1/admin/users" && method === "POST") {
+    const a = { id: `u-new-${accounts.length + 1}`, email: (body as { email: string }).email };
+    accounts.push(a);
+    return json(userJson(a));
+  }
+  if (p === "/auth/v1/token") {
+    const a = accounts.find((x) => x.email === (body as { email?: string })?.email) ?? accounts[0];
+    return json({ access_token: "stub-token-2", refresh_token: "r2", token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: userJson(a) });
+  }
+  return json({ message: "unexpected" }, 500);
+}
+/**
+ * A write. An upsert of a member row merges the columns it names into the
+ * row it meets (PostgREST's merge-duplicates), and a new row takes the
+ * column default, status 'active'. A PATCH changes the rows it matches.
+ */
+function write(method: string, table: string, q: URLSearchParams, body: unknown): Response {
+  if (table === "organization_members" && method === "POST") {
+    for (const rec of (Array.isArray(body) ? body : [body]) as Row[]) {
+      const hit = members.find((r) => r.organization_id === rec.organization_id && r.user_id === rec.user_id);
+      if (hit) Object.assign(hit, rec);
+      else members.push({ status: "active", ...rec });
+    }
+    return new Response(null, { status: 201 });
+  }
+  if (method === "PATCH") {
+    const rows = table === "organization_members" ? members : table === "invitations" ? invitations : [];
+    for (const r of rows.filter((x) => matches(x, q))) Object.assign(r, body as Row);
+    return new Response(null, { status: 204 });
+  }
+  return new Response(null, { status: 201 });
+}
+
+const world = (o: { members?: Row[]; failing?: string[]; platformOwner?: boolean; signedIn?: boolean; accounts?: Account[]; invitations?: Row[] } = {}) => {
   orgs = [LIVE, SECOND, GONE].map((x) => ({ ...x }));
   members = (o.members ?? []).map((r) => ({ ...r }));
   failing = new Set(o.failing ?? []);
   platformOwner = o.platformOwner ?? false;
   signedIn = o.signedIn ?? true;
+  accounts = (o.accounts ?? []).map((a) => ({ ...a }));
+  invitations = (o.invitations ?? []).map((r) => ({ ...r }));
+  authCalls = [];
   requests = [];
 };
 const row = (org: { id: string }, role: string, status: string, user = ME.id): Row => ({ organization_id: org.id, user_id: user, role, status });
-const reads = (table: string) => requests.filter((r) => r.table === table);
+const reads = (table: string) => requests.filter((r) => r.table === table && r.method === "GET");
+/** Every write made to the data API, as "METHOD table". */
+const writes = () => requests.filter((r) => r.method !== "GET" && r.method !== "HEAD").map((r) => `${r.method} ${r.table}`);
+const memberOf = (org: { id: string }, user: string) => members.find((r) => r.organization_id === org.id && r.user_id === user);
 /** The URL a redirect() threw, or "answered" / the error message. */
 const outcome = async (run: () => Promise<unknown>) => {
   try {
@@ -378,6 +458,181 @@ async function main() {
     }
     world({ members: [row(LIVE, "user", "active")], platformOwner: true });
     eq("a platform owner: /super/organizations", await outcome(() => selectOrg()), "redirect /super/organizations");
+
+    console.log("\n(h) rule 9 in the platform console: /api/super/tenants/[id]/admins");
+    {
+      const adminsRoute = await import("../../app/api/super/tenants/[id]/admins/route");
+      const PEOPLE: Account[] = [
+        { id: "u-act", email: "active.admin@example.test" },
+        { id: "u-ina", email: "inactive.admin@example.test" },
+        { id: "u-sus", email: "suspended.analyst@example.test" },
+        { id: "u-lrn", email: "learner@example.test" },
+        { id: "u-out", email: "outsider@example.test" },
+      ];
+      // The platform owner (the session) holds no row in the tenant.
+      const consoleWorld = (failingTables: string[] = []) => world({
+        platformOwner: true,
+        accounts: PEOPLE,
+        failing: failingTables,
+        members: [row(LIVE, "admin", "active", "u-act"), row(LIVE, "admin", "inactive", "u-ina"), row(LIVE, "data_analyst", "suspended", "u-sus"), row(LIVE, "user", "active", "u-lrn")],
+      });
+      const url = `http://lms.test/api/super/tenants/${LIVE.id}/admins`;
+      const ctx = () => ({ params: Promise.resolve({ id: LIVE.id }) });
+      const add = async (email: string, role = "admin") => {
+        const res = await adminsRoute.POST(new Request(url, { method: "POST", body: JSON.stringify({ email, role }) }), ctx());
+        return { status: res.status, body: (await res.json()) as Row };
+      };
+      const memberWrites = (method: string) => requests.filter((r) => r.table === "organization_members" && r.method === method).map((r) => r.body as Row);
+      const audit = () => requests.filter((r) => r.table === "platform_audit_log" && r.method === "POST").map((r) => (r.body as { metadata?: Row }).metadata ?? {});
+      /** The row before the add is read, for that person in that tenant, before the first write. */
+      const priorReadFirst = (userId: string) => {
+        const i = requests.findIndex((r) => r.table === "organization_members" && r.method === "GET");
+        const w = requests.findIndex((r) => r.method !== "GET" && r.method !== "HEAD");
+        const r = requests[i];
+        return [i >= 0 && i < w, r?.select, r?.query.get("organization_id"), r?.query.get("user_id")];
+      };
+
+      consoleWorld();
+      {
+        const res = await adminsRoute.GET(new Request(url), ctx());
+        const j = (await res.json()) as { admins: Array<{ user_id: string; role: string; status: string }> };
+        eq("GET: each administrator with the status of their row; a learner is not listed",
+          [res.status, j.admins.map((a) => `${a.user_id}:${a.role}:${a.status}`).sort()],
+          [200, ["u-act:admin:active", "u-ina:admin:inactive", "u-sus:data_analyst:suspended"]]);
+        eq("…the member read selects the status", reads("organization_members").map((r) => r.select), ["user_id,role,status"]);
+      }
+
+      for (const [who, id, email, before, role] of [
+        ["an inactive admin", "u-ina", PEOPLE[1].email, "inactive", "admin"],
+        ["a suspended data analyst", "u-sus", PEOPLE[2].email, "suspended", "data_analyst"],
+      ] as const) {
+        consoleWorld();
+        const got = await add(email, role);
+        eq(`POST, ${who}: 200, the row is active again with its role`, [got.status, memberOf(LIVE, id)?.status, memberOf(LIVE, id)?.role], [200, "active", role]);
+        eq("…the member write names status active beside the role", memberWrites("POST").map((b) => [b.role, b.status]), [[role, "active"]]);
+        eq(`…the audit row says it reactivated, from ${before}`, audit().map((a) => [a.reactivated, a.previous_status]), [[true, before]]);
+        eq("…the answer says so too, and no account is made", [got.body.reactivated, got.body.invited, authCalls.filter((c) => c === "POST /auth/v1/admin/users").length], [true, false, 0]);
+        eq("…the row before the add is read first: that person's status in that tenant", priorReadFirst(id), [true, "status", `eq.${LIVE.id}`, `eq.${id}`]);
+      }
+      consoleWorld();
+      {
+        const got = await add(PEOPLE[0].email);
+        eq("POST, an active admin: still active; not reactivated, in the audit row and the answer",
+          [got.status, memberOf(LIVE, "u-act")?.status, audit().map((a) => [a.reactivated, a.previous_status]), got.body.reactivated],
+          [200, "active", [[false, "active"]], false]);
+      }
+      consoleWorld();
+      {
+        const got = await add(PEOPLE[4].email);
+        eq("POST, an account with no row in the tenant: a new active row; not reactivated, no previous status",
+          [got.status, memberOf(LIVE, "u-out")?.status, memberOf(LIVE, "u-out")?.role, audit().map((a) => [a.reactivated, a.previous_status]), got.body.reactivated],
+          [200, "active", "admin", [[false, null]], false]);
+      }
+      consoleWorld(["organization_members"]);
+      {
+        const got = await add(PEOPLE[1].email);
+        eq("POST, the row before the add cannot be read: 503 try again, nothing written, the row stays inactive",
+          [got.status, /try again/i.test(String(got.body.error)), writes(), memberOf(LIVE, "u-ina")?.status],
+          [503, true, [], "inactive"]);
+      }
+      consoleWorld();
+      {
+        const res = await adminsRoute.PATCH(new Request(url, { method: "PATCH", body: JSON.stringify({ user_id: "u-ina", role: "data_analyst" }) }), ctx());
+        eq("PATCH, the role change of an inactive admin: 200, the write names the role alone",
+          [res.status, memberWrites("PATCH").map((b) => Object.keys(b))], [200, [["role"]]]);
+        eq("…the row has the new role and is still inactive", [memberOf(LIVE, "u-ina")?.role, memberOf(LIVE, "u-ina")?.status], ["data_analyst", "inactive"]);
+      }
+    }
+
+    console.log("\n(i) rule 9 and rule 8 on an invitation: /api/invitations/accept and its page");
+    {
+      const acceptRoute = await import("../../app/api/invitations/accept/route");
+      const invitationPage = (await import("../../app/invitations/[token]/page")).default;
+      const INVITEE: Account = { id: "u-inv", email: "invitee@example.test" };
+      const PAST = "2020-01-01T00:00:00Z";
+      const invitation = (org: { id: string }, o: { expires_at?: string; accepted_at?: string | null } = {}): Row => ({
+        id: "inv-1", token: "t-1", organization_id: org.id, email: INVITEE.email, role: "user",
+        accepted_at: o.accepted_at ?? null, expires_at: o.expires_at ?? "2100-01-01T00:00:00Z",
+      });
+      const accept = async (token = "t-1") => {
+        const res = await acceptRoute.POST(new Request("http://lms.test/api/invitations/accept", { method: "POST", body: JSON.stringify({ token, password: "a-long-password-1" }) }));
+        return { status: res.status, body: (await res.json()) as Row };
+      };
+      /** Every string in an element tree, string props included (a title is a prop). */
+      const allTexts = (n: unknown): string[] => {
+        if (n === null || n === undefined || typeof n === "boolean") return [];
+        if (typeof n === "string" || typeof n === "number") return [String(n)];
+        if (Array.isArray(n)) return n.flatMap(allTexts);
+        const el = n as { type?: unknown; props?: Record<string, unknown> };
+        const own = typeof el.type === "function" ? [`<${(el.type as { name?: string }).name}>`] : [];
+        return [...own, ...Object.entries(el.props ?? {}).flatMap(([k, v]) => (k === "children" ? allTexts(v) : typeof v === "string" ? [v] : []))];
+      };
+      const pageText = async () => {
+        let el: unknown = null;
+        const o = await outcome(async () => { el = await invitationPage({ params: Promise.resolve({ token: "t-1" }) }); });
+        return { o, t: allTexts(el).join(" ").replace(/\s+/g, " ") };
+      };
+
+      world({ accounts: [INVITEE] });
+      const unknown = await accept("t-unknown");
+      eq("an unknown token: 404 Invalid invitation (the answer to match)", [unknown.status, unknown.body], [404, { error: "Invalid invitation" }]);
+
+      for (const [what, inv] of [
+        ["an open invitation", invitation(GONE)],
+        ["an expired invitation", invitation(GONE, { expires_at: PAST })],
+        ["an accepted invitation", invitation(GONE, { accepted_at: "2026-11-01T00:00:00Z" })],
+      ] as Array<[string, Row]>) {
+        for (const [who, accs] of [["an existing account", [INVITEE]], ["no account yet", []]] as Array<[string, Account[]]>) {
+          world({ accounts: accs, invitations: [inv], members: accs.length ? [row(GONE, "user", "inactive", INVITEE.id)] : [] });
+          const got = await accept();
+          eq(`a deleted organisation, ${what}, ${who}: the unknown token's answer`, [got.status, got.body], [unknown.status, unknown.body]);
+          eq("…no auth server call (no account looked up, made or changed, no sign-in) and no write", [authCalls, writes()], [[], []]);
+        }
+      }
+      eq("…the invitation read asks for the organisation's deleted_at", /organizations\([^)]*deleted_at/.test(reads("invitations")[0]?.select ?? ""), true);
+
+      world({ accounts: [INVITEE], invitations: [invitation(LIVE)], failing: ["invitations"] });
+      {
+        const got = await accept();
+        eq("the invitation read fails: 503 try again, no auth server call, no write",
+          [got.status, /try again/i.test(String(got.body.error)), authCalls, writes()], [503, true, [], []]);
+      }
+
+      for (const status of ["inactive", "suspended"]) {
+        world({ accounts: [INVITEE], invitations: [invitation(LIVE)], members: [row(LIVE, "user", status, INVITEE.id)] });
+        const got = await accept();
+        const upserts = requests.filter((r) => r.table === "organization_members" && r.method === "POST").map((r) => Object.keys(r.body as Row).sort());
+        eq(`a live organisation, the invitee's row ${status}: accepted (200 ok)`, [got.status, got.body.ok], [200, true]);
+        eq("…the member write names the role and never the status", upserts, [["organization_id", "role", "user_id"]]);
+        eq(`…the row is still ${status}`, memberOf(LIVE, INVITEE.id)?.status, status);
+      }
+      world({ accounts: [INVITEE], invitations: [invitation(LIVE)] });
+      {
+        const got = await accept();
+        eq("a live organisation, no row yet (the control): accepted, a new active row with the invitation's role, the invitation stamped, signed in",
+          [got.status, got.body.ok, memberOf(LIVE, INVITEE.id)?.status, memberOf(LIVE, INVITEE.id)?.role, typeof invitations[0].accepted_at, authCalls.includes("POST /auth/v1/token")],
+          [200, true, "active", "user", "string", true]);
+      }
+
+      world({ invitations: [invitation(GONE)] });
+      {
+        const { o, t } = await pageText();
+        eq("the page, a deleted organisation's invitation: not found, the organisation not named, no form",
+          [o, /Invitation not found/.test(t), /Gone/.test(t), /<AcceptForm>/.test(t)], ["answered", true, false, false]);
+        eq("…the page's read asks for the organisation's deleted_at", /organizations\([^)]*deleted_at/.test(reads("invitations")[0]?.select ?? ""), true);
+      }
+      world({ invitations: [invitation(LIVE)] });
+      {
+        const { o, t } = await pageText();
+        eq("the page, a live organisation's invitation (the control): the organisation named, with the form",
+          [o, /You've been invited/.test(t), /Live/.test(t), /<AcceptForm>/.test(t)], ["answered", true, true, true]);
+      }
+      world({ invitations: [invitation(LIVE)], failing: ["invitations"] });
+      {
+        const { t } = await pageText();
+        eq("the page, the read fails: try again, never 'not found'", [/try again/i.test(t), /not found/.test(t), /<AcceptForm>/.test(t)], [true, false, false]);
+      }
+    }
   } finally {
     globalThis.fetch = realFetch;
     console.error = realError;

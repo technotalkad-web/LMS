@@ -7,12 +7,18 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Plus, Trash2, Save, Mail, ShieldAlert } from "lucide-react";
 
-type Admin = { user_id: string; role: string; email: string };
+type Admin = { user_id: string; role: string; status: string; email: string };
 
 const ROLE_LABEL: Record<string, string> = {
   super_owner: "Super owner",
   admin: "Admin",
   data_analyst: "Data analyst",
+};
+
+/** A row that is not active gives no access; adding the person again sets it active. */
+const STATUS_LABEL: Record<string, string> = {
+  inactive: "Inactive",
+  suspended: "Suspended",
 };
 
 export function TenantDetailEditor({
@@ -82,6 +88,7 @@ export function TenantDetailEditor({
       return;
     }
     const wasInvited = j.invited;
+    const wasReactivated = j.reactivated === true;
     setNewEmail("");
     // Refresh admin list locally + server
     const listRes = await fetch(`/api/super/tenants/${tenantId}/admins`);
@@ -92,6 +99,8 @@ export function TenantDetailEditor({
       toast.success(
         "User didn't exist — a magic-link invitation has been emailed. They'll set their password on first sign-in."
       );
+    } else if (wasReactivated) {
+      toast.success("This person's membership was not active. It is active again, so they have access.");
     }
   }
 
@@ -192,7 +201,17 @@ export function TenantDetailEditor({
             {admins.map((a) => (
               <li key={a.user_id} className="flex items-center justify-between gap-3 py-2.5">
                 <div className="min-w-0">
-                  <p className="text-sm font-semibold text-ink truncate">{a.email}</p>
+                  <p className="text-sm font-semibold text-ink truncate">
+                    {a.email}
+                    {a.status !== "active" && (
+                      <span
+                        className="ml-2 align-middle text-[10px] font-semibold uppercase tracking-wider text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5"
+                        title="No access while the membership is not active. Add this person again to make it active."
+                      >
+                        {STATUS_LABEL[a.status] ?? a.status ?? "Unknown"}
+                      </span>
+                    )}
+                  </p>
                   <p className="text-xs text-muted font-mono truncate">{a.user_id}</p>
                 </div>
                 <div className="flex items-center gap-2">

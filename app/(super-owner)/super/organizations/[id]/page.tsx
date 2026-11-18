@@ -86,18 +86,19 @@ export default async function TenantDetailPage({
     storageMb: await effCap("storage_mb"),
   };
 
-  // Admins
+  // Admins, each with the status of their row (as the admins route lists them).
   const { data: members } = await svc
     .from("organization_members")
-    .select("user_id, role")
+    .select("user_id, role, status")
     .eq("organization_id", id);
-  const adminRows = ((members ?? []) as Array<{ user_id: string; role: string }>).filter(
+  const adminRows = ((members ?? []) as Array<{ user_id: string; role: string; status: string }>).filter(
     (m) => ADMIN_ROLES.has(m.role)
   );
   const emailById = await resolveEmails(svc, adminRows.map((r) => r.user_id));
   const admins = adminRows.map((r) => ({
     user_id: r.user_id,
     role: r.role,
+    status: r.status,
     email: emailById.get(r.user_id) ?? "(unknown)",
   }));
 
