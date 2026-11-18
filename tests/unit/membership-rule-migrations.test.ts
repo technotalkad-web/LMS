@@ -35,10 +35,32 @@
  *     names are matched quoted or not, with or without their schema, and
  *     each rule also reads the statements inside a DO block or a function
  *     body and inside the strings a statement runs with `execute`;
- *   - 0115 passes these rules and holds no `drop policy`, no `create policy`
- *     and no `drop function`;
+ *   - 0115 passes these rules and holds no `create policy`, no `drop
+ *     function`, and one `drop policy`: the statement of its section 0d;
+ *   - hand-made databases (ADR 0030, note "Hand-made databases,
+ *     2026-11-18"): two frozen lists, KNOWN_ALIASES and LEGACY_DROPS. 0115's
+ *     section 0d holds exactly their four policy statements (two renames,
+ *     the repository spelling of the second alias, the one removal) and no
+ *     `execute`, and the file renames or removes nothing else anywhere (a
+ *     rename is counted in its strings too, so one run through `execute`
+ *     counts). The removal's block is read whole, end to end, with nothing
+ *     else in it: the DROPS mark opens its one `if`; inside it, in this
+ *     order, the lock on public.enrollments, the second read of the policy
+ *     (its table, name, select, permissive, and both of its expressions
+ *     tested with `~*` against organization_members: the before-check's own
+ *     tests) and its refusal, then the removal; then the `if` and the block
+ *     close. B11 prints an alter policy statement only for the seven
+ *     policies and the first alias (and each helper's definition); the
+ *     own-row alias and the legacy policy are printed in parts. The premise
+ *     of the removal is held too: no migration creates a relation named
+ *     exactly public.enrollments, and no app source file (app/, lib/,
+ *     components/, types/, supabase/functions/ and the root middleware.ts
+ *     and instrumentation-client.ts) reads a table of exactly that name: a
+ *     client .from(), a schema-qualified name, a REST path, an embed in a
+ *     select list, or an unqualified SQL from or join;
  *   - the after-check block of 0115 and ops/0115-after-checks.sql are the
- *     same text between their two marker lines;
+ *     same text between their two marker lines, and it names neither alias
+ *     nor enrollments;
  *   - planted cases prove each rule fires.
  *
  * It is not keyed on file numbers: lower numbers than 0115 are still to be
@@ -89,6 +111,25 @@ const MEMBER_POLICIES: { table: string; name: string; rule: "both" | "helper" }[
   { table: "course_packages", name: "org members read packages", rule: "helper" },
   { table: "course_packages", name: "org admins write packages", rule: "helper" },
   { table: "course_ratings", name: "org admins read all ratings", rule: "helper" },
+];
+
+/**
+ * Hand-made databases (ADR 0030, note "Hand-made databases, 2026-11-18"):
+ * the closed list of known aliases that 0115's section 0d gives the
+ * repository's name, and the closed list of legacy policies it removes.
+ * Nothing else is ever renamed or removed; an addition is a dated note under
+ * ADR 0030 with its rehearsal.
+ */
+const KNOWN_ALIASES = [
+  { table: "organizations", alias: "members_view_their_orgs", name: "members can read their orgs" },
+  { table: "organization_members", alias: "View own membership", name: "members can read own memberships" },
+] as const;
+const LEGACY_DROPS = [{ table: "enrollments", name: "admins_view_org_enrollments" }] as const;
+/** Section 0d's four policy statements, in their order, as the note writes them. */
+const SECTION_0D = [
+  ...KNOWN_ALIASES.map((a) => `alter policy "${a.alias}" on public.${a.table} rename to "${a.name}"`),
+  `alter policy "${KNOWN_ALIASES[1].name}" on public.${KNOWN_ALIASES[1].table} using (user_id = auth.uid())`,
+  ...LEGACY_DROPS.map((d) => `drop policy "${d.name}" on public.${d.table}`),
 ];
 
 const STATUS_TEST = /\bstatus\s*=\s*'active'/i;
@@ -255,6 +296,150 @@ function breaches(file: string, sql: string): string[] {
   return [...out];
 }
 
+/** String literals emptied (comments already dropped): a name inside a format() string is not a statement. */
+const blankStrings = (code: string) => code.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"/g, (t) => (t.startsWith("'") ? "''" : t));
+const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+const POLICY_STATEMENT = /\b(?:create|alter|drop)\s+policy\b[^;]*/gi;
+
+/** 0115's section 0d: from its heading line to the heading of section 1. */
+const section0d = (raw: string) => {
+  const b = raw.indexOf("\n-- 0d. ");
+  const e = b < 0 ? -1 : raw.indexOf("\n-- 1. ", b);
+  return b < 0 || e < 0 ? null : raw.slice(b, e);
+};
+
+/** Section 0d's removal, its whole DO block as code (comments dropped); a string literal where the text is free. */
+const REMOVAL_BLOCK = new RegExp(
+  [
+    String.raw`\bdo\s+\$\$\s*begin\s+`,
+    String.raw`if\s+exists\s*\(\s*select\s+1\s+from\s+pg_temp\.adr0030_0115_before\s+`,
+    String.raw`where\s+check_id\s*=\s*'B4a'\s+and\s+item\s*=\s*'public\.enrollments: admins_view_org_enrollments'\s+`,
+    String.raw`and\s+verdict\s*=\s*'DROPS'\s*\)\s*then\s+`,
+    String.raw`lock\s+table\s+public\.enrollments\s+in\s+access\s+exclusive\s+mode\s*;\s*`,
+    String.raw`if\s+not\s+exists\s*\(\s*select\s+1\s+from\s+pg_policy\s+p\s+`,
+    String.raw`where\s+p\.polrelid\s*=\s*to_regclass\(\s*'public\.enrollments'\s*\)\s+`,
+    String.raw`and\s+p\.polname\s*=\s*'admins_view_org_enrollments'\s+`,
+    String.raw`and\s+p\.polcmd\s*=\s*'r'\s+and\s+p\.polpermissive\s+`,
+    String.raw`and\s+\(\s*coalesce\(\s*pg_get_expr\(\s*p\.polqual\s*,\s*p\.polrelid\s*\)\s*,\s*''\s*\)\s*\|\|\s*' '\s*`,
+    String.raw`\|\|\s*coalesce\(\s*pg_get_expr\(\s*p\.polwithcheck\s*,\s*p\.polrelid\s*\)\s*,\s*''\s*\)\s*\)\s*~\*\s*'organization_members'\s*\)\s*then\s+`,
+    String.raw`raise\s+exception\s+'0115 refused: the policy "admins_view_org_enrollments" on public\.enrollments is no longer\b(?:[^']|'')*'\s+`,
+    String.raw`using\s+hint\s*=\s*'(?:[^']|'')*'\s*;\s*`,
+    String.raw`end\s+if\s*;\s*`,
+    String.raw`drop\s+policy\s+"admins_view_org_enrollments"\s+on\s+public\.enrollments\s*;\s*`,
+    String.raw`end\s+if\s*;\s*end\s*\$\$\s*;`,
+  ].join(""),
+  "i",
+);
+
+/**
+ * The rules 0115 alone holds since the note "Hand-made databases,
+ * 2026-11-18" (answers one line per breach): no `create policy` and no
+ * `drop function`; its policy statements are the seven alters of section 3
+ * and the four of section 0d, nothing else; section 0d holds exactly those
+ * four, each behind the before-check's verdict, and nothing through
+ * `execute`; the removal's block holds, inside the DROPS mark's one `if`
+ * and in this order, the lock on its table, the second read under that
+ * lock with its refusal, and the removal, and nothing else; the file
+ * renames nothing else.
+ */
+function ruleFileBreaches(raw: string): string[] {
+  const out: string[] = [];
+  const code = blankStrings(stripComments(raw));
+  if (/\bcreate\s+policy\b/i.test(code)) out.push("0115 holds create policy");
+  if (/\bdrop\s+function\b/i.test(code)) out.push("0115 holds drop function");
+  const stmts = [...code.matchAll(POLICY_STATEMENT)].map((m) => norm(m[0]));
+  const others = stmts.filter((s) => !SECTION_0D.includes(s));
+  const seven = others.filter((s) =>
+    MEMBER_POLICIES.some((p) => s.startsWith(`alter policy "${p.name}" on public.${p.table} using `)),
+  );
+  if (seven.length !== MEMBER_POLICIES.length || seven.length !== others.length) {
+    out.push(`0115 holds policy statements outside section 3 and section 0d: ${JSON.stringify(others.filter((s) => !seven.includes(s)))}`);
+  }
+  const drops = stmts.filter((s) => /^drop\b/i.test(s));
+  if (JSON.stringify(drops) !== JSON.stringify(SECTION_0D.filter((s) => s.startsWith("drop ")))) {
+    out.push(`0115 removes ${JSON.stringify(drops)}`);
+  }
+  // counted with the strings kept: a rename run through `execute` counts too
+  const renames = (stripComments(raw).match(/\brename\s+to\b/gi) ?? []).length;
+  if (renames !== KNOWN_ALIASES.length) out.push(`0115 renames ${renames} times, not ${KNOWN_ALIASES.length}`);
+  const sec = section0d(raw);
+  if (sec === null) {
+    out.push("0115 has no section 0d");
+    return out;
+  }
+  const secCode = stripComments(sec);
+  const got = [...blankStrings(secCode).matchAll(POLICY_STATEMENT)].map((m) => norm(m[0]));
+  if (JSON.stringify(got) !== JSON.stringify(SECTION_0D)) out.push(`0115's section 0d holds ${JSON.stringify(got)}`);
+  if (/\bexecute\b/i.test(secCode)) out.push("0115's section 0d runs a statement through execute");
+  const marks = (v: string) => (secCode.match(new RegExp(String.raw`verdict\s*=\s*'${v}'`, "gi")) ?? []).length;
+  if ((secCode.match(/\bpg_temp\.adr0030_0115_before\b/gi) ?? []).length !== 3 || marks("RENAMES") !== 2 || marks("DROPS") !== 1) {
+    out.push("0115's section 0d does not act on the before-check's RENAMES and DROPS rows alone");
+  }
+  // The removal's block, read whole and end to end (comments dropped,
+  // strings kept), with only white space or a string between its tokens: the
+  // DROPS mark opens its one if; inside it the lock on the table, the second
+  // read under that lock (the before-check's own tests: that table, that
+  // name, select, permissive, and both expressions tested with ~* against
+  // organization_members) with its refusal, then the drop; then the if and
+  // the block close. A test turned round (not, !~*, a constant), a step
+  // moved, or the drop outside the if does not match.
+  if (!REMOVAL_BLOCK.test(secCode)) {
+    out.push("0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal");
+  }
+  return out;
+}
+
+/**
+ * 0115's B11 rows, one per branch of the before-check select: where each
+ * reads from, and whether it prints a runnable statement, the whole policy
+ * in parts, or a function's definition.
+ */
+function b11Forms(raw: string): string[] | null {
+  const b = raw.indexOf("-- before-check select: begin");
+  const e = raw.indexOf("-- before-check select: end");
+  if (b < 0 || e < b) return null;
+  return stripComments(raw.slice(b, e))
+    .split(/\bunion\s+all\b/i)
+    .filter((br) => /^\s*select\s+'B11'/i.test(br))
+    .map((br) => {
+      const from = /\bfrom\s+(helper|pol|renames|drops)\b/i.exec(br)?.[1] ?? "?";
+      const kind = /\bwhere\s+rn\.kind\s*=\s*'(\w+)'/i.exec(br)?.[1];
+      const form = /format\('alter policy\b/i.test(br) ? "statement" : /format\('table public\.%I; policy %I;/i.test(br) ? "parts" : /\bpg_get_functiondef\s*\(/i.test(br) ? "definition" : "?";
+      return `${from}${kind ? ` ${kind}` : ""}: ${form}`;
+    });
+}
+
+/** The premise of the removal: a migration creating (or renaming a relation to) exactly public.enrollments. */
+const CREATES_ENROLLMENTS =
+  /\bcreate\s+(?:or\s+replace\s+)?(?:(?:temp|temporary|unlogged)\s+)?(?:table|view|materialized\s+view|foreign\s+table)\s+(?:if\s+not\s+exists\s+)?(?:"?public"?\s*\.\s*)?"?enrollments"?(?![\w$])|\brename\s+to\s+"?enrollments"?(?![\w$])/i;
+/**
+ * …and a read of a table of exactly that name in the app: a client .from(),
+ * a schema-qualified name, a REST path, an embed in a select list (after a
+ * comma, a quote, a parenthesis or an alias colon, with or without a `!hint`),
+ * or an unqualified SQL from or join.
+ */
+const READS_ENROLLMENTS = new RegExp(
+  [
+    /\.from\(\s*["'`]enrollments["'`]/.source,
+    /\bpublic\.enrollments\b/.source,
+    /\/rest\/v1\/enrollments\b/.source,
+    /[,"'`(:]\s*enrollments\s*(?:!\s*\w+\s*)?\(/.source,
+    /\b(?:[Ff][Rr][Oo][Mm]|[Jj][Oo][Ii][Nn])\s+"?enrollments"?(?![\w$-])/.source,
+  ].join("|"),
+);
+/** The app's source: the folders and root files that ship or run with it (not migrations, scripts or tests). */
+const APP_SOURCES = ["app", "lib", "components", "types", "supabase/functions", "middleware.ts", "instrumentation-client.ts"];
+const createsEnrollments = (file: string, sql: string) =>
+  CREATES_ENROLLMENTS.test(stripComments(sql)) ? [`${file}: creates a relation named public.enrollments`] : [];
+const sourceFiles = (dir: string): string[] => {
+  const abs = path.join(root, dir);
+  if (!fs.existsSync(abs)) return [];
+  if (fs.statSync(abs).isFile()) return [dir];
+  return fs.readdirSync(abs, { withFileTypes: true }).flatMap((d) =>
+    d.name === "node_modules" ? [] : d.isDirectory() ? sourceFiles(path.join(dir, d.name)) : /\.(?:[cm]?[jt]sx?|sql)$/.test(d.name) ? [path.join(dir, d.name)] : [],
+  );
+};
+
 /** The numbers of a never-paste sentence: "After 0115, none of … is pasted again". */
 const neverPaste = (text: string) => {
   const prose = text.replace(/^--[ \t]?/gm, "").replace(/\s*\n\s*/g, " ");
@@ -299,7 +484,21 @@ console.log("\n0115 itself");
 const rule = read(`${MIG_DIR}/${RULE_FILE}`);
 const ruleCode = stripComments(rule);
 eq("0115 passes the rules", breaches(RULE_FILE, rule), []);
-eq("0115 holds no drop policy, create policy or drop function", /\bdrop\s+policy\b|\bcreate\s+policy\b|\bdrop\s+function\b/i.test(ruleCode), false);
+eq("0115 holds no create policy, no drop function, and one drop policy: section 0d's statement", ruleFileBreaches(rule), []);
+eq("0115's section 0d holds the four policy statements of the note, in order", (() => {
+  const sec = section0d(rule);
+  return sec === null ? null : [...blankStrings(stripComments(sec)).matchAll(POLICY_STATEMENT)].map((m) => norm(m[0]));
+})(), [
+  'alter policy "members_view_their_orgs" on public.organizations rename to "members can read their orgs"',
+  'alter policy "View own membership" on public.organization_members rename to "members can read own memberships"',
+  'alter policy "members can read own memberships" on public.organization_members using (user_id = auth.uid())',
+  'drop policy "admins_view_org_enrollments" on public.enrollments',
+]);
+eq(
+  "B11 prints an alter policy statement for the seven policies and the first alias only; the own-row alias and the legacy policy in parts",
+  b11Forms(rule),
+  ["helper: definition", "pol: statement", "renames org: statement", "renames own: parts", "drops: parts"],
+);
 const ruleStmts = statements(ruleCode);
 eq(
   "0115 restates the four helpers with both tests",
@@ -327,6 +526,25 @@ const inFile = block(rule);
 eq("0115 marks its after-check block", inFile !== null && inFile.length > 1000, true);
 eq(`${AFTER_CHECKS} holds the same block, character for character`, block(read(AFTER_CHECKS)) === inFile, true);
 eq(`${AFTER_CHECKS} ends in rollback and writes nothing`, /\nrollback;\s*$/.test(read(AFTER_CHECKS)) && !/\bcommit;/.test(stripComments(read(AFTER_CHECKS))), true);
+eq(
+  "the after-check block names neither alias nor enrollments (its expected sets do not grow)",
+  inFile === null ? null : [...KNOWN_ALIASES.map((a) => a.alias), "enrollments"].filter((w) => inFile.toLowerCase().includes(w.toLowerCase())),
+  [],
+);
+
+console.log("\nthe premise of section 0d's removal (public.enrollments is outside the repository and the app)");
+eq("the legacy list is one policy on public.enrollments", LEGACY_DROPS.map((d) => `${d.table}|${d.name}`), ["enrollments|admins_view_org_enrollments"]);
+eq("no migration creates a relation named exactly public.enrollments", files.flatMap((f) => createsEnrollments(f, read(`${MIG_DIR}/${f}`))), []);
+const appFiles = APP_SOURCES.flatMap(sourceFiles);
+eq("the app's source holds files to read (app/, lib/, components/ and middleware.ts among them)", (() => {
+  const norm2 = appFiles.map((f) => f.replace(/\\/g, "/"));
+  return norm2.length > 100 && ["app/", "lib/", "components/"].every((d) => norm2.some((f) => f.startsWith(d))) && norm2.includes("middleware.ts");
+})(), true);
+eq(
+  "no app source file reads a table of exactly that name",
+  appFiles.filter((f) => READS_ENROLLMENTS.test(read(f))).map((f) => f.replace(/\\/g, "/")),
+  [],
+);
 
 console.log("\nplanted cases: each rule fires");
 const stmtOf = (rel: string, re: RegExp) => {
@@ -443,6 +661,138 @@ eq(
       "'members read widgets', 'widgets');\nend\n$$;\n",
   ),
   [],
+);
+
+console.log("\nplanted cases: hand-made databases (the closed lists of section 0d)");
+const beforeCommit = (extra: string) => rule.replace(/\ncommit;\s*$/, `\n${extra}\ncommit;\n`);
+eq("the planting point exists (0115 ends in commit)", beforeCommit("select 1;") !== rule, true);
+eq(
+  "a second drop policy in 0115 fails",
+  ruleFileBreaches(beforeCommit('drop policy "admins_view_org_enrollments" on public.courses;')),
+  [
+    '0115 holds policy statements outside section 3 and section 0d: ["drop policy \\"admins_view_org_enrollments\\" on public.courses"]',
+    '0115 removes ["drop policy \\"admins_view_org_enrollments\\" on public.enrollments","drop policy \\"admins_view_org_enrollments\\" on public.courses"]',
+  ],
+);
+eq(
+  "a third rename in 0115 fails",
+  ruleFileBreaches(beforeCommit('alter policy "members_view_their_orgs" on public.organizations rename to "members read orgs";')),
+  [
+    '0115 holds policy statements outside section 3 and section 0d: ["alter policy \\"members_view_their_orgs\\" on public.organizations rename to \\"members read orgs\\""]',
+    "0115 renames 3 times, not 2",
+  ],
+);
+eq(
+  "a third rename inside section 0d fails there too",
+  ruleFileBreaches(rule.replace(
+    '    drop policy "admins_view_org_enrollments" on public.enrollments;',
+    '    drop policy "admins_view_org_enrollments" on public.enrollments;\n    alter policy "x" on public.enrollments rename to "y";',
+  )).length >= 3,
+  true,
+);
+eq(
+  "section 0d without the lock fails",
+  ruleFileBreaches(rule.replace("    lock table public.enrollments in access exclusive mode;\n", "")),
+  ["0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal"],
+);
+eq(
+  "…and with the removal above the lock",
+  ruleFileBreaches(rule
+    .replace('    drop policy "admins_view_org_enrollments" on public.enrollments;\n', "")
+    .replace(
+      "    lock table public.enrollments in access exclusive mode;\n",
+      '    drop policy "admins_view_org_enrollments" on public.enrollments;\n    lock table public.enrollments in access exclusive mode;\n',
+    )),
+  ["0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal"],
+);
+eq(
+  "…and with a second read that no longer tests the text",
+  ruleFileBreaches(rule.replace(/\n\s*and \(coalesce\(pg_get_expr\(p\.polqual[^\n]*\n[^\n]*~\* 'organization_members'\) then/, ") then")),
+  ["0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal"],
+);
+eq(
+  "…and with the text tested by !~* in place of ~*",
+  ruleFileBreaches(rule.replace("'')) ~* 'organization_members') then", "'')) !~* 'organization_members') then")),
+  ["0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal"],
+);
+eq(
+  "…and with a constant in place of the policy's text",
+  ruleFileBreaches(rule.replace(
+    /\(coalesce\(pg_get_expr\(p\.polqual, p\.polrelid\), ''\) \|\| ' '\n\s*\|\| coalesce\(pg_get_expr\(p\.polwithcheck, p\.polrelid\), ''\)\) ~\* 'organization_members'\) then/,
+    "'organization_members' ~* 'organization_members') then",
+  )),
+  ["0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal"],
+);
+eq(
+  "…and with the removal moved below the DROPS mark's end if (it would run on every paste)",
+  ruleFileBreaches(rule.replace(
+    '    drop policy "admins_view_org_enrollments" on public.enrollments;\n  end if;\n',
+    '  end if;\n  drop policy "admins_view_org_enrollments" on public.enrollments;\n',
+  )),
+  ["0115's section 0d does not lock public.enrollments, read the policy again and refuse, in that order, before its removal"],
+);
+eq(
+  "a B11 row for the own-row alias printed as a statement fails",
+  b11Forms(rule.replace("format('table public.%I; policy %I; permissive; for select; to %s; using (%s)', rn.tbl, rn.alias,", "format('alter policy %I on public.%I using (%s)', rn.name, rn.tbl,")),
+  ["helper: definition", "pol: statement", "renames org: statement", "renames own: statement", "drops: parts"],
+);
+eq(
+  "the same four policy statements run through execute in section 0d fail",
+  ruleFileBreaches(rule.replace(
+    '    alter policy "members_view_their_orgs" on public.organizations rename to "members can read their orgs";',
+    "    execute 'select 1';\n    alter policy \"members_view_their_orgs\" on public.organizations rename to \"members can read their orgs\";",
+  )),
+  ["0115's section 0d runs a statement through execute"],
+);
+eq(
+  "a migration that creates public.enrollments fails the premise",
+  createsEnrollments("0116_planted.sql", 'create table if not exists "public"."enrollments" (id uuid primary key);\n'),
+  ["0116_planted.sql: creates a relation named public.enrollments"],
+);
+eq(
+  "…and one that renames a relation to it",
+  createsEnrollments("0116_planted.sql", "alter table public.course_enrollments_old rename to enrollments;\n"),
+  ["0116_planted.sql: creates a relation named public.enrollments"],
+);
+eq(
+  "…while other names pass (journey_enrollments, a view named enrollments_v, another schema)",
+  createsEnrollments(
+    "0116_planted.sql",
+    "create table public.journey_enrollments (id uuid);\ncreate view public.enrollments_v as select 1;\ncreate table lrs.enrollments (id uuid);\n",
+  ),
+  [],
+);
+eq(
+  "a rename run through execute anywhere in 0115 is counted",
+  ruleFileBreaches(beforeCommit("do $$ begin execute 'alter policy \"a\" on public.b rename to \"c\"'; end $$;")),
+  ["0115 renames 3 times, not 2"],
+);
+eq(
+  "an app read of a table named enrollments is found",
+  [
+    'await supabase.from("enrollments").select("*")',
+    "fetch(`${url}/rest/v1/enrollments?select=*`)",
+    "select * from public.enrollments",
+    'supabase.from("courses").select("id, enrollments(*)")',
+    'supabase.from("courses").select(`*, e:enrollments!inner(user_id)`)',
+    'supabase.from("courses").select("id,enrollments ( id )")',
+    "select e.id from enrollments e",
+    'SELECT 1 FROM courses c JOIN "enrollments" e ON e.course_id = c.id',
+  ].map((t) => READS_ENROLLMENTS.test(t)),
+  [true, true, true, true, true, true, true, true],
+);
+eq(
+  "…and a tab key, a route, another table, a word in a sentence or a function is not",
+  [
+    '{ key: "enrollments", label: "Enrollments" }',
+    'fetch("/api/journey/enrollments")',
+    'supabase.from("journey_enrollments")',
+    'supabase.from("courses").select("*, journey_enrollments(*)")',
+    "affects new enrollments (or everyone",
+    "select * from enrollments_v",
+    "const n = countEnrollments(org);",
+  ].map((t) => READS_ENROLLMENTS.test(t)),
+  [false, false, false, false, false, false, false],
 );
 
 console.log("\nplanted cases: functions and views (rule f, the class of 0115's B4c)");
