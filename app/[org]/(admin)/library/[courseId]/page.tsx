@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 import { createClient } from "@/lib/supabase/server";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { loadFieldOptionRows } from "@/lib/org/field-options";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
@@ -120,16 +121,12 @@ export default async function AdminCourseDetailPage({
   // the same predicate (canRerunCertification) on the same input, the RAW
   // membership role the route reads through requireOrgAdminApi (`role`
   // above is normalised: the legacy "owner" and an impersonation read as
-  // super_owner, and the route refuses both). Read only with the flag on.
+  // super_owner, and the route refuses both), from a membership that counts
+  // (ADR 0030), as the route reads it. Read only with the flag on.
   let rerunAllowed = false;
   if (showTiers) {
-    const { data: membership } = await supabase
-      .from("organization_members")
-      .select("role")
-      .eq("organization_id", org.id)
-      .eq("user_id", user.id)
-      .maybeSingle();
-    rerunAllowed = canRerunCertification((membership as { role?: string | null } | null)?.role);
+    const membership = await resolveOrgMembership(supabase, { id: org.id }, user.id);
+    rerunAllowed = typeof membership === "object" && canRerunCertification(membership.role);
   }
 
 

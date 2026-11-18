@@ -99,15 +99,13 @@ export function partitionByScope(ctx: ManagerContext, userIds: string[]): { allo
   return { allowed, denied };
 }
 
-/** Cheap nav gate: is this person named as a manager by any active member? */
+/**
+ * Cheap nav gate: is this person named as a manager by any active member?
+ * The caller has already passed requireOrgAccess for this org in the same
+ * request, so the person's own membership counts (ADR 0030); their own row
+ * is not read again here.
+ */
 export async function isNamedManager(svc: SupabaseClient, orgId: string, userId: string): Promise<boolean> {
-  const { data: me } = await svc
-    .from("organization_members")
-    .select("status")
-    .eq("organization_id", orgId)
-    .eq("user_id", userId)
-    .maybeSingle();
-  if ((me as { status?: string } | null)?.status !== "active") return false;
   const { count } = await svc
     .from("organization_members")
     .select("user_id", { count: "exact", head: true })

@@ -405,11 +405,17 @@ async function pageCases() {
     const fnMissing = () => json({ code: "PGRST202", message: "Could not find the function in the schema cache" }, 404);
     if (p === "/auth/v1/user") return json(userRow());
     if (p === "/rest/v1/profiles") return json([{ must_change_password: false }]);
-    if (p === "/rest/v1/organizations") return json([{ id: ORG_ID, name: "Org", slug: "org", logo_url: null, brand_color: null, brand_font: null, custom_domain: null }]);
+    if (p === "/rest/v1/organizations") return json([{ id: ORG_ID, name: "Org", slug: "org", logo_url: null, brand_color: null, brand_font: null, custom_domain: null, deleted_at: null }]);
     if (p === "/rest/v1/platform_impersonation_sessions") {
       return json(impersonating ? [{ id: IMP_SESSION, actor_user_id: NAV_USERS.platform.id, target_org_id: ORG_ID, target_user_id: null, started_at: "2026-11-15T00:00:00Z", expires_at: "2999-01-01T00:00:00Z", ended_at: null, revoked_at: null }] : []);
     }
-    if (p === "/rest/v1/organization_members") return json(NAV_USERS[viewer].role ? [{ role: NAV_USERS[viewer].role }] : []);
+    // ADR 0030: requireOrgAccess answers an impersonation only on top of the
+    // owner's own membership that counts, so the impersonating platform
+    // owner holds an active member row in the org (a plain user).
+    if (p === "/rest/v1/organization_members") {
+      const navRole = NAV_USERS[viewer].role ?? (viewer === "platform" && impersonating ? "user" : null);
+      return json(navRole ? [{ role: navRole, status: "active" }] : []);
+    }
     if (p === "/rest/v1/platform_owners") return json([]);
     if (p === "/rest/v1/courses") {
       // A path Start embeds the ?lp= path's step row (ADR 0024 P2-7, the review's F3).
@@ -619,11 +625,10 @@ async function pageCases() {
     }
 
     // (b) P2-5 item 3c: while requireOrgAccess answers an impersonation
-    // (super_owner), a Start is refused; Preview stays allowed. The stub
-    // answers the organisation read for any viewer, so the gate runs here
-    // for a viewer with no membership row. In the app that read is under
-    // the caller's own session and the organisations policy admits members
-    // only, so the caller who reaches the gate is a member impersonating.
+    // (super_owner), a Start is refused; Preview stays allowed. The caller
+    // who reaches the gate is a member impersonating: requireOrgAccess gives
+    // the impersonation answer only on top of a membership that counts (ADR
+    // 0030), so the stub gives the impersonating owner an active row.
     // P2-6 (O2): the refusal stays first, before the launch_context call,
     // whose not_member reads the impersonator's own membership.
     {

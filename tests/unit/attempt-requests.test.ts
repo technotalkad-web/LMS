@@ -234,7 +234,8 @@ console.log("\nPATCH /api/attempt-requests/{id}: the approval rule, the override
   eq("a missing override_confirmed column answers 503 schema_missing, logged, nothing approved",
     inOrder(src, ["if (override && isMissingColumn(error, \"override_confirmed\"))", '"schema_missing"', '{ error: "schema_missing" }, { status: 503 }']), true);
   eq("every check precedes the update", src.indexOf("approvalDecision({") < src.indexOf(".update({"), true);
-  eq("roles unchanged: ADMIN_ROLES gates the caller", /if \(!ADMIN_ROLES\.includes\(normalizeRole\(caller\?\.role as string\)/.test(src), true);
+  eq("roles unchanged: ADMIN_ROLES gates the caller, whose role comes from a membership that counts (ADR 0030)",
+    /const caller = await resolveOrgMembership</.test(src) && /if \(!ADMIN_ROLES\.includes\(normalizeRole\(caller\.role\)/.test(src), true);
 }
 
 console.log("\nPOST /api/attempt-requests/bulk: fail closed, skip a live retake (ADR 0014 step 11 (5))");

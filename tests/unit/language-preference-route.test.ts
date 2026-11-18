@@ -110,7 +110,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const list = (rows: Row[]) => (accept.includes("vnd.pgrst.object") ? json(rows[0] ?? null) : json(rows));
 
   if (p === "/auth/v1/user") return json(ME);
-  if (p === "/rest/v1/organizations") return list([{ id: ORG }]);
+  if (p === "/rest/v1/organizations") return list([{ id: ORG, deleted_at: null }]);
+  // The caller's own row, read by lib/auth/org-membership.ts: an active learner.
+  if (p === "/rest/v1/organization_members") return list([{ role: "user", status: "active" }]);
   if (p === "/rest/v1/courses") return list([{ id: COURSE }]);
   if (p === "/rest/v1/course_packages") return list(PACKAGES.filter((r) => matches(r, url.searchParams)));
   if (p === "/rest/v1/course_versions") return json(VERSIONS.filter((r) => matches(r, url.searchParams)));

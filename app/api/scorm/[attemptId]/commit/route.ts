@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { ensureEngineVersion, updateAttemptFailSoft } from "@/lib/courses/progress";
 import { outcomeFinalVerdict, type OutcomeFinalVerdict } from "@/lib/courses/engine-version";
 import { attemptAbandonedResponse } from "@/lib/attempts/abandon";
@@ -137,6 +138,7 @@ export async function POST(
         ignored_pass?: unknown;
         /** 0107 (ADR 0024); undefined on a database without it. */
         context_kind?: string | null;
+        organization_id?: string;
         course_version_id?: string;
         course_versions?: {
           id: string;
@@ -151,6 +153,20 @@ export async function POST(
   // (ii) only a clean "no such attempt for this user" is a 404.
   if (!a) {
     return NextResponse.json({ error: "attempt_not_found" }, { status: 404 });
+  }
+  // ADR 0030: the attempt is the caller's; their membership in its org must
+  // still count (active, in an org that is not deleted). Otherwise nothing
+  // is written and the attempt is left as it is: 403 no_access, or 503 when
+  // the check cannot be read.
+  const access = a.organization_id
+    ? await resolveOrgMembership(supabase, { id: a.organization_id }, user.id)
+    : "unreadable";
+  if (access === "unreadable") {
+    console.error(`[scorm/commit] membership check unreadable for attempt ${attemptId}`);
+    return NextResponse.json({ error: "access_unreadable" }, { status: 503 });
+  }
+  if (access === "none") {
+    return NextResponse.json({ error: "no_access" }, { status: 403 });
   }
   // ALDS step 0 (P4): abandoned is terminal — a stale tab's commit or unload
   // beacon must never write to (and so revive) an abandoned attempt.

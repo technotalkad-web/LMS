@@ -37,9 +37,10 @@
  *     comparison with a role name (`role === "admin"`,
  *     `[...roles].includes(role)`, canManage(role)…) of a value read from a
  *     lookup of the caller (an organization_members read selecting role
- *     with `.eq("user_id", …)`, requireOrgAccess, or loadTicketForCaller,
- *     whose `party` is "admin" only for an active admin of the ticket's
- *     org); directly in the condition or through a variable holding one. A
+ *     with `.eq("user_id", …)`, requireOrgAccess, resolveOrgMembership, or
+ *     loadTicketForCaller, whose `party` is "admin" only for an admin of
+ *     the ticket's org whose membership counts); directly in the condition
+ *     or through a variable holding one. A
  *     comparison on anything else (a body field), a membership-only test
  *     (`if (!member) return`), requireOrgAccess alone (every member passes
  *     it) and a role helper whose answer is never tested are not guards. An
@@ -314,8 +315,17 @@ const ROLE_TESTS = new Set(["canManage", "canManageOwners", "canViewReports", "i
 const ROLE_NAMES = new Set(["super_owner", "owner", "admin", "data_analyst", "user", "member"]);
 /** The role names an admin-only check lets through: `=== "admin"` is true for an allowed caller, `=== "user"` for a refused one. */
 const ADMIN_ROLE_NAMES = new Set(["super_owner", "owner", "admin"]);
-/** "file name": lookups of the caller whose answer carries the caller's role (requireOrgAccess: `.role`; loadTicketForCaller: `.party`, "admin" only for an active admin of the ticket's org). */
-const CALLER_LOOKUPS = new Set(["lib/auth/require-org-access.ts requireOrgAccess", "lib/tickets/auth.ts loadTicketForCaller"]);
+/**
+ * "file name": lookups of the caller whose answer carries the caller's role
+ * (requireOrgAccess: `.role`; resolveOrgMembership: `.role` of a membership
+ * that counts, ADR 0030; loadTicketForCaller: `.party`, "admin" only for an
+ * admin of the ticket's org whose membership counts).
+ */
+const CALLER_LOOKUPS = new Set([
+  "lib/auth/require-org-access.ts requireOrgAccess",
+  "lib/auth/org-membership.ts resolveOrgMembership",
+  "lib/tickets/auth.ts loadTicketForCaller",
+]);
 
 /**
  * The receiver chain of a call: `a.from("t").select("x").eq(…)` → segs from,

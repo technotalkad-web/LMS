@@ -77,6 +77,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const p = url.pathname;
   requests.push({ method, path: p, select, body, query: url.searchParams });
   if (p === "/auth/v1/user") return json(USER);
+  // ADR 0030: the learner's membership in the attempt's org counts (lib/auth/org-membership.ts).
+  if (p === "/rest/v1/organizations" && select === "id,deleted_at") return json([{ id: "o1", deleted_at: null }]);
+  if (p === "/rest/v1/organization_members" && select === "role,status") return json([{ role: "user", status: "active" }]);
   if (p === "/rest/v1/course_attempts") {
     if (method === "PATCH") {
       const patch = JSON.parse(body) as Row;

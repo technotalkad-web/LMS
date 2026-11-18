@@ -10,7 +10,9 @@
  *     malformed, expired, ended or revoked cookie gets none; no cookie costs
  *     no request at all;
  *   - requireOrgAccess(): a member holding the owner's cookie keeps their own
- *     membership role; the owner is answered super_owner;
+ *     membership role; the owner is answered super_owner on top of their own
+ *     membership that counts (ADR 0030), and an owner with no membership row
+ *     there is sent back to /super/organizations;
  *   - GET /api/super/impersonate answers the session to its owner only;
  *   - sign-out ends the session (row stamped, cookie deleted) before it signs
  *     out, and still signs out when ending it fails;
@@ -53,7 +55,7 @@ const IMP_COOKIE = "lms_impersonation";
 const OWNER: User = { id: "6c1e0a6e-0000-4000-8000-00000000a001", aud: "authenticated", role: "authenticated", email: "owner@example.test", email_confirmed_at: "2026-01-01T00:00:00Z" };
 const MEMBER: User = { id: "6c1e0a6e-0000-4000-8000-00000000b001", aud: "authenticated", role: "authenticated", email: "member@example.test", email_confirmed_at: "2026-01-01T00:00:00Z" };
 const TOKENS: Record<string, User> = { "tok-owner": OWNER, "tok-member": MEMBER };
-const ORG = { id: "org-1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null };
+const ORG = { id: "org-1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null, deleted_at: null };
 const session = (token: string) =>
   ({ access_token: token, refresh_token: `r-${token}`, token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: TOKENS[token] });
 // The forgot-password reset token the /verify step handed this browser.
@@ -174,7 +176,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/organization_members") {
     if (method !== "GET") return new Response(null, { status: 201 });
     const role = roles[eqParam(q, "user_id") ?? ""];
-    return json(role ? [{ role }] : []);
+    return json(role ? [{ role, status: "active" }] : []);
   }
   if (p === "/rest/v1/platform_owners") return json(eqParam(q, "user_id") === OWNER.id ? [{ user_id: OWNER.id }] : []);
   if (p === "/rest/v1/invitations") {
@@ -289,8 +291,18 @@ async function main() {
     console.log("\nrequireOrgAccess: every caller inherits the check");
     {
       await ownerStarts();
+      // ADR 0030: the impersonation answer is given only on top of the
+      // owner's own membership that counts; with no row the owner is sent
+      // back, as a non-member is (/super/organizations for a platform owner).
+      const noRow = await requireOrgAccess(ORG.slug).then(
+        () => "answered",
+        (e: unknown) => String((e as { digest?: unknown })?.digest ?? e).split(";")[2] ?? "error"
+      );
+      eq("the owner with no membership row is sent back to /super/organizations, never answered super_owner", noRow, "/super/organizations");
+      roles[OWNER.id] = "user";
       const owner = await requireOrgAccess(ORG.slug);
-      eq("the owner (no membership) is answered super_owner with the impersonation", [owner.role, owner.impersonation?.actorUserId], ["super_owner", OWNER.id]);
+      eq("the owner with an active membership is answered super_owner with the impersonation", [owner.role, owner.impersonation?.actorUserId], ["super_owner", OWNER.id]);
+      delete roles[OWNER.id];
 
       signIn("tok-member");
       roles[MEMBER.id] = "user";

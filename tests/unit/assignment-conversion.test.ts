@@ -94,10 +94,11 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const query = decodeURIComponent(url.search);
   requests.push({ method, table, query, body, apikey: headers.get("apikey") });
   if (p === "/auth/v1/user") return json(USER);
-  if (table === "organizations") return json([{ id: ORG, name: "Org", slug: "org" }]);
+  if (table === "organizations") return json([{ id: ORG, name: "Org", slug: "org", deleted_at: null }]);
   if (table === "organization_members" && method === "GET") {
     const sel = url.searchParams.get("select") ?? "";
-    if (sel === "role") return json([{ role: "admin" }]);
+    // The caller's own row, read by lib/auth/org-membership.ts (role and status).
+    if (sel === "role,status") return json([{ role: "admin", status: "active" }]);
     const inList = /user_id=in\.\(([^)]*)\)/.exec(query)?.[1] ?? "";
     return json(inList.split(",").filter(Boolean).map((u) => ({ user_id: u, business_vertical: null, department: null })));
   }

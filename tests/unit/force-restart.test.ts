@@ -1324,7 +1324,7 @@ async function regrant() {
     eq("…the expiry is DEFAULT_GRANT_EXPIRY_DAYS from lib/attempts/constants", /import \{ DEFAULT_GRANT_EXPIRY_DAYS \} from "@\/lib\/attempts\/constants";/.test(src), true);
     const mp = fs.readFileSync(path.join(root, "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts"), "utf8");
     eq("multipart route: org id/name/slug, course id/title, the admin, the origin, the version number, the notifier",
-      /\.select\("id, name, slug"\)/.test(mp) && /\.select\("id, title"\)/.test(mp) &&
+      /resolveOrgMembership<\{ id: string; name: string; slug: string \}>\([^)]*"id, name, slug"\s*\)/.test(mp) && /\.select\("id, title"\)/.test(mp) &&
         /forceRestartOlderVersions\(svc, \{\s*packageId,\s*newVersionId: result\.versionId,\s*versionNumber: result\.versionNumber,\s*admin: \{ id: caller\.id \},/.test(mp) &&
         /origin: await originFromRequest\(\),/.test(mp) && /notify: \{ decision: notifyLearnerOfDecision, emails: resolveEmails \},/.test(mp), true);
     const fin = fs.readFileSync(path.join(root, "app/api/courses/upload/finalize/route.ts"), "utf8");

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import {
   maskedConfig,
   saveLrsConfig,
@@ -22,19 +24,12 @@ async function requireAdmin(orgSlug: string | null) {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return { error: NextResponse.json({ error: "Org not found" }, { status: 404 }) };
-  const { data: mem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const role = mem?.role as string | undefined;
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const mem = await resolveOrgMembership(supabase, { slug: orgSlug }, user.id);
+  if (mem === "unreadable") return { error: NextResponse.json({ error: CHECK_FAILED }, { status: 503 }) };
+  if (mem === "none") return { error: NextResponse.json({ error: "Org not found" }, { status: 404 }) };
+  const org = mem.org;
+  const role = mem.role;
   if (!(role === "super_owner" || role === "owner" || role === "admin")) {
     return { error: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
   }

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import {
   GOVERNED_FIELDS,
   type GovernedField,
@@ -25,20 +27,18 @@ async function resolveOrg(orgSlug: string | null) {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: "Unauthorized", status: 401 as const };
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, slug, require_manager_fields")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return { error: "Organization not found", status: 404 as const };
-  const { data: mem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!mem) return { error: "Forbidden", status: 403 as const };
-  const role = mem.role as string;
+  // ADR 0030: the org and the caller's role, from a membership that counts;
+  // anything else is answered as a signed-in non-member is.
+  const mem = await resolveOrgMembership<{ id: string; slug: string; require_manager_fields: boolean | null }>(
+    supabase,
+    { slug: orgSlug },
+    user.id,
+    "id, slug, require_manager_fields"
+  );
+  if (mem === "unreadable") return { error: CHECK_FAILED, status: 503 as const };
+  if (mem === "none") return { error: "Organization not found", status: 404 as const };
+  const org = mem.org;
+  const role = mem.role;
   return {
     supabase,
     org,

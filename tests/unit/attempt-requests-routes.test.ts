@@ -99,8 +99,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const one = (row: Row | null) => (accept.includes("vnd.pgrst.object") ? json(row) : json(row ? [row] : []));
 
   if (p === "/auth/v1/user") return json(ME);
-  if (p === "/rest/v1/organizations") return json([{ id: ORG, name: "Org", slug: "org" }]);
-  if (p === "/rest/v1/organization_members") return json(select === "role" ? [{ role: callerRole }] : []);
+  if (p === "/rest/v1/organizations") return json([{ id: ORG, name: "Org", slug: "org", deleted_at: null }]);
+  // The caller's own row, read by lib/auth/org-membership.ts (role and status).
+  if (p === "/rest/v1/organization_members") return json(select === "role,status" ? [{ role: callerRole, status: "active" }] : []);
   if (p === "/rest/v1/courses") return json([{ id: COURSE, title: "Home loans", pass_required: false }]);
   if (p === "/rest/v1/course_versions") return json([{ id: VERSION }]);
   if (p === "/rest/v1/course_attempts" && method === "GET") {

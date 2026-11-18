@@ -1,4 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { ADMIN_ROLES } from "@/lib/attempts/requests";
 import type { ActionError } from "@/lib/actions/types";
@@ -48,9 +50,11 @@ export type TicketCaller = {
 };
 
 /**
- * Session → ticket → the caller's standing on it. An active admin of the
- * ticket's org is "admin"; the person who raised it is "requester"; anyone
- * else gets 404 (the ticket's existence is not confirmed).
+ * Session → ticket → the caller's standing on it. Both parties need a
+ * membership in the ticket's org that counts (ADR 0030: active, in an org
+ * that is not deleted): an admin through it is "admin"; the person who
+ * raised it is "requester"; anyone else gets 404 (the ticket's existence is
+ * not confirmed). A membership check that cannot be read answers 503.
  */
 export async function loadTicketForCaller(ticketId: string): Promise<TicketCaller | ActionError> {
   const session = await createClient();
@@ -69,16 +73,16 @@ export async function loadTicketForCaller(ticketId: string): Promise<TicketCalle
     }
   }
   if (!ticket) return { error: "Ticket not found", status: 404 };
-  const { data: mem } = await svc
-    .from("organization_members")
-    .select("role, status")
-    .eq("organization_id", ticket.organization_id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const m = mem as { role: string; status: string } | null;
-  const active = !!m && m.status === "active";
-  const party: TicketCaller["party"] | null = active && isAdminRole(m!.role) ? "admin" : active && ticket.user_id === user.id ? "requester" : null;
-  if (!party) return { error: "Ticket not found", status: 404 };
-  const { data: o } = await svc.from("organizations").select("id, name, slug").eq("id", ticket.organization_id).single();
-  return { svc, user: { id: user.id, email: user.email ?? null }, org: o as { id: string; name: string; slug: string }, ticket, party };
+  const m = await resolveOrgMembership<{ id: string; name: string; slug: string }>(
+    svc,
+    { id: ticket.organization_id },
+    user.id,
+    "id, name, slug"
+  );
+  if (m === "unreadable") return { error: CHECK_FAILED, status: 503 };
+  const party: TicketCaller["party"] | null =
+    m === "none" ? null : isAdminRole(m.role) ? "admin" : ticket.user_id === user.id ? "requester" : null;
+  if (m === "none" || !party) return { error: "Ticket not found", status: 404 };
+  const o = m.org;
+  return { svc, user: { id: user.id, email: user.email ?? null }, org: { id: o.id, name: o.name, slug: o.slug }, ticket, party };
 }

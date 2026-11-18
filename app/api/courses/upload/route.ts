@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { isVersionConflictError, uploadCoursePackage } from "@/lib/courses/upload";
 import { notifyCourseUpdate } from "@/lib/courses/notify-update";
 import {
@@ -55,22 +57,21 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name, slug")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) {
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const membership = await resolveOrgMembership<{ id: string; name: string; slug: string }>(
+    supabase,
+    { slug: orgSlug },
+    user.id,
+    "id, name, slug"
+  );
+  if (membership === "unreadable") {
+    return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  }
+  if (membership === "none") {
     return NextResponse.json({ error: "Organization not found" }, { status: 404 });
   }
-
-  const { data: membership } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const callerRole = membership?.role as string | undefined;
+  const org = membership.org;
+  const callerRole = membership.role;
   const canWrite =
     callerRole === "super_owner" ||
     callerRole === "owner" || // legacy compat

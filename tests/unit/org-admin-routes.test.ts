@@ -14,9 +14,11 @@
  * those calls. Reading the org (or any members-visible row) on the caller's
  * session is not a role check: every member can read it.
  *
- *   (a) a plain member, a data analyst and a signed-in caller with no
- *       membership are refused with 403, and no service-key request, no
- *       Cloudflare request and no write of any kind is made;
+ *   (a) a plain member and a data analyst are refused with 403, and a
+ *       signed-in caller with no membership with the answer a non-member
+ *       gets (ADR 0030: 404 where the route names the org by its slug, 403
+ *       where it knows the org from a row it read); no service-key request,
+ *       no Cloudflare request and no write of any kind is made;
  *   (b) signed out: 401, nothing else;
  *   (c) an admin and a super owner still succeed, with the calls made;
  *   (d) a session update or delete that changes no row (RLS refused it) is
@@ -136,7 +138,7 @@ const matches = (r: Row, q: URLSearchParams) =>
   });
 
 const orgRow = (): Row => ({
-  id: ORG, name: "Org", slug: "org", sso_provider_id: "prov-old",
+  id: ORG, name: "Org", slug: "org", deleted_at: null, sso_provider_id: "prov-old",
   custom_domain: "old.example.test", custom_domain_verified: false, custom_domain_status: "pending", cf_hostname_id: "cf-old",
 });
 const MEMBERS: Row[] = [
@@ -221,8 +223,10 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   }
 
   const readFailure = () => json({ code: "XX000", message: "stub read failure" }, 500);
-  if (failRead && p === `/rest/v1/${failRead}` && select !== "role") return readFailure();
-  if (failRole && p === "/rest/v1/organization_members" && select === "role") return readFailure();
+  // The caller's own membership read (lib/auth/org-membership.ts): role and status.
+  const ownRead = select === "role,status";
+  if (failRead && p === `/rest/v1/${failRead}` && !ownRead) return readFailure();
+  if (failRole && p === "/rest/v1/organization_members" && ownRead) return readFailure();
   if (deletedAway && (p === "/rest/v1/course_assignments" || p === "/rest/v1/learning_path_assignments")) {
     return deletedAway === "fails" ? readFailure() : list([]);
   }
@@ -231,14 +235,14 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return list([{ ...orgRow(), ...(orgSaved ?? {}) }].filter((r) => matches(r, q)));
   }
   if (p === "/rest/v1/organization_members") {
-    if (select === "role") {
+    if (ownRead) {
       // The caller's own membership rows, filtered as asked (org and user).
       const mine: Row[] = [];
-      if (role) mine.push({ user_id: ME.id, organization_id: ORG, role });
-      if (otherRole) mine.push({ user_id: ME.id, organization_id: OTHER_ORG, role: otherRole });
+      if (role) mine.push({ user_id: ME.id, organization_id: ORG, role, status: "active" });
+      if (otherRole) mine.push({ user_id: ME.id, organization_id: OTHER_ORG, role: otherRole, status: "active" });
       const hit = mine.filter((r) => matches(r, q));
       if (asObject && hit.length > 1) return json({ code: "PGRST116", message: "multiple rows" }, 406);
-      return list(hit.map((r) => ({ role: r.role })));
+      return list(hit.map((r) => ({ role: r.role, status: r.status })));
     }
     return list(MEMBERS.filter((r) => matches(r, q)));
   }
@@ -291,23 +295,24 @@ async function main() {
     const del = (u: string) => new Request(`http://lms.test${u}`, { method: "DELETE" });
     const params = (id: string) => ({ params: Promise.resolve({ id }) });
 
-    type Call = { name: string; run: () => Promise<Response>; table: string; verb: "PATCH" | "DELETE" | "POST" };
+    /** bySlug: the route names the org by its slug (requireOrgAdminApi); otherwise it knows the org from a row (isOrgAdminCaller). */
+    type Call = { name: string; run: () => Promise<Response>; table: string; verb: "PATCH" | "DELETE" | "POST"; bySlug: boolean };
     const CALLS: Call[] = [
-      { name: "POST /api/org/sso (configure)", table: "organizations", verb: "PATCH",
+      { name: "POST /api/org/sso (configure)", table: "organizations", verb: "PATCH", bySlug: true,
         run: () => sso.POST(post("/api/org/sso", { orgSlug: "org", action: "configure", metadataUrl: "https://idp.example.test/metadata", domains: ["acme.test"] })) },
-      { name: "POST /api/org/sso (disable)", table: "organizations", verb: "PATCH",
+      { name: "POST /api/org/sso (disable)", table: "organizations", verb: "PATCH", bySlug: true,
         run: () => sso.POST(post("/api/org/sso", { orgSlug: "org", action: "disable" })) },
-      { name: "POST /api/org/branding (domain change)", table: "organizations", verb: "PATCH",
+      { name: "POST /api/org/branding (domain change)", table: "organizations", verb: "PATCH", bySlug: true,
         run: () => branding.POST(post("/api/org/branding", { orgSlug: "org", name: "New name", custom_domain: "learn.acme.test" })) },
-      { name: "POST /api/org/branding/domain-status", table: "organizations", verb: "PATCH",
+      { name: "POST /api/org/branding/domain-status", table: "organizations", verb: "PATCH", bySlug: true,
         run: () => domainStatus.POST(post("/api/org/branding/domain-status", { orgSlug: "org" })) },
-      { name: "DELETE /api/assignments/{id}", table: "course_assignments", verb: "DELETE",
+      { name: "DELETE /api/assignments/{id}", table: "course_assignments", verb: "DELETE", bySlug: false,
         run: () => assignment.DELETE(del("/api/assignments/a1"), params("a1")) },
-      { name: "DELETE /api/learning-path-assignments/{id}", table: "learning_path_assignments", verb: "DELETE",
+      { name: "DELETE /api/learning-path-assignments/{id}", table: "learning_path_assignments", verb: "DELETE", bySlug: false,
         run: () => pathAssignment.DELETE(del("/api/learning-path-assignments/pa1"), params("pa1")) },
-      { name: "POST /api/learning-path-assignments", table: "learning_path_assignments", verb: "POST",
+      { name: "POST /api/learning-path-assignments", table: "learning_path_assignments", verb: "POST", bySlug: true,
         run: () => pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, assignToOrg: true, userIds: ["u-2"], scopes: [{ vertical: "Sales" }] })) },
-      { name: "POST /api/learning-paths/{id}/courses (notify_update)", table: "learning_path_courses", verb: "POST",
+      { name: "POST /api/learning-paths/{id}/courses (notify_update)", table: "learning_path_courses", verb: "POST", bySlug: false,
         run: () => pathCourses.POST(post(`/api/learning-paths/${PATH}/courses`, { courseId: COURSE, notify_update: true }), params(PATH)) },
     ];
 
@@ -334,13 +339,14 @@ async function main() {
       return { status: res.status, body: (await res.json()) as Row };
     };
 
-    console.log("\n(a) refused: a plain member, a data analyst, a caller with no membership — 403, no service-role, external or write call");
+    console.log("\n(a) refused: a plain member, a data analyst (403), a caller with no membership (a non-member's answer) — no service-role, external or write call");
     for (const c of CALLS) {
       for (const r of ["user", "data_analyst", null]) {
         const out = await call(c, { role: r });
-        eq(`${c.name} as ${r ?? "no membership"}: 403 with an error, no service-key / Cloudflare / write request`,
+        const want = r === null && c.bySlug ? 404 : 403;
+        eq(`${c.name} as ${r ?? "no membership"}: ${want} with an error, no service-key / Cloudflare / write request`,
           [out.status, typeof out.body.error, out.body.ok ?? null, serviceCalls().length, external().length, writes().length],
-          [403, "string", null, 0, 0, 0]);
+          [want, "string", null, 0, 0, 0]);
       }
     }
 

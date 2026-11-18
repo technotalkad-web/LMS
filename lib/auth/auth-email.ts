@@ -1,6 +1,7 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { dispatchResend, resendConfigured } from "@/lib/email/resend";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 
 /**
  * White-label auth emails.
@@ -21,11 +22,12 @@ import { dispatchResend, resendConfigured } from "@/lib/email/resend";
  *
  * A tenant-branded sign-in link is sent only to a member of that
  * organisation. "Member" is the rule the tenant pages use to let a signed-in
- * user in (lib/auth/require-org-access.ts): an organization_members row for
- * the organisation and the user, whatever its status. Anyone else, and any
- * lookup that fails, gets the generic platform sign-in email instead (the
- * global sender, no tenant branding, no tenant SMTP, no row in that
- * organisation's notification log).
+ * user in (lib/auth/require-org-access.ts, ADR 0030): a membership that
+ * counts, an active organization_members row in an organisation that is not
+ * deleted. Anyone else, and any lookup that fails, gets the generic platform
+ * sign-in email instead (the global sender, no tenant branding, no tenant
+ * SMTP, no row in that organisation's notification log): the person's own
+ * sign-in link, never the organisation's mail.
  */
 
 type AuthLinkType = "invite" | "magiclink";
@@ -46,15 +48,10 @@ function signInLink(origin: string, tokenHash: string, type: AuthLinkType, next:
   );
 }
 
-/** True only when the user holds a membership row in the organisation; false on any error. */
+/** True only when the user holds a membership in the organisation that counts; false otherwise and on any failed read. */
 async function isMember(client: SupabaseClient, organizationId: string, userId: string): Promise<boolean> {
-  const { data, error } = await client
-    .from("organization_members")
-    .select("user_id")
-    .eq("organization_id", organizationId)
-    .eq("user_id", userId)
-    .limit(1);
-  return !error && (data?.length ?? 0) > 0;
+  const m = await resolveOrgMembership(client, { id: organizationId }, userId);
+  return typeof m === "object";
 }
 
 /** The generic platform sign-in email (global Resend sender). True when it was sent. */

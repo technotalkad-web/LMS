@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { accessUnreadableAnswer, requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import {
   contentNotFound,
@@ -32,7 +32,9 @@ export async function GET(
   const { org: orgSlug, courseId, path: pathSegments } = await params;
 
   // Auth
-  const { user, org } = await requireOrgAccess(orgSlug);
+  const access = await requireOrgAccess(orgSlug).catch(accessUnreadableAnswer);
+  if (access instanceof Response) return access;
+  const { user, org } = access;
 
   const supabase = await createClient();
   const version = await legacyCourseVersion(supabase, org.id, user.id, courseId);

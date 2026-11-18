@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { isSupportedLanguage } from "@/lib/i18n/languages";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
@@ -144,9 +146,14 @@ export async function PUT(
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: org } = await supabase
-    .from("organizations").select("id").eq("slug", body.orgSlug).maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  // ADR 0030: the caller must hold a membership in this org that counts
+  // (active, in an org that is not deleted), before any service-role call.
+  // Anything else gets the answer a signed-in non-member gets, and nothing
+  // is written; a check that cannot be read answers 503 and writes nothing.
+  const membership = await resolveOrgMembership(supabase, { slug: body.orgSlug }, user.id);
+  if (membership === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (membership === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = membership.org;
 
   // Verify the course exists in this org.
   const { data: course } = await supabase

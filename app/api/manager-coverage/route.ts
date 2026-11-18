@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadOrgGovernance } from "@/lib/org/field-options";
 import { checkScopeTarget } from "@/lib/org/scope-groups";
@@ -20,11 +22,13 @@ async function ctx(orgSlug: string | null) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { error: "Unauthorized", status: 401 as const };
-  const { data: org } = await supabase.from("organizations").select("id, slug").eq("slug", orgSlug).maybeSingle();
-  if (!org) return { error: "Organization not found", status: 404 as const };
-  const { data: mem } = await supabase.from("organization_members").select("role, status").eq("organization_id", org.id).eq("user_id", user.id).maybeSingle();
-  const m = mem as { role: string; status: string } | null;
-  if (!m || m.status !== "active" || !["super_owner", "owner", "admin"].includes(m.role)) return { error: "Forbidden", status: 403 as const };
+  // ADR 0030: a membership that counts (active, in an org that is not
+  // deleted); anything else is answered as a signed-in non-member is.
+  const m = await resolveOrgMembership<{ id: string; slug: string }>(supabase, { slug: orgSlug }, user.id, "id, slug");
+  if (m === "unreadable") return { error: CHECK_FAILED, status: 503 as const };
+  if (m === "none") return { error: "Organization not found", status: 404 as const };
+  const org = m.org;
+  if (!["super_owner", "owner", "admin"].includes(m.role)) return { error: "Forbidden", status: 403 as const };
   const svc = createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
   return { svc, org: org as { id: string; slug: string }, user };
 }

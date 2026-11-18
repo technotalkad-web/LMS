@@ -340,10 +340,11 @@ console.log("\n(viii) \"Re-run check\" shows for exactly the roles the certify r
     /if\s*\(!canRerunCertification\(role\)\)\s*\{\s*return NextResponse\.json\(\{\s*error:\s*"super_owner_required"\s*\},\s*\{\s*status:\s*403\s*\}\);/.test(route) &&
       /const\s*\{[^}]*\brole\b[^}]*\}\s*=\s*auth;/.test(route) && /=\s*await requireOrgAdminApi\(/.test(route), true);
   eq("the route compares no role literal itself", /\brole\s*[!=]==?\s*"/.test(route), false);
-  eq("the page feeds it the RAW organization_members.role of the signed-in user, read as requireOrgAdminApi reads it",
-    /\.from\("organization_members"\)\s*\.select\("role"\)\s*\.eq\("organization_id",\s*org\.id\)\s*\.eq\("user_id",\s*user\.id\)\s*\.maybeSingle\(\)/.test(page) &&
-      /rerunAllowed\s*=\s*canRerunCertification\(\(membership as [^)]*\)\?\.role\);/.test(page), true);
-  eq("the page reads it only with the flag on: if (showTiers) { … }", /if\s*\(showTiers\)\s*\{\s*const\s*\{\s*data:\s*membership\s*\}/.test(page), true);
+  // ADR 0030: both read it through lib/auth/org-membership.ts (requireOrgAdminApi calls the same resolver).
+  eq("the page feeds it the RAW role of the signed-in user's membership that counts, read as requireOrgAdminApi reads it",
+    /const membership = await resolveOrgMembership\(supabase,\s*\{\s*id:\s*org\.id\s*\},\s*user\.id\);/.test(page) &&
+      /rerunAllowed\s*=\s*typeof membership === "object" && canRerunCertification\(membership\.role\);/.test(page), true);
+  eq("the page reads it only with the flag on: if (showTiers) { … }", /if\s*\(showTiers\)\s*\{\s*const membership = await resolveOrgMembership\(/.test(page), true);
   eq("the button's predicate starts from it, never from the normalised role",
     /const canRerun\s*=\s*rerunAllowed\s*&&/.test(page) && !/\brole\s*===?\s*"super_owner"/.test(page), true);
 }

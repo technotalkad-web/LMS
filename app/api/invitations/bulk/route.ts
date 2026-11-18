@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 
 /**
@@ -32,24 +34,22 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, allowed_email_domains")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const callerMem = await resolveOrgMembership<{ id: string; allowed_email_domains: string[] | null }>(
+    supabase,
+    { slug: orgSlug },
+    user.id,
+    "id, allowed_email_domains"
+  );
+  if (callerMem === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (callerMem === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = callerMem.org;
 
   // ---- Admin gate (parity with the single POST /api/invitations) ----
   // The `invitations` admin-only RLS policy already blocks non-admin inserts,
   // but check explicitly so a non-admin gets a clean 403 instead of a 200
   // with every row errored — and so the gate doesn't silently depend on RLS.
-  const { data: callerMem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const cr = callerMem?.role as string | undefined;
+  const cr = callerMem.role;
   if (!(cr === "super_owner" || cr === "owner" || cr === "admin")) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }

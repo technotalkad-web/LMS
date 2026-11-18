@@ -2,9 +2,10 @@
  * A tenant-branded sign-in link is sent only to a member of that
  * organisation. POST /api/auth/magic-link with an orgSlug uses the tenant
  * pipeline (tenant SMTP, tenant branding, a row in that organisation's
- * notification log) only when the address belongs to a member: an
- * organization_members row for the organisation and the user, whatever its
- * status, the rule the tenant pages use (lib/auth/require-org-access.ts).
+ * notification log) only when the address belongs to a member: a
+ * membership that counts (ADR 0030: an active organization_members row in
+ * an organisation that is not deleted), the rule the tenant pages use
+ * (lib/auth/require-org-access.ts, through lib/auth/org-membership.ts).
  * Anyone else gets the generic platform email; the answer is { ok: true } in
  * every case, so the form tells nobody who is a member.
  *
@@ -78,7 +79,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
   if (p === "/rest/v1/organizations") {
     const slug = eqOf(url.searchParams, "slug");
-    if (slug === "org") return json([{ id: ORG, slug: "org", name: "Org" }]);
+    const id = eqOf(url.searchParams, "id");
+    if (slug === "org" || id === ORG) return json([{ id: ORG, slug: "org", name: "Org", deleted_at: null }]);
+    if (id === OTHER_ORG) return json([{ id: OTHER_ORG, slug: "other", name: "Other", deleted_at: null }]);
     return json([]);
   }
   if (p === "/rest/v1/organization_members") {
@@ -87,7 +90,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     const uid = eqOf(url.searchParams, "user_id");
     // PostgREST semantics: without an organisation filter, a membership anywhere matches.
     const orgs = url.searchParams.has("organization_id") ? [org] : Object.keys(MEMBERS);
-    return json(orgs.some((o) => (MEMBERS[o] ?? []).includes(uid)) ? [{ user_id: uid }] : []);
+    return json(orgs.some((o) => (MEMBERS[o] ?? []).includes(uid)) ? [{ user_id: uid, role: "user", status: "active" }] : []);
   }
   if (p === "/rest/v1/notification_settings") return json([{ smtp_host: "smtp.stub.test", smtp_port: 587, smtp_secure: false, from_email: "noreply@example.test", from_name: "Org", email_paused: false, event_paused: {} }]);
   if (p === "/rest/v1/notification_templates") return json([]);

@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendNotification } from "@/lib/notifications/send";
 import { resolveEmails } from "@/lib/users/emails";
@@ -56,23 +58,21 @@ export async function POST(request: Request) {
   } = await supabase.auth.getUser();
   if (!caller) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: orgRaw } = await supabase
-    .from("organizations")
-    .select("id, name, slug")
-    .eq("slug", body.orgSlug)
-    .maybeSingle();
-  if (!orgRaw) {
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const callerMem = await resolveOrgMembership<{ id: string; name: string; slug: string }>(
+    supabase,
+    { slug: body.orgSlug },
+    caller.id,
+    "id, name, slug"
+  );
+  if (callerMem === "unreadable") {
+    return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  }
+  if (callerMem === "none") {
     return NextResponse.json({ error: "Org not found" }, { status: 404 });
   }
-  const org = orgRaw as { id: string; name: string; slug: string };
-
-  const { data: callerMem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", caller.id)
-    .maybeSingle();
-  const r = callerMem?.role as string | undefined;
+  const org = callerMem.org;
+  const r = callerMem.role;
   const canWrite = r === "super_owner" || r === "owner" || r === "admin";
   if (!canWrite) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 

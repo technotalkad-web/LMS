@@ -100,13 +100,14 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/notification_settings") return json([settings]);
   if (p === "/rest/v1/notification_templates") return json(template ? [template] : []);
   if (p === "/rest/v1/notification_log") return json([], 201);
-  if (p === "/rest/v1/organizations") return json([{ id: ORG, name: "Org", slug: "org", allowed_email_domains: [] }]);
+  if (p === "/rest/v1/organizations") return json([{ id: ORG, name: "Org", slug: "org", allowed_email_domains: [], deleted_at: null }]);
   if (p === "/rest/v1/organization_members") {
     if (method !== "GET") return json([], 201);
-    if (select === "role") return json([{ role: "super_owner" }]);
+    // The caller's own row (lib/auth/org-membership.ts: role and status).
+    if (select === "role,status" && eqOf(url.searchParams, "user_id") === ME.id) return json([{ role: "super_owner", status: "active" }]);
     if (select.includes("organizations(")) return json([{ organization_id: ORG, organizations: { name: "Org" } }]);
     const uid = eqOf(url.searchParams, "user_id");
-    if (uid) return json(members.has(uid) ? [{ user_id: uid }] : []);
+    if (uid) return json(members.has(uid) ? [{ user_id: uid, role: "user", status: "active" }] : []);
     return json([]);
   }
   // A platform owner whose row does not require the second factor (as the e2e

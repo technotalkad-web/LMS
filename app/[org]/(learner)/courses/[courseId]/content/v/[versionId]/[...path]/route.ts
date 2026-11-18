@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { accessUnreadableAnswer, requireOrgAccess } from "@/lib/auth/require-org-access";
 import { createClient } from "@/lib/supabase/server";
 import {
   UUID_RE,
@@ -30,7 +30,9 @@ export async function GET(
   }
 ) {
   const { org: orgSlug, courseId, versionId, path: pathSegments } = await params;
-  const { user, org } = await requireOrgAccess(orgSlug);
+  const access = await requireOrgAccess(orgSlug).catch(accessUnreadableAnswer);
+  if (access instanceof Response) return access;
+  const { user, org } = access;
   const supabase = await createClient();
 
   // A pre-versioning package whose top-level folder is literally "v" lands
