@@ -20,20 +20,30 @@
  *     person X (an active learner here), and a platform owner with an
  *     inactive row and one with an active row;
  *   B, live: an active administrator, and X's row (an administrator's), inactive;
- *   D: an active administrator, read before and after D is soft-deleted;
+ *   D: an active administrator and an active learner, both added before D
+ *     is soft-deleted; before the delete the administrator reads D, the
+ *     learner's member row and the learner's profile (the control that lets
+ *     the reads after the delete fail);
  *   a signed-in person with no membership (the outsider), and a platform
  *   owner with no row in A.
  *
  * Cases (each refused answer is compared with the outsider's on the same
  * organisation, and a page also with an unknown organisation address):
  *   (1) the inactive administrator, the suspended administrator, the inactive
- *       learner, the inactive data analyst, and D's administrator after the
- *       soft delete: the data API (the organisation row, its courses, other
- *       members' rows and profiles, the four helpers), a learner page, an
- *       admin page and a route guarded by row security alone (POST
- *       /api/folders) answer as for the outsider; the control reads and
- *       writes as today. A person still reads their own membership row
- *       (decision 5).
+ *       learner, the inactive data analyst, and D's administrator and D's
+ *       learner after the soft delete: the data API (the organisation row,
+ *       its courses, other members' rows and profiles, the four helpers), a
+ *       learner page, an admin page and a route guarded by row security alone
+ *       (POST /api/folders, the administrators only) answer as for the
+ *       outsider; the control reads and writes as today. A person still reads
+ *       their own membership row (decision 5). The profile read names a
+ *       co-member of the person's own organisation: A's control for A's
+ *       people, D's learner for D's administrator (whose zero count of other
+ *       members' rows now has that learner's row behind it), and D's
+ *       administrator for D's learner. The profile and other-member reads
+ *       prove nothing for the learners and the data analyst, who never had
+ *       them; the organisation row, the courses and the helpers carry those
+ *       people.
  *   (2) a status changed in mid-session is refused at the next request and
  *       restored when set back (page, data API).
  *   (3) X, an active learner in A who holds an inactive administrator row in
@@ -268,6 +278,7 @@ test.describe.serial("ADR 0030 spec 80: membership status, the database group (0
       ["x", s.a, "user", "active"],
       ["adminB", s.b, "admin", "active"],
       ["deletedAdmin", s.d, "admin", "active"],
+      ["deletedLearner", s.d, "user", "active"],
       ["outsider", null, "user", "active"],
       ["poNone", null, "user", "active"],
       ["poInactive", s.a, "user", "inactive"],
@@ -292,9 +303,14 @@ test.describe.serial("ADR 0030 spec 80: membership status, the database group (0
       s.platformOwners.push(u(key).id);
     }
 
-    // D's control, before the soft delete: its administrator reads D
+    // D's control, before the soft delete: its administrator reads D, D's
+    // learner's member row and that learner's profile. Without it the reads of
+    // case (1) after the delete could not fail.
     const dDb = await sessionDb(u("deletedAdmin"));
-    expect((await reads(dDb, s.d.id, u("deletedAdmin").id)).org, "D's administrator reads D before the soft delete").toBe(1);
+    const dBefore = await reads(dDb, s.d.id, u("deletedAdmin").id);
+    expect(dBefore.org, "D's administrator reads D before the soft delete").toBe(1);
+    expect(dBefore.others, "D's administrator reads D's learner's member row before the soft delete").toBe(1);
+    expect(await canReadProfile(dDb, u("deletedLearner").id), "D's administrator reads D's learner's profile before the soft delete").toBe(true);
     const now = Date.now();
     const { error: delErr } = await svc()
       .from("organizations")
@@ -329,15 +345,20 @@ test.describe.serial("ADR 0030 spec 80: membership status, the database group (0
     expect([control.member, control.admin], "control: is_org_member, is_org_admin").toEqual([true, true]);
     expect(await canReadProfile(s.db.admin, u("inactiveLearner").id), "control: the inactive learner's profile").toBe(true);
 
-    for (const [key, org, outsider] of [
-      ["inactiveAdmin", s.a!, outsiderA],
-      ["suspendedAdmin", s.a!, outsiderA],
-      ["inactiveLearner", s.a!, outsiderA],
-      ["inactiveAnalyst", s.a!, outsiderA],
-      ["deletedAdmin", s.d!, outsiderD],
-    ] as Array<[string, SeededOrg, Reads]>) {
+    // The last field names the co-member whose profile is read. D's
+    // administrator names D's learner, whose row and profile the seed's control
+    // read before the delete, so its zero count and its refused profile read
+    // here can fail.
+    for (const [key, org, outsider, coMember] of [
+      ["inactiveAdmin", s.a!, outsiderA, "admin"],
+      ["suspendedAdmin", s.a!, outsiderA, "admin"],
+      ["inactiveLearner", s.a!, outsiderA, "admin"],
+      ["inactiveAnalyst", s.a!, outsiderA, "admin"],
+      ["deletedAdmin", s.d!, outsiderD, "deletedLearner"],
+      ["deletedLearner", s.d!, outsiderD, "deletedAdmin"],
+    ] as Array<[string, SeededOrg, Reads, string]>) {
       expect(await reads(s.db[key], org.id, u(key).id), `${key}: as the outsider`).toEqual(outsider);
-      expect(await canReadProfile(s.db[key], u("admin").id), `${key}: no co-member's profile`).toBe(false);
+      expect(await canReadProfile(s.db[key], u(coMember).id), `${key}: no co-member's profile (${coMember})`).toBe(false);
       const { data: own, error } = await s.db[key].from("organization_members").select("status").eq("organization_id", org.id).eq("user_id", u(key).id);
       expect(error, error?.message).toBeNull();
       expect((own ?? []).length, `${key}: still reads their own membership row`).toBe(1);
@@ -358,6 +379,7 @@ test.describe.serial("ADR 0030 spec 80: membership status, the database group (0
         ["inactiveLearner", s.a!],
         ["inactiveAnalyst", s.a!],
         ["deletedAdmin", s.d!],
+        ["deletedLearner", s.d!],
       ] as Array<[string, SeededOrg]>) {
         expect(await pageOutcome(s.ctx[key], page(org)), `${key} on ${page(org)}`).toBe(outsiderA);
       }
