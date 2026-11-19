@@ -2,6 +2,11 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { CHECK_FAILED } from "@/lib/auth/api-admin";
 import { resolveOrgMembership } from "@/lib/auth/org-membership";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE,
+} from "@/lib/attempts/abandon";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 
 /**
@@ -21,6 +26,12 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
  *   - only a super owner may appoint a super owner, or modify / remove one
  *   - nobody can remove themselves
  *   - the org's last super owner cannot be demoted or removed
+ *
+ * ADR 0030 decision 4: a removal ends that person's open launches in this
+ * organisation, as a deactivation does. After the row is deleted, their
+ * live cmi5/xAPI launch tokens here are expired. If that fails the removal
+ * stands; it is logged with ids only and the answer adds
+ * `tokens_expired: false` and a line in `warnings`.
  */
 const VALID_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
 type ValidRole = (typeof VALID_ROLES)[number];
@@ -155,7 +166,8 @@ export async function DELETE(
     );
   }
 
-  const { data, error } = await svc()
+  const s = svc();
+  const { data, error } = await s
     .from("organization_members")
     .delete()
     .eq("organization_id", ctx.orgId)
@@ -164,6 +176,12 @@ export async function DELETE(
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
   if (!data?.length) {
     return NextResponse.json({ error: "Member was not removed (not found)" }, { status: 404 });
+  }
+  // Decision 4: the removed person's open launches here end now.
+  const tokErr = await expireLaunchTokensForMembers(s, ctx.orgId, [userId]);
+  if (tokErr) {
+    logLaunchTokenExpiryFailed("organization-members/[userId] DELETE", ctx.orgId, [userId], tokErr);
+    return NextResponse.json({ ok: true, tokens_expired: false, warnings: [LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE] });
   }
   return NextResponse.json({ ok: true });
 }

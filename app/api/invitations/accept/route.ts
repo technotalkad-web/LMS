@@ -124,10 +124,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Failed to resolve user" }, { status: 500 });
   }
 
-  // 3) Write membership (idempotent). The write names the role and never
-  // the status: a new row starts active, and an existing row keeps its
-  // status, so accepting an invitation never brings back a person whose
-  // membership was made inactive. An administrator does that on purpose.
+  // 3) Write membership (idempotent). Neither write names the status: a new
+  // row starts active, and an existing row keeps its status, so accepting
+  // an invitation never brings back a person whose membership was made
+  // inactive. An administrator does that on purpose (ADR 0030 rule 9).
+  // A row that is not active is not written at all: the invitation's role
+  // is not left on it for a later reactivation to grant without anyone
+  // choosing it. An active row takes the invitation's role, as before.
   await svc
     .from("organization_members")
     .upsert(
@@ -136,8 +139,14 @@ export async function POST(request: Request) {
         user_id: userId,
         role: invitation.role,
       },
-      { onConflict: "organization_id,user_id" }
+      { onConflict: "organization_id,user_id", ignoreDuplicates: true }
     );
+  await svc
+    .from("organization_members")
+    .update({ role: invitation.role })
+    .eq("organization_id", invitation.organization_id)
+    .eq("user_id", userId)
+    .eq("status", "active");
 
   // 4) Mark invitation accepted.
   await svc

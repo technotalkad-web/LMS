@@ -182,11 +182,13 @@ export function LearnersClient({
       `/api/organization-members/${userId}?orgSlug=${orgSlug}`,
       { method: "DELETE" }
     );
+    const j = (await res.json().catch(() => ({}))) as { error?: string; warnings?: string[] };
     if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
       toast.error(j.error ?? "Failed");
       return;
     }
+    // The removal stands; say so when their open course launches could not be closed.
+    for (const w of j.warnings ?? []) toast.info(w);
     router.refresh();
   }
 

@@ -64,6 +64,13 @@ export async function expireLaunchTokens(
 }
 
 /**
+ * The user ids in one token read of expireLaunchTokensForMembers: the
+ * `.in()` house rule of lib/db/chunked.ts (150), since the ids travel in
+ * the read's URL as an embedded filter.
+ */
+export const MEMBER_TOKEN_CHUNK = 150;
+
+/**
  * ADR 0030 decision 4: a deactivation ends that person's open launches.
  *
  * Expire every still-live cmi5/xAPI launch token of these people's attempts
@@ -71,14 +78,15 @@ export async function expireLaunchTokens(
  * refuse only an abandoned attempt, so a completed attempt with a live token
  * could still be written to; that is why the tokens are found by being live
  * and not by the attempt's status. One read of the live tokens, found
- * through the attempt's user and organisation (user ids in chunks of 200,
- * each read paged), then the existing expiry above. The attempts are not
- * touched and nothing is queued.
+ * through the attempt's user and organisation (user ids in chunks of
+ * MEMBER_TOKEN_CHUNK, each read paged), then the existing expiry above. The
+ * attempts are not touched and nothing is queued.
  *
  * Called by each writer that leaves a membership row in a status other than
- * `active`, in the same request and after that write. Returns the first
- * error and never throws: the deactivation already happened and stands,
- * and the caller logs the ids and reports the failure in its answer.
+ * `active`, and by the two routes that remove a membership row, in the same
+ * request and after that write. Returns the first error and never throws:
+ * the deactivation or removal already happened and stands, and the caller
+ * logs the ids and reports the failure in its answer.
  */
 export async function expireLaunchTokensForMembers(
   svc: SupabaseClient,
@@ -90,7 +98,7 @@ export async function expireLaunchTokensForMembers(
   try {
     const nowIso = new Date().toISOString();
     const attemptIds = new Set<string>();
-    for (const part of chunk(ids, 200)) {
+    for (const part of chunk(ids, MEMBER_TOKEN_CHUNK)) {
       const live = await fetchAll<{ attempt_id: string }>(
         svc,
         "cmi5_launch_tokens",
@@ -131,3 +139,7 @@ export function logLaunchTokenExpiryFailed(
 /** The line a Users form shows when the expiry failed. */
 export const LAUNCH_TOKENS_NOT_EXPIRED =
   "Saved, but their open course launches could not be closed. Each one stops on its own within 24 hours of its launch.";
+
+/** The same line after a member is removed. */
+export const LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE =
+  "Removed, but their open course launches could not be closed. Each one stops on its own within 24 hours of its launch.";

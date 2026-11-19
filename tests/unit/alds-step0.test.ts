@@ -6,7 +6,7 @@
  *   P5  the analytics ?content= guard (contentFilterInOrg)
  * And ADR 0030 decision 4: expireLaunchTokensForMembers finds the live
  * tokens of these people's attempts in one organisation, whatever the
- * attempt's status, in chunks of 200 people with each read paged, hands the
+ * attempt's status, in chunks of 150 people with each read paged, hands the
  * attempt ids to the existing expiry, touches no other table, and returns
  * an error rather than throwing.
  * No DB: a recording fake stands in for the supabase-js query builder.
@@ -308,7 +308,7 @@ async function main() {
     const r = await expireLaunchTokensForMembers(client, "o1", [...people, "u0", ""]);
     eq("no error", r, null);
     const rd = tokenReads(queries);
-    eq("one read per 200 distinct people: 3 reads", rd.map((q) => inList(q).length), [200, 200, 50]);
+    eq("one read per 150 distinct people (the house .in() rule): 3 reads", rd.map((q) => inList(q).length), [150, 150, 150]);
     eq("…every person read once", new Set(rd.flatMap(inList)).size, 450);
     eq("…the read is of cmi5_launch_tokens, the attempt through an inner embed",
       [rd.every((q) => q.table === "cmi5_launch_tokens"), argsOf(rd[0], "select")[0]?.[0]],

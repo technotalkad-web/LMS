@@ -45,8 +45,9 @@
  *       organisation gets the answer an unknown token gets, also when it is
  *       expired or accepted, with no account call, no write and no sign-in;
  *       a failed read answers 503 with none of those; an accepted
- *       invitation writes the role and never the status, so an inactive or
- *       suspended row stays as it was, and a new row starts active; the
+ *       invitation never writes the status: an inactive or suspended row
+ *       stays as it was, its role included, an active row takes the
+ *       invitation's role, and a new row starts active; the
  *       page shows a deleted organisation's invitation as not found and
  *       does not name it;
  *   (j) decision 4 in the four writers that can leave a row not active
@@ -58,10 +59,13 @@
  *       token in another organisation and another member's token are left
  *       as they were, and no attempt is written; a write that leaves the
  *       row active reads no token; the bulk upload makes one call after its
- *       loop, keyed on each person's last written status, in chunks of 200;
+ *       loop, keyed on each person's last written status, in chunks of 150;
  *       a failed expiry leaves the deactivation standing, is logged with
  *       ids only and is reported in the answer (`tokens_expired: false`,
- *       and a line the admin sees);
+ *       and a line the admin sees); the two routes that remove a member row
+ *       (DELETE /api/organization-members/[userId] and the console's
+ *       DELETE /api/super/tenants/[id]/admins) do the same after the row is
+ *       deleted, and a removal that finds no row reads no token;
  *   (k) rule 10, the organisation's mail goes only to memberships that
  *       count: a welcome only for a row written active (POST /api/users,
  *       the bulk upload) and never into a deleted organisation (the
@@ -195,7 +199,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/user") return signedIn ? json(ME) : json({ message: "no session" }, 401);
   if (p.startsWith("/auth/v1/")) return authServer(method, p, body);
   if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
-  if (method !== "GET") return write(method, table, q, body);
+  if (method !== "GET") return write(method, table, q, body, h.get("prefer") ?? "");
   if (failing.has(table)) return json({ code: "XX000", message: "stub read failure" }, 500);
   const page = (rows: Row[]) => {
     const offset = Number(q.get("offset") ?? 0);
@@ -264,18 +268,26 @@ function authServer(method: string, p: string, body: unknown): Response {
 }
 /**
  * A write. An upsert of a member row merges the columns it names into the
- * row it meets (PostgREST's merge-duplicates), and a new row takes the
- * column default, status 'active'. A PATCH changes the rows it matches.
+ * row it meets (PostgREST's merge-duplicates), or leaves that row as it is
+ * when it asks to ignore duplicates; a new row takes the column default,
+ * status 'active'. A PATCH changes the rows it matches. A DELETE of member
+ * rows removes the rows it matches and, when it selects, answers them.
  */
-function write(method: string, table: string, q: URLSearchParams, body: unknown): Response {
+function write(method: string, table: string, q: URLSearchParams, body: unknown, prefer = ""): Response {
   if (failing.has(`${method} ${table}`)) return json({ code: "XX000", message: "stub write failure" }, 500);
   if (table === "organization_members" && method === "POST") {
+    const ignoreDuplicates = /resolution=ignore-duplicates/.test(prefer);
     for (const rec of (Array.isArray(body) ? body : [body]) as Row[]) {
       const hit = members.find((r) => r.organization_id === rec.organization_id && r.user_id === rec.user_id);
-      if (hit) Object.assign(hit, rec);
+      if (hit) { if (!ignoreDuplicates) Object.assign(hit, rec); }
       else members.push({ status: "active", ...rec });
     }
     return new Response(null, { status: 201 });
+  }
+  if (table === "organization_members" && method === "DELETE") {
+    const gone = members.filter((r) => matches(r, q));
+    members = members.filter((r) => !gone.includes(r));
+    return q.has("select") ? json(gone.map((r) => project(r, q.get("select") ?? ""))) : new Response(null, { status: 204 });
   }
   if (method === "PATCH") {
     const rows =
@@ -691,13 +703,23 @@ async function main() {
           [got.status, /try again/i.test(String(got.body.error)), authCalls, writes()], [503, true, [], []]);
       }
 
+      // The invitation names the admin role; the invitee's existing row is a learner's.
+      const adminInvitation = (): Row => ({ ...invitation(LIVE), role: "admin" });
+      const memberWritesNamed = () => requests.filter((r) => r.table === "organization_members" && r.method !== "GET")
+        .map((r) => `${r.method} ${Object.keys(r.body as Row).sort().join(",")}`);
       for (const status of ["inactive", "suspended"]) {
-        world({ accounts: [INVITEE], invitations: [invitation(LIVE)], members: [row(LIVE, "user", status, INVITEE.id)] });
+        world({ accounts: [INVITEE], invitations: [adminInvitation()], members: [row(LIVE, "user", status, INVITEE.id)] });
         const got = await accept();
-        const upserts = requests.filter((r) => r.table === "organization_members" && r.method === "POST").map((r) => Object.keys(r.body as Row).sort());
         eq(`a live organisation, the invitee's row ${status}: accepted (200 ok)`, [got.status, got.body.ok], [200, true]);
-        eq("…the member write names the role and never the status", upserts, [["organization_id", "role", "user_id"]]);
-        eq(`…the row is still ${status}`, memberOf(LIVE, INVITEE.id)?.status, status);
+        eq("…the member writes name the role and never the status", memberWritesNamed(), ["POST organization_id,role,user_id", "PATCH role"]);
+        eq(`…the row is left as it was: still ${status}, and still a learner's (the invitation's role is not kept for a later reactivation)`,
+          [memberOf(LIVE, INVITEE.id)?.status, memberOf(LIVE, INVITEE.id)?.role], [status, "user"]);
+      }
+      world({ accounts: [INVITEE], invitations: [adminInvitation()], members: [row(LIVE, "user", "active", INVITEE.id)] });
+      {
+        const got = await accept();
+        eq("a live organisation, the invitee's row active: accepted, the row takes the invitation's role and stays active, as before",
+          [got.status, got.body.ok, memberOf(LIVE, INVITEE.id)?.status, memberOf(LIVE, INVITEE.id)?.role], [200, true, "active", "admin"]);
       }
       world({ accounts: [INVITEE], invitations: [invitation(LIVE)] });
       {
@@ -734,7 +756,9 @@ async function main() {
       const bulkRoute = await import("../../app/api/users/bulk/route");
       const employeesRoute = await import("../../app/api/integrations/employees/route");
       const { hashApiKey } = await import("../../lib/integrations/auth");
-      const { LAUNCH_TOKENS_NOT_EXPIRED } = await import("../../lib/attempts/abandon");
+      const memberRoute = await import("../../app/api/organization-members/[userId]/route");
+      const adminsRoute = await import("../../app/api/super/tenants/[id]/admins/route");
+      const { LAUNCH_TOKENS_NOT_EXPIRED, LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE } = await import("../../lib/attempts/abandon");
 
       const T: Account = { id: "u-t", email: "target@example.test" };
       const B: Account = { id: "u-b", email: "bystander@example.test" };
@@ -762,7 +786,8 @@ async function main() {
       ];
       const ALL_LIVE = ["f-done", "f-open", "f-other", "f-second"];
       // The session is an active administrator of LIVE; T and B are learners.
-      const writerWorld = (o: { failing?: string[]; tStatus?: string; extraAccounts?: Account[]; extraMembers?: Row[]; extraAttempts?: Row[]; extraTokens?: Row[] } = {}) => world({
+      const writerWorld = (o: { failing?: string[]; tStatus?: string; extraAccounts?: Account[]; extraMembers?: Row[]; extraAttempts?: Row[]; extraTokens?: Row[]; platformOwner?: boolean } = {}) => world({
+        platformOwner: o.platformOwner,
         accounts: [T, B, ...(o.extraAccounts ?? [])],
         members: [
           row(LIVE, "admin", "active"),
@@ -930,7 +955,7 @@ async function main() {
         eq("bulk, T's row active (the control): no token is read or changed", [got.status, memberOf(LIVE, T.id)?.status, tokenCalls(), liveTokens()], [200, "active", [], ALL_LIVE]);
       }
       {
-        // 201 people deactivated in one file: chunks of 200, still one call after the loop.
+        // 201 people deactivated in one file: chunks of 150, still one call after the loop.
         const many: Account[] = Array.from({ length: 201 }, (_, i) => ({ id: `u-m${String(i).padStart(3, "0")}`, email: `member${i}@example.test` }));
         const first = many[0], last = many[200];
         writerWorld({
@@ -942,9 +967,9 @@ async function main() {
         const got = await upload(many.map((a, i) => line(a, `E-M${i}`, "inactive")));
         const rd = requests.filter((r) => r.table === "cmi5_launch_tokens" && r.method === "GET");
         const sizes = rd.map((r) => (r.query.get("course_attempts.user_id") ?? "").replace(/^in\.\(|\)$/g, "").split(",").length);
-        eq("bulk, 201 people deactivated: 201 rows updated, two reads of 200 and 1 people, then one expiry, all after the last member write",
+        eq("bulk, 201 people deactivated: 201 rows updated, two reads of 150 and 51 people, then one expiry, all after the last member write",
           [got.status, got.body.results.filter((r) => r.status === "updated").length, sizes, tokenCalls().filter((m) => m === "PATCH").length, afterMemberWrites()],
-          [200, 201, [200, 1], 1, true]);
+          [200, 201, [150, 51], 1, true]);
         eq("…the live tokens of the first and the last person are both expired; the others' stay", liveTokens(), ALL_LIVE);
       }
       writerWorld({ failing: ["cmi5_launch_tokens"] });
@@ -981,6 +1006,50 @@ async function main() {
         const got = await leave("E-T");
         reportedForT("CRM DELETE, the token read fails", got);
         eq("…no token is expired, and the rest of the answer is as before", [liveTokens(), got.body.ok, got.body.action], [ALL_LIVE, true, "deactivated"]);
+      }
+
+      // ---- the two removals: the Users page's remove and the console's remove ----
+      // A removed membership grants nothing either; its open launches end as a deactivation's do.
+      const removeOnUsersPage = async (who = T.id) => {
+        const res = await memberRoute.DELETE(
+          new Request(`http://lms.test/api/organization-members/${who}?orgSlug=${LIVE.slug}`, { method: "DELETE" }),
+          { params: Promise.resolve({ userId: who }) }
+        );
+        return { status: res.status, body: (await res.json()) as Row };
+      };
+      const removeInConsole = async () => {
+        const res = await adminsRoute.DELETE(
+          new Request(`http://lms.test/api/super/tenants/${LIVE.id}/admins?user_id=${T.id}`, { method: "DELETE" }),
+          { params: Promise.resolve({ id: LIVE.id }) }
+        );
+        return { status: res.status, body: (await res.json()) as Row };
+      };
+      for (const [what, remove] of [
+        ["DELETE /api/organization-members/[userId]", () => removeOnUsersPage()],
+        ["the console's DELETE", removeInConsole],
+      ] as Array<[string, () => Promise<{ status: number; body: Row }>]>) {
+        writerWorld({ platformOwner: what.startsWith("the console") });
+        {
+          const got = await remove();
+          eq(`${what}, T: 200 ok, T's row in this organisation is gone`, [got.status, got.body, memberOf(LIVE, T.id) ?? null], [200, { ok: true }, null]);
+          closedForT("…");
+        }
+        writerWorld({ platformOwner: what.startsWith("the console"), failing: ["cmi5_launch_tokens"] });
+        {
+          const got = await remove();
+          eq(`${what}, the token read fails: still 200, and the removal stands`, [got.status, memberOf(LIVE, T.id) ?? null], [200, null]);
+          eq("…the answer reports it, with the line the admin sees", [got.body.tokens_expired, got.body.warnings], [false, [LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE]]);
+          eq("…no token is expired", liveTokens(), ALL_LIVE);
+          eq("…one log line, with the organisation and the person by id, no address",
+            [failureLog().map((l) => [l.organization_id, l.user_ids]), failureLog().some((l) => JSON.stringify(l).includes("@"))],
+            [[[LIVE.id, [T.id]]], false]);
+        }
+      }
+      writerWorld();
+      {
+        const got = await removeOnUsersPage("u-nobody");
+        eq("DELETE /api/organization-members/[userId], a person with no row here (the control): 404, no token is read or changed",
+          [got.status, tokenCalls(), liveTokens()], [404, [], ALL_LIVE]);
       }
     }
     console.log("\n(k) rule 10: the organisation's mail goes only to memberships that count");

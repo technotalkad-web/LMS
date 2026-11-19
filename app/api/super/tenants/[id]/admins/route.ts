@@ -5,6 +5,11 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 import { notifyBackground } from "@/lib/notifications/send";
 import { membershipCounts } from "@/lib/auth/org-membership";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE,
+} from "@/lib/attempts/abandon";
 import { originFromRequest } from "@/lib/http/origin";
 
 function generateTempPassword(): string {
@@ -250,12 +255,18 @@ export async function DELETE(
   if (!userId) {
     return NextResponse.json({ error: "user_id required" }, { status: 400 });
   }
-  const { error } = await svc()
+  const s = svc();
+  const { error } = await s
     .from("organization_members")
     .delete()
     .eq("organization_id", tenantId)
     .eq("user_id", userId);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  // ADR 0030 decision 4: a removal ends that person's open launches in the
+  // tenant, as a deactivation does. A failed expiry leaves the removal
+  // standing; it is logged with ids only and reported in the answer.
+  const tokErr = await expireLaunchTokensForMembers(s, tenantId, [userId]);
+  if (tokErr) logLaunchTokenExpiryFailed("super/tenants/[id]/admins DELETE", tenantId, [userId], tokErr);
   await auditLog({
     actorUserId: guard.userId,
     action: "tenant.remove_admin",
@@ -263,5 +274,7 @@ export async function DELETE(
     targetId: tenantId,
     metadata: { user_id: userId },
   });
-  return NextResponse.json({ ok: true });
+  return NextResponse.json(
+    tokErr ? { ok: true, tokens_expired: false, warnings: [LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE] } : { ok: true }
+  );
 }

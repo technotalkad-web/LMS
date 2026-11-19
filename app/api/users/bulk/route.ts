@@ -54,7 +54,7 @@ import { expireLaunchTokensForMembers, logLaunchTokenExpiryFailed } from "@/lib/
  *
  * After the loop, one call closes the open course launches of every person
  * whose row this upload last wrote inactive or suspended (ADR 0030 decision
- * 4; user ids in chunks of 200, never one call per row). If that fails the
+ * 4; user ids in chunks of 150, never one call per row). If that fails the
  * rows stand; the answer adds `tokens_expired: false` and a note on each of
  * those rows.
  *
