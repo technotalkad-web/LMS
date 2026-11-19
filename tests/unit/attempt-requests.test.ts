@@ -562,6 +562,43 @@ async function ticketCases() {
     eq("…one attempts read, with context_kind neq preview", f.queries.filter(isAttempts).map(filterOf), ["preview"]);
   }
   {
+    // ADR 0030 rule 10: two grants in one call read the organisation's
+    // members that count once, never once per learner. Here neither granted
+    // learner counts (only the admin's row is active), so nobody is mailed.
+    const t = withPreviews(true);
+    t.organizations = [{ id: ORG, deleted_at: null }];
+    t.organization_members = [
+      { organization_id: ORG, user_id: "admin-1", role: "admin", status: "active" },
+      { organization_id: ORG, user_id: "u1", role: "user", status: "inactive" },
+      { organization_id: ORG, user_id: "u5", role: "user", status: "suspended" },
+    ];
+    const f = fakeDb(t);
+    const out = await ticketOf(f.db);
+    const memberReads = f.queries.filter((q) => q.table === "organization_members");
+    eq("two grants: one read of the organisation and one of its active members for the call, none per learner",
+      [byUid(out).u1, byUid(out).u5, f.queries.filter((q) => q.table === "organizations").length, memberReads.length,
+        memberReads[0]?.ops.some((o) => o.op === "eq" && o.args[0] === "status" && o.args[1] === "active")],
+      ["granted", "granted", 1, 1, true]);
+  }
+  {
+    // The members that count cannot be read: the grants stand, no mail, one log line with the organisation's id.
+    const f = fakeDb(withPreviews(true), (q) => (q.table === "organizations" ? BOOM : null));
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...m: unknown[]) => { warned.push(m.map(String).join(" ")); };
+    let out: unknown;
+    try {
+      out = await ticketOf(f.db);
+    } finally {
+      console.warn = warn;
+    }
+    const lines = warned.filter((l) => l.includes("mail_recipients_unreadable"));
+    eq("the members that count cannot be read: both grants stand, read once, no member read, one log line with the organisation's id",
+      [byUid(out).u1, byUid(out).u5, f.inserts.length, f.queries.filter((q) => q.table === "organizations").length,
+        f.queries.filter((q) => q.table === "organization_members").length, lines.length, lines.every((l) => l.includes(ORG) && !l.includes("@"))],
+      ["granted", "granted", 2, 1, 0, 1, true]);
+  }
+  {
     // A database without 0107: the filter answers 42703 naming context_kind.
     const f = fakeDb(withPreviews(false), (q) => (isAttempts(q) && filterOf(q) !== null ? NO_CONTEXT : null));
     const out = await ticketOf(f.db);

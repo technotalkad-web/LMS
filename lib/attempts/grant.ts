@@ -10,6 +10,7 @@ import {
 } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from "./requests";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
 import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
@@ -38,6 +39,11 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * without 0107 the filter's missing-column error reads today's select once;
  * any other error reports every learner failed, as before. Phase 4 (step 37)
  * moves this read to readContextResult.
+ *
+ * ADR 0030 rule 10: each granted learner is mailed only while their
+ * membership counts. The organisation's members that count are read once
+ * for the call (countingMemberIds), never once per learner; when that read
+ * fails no mail is sent and the grants stand.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -137,6 +143,7 @@ export async function grantExtraAttempts(
   const days = args.expiresInDays;
   const expiresAt = expiryFromDays(days === null || (typeof days === "number" && GRANT_EXPIRY_CHOICES.includes(days)) ? days : undefined);
   const people = await namesAndEmails(svc, ids);
+  let counting: ReadonlySet<string> | "unreadable" | undefined;
   for (const uid of ids) {
     const mine = byUser.get(uid) ?? [];
     const retakeIds = retakes.get(`${uid}:${course.id}`)?.retakeIds ?? new Set<string>();
@@ -181,11 +188,21 @@ export async function grantExtraAttempts(
       continue;
     }
     results.push({ userId: uid, status: "granted" });
+    // ADR 0030 rule 10: the organisation's members that count, read once for
+    // this call at its first grant. Unreadable: no mail; the grants stand.
+    if (counting === undefined) {
+      counting = await countingMemberIds(svc, args.orgId);
+      if (counting === "unreadable") {
+        console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-grant", org_id: args.orgId }));
+      }
+    }
+    if (counting === "unreadable") continue;
     const who = people.get(uid);
     await notifyLearnerOfDecision(svc, {
       orgId: args.orgId, orgName: args.orgName, orgSlug: args.orgSlug, origin: args.origin,
       courseId: course.id, courseTitle: course.title,
       learner: { id: uid, email: who?.email ?? "" }, approved: true, note: null, expiresAt,
+      counting,
     });
   }
   return { results, courseTitle: course.title };
