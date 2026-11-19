@@ -18,9 +18,11 @@
 -- again afterwards creates the table empty, as its first paste did.
 --
 -- Row writes: the table's rows go with it. Locks: ACCESS EXCLUSIVE on the
--- table, and the foreign keys' locks on public.organizations and auth.users,
--- until commit. lock_timeout 5 s: if a lock is not granted the whole script
--- rolls back; paste it again.
+-- table and, through its two foreign keys, on public.organizations and
+-- auth.users, until commit. Reads of those two wait as well, sign-ins and
+-- nearly every page included; usually for a moment, at most a few times 5 s.
+-- Paste it at a quiet time. lock_timeout 5 s: if a lock is not granted the
+-- whole script rolls back; paste it again.
 
 begin;
 
