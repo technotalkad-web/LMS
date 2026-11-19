@@ -111,8 +111,10 @@ Each file's header is the full rule; this is the cross-file summary.
   returns a tenant's state with its sent count of the past 24 hours) and one
   index on `notification_log`. Written and rehearsed
   (`scripts/migration-rehearsal`: `0114-defaults`, `0114-no-defaults`,
-  `0114-at-0104`, `0114-with-0115`, `0114-then-0115`, `0114-drift`); **not
-  pasted on staging or production yet** (2026-11-19). The two tables are
+  `0114-at-0104`, `0114-with-0115`, `0114-then-0115`, `0114-drift`).
+  **Pasted on staging 2026-11-19** in the sitting below (the pre-check read
+  27 rows of ok or info before and after; `ops/0115-after-checks.sql`
+  passed); **not on production yet**. The two tables are
   deny-all and service-role only (select, insert, update; never delete); the
   two functions are security invoker and only the service role executes
   them. It needs nothing past 0021, and 0115 may be pasted before or after
@@ -128,8 +130,9 @@ Each file's header is the full rule; this is the cross-file summary.
   deny-all table for the LMS's own "set your password" links (rule N9).
   `service_role` may select the table, insert five named columns and update
   two, and has no delete, so only the database decides when a link expires.
-  Written and rehearsed (`0117-defaults`, `0117-no-defaults`); **not pasted
-  on staging or production yet** (2026-11-19). It needs only
+  Written and rehearsed (`0117-defaults`, `0117-no-defaults`). **Pasted on
+  staging 2026-11-19**, right after 0114 in the same sitting; **not on
+  production yet**. It needs only
   `public.organizations` and `auth.users`. It **must** be pasted ahead of
   pull request B's code (code that comes first turns away an add with no
   password before creating any account). Rows older than 90 days are
@@ -159,7 +162,8 @@ Each file's header is the full rule; this is the cross-file summary.
      passed.
   3. Paste 0117 in full.
   4. Run `ops/0115-after-checks.sql` by itself, once, as after any sitting
-     ("DO" then "ROLLBACK" is a pass).
+     (a pass reads "Success. No rows returned" in the SQL editor, or "DO"
+     then "ROLLBACK" in psql).
   5. Run the pre-check again: all rows `ok` or `info`, with P19 showing
      both files pasted. Note the date on this page.
 
