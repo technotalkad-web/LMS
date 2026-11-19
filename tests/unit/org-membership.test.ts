@@ -558,6 +558,19 @@ async function main() {
       ], [true, true, true, true, true]);
       eq("…and both group layouts call requireOrgAccess", ["app/[org]/(admin)/layout.tsx", "app/[org]/(learner)/layout.tsx"].map((f) =>
         /\bawait\s+requireOrgAccess\(/.test(src(f) ?? "")), [true, true]);
+      // reset() alone draws the segment again from what the browser holds,
+      // so a server-thrown error comes back unchanged: Try again must ask the
+      // server (router.refresh) and then reset, in one transition.
+      const panel = src("components/ui/route-error.tsx") ?? "";
+      const handler = /const\s+(\w+)\s*=\s*\(\)\s*=>\s*startTransition\(\(\)\s*=>\s*\{\s*router\.refresh\(\);\s*reset\(\);\s*\}\)/.exec(panel);
+      eq("RouteError's Try again refreshes from the server, then resets, in one transition", [
+        /import\s*\{[^}]*\buseRouter\b[^}]*\}\s*from\s*["']next\/navigation["']/.test(panel),
+        /import\s*\{[^}]*\bstartTransition\b[^}]*\}\s*from\s*["']react["']/.test(panel),
+        /\bconst\s+router\s*=\s*useRouter\(\)/.test(panel),
+        handler !== null,
+        handler !== null && new RegExp(`<Button\\b[^>]*\\bonClick=\\{${handler[1]}\\}`).test(panel),
+        /onClick=\{\s*reset\s*\}/.test(panel),
+      ], [true, true, true, true, true, false]);
     }
 
     console.log("\n(g) /select-org");
