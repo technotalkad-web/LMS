@@ -77,21 +77,26 @@
  *     ticket, whose organisation comes from the ticket (an inactive and a
  *     suspended administrator, X in B, D's administrator after the soft
  *     delete); no reply is written; the control's reply mails nobody, its
- *     requester being the inactive learner;
+ *     requester being the inactive learner (read again in the mail test,
+ *     after a positive control, since the reply mails in the background);
  *   - the export and the lists: the control's Users list, course learners
  *     table and its CSV still show the inactive learner, whose attempts are
  *     unchanged; the refused administrators and the inactive data analyst
  *     get the outsider's answer from the export; the active data analyst
- *     opens the reports page, is refused the export (manage only) and is
- *     sent from the Users page, and the inactive one gets the outsider's
- *     answer on the reports page;
+ *     opens the reports page, which reads with the service role and still
+ *     shows the inactive learner's attempt, is refused the export (manage
+ *     only; no export admits a data analyst) and is sent from the Users
+ *     page, and the inactive one gets the outsider's answer on the reports
+ *     page;
  *   - mail: an organisation-wide assignment logs a mail for each active
  *     member and none for the inactive and suspended ones (email paused, so
  *     nothing leaves); a broadcast in A to X and the inactive learner
  *     reaches X only, and one in B to X reaches nobody;
  *   - a cmi5 launch open while the learner is deactivated on the Users
  *     page: the next statement is refused, the attempt stays in progress,
- *     and after reactivation a new launch resumes it;
+ *     and after reactivation a new launch resumes it; removing the learner
+ *     on the Users page then refuses that new launch's next statement too
+ *     (the row is written back for the tests after it);
  *   - a SCORM commit from the inactive learner is refused 403 no_access and
  *     writes nothing (the membership is tested before the runtime);
  *   - language-preference from the inactive learner: the outsider's answer,
@@ -716,6 +721,9 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     }
     const ok = await reply("admin", app.tickets.a);
     expect(ok.status, `the control (A's active administrator) replies: ${ok.body}`).toBe(200);
+    // The reply's mail is sent in the background, after the answer: this
+    // first read can come before it would be logged. The mail test below
+    // reads it again after a positive control has been logged.
     expect(await mailRows(app.a!.id, ap("inactiveLearner").id, "custom_broadcast"), "the reply's mail does not reach its requester, whose row does not count").toBe(0);
   });
 
@@ -750,6 +758,9 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
 
     // The data analyst: the reports page (read with the service role); the export and the Users page are for managers.
     expect(await pageOutcome(app.ctx.analyst, `/${a.slug}/reports`), "the active analyst opens the reports page").toBe("rendered");
+    // Case 2's control: that service-role read still shows the inactive
+    // learner's rows (their attempt, in the page's recent attempts).
+    expect(await html("analyst", `/${a.slug}/reports`), "the active analyst's reports page shows the inactive learner's attempt").toContain(learner.email);
     expect((await get("analyst", exportOf(a, courseId))).status, "the active analyst is refused the export (managers only, as before)").toBe(403);
     expect(await pageOutcome(app.ctx.analyst, `/${a.slug}/users`), "the active analyst is sent from the Users page (managers only, as before)").toBe(`redirect /${a.slug}/dashboard`);
     expect(await pageOutcome(app.ctx.inactiveAnalyst, `/${a.slug}/reports`), "the inactive analyst: the reports page, as the outsider").toBe(
@@ -792,14 +803,15 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     expect(await mailRows(b.id, ap("x").id, "custom_broadcast"), "no broadcast logged for X in B").toBe(0);
     // In A, X counts and the inactive learner does not: one recipient.
     const xBefore = await mailRows(a.id, ap("x").id, "custom_broadcast");
-    const learnerBefore = await mailRows(a.id, ap("inactiveLearner").id, "custom_broadcast");
     const inA = await broadcast("admin", a, [ap("x").id, ap("inactiveLearner").id]);
     expect([inA.status, (JSON.parse(inA.body || "{}") as { total?: number }).total], "A's broadcast to X and the inactive learner: X only").toEqual([200, 1]);
     await expect.poll(() => mailRows(a.id, ap("x").id, "custom_broadcast"), { message: "X's broadcast in A logged", timeout: 60_000 }).toBe(xBefore + 1);
-    expect(await mailRows(a.id, ap("inactiveLearner").id, "custom_broadcast"), "none for the inactive learner").toBe(learnerBefore);
+    // After that positive control, none at all for the inactive learner: not
+    // this broadcast, and not the earlier ticket reply's background mail.
+    expect(await mailRows(a.id, ap("inactiveLearner").id, "custom_broadcast"), "none for the inactive learner (this broadcast, and the ticket reply before it)").toBe(0);
   });
 
-  test("a cmi5 launch open while the learner is deactivated on the Users page: the next statement is refused, the attempt stays in progress, a new launch resumes it", async ({ baseURL }) => {
+  test("a cmi5 launch open while the learner is deactivated on the Users page: the next statement is refused, the attempt stays in progress, a new launch resumes it; a removal closes the next one", async ({ baseURL }) => {
     test.setTimeout(5 * 60_000);
     const a = app.a!;
     const course = app.course!;
@@ -840,6 +852,21 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     const auth2 = await authTokenFor(ctx.request, attemptId);
     expect(auth2, "with a new launch token").not.toBe(auth);
     expect(await statement(ctx, auth2, attemptId, who, baseURL!, "initialized"), "the new launch records").toBeLessThan(300);
+
+    // Removing the member on the Users page closes the open launch as a
+    // deactivation does. The row is written back in `finally`: the SCORM
+    // test below uses this learner as its active control.
+    const kept = await state();
+    const removed = await app.ctx.admin.request.delete(`/api/organization-members/${who.id}?orgSlug=${a.slug}`, { maxRedirects: 0 });
+    const removedBody = (await removed.json()) as { ok?: boolean; tokens_expired?: boolean };
+    try {
+      expect([removed.status(), removedBody.ok], "the Users page removes the learner").toEqual([200, true]);
+      expect(removedBody.tokens_expired, "the removal expired the launch tokens").not.toBe(false);
+      expect(await statement(ctx, auth2, attemptId, who, baseURL!, "passed", { score: { scaled: 0.9 } }), "the next statement on the open launch is refused").toBe(401);
+      expect(await state(), "the attempt is left as it was").toEqual(kept);
+    } finally {
+      await addMember({ organizationId: a.id, userId: who.id, role: "user" });
+    }
   });
 
   test("a SCORM commit from the inactive learner is refused 403 no_access and writes nothing; an active learner's reaches the runtime test", async () => {
