@@ -29,7 +29,10 @@
  *       read, which a route handler answers 503 (a redirect still passes
  *       through); requireOrgAdminApi answers such a person 404 (a
  *       non-member's answer) and 503 when unreadable; isOrgAdminCaller
- *       answers false and null;
+ *       answers false and null; both group layouts call requireOrgAccess,
+ *       and app/[org]/error.tsx, the error file above them (an error file
+ *       does not catch its own folder's layout), is a client file that
+ *       shows RouteError;
  *   (g) /select-org lists only organisations that count: one goes straight
  *       there, none shows the no-access text with a sign-out control and no
  *       redirect, and an unreadable list says "try again" and goes nowhere;
@@ -98,7 +101,9 @@
  *
  * Run:  npx tsx tests/unit/org-membership.test.ts   (or npm run test:unit)
  */
+import fs from "node:fs";
 import Module from "node:module";
+import path from "node:path";
 import React from "react";
 import { createClient } from "@supabase/supabase-js";
 
@@ -531,6 +536,23 @@ async function main() {
     for (const t of ["organizations", "organization_members"]) {
       world({ members: [row(LIVE, "admin", "active")], failing: [t] });
       eq(`isOrgAdminCaller, the ${t} read fails: null (503), never false`, await isOrgAdminCaller(client(), LIVE.id, ME.id), null);
+    }
+    {
+      // The guard throws AccessUnreadableError in the two group layouts. An
+      // error file does not catch the layout of its own folder, so the
+      // groups' own error files never see it; the one above them does.
+      const root = path.resolve(__dirname, "../..");
+      const src = (rel: string) => (fs.existsSync(path.join(root, rel)) ? fs.readFileSync(path.join(root, rel), "utf8") : null);
+      const boundary = src("app/[org]/error.tsx");
+      eq("app/[org]/error.tsx exists, is a client file and shows RouteError", [
+        boundary !== null,
+        /^\s*["']use client["'];?/.test(boundary ?? ""),
+        /import\s*\{\s*RouteError\s*\}\s*from\s*["']@\/components\/ui\/route-error["']/.test(boundary ?? ""),
+        /<RouteError\b[^>]*\/>/.test(boundary ?? ""),
+        /export\s+default\s+function/.test(boundary ?? ""),
+      ], [true, true, true, true, true]);
+      eq("…and both group layouts call requireOrgAccess", ["app/[org]/(admin)/layout.tsx", "app/[org]/(learner)/layout.tsx"].map((f) =>
+        /\bawait\s+requireOrgAccess\(/.test(src(f) ?? "")), [true, true]);
     }
 
     console.log("\n(g) /select-org");
