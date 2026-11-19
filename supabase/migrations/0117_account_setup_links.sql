@@ -67,12 +67,27 @@
 -- finds the table-wide select line; grants that name columns are not what
 -- it looks for.
 --
--- RETENTION: keep rows 90 days. The owner clears older ones by hand with
--- this statement (SQL editor, role selector on postgres; once a month is
--- plenty):
---   delete from public.account_setup_links where created_at < now() - interval '90 days';
--- No link outlives 7 days, so a row past 90 days can open nothing. The rows
--- are not learner history.
+-- RETENTION: the owner clears rows older than 90 days by hand (SQL editor,
+-- role selector on postgres; once a month is plenty), except the newest row
+-- of each account in each organisation. That row stays, at any age and in
+-- any state, until the account or the organisation is deleted: the "Send
+-- setup link" action is offered only where the account holds a row of this
+-- table for that organisation (ADR 0029, rule N12), and whatever held a
+-- link back (a paused tenant, a mailbox not yet ready, a person added as
+-- inactive) may go on for more than 90 days. Where two rows share a
+-- created_at, the one with the higher id is treated as the newer. Use this
+-- statement and no other:
+--   delete from public.account_setup_links l
+--    where l.created_at < now() - interval '90 days'
+--      and exists (
+--        select 1 from public.account_setup_links n
+--         where n.user_id = l.user_id
+--           and n.organization_id = l.organization_id
+--           and (n.created_at, n.id) > (l.created_at, l.id));
+-- Never the short form that removes every row past 90 days: it would take
+-- that action away from a person who has not set a password yet. No link
+-- outlives 7 days, so a kept row opens nothing. The rows are not learner
+-- history.
 --
 -- REVERSE: ops/0117-reverse.sql drops the table if present; run it once the
 -- code that uses it has been rolled back. Links already mailed then stop
@@ -118,7 +133,8 @@
 --         where schemaname = 'public' and tablename = 'account_setup_links' order by 1;
 --   A6  zero rows at the first paste (the code has not written yet):
 --         select count(*) from public.account_setup_links;
---   A7  the column defaults and the two checks, as printed:
+--   A7  the column defaults and the two checks, as printed (the intervals
+--       print as below under the default IntervalStyle, postgres):
 --         select a.attname, pg_get_expr(d.adbin, d.adrelid) from pg_attrdef d
 --         join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
 --         where d.adrelid = 'public.account_setup_links'::regclass order by a.attnum;
@@ -138,6 +154,9 @@ begin;
 -- if a lock is not granted within 5 s the whole transaction rolls back
 -- cleanly and can simply be applied again.
 set local lock_timeout = '5s';
+-- The after-checks compare intervals as printed ('7 days'), and that text
+-- follows the session's IntervalStyle: fix it to the default here.
+set local intervalstyle = 'postgres';
 
 -- ---------------------------------------------------------------------------
 -- 0. Refusals: the pre-check facts this file relies on (P1, P2, P15-P18). A
@@ -262,7 +281,7 @@ create index if not exists account_setup_links_org_created_idx
   on public.account_setup_links (organization_id, created_at desc);
 
 comment on table public.account_setup_links is
-  'One row per set-your-password link (ADR 0029): ids, the issuer and a SHA-256 digest of the link secret; no secret, URL, address or password is kept. Good for one use within 7 days. Service role only; rows kept 90 days.';
+  'One row per set-your-password link (ADR 0029): ids, the issuer and a SHA-256 digest of the link secret; no secret, URL, address or password is kept. Good for one use within 7 days. Service role only. Rows older than 90 days are cleared by hand, but the newest row of each account and organisation is kept.';
 comment on column public.account_setup_links.token_hash is
   'SHA-256 digest of the link secret; the secret is not stored.';
 comment on column public.account_setup_links.issuer is

@@ -120,7 +120,10 @@ Each file's header is the full rule; this is the cross-file summary.
   first treats a tenant with complete settings as able to send, applies no
   cap and writes no job marks). Reverse with `ops/0114-reverse.sql` once the
   code is rolled back; it loses any daily caps a platform owner set, and its
-  header shows the select that saves them first.
+  header shows the select that saves them first. Until it commits it holds
+  `organizations` and `notification_log` against reads as well as writes
+  (sign-ins and most pages wait; the 5 s lock timeout applies to each lock
+  it asks for, so at worst a few times 5 s), so run it at a quiet moment.
 - **0117** (`0117_account_setup_links.sql`, ADR 0029 pull request B): one
   deny-all table for the LMS's own "set your password" links (rule N9).
   `service_role` may select the table, insert five named columns and update
@@ -129,13 +132,19 @@ Each file's header is the full rule; this is the cross-file summary.
   on staging or production yet** (2026-11-19). It needs only
   `public.organizations` and `auth.users`. It **must** be pasted ahead of
   pull request B's code (code that comes first turns away an add with no
-  password before creating any account). Rows are kept 90 days, with the
-  clean-up statement in the file's header. Reverse with
+  password before creating any account). Rows older than 90 days are
+  cleared by hand with the statement in the file's header, which always
+  keeps the newest row of each account in each organisation, because the
+  "Send setup link" action (rule N12) is offered only where such a row
+  exists; never use a plain delete of every old row. Reverse with
   `ops/0117-reverse.sql` once the code is rolled back; links already mailed
   then stop working, and a later paste starts the table empty, so the
   "Send setup link" action is not offered again for those accounts and a
   person who never set a password gets in by "Forgot password" (the
-  reverse's header says so).
+  reverse's header says so). Until it commits the reverse holds
+  `organizations` and `auth.users` against reads as well as writes
+  (sign-ins and most pages wait; the 5 s lock timeout applies to each lock
+  it asks for, so at worst a few times 5 s), so run it at a quiet moment.
 - **The 0114 and 0117 sitting** (ADR 0029, checklist D7). The pull request's
   first push carries only these files (the two migrations, their reverses,
   the pre-check, the rehearsal and this page), no app code, and its single

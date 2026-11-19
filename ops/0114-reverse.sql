@@ -24,11 +24,16 @@
 -- RE-PASTE. Idempotent: a second paste finds nothing to drop. Pasting 0114
 -- again afterwards creates everything empty, as its first paste did.
 --
--- Row writes: the two tables' rows go with them. Locks, until commit: ACCESS
--- EXCLUSIVE on each dropped table and on public.notification_log while its
--- index is dropped (mail being logged waits a moment), and the foreign key's
--- lock on public.organizations. lock_timeout 5 s: if a lock is not granted
--- the whole script rolls back; paste it again.
+-- Row writes: the two tables' rows go with them. Locks, held until commit:
+-- ACCESS EXCLUSIVE on each dropped table, on public.notification_log (its
+-- index is dropped) and on public.organizations (the state table's foreign
+-- key goes with the table). That lock stops reads as well as writes: while
+-- the script runs, every read of organizations or notification_log waits,
+-- so sign-ins, nearly every page and the mail log pages pause. The 5 s
+-- lock_timeout applies to each lock the script asks for, so at worst a
+-- reader waits a few times 5 s; usually it is a moment. Paste it at a quiet
+-- moment. If any lock is not granted within 5 s the whole script rolls
+-- back; paste it again.
 
 begin;
 

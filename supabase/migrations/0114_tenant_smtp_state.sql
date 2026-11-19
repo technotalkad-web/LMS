@@ -57,13 +57,17 @@
 -- deleted_at of timestamp with time zone (0001, 0021), readable by
 -- service_role (the count function runs with its caller's rights);
 -- public.notification_log as a plain table with organization_id uuid,
--- status text and sent_at timestamp with time zone (0014), every check on
--- status letting 'sent' and 'failed' through, readable by service_role;
--- the roles anon, authenticated and service_role. Each name the file
--- creates must be free or already hold this file's shape: the "if not
--- exists" forms would otherwise skip a look-alike object without a word,
--- which is why staging, set up by hand before the repository's migrations,
--- is read first (ADR 0030, note "Hand-made databases, 2026-11-18").
+-- status text and sent_at timestamp with time zone (0014), readable by
+-- service_role, each check on status kept in the list form Postgres stores
+-- for `status in (...)` with both 'sent' and 'failed' in the list. Only that
+-- form is read as letting both words through: a check on status in any
+-- other form stops the paste (fact P8), even one that would let them
+-- through, so that a person reads it first; the roles anon, authenticated
+-- and service_role. Each name the file creates must be free or already
+-- hold this file's shape: the "if not exists" forms would otherwise skip a
+-- look-alike object without a word, which is why staging, set up by hand
+-- before the repository's migrations, is read first (ADR 0030, note
+-- "Hand-made databases, 2026-11-18").
 --
 -- RE-PASTE. Idempotent: `create table if not exists`, `create index if not
 -- exists`, `drop policy if exists` before `create policy`, `create or
@@ -144,6 +148,21 @@
 --   A6  zero rows at the first paste (the code has not written yet):
 --         select (select count(*) from public.tenant_smtp_state) as state_rows,
 --                (select count(*) from public.mail_job_counts) as job_rows;
+--   A7  the column defaults and the check bodies of both tables, as printed:
+--         select d.adrelid::regclass, a.attname, pg_get_expr(d.adbin, d.adrelid)
+--         from pg_attrdef d
+--         join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+--         where d.adrelid in ('public.tenant_smtp_state'::regclass, 'public.mail_job_counts'::regclass)
+--         order by 1, a.attnum;
+--         expected five rows: state_changed_at now(), failed_recipients
+--         '{}'::uuid[], updated_at now(); started 0, finished 0.
+--         select conrelid::regclass, conname, pg_get_constraintdef(oid) from pg_constraint
+--         where conrelid in ('public.tenant_smtp_state'::regclass, 'public.mail_job_counts'::regclass)
+--           and contype = 'c' order by 1, 2;
+--         expected three rows: CHECK (((daily_limit IS NULL) OR ((daily_limit
+--         >= 1) AND (daily_limit <= 100000)))), CHECK ((state = ANY
+--         (ARRAY['healthy'::text, 'failing'::text]))), and CHECK ((kind = ANY
+--         (ARRAY['tenant'::text, 'platform'::text]))).
 --   The pre-check again: every row ok or info, and P19 reads 0114 pasted.
 
 begin;
@@ -475,18 +494,23 @@ declare
   r       record;
 begin
   for r in
-    select x.rel, x.cols, x.pk, x.checks, to_regclass(x.rel) as oid
+    select x.rel, x.cols, x.pk, x.checks, x.defaults, x.check_defs, to_regclass(x.rel) as oid
       from (values
         ('public.tenant_smtp_state',
          'organization_id uuid not null, state text, state_changed_at timestamp with time zone not null, '
          'last_success_at timestamp with time zone, last_failure_at timestamp with time zone, last_error_code text, '
          'failed_recipients uuid[] not null, last_alert_at timestamp with time zone, '
          'alert_due_at timestamp with time zone, daily_limit integer, updated_at timestamp with time zone not null',
-         'organization_id', 'daily_limit, state'),
+         'organization_id', 'daily_limit, state',
+         'state_changed_at=now(), failed_recipients=''{}''::uuid[], updated_at=now()',
+         'daily_limit: CHECK (((daily_limit IS NULL) OR ((daily_limit >= 1) AND (daily_limit <= 100000)))) | '
+         'state: CHECK ((state = ANY (ARRAY[''healthy''::text, ''failing''::text])))'),
         ('public.mail_job_counts',
          'day date not null, kind text not null, started integer not null, finished integer not null',
-         'day, kind', 'kind')
-      ) as x(rel, cols, pk, checks)
+         'day, kind', 'kind',
+         'started=0, finished=0',
+         'kind: CHECK ((kind = ANY (ARRAY[''tenant''::text, ''platform''::text])))')
+      ) as x(rel, cols, pk, checks, defaults, check_defs)
   loop
     -- the columns, their types, nullability and order
     select string_agg(format('%s %s%s', a.attname, format_type(a.atttypid, a.atttypmod),
@@ -516,6 +540,28 @@ begin
     if v_bad is distinct from r.checks
        or (select count(*) from pg_constraint c where c.conrelid = r.oid and c.contype = 'c') <> cardinality(string_to_array(r.checks, ', ')) then
       raise exception '0114 after-check: % checks are on (%), expected (%)', r.rel, v_bad, r.checks;
+    end if;
+
+    -- the column defaults and the check bodies, as printed (A7; beyond
+    -- checklist D2's list, added on the review's first reading). A table of
+    -- this name that was already there with the right columns and keys
+    -- keeps its own defaults and checks through `if not exists`, so they
+    -- are read here, not assumed; each check is read by its column
+    select string_agg(format('%s=%s', a.attname, pg_get_expr(d.adbin, d.adrelid)), ', ' order by a.attnum)
+      into v_bad
+      from pg_attrdef d
+      join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+     where d.adrelid = r.oid;
+    if v_bad is distinct from r.defaults then
+      raise exception '0114 after-check: % has unexpected column defaults: %', r.rel, coalesce(v_bad, 'none');
+    end if;
+    select string_agg(a.attname || ': ' || pg_get_constraintdef(c.oid), ' | ' order by a.attname)
+      into v_bad
+      from pg_constraint c
+      join pg_attribute a on a.attrelid = c.conrelid and a.attnum = c.conkey[1]
+     where c.conrelid = r.oid and c.contype = 'c' and cardinality(c.conkey) = 1;
+    if v_bad is distinct from r.check_defs then
+      raise exception '0114 after-check: % checks read %, expected %', r.rel, coalesce(v_bad, 'nothing'), r.check_defs;
     end if;
 
     -- row level security on, one deny-all policy for all commands

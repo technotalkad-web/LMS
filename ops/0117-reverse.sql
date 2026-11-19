@@ -31,10 +31,15 @@
 -- RE-PASTE. Idempotent: a second paste finds nothing to drop. Pasting 0117
 -- again afterwards creates the table empty, as its first paste did.
 --
--- Row writes: the table's rows go with it. Locks: ACCESS EXCLUSIVE on the
--- table, and the foreign keys' locks on public.organizations and auth.users,
--- until commit. lock_timeout 5 s: if a lock is not granted the whole script
--- rolls back; paste it again.
+-- Row writes: the table's rows go with it. Locks, held until commit: ACCESS
+-- EXCLUSIVE on the table, and also on public.organizations and auth.users,
+-- because its three foreign keys go with it. That lock stops reads as well
+-- as writes: while the script runs, every read of organizations or
+-- auth.users waits, so sign-ins and nearly every page pause. The 5 s
+-- lock_timeout applies to each lock the script asks for, so at worst a
+-- reader waits a few times 5 s; usually it is a moment. Paste it at a quiet
+-- moment. If any lock is not granted within 5 s the whole script rolls
+-- back; paste it again.
 
 begin;
 

@@ -27,9 +27,20 @@
 --       days is fine
 --   (8) foreign keys: removing the issuing person nulls issued_by and keeps
 --       the row; removing the account, or the organisation, removes it
+--   (9) the owner's clean-up, run twice as the statement in 0117's header
+--       reads, word for word (it runs before (8)): over five more accounts
+--       and a second organisation it removes exactly four rows, each older
+--       than 90 days with a newer row of the same account and organisation;
+--       it keeps an account's only row however old, the newest of three old
+--       rows, the higher id of two rows made at one time, and an old row
+--       beside a newer one in another organisation; the second run removes
+--       nothing, and the three rows of (6) stay as they were
 -- Fixture ids end in 0117a…. One transaction ending in ROLLBACK; a failure
 -- raises 'assert-0117: (n) ...'. PGlite runs as postgres (the owner).
+-- IntervalStyle is fixed to the default, because (1) compares intervals as
+-- printed.
 begin;
+set local intervalstyle = 'postgres';
 
 -- ---------------------------------------------------------------------------
 -- (1) empty; columns, defaults, keys, checks, indexes, comments
@@ -377,6 +388,109 @@ begin
   end;
   if got <> '23514' then
     raise exception 'assert-0117: (7) the owner''s update to a life of 7 days and a second → % (expected 23514)', got;
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- (9) the owner's clean-up keeps the newest row of each account in each
+--     organisation. The statement below is the one in 0117's header, word
+--     for word: a comment cannot be run, so the two copies must stay the
+--     same. It runs before (8), which removes the fixture organisation.
+-- ---------------------------------------------------------------------------
+insert into public.organizations (id, name, slug)
+values ('00000000-0000-0000-0000-0117a0000002', 'Org 0117 second', 'org-0117-rehearsal-2');
+insert into auth.users (id, email)
+values ('00000000-0000-0000-0000-0117a0000021', 'keep-a-0117@example.test'),
+       ('00000000-0000-0000-0000-0117a0000022', 'keep-b-0117@example.test'),
+       ('00000000-0000-0000-0000-0117a0000023', 'keep-c-0117@example.test'),
+       ('00000000-0000-0000-0000-0117a0000024', 'keep-d-0117@example.test'),
+       ('00000000-0000-0000-0000-0117a0000025', 'keep-e-0117@example.test');
+-- Each row's expires_at is its created_at plus 7 days, as the seven-day
+-- check allows; an account holds at most one row that is neither used nor
+-- ended, as the one-open index requires, in both organisations too.
+insert into public.account_setup_links
+       (id, user_id, organization_id, issuer, token_hash, created_at, expires_at, used_at, ended_at)
+select x.id::uuid, x.usr::uuid, x.org::uuid, 'tenant', x.hash,
+       now() - x.age, now() - x.age + interval '7 days',
+       case when x.state = 'used' then now() - x.age + interval '1 day' end,
+       case when x.state = 'ended' then now() - x.age + interval '1 day' end
+  from (values
+    -- account A: its only row, 200 days old and never used
+    ('00000000-0000-0000-0000-0117a00000a1', '00000000-0000-0000-0000-0117a0000021', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-a1', interval '200 days', 'open'),
+    -- account B: 300, 200 and 120 days old
+    ('00000000-0000-0000-0000-0117a00000b1', '00000000-0000-0000-0000-0117a0000022', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-b1', interval '300 days', 'ended'),
+    ('00000000-0000-0000-0000-0117a00000b2', '00000000-0000-0000-0000-0117a0000022', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-b2', interval '200 days', 'ended'),
+    ('00000000-0000-0000-0000-0117a00000b3', '00000000-0000-0000-0000-0117a0000022', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-b3', interval '120 days', 'open'),
+    -- account C: 200 days (ended), 30 days (ended) and 10 days (open)
+    ('00000000-0000-0000-0000-0117a00000c1', '00000000-0000-0000-0000-0117a0000023', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-c1', interval '200 days', 'ended'),
+    ('00000000-0000-0000-0000-0117a00000c2', '00000000-0000-0000-0000-0117a0000023', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-c2', interval '30 days', 'ended'),
+    ('00000000-0000-0000-0000-0117a00000c3', '00000000-0000-0000-0000-0117a0000023', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-c3', interval '10 days', 'open'),
+    -- account D: two rows made at one time, 150 days ago; the higher id is
+    -- the newer, and it is the ended one, so state plays no part
+    ('00000000-0000-0000-0000-0117a00000d1', '00000000-0000-0000-0000-0117a0000024', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-d1', interval '150 days', 'open'),
+    ('00000000-0000-0000-0000-0117a00000d2', '00000000-0000-0000-0000-0117a0000024', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-d2', interval '150 days', 'ended'),
+    -- account E: 200 days in the fixture organisation (used), 10 days in the
+    -- second organisation (open)
+    ('00000000-0000-0000-0000-0117a00000e1', '00000000-0000-0000-0000-0117a0000025', '00000000-0000-0000-0000-0117a0000001', 'hash-0117-keep-e1', interval '200 days', 'used'),
+    ('00000000-0000-0000-0000-0117a00000e2', '00000000-0000-0000-0000-0117a0000025', '00000000-0000-0000-0000-0117a0000002', 'hash-0117-keep-e2', interval '10 days', 'open')
+  ) as x(id, usr, org, hash, age, state);
+
+do $$
+begin
+  if (select count(*) from public.account_setup_links
+       where user_id between '00000000-0000-0000-0000-0117a0000021' and '00000000-0000-0000-0000-0117a0000025') <> 11
+     or (select count(*) from public.account_setup_links
+          where user_id = '00000000-0000-0000-0000-0117a0000011') <> 3 then
+    raise exception 'assert-0117: (9) the fixture: not eleven rows for the five accounts beside the three rows of (6)';
+  end if;
+end
+$$;
+
+-- the clean-up, first run
+delete from public.account_setup_links l
+ where l.created_at < now() - interval '90 days'
+   and exists (
+     select 1 from public.account_setup_links n
+      where n.user_id = l.user_id
+        and n.organization_id = l.organization_id
+        and (n.created_at, n.id) > (l.created_at, l.id));
+
+do $$
+declare
+  v text;
+begin
+  select string_agg(token_hash, ', ' order by token_hash) into v
+    from public.account_setup_links
+   where user_id between '00000000-0000-0000-0000-0117a0000021' and '00000000-0000-0000-0000-0117a0000025';
+  if v is distinct from 'hash-0117-keep-a1, hash-0117-keep-b3, hash-0117-keep-c2, hash-0117-keep-c3, '
+                        'hash-0117-keep-d2, hash-0117-keep-e1, hash-0117-keep-e2' then
+    raise exception 'assert-0117: (9) after the first run the five accounts keep % (expected exactly four rows removed: b1, b2, c1 and d1)', v;
+  end if;
+  select string_agg(token_hash, ', ' order by token_hash) into v
+    from public.account_setup_links where user_id = '00000000-0000-0000-0000-0117a0000011';
+  if v is distinct from 'hash-0117-b, hash-0117-e, hash-0117-f' then
+    raise exception 'assert-0117: (9) the three rows of (6) changed: %', v;
+  end if;
+end
+$$;
+
+-- the clean-up, second run
+delete from public.account_setup_links l
+ where l.created_at < now() - interval '90 days'
+   and exists (
+     select 1 from public.account_setup_links n
+      where n.user_id = l.user_id
+        and n.organization_id = l.organization_id
+        and (n.created_at, n.id) > (l.created_at, l.id));
+
+do $$
+begin
+  if (select count(*) from public.account_setup_links
+       where user_id between '00000000-0000-0000-0000-0117a0000021' and '00000000-0000-0000-0000-0117a0000025') <> 7
+     or (select count(*) from public.account_setup_links
+          where user_id = '00000000-0000-0000-0000-0117a0000011') <> 3 then
+    raise exception 'assert-0117: (9) the second run removed rows (expected none)';
   end if;
 end
 $$;

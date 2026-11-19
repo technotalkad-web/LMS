@@ -21,6 +21,7 @@ begin
 end
 $$;
 alter table public.notification_log drop constraint if exists notification_log_status_planted;
+alter table public.notification_log drop constraint if exists notification_log_status_planted_shape;
 grant select on public.organizations to service_role;
 grant select on public.notification_log to service_role;
 drop table if exists public.tenant_smtp_state;
