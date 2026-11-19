@@ -132,7 +132,10 @@ Each file's header is the full rule; this is the cross-file summary.
   password before creating any account). Rows are kept 90 days, with the
   clean-up statement in the file's header. Reverse with
   `ops/0117-reverse.sql` once the code is rolled back; links already mailed
-  then stop working.
+  then stop working, and a later paste starts the table empty, so the
+  "Send setup link" action is not offered again for those accounts and a
+  person who never set a password gets in by "Forgot password" (the
+  reverse's header says so).
 - **The 0114 and 0117 sitting** (ADR 0029, checklist D7). The pull request's
   first push carries only these files (the two migrations, their reverses,
   the pre-check, the rehearsal and this page), no app code, and its single

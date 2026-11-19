@@ -76,7 +76,9 @@
 --
 -- REVERSE: ops/0117-reverse.sql drops the table if present; run it once the
 -- code that uses it has been rolled back. Links already mailed then stop
--- working.
+-- working, and a later paste starts the table empty, so the "Send setup
+-- link" action is no longer offered for the accounts those links were for
+-- (the reverse file's header says what that leaves).
 --
 -- BEFORE the apply: ops/0114-0117-before-checks.sql, one read-only select,
 -- run alone; its rows exported whole. Any REFUSES means no paste.
@@ -116,6 +118,18 @@
 --         where schemaname = 'public' and tablename = 'account_setup_links' order by 1;
 --   A6  zero rows at the first paste (the code has not written yet):
 --         select count(*) from public.account_setup_links;
+--   A7  the column defaults and the two checks, as printed:
+--         select a.attname, pg_get_expr(d.adbin, d.adrelid) from pg_attrdef d
+--         join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+--         where d.adrelid = 'public.account_setup_links'::regclass order by a.attnum;
+--         expected three rows: id gen_random_uuid(), created_at now(),
+--         expires_at (now() + '7 days'::interval).
+--         select conname, pg_get_constraintdef(oid) from pg_constraint
+--         where conrelid = 'public.account_setup_links'::regclass and contype = 'c' order by 1;
+--         expected two rows: the issuer check, CHECK ((issuer = ANY
+--         (ARRAY['tenant'::text, 'platform'::text]))), and
+--         account_setup_links_seven_days, CHECK ((expires_at <= (created_at +
+--         '7 days'::interval))).
 --   The pre-check again: every row ok or info, and P19 reads 0117 pasted.
 
 begin;
@@ -297,6 +311,19 @@ begin
     raise exception '0117 after-check: unexpected columns: %', v_bad;
   end if;
 
+  -- the column defaults, as printed (A7): id, created_at and expires_at, 7
+  -- days on, and no other. A table of this name that was already there with
+  -- the right columns keeps its own defaults through `if not exists`, so the
+  -- life a link gets is read here, not assumed (ADR 0029 rule N9)
+  select string_agg(format('%s=%s', a.attname, pg_get_expr(d.adbin, d.adrelid)), ', ' order by a.attnum)
+    into v_bad
+    from pg_attrdef d
+    join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+   where d.adrelid = v_rel;
+  if v_bad is distinct from 'id=gen_random_uuid(), created_at=now(), expires_at=(now() + ''7 days''::interval)' then
+    raise exception '0117 after-check: unexpected column defaults: %', v_bad;
+  end if;
+
   -- row level security on, one deny-all policy for all commands
   if not (select relrowsecurity from pg_class where oid = v_rel) then
     raise exception '0117 after-check: row level security is off';
@@ -377,6 +404,22 @@ begin
         where c.conrelid = v_rel and c.contype = 'c' and c.conname = 'account_setup_links_seven_days')
      or (select count(*) from pg_constraint c where c.conrelid = v_rel and c.contype = 'c') <> 2 then
     raise exception '0117 after-check: the unique token hash, the issuer check or the seven-day check is missing';
+  end if;
+  -- the two checks' bodies, as printed (A7): a check of the right name may
+  -- still allow a longer life, so the text is compared, not the name alone
+  select pg_get_constraintdef(c.oid) into v_bad
+    from pg_constraint c
+   where c.conrelid = v_rel and c.contype = 'c' and c.conname = 'account_setup_links_seven_days';
+  if v_bad is distinct from 'CHECK ((expires_at <= (created_at + ''7 days''::interval)))' then
+    raise exception '0117 after-check: account_setup_links_seven_days reads %, expected CHECK ((expires_at <= (created_at + ''7 days''::interval)))',
+      coalesce(v_bad, 'nothing');
+  end if;
+  select string_agg(pg_get_constraintdef(c.oid), ' | ' order by pg_get_constraintdef(c.oid)) into v_bad
+    from pg_constraint c
+   where c.conrelid = v_rel and c.contype = 'c' and c.conname <> 'account_setup_links_seven_days';
+  if v_bad is distinct from 'CHECK ((issuer = ANY (ARRAY[''tenant''::text, ''platform''::text])))' then
+    raise exception '0117 after-check: the issuer check reads %, expected CHECK ((issuer = ANY (ARRAY[''tenant''::text, ''platform''::text])))',
+      coalesce(v_bad, 'nothing');
   end if;
 
   -- the indexes: the primary key, the unique token hash, and the two

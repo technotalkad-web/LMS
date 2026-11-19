@@ -9,12 +9,21 @@
 -- add with a password works, and the set-password page answers that the
 -- link can no longer be used.
 --
--- WHAT IT LOSES: every setup link, open or not. A link already mailed stops
--- working; the person uses "Forgot password", or an administrator sends a
--- new link once 0117 is pasted again. The rows hold ids, times and a hash of
--- each token, and are not learner history. Copy them first if the owner
--- wants them kept (the hash is left out: it opens nothing once the table is
--- gone):
+-- WHAT IT LOSES: every setup link, open or not, and with them the record of
+-- which accounts were created with one.
+--   - A link already mailed stops working.
+--   - Pasting 0117 again creates the table empty. The "Send setup link"
+--     action, on the Users pages and in the console, is offered only for an
+--     account that holds a row of this table for that organisation (ADR 0029
+--     rule N12). So after a reverse it is not offered for any account
+--     created before it, and the administrator sees "This person already has
+--     a way in" instead.
+--   - A person who was sent a link and never set a password then gets in
+--     only by "Forgot password" on the sign-in page.
+-- The rows hold ids, times and a hash of each token, and are not learner
+-- history. Copy them first if the owner wants a record of them. The copy
+-- leaves out the hash, so it is a record to read, not rows to put back:
+-- token_hash is required and unique, and the copy cannot fill it.
 --   select id, user_id, organization_id, issuer, issued_by, created_at,
 --          expires_at, used_at, ended_at
 --   from public.account_setup_links order by created_at;
