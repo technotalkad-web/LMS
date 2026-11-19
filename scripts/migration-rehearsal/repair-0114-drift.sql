@@ -27,4 +27,5 @@ drop table if exists public.tenant_smtp_state;
 drop table if exists public.mail_job_counts;
 drop index if exists public.notification_log_org_sent_at_idx;
 drop function if exists public.tenant_mail_status(uuid);
-drop function if exists public.mail_job_mark(text);
+drop function if exists public.mail_job_mark(text, text);
+drop function if exists public.mail_job_mark(text, text, date);
