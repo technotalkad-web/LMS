@@ -79,7 +79,16 @@
  *       their one person only while that person's membership counts; when
  *       the members that count cannot be read, nothing is sent and the
  *       sender is not entered (a broadcast answers 503), and the log line
- *       holds the organisation's id and no address.
+ *       holds the organisation's id and no address;
+ *   (l) the platform notices (GET /api/broadcasts): an administrators-only
+ *       notice is shown only to a person who holds an administrator row
+ *       that counts somewhere; one whose only administrator row is inactive,
+ *       suspended or in a deleted organisation does not see it (a notice for
+ *       everyone still shows); an unreadable list answers 503;
+ *   (m) rule 8 for an organisation's API key: the key of a deleted
+ *       organisation is refused exactly as a revoked key is (null from
+ *       authenticateApiKey, and the same 401 from an integrations route),
+ *       and its use is not stamped; a live organisation's key still works.
  *
  * No database, no network.
  *
@@ -129,6 +138,8 @@ let attempts: Row[] = [];
 let tokens: Row[] = [];
 let apiKeys: Row[] = [];
 let logged: string[] = [];
+// (l): the platform notices.
+let broadcasts: Row[] = [];
 
 const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
 (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
@@ -225,10 +236,11 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     const limit = q.has("limit") ? Number(q.get("limit")) : rows.length;
     return json(rows.slice(offset, offset + limit));
   }
+  if (table === "platform_broadcasts") return json(broadcasts.filter((r) => matches(r, q)));
   if (table === "org_api_keys") {
     return json(apiKeys.filter((r) => matches(r, q)).map((r) => {
       const o = orgs.find((x) => x.id === r.organization_id);
-      return { id: r.id, organization_id: r.organization_id, is_active: r.is_active, organizations: o ? { slug: o.slug } : null };
+      return { id: r.id, organization_id: r.organization_id, is_active: r.is_active, organizations: o ? { slug: o.slug, deleted_at: o.deleted_at } : null };
     }));
   }
   return json([]);
@@ -278,7 +290,8 @@ function write(method: string, table: string, q: URLSearchParams, body: unknown)
   return new Response(null, { status: 201 });
 }
 
-const world = (o: { members?: Row[]; failing?: string[]; platformOwner?: boolean; signedIn?: boolean; accounts?: Account[]; invitations?: Row[]; attempts?: Row[]; tokens?: Row[]; apiKeys?: Row[] } = {}) => {
+const world = (o: { members?: Row[]; failing?: string[]; platformOwner?: boolean; signedIn?: boolean; accounts?: Account[]; invitations?: Row[]; attempts?: Row[]; tokens?: Row[]; apiKeys?: Row[]; broadcasts?: Row[] } = {}) => {
+  broadcasts = (o.broadcasts ?? []).map((r) => ({ ...r }));
   orgs = [LIVE, SECOND, GONE].map((x) => ({ ...x }));
   members = (o.members ?? []).map((r) => ({ ...r }));
   failing = new Set(o.failing ?? []);
@@ -1343,6 +1356,65 @@ async function main() {
         globalThis.fetch = stub as typeof fetch;
         console.warn = realWarn;
       }
+    }
+
+    console.log("\n(l) the platform notices: an administrators-only notice needs an administrator row that counts");
+    {
+      const route = await import("../../app/api/broadcasts/route");
+      const NOTICES: Row[] = [
+        { id: "n-all", title: "For everyone", body_md: "x", tone: "info", audience: "all", dismissable: false, is_active: true, posted_at: "2026-11-01T00:00:00Z", expires_at: null },
+        { id: "n-admins", title: "For administrators", body_md: "x", tone: "info", audience: "admins_only", dismissable: false, is_active: true, posted_at: "2026-11-01T00:00:00Z", expires_at: null },
+      ];
+      const shown = async (members: Row[], failing: string[] = []) => {
+        world({ members, broadcasts: NOTICES, failing });
+        const res = await route.GET();
+        const body = (await res.json()) as { broadcasts?: Row[]; error?: string };
+        return { status: res.status, ids: (body.broadcasts ?? []).map((b) => String(b.id)).sort() };
+      };
+      eq("an active administrator of a live organisation: both notices", await shown([row(LIVE, "admin", "active")]), { status: 200, ids: ["n-admins", "n-all"] });
+      for (const [label, members] of [
+        ["an inactive administrator row only", [row(LIVE, "admin", "inactive")]],
+        ["a suspended super owner row only", [row(LIVE, "super_owner", "suspended")]],
+        ["an active administrator row in a deleted organisation only", [row(GONE, "admin", "active")]],
+        ["an inactive administrator row beside an active learner row elsewhere", [row(LIVE, "admin", "inactive"), row(SECOND, "user", "active")]],
+      ] as Array<[string, Row[]]>) {
+        eq(`${label}: the notice for everyone only`, await shown(members), { status: 200, ids: ["n-all"] });
+      }
+      eq("the memberships cannot be read: 503, no notice", await shown([row(LIVE, "admin", "active")], ["organization_members"]), { status: 503, ids: [] });
+    }
+
+    console.log("\n(m) rule 8: the API key of a deleted organisation is refused as a revoked key is");
+    {
+      const { authenticateApiKey, generateApiKey } = await import("../../lib/integrations/auth");
+      const catalog = await import("../../app/api/integrations/catalog/route");
+      const live = generateApiKey();
+      const gone = generateApiKey();
+      const revoked = generateApiKey();
+      const keys = () => [
+        { id: "k-live", organization_id: LIVE.id, is_active: true, key_hash: live.hash },
+        { id: "k-gone", organization_id: GONE.id, is_active: true, key_hash: gone.hash },
+        { id: "k-revoked", organization_id: LIVE.id, is_active: false, key_hash: revoked.hash },
+      ];
+      const authAs = async (key: string) => {
+        world({ apiKeys: keys() });
+        const r = await authenticateApiKey(new Request("http://lms.test/api/integrations/catalog", { headers: { authorization: `Bearer ${key}` } }));
+        await new Promise((done) => setTimeout(done, 0)); // the use stamp is fire-and-forget
+        return { org: r?.orgId ?? null, stamped: writes().filter((w) => w === "PATCH org_api_keys").length };
+      };
+      eq("a live organisation's key: accepted, its use stamped", await authAs(live.key), { org: LIVE.id, stamped: 1 });
+      eq("a revoked key (the reference answer): refused, not stamped", await authAs(revoked.key), { org: null, stamped: 0 });
+      eq("a deleted organisation's key: refused as the revoked one, not stamped", await authAs(gone.key), { org: null, stamped: 0 });
+      eq("…the key read embeds the organisation's deleted_at",
+        reads("org_api_keys").some((r) => /organizations\(slug,\s*deleted_at\)/.test(r.select)), true);
+      const viaRoute = async (key: string) => {
+        world({ apiKeys: keys() });
+        const res = await catalog.GET(new Request("http://lms.test/api/integrations/catalog", { headers: { authorization: `Bearer ${key}` } }));
+        return { status: res.status, body: await res.text(), writes: writes() };
+      };
+      const refusedRevoked = await viaRoute(revoked.key);
+      eq("GET /api/integrations/catalog with a deleted organisation's key: the revoked key's status and body, nothing written",
+        await viaRoute(gone.key), { ...refusedRevoked, writes: [] });
+      eq("…and that answer is a 401", refusedRevoked.status, 401);
     }
   } finally {
     globalThis.fetch = realFetch;

@@ -52,7 +52,13 @@
  *       (an inactive and a suspended member get nothing; the active ones
  *       get what they got before), from one read of them per request; when
  *       that read fails the change stands and nothing is sent (the sender
- *       is not entered).
+ *       is not entered);
+ *   (m) ADR 0030 rule 2: an admin or super owner whose row is inactive or
+ *       suspended, and an admin of an organisation that is deleted, are
+ *       each answered exactly as a signed-in caller with no membership
+ *       (the same status and body), with no service-key, Cloudflare or
+ *       write request; the same admin, active in the live organisation, is
+ *       let through.
  *
  * The stub models RLS: a session write by a non-admin changes no row
  * (update / delete answer []) or fails (insert answers 42501). next/headers
@@ -95,6 +101,10 @@ let signedIn = true;
 let role: string | null = "user";
 /** The caller's membership role in OTHER_ORG; null = no membership row. */
 let otherRole: string | null = null;
+/** The status of the caller's row in ORG (ADR 0030: only "active" counts). */
+let myStatus = "active";
+/** ORG is soft-deleted (deleted_at set). */
+let orgDeleted = false;
 /** An admin's session update / delete changes no row (as if RLS refused it). */
 let zeroRows = false;
 /** A table whose reads fail (the caller's own role read excepted). */
@@ -144,7 +154,7 @@ const matches = (r: Row, q: URLSearchParams) =>
   });
 
 const orgRow = (): Row => ({
-  id: ORG, name: "Org", slug: "org", deleted_at: null, sso_provider_id: "prov-old",
+  id: ORG, name: "Org", slug: "org", deleted_at: orgDeleted ? "2026-11-01T00:00:00Z" : null, sso_provider_id: "prov-old",
   custom_domain: "old.example.test", custom_domain_verified: false, custom_domain_status: "pending", cf_hostname_id: "cf-old",
 });
 /** Every member row the service role reads; u-3 and u-4 hold rows that do not count (ADR 0030). */
@@ -256,7 +266,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (ownRead) {
       // The caller's own membership rows, filtered as asked (org and user).
       const mine: Row[] = [];
-      if (role) mine.push({ user_id: ME.id, organization_id: ORG, role, status: "active" });
+      if (role) mine.push({ user_id: ME.id, organization_id: ORG, role, status: myStatus });
       if (otherRole) mine.push({ user_id: ME.id, organization_id: OTHER_ORG, role: otherRole, status: "active" });
       const hit = mine.filter((r) => matches(r, q));
       if (asObject && hit.length > 1) return json({ code: "PGRST116", message: "multiple rows" }, 406);
@@ -338,10 +348,13 @@ async function main() {
     const world = (o: {
       role?: string | null; otherRole?: string | null; signedIn?: boolean; zeroRows?: boolean; failRead?: string;
       failRole?: boolean; afterDelete?: "gone" | "fails"; orgUpdate?: "error" | "lost-reply" | "lost-reply-unreadable";
+      status?: string; orgDeleted?: boolean;
     }) => {
       requests = [];
       role = o.role === undefined ? "user" : o.role;
       otherRole = o.otherRole ?? null;
+      myStatus = o.status ?? "active";
+      orgDeleted = o.orgDeleted ?? false;
       signedIn = o.signedIn ?? true;
       zeroRows = o.zeroRows ?? false;
       failRead = o.failRead ?? null;
@@ -626,6 +639,27 @@ async function main() {
         eq(`${c.name}, the members that count cannot be read: the change stands (200), nothing is sent, the sender is not entered`,
           [out.status, mailed(), senderEntered()], [200, [], false]);
       }
+    }
+
+    console.log("\n(m) ADR 0030 rule 2: a row that does not count, or a deleted organisation, is answered as no membership");
+    for (const c of CALLS) {
+      const outsider = await call(c, { role: null });
+      const variants: Array<[string, Parameters<typeof world>[0]]> = [
+        ["an admin whose row is inactive", { role: "admin", status: "inactive" }],
+        ["an admin whose row is suspended", { role: "admin", status: "suspended" }],
+        ["a super owner whose row is inactive", { role: "super_owner", status: "inactive" }],
+        ["an active admin of a deleted organisation", { role: "admin", orgDeleted: true }],
+      ];
+      for (const [label, o] of variants) {
+        const out = await call(c, o);
+        eq(`${c.name}, ${label}: the no-membership answer (${outsider.status}), no service-key / Cloudflare / write request`,
+          [out.status, out.body, serviceCalls().length, external().length, writes().length],
+          [outsider.status, outsider.body, 0, 0, 0]);
+      }
+      // The control beside it: the same admin, active, in the live organisation, is let through.
+      const control = await call(c, { role: "admin" });
+      eq(`${c.name}, the control (an active admin of the live organisation): answered ${control.status}, not the no-membership answer`,
+        control.status !== outsider.status, true);
     }
 
     eq("no request left the stub", unmatched, []);

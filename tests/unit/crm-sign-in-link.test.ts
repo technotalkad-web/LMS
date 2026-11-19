@@ -167,7 +167,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
 
   if (p === "/rest/v1/org_api_keys") {
     if (method !== "GET") return new Response(null, { status: 204 });
-    return json([{ id: "key-1", organization_id: ORG, is_active: true, organizations: { slug: "org" } }]);
+    return json([{ id: "key-1", organization_id: ORG, is_active: true, organizations: { slug: "org", deleted_at: null } }]);
   }
   if (p === "/rest/v1/profiles") {
     if (q.has("id")) return json(PROFILES.filter((r) => r.id === eqOf(q, "id")));

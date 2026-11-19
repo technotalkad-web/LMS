@@ -90,7 +90,17 @@ Rules your sync can rely on:
   fields you send.
 - **`DELETE /api/integrations/employees`** with `{ "employee_id": "…" }` =
   leaver. Deactivates (learning history preserved); they instantly disappear
-  from summary and SSO.
+  from summary and SSO. From their next request the person loses access to
+  the organisation in the LMS, also in a browser where they are still
+  signed in. A module they have open stops recording at once (its launch is
+  closed), and the organisation's mail to them (reminders, assignments,
+  broadcasts) stops. The answer is
+  `{ "ok": true, "action": "deactivated", "employee_id": "…" }`; if the open
+  launch could not be closed it also carries `"tokens_expired": false`: the
+  deactivation still stands, and that launch can record until it expires on
+  its own, at most 24 hours after it was opened. An upsert of the same
+  `employee_id` restores access at the next request; the learner opens the
+  module again and it resumes where they left off.
 - **Master-data governance applies**: fields the Super Owner governs
   (designation, city, …) must use master values → `400` with the exact
   message admins see. Sync the master lists first or map values in the CRM.
@@ -487,7 +497,8 @@ cache-refresh signal, the summary as truth.
 | `/api/integrations/progress` | GET / POST | API key | Bulk learner progress, paged and filterable — the Progress API replacement |
 | `/api/integrations/enter` / `exit` | GET | browser | Embedded-mode cookies (used automatically; not called by the CRM) |
 
-**Status codes:** `401` bad/revoked key · `403` admin account refused ·
+**Status codes:** `401` bad or revoked key, or the key of an organisation
+that has been deleted (the same answer) · `403` admin account refused ·
 `404` no active LMS account for that employee_id or email (on `sso-link`, an
 email must be the person's LMS login address, and an account that signs in
 through an identity provider gets no link) · `400` validation
@@ -505,6 +516,9 @@ and no link was minted; retry).
   these endpoints and scoped to one org.
 - SSO and sync **structurally cannot touch admin accounts** or escalate
   roles; a leaked key cannot yield admin access. Revocation is immediate.
+- A key works only while its organisation exists: once the organisation is
+  deleted (at the end of its deletion grace period), every call with its
+  key is refused with the answer a revoked key gets (`401`).
 - Keys are managed by the Super Owner only, with last-used timestamps for
   audit.
 

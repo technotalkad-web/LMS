@@ -12,7 +12,13 @@
  *   - requireOrgAccess(): a member holding the owner's cookie keeps their own
  *     membership role; the owner is answered super_owner on top of their own
  *     membership that counts (ADR 0030), and an owner with no membership row
- *     there is sent back to /super/organizations;
+ *     there is sent back to /super/organizations; an owner whose row is
+ *     inactive or suspended, a session started before the organisation was
+ *     deleted, and a member whose row does not count (or whose organisation
+ *     is deleted) each get the answer of no row;
+ *   - POST /api/super/impersonate refuses a deleted organisation with the
+ *     unknown organisation's answer and writes no session row, no audit row
+ *     and no cookie (ADR 0030 decision 6(a)); the live one still starts;
  *   - GET /api/super/impersonate answers the session to its owner only;
  *   - sign-out ends the session (row stamped, cookie deleted) before it signs
  *     out, and still signs out when ending it fails;
@@ -98,6 +104,12 @@ let authDown = false;
 let passwordUpdateFails = false;
 let adminPasswordUpdateFails = false;
 const roles: Record<string, string> = {};
+/** The status of a user's row in ORG (ADR 0030: only "active" counts); absent = active. */
+const statuses: Record<string, string> = {};
+/** ORG is soft-deleted (deleted_at set). */
+let orgDeleted = false;
+/** platform_audit_log rows written (the start route's audit row). */
+let audits: Row[] = [];
 let requests: Req[] = [];
 let errors: string[] = [];
 const unmatched: string[] = [];
@@ -172,13 +184,26 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json(object ? otp : [otp]);
   }
   if (p === "/rest/v1/profiles") return method === "GET" ? json([{ must_change_password: false }]) : new Response(null, { status: 204 });
-  if (p === "/rest/v1/organizations") return json([ORG]);
+  if (p === "/rest/v1/organizations") {
+    // Filtered by id or slug when the read names one; deleted_at set when the org is soft-deleted.
+    const id = eqParam(q, "id");
+    const slug = eqParam(q, "slug");
+    const hit = (id === null || id === ORG.id) && (slug === null || slug === ORG.slug);
+    const row = { ...ORG, deleted_at: orgDeleted ? "2026-11-01T00:00:00Z" : null };
+    return json(hit ? (object ? row : [row]) : object ? null : []);
+  }
   if (p === "/rest/v1/organization_members") {
     if (method !== "GET") return new Response(null, { status: 201 });
-    const role = roles[eqParam(q, "user_id") ?? ""];
-    return json(role ? [{ role, status: "active" }] : []);
+    const uid = eqParam(q, "user_id") ?? "";
+    const role = roles[uid];
+    return json(role ? [{ role, status: statuses[uid] ?? "active" }] : []);
   }
-  if (p === "/rest/v1/platform_owners") return json(eqParam(q, "user_id") === OWNER.id ? [{ user_id: OWNER.id }] : []);
+  // mfa_required false, as the e2e fixtures seed a platform owner, so the start route's guard admits the owner.
+  if (p === "/rest/v1/platform_owners") return json(eqParam(q, "user_id") === OWNER.id ? [{ user_id: OWNER.id, mfa_required: false }] : []);
+  if (p === "/rest/v1/platform_audit_log") {
+    if (method === "POST") audits.push(JSON.parse(body || "{}") as Row);
+    return new Response(null, { status: 201 });
+  }
   if (p === "/rest/v1/invitations") {
     if (method !== "GET") return new Response(null, { status: 204 });
     // The organisation is embedded, live (the accept route refuses a deleted one).
@@ -194,6 +219,9 @@ const fresh = () => {
   rows.clear();
   revoked.clear();
   for (const k of Object.keys(roles)) delete roles[k];
+  for (const k of Object.keys(statuses)) delete statuses[k];
+  orgDeleted = false;
+  audits = [];
   requests = []; deleted = []; errors = [];
   ignoreActorFilter = false; authDown = false; passwordUpdateFails = false; adminPasswordUpdateFails = false;
 };
@@ -309,6 +337,65 @@ async function main() {
       roles[MEMBER.id] = "user";
       const member = await requireOrgAccess(ORG.slug);
       eq("a member holding the owner's cookie keeps their own role, no impersonation", [member.user.id, member.role, member.impersonation], [MEMBER.id, "user", null]);
+    }
+
+    console.log("\nrequireOrgAccess: a row that does not count, and a deleted organisation, are answered as no row (ADR 0030)");
+    {
+      const sentTo = () => requireOrgAccess(ORG.slug).then(
+        (a) => `answered ${a.role}`,
+        (e: unknown) => String((e as { digest?: unknown })?.digest ?? e).split(";")[2] ?? "error"
+      );
+      await ownerStarts();
+      const noRow = await sentTo();
+      for (const status of ["inactive", "suspended"]) {
+        roles[OWNER.id] = "admin";
+        statuses[OWNER.id] = status;
+        eq(`the impersonating owner whose own row is ${status}: the no-row answer (${noRow}), never super_owner`, await sentTo(), noRow);
+      }
+      delete statuses[OWNER.id];
+      eq("…the control: the same row set active is answered super_owner", await sentTo(), "answered super_owner");
+      orgDeleted = true;
+      eq("a session started before the organisation was deleted: the no-row answer, even with an active row (it opens no page)", await sentTo(), noRow);
+      orgDeleted = false;
+      delete roles[OWNER.id];
+
+      signIn("tok-member");
+      const outsider = await sentTo();
+      roles[MEMBER.id] = "user";
+      for (const status of ["inactive", "suspended"]) {
+        statuses[MEMBER.id] = status;
+        eq(`a member whose row is ${status}, holding the owner's cookie: the non-member's answer (${outsider})`, await sentTo(), outsider);
+      }
+      delete statuses[MEMBER.id];
+      orgDeleted = true;
+      eq("an active member of the deleted organisation: the non-member's answer", await sentTo(), outsider);
+      orgDeleted = false;
+      eq("…the control: the member, active, in the live organisation, keeps their role", await sentTo(), "answered user");
+    }
+
+    console.log("\nPOST /api/super/impersonate: a deleted organisation is refused as an unknown one (ADR 0030 decision 6(a))");
+    {
+      const start = async (orgId: string) => {
+        requests = []; audits = [];
+        const res = await impersonateRoute.POST(new Request("http://lms.test/api/super/impersonate", { method: "POST", body: JSON.stringify({ org_id: orgId, reason: "unit test" }) }));
+        return { status: res.status, body: (await res.json()) as Row };
+      };
+      const sessionWrites = () => requests.filter((r) => r.path === "/rest/v1/platform_impersonation_sessions" && r.method !== "GET").length;
+      fresh();
+      signIn("tok-owner");
+      const unknown = await start("6c1e0a6e-0000-4000-8000-0000000000ff");
+      eq("an unknown organisation (the reference answer): 404, no session row, no audit row, no cookie",
+        [unknown.status, sessionWrites(), audits.length, browser.has(IMP_COOKIE)], [404, 0, 0, false]);
+      orgDeleted = true;
+      const gone = await start(ORG.id);
+      eq("a deleted organisation: the unknown organisation's status and body, no session row, no audit row, no cookie",
+        [gone.status, gone.body, sessionWrites(), audits.length, browser.has(IMP_COOKIE)], [unknown.status, unknown.body, 0, 0, false]);
+      eq("…the organisation read names deleted_at",
+        requests.some((r) => r.path === "/rest/v1/organizations" && (r.query.get("select") ?? "").split(",").includes("deleted_at")), true);
+      orgDeleted = false;
+      const live = await start(ORG.id);
+      eq("the control, the live organisation: 200 ok, one session row, one audit row, the cookie set",
+        [live.status, live.body.ok, sessionWrites(), audits.map((a) => a.action), browser.has(IMP_COOKIE)], [200, true, 1, ["tenant.impersonate_start"], true]);
     }
 
     console.log("\nGET /api/super/impersonate");
