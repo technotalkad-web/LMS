@@ -24,6 +24,14 @@ import {
  *     courses are skipped; each other organisation's members that count
  *     are read once per run, and an organisation whose read fails is
  *     skipped for this run (nothing sent, no state written).
+ *   - Such a skip fails the run (ADR 0030, note "Pull request B build
+ *     decisions", change 2): it is counted as `unreadable_orgs`, and when
+ *     the count is above zero the answer is 500 with `ok: false` and the
+ *     heartbeat is recorded as an error, at both exits. The other
+ *     organisations' mail and reminder state are finished first. A deleted
+ *     organisation is not a failure. The body holds numbers and booleans
+ *     only; the organisation's id is in the mail_recipients_unreadable log
+ *     line. The next scheduled run is the retry.
  *   - Skip learners who have already completed/passed the course.
  *   - Skip learners whose first_assigned_at is older than cap_days.
  *   - Skip learners whose last_nudge_at is newer than cadence_days ago.
@@ -105,21 +113,29 @@ export async function POST(request: Request) {
   // an organisation whose read fails is dropped for this run and logged with
   // its id.
   const countingByOrg = new Map<string, ReadonlySet<string>>();
+  // Organisations skipped because their members could not be read: the run
+  // fails when there is one (a count only, never an id, in the body).
+  let unreadableOrgs = 0;
   for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
     const counting = await countingMemberIds(svc, oid);
     if (counting === "unreadable") {
       console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "cron/reminders", org_id: oid }));
+      unreadableOrgs++;
       continue;
     }
     countingByOrg.set(oid, counting);
   }
+  const ok = unreadableOrgs === 0;
   const enabledCourses = allCourses.filter((c) => countingByOrg.has(c.organization_id));
   if (enabledCourses.length === 0) {
     // A successful run with nothing to do must still heartbeat, or the health
     // probe reads reminders as never-seen/stale → false "degraded" (which is
     // exactly what happened on pre-launch prod: no reminder-enabled courses).
-    await recordHeartbeat("reminders", { scanned: 0, sent: 0, skipped: 0 });
-    return NextResponse.json({ scanned: 0, sent: 0, skipped: 0 });
+    // A run left with nothing because no organisation could be read is not
+    // successful: it records an errored heartbeat and answers 500.
+    const summary = { ok, scanned: 0, sent: 0, skipped: 0, unreadable_orgs: unreadableOrgs };
+    await recordHeartbeat("reminders", summary, ok);
+    return NextResponse.json(summary, { status: ok ? 200 : 500 });
   }
 
   const courseIds = enabledCourses.map((c) => c.course_id);
@@ -446,15 +462,26 @@ export async function POST(request: Request) {
       .upsert(stateUpserts, { onConflict: "user_id,course_id" });
   }
 
-  await recordHeartbeat("reminders", {
-    scanned: enabledCourses.length,
-    sent,
-    skipped,
-  });
-  return NextResponse.json({
-    scanned: enabledCourses.length,
-    sent,
-    skipped,
-    upserts: stateUpserts.length,
-  });
+  await recordHeartbeat(
+    "reminders",
+    {
+      ok,
+      scanned: enabledCourses.length,
+      sent,
+      skipped,
+      unreadable_orgs: unreadableOrgs,
+    },
+    ok
+  );
+  return NextResponse.json(
+    {
+      ok,
+      scanned: enabledCourses.length,
+      sent,
+      skipped,
+      upserts: stateUpserts.length,
+      unreadable_orgs: unreadableOrgs,
+    },
+    { status: ok ? 200 : 500 }
+  );
 }

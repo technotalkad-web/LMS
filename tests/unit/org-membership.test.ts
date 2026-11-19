@@ -86,7 +86,12 @@
  *       their one person only while that person's membership counts; when
  *       the members that count cannot be read, nothing is sent and the
  *       sender is not entered (a broadcast answers 503), and the log line
- *       holds the organisation's id and no address;
+ *       holds the organisation's id and no address; the reminders and
+ *       journey nudges crons then report a failed run (500, ok false, the
+ *       count unreadable_orgs, a heartbeat written as an error), at the
+ *       reminders' early exit and at its end, after the other
+ *       organisations' mail and state; a deleted organisation is no failure,
+ *       and a healthy run answers 200, ok true, with a heartbeat "ok";
  *   (l) the platform notices (GET /api/broadcasts): an administrators-only
  *       notice is shown only to a person who holds an administrator row
  *       that counts somewhere; one whose only administrator row is inactive,
@@ -1179,7 +1184,7 @@ async function main() {
       const GONE_ROWS = [ca("c-gone", GONE, "org"), ca("c-gone", GONE, "user", "u-g")];
 
       let mt: Record<string, Row[]> = {};
-      let mFail: (table: string, select: string) => boolean = () => false;
+      let mFail: (table: string, select: string, query: URLSearchParams) => boolean = () => false;
       let warned: string[] = [];
       const mailStub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
         const url = new URL(input instanceof Request ? input.url : String(input));
@@ -1202,7 +1207,7 @@ async function main() {
         }
         if (table.startsWith("rpc/")) return json([]);
         if (method === "GET") {
-          if (mFail(table, select)) return json({ code: "XX000", message: "stub read failure" }, 500);
+          if (mFail(table, select, q)) return json({ code: "XX000", message: "stub read failure" }, 500);
           if (table === "profiles") {
             const id = q.get("id") ?? "";
             const ids = id.startsWith("in.(") ? id.slice(4, -1).split(",") : id.startsWith("eq.") ? [id.slice(3)] : [];
@@ -1226,7 +1231,8 @@ async function main() {
       };
       const mailWorld = (o: {
         assignments?: Row[]; pathAssignments?: Row[]; reminderState?: Row[]; extraMembers?: Row[];
-        fail?: (table: string, select: string) => boolean;
+        reminderSettings?: Row[]; programs?: Row[]; enrolments?: Row[];
+        fail?: (table: string, select: string, query: URLSearchParams) => boolean;
       } = {}) => {
         mt = {
           organizations: [LIVE, SECOND, GONE].map((x) => ({ ...x })),
@@ -1235,12 +1241,15 @@ async function main() {
           team_members: ["u-act", "u-ina", "u-sus"].map((u) => ({ team_id: "t-live", user_id: u })),
           org_groups: [{ id: "g-live", organization_id: LIVE.id, group_type: "static", rules: {}, is_active: true }],
           org_group_members: ["u-act", "u-ina", "u-sus"].map((u) => ({ group_id: "g-live", user_id: u })),
-          course_reminder_settings: [reminderSetting("c-live", LIVE), reminderSetting("c-gone", GONE)],
+          course_reminder_settings: (o.reminderSettings ?? [reminderSetting("c-live", LIVE), reminderSetting("c-gone", GONE)]).map((r) => ({ ...r })),
           course_assignments: (o.assignments ?? []).map((r) => ({ ...r })),
           learning_path_assignments: (o.pathAssignments ?? []).map((r) => ({ ...r })),
           courses: [{ id: "c-live", organization_id: LIVE.id, title: "Course L" }, { id: "c-gone", organization_id: GONE.id, title: "Course G" }],
-          journey_programs: [journeyProgram("p-live", LIVE), journeyProgram("p-gone", GONE)],
-          journey_enrollments: [enrol("e-act", "u-act", "p-live"), enrol("e-act2", "u-act2", "p-live"), enrol("e-ina", "u-ina", "p-live"), enrol("e-g", "u-g", "p-gone")],
+          journey_programs: (o.programs ?? [journeyProgram("p-live", LIVE), journeyProgram("p-gone", GONE)]).map((r) => ({ ...r })),
+          journey_enrollments: [
+            enrol("e-act", "u-act", "p-live"), enrol("e-act2", "u-act2", "p-live"), enrol("e-ina", "u-ina", "p-live"), enrol("e-g", "u-g", "p-gone"),
+            ...(o.enrolments ?? []),
+          ],
         };
         mFail = o.fail ?? (() => false);
         requests = [];
@@ -1261,14 +1270,28 @@ async function main() {
       const unreadableLogged = () => warned
         .map((l) => { try { return JSON.parse(l) as Row; } catch { return null; } })
         .filter((l): l is Row => l?.event === "mail_recipients_unreadable");
+      /** countingMemberIds' member read of one organisation only. */
+      const COUNTING_READ_OF = (...orgs: Array<{ id: string }>) => (table: string, select: string, query: URLSearchParams) =>
+        COUNTING_READ(table, select) && orgs.some((o) => query.get("organization_id") === `eq.${o.id}`);
+      /** Each heartbeat the run wrote: [job, last_status, detail.ok, detail.unreadable_orgs]. */
+      const beats = () => requests.filter((r) => r.table === "ops_heartbeats" && r.method === "POST").map((r) => {
+        const b = r.body as Row;
+        const d = (b.last_detail ?? {}) as Row;
+        return [b.name, b.last_status, d.ok, d.unreadable_orgs];
+      });
 
       const realWarn = console.warn;
       globalThis.fetch = mailStub as typeof fetch;
       console.warn = (...a: unknown[]) => { warned.push(a.map((x) => (typeof x === "string" ? x : String(x))).join(" ")); };
       try {
         // ---- the reminders cron ----
-        const remind = async () =>
-          (await reminders.POST(new Request("http://lms.test/api/cron/reminders", { method: "POST", headers: { "x-cron-secret": SECRET } }))).status;
+        const remindRun = async () => {
+          const res = await reminders.POST(new Request("http://lms.test/api/cron/reminders", { method: "POST", headers: { "x-cron-secret": SECRET } }));
+          return { status: res.status, body: (await res.json()) as Row };
+        };
+        /** A healthy run: ok, no organisation unreadable, and the heartbeat "ok". */
+        const HEALTHY_REMINDERS = [true, 0, [["reminders", "ok", true, 0]]];
+        const health = (r: { body: Row }) => [r.body.ok, r.body.unreadable_orgs, beats()];
         const stateFor = () => requests.filter((r) => r.table === "reminder_state" && r.method === "POST")
           .flatMap((r) => (r.body as Row[]).map((x) => String(x.user_id))).sort();
         const AUDIENCES: Array<[string, Row[], string[]]> = [
@@ -1279,11 +1302,12 @@ async function main() {
         ];
         for (const [name, rows, want] of AUDIENCES) {
           mailWorld({ assignments: [...rows, ...GONE_ROWS] });
-          const status = await remind();
+          const r = await remindRun();
           eq(`reminders, a course assigned ${name}: only members that count are reminded, and only they get reminder state`,
-            [status, mailed("asset_reminder"), stateFor()], [200, want, want]);
+            [r.status, mailed("asset_reminder"), stateFor()], [200, want, want]);
           eq("…a deleted organisation's course reminds nobody, and none of its rows is read; one read of the members that count",
             [mailed().includes("u-g"), readsOfOrg(GONE), countingReads()], [false, 0, 1]);
+          eq("…the only other organisation is deleted, which is no failure: ok, unreadable_orgs 0, a heartbeat \"ok\"", health(r), HEALTHY_REMINDERS);
         }
         {
           // Both first assigned 40 days ago, past the 30-day cap: an active
@@ -1292,19 +1316,57 @@ async function main() {
           const OLD = new Date(Date.now() - 40 * 86400000).toISOString();
           const old = (u: string): Row => ({ user_id: u, course_id: "c-live", first_assigned_at: OLD, last_nudge_at: OLD, nudge_count: 3, stopped: false });
           mailWorld({ assignments: ["u-act", "u-ina"].map((u) => ca("c-live", LIVE, "user", u)), reminderState: [old("u-act"), old("u-ina")] });
-          const status = await remind();
-          const upserts = requests.filter((r) => r.table === "reminder_state" && r.method === "POST")
-            .flatMap((r) => (r.body as Row[]).map((x) => `${x.user_id} stopped=${x.stopped}`)).sort();
+          const r = await remindRun();
+          const upserts = requests.filter((q) => q.table === "reminder_state" && q.method === "POST")
+            .flatMap((q) => (q.body as Row[]).map((x) => `${x.user_id} stopped=${x.stopped}`)).sort();
           eq("reminders past the cap: the active learner's state is written stopped and nobody is mailed; nothing is written for the inactive learner",
-            [status, mailed(), upserts], [200, [], ["u-act stopped=true"]]);
+            [r.status, mailed(), upserts], [200, [], ["u-act stopped=true"]]);
+          eq("…a healthy run: ok, unreadable_orgs 0, a heartbeat \"ok\"", health(r), HEALTHY_REMINDERS);
         }
+        // The early exit: LIVE, the only live organisation with a course, cannot
+        // be read, so no course is left to scan (GONE is deleted).
         mailWorld({ assignments: [ca("c-live", LIVE, "org"), ca("c-live", LIVE, "user", "u-act")], fail: COUNTING_READ });
         {
-          const status = await remind();
-          eq("reminders, the members that count cannot be read: 200, nobody reminded, the sender not entered, no state written",
-            [status, mailed(), senderEntered(), stateFor()], [200, [], false, []]);
+          const r = await remindRun();
+          eq("reminders, the members that count cannot be read (every organisation, the early exit): 500, ok false, unreadable_orgs 1, nothing scanned",
+            [r.status, r.body.ok, r.body.unreadable_orgs, r.body.scanned], [500, false, 1, 0]);
+          eq("…nobody reminded, the sender not entered, no state written, and the heartbeat written as an error",
+            [mailed(), senderEntered(), stateFor(), beats()], [[], false, [], [["reminders", "error", false, 1]]]);
           eq("…logged once, with the organisation's id and no address",
             [unreadableLogged().map((l) => [l.site, l.org_id]), warned.some((l) => l.includes("@"))], [[["cron/reminders", LIVE.id]], false]);
+          eq("…the body holds numbers and booleans only", Object.values(r.body).every((v) => typeof v === "number" || typeof v === "boolean"), true);
+        }
+        // The early exit with two live organisations, neither readable.
+        mailWorld({
+          reminderSettings: [reminderSetting("c-live", LIVE), reminderSetting("c-second", SECOND), reminderSetting("c-gone", GONE)],
+          assignments: [ca("c-live", LIVE, "org"), ca("c-second", SECOND, "org"), ...GONE_ROWS],
+          fail: COUNTING_READ_OF(LIVE, SECOND),
+        });
+        {
+          const r = await remindRun();
+          eq("reminders, two live organisations and neither can be read: 500, unreadable_orgs 2, nobody reminded, an errored heartbeat",
+            [r.status, r.body.unreadable_orgs, mailed(), beats()], [500, 2, [], [["reminders", "error", false, 2]]]);
+        }
+        // The exit at the end: LIVE (read first) cannot be read, SECOND can.
+        mailWorld({
+          reminderSettings: [reminderSetting("c-live", LIVE), reminderSetting("c-second", SECOND), reminderSetting("c-gone", GONE)],
+          assignments: [ca("c-live", LIVE, "org"), ca("c-second", SECOND, "org"), ...GONE_ROWS],
+          fail: COUNTING_READ_OF(LIVE),
+        });
+        {
+          const r = await remindRun();
+          eq("reminders, one live organisation unreadable and one readable: the readable one's member is reminded and gets reminder state",
+            [mailed("asset_reminder"), stateFor(), r.body.scanned], [["u-out"], ["u-out"], 1]);
+          eq("…and the run answers 500, ok false, unreadable_orgs 1, with an errored heartbeat",
+            [r.status, r.body.ok, r.body.unreadable_orgs, beats()], [500, false, 1, [["reminders", "error", false, 1]]]);
+          eq("…the unreadable organisation is logged by its id, the body holds numbers and booleans only",
+            [unreadableLogged().map((l) => l.org_id), Object.values(r.body).every((v) => typeof v === "number" || typeof v === "boolean")], [[LIVE.id], true]);
+        }
+        // No reminder-enabled course at all, and a deleted organisation's only.
+        for (const [what, settings] of [["no reminder-enabled course at all", []], ["only a deleted organisation has reminders on", [reminderSetting("c-gone", GONE)]]] as Array<[string, Row[]]>) {
+          mailWorld({ reminderSettings: settings, assignments: GONE_ROWS });
+          const r = await remindRun();
+          eq(`reminders, ${what}: 200 with a healthy heartbeat, as before`, [r.status, r.body.scanned, ...health(r)], [200, 0, ...HEALTHY_REMINDERS]);
         }
 
         // ---- the journey nudges cron ----
@@ -1325,13 +1387,38 @@ async function main() {
             [readsOfOrg(GONE), requests.filter((q) => q.table === "journey_enrollments" && q.query.get("program_id") === "eq.p-gone").length, r.body.skipped_org_programs, mailed().includes("u-g")],
             [0, 0, 1, false]);
           eq("…one read of the members that count", countingReads(), 1);
+          eq("…the only other organisation is deleted, which is no failure: ok, unreadable_orgs 0, a heartbeat \"ok\"",
+            [r.body.ok, r.body.unreadable_orgs, beats()], [true, 0, [["journey-nudges", "ok", true, 0]]]);
         }
         mailWorld({ fail: COUNTING_READ });
         {
           const r = await nudge();
-          eq("journey nudges, the members that count cannot be read: nobody mailed, the sender not entered, no enrolment claimed",
-            [r.status, mailed(), senderEntered(), claims()], [200, [], false, []]);
+          eq("journey nudges, the members that count cannot be read: 500, nobody mailed, the sender not entered, no enrolment claimed",
+            [r.status, mailed(), senderEntered(), claims()], [500, [], false, []]);
+          eq("…ok false, unreadable_orgs 1, and the heartbeat written as an error",
+            [r.body.ok, r.body.unreadable_orgs, beats()], [false, 1, [["journey-nudges", "error", false, 1]]]);
           eq("…logged with the organisation's id", unreadableLogged().map((l) => [l.site, l.org_id]), [["cron/journey-nudges", LIVE.id]]);
+        }
+        // LIVE (two programs, read first) cannot be read, SECOND can; GONE is deleted.
+        mailWorld({
+          programs: [journeyProgram("p-live", LIVE), journeyProgram("p-live2", LIVE), journeyProgram("p-second", SECOND), journeyProgram("p-gone", GONE)],
+          enrolments: [enrol("e-out", "u-out", "p-second")],
+          fail: COUNTING_READ_OF(LIVE),
+        });
+        {
+          const r = await nudge();
+          // The claim stamps today's date (a send the stub's sender does not
+          // report as sent then releases it, as for every learner here).
+          const stamped = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on)
+            .map((q) => String(q.query.get("id")));
+          eq("journey nudges, one live organisation unreadable and one readable: the readable one's learner is reminded and claimed",
+            [mailed("journey_nudge"), stamped], [["u-out"], ["eq.e-out"]]);
+          eq("…and the run answers 500, ok false, with an errored heartbeat",
+            [r.status, r.body.ok, beats()], [500, false, [["journey-nudges", "error", false, 1]]]);
+          eq("…unreadable_orgs counts the organisation once (its two programs are skipped); skipped_org_programs keeps its meaning",
+            [r.body.unreadable_orgs, r.body.skipped_org_programs], [1, 3]);
+          eq("…the unreadable organisation is read once and logged by its id for each program",
+            [countingReads(), unreadableLogged().map((l) => [l.org_id, l.program_id])], [2, [[LIVE.id, "p-live"], [LIVE.id, "p-live2"]]]);
         }
 
         // ---- the broadcast route (the session is an active administrator of LIVE) ----

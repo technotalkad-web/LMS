@@ -50,6 +50,16 @@ import {
  * stamp, and no escalation about them); an escalation goes only to a
  * manager whose membership counts.
  *
+ * Such a skip fails the run (ADR 0030, note "Pull request B build
+ * decisions", change 2): the organisations whose members could not be read
+ * are counted as `unreadable_orgs`, and `ok` is true only when that count is
+ * zero, so the heartbeat reads error and the answer is 500. The other
+ * organisations' programs are finished first. `skipped_org_programs` keeps
+ * its meaning (programs skipped, a deleted organisation's included); a
+ * deleted organisation is not a failure. The organisation's id is in the
+ * mail_recipients_unreadable log line, not in a count. The next scheduled
+ * run is the retry.
+ *
  * Scheduled hourly from .github/workflows/cron.yml.
  */
 
@@ -103,6 +113,9 @@ async function run() {
   // Rule 10: the members that count, read once per organisation in this run.
   const countingByOrg = new Map<string, ReadonlySet<string> | "unreadable">();
   let skippedOrg = 0;
+  // Organisations (not programs) whose members could not be read: the run
+  // fails when there is one.
+  let unreadableOrgs = 0;
 
   for (const p of (progRows ?? []) as Array<{
     id: string;
@@ -142,7 +155,9 @@ async function run() {
       continue;
     }
     if (!countingByOrg.has(p.organization_id)) {
-      countingByOrg.set(p.organization_id, await countingMemberIds(svc, p.organization_id));
+      const read = await countingMemberIds(svc, p.organization_id);
+      if (read === "unreadable") unreadableOrgs++;
+      countingByOrg.set(p.organization_id, read);
     }
     const counting = countingByOrg.get(p.organization_id)!;
     if (counting === "unreadable") {
@@ -420,13 +435,14 @@ async function run() {
   }
 
   return {
-    ok: true,
+    ok: unreadableOrgs === 0,
     total_ms: Date.now() - t0,
     scanned,
     reminded,
     escalated,
     skipped_early: skippedEarly,
     skipped_org_programs: skippedOrg,
+    unreadable_orgs: unreadableOrgs,
     capped,
     details,
   };
