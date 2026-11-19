@@ -104,7 +104,62 @@ Each file's header is the full rule; this is the cross-file summary.
   until the paste. Rows are kept 90 days (the delete statement is in the
   file's header and `ops/RUNBOOK.md` §6.3). Reverse: `ops/0113-reverse.sql`,
   after the code is rolled back.
-- 0114 (`tenant_smtp_state`, ADR 0029 pull request B) is not written yet.
+- **0114** (`0114_tenant_smtp_state.sql`, ADR 0029 pull request B): adds
+  `tenant_smtp_state` (each tenant's mail health, owed alert and daily cap),
+  `mail_job_counts` (a daily count of reset-code and sign-in-link jobs,
+  written only through `mail_job_mark`), `tenant_mail_status` (one call that
+  returns a tenant's state with its sent count of the past 24 hours) and one
+  index on `notification_log`. Written and rehearsed
+  (`scripts/migration-rehearsal`: `0114-defaults`, `0114-no-defaults`,
+  `0114-at-0104`, `0114-with-0115`, `0114-then-0115`, `0114-drift`); **not
+  pasted on staging or production yet** (2026-11-19). The two tables are
+  deny-all and service-role only (select, insert, update; never delete); the
+  two functions are security invoker and only the service role executes
+  them. It needs nothing past 0021, and 0115 may be pasted before or after
+  it. Paste it **ahead of** pull request B's code (preferred; code that comes
+  first treats a tenant with complete settings as able to send, applies no
+  cap and writes no job marks). Reverse with `ops/0114-reverse.sql` once the
+  code is rolled back; it loses any daily caps a platform owner set, and its
+  header shows the select that saves them first.
+- **0117** (`0117_account_setup_links.sql`, ADR 0029 pull request B): one
+  deny-all table for the LMS's own "set your password" links (rule N9).
+  `service_role` may select the table, insert five named columns and update
+  two, and has no delete, so only the database decides when a link expires.
+  Written and rehearsed (`0117-defaults`, `0117-no-defaults`); **not pasted
+  on staging or production yet** (2026-11-19). It needs only
+  `public.organizations` and `auth.users`. It **must** be pasted ahead of
+  pull request B's code (code that comes first turns away an add with no
+  password before creating any account). Rows are kept 90 days, with the
+  clean-up statement in the file's header. Reverse with
+  `ops/0117-reverse.sql` once the code is rolled back; links already mailed
+  then stop working.
+- **The 0114 and 0117 sitting** (ADR 0029, checklist D7). The pull request's
+  first push carries only these files (the two migrations, their reverses,
+  the pre-check, the rehearsal and this page), no app code, and its single
+  independent review reads the two migrations then. On staging, with the
+  owner at the SQL editor (role selector on postgres, never the Supabase
+  CLI) and while no spec, CI e2e run or harness is running:
+  1. Run `ops/0114-0117-before-checks.sql` by itself. It only reads and
+     always gives 27 rows; save them all as a file. If any row says
+     `REFUSES`, or anything looks unexpected, stop: paste nothing and send
+     the rows to the architect.
+  2. Paste 0114 in full. A success message means its built-in after-checks
+     passed.
+  3. Paste 0117 in full.
+  4. Run `ops/0115-after-checks.sql` by itself, once, as after any sitting
+     ("DO" then "ROLLBACK" is a pass).
+  5. Run the pre-check again: all rows `ok` or `info`, with P19 showing
+     both files pasted. Note the date on this page.
+
+  Only after that is the app code pushed. Each file's section 0 tests the
+  same facts the pre-check reports and stops before creating anything, and
+  each file is a single transaction, so a stopped or failed paste leaves no
+  trace. Production gets its own sitting, before the tag that carries the
+  code, run by the owner after it has been explained: 0113 first if
+  production lacks it (with its own checks), then steps 1 to 5, doing step
+  4 only if 0115 is on production by then. The rehearsal covers staging's
+  sitting as `0114-0117-sitting` and production's as `0114-0117-at-0104`
+  and `0114-0117-at-0104-with-0115`.
 
 ## Paste order: membership status (ADR 0030)
 
