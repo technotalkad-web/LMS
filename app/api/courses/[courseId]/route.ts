@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED, isOrgAdminCaller } from "@/lib/auth/api-admin";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { countLearnerAttemptsOnCourse, isLearnerHistoryError } from "@/lib/courses/learner-history";
 
@@ -190,14 +191,10 @@ export async function DELETE(
       .maybeSingle();
     const orgId = (course as { organization_id?: string } | null)?.organization_id;
     if (orgId) {
-      const { data: mem } = await supabase
-        .from("organization_members")
-        .select("role")
-        .eq("organization_id", orgId)
-        .eq("user_id", user.id)
-        .maybeSingle();
-      const role = (mem?.role as string | undefined) ?? "";
-      if (role === "super_owner" || role === "owner" || role === "admin") {
+      // ADR 0030: administrator rights only from a membership that counts.
+      const admin = await isOrgAdminCaller(supabase, orgId, user.id);
+      if (admin === null) return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+      if (admin) {
         // Attempts belong to other users: count with the service role, after
         // the admin check. Fail closed when the count cannot be read.
         const svc = createServiceClient(

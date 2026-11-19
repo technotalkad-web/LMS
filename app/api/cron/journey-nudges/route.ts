@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { notifyBackground } from "@/lib/notifications/send";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 import {
   computeJourneyState,
   courseDaysOf,
@@ -41,6 +42,24 @@ import {
  * Manager escalation (0065) stays CALENDAR-ONLY (a self-paced journey has no
  * "behind") and keeps its own nudge_cooldown_days clock via last_nudged_at.
  *
+ * ADR 0030 rule 10: only members that count (active, in an organisation that
+ * is not deleted) are mailed. A deleted organisation's programs are skipped;
+ * each other organisation's members that count are read once per run, and
+ * an organisation whose read fails is skipped for this run. A learner whose
+ * membership does not count is skipped before the claim (no reminder, no
+ * stamp, and no escalation about them); an escalation goes only to a
+ * manager whose membership counts.
+ *
+ * Such a skip fails the run (ADR 0030, note "Pull request B build
+ * decisions", change 2): the organisations whose members could not be read
+ * are counted as `unreadable_orgs`, and `ok` is true only when that count is
+ * zero, so the heartbeat reads error and the answer is 500. The other
+ * organisations' programs are finished first. `skipped_org_programs` keeps
+ * its meaning (programs skipped, a deleted organisation's included); a
+ * deleted organisation is not a failure. The organisation's id is in the
+ * mail_recipients_unreadable log line, not in a count. The next scheduled
+ * run is the retry.
+ *
  * Scheduled hourly from .github/workflows/cron.yml.
  */
 
@@ -78,7 +97,7 @@ async function run() {
   // migrations — 0065/0088 fields arrive as undefined before they run.
   const { data: progRows, error: progErr } = await svc
     .from("journey_programs")
-    .select("*, organizations!inner(name, slug)")
+    .select("*, organizations!inner(name, slug, deleted_at)")
     .eq("is_active", true)
     .eq("nudge_enabled", true)
     .not("current_version_id", "is", null);
@@ -91,6 +110,12 @@ async function run() {
   let capped = false;
   const details: Array<{ org: string; reminded: number; escalated: number }> = [];
   const courseTitle = new Map<string, string>(); // courseId → title (cross-program cache)
+  // Rule 10: the members that count, read once per organisation in this run.
+  const countingByOrg = new Map<string, ReadonlySet<string> | "unreadable">();
+  let skippedOrg = 0;
+  // Organisations (not programs) whose members could not be read: the run
+  // fails when there is one.
+  let unreadableOrgs = 0;
 
   for (const p of (progRows ?? []) as Array<{
     id: string;
@@ -101,13 +126,20 @@ async function run() {
     deadline_days?: number | null; // 0065
     escalation_enabled?: boolean;
     escalation_after_days?: number;
-    organizations: { name: string; slug: string } | Array<{ name: string; slug: string }>;
+    organizations:
+      | { name: string; slug: string; deleted_at?: string | null }
+      | Array<{ name: string; slug: string; deleted_at?: string | null }>;
   }>) {
     if (reminded >= MAX_REMINDERS_PER_RUN) {
       capped = true;
       break;
     }
     const org = Array.isArray(p.organizations) ? p.organizations[0] : p.organizations;
+    // Rule 10: a deleted organisation is skipped by the run, before any read.
+    if (!org || org.deleted_at !== null) {
+      skippedOrg++;
+      continue;
+    }
     const { data: gsRow } = await svc
       .from("gamification_settings")
       .select("timezone")
@@ -122,17 +154,31 @@ async function run() {
       skippedEarly++;
       continue;
     }
+    if (!countingByOrg.has(p.organization_id)) {
+      const read = await countingMemberIds(svc, p.organization_id);
+      if (read === "unreadable") unreadableOrgs++;
+      countingByOrg.set(p.organization_id, read);
+    }
+    const counting = countingByOrg.get(p.organization_id)!;
+    if (counting === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "cron/journey-nudges", org_id: p.organization_id, program_id: p.id }));
+      skippedOrg++;
+      continue;
+    }
     const cooldownCutoff = new Date(Date.now() - (p.nudge_cooldown_days ?? 3) * 86400000);
     const escalationOn = p.escalation_enabled === true;
     const escalateAfter = p.escalation_after_days ?? 3;
 
-    // L1 managers for this org (0011 line_manager_id), fetched once per program.
+    // L1 managers for this org (0011 line_manager_id), fetched once per program:
+    // the learners' own rows, active only (rule 10). Whether the manager's own
+    // membership counts is tested at the send.
     let managerOf = new Map<string, string>();
     if (escalationOn) {
       const { data: memRows } = await svc
         .from("organization_members")
         .select("user_id, line_manager_id")
         .eq("organization_id", p.organization_id)
+        .eq("status", "active")
         .not("line_manager_id", "is", null);
       managerOf = new Map(
         ((memRows ?? []) as Array<{ user_id: string; line_manager_id: string }>).map(
@@ -196,6 +242,9 @@ async function run() {
           capped = true;
           break;
         }
+        // Rule 10: a learner whose membership does not count gets no reminder,
+        // is not stamped, and raises no escalation.
+        if (!counting.has(e.user_id)) continue;
         const v = Array.isArray(e.journey_versions)
           ? e.journey_versions[0]
           : e.journey_versions;
@@ -334,7 +383,8 @@ async function run() {
 
         if (needsEscalation) {
           const managerId = managerOf.get(e.user_id);
-          if (managerId) {
+          // Rule 10: only a manager whose membership counts is mailed.
+          if (managerId && counting.has(managerId)) {
             const { data: mgr } = await svc
               .from("profiles")
               .select("first_name, last_name, email")
@@ -385,12 +435,14 @@ async function run() {
   }
 
   return {
-    ok: true,
+    ok: unreadableOrgs === 0,
     total_ms: Date.now() - t0,
     scanned,
     reminded,
     escalated,
     skipped_early: skippedEarly,
+    skipped_org_programs: skippedOrg,
+    unreadable_orgs: unreadableOrgs,
     capped,
     details,
   };

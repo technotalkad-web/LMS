@@ -1,4 +1,6 @@
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -54,21 +56,23 @@ export async function authorizeManager(orgSlug: string | undefined): Promise<Man
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: "Unauthorized", status: 401 };
-  const { data: org } = await supabase.from("organizations").select("id, name, slug").eq("slug", orgSlug).maybeSingle();
-  if (!org) return { error: "Organization not found", status: 404 };
-  const { data: mem } = await supabase
-    .from("organization_members")
-    .select("role, status")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!mem || (mem as { status?: string }).status !== "active") return { error: "Forbidden", status: 403 };
+  // ADR 0030: a membership that counts (active, in an org that is not
+  // deleted); anything else is answered as a signed-in non-member is.
+  const m = await resolveOrgMembership<{ id: string; name: string | null; slug: string }>(
+    supabase,
+    { slug: orgSlug },
+    user.id,
+    "id, name, slug"
+  );
+  if (m === "unreadable") return { error: CHECK_FAILED, status: 503 };
+  if (m === "none") return { error: "Organization not found", status: 404 };
+  const org = m.org;
   const svc = svcClient();
-  const ctx = await loadManagerContext(svc, org.id as string, user.id);
+  const ctx = await loadManagerContext(svc, org.id, user.id);
   if (!ctx.isManager) return { error: "You are not mapped as anyone's manager.", status: 403 };
   return {
     svc,
-    org: { id: org.id as string, name: (org.name as string) ?? "your org", slug: org.slug as string },
+    org: { id: org.id, name: org.name ?? "your org", slug: org.slug },
     user: { id: user.id, email: user.email ?? null },
     ctx,
     origin: await originFromRequest(),

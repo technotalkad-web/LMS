@@ -4,6 +4,12 @@ import { randomBytes } from "node:crypto";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 import { notifyBackground } from "@/lib/notifications/send";
+import { membershipCounts } from "@/lib/auth/org-membership";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE,
+} from "@/lib/attempts/abandon";
 import { originFromRequest } from "@/lib/http/origin";
 
 function generateTempPassword(): string {
@@ -34,12 +40,14 @@ export async function GET(
   const { id: tenantId } = await params;
   const s = svc();
 
+  // Each row's status is returned with it: an administrator whose row is
+  // not active has no access to the tenant, and the console shows that.
   const { data: members } = await s
     .from("organization_members")
-    .select("user_id, role")
+    .select("user_id, role, status")
     .eq("organization_id", tenantId);
 
-  const rows = ((members ?? []) as Array<{ user_id: string; role: string }>).filter(
+  const rows = ((members ?? []) as Array<{ user_id: string; role: string; status: string }>).filter(
     (m) => ADMIN_ROLES.has(m.role)
   );
 
@@ -49,6 +57,7 @@ export async function GET(
     admins: rows.map((r) => ({
       user_id: r.user_id,
       role: r.role,
+      status: r.status,
       email: emailById.get(r.user_id) ?? "(unknown)",
     })),
   });
@@ -80,13 +89,13 @@ export async function POST(
 
   const { data: orgRaw } = await s
     .from("organizations")
-    .select("id, name, slug")
+    .select("id, name, slug, deleted_at")
     .eq("id", tenantId)
     .maybeSingle();
   if (!orgRaw) {
     return NextResponse.json({ error: "Org not found" }, { status: 404 });
   }
-  const org = orgRaw as { id: string; name: string; slug: string };
+  const org = orgRaw as { id: string; name: string; slug: string; deleted_at: string | null };
 
   const { data: listed } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
   let user = listed?.users?.find((u) => u.email?.toLowerCase() === email);
@@ -110,6 +119,28 @@ export async function POST(
     isBrandNew = true;
   }
 
+  // The add is a deliberate act that sets the row active, so it brings back
+  // a person whose row was inactive or suspended. Read the row it replaces
+  // first, so the audit row can say so. An account made just now has no row.
+  // A failed read is not "no row": nothing is written.
+  let previousStatus: string | null = null;
+  if (!isBrandNew) {
+    const { data: prior, error: priorErr } = await s
+      .from("organization_members")
+      .select("status")
+      .eq("organization_id", tenantId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (priorErr) {
+      return NextResponse.json(
+        { error: "Could not read this person's membership. Please try again." },
+        { status: 503 }
+      );
+    }
+    previousStatus = (prior as { status?: string | null } | null)?.status ?? null;
+  }
+  const reactivated = previousStatus !== null && previousStatus !== "active";
+
   // profiles uses `id` as the FK to auth.users(id) in this DB.
   await s
     .from("profiles")
@@ -127,7 +158,7 @@ export async function POST(
   const { error: memErr } = await s
     .from("organization_members")
     .upsert(
-      { organization_id: tenantId, user_id: user.id, role },
+      { organization_id: tenantId, user_id: user.id, role, status: "active" },
       { onConflict: "organization_id,user_id" }
     );
   if (memErr) {
@@ -135,7 +166,11 @@ export async function POST(
   }
 
   const origin = await originFromRequest();
-  if (isBrandNew && tempPassword) {
+  // ADR 0030 rule 10: the welcome goes only when the row just written counts.
+  // It is written active, so only a deleted organisation sends none; the add
+  // itself stands (the console staffs any tenant), and the platform owner
+  // still gets the temporary password in this answer.
+  if (isBrandNew && tempPassword && membershipCounts({ status: "active" }, org)) {
     const loginUrl = origin
       ? `${origin}/${org.slug}/login`
       : `/${org.slug}/login`;
@@ -160,13 +195,14 @@ export async function POST(
     action: "tenant.add_admin",
     targetType: "organization",
     targetId: tenantId,
-    metadata: { email, role, brand_new: isBrandNew },
+    metadata: { email, role, brand_new: isBrandNew, reactivated, previous_status: previousStatus },
   });
 
   return NextResponse.json({
     ok: true,
     user_id: user.id,
     invited: isBrandNew,
+    reactivated,
     temp_password: tempPassword,
     login_url: `${origin}/${org.slug}/login`,
   });
@@ -189,6 +225,8 @@ export async function PATCH(
       { status: 400 }
     );
   }
+  // The role only. A role change never sets the status: only the add (POST)
+  // brings back a row that is not active.
   const { error } = await svc()
     .from("organization_members")
     .update({ role: body.role })
@@ -217,12 +255,18 @@ export async function DELETE(
   if (!userId) {
     return NextResponse.json({ error: "user_id required" }, { status: 400 });
   }
-  const { error } = await svc()
+  const s = svc();
+  const { error } = await s
     .from("organization_members")
     .delete()
     .eq("organization_id", tenantId)
     .eq("user_id", userId);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+  // ADR 0030 decision 4: a removal ends that person's open launches in the
+  // tenant, as a deactivation does. A failed expiry leaves the removal
+  // standing; it is logged with ids only and reported in the answer.
+  const tokErr = await expireLaunchTokensForMembers(s, tenantId, [userId]);
+  if (tokErr) logLaunchTokenExpiryFailed("super/tenants/[id]/admins DELETE", tenantId, [userId], tokErr);
   await auditLog({
     actorUserId: guard.userId,
     action: "tenant.remove_admin",
@@ -230,5 +274,7 @@ export async function DELETE(
     targetId: tenantId,
     metadata: { user_id: userId },
   });
-  return NextResponse.json({ ok: true });
+  return NextResponse.json(
+    tokErr ? { ok: true, tokens_expired: false, warnings: [LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE] } : { ok: true }
+  );
 }

@@ -19,6 +19,10 @@
  * update, never an error; any other error is not swallowed; a team, org or
  * group row that already exists is never a conversion candidate.
  *
+ * Also ADR 0030 rule 10 at POST /api/assignments: a learner whose row does
+ * not count is assigned but not emailed, and an org-wide row emails the
+ * active members only.
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/assignment-conversion.test.ts   (or npm run test:unit)
@@ -94,10 +98,17 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const query = decodeURIComponent(url.search);
   requests.push({ method, table, query, body, apikey: headers.get("apikey") });
   if (p === "/auth/v1/user") return json(USER);
-  if (table === "organizations") return json([{ id: ORG, name: "Org", slug: "org" }]);
+  if (table === "organizations") return json([{ id: ORG, name: "Org", slug: "org", deleted_at: null }]);
   if (table === "organization_members" && method === "GET") {
     const sel = url.searchParams.get("select") ?? "";
-    if (sel === "role") return json([{ role: "admin" }]);
+    // The caller's own row, read by lib/auth/org-membership.ts (role and status).
+    if (sel === "role,status") return json([{ role: "admin", status: "active" }]);
+    // The org's members that count, read by countingMemberIds for the mail
+    // (ADR 0030 rule 10): every learner here is an active member but u-gone,
+    // whose row is inactive (the assignee check above still finds it).
+    if (sel === "user_id,role,status") {
+      return json(["u-adm", "u-new", "u-self"].map((user_id) => ({ user_id, role: "user", status: "active" })));
+    }
     const inList = /user_id=in\.\(([^)]*)\)/.exec(query)?.[1] ?? "";
     return json(inList.split(",").filter(Boolean).map((u) => ({ user_id: u, business_vertical: null, department: null })));
   }
@@ -207,6 +218,17 @@ async function main() {
       ]);
       const none = await course({}, { userIds: ["u-new"] });
       eq("nothing already there: no conversion call", none.rs.filter(isConversion).length, 0);
+    }
+
+    console.log("\nPOST /api/assignments: ADR 0030 rule 10, only members that count are emailed");
+    {
+      const logged = (rs: Req[]) => rs.filter((q) => q.table === "notification_log" && q.method === "POST").map((q) => String((q.body as Row).to_user_id)).sort();
+      const r = await course({}, { userIds: ["u-new", "u-gone"] });
+      eq("an active and an inactive learner named directly: both assigned, only the active one emailed",
+        [r.status, r.body.assigned, writesOf(r.rs, CA), emailedOf(r.rs), logged(r.rs)],
+        [200, 2, ["insert u-new", "insert u-gone"], ["u-new"], ["u-new"]]);
+      const org = await course({}, { assignToOrg: true });
+      eq("an org-wide row: every active member emailed, the inactive one not", [org.status, logged(org.rs)], [200, ["u-adm", "u-new", "u-self"]]);
     }
 
     console.log("\nPOST /api/assignments: without the column (today's sequence)");

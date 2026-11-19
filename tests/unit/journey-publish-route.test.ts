@@ -200,8 +200,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const object = (headers.get("accept") ?? "").includes("vnd.pgrst.object");
   const failing = (what: string) => world.fail.includes(what);
   if (p === "/auth/v1/user") return json(USER);
-  if (p === "/rest/v1/organizations") return failing("org") ? pgError("XX000", "stub failure", 500) : json([{ id: "org-1" }]);
-  if (p === "/rest/v1/organization_members") return failing("role") ? pgError("XX000", "stub failure", 500) : json([{ role: world.role }]);
+  if (p === "/rest/v1/organizations") return failing("org") ? pgError("XX000", "stub failure", 500) : json([{ id: "org-1", deleted_at: null }]);
+  if (p === "/rest/v1/organization_members") return failing("role") ? pgError("XX000", "stub failure", 500) : json([{ role: world.role, status: "active" }]);
   // An organization_id filter, applied as the database applies it: a row of another organisation is not returned.
   const inScope = (org: string) => { const f = url.searchParams.get("organization_id"); return f === null || f === `eq.${org}`; };
   if (p === "/rest/v1/journey_programs" && method === "GET") {
@@ -312,8 +312,9 @@ async function main() {
     eq("the writes in order: the version insert, the pointer update, then the one call", all.writes, [
       "POST journey_versions", "PATCH journey_programs", "POST rpc/journey_repin_enrollments",
     ]);
-    eq("…nine requests in all, as before P2-8 (no request per day)", all.all, [
-      "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET journey_programs", "GET journey_days",
+    // ADR 0030: the role check reads the caller's row and the org's deletion together (one more request than before).
+    eq("…ten requests in all: as before P2-8 (no request per day), and the org's deletion read beside the role", all.all, [
+      "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET organizations", "GET journey_programs", "GET journey_days",
       "GET journey_versions", "POST journey_versions", "PATCH journey_programs", "POST rpc/journey_repin_enrollments",
     ]);
     eq("…the call names its four arguments as 0107 declares them", all.rpcs.map((q) => q.body), [
@@ -362,8 +363,8 @@ async function main() {
     ]);
     const draftArg = (d.rpcs[0]?.body as Row | undefined)?.p_draft as Row | undefined;
     eq("…its days and day_ids are exactly what the publish inserts from the same draft", [draftArg?.days, draftArg?.day_ids], [ins?.days, ins?.day_ids]);
-    eq("…six requests, no request per day", d.all, [
-      "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET journey_programs", "GET journey_days", "POST rpc/journey_repin_enrollments",
+    eq("…seven requests (the org's deletion read beside the role, ADR 0030), no request per day", d.all, [
+      "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET organizations", "GET journey_programs", "GET journey_days", "POST rpc/journey_repin_enrollments",
     ]);
     eq("…no enrolment, badge or credit touched; nothing logged", [touches(d), d.lines], [[], []]);
     const dMissing = await dry({ rpc: { status: 404, body: { code: "PGRST202", message: "Could not find the function", details: null, hint: null } } });
@@ -449,8 +450,8 @@ async function main() {
       [put.status, put.body.ok, put.body.saved, put.body.inserted, put.body.removed, put.body.renumbered], [200, true, 5, 1, 0, 2]);
     eq("…`days` is the read-back: the new day with its id, every saved day with its own", days.map((r) => `${r.day_number}:${r.id}`),
       [`1:${D3}`, `2:${D2}`, `3:${D1}`, `4:${D4}`, `5:${dayId(501)}`]);
-    eq("…seven requests: the session, the org, the role, the program, the modules, the call, the read-back", put.all, [
-      "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET journey_programs", "GET courses", "POST rpc/journey_save_days", "GET journey_days",
+    eq("…eight requests: the session, the org, the role with the org's deletion (ADR 0030), the program, the modules, the call, the read-back", put.all, [
+      "GET /auth/v1/user", "GET organizations", "GET organization_members", "GET organizations", "GET journey_programs", "GET courses", "POST rpc/journey_save_days", "GET journey_days",
     ]);
     // The tenant boundary of the save (P2-8 note, item 7): the program and the
     // modules are both read within the caller's organisation. The stub applies

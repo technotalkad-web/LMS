@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { originFromRequest } from "@/lib/http/origin";
 import { svcClient } from "@/lib/tickets/auth";
 import { describeTicket, validateManagerContext } from "@/lib/tickets/context";
@@ -36,8 +38,18 @@ export async function POST(request: Request) {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: org } = await supabase.from("organizations").select("id, name, slug").eq("slug", body.orgSlug).maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  // ADR 0030: the caller must hold a membership in this org that counts
+  // (active, in an org that is not deleted), for a learner ticket and a
+  // manager ticket alike; anything else is answered as a non-member is.
+  const membership = await resolveOrgMembership<{ id: string; name: string; slug: string }>(
+    supabase,
+    { slug: body.orgSlug },
+    user.id,
+    "id, name, slug"
+  );
+  if (membership === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (membership === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = membership.org;
 
   const priority = body.priority && ["low", "normal", "high"].includes(body.priority) ? body.priority : "normal";
   const note = body.body?.trim() || null;
@@ -55,13 +67,6 @@ export async function POST(request: Request) {
   // ---- manager ticket -----------------------------------------------------
   if (!isTicketCategory(body.category)) return NextResponse.json({ error: "category is not valid" }, { status: 400 });
   const svc = svcClient();
-  const { data: mem } = await svc
-    .from("organization_members")
-    .select("status")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if ((mem as { status?: string } | null)?.status !== "active") return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   const v = await validateManagerContext(svc, org.id, user.id, body.context ?? {});
   if ("error" in v) return NextResponse.json({ error: v.error }, { status: v.status });
   const { subject: generated, lines } = await describeTicket(svc, body.category, v.context);

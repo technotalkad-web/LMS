@@ -13,6 +13,16 @@
  * Previews, so a path-tagged by-role Preview (legacy_role) of the other step does not
  * complete the path; without 0107 the filter's 42703 is read once more without it.
  *
+ * ADR 0030 (the membership rule; the record names scorm-commit-runtime.test.ts,
+ * which holds the runtime rule's pure functions only, so the route's cases are
+ * here): right after the attempt is found to be the caller's, a caller whose
+ * membership in the attempt's organisation does not count (inactive,
+ * suspended, no row, or a deleted organisation) gets 403 `no_access`, and a
+ * check that cannot be read 503 `access_unreadable`. Neither writes the
+ * attempt, calls an RPC, reads the package or makes a service-key request,
+ * and the refusal comes before the runtime test (a cmi5 attempt gets 403,
+ * not 409).
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/scorm-commit-route.test.ts   (or npm run test:unit)
@@ -28,7 +38,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 type Row = Record<string, unknown>;
-type Req = { method: string; path: string; select: string; body: string; query: URLSearchParams };
+type Req = { method: string; path: string; select: string; body: string; query: URLSearchParams; key: string | null };
 
 const SUPABASE = "http://stub.supabase.test";
 const A1 = "2026.10.28";
@@ -63,6 +73,9 @@ let storageDriver: string | null = null;
 let pathWorld = false;
 let pathAttempts: Row[] = [];
 let no0107 = false;
+/** ADR 0030: the caller's membership in the attempt's org, and the attempt's runtime. */
+let access: { status?: string; deleted?: boolean; noRow?: boolean; fails?: "org" | "member" } = {};
+let manifestType = "scorm12";
 const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
 const PATH_READ = "course_version_id,completion_status,success_status,learning_path_id";
 const unmatched: string[] = [];
@@ -75,8 +88,18 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const body = typeof init?.body === "string" ? init.body : "";
   const select = url.searchParams.get("select") ?? "";
   const p = url.pathname;
-  requests.push({ method, path: p, select, body, query: url.searchParams });
+  const key = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get("apikey");
+  requests.push({ method, path: p, select, body, query: url.searchParams, key });
   if (p === "/auth/v1/user") return json(USER);
+  // ADR 0030: the learner's membership in the attempt's org (lib/auth/org-membership.ts); counts unless a case says otherwise.
+  if (p === "/rest/v1/organizations" && select === "id,deleted_at") {
+    if (access.fails === "org") return json({ code: "XX000", message: "stub read failure" }, 500);
+    return json([{ id: "o1", deleted_at: access.deleted ? "2026-11-01T00:00:00Z" : null }]);
+  }
+  if (p === "/rest/v1/organization_members" && select === "role,status") {
+    if (access.fails === "member") return json({ code: "XX000", message: "stub read failure" }, 500);
+    return json(access.noRow ? [] : [{ role: "user", status: access.status ?? "active" }]);
+  }
   if (p === "/rest/v1/course_attempts") {
     if (method === "PATCH") {
       const patch = JSON.parse(body) as Row;
@@ -88,7 +111,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       return json([{ id: "a1" }]);
     }
     if (select.startsWith("*,course_versions(")) {
-      return json([{ ...row, course_versions: { id: "v1", manifest_type: "scorm12", manifest_data: manifest, launch_url: "index_lms.html", storage_prefix: "p/", storage_driver: storageDriver } }]);
+      return json([{ ...row, course_versions: { id: "v1", manifest_type: manifestType, manifest_data: manifest, launch_url: "index_lms.html", storage_prefix: "p/", storage_driver: storageDriver } }]);
     }
     if (pathWorld && select.startsWith("organization_id,course_version_id")) {
       return json([{ organization_id: "o1", course_version_id: "v1", course_versions: { course_id: "c1", courses: { title: "Step one" } }, score: 1 }]);
@@ -311,6 +334,49 @@ async function main() {
       no0107 = false;
       pathWorld = false;
       pathAttempts = [];
+    }
+
+    console.log("\nADR 0030: a caller whose membership in the attempt's org does not count writes nothing");
+    {
+      const nothingDone = (r: Awaited<ReturnType<typeof run>>) => ({
+        patches: r.patches.length,
+        rpcs: r.rpcs.length,
+        storage: r.reads,
+        serviceKey: requests.filter((q) => q.key === "stub-service-key").length,
+        writes: requests.filter((q) => q.method !== "GET" && q.method !== "HEAD").length,
+      });
+      const NOTHING = { patches: 0, rpcs: 0, storage: 0, serviceKey: 0, writes: 0 };
+      for (const [label, world] of [
+        ["an inactive row", { status: "inactive" }],
+        ["a suspended row", { status: "suspended" }],
+        ["no row", { noRow: true }],
+        ["an active row in an organisation that is deleted", { deleted: true }],
+      ] as Array<[string, typeof access]>) {
+        access = world;
+        const r = await run(PASSING, true, failedRow(), { engineVersion: A1 });
+        eq(`${label}: 403 { error: "no_access" }`, [r.status, r.body], [403, { error: "no_access" }]);
+        eq(`…${label}: no attempt write, no RPC, no package read, no service-key request, no write of any kind`, nothingDone(r), NOTHING);
+      }
+      for (const [label, world] of [
+        ["the organisation read fails", { fails: "org" }],
+        ["the member read fails", { fails: "member" }],
+      ] as Array<[string, typeof access]>) {
+        access = world;
+        const r = await run(PASSING, true, failedRow(), { engineVersion: A1 });
+        eq(`${label}: 503 { error: "access_unreadable" }, never the 403`, [r.status, r.body], [503, { error: "access_unreadable" }]);
+        eq(`…${label}: nothing written, nothing read with the service key`, nothingDone(r), NOTHING);
+      }
+      // The order: the membership refusal comes before ADR 0010's runtime test.
+      manifestType = "cmi5";
+      access = { status: "inactive" };
+      const before = await run(PASSING, true, failedRow(), { engineVersion: A1 });
+      access = {};
+      const control = await run(PASSING, true, failedRow(), { engineVersion: A1 });
+      manifestType = "scorm12";
+      eq("a cmi5 attempt of an inactive member: 403 no_access (the membership is tested first); an active member's: 409 wrong_runtime, as before",
+        [before.status, before.body.error, control.status, control.body.error], [403, "no_access", 409, "wrong_runtime"]);
+      const ok = await run(PASSING, true, failedRow(), { engineVersion: A1 });
+      eq("the control: an active member's SCORM commit is written as before (200, one update)", [ok.status, ok.patches.length], [200, 1]);
     }
 
     eq("no request left the stub", unmatched, []);

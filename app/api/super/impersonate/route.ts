@@ -45,10 +45,14 @@ export async function POST(request: Request) {
   );
   const { data: org } = await svc
     .from("organizations")
-    .select("id, name, slug")
+    .select("id, name, slug, deleted_at")
     .eq("id", body.org_id)
     .maybeSingle();
-  if (!org) {
+  // ADR 0030 decision 6(a): a deleted organisation is closed to
+  // impersonation. It gets the unknown organisation's answer, before any
+  // session row or audit row is written; it is brought back by clearing
+  // deleted_at, not entered around it.
+  if (!org || (org as { deleted_at?: string | null }).deleted_at !== null) {
     return NextResponse.json({ error: "Org not found" }, { status: 404 });
   }
   const o = org as { id: string; name: string; slug: string };

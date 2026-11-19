@@ -8,9 +8,14 @@
  * is not silenced by the org pause toggles (these are explicit, low-volume
  * transactional messages a learner or admin is waiting on). Delivery is
  * fire-and-forget via notifyBackground — a mail hiccup never fails the action.
+ *
+ * ADR 0030 rule 10: both go only to people whose membership in the org counts
+ * (active, in an organisation that is not deleted). A failed membership read
+ * sends nothing.
  */
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
+import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = any;
@@ -31,8 +36,9 @@ export const ADMIN_ROLES = ["super_owner", "owner", "admin"] as const;
 const ADMIN_READ_ROLES = ["super_owner", "owner", "admin"];
 
 /**
- * Email every admin of an org that a learner has asked for another attempt.
- * Fail-soft: a missing recipient or a mail error is logged, never thrown.
+ * Email every admin of an org, whose membership counts, that a learner has
+ * asked for another attempt. Fail-soft: a missing recipient or a mail error
+ * is logged, never thrown.
  */
 export async function notifyAdminsOfRequest(
   svc: AnyClient,
@@ -48,12 +54,13 @@ export async function notifyAdminsOfRequest(
   }
 ): Promise<void> {
   try {
-    const { data: admins } = await svc
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", args.orgId)
-      .in("role", ADMIN_READ_ROLES);
-    const ids = ((admins ?? []) as Array<{ user_id: string }>).map((a) => a.user_id);
+    // Rule 10: the administrators whose membership counts. Unreadable: no mail.
+    const admins = await countingMemberIds(svc, args.orgId, ADMIN_READ_ROLES);
+    if (admins === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-request", org_id: args.orgId }));
+      return;
+    }
+    const ids = [...admins];
     if (ids.length === 0) return;
     const emails = await resolveEmails(svc, ids);
     const link = args.origin ? `${args.origin}/${args.orgSlug}/attempt-requests` : "";
@@ -86,8 +93,30 @@ export async function notifyAdminsOfRequest(
 }
 
 /**
- * Email a learner that their attempt request was approved or declined.
- * Fail-soft.
+ * ADR 0030 rule 10: true when the person's membership in the org counts.
+ * `counting` is the org's members that count when the caller read them once
+ * for several mails (countingMemberIds); else the person's own membership is
+ * read here. A failed read is never "counts": no mail.
+ */
+async function recipientCounts(
+  svc: AnyClient,
+  orgId: string,
+  userId: string,
+  counting: ReadonlySet<string> | undefined
+): Promise<boolean> {
+  if (counting) return counting.has(userId);
+  const m = await resolveOrgMembership(svc, { id: orgId }, userId);
+  if (m === "unreadable") {
+    console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-decision", org_id: orgId }));
+    return false;
+  }
+  return m !== "none";
+}
+
+/**
+ * Email a learner that their attempt request was approved or declined (or
+ * that an administrator granted them an attempt), when their membership in
+ * the org counts. Fail-soft.
  */
 export async function notifyLearnerOfDecision(
   svc: AnyClient,
@@ -102,10 +131,13 @@ export async function notifyLearnerOfDecision(
     approved: boolean;
     note?: string | null;
     expiresAt?: string | null;
+    /** The org's members that count, when the caller sends several of these in one request. */
+    counting?: ReadonlySet<string>;
   }
 ): Promise<void> {
   try {
     if (!args.learner.email) return;
+    if (!(await recipientCounts(svc, args.orgId, args.learner.id, args.counting))) return;
     const courseLink = args.origin ? `${args.origin}/${args.orgSlug}/courses/${args.courseId}` : "";
     const note = args.note?.trim();
     let body: string;

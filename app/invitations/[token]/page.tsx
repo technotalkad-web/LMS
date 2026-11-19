@@ -7,9 +7,11 @@ import { AcceptForm } from "./accept-form";
  *   /invitations/{token}
  *
  * Looks up the invitation, shows the org name + role, presents a password
- * form. Submission flows through /api/invitations/accept which creates the
- * auth user (or signs in the existing one), writes the membership, marks
- * the invitation accepted, and redirects to /select-org.
+ * form. An invitation of a deleted organisation is shown as not found, as
+ * the accept route answers it. Submission flows through
+ * /api/invitations/accept which creates the auth user (or signs in the
+ * existing one), writes the membership, marks the invitation accepted, and
+ * redirects to /select-org.
  *
  * No auth required on this route - the token itself is the credential.
  * The middleware exempts /invitations/* for this reason.
@@ -27,13 +29,31 @@ export default async function InvitationAcceptPage({
     { auth: { persistSession: false } }
   );
 
-  const { data: invitation } = await svc
+  const { data: invitation, error: readError } = await svc
     .from("invitations")
-    .select("id, email, role, accepted_at, expires_at, organization_id, organizations(name, slug)")
+    .select("id, email, role, accepted_at, expires_at, organization_id, organizations(name, slug, deleted_at)")
     .eq("token", token)
     .maybeSingle();
 
-  if (!invitation) {
+  if (readError) {
+    return (
+      <Shell title="Something went wrong">
+        <p className="text-muted text-sm">
+          We could not check this invitation. Please try again in a moment.
+        </p>
+      </Shell>
+    );
+  }
+
+  const orgRow = (invitation as unknown as {
+    organizations?:
+      | { name?: string; slug?: string; deleted_at?: string | null }
+      | { name?: string; slug?: string; deleted_at?: string | null }[]
+      | null;
+  } | null)?.organizations;
+  const org = Array.isArray(orgRow) ? orgRow[0] : orgRow;
+
+  if (!invitation || !org || org.deleted_at !== null) {
     return (
       <Shell title="Invitation not found">
         <p className="text-muted text-sm">
@@ -65,11 +85,7 @@ export default async function InvitationAcceptPage({
     );
   }
 
-  const orgRow = (invitation as unknown as {
-    organizations?: { name?: string; slug?: string } | { name?: string; slug?: string }[];
-  }).organizations;
-  const org = Array.isArray(orgRow) ? orgRow[0] : orgRow;
-  const orgName = org?.name ?? "the workspace";
+  const orgName = org.name ?? "the workspace";
 
   return (
     <Shell title="You've been invited">

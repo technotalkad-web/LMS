@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -161,7 +162,16 @@ export async function POST(
           ? p.organizations[0]
           : p.organizations;
 
-        const recipientIds = await resolvePathLearners(svc, p.organization_id, pathId);
+        // ADR 0030 rule 10: the organisation mails only members that count
+        // (active, in an organisation that is not deleted). One read of them
+        // for this request: it is the org-wide audience and the filter on
+        // every other one. Unreadable: no mail.
+        const counting = await countingMemberIds(svc, p.organization_id);
+        if (counting === "unreadable") {
+          console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "learning-paths/[id]/courses", org_id: p.organization_id }));
+          return;
+        }
+        const recipientIds = await resolvePathLearners(svc, p.organization_id, pathId, counting);
         if (recipientIds.size === 0) return;
 
         const emailById = await resolveEmails(svc, recipientIds);
@@ -201,11 +211,17 @@ export async function POST(
   return NextResponse.json({ ok: true, step: nextStep });
 }
 
+/**
+ * The path's assigned learners whose membership counts: `counting` (the
+ * org's members that count) is the org-wide audience and filters the
+ * others (ADR 0030 rule 10).
+ */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 async function resolvePathLearners(
   svc: any,
   orgId: string,
-  pathId: string
+  pathId: string,
+  counting: ReadonlySet<string>
 ): Promise<Set<string>> {
   const out = new Set<string>();
   // select("*") for 0069 deploy safety (group_id).
@@ -240,12 +256,11 @@ async function resolvePathLearners(
     }
   }
   if (coversOrg) {
-    const { data: om } = await svc
-      .from("organization_members")
-      .select("user_id")
-      .eq("organization_id", orgId);
-    for (const m of om ?? []) out.add(m.user_id as string);
+    for (const uid of counting) out.add(uid);
   }
+  // A person named directly, in a team or in a static group may hold a row
+  // that does not count: they get no mail.
+  for (const uid of out) if (!counting.has(uid)) out.delete(uid);
   return out;
 }
 

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { computeScoring, type ScorableAttempt } from "@/lib/scoring/policy";
@@ -76,20 +78,12 @@ export async function POST(request: Request) {
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
-
-  const { data: caller } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!ADMIN_ROLES.includes(normalizeRole(caller?.role as string) as (typeof ADMIN_ROLES)[number])) {
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const caller = await resolveOrgMembership<{ id: string; name: string }>(supabase, { slug: orgSlug }, user.id, "id, name");
+  if (caller === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (caller === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = caller.org;
+  if (!ADMIN_ROLES.includes(normalizeRole(caller.role) as (typeof ADMIN_ROLES)[number])) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
@@ -229,24 +223,32 @@ export async function POST(request: Request) {
   if (insErr) return NextResponse.json({ error: insErr.message }, { status: 400 });
   const grantedIds = ((insertedRows ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
 
-  // Notify each granted learner (background).
-  const [emailMap, origin] = await Promise.all([
+  // Notify each granted learner (background). ADR 0030 rule 10: only those
+  // whose membership counts, read once for all of them; unreadable, no mail.
+  // The grants stand either way.
+  const [emailMap, origin, counting] = await Promise.all([
     resolveEmails(s, grantedIds),
     originFromRequest(),
+    countingMemberIds(s, org.id as string),
   ]);
-  for (const uid of grantedIds) {
-    await notifyLearnerOfDecision(s, {
-      orgId: org.id as string,
-      orgName: (org.name as string) ?? "your org",
-      orgSlug,
-      origin,
-      courseId: course.id as string,
-      courseTitle: (course.title as string) ?? "a course",
-      learner: { id: uid, email: emailMap.get(uid) ?? "" },
-      approved: true,
-      note: null,
-      expiresAt,
-    });
+  if (counting === "unreadable") {
+    console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-requests/bulk", org_id: org.id }));
+  } else {
+    for (const uid of grantedIds) {
+      await notifyLearnerOfDecision(s, {
+        orgId: org.id as string,
+        orgName: (org.name as string) ?? "your org",
+        orgSlug,
+        origin,
+        courseId: course.id as string,
+        courseTitle: (course.title as string) ?? "a course",
+        learner: { id: uid, email: emailMap.get(uid) ?? "" },
+        approved: true,
+        note: null,
+        expiresAt,
+        counting,
+      });
+    }
   }
 
   return NextResponse.json({

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { originFromRequest } from "@/lib/http/origin";
@@ -17,6 +19,7 @@ import {
   validateManagerAssignment,
   type ManagerAssignment,
 } from "@/lib/org/reporting-line";
+import { expireLaunchTokensForMembers, logLaunchTokenExpiryFailed } from "@/lib/attempts/abandon";
 
 /**
  *   POST /api/users/bulk
@@ -48,6 +51,12 @@ import {
  *     (account_invite, below). The app never asks Supabase Auth to send
  *     (ADR 0029 section F; tests/unit/auth-mailer-calls.test.ts).
  *   - profile + membership are upserted.
+ *
+ * After the loop, one call closes the open course launches of every person
+ * whose row this upload last wrote inactive or suspended (ADR 0030 decision
+ * 4; user ids in chunks of 150, never one call per row). If that fails the
+ * rows stand; the answer adds `tokens_expired: false` and a note on each of
+ * those rows.
  *
  * Returns { summary, results[] }.
  */
@@ -92,20 +101,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name, slug, allowed_email_domains")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
-
-  const { data: callerMem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", caller.id)
-    .maybeSingle();
-  const cr = callerMem?.role as string | undefined;
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const callerMem = await resolveOrgMembership<{
+    id: string;
+    name: string;
+    slug: string;
+    allowed_email_domains: string[] | null;
+  }>(supabase, { slug: orgSlug }, caller.id, "id, name, slug, allowed_email_domains");
+  if (callerMem === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (callerMem === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = callerMem.org;
+  const cr = callerMem.role;
   const canWrite = cr === "super_owner" || cr === "owner" || cr === "admin";
   if (!canWrite) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
@@ -250,6 +256,9 @@ export async function POST(request: Request) {
   // loop tight and limits round-trips at scale.)
   const pendingTeamMemberships: Array<{ team_id: string; user_id: string }> =
     [];
+  // ADR 0030 decision 4: each person's last written status and its row, for
+  // the one launch-token expiry after the loop.
+  const lastWritten = new Map<string, { status: string; row: number }>();
 
   const results: ResultRow[] = [];
 
@@ -573,6 +582,7 @@ export async function POST(request: Request) {
     }
 
     upsertSnapshot(hierarchy, { user_id: authUserId, status, ...effective });
+    lastWritten.set(authUserId, { status, row: rowNum });
 
     let outcome: ResultRow["status"];
     if (createdThisRow === "invited") outcome = "invited";
@@ -594,7 +604,10 @@ export async function POST(request: Request) {
     }
 
     // Fire welcome email for new accounts (skip when we just updated metadata).
-    if (!priorMem) {
+    // ADR 0030 rule 10: only when the row just written is active (the org
+    // counted for the caller above), so a row written inactive or suspended
+    // gets no welcome.
+    if (!priorMem && status === "active") {
       const origin = await originFromRequest();
       const learnerName =
         r.first_name!.trim() + (r.last_name ? " " + r.last_name.trim() : "");
@@ -646,6 +659,26 @@ export async function POST(request: Request) {
   // Rows were processed managers-first; report them in file order.
   results.sort((a, b) => a.row - b.row);
 
+  // ---- ADR 0030 decision 4: one expiry for every person left not active ----
+  // Keyed on the status each person's row was last written with, so a later
+  // row that sets them active again leaves their launches open.
+  const deactivated = [...lastWritten].filter(([, w]) => w.status !== "active");
+  let tokensExpired = true;
+  if (deactivated.length > 0) {
+    const userIds = deactivated.map(([id]) => id);
+    const tokErr = await expireLaunchTokensForMembers(svc, org.id as string, userIds);
+    if (tokErr) {
+      tokensExpired = false;
+      logLaunchTokenExpiryFailed("users/bulk POST", org.id as string, userIds, tokErr);
+      const hit = new Set(deactivated.map(([, w]) => w.row));
+      for (const r of results) {
+        if (hit.has(r.row)) {
+          r.message = `${r.message ? r.message + " · " : ""}open course launches not closed; each stops within 24 hours of its launch`;
+        }
+      }
+    }
+  }
+
   // ---- #162: flush queued team memberships in one batch ----
   let teamMembershipsAdded = 0;
   if (pendingTeamMemberships.length > 0) {
@@ -685,7 +718,7 @@ export async function POST(request: Request) {
     teams_created_names: teamsCreated,
     team_memberships_added: teamMembershipsAdded,
   };
-  return NextResponse.json({ summary, results });
+  return NextResponse.json({ summary, results, ...(tokensExpired ? {} : { tokens_expired: false }) });
 }
 
 const KNOWN_COLS = [

@@ -5,6 +5,7 @@ import { resolveEmails } from "@/lib/users/emails";
 import { mapWithConcurrency } from "@/lib/util/concurrency";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { isReleased } from "@/lib/learner/release";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 import {
   fetchActiveMembers,
   resolveGroupMembers,
@@ -18,6 +19,19 @@ import {
  * Hourly scheduled task. For each course with reminders enabled:
  *   - Resolve every learner currently assigned (user/team/org/group). A
  *     self-enrolment row (source 'self') is no assignment (decision A22).
+ *   - ADR 0030 rule 10: only members that count are reminded (active, in
+ *     an organisation that is not deleted). A deleted organisation's
+ *     courses are skipped; each other organisation's members that count
+ *     are read once per run, and an organisation whose read fails is
+ *     skipped for this run (nothing sent, no state written).
+ *   - Such a skip fails the run (ADR 0030, note "Pull request B build
+ *     decisions", change 2): it is counted as `unreadable_orgs`, and when
+ *     the count is above zero the answer is 500 with `ok: false` and the
+ *     heartbeat is recorded as an error, at both exits. The other
+ *     organisations' mail and reminder state are finished first. A deleted
+ *     organisation is not a failure. The body holds numbers and booleans
+ *     only; the organisation's id is in the mail_recipients_unreadable log
+ *     line. The next scheduled run is the retry.
  *   - Skip learners who have already completed/passed the course.
  *   - Skip learners whose first_assigned_at is older than cap_days.
  *   - Skip learners whose last_nudge_at is newer than cadence_days ago.
@@ -33,7 +47,7 @@ type ReminderRow = {
     id: string;
     title: string;
     organization_id: string;
-    organizations?: { name?: string; slug?: string } | null;
+    organizations?: { name?: string; slug?: string; deleted_at?: string | null } | null;
   } | null;
 };
 
@@ -72,10 +86,10 @@ export async function POST(request: Request) {
   const { data: settings } = await svc
     .from("course_reminder_settings")
     .select(
-      "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug))"
+      "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug, deleted_at))"
     )
     .eq("enabled", true);
-  const enabledCourses = ((settings ?? []) as unknown[]).map((r) => {
+  const allCourses = ((settings ?? []) as unknown[]).map((r) => {
     const row = r as ReminderRow;
     const c = row.courses;
     const orgSubraw = c?.organizations;
@@ -88,14 +102,40 @@ export async function POST(request: Request) {
       organization_id: c?.organization_id ?? "",
       org_name: orgSub?.name ?? "your org",
       org_slug: orgSub?.slug ?? "",
+      // Rule 10: a deleted organisation is skipped by the run. A course whose
+      // organisation was not read is not taken for live either.
+      org_live: !!orgSub && orgSub.deleted_at === null,
     };
   });
+
+  // ADR 0030 rule 10: the members that count, read once per organisation for
+  // this run. A deleted organisation's courses are dropped before any read;
+  // an organisation whose read fails is dropped for this run and logged with
+  // its id.
+  const countingByOrg = new Map<string, ReadonlySet<string>>();
+  // Organisations skipped because their members could not be read: the run
+  // fails when there is one (a count only, never an id, in the body).
+  let unreadableOrgs = 0;
+  for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
+    const counting = await countingMemberIds(svc, oid);
+    if (counting === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "cron/reminders", org_id: oid }));
+      unreadableOrgs++;
+      continue;
+    }
+    countingByOrg.set(oid, counting);
+  }
+  const ok = unreadableOrgs === 0;
+  const enabledCourses = allCourses.filter((c) => countingByOrg.has(c.organization_id));
   if (enabledCourses.length === 0) {
     // A successful run with nothing to do must still heartbeat, or the health
     // probe reads reminders as never-seen/stale → false "degraded" (which is
     // exactly what happened on pre-launch prod: no reminder-enabled courses).
-    await recordHeartbeat("reminders", { scanned: 0, sent: 0, skipped: 0 });
-    return NextResponse.json({ scanned: 0, sent: 0, skipped: 0 });
+    // A run left with nothing because no organisation could be read is not
+    // successful: it records an errored heartbeat and answers 500.
+    const summary = { ok, scanned: 0, sent: 0, skipped: 0, unreadable_orgs: unreadableOrgs };
+    await recordHeartbeat("reminders", summary, ok);
+    return NextResponse.json(summary, { status: ok ? 200 : 500 });
   }
 
   const courseIds = enabledCourses.map((c) => c.course_id);
@@ -174,21 +214,9 @@ export async function POST(request: Request) {
     }
   }
 
-  // Org members per org
-  const orgIds = Array.from(new Set(assignments.map((a) => a.organization_id)));
-  const { data: orgMembers } = orgIds.length
-    ? await svc
-        .from("organization_members")
-        .select("organization_id, user_id")
-        .in("organization_id", orgIds)
-    : { data: [] };
-  const orgUserIds = new Map<string, Set<string>>();
-  for (const m of orgMembers ?? []) {
-    const oid = m.organization_id as string;
-    const s = orgUserIds.get(oid) ?? new Set<string>();
-    s.add(m.user_id as string);
-    orgUserIds.set(oid, s);
-  }
+  // Org members per org: an org-wide row reaches the members that count,
+  // read once above (rule 10).
+  const orgUserIds = countingByOrg;
 
   // Completed pairs. `!inner` makes the embedded-column filter actually
   // restrict parent rows to the courses we care about (without it the filter
@@ -255,18 +283,22 @@ export async function POST(request: Request) {
     });
   }
 
-  // Resolve user emails (one bulk call)
+  // Resolve user emails (one bulk call), for members that count only.
   const allUserIds = new Set<string>();
   for (const a of assignments) {
-    if (a.assignee_type === "user" && a.user_id) allUserIds.add(a.user_id);
+    const counting = countingByOrg.get(a.organization_id);
+    const add = (uid: string) => {
+      if (counting?.has(uid)) allUserIds.add(uid);
+    };
+    if (a.assignee_type === "user" && a.user_id) add(a.user_id);
     if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUserIds.get(a.team_id) ?? []) allUserIds.add(uid);
+      for (const uid of teamUserIds.get(a.team_id) ?? []) add(uid);
     }
     if (a.assignee_type === "group" && a.group_id) {
-      for (const uid of groupUserIds.get(a.group_id) ?? []) allUserIds.add(uid);
+      for (const uid of groupUserIds.get(a.group_id) ?? []) add(uid);
     }
     if (a.assignee_type === "org") {
-      for (const uid of orgUserIds.get(a.organization_id) ?? []) allUserIds.add(uid);
+      for (const uid of orgUserIds.get(a.organization_id) ?? []) add(uid);
     }
   }
   // Resolve emails via profiles (indexed, no pagination cap) — listUsers paged
@@ -327,6 +359,16 @@ export async function POST(request: Request) {
       }
       if (a.assignee_type === "org") {
         for (const uid of orgUserIds.get(a.organization_id) ?? []) learnerIds.add(uid);
+      }
+    }
+    // Rule 10: a person named directly, in a team or in a static group may
+    // hold a row that does not count. They are skipped before every other
+    // rule, so no reminder state is written for them either.
+    const counting = countingByOrg.get(course.organization_id);
+    for (const uid of learnerIds) {
+      if (!counting?.has(uid)) {
+        learnerIds.delete(uid);
+        skipped++;
       }
     }
 
@@ -420,15 +462,26 @@ export async function POST(request: Request) {
       .upsert(stateUpserts, { onConflict: "user_id,course_id" });
   }
 
-  await recordHeartbeat("reminders", {
-    scanned: enabledCourses.length,
-    sent,
-    skipped,
-  });
-  return NextResponse.json({
-    scanned: enabledCourses.length,
-    sent,
-    skipped,
-    upserts: stateUpserts.length,
-  });
+  await recordHeartbeat(
+    "reminders",
+    {
+      ok,
+      scanned: enabledCourses.length,
+      sent,
+      skipped,
+      unreadable_orgs: unreadableOrgs,
+    },
+    ok
+  );
+  return NextResponse.json(
+    {
+      ok,
+      scanned: enabledCourses.length,
+      sent,
+      skipped,
+      upserts: stateUpserts.length,
+      unreadable_orgs: unreadableOrgs,
+    },
+    { status: ok ? 200 : 500 }
+  );
 }

@@ -21,7 +21,11 @@
  *       read today's select once more and went on);
  *   (c) any other error on the filtered read answers 503 and writes nothing;
  *   (d) a body that names the preview context (`context: { kind: "preview"
- *       }`, ADR 0024 step 27's field) answers 400 before any read or write.
+ *       }`, ADR 0024 step 27's field) answers 400 before any read or write;
+ *   (e) ADR 0030: a caller whose membership does not count (an inactive or
+ *       suspended row, no row, or a deleted organisation) gets the 404 a
+ *       non-member gets, and one whose check cannot be read 503; neither
+ *       makes a service-role request or writes anything.
  *
  * The cases of P2-9 itself (a path's and a journey day's context, the
  * entitlement, the audit row) are tests/unit/language-switch-context.test.ts.
@@ -39,7 +43,7 @@ const eq = (n: string, got: unknown, want: unknown) => {
 };
 
 type Row = Record<string, unknown>;
-type Req = { method: string; path: string; select: string; query: URLSearchParams; body: unknown };
+type Req = { method: string; path: string; select: string; query: URLSearchParams; body: unknown; key: string | null };
 
 const SUPABASE = "http://stub.supabase.test";
 const ORG = "o1";
@@ -72,6 +76,8 @@ let attempts: Row[] = [];
 let assessed = new Set<string>();
 let no0107 = false;
 let filteredError: { code: string; message: string } | null = null;
+/** ADR 0030: the caller's own membership (active unless a case says otherwise). */
+let access: { status?: string; deleted?: boolean; noRow?: boolean; fails?: "org" | "member" } = {};
 const unmatched: string[] = [];
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -102,15 +108,24 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const url = new URL(input instanceof Request ? input.url : String(input));
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const accept = new Headers(init?.headers).get("accept") ?? "";
+  const key = new Headers(init?.headers).get("apikey");
   const select = url.searchParams.get("select") ?? "";
   const p = url.pathname;
   let body: unknown = null;
   if (typeof init?.body === "string") { try { body = JSON.parse(init.body); } catch { body = init.body; } }
-  requests.push({ method, path: p, select, query: url.searchParams, body });
+  requests.push({ method, path: p, select, query: url.searchParams, body, key });
   const list = (rows: Row[]) => (accept.includes("vnd.pgrst.object") ? json(rows[0] ?? null) : json(rows));
 
   if (p === "/auth/v1/user") return json(ME);
-  if (p === "/rest/v1/organizations") return list([{ id: ORG }]);
+  if (p === "/rest/v1/organizations") {
+    if (access.fails === "org") return json(TIMEOUT, 500);
+    return list([{ id: ORG, deleted_at: access.deleted ? "2026-11-01T00:00:00Z" : null }]);
+  }
+  // The caller's own row, read by lib/auth/org-membership.ts: an active learner unless a case says otherwise.
+  if (p === "/rest/v1/organization_members") {
+    if (access.fails === "member") return json(TIMEOUT, 500);
+    return list(access.noRow ? [] : [{ role: "user", status: access.status ?? "active" }]);
+  }
   if (p === "/rest/v1/courses") return list([{ id: COURSE }]);
   if (p === "/rest/v1/course_packages") return list(PACKAGES.filter((r) => matches(r, url.searchParams)));
   if (p === "/rest/v1/course_versions") return json(VERSIONS.filter((r) => matches(r, url.searchParams)));
@@ -243,6 +258,40 @@ async function main() {
       eq("400, before any request (no session read, no attempts read, nothing written)", [r.status, requests.length, statusOf("real"), statusOf("pv")], [400, 0, "in_progress", "in_progress"]);
       const i = await pick({ rows: [REAL], context: { kind: "individual" } });
       eq("{kind: individual} reads the Individual context, as an absent context does", [i.status, i.body.requires_confirm], [409, true]);
+    }
+
+    /* ---------------- (e) ---------------- */
+    console.log("\n(e) ADR 0030: a membership that does not count");
+    {
+      const serviceKey = () => requests.filter((q) => q.key === "stub-service-key").length;
+      access = { noRow: true };
+      const outsider = await pick({ rows: [REAL], restart: true });
+      eq("no row (a non-member, the reference answer): 404, no service-role request, nothing written, the open row untouched",
+        [outsider.status, serviceKey(), writes().length, statusOf("real")], [404, 0, 0, "in_progress"]);
+      for (const [label, world] of [
+        ["an inactive row", { status: "inactive" }],
+        ["a suspended row", { status: "suspended" }],
+        ["an active row in an organisation that is deleted", { deleted: true }],
+      ] as Array<[string, typeof access]>) {
+        access = world;
+        const r = await pick({ rows: [REAL], restart: true });
+        eq(`${label}: the non-member's status and body, no service-role request, no preference saved, nothing abandoned`,
+          [r.status, r.body, serviceKey(), upserts().length, writes().length, statusOf("real")],
+          [outsider.status, outsider.body, 0, 0, 0, "in_progress"]);
+      }
+      for (const [label, world] of [
+        ["the organisation read fails", { fails: "org" }],
+        ["the member read fails", { fails: "member" }],
+      ] as Array<[string, typeof access]>) {
+        access = world;
+        const r = await pick({ rows: [REAL], restart: true });
+        eq(`${label}: 503, never the 404; no service-role request, nothing written`,
+          [r.status, serviceKey(), writes().length, statusOf("real")], [503, 0, 0, "in_progress"]);
+      }
+      access = {};
+      const control = await pick({ rows: [REAL], restart: true });
+      eq("the control, an active row: the switch goes on (200, the open row abandoned, the preference saved)",
+        [control.status, statusOf("real"), upserts().length], [200, "abandoned", 1]);
     }
 
     eq("no request left the stub", unmatched, []);

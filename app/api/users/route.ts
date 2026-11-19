@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { originFromRequest } from "@/lib/http/origin";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { notifyBackground } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
@@ -15,6 +17,11 @@ import {
   messagesOf,
   validateManagerAssignment,
 } from "@/lib/org/reporting-line";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED,
+} from "@/lib/attempts/abandon";
 
 /**
  *   POST /api/users
@@ -24,6 +31,11 @@ import {
  * If `password` is provided, the account is provisioned immediately.
  * If `password` is blank, the system auto-generates one and sends a
  * Supabase magic-link invitation email so the user can set their own.
+ *
+ * A row written inactive or suspended also closes that person's open course
+ * launches in this organisation (ADR 0030 decision 4). If that fails the
+ * write stands; the answer adds `tokens_expired: false` and a line in
+ * `warnings`.
  */
 
 type CreateUserBody = {
@@ -124,22 +136,21 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name, slug, allowed_email_domains")
-    .eq("slug", body.orgSlug!)
-    .maybeSingle();
-  if (!org) {
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const callerMem = await resolveOrgMembership<{
+    id: string;
+    name: string;
+    slug: string;
+    allowed_email_domains: string[] | null;
+  }>(supabase, { slug: body.orgSlug! }, caller.id, "id, name, slug, allowed_email_domains");
+  if (callerMem === "unreadable") {
+    return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  }
+  if (callerMem === "none") {
     return NextResponse.json({ error: "Organization not found" }, { status: 404 });
   }
-
-  const { data: callerMem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", caller.id)
-    .maybeSingle();
-  const cr = callerMem?.role as string | undefined;
+  const org = callerMem.org;
+  const cr = callerMem.role;
   const canWrite =
     cr === "super_owner" || cr === "owner" || cr === "admin";
   if (!canWrite) {
@@ -384,8 +395,23 @@ export async function POST(request: Request) {
     );
   }
 
+  // ADR 0030 decision 4: a row left in a status other than active ends the
+  // person's open launches here, after the row is written.
+  let tokensExpired = true;
+  if (status !== "active") {
+    const tokErr = await expireLaunchTokensForMembers(svc, org.id, [authUserId]);
+    if (tokErr) {
+      tokensExpired = false;
+      logLaunchTokenExpiryFailed("users POST", org.id, [authUserId], tokErr);
+      managerWarnings = [...managerWarnings, LAUNCH_TOKENS_NOT_EXPIRED];
+    }
+  }
+
   // Fire welcome / account-creation email (background, non-blocking).
-  if (!priorMem) {
+  // ADR 0030 rule 10: only when the row just written is active (the org
+  // counted for the caller above), so a person added as inactive or
+  // suspended gets no welcome.
+  if (!priorMem && status === "active") {
     // Use the request-origin helper (see #146 for the full sweep).
     const origin = await originFromRequest();
     const learnerName =
@@ -437,5 +463,6 @@ export async function POST(request: Request) {
     user_id: authUserId,
     invited: didInvite,
     warnings: managerWarnings,
+    ...(tokensExpired ? {} : { tokens_expired: false }),
   });
 }

@@ -1,5 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE,
+} from "@/lib/attempts/abandon";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 
 /**
@@ -19,6 +26,12 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
  *   - only a super owner may appoint a super owner, or modify / remove one
  *   - nobody can remove themselves
  *   - the org's last super owner cannot be demoted or removed
+ *
+ * ADR 0030 decision 4: a removal ends that person's open launches in this
+ * organisation, as a deactivation does. After the row is deleted, their
+ * live cmi5/xAPI launch tokens here are expired. If that fails the removal
+ * stands; it is logged with ids only and the answer adds
+ * `tokens_expired: false` and a line in `warnings`.
  */
 const VALID_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
 type ValidRole = (typeof VALID_ROLES)[number];
@@ -52,20 +65,12 @@ async function authorize(request: Request, userId: string): Promise<Ctx> {
   } = await supabase.auth.getUser();
   if (!user) return { error: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return { error: NextResponse.json({ error: "Org not found" }, { status: 404 }) };
-
-  const { data: caller } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const callerRole = normalizeRole(caller?.role as string | undefined);
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const caller = await resolveOrgMembership(supabase, { slug: orgSlug }, user.id);
+  if (caller === "unreadable") return { error: NextResponse.json({ error: CHECK_FAILED }, { status: 503 }) };
+  if (caller === "none") return { error: NextResponse.json({ error: "Org not found" }, { status: 404 }) };
+  const org = caller.org;
+  const callerRole = normalizeRole(caller.role);
   if (callerRole !== "super_owner" && callerRole !== "admin") {
     return { error: NextResponse.json({ error: "Forbidden" }, { status: 403 }) };
   }
@@ -161,7 +166,8 @@ export async function DELETE(
     );
   }
 
-  const { data, error } = await svc()
+  const s = svc();
+  const { data, error } = await s
     .from("organization_members")
     .delete()
     .eq("organization_id", ctx.orgId)
@@ -170,6 +176,12 @@ export async function DELETE(
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
   if (!data?.length) {
     return NextResponse.json({ error: "Member was not removed (not found)" }, { status: 404 });
+  }
+  // Decision 4: the removed person's open launches here end now.
+  const tokErr = await expireLaunchTokensForMembers(s, ctx.orgId, [userId]);
+  if (tokErr) {
+    logLaunchTokenExpiryFailed("organization-members/[userId] DELETE", ctx.orgId, [userId], tokErr);
+    return NextResponse.json({ ok: true, tokens_expired: false, warnings: [LAUNCH_TOKENS_NOT_EXPIRED_ON_REMOVE] });
   }
   return NextResponse.json({ ok: true });
 }

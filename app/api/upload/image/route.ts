@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { randomBytes } from "crypto";
 
@@ -101,27 +103,21 @@ export async function POST(request: Request) {
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, slug")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) {
+  // ADR 0030: the org and the caller's role, from a membership that counts
+  // (active, in an org that is not deleted), for every kind of upload;
+  // anything else is answered as a signed-in non-member is.
+  const mem = await resolveOrgMembership<{ id: string; slug: string }>(supabase, { slug: orgSlug }, user.id, "id, slug");
+  if (mem === "unreadable") {
+    return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  }
+  if (mem === "none") {
     return NextResponse.json({ error: "Org not found" }, { status: 404 });
   }
-  const { data: mem } = await supabase
-    .from("organization_members")
-    .select("role, status")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const role = mem?.role as string | undefined;
+  const org = mem.org;
+  const role = mem.role;
   if (kind === "avatar") {
-    // Any ACTIVE member may upload their own photo, unless the org's
-    // gamification settings disable avatar uploads (admin kill switch).
-    if (!mem || (mem.status as string) !== "active") {
-      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-    }
+    // Any member whose membership counts may upload their own photo, unless
+    // the org's gamification settings disable avatar uploads (admin kill switch).
     const { data: gs } = await supabase
       .from("gamification_settings")
       .select("allow_avatar_uploads")

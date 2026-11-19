@@ -355,8 +355,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   requests.push({ method, path: p, select, query: url.searchParams });
   if (p === "/auth/v1/user") return json(USER);
   if (p === "/rest/v1/profiles") return json([{ must_change_password: false }]);
-  if (p === "/rest/v1/organizations") return json([{ id: "o1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null }]);
-  if (p === "/rest/v1/organization_members") return json([{ role: world.role }]);
+  if (p === "/rest/v1/organizations") return json([{ id: "o1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null, deleted_at: null }]);
+  if (p === "/rest/v1/organization_members") return json([{ role: world.role, status: "active" }]);
   if (p === "/rest/v1/learning_paths") return json([{ id: PATH, is_active: world.pathActive }]);
   if (p === "/rest/v1/learning_path_courses") {
     // The step's own rule is a 0107 column, named last after the embed.

@@ -3,6 +3,8 @@ import { loadOrgGovernance } from "@/lib/org/field-options";
 import { checkScopeTarget, ensureScopeGroup } from "@/lib/org/scope-groups";
 import { describeScopes, loadScopesFor, scopeLabel, scopesCover, type ScopePair } from "@/lib/content/scopes";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmails } from "@/lib/users/emails";
 import { notifyBackground } from "@/lib/notifications/send";
@@ -54,20 +56,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name")
-    .eq("slug", body.orgSlug)
-    .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
-
-  const { data: membership } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  const callerRole = membership?.role as string | undefined;
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const membership = await resolveOrgMembership<{ id: string; name: string }>(
+    supabase,
+    { slug: body.orgSlug },
+    user.id,
+    "id, name"
+  );
+  if (membership === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (membership === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = membership.org;
+  const callerRole = membership.role;
   const canWrite =
     callerRole === "super_owner" ||
     callerRole === "owner" || // legacy compat
@@ -338,6 +337,16 @@ export async function POST(request: Request) {
           .maybeSingle();
         const courseTitle = (courseRow as { title?: string } | null)?.title ?? "a course";
 
+        // ADR 0030 rule 10: the organisation mails only members that count
+        // (active, in an organisation that is not deleted). One read of them
+        // for this request: it is the org-wide audience and the filter on
+        // every other one. Unreadable: no mail.
+        const counting = await countingMemberIds(svc, org.id);
+        if (counting === "unreadable") {
+          console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "assignments", org_id: org.id }));
+          return;
+        }
+
         // Resolve recipient user_ids — only for rows we ACTUALLY inserted, so a
         // re-assignment that hit a 23505 duplicate (already assigned) doesn't
         // re-email that learner.
@@ -361,13 +370,12 @@ export async function POST(request: Request) {
               recipientUserIds.add(uid);
             }
           } else if (ins.assignee_type === "org") {
-            const { data: om } = await svc
-              .from("organization_members")
-              .select("user_id")
-              .eq("organization_id", org.id);
-            for (const m of om ?? []) recipientUserIds.add(m.user_id as string);
+            for (const uid of counting) recipientUserIds.add(uid);
           }
         }
+        // A person named directly, in a team or in a static group may hold a
+        // row that does not count: they get no mail.
+        for (const uid of recipientUserIds) if (!counting.has(uid)) recipientUserIds.delete(uid);
 
         // Resolve emails (indexed via profiles; no listUsers pagination cap).
         const emailById = await resolveEmails(svc, recipientUserIds);

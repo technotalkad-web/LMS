@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { notifyAdminsOfRequest } from "@/lib/attempts/requests";
@@ -66,21 +68,17 @@ export async function POST(request: Request) {
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id, name")
-    .eq("slug", body.orgSlug)
-    .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
-
-  // The caller must be a member of this org.
-  const { data: membership } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", user.id)
-    .maybeSingle();
-  if (!membership) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  // The caller must hold a membership in this org that counts (ADR 0030):
+  // anything else is answered as a signed-in non-member is.
+  const membership = await resolveOrgMembership<{ id: string; name: string }>(
+    supabase,
+    { slug: body.orgSlug },
+    user.id,
+    "id, name"
+  );
+  if (membership === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (membership === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = membership.org;
 
   // The course must belong to this org.
   const { data: course } = await supabase

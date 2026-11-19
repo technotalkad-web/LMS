@@ -2,16 +2,19 @@
  * A tenant-branded sign-in link is sent only to a member of that
  * organisation. POST /api/auth/magic-link with an orgSlug uses the tenant
  * pipeline (tenant SMTP, tenant branding, a row in that organisation's
- * notification log) only when the address belongs to a member: an
- * organization_members row for the organisation and the user, whatever its
- * status, the rule the tenant pages use (lib/auth/require-org-access.ts).
+ * notification log) only when the address belongs to a member: a
+ * membership that counts (ADR 0030: an active organization_members row in
+ * an organisation that is not deleted), the rule the tenant pages use
+ * (lib/auth/require-org-access.ts, through lib/auth/org-membership.ts).
  * Anyone else gets the generic platform email; the answer is { ok: true } in
  * every case, so the form tells nobody who is a member.
  *
  *   - member: tenant SMTP, one log row, no platform email;
- *   - an account that is a member of another organisation only, and a
- *     membership lookup that fails: no tenant SMTP, no log row, one
- *     platform email that lands on /select-org;
+ *   - an account that is a member of another organisation only, a member
+ *     whose row is inactive or suspended, an active member of an
+ *     organisation that is deleted, and a membership lookup that fails: no
+ *     tenant SMTP, no log row, one platform email that lands on
+ *     /select-org;
  *   - an address with no account: nothing sent;
  *   - an unknown slug, and no slug: the platform email.
  *
@@ -55,6 +58,10 @@ const USERS: Record<string, string> = {
 const MEMBERS: Record<string, string[]> = { [ORG]: ["u-member"], [OTHER_ORG]: ["u-outsider"] };
 let requests: Req[] = [];
 let membershipFails = false;
+/** The status of u-member's row in ORG (ADR 0030: only "active" counts). */
+let memberStatus = "active";
+/** ORG is soft-deleted (deleted_at set). */
+let orgDeleted = false;
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const eqOf = (q: URLSearchParams, k: string) => (q.get(k) ?? "").replace(/^eq\./, "");
@@ -78,7 +85,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
   if (p === "/rest/v1/organizations") {
     const slug = eqOf(url.searchParams, "slug");
-    if (slug === "org") return json([{ id: ORG, slug: "org", name: "Org" }]);
+    const id = eqOf(url.searchParams, "id");
+    if (slug === "org" || id === ORG) return json([{ id: ORG, slug: "org", name: "Org", deleted_at: orgDeleted ? "2026-11-01T00:00:00Z" : null }]);
+    if (id === OTHER_ORG) return json([{ id: OTHER_ORG, slug: "other", name: "Other", deleted_at: null }]);
     return json([]);
   }
   if (p === "/rest/v1/organization_members") {
@@ -87,7 +96,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     const uid = eqOf(url.searchParams, "user_id");
     // PostgREST semantics: without an organisation filter, a membership anywhere matches.
     const orgs = url.searchParams.has("organization_id") ? [org] : Object.keys(MEMBERS);
-    return json(orgs.some((o) => (MEMBERS[o] ?? []).includes(uid)) ? [{ user_id: uid }] : []);
+    const hit = orgs.find((o) => (MEMBERS[o] ?? []).includes(uid));
+    return json(hit ? [{ user_id: uid, role: "user", status: hit === ORG && uid === "u-member" ? memberStatus : "active" }] : []);
   }
   if (p === "/rest/v1/notification_settings") return json([{ smtp_host: "smtp.stub.test", smtp_port: 587, smtp_secure: false, from_email: "noreply@example.test", from_name: "Org", email_paused: false, event_paused: {} }]);
   if (p === "/rest/v1/notification_templates") return json([]);
@@ -124,14 +134,22 @@ async function main() {
     eq("one row in the organisation's notification log", logRows(), 1);
     eq("no platform email", platformMails().length, 0);
 
-    for (const [label, payload, fails] of [
-      ["an account that is a member of another organisation only", { email: "outsider@example.test", orgSlug: "org" }, false],
-      ["a member whose membership lookup fails", { email: "member@example.test", orgSlug: "org" }, true],
-    ] as const) {
+    const MEMBER = { email: "member@example.test", orgSlug: "org" };
+    for (const [label, payload, world] of [
+      ["an account that is a member of another organisation only", { email: "outsider@example.test", orgSlug: "org" }, {}],
+      ["a member whose row is inactive (ADR 0030)", MEMBER, { status: "inactive" }],
+      ["a member whose row is suspended (ADR 0030)", MEMBER, { status: "suspended" }],
+      ["an active member of an organisation that is deleted (ADR 0030)", MEMBER, { deleted: true }],
+      ["a member whose membership lookup fails", MEMBER, { fails: true }],
+    ] as Array<[string, Record<string, string>, { status?: string; deleted?: boolean; fails?: boolean }]>) {
       console.log(`\n${label}: the platform email`);
-      membershipFails = fails;
+      membershipFails = world.fails ?? false;
+      memberStatus = world.status ?? "active";
+      orgDeleted = world.deleted ?? false;
       const r = await ask(payload);
       membershipFails = false;
+      memberStatus = "active";
+      orgDeleted = false;
       eq("the same answer as for a member", r.status === member.status && r.text === member.text, true);
       eq("no tenant SMTP send", tenantSmtp(), 0);
       eq("no row in the organisation's notification log", logRows(), 0);

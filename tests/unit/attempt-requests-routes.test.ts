@@ -24,7 +24,10 @@
  *       missing-column error naming context_kind): one failed read, then
  *       today's read once without the filter, and today's outcome;
  *   (e) any other error on the filtered read fails closed as the route does
- *       today (503), after one attempts read, with nothing written.
+ *       today (503), after one attempts read, with nothing written;
+ *   (f) ADR 0030 rule 10: the bulk grant mails only the granted learners
+ *       whose membership counts, from one read of the org's members that
+ *       count; when that read fails the grants stand and nothing is sent.
  *
  * No database, no network.
  *
@@ -69,6 +72,11 @@ let callerRole = "user";
 let no0107 = false;
 let filteredError: { code: string; message: string } | null = null;
 let pendingRequest: Row | null = null;
+/**
+ * (f) only: the learners' member rows (ADR 0030 rule 10) and their emails.
+ * Null elsewhere: no member row but the caller's, and no email, as before.
+ */
+let mailWorld: { statuses: Record<string, string>; countingFails: boolean } | null = null;
 const unmatched: string[] = [];
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -99,8 +107,15 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const one = (row: Row | null) => (accept.includes("vnd.pgrst.object") ? json(row) : json(row ? [row] : []));
 
   if (p === "/auth/v1/user") return json(ME);
-  if (p === "/rest/v1/organizations") return json([{ id: ORG, name: "Org", slug: "org" }]);
-  if (p === "/rest/v1/organization_members") return json(select === "role" ? [{ role: callerRole }] : []);
+  if (p === "/rest/v1/organizations") return json([{ id: ORG, name: "Org", slug: "org", deleted_at: null }]);
+  // The caller's own row, read by lib/auth/org-membership.ts (role and status).
+  if (p === "/rest/v1/organization_members" && mailWorld && select === "user_id,role,status") {
+    // countingMemberIds: the org's active rows (one read for the whole run).
+    if (mailWorld.countingFails) return json({ code: "XX000", message: "stub read failure" }, 500);
+    const rows = Object.entries(mailWorld.statuses).map(([user_id, status]) => ({ user_id, organization_id: ORG, role: "user", status }));
+    return json(rows.filter((r) => matches(r, url.searchParams)));
+  }
+  if (p === "/rest/v1/organization_members") return json(select === "role,status" ? [{ role: callerRole, status: "active" }] : []);
   if (p === "/rest/v1/courses") return json([{ id: COURSE, title: "Home loans", pass_required: false }]);
   if (p === "/rest/v1/course_versions") return json([{ id: VERSION }]);
   if (p === "/rest/v1/course_attempts" && method === "GET") {
@@ -119,6 +134,10 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     // The approval's own row; every grant and open-request read answers none.
     if (select === "id,organization_id,course_id,user_id,status") return json(pendingRequest ? [pendingRequest] : []);
     return json([]);
+  }
+  if (p === "/rest/v1/profiles" && mailWorld) {
+    const ids = (url.searchParams.get("id") ?? "").replace(/^in\.\(|\)$/g, "").split(",").filter(Boolean);
+    return json(ids.map((id) => ({ id, email: `${id}@example.test` })));
   }
   if (p === "/rest/v1/profiles") return json([]);
   if (p.startsWith("/rest/v1/rpc/")) return json([]);
@@ -164,12 +183,16 @@ async function main() {
     const bulkRoute = await import("../../app/api/attempt-requests/bulk/route");
     const { REQUEST_MESSAGES } = await import("../../lib/attempts/request-decision");
 
-    const world = (o: { rows: Row[]; role?: string; no0107?: boolean; filteredError?: { code: string; message: string } | null }) => {
+    const world = (o: {
+      rows: Row[]; role?: string; no0107?: boolean; filteredError?: { code: string; message: string } | null;
+      mail?: { statuses: Record<string, string>; countingFails?: boolean };
+    }) => {
       requests = [];
       attempts = o.rows.map((r) => ({ ...r }));
       callerRole = o.role ?? "user";
       no0107 = o.no0107 ?? false;
       filteredError = o.filteredError ?? null;
+      mailWorld = o.mail ? { statuses: o.mail.statuses, countingFails: o.mail.countingFails ?? false } : null;
     };
     const ask = async (o: Parameters<typeof world>[0]) => {
       world(o);
@@ -286,6 +309,30 @@ async function main() {
       const r = await bulk({ rows: BULK_ROWS, filteredError: TIMEOUT });
       eq("a timeout on the filtered read: 503 records_unreadable, one attempts read, nothing inserted",
         [r.status, r.body.error, attemptReads().length, inserted().length], [503, "records_unreadable", 1, 0]);
+    }
+
+    /* ---------------- (f) ADR 0030 rule 10 on the bulk grant's mail ---------------- */
+    console.log("\n(f) the bulk grant mails only the granted learners whose membership counts");
+    {
+      const ROWS = [
+        done("f-act", "u-act", "failed", 1, "individual"),
+        done("f-ina", "u-ina", "failed", 1, "individual"),
+        done("f-sus", "u-sus", "failed", 1, "individual"),
+      ];
+      const statuses = { "u-act": "active", "u-ina": "inactive", "u-sus": "suspended" };
+      const mailed = () => requests.filter((r) => r.path === "/rest/v1/notification_log" && r.method === "POST").map((r) => String((r.body as Row).to_user_id));
+      const memberReads = () => requests.filter((r) => r.path === "/rest/v1/organization_members" && r.select !== "role,status");
+      {
+        const r = await bulk({ rows: ROWS, mail: { statuses } });
+        eq("three failed learners, one active, one inactive, one suspended: all three granted, only the active one mailed",
+          [r.status, r.body.granted, inserted().map((x) => x.user_id).sort(), mailed()], [200, 3, ["u-act", "u-ina", "u-sus"], ["u-act"]]);
+        eq("…from one read of the members that count, not one per learner", memberReads().map((q) => q.select), ["user_id,role,status"]);
+      }
+      {
+        const r = await bulk({ rows: ROWS, mail: { statuses, countingFails: true } });
+        eq("that read fails: the grants stand, nothing is mailed, the sender is not entered",
+          [r.status, r.body.granted, mailed(), requests.some((q) => q.path === "/rest/v1/notification_settings")], [200, 3, [], false]);
+      }
     }
 
     eq("no request left the stub", unmatched, []);

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CHECK_FAILED } from "@/lib/auth/api-admin";
+import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   GOVERNED_FIELDS,
@@ -13,6 +15,11 @@ import {
   validateManagerAssignment,
   type ManagerAssignment,
 } from "@/lib/org/reporting-line";
+import {
+  expireLaunchTokensForMembers,
+  logLaunchTokenExpiryFailed,
+  LAUNCH_TOKENS_NOT_EXPIRED,
+} from "@/lib/attempts/abandon";
 
 /**
  *   PATCH /api/users/[userId]?orgSlug=...
@@ -20,6 +27,11 @@ import {
  *         handled separately for security reasons).
  *
  * Admin-only. Updates profile + membership for an existing org member.
+ *
+ * An edit that sets the status to inactive or suspended also closes that
+ * person's open course launches in this organisation (ADR 0030 decision 4).
+ * If that fails the edit stands; the answer adds `tokens_expired: false`
+ * and a line in `warnings`.
  */
 
 const VALID_LMS_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
@@ -74,20 +86,12 @@ export async function PATCH(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: org } = await supabase
-    .from("organizations")
-    .select("id")
-    .eq("slug", orgSlug)
-    .maybeSingle();
-  if (!org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
-
-  const { data: callerMem } = await supabase
-    .from("organization_members")
-    .select("role")
-    .eq("organization_id", org.id)
-    .eq("user_id", caller.id)
-    .maybeSingle();
-  const cr = callerMem?.role as string | undefined;
+  // ADR 0030: the org and the caller's role, from a membership that counts.
+  const callerMem = await resolveOrgMembership(supabase, { slug: orgSlug }, caller.id);
+  if (callerMem === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  if (callerMem === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const org = callerMem.org;
+  const cr = callerMem.role;
   const canWrite = cr === "super_owner" || cr === "owner" || cr === "admin";
   if (!canWrite) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
@@ -313,6 +317,20 @@ export async function PATCH(
         { error: `Membership update failed: ${mErr.message}` },
         { status: 400 }
       );
+    }
+  }
+
+  // ADR 0030 decision 4: a row left in a status other than active ends the
+  // person's open launches here, after the row is written.
+  if (memFields.status !== undefined && memFields.status !== "active") {
+    const tokErr = await expireLaunchTokensForMembers(svc, org.id as string, [userId]);
+    if (tokErr) {
+      logLaunchTokenExpiryFailed("users/[userId] PATCH", org.id as string, [userId], tokErr);
+      return NextResponse.json({
+        ok: true,
+        warnings: [...managerWarnings, LAUNCH_TOKENS_NOT_EXPIRED],
+        tokens_expired: false,
+      });
     }
   }
 

@@ -102,8 +102,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/user") return json(viewer);
   if (p.startsWith("/auth/v1/admin/users/")) return json(LEARNER);
   if (p === "/rest/v1/profiles") return json([{ must_change_password: false }]);
-  if (p === "/rest/v1/organizations") return json([{ id: "o1", name: "Org", slug: "org", logo_url: null, brand_color: null, brand_font: null, custom_domain: null }]);
-  if (p === "/rest/v1/organization_members") return json([{ role: viewer === ADMIN ? "admin" : "user" }]);
+  if (p === "/rest/v1/organizations") return json([{ id: "o1", name: "Org", slug: "org", logo_url: null, brand_color: null, brand_font: null, custom_domain: null, deleted_at: null }]);
+  if (p === "/rest/v1/organization_members") return json([{ role: viewer === ADMIN ? "admin" : "user", status: "active" }]);
   if (p === "/rest/v1/courses") return json([{ id: "c1", title: "Home loans", organization_id: "o1", show_attempts_history: true }]);
   if (p === "/rest/v1/xapi_statements") return json(statements);
   if (p === "/rest/v1/course_versions") {

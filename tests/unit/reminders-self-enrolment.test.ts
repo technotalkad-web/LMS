@@ -55,11 +55,15 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const query = decodeURIComponent(url.search);
   requests.push({ method, table, select: url.searchParams.get("select") ?? "", query, body });
   if (table === "course_reminder_settings") {
-    return json([{ course_id: COURSE, enabled: true, cadence_days: 1, cap_days: 30, courses: { id: COURSE, title: "Course K", organization_id: ORG, organizations: { name: "Org", slug: "org" } } }]);
+    return json([{ course_id: COURSE, enabled: true, cadence_days: 1, cap_days: 30, courses: { id: COURSE, title: "Course K", organization_id: ORG, organizations: { name: "Org", slug: "org", deleted_at: null } } }]);
   }
   if (table === "course_assignments") return json(assignmentRows);
   if (table === "team_members") return json([{ team_id: "t-1", user_id: "u-both" }]);
-  if (table === "organization_members") return json([]);
+  // ADR 0030 rule 10: the run reminds only members that count, so every
+  // learner here holds an active row in a live organisation.
+  if (table === "organization_members") {
+    return json(["u-adm", "u-both", "u-self"].map((user_id) => ({ user_id, role: "user", status: "active" })));
+  }
   if (table === "course_attempts") return json([]);
   if (table === "reminder_state" && method === "GET") return json([]);
   if (table === "reminder_state") return json([], 201);
@@ -68,7 +72,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json(inList.split(",").filter(Boolean).map((id) => ({ id, email: `${id}@example.test` })));
   }
   if (table === "notification_settings") return json([{ email_paused: true, event_paused: {} }]);
-  if (table === "organizations") return json([{ name: "Org" }]);
+  if (table === "organizations") return json([{ id: ORG, name: "Org", deleted_at: null }]);
   if (table === "notification_log") return json([], 201);
   return json([]);
 };

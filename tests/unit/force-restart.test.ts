@@ -1298,6 +1298,58 @@ async function regrant() {
     const r = await forceRestartOlderVersions(client, args);
     eq("a failing notifier → still ok, reissued 1", [r.status, r.reissued], ["ok", 1]);
   }
+  {
+    // ADR 0030 rule 10: two re-issues in one run. The organisation's members
+    // that count are read once for the run and handed to the notifier with
+    // each notice; nobody's membership is read per learner.
+    const members = (q: Query): Answer | undefined =>
+      q.table === "organizations" ? { data: { id: "org1", deleted_at: null } }
+      : q.table === "organization_members" ? { data: [{ user_id: "u1", role: "user", status: "active" }] }
+      : undefined;
+    const { client, queries } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow(), linkRow({ id: "g2", user_id: "u2", used_attempt_id: "a2" })] }),
+      requests: () => ({ data: null, error: null }),
+      other: members,
+    });
+    const args = runArgs();
+    const seen: Array<[string, string[] | null]> = [];
+    args.notify.decision = async (_svc: unknown, a: { learner: { id: string }; counting?: ReadonlySet<string> }) => {
+      seen.push([a.learner.id, a.counting ? [...a.counting].sort() : null]);
+    };
+    const r = await forceRestartOlderVersions(client, args);
+    const orgRead = queries.find((q) => q.table === "organizations");
+    const memberRead = queries.find((q) => q.table === "organization_members");
+    eq("two re-issues: both notices carry the members that count, from one read for the run",
+      [r.reissued, seen.sort(), queries.filter((q) => q.table === "organizations").length, queries.filter((q) => q.table === "organization_members").length],
+      [2, [["u1", ["u1"]], ["u2", ["u1"]]], 1, 1]);
+    eq("…the organisation read names this organisation and its deleted_at; the member read takes active rows only",
+      [orgRead ? arg(orgRead, "eq", "id") : null, String(orgRead ? sel(orgRead) : "").includes("deleted_at"), memberRead ? arg(memberRead, "eq", "status") : null],
+      [["id", "org1"], true, ["status", "active"]]);
+  }
+  {
+    // The members that count cannot be read: no notice is sent, one log line
+    // with the organisation's id, and the run's outcome is unchanged.
+    const { client } = attemptsWorld(regrantRows(), {
+      links: () => ({ data: [linkRow(), linkRow({ id: "g2", user_id: "u2", used_attempt_id: "a2" })] }),
+      requests: () => ({ data: null, error: null }),
+      other: (q) => (q.table === "organizations" ? { error: { code: "XX000", message: "boom" } } : undefined),
+    });
+    const args = runArgs();
+    let calls = 0;
+    args.notify.decision = async () => { calls++; };
+    const warned: string[] = [];
+    const warn = console.warn;
+    console.warn = (...m: unknown[]) => { warned.push(m.map(String).join(" ")); };
+    let r: Awaited<ReturnType<typeof forceRestartOlderVersions>> | null = null;
+    try {
+      r = await forceRestartOlderVersions(client, args);
+    } finally {
+      console.warn = warn;
+    }
+    const lines = warned.filter((l) => l.includes("mail_recipients_unreadable"));
+    eq("the members that count cannot be read: still ok, reissued 2, no notice sent", [r?.status, r?.reissued, calls], ["ok", 2, 0]);
+    eq("…one log line, with the organisation's id and no address", [lines.length, lines.every((l) => l.includes("org1") && !l.includes("@"))], [1, true]);
+  }
 
   console.log("\n(ix) rule (g) and the messages");
   {
@@ -1324,7 +1376,7 @@ async function regrant() {
     eq("…the expiry is DEFAULT_GRANT_EXPIRY_DAYS from lib/attempts/constants", /import \{ DEFAULT_GRANT_EXPIRY_DAYS \} from "@\/lib\/attempts\/constants";/.test(src), true);
     const mp = fs.readFileSync(path.join(root, "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts"), "utf8");
     eq("multipart route: org id/name/slug, course id/title, the admin, the origin, the version number, the notifier",
-      /\.select\("id, name, slug"\)/.test(mp) && /\.select\("id, title"\)/.test(mp) &&
+      /resolveOrgMembership<\{ id: string; name: string; slug: string \}>\([^)]*"id, name, slug"\s*\)/.test(mp) && /\.select\("id, title"\)/.test(mp) &&
         /forceRestartOlderVersions\(svc, \{\s*packageId,\s*newVersionId: result\.versionId,\s*versionNumber: result\.versionNumber,\s*admin: \{ id: caller\.id \},/.test(mp) &&
         /origin: await originFromRequest\(\),/.test(mp) && /notify: \{ decision: notifyLearnerOfDecision, emails: resolveEmails \},/.test(mp), true);
     const fin = fs.readFileSync(path.join(root, "app/api/courses/upload/finalize/route.ts"), "utf8");

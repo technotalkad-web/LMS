@@ -58,6 +58,8 @@
  * Pure part first (no next/* import, no runtime Supabase import), then the
  * I/O part. The notifier and the email resolver come in through the args
  * (lib/attempts/requests.ts and lib/users/emails.ts are never imported here).
+ * The re-issue mail's recipient filter (ADR 0030 rule 10) is one read of
+ * the organisation's members that count, from lib/auth/org-membership.ts.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { expireLaunchTokens } from "@/lib/attempts/abandon";
@@ -66,6 +68,7 @@ import { DEFAULT_GRANT_EXPIRY_DAYS } from "@/lib/attempts/constants";
 import { computeScoring, DEFAULT_POLICY, officialDone, type ScorableAttempt } from "@/lib/scoring/policy";
 import { grantSnapshotFor, isMissingColumn, isSchemaMissing } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
+import { countingMemberIds } from "@/lib/auth/org-membership";
 
 /**
  * `.in()` lists stay at 150 ids and every read is paged at 1000 rows ordered
@@ -501,6 +504,8 @@ export type ForceRestartNotify = {
       approved: boolean;
       note?: string | null;
       expiresAt?: string | null;
+      /** The organisation's members that count, read once for the run (ADR 0030 rule 10). */
+      counting?: ReadonlySet<string>;
     }
   ) => Promise<void>;
   emails: (svc: SupabaseClient, userIds: Iterable<string>) => Promise<Map<string, string>>;
@@ -657,11 +662,23 @@ async function reissueGrants(svc: SupabaseClient, args: ForceRestartArgs, resetI
   return out;
 }
 
-/** The learner's email for each re-issued grant; fail-soft, never changes the outcome. */
+/**
+ * The learner's email for each re-issued grant; fail-soft, never changes the
+ * outcome. ADR 0030 rule 10: the organisation's members that count are read
+ * once for the run's re-issues and passed to the notifier, never read once
+ * per learner; when that read fails no mail is sent.
+ */
 async function notifyReissued(svc: SupabaseClient, args: ForceRestartArgs, notices: Regrant["notices"]): Promise<void> {
   if (notices.length === 0) return;
   try {
-    const emails = await args.notify.emails(svc, notices.map((n) => n.userId));
+    const [emails, counting] = await Promise.all([
+      args.notify.emails(svc, notices.map((n) => n.userId)),
+      countingMemberIds(svc, args.org.id),
+    ]);
+    if (counting === "unreadable") {
+      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "force-restart", org_id: args.org.id }));
+      return;
+    }
     for (const n of notices) {
       try {
         await args.notify.decision(svc, {
@@ -675,6 +692,7 @@ async function notifyReissued(svc: SupabaseClient, args: ForceRestartArgs, notic
           approved: true,
           note: n.note,
           expiresAt: n.expiresAt,
+          counting,
         });
       } catch {
         // A mail hiccup never changes a forced restart's outcome.

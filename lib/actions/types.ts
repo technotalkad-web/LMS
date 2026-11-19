@@ -5,7 +5,8 @@ export type PerLearnerResult = {
   reason?: string;
 };
 
-export type ActionError = { error: string; status: 400 | 401 | 403 | 404 | 409 };
+/** 503: a check could not be read (ADR 0030: "try again", never a refusal or a grant). */
+export type ActionError = { error: string; status: 400 | 401 | 403 | 404 | 409 | 503 };
 
 export const isActionError = (x: unknown): x is ActionError =>
   !!x && typeof x === "object" && "error" in x && "status" in x;

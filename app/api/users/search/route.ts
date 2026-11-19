@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { requireOrgAccess } from "@/lib/auth/require-org-access";
+import { accessUnreadableAnswer, requireOrgAccess } from "@/lib/auth/require-org-access";
 import { canManage } from "@/lib/auth/permissions";
 
 /**
@@ -47,7 +47,9 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
   }
 
-  const { org, role } = await requireOrgAccess(orgSlug);
+  const access = await requireOrgAccess(orgSlug).catch(accessUnreadableAnswer);
+  if (access instanceof Response) return access;
+  const { org, role } = access;
   if (!canManage(role)) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }

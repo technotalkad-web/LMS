@@ -36,10 +36,14 @@
  *     of the caller, or a
  *     comparison with a role name (`role === "admin"`,
  *     `[...roles].includes(role)`, canManage(role)…) of a value read from a
- *     lookup of the caller (an organization_members read selecting role
- *     with `.eq("user_id", …)`, requireOrgAccess, or loadTicketForCaller,
- *     whose `party` is "admin" only for an active admin of the ticket's
- *     org); directly in the condition or through a variable holding one. A
+ *     lookup of the caller that carries the answer of the one membership
+ *     resolver (ADR 0030 section H point 4): resolveOrgMembership itself,
+ *     requireOrgAccess, or loadTicketForCaller, whose `party` is "admin"
+ *     only for an admin of the ticket's org whose membership counts;
+ *     directly in the condition or through a variable holding one. A role
+ *     read of the caller's own organization_members row written inline in
+ *     a route is not such a lookup: it reads neither the status nor the
+ *     organisation's deletion. A
  *     comparison on anything else (a body field), a membership-only test
  *     (`if (!member) return`), requireOrgAccess alone (every member passes
  *     it) and a role helper whose answer is never tested are not guards. An
@@ -62,6 +66,22 @@
  *     only refuses in some cases (`if (body.action === "x" && !admin)`). A
  *     same-file helper's guard is a role test for its caller only when it
  *     covers the end of the helper.
+ *
+ * Each allow-list entry names its authority (ADR 0030 section H point 4).
+ * A handler of an entry whose authority is the caller's membership is
+ * walked a second time, in membership mode: each of its effects must come
+ * after an exit on the membership answer that covers it, under the same
+ * scope rules as a role guard. The answer is the resolver's
+ * (resolveOrgMembership: "none" and "unreadable" are both refused, and both
+ * must be tested), or that of a lib/ carrier that acts on the resolver
+ * itself and answers an ActionError (loadTicketForCaller,
+ * authorizeManager); the test checks that each carrier calls the resolver
+ * and that its own exits on the answer cover its end. As with the effects,
+ * a call into lib/ counts at the route's call site. In that mode a role
+ * guard does not count, and an exit on the membership answer is never a
+ * role guard in the first walk. Entries with another authority (the cron
+ * secret, an API key, a launch token, the invitation token, the public
+ * sign-in flows, the caller's own account) are walked once, as before.
  *
  * The scan is a tripwire for the common mistakes (no check at all, an org
  * read taken for one, a check placed after the call or in one branch only,
@@ -98,47 +118,80 @@ const rel = (abs: string) => path.relative(root, abs).split(path.sep).join("/");
  *     which every flagged route file under the prefix must contain.
  * An entry, or a listed handler, that no longer matches a flagged handler
  * fails the test, so the list stays short and current.
+ *   - `authority` names what authorises the handler in place of an org
+ *     role (ADR 0030 section H point 4). "membership" entries must act on
+ *     the membership answer before their first effect (the second walk).
  */
-type Allow = { reason: string; prefix?: string; requires?: RegExp; handlers?: string[] };
+const AUTHORITIES = ["cron-secret", "api-key", "launch-token", "invitation-token", "public-sign-in", "own-account", "membership"] as const;
+type Authority = (typeof AUTHORITIES)[number];
+type Allow = { reason: string; authority: Authority; prefix?: string; requires?: RegExp; handlers?: string[] };
 const ALLOW: Allow[] = [
-  { prefix: "app/api/cron/", requires: /CRON_SECRET/,
+  { prefix: "app/api/cron/", requires: /CRON_SECRET/, authority: "cron-secret",
     reason: "scheduled jobs: authorised by the cron secret, no user session" },
-  { prefix: "app/api/integrations/", requires: /authenticateApiKey\(/,
+  { prefix: "app/api/integrations/", requires: /authenticateApiKey\(/, authority: "api-key",
     reason: "machine-to-machine: authorised by the org's API key, which fixes the org" },
-  { prefix: "app/api/xapi/", requires: /bindXapi\(|fetch_token/,
+  { prefix: "app/api/xapi/", requires: /bindXapi\(|fetch_token/, authority: "launch-token",
     reason: "content runtime: authorised by the launch token bound to the learner's own attempt" },
-  { handlers: ["app/api/scorm/[attemptId]/commit/route.ts POST"],
-    reason: "content runtime: the signed-in learner's own attempt (its webhook and emails are about that attempt)" },
+  { handlers: ["app/api/scorm/[attemptId]/commit/route.ts POST"], authority: "membership",
+    reason: "content runtime: the signed-in learner's own attempt, while their membership in its org counts (its webhook and emails are about that attempt)" },
   { handlers: [
       "app/api/auth/forgot-password/request/route.ts POST",
       "app/api/auth/forgot-password/reset/route.ts POST",
       "app/api/auth/forgot-password/verify/route.ts POST",
       "app/api/auth/magic-link/route.ts POST",
     ],
+    authority: "public-sign-in",
     reason: "public sign-in and password-reset flows: no session yet, so no org role applies" },
   { handlers: [
       "app/api/auth/change-password/route.ts POST",
       "app/auth/callback/route.ts GET",
       "app/auth/sign-out/route.ts POST",
     ],
+    authority: "own-account",
     reason: "the caller's own account and session: their own password, sign-in and sign-out" },
-  { handlers: ["app/api/invitations/accept/route.ts POST"],
+  { handlers: ["app/api/invitations/accept/route.ts POST"], authority: "invitation-token",
     reason: "authorised by the invitation token, not by an org role" },
-  { handlers: ["app/api/tickets/route.ts POST"],
-    reason: "raising a ticket: any member on their own session; a manager ticket checks active membership and that everyone it names is in the caller's reporting line" },
-  { handlers: ["app/api/tickets/[id]/messages/route.ts POST"],
-    reason: "a reply on a ticket thread by its requester or by an admin of its org (loadTicketForCaller refuses anyone else)" },
-  { handlers: ["app/api/upload/image/route.ts POST"],
-    reason: "kind avatar is the caller's own profile photo (an active member, when the org allows uploads); every other kind checks the admin role in its own branch" },
-  { handlers: ["app/api/manager/remind/route.ts POST"],
-    reason: "manager action: checked against the caller's reporting line, not an org role" },
-  { handlers: ["app/api/attempt-requests/route.ts POST"],
-    reason: "a learner asks for another attempt on their own record (membership checked)" },
-  { handlers: ["app/api/courses/[courseId]/language-preference/route.ts PUT"],
-    reason: "self-service: the caller's own language preference row" },
-  { handlers: ["app/api/broadcasts/route.ts POST"],
+  { handlers: ["app/api/tickets/route.ts POST"], authority: "membership",
+    reason: "raising a ticket: any member whose membership counts, on their own session; a manager ticket also checks that everyone it names is in the caller's reporting line" },
+  { handlers: ["app/api/tickets/[id]/messages/route.ts POST"], authority: "membership",
+    reason: "a reply on a ticket thread by its requester or by an admin of its org, each with a membership that counts (loadTicketForCaller refuses anyone else)" },
+  { handlers: ["app/api/upload/image/route.ts POST"], authority: "membership",
+    reason: "kind avatar is the caller's own profile photo (a membership that counts, when the org allows uploads); every other kind checks the admin role in its own branch" },
+  { handlers: ["app/api/manager/remind/route.ts POST"], authority: "membership",
+    reason: "manager action: a membership that counts (authorizeManager), then the caller's reporting line, not an org role" },
+  { handlers: ["app/api/attempt-requests/route.ts POST"], authority: "membership",
+    reason: "a learner with a membership that counts asks for another attempt on their own record" },
+  { handlers: ["app/api/courses/[courseId]/language-preference/route.ts PUT"], authority: "membership",
+    reason: "self-service: the caller's own language preference row, while their membership counts" },
+  { handlers: ["app/api/broadcasts/route.ts POST"], authority: "own-account",
     reason: "self-service: the caller marks a platform broadcast read on their own row" },
 ];
+/**
+ * The handlers whose authority is the caller's membership: the six of ADR
+ * 0030 section H point 4 (language-preference, tickets, manager/remind,
+ * attempt-requests, upload/image, the SCORM commit), tickets with both of
+ * its handlers. A change to this set is a change to the record.
+ */
+const MEMBERSHIP_HANDLERS = [
+  "app/api/attempt-requests/route.ts POST",
+  "app/api/courses/[courseId]/language-preference/route.ts PUT",
+  "app/api/manager/remind/route.ts POST",
+  "app/api/scorm/[attemptId]/commit/route.ts POST",
+  "app/api/tickets/[id]/messages/route.ts POST",
+  "app/api/tickets/route.ts POST",
+  "app/api/upload/image/route.ts POST",
+];
+/**
+ * "file name" → the answers a membership carrier gives a refused caller.
+ * resolveOrgMembership is the resolver; the others are lib/ functions that
+ * act on its answer themselves and answer an ActionError ("error"), which
+ * the route must still act on (each is checked below).
+ */
+const MEMBERSHIP_ANSWERS = new Map<string, string[]>([
+  ["lib/auth/org-membership.ts resolveOrgMembership", ["none", "unreadable"]],
+  ["lib/tickets/auth.ts loadTicketForCaller", ["error"]],
+  ["lib/manager/actions.ts authorizeManager", ["error"]],
+]);
 
 /* ---------------- parsing and resolution ---------------- */
 
@@ -297,6 +350,14 @@ type Ctx = {
   checkProps: Set<string>;
   /** Names holding an object with a service client in some properties (`const c = await ctx()` → c.svc). */
   serviceObjs: Map<string, Set<string>>;
+  /** Membership mode (ADR 0030 H.4): only an exit on the membership answer guards. */
+  member: boolean;
+  /**
+   * Membership mode: names holding a membership answer → the refused
+   * answers not yet ruled out by an exit in this scope. Replaced, never
+   * mutated, so a scope restores it by keeping the old map.
+   */
+  memLeft: Map<string, Set<string>>;
 };
 /** svcObj entries are "param.prop": the parameter holds an object whose `prop` is a service client. */
 type Params = { svc: string[]; storage: string[]; role: string[]; check: string[]; svcObj: string[] };
@@ -314,8 +375,17 @@ const ROLE_TESTS = new Set(["canManage", "canManageOwners", "canViewReports", "i
 const ROLE_NAMES = new Set(["super_owner", "owner", "admin", "data_analyst", "user", "member"]);
 /** The role names an admin-only check lets through: `=== "admin"` is true for an allowed caller, `=== "user"` for a refused one. */
 const ADMIN_ROLE_NAMES = new Set(["super_owner", "owner", "admin"]);
-/** "file name": lookups of the caller whose answer carries the caller's role (requireOrgAccess: `.role`; loadTicketForCaller: `.party`, "admin" only for an active admin of the ticket's org). */
-const CALLER_LOOKUPS = new Set(["lib/auth/require-org-access.ts requireOrgAccess", "lib/tickets/auth.ts loadTicketForCaller"]);
+/**
+ * "file name": lookups of the caller whose answer carries the caller's role
+ * (requireOrgAccess: `.role`; resolveOrgMembership: `.role` of a membership
+ * that counts, ADR 0030; loadTicketForCaller: `.party`, "admin" only for an
+ * admin of the ticket's org whose membership counts).
+ */
+const CALLER_LOOKUPS = new Set([
+  "lib/auth/require-org-access.ts requireOrgAccess",
+  "lib/auth/org-membership.ts resolveOrgMembership",
+  "lib/tickets/auth.ts loadTicketForCaller",
+]);
 
 /**
  * The receiver chain of a call: `a.from("t").select("x").eq(…)` → segs from,
@@ -528,14 +598,14 @@ const objMap = (entries: string[], base?: Map<string, Set<string>>) => {
 
 const walkCache = new WeakMap<ts.Node, Map<string, Ev[]>>();
 /** Events of a module-level function, walked with fresh scope (memoised). */
-function walkFn(fn: ts.FunctionLikeDeclaration, m: Mod, route: boolean, params: Params, stack: ts.Node[]): Ev[] {
+function walkFn(fn: ts.FunctionLikeDeclaration, m: Mod, route: boolean, params: Params, stack: ts.Node[], member = false): Ev[] {
   if (stack.includes(fn) || stack.length > 40) return [];
-  const key = `${route}|${[params.svc, params.storage, params.role, params.check, params.svcObj].map((l) => [...l].sort().join(",")).join("|")}`;
+  const key = `${route}|${member}|${[params.svc, params.storage, params.role, params.check, params.svcObj].map((l) => [...l].sort().join(",")).join("|")}`;
   let byKey = walkCache.get(fn);
   const hit = byKey?.get(key);
   if (hit) return hit;
   const out: Ev[] = [];
-  const c: Ctx = { m, route, g: false, service: new Set([...moduleService(m), ...params.svc]), storage: new Set(params.storage), closures: new Map(), stack: [...stack, fn], roleVars: new Set(params.role), checkVars: new Set(params.check), refuseVars: new Set(), checkProps: new Set(), serviceObjs: objMap(params.svcObj) };
+  const c: Ctx = { m, route, g: false, service: new Set([...moduleService(m), ...params.svc]), storage: new Set(params.storage), closures: new Map(), stack: [...stack, fn], roleVars: new Set(params.role), checkVars: new Set(params.check), refuseVars: new Set(), checkProps: new Set(), serviceObjs: objMap(params.svcObj), member, memLeft: new Map() };
   runBody(fn, c, out);
   if (!byKey) { byKey = new Map(); walkCache.set(fn, byKey); }
   byKey.set(key, out);
@@ -646,7 +716,7 @@ function invoke(t: Target & { kind: "fn" }, args: readonly ts.Expression[], c: C
     out.push(...atCallSite(lift(sub, t.name), c));
     return;
   }
-  out.push(...atCallSite(lift(walkFn(t.fn, t.mod, c.route && t.mod === c.m, { svc: svcParams, storage: storageParams, role: roleParams, check: checkParams, svcObj: objParams }, c.stack), t.name), c));
+  out.push(...atCallSite(lift(walkFn(t.fn, t.mod, c.route && t.mod === c.m, { svc: svcParams, storage: storageParams, role: roleParams, check: checkParams, svcObj: objParams }, c.stack, c.member), t.name), c));
 }
 
 function onCall(call: ts.CallExpression, c: Ctx, out: Ev[]) {
@@ -678,8 +748,9 @@ function onCall(call: ts.CallExpression, c: Ctx, out: Ev[]) {
     const ch = chainOf(call);
     const table = strArg(ch.segs.find((s) => s.name === "from")?.args[0]);
     const byCaller = ch.segs.some((s) => s.name === "eq" && strArg(s.args[0]) === "user_id");
-    const selectsRole = ch.segs.some((s) => s.name === "select" && /\brole\b/.test(strArg(s.args[0]) ?? ""));
-    if (table === "organization_members" && byCaller && selectsRole) out.push({ kind: "lookup", what: "organization_members role lookup" });
+    // ADR 0030 H.4: an inline organization_members role read is no lookup of
+    // the caller (it reads neither the status nor the deletion); only the
+    // resolver's answer carries a role (CALLER_LOOKUPS, ROLE_GUARD_FNS).
     if (table === "platform_owners" && byCaller) out.push({ kind: "check", what: "platform_owners lookup" });
     // roles.includes(role) / ROLES.has(role)
     const own = callee.name.text;
@@ -695,7 +766,8 @@ function onCall(call: ts.CallExpression, c: Ctx, out: Ev[]) {
   const t = calleeTarget(c, callee);
   if (t?.kind === "fn") {
     if (c.route && t.mod.file.startsWith("lib/auth/")) {
-      if (SELF_GUARDS.has(t.name)) { out.push({ kind: "guard", what: t.name }); c.g = true; }
+      // The platform owner's guard is no membership: it does not count in membership mode.
+      if (SELF_GUARDS.has(t.name)) { if (!c.member) { out.push({ kind: "guard", what: t.name }); c.g = true; } }
       else if (ROLE_GUARD_FNS.has(t.name)) out.push({ kind: "check", what: t.name });
       else if (ROLE_TESTS.has(t.name) && call.arguments.some((a) => referencesRole(a, c))) out.push({ kind: "check", what: t.name });
     }
@@ -725,12 +797,102 @@ function onCompare(b: ts.BinaryExpression, c: Ctx, out: Ev[]) {
 /** Walks one arm (an `if` branch, a try / catch block) starting from cover `g`; answers whether its end is covered. */
 function arm(s: ts.Statement, g: boolean, c: Ctx, out: Ev[]): boolean {
   const g0 = c.g;
+  const left0 = c.memLeft;
   c.g = g;
   if (ts.isBlock(s)) for (const st of s.statements) visit(st, c, out);
   else visit(s, c, out);
   const end = c.g;
   c.g = g0;
+  c.memLeft = left0;
   return end;
+}
+
+/* ---------------- membership mode (ADR 0030 H.4) ---------------- */
+
+/**
+ * The refused answers of a membership answer bound by `init`: a call to a
+ * carrier of MEMBERSHIP_ANSWERS, or a conditional whose arms are such
+ * calls or string literals that are themselves refused answers (the SCORM
+ * commit's `id ? await resolveOrgMembership(…) : "unreadable"`). null for
+ * anything else.
+ */
+function membershipAnswerOf(init: ts.Expression, c: Ctx): string[] | null {
+  const e = skipOuter(init);
+  if (ts.isCallExpression(e)) {
+    const t = calleeTarget(c, e.expression);
+    return t?.kind === "fn" ? MEMBERSHIP_ANSWERS.get(`${t.mod.file} ${t.name}`) ?? null : null;
+  }
+  if (ts.isConditionalExpression(e)) {
+    const arms = [e.whenTrue, e.whenFalse];
+    const fromCalls = arms.map((a) => membershipAnswerOf(a, c)).filter((x): x is string[] => x !== null);
+    if (fromCalls.length === 0) return null;
+    const refused = new Set(fromCalls.flat());
+    const ok = arms.every((a) => membershipAnswerOf(a, c) !== null || (strArg(skipOuter(a)) !== null && refused.has(strArg(skipOuter(a))!)));
+    return ok ? [...refused] : null;
+  }
+  return null;
+}
+
+/**
+ * The refused answers a condition is true for, by name, in the forms read
+ * here: `m === "none"` (either side), `typeof m === "string"` (the
+ * resolver's string answers), `isActionError(c)` and `"error" in c` (a
+ * carrier's ActionError), and `||` of these. `&&`, `!` and anything else
+ * rule nothing out.
+ */
+function exclusions(e0: ts.Expression, c: Ctx): Map<string, Set<string>> {
+  const e = skipOuter(e0);
+  const out = new Map<string, Set<string>>();
+  const add = (name: string, xs: string[]) => {
+    const left = c.memLeft.get(name);
+    if (!left) return;
+    const hit = xs.filter((x) => left.has(x));
+    if (!hit.length) return;
+    out.set(name, new Set([...(out.get(name) ?? []), ...hit]));
+  };
+  if (ts.isBinaryExpression(e)) {
+    const k = e.operatorToken.kind;
+    if (k === ts.SyntaxKind.BarBarToken) {
+      for (const side of [exclusions(e.left, c), exclusions(e.right, c)]) for (const [n, xs] of side) add(n, [...xs]);
+      return out;
+    }
+    if (k === ts.SyntaxKind.EqualsEqualsEqualsToken || k === ts.SyntaxKind.EqualsEqualsToken) {
+      const [l, r] = [skipOuter(e.left), skipOuter(e.right)];
+      const lit = strArg(l) ?? strArg(r);
+      const other = strArg(l) !== null ? r : l;
+      if (lit !== null && ts.isIdentifier(other)) add(other.text, [lit]);
+      if (lit === "string" && ts.isTypeOfExpression(other) && ts.isIdentifier(skipOuter(other.expression))) {
+        const name = (skipOuter(other.expression) as ts.Identifier).text;
+        add(name, [...(c.memLeft.get(name) ?? [])].filter((x) => x !== "error"));
+      }
+      return out;
+    }
+    if (k === ts.SyntaxKind.InKeyword && strArg(skipOuter(e.left)) === "error" && ts.isIdentifier(skipOuter(e.right))) {
+      add((skipOuter(e.right) as ts.Identifier).text, ["error"]);
+    }
+    return out;
+  }
+  if (ts.isCallExpression(e) && ts.isIdentifier(skipOuter(e.expression)) && (skipOuter(e.expression) as ts.Identifier).text === "isActionError") {
+    const a = e.arguments[0] && skipOuter(e.arguments[0]);
+    if (a && ts.isIdentifier(a)) add(a.text, ["error"]);
+  }
+  return out;
+}
+
+/** Membership mode: a name bound to a membership answer starts with every refused answer left. */
+function bindMembership(name: ts.BindingName | ts.Expression, init: ts.Expression, c: Ctx) {
+  if (!c.member || !c.route || !ts.isIdentifier(name)) return;
+  const refused = membershipAnswerOf(init, c);
+  c.memLeft = new Map(c.memLeft);
+  if (refused) c.memLeft.set(name.text, new Set(refused));
+  else c.memLeft.delete(name.text);
+}
+
+/** memLeft with the answers ruled out removed (a new map). */
+function narrow(left: Map<string, Set<string>>, excl: Map<string, Set<string>>): Map<string, Set<string>> {
+  const out = new Map(left);
+  for (const [n, xs] of excl) out.set(n, new Set([...(left.get(n) ?? [])].filter((x) => !xs.has(x))));
+  return out;
 }
 
 /**
@@ -827,6 +989,7 @@ function visit(n: ts.Node, c: Ctx, out: Ev[]): void {
     visit(n.initializer, c, out);
     bind(bindingNames(n.name), n.initializer, before);
     bindProps(n.name, n.initializer, before);
+    bindMembership(n.name, n.initializer, c);
     if (ts.isIdentifier(n.name) && isServiceExpr(n.initializer, c)) c.service.add(n.name.text);
     if (ts.isIdentifier(n.name) && isStorageExpr(n.initializer, c)) c.storage.add(n.name.text);
     // `const c = await ctx()` (c.svc) or `const { svc } = await ctx()`.
@@ -845,6 +1008,7 @@ function visit(n: ts.Node, c: Ctx, out: Ev[]): void {
     visit(n.right, c, out);
     bind([n.left.text], n.right, before);
     bindProps(n.left, n.right, before);
+    bindMembership(n.left, n.right, c);
     if (isServiceExpr(n.right, c)) c.service.add(n.left.text);
     if (isStorageExpr(n.right, c)) c.storage.add(n.left.text);
     return;
@@ -856,7 +1020,8 @@ function visit(n: ts.Node, c: Ctx, out: Ev[]): void {
   if (c.route && ts.isIfStatement(n)) {
     const before = out.length;
     visit(n.expression, c, out);
-    const tested = out.slice(before).some((e) => e.kind === "check" || e.kind === "guard") || readsCheck(n.expression, c);
+    // Membership mode: role tests do not guard (P_NEUTRAL); only the exits on the membership answer below.
+    const tested = !c.member && (out.slice(before).some((e) => e.kind === "check" || e.kind === "guard") || readsCheck(n.expression, c));
     const p = tested ? pol(n.expression, c) : P_NEUTRAL;
     const thenExits = exits(n.thenStatement);
     const elseExits = n.elseStatement !== undefined && exits(n.elseStatement);
@@ -868,8 +1033,24 @@ function visit(n: ts.Node, c: Ctx, out: Ev[]): void {
       // A form the scan does not model: as before, the arm that does not exit is taken as covered.
       if (!p.known) { thenOk = elseExits; elseOk = thenExits; }
     }
+    // Membership mode: an exit on refused membership answers rules them out
+    // for the else arm and what follows; once a name has none left, the
+    // caller past this point holds a membership that counts.
+    const left0 = c.memLeft;
+    let leftAfter = left0;
+    if (c.member && thenExits) {
+      const excl = exclusions(n.expression, c);
+      if (excl.size) {
+        leftAfter = narrow(left0, excl);
+        if ([...excl.keys()].some((name) => leftAfter.get(name)?.size === 0)) {
+          out.push({ kind: "guard", what: `membership: if (${n.expression.getText().replace(/\s+/g, " ").slice(0, 70)}) exits` });
+          elseOk = true;
+        }
+      }
+    }
     const g0 = c.g;
     const endThen = arm(n.thenStatement, g0 || thenOk, c, out);
+    c.memLeft = leftAfter;
     const endElse = n.elseStatement ? arm(n.elseStatement, g0 || elseOk, c, out) : g0 || elseOk;
     c.g = g0 || ((thenExits || endThen) && (elseExits || endElse));
     return;
@@ -886,8 +1067,10 @@ function visit(n: ts.Node, c: Ctx, out: Ev[]): void {
   }
   if (ts.isBlock(n) || ts.isCaseClause(n) || ts.isDefaultClause(n) || ts.isIterationStatement(n, false)) {
     const g0 = c.g;
+    const left0 = c.memLeft;
     ts.forEachChild(n, (ch) => visit(ch, c, out));
     c.g = g0;
+    c.memLeft = left0;
     return;
   }
   // What a function returns: a role-test result, whole or in a property of
@@ -921,13 +1104,14 @@ const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 /** firstEffect: the first effect seen (covered or not); unguarded: the first effect no guard covers. */
 type HandlerReport = { file: string; method: string; events: Ev[]; firstEffect: string | null; unguarded: string | null };
 
-function handlers(m: Mod): HandlerReport[] {
+/** `member`: the membership-mode walk (ADR 0030 H.4): `unguarded` is then the first effect no exit on the membership answer covers. */
+function handlers(m: Mod, member = false): HandlerReport[] {
   const out: HandlerReport[] = [];
   for (const method of METHODS) {
     if (!m.exports.has(method)) continue;
     const t = resolveExport(m, method);
     if (t?.kind !== "fn") { out.push({ file: m.file, method, events: [], firstEffect: "UNRESOLVED HANDLER", unguarded: "UNRESOLVED HANDLER" }); continue; }
-    const events = walkFn(t.fn, t.mod, t.mod === m, NO_PARAMS, []);
+    const events = walkFn(t.fn, t.mod, t.mod === m, NO_PARAMS, [], member);
     const first = events.find((e) => e.kind === "effect" || e.kind === "safe-effect");
     const open = events.find((e) => e.kind === "effect");
     out.push({ file: m.file, method, events, firstEffect: first?.what ?? null, unguarded: open?.what ?? null });
@@ -970,6 +1154,23 @@ function plant(src: string, file = `app/api/__planted_${++plantN}__/route.ts`): 
   planted.set(file, src);
   return handlers(parse(file, src));
 }
+/** The same, walked in membership mode (ADR 0030 H.4). */
+function plantMember(src: string, file = `app/api/__planted_${++plantN}__/route.ts`): HandlerReport[] {
+  planted.set(file, src);
+  return handlers(parse(file, src), true);
+}
+/** For each handler of a membership-authority entry: the effects no exit on the membership answer covers. */
+function membershipProblems(allow: Allow[], flagged: HandlerReport[]): string[] {
+  const out: string[] = [];
+  for (const h of flagged) {
+    if (allowFor(h, allow)?.authority !== "membership") continue;
+    const m = planted.has(h.file) ? parse(h.file, sourceOf(h.file)) : modAt(h.file)!;
+    const mh = handlers(m, true).find((x) => x.method === h.method);
+    if (!mh) out.push(`${keyOf(h)}: no handler`);
+    else if (mh.unguarded !== null) out.push(`${keyOf(h)}: ${mh.unguarded} before an exit on the membership answer`);
+  }
+  return out;
+}
 function sourceOf(file: string): string {
   return planted.get(file) ?? fs.readFileSync(path.join(root, file), "utf8");
 }
@@ -1002,6 +1203,48 @@ eq("no handler makes a service-role write, an auth admin call, a storage write o
 eq("every allow-list entry and listed handler still matches a flagged handler (nothing stale)", staleEntries(ALLOW, flagged), []);
 eq("every allow-list entry has a reason, and names a prefix or handlers", ALLOW.filter((a) => a.reason.trim().length < 20 || (a.prefix === undefined) === (a.handlers === undefined)).map(allowLabel), []);
 eq("a prefix entry carries `requires`, and every flagged route file under it contains that authority", prefixProblems(ALLOW, flagged), []);
+
+console.log("\nADR 0030 H.4: each allow-list entry names its authority; a membership entry acts on the membership answer before its first effect");
+eq("every entry names an authority from the closed list", ALLOW.filter((a) => !(AUTHORITIES as readonly string[]).includes(a.authority)).map(allowLabel), []);
+eq("the handlers whose authority is the caller's membership are exactly the record's six routes (tickets with both handlers)",
+  ALLOW.filter((a) => a.authority === "membership").flatMap((a) => a.handlers ?? [a.prefix ?? ""]).sort(), MEMBERSHIP_HANDLERS);
+eq("no membership entry is a prefix entry (each handler is named)", ALLOW.filter((a) => a.authority === "membership" && a.prefix !== undefined).map(allowLabel), []);
+eq("every handler of a membership entry exits on the membership answer (\"none\" and \"unreadable\", or the carrier's error) before each of its effects",
+  membershipProblems(ALLOW, flagged), []);
+{
+  const memberWalks = MEMBERSHIP_HANDLERS.map((k) => {
+    const [file, method] = k.split(" ");
+    const h = handlers(modAt(file)!, true).find((x) => x.method === method);
+    return { k, effects: (h?.events ?? []).filter((e) => e.kind === "effect" || e.kind === "safe-effect").length, guards: (h?.events ?? []).filter((e) => e.kind === "guard" && e.what.startsWith("membership:")).length };
+  });
+  eq("non-vacuous: each membership handler has an effect and an exit on the membership answer in its own code",
+    memberWalks.filter((w) => w.effects === 0 || w.guards === 0).map((w) => w.k), []);
+  // The carriers: lib/ functions whose ActionError answer stands for the resolver's.
+  for (const [key, refused] of MEMBERSHIP_ANSWERS) {
+    const [file, name] = key.split(" ");
+    if (file === "lib/auth/org-membership.ts") {
+      eq(`${key}: the resolver is exported and its refused answers are "none" and "unreadable"`, [!!modAt(file)?.exports.has(name), refused], [true, ["none", "unreadable"]]);
+      continue;
+    }
+    const mod = modAt(file);
+    const t = mod ? resolveExport(mod, name) : null;
+    const fn = t?.kind === "fn" ? t.fn : null;
+    let callsResolver = false;
+    const v = (n: ts.Node): void => {
+      if (callsResolver) return;
+      if (ts.isCallExpression(n) && mod) {
+        const ct = calleeTarget({ m: mod }, n.expression);
+        if (ct?.kind === "fn" && ct.mod.file === "lib/auth/org-membership.ts" && ct.name === "resolveOrgMembership") callsResolver = true;
+      }
+      ts.forEachChild(n, v);
+    };
+    if (fn?.body) v(fn.body);
+    const ends = fn && mod ? walkFn(fn, mod, true, NO_PARAMS, [], true).filter((e) => e.kind === "end").map((e) => e.what) : [];
+    eq(`${key}: calls resolveOrgMembership, and its own exits on that answer cover its end (it answers an error to a refused caller)`,
+      [callsResolver, ends.at(-1) ?? null, refused], [true, "covered", ["error"]]);
+  }
+}
+
 const guardedCount = all.filter((h) => h.firstEffect !== null && h.unguarded === null).length;
 const effectCount = all.filter((h) => h.firstEffect !== null).length;
 console.log(`  (${files.length} route files, ${all.length} handlers; ${effectCount} with an effect: ${guardedCount} guarded first, ${flagged.length} on the allow-list)`);
@@ -1059,7 +1302,7 @@ console.log("\nthe detectors see what a text search sees in lib/ (no blind spot 
     checked++;
     const m = modAt(f)!;
     const evs: Ev[] = [];
-    visit(m.sf, { m, route: false, g: false, service: new Set(moduleService(m)), storage: new Set(), closures: new Map(), stack: [], roleVars: new Set(), checkVars: new Set(), refuseVars: new Set(), checkProps: new Set(), serviceObjs: new Map() }, evs);
+    visit(m.sf, { m, route: false, g: false, service: new Set(moduleService(m)), storage: new Set(), closures: new Map(), stack: [], roleVars: new Set(), checkVars: new Set(), refuseVars: new Set(), checkProps: new Set(), serviceObjs: new Map(), member: false, memLeft: new Map() }, evs);
     // Functions declared at module level run when called; walk each once.
     for (const fn of m.fns.values()) evs.push(...walkFn(fn, m, false, NO_PARAMS, []));
     if (wantFetch && !evs.some((e) => e.what === "fetch")) missed.push(`${f}: fetch`);
@@ -1166,18 +1409,30 @@ console.log("\nplanted cases");
     export const GET = POST;
     export const PUT = handle;`)), ["GET:FLAGGED", "POST:FLAGGED", "PUT:FLAGGED"]);
 
-  const MEM = `const { data: m } = await s.from("organization_members").select("role").eq("organization_id", "o").eq("user_id", u.id).maybeSingle();`;
+  // The caller's role from the one membership resolver (ADR 0030 H.4). The
+  // planted cases below were written on an inline role read before; each
+  // now reads through the resolver, and INLINE_MEM is the old form.
+  const RESOLVER_IMPORT = `import { resolveOrgMembership } from "@/lib/auth/org-membership";\n`;
+  const MEM = `const m = await resolveOrgMembership(s, { slug: "x" }, u.id);`;
+  const INLINE_MEM = `const { data: m } = await s.from("organization_members").select("role").eq("organization_id", "o").eq("user_id", u.id).maybeSingle();`;
   const USER = `const s = await createClient(); const { data: { user: u } } = await s.auth.getUser(); if (!u) return NextResponse.json({}, { status: 401 });`;
-  eq("an organization_members role lookup followed by a role comparison is a guard",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+  eq("the resolver's answer followed by a role comparison is a guard",
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       if (m?.role !== "admin" && m?.role !== "super_owner") return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
+  eq("ADR 0030 H.4: an inline organization_members role read of the caller, then the same comparison, is no guard any more (nor with a role list test)",
+    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${INLINE_MEM}
+      if (m?.role !== "admin" && m?.role !== "super_owner") return NextResponse.json({}, { status: 403 });
+      const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }
+    export async function PUT() { ${USER} ${INLINE_MEM}
+      if (!["super_owner", "admin"].includes(m?.role as string)) return NextResponse.json({}, { status: 403 });
+      const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:FLAGGED", "PUT:FLAGGED"]);
   eq("…and so is a role list check after the lookup",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       if (!["super_owner", "admin"].includes(m?.role as string)) return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
   eq("a role lookup with no comparison is not a guard",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       const svc = ${SVC}; await svc.from("x").insert({ role: m?.role }); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);
   eq("a role comparison on a body field, with no lookup of the caller, is not a guard",
     verdict(plant(SVC_IMPORTS + `export async function POST(req: Request) { const body = await req.json();
@@ -1189,17 +1444,17 @@ console.log("\nplanted cases");
       if (ms?.[0]?.role !== "admin") return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);
   eq("a role test stored in a variable and tested by an exiting `if` is a guard",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       const r = m?.role as string | undefined;
       const canWrite = r === "super_owner" || r === "admin";
       if (!canWrite) return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
   eq("a role comparison that never leads to an exit is not a guard",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       const label = m?.role === "admin" ? "Admin" : "Member";
       const svc = ${SVC}; await svc.from("x").insert({ label }); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);
   eq("a role test in an `if` whose branches do not leave the handler is not a guard",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       let note = ""; if (m?.role !== "admin") { note = "not an admin"; }
       const svc = ${SVC}; await svc.from("x").insert({ note }); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);
   eq("requireOrgAdminApi's answer used but its refusal never tested: an exit on data read with it is not a guard",
@@ -1217,12 +1472,16 @@ console.log("\nplanted cases");
       const ok = !("error" in auth);
       if (!ok) return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
-  eq("a membership-only test (if (!member) return) is not a role check",
-    verdict(plant(SVC_IMPORTS + `export async function POST() { ${USER} ${MEM}
+  eq("a membership-only test (if (!member) return, or an exit on the resolver's \"none\" and \"unreadable\") is not a role check",
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST() { ${USER} ${MEM}
       if (!m) return NextResponse.json({}, { status: 403 });
-      const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);
+      const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }
+    export async function PUT() { ${USER} ${MEM}
+      if (m === "unreadable") return NextResponse.json({}, { status: 503 });
+      if (m === "none") return NextResponse.json({}, { status: 404 });
+      const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:FLAGGED", "PUT:FLAGGED"]);
   eq("the lookup and the comparison inside a same-file helper (ctx()) are a guard at the call",
-    verdict(plant(SVC_IMPORTS + `async function ctx() { ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `async function ctx() { ${USER} ${MEM}
       if (m?.role !== "admin") return null; return { s }; }
     export async function POST() { const c = await ctx(); if (!c) return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
@@ -1278,16 +1537,16 @@ console.log("\nplanted cases");
   const CTX_ROLE = `async function ctx() { ${USER} ${MEM} if (!m) return { error: "Forbidden" };
       const admin = ["super_owner", "owner", "admin"].includes(m.role as string); const svc = ${SVC}; return { svc, admin }; }\n`;
   eq("a helper that returns the role test in a property: testing only its error (membership) is not a guard",
-    verdict(plant(SVC_IMPORTS + CTX_ROLE + `export async function PUT() { const c = await ctx(); if ("error" in c) return NextResponse.json({}, { status: 403 });
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + CTX_ROLE + `export async function PUT() { const c = await ctx(); if ("error" in c) return NextResponse.json({}, { status: 403 });
       await c.svc.from("x").delete().eq("id", "1"); return NextResponse.json({}); }`)), ["PUT:FLAGGED"]);
   eq("…testing that property (`if (!c.admin)`) before the write is",
-    verdict(plant(SVC_IMPORTS + CTX_ROLE + `export async function PUT() { const c = await ctx(); if ("error" in c) return NextResponse.json({}, { status: 403 });
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + CTX_ROLE + `export async function PUT() { const c = await ctx(); if ("error" in c) return NextResponse.json({}, { status: 403 });
       if (!c.admin) return NextResponse.json({}, { status: 403 }); await c.svc.from("x").delete().eq("id", "1"); return NextResponse.json({}); }`)), ["PUT:guarded"]);
   eq("…and so is testing it destructured (`const { admin, svc } = …; if (!admin)`)",
-    verdict(plant(SVC_IMPORTS + CTX_ROLE + `export async function PUT() { const c = await ctx(); if ("error" in c) return NextResponse.json({}, { status: 403 });
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + CTX_ROLE + `export async function PUT() { const c = await ctx(); if ("error" in c) return NextResponse.json({}, { status: 403 });
       const { admin, svc } = c; if (!admin) return NextResponse.json({}, { status: 403 }); await svc.from("x").delete().eq("id", "1"); return NextResponse.json({}); }`)), ["PUT:guarded"]);
   eq("a helper whose whole answer is the role test (`return m?.role === \"admin\"`), tested by the route, is a guard",
-    verdict(plant(SVC_IMPORTS + `async function isAdmin() { ${USER} ${MEM} return m?.role === "admin"; }
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `async function isAdmin() { ${USER} ${MEM} return m?.role === "admin"; }
     export async function POST() { if (!(await isAdmin())) return NextResponse.json({}, { status: 403 });
       const svc = ${SVC}; await svc.from("x").insert({}); return NextResponse.json({}); }`)), ["POST:guarded"]);
 
@@ -1329,7 +1588,7 @@ console.log("\nplanted cases");
     export async function PUT() { const auth = await requireOrgAdminApi("x"); const denied = "error" in auth;
       if (!denied) return ${DENY}; await deleteSamlProvider("p"); return NextResponse.json({}); }`)), ["POST:guarded", "PUT:FLAGGED"]);
   eq("the upload shape (membership on one branch, the admin check on the other, the write after both) is flagged",
-    verdict(plant(SVC_IMPORTS + `export async function POST(req: Request) { const body = await req.json(); ${USER} ${MEM}
+    verdict(plant(SVC_IMPORTS + RESOLVER_IMPORT + `export async function POST(req: Request) { const body = await req.json(); ${USER} ${MEM}
       if (body.kind === "avatar") { if (!m) return ${DENY}; }
       else { const canWrite = m?.role === "super_owner" || m?.role === "admin"; if (!canWrite) return ${DENY}; }
       const svc = ${SVC}; await svc.storage.from("b").upload("k", "v"); return NextResponse.json({}); }`)), ["POST:FLAGGED"]);
@@ -1390,14 +1649,89 @@ console.log("\nplanted cases");
       [["app/api/integrations/__planted_comment__/route.ts POST: lacks /authenticateApiKey\\(/"], []]);
   }
   eq("a prefix entry without `requires` is reported",
-    prefixProblems([{ prefix: "app/api/__loose__/", reason: "planted loose entry for the test" }], []), ["app/api/__loose__/: no requires"]);
+    prefixProblems([{ prefix: "app/api/__loose__/", authority: "cron-secret", reason: "planted loose entry for the test" }], []), ["app/api/__loose__/: no requires"]);
   eq("a prefix entry that covers no flagged handler, and a listed handler that is not flagged, are reported stale",
     staleEntries([
-      { prefix: "app/api/__nothing_here__/", requires: /x/, reason: "planted stale entry for the test" },
-      { handlers: ["app/api/org/sso/route.ts POST", "app/api/__gone__/route.ts POST"], reason: "planted stale handlers for the test" },
+      { prefix: "app/api/__nothing_here__/", requires: /x/, authority: "cron-secret", reason: "planted stale entry for the test" },
+      { handlers: ["app/api/org/sso/route.ts POST", "app/api/__gone__/route.ts POST"], authority: "own-account", reason: "planted stale handlers for the test" },
       ...ALLOW,
     ], flagged),
     ["app/api/__nothing_here__/", "app/api/org/sso/route.ts POST", "app/api/__gone__/route.ts POST"]);
+}
+
+console.log("\nplanted cases: membership mode (ADR 0030 H.4)");
+{
+  const SVC_IMPORTS = `import { NextResponse } from "next/server";\nimport { createClient } from "@/lib/supabase/server";\nimport { createClient as createServiceClient } from "@supabase/supabase-js";\nimport { resolveOrgMembership } from "@/lib/auth/org-membership";\n`;
+  const SVC = `createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } })`;
+  const USER = `const s = await createClient(); const { data: { user: u } } = await s.auth.getUser(); if (!u) return NextResponse.json({}, { status: 401 });`;
+  const MEM = `const m = await resolveOrgMembership(s, { slug: "x" }, u.id);`;
+  const WRITE = `const svc = ${SVC}; await svc.from("x").insert({});`;
+  const OK = `return NextResponse.json({});`;
+  const NONE = `if (m === "none") return NextResponse.json({}, { status: 404 });`;
+  const UNREADABLE = `if (m === "unreadable") return NextResponse.json({}, { status: 503 });`;
+  const route = (body: string) => SVC_IMPORTS + `export async function POST(req: Request) { const body = await req.json(); ${USER} ${MEM} ${body} }`;
+  const member = (src: string) => verdict(plantMember(src));
+
+  eq("exits on \"unreadable\" and on \"none\" before the write: the membership answer is acted on",
+    member(route(`${UNREADABLE} ${NONE} ${WRITE} ${OK}`)), ["POST:guarded"]);
+  eq("…in the other order, or as one `||` test, or as `typeof m === \"string\"`, too",
+    [member(route(`${NONE} ${UNREADABLE} ${WRITE} ${OK}`)),
+      member(route(`if (m === "none" || m === "unreadable") return NextResponse.json({}, { status: 404 }); ${WRITE} ${OK}`)),
+      member(route(`if (typeof m === "string") return NextResponse.json({}, { status: 404 }); ${WRITE} ${OK}`))],
+    [["POST:guarded"], ["POST:guarded"], ["POST:guarded"]]);
+  eq("the answer never tested: the write is not covered", member(route(`${WRITE} ${OK}`)), ["POST:FLAGGED"]);
+  eq("the answer tested after the write: not covered", member(route(`${WRITE} ${UNREADABLE} ${NONE} ${OK}`)), ["POST:FLAGGED"]);
+  eq("\"unreadable\" alone is not acting on the answer, and \"none\" alone neither (a failed check is never \"none\" let through)",
+    [member(route(`${UNREADABLE} ${WRITE} ${OK}`)), member(route(`${NONE} ${WRITE} ${OK}`))], [["POST:FLAGGED"], ["POST:FLAGGED"]]);
+  eq("both exits inside one branch only do not cover the write after it",
+    member(route(`if (body.kind === "a") { ${UNREADABLE} ${NONE} } ${WRITE} ${OK}`)), ["POST:FLAGGED"]);
+  eq("an `&&` test (`m === \"none\" && body.strict`) rules nothing out",
+    member(route(`${UNREADABLE} if (m === "none" && body.strict) return NextResponse.json({}, { status: 404 }); ${WRITE} ${OK}`)), ["POST:FLAGGED"]);
+  eq("the SCORM commit's shape (`id ? await resolveOrgMembership(…) : \"unreadable\"`) is the resolver's answer; a conditional whose other arm is a made-up success is not",
+    [member(SVC_IMPORTS + `export async function POST() { ${USER}
+        const a = { organization_id: "o" };
+        const access = a.organization_id ? await resolveOrgMembership(s, { id: a.organization_id }, u.id) : "unreadable";
+        if (access === "unreadable") { return NextResponse.json({ error: "access_unreadable" }, { status: 503 }); }
+        if (access === "none") { return NextResponse.json({ error: "no_access" }, { status: 403 }); }
+        ${WRITE} ${OK} }`),
+      member(SVC_IMPORTS + `export async function POST() { ${USER}
+        const a = { organization_id: "o" };
+        const access = a.organization_id ? await resolveOrgMembership(s, { id: a.organization_id }, u.id) : { org: { id: "o" }, role: "user" };
+        if (access === "unreadable") return NextResponse.json({}, { status: 503 });
+        if (access === "none") return NextResponse.json({}, { status: 403 });
+        ${WRITE} ${OK} }`)],
+    [["POST:guarded"], ["POST:FLAGGED"]]);
+  eq("a role guard alone (requireOrgAdminApi acted on) is no exit on the membership answer in this mode; the platform owner's guard neither",
+    [member(SVC_IMPORTS + `import { requireOrgAdminApi } from "@/lib/auth/api-admin";
+      export async function POST() { const auth = await requireOrgAdminApi("x"); if ("error" in auth) return NextResponse.json({}, { status: 403 }); ${WRITE} ${OK} }`),
+      member(SVC_IMPORTS + `import { requirePlatformOwner } from "@/lib/auth/require-platform-owner";
+      export async function POST() { await requirePlatformOwner(); ${WRITE} ${OK} }`)],
+    [["POST:FLAGGED"], ["POST:FLAGGED"]]);
+  eq("an inline read of the caller's own row with a status filter, then `if (!m) return`, is no membership exit",
+    member(SVC_IMPORTS + `export async function POST() { ${USER}
+      const { data: m } = await s.from("organization_members").select("role, status").eq("organization_id", "o").eq("user_id", u.id).eq("status", "active").maybeSingle();
+      if (!m) return NextResponse.json({}, { status: 404 }); ${WRITE} ${OK} }`), ["POST:FLAGGED"]);
+  eq("a lib/ carrier's ActionError (authorizeManager, loadTicketForCaller) acted on before the write counts at the call site; not acted on, it does not",
+    [member(`import { NextResponse } from "next/server";\nimport { createClient as createServiceClient } from "@supabase/supabase-js";\nimport { authorizeManager, isActionError } from "@/lib/manager/actions";\n` +
+        `export async function POST() { const a = await authorizeManager("x"); if (isActionError(a)) return NextResponse.json({}, { status: a.status }); ${WRITE} ${OK} }`),
+      member(`import { NextResponse } from "next/server";\nimport { createClient as createServiceClient } from "@supabase/supabase-js";\nimport { isActionError } from "@/lib/actions/types";\nimport { loadTicketForCaller } from "@/lib/tickets/auth";\n` +
+        `export async function POST() { const c = await loadTicketForCaller("t"); if ("error" in c) return NextResponse.json({}, { status: 404 }); ${WRITE} ${OK} }
+        export async function PUT() { const c = await loadTicketForCaller("t"); ${WRITE} if (isActionError(c)) return NextResponse.json({}, { status: c.status }); ${OK} }`)],
+    [["POST:guarded"], ["POST:guarded", "PUT:FLAGGED"]]);
+  {
+    // The allow-list check itself, on a planted membership entry.
+    const file = "app/api/__planted_membership__/route.ts";
+    const NO_EXIT = route(`${WRITE} ${OK}`);
+    const flaggedPlant = plant(NO_EXIT, file);
+    const entry: Allow[] = [{ handlers: [`${file} POST`], authority: "membership", reason: "planted membership entry for the test" }];
+    const other: Allow[] = [{ handlers: [`${file} POST`], authority: "own-account", reason: "planted own-account entry for the test" }];
+    const without = membershipProblems(entry, flaggedPlant);
+    const otherAuthority = membershipProblems(other, flaggedPlant);
+    const fixed = plant(route(`${UNREADABLE} ${NONE} ${WRITE} ${OK}`), file);
+    eq("a membership entry whose handler writes before acting on the answer is reported; under another authority it is not walked again; with the exits it passes",
+      [without, otherAuthority, verdict(fixed), membershipProblems(entry, fixed)],
+      [[`${file} POST: service-role insert on x before an exit on the membership answer`], [], ["POST:FLAGGED"], []]);
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

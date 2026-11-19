@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { listCountingMemberships } from "@/lib/auth/org-membership";
+import { CHECK_FAILED, isOrgAdminRole } from "@/lib/auth/api-admin";
 
 /**
  *   GET    /api/broadcasts             — currently-visible broadcasts for caller
@@ -22,15 +24,11 @@ export async function GET() {
     { auth: { persistSession: false } }
   );
 
-  // Caller's role across orgs (used for admins_only filter).
-  const { data: mems } = await svc
-    .from("organization_members")
-    .select("role")
-    .eq("user_id", user.id);
-  const roles = ((mems ?? []) as Array<{ role: string }>).map((m) => m.role);
-  const isAdminSomewhere = roles.some(
-    (r) => r === "super_owner" || r === "owner" || r === "admin"
-  );
+  // Caller's role across orgs (used for admins_only filter): only from
+  // memberships that count (ADR 0030: active, in an org that is not deleted).
+  const mems = await listCountingMemberships(svc, user.id);
+  if (mems === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
+  const isAdminSomewhere = mems.some((m) => isOrgAdminRole(m.role));
 
   // Platform owner?
   const { data: po } = await svc

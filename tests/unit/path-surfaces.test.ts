@@ -126,9 +126,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     case "/rest/v1/profiles":
       return json([{ must_change_password: false, first_name: "Pat", last_name: "Learner" }]);
     case "/rest/v1/organizations":
-      return json([{ id: "o1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null }]);
+      return json([{ id: "o1", name: "Acme", slug: "acme", logo_url: null, brand_color: null, brand_font: null, custom_domain: null, deleted_at: null }]);
     case "/rest/v1/organization_members":
-      return json([{ role: "member" }]);
+      return json([{ role: "member", status: "active" }]);
     case "/rest/v1/learning_paths": {
       if (q.has("visibility")) return json([]);
       const row = { id: PATH, name: "Onboarding Path", description: null, organization_id: "o1", is_active: world.pathActive, thumbnail_url: null, visibility: "private", sequence_mode: world.sequence };

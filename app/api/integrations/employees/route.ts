@@ -9,6 +9,7 @@ import {
   type GovernedField,
 } from "@/lib/org/field-options";
 import { checkQuota } from "@/lib/billing/enforce-quota";
+import { expireLaunchTokensForMembers, logLaunchTokenExpiryFailed } from "@/lib/attempts/abandon";
 import {
   fetchHierarchyMembers,
   validateManagerAssignment,
@@ -27,7 +28,10 @@ import {
  * Rules the CRM can rely on:
  *   - employee_id is the identity key; upserting an existing id UPDATES and
  *     re-activates (rehire = same call as hire). DELETE = leaver
- *     (deactivated, history preserved — never hard-deleted).
+ *     (deactivated, history preserved — never hard-deleted). A DELETE also
+ *     closes the employee's open course launches in this organisation
+ *     (ADR 0030 decision 4); if that fails the deactivation stands and the
+ *     answer adds `tokens_expired: false`.
  *   - Integration-created accounts are always LEARNERS ('user'); role can
  *     never be set or escalated here, and existing ADMIN accounts are
  *     refused entirely (403) — a CRM compromise cannot touch admins.
@@ -402,5 +406,13 @@ export async function DELETE(request: Request) {
     .eq("organization_id", auth.orgId)
     .eq("user_id", m.user_id);
   if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.json({ ok: true, action: "deactivated", employee_id: employeeId });
+  // ADR 0030 decision 4: the leaver's open launches end with the deactivation.
+  const tokErr = await expireLaunchTokensForMembers(auth.svc, auth.orgId, [m.user_id]);
+  if (tokErr) logLaunchTokenExpiryFailed("integrations/employees DELETE", auth.orgId, [m.user_id], tokErr);
+  return NextResponse.json({
+    ok: true,
+    action: "deactivated",
+    employee_id: employeeId,
+    ...(tokErr ? { tokens_expired: false } : {}),
+  });
 }

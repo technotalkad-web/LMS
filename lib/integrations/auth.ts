@@ -50,19 +50,26 @@ export async function authenticateApiKey(
   );
   const { data } = await svc
     .from("org_api_keys")
-    .select("id, organization_id, is_active, organizations(slug)")
+    .select("id, organization_id, is_active, organizations(slug, deleted_at)")
     .eq("key_hash", hashApiKey(key))
     .maybeSingle();
   const row = data as {
     id: string;
     organization_id: string;
     is_active: boolean;
-    organizations: { slug: string } | Array<{ slug: string }>;
+    organizations:
+      | { slug: string; deleted_at?: string | null }
+      | Array<{ slug: string; deleted_at?: string | null }>
+      | null;
   } | null;
   if (!row || row.is_active !== true) return null;
   const orgRel = Array.isArray(row.organizations)
     ? row.organizations[0]
     : row.organizations;
+  // ADR 0030 rule 8: the key of a deleted organisation is refused with the
+  // answer a revoked key gets, before its use is stamped. An organisation
+  // read without its deletion column is refused too (the test fails closed).
+  if (!orgRel || orgRel.deleted_at !== null) return null;
 
   // Usage timestamp — fire-and-forget, never blocks the request.
   void svc

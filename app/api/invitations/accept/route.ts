@@ -8,7 +8,10 @@ import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
  *   body: { token: "<uuid>", password: "..." }
  *
  * Accept flow:
- *   1. Validate the token exists, isn't accepted, isn't expired.
+ *   1. Validate the token exists, its organisation is not deleted, and it
+ *      isn't accepted or expired. An invitation of a deleted organisation
+ *      gets the answer an unknown token gets, before any account is made or
+ *      changed.
  *   2. If an auth.users row already exists for the invitation's email, just
  *      sign the user in with the given password and write the membership.
  *   3. Otherwise create the auth user with that password (email pre-confirmed
@@ -47,14 +50,20 @@ export async function POST(request: Request) {
     { auth: { persistSession: false } }
   );
 
-  // 1) Validate token.
-  const { data: invitation } = await svc
+  // 1) Validate token, with its organisation's deletion.
+  const { data: invitation, error: readError } = await svc
     .from("invitations")
-    .select("id, organization_id, email, role, accepted_at, expires_at")
+    .select("id, organization_id, email, role, accepted_at, expires_at, organizations(deleted_at)")
     .eq("token", token)
     .maybeSingle();
 
-  if (!invitation) {
+  if (readError) {
+    return NextResponse.json(
+      { error: "Could not check this invitation. Please try again." },
+      { status: 503 }
+    );
+  }
+  if (!invitation || !organisationIsLive(invitation)) {
     return NextResponse.json({ error: "Invalid invitation" }, { status: 404 });
   }
   if (invitation.accepted_at) {
@@ -115,7 +124,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Failed to resolve user" }, { status: 500 });
   }
 
-  // 3) Write membership (idempotent).
+  // 3) Write membership (idempotent). Neither write names the status: a new
+  // row starts active, and an existing row keeps its status, so accepting
+  // an invitation never brings back a person whose membership was made
+  // inactive. An administrator does that on purpose (ADR 0030 rule 9).
+  // A row that is not active is not written at all: the invitation's role
+  // is not left on it for a later reactivation to grant without anyone
+  // choosing it. An active row takes the invitation's role, as before.
   await svc
     .from("organization_members")
     .upsert(
@@ -124,8 +139,14 @@ export async function POST(request: Request) {
         user_id: userId,
         role: invitation.role,
       },
-      { onConflict: "organization_id,user_id" }
+      { onConflict: "organization_id,user_id", ignoreDuplicates: true }
     );
+  await svc
+    .from("organization_members")
+    .update({ role: invitation.role })
+    .eq("organization_id", invitation.organization_id)
+    .eq("user_id", userId)
+    .eq("status", "active");
 
   // 4) Mark invitation accepted.
   await svc
@@ -161,4 +182,18 @@ export async function POST(request: Request) {
     ok: true,
     organizationId: invitation.organization_id,
   });
+}
+
+/**
+ * True when the invitation's organisation exists and is not deleted. An
+ * embed read without `deleted_at` does not count as live.
+ */
+function organisationIsLive(invitation: { organizations?: unknown }): boolean {
+  const embed = invitation.organizations as
+    | { deleted_at?: string | null }
+    | Array<{ deleted_at?: string | null }>
+    | null
+    | undefined;
+  const org = Array.isArray(embed) ? embed[0] : embed;
+  return !!org && org.deleted_at === null;
 }
