@@ -285,6 +285,8 @@ function authServer(method: string, p: string, body: unknown): Response {
  */
 function write(method: string, table: string, q: URLSearchParams, body: unknown, prefer = ""): Response {
   if (failing.has(`${method} ${table}`)) return json({ code: "XX000", message: "stub write failure" }, 500);
+  // ADR 0029: each send opens its run with tenant_mail_status (migration 0114), a read by POST: one row, no state yet.
+  if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? null, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
   if (table === "organization_members" && method === "POST") {
     const ignoreDuplicates = /resolution=ignore-duplicates/.test(prefer);
     for (const rec of (Array.isArray(body) ? body : [body]) as Row[]) {
@@ -1218,6 +1220,8 @@ async function main() {
           const ids = (body as { p_ids?: string[] } | null)?.p_ids ?? [];
           return json(ids.map((id) => ({ enrollment_id: id, done: 0, done_today: false, credited: [] })));
         }
+        // ADR 0029: each send opens its run with tenant_mail_status (migration 0114): one row, no state yet.
+        if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? null, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
         if (table.startsWith("rpc/")) return json([]);
         if (method === "GET") {
           if (mFail(table, select, q)) return json({ code: "XX000", message: "stub read failure" }, 500);

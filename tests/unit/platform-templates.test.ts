@@ -8,7 +8,10 @@
  *     password, no person's name, no tenant branding;
  *   - the organisation's name is plain text cut to 60 characters, with
  *     anything shaped like a link or an address removed;
- *   - content that fails its check throws, before anything could be sent.
+ *   - content that fails its check throws, before anything could be sent;
+ *   - the alert's reading daily_limit (ADR 0029, rule FP4): its own fixed
+ *     text, the limit as a whole number, and that codes and welcomes go on
+ *     until the limit.
  *
  * No database, no network.
  *
@@ -86,6 +89,17 @@ console.log("\nthe values a message carries");
     const a = renderPlatformEmail("tenant_smtp_alert", { ...GOOD.tenant_smtp_alert, reading, errorClass: cls });
     eq(`the alert, ${reading}${cls ? ` (${cls})` : ""}: the fixed reason, the learners' message and the settings address`, [a.text.includes(words), a.text.includes("Email could not be sent. Please contact your LMS Administrator."), a.text.includes(SETTINGS)], [true, true, true]);
   }
+  {
+    const d = renderPlatformEmail("tenant_smtp_alert", { organizationName: "Acme Learning", settingsUrl: SETTINGS, reading: "daily_limit", errorClass: null, dailyLimit: 1500 });
+    eq("the alert, daily_limit: routine mail has stopped, with the limit, the settings address and the organisation",
+      [d.text.includes("Routine email from the LMS for Acme Learning has stopped"), d.text.includes("1500 emails in 24 hours"), d.text.includes(SETTINGS), d.subject.includes("routine email has stopped")], [true, true, true, true]);
+    eq("…codes, links and welcomes go on until the limit; it opens again by itself; no other mail server",
+      [d.text.includes("Password reset codes, sign-in links and welcome emails still go out until the full limit is reached"), d.text.includes("starts again by itself"), d.text.includes("Nothing is sent through any other mail server")], [true, true, true]);
+    eq("…it does not say the SMTP is broken", [d.text.includes("refused the sign-in"), d.text.includes("not being sent through the organisation's own mail server")], [false, false]);
+    eq("…the learners' message is named for the limit itself", d.text.includes("Email could not be sent. Please contact your LMS Administrator."), true);
+    const f = renderPlatformEmail("tenant_smtp_alert", GOOD.tenant_smtp_alert);
+    eq("…and the failing alert does not speak of a limit", f.text.includes("daily email limit"), false);
+  }
   const t = renderPlatformEmail("platform_test", {});
   eq("the test: fixed text only", t.text.includes("test message from the LMS platform sender"), true);
 }
@@ -144,6 +158,12 @@ console.log("\ncontent that fails its check throws");
     ["an alert with the class __proto__", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "__proto__" }],
     ["an alert with the class none (the map's own fallback key, not a class)", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "none" }],
     ["an alert with the class rejected (a recipient's refusal never raises an alert)", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "rejected" }],
+    ["a daily_limit alert with no limit", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "daily_limit", errorClass: null }],
+    ["a daily_limit alert with a limit of 0", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "daily_limit", errorClass: null, dailyLimit: 0 }],
+    ["a daily_limit alert with a limit above 100000", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "daily_limit", errorClass: null, dailyLimit: 100001 }],
+    ["a daily_limit alert with a fractional limit", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "daily_limit", errorClass: null, dailyLimit: 12.5 }],
+    ["a daily_limit alert with the limit as text", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "daily_limit", errorClass: null, dailyLimit: "1500" }],
+    ["a failing alert that carries a limit", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "auth", dailyLimit: 1500 }],
   ];
   for (const [label, event, content] of bad) eq(label, throws(() => renderPlatformEmail(event, content as never)), "PlatformTemplateError");
 }

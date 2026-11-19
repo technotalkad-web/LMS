@@ -19,6 +19,13 @@
  * names credential tokens (the emailed subject carries the values, the logged
  * subject keeps the tokens literal).
  *
+ * ADR 0029 pull request B: the pause never stops password_reset and
+ * magic_link (D1), so the paused paths are checked on a welcome that carries
+ * a password, and a paused reset code is checked as sent; the rows a run
+ * writes without sending (not configured, the daily limit) and a group's
+ * one insert (sendMany) hold no credential either. Each send opens its run
+ * with tenant_mail_status, which the stub answers.
+ *
  * Every credential check is a boolean or a count: a failing check never
  * prints a value.
  *
@@ -67,6 +74,9 @@ let template: Row | null = null;
 let authUsers: Array<{ id: string; email: string }> = [];
 let members = new Set<string>();
 let created = 0;
+/** tenant_mail_status's one row (ADR 0029, migration 0114): the state and the 24-hour count. */
+let mailStatus: Row = {};
+const statusRow = (over: Row = {}): Row => ({ state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0, ...over });
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const userJson = (id: string, email: string) => ({ id, aud: "authenticated", role: "authenticated", email, app_metadata: {}, user_metadata: {}, created_at: "2026-01-01T00:00:00Z" });
@@ -113,13 +123,15 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   // A platform owner whose row does not require the second factor (as the e2e
   // fixtures seed one), so the platform route guard admits this session.
   if (p === "/rest/v1/platform_owners") return json([{ user_id: ME.id, mfa_required: false }]);
+  if (p === "/rest/v1/rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? ORG, ...statusRow(mailStatus) }]);
   if (p.startsWith("/rest/v1/rpc/")) return json(null);
   if (method === "GET" || method === "HEAD") return json([]);
   return json([], 201);
 };
 
 /* ---------------- what each run wrote ---------------- */
-const logRows = () => requests.filter((q) => q.path === "/rest/v1/notification_log" && q.method === "POST").map((q) => ({ body: q.body as Row, raw: q.raw }));
+// A group of a run is one insert of several rows (ADR 0029); a single send inserts one object.
+const logRows = () => requests.filter((q) => q.path === "/rest/v1/notification_log" && q.method === "POST").flatMap((q) => (Array.isArray(q.body) ? (q.body as Row[]).map((b) => ({ body: b, raw: JSON.stringify(b) })) : [{ body: q.body as Row, raw: q.raw }]));
 const smtpRaw = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").map((q) => q.raw).join("\n");
 const smtpPayloads = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").map((q) => q.body as { subject: string; text: string });
 
@@ -137,8 +149,9 @@ async function checkLog(label: string, opts: { rows: number; secrets: string[]; 
   eq(`${label}: the stored context keys`, Object.keys((rows[0]?.body.context ?? {}) as Row).sort(), [...opts.storedKeys].sort());
 }
 
-function reset(opts: { users?: Array<{ id: string; email: string }>; members?: string[]; settings?: Row; template?: Row | null } = {}) {
+function reset(opts: { users?: Array<{ id: string; email: string }>; members?: string[]; settings?: Row; template?: Row | null; status?: Row } = {}) {
   requests = [];
+  mailStatus = opts.status ?? {};
   authUsers = [...(opts.users ?? [])];
   members = new Set(opts.members ?? []);
   settings = opts.settings ?? { smtp_host: "smtp.stub.test", smtp_port: 587, smtp_secure: false, from_email: "noreply@example.test", from_name: "Org", email_paused: false, event_paused: {} };
@@ -181,18 +194,68 @@ async function main() {
 
     console.log("\nsendNotification: the pause paths store no credential");
     {
+      const SMTP = { smtp_host: "smtp.stub.test", smtp_port: 587, smtp_secure: false, from_email: "noreply@example.test", from_name: "Org" };
       for (const [label, s] of [
-        ["master pause", { email_paused: true, event_paused: {} }],
-        ["event pause", { email_paused: false, event_paused: { password_reset: true } }],
+        ["master pause", { ...SMTP, email_paused: true, event_paused: {} }],
+        ["event pause", { ...SMTP, email_paused: false, event_paused: { account_creation: true } }],
       ] as const) {
+        // A welcome that carries a password stays under the pause (ADR 0029, rule N7).
+        reset({ settings: s });
+        const r = await send.sendNotification({
+          organizationId: ORG, event: "account_creation", to: { user_id: "u-l", email: "learner@example.test" },
+          context: { learner_email: "learner@example.test", password: TYPED_PASSWORD, login_id: "learner@example.test", org_name: "Org" },
+        });
+        eq(`${label}: paused, nothing mailed`, r.status === "paused" && smtpPayloads().length === 0, true);
+        await checkLog(label, { rows: 1, secrets: [TYPED_PASSWORD], storedKeys: ["org_name"], mailed: false });
+      }
+      for (const [label, s] of [
+        ["master pause", { ...SMTP, email_paused: true, event_paused: {} }],
+        ["event pause", { ...SMTP, email_paused: false, event_paused: { password_reset: true } }],
+      ] as const) {
+        // D1: the pause never stops a reset code; it still goes only through the tenant's SMTP.
         reset({ settings: s });
         const r = await send.sendNotification({
           organizationId: ORG, event: "password_reset", to: { user_id: "u-l", email: "learner@example.test" },
           context: { learner_email: "learner@example.test", otp_code: "482915", otp_minutes: "10", org_name: "Org" },
         });
-        eq(`${label}: paused, nothing mailed`, r.status === "paused" && smtpPayloads().length === 0, true);
-        await checkLog(label, { rows: 1, secrets: ["482915"], storedKeys: ["org_name", "otp_minutes"], mailed: false });
+        eq(`${label}: a reset code is not paused, it is sent through the tenant's SMTP`, r.status === "sent" && smtpPayloads().length === 1, true);
+        await checkLog(`${label}, reset code`, { rows: 1, secrets: ["482915"], storedKeys: ["org_name", "otp_minutes"] });
       }
+    }
+
+    console.log("\nrows a run writes without sending store no credential (ADR 0029)");
+    {
+      reset({ settings: { email_paused: false, event_paused: {} } });
+      const nc = await send.sendNotification({
+        organizationId: ORG, event: "account_creation", to: { user_id: "u-l", email: "learner@example.test" },
+        context: { learner_email: "learner@example.test", password: TYPED_PASSWORD, org_name: "Org" },
+      });
+      eq("not configured: not sent, not attempted, class not_configured", nc.status === "failed" && nc.attempted === false && nc.errorClass === "not_configured", true);
+      await checkLog("not configured", { rows: 1, secrets: [TYPED_PASSWORD], storedKeys: ["org_name"], mailed: false });
+      reset({ status: { sent_24h: 375 } });
+      const dl = await send.sendNotification({
+        organizationId: ORG, event: "account_creation", to: { user_id: "u-l", email: "learner@example.test" },
+        context: { learner_email: "learner@example.test", password: TYPED_PASSWORD, org_name: "Org" },
+      });
+      eq("at the daily limit: not attempted, one row with the fixed error daily_limit, nothing mailed", dl.errorClass === "daily_limit" && logRows()[0]?.body.error === "daily_limit" && smtpPayloads().length === 0, true);
+      await checkLog("daily limit", { rows: 1, secrets: [TYPED_PASSWORD], storedKeys: ["org_name"], mailed: false });
+    }
+
+    console.log("\nsendMany: a group's one insert stores no credential (ADR 0029)");
+    {
+      reset();
+      const { openRun } = await import("../../lib/notifications/smtp-state");
+      const run = await openRun({ organizationId: ORG });
+      const people = [1, 2, 3].map((n) => ({ id: `u-${n}`, email: `p${n}@example.test`, password: `${TYPED_PASSWORD}-${n}` }));
+      const results = await send.sendMany(run, people, (p) => ({
+        event: "account_creation", to: { user_id: p.id, email: p.email },
+        context: { learner_email: p.email, password: p.password, org_name: "Org", course_name: "Home loans" },
+      }));
+      const inserts = requests.filter((q) => q.path === "/rest/v1/notification_log" && q.method === "POST");
+      eq("three sent", results.every((r) => r.status === "sent"), true);
+      eq("…the first alone, then the two others in one insert", inserts.length, 2);
+      eq("…the second insert holds two rows", Array.isArray(inserts[1]?.body) ? (inserts[1].body as Row[]).length : 0, 2);
+      await checkLog("sendMany", { rows: 3, secrets: people.map((p) => p.password), storedKeys: ["course_name", "org_name"] });
     }
 
     console.log("\nsendNotification: a subject naming credential tokens is logged with the tokens literal");

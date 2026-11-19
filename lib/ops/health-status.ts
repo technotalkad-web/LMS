@@ -150,6 +150,286 @@ export function classifyCrons(input: {
   return { status: failing > 0 ? "fail" : warning > 0 ? "warn" : "ok", jobs };
 }
 
+/* ------------------------------------------------------------------------
+ * ADR 0029 pull request B: the pure rules the health route, the console and
+ * the two mail crons share. No I/O here; the callers read and write.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * The one ops_heartbeats row that is not a job (ADR 0029, note of 2026-11-19
+ * on a skipped run): a request that mails nobody because the read of its
+ * recipients failed writes it as an error, with one fixed word naming the
+ * site. It is in no cadence list, so `crons` never shows it as a job.
+ */
+export const MAIL_RECIPIENTS_HEARTBEAT = "mail-recipients-unreadable";
+/** How long the last such skip keeps `mail_recipients` at warn. */
+export const MAIL_RECIPIENTS_WARN_HOURS = 24;
+
+/**
+ * `mail_recipients` (returned under email_checks). A skip row younger than
+ * MAIL_RECIPIENTS_WARN_HOURS gives "warn"; a missing or older row gives
+ * "ok"; a heartbeats read that failed gives "unknown". It never gives
+ * "fail", nobody has to clear it, and OPS_EXPECT_CRONS does not gate it.
+ */
+export function classifyMailRecipients(input: {
+  rows: Array<{ name: string; last_run_at: string }> | "unreadable";
+  nowMs: number;
+}): { status: "ok" | "warn" | "unknown"; last_skip_at: string | null } {
+  if (input.rows === "unreadable") return { status: "unknown", last_skip_at: null };
+  const row = input.rows.find((r) => r.name === MAIL_RECIPIENTS_HEARTBEAT);
+  const at = row ? Date.parse(row.last_run_at) : NaN;
+  if (!Number.isFinite(at)) return { status: "ok", last_skip_at: null };
+  const iso = new Date(at).toISOString();
+  const fresh = input.nowMs - at <= MAIL_RECIPIENTS_WARN_HOURS * 3_600_000;
+  return { status: fresh ? "warn" : "ok", last_skip_at: iso };
+}
+
+/**
+ * The vocabulary for a mail cron's own failed steps (ADR 0029). A heartbeat
+ * or a page names a failure with one of these words and a count, so no
+ * identifier, address, title or database text travels with it.
+ */
+export const CRON_ERROR_WORDS = [
+  "config_read",
+  "members_read",
+  "assignments_read",
+  "progress_read",
+  "state_read",
+  "state_write",
+  "profiles_read",
+  "mail_status_read",
+  "log_write",
+  "alert",
+  "call_limit",
+  "unknown",
+] as const;
+export type CronErrorWord = (typeof CRON_ERROR_WORDS)[number];
+export type CronErrorCounts = Partial<Record<CronErrorWord, number>>;
+
+/** The counts of one run of a mail cron (reminders, journey-nudges). An unknown number is left undefined. */
+export type MailCronRun = {
+  errors: CronErrorCounts;
+  unreadableOrgs: number;
+  stoppedBeforeSend: boolean;
+  due?: number;
+  sent?: number;
+  failed?: number;
+  left?: number;
+  leftComplete?: boolean;
+  leftDailyLimit?: number;
+  leftOrgs?: number;
+  no0114: boolean;
+};
+
+const isCount = (n: unknown): n is number => typeof n === "number" && Number.isInteger(n) && n >= 0;
+
+/** The numeric keys of the detail, in the order they are written. */
+const DETAIL_COUNT_KEYS = ["failed_steps", "unreadable_orgs", "due", "sent", "failed", "left", "left_daily_limit", "left_orgs"] as const;
+const DETAIL_FLAG_KEYS = ["stopped_before_send", "left_complete", "no_0114"] as const;
+
+/**
+ * Builds what reminders and journey-nudges return to the scheduler and what
+ * they store in their heartbeat (ADR 0029). The scheduler's copy is printed
+ * in a public workflow log, so it is flat: numbers and booleans, including a
+ * total of failed steps but not their kinds. The heartbeat copy adds
+ * `errors`, the per-word counts. Counts the run never established are
+ * omitted rather than reported as zero. `extra` carries a route's existing
+ * named counts into the scheduler's copy only.
+ */
+export function buildMailCronDetail(
+  run: MailCronRun,
+  extra: Record<string, number | boolean> = {}
+): { ok: boolean; answer: Record<string, number | boolean>; heartbeat: Record<string, unknown> } {
+  const errors: CronErrorCounts = {};
+  let failedSteps = 0;
+  for (const word of CRON_ERROR_WORDS) {
+    const n = run.errors[word];
+    if (isCount(n) && n > 0) {
+      errors[word] = n;
+      failedSteps += n;
+    }
+  }
+  const unreadable = isCount(run.unreadableOrgs) ? run.unreadableOrgs : 0;
+  const common: Record<string, number | boolean> = { v: 1, failed_steps: failedSteps, unreadable_orgs: unreadable, stopped_before_send: run.stoppedBeforeSend === true };
+  const optional: Array<[string, unknown]> = [
+    ["due", run.due],
+    ["sent", run.sent],
+    ["failed", run.failed],
+    ["left", run.left],
+    ["left_daily_limit", run.leftDailyLimit],
+    ["left_orgs", run.leftOrgs],
+  ];
+  for (const [k, v] of optional) if (isCount(v)) common[k] = v;
+  if (typeof run.leftComplete === "boolean") common.left_complete = run.leftComplete;
+  common.no_0114 = run.no0114 === true;
+  const answer: Record<string, number | boolean> = {};
+  for (const [k, v] of Object.entries(extra)) if (isCount(v) || typeof v === "boolean") answer[k] = v;
+  Object.assign(answer, common);
+  const heartbeat: Record<string, unknown> = { ...common };
+  if (failedSteps > 0) heartbeat.errors = errors;
+  return { ok: failedSteps === 0 && unreadable === 0, answer, heartbeat };
+}
+
+/** A mail cron's heartbeat detail as the reader lets it through. `known` false: a row without v (older code, by hand, another job). */
+export type MailCronDetail = {
+  known: boolean;
+  failed_steps?: number;
+  unreadable_orgs?: number;
+  due?: number;
+  sent?: number;
+  failed?: number;
+  left?: number;
+  left_daily_limit?: number;
+  left_orgs?: number;
+  stopped_before_send?: boolean;
+  left_complete?: boolean;
+  no_0114?: boolean;
+  errors?: CronErrorCounts;
+  last_ok_at?: string;
+};
+
+/** A time that parses, given back in one form; anything else is null. */
+function parsableTime(v: unknown): string | null {
+  if (typeof v !== "string" || v.length > 40) return null;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * Parses a mail cron's stored last_detail defensively (ADR 0029). Only the
+ * builder's own keys survive, and only with the right type: counts must be
+ * non-negative integers, error keys must come from CRON_ERROR_WORDS, and
+ * last_ok_at must be a parsable time (re-serialised). Anything else is
+ * discarded, whoever wrote the row. Without `v: 1` the detail is unknown.
+ */
+export function readMailCronDetail(raw: unknown): MailCronDetail {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { known: false };
+  const r = raw as Record<string, unknown>;
+  if (r.v !== 1) return { known: false };
+  const out: MailCronDetail = { known: true };
+  for (const k of DETAIL_COUNT_KEYS) if (isCount(r[k])) out[k] = r[k] as number;
+  for (const k of DETAIL_FLAG_KEYS) if (typeof r[k] === "boolean") out[k] = r[k] as boolean;
+  if (r.errors && typeof r.errors === "object" && !Array.isArray(r.errors)) {
+    const e = r.errors as Record<string, unknown>;
+    const errors: CronErrorCounts = {};
+    for (const word of CRON_ERROR_WORDS) {
+      if (Object.prototype.hasOwnProperty.call(e, word) && isCount(e[word])) errors[word] = e[word] as number;
+    }
+    if (Object.keys(errors).length > 0) out.errors = errors;
+  }
+  const lastOk = parsableTime(r.last_ok_at);
+  if (lastOk) out.last_ok_at = lastOk;
+  return out;
+}
+
+/**
+ * Works out last_ok_at for a run that failed, from the row as it stood
+ * before this run (ADR 0029): a previous success contributes its own time,
+ * a previous failure passes on whatever it carried. Every other case (no
+ * previous row, a row without the field, a read error) yields null, which
+ * the page shows as unknown; the time is never estimated.
+ */
+export function carriedLastOk(
+  prev: { last_status: string; last_run_at: string; last_detail: unknown } | null | "unreadable"
+): string | null {
+  if (!prev || prev === "unreadable") return null;
+  if (prev.last_status === "ok") return parsableTime(prev.last_run_at);
+  return readMailCronDetail(prev.last_detail).last_ok_at ?? null;
+}
+
+/** The last successful run as shown: the row's own time while it reads ok, the carried one while it reads error. */
+export function lastSuccessfulRun(row: { last_status: string; last_run_at: string; last_detail?: unknown } | null): string | null {
+  if (!row) return null;
+  return row.last_status === "ok" ? parsableTime(row.last_run_at) : readMailCronDetail(row.last_detail).last_ok_at ?? null;
+}
+
+/** Pending reminders as shown: "not known" when the run did not count, "at least n" when its count was incomplete. */
+export type PendingReading = { kind: "not_known" } | { kind: "exact"; n: number } | { kind: "at_least"; n: number };
+
+export function pendingOf(detail: MailCronDetail): PendingReading {
+  if (!detail.known || detail.left === undefined) return { kind: "not_known" };
+  return detail.left_complete === false ? { kind: "at_least", n: detail.left } : { kind: "exact", n: detail.left };
+}
+
+/**
+ * What the console shows for one mail cron (ADR 0029): when it last
+ * succeeded, the parsed failure detail, and the reminders still owed. Each
+ * part is null or not_known when the heartbeat row cannot supply it.
+ */
+export function mailCronItems(row: { last_status: string; last_run_at: string; last_detail?: unknown } | null): {
+  lastOk: string | null;
+  details: MailCronDetail | null;
+  pending: PendingReading;
+} {
+  if (!row) return { lastOk: null, details: null, pending: { kind: "not_known" } };
+  const detail = readMailCronDetail(row.last_detail);
+  return { lastOk: lastSuccessfulRun(row), details: detail.known ? detail : null, pending: pendingOf(detail) };
+}
+
+/**
+ * The pending count a mail cron reports (ADR 0029). For reminders it is the
+ * mail never started, because any attempt marks the learner as reminded. For
+ * journey-nudges a failed send also stays owed, since its claim is released,
+ * except a timeout, whose claim is kept for the day.
+ */
+export function owedAfterRun(job: "reminders" | "journey-nudges", input: { notStarted: number; failedClasses: readonly string[] }): number {
+  if (job === "reminders") return input.notStarted;
+  return input.notStarted + input.failedClasses.filter((c) => c !== "timeout").length;
+}
+
+/** A tenant's SMTP reading (ADR 0029 section C). */
+export type TenantReading = "not_configured" | "configured" | "healthy" | "failing";
+
+/**
+ * `tenant_smtp` (returned under email_checks; ADR 0029). Gives "warn" when
+ * some organisation with members cannot send (failing or not configured) or
+ * has reached the point where its routine mail stops for the day. Gives
+ * "unknown" without readable status (including a database without 0114).
+ * It never escalates to "fail": each tenant repairs its own server.
+ */
+export function classifyTenantSmtp(
+  input: Array<{ reading: TenantReading; hasMembers: boolean; routineStopped: boolean }> | "unreadable" | "missing"
+): { status: "ok" | "warn" | "unknown"; counts: Record<TenantReading | "routine_stopped", number> | null } {
+  if (input === "unreadable" || input === "missing") return { status: "unknown", counts: null };
+  const counts: Record<TenantReading | "routine_stopped", number> = { not_configured: 0, configured: 0, healthy: 0, failing: 0, routine_stopped: 0 };
+  let warn = false;
+  for (const o of input) {
+    counts[o.reading]++;
+    if (o.routineStopped) counts.routine_stopped++;
+    if (o.hasMembers && (o.reading === "failing" || o.reading === "not_configured" || o.routineStopped)) warn = true;
+  }
+  return { status: warn ? "warn" : "ok", counts };
+}
+
+/** Code and link jobs the platform ended: `mail_jobs` warns at this many lost over today and yesterday (UTC). */
+export const MAIL_JOBS_LOST_WARN = 3;
+/** …or above this share lost, once this many have started (rule FP9's number). */
+export const MAIL_JOBS_LOST_SHARE = 0.02;
+export const MAIL_JOBS_SHARE_FROM = 50;
+
+/**
+ * `mail_jobs` (returned under email_checks; ADR 0029). "Lost" is jobs that
+ * recorded a start but no finish, summed over the UTC days given (today and
+ * yesterday). It warns from MAIL_JOBS_LOST_WARN lost, or once enough have
+ * started for the share to mean something and the share exceeds
+ * MAIL_JOBS_LOST_SHARE. Unreadable or absent counts give "unknown"; never "fail".
+ */
+export function classifyMailJobs(
+  input: Array<{ started: number; finished: number }> | "unreadable" | "missing"
+): { status: "ok" | "warn" | "unknown"; started: number | null; lost: number | null } {
+  if (input === "unreadable" || input === "missing") return { status: "unknown", started: null, lost: null };
+  let started = 0;
+  let lost = 0;
+  for (const r of input) {
+    const s = isCount(r.started) ? r.started : 0;
+    const f = isCount(r.finished) ? r.finished : 0;
+    started += s;
+    lost += Math.max(0, s - f);
+  }
+  const warn = lost >= MAIL_JOBS_LOST_WARN || (started >= MAIL_JOBS_SHARE_FROM && lost / started > MAIL_JOBS_LOST_SHARE);
+  return { status: warn ? "warn" : "ok", started, lost };
+}
+
 /**
  * db fail → down; storage, crons or platformEmail fail → degraded; any warn →
  * warn. platformEmail is given only for a caller that holds the secret: the

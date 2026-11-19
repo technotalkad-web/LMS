@@ -44,6 +44,15 @@ export type SmtpDispatchPayload = {
   text: string;
 };
 
+/**
+ * How long one send is waited for, in both systems (ADR 0029, rule T1 of the
+ * timing note of 2026-11-18): the tenant pipeline and the platform sender
+ * both pass it. It is the after-response job's budget (25 s) less 10 s kept
+ * for the job's reads, its rows and an alert; if that budget moves, this
+ * moves with it. send-smtp may still deliver after the wait ends.
+ */
+export const SMTP_SEND_WAIT_MS = 15_000;
+
 export type SmtpDispatchOptions = {
   /**
    * Stop waiting after this many milliseconds and answer a timeout. The

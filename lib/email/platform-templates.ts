@@ -12,7 +12,8 @@
  *     cleanOrganizationName (cut to 60 characters, anything shaped like a
  *     link or an address removed);
  *   - the role a person was given on the console's add-admin route;
- *   - a fixed reading and error class of a tenant's SMTP.
+ *   - a fixed reading and error class of a tenant's SMTP, and for the
+ *     reading daily_limit the organisation's daily limit as a whole number.
  * A content value that fails its check throws PlatformTemplateError: it is
  * a programming error, and nothing is sent.
  *
@@ -36,8 +37,12 @@ export function isPlatformEvent(value: unknown): value is PlatformEvent {
 /** The role the console's add-admin route gives (app/api/super/tenants/[id]/admins/route.ts). */
 export type WelcomeRole = "super_owner" | "admin" | "data_analyst";
 
-/** A tenant SMTP reading that is not ready, and the class of its last failure. */
-export type AlertReading = "failing" | "not_configured";
+/**
+ * Why the alert is sent: the tenant's SMTP is failing or not configured, or
+ * its routine mail stopped at its daily limit less the reserve (ADR 0029,
+ * rule FP4), and the class of its last failure.
+ */
+export type AlertReading = "failing" | "not_configured" | "daily_limit";
 export type AlertErrorClass = "auth" | "quota" | "timeout" | "unreachable" | "unknown";
 
 export type PlatformContent = {
@@ -49,6 +54,8 @@ export type PlatformContent = {
     settingsUrl: string;
     reading: AlertReading;
     errorClass: AlertErrorClass | null;
+    /** The organisation's daily limit: given with the reading daily_limit only, a whole number from 1 to 100,000. */
+    dailyLimit?: number;
   };
   platform_test: Record<string, never>;
 };
@@ -190,13 +197,32 @@ function blocksFor<E extends PlatformEvent>(event: E, content: PlatformContent[E
     case "tenant_smtp_alert": {
       const c = content as PlatformContent["tenant_smtp_alert"];
       const settingsUrl = checkUrl("settingsUrl", c?.settingsUrl);
-      if (c.reading !== "failing" && c.reading !== "not_configured") {
-        throw new PlatformTemplateError("reading: failing or not_configured");
+      if (c.reading !== "failing" && c.reading !== "not_configured" && c.reading !== "daily_limit") {
+        throw new PlatformTemplateError("reading: failing, not_configured or daily_limit");
       }
       if (c.errorClass !== null && (typeof c.errorClass !== "string" || !ALERT_ERROR_CLASSES.includes(c.errorClass))) {
         throw new PlatformTemplateError("errorClass: a fixed class or null");
       }
       const org = cleanOrganizationName(c.organizationName);
+      if (c.reading === "daily_limit") {
+        const limit = c.dailyLimit;
+        if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100_000) {
+          throw new PlatformTemplateError("dailyLimit: a whole number from 1 to 100000 with the reading daily_limit");
+        }
+        return {
+          subject: "Notice: the organisation's routine email has stopped for today",
+          blocks: [
+            { kind: "p", text: `Routine email from the LMS for ${org} has stopped: the organisation is close to its daily email limit of ${limit} emails in 24 hours.` },
+            { kind: "p", text: "Reminders, announcements, and assignment and completion emails are not being sent." },
+            { kind: "p", text: "Password reset codes, sign-in links and welcome emails still go out until the full limit is reached. At the limit no email is sent, and learners who ask for a code see \"Email could not be sent. Please contact your LMS Administrator.\"" },
+            { kind: "p", text: "Routine email starts again by itself as the emails of the last 24 hours become more than a day old. Nothing is sent through any other mail server." },
+            { kind: "p", text: "The limit is set by the platform owner. The organisation's settings show the count:" },
+            { kind: "link", href: settingsUrl },
+            { kind: "p", text: `You receive this as an administrator of ${org}. ${SIGN_OFF}` },
+          ],
+        };
+      }
+      if (c.dailyLimit !== undefined) throw new PlatformTemplateError("dailyLimit: only with the reading daily_limit");
       const reason =
         c.reading === "not_configured"
           ? "The organisation has no complete SMTP settings."

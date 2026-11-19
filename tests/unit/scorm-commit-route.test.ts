@@ -131,6 +131,12 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (p === "/rest/v1/learning_paths") return json([{ id: "p1", name: "Path one" }]);
     if (p === "/rest/v1/organizations") return json([{ name: "Org", slug: "org" }]);
   }
+  // ADR 0029: every tenant send opens its run with tenant_mail_status
+  // (migration 0114): one row for the organisation, with no state row yet.
+  if (p === "/rest/v1/rpc/tenant_mail_status") {
+    const org = (JSON.parse(body || "{}") as Row).p_org ?? null;
+    return json([{ organization_id: org, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
+  }
   if (p.startsWith("/rest/v1/rpc/")) return json(null);
   if (p.startsWith("/rest/v1/")) return json([]);
   if (url.searchParams.get("token") === "t") return new Response(LAUNCH, { status: 200 });
@@ -316,7 +322,8 @@ async function main() {
       eq("…the same commit on an Individual row calls both RPCs", learnerMid.rpcs, BOTH);
 
       const l = await run(PASSING, true, fresh({ context_kind: "path" }), {});
-      eq("a learner's passing commit: classified, both RPCs, the milestone runs", [l.classified, l.rpcs, l.milestone], [true, BOTH, true]);
+      // The course's mail opens its run with tenant_mail_status (ADR 0029), after both RPCs.
+      eq("a learner's passing commit: classified, both RPCs, the milestone runs", [l.classified, l.rpcs, l.milestone], [true, [...BOTH, ["tenant_mail_status", null]], true]);
       eq("…the path read drops Previews: one read, context_kind neq.preview", pathReads().map((q) => q.query.get("context_kind")), ["neq.preview"]);
       eq("…so the path-tagged by-role Preview of step 2 does not complete the path: one email (the course's), no path completion", side(), { emails: 1, webhook: true, pathDone: false });
 
@@ -328,7 +335,8 @@ async function main() {
       no0107 = true;
       pathAttempts = [{ ...REAL_V1, context_kind: undefined }, { ...LEGACY_PREVIEW_V2, context_kind: undefined }];
       const m = await run(PASSING, true, fresh(), {});
-      eq("a row without the key: today's commit (classified, both RPCs, the milestone)", [m.status, m.classified, m.rpcs, m.milestone], [200, true, BOTH, true]);
+      // Two mails (the course's and the path's), each opening its run with tenant_mail_status, after both RPCs.
+      eq("a row without the key: today's commit (classified, both RPCs, the milestone)", [m.status, m.classified, m.rpcs, m.milestone], [200, true, [...BOTH, ["tenant_mail_status", null], ["tenant_mail_status", null]], true]);
       eq("…the path read: the filter's 42703, then today's read once without it (every row counts, as today)",
         [pathReads().map((q) => q.query.get("context_kind")), side()], [["neq.preview", null], { emails: 2, webhook: true, pathDone: true }]);
       no0107 = false;

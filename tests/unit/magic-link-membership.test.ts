@@ -102,6 +102,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/rest/v1/notification_settings") return json([{ smtp_host: "smtp.stub.test", smtp_port: 587, smtp_secure: false, from_email: "noreply@example.test", from_name: "Org", email_paused: false, event_paused: {} }]);
   if (p === "/rest/v1/notification_templates") return json([]);
   if (p === "/rest/v1/notification_log") return json([], 201);
+  // ADR 0029: each send opens its run with tenant_mail_status (migration 0114): one row, no state yet.
+  if (p === "/rest/v1/rpc/tenant_mail_status") return json([{ organization_id: (body as { p_org?: string } | null)?.p_org ?? ORG, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
   return json([]);
 };
 
