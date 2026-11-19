@@ -968,7 +968,7 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
         .select("metadata")
         .eq("action", "tenant.add_admin")
         .eq("target_id", a.id)
-        .order("created_at", { ascending: false })
+        .order("at", { ascending: false })
         .limit(1)
         .maybeSingle();
       expect(error, error?.message).toBeNull();
