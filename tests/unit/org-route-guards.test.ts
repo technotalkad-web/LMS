@@ -139,9 +139,10 @@ const ALLOW: Allow[] = [
       "app/api/auth/forgot-password/reset/route.ts POST",
       "app/api/auth/forgot-password/verify/route.ts POST",
       "app/api/auth/magic-link/route.ts POST",
+      "app/api/auth/set-password/route.ts POST",
     ],
     authority: "public-sign-in",
-    reason: "public sign-in and password-reset flows: no session yet, so no org role applies" },
+    reason: "public sign-in, password-reset and setup-link flows: no session yet, so no org role applies (the setup link's token is the authority, checked in lib/auth/setup-link.ts)" },
   { handlers: [
       "app/api/auth/change-password/route.ts POST",
       "app/auth/callback/route.ts GET",

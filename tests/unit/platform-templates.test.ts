@@ -11,7 +11,12 @@
  *   - content that fails its check throws, before anything could be sent;
  *   - the alert's reading daily_limit (ADR 0029, rule FP4): its own fixed
  *     text, the limit as a whole number, and that codes and welcomes go on
- *     until the limit.
+ *     until the limit;
+ *   - the welcome's setup link (ADR 0029, rules N4 and N5, step 15): only the
+ *     LMS's own /auth/set-password address with the token alone in its
+ *     fragment, shown whole in the text and in the HTML (as the address and
+ *     as the shown text), with its life in days; any other value throws, and
+ *     the welcome never holds a password.
  *
  * No database, no network.
  *
@@ -39,11 +44,13 @@ const throws = (fn: () => unknown): string => {
 const SIGN_IN = "https://lms.stub/acme/login";
 const LINK = "https://lms.stub/auth/finish?token_hash=abc123&type=magiclink";
 const SETTINGS = "https://lms.stub/acme/settings?tab=smtp";
+const TOKEN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdE";
+const SETUP = `https://lms.stub/auth/set-password#t=${TOKEN}`;
 
 const GOOD: { [E in PlatformEvent]: PlatformContent[E] } = {
   platform_reset_code: { code: "482913", minutes: 10 },
   platform_sign_in_link: { link: LINK, minutes: 60 },
-  platform_admin_welcome: { organizationName: "Acme Learning", signInUrl: SIGN_IN, role: "admin" },
+  platform_admin_welcome: { organizationName: "Acme Learning", signInUrl: SIGN_IN, role: "admin", setupLink: SETUP, days: 7 },
   tenant_smtp_alert: { organizationName: "Acme Learning", settingsUrl: SETTINGS, reading: "failing", errorClass: "auth" },
   platform_test: {},
 };
@@ -73,9 +80,19 @@ console.log("\nthe values a message carries");
   for (const role of ["super_owner", "admin", "data_analyst"] as const) {
     const w = renderPlatformEmail("platform_admin_welcome", { ...GOOD.platform_admin_welcome, role });
     const label = { super_owner: "Super owner", admin: "Administrator", data_analyst: "Data analyst" }[role];
-    // The only line that mentions a password is the fixed sentence saying the email never holds one.
-    const passwordLines = w.text.split("\n").filter((l) => /password/i.test(l));
-    eq(`the welcome for ${role}: the organisation, the sign-in address and the role; the only password line is the fixed one`, [w.text.includes("Acme Learning"), w.text.includes(SIGN_IN), w.text.includes(`Your role: ${label}.`), passwordLines], [true, true, true, ["The person who created your account gives you your first password; this email never contains one. If you do not have it, choose \"Forgot password?\" on that page."]]);
+    // The only lines that name a password are the fixed ones around the setup
+    // link (the link's own line names its path, not a password).
+    const passwordLines = w.text.split("\n").filter((l) => /password/i.test(l) && l !== SETUP);
+    eq(`the welcome for ${role}: the organisation, the sign-in address, the role and the setup link; the only password lines are the fixed ones`,
+      [w.text.includes("Acme Learning"), w.text.includes(SIGN_IN), w.text.includes(`Your role: ${label}.`), w.text.includes(SETUP), passwordLines],
+      [true, true, true, true, ["Set your own password with this link:", "After that, choose \"Forgot password?\" on the sign-in page."]]);
+  }
+  {
+    const w = renderPlatformEmail("platform_admin_welcome", GOOD.platform_admin_welcome);
+    eq("the welcome's setup link: whole in the text, as the HTML link's address and as its shown text", [w.text.split("\n").includes(SETUP), w.html.includes(`href="${SETUP}"`), w.html.includes(`>${SETUP}</a>`)], [true, true, true]);
+    eq("…with its life in days and the way after it", [w.text.includes("It works once and expires in 7 days."), w.text.includes("After that, choose \"Forgot password?\" on the sign-in page.")], [true, true]);
+    eq("…the setup link comes before the sign-in address", w.text.indexOf(SETUP) < w.text.indexOf(SIGN_IN), true);
+    eq("…a shorter life is stated as given", renderPlatformEmail("platform_admin_welcome", { ...GOOD.platform_admin_welcome, days: 3 }).text.includes("expires in 3 days."), true);
   }
   for (const [reading, cls, words] of [
     ["failing", "auth", "refused the sign-in"],
@@ -145,15 +162,28 @@ console.log("\ncontent that fails its check throws");
     ["a link with credentials", "platform_sign_in_link", { link: "https://u:p@lms.stub/x", minutes: 10 }],
     ["a link with a quote", "platform_sign_in_link", { link: 'https://lms.stub/x"onmouseover=1', minutes: 10 }],
     ["a link with a space", "platform_sign_in_link", { link: "https://lms.stub/x y", minutes: 10 }],
-    ["a welcome with the legacy role owner", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "owner" }],
-    ["a welcome with no sign-in address", "platform_admin_welcome", { organizationName: "A", role: "admin" }],
+    ["a welcome with the legacy role owner", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "owner", setupLink: SETUP, days: 7 }],
+    ["a welcome with no sign-in address", "platform_admin_welcome", { organizationName: "A", role: "admin", setupLink: SETUP, days: 7 }],
     ["an alert with an unknown reading", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "healthy", errorClass: null }],
     ["an alert with an unknown class", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "boom" }],
     // An inherited key of a plain object is not a value of the list.
-    ["a welcome with the role constructor", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "constructor" }],
-    ["a welcome with the role __proto__", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "__proto__" }],
-    ["a welcome with the role toString", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "toString" }],
-    ["a welcome with no role", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN }],
+    ["a welcome with the role constructor", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "constructor", setupLink: SETUP, days: 7 }],
+    ["a welcome with the role __proto__", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "__proto__", setupLink: SETUP, days: 7 }],
+    ["a welcome with the role toString", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "toString", setupLink: SETUP, days: 7 }],
+    ["a welcome with no role", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, setupLink: SETUP, days: 7 }],
+    ["a welcome with no setup link", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", days: 7 }],
+    ["a welcome whose setup link is relative", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `/auth/set-password#t=${TOKEN}`, days: 7 }],
+    ["a welcome whose setup link is on another path", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `https://lms.stub/auth/finish#t=${TOKEN}`, days: 7 }],
+    ["a welcome whose setup link carries the token in the query", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `https://lms.stub/auth/set-password?t=${TOKEN}`, days: 7 }],
+    ["a welcome whose setup link has a query beside the fragment", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `https://lms.stub/auth/set-password?x=1#t=${TOKEN}`, days: 7 }],
+    ["a welcome whose setup link token is too short", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `https://lms.stub/auth/set-password#t=${TOKEN.slice(1)}`, days: 7 }],
+    ["a welcome whose setup link fragment holds more than the token", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `${SETUP}&next=x`, days: 7 }],
+    ["a welcome whose setup link is a javascript: address", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: "javascript:alert(1)", days: 7 }],
+    ["a welcome whose setup link has credentials", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: `https://u:p@lms.stub/auth/set-password#t=${TOKEN}`, days: 7 }],
+    ["a welcome with a life of 0 days", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: SETUP, days: 0 }],
+    ["a welcome with a life of 8 days (the table refuses more than 7)", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: SETUP, days: 8 }],
+    ["a welcome with a fractional life", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: SETUP, days: 6.5 }],
+    ["a welcome with no life", "platform_admin_welcome", { organizationName: "A", signInUrl: SIGN_IN, role: "admin", setupLink: SETUP }],
     ["an alert with the class constructor", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "constructor" }],
     ["an alert with the class __proto__", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "__proto__" }],
     ["an alert with the class none (the map's own fallback key, not a class)", "tenant_smtp_alert", { organizationName: "A", settingsUrl: SETTINGS, reading: "failing", errorClass: "none" }],

@@ -12,6 +12,10 @@
  *     cleanOrganizationName (cut to 60 characters, anything shaped like a
  *     link or an address removed);
  *   - the role a person was given on the console's add-admin route;
+ *   - in the welcome only, the setup link of an account the console has
+ *     just created (ADR 0029, rules N4 and N5): the LMS's own address
+ *     /auth/set-password with its token in the fragment and nothing else,
+ *     and its life in days. The person sets their own password there;
  *   - a fixed reading and error class of a tenant's SMTP, and for the
  *     reading daily_limit the organisation's daily limit as a whole number.
  * A content value that fails its check throws PlatformTemplateError: it is
@@ -48,7 +52,15 @@ export type AlertErrorClass = "auth" | "quota" | "timeout" | "unreachable" | "un
 export type PlatformContent = {
   platform_reset_code: { code: string; minutes: number };
   platform_sign_in_link: { link: string; minutes: number };
-  platform_admin_welcome: { organizationName: string; signInUrl: string; role: WelcomeRole };
+  platform_admin_welcome: {
+    organizationName: string;
+    signInUrl: string;
+    role: WelcomeRole;
+    /** The setup link the server issued for this new account: /auth/set-password#t=<token>. */
+    setupLink: string;
+    /** The link's life in days, a whole number from 1 to 7 (the table refuses a longer one). */
+    days: number;
+  };
   tenant_smtp_alert: {
     organizationName: string;
     settingsUrl: string;
@@ -105,6 +117,27 @@ function checkUrl(field: string, value: unknown): string {
   }
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) {
     throw new PlatformTemplateError(`${field}: only an http or https address without credentials`);
+  }
+  return value;
+}
+
+/**
+ * The welcome's setup link (ADR 0029, rule N5): an absolute address the
+ * server built, on the path /auth/set-password, with no query and with the
+ * token alone in the fragment (#t= and 43 characters of base64url).
+ */
+function checkSetupLink(value: unknown): string {
+  const link = checkUrl("setupLink", value);
+  const url = new URL(link);
+  if (url.pathname !== "/auth/set-password" || url.search !== "" || !/^#t=[A-Za-z0-9_-]{43}$/.test(url.hash)) {
+    throw new PlatformTemplateError("setupLink: only the LMS's own set-password address with its token in the fragment");
+  }
+  return link;
+}
+
+function checkDays(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 7) {
+    throw new PlatformTemplateError("days: a whole number from 1 to 7");
   }
   return value;
 }
@@ -178,18 +211,20 @@ function blocksFor<E extends PlatformEvent>(event: E, content: PlatformContent[E
       if (typeof role !== "string" || !WELCOME_ROLES.includes(role)) {
         throw new PlatformTemplateError("role: super_owner, admin or data_analyst");
       }
+      const setupLink = checkSetupLink(c.setupLink);
+      const days = checkDays(c.days);
       const org = cleanOrganizationName(c.organizationName);
       return {
         subject: "Your LMS account",
         blocks: [
           { kind: "p", text: `An account was created for you on the LMS for ${org}.` },
           { kind: "p", text: `Your role: ${ROLE_LABEL[role]}.` },
-          { kind: "p", text: "Sign in at:" },
+          { kind: "p", text: "Set your own password with this link:" },
+          { kind: "link", href: setupLink },
+          { kind: "p", text: `It works once and expires in ${days} days.` },
+          { kind: "p", text: "After that, choose \"Forgot password?\" on the sign-in page." },
+          { kind: "p", text: "Then sign in at:" },
           { kind: "link", href: signInUrl },
-          {
-            kind: "p",
-            text: "The person who created your account gives you your first password; this email never contains one. If you do not have it, choose \"Forgot password?\" on that page.",
-          },
           { kind: "p", text: SIGN_OFF },
         ],
       };

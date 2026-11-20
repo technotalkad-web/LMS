@@ -61,8 +61,9 @@ export type RoutingRow = {
 /**
  * Section A's table: where each event is sent from. A file that does not
  * exist yet is a sender a later step builds (the two public routes' job in
- * lib/auth/credential-mail.ts; the console's welcome on the platform
- * sender). The scan reads the code against this table, never the other way.
+ * lib/auth/credential-mail.ts; the Users pages' "Send setup link" route of
+ * pull request C). The console's welcome is the platform sender's since
+ * stage 3. The scan reads the code against this table, never the other way.
  */
 export const ROUTING_TABLE: readonly RoutingRow[] = [
   {

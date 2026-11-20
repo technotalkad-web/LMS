@@ -112,6 +112,9 @@ export async function updateSession(request: NextRequest) {
     path.startsWith("/api/auth/forgot-password") ||
     // Magic-link request endpoint is a pre-auth login action.
     path.startsWith("/api/auth/magic-link") ||
+    // The setup link's read and set step (ADR 0029 rule N9): the token in
+    // the body is the authority; the page itself is under /auth above.
+    path.startsWith("/api/auth/set-password") ||
     // Ops health probe: public liveness summary; detail gated by CRON_SECRET
     // header inside the route (watchdog + uptime robots run unauthenticated).
     path.startsWith("/api/ops/health");
@@ -177,6 +180,10 @@ export async function updateSession(request: NextRequest) {
     response.cookies.getAll().forEach((c) => rewrite.cookies.set(c));
     return rewrite;
   }
+
+  // The set-password page holds a setup link's token in its fragment until
+  // the page has read it: it sends no referrer (ADR 0029, rule N9).
+  if (path === "/auth/set-password") response.headers.set("Referrer-Policy", "no-referrer");
 
   return response;
 }

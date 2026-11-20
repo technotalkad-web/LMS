@@ -26,8 +26,9 @@
  *     the sign-in callback in each shape (?token_hash=, ?code= for Google and
  *     PKCE links, and the fragment hand-off), invitation accept, password
  *     change and the forgot-password reset (the owner resetting their own
- *     password, signed in or not, and another account's); a source check
- *     keeps every such route on the one shared helper.
+ *     password, signed in or not, and another account's) and the set step
+ *     of a setup link (ADR 0029, rule N9); a source check keeps every such
+ *     route on the one shared helper.
  *
  * No database, no network.
  *
@@ -38,6 +39,10 @@ import fs from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import { hashResetToken } from "../../lib/auth/password-reset";
+// The table keeps a SHA-256 of the token (lib/auth/setup-link.ts); computed here, since that module
+// reaches next/headers, which is stubbed only below.
+import { createHash } from "node:crypto";
+const hashSetupToken = (t: string) => createHash("sha256").update(t).digest("hex");
 
 let pass = 0, fail = 0;
 /** `todo`, when given, is printed under a failure: what to change to pass. */
@@ -66,6 +71,8 @@ const session = (token: string) =>
   ({ access_token: token, refresh_token: `r-${token}`, token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: TOKENS[token] });
 // The forgot-password reset token the /verify step handed this browser.
 const RESET_TOKEN = "reset-token-1";
+// A setup link's token (ADR 0029, rule N9): 43 characters of base64url.
+const SETUP_TOKEN = "S".repeat(43);
 
 // ---- the browser: one cookie jar for every request of a case ----
 const browser = new Map<string, string>();
@@ -110,6 +117,8 @@ const statuses: Record<string, string> = {};
 let orgDeleted = false;
 /** platform_audit_log rows written (the start route's audit row). */
 let audits: Row[] = [];
+/** account_setup_links rows (ADR 0029, migration 0117). */
+let setupLinks: Row[] = [];
 let requests: Req[] = [];
 let errors: string[] = [];
 const unmatched: string[] = [];
@@ -144,6 +153,11 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/token" && q.get("grant_type") === "password") return json(session("tok-member"));
   if (p === "/auth/v1/token" && q.get("grant_type") === "pkce") return json(session("tok-member"));
   if (p === "/auth/v1/admin/users") return json({ users: [MEMBER, OWNER], aud: "authenticated" });
+  // An account read by id: neither has signed in (no sign-in time, as the auth server leaves it out).
+  if (p.startsWith("/auth/v1/admin/users/") && method === "GET") {
+    const u = [MEMBER, OWNER].find((x) => p === `/auth/v1/admin/users/${x.id}`);
+    return u ? json(u) : json({ code: 404, error_code: "user_not_found", msg: "User not found" }, 404);
+  }
   if (p.startsWith("/auth/v1/admin/users/") && method === "PUT") {
     if (adminPasswordUpdateFails) return json({ code: 422, error_code: "weak_password", msg: "Password is known to be weak." }, 422);
     const u = [MEMBER, OWNER].find((x) => p === `/auth/v1/admin/users/${x.id}`);
@@ -184,6 +198,23 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json(object ? otp : [otp]);
   }
   if (p === "/rest/v1/profiles") return method === "GET" ? json([{ must_change_password: false }]) : new Response(null, { status: 204 });
+  if (p === "/rest/v1/account_setup_links") {
+    // The rows a request names: by token hash, id or user, open or not.
+    const hit = setupLinks.filter((r) =>
+      [...q.entries()].every(([k, v]) => {
+        if (k === "select" || k === "limit") return true;
+        if (v === "is.null") return r[k] === null || r[k] === undefined;
+        if (v.startsWith("eq.")) return String(r[k]) === v.slice(3);
+        if (v.startsWith("gt.")) return Date.parse(String(r[k])) > Date.parse(v.slice(3));
+        return true;
+      })
+    );
+    if (method === "GET") return json(object ? hit[0] ?? null : hit);
+    if (method === "PATCH") {
+      for (const r of hit) Object.assign(r, JSON.parse(body || "{}") as Row);
+      return (headers.get("prefer") ?? "").includes("return=representation") ? json(hit) : new Response(null, { status: 204 });
+    }
+  }
   if (p === "/rest/v1/organizations") {
     // Filtered by id or slug when the read names one; deleted_at set when the org is soft-deleted.
     const id = eqParam(q, "id");
@@ -196,7 +227,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (method !== "GET") return new Response(null, { status: 201 });
     const uid = eqParam(q, "user_id") ?? "";
     const role = roles[uid];
-    return json(role ? [{ role, status: statuses[uid] ?? "active" }] : []);
+    return json(role ? [{ organization_id: ORG.id, role, status: statuses[uid] ?? "active" }] : []);
   }
   // mfa_required false, as the e2e fixtures seed a platform owner, so the start route's guard admits the owner.
   if (p === "/rest/v1/platform_owners") return json(eqParam(q, "user_id") === OWNER.id ? [{ user_id: OWNER.id, mfa_required: false }] : []);
@@ -222,6 +253,7 @@ const fresh = () => {
   for (const k of Object.keys(statuses)) delete statuses[k];
   orgDeleted = false;
   audits = [];
+  setupLinks = [];
   requests = []; deleted = []; errors = [];
   ignoreActorFilter = false; authDown = false; passwordUpdateFails = false; adminPasswordUpdateFails = false;
 };
@@ -585,6 +617,27 @@ async function main() {
         ["string", true, [id], true, false]);
     }
 
+    {
+      // ADR 0029, rule N9: the set step of a setup link sets the password of
+      // the link's account with the service role; the person signs in next on
+      // this browser. The owner, signed in and impersonating, opens a new
+      // administrator's link here: the impersonation ends after the password
+      // is set, as after a completed reset.
+      const id = await ownerStarts();
+      roles[MEMBER.id] = "admin";
+      setupLinks = [{ id: "link-1", user_id: MEMBER.id, organization_id: ORG.id, issuer: "platform", token_hash: hashSetupToken(SETUP_TOKEN), expires_at: new Date(Date.now() + 86_400_000).toISOString(), used_at: null, ended_at: null }];
+      const setRoute = await import("../../app/api/auth/set-password/route");
+      const res = await setRoute.POST(new Request("http://lms.test/api/auth/set-password", { method: "POST", body: JSON.stringify({ token: SETUP_TOKEN, password: "Another-Pass-1" }) }));
+      const put = adminPut(MEMBER);
+      const sent = (put >= 0 ? JSON.parse(requests[put].body) : {}) as Row;
+      const end = indexOf((r) => r.path === "/rest/v1/platform_impersonation_sessions" && r.method === "PATCH");
+      eq("setup link, the set step: 200, the account's password and confirmed mark set in one call",
+        [res.status, sent.password, sent.email_confirm, requests.filter((r) => r.path.startsWith("/auth/v1/admin/users/") && r.method === "PUT").length], [200, "Another-Pass-1", true, 1]);
+      eq("…the owner's row is stamped ended after the password is set, and the cookie deleted",
+        [typeof rows.get(id)?.ended_at, put >= 0 && end > put, deleted.includes(IMP_COOKIE), browser.has(IMP_COOKIE)], ["string", true, true, false]);
+      eq("…no sign-in is made on the server", requests.filter((r) => r.path === "/auth/v1/token").length, 0);
+    }
+
     console.log("\nsource check: every server route that changes the sign-in uses the shared helper");
     {
       const root = path.resolve(__dirname, "../..");
@@ -613,6 +666,9 @@ async function main() {
         "app/api/invitations/accept/route.ts",
         "app/auth/callback/route.ts",
         "app/auth/sign-out/route.ts",
+        // The set step of a setup link (ADR 0029, rule N9), reached through
+        // app/api/auth/set-password/route.ts: the person signs in next.
+        "lib/auth/setup-link.ts",
       ];
       // The scan cannot tell this browser's password from another user's. A
       // route that sets another user's password (an admin action that leaves

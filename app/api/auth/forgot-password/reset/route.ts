@@ -6,6 +6,7 @@ import {
   safeHashEqual,
 } from "@/lib/auth/password-reset";
 import { endImpersonationForSessionChange } from "@/lib/auth/impersonation";
+import { endOpenSetupLinks } from "@/lib/auth/setup-link";
 
 /**
  *   POST /api/auth/forgot-password/reset
@@ -129,6 +130,11 @@ export async function POST(request: Request) {
     .from("profiles")
     .update({ must_change_password: false })
     .eq("id", user.id);
+
+  // A completed reset ends the account's open setup link, after the password
+  // is set (ADR 0029, rule N9). It never fails the reset: a failure, a
+  // database without 0117 among them, is logged with its class only.
+  await endOpenSetupLinks(svc, user.id, "reset");
 
   // Mark this row used so the token can't be replayed, and close every other
   // code of the address that is still open: a completed reset ends them all,

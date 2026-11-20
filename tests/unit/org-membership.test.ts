@@ -1270,9 +1270,19 @@ async function main() {
           );
           const j = (await res.json()) as Row;
           const live = org.deleted_at === null;
-          eq(`console add of a new administrator to ${live ? "a live" : "a deleted"} organisation: 200, the row written active, the password in the answer, ${live ? "and the welcome is sent" : "and no welcome is sent"}`,
-            [res.status, memberOf(org, String(j.user_id))?.status, typeof j.temp_password, sentEvents()],
-            [200, "active", "string", live ? [`account_creation ${j.user_id}`] : []]);
+          // ADR 0029 step 15: the account is made with no password and a setup
+          // link, and the welcome is platform mail. Its row is written in both
+          // organisations (section Q, point 6); only the live one is mailed.
+          const linkRows = requests.filter((r) => r.table === "account_setup_links" && r.method === "POST").map((r) => r.body as Row);
+          const welcomes = requests.filter((r) => r.table === "platform_email_log" && r.method === "POST").map((r) => `${(r.body as Row).event_type} ${(r.body as Row).to_user_id}`);
+          eq(`console add of a new administrator to ${live ? "a live" : "a deleted"} organisation: 200, the row written active, no password in the answer, no tenant mail, ${live ? "and the welcome goes to the platform sender" : "and no welcome is sent"}`,
+            [res.status, memberOf(org, String(j.user_id))?.status, "temp_password" in j, sentEvents(), welcomes],
+            [200, "active", false, [], live ? [`platform_admin_welcome ${j.user_id}`] : []]);
+          eq(`…the link's row is written for that organisation either way, by the platform`,
+            linkRows.map((b) => [b.user_id, b.organization_id, b.issuer]), [[j.user_id, org.id, "platform"]]);
+          eq(`…${live ? "the welcome to a reserved test address is suppressed, so the answer holds the link" : "the answer says inactive and holds no link"}`,
+            [j.email_outcome, typeof j.setup_link],
+            [live ? { status: "not_sent", class: "test_domain" } : { status: "not_sent", class: "inactive" }, live ? "string" : "undefined"]);
         }
       }
 

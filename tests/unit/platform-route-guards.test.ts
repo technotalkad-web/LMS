@@ -70,6 +70,7 @@ const TABLE: Record<string, Level> = {
   "app/api/super/tenants/[id]/route.ts DELETE": "full",
   "app/api/super/tenants/[id]/admins/route.ts GET": "full",
   "app/api/super/tenants/[id]/admins/route.ts POST": "full",
+  "app/api/super/tenants/[id]/admins/route.ts PUT": "full",
   "app/api/super/tenants/[id]/admins/route.ts PATCH": "full",
   "app/api/super/tenants/[id]/admins/route.ts DELETE": "full",
   "app/api/super/impersonate/route.ts POST": "full",

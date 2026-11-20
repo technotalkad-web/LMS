@@ -3,8 +3,7 @@
  * notification log. The real send path (sendNotification, notifyBackground,
  * sendAuthEmail) and each route that emails a credential run under a stubbed
  * fetch: the password-reset request, the tenant sign-in link, the single and
- * bulk user creation (invite link and typed password) and the platform's
- * tenant-admin creation (temporary password). For each one the
+ * bulk user creation (invite link and typed password). For each one the
  * notification_log insert is captured and checked:
  *
  *   - the route answered as it does today and exactly the expected number of
@@ -25,6 +24,12 @@
  * writes without sending (not configured, the daily limit) and a group's
  * one insert (sendMany) hold no credential either. Each send opens its run
  * with tenant_mail_status, which the stub answers.
+ *
+ * The platform's tenant-admin creation (ADR 0029 step 15, rule N6) makes no
+ * password: the account gets a setup link, mailed by the platform sender. Its
+ * mail carries the link; the answer, the platform_email_log row, the
+ * account_setup_links row (the token's digest only) and every log line do
+ * not, and no notification_log row is written.
  *
  * Every credential check is a boolean or a count: a failing check never
  * prints a value.
@@ -107,6 +112,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json({ ...userJson(u.id, u.email), action_link: "https://stub/verify", email_otp: "000000", hashed_token: TOKEN_HASH, redirect_to: "", verification_type: "magiclink" });
   }
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
+  // The platform sender's limit reads: no row in 24 hours (a count of 0).
+  if (p === "/rest/v1/platform_email_log" && method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": "*/0" } });
   if (p === "/rest/v1/notification_settings") return json([settings]);
   if (p === "/rest/v1/notification_templates") return json(template ? [template] : []);
   if (p === "/rest/v1/notification_log") return json([], 201);
@@ -335,15 +342,45 @@ async function main() {
       await checkLog("bulk", { rows: 2, secrets: [CSV_PASSWORD, TOKEN_HASH], storedKeys: ["org_name"] });
     }
 
-    console.log("\nPOST /api/super/tenants/[id]/admins: the temporary password");
+    console.log("\nPOST /api/super/tenants/[id]/admins: the setup link (ADR 0029 step 15)");
     {
       const route = await import("../../app/api/super/tenants/[id]/admins/route");
-      reset();
-      const res = await route.POST(new Request("http://lms.test/api/super/tenants/org-1/admins", { method: "POST", body: JSON.stringify({ email: "newadmin@example.test", role: "admin" }) }), { params: Promise.resolve({ id: ORG }) });
-      const out = (await res.json()) as { temp_password?: string };
-      const temp = out.temp_password ?? "";
-      eq("200 with a temporary password for the platform owner", res.status === 200 && temp.length === 16, true);
-      await checkLog("tenant admin", { rows: 1, secrets: temp ? [temp] : ["(no password)"], storedKeys: ["org_name"] });
+      const PLATFORM_ENV: Record<string, string> = {
+        PLATFORM_SMTP_HOST: "smtp.platform.stub", PLATFORM_SMTP_PORT: "465", PLATFORM_SMTP_USER: "platform-mailer",
+        PLATFORM_SMTP_PASSWORD: "stub-platform-app-password", PLATFORM_SMTP_FROM: "LMS <noreply@platform.stub>", PLATFORM_EMAIL_ALLOW_DOMAINS: "platform.stub",
+      };
+      for (const [k, v] of Object.entries(PLATFORM_ENV)) process.env[k] = v;
+      const lines: string[] = [];
+      const real = { log: console.log, warn: console.warn, error: console.error };
+      try {
+        reset();
+        console.warn = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+        console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+        const res = await route.POST(new Request("http://lms.test/api/super/tenants/org-1/admins", { method: "POST", body: JSON.stringify({ email: "newadmin@platform.stub", role: "admin" }) }), { params: Promise.resolve({ id: ORG }) });
+        console.warn = real.warn; console.error = real.error;
+        const raw = await res.text();
+        const out = JSON.parse(raw) as Row;
+        const mail = smtpRaw();
+        const link = /\/auth\/set-password#t=([A-Za-z0-9_-]{43})/.exec(mail);
+        const token = link?.[1] ?? "(no token)";
+        eq("200, and the welcome was sent", res.status === 200 && (out.email_outcome as Row | null)?.status === "sent", true);
+        eq("…so the answer holds no link, and no password anywhere", "setup_link" in out || "temp_password" in out || /password/i.test(raw), false);
+        eq("the welcome went to the platform sender and carries the setup link", requests.some((q) => q.path === "/functions/v1/send-smtp") && link !== null, true);
+        await checkLog("tenant admin", { rows: 0, secrets: [token], storedKeys: [], mailed: false });
+        const platformRows = requests.filter((q) => q.path === "/rest/v1/platform_email_log" && q.method === "POST").map((q) => q.raw);
+        eq("one platform_email_log row", platformRows.length, 1);
+        eq("…and it holds neither the token nor the link", platformRows.some((r) => r.includes(token) || r.includes("set-password")), false);
+        const linkRows = requests.filter((q) => q.path === "/rest/v1/account_setup_links" && q.method === "POST").map((q) => q.raw);
+        const { createHash } = await import("node:crypto");
+        eq("one account_setup_links row", linkRows.length, 1);
+        eq("…it holds the token's digest", linkRows.some((r) => r.includes(createHash("sha256").update(token).digest("hex"))), true);
+        eq("…and never the token", linkRows.some((r) => r.includes(token)), false);
+        eq("no log line holds the token or the link", lines.some((l) => l.includes(token) || l.includes("set-password#")), false);
+        eq("the account was made with the address alone", requests.filter((q) => q.path === "/auth/v1/admin/users" && q.method === "POST").flatMap((q) => Object.keys(q.body as Row).sort()), ["email"]);
+      } finally {
+        console.warn = real.warn; console.error = real.error;
+        for (const k of Object.keys(PLATFORM_ENV)) delete process.env[k];
+      }
     }
   } finally {
     globalThis.fetch = realFetch;

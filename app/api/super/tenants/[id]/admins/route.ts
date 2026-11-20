@@ -1,10 +1,20 @@
-import { resolveEmails } from "@/lib/users/emails";
+import { resolveEmailsStrict } from "@/lib/users/emails";
 import { NextResponse } from "next/server";
-import { randomBytes } from "node:crypto";
-import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
-import { notifyBackground } from "@/lib/notifications/send";
+import { sendPlatformEmail, type PlatformSendResult } from "@/lib/email/platform-sender";
 import { membershipCounts } from "@/lib/auth/org-membership";
+import {
+  HAS_A_WAY_IN_MESSAGE,
+  SETUP_LINKS_NEED_0117,
+  SETUP_LINKS_PER_DAY,
+  SETUP_LINK_DAYS,
+  createAccountForSetupLink,
+  issueSetupLink,
+  platformSetupLinkOffers,
+  platformSetupLinkResendCheck,
+  setupLinksReady,
+} from "@/lib/auth/setup-link";
 import {
   expireLaunchTokensForMembers,
   logLaunchTokenExpiryFailed,
@@ -12,16 +22,33 @@ import {
 } from "@/lib/attempts/abandon";
 import { originFromRequest } from "@/lib/http/origin";
 
-function generateTempPassword(): string {
-  const alphabet =
-    "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
-  const bytes = randomBytes(16);
-  let out = "";
-  for (const b of bytes) out += alphabet[b % alphabet.length];
-  return out;
-}
+/**
+ * The console's administrators of a tenant (ADR 0029 step 15, section N
+ * rules N4, N8 and N12; ADR 0030 rules 9 and 10).
+ *
+ *   GET     the administrators, each with the status of their row and
+ *           whether "Send setup link again" is offered for them;
+ *   POST    add one. A new account is created with no password (the address
+ *           alone) and issued a setup link; the platform sender mails it in
+ *           platform_admin_welcome. The answer says whether the welcome was
+ *           sent and holds the link only when it was not (rule N8). An
+ *           account that already existed is added as before and mailed
+ *           nothing. Without migration 0117 a new account is refused before
+ *           anything is created; an existing one is added as before;
+ *   PUT     "Send setup link again" (rule N12): a new link, the older one
+ *           ended, for an administrator the console created with a link who
+ *           has never signed in, at most three in 24 hours;
+ *   PATCH   the role only;
+ *   DELETE  remove the row.
+ *
+ * No answer, log line or audit row holds a password, and no audit row holds
+ * a link.
+ */
 
 const ADMIN_ROLES = new Set(["super_owner", "admin", "data_analyst"]);
+type AdminRole = "super_owner" | "admin" | "data_analyst";
+
+const TRY_AGAIN = "Could not check this right now. Please try again.";
 
 function svc() {
   return createServiceClient(
@@ -29,6 +56,43 @@ function svc() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+}
+
+/** What an answer says of the welcome: sent, or not sent with its class (the platform sender's code). */
+type WelcomeAnswer = { status: "sent" } | { status: "not_sent"; class: string };
+
+/**
+ * Mail the welcome with its setup link, through the platform sender only.
+ * Never throws: a content check that fails (no absolute address to build the
+ * link on) is "not sent", as a failed send is.
+ */
+async function sendWelcome(args: {
+  userId: string;
+  email: string;
+  org: { id: string; name: string; slug: string };
+  role: AdminRole;
+  setupLink: string;
+  origin: string;
+}): Promise<WelcomeAnswer> {
+  let result: PlatformSendResult;
+  try {
+    result = await sendPlatformEmail({
+      event: "platform_admin_welcome",
+      to: { userId: args.userId, email: args.email, platformOwner: false },
+      organizationId: args.org.id,
+      content: {
+        organizationName: args.org.name,
+        signInUrl: `${args.origin}/${args.org.slug}/login`,
+        role: args.role,
+        setupLink: args.setupLink,
+        days: SETUP_LINK_DAYS,
+      },
+    });
+  } catch {
+    return { status: "not_sent", class: "unknown" };
+  }
+  if (result.status === "sent") return { status: "sent" };
+  return { status: "not_sent", class: result.errorCode ?? "unknown" };
 }
 
 export async function GET(
@@ -51,7 +115,11 @@ export async function GET(
     (m) => ADMIN_ROLES.has(m.role)
   );
 
-  const emailById = await resolveEmails(s, rows.map((r) => r.user_id));
+  // The addresses are shown, never mailed, from this read: one that fails
+  // shows "(unknown)" for everyone rather than a partial list.
+  const ids = rows.map((r) => r.user_id);
+  const [emails, offered] = await Promise.all([resolveEmailsStrict(s, ids), platformSetupLinkOffers(s, tenantId, ids)]);
+  const emailById = emails === "unreadable" ? new Map<string, string>() : emails;
 
   return NextResponse.json({
     admins: rows.map((r) => ({
@@ -59,6 +127,7 @@ export async function GET(
       role: r.role,
       status: r.status,
       email: emailById.get(r.user_id) ?? "(unknown)",
+      setup_link: offered.has(r.user_id),
     })),
   });
 }
@@ -100,20 +169,16 @@ export async function POST(
   const { data: listed } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
   let user = listed?.users?.find((u) => u.email?.toLowerCase() === email);
   let isBrandNew = false;
-  let tempPassword: string | null = null;
 
   if (!user) {
-    tempPassword = generateTempPassword();
-    const { data: created, error } = await s.auth.admin.createUser({
-      email,
-      password: tempPassword,
-      email_confirm: true,
-    });
-    if (error || !created?.user) {
-      return NextResponse.json(
-        { error: error?.message ?? "Could not create user" },
-        { status: 400 }
-      );
+    // A new account gets a setup link (rule N9), which needs migration 0117:
+    // without the table nothing is created (section J).
+    const ready = await setupLinksReady(s);
+    if (ready === "missing") return NextResponse.json({ error: SETUP_LINKS_NEED_0117 }, { status: 503 });
+    if (ready === "unreadable") return NextResponse.json({ error: TRY_AGAIN }, { status: 503 });
+    const created = await createAccountForSetupLink(s, email);
+    if ("error" in created) {
+      return NextResponse.json({ error: created.error }, { status: 400 });
     }
     user = created.user;
     isBrandNew = true;
@@ -141,7 +206,9 @@ export async function POST(
   }
   const reactivated = previousStatus !== null && previousStatus !== "active";
 
-  // profiles uses `id` as the FK to auth.users(id) in this DB.
+  // profiles uses `id` as the FK to auth.users(id) in this DB. The forced
+  // change is never set: a new account has no password to change, and a
+  // found account's flag is left as it is.
   await s
     .from("profiles")
     .upsert(
@@ -150,7 +217,7 @@ export async function POST(
         email, // NOT NULL in profiles — must be set on insert
         first_name: email.split("@")[0],
         username: email,
-        must_change_password: isBrandNew,
+        ...(isBrandNew ? { must_change_password: false } : {}),
       },
       { onConflict: "id" }
     );
@@ -166,28 +233,24 @@ export async function POST(
   }
 
   const origin = await originFromRequest();
-  // ADR 0030 rule 10: the welcome goes only when the row just written counts.
-  // It is written active, so only a deleted organisation sends none; the add
-  // itself stands (the console staffs any tenant), and the platform owner
-  // still gets the temporary password in this answer.
-  if (isBrandNew && tempPassword && membershipCounts({ status: "active" }, org)) {
-    const loginUrl = origin
-      ? `${origin}/${org.slug}/login`
-      : `/${org.slug}/login`;
-    await notifyBackground({
-      organizationId: org.id,
-      event: "account_creation",
-      to: { user_id: user.id, email },
-      context: {
-        learner_name: email,
-        learner_email: email,
-        username: email,
-        login_id: email,
-        password: tempPassword,
-        org_name: org.name,
-        portal_url: loginUrl,
-      },
-    });
+  let welcome: WelcomeAnswer | null = null;
+  let setupLink: string | null = null;
+  if (isBrandNew) {
+    // The link's row is written whether or not the welcome then goes (ADR
+    // 0029 section Q, point 6), so "Send setup link again" can follow.
+    const issued = await issueSetupLink(s, { userId: user.id, organizationId: tenantId, issuer: "platform", issuedBy: guard.userId, origin });
+    if (!issued.ok) {
+      welcome = { status: "not_sent", class: "link_failed" };
+    } else if (!membershipCounts({ status: "active" }, org)) {
+      // ADR 0030 rule 10: the row is written active, so only a deleted
+      // organisation sends none. No link is returned: rule N14 (a) would
+      // refuse it at once.
+      welcome = { status: "not_sent", class: "inactive" };
+    } else {
+      welcome = await sendWelcome({ userId: user.id, email, org, role: role as AdminRole, setupLink: issued.url, origin });
+      // Rule N8: the link is returned only when the welcome was not sent.
+      if (welcome.status !== "sent") setupLink = issued.url;
+    }
   }
 
   await auditLog({
@@ -195,7 +258,14 @@ export async function POST(
     action: "tenant.add_admin",
     targetType: "organization",
     targetId: tenantId,
-    metadata: { email, role, brand_new: isBrandNew, reactivated, previous_status: previousStatus },
+    metadata: {
+      email,
+      role,
+      brand_new: isBrandNew,
+      reactivated,
+      previous_status: previousStatus,
+      welcome: welcome ? (welcome.status === "sent" ? "sent" : welcome.class) : null,
+    },
   });
 
   return NextResponse.json({
@@ -203,8 +273,91 @@ export async function POST(
     user_id: user.id,
     invited: isBrandNew,
     reactivated,
-    temp_password: tempPassword,
+    email_outcome: welcome,
+    ...(setupLink ? { setup_link: setupLink } : {}),
     login_url: `${origin}/${org.slug}/login`,
+  });
+}
+
+/** The answer of "Send setup link again" when a check refuses it. */
+function refusal(check: "missing" | "unreadable" | "has_way_in" | "limit") {
+  if (check === "missing") return NextResponse.json({ error: SETUP_LINKS_NEED_0117 }, { status: 503 });
+  if (check === "unreadable") return NextResponse.json({ error: TRY_AGAIN }, { status: 503 });
+  if (check === "limit") {
+    return NextResponse.json(
+      { error: `At most ${SETUP_LINKS_PER_DAY} setup links in 24 hours for one person. Try again later.` },
+      { status: 429 }
+    );
+  }
+  return NextResponse.json({ error: HAS_A_WAY_IN_MESSAGE }, { status: 409 });
+}
+
+/** The tenant and the person's row in it; null when either read failed. */
+async function readTenantRow(s: SupabaseClient, tenantId: string, userId: string) {
+  const orgRead = await s.from("organizations").select("id, name, slug, deleted_at").eq("id", tenantId).maybeSingle();
+  if (orgRead.error) return null;
+  const memberRead = await s
+    .from("organization_members")
+    .select("role, status")
+    .eq("organization_id", tenantId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (memberRead.error) return null;
+  return {
+    org: orgRead.data as { id: string; name: string; slug: string; deleted_at: string | null } | null,
+    member: memberRead.data as { role: string | null; status: string | null } | null,
+  };
+}
+
+export async function PUT(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const guard = await requirePlatformOwnerApi("full");
+  if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
+  const { id: tenantId } = await params;
+  const body = (await request.json().catch(() => ({}))) as { user_id?: unknown };
+  const userId = typeof body.user_id === "string" ? body.user_id : "";
+  if (!userId) return NextResponse.json({ error: "user_id required" }, { status: 400 });
+
+  const s = svc();
+  const read = await readTenantRow(s, tenantId, userId);
+  if (!read) return refusal("unreadable");
+  if (!read.org) return NextResponse.json({ error: "Org not found" }, { status: 404 });
+  const { org, member } = read;
+  if (!member || !ADMIN_ROLES.has(member.role ?? "")) return refusal("has_way_in");
+
+  const check = await platformSetupLinkResendCheck(s, tenantId, userId);
+  if (check !== "ok") return refusal(check);
+
+  // Rule N12 with ADR 0030 rule 10: a row that does not count gets no link,
+  // and no new row is written. The console makes the person active first.
+  if (!membershipCounts(member, org)) {
+    return NextResponse.json({ ok: true, email_outcome: { status: "not_sent", class: "inactive" } });
+  }
+
+  const emails = await resolveEmailsStrict(s, [userId]);
+  if (emails === "unreadable") return refusal("unreadable");
+  const email = emails.get(userId);
+  if (!email) return NextResponse.json({ error: "This person has no email address on file." }, { status: 409 });
+
+  const origin = await originFromRequest();
+  const issued = await issueSetupLink(s, { userId, organizationId: tenantId, issuer: "platform", issuedBy: guard.userId, origin });
+  if (!issued.ok) return refusal(issued.missing ? "missing" : "unreadable");
+  const welcome = await sendWelcome({ userId, email, org, role: member.role as AdminRole, setupLink: issued.url, origin });
+
+  await auditLog({
+    actorUserId: guard.userId,
+    action: "tenant.resend_setup_link",
+    targetType: "organization",
+    targetId: tenantId,
+    metadata: { user_id: userId, welcome: welcome.status === "sent" ? "sent" : welcome.class },
+  });
+
+  return NextResponse.json({
+    ok: true,
+    email_outcome: welcome,
+    ...(welcome.status !== "sent" ? { setup_link: issued.url } : {}),
   });
 }
 

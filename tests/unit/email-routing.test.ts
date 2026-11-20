@@ -25,8 +25,10 @@
  * 2026-11-20, part 3): a file that an early stage cannot yet pass is named
  * in STILL_TO_COME with the stage that changes it. Its findings are set
  * aside, and the test fails as soon as it has none (so the list never goes
- * stale). Stage 2 removes lib/auth/auth-email.ts; stage 3 removes the
- * console's admins route and adds the case that the list is empty.
+ * stale). Stage 3 took the console's admins route off the list: its welcome
+ * is platform mail now. lib/auth/auth-email.ts stays on it until the second
+ * half of stage 2 is built; the case that the list is empty comes when it
+ * leaves.
  *
  * Run:  npx tsx tests/unit/email-routing.test.ts   (or npm run test:unit)
  * (No database, no network.)
@@ -54,7 +56,6 @@ const ROOT = path.resolve(__dirname, "..", "..");
 /** The files an early stage cannot pass yet, with the stage that changes them. */
 const STILL_TO_COME: Record<string, string> = {
   "lib/auth/auth-email.ts": "stage 2: the tenant link only, with the literal event magic_link",
-  "app/api/super/tenants/[id]/admins/route.ts": "stage 3: the welcome moves to the platform sender",
 };
 
 /** The send calls and the system each one carries. */

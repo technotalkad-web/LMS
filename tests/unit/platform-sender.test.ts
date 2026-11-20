@@ -14,7 +14,8 @@
  *     another still sends, and alerts and welcomes are outside it; the
  *     ceiling (default 375, a deployment setting) refuses everything except
  *     a platform owner's own code, link and test;
- *   - the welcome goes to each of the add-admin route's three roles;
+ *   - the welcome goes to each of the add-admin route's three roles, with
+ *     its setup link and never a password (ADR 0029, rules N4 and N5);
  *   - a trailing line break in the stored password is not sent;
  *   - the error classes, read from send-smtp's free text, with a recipient's
  *     refusal and a sender's failure kept apart; the 15 s wait (rule T1, the
@@ -80,8 +81,10 @@ const code = (to: typeof OWNER, organizationId: string | null): PlatformSendRequ
 const link = (to: typeof OWNER, organizationId: string | null): PlatformSendRequest<"platform_sign_in_link"> =>
   ({ event: "platform_sign_in_link", to, organizationId, content: { link: LINK, minutes: 60 } });
 const test = (): PlatformSendRequest<"platform_test"> => ({ event: "platform_test", to: OWNER, organizationId: null, content: {} });
+/** A setup link in the form the server issues: the token alone in the fragment. */
+const SETUP_LINK = `https://lms.stub/auth/set-password#t=${"S".repeat(43)}`;
 const welcome = (to: typeof OWNER, organizationId: string, role: "super_owner" | "admin" | "data_analyst" = "admin"): PlatformSendRequest<"platform_admin_welcome"> =>
-  ({ event: "platform_admin_welcome", to, organizationId, content: { organizationName: "Tenant A", signInUrl: "https://lms.stub/tenant-a/login", role } });
+  ({ event: "platform_admin_welcome", to, organizationId, content: { organizationName: "Tenant A", signInUrl: "https://lms.stub/tenant-a/login", role, setupLink: SETUP_LINK, days: 7 } });
 const alert = (to: typeof OWNER, organizationId: string): PlatformSendRequest<"tenant_smtp_alert"> =>
   ({ event: "tenant_smtp_alert", to, organizationId, content: { organizationName: "Tenant A", settingsUrl: "https://lms.stub/tenant-a/settings", reading: "failing", errorClass: "auth" } });
 
@@ -403,7 +406,8 @@ async function main() {
     }
 
     console.log("\nthe welcome goes to each of the add-admin route's three roles");
-    const PASSWORD_LINE = "The person who created your account gives you your first password; this email never contains one. If you do not have it, choose \"Forgot password?\" on that page.";
+    // The welcome's fixed lines that name a password: the setup link's lead-in and the way after it.
+    const PASSWORD_LINES = ["Set your own password with this link:", "After that, choose \"Forgot password?\" on the sign-in page."];
     for (const role of ["super_owner", "admin", "data_analyst"] as const) {
       fresh();
       // A caller that slips a password into the content (not a field of the type): it is never sent.
@@ -411,8 +415,10 @@ async function main() {
       const sentinel = "Sentinel-Pass-0029!";
       const r = await send({ ...req, content: { ...req.content, password: sentinel } as typeof req.content });
       const p = JSON.parse(sends()[0]?.body ?? "{}") as { text?: string; html?: string; subject?: string };
-      const passwordLines = (p.text ?? "").split("\n").filter((l) => /password/i.test(l));
-      eq(`${role}: sent, with the role in the text; the only line about a password is the fixed one, and the slipped-in value is in no part of the mail`, [r.status, (p.text ?? "").includes("Your role:"), passwordLines, [p.subject, p.text, p.html].some((x) => (x ?? "").includes(sentinel))], ["sent", true, [PASSWORD_LINE], false]);
+      // The link's own line names its path (/auth/set-password), not a password.
+      const passwordLines = (p.text ?? "").split("\n").filter((l) => /password/i.test(l) && l !== SETUP_LINK);
+      eq(`${role}: sent, with the role and the setup link in the text; the only lines about a password are the fixed ones, and the slipped-in value is in no part of the mail`, [r.status, (p.text ?? "").includes("Your role:"), (p.text ?? "").includes(SETUP_LINK), passwordLines, [p.subject, p.text, p.html].some((x) => (x ?? "").includes(sentinel))], ["sent", true, true, PASSWORD_LINES, false]);
+      eq(`${role}: no log row holds the setup link or its token`, inserts().some((i) => i.body.includes(SETUP_LINK.split("#t=")[1])), false);
     }
 
     console.log("\nthe password setting: a trailing line break is not part of it");

@@ -196,9 +196,9 @@ async function main() {
     const ROOT = path.resolve(__dirname, "..", "..");
     const SENDS = /\b(sendNotification|notifyBackground|sendMany|sendPlatformEmail|sendAuthEmail|sendSettingsTest|notifyLearnerOfDecision|notifyAdminsOfRequest|notifyAdminsOfTicket|notifyRequesterOfTicket|notifyCourseUpdate)\s*\(/;
     const LOOSE = /\bresolveEmails\s*\(|emails:\s*resolveEmails\b(?!Strict)/;
-    const LOOSE_STILL_TO_COME: Record<string, string> = {
-      "app/api/super/tenants/[id]/admins/route.ts": "stage 3: the console's welcome moves to the platform sender",
-    };
+    // Empty since stage 3: the console's admins route reads addresses with the
+    // strict reader beside its platform welcome.
+    const LOOSE_STILL_TO_COME: Record<string, string> = {};
     const files: string[] = [];
     const walk = (dir: string) => {
       for (const d of readdirSync(dir, { withFileTypes: true })) {

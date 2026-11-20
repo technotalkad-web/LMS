@@ -74,9 +74,11 @@ const CREDENTIAL_KEYS = ["password", "otp_code", "direct_link", "portal_url"];
  * notifyBackground / sendNotification calls with an object literal, under
  * app/ and lib/: the single sends left once ADR 0029's stage 2 made the
  * loops runs (the welcomes, the public code and link, the commit route's
- * two, a ticket requester's and a decision's mail, the console's welcome).
+ * two, a ticket requester's and a decision's mail). The console's welcome
+ * left this list in stage 3: it is platform mail now, with a setup link and
+ * no password (lib/email/platform-templates.ts).
  */
-const EXPECTED_CALL_SITES = 11;
+const EXPECTED_CALL_SITES = 10;
 /** sendMany calls (the run's loop helper), under app/ and lib/: every loop of tenant mail since stage 2. */
 const EXPECTED_RUN_HELPER_SITES = 15;
 
