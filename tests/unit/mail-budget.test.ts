@@ -18,6 +18,14 @@
  *     recipients as for 5;
  *   - pull request B's bulk file carries neither budget.
  *
+ * The two cron routes' own budget cases (ADR 0029, note of 2026-11-21, part
+ * 2) run against the routes themselves, so they live where both crons'
+ * world is, in part (k) of tests/unit/org-membership.test.ts: a reminders
+ * read with no room to finish, and reminders due with no room to open any
+ * run, stop the run with call_limit; the finished attempts' filter on the
+ * request; and a journey-nudges call with no alert due that reads a full
+ * page (500 due learners, 500 managers) and sends its first group.
+ *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
  * Run:  npx tsx tests/unit/mail-budget.test.ts   (or npm run test:unit)
