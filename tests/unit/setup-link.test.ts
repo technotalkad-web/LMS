@@ -43,8 +43,13 @@
  *     link again" for a never-signed-in administrator the console created
  *     with a link, at most three in 24 hours, the fixed line for anyone
  *     else, inactive for a row that does not count; the list offers it;
+ *   - a welcome that timed out: "not sent" with the class timeout and the
+ *     link in the answer, which the console shows as "may have been sent";
+ *   - the middleware lets a signed-out visitor reach the page and the
+ *     route, and the page sends no referrer;
  *   - the auth server's sent times are read nowhere in app/ and lib/;
- *   - no log line holds a token, a link or a password.
+ *   - no request address holds the token, and no log line holds a token, a
+ *     link or a password.
  *
  * No database, no network.
  *
@@ -55,6 +60,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import ts from "typescript";
+import { NextRequest } from "next/server";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -111,6 +117,10 @@ let putAnswer: Put = "ok";
 let linksTable: "ok" | "missing" | "fail" = "ok";
 let failing = new Set<string>();
 let requests: Req[] = [];
+/** Every request address the code made, path and query, across all cases. */
+const addresses: string[] = [];
+/** What send-smtp answers. */
+let smtpAnswer: { ok: true } | { ok: false; error: string } = { ok: true };
 let nextLink = 1;
 let created = 0;
 /** Runs just before a claim (a PATCH that sets used_at) is applied: another writer gets there first. */
@@ -200,6 +210,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const table = p.replace("/rest/v1/", "");
   const prefer = headers.get("prefer") ?? "";
   requests.push({ method, path: p, table, query: q, body, raw, prefer });
+  addresses.push(decodeURIComponent(p + url.search));
   if (p.startsWith("/auth/v1/")) {
     if (method === "PUT" && putAnswer === "throw" && p.startsWith("/auth/v1/admin/users/")) throw new TypeError("fetch failed");
     if (method === "GET" && p.startsWith("/auth/v1/admin/users/")) {
@@ -208,7 +219,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     }
     return authServer(method, p, body as Row | null, q);
   }
-  if (p === "/functions/v1/send-smtp") return json({ ok: true });
+  if (p === "/functions/v1/send-smtp") return json(smtpAnswer);
   const object = (headers.get("accept") ?? "").includes("vnd.pgrst.object");
   const answer = (rows: Row[]) => json(object ? rows[0] ?? null : rows);
   if (failing.has(`${method} ${table}`) || (method === "GET" && failing.has(table))) return readFailure();
@@ -298,6 +309,7 @@ function world(o: { links?: Row[]; members?: Row[]; signIn?: SignIn; owners?: st
   failing = new Set(o.failing ?? []);
   beforeClaim = null;
   beforeRelease = null;
+  smtpAnswer = { ok: true };
   jar.clear();
   jar.set("sb-stub-auth-token", SESSION);
 }
@@ -654,6 +666,15 @@ async function main() {
       eq("a welcome that was not sent (not allowed): the answer says so and holds the link, once", [notSent.body.email_outcome, typeof notSent.body.setup_link, String(notSent.body.setup_link).includes("/auth/set-password#t=")], [{ status: "not_sent", class: "not_allowed" }, "string", true]);
 
       world({ links: [], members: [] });
+      smtpAnswer = { ok: false, error: "Connection timed out" };
+      const timedOut = await add("first.admin@platform.stub");
+      eq("a welcome that timed out (rule N8): not sent with the class timeout, and the answer holds the link",
+        [timedOut.body.email_outcome, String(timedOut.body.setup_link ?? "").includes("/auth/set-password#t=")], [{ status: "not_sent", class: "timeout" }, true]);
+      const editor = fs.readFileSync(path.join(ROOT, "app", "(super-owner)", "super", "organizations", "[id]", "tenant-detail-editor.tsx"), "utf8");
+      eq("…and the console shows it as a welcome that may have been sent, keyed on that class",
+        [editor.includes('mayHaveArrived: outcome.class === "timeout"'), editor.includes("The welcome email may have been sent")], [true, true]);
+
+      world({ links: [], members: [] });
       const found = await add(P.email);
       eq("an account that already existed: added, no account made, no link, no mail, its flag not written",
         [found.status, creates().length, links.length, smtp().length, "must_change_password" in ((requests.find((q) => q.table === "profiles" && q.method === "POST")?.body as Row) ?? {}), "setup_link" in found.body],
@@ -717,6 +738,32 @@ async function main() {
       eq("a tenant's link row only: not offered on the console", await list(), [[P.id, false]]);
       world({ table: "missing" });
       eq("without 0117: not offered", await list(), [[P.id, false]]);
+    }
+
+    console.log("\nthe middleware: a signed-out visitor reaches the page and the route");
+    {
+      const { updateSession } = await import("../../lib/supabase/middleware");
+      delete process.env.CUSTOM_DOMAINS_ENABLED;
+      delete process.env.PLATFORM_OWNER_IP_ALLOWLIST;
+      const through = async (url: string, method = "GET") => {
+        const res = await updateSession(new NextRequest(url, { method }));
+        return { status: res.status, location: res.headers.get("location"), referrer: res.headers.get("referrer-policy") };
+      };
+      const page = await through("https://lms.stub/auth/set-password");
+      eq("the page, signed out: not sent to a sign-in page, and it sends no referrer", [page.location, page.referrer], [null, "no-referrer"]);
+      const api = await through("https://lms.stub/api/auth/set-password", "POST");
+      eq("the route, signed out: not sent to a sign-in page", api.location, null);
+      const other = await through("https://lms.stub/tenant-a/dashboard");
+      eq("…the control: a signed-out page of an organisation is sent to its sign-in page", [other.status, other.location ? new URL(other.location).pathname : null, other.referrer], [307, "/tenant-a/login", null]);
+    }
+
+    console.log("\nno request address holds the token");
+    {
+      eq(`non-vacuous: the code made requests (${addresses.length})`, addresses.length > 100, true);
+      eq("no request the code made carries the token in its path or query", addresses.filter((a) => a.includes(TOKEN)).length, 0);
+      const form = fs.readFileSync(path.join(ROOT, "app", "auth", "set-password", "set-password-form.tsx"), "utf8");
+      const posts = [...form.matchAll(/fetch\(\s*"([^"]+)"/g)].map((m) => m[1]);
+      eq("the page posts the token to the route in the body, to an address with no query", [posts, /body: JSON\.stringify\(\{ token: token\.current/.test(form)], [["/api/auth/set-password", "/api/auth/set-password"], true]);
     }
 
     console.log("\nno log line holds a token, a link or a password");
