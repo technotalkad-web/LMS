@@ -16,8 +16,10 @@
  *     again has its mark cleared and gets no alert;
  *   - an alert is still sent when the organisation's platform allowance for
  *     codes and links is used up (that limit is not the alert's);
- *   - the reading daily_limit: due from the moment routine mail stops, mailed
- *     with the limit;
+ *   - the reading daily_limit: due from the moment routine mail stops (also
+ *     when the run's own deliveries reach the line with nothing refused),
+ *     mailed with the limit; a refusal once routine mail has stopped, or at
+ *     the full limit, is spaced 24 hours from the last alert, not 6;
  *   - a failed read before the claim leaves the alert due for the next call;
  *   - without migration 0114: no mark, and the read for the oldest due alert
  *     answers "none" without an error.
@@ -161,6 +163,35 @@ async function main() {
       const at = await openRun({ organizationId: ORG });
       await sendNotification(one("password_reset"), { run: at });
       eq("at the limit itself, the same day: no second alert", [at.report.alertMarked, world.state?.alert_due_at ?? null], [false, null]);
+
+      // Only the moment routine mail stops takes the 6-hour spacing; a refusal
+      // once it has stopped, or at the full limit, takes the 24-hour one.
+      const lastAlert = (hoursAgo: number, sent24h: number) =>
+        freshWorld({ sent24h, state: { organization_id: ORG, state: "healthy", state_changed_at: iso(48 * H), failed_recipients: [], last_success_at: iso(H), last_alert_at: iso(hoursAgo * H) } });
+      lastAlert(7, 375);
+      const full = await openRun({ organizationId: ORG });
+      await sendMany(full, people(3), mailTo);
+      eq("routine mail at the full limit, last alert 7 hours ago: no second alert", [full.report.routineStopped, full.report.alertMarked, world.state?.alert_due_at ?? null], [true, false, null]);
+      lastAlert(25, 375);
+      const fullLater = await openRun({ organizationId: ORG });
+      await sendMany(fullLater, people(3), mailTo);
+      eq("…the same with the last alert 25 hours ago: one is due", [fullLater.report.alertMarked, typeof world.state?.alert_due_at], [true, "string"]);
+      lastAlert(7, 340);
+      const stopped = await openRun({ organizationId: ORG });
+      await sendMany(stopped, people(3), mailTo);
+      eq("routine mail already stopped when the run opened (340 of 375), last alert 7 hours ago: none", [stopped.report.routineStopped, stopped.report.alertMarked, world.state?.alert_due_at ?? null], [true, false, null]);
+      lastAlert(7, 335);
+      const crossing = await openRun({ organizationId: ORG });
+      const cr = await sendMany(crossing, people(4), mailTo);
+      eq("the run's own sends reach the line (335 of 375), last alert 7 hours ago: one is due", [cr.map((x) => (x.status === "sent" ? "sent" : x.errorClass)).join(","), crossing.report.alertMarked, typeof world.state?.alert_due_at], ["sent,sent,daily_limit,daily_limit", true, "string"]);
+      lastAlert(7, 335);
+      const exact = await openRun({ organizationId: ORG });
+      const ex = await sendMany(exact, people(2), mailTo);
+      eq("…and when they reach it exactly, with nothing refused: one is due", [ex.map((x) => x.status).join(","), exact.report.routineStopped, exact.report.alertMarked, typeof world.state?.alert_due_at], ["sent,sent", false, true, "string"]);
+      lastAlert(7, 336);
+      const byCode = await openRun({ organizationId: ORG });
+      const bc = await sendNotification(one("password_reset"), { run: byCode });
+      eq("…and when a reset code reaches it: one is due", [bc.status, byCode.report.alertMarked, typeof world.state?.alert_due_at], ["sent", true, "string"]);
     }
 
     console.log("\na failed read before the claim leaves the alert due");

@@ -337,10 +337,18 @@ export function carriedLastOk(
   return readMailCronDetail(prev.last_detail).last_ok_at ?? null;
 }
 
-/** The last successful run as shown: the row's own time while it reads ok, the carried one while it reads error. */
+/**
+ * The last successful run as shown: the row's own time while it reads ok,
+ * the carried one while it reads error. A row whose detail has no `v: 1`
+ * shows null (not known) either way: older code wrote ok after a run whose
+ * reads had failed, so its ok is not evidence of a success. carriedLastOk
+ * keeps its own rule; this is the display reader only.
+ */
 export function lastSuccessfulRun(row: { last_status: string; last_run_at: string; last_detail?: unknown } | null): string | null {
   if (!row) return null;
-  return row.last_status === "ok" ? parsableTime(row.last_run_at) : readMailCronDetail(row.last_detail).last_ok_at ?? null;
+  const detail = readMailCronDetail(row.last_detail);
+  if (!detail.known) return null;
+  return row.last_status === "ok" ? parsableTime(row.last_run_at) : detail.last_ok_at ?? null;
 }
 
 /** Pending reminders as shown: "not known" when the run did not count, "at least n" when its count was incomplete. */

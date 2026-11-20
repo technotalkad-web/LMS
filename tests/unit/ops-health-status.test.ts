@@ -259,12 +259,16 @@ console.log("\nthe mail crons' detail: words, builder, reader, carry, pending");
   const olderErrorRow = { last_status: "error", last_run_at: ago(10), last_detail: { ok: false, orgs: ["acme"], error: "database message" } };
   const items = mailCronItems(olderErrorRow);
   eq("an errored row without v: not known three times (last successful run, failure details, pending)", [items.lastOk, items.details, items.pending], [null, null, { kind: "not_known" }]);
+  for (const [label, detail] of [["no detail", null], ["a detail without v", { courses: 3, sent: 2 }]] as const) {
+    const ok = mailCronItems({ last_status: "ok", last_run_at: ago(10), last_detail: detail });
+    eq(`an ok row with ${label}: not known three times (its ok is not evidence of a success)`, [ok.lastOk, ok.details, ok.pending], [null, null, { kind: "not_known" }]);
+  }
 
   eq("carry: an ok row gives its own time", carriedLastOk({ last_status: "ok", last_run_at: ago(60), last_detail: null }), ago(60));
   eq("carry: a failed row with last_ok_at gives that time", carriedLastOk({ last_status: "error", last_run_at: ago(5), last_detail: { v: 1, last_ok_at: ago(90) } }), ago(90));
   eq("carry: a failed row from older code gives not known", carriedLastOk({ last_status: "error", last_run_at: ago(5), last_detail: { ok: false } }), null);
   eq("carry: no row, or a row that could not be read, gives not known", [carriedLastOk(null), carriedLastOk("unreadable")], [null, null]);
-  eq("the last successful run as shown: the row's own time while ok, the carried one while error", [lastSuccessfulRun({ last_status: "ok", last_run_at: ago(1) }), lastSuccessfulRun({ last_status: "error", last_run_at: ago(1), last_detail: { v: 1, last_ok_at: ago(100) } }), lastSuccessfulRun(null)], [ago(1), ago(100), null]);
+  eq("the last successful run as shown: the row's own time while ok, the carried one while error", [lastSuccessfulRun({ last_status: "ok", last_run_at: ago(1), last_detail: { v: 1 } }), lastSuccessfulRun({ last_status: "error", last_run_at: ago(1), last_detail: { v: 1, last_ok_at: ago(100) } }), lastSuccessfulRun(null)], [ago(1), ago(100), null]);
 
   eq("pending: a number that was left out reads not known, never 0", [pendingOf({ known: true }), pendingOf({ known: false, left: 4 })], [{ kind: "not_known" }, { kind: "not_known" }]);
   eq("pending: an incomplete count reads at least n", pendingOf({ known: true, left: 4, left_complete: false }), { kind: "at_least", n: 4 });

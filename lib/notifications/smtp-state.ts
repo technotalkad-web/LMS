@@ -78,7 +78,7 @@ export const CRON_SEND_WINDOW_MS = 240_000;
 export const CALL_SUM_LIMIT = Math.floor(WORKERS_SUBREQUEST_BUDGET * 0.8);
 /** A ready organisation turns failing after timeouts, unreachables or unknowns to this many different people. */
 export const FLIP_AFTER_PEOPLE = 3;
-/** An alert for a flip (or for routine mail stopped by the daily limit) is not marked within this of the last alert. */
+/** An alert for a flip (or for the run in which routine mail reaches its daily line) is not marked within this of the last alert. */
 export const ALERT_BOUND_FLIP_MS = 6 * 3_600_000;
 /** An alert for mail not sent while not ready is not marked within this of the last alert. */
 export const ALERT_BOUND_NOT_SENT_MS = 24 * 3_600_000;
@@ -368,15 +368,31 @@ export type AlertCause = "flip" | "not_sent" | "daily_limit";
 
 /**
  * Whether an alert may be marked as due now (section E, rule FP4): never
- * while one is already due; for a flip, or routine mail stopped by the
- * daily limit, not within 6 hours of the last alert; for mail not sent while
- * not ready, not within 24 hours of it.
+ * while one is already due; for a flip, or for the run in which routine mail
+ * reaches its daily line, not within 6 hours of the last alert; for mail not
+ * sent (while not ready, or refused by a limit that had already stopped it),
+ * not within 24 hours of it. The cause is chosen by the run (dailyLimitCause).
  */
 export function alertMayBeMarked(input: { cause: AlertCause; lastAlertAt: string | null; alertDueAt: string | null; nowMs: number }): boolean {
   if (input.alertDueAt) return false;
   const last = input.lastAlertAt ? Date.parse(input.lastAlertAt) : NaN;
   if (!Number.isFinite(last)) return true;
   return input.nowMs - last >= (input.cause === "not_sent" ? ALERT_BOUND_NOT_SENT_MS : ALERT_BOUND_FLIP_MS);
+}
+
+/**
+ * The cause a mail refused by the daily limit owes (rule FP4). Routine mail
+ * that stops in this run (the run opened below the routine line, and the
+ * count is still under the full limit) owes "daily_limit", spaced like a
+ * flip. Everything else owes "not_sent", spaced 24 hours from the last
+ * alert: a reserve event, a refusal at the full limit, and a refusal in a
+ * run that opened with routine mail already stopped, whose stop was alerted
+ * by the run that reached the line. So a day at the limit draws one alert,
+ * not one every 6 hours. `count` includes the sends already started.
+ */
+export function dailyLimitCause(input: { event: NotificationEvent; sentAtOpen: number; count: number; limit: DailyLimit }): AlertCause {
+  if (drawsOnReserve(input.event)) return "not_sent";
+  return input.sentAtOpen < input.limit.routineStop && input.count < input.limit.limit ? "daily_limit" : "not_sent";
 }
 
 /* ------------------------------------------------------------------ the run */
@@ -753,11 +769,9 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         results[i] = notAttempted(gate.cls, gate.error);
         run.report.notAttempted[gate.cls]++;
         if (gate.cls === "daily_limit") {
-          if (drawsOnReserve(event)) causes.add("not_sent");
-          else {
-            causes.add("daily_limit");
-            run.report.routineStopped = true;
-          }
+          if (!drawsOnReserve(event)) run.report.routineStopped = true;
+          // gateSend refuses for the daily limit only when run.limit is set.
+          if (run.limit) causes.add(dailyLimitCause({ event, sentAtOpen: run.sent24h, count: run.sent24h + run.sentInRun + group.length, limit: run.limit }));
           if (io.rowForDailyLimit) rows.push({ item: items[i], result: results[i] });
         } else {
           if (gate.cls === "not_ready" || (gate.cls === "not_configured" && !run.deleted)) causes.add("not_sent");
@@ -785,6 +799,7 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
     }
     first = first && group.length === 0;
     const outcomes: Array<{ recipientId: string | null; outcome: SendOutcome }> = [];
+    const countBefore = run.sent24h + run.sentInRun;
     if (group.length > 0) {
       spendCalls(run.budget, group.length * MAIL_CALL_COSTS.send + templatesNeeded * MAIL_CALL_COSTS.template);
       const answers = await Promise.all(
@@ -810,6 +825,10 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         rows.push({ item: items[idx], result: results[idx] });
         outcomes.push({ recipientId: io.recipientOf(items[idx]), outcome: a.ok ? { ok: true } : { ok: false, cls: a.cls } });
       });
+      // This group's deliveries took the count to the routine line: routine
+      // mail stops now, even when nothing in the run was refused for it (an
+      // exact fit, or a code or welcome mail that reached the line).
+      if (run.limit && countBefore < run.limit.routineStop && run.sent24h + run.sentInRun >= run.limit.routineStop) causes.add("daily_limit");
     }
     if (rows.length > 0) {
       spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
