@@ -508,7 +508,10 @@ export type ForceRestartNotify = {
       counting?: ReadonlySet<string>;
     }
   ) => Promise<void>;
-  emails: (svc: SupabaseClient, userIds: Iterable<string>) => Promise<Map<string, string>>;
+  /** The strict address reader (ADR 0029): "unreadable" when the read failed, never a partial map. */
+  emails: (svc: SupabaseClient, userIds: Iterable<string>) => Promise<Map<string, string> | "unreadable">;
+  /** Records a mail skipped because its recipients could not be read (ADR 0029's skip helper, recordRecipientsUnreadable). Never throws. */
+  skipped: (site: string, organizationId: string | null) => Promise<void>;
 };
 
 export type ForceRestartArgs = {
@@ -675,8 +678,10 @@ async function notifyReissued(svc: SupabaseClient, args: ForceRestartArgs, notic
       args.notify.emails(svc, notices.map((n) => n.userId)),
       countingMemberIds(svc, args.org.id),
     ]);
-    if (counting === "unreadable") {
-      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "force-restart", org_id: args.org.id }));
+    // ADR 0029: a failed read of the recipients or of their addresses mails
+    // nobody and records the skip; the restart is already stored.
+    if (counting === "unreadable" || emails === "unreadable") {
+      await args.notify.skipped("force-restart", args.org.id);
       return;
     }
     for (const n of notices) {

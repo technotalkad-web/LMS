@@ -83,7 +83,7 @@ export function BroadcastClient({
   const [body, setBody] = useState("");
   const [buttons, setButtons] = useState<ButtonRow[]>([]);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ sent: number; failed: number; total: number } | null>(null);
+  const [result, setResult] = useState<{ sent: number; failed: number; total: number; notConfirmed: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   function toggleUser(id: string) {
@@ -138,9 +138,11 @@ export function BroadcastClient({
       body: JSON.stringify(payload),
     });
     setBusy(false);
-    const j = (await res.json().catch(() => ({}))) as { sent?: number; failed?: number; total?: number; error?: string };
+    const j = (await res.json().catch(() => ({}))) as { sent?: number; failed?: number; total?: number; error?: string; email?: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null };
     if (!res.ok) { setError(j.error ?? "Send failed"); return; }
-    setResult({ sent: j.sent ?? 0, failed: j.failed ?? 0, total: j.total ?? 0 });
+    // ADR 0029 rule T4: emailed and not emailed; a timeout is "not confirmed" (rule T2).
+    const notConfirmed = j.email && !j.email.recipients_unreadable ? j.email.not_confirmed : 0;
+    setResult({ sent: j.sent ?? 0, failed: Math.max(0, (j.failed ?? 0) - notConfirmed), total: j.total ?? 0, notConfirmed });
     setSubject(""); setBody(""); setButtons([]);
     router.refresh();
   }
@@ -171,7 +173,10 @@ export function BroadcastClient({
           <KpiStrip>
             <KpiCard label="Recipients" value={result.total} />
             <KpiCard label="Sent" value={result.sent} accent="text-emerald-600" icon={<CheckCircle2 className="w-4 h-4" />} />
-            <KpiCard label="Failed" value={result.failed} accent={result.failed > 0 ? "text-red-600" : undefined} icon={<AlertTriangle className="w-4 h-4" />} />
+            <KpiCard label="Not emailed" value={result.failed} accent={result.failed > 0 ? "text-red-600" : undefined} icon={<AlertTriangle className="w-4 h-4" />} />
+            {result.notConfirmed > 0 && (
+              <KpiCard label="Not confirmed (may still arrive)" value={result.notConfirmed} accent="text-amber-600" icon={<AlertTriangle className="w-4 h-4" />} />
+            )}
           </KpiStrip>
         </Card>
       )}

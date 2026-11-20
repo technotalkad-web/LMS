@@ -3,7 +3,8 @@ import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { finalizeAnswer, finalizeDirectUpload } from "@/lib/courses/direct-upload";
 import { originFromRequest } from "@/lib/http/origin";
 import { notifyLearnerOfDecision } from "@/lib/attempts/requests";
-import { resolveEmails } from "@/lib/users/emails";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { recordRecipientsUnreadable } from "@/lib/notifications/smtp-state";
 
 /**
  *   POST /api/courses/upload/finalize   { orgSlug, versionId, notify_update?, mode? }
@@ -43,7 +44,7 @@ export async function POST(request: NextRequest) {
     restartMode: body.mode === "force_restart" ? "force_restart" : "grandfather",
     // ADR 0014 step 8: what a forced restart's re-issued grant needs to tell the learner.
     origin: await originFromRequest(),
-    notify: { decision: notifyLearnerOfDecision, emails: resolveEmails },
+    notify: { decision: notifyLearnerOfDecision, emails: resolveEmailsStrict, skipped: recordRecipientsUnreadable },
   });
   const answer = finalizeAnswer(result);
   return NextResponse.json(answer.body, { status: answer.status });

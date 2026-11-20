@@ -1,7 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { grantExtraAttempts } from "@/lib/attempts/grant";
 import { assignCourseDirect } from "@/lib/assignments/direct";
-import { namesAndEmails } from "@/lib/users/people";
 import { isActionError, type ActionError, type PerLearnerResult } from "@/lib/actions/types";
 import { notifyRequesterOfTicket } from "./notify";
 import { OUTCOME_LABEL, type TicketOutcome } from "./types";
@@ -34,12 +33,15 @@ export async function actOnTicket(
   // since. Act only on those still active in the org (the admin acts org-wide).
   let ctx = ticket.context;
   if (ctx && ctx.userIds.length) {
-    const { data: rows } = await svc
+    const { data: rows, error: rowsErr } = await svc
       .from("organization_members")
       .select("user_id")
       .eq("organization_id", args.org.id)
       .eq("status", "active")
       .in("user_id", ctx.userIds);
+    // A failed read is never "nobody is active" (ADR 0029, part 3): the
+    // action and its mail rest on it, so nothing is done.
+    if (rowsErr) return { error: "Could not read who is on this ticket. Nothing was changed; try again.", status: 503 };
     const active = new Set(((rows ?? []) as Array<{ user_id: string }>).map((r) => r.user_id));
     ctx = { ...ctx, userIds: ctx.userIds.filter((id) => active.has(id)) };
     if (ctx.userIds.length === 0 && (args.action === "grant_retry" || args.action === "assign" || args.action === "extend_due")) {
@@ -112,10 +114,9 @@ export async function actOnTicket(
   await svc.from("help_ticket_messages").insert({
     organization_id: args.org.id, ticket_id: ticket.id, author_id: args.admin.id, author_role: "admin", body: adminNote,
   });
-  const requester = (await namesAndEmails(svc, [ticket.user_id])).get(ticket.user_id);
   await notifyRequesterOfTicket(svc, {
     orgId: args.org.id, orgName: args.org.name, orgSlug: args.org.slug, origin: args.origin,
-    requester: { id: ticket.user_id, email: requester?.email ?? null },
+    requester: { id: ticket.user_id },
     subject: ticket.subject, headline: OUTCOME_LABEL[outcome], message: adminNote,
   });
   return { outcome, summary, results };

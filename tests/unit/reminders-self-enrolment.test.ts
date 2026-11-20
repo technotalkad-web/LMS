@@ -71,7 +71,11 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     const inList = /id=in\.\(([^)]*)\)/.exec(query)?.[1] ?? "";
     return json(inList.split(",").filter(Boolean).map((id) => ({ id, email: `${id}@example.test` })));
   }
-  if (table === "notification_settings") return json([{ email_paused: true, event_paused: {} }]);
+  // ADR 0029: the reminders are one run for the organisation, and a reminder
+  // that is not attempted is not a nudge (step 10), so the organisation's
+  // SMTP is complete here and the send goes.
+  if (url.pathname === "/functions/v1/send-smtp") return json({ ok: true });
+  if (table === "notification_settings") return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, from_email: "noreply@tenant.stub", email_paused: false, event_paused: {} }]);
   // ADR 0029: each send opens its run with tenant_mail_status (migration 0114): one row, no state yet.
   if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? ORG, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
   if (table === "organizations") return json([{ id: ORG, name: "Org", deleted_at: null }]);
@@ -101,11 +105,13 @@ async function main() {
       assignmentRows = rows;
       requests = [];
       const res = await route.POST(new Request("http://lms.test/api/cron/reminders", { method: "POST", headers: { "x-cron-secret": SECRET } }));
-      const upsert = requests.find((q) => q.table === "reminder_state" && q.method === "POST");
+      // The state is written with each group of sends (ADR 0029 rule FP7), and
+      // a group's log rows are one insert: both are read across every write.
+      const upserts = requests.filter((q) => q.table === "reminder_state" && q.method === "POST");
       return {
         status: res.status,
-        reminded: ((upsert?.body ?? []) as Row[]).map((r) => r.user_id as string).sort(),
-        logged: requests.filter((q) => q.table === "notification_log").map((q) => (q.body as Row).to_user_id as string).sort(),
+        reminded: upserts.flatMap((q) => (q.body ?? []) as Row[]).map((r) => r.user_id as string).sort(),
+        logged: requests.filter((q) => q.table === "notification_log").flatMap((q) => (Array.isArray(q.body) ? (q.body as Row[]) : [q.body as Row])).map((r) => r.to_user_id as string).sort(),
         resolved: requests.filter((q) => q.table === "profiles").flatMap((q) => (/id=in\.\(([^)]*)\)/.exec(q.query)?.[1] ?? "").split(",")).sort(),
         reads: requests.filter((q) => q.method === "GET" && (q.table === "course_assignments" || q.table === "course_attempts")).map((q) => `${q.table} ${q.query}`),
       };

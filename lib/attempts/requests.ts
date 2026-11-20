@@ -6,15 +6,21 @@
  * Emails go out as `custom_broadcast` with an override subject/body: that path
  * needs no new template, no widening of the notification_templates CHECK, and
  * is not silenced by the org pause toggles (these are explicit, low-volume
- * transactional messages a learner or admin is waiting on). Delivery is
- * fire-and-forget via notifyBackground — a mail hiccup never fails the action.
+ * transactional messages a learner or admin is waiting on). A mail hiccup
+ * never fails the action.
  *
  * ADR 0030 rule 10: both go only to people whose membership in the org counts
- * (active, in an organisation that is not deleted). A failed membership read
- * sends nothing.
+ * (active, in an organisation that is not deleted).
+ *
+ * ADR 0029 (note of 2026-11-19; part 3 of the note of 2026-11-20): a failed
+ * read of the recipients or of their addresses is never "nobody": nobody is
+ * mailed and the skip is recorded (recordRecipientsUnreadable). The
+ * administrators' mail is one run (rule FP7). A learner's decision mail is
+ * one send, inside the caller's run when it sends several.
  */
-import { resolveEmails } from "@/lib/users/emails";
-import { notifyBackground } from "@/lib/notifications/send";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { sendMany, sendNotification } from "@/lib/notifications/send";
+import { openRun, recordRecipientsUnreadable, requestBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -37,8 +43,9 @@ const ADMIN_READ_ROLES = ["super_owner", "owner", "admin"];
 
 /**
  * Email every admin of an org, whose membership counts, that a learner has
- * asked for another attempt. Fail-soft: a missing recipient or a mail error
- * is logged, never thrown.
+ * asked for another attempt, in one run. A failed read of the
+ * administrators or of their addresses mails nobody and records the skip:
+ * the request itself still shows in the queue and the Attention Center.
  */
 export async function notifyAdminsOfRequest(
   svc: AnyClient,
@@ -54,41 +61,43 @@ export async function notifyAdminsOfRequest(
   }
 ): Promise<void> {
   try {
-    // Rule 10: the administrators whose membership counts. Unreadable: no mail.
+    // Rule 10: the administrators whose membership counts.
     const admins = await countingMemberIds(svc, args.orgId, ADMIN_READ_ROLES);
     if (admins === "unreadable") {
-      console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-request", org_id: args.orgId }));
+      await recordRecipientsUnreadable("attempt-request", args.orgId);
       return;
     }
     const ids = [...admins];
     if (ids.length === 0) return;
-    const emails = await resolveEmails(svc, ids);
+    const emails = await resolveEmailsStrict(svc, ids);
+    if (emails === "unreadable") {
+      await recordRecipientsUnreadable("attempt-request", args.orgId);
+      return;
+    }
     const link = args.origin ? `${args.origin}/${args.orgSlug}/attempt-requests` : "";
     const who = args.learnerName ? `${args.learnerName} (${args.learnerEmail})` : args.learnerEmail;
     const body =
       `**${who}** has requested another attempt at **${args.courseTitle}**.\n\n` +
       (args.reason ? `> ${args.reason}\n\n` : "") +
       `Review and approve or decline it in the Attempt Requests queue.`;
-    for (const [uid, email] of emails) {
-      await notifyBackground({
-        organizationId: args.orgId,
-        event: "custom_broadcast",
-        to: { user_id: uid, email },
-        context: {
-          org_name: args.orgName,
-          course_name: args.courseTitle,
-          learner_email: args.learnerEmail,
-          direct_link: link,
-        },
-        override: {
-          subject: `Attempt request: ${args.courseTitle}`,
-          body_md: body,
-          buttons: link ? [{ label: "Review request", url: link }] : [],
-        },
-      });
-    }
+    const run = await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: 8 }), db: svc });
+    await sendMany(run, [...emails], ([uid, email]) => ({
+      event: "custom_broadcast",
+      to: { user_id: uid, email },
+      context: {
+        org_name: args.orgName,
+        course_name: args.courseTitle,
+        learner_email: args.learnerEmail,
+        direct_link: link,
+      },
+      override: {
+        subject: `Attempt request: ${args.courseTitle}`,
+        body_md: body,
+        buttons: link ? [{ label: "Review request", url: link }] : [],
+      },
+    }));
   } catch (e) {
-    console.error("[attempt-requests] notifyAdminsOfRequest failed:", e);
+    console.error(JSON.stringify({ event: "attempt_request_mail_failed", site: "attempt-request", org_id: args.orgId, error: e instanceof Error ? e.name : "unknown" }));
   }
 }
 
@@ -107,7 +116,7 @@ async function recipientCounts(
   if (counting) return counting.has(userId);
   const m = await resolveOrgMembership(svc, { id: orgId }, userId);
   if (m === "unreadable") {
-    console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-decision", org_id: orgId }));
+    await recordRecipientsUnreadable("attempt-decision", orgId);
     return false;
   }
   return m !== "none";
@@ -133,6 +142,8 @@ export async function notifyLearnerOfDecision(
     expiresAt?: string | null;
     /** The org's members that count, when the caller sends several of these in one request. */
     counting?: ReadonlySet<string>;
+    /** The caller's run, when it sends several of these in one request: they share its stop rule and budgets. */
+    run?: MailRun;
   }
 ): Promise<void> {
   try {
@@ -157,23 +168,27 @@ export async function notifyLearnerOfDecision(
         `Your request for another attempt at **${args.courseTitle}** was not approved.` +
         (note ? `\n\n_Note from your administrator:_ ${note}` : "");
     }
-    await notifyBackground({
-      organizationId: args.orgId,
-      event: "custom_broadcast",
-      to: { user_id: args.learner.id, email: args.learner.email },
-      context: {
-        org_name: args.orgName,
-        course_name: args.courseTitle,
-        course_id: args.courseId,
-        direct_link: courseLink,
+    await sendNotification(
+      {
+        organizationId: args.orgId,
+        event: "custom_broadcast",
+        to: { user_id: args.learner.id, email: args.learner.email },
+        context: {
+          org_name: args.orgName,
+          course_name: args.courseTitle,
+          course_id: args.courseId,
+          direct_link: courseLink,
+        },
+        override: {
+          subject,
+          body_md: body,
+          buttons: args.approved && courseLink ? [{ label: "Go to course", url: courseLink }] : [],
+        },
       },
-      override: {
-        subject,
-        body_md: body,
-        buttons: args.approved && courseLink ? [{ label: "Go to course", url: courseLink }] : [],
-      },
-    });
+      args.run ? { run: args.run } : {}
+    );
   } catch (e) {
-    console.error("[attempt-requests] notifyLearnerOfDecision failed:", e);
+    console.error(JSON.stringify({ event: "attempt_request_mail_failed", site: "attempt-decision", org_id: args.orgId, error: e instanceof Error ? e.name : "unknown" }));
   }
 }
+

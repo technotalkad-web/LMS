@@ -212,7 +212,10 @@ async function main() {
       world.stateTable = "fail";
       eq("the read for the oldest due alert fails: failed (read)", await dueAlert(), { kind: "failed", step: "read" });
       freshWorld(base());
-      eq("no platform address to link to: failed (config), nothing read", [await sendDueAlert({ baseUrl: "", env: PLATFORM_ENV }), requests.length], [{ kind: "failed", step: "config" }, 0]);
+      eq("no platform address to link to, with an alert due: failed (config) after the one read, nothing sent, the alert still due",
+        [await sendDueAlert({ baseUrl: "", env: PLATFORM_ENV }), requests.length, platformSends().length, typeof world.state?.alert_due_at], [{ kind: "failed", step: "config" }, 1, 0, "string"]);
+      freshWorld();
+      eq("…with no alert due: none (a scheduled call without the address fails nothing when nothing is due)", [await sendDueAlert({ baseUrl: "", env: PLATFORM_ENV }), requests.length], [{ kind: "none" }, 1]);
       freshWorld(base());
       const tight = cronBudget({ spent: 30 });
       eq("a call with no room for an alert reads nothing and leaves it due", [await sendDueAlert({ baseUrl: BASE, env: PLATFORM_ENV, budget: tight }), requests.length, typeof world.state?.alert_due_at], [{ kind: "no_room" }, 0, "string"]);

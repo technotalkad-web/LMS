@@ -147,6 +147,7 @@ const READS: Record<string, Entry> = {
   "lib/manager/insights.ts#computeLearnerInsights#1": { cls: "subject", reason: "learner dimensions (fetchByIds)" },
   "lib/manager/insights.ts#computeLearnerInsights#2": { cls: "subject", reason: "learner dimensions, pre-0096 columns (fetchByIds)" },
   "lib/org/groups.ts#q#1": { cls: "subject", reason: "dynamic group members (active rows)" },
+  "lib/org/groups.ts#q#2": { cls: "subject", reason: "dynamic group members (active rows), the strict reader for mail (ADR 0029): a failed read is never nobody" },
   "lib/org/reporting-line.ts#q#1": { cls: "subject", reason: "the whole hierarchy, every status by design" },
   "lib/tickets/actions.ts#actOnTicket#1": { cls: "subject", reason: "the people a ticket names (active rows)" },
   "lib/users/people.ts#memberIdsInOrg#1": { cls: "subject", reason: "ids that are rows of the org (fetchByIds)" },

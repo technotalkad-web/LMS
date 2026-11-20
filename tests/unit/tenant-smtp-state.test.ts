@@ -29,7 +29,17 @@
  *     RPC error is "unreadable" and kept apart from "missing";
  *   - the RPC request itself: path and single argument are pinned, because
  *     a misspelt name would look like an unpasted migration indefinitely;
- *   - recordRecipientsUnreadable (ADR 0029, note of 2026-11-19).
+ *   - recordRecipientsUnreadable (ADR 0029, note of 2026-11-19), and the
+ *     scan that holds the event name to the helper and the two crons;
+ *   - stage 2: the Settings test (a delivery reads healthy, a failure
+ *     failing at once, rejected changes nothing, settings that are not
+ *     complete attempt nothing, without 0114 it is sent and its state write
+ *     skipped); the platform's call limit (call_limit, one fixed line, the
+ *     rest left, nothing written); the run's group hooks (a claim taken for
+ *     each group just before its sends, a withdrawn mail not attempted, the
+ *     state written with each group); a learner's request that mails the
+ *     administrators, with their read or their addresses unreadable;
+ *     an organisation read that fails attempts nothing.
  *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
@@ -65,7 +75,13 @@ import {
   runReading,
   type SmtpStateSnapshot,
 } from "../../lib/notifications/smtp-state";
-import { sendMany, sendNotification, type SendArgs } from "../../lib/notifications/send";
+import { sendMany, sendNotification, sendSettingsTest, type SendArgs } from "../../lib/notifications/send";
+import { CALL_LIMIT_LOG_EVENT, requestBudget } from "../../lib/notifications/smtp-state";
+import { notifyAdminsOfTicket } from "../../lib/tickets/notify";
+import { notifyAdminsOfRequest } from "../../lib/attempts/requests";
+import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs";
+import path from "node:path";
 import { MAIL_RECIPIENTS_HEARTBEAT } from "../../lib/ops/health-status";
 
 const NOW = Date.now();
@@ -197,7 +213,11 @@ async function main() {
       }
       freshWorld({ settings: { ...SMTP_SETTINGS, email_paused: true } });
       const b = await sendNotification({ ...one("custom_broadcast"), override: { subject: "Notice", body_md: "Hello" } });
-      eq("custom_broadcast still passes the master pause, as before (kept, not changed by this stage)", b.status, "sent");
+      // Section C keeps every event but the two public ones under the pause;
+      // this old pass of custom_broadcast (ticket and attempt-request mail)
+      // is kept as it was and is raised in pull request B's text for the
+      // owner, as the free-plan note's "Found on main" asks.
+      eq("custom_broadcast still passes the master pause, as before (kept; raised in the pull request's text, not changed by this record's code)", b.status, "sent");
     }
 
     console.log("\na deleted organisation; one scheduled for deletion");
@@ -207,11 +227,17 @@ async function main() {
       const r = await sendMany(run, people(3), mailTo());
       eq("deleted: reads not_configured, not ready, nothing attempted", [runReading(run), runReady(run), sends().length, r.map((x) => x.errorClass)], ["not_configured", false, 0, ["not_configured", "not_configured", "not_configured"]]);
       eq("…no alert marked, no state written", [run.report.alertMarked, stateWrites().length], [false, 0]);
-      freshWorld({ org: { id: ORG, name: "Tenant A", slug: "tenant-a", deleted_at: null, deletion_scheduled_at: iso(-30 * 24 * H) } });
-      eq("scheduled for deletion (deleted_at empty): sends as today", (await sendNotification(one("asset_assignment"))).status, "sent");
+      // The real column (supabase/migrations/0021_platform_owner.sql), set,
+      // with deleted_at empty: the organisation is live for its grace.
+      freshWorld({ org: { id: ORG, name: "Tenant A", slug: "tenant-a", deleted_at: null, scheduled_deletion_at: iso(-30 * 24 * H) } });
+      const scheduled = await openRun({ organizationId: ORG });
+      eq("scheduled for deletion (deleted_at empty): live, ready, and it sends as today", [scheduled.deleted, runReady(scheduled), (await sendNotification(one("asset_assignment"), { run: scheduled })).status], [false, true, "sent"]);
       freshWorld({ org: "fail" });
       const run2 = await openRun({ organizationId: ORG });
-      eq("an organisation read that fails is not read as deleted: the mail still goes", [run2.deleted, (await sendNotification(one("asset_assignment"), { run: run2 })).status], [false, "sent"]);
+      const r2 = await sendNotification(one("asset_assignment"), { run: run2 });
+      eq("an organisation read that fails: whether it is deleted is not known, so nothing is attempted (a deleted organisation's SMTP is never used)",
+        [run2.deleted, runReady(run2), r2.status, r2.errorClass, r2.attempted, sends().length], [false, false, "failed", "settings_unreadable", false, 0]);
+      eq("…its row says the organisation could not be read, and the state is not written", [logRows()[0]?.error, stateWrites().length], ["The organisation could not be read. Nothing was sent.", 0]);
     }
 
     console.log("\nno fallback");
@@ -268,6 +294,133 @@ async function main() {
       const { lines: l2 } = await captureLogs(async () => { try { await recordRecipientsUnreadable("ticket-requester", ORG); } catch { threw = true; } });
       globalThis.fetch = realFetch;
       eq("a write that fails changes nothing: no throw, and the log line is still written", [threw, l2.length], [false, 1]);
+    }
+
+    console.log("\nthe event name of a skipped request: the helper and the two crons only (note of 2026-11-19, point 7)");
+    {
+      const ROOT = path.resolve(__dirname, "..", "..");
+      const files: string[] = [];
+      const walk = (dir: string) => {
+        for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+          const q = path.join(dir, d.name);
+          if (d.isDirectory()) walk(q);
+          else if (/\.(ts|tsx)$/.test(d.name)) files.push(q);
+        }
+      };
+      walk(path.join(ROOT, "app"));
+      walk(path.join(ROOT, "lib"));
+      const rel = (f: string) => path.relative(ROOT, f).replace(/\\/g, "/");
+      const named = files.filter((f) => fs.readFileSync(f, "utf8").includes("mail_recipients_unreadable")).map(rel).sort();
+      eq("mail_recipients_unreadable is written in the helper and the two cron routes, and nowhere else", named,
+        ["app/api/cron/journey-nudges/route.ts", "app/api/cron/reminders/route.ts", "lib/notifications/smtp-state.ts"]);
+      for (const cron of ["app/api/cron/reminders/route.ts", "app/api/cron/journey-nudges/route.ts"]) {
+        const src = fs.readFileSync(path.join(ROOT, cron), "utf8");
+        eq(`${cron} neither names the skip row nor calls the helper`, [src.includes("mail-recipients-unreadable"), src.includes("MAIL_RECIPIENTS_HEARTBEAT"), src.includes("recordRecipientsUnreadable")], [false, false, false]);
+      }
+    }
+
+    console.log("\nthe Settings test (section C, step 11)");
+    {
+      const admin = { user_id: "0c000000-0000-4000-8000-000000000001", email: "admin@tenant.stub" };
+      freshWorld();
+      let run = await openRun({ organizationId: ORG, budget: requestBudget() });
+      let r = await sendSettingsTest(run, admin);
+      eq("a delivered test: sent, the state written healthy, one row logged as sent under its own event",
+        [r.status, (world.state as Row | null)?.state, logRows().map((x) => [x.event_type, x.status, x.to_address])], ["sent", "healthy", [["smtp_test", "sent", admin.email]]]);
+      eq("…the fixed text goes through the organisation's own server only", [sends().length, sends()[0]?.host], [1, "smtp.tenant.stub"]);
+      freshWorld({ state: { organization_id: ORG, state: "healthy", state_changed_at: iso(H), failed_recipients: [], last_success_at: iso(H) }, smtp: () => ({ ok: false, error: "535 5.7.8 Username and Password not accepted" }) });
+      run = await openRun({ organizationId: ORG });
+      r = await sendSettingsTest(run, admin);
+      eq("a failed test turns the organisation failing at once, with its class, and marks one alert as due (nothing is mailed by the request)",
+        [r.status, r.errorClass, (world.state as Row | null)?.state, (world.state as Row | null)?.last_error_code, typeof (world.state as Row | null)?.alert_due_at, world.platformLog.length], ["failed", "auth", "failing", "auth", "string", 0]);
+      freshWorld({ state: { organization_id: ORG, state: "healthy", state_changed_at: iso(H), failed_recipients: [], last_success_at: iso(H) }, smtp: () => ({ ok: false, error: "550 5.1.1 user unknown" }) });
+      run = await openRun({ organizationId: ORG });
+      r = await sendSettingsTest(run, admin);
+      eq("…a rejected test (the receiving mailbox refused it) changes nothing", [r.errorClass, (world.state as Row | null)?.state, stateWrites().length], ["rejected", "healthy", 0]);
+      freshWorld({ settings: { ...SMTP_SETTINGS, smtp_host: null } });
+      run = await openRun({ organizationId: ORG });
+      r = await sendSettingsTest(run, admin);
+      eq("settings that are not complete: not attempted, not_configured, its row written, nothing sent", [r.attempted, r.errorClass, sends().length, logRows().length], [false, "not_configured", 0, 1]);
+      freshWorld({ settings: { ...SMTP_SETTINGS, email_paused: true } });
+      run = await openRun({ organizationId: ORG });
+      eq("a pause does not stop the test: the administrator asked for it", (await sendSettingsTest(run, admin)).status, "sent");
+      freshWorld({ status: "missing" });
+      run = await openRun({ organizationId: ORG });
+      r = await sendSettingsTest(run, admin);
+      eq("without 0114: the test is sent and shown, and its state write is skipped", [r.status, sends().length, stateWrites().length], ["sent", 1, 0]);
+    }
+
+    console.log("\nthe platform's call limit (rule FP8)");
+    {
+      freshWorld({ smtp: () => ({ ok: false, error: "Too many subrequests." }) });
+      const run = await openRun({ organizationId: ORG, budget: requestBudget() });
+      const { value: r, lines } = await captureLogs(() => sendMany(run, people(6), mailTo()));
+      eq("a send the platform refuses is no tenant failure: left, not attempted, the state not written, no further send",
+        [r.map((x) => x.errorClass), r.every((x) => x.attempted === false), stateWrites().length, sends().length], [["left", "left", "left", "left", "left", "left"], true, 0, 1]);
+      eq("…counted once as call_limit, with one fixed log line, and no row written", [run.errors.call_limit, lines.filter((l) => l.includes(CALL_LIMIT_LOG_EVENT)).length, logInserts().length], [1, 1, 0]);
+    }
+
+    console.log("\nthe run's group hooks (rules T4 and FP7)");
+    {
+      freshWorld();
+      const run = await openRun({ organizationId: ORG, budget: requestBudget() });
+      const claimed: string[][] = [];
+      const written: string[][] = [];
+      const lost = new Set([people(6)[2].id]);
+      const r = await sendMany(run, people(6), mailTo(), {
+        hooks: {
+          beforeCalls: 1,
+          before: async (group) => {
+            claimed.push(group.map((x) => x.id));
+            return { keep: group.map((x) => !lost.has(x.id)), calls: 1 };
+          },
+          afterCalls: 1,
+          after: async (entries) => {
+            written.push(entries.map((e) => `${e.item.id.slice(-1)}:${e.result.status}`));
+            return { calls: 1 };
+          },
+        },
+      });
+      eq("each group is claimed just before its sends: the first alone, then the rest", claimed.map((g) => g.length), [1, 4, 1]);
+      eq("…one the claim did not keep is withdrawn: not attempted, no row", [r[2].errorClass, r[2].attempted, logRows().some((x) => x.to_user_id === people(6)[2].id)], ["withdrawn", false, false]);
+      eq("…the caller's step after each group sees that group's mail", written, [["1:sent"], ["2:sent", "3:not_attempted", "4:sent", "5:sent"], ["6:sent"]]);
+      freshWorld();
+      const tight = requestBudget({ spent: 24 });
+      const run2 = await openRun({ organizationId: ORG, budget: tight });
+      const claims: number[] = [];
+      const r2 = await sendMany(run2, people(10), mailTo(), {
+        hooks: { beforeCalls: 1, before: async (g) => { claims.push(g.length); return { keep: g.map(() => true), calls: 1 }; } },
+      });
+      const started = r2.filter((x) => x.attempted).length;
+      eq("a mail the request had no room for holds no claim: only the groups that started were claimed", [claims.reduce((a, b) => a + b, 0), started > 0, started < 10], [started, true, true]);
+      eq("…the hooks' calls are within the sum", tight.calls <= 40, true);
+    }
+
+    console.log("\nmail to the administrators from a learner's request (note of 2026-11-19, point 2)");
+    {
+      const db = () => createClient("http://stub.supabase.test", "stub-service-key-0029", { auth: { persistSession: false } });
+      const admins = [
+        { organization_id: ORG, user_id: "0d000000-0000-4000-8000-000000000001", role: "super_owner", status: "active" },
+        { organization_id: ORG, user_id: "0d000000-0000-4000-8000-000000000002", role: "admin", status: "active" },
+      ];
+      const profiles = Object.fromEntries(admins.map((a, i) => [a.user_id, `admin${i + 1}@tenant.stub`]));
+      const ticket = () => notifyAdminsOfTicket(db(), { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", subject: "Help", requester: { name: "A manager", email: null }, categoryLabel: "Retry", lines: ["one"], note: null });
+      const request = () => notifyAdminsOfRequest(db(), { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", courseTitle: "Home loans", learnerEmail: "learner@tenant.stub", reason: null });
+      const skipRows = () => requests.filter((q) => q.table === "ops_heartbeats").map((q) => (q.body as Row).last_detail);
+      for (const [label, send, site] of [["a ticket", ticket, "ticket-admins"], ["an attempt request", request, "attempt-request"]] as const) {
+        freshWorld({ members: admins, profiles });
+        await send();
+        eq(`${label}: the administrators are mailed in one run (one state read)`, [logRows().map((x) => x.to_user_id).sort(), statusCalls().length], [admins.map((a) => a.user_id).sort(), 1]);
+        freshWorld({ members: admins, profiles, membersFail: true });
+        await captureLogs(() => send());
+        eq(`${label}, the administrators cannot be read: nobody mailed, the sender not entered, the skip recorded once`, [sends().length, statusCalls().length, skipRows()], [0, 0, [{ site }]]);
+        freshWorld({ members: admins, profiles, profilesFail: true });
+        await captureLogs(() => send());
+        eq(`${label}, their addresses cannot be read: never "no address": nobody mailed, the skip recorded once`, [sends().length, statusCalls().length, skipRows()], [0, 0, [{ site }]]);
+        freshWorld({ members: [], profiles });
+        await send();
+        eq(`${label}, a read that finds no administrator: nothing is sent and nothing is recorded`, [sends().length, skipRows()], [0, []]);
+      }
     }
   } finally {
     removeStub();

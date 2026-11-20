@@ -607,12 +607,13 @@ function sourceCases() {
     const branch = src.slice(src.indexOf('if (target === "course") {'), src.indexOf("// Journey: the learner's ACTIVE enrollment"));
     const at = branch.indexOf('reason: "records could not be read; try again"');
     eq("the course branch skips on line.historyUnavailable / status 'unavailable' with its reason", [
-      /if \(line\.historyUnavailable \|\| line\.status === "unavailable"\) \{\s*results\.push\(\{ userId: uid, status: "skipped", reason: "records could not be read; try again" \}\);\s*continue;\s*\}/.test(branch),
+      /if \(line\.historyUnavailable \|\| line\.status === "unavailable"\) \{\s*byUser\.set\(uid, \{ userId: uid, status: "skipped", reason: "records could not be read; try again" \}\);\s*continue;\s*\}/.test(branch),
     ], [true]);
-    eq("…after the !line check and before the completed skip, notifyBackground( and the reminder_state upsert", [
+    // ADR 0029: the sends are one run (sendMany), and the state is written with each group.
+    eq("…after the !line check and before the completed skip, the run's sends (sendMany) and the reminder_state upsert", [
       at > branch.indexOf("if (!line)"),
       at < branch.indexOf('line.status === "completed"'),
-      at < branch.indexOf("notifyBackground("),
+      at < branch.indexOf("sendMany("),
       at < branch.indexOf('.from("reminder_state").upsert('),
       branch.indexOf('.from("reminder_state").upsert(') > 0,
     ], [true, true, true, true, true]);

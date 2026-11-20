@@ -1,41 +1,59 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { sendNotification } from "@/lib/notifications/send";
-import { resolveEmails } from "@/lib/users/emails";
-import { mapWithConcurrency } from "@/lib/util/concurrency";
+import { sendMany } from "@/lib/notifications/send";
+import { CALL_SUM_LIMIT, MAIL_CALL_COSTS, cronBudget, hasRoom, openRun, spendCalls } from "@/lib/notifications/smtp-state";
+import { resolveEmailsStrict } from "@/lib/users/emails";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
+import { buildMailCronDetail, owedAfterRun, type CronErrorCounts, type CronErrorWord } from "@/lib/ops/health-status";
 import { isReleased } from "@/lib/learner/release";
 import { countingMemberIds } from "@/lib/auth/org-membership";
-import {
-  fetchActiveMembers,
-  resolveGroupMembers,
-  type GroupRow,
-} from "@/lib/org/groups";
+import { isMissingRelation } from "@/lib/scoring/attempt-kind";
+import { resolveManyGroupsStrict } from "@/lib/org/groups";
 
 /**
  *   POST /api/cron/reminders
  *   header: x-cron-secret: <CRON_SECRET env var>
  *
- * Hourly scheduled task. For each course with reminders enabled:
+ * Daily scheduled task (.github/workflows/cron.yml). For each course with
+ * reminders enabled:
  *   - Resolve every learner currently assigned (user/team/org/group). A
  *     self-enrolment row (source 'self') is no assignment (decision A22).
  *   - ADR 0030 rule 10: only members that count are reminded (active, in
  *     an organisation that is not deleted). A deleted organisation's
  *     courses are skipped; each other organisation's members that count
  *     are read once per run, and an organisation whose read fails is
- *     skipped for this run (nothing sent, no state written).
- *   - Such a skip fails the run (ADR 0030, note "Pull request B build
- *     decisions", change 2): it is counted as `unreadable_orgs`, and when
- *     the count is above zero the answer is 500 with `ok: false` and the
- *     heartbeat is recorded as an error, at both exits. The other
- *     organisations' mail and reminder state are finished first. A deleted
- *     organisation is not a failure. The body holds numbers and booleans
- *     only; the organisation's id is in the mail_recipients_unreadable log
- *     line. The next scheduled run is the retry.
+ *     skipped for this run (nothing sent, no state written), counted as
+ *     `unreadable_orgs`, and fails the run. The other organisations' mail
+ *     and reminder state are finished first. A deleted organisation is not
+ *     a failure. The organisation's id is in the mail_recipients_unreadable
+ *     log line, never in the answer.
  *   - Skip learners who have already completed/passed the course.
  *   - Skip learners whose first_assigned_at is older than cap_days.
  *   - Skip learners whose last_nudge_at is newer than cadence_days ago.
  *   - For survivors, send asset_reminder + update reminder_state.
+ *
+ * ADR 0029 (rules T5, FP2, FP4, FP7 and FP8; the hand-over note of
+ * 2026-11-19, point 4; the note of 2026-11-20, part 2):
+ *   - The sends are runs: one for each organisation, all on this call's one
+ *     clock and one count. Longest waiting first: never reminded, then the
+ *     oldest last reminder, across organisations. What the call has no room
+ *     for is left for the next call and counted (`left`, `left_orgs`), as is
+ *     what a daily limit stopped (`left_daily_limit`).
+ *   - The reminders' state is written with each group of sends. A tried
+ *     reminder is a reminder whatever its result; one not attempted gets no
+ *     state, so a later call takes it.
+ *   - A failed run is the job's own failed read or write, or the platform's
+ *     call limit: the settings, the members that count, the assignments,
+ *     the team and group members, the completed attempts, the reminder
+ *     state, the addresses, the state writes. A failed read of the
+ *     settings, the assignments, a team or group, the attempts, the state
+ *     or the addresses stops the run before any send (a failed read is
+ *     never "no courses", "nobody" or "never reminded"). A tenant's failed
+ *     send, a daily limit, a paused organisation and a database without
+ *     migration 0114 are clean runs.
+ *   - The answer and the heartbeat are built by buildMailCronDetail: counts
+ *     and fixed words only, never an id, a name, an address or a database
+ *     message. A failed run carries its last successful run (last_ok_at).
  */
 
 type ReminderRow = {
@@ -63,6 +81,9 @@ type Assignment = {
   source?: string | null;
 };
 
+/** A run's own reads before its sends, at most: the organisation's two member reads and the opening of its run. */
+const ORG_OPEN_CALLS = 2 + MAIL_CALL_COSTS.open;
+
 export async function POST(request: Request) {
   const expected = process.env.CRON_SECRET;
   const got = request.headers.get("x-cron-secret");
@@ -81,15 +102,39 @@ export async function POST(request: Request) {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+  const budget = cronBudget();
+  const errors: CronErrorCounts = {};
+  const fail = (word: CronErrorWord) => {
+    errors[word] = (errors[word] ?? 0) + 1;
+  };
+  let unreadableOrgs = 0;
+  let scanned = 0;
+  let skipped = 0;
+  let upserts = 0;
 
-  // 1) Courses with reminders enabled.
-  const { data: settings } = await svc
+  /** The run's end: one heartbeat and one answer, from one builder. */
+  const finish = async (counts: { stoppedBeforeSend: boolean; due?: number; sent?: number; failed?: number; left?: number; leftComplete?: boolean; leftDailyLimit?: number; leftOrgs?: number; no0114?: boolean }) => {
+    const detail = buildMailCronDetail(
+      { errors, unreadableOrgs, no0114: counts.no0114 === true, ...counts },
+      { scanned, skipped, upserts }
+    );
+    await recordHeartbeat("reminders", detail.heartbeat, detail.ok, { carryLastOk: true });
+    return NextResponse.json(detail.answer, { status: detail.ok ? 200 : 500 });
+  };
+
+  // 1) Courses with reminders enabled. A failed read is never "no courses".
+  spendCalls(budget, 1);
+  const { data: settings, error: settingsErr } = await svc
     .from("course_reminder_settings")
     .select(
       "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug, deleted_at))"
     )
     .eq("enabled", true);
-  const allCourses = ((settings ?? []) as unknown[]).map((r) => {
+  if (settingsErr || !Array.isArray(settings)) {
+    fail("config_read");
+    return finish({ stoppedBeforeSend: true });
+  }
+  const allCourses = (settings as unknown[]).map((r) => {
     const row = r as ReminderRow;
     const c = row.courses;
     const orgSubraw = c?.organizations;
@@ -111,12 +156,16 @@ export async function POST(request: Request) {
   // ADR 0030 rule 10: the members that count, read once per organisation for
   // this run. A deleted organisation's courses are dropped before any read;
   // an organisation whose read fails is dropped for this run and logged with
-  // its id.
+  // its id. An organisation this call has no room left to read is left for
+  // the next call.
   const countingByOrg = new Map<string, ReadonlySet<string>>();
-  // Organisations skipped because their members could not be read: the run
-  // fails when there is one (a count only, never an id, in the body).
-  let unreadableOrgs = 0;
+  let leftOrgs = 0;
   for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
+    if (!hasRoom(budget, ORG_OPEN_CALLS + MAIL_CALL_COSTS.send + 3)) {
+      leftOrgs++;
+      continue;
+    }
+    spendCalls(budget, 2);
     const counting = await countingMemberIds(svc, oid);
     if (counting === "unreadable") {
       console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "cron/reminders", org_id: oid }));
@@ -125,7 +174,6 @@ export async function POST(request: Request) {
     }
     countingByOrg.set(oid, counting);
   }
-  const ok = unreadableOrgs === 0;
   const enabledCourses = allCourses.filter((c) => countingByOrg.has(c.organization_id));
   if (enabledCourses.length === 0) {
     // A successful run with nothing to do must still heartbeat, or the health
@@ -133,28 +181,35 @@ export async function POST(request: Request) {
     // exactly what happened on pre-launch prod: no reminder-enabled courses).
     // A run left with nothing because no organisation could be read is not
     // successful: it records an errored heartbeat and answers 500.
-    const summary = { ok, scanned: 0, sent: 0, skipped: 0, unreadable_orgs: unreadableOrgs };
-    await recordHeartbeat("reminders", summary, ok);
-    return NextResponse.json(summary, { status: ok ? 200 : 500 });
+    return finish(
+      leftOrgs > 0
+        ? { stoppedBeforeSend: false, leftOrgs, leftComplete: false }
+        : { stoppedBeforeSend: false, due: 0, sent: 0, failed: 0, left: 0, leftComplete: unreadableOrgs === 0, leftDailyLimit: 0, leftOrgs: 0 }
+    );
   }
-
+  scanned = enabledCourses.length;
   const courseIds = enabledCourses.map((c) => c.course_id);
 
   // 2) All assignments + memberships + completed user/course pairs.
   // select("*") for 0069 deploy safety (group_id may not be migrated yet).
-  const { data: assignmentRows } = await svc
+  spendCalls(budget, 1);
+  const { data: assignmentRows, error: assignErr } = await svc
     .from("course_assignments")
     .select("*")
     .in("course_id", courseIds);
+  if (assignErr || !Array.isArray(assignmentRows)) {
+    fail("assignments_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
   // Decision A22 (ADR 0024 step 49's reminders row, P2-6 item 2): a learner's
   // own self-enrolment (source 'self', written when they pressed Start on an
   // "Everyone" course) is no assignment and reminds nobody. The row, not the
   // learner: a team, group or org row still reminds them. select("*") is the
   // missing-column fallback: without 0107 no row has a source and none is
   // skipped, today's run.
-  const assignments = ((assignmentRows ?? []) as Assignment[]).filter((a) => a.source !== "self");
+  const assignments = (assignmentRows as Assignment[]).filter((a) => a.source !== "self");
 
-  // Teams used by assignments
+  // Teams used by assignments, read strictly: a failed read is not "no members".
   const teamIds = Array.from(
     new Set(
       assignments
@@ -162,20 +217,28 @@ export async function POST(request: Request) {
         .map((a) => a.team_id as string)
     )
   );
-  const { data: teamMembers } = teamIds.length
-    ? await svc.from("team_members").select("team_id, user_id").in("team_id", teamIds)
-    : { data: [] };
   const teamUserIds = new Map<string, Set<string>>();
-  for (const m of teamMembers ?? []) {
-    const tid = m.team_id as string;
-    const s = teamUserIds.get(tid) ?? new Set<string>();
-    s.add(m.user_id as string);
-    teamUserIds.set(tid, s);
+  if (teamIds.length > 0) {
+    spendCalls(budget, Math.ceil(teamIds.length / 150));
+    for (let i = 0; i < teamIds.length; i += 150) {
+      const part = teamIds.slice(i, i + 150);
+      const { data: teamMembers, error: teamErr } = await svc.from("team_members").select("team_id, user_id").in("team_id", part);
+      if (teamErr || !Array.isArray(teamMembers)) {
+        fail("members_read");
+        return finish({ stoppedBeforeSend: true, leftOrgs });
+      }
+      for (const m of teamMembers) {
+        const tid = m.team_id as string;
+        const set = teamUserIds.get(tid) ?? new Set<string>();
+        set.add(m.user_id as string);
+        teamUserIds.set(tid, set);
+      }
+    }
   }
 
-  // Custom Groups used by assignments (0069) — membership resolved LIVE via
-  // the shared resolver so semantics match every other audience feature.
-  // Fail-soft: a resolver error skips group nudges rather than failing the run.
+  // Custom Groups used by assignments (0069), membership resolved LIVE. A
+  // database without the groups table (before 0067) has no group rows; any
+  // other failed read stops the run before a send.
   const groupIds = Array.from(
     new Set(
       assignments
@@ -185,32 +248,23 @@ export async function POST(request: Request) {
   );
   const groupUserIds = new Map<string, Set<string>>();
   if (groupIds.length > 0) {
-    try {
-      const { data: groupRows } = await svc
-        .from("org_groups")
-        .select("id, organization_id, group_type, rules, is_active")
-        .in("id", groupIds);
-      const groups = ((groupRows ?? []) as GroupRow[]).filter(
-        (g) => g.is_active !== false
-      );
-      // Shared active-member cache per org for dynamic-rule evaluation.
-      const membersByOrg = new Map<string, Awaited<ReturnType<typeof fetchActiveMembers>>>();
-      for (const g of groups) {
-        if (g.group_type === "dynamic" && !membersByOrg.has(g.organization_id)) {
-          membersByOrg.set(
-            g.organization_id,
-            await fetchActiveMembers(svc, g.organization_id)
-          );
-        }
-        const ids = await resolveGroupMembers(
-          svc,
-          g,
-          membersByOrg.get(g.organization_id)
-        );
-        groupUserIds.set(g.id, new Set(ids));
+    spendCalls(budget, 1);
+    const { data: groupRows, error: groupErr } = await svc
+      .from("org_groups")
+      .select("id, organization_id")
+      .in("id", groupIds);
+    if (groupErr && !isMissingRelation(groupErr, "org_groups")) {
+      fail("members_read");
+      return finish({ stoppedBeforeSend: true, leftOrgs });
+    }
+    for (const g of (groupRows ?? []) as Array<{ id: string; organization_id: string }>) {
+      spendCalls(budget, 2);
+      const ids = await resolveManyGroupsStrict(svc, g.organization_id, [g.id]);
+      if (ids === "unreadable") {
+        fail("members_read");
+        return finish({ stoppedBeforeSend: true, leftOrgs });
       }
-    } catch {
-      // pre-0067 database or transient failure — group assignments skip this run
+      groupUserIds.set(g.id, ids);
     }
   }
 
@@ -220,23 +274,21 @@ export async function POST(request: Request) {
 
   // Completed pairs. `!inner` makes the embedded-column filter actually
   // restrict parent rows to the courses we care about (without it the filter
-  // is a no-op and scans all attempts). Capture the error and ABORT on failure
-  // — proceeding with an empty completed-set would re-nudge learners who have
-  // already finished (the skip-guard below relies on this set being complete).
+  // is a no-op and scans all attempts). A failed read stops the run: an empty
+  // completed-set would re-nudge learners who have already finished.
+  spendCalls(budget, 1);
   const { data: completedAttempts, error: completedErr } = await svc
     .from("course_attempts")
     .select(
       "user_id, course_versions!inner(course_id), completion_status, success_status"
     )
     .in("course_versions.course_id", courseIds);
-  if (completedErr) {
-    return NextResponse.json(
-      { error: `reminders: completed-attempts query failed: ${completedErr.message}` },
-      { status: 500 }
-    );
+  if (completedErr || !Array.isArray(completedAttempts)) {
+    fail("progress_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
   }
   const completedPairs = new Set<string>(); // `user|course`
-  for (const a of completedAttempts ?? []) {
+  for (const a of completedAttempts) {
     const row = a as {
       user_id?: string;
       course_versions?:
@@ -258,13 +310,20 @@ export async function POST(request: Request) {
     }
   }
 
-  // Existing reminder state
-  const { data: stateRows } = await svc
+  // Existing reminder state. A failed read would make every learner look
+  // never reminded, mail them again and write over their state: it stops the
+  // run before any send.
+  spendCalls(budget, 1);
+  const { data: stateRows, error: stateErr } = await svc
     .from("reminder_state")
     .select(
       "user_id, course_id, first_assigned_at, last_nudge_at, nudge_count, stopped"
     )
     .in("course_id", courseIds);
+  if (stateErr || !Array.isArray(stateRows)) {
+    fail("state_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
   const stateByKey = new Map<
     string,
     {
@@ -274,16 +333,17 @@ export async function POST(request: Request) {
       stopped: boolean;
     }
   >();
-  for (const s of stateRows ?? []) {
-    stateByKey.set(`${s.user_id}|${s.course_id}`, {
-      first_assigned_at: s.first_assigned_at as string,
-      last_nudge_at: (s.last_nudge_at as string | null) ?? null,
-      nudge_count: (s.nudge_count as number) ?? 0,
-      stopped: (s.stopped as boolean) ?? false,
+  for (const st of stateRows) {
+    stateByKey.set(`${st.user_id}|${st.course_id}`, {
+      first_assigned_at: st.first_assigned_at as string,
+      last_nudge_at: (st.last_nudge_at as string | null) ?? null,
+      nudge_count: (st.nudge_count as number) ?? 0,
+      stopped: (st.stopped as boolean) ?? false,
     });
   }
 
-  // Resolve user emails (one bulk call), for members that count only.
+  // The addresses, for members that count only, in one strict read: a
+  // failed read is never "no address".
   const allUserIds = new Set<string>();
   for (const a of assignments) {
     const counting = countingByOrg.get(a.organization_id);
@@ -301,9 +361,12 @@ export async function POST(request: Request) {
       for (const uid of orgUserIds.get(a.organization_id) ?? []) add(uid);
     }
   }
-  // Resolve emails via profiles (indexed, no pagination cap) — listUsers paged
-  // only the first 1000 platform users, silently dropping everyone beyond it.
-  const emailById = await resolveEmails(svc, allUserIds);
+  spendCalls(budget, Math.ceil(allUserIds.size / 150));
+  const emailById = await resolveEmailsStrict(svc, allUserIds);
+  if (emailById === "unreadable") {
+    fail("profiles_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
 
   const now = Date.now();
   // LEGITIMATE NEXT_PUBLIC_SITE_URL use: cron triggers have no inbound
@@ -313,9 +376,7 @@ export async function POST(request: Request) {
   const portalBase =
     process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
 
-  let sent = 0;
-  let skipped = 0;
-  const stateUpserts: Array<{
+  type StateUpsert = {
     user_id: string;
     course_id: string;
     organization_id: string;
@@ -323,18 +384,17 @@ export async function POST(request: Request) {
     last_nudge_at: string;
     nudge_count: number;
     stopped: boolean;
-  }> = [];
+  };
+  const stopUpserts: StateUpsert[] = [];
 
-  // Phase 1: apply all skip rules and build the list of eligible send-jobs.
-  // (No sends here.) Phase 2 fans the sends out with bounded concurrency so a
-  // run with thousands of learners doesn't go serially (Worker timeout) nor
-  // all-at-once (SMTP overload).
+  // Phase 1: apply all skip rules and build the list of due reminders.
   type Job = {
     uid: string;
     email: string;
     course: (typeof enabledCourses)[number];
     firstAssignedIso: string;
     nudgeCount: number;
+    lastNudgeMs: number;
     directLink: string;
   };
   const jobs: Job[] = [];
@@ -385,7 +445,7 @@ export async function POST(request: Request) {
       // Past cap → stop
       if (now - firstAssigned >= capMs) {
         if (st && !st.stopped) {
-          stateUpserts.push({
+          stopUpserts.push({
             user_id: uid,
             course_id: course.course_id,
             organization_id: course.organization_id,
@@ -420,6 +480,7 @@ export async function POST(request: Request) {
           ? st.first_assigned_at
           : new Date(firstAssigned).toISOString(),
         nudgeCount: st?.nudge_count ?? 0,
+        lastNudgeMs: lastNudgeTime,
         directLink: portalBase
           ? `${portalBase}/${course.org_slug}/courses/${course.course_id}/launch`
           : `/${course.org_slug}/courses/${course.course_id}/launch`,
@@ -427,61 +488,105 @@ export async function POST(request: Request) {
     }
   }
 
-  // Phase 2: bounded-concurrency send. (sent/skipped++ and .push are synchronous
-  // between awaits, so they're safe under JS's single-threaded model.)
-  await mapWithConcurrency(jobs, 8, async (job) => {
-    const result = await sendNotification({
-      organizationId: job.course.organization_id,
-      event: "asset_reminder",
-      to: { user_id: job.uid, email: job.email },
-      context: {
-        learner_name: job.email,
-        learner_email: job.email,
-        course_name: job.course.title,
-        course_id: job.course.course_id,
-        org_name: job.course.org_name,
-        direct_link: job.directLink,
-      },
-    });
-    if (result.status === "sent") sent++;
-    else skipped++;
-    stateUpserts.push({
-      user_id: job.uid,
-      course_id: job.course.course_id,
-      organization_id: job.course.organization_id,
-      first_assigned_at: job.firstAssignedIso,
-      last_nudge_at: new Date(now).toISOString(),
-      nudge_count: job.nudgeCount + 1,
-      stopped: false,
-    });
-  });
-
-  if (stateUpserts.length > 0) {
-    await svc
-      .from("reminder_state")
-      .upsert(stateUpserts, { onConflict: "user_id,course_id" });
+  // Reminders past their cap are stopped in one write, before any send.
+  if (stopUpserts.length > 0) {
+    spendCalls(budget, 1);
+    const { error } = await svc.from("reminder_state").upsert(stopUpserts, { onConflict: "user_id,course_id" });
+    if (error) fail("state_write");
+    else upserts += stopUpserts.length;
   }
 
-  await recordHeartbeat(
-    "reminders",
-    {
-      ok,
-      scanned: enabledCourses.length,
-      sent,
-      skipped,
-      unreadable_orgs: unreadableOrgs,
-    },
-    ok
-  );
-  return NextResponse.json(
-    {
-      ok,
-      scanned: enabledCourses.length,
-      sent,
-      skipped,
-      upserts: stateUpserts.length,
-      unreadable_orgs: unreadableOrgs,
-    },
-    { status: ok ? 200 : 500 }
-  );
+  // Phase 2: the sends. Longest waiting first, across organisations: never
+  // reminded (0), then the oldest last reminder. One run for each
+  // organisation, taken in the order of its longest-waiting learner, all on
+  // this call's one budget.
+  jobs.sort((a, b) => a.lastNudgeMs - b.lastNudgeMs);
+  const byOrg = new Map<string, Job[]>();
+  for (const job of jobs) {
+    const list = byOrg.get(job.course.organization_id) ?? [];
+    list.push(job);
+    byOrg.set(job.course.organization_id, list);
+  }
+  let sent = 0;
+  let failedSends = 0;
+  let notStarted = 0;
+  let leftDailyLimit = 0;
+  let no0114 = false;
+  const nowIso = new Date(now).toISOString();
+  for (const [orgId, orgJobs] of byOrg) {
+    if (!hasRoom(budget, MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.send + 3) || budget.calls + MAIL_CALL_COSTS.open >= CALL_SUM_LIMIT) {
+      // No room to open this organisation's run: its reminders are left.
+      notStarted += orgJobs.length;
+      leftOrgs++;
+      continue;
+    }
+    const run = await openRun({ organizationId: orgId, budget, db: svc });
+    if (run.no0114) no0114 = true;
+    const results = await sendMany(
+      run,
+      orgJobs,
+      (job) => ({
+        event: "asset_reminder",
+        to: { user_id: job.uid, email: job.email },
+        context: {
+          learner_name: job.email,
+          learner_email: job.email,
+          course_name: job.course.title,
+          course_id: job.course.course_id,
+          org_name: job.course.org_name,
+          direct_link: job.directLink,
+        },
+      }),
+      {
+        hooks: {
+          // The reminders' state is written with each group (rule FP7): a
+          // tried reminder counts whatever its result; one not attempted is
+          // left for a later call.
+          afterCalls: 1,
+          after: async (entries) => {
+            const rows: StateUpsert[] = entries
+              .filter((e) => e.result.status === "sent" || e.result.status === "failed")
+              .map(({ item: job }) => ({
+                user_id: job.uid,
+                course_id: job.course.course_id,
+                organization_id: job.course.organization_id,
+                first_assigned_at: job.firstAssignedIso,
+                last_nudge_at: nowIso,
+                nudge_count: job.nudgeCount + 1,
+                stopped: false,
+              }));
+            if (rows.length === 0) return { calls: 0 };
+            const { error } = await svc.from("reminder_state").upsert(rows, { onConflict: "user_id,course_id" });
+            if (error) fail("state_write");
+            else upserts += rows.length;
+            return { calls: 1 };
+          },
+        },
+      }
+    );
+    for (const word of Object.keys(run.errors) as CronErrorWord[]) {
+      errors[word] = (errors[word] ?? 0) + (run.errors[word] ?? 0);
+    }
+    for (const r of results) {
+      if (r.status === "sent") sent++;
+      else if (r.attempted) failedSends++;
+      else {
+        notStarted++;
+        if (r.errorClass === "daily_limit") leftDailyLimit++;
+      }
+    }
+  }
+  skipped += failedSends + notStarted;
+
+  return finish({
+    stoppedBeforeSend: false,
+    due: jobs.length,
+    sent,
+    failed: failedSends,
+    left: owedAfterRun("reminders", { notStarted, failedClasses: [] }),
+    leftComplete: leftOrgs === 0 && unreadableOrgs === 0,
+    leftDailyLimit,
+    leftOrgs,
+    no0114,
+  });
 }

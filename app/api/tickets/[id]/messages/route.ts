@@ -3,7 +3,6 @@ import { originFromRequest } from "@/lib/http/origin";
 import { isActionError } from "@/lib/actions/types";
 import { loadTicketForCaller } from "@/lib/tickets/auth";
 import { notifyRequesterOfTicket } from "@/lib/tickets/notify";
-import { namesAndEmails } from "@/lib/users/people";
 
 /**
  *   POST /api/tickets/[id]/messages
@@ -38,10 +37,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
   const origin = await originFromRequest();
   if (party === "admin") {
-    const who = (await namesAndEmails(svc, [ticket.user_id])).get(ticket.user_id);
     await notifyRequesterOfTicket(svc, {
       orgId: org.id, orgName: org.name, orgSlug: org.slug, origin,
-      requester: { id: ticket.user_id, email: who?.email ?? null },
+      requester: { id: ticket.user_id },
       subject: ticket.subject, headline: "Reply from your admin", message: text,
     });
   }

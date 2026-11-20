@@ -3,10 +3,11 @@ import { createClient } from "@/lib/supabase/server";
 import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { resolveEmails } from "@/lib/users/emails";
-import { notifyBackground } from "@/lib/notifications/send";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
-import { resolveManyGroups } from "@/lib/org/groups";
+import { assignedRecipientsStrict } from "@/lib/org/groups";
 
 /**
  *   POST   /api/learning-paths/{id}/courses   body: { courseId }
@@ -133,14 +134,18 @@ export async function POST(
   // completion is computed live from course attempts, so previously-
   // completed learners are now "incomplete" against the new structure; we
   // give them a heads-up so they know to come back for the new content.
+  let email: MailOutcome | null = null;
   if (body.notify_update) {
-    await (async () => {
+    email = await (async (): Promise<MailOutcome | null> => {
+      let orgId: string | null = null;
       try {
         const svc = createServiceClient(
           process.env.NEXT_PUBLIC_SUPABASE_URL!,
           process.env.SUPABASE_SERVICE_ROLE_KEY!,
           { auth: { persistSession: false } }
         );
+        const budget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+        spendCalls(budget, 1);
         const { data: pathRow } = await svc
           .from("learning_paths")
           .select(
@@ -157,7 +162,8 @@ export async function POST(
                 | { name?: string; slug?: string }[];
             }
           | null;
-        if (!p?.organization_id) return;
+        if (!p?.organization_id) return null;
+        orgId = p.organization_id;
         const orgInfo = Array.isArray(p.organizations)
           ? p.organizations[0]
           : p.organizations;
@@ -165,103 +171,68 @@ export async function POST(
         // ADR 0030 rule 10: the organisation mails only members that count
         // (active, in an organisation that is not deleted). One read of them
         // for this request: it is the org-wide audience and the filter on
-        // every other one. Unreadable: no mail.
+        // every other one. A failed read of the recipients mails nobody.
+        spendCalls(budget, 2);
         const counting = await countingMemberIds(svc, p.organization_id);
         if (counting === "unreadable") {
-          console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "learning-paths/[id]/courses", org_id: p.organization_id }));
-          return;
+          await recordRecipientsUnreadable("learning-paths/[id]/courses", p.organization_id);
+          return RECIPIENTS_UNREADABLE;
         }
-        const recipientIds = await resolvePathLearners(svc, p.organization_id, pathId, counting);
-        if (recipientIds.size === 0) return;
+        spendCalls(budget, 3);
+        const recipients = await assignedRecipientsStrict(
+          svc,
+          p.organization_id,
+          { table: "learning_path_assignments", column: "path_id", id: pathId },
+          counting
+        );
+        if (recipients === "unreadable") {
+          await recordRecipientsUnreadable("learning-paths/[id]/courses", p.organization_id);
+          return RECIPIENTS_UNREADABLE;
+        }
+        if (recipients.size === 0) return mailCounts([]);
 
-        const emailById = await resolveEmails(svc, recipientIds);
+        spendCalls(budget, Math.ceil(recipients.size / 150));
+        const emailById = await resolveEmailsStrict(svc, recipients);
+        if (emailById === "unreadable") {
+          await recordRecipientsUnreadable("learning-paths/[id]/courses", p.organization_id);
+          return RECIPIENTS_UNREADABLE;
+        }
 
         const portalBase = await originFromRequest();
         const directLink = portalBase && orgInfo?.slug
           ? `${portalBase}/${orgInfo.slug}/dashboard`
           : "";
 
-        for (const uid of recipientIds) {
-          const email = emailById.get(uid);
-          if (!email) continue;
-          await notifyBackground({
-            organizationId: p.organization_id,
-            event: "asset_update",
-            to: { user_id: uid, email },
-            context: {
-              learner_name: email,
-              learner_email: email,
-              path_name: p.name ?? "your learning path",
-              path_id: pathId,
-              // The asset_update template renders {Course_Name}; for a path
-              // update we populate it with the path's name so the email reads
-              // naturally instead of leaking a literal {Course_Name} token.
-              course_name: p.name ?? "your learning path",
-              org_name: orgInfo?.name ?? "your org",
-              direct_link: directLink,
-            },
-          });
-        }
+        const people = [...recipients].flatMap((uid) => {
+          const address = emailById.get(uid);
+          return address ? [{ uid, email: address }] : [];
+        });
+        const run = await openRun({ organizationId: p.organization_id, budget, db: svc });
+        const results = await sendMany(run, people, (person) => ({
+          event: "asset_update",
+          to: { user_id: person.uid, email: person.email },
+          context: {
+            learner_name: person.email,
+            learner_email: person.email,
+            path_name: p.name ?? "your learning path",
+            path_id: pathId,
+            // The asset_update template renders {Course_Name}; for a path
+            // update we populate it with the path's name so the email reads
+            // naturally instead of leaking a literal {Course_Name} token.
+            course_name: p.name ?? "your learning path",
+            org_name: orgInfo?.name ?? "your org",
+            direct_link: directLink,
+          },
+        }));
+        return mailCounts(results, recipients.size - people.length);
       } catch (e) {
-        console.warn("[path/add-course] update-notify failed:", e);
+        console.warn(JSON.stringify({ event: "assignment_mail_failed", site: "learning-paths/[id]/courses", org_id: orgId, error: e instanceof Error ? e.name : "unknown" }));
+        return null;
       }
     })();
   }
 
-  return NextResponse.json({ ok: true, step: nextStep });
-}
-
-/**
- * The path's assigned learners whose membership counts: `counting` (the
- * org's members that count) is the org-wide audience and filters the
- * others (ADR 0030 rule 10).
- */
-/* eslint-disable @typescript-eslint/no-explicit-any */
-async function resolvePathLearners(
-  svc: any,
-  orgId: string,
-  pathId: string,
-  counting: ReadonlySet<string>
-): Promise<Set<string>> {
-  const out = new Set<string>();
-  // select("*") for 0069 deploy safety (group_id).
-  const { data: rows } = await svc
-    .from("learning_path_assignments")
-    .select("*")
-    .eq("path_id", pathId);
-  const teamIds = new Set<string>();
-  const groupIds = new Set<string>();
-  let coversOrg = false;
-  for (const r of (rows ?? []) as Array<{
-    assignee_type: "user" | "team" | "org" | "group";
-    user_id: string | null;
-    team_id: string | null;
-    group_id?: string | null;
-  }>) {
-    if (r.assignee_type === "user" && r.user_id) out.add(r.user_id);
-    else if (r.assignee_type === "team" && r.team_id) teamIds.add(r.team_id);
-    else if (r.assignee_type === "group" && r.group_id) groupIds.add(r.group_id);
-    else if (r.assignee_type === "org") coversOrg = true;
-  }
-  if (teamIds.size > 0) {
-    const { data: tm } = await svc
-      .from("team_members")
-      .select("user_id")
-      .in("team_id", Array.from(teamIds));
-    for (const m of tm ?? []) out.add(m.user_id as string);
-  }
-  if (groupIds.size > 0) {
-    for (const uid of await resolveManyGroups(svc, orgId, Array.from(groupIds))) {
-      out.add(uid);
-    }
-  }
-  if (coversOrg) {
-    for (const uid of counting) out.add(uid);
-  }
-  // A person named directly, in a team or in a static group may hold a row
-  // that does not count: they get no mail.
-  for (const uid of out) if (!counting.has(uid)) out.delete(uid);
-  return out;
+  return NextResponse.json({ ok: true, step: nextStep, email });
 }
 
 export async function DELETE(

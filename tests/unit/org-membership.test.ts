@@ -1199,6 +1199,9 @@ async function main() {
       const GONE_ROWS = [ca("c-gone", GONE, "org"), ca("c-gone", GONE, "user", "u-g")];
 
       let mt: Record<string, Row[]> = {};
+      // ADR 0029 stage 2: what send-smtp and tenant_mail_status answer in this world.
+      let smtpAnswer: () => Response = () => json({ ok: true });
+      let statusAnswer: ((org: unknown) => Response) | null = null;
       let mFail: (table: string, select: string, query: URLSearchParams) => boolean = () => false;
       let warned: string[] = [];
       const mailStub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -1214,13 +1217,20 @@ async function main() {
         if (raw) { try { body = JSON.parse(raw); } catch { body = raw; } }
         if (p.startsWith("/rest/v1/")) requests.push({ method, table, select, query: q, key: h.get("apikey"), body });
         if (p === "/auth/v1/user") return json(ME);
+        // ADR 0029: a loop is one run, and a run attempts a mail only through
+        // an organisation's complete SMTP settings; the send then goes.
+        if (p === "/functions/v1/send-smtp") return smtpAnswer();
         if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
+        if (table === "notification_settings" && method === "GET") {
+          return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, smtp_user: null, smtp_password: null, from_email: "noreply@tenant.stub", from_name: null, reply_to: null, email_paused: false, event_paused: {}, logo_url: null, brand_color: null, footer_text: null }]);
+        }
         if (table === "rpc/journey_reminder_counts") {
           // Nothing credited yet: every enrolment is behind.
           const ids = (body as { p_ids?: string[] } | null)?.p_ids ?? [];
           return json(ids.map((id) => ({ enrollment_id: id, done: 0, done_today: false, credited: [] })));
         }
         // ADR 0029: each send opens its run with tenant_mail_status (migration 0114): one row, no state yet.
+        if (table === "rpc/tenant_mail_status" && statusAnswer) return statusAnswer((body as Row | null)?.p_org ?? null);
         if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? null, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
         if (table.startsWith("rpc/")) return json([]);
         if (method === "GET") {
@@ -1271,10 +1281,13 @@ async function main() {
         mFail = o.fail ?? (() => false);
         requests = [];
         warned = [];
+        smtpAnswer = () => json({ ok: true });
+        statusAnswer = null;
       };
       /** The user ids the sender logged a mail for (for one event, when named), sorted. */
       const mailed = (event?: string) => requests.filter((r) => r.table === "notification_log" && r.method === "POST")
-        .map((r) => r.body as Row).filter((b) => !event || b.event_type === event).map((b) => String(b.to_user_id)).sort();
+        // One insert holds one row, or a group's rows (ADR 0029: one insert for each group of a run).
+        .flatMap((r) => (Array.isArray(r.body) ? (r.body as Row[]) : [r.body as Row])).filter((b) => !event || b.event_type === event).map((b) => String(b.to_user_id)).sort();
       /** The sender's first read: false means it was never entered. */
       const senderEntered = () => requests.some((r) => r.table === "notification_settings");
       /** countingMemberIds' member read. */
@@ -1424,8 +1437,8 @@ async function main() {
         });
         {
           const r = await nudge();
-          // The claim stamps today's date (a send the stub's sender does not
-          // report as sent then releases it, as for every learner here).
+          // The claim stamps today's date (a give-back, after a send that was
+          // not delivered, writes the earlier value).
           const stamped = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on)
             .map((q) => String(q.query.get("id")));
           eq("journey nudges, one live organisation unreadable and one readable: the readable one's learner is reminded and claimed",
@@ -1436,6 +1449,110 @@ async function main() {
             [r.body.unreadable_orgs, r.body.skipped_org_programs], [1, 3]);
           eq("…the unreadable organisation is read once and logged by its id for each program",
             [countingReads(), unreadableLogged().map((l) => [l.org_id, l.program_id])], [2, [[LIVE.id, "p-live"], [LIVE.id, "p-live2"]]]);
+        }
+
+        // ---- ADR 0029 stage 2: the two crons' failed runs, their detail, and the carry ----
+        {
+          /** The heartbeat a run wrote: its status and its detail. */
+          const beat = (name: string) => {
+            const b = requests.filter((r) => r.table === "ops_heartbeats" && r.method === "POST" && (r.body as Row).name === name).map((r) => r.body as Row);
+            return b.length === 1 ? { status: b[0].last_status, detail: (b[0].last_detail ?? {}) as Row } : null;
+          };
+          const flat = (body: Row) => Object.values(body).every((v) => typeof v === "number" || typeof v === "boolean");
+          const textIn = (o: unknown) => JSON.stringify(o).match(/"[^"]*"\s*:\s*"[^"]*"/g) ?? [];
+          // The reminders: each named failed read answers 500 with a failed heartbeat and its word; nobody is mailed.
+          const REMINDER_READS: Array<[string, (t: string, sel: string) => boolean, string]> = [
+            ["the reminder settings", (t) => t === "course_reminder_settings", "config_read"],
+            ["the assignments", (t) => t === "course_assignments", "assignments_read"],
+            ["a team's members", (t) => t === "team_members", "members_read"],
+            ["the completed attempts", (t) => t === "course_attempts", "progress_read"],
+            ["the reminder state", (t) => t === "reminder_state", "state_read"],
+            ["the addresses", (t) => t === "profiles", "profiles_read"],
+          ];
+          for (const [what, fails, word] of REMINDER_READS) {
+            mailWorld({ assignments: [ca("c-live", LIVE, "team", "t-live"), ca("c-live", LIVE, "user", "u-act2")], fail: (t, sel) => fails(t, sel) });
+            const r = await remindRun();
+            const b = beat("reminders");
+            eq(`reminders, ${what} cannot be read: 500, a failed heartbeat with the word ${word}, stopped before any send, nobody mailed, no state written`,
+              [r.status, r.body.ok, b?.status, (b?.detail.errors as Row | undefined)?.[word], b?.detail.stopped_before_send, mailed(), stateFor()], [500, false, "error", 1, true, [], []]);
+            eq("…a number it never counted is left out of the answer, never 0; the answer holds numbers and booleans only",
+              ["due" in r.body, "left" in r.body, flat(r.body)], [false, false, true]);
+          }
+          {
+            // A tenant's failed send is not a failed run: the reminder was tried, and counts.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            smtpAnswer = () => json({ ok: false, error: "550 5.1.1 user unknown" });
+            const r = await remindRun();
+            eq("reminders, a tenant's failed send: a clean run (200, ok), the reminder counted as tried, nothing pending",
+              [r.status, r.body.ok, r.body.failed, r.body.left, beat("reminders")?.status, stateFor()], [200, true, 1, 0, "ok", ["u-act"]]);
+          }
+          {
+            // tenant_mail_status missing (no 0114): a clean run that says so, the reminder sent with no limit.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+            const r = await remindRun();
+            eq("reminders without 0114: 200, ok, no_0114 true, the reminder sent as before", [r.status, r.body.ok, r.body.no_0114, mailed("asset_reminder")], [200, true, true, ["u-act"]]);
+            // Any other failure of it is the job's own failed read; the send is still attempted with no limit.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            statusAnswer = () => json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
+            const r2 = await remindRun();
+            eq("reminders, tenant_mail_status failing otherwise: a failed run (mail_status_read), and the reminder still attempted",
+              [r2.status, r2.body.ok, (beat("reminders")?.detail.errors as Row | undefined)?.mail_status_read, mailed("asset_reminder")], [500, false, 1, ["u-act"]]);
+          }
+          {
+            // The daily limit is a clean run: what it left is counted, and its state is not written.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act"), ca("c-live", LIVE, "user", "u-act2")] });
+            statusAnswer = (org) => json([{ organization_id: org, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: 30, sent_24h: 5 }]);
+            const r = await remindRun();
+            eq("reminders at the daily limit's routine line: a clean run, both left for a later call (left_daily_limit), no state written",
+              [r.status, r.body.ok, r.body.sent, r.body.left, r.body.left_daily_limit, stateFor()], [200, true, 0, 2, 2, []]);
+          }
+          {
+            // The carry: a failed run reads its own row once and carries the last successful run; a clean run reads none.
+            mailWorld({ fail: (t) => t === "course_reminder_settings" });
+            mt.ops_heartbeats = [{ name: "reminders", last_status: "ok", last_run_at: "2026-11-19T21:00:00.000Z", last_detail: { v: 1 } }];
+            await remindRun();
+            const carried = beat("reminders");
+            eq("reminders, a failed run: one read of its own heartbeat row, and last_ok_at carried from the last good run",
+              [requests.filter((r) => r.table === "ops_heartbeats" && r.method === "GET").length, carried?.detail.last_ok_at], [1, "2026-11-19T21:00:00.000Z"]);
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            await remindRun();
+            eq("…a clean run reads no row and stores no last_ok_at", [requests.filter((r) => r.table === "ops_heartbeats" && r.method === "GET").length, "last_ok_at" in (beat("reminders")?.detail ?? {})], [0, false]);
+          }
+          // The journey nudges: no slug, no id and no free text in the answer or the heartbeat.
+          {
+            mailWorld();
+            const r = await nudge();
+            const b = beat("journey-nudges");
+            eq("journey nudges: the answer and the heartbeat hold numbers and booleans only: no organisation's slug or id, no list",
+              [flat(r.body), b ? flat(b.detail) : false, "details" in r.body, textIn(r.body), textIn(b?.detail)], [true, true, false, [], []]);
+          }
+          {
+            mailWorld({ fail: (t) => t === "journey_programs" });
+            const r = await nudge();
+            const b = beat("journey-nudges");
+            eq("journey nudges, the programs cannot be read: 500, config_read, stopped before any send, and no database message anywhere",
+              [r.status, (b?.detail.errors as Row | undefined)?.config_read, b?.detail.stopped_before_send, flat(r.body), JSON.stringify(r.body).includes("stub read failure")], [500, 1, true, true, false]);
+          }
+          {
+            mailWorld({ fail: (t) => t === "profiles" });
+            const r = await nudge();
+            eq("journey nudges, the profiles cannot be read: never \"no address\": 500 (profiles_read), nobody mailed, no claim taken, the learners owed",
+              [r.status, (beat("journey-nudges")?.detail.errors as Row | undefined)?.profiles_read, mailed(), claims(), Number(r.body.left) > 0], [500, 1, [], [], true]);
+          }
+          {
+            // A timeout keeps the claim (the mail may still arrive); another failure gives it back (rule T2).
+            mailWorld({ programs: [journeyProgram("p-live", LIVE)], enrolments: [] });
+            smtpAnswer = () => json({ ok: false, error: "Timed out after 15000ms waiting for the send-smtp function." });
+            const r = await nudge();
+            const giveBacks = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on === null);
+            eq("journey nudges, a timed-out nudge keeps its claim and is not owed", [r.status, r.body.ok, giveBacks.length, r.body.left], [200, true, 0, 0]);
+            mailWorld({ programs: [journeyProgram("p-live", LIVE)], enrolments: [] });
+            smtpAnswer = () => json({ ok: false, error: "550 5.1.1 user unknown" });
+            const r2 = await nudge();
+            const back = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on === null);
+            eq("…a nudge that failed otherwise gives its claim back and is owed", [r2.status, back.length > 0, Number(r2.body.left) > 0], [200, true, true]);
+          }
         }
 
         // ---- the broadcast route (the session is an active administrator of LIVE) ----
@@ -1526,7 +1643,7 @@ async function main() {
         });
         const reply = (org: typeof LIVE, who: string) => notifyRequesterOfTicket(svc(), {
           orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: "",
-          requester: { id: who, email: `${who}@example.test` }, subject: "Help", headline: "Reply from your admin", message: "Done",
+          requester: { id: who }, subject: "Help", headline: "Reply from your admin", message: "Done",
         });
         for (const [kind, send] of [["attempt decision", decide], ["ticket reply", reply]] as const) {
           for (const [who, org, want] of [["u-act", LIVE, true], ["u-ina", LIVE, false], ["u-sus", LIVE, false], ["u-out", LIVE, false], ["u-g", GONE, false]] as const) {

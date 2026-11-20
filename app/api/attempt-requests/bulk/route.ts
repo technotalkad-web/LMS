@@ -15,7 +15,8 @@ import {
 } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { bulkEligibility } from "@/lib/attempts/request-decision";
-import { resolveEmails } from "@/lib/users/emails";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
 import {
   ADMIN_ROLES,
   expiryFromDays,
@@ -223,17 +224,21 @@ export async function POST(request: Request) {
   if (insErr) return NextResponse.json({ error: insErr.message }, { status: 400 });
   const grantedIds = ((insertedRows ?? []) as Array<{ user_id: string }>).map((r) => r.user_id);
 
-  // Notify each granted learner (background). ADR 0030 rule 10: only those
-  // whose membership counts, read once for all of them; unreadable, no mail.
-  // The grants stand either way.
-  const [emailMap, origin, counting] = await Promise.all([
-    resolveEmails(s, grantedIds),
-    originFromRequest(),
-    countingMemberIds(s, org.id as string),
-  ]);
-  if (counting === "unreadable") {
-    console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-requests/bulk", org_id: org.id }));
-  } else {
+  // Notify each granted learner. ADR 0030 rule 10: only those whose
+  // membership counts, read once for all of them. A failed read of them or
+  // of their addresses mails nobody and records the skip (ADR 0029); the
+  // grants stand either way. The mails share one run (rule T4).
+  const [emailMap, origin, counting] = grantedIds.length > 0
+    ? await Promise.all([
+        resolveEmailsStrict(s, grantedIds),
+        originFromRequest(),
+        countingMemberIds(s, org.id as string),
+      ])
+    : [new Map<string, string>(), "", new Set<string>()] as const;
+  if (counting === "unreadable" || emailMap === "unreadable") {
+    await recordRecipientsUnreadable("attempt-requests/bulk", org.id as string);
+  } else if (grantedIds.some((uid) => counting.has(uid))) {
+    const run = await openRun({ organizationId: org.id as string, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS }), db: s });
     for (const uid of grantedIds) {
       await notifyLearnerOfDecision(s, {
         orgId: org.id as string,
@@ -247,6 +252,7 @@ export async function POST(request: Request) {
         note: null,
         expiresAt,
         counting,
+        run,
       });
     }
   }

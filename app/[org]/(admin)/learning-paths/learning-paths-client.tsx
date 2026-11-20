@@ -266,6 +266,10 @@ export function LearningPathsClient({
       toast.error(j.error ?? "Failed");
       return;
     }
+    // ADR 0029 rule T4: the update mail, when it was asked for.
+    const added = (await res.json().catch(() => ({}))) as { email?: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null };
+    const said = mailWords(added.email);
+    if (said) toast.info(`Course added. ${said}`);
     setPickedCourse((s) => ({ ...s, [pathId]: "" }));
     router.refresh();
   }
@@ -364,12 +368,15 @@ export function LearningPathsClient({
         dueAt,
       }),
     });
-    const j = (await res.json().catch(() => ({}))) as { error?: string; warnings?: string[] };
+    const j = (await res.json().catch(() => ({}))) as { error?: string; warnings?: string[]; email?: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null };
     if (!res.ok) {
       toast.error(j.error ?? "Failed");
       return;
     }
     for (const w of j.warnings ?? []) toast.info(`Assigned. ${w}`);
+    // ADR 0029 rule T4: how many learners were emailed, and how many not.
+    const said = mailWords(j.email);
+    if (said) toast.info(`Assigned. ${said}`);
     if (opts.scope) { setPickedVertical((s) => ({ ...s, [pathId]: "" })); setPickedDepartment((s) => ({ ...s, [pathId]: "" })); }
     if (opts.user) setPickedUser((s) => ({ ...s, [pathId]: "" }));
     if (opts.team) setPickedTeam((s) => ({ ...s, [pathId]: "" }));
@@ -394,6 +401,9 @@ export function LearningPathsClient({
       toast.error(j.error ?? "Failed");
       return;
     }
+    const done = (await res.json().catch(() => ({}))) as { email?: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null };
+    const said = mailWords(done.email);
+    if (said) toast.info(`Removed. ${said}`);
     router.refresh();
   }
 
@@ -1421,4 +1431,19 @@ function SequenceOption({
       </div>
     </button>
   );
+}
+
+/**
+ * What an action's answer says of its mail (ADR 0029 rule T4): emailed and
+ * not emailed, a timeout as "not confirmed" (rule T2), or nobody emailed
+ * because the recipients could not be read. Null when there was no mail.
+ */
+function mailWords(o: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null | undefined): string | null {
+  if (!o) return null;
+  if (o.recipients_unreadable) return "Nobody was emailed: the recipients could not be read. The change is saved; tell them another way or try again later.";
+  if (o.emailed + o.not_emailed + o.not_confirmed === 0) return null;
+  const parts = [`Emailed ${o.emailed}.`];
+  if (o.not_emailed > 0) parts.push(`Not emailed ${o.not_emailed}.`);
+  if (o.not_confirmed > 0) parts.push(`Not confirmed ${o.not_confirmed}: the mail may still arrive.`);
+  return parts.join(" ");
 }

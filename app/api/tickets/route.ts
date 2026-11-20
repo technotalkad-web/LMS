@@ -85,7 +85,9 @@ export async function POST(request: Request) {
     if (code === "42703" || code === "PGRST204") return NextResponse.json({ error: "Support requests from the Report Card are not enabled yet (migration 0095)" }, { status: 409 });
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
-  const me = (await namesAndEmails(svc, [user.id])).get(user.id);
+  // The ticket is saved: a failed read of the requester's own name is not a
+  // reason to answer an error. The mail then names them by their address.
+  const me = await namesAndEmails(svc, [user.id]).then((m) => m.get(user.id)).catch(() => undefined);
   await notifyAdminsOfTicket(svc, {
     orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: await originFromRequest(),
     subject, requester: { name: me?.name ?? "A manager", email: me?.email ?? user.email ?? null },

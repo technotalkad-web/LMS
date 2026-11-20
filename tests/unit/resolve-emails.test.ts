@@ -8,7 +8,8 @@
  *
  * Run:  npx tsx tests/unit/resolve-emails.test.ts   (or npm run test:unit)
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { resolveEmails, resolveEmailsStrict } from "../../lib/users/emails";
 
@@ -129,6 +130,47 @@ async function main() {
     "app/(super-owner)/super/organizations/[id]/page.tsx",
   ]) {
     eq(`${f} reads no capped list`, capped.test(readFileSync(f, "utf8")), false);
+  }
+
+  // ADR 0029 (part 3 of the note of 2026-11-20): every file under app/ and
+  // lib/ that sends mail takes the strict reader, so a failed read of
+  // addresses is never "no address". Pages that only show addresses keep the
+  // loose one. A file that still holds the loose one beside a send is named
+  // in LOOSE_STILL_TO_COME with the stage that changes it; the case fails as
+  // soon as it no longer does, so the list never goes stale.
+  {
+    const ROOT = path.resolve(__dirname, "..", "..");
+    const SENDS = /\b(sendNotification|notifyBackground|sendMany|sendPlatformEmail|sendAuthEmail|sendSettingsTest|notifyLearnerOfDecision|notifyAdminsOfRequest|notifyAdminsOfTicket|notifyRequesterOfTicket|notifyCourseUpdate)\s*\(/;
+    const LOOSE = /\bresolveEmails\s*\(|emails:\s*resolveEmails\b(?!Strict)/;
+    const LOOSE_STILL_TO_COME: Record<string, string> = {
+      "app/api/super/tenants/[id]/admins/route.ts": "stage 3: the console's welcome moves to the platform sender",
+    };
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const d of readdirSync(dir, { withFileTypes: true })) {
+        const q = path.join(dir, d.name);
+        if (d.isDirectory()) walk(q);
+        else if (/\.(ts|tsx)$/.test(d.name)) files.push(q);
+      }
+    };
+    walk(path.join(ROOT, "app"));
+    walk(path.join(ROOT, "lib"));
+    const offenders: string[] = [];
+    let senders = 0;
+    for (const abs of files) {
+      const rel = path.relative(ROOT, abs).replace(/\\/g, "/");
+      const src = readFileSync(abs, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+      if (rel === "lib/users/emails.ts" || !SENDS.test(src)) continue;
+      senders++;
+      if (LOOSE.test(src) && !(rel in LOOSE_STILL_TO_COME)) offenders.push(rel);
+    }
+    eq(`non-vacuous: the scan reads the files that send (${senders})`, senders >= 20, true);
+    eq("no file that sends mail reads addresses with the loose resolveEmails", offenders, []);
+    for (const [rel, stage] of Object.entries(LOOSE_STILL_TO_COME)) {
+      eq(`still to come, ${stage}: ${rel} still holds the loose reader (remove it from the list when it does not)`, LOOSE.test(readFileSync(path.join(ROOT, rel), "utf8")), true);
+    }
+    eq("a planted file that sends and reads loosely is caught", LOOSE.test("const m = await resolveEmails(svc, ids); await sendMany(run, m, f);") && SENDS.test("await sendMany(run, m, f);"), true);
+    eq("…the strict reader is not mistaken for the loose one", LOOSE.test("const m = await resolveEmailsStrict(svc, ids); notify: { emails: resolveEmailsStrict }"), false);
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

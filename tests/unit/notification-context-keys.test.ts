@@ -70,10 +70,15 @@ const CLASSIFIED: Record<string, "stored" | "dropped"> = {
   reminder_line: "dropped",
 };
 const CREDENTIAL_KEYS = ["password", "otp_code", "direct_link", "portal_url"];
-/** notifyBackground / sendNotification calls with an object literal, under app/ and lib/. */
-const EXPECTED_CALL_SITES = 26;
-/** sendMany calls (the run's loop helper), under app/ and lib/: none before stage 2 turns the loops into runs. */
-const EXPECTED_RUN_HELPER_SITES = 0;
+/**
+ * notifyBackground / sendNotification calls with an object literal, under
+ * app/ and lib/: the single sends left once ADR 0029's stage 2 made the
+ * loops runs (the welcomes, the public code and link, the commit route's
+ * two, a ticket requester's and a decision's mail, the console's welcome).
+ */
+const EXPECTED_CALL_SITES = 11;
+/** sendMany calls (the run's loop helper), under app/ and lib/: every loop of tenant mail since stage 2. */
+const EXPECTED_RUN_HELPER_SITES = 15;
 
 /* ---------------- a small scanner: skips strings, templates and comments ---------------- */
 
@@ -207,10 +212,13 @@ function scanRunHelper(src: string, file: string): { sites: Site[]; errors: stri
     if (/function\s+$/.test(before) || isInsideNonCode(src, m.index)) continue;
     const line = lineOf(src, m.index);
     try {
-      const close = matchClose(src, paren);
-      const arrow = src.lastIndexOf("=>", close);
-      if (arrow < paren) throw new Error(`${file}:${line} sendMany's mail is not an arrow function`);
-      const body = src.slice(arrow + 2, close).trimStart();
+      // The builder is the call's third argument; a fourth (the run's group
+      // hooks) may hold arrows of its own.
+      const builder = entries(src, paren)[2];
+      const arrowAt = builder ? builder.text.indexOf("=>") : -1;
+      if (!builder || arrowAt < 0) throw new Error(`${file}:${line} sendMany's mail is not an arrow function`);
+      const arrow = builder.start + arrowAt;
+      const body = builder.text.slice(arrowAt + 2).trimStart();
       if (!body.startsWith("(")) throw new Error(`${file}:${line} sendMany's builder does not return an object literal`);
       const open = src.indexOf("{", arrow);
       sites.push({ file, line, keys: contextKeysAt(src, open, file, line) });

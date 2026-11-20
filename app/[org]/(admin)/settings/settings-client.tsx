@@ -73,6 +73,55 @@ export type WorkspaceBranding = {
   learner_theme_custom: Record<string, string> | null;
 };
 
+/** The organisation's SMTP reading for the SMTP tab (ADR 0029 section C). */
+export type MailState =
+  | {
+      known: true;
+      reading: "not_configured" | "configured" | "healthy" | "failing";
+      since: string | null;
+      lastErrorClass: string | null;
+      lastSuccessAt: string | null;
+      sent24h: number;
+      limit: number;
+      routineStop: number;
+    }
+  | { known: false; reading: "not_configured" | "configured" | "healthy" | "failing" };
+
+/** What a Settings test answered (lib/notifications/send.ts, SettingsTestOutcome). */
+type TestOutcome = {
+  status: "sent" | "not_confirmed" | "not_sent";
+  errorClass: string | null;
+  attempted: boolean;
+  reading: MailState["reading"];
+};
+
+const CLASS_WORDS: Record<string, string> = {
+  auth: "the mail server refused the sign-in (user name or app password)",
+  quota: "the mailbox's own sending limit was reached",
+  timeout: "the mail server did not answer in time",
+  unreachable: "the mail server could not be reached as configured",
+  rejected: "the receiving mailbox refused this message",
+  unknown: "the mail server answered with an error",
+  not_configured: "the SMTP settings are not complete (host, port and From address)",
+  daily_limit: "your organisation reached its daily email limit",
+  settings_unreadable: "the settings could not be read; try again",
+  no_address: "your account has no email address to send the test to",
+};
+
+const READING_WORDS: Record<MailState["reading"], string> = {
+  not_configured: "Not configured: no email is sent to your learners until host, port and From address are saved.",
+  configured: "Configured: no email has been sent yet. Send a test to check it.",
+  healthy: "Working: the latest email was delivered.",
+  failing: "Failing: email to your learners is not sent until a test or another email is delivered.",
+};
+
+function testWords(t: TestOutcome): { tone: "ok" | "warn" | "bad"; text: string } {
+  if (t.status === "sent") return { tone: "ok", text: "Test sent to your own address. Check your inbox." };
+  if (t.status === "not_confirmed") return { tone: "warn", text: "Not confirmed: the mail may still arrive." };
+  const why = (t.errorClass && CLASS_WORDS[t.errorClass]) || "it could not be sent";
+  return { tone: "bad", text: t.attempted ? `Test not sent: ${why}.` : `Test not attempted: ${why}.` };
+}
+
 export type SsoConfig = {
   enabled: boolean;
   enforced: boolean;
@@ -102,6 +151,7 @@ export type LrsConfigView = {
 export function SettingsClient({
   orgSlug,
   settings,
+  mailState,
   templates,
   orgName,
   workspace,
@@ -111,6 +161,7 @@ export function SettingsClient({
 }: {
   orgSlug: string;
   settings: Settings;
+  mailState: MailState;
   templates: Tpl[];
   orgName: string;
   workspace: WorkspaceBranding;
@@ -153,7 +204,7 @@ export function SettingsClient({
         </div>
       )}
       {tab === "smtp" && (
-        <SmtpForm orgSlug={orgSlug} initial={settings} onSaved={() => router.refresh()} />
+        <SmtpForm orgSlug={orgSlug} initial={settings} mailState={mailState} onSaved={() => router.refresh()} />
       )}
       {tab === "branding" && (
         <BrandingPauseForm
@@ -180,16 +231,39 @@ export function SettingsClient({
 function SmtpForm({
   orgSlug,
   initial,
+  mailState,
   onSaved,
 }: {
   orgSlug: string;
   initial: Settings;
+  mailState: MailState;
   onSaved: () => void;
 }) {
   const [form, setForm] = useState({ ...initial, smtp_password: "" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [test, setTest] = useState<TestOutcome | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  async function sendTest() {
+    setTesting(true);
+    setError(null);
+    setTest(null);
+    const res = await fetch("/api/notifications/settings/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug }),
+    });
+    setTesting(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string; test?: TestOutcome };
+    if (!res.ok || !j.test) {
+      setError(j.error ?? "The test could not be run");
+      return;
+    }
+    setTest(j.test);
+    onSaved();
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -213,12 +287,14 @@ function SmtpForm({
       body: JSON.stringify(payload),
     });
     setBusy(false);
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    const j = (await res.json().catch(() => ({}))) as { error?: string; test?: TestOutcome | null };
     if (!res.ok) {
       setError(j.error ?? "Save failed");
       return;
     }
     setSaved(true);
+    // A save that changed an SMTP field ran the test: show its result.
+    setTest(j.test ?? null);
     setForm((f) => ({ ...f, smtp_password: "" }));
     onSaved();
   }
@@ -231,7 +307,38 @@ function SmtpForm({
       <h2 className="serif text-2xl">SMTP server</h2>
       <p className="text-xs text-muted -mt-2">
         587 STARTTLS, 465 SSL, 25 unencrypted. Auth via app password recommended.
+        Every email to your learners goes through this server only; nothing is sent another way.
       </p>
+
+      <div
+        className={`rounded-lg border p-3 text-sm ${
+          mailState.reading === "healthy"
+            ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+            : mailState.reading === "configured"
+              ? "border-line bg-canvas text-ink"
+              : "border-amber-200 bg-amber-50 text-amber-900"
+        }`}
+      >
+        <div>{READING_WORDS[mailState.reading]}</div>
+        {mailState.known ? (
+          <div className="mt-1 text-xs opacity-80 space-y-0.5">
+            {mailState.since && <div>Since {new Date(mailState.since).toLocaleString()}.</div>}
+            {mailState.reading === "failing" && mailState.lastErrorClass && (
+              <div>Last error: {CLASS_WORDS[mailState.lastErrorClass] ?? mailState.lastErrorClass}.</div>
+            )}
+            <div>
+              Sent in the last 24 hours: {mailState.sent24h} of the limit of {mailState.limit}.
+              {mailState.sent24h >= mailState.limit
+                ? " All email has stopped until earlier email is more than 24 hours old."
+                : mailState.sent24h >= mailState.routineStop
+                  ? " Reminders, announcements and assignment email have stopped; reset codes and welcome email go on until the limit."
+                  : ""}
+            </div>
+          </div>
+        ) : (
+          <div className="mt-1 text-xs opacity-80">{"The server's last result and today's count are not known yet."}</div>
+        )}
+      </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Host">
@@ -326,11 +433,29 @@ function SmtpForm({
           Saved.
         </div>
       )}
+      {test && (() => {
+        const w = testWords(test);
+        const tone =
+          w.tone === "ok"
+            ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+            : w.tone === "warn"
+              ? "border-amber-200 bg-amber-50 text-amber-900"
+              : "border-red-200 bg-red-50 text-red-900";
+        return <div className={`border rounded-lg p-3 text-sm ${tone}`}>{w.text}</div>;
+      })()}
 
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={sendTest}
+          disabled={busy || testing}
+          className="px-5 py-2 border border-line rounded-lg font-medium hover:bg-canvas disabled:opacity-50"
+        >
+          {testing ? "Sending test…" : "Send test"}
+        </button>
         <button
           type="submit"
-          disabled={busy}
+          disabled={busy || testing}
           className="px-5 py-2 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50"
         >
           {busy ? "Saving…" : "Save SMTP"}

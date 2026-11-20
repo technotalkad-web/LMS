@@ -189,6 +189,17 @@ export const SMTP_ERROR_CLASS_TABLE: ReadonlyArray<{ cls: SmtpErrorClass; patter
   },
 ];
 
+/**
+ * The hosting platform's own limit on outbound calls in one request (rule
+ * FP8 of ADR 0029). On Workers a fetch past the limit throws "Too many
+ * subrequests.", which dispatchSmtp and the database client hand back as an
+ * error message. It is the job's own failed step (the word call_limit),
+ * never a tenant's failed send: the mail never left this request.
+ */
+export function isCallLimitMessage(message: string | null | undefined): boolean {
+  return /too many subrequests/i.test(String(message ?? ""));
+}
+
 /** The class of a send-smtp error message; text that matches nothing is "unknown". */
 export function classifySmtpError(message: string | null | undefined): SmtpErrorClass {
   const text = String(message ?? "");

@@ -55,7 +55,7 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { isMissingRelation, isSchemaMissing } from "@/lib/scoring/attempt-kind";
 import { WORKERS_SUBREQUEST_BUDGET } from "@/lib/integrations/webhook-hold";
-import type { SmtpErrorClass } from "@/lib/email/smtp-function";
+import { isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
 import { sendPlatformEmail } from "@/lib/email/platform-sender";
 import type { AlertErrorClass, AlertReading } from "@/lib/email/platform-templates";
 import { countingMemberIds } from "@/lib/auth/org-membership";
@@ -138,6 +138,14 @@ function budget(kind: MailBudget["kind"], windowMs: number, callLimit: number, o
   const now = opts.now ?? Date.now;
   return { kind, startedAt: now(), windowMs, callLimit, calls: Math.max(0, opts.spent ?? 0), now };
 }
+
+/**
+ * An administrator's request's own outbound calls before its mail part
+ * starts (the session, the caller's membership, the route's reads and its
+ * writes): an estimate until gate G3 measures each route (rule FP2). The
+ * mail part adds the reads it makes itself with spendCalls.
+ */
+export const ADMIN_REQUEST_OWN_CALLS = 10;
 
 /** The budgets of a request an administrator makes. `spent`: the route's own calls before its mail. */
 export function requestBudget(opts: { spent?: number; now?: () => number } = {}): MailBudget {
@@ -397,7 +405,13 @@ export function dailyLimitCause(input: { event: NotificationEvent; sentAtOpen: n
 
 /* ------------------------------------------------------------------ the run */
 
-export type NotAttemptedClass = "paused" | "not_configured" | "not_ready" | "daily_limit" | "settings_unreadable" | "left";
+/**
+ * Why a mail of a run was not attempted. "left": the budgets had no room, or
+ * the platform's call limit stopped the run. "withdrawn": the caller's own
+ * step before the group dropped it (a claim another call holds, or a claim
+ * that could not be taken). Neither writes a row.
+ */
+export type NotAttemptedClass = "paused" | "not_configured" | "not_ready" | "daily_limit" | "settings_unreadable" | "left" | "withdrawn";
 
 export type RunItemResult =
   | { status: "sent" }
@@ -424,6 +438,10 @@ export type MailRun = {
   readonly settings: NotificationSettings | null | "unreadable";
   readonly orgName: string;
   readonly deleted: boolean;
+  /** The organisation's own row could not be read: nothing is attempted (its deletion is not known). */
+  readonly orgUnreadable: boolean;
+  /** The platform's limit on outbound calls was met in this run: nothing more is attempted or written. */
+  callLimited: boolean;
   /** tenant_mail_status: "ok", "missing" (no 0114) or "unreadable". */
   readonly status: StatusRead["kind"];
   /** No 0114 on this database: the run took the fallback. */
@@ -468,11 +486,34 @@ function countError(errors: CronErrorCounts, word: CronErrorWord): void {
   errors[word] = (errors[word] ?? 0) + 1;
 }
 
+/** The fixed log line of a request that met the platform's call limit (rule FP8): one search finds every case. */
+export const CALL_LIMIT_LOG_EVENT = "platform_call_limit";
+
+/**
+ * The run met the platform's limit on outbound calls (rule FP8): the job's
+ * own failed step, counted once as call_limit with one fixed log line. From
+ * then on the run attempts and writes nothing, since every call would fail.
+ */
+export function noteCallLimit(run: MailRun, where: string): void {
+  if (run.callLimited) return;
+  run.callLimited = true;
+  run.stopped = true;
+  countError(run.errors, "call_limit");
+  console.error(JSON.stringify({ event: CALL_LIMIT_LOG_EVENT, where }));
+}
+
+function errorText(e: unknown): string {
+  if (e && typeof e === "object" && "message" in e) return String((e as { message?: unknown }).message ?? "");
+  return String(e ?? "");
+}
+
 /**
  * Open a run for one organisation: three reads together (the settings, the
  * organisation, tenant_mail_status), charged to the budget. Never throws.
- * A failed organisation read leaves the organisation live: only a deleted_at
- * that was read means deleted.
+ * A failed organisation read is not read as live: whether the organisation
+ * is deleted is not known, and a deleted organisation's SMTP is never used
+ * (section C), so the run attempts nothing, as for settings that could not
+ * be read.
  */
 export async function openRun(opts: {
   organizationId: string;
@@ -525,6 +566,8 @@ export async function openRun(opts: {
     settings,
     orgName: (typeof orgRow?.name === "string" && orgRow.name) || "your org",
     deleted,
+    orgUnreadable: org === "unreadable",
+    callLimited: false,
     status: status.kind,
     no0114: status.kind === "missing",
     stored,
@@ -548,7 +591,7 @@ export async function openRun(opts: {
       attempted: 0,
       sent: 0,
       failed: 0,
-      notAttempted: { paused: 0, not_configured: 0, not_ready: 0, daily_limit: 0, settings_unreadable: 0, left: 0 },
+      notAttempted: { paused: 0, not_configured: 0, not_ready: 0, daily_limit: 0, settings_unreadable: 0, left: 0, withdrawn: 0 },
       stateWrites: 0,
       alertMarked: false,
       routineStopped: false,
@@ -567,6 +610,7 @@ export function runReading(run: MailRun): TenantReading {
  * status unreadable, it is ready when the settings are complete.
  */
 export function runReady(run: MailRun): boolean {
+  if (run.orgUnreadable || run.settings === "unreadable") return false;
   const reading = runReading(run);
   if (reading === "not_configured" || reading === "failing") return false;
   return !run.limit || run.sent24h + run.sentInRun < run.limit.limit;
@@ -576,7 +620,8 @@ const NOT_CONFIGURED_TEXT = "The organisation's SMTP is not configured (Settings
 
 /**
  * Whether one mail of this event is attempted now, and if not, why. In this
- * order: the settings could not be read; the organisation is deleted; the
+ * order: the settings or the organisation could not be read; the
+ * platform's call limit was met in this run; the organisation is deleted; the
  * pause (never for password_reset and magic_link, nor, as before, for
  * custom_broadcast); the settings are incomplete; the run has stopped; the
  * daily limit, counting the sends already started (`inFlight`).
@@ -589,6 +634,10 @@ export function gateSend(
   if (run.settings === "unreadable") {
     return { attempt: false, cls: "settings_unreadable", error: "The organisation's email settings could not be read. Nothing was sent." };
   }
+  if (run.orgUnreadable) {
+    return { attempt: false, cls: "settings_unreadable", error: "The organisation could not be read. Nothing was sent." };
+  }
+  if (run.callLimited) return { attempt: false, cls: "left", error: "Left: the request met the platform's limit on outbound calls." };
   if (run.deleted) return { attempt: false, cls: "not_configured", error: "The organisation is deleted; its SMTP is not used. Nothing was sent." };
   const cfg = run.settings;
   const pauseApplies = !PAUSE_EXEMPT_EVENTS.includes(event) && event !== "custom_broadcast";
@@ -606,7 +655,7 @@ export function gateSend(
 
 /** Write the run's state row (an upsert of the state columns only). A missing table stops further writes in this run. */
 async function writeState(run: MailRun, next: SmtpStateSnapshot): Promise<void> {
-  if (!run.stateWritable) return;
+  if (!run.stateWritable || run.callLimited) return;
   spendCalls(run.budget, MAIL_CALL_COSTS.stateWrite);
   run.report.stateWrites++;
   try {
@@ -624,13 +673,15 @@ async function writeState(run: MailRun, next: SmtpStateSnapshot): Promise<void> 
       { onConflict: "organization_id" }
     );
     if (error) {
+      if (isCallLimitMessage(errorText(error))) return noteCallLimit(run, "state_write");
       if (isMissingRelation(error, "tenant_smtp_state")) run.stateWritable = false;
       else countError(run.errors, "state_write");
       console.warn(JSON.stringify({ event: "tenant_smtp_state_write_failed", org_id: run.organizationId, code: String(error.code ?? "unknown") }));
       return;
     }
     run.rowExists = true;
-  } catch {
+  } catch (e) {
+    if (isCallLimitMessage(errorText(e))) return noteCallLimit(run, "state_write");
     countError(run.errors, "state_write");
     console.warn(JSON.stringify({ event: "tenant_smtp_state_write_failed", org_id: run.organizationId, code: "thrown" }));
   }
@@ -646,12 +697,13 @@ async function writeState(run: MailRun, next: SmtpStateSnapshot): Promise<void> 
  * when its state read failed.
  */
 async function markAlertDue(run: MailRun, cause: AlertCause): Promise<void> {
-  if (run.alertMarked || run.deleted || !run.stateWritable) return;
+  if (run.alertMarked || run.deleted || !run.stateWritable || run.callLimited) return;
   const nowMs = run.now();
   if (!alertMayBeMarked({ cause, lastAlertAt: run.lastAlertAt, alertDueAt: run.alertDueAt, nowMs })) return;
   const nowIso = new Date(nowMs).toISOString();
   const boundIso = new Date(nowMs - (cause === "not_sent" ? ALERT_BOUND_NOT_SENT_MS : ALERT_BOUND_FLIP_MS)).toISOString();
-  const fail = (code: string, missing: boolean) => {
+  const fail = (code: string, missing: boolean, error?: unknown) => {
+    if (error !== undefined && isCallLimitMessage(errorText(error))) return noteCallLimit(run, "alert_mark");
     if (missing) run.stateWritable = false;
     else countError(run.errors, "alert");
     console.warn(JSON.stringify({ event: "tenant_smtp_alert_mark_failed", org_id: run.organizationId, code }));
@@ -663,7 +715,7 @@ async function markAlertDue(run: MailRun, cause: AlertCause): Promise<void> {
         .from("tenant_smtp_state")
         .upsert({ organization_id: run.organizationId, alert_due_at: nowIso, updated_at: nowIso }, { onConflict: "organization_id", ignoreDuplicates: true })
         .select("organization_id");
-      if (ins.error) return fail(String(ins.error.code ?? "unknown"), isMissingRelation(ins.error, "tenant_smtp_state"));
+      if (ins.error) return fail(String(ins.error.code ?? "unknown"), isMissingRelation(ins.error, "tenant_smtp_state"), ins.error);
       run.rowExists = true;
       if (Array.isArray(ins.data) && ins.data.length > 0) {
         run.alertMarked = true;
@@ -680,14 +732,14 @@ async function markAlertDue(run: MailRun, cause: AlertCause): Promise<void> {
       .is("alert_due_at", null)
       .or(`last_alert_at.is.null,last_alert_at.lt."${boundIso}"`)
       .select("organization_id");
-    if (upd.error) return fail(String(upd.error.code ?? "unknown"), isMissingRelation(upd.error, "tenant_smtp_state"));
+    if (upd.error) return fail(String(upd.error.code ?? "unknown"), isMissingRelation(upd.error, "tenant_smtp_state"), upd.error);
     if (Array.isArray(upd.data) && upd.data.length > 0) {
       run.alertMarked = true;
       run.alertDueAt = nowIso;
       run.report.alertMarked = true;
     }
-  } catch {
-    fail("thrown", false);
+  } catch (e) {
+    fail("thrown", false, e);
   }
 }
 
@@ -719,16 +771,41 @@ async function settleGroup(run: MailRun, outcomes: Array<{ recipientId: string |
   else if (causes.has("not_sent")) await markAlertDue(run, "not_sent");
 }
 
+/**
+ * A caller's own work for one group of a run, around its sends (rule T4 and
+ * the free-plan note): a nudge's claim taken for the group just before its
+ * sends, and the reminders' state written with the group. Each declares the
+ * most calls it makes, which the run keeps room for when it sizes a group,
+ * and answers the calls it made, which the run spends.
+ */
+export type GroupHooks<T> = {
+  /**
+   * Before a group's sends, with the items the run is about to attempt.
+   * Answers which of them to keep; one dropped is "withdrawn" (no row, not
+   * attempted). Called only for a group with at least one send. A throw
+   * withdraws the whole group.
+   */
+  before?: (items: readonly T[]) => Promise<{ keep: readonly boolean[]; calls: number }>;
+  beforeCalls?: number;
+  /** After a group's sends and its log insert, with every item the group decided, in order. A throw is ignored. */
+  after?: (entries: ReadonlyArray<{ item: T; result: RunItemResult }>) => Promise<{ calls: number }>;
+  afterCalls?: number;
+};
+
 /** What the run engine needs from the pipeline (lib/notifications/send.ts). */
 export type RunMailIO<T> = {
   eventOf: (item: T) => NotificationEvent;
   recipientOf: (item: T) => string | null;
-  /** Render and dispatch one mail. A throw reads as an unknown failure. */
-  attempt: (item: T) => Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass }>;
-  /** One notification_log insert for these rows; false when the write failed. */
-  writeLog: (entries: Array<{ item: T; result: RunItemResult }>) => Promise<boolean>;
+  /**
+   * Render and dispatch one mail. A throw reads as an unknown failure.
+   * `callLimit`: the platform refused the outbound call itself (rule FP8).
+   */
+  attempt: (item: T) => Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass; callLimit?: boolean }>;
+  /** One notification_log insert for these rows; false when the write failed, "call_limit" when the platform refused it. */
+  writeLog: (entries: Array<{ item: T; result: RunItemResult }>) => Promise<boolean | "call_limit">;
   /** A mail refused by the daily limit writes its row (one mail on its own); a loop writes none and reports the count. */
   rowForDailyLimit: boolean;
+  hooks?: GroupHooks<T>;
 };
 
 /** The calls a group of `sends` may need, beyond the sends: its log insert, a state write and an alert mark. */
@@ -745,20 +822,24 @@ const GROUP_TAIL_CALLS = MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite 
 export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailIO<T>): Promise<RunItemResult[]> {
   const results: RunItemResult[] = new Array(items.length);
   const notAttempted = (cls: NotAttemptedClass, error: string): RunItemResult => ({ status: "not_attempted", cls, error });
+  const hooks = io.hooks ?? {};
+  const hookCalls = (hooks.before ? Math.max(0, hooks.beforeCalls ?? 0) : 0) + (hooks.after ? Math.max(0, hooks.afterCalls ?? 0) : 0);
   let i = 0;
   let first = true;
   while (i < items.length) {
     const causes = new Set<AlertCause>();
     const rows: Array<{ item: T; result: RunItemResult }> = [];
-    const group: number[] = [];
+    const decided: number[] = [];
+    let group: number[] = [];
     // The first send goes alone, and so does a probe. Once a failure that
     // counts toward a flip is on the row, a group holds no more sends than
     // the people still needed to flip: a dead SMTP costs at most three
     // attempts in a run (section C), never a whole group more.
     const counting = run.stored.state !== "failing" ? run.stored.failed_recipients.length : 0;
     const size = first || run.probeOpen ? 1 : counting > 0 ? Math.max(1, Math.min(SENDS_AT_ONCE, FLIP_AFTER_PEOPLE - counting)) : SENDS_AT_ONCE;
-    // How many sends fit the count and the window, with the group's tail.
-    const roomCalls = run.budget.callLimit - run.budget.calls - GROUP_TAIL_CALLS;
+    // How many sends fit the count and the window, with the group's tail
+    // and the caller's own calls around the group.
+    const roomCalls = run.budget.callLimit - run.budget.calls - GROUP_TAIL_CALLS - hookCalls;
     const fit = hasRoom(run.budget, 0) ? Math.max(0, Math.floor(roomCalls / MAIL_CALL_COSTS.send)) : 0;
     let templatesNeeded = 0;
     const eventsInGroup = new Set<string>();
@@ -768,12 +849,13 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
       if (!gate.attempt) {
         results[i] = notAttempted(gate.cls, gate.error);
         run.report.notAttempted[gate.cls]++;
+        decided.push(i);
         if (gate.cls === "daily_limit") {
           if (!drawsOnReserve(event)) run.report.routineStopped = true;
           // gateSend refuses for the daily limit only when run.limit is set.
           if (run.limit) causes.add(dailyLimitCause({ event, sentAtOpen: run.sent24h, count: run.sent24h + run.sentInRun + group.length, limit: run.limit }));
           if (io.rowForDailyLimit) rows.push({ item: items[i], result: results[i] });
-        } else {
+        } else if (gate.cls !== "left") {
           if (gate.cls === "not_ready" || (gate.cls === "not_configured" && !run.deleted)) causes.add("not_sent");
           rows.push({ item: items[i], result: results[i] });
         }
@@ -789,13 +871,40 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
       group.push(i);
       i++;
     }
-    if (group.length === 0 && rows.length === 0 && i < items.length) {
+    if (group.length === 0 && decided.length === 0 && i < items.length) {
       // No room for the next send: the rest is left for a later request or call.
       for (; i < items.length; i++) {
         results[i] = notAttempted("left", "Left: the request had no room for this mail.");
         run.report.notAttempted.left++;
       }
       break;
+    }
+    // The caller's own step before the sends (a claim for this group).
+    if (group.length > 0 && hooks.before) {
+      let keep: readonly boolean[] = [];
+      try {
+        const answer = await hooks.before(group.map((idx) => items[idx]));
+        spendCalls(run.budget, Math.max(0, answer.calls));
+        keep = answer.keep;
+      } catch {
+        spendCalls(run.budget, Math.max(0, hooks.beforeCalls ?? 0));
+        keep = [];
+      }
+      const kept: number[] = [];
+      group.forEach((idx, k) => {
+        if (keep[k] === true) kept.push(idx);
+        else {
+          results[idx] = notAttempted("withdrawn", "Withdrawn before its group: its claim was not taken.");
+          run.report.notAttempted.withdrawn++;
+          decided.push(idx);
+        }
+      });
+      if (kept.length < group.length) {
+        // Templates for events no longer sent are not read.
+        const events = new Set(kept.map((idx) => io.eventOf(items[idx])));
+        templatesNeeded = [...eventsInGroup].filter((e) => events.has(e as NotificationEvent)).length;
+      }
+      group = kept;
     }
     first = first && group.length === 0;
     const outcomes: Array<{ recipientId: string | null; outcome: SendOutcome }> = [];
@@ -806,13 +915,23 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         group.map(async (idx) => {
           try {
             return await io.attempt(items[idx]);
-          } catch {
+          } catch (e) {
+            if (isCallLimitMessage(errorText(e))) return { ok: false as const, error: "call_limit", cls: "unknown" as SmtpErrorClass, callLimit: true };
             return { ok: false as const, error: "The send failed before it reached the mail server.", cls: "unknown" as SmtpErrorClass };
           }
         })
       );
       group.forEach((idx, k) => {
         const a = answers[k];
+        decided.push(idx);
+        if (!a.ok && a.callLimit) {
+          // The platform refused the call itself: not the tenant's SMTP, and
+          // not a send. The run stops, and the rest is left.
+          results[idx] = notAttempted("left", "Left: the request met the platform's limit on outbound calls.");
+          run.report.notAttempted.left++;
+          noteCallLimit(run, "send");
+          return;
+        }
         run.report.attempted++;
         if (a.ok) {
           results[idx] = { status: "sent" };
@@ -830,19 +949,88 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
       // exact fit, or a code or welcome mail that reached the line).
       if (run.limit && countBefore < run.limit.routineStop && run.sent24h + run.sentInRun >= run.limit.routineStop) causes.add("daily_limit");
     }
-    if (rows.length > 0) {
+    if (rows.length > 0 && !run.callLimited) {
       spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
-      let logged = false;
+      let logged: boolean | "call_limit" = false;
       try {
         logged = await io.writeLog(rows);
-      } catch {
-        logged = false;
+      } catch (e) {
+        logged = isCallLimitMessage(errorText(e)) ? "call_limit" : false;
       }
-      if (!logged) countError(run.errors, "log_write");
+      if (logged === "call_limit") noteCallLimit(run, "log_write");
+      else if (!logged) countError(run.errors, "log_write");
     }
-    await settleGroup(run, outcomes, causes);
+    if (hooks.after && decided.length > 0 && !run.callLimited) {
+      decided.sort((a, b) => a - b);
+      try {
+        const answer = await hooks.after(decided.map((idx) => ({ item: items[idx], result: results[idx] })));
+        spendCalls(run.budget, Math.max(0, answer.calls));
+      } catch {
+        spendCalls(run.budget, Math.max(0, hooks.afterCalls ?? 0));
+      }
+    }
+    if (!run.callLimited) await settleGroup(run, outcomes, causes);
+    if (run.callLimited) {
+      for (; i < items.length; i++) {
+        results[i] = notAttempted("left", "Left: the request met the platform's limit on outbound calls.");
+        run.report.notAttempted.left++;
+      }
+      break;
+    }
   }
   return results;
+}
+
+/* ------------------------------------------------------- the Settings test */
+
+/**
+ * Whether the Settings test is attempted now (section C, step 11). It goes
+ * through the organisation's own SMTP only, so it needs settings that were
+ * read and are complete, an organisation that was read and is not deleted,
+ * and room under the daily limit with its reserve (rule FP4: the test draws
+ * on the reserve). No pause stops it: the administrator asked for it.
+ */
+export function gateSettingsTest(run: MailRun): { attempt: true } | { attempt: false; cls: NotAttemptedClass; error: string } {
+  if (run.settings === "unreadable") {
+    return { attempt: false, cls: "settings_unreadable", error: "The organisation's email settings could not be read. Nothing was sent." };
+  }
+  if (run.orgUnreadable) return { attempt: false, cls: "settings_unreadable", error: "The organisation could not be read. Nothing was sent." };
+  if (run.deleted || !settingsComplete(run.settings)) return { attempt: false, cls: "not_configured", error: NOT_CONFIGURED_TEXT };
+  if (run.limit && run.sent24h + run.sentInRun >= run.limit.limit) return { attempt: false, cls: "daily_limit", error: "daily_limit" };
+  return { attempt: true };
+}
+
+/**
+ * The state after a Settings test (section C): a delivered test reads
+ * healthy; a failed test turns the organisation failing at once, whatever
+ * the class but rejected (one recipient's refusal says nothing about the
+ * sender). A flip marks an alert as due under section E's bounds. Without
+ * migration 0114 the run cannot write, and nothing is written.
+ */
+export async function settleSettingsTest(run: MailRun, outcome: SendOutcome, recipientId: string | null): Promise<void> {
+  run.report.attempted++;
+  if (outcome.ok) {
+    run.report.sent++;
+    run.sentInRun++;
+    const step = nextState(run.stored, outcome, recipientId, run.now());
+    run.stored = step.next;
+    if (step.write) await writeState(run, run.stored);
+    return;
+  }
+  run.report.failed++;
+  if (outcome.cls === "rejected") return;
+  const nowIso = new Date(run.now()).toISOString();
+  const wasFailing = run.stored.state === "failing";
+  run.stored = {
+    ...run.stored,
+    state: "failing",
+    state_changed_at: wasFailing ? run.stored.state_changed_at : nowIso,
+    last_failure_at: nowIso,
+    last_error_code: outcome.cls,
+  };
+  run.stopped = true;
+  await writeState(run, run.stored);
+  if (!wasFailing) await markAlertDue(run, "flip");
 }
 
 /* ------------------------------------------------------------------- the alert */
@@ -874,7 +1062,6 @@ export async function sendDueAlert(opts: {
   now?: () => number;
 }): Promise<DueAlertResult> {
   const base = String(opts.baseUrl ?? "").replace(/\/+$/, "");
-  if (!/^https?:\/\/[^/\s]+/.test(base)) return { kind: "failed", step: "config" };
   const db = opts.db ?? svc();
   const env = opts.env ?? process.env;
   const now = opts.now ?? Date.now;
@@ -906,6 +1093,12 @@ export async function sendDueAlert(opts: {
   }
   if (!due) return { kind: "none" };
   const orgId = due.organization_id;
+  // The alert's Settings link needs the platform address; without it a due
+  // alert cannot be sent, and it stays due.
+  if (!/^https?:\/\/[^/\s]+/.test(base)) {
+    warn("config", orgId, "no_base_url");
+    return { kind: "failed", step: "config" };
+  }
 
   // 2. Its state with the count, its settings and the organisation, read now.
   spendCalls(b, 3);
@@ -951,11 +1144,14 @@ export async function sendDueAlert(opts: {
   let reading: AlertReading | null = null;
   let errorClass: AlertErrorClass | null = null;
   const limit = tenantDailyLimit(row.daily_limit, env);
-  if (row.state === "failing") {
+  // readingOf's order: settings that are not complete read not_configured
+  // before the stored state, so the alert says what the console and the
+  // banner say.
+  if (!settingsComplete(settings)) {
+    reading = "not_configured";
+  } else if (row.state === "failing") {
     reading = "failing";
     errorClass = row.last_error_code && ALERT_CLASSES.includes(row.last_error_code) ? (row.last_error_code as AlertErrorClass) : null;
-  } else if (!settingsComplete(settings)) {
-    reading = "not_configured";
   } else if (row.sent_24h >= limit.routineStop) {
     reading = "daily_limit";
   }

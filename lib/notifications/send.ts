@@ -2,9 +2,10 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { loadTemplate, mdToHtml, DEFAULT_CTAS, DEFAULT_TEMPLATES } from "./templates";
 import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
-import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, type SmtpErrorClass } from "@/lib/email/smtp-function";
+import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
 import { isTenantEvent } from "./routing";
-import { openRun, runMail, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, openRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
+import type { TenantReading } from "@/lib/ops/health-status";
 import type {
   NotificationEvent,
   NotificationContext,
@@ -94,7 +95,7 @@ function templateFor(run: MailRun, event: NotificationEvent): Promise<Template> 
 async function attemptOne(
   run: MailRun,
   args: SendArgs
-): Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass }> {
+): Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass; callLimit?: boolean }> {
   const { event, to, context, override } = args;
   const cfg = run.settings as NotificationSettings;
   const tpl: Template = override
@@ -147,6 +148,7 @@ async function attemptOne(
     { timeoutMs: SMTP_SEND_WAIT_MS }
   );
   if (result.ok) return { ok: true };
+  if (isCallLimitMessage(result.error)) return { ok: false, cls: "unknown", error: "call_limit", callLimit: true };
   return { ok: false, cls: classifySmtpError(result.error), error: `tenant SMTP failed: ${result.error ?? "unknown"}` };
 }
 
@@ -164,7 +166,7 @@ async function loggedSubjectTemplate(run: MailRun, args: SendArgs, result: RunIt
  * as one object), on this module's own service client: the route guard scan
  * (tests/unit/org-route-guards.test.ts) follows the insert to it.
  */
-async function writeLogRows(run: MailRun, entries: Array<{ item: SendArgs; result: RunItemResult }>): Promise<boolean> {
+async function writeLogRows(run: MailRun, entries: Array<{ item: SendArgs; result: RunItemResult }>): Promise<boolean | "call_limit"> {
   const rows = await Promise.all(
     entries.map(async ({ item, result }) =>
       logRow({
@@ -182,11 +184,13 @@ async function writeLogRows(run: MailRun, entries: Array<{ item: SendArgs; resul
   try {
     const { error } = await svc().from("notification_log").insert(rows.length === 1 ? rows[0] : rows);
     if (error) {
+      if (isCallLimitMessage(error.message)) return "call_limit";
       console.warn(JSON.stringify({ event: "notification_log_write_failed", org_id: run.organizationId, code: String(error.code ?? "unknown") }));
       return false;
     }
     return true;
-  } catch {
+  } catch (e) {
+    if (isCallLimitMessage(e instanceof Error ? e.message : String(e))) return "call_limit";
     console.warn(JSON.stringify({ event: "notification_log_write_failed", org_id: run.organizationId, code: "thrown" }));
     return false;
   }
@@ -198,13 +202,14 @@ function toSendResult(args: SendArgs, r: RunItemResult): SendResult {
   return { status: r.cls === "paused" ? "paused" : "failed", error: r.error, errorClass: r.cls, attempted: false, to: args.to.email };
 }
 
-function runIO(run: MailRun, rowForDailyLimit: boolean) {
+function runIO(run: MailRun, rowForDailyLimit: boolean, hooks?: GroupHooks<SendArgs>) {
   return {
     eventOf: (a: SendArgs) => a.event,
     recipientOf: (a: SendArgs) => a.to.user_id ?? null,
     attempt: (a: SendArgs) => attemptOne(run, a),
     writeLog: (entries: Array<{ item: SendArgs; result: RunItemResult }>) => writeLogRows(run, entries),
     rowForDailyLimit,
+    hooks,
   };
 }
 
@@ -237,11 +242,179 @@ export async function sendNotification(args: SendArgs, opts: { run?: MailRun } =
  * reads errorClass "left". A mail stopped by the daily limit writes no row
  * here (the caller reports the count).
  */
-export async function sendMany<R>(run: MailRun, recipients: readonly R[], mail: (recipient: R) => MailSpec): Promise<SendResult[]> {
+export async function sendMany<R>(
+  run: MailRun,
+  recipients: readonly R[],
+  mail: (recipient: R) => MailSpec,
+  opts: { hooks?: GroupHooks<R> } = {}
+): Promise<SendResult[]> {
   const list: SendArgs[] = recipients.map((r) => ({ ...mail(r), organizationId: run.organizationId }));
   for (const a of list) refuseNonTenant(a.event, "sendMany");
-  const results = await runMail(run, list, runIO(run, false));
+  // The caller's hooks see its own recipients, not the rendered arguments.
+  const byArgs = new Map<SendArgs, R>(list.map((a, k) => [a, recipients[k]]));
+  const h = opts.hooks;
+  const hooks: GroupHooks<SendArgs> | undefined = h
+    ? {
+        before: h.before ? (items) => h.before!(items.map((a) => byArgs.get(a)!)) : undefined,
+        beforeCalls: h.beforeCalls,
+        after: h.after ? (entries) => h.after!(entries.map((e) => ({ item: byArgs.get(e.item)!, result: e.result }))) : undefined,
+        afterCalls: h.afterCalls,
+      }
+    : undefined;
+  const results = await runMail(run, list, runIO(run, false, hooks));
   return results.map((r, k) => toSendResult(list[k], r));
+}
+
+/**
+ * A welcome's outcome on the Users answers and rows (ADR 0029 section C, step
+ * 16): sent, or not sent with its class. A timeout is "not_sent" with the
+ * class timeout, which the page reads as "not confirmed: the mail may still
+ * arrive" (rule T2); a paused event has the class paused; a person whose
+ * membership does not count, inactive (no row, no state).
+ */
+export type WelcomeOutcome = { status: "sent" } | { status: "not_sent"; class: string };
+
+export function welcomeOutcome(r: SendResult): WelcomeOutcome {
+  if (r.status === "sent") return { status: "sent" };
+  return { status: "not_sent", class: r.errorClass ?? "unknown" };
+}
+
+/**
+ * What an administrator's answer says of a loop of mail (rule T4): how many
+ * people were emailed, how many were not, and how many sends timed out
+ * ("not confirmed: the mail may still arrive", rule T2). A person with no
+ * address on file is one not emailed (`noAddress`). Counts only: no address,
+ * id or error text.
+ */
+export type MailCounts = { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number };
+/** The recipients could not be read: nobody was emailed (ADR 0029, hand-over note of 2026-11-19, point 1). */
+export type MailUnread = { recipients_unreadable: true };
+export type MailOutcome = MailCounts | MailUnread;
+
+export const RECIPIENTS_UNREADABLE: MailUnread = { recipients_unreadable: true };
+
+export function mailCounts(results: readonly SendResult[], noAddress = 0): MailCounts {
+  let emailed = 0;
+  let notConfirmed = 0;
+  let notEmailed = Math.max(0, noAddress);
+  for (const r of results) {
+    if (r.status === "sent") emailed++;
+    else if (r.errorClass === "timeout") notConfirmed++;
+    else notEmailed++;
+  }
+  return { recipients_unreadable: false, emailed, not_emailed: notEmailed, not_confirmed: notConfirmed };
+}
+
+/** The event a Settings test is logged with. It is no NotificationEvent: no template, no pause, no routing row. */
+export const SETTINGS_TEST_LOG_EVENT = "smtp_test";
+
+const SETTINGS_TEST_SUBJECT = "Test message from your LMS";
+
+/**
+ * The Settings test (ADR 0029 section C, step 11): one fixed message through
+ * the organisation's own SMTP to the administrator who asked for it, waited
+ * for at most SMTP_SEND_WAIT_MS, with its notification_log row. Its outcome
+ * sets the state (settleSettingsTest): a delivered test reads healthy, a
+ * failed one failing at once. Not attempted when the settings are not
+ * complete, could not be read, or the daily limit is used up. Never throws.
+ */
+export async function sendSettingsTest(run: MailRun, to: { user_id: string; email: string }): Promise<SendResult> {
+  const gate = gateSettingsTest(run);
+  let result: SendResult;
+  if (!gate.attempt) {
+    result = { status: "failed", error: gate.error, errorClass: gate.cls, attempted: false, to: to.email };
+  } else {
+    const cfg = run.settings as NotificationSettings;
+    const text =
+      `This is a test message from ${run.orgName}'s learning platform.
+
+` +
+      "It was sent through your organisation's own email server, as every email to your learners is. " +
+      "If it reached you, the server is working.";
+    const html = renderEmailShell({
+      subject: SETTINGS_TEST_SUBJECT,
+      bodyHtml: mdToHtml(text),
+      branding: { orgName: run.orgName, logoUrl: cfg.logo_url ?? null, brandColor: cfg.brand_color ?? "#1a1816", footerText: cfg.footer_text ?? null },
+      ctaLabel: null,
+      ctaUrl: null,
+    });
+    spendCalls(run.budget, MAIL_CALL_COSTS.send);
+    let answer: { ok: boolean; error?: string };
+    try {
+      answer = await dispatchSmtp(
+        {
+          host: cfg.smtp_host!,
+          port: cfg.smtp_port!,
+          secure: cfg.smtp_secure,
+          user: cfg.smtp_user ?? undefined,
+          pass: cfg.smtp_password ?? undefined,
+          from: cfg.from_name ? `"${cfg.from_name}" <${cfg.from_email}>` : cfg.from_email!,
+          to: to.email,
+          replyTo: cfg.reply_to ?? undefined,
+          subject: SETTINGS_TEST_SUBJECT,
+          text,
+          html,
+        },
+        { timeoutMs: SMTP_SEND_WAIT_MS }
+      );
+    } catch {
+      answer = { ok: false, error: "The send failed before it reached the mail server." };
+    }
+    if (answer.ok) {
+      result = { status: "sent", attempted: true, to: to.email };
+      await settleSettingsTest(run, { ok: true }, to.user_id);
+    } else {
+      const cls = classifySmtpError(answer.error);
+      result = { status: "failed", error: `tenant SMTP failed: ${answer.error ?? "unknown"}`, errorClass: cls, attempted: true, to: to.email };
+      await settleSettingsTest(run, { ok: false, cls }, to.user_id);
+    }
+  }
+  // Its row: counted in the organisation's 24 hours when it was sent (rule FP4).
+  spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
+  try {
+    const { error } = await svc().from("notification_log").insert({
+      organization_id: run.organizationId,
+      event_type: SETTINGS_TEST_LOG_EVENT,
+      channel: "email",
+      to_user_id: to.user_id,
+      to_address: to.email,
+      subject: SETTINGS_TEST_SUBJECT,
+      status: result.status === "sent" ? "sent" : "failed",
+      error: result.status === "sent" ? null : result.error ?? null,
+      context: {},
+    });
+    if (error) console.warn(JSON.stringify({ event: "notification_log_write_failed", org_id: run.organizationId, code: String(error.code ?? "unknown") }));
+  } catch {
+    console.warn(JSON.stringify({ event: "notification_log_write_failed", org_id: run.organizationId, code: "thrown" }));
+  }
+  return result;
+}
+
+/**
+ * What the SMTP tab shows after a Settings test (section C, rule T2): sent;
+ * not confirmed (a timeout: the mail may still arrive); not sent, with its
+ * class; then the organisation's reading as the test left it. No address and
+ * no server text.
+ */
+export type SettingsTestOutcome = {
+  status: "sent" | "not_confirmed" | "not_sent";
+  errorClass: string | null;
+  attempted: boolean;
+  reading: TenantReading;
+};
+
+/**
+ * The Settings test of the save route and of the test route: one run for
+ * the organisation, one send to the administrator's own address. With no
+ * address on the session the outcome is not_sent with the class no_address
+ * and nothing is attempted.
+ */
+export async function runSettingsTest(args: { organizationId: string; user: { id: string; email: string | null } }): Promise<SettingsTestOutcome> {
+  const run = await openRun({ organizationId: args.organizationId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS }) });
+  if (!args.user.email) return { status: "not_sent", errorClass: "no_address", attempted: false, reading: runReading(run) };
+  const r = await sendSettingsTest(run, { user_id: args.user.id, email: args.user.email });
+  const status = r.status === "sent" ? "sent" : r.errorClass === "timeout" ? "not_confirmed" : "not_sent";
+  return { status, errorClass: r.status === "sent" ? null : r.errorClass ?? null, attempted: r.attempted === true, reading: runReading(run) };
 }
 
 /**

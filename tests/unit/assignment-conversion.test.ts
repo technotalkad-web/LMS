@@ -222,7 +222,8 @@ async function main() {
 
     console.log("\nPOST /api/assignments: ADR 0030 rule 10, only members that count are emailed");
     {
-      const logged = (rs: Req[]) => rs.filter((q) => q.table === "notification_log" && q.method === "POST").map((q) => String((q.body as Row).to_user_id)).sort();
+      // A group's log rows are one insert (ADR 0029): read every row of every insert.
+      const logged = (rs: Req[]) => rs.filter((q) => q.table === "notification_log" && q.method === "POST").flatMap((q) => (Array.isArray(q.body) ? (q.body as Row[]) : [q.body as Row])).map((r) => String(r.to_user_id)).sort();
       const r = await course({}, { userIds: ["u-new", "u-gone"] });
       eq("an active and an inactive learner named directly: both assigned, only the active one emailed",
         [r.status, r.body.assigned, writesOf(r.rs, CA), emailedOf(r.rs), logged(r.rs)],

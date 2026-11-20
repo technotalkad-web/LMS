@@ -3,7 +3,6 @@ import { originFromRequest } from "@/lib/http/origin";
 import { isActionError } from "@/lib/actions/types";
 import { loadTicketForCaller } from "@/lib/tickets/auth";
 import { notifyRequesterOfTicket } from "@/lib/tickets/notify";
-import { namesAndEmails } from "@/lib/users/people";
 
 /**
  *   PATCH /api/tickets/[id]
@@ -47,10 +46,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   }
   const closedNow = update.status === "closed" && ticket.status !== "closed";
   if (replied || closedNow) {
-    const who = (await namesAndEmails(svc, [ticket.user_id])).get(ticket.user_id);
     await notifyRequesterOfTicket(svc, {
       orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: await originFromRequest(),
-      requester: { id: ticket.user_id, email: who?.email ?? null },
+      requester: { id: ticket.user_id },
       subject: ticket.subject,
       headline: closedNow ? "Ticket closed" : "Reply from your admin",
       message: replied ? note! : ticket.admin_note,

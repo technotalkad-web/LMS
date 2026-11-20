@@ -10,7 +10,8 @@ import {
   forceRestartReport,
 } from "@/lib/attempts/force-restart";
 import { notifyLearnerOfDecision } from "@/lib/attempts/requests";
-import { resolveEmails } from "@/lib/users/emails";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { recordRecipientsUnreadable } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { runPackageGuardian } from "@/lib/alds/guardian";
 import {
@@ -217,7 +218,7 @@ export async function POST(
       org: { id: org.id, name: (org as { name?: string }).name ?? "", slug: (org as { slug?: string }).slug ?? orgSlug },
       origin: await originFromRequest(),
       course: { id: course.id, title: (course as { title?: string }).title ?? "this course" },
-      notify: { decision: notifyLearnerOfDecision, emails: resolveEmails },
+      notify: { decision: notifyLearnerOfDecision, emails: resolveEmailsStrict, skipped: recordRecipientsUnreadable },
     });
     answer = forceRestartReplaceAnswer({
       courseId,

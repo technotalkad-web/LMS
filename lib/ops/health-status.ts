@@ -262,12 +262,16 @@ export function buildMailCronDetail(
   for (const [k, v] of optional) if (isCount(v)) common[k] = v;
   if (typeof run.leftComplete === "boolean") common.left_complete = run.leftComplete;
   common.no_0114 = run.no0114 === true;
+  // `ok` is the run's verdict in both copies, as the two routes answered and
+  // stored it before (part (k) of tests/unit/org-membership.test.ts reads it).
+  const ok = failedSteps === 0 && unreadable === 0;
+  common.ok = ok;
   const answer: Record<string, number | boolean> = {};
   for (const [k, v] of Object.entries(extra)) if (isCount(v) || typeof v === "boolean") answer[k] = v;
   Object.assign(answer, common);
   const heartbeat: Record<string, unknown> = { ...common };
   if (failedSteps > 0) heartbeat.errors = errors;
-  return { ok: failedSteps === 0 && unreadable === 0, answer, heartbeat };
+  return { ok, answer, heartbeat };
 }
 
 /** A mail cron's heartbeat detail as the reader lets it through. `known` false: a row without v (older code, by hand, another job). */

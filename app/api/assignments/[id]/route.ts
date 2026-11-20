@@ -3,9 +3,10 @@ import { createClient } from "@/lib/supabase/server";
 import { isOrgAdminCaller, notAdminAnswer } from "@/lib/auth/api-admin";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { resolveEmails } from "@/lib/users/emails";
-import { notifyBackground } from "@/lib/notifications/send";
-import { resolveManyGroups } from "@/lib/org/groups";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { assigneeRecipientsStrict } from "@/lib/org/groups";
 
 /**
  *   DELETE /api/assignments/{id}
@@ -88,86 +89,83 @@ export async function DELETE(
     );
   }
 
-  // Fire unassignment notifications (background).
+  // Unassignment mail (ADR 0029 rule T4): one run, within this request's
+  // budgets; the answer says how many were emailed and how many were not.
+  // A failed read of the recipients mails nobody, records the skip and says so.
+  let email: MailOutcome | null = null;
   if (row) {
-    await (async () => {
+    email = await (async (): Promise<MailOutcome | null> => {
+      const r = row as {
+        course_id: string;
+        organization_id: string;
+        assignee_type: "user" | "team" | "org" | "group";
+        user_id: string | null;
+        team_id: string | null;
+        group_id?: string | null;
+        courses?: { title?: string } | { title?: string }[];
+        organizations?:
+          | { name?: string; slug?: string }
+          | { name?: string; slug?: string }[];
+      };
       try {
         const svc = createServiceClient(
           process.env.NEXT_PUBLIC_SUPABASE_URL!,
           process.env.SUPABASE_SERVICE_ROLE_KEY!,
           { auth: { persistSession: false } }
         );
-        const r = row as {
-          course_id: string;
-          organization_id: string;
-          assignee_type: "user" | "team" | "org" | "group";
-          user_id: string | null;
-          team_id: string | null;
-          group_id?: string | null;
-          courses?: { title?: string } | { title?: string }[];
-          organizations?:
-            | { name?: string; slug?: string }
-            | { name?: string; slug?: string }[];
-        };
+        const budget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
         // ADR 0030 rule 10: the organisation mails only members that count
         // (active, in an organisation that is not deleted). One read of them
         // for this request: it is the org-wide audience and the filter on
-        // every other one. Unreadable: no mail.
+        // every other one.
+        spendCalls(budget, 2);
         const counting = await countingMemberIds(svc, r.organization_id);
         if (counting === "unreadable") {
-          console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "assignments/[id]", org_id: r.organization_id }));
-          return;
+          await recordRecipientsUnreadable("assignments/[id]", r.organization_id);
+          return RECIPIENTS_UNREADABLE;
         }
-        const recipientIds = new Set<string>();
-        if (r.assignee_type === "user" && r.user_id) {
-          recipientIds.add(r.user_id);
-        } else if (r.assignee_type === "team" && r.team_id) {
-          const { data: tm } = await svc
-            .from("team_members")
-            .select("user_id")
-            .eq("team_id", r.team_id);
-          for (const m of tm ?? []) recipientIds.add(m.user_id as string);
-        } else if (r.assignee_type === "group" && r.group_id) {
-          for (const uid of await resolveManyGroups(svc, r.organization_id, [
-            r.group_id,
-          ])) {
-            recipientIds.add(uid);
-          }
-        } else if (r.assignee_type === "org") {
-          for (const uid of counting) recipientIds.add(uid);
+        spendCalls(budget, 2);
+        const recipients = await assigneeRecipientsStrict(svc, r.organization_id, [r], counting);
+        if (recipients === "unreadable") {
+          await recordRecipientsUnreadable("assignments/[id]", r.organization_id);
+          return RECIPIENTS_UNREADABLE;
         }
-        // A person named directly, in a team or in a static group may hold a
-        // row that does not count: they get no mail.
-        for (const uid of recipientIds) if (!counting.has(uid)) recipientIds.delete(uid);
-        if (recipientIds.size === 0) return;
+        if (recipients.size === 0) return mailCounts([]);
 
-        const emailById = await resolveEmails(svc, recipientIds);
+        spendCalls(budget, Math.ceil(recipients.size / 150));
+        const emailById = await resolveEmailsStrict(svc, recipients);
+        if (emailById === "unreadable") {
+          await recordRecipientsUnreadable("assignments/[id]", r.organization_id);
+          return RECIPIENTS_UNREADABLE;
+        }
 
         const course = Array.isArray(r.courses) ? r.courses[0] : r.courses;
         const orgInfo = Array.isArray(r.organizations)
           ? r.organizations[0]
           : r.organizations;
 
-        for (const uid of recipientIds) {
-          const email = emailById.get(uid);
-          if (!email) continue;
-          await notifyBackground({
-            organizationId: r.organization_id,
-            event: "asset_unassignment",
-            to: { user_id: uid, email },
-            context: {
-              learner_name: email,
-              learner_email: email,
-              course_name: course?.title ?? "a course",
-              org_name: orgInfo?.name ?? "your org",
-            },
-          });
-        }
+        const people = [...recipients].flatMap((uid) => {
+          const address = emailById.get(uid);
+          return address ? [{ uid, email: address }] : [];
+        });
+        const run = await openRun({ organizationId: r.organization_id, budget, db: svc });
+        const results = await sendMany(run, people, (p) => ({
+          event: "asset_unassignment",
+          to: { user_id: p.uid, email: p.email },
+          context: {
+            learner_name: p.email,
+            learner_email: p.email,
+            course_name: course?.title ?? "a course",
+            org_name: orgInfo?.name ?? "your org",
+          },
+        }));
+        return mailCounts(results, recipients.size - people.length);
       } catch (e) {
-        console.warn("[unassignment] notify failed:", e);
+        console.warn(JSON.stringify({ event: "assignment_mail_failed", site: "assignments/[id]", org_id: r.organization_id, error: e instanceof Error ? e.name : "unknown" }));
+        return null;
       }
     })();
   }
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, email });
 }
