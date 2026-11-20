@@ -4,6 +4,10 @@
  * run's cases. The routes' sums come with stage 2.
  *   - the rule: at most 40 calls (0.8 of the plan's 50) for a request or a
  *     cron call; an alert's cost and a scheduled call's two sums;
+ *   - ESTIMATES, not proof: the sums of an administrator's request and of a
+ *     scheduled call add the code's call costs to read counts typed by hand.
+ *     They are labelled so until gate G3 measures each route; nothing here
+ *     shows that a route makes that many reads;
  *   - the counted calls are the calls made: the budget's count equals the
  *     requests the run sent, for a run of sends, a stopped run and an alert;
  *   - under a clock the test sets: no send starts after the window (45 s for
@@ -51,21 +55,24 @@ async function main() {
     eq("an alert costs at most 25 calls: within one call's sum, with room left for other work", [ALERT_CALL_COST, ALERT_CALL_COST <= CALL_SUM_LIMIT], [25, true]);
     eq("a scheduled call's two sums: with an alert, at most 15 calls remain for its own mail", CALL_SUM_LIMIT - ALERT_CALL_COST, 15);
 
-    console.log("\nthe sums of the kinds of request (rule FP2), from the costs in the code");
+    console.log("\nESTIMATES until gate G3 measures each route: the sums of the kinds of request (rule FP2), from the code's costs and read counts typed by hand");
     {
+      // ESTIMATE. The read counts below are typed by hand from reading the
+      // routes; no route is run here. Gate G3 measures each route on staging,
+      // and its numbers replace these.
       // An administrator's request: its own calls, the mail part's reads (a
       // title, the members that count, a team or group, the addresses), the
       // opening of its run, and one first send with its group's tail.
       const mailReads = 1 + 2 + 2 + 1;
       const firstGroup = MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark;
-      eq("an administrator's request: its own work, its reads and a first mail fit the 40", ADMIN_REQUEST_OWN_CALLS + mailReads + MAIL_CALL_COSTS.open + firstGroup <= CALL_SUM_LIMIT, true);
+      eq("estimate (hand-typed read counts; gate G3 measures the routes): an administrator's request, its own work, its reads and a first mail fit the 40", ADMIN_REQUEST_OWN_CALLS + mailReads + MAIL_CALL_COSTS.open + firstGroup <= CALL_SUM_LIMIT, true);
       // A scheduled call without an alert: the programs or settings, a time
       // zone, the members that count, the line managers, a page, its counts,
       // its profiles and titles, the opening, and a first claimed mail with
       // its tail and its give-back.
       const cronReads = 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1;
-      eq("a scheduled call without an alert: its reads and a first claimed mail fit the 40", cronReads + MAIL_CALL_COSTS.open + 1 + firstGroup + SENDS_AT_ONCE <= CALL_SUM_LIMIT, true);
-      eq("…with an alert due, the alert alone fits, and what it leaves is what the call's own mail may use", [ALERT_CALL_COST <= CALL_SUM_LIMIT, CALL_SUM_LIMIT - ALERT_CALL_COST], [true, 15]);
+      eq("estimate (hand-typed read counts; gate G3 measures the routes): a scheduled call without an alert, its reads and a first claimed mail fit the 40", cronReads + MAIL_CALL_COSTS.open + 1 + firstGroup + SENDS_AT_ONCE <= CALL_SUM_LIMIT, true);
+      eq("estimate (from the code's alert cost; gate G3 measures the call): with an alert due, the alert alone fits, and what it leaves is what the call's own mail may use", [ALERT_CALL_COST <= CALL_SUM_LIMIT, CALL_SUM_LIMIT - ALERT_CALL_COST], [true, 15]);
     }
 
     console.log("\nthe counted calls are the calls made");
