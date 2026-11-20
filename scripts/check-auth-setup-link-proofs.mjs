@@ -2,7 +2,7 @@
 // =============================================================================
 // scripts/check-auth-setup-link-proofs.mjs: staging proofs for ADR 0029's
 // open questions 15 (an account made with an address only) and 19 (the
-// sign-in time and an ended session).
+// sign-in time, an ended session, and the setup link's fragment through mail).
 // =============================================================================
 //
 // RUN BY HAND, STAGING ONLY. It refuses any Supabase project but staging
@@ -11,9 +11,10 @@
 // set-password code will (auth.admin.createUser, auth.admin.updateUserById,
 // auth.admin.generateLink with verifyOtp as app/auth/callback/route.ts uses
 // it, auth.admin.getUserById, and signInWithPassword on a fresh client that
-// keeps no session), plus one invite as the control of point 2.
+// keeps no session), and, for point 6, staging's send-smtp Edge Function with
+// the request lib/email/smtp-function.ts (dispatchSmtp) makes.
 //
-// Accounts: new per run, in the lifecycle namespace
+// Accounts of points 1 and 3 to 5: new per run, in the lifecycle namespace
 // (`lifecycle+p0029-<role>-<run>@lifecycle.test`, tests/e2e/helpers/
 // namespace.ts). The domain is reserved and has no inbox; the e2e purge never
 // matches it, and the lifecycle cleanup sweeps it after 48 h if a delete here
@@ -21,27 +22,71 @@
 // profiles trigger adds one profile row per account; it goes with the
 // account). Every account is deleted at the end, also after a failure.
 //
-// Output: step names, pass / fail / recorded, HTTP statuses, error codes and
-// "set" / "empty" for a time. Never an address, password, token, session,
-// id or error message.
+// Accounts of point 2 (the mailbox form): three per run, at new aliases of
+// the test mailbox (`<its local part>+p0029h-<role>-<run>@<its domain>`,
+// roles a1, a2 and i). The lifecycle cleanup never sweeps the mailbox's
+// domain, so the run first deletes any account left at an alias with this
+// prefix, and deletes its own at the end, also after a failure.
 //
-// The point 2 control sends ONE invite mail per run to a reserved address
-// that nothing can deliver to.
+// Mail sent per run: ONE invite from the auth server (point 2's control) and
+// ONE fixed message through send-smtp (point 6). Each goes to a new alias of
+// the test mailbox and nowhere else: every mailbox-domain address passes one
+// guard that refuses anything but the mailbox or a "+tag" alias of it. The
+// mailbox's address comes from the environment and is never printed,
+// logged or written.
+//
+// Point 2, mailbox form. A1 is created with the address only. A2 is created
+// the same way, then given a password and a confirmed address by the
+// administrator call, then signs in once. I is then invited (the control).
+// The mailbox is read in its inbox and in the all-mail and spam folders
+// (found by their special-use marks), one search per alias by recipient,
+// on a fresh connection per read. Pass: I's mail is found within 5 minutes,
+// and a last read, no sooner than 5 minutes after A2's sign-in, finds I's
+// mail again and no message to A1 or A2 in any of the three folders. Void:
+// the invite is refused, its mail is not found in time, or a folder cannot
+// be found. Fail: any message to A1 or A2. The four sent times are recorded
+// only. A run with the mailbox takes about 6 to 11 minutes.
+//
+// Point 6, transport leg. One fixed message through send-smtp with the test
+// organisation's SMTP settings (the BOT_SMTP_* names), to a new alias. Its
+// text part and its HTML part each carry two links on staging's own host: a
+// setup-style link whose 43-character value follows "#t=", and a control of
+// the same shape whose value is in the query. The two parts are read back
+// from the mailbox and decoded one by one. Pass: the setup-style link is
+// there character for character in the text part, as the HTML link's
+// address and as its shown text. A control that is not there whole makes
+// the leg void. The platform and tenant legs are later steps; they print
+// "not run". In a run, point 6 goes before point 2, so a void of point 2 is
+// the last thing tried.
+//
+// Output: step names, pass / fail / recorded / void / not run, HTTP statuses,
+// error codes, "set" / "empty" for a time, "set" / "unset" for a setting,
+// "whole" / "changed" for a link, folder roles and seconds. Never an address,
+// password, token, link, session, id or error message.
 //
 // SETTINGS (environment only; the script reads no file):
 //   NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
 //   SUPABASE_SERVICE_ROLE_KEY (the staging values the lifecycle suite uses).
+//   Points 2 and 6 read the names tests/bot/lifecycle/inbox.ts reads:
+//   BOT_MAIL_ADDRESS and BOT_IMAP_PASS (or BOT_SMTP_PASS, the reader's
+//   fallback), with BOT_IMAP_HOST and BOT_IMAP_PORT optional. Point 6 also
+//   needs BOT_SMTP_USER and BOT_SMTP_PASS, with BOT_SMTP_HOST, BOT_SMTP_PORT,
+//   BOT_SMTP_SECURE and BOT_SMTP_FROM_NAME optional (configureOrgSmtp's
+//   defaults). Without them those points print "not run" and the rest runs.
 //   Loaded the way the Playwright configs load them, e.g.
 //     node -r dotenv/config scripts/check-auth-setup-link-proofs.mjs \
 //       dotenv_config_path=<checkout>/.env.test.local --report <file>.json
 //
 // FLAGS:
-//   --dry-run        check the settings and the project guard; call nothing
+//   --dry-run        check the settings, the project guard and the recipient
+//                    guard; call nothing
+//   --mail-only      run only points 2 and 6 (the mailbox points)
 //   --report <file>  also write the results as JSON (no secrets, no ids)
 //
 // EXIT: 0 every proof passed; 1 a proof failed or its control was void;
-// 2 refused (not staging, a setting missing); 3 harness error or a failed
-// cleanup.
+// 2 refused (not staging, a setting missing; also --mail-only when the
+// mailbox settings are unset, after its "not run" lines); 3 harness error or
+// a failed cleanup.
 // =============================================================================
 
 import { createClient } from "@supabase/supabase-js";
@@ -51,21 +96,36 @@ import { createRequire } from "node:module";
 
 const STAGING_REF = "zeaclbapadosqqttexxh";
 const PRODUCTION_REF = "alkfrcglmseksweqhwzq";
+/** Staging's own app host (wrangler.toml [vars] NEXT_PUBLIC_SITE_URL; scripts/staging-cron-post.mjs). */
+const STAGING_SITE = "https://my-lms.mentora.workers.dev";
+/** Built from the staging ref, never from SEND_SMTP_FUNCTION_URL, so no override can move it. */
+const SEND_SMTP_URL = `https://${STAGING_REF}.supabase.co/functions/v1/send-smtp`;
 const NS_PREFIX = "lifecycle";
 const NS_DOMAIN = "lifecycle.test";
+/** The "+tag" prefix of this harness's mailbox aliases; no spec uses it. */
+const MAIL_TAG_PREFIX = "p0029h-";
 const SENT_FIELDS = ["confirmation_sent_at", "invited_at", "recovery_sent_at", "email_change_sent_at"];
 const USER_PAGE_SIZE = 1000;
 const USER_MAX_PAGES = 20;
+/** How long a control's mail is waited for, and the least time between A2's sign-in and the last read. */
+const MAIL_WAIT_MS = 5 * 60_000;
+const MAIL_POLL_MS = 15_000;
+/** Longer than send-smtp's own 25 s, so the harness sees its answer. */
+const SEND_WAIT_MS = 30_000;
+/** lib/email/smtp-function.ts SMTP_SEND_WAIT_MS: how long the app waits for one send. */
+const APP_SEND_WAIT_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // Flags and settings
 // ---------------------------------------------------------------------------
 const argv = process.argv.slice(2).filter((a) => !a.startsWith("dotenv_config_"));
 let dryRun = false;
+let mailOnly = false;
 let reportPath = null;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--dry-run") dryRun = true;
+  else if (a === "--mail-only") mailOnly = true;
   else if (a === "--report" && argv[i + 1]) reportPath = argv[++i];
   else {
     console.error(`✖ unknown flag (${a.slice(0, 20)})`);
@@ -73,9 +133,10 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 
-const URL_ = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
-const ANON = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
-const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
+const env = process.env;
+const URL_ = env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+const ANON = env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+const SERVICE = env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 
 function refuse(msg) {
   console.error(`✖ refused: ${msg}`);
@@ -98,10 +159,34 @@ const missing = [
 if (missing.length) refuse(`missing setting(s): ${missing.join(", ")}.`);
 
 console.log("guard: staging project, settings set (url set, anon key set, service key set)");
-if (dryRun) {
-  console.log("dry run: no call made.");
-  process.exit(0);
+
+// The mailbox settings: names only, "set" or "unset", never a value.
+const isSet = (name) => typeof env[name] === "string" && env[name].trim() !== "";
+const MAIL_SETTING_NAMES = [
+  "BOT_MAIL_ADDRESS", "BOT_IMAP_PASS", "BOT_IMAP_HOST", "BOT_IMAP_PORT",
+  "BOT_SMTP_USER", "BOT_SMTP_PASS", "BOT_SMTP_HOST", "BOT_SMTP_PORT", "BOT_SMTP_SECURE", "BOT_SMTP_FROM_NAME",
+];
+console.log(`mailbox settings: ${MAIL_SETTING_NAMES.map((n) => `${n} ${isSet(n) ? "set" : "unset"}`).join(", ")}`);
+
+/** The mailbox as { raw, base, local, domain }, all lower case but raw; null when it is not one plain address. */
+function parseMailbox(value) {
+  const raw = String(value ?? "").trim();
+  const m = /^([a-z0-9._%-]+)@([a-z0-9-]+(?:\.[a-z0-9-]+)+)$/.exec(raw.toLowerCase());
+  return m ? { raw, base: `${m[1]}@${m[2]}`, local: m[1], domain: m[2] } : null;
 }
+const MAILBOX = parseMailbox(env.BOT_MAIL_ADDRESS);
+/** As tests/bot/lifecycle/inbox.ts reads it. */
+const READER_PASS = (env.BOT_IMAP_PASS || env.BOT_SMTP_PASS || "").replace(/\s+/g, "");
+const mailReason = !isSet("BOT_MAIL_ADDRESS")
+  ? "BOT_MAIL_ADDRESS unset"
+  : !MAILBOX
+    ? "BOT_MAIL_ADDRESS set but not one plain address without a +tag"
+    : !READER_PASS
+      ? "the reader's password (BOT_IMAP_PASS or BOT_SMTP_PASS) unset"
+      : null;
+const mailReady = mailReason === null;
+const smtpReason = mailReason ?? (!isSet("BOT_SMTP_USER") || !isSet("BOT_SMTP_PASS") ? "BOT_SMTP_USER or BOT_SMTP_PASS unset" : null);
+const smtpReady = smtpReason === null;
 
 // ---------------------------------------------------------------------------
 // Results
@@ -123,18 +208,34 @@ function errInfo(error) {
   const code = error.code ?? (error.name && error.name !== "Error" ? error.name : "-");
   return `status=${status} code=${code}`;
 }
-function errCode(error) {
-  return error ? `${error.status ?? "-"}/${error.code ?? error.name ?? "-"}` : "none";
+/** A code from a server or a library, kept only when it looks like one. */
+const safeCode = (c) => (c === undefined || c === null ? "-" : /^[A-Za-z0-9_.-]{1,64}$/.test(String(c)) ? String(c) : "other");
+/** An IMAP failure as codes only: never the message, which can carry the address. */
+function imapErr(e) {
+  return `code=${safeCode(e?.code)}${e?.serverResponseCode ? ` server=${safeCode(e.serverResponseCode)}` : ""}${e?.authenticationFailed ? " auth_failed" : ""}`;
+}
+
+/** Every setting value that must never be printed, matched without regard to case. */
+const REDACT = [
+  MAILBOX?.raw, MAILBOX?.base, MAILBOX && MAILBOX.local.length >= 4 ? MAILBOX.local : null,
+  env.BOT_SMTP_USER?.trim(), READER_PASS, (env.BOT_SMTP_PASS || "").replace(/\s+/g, ""), SERVICE, ANON,
+].filter((v) => typeof v === "string" && v.length >= 4);
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function scrub(text) {
+  let s = String(text ?? "");
+  for (const v of REDACT) s = s.replace(new RegExp(escRe(v), "gi"), "<redacted>");
+  return s
+    .replace(/\S+@\S+/g, "<address>")
+    .replace(/https?:\/\/\S+/g, "<url>")
+    .replace(/eyJ[\w.-]+/g, "<token>");
 }
 /** A thrown harness error, with anything that could be an address, a URL or a token removed. */
 function harnessText(e) {
-  const msg = String(e?.message ?? "")
-    .replace(/\S+@\S+/g, "<address>")
-    .replace(/https?:\/\/\S+/g, "<url>")
-    .replace(/eyJ[\w.-]+/g, "<token>")
-    .slice(0, 160);
-  return `${e?.name ?? "Error"}: ${msg}`;
+  const msg = scrub(e?.message ?? "").slice(0, 160);
+  return `${safeCode(e?.name ?? "Error")}: ${msg}`;
 }
+const sec = (ms) => (ms / 1000).toFixed(1);
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 /** "set" or "empty (...)": how the auth server returned a time. */
 function timeState(user, key) {
@@ -149,7 +250,6 @@ const isEmpty = (user, key) => !!user && timeState(user, key).startsWith("empty"
 function sentStates(user) {
   return SENT_FIELDS.map((k) => `${k}=${timeState(user, k)}`).join(", ");
 }
-const sentSet = (user) => SENT_FIELDS.filter((k) => user && !isEmpty(user, k));
 
 // ---------------------------------------------------------------------------
 // Clients and accounts
@@ -162,19 +262,35 @@ const fresh = (fetchImpl) =>
 /** An anon client whose Data API calls carry the given access token. */
 const asToken = (token) =>
   createClient(URL_, ANON, { auth: AUTH_OPTS, global: { headers: { Authorization: `Bearer ${token}` } } });
-/** A fetch that records the HTTP status of calls to the auth server's /logout. */
-function logoutRecorder() {
-  const box = { status: null };
+/**
+ * A fetch that records the HTTP status of calls to one auth path and, for an
+ * answer that is not OK, the body's error code (never its message).
+ */
+function answerRecorder(pathPart) {
+  const box = { status: null, code: null };
   const f = async (input, init) => {
     const res = await fetch(input, init);
-    if (String(typeof input === "string" ? input : input?.url ?? "").includes("/auth/v1/logout")) box.status = res.status;
+    if (String(typeof input === "string" ? input : input?.url ?? "").includes(pathPart)) {
+      box.status = res.status;
+      if (!res.ok) {
+        try {
+          const b = await res.clone().json();
+          box.code = safeCode(b?.error_code ?? b?.code);
+        } catch {
+          box.code = "unread";
+        }
+      }
+    }
     return res;
   };
   return { box, f };
 }
+const logoutRecorder = () => answerRecorder("/auth/v1/logout");
 
 const RUN = randomBytes(3).toString("hex");
 const addr = (role) => `${NS_PREFIX}+p0029-${role}-${RUN}@${NS_DOMAIN}`;
+/** A new alias of the mailbox for this run, lower case. */
+const mailAlias = (role, box = MAILBOX) => `${box.local}+${MAIL_TAG_PREFIX}${role}-${RUN}@${box.domain}`;
 /** Long, with upper, lower, digit and symbol, so no password rule refuses it. */
 const newPassword = () => `${randomBytes(18).toString("base64url")}Aa1!`;
 const claims = (jwt) => {
@@ -186,7 +302,7 @@ const claims = (jwt) => {
 };
 
 const created = new Map(); // role -> id
-const runAddresses = new Set();
+const runAddresses = new Set(); // lower case
 function track(role, user) {
   if (user?.id) created.set(role, user.id);
 }
@@ -203,9 +319,274 @@ async function signIn(email, password, fetchImpl) {
 const refusedText = (r) => (r.session ? "a session came back" : errInfo(r.error));
 
 // ---------------------------------------------------------------------------
+// The recipient guard: the test mailbox or a "+tag" alias of it, nothing else
+// ---------------------------------------------------------------------------
+class RecipientRefused extends Error {
+  constructor() {
+    super("recipient refused: not the test mailbox or an alias of it");
+    this.name = "RecipientRefused";
+  }
+}
+/** True only for the mailbox itself or `<its local part>+<tag>@<its domain>`, the tag of [a-z0-9-]. */
+function isMailboxRecipient(address, box) {
+  if (!box || typeof address !== "string") return false;
+  const a = address.toLowerCase();
+  if (a === box.base) return true;
+  const m = /^([^@\s+]+)\+([a-z0-9-]{1,64})@([^@\s]+)$/.exec(a);
+  return !!m && m[1] === box.local && m[3] === box.domain;
+}
+function mailboxRecipient(address, box) {
+  if (!isMailboxRecipient(address, box)) throw new RecipientRefused();
+  return address;
+}
+/** The only ways this harness creates an account at, or mails, the mailbox's domain. */
+async function createAtMailbox(address, { client = svc, box = MAILBOX } = {}) {
+  mailboxRecipient(address, box);
+  return client.auth.admin.createUser({ email: address });
+}
+async function inviteAtMailbox(address, { client = svc, box = MAILBOX } = {}) {
+  mailboxRecipient(address, box);
+  return client.auth.admin.inviteUserByEmail(address);
+}
+
+// ---------------------------------------------------------------------------
+// send-smtp, as lib/email/smtp-function.ts (dispatchSmtp) calls it, with the
+// test organisation's settings read the way tests/bot/lifecycle/inbox.ts
+// (configureOrgSmtp) stores them and lib/notifications/send.ts sends them.
+// ---------------------------------------------------------------------------
+function testOrgSmtp() {
+  const user = (env.BOT_SMTP_USER || "").trim();
+  const fromName = env.BOT_SMTP_FROM_NAME || "QA LMS Bot";
+  return {
+    host: env.BOT_SMTP_HOST || "smtp.gmail.com",
+    port: Number(env.BOT_SMTP_PORT || 465),
+    secure: String(env.BOT_SMTP_SECURE || "true") === "true",
+    user: user || undefined,
+    pass: (env.BOT_SMTP_PASS || "").replace(/\s+/g, "") || undefined,
+    from: fromName ? `"${fromName}" <${user}>` : user,
+  };
+}
+let classifier = null;
+/** The app's own class of a send-smtp error text (lib/email/smtp-function.ts); the text is never printed. */
+async function smtpClass(text) {
+  try {
+    classifier ??= (await import(new URL("../lib/email/smtp-function.ts", import.meta.url).href)).classifySmtpError;
+    return safeCode(classifier(text));
+  } catch {
+    return "unclassified";
+  }
+}
+async function sendThroughSmtpFunction(to, message, { fetchImpl = fetch, box = MAILBOX } = {}) {
+  mailboxRecipient(to, box);
+  const payload = { ...testOrgSmtp(), to, subject: message.subject, html: message.html, text: message.text };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEND_WAIT_MS);
+  const started = Date.now();
+  try {
+    const res = await fetchImpl(SEND_SMTP_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${SERVICE}` },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const ms = Date.now() - started;
+    if (res.status === 401) return { ok: false, status: 401, cls: "bearer_refused", ms };
+    if (!res.ok && res.status !== 200) return { ok: false, status: res.status, cls: await smtpClass(`Edge Function returned HTTP ${res.status}.`), ms };
+    const body = await res.json().catch(() => null);
+    if (body?.ok === true) return { ok: true, status: res.status, ms };
+    return { ok: false, status: res.status, cls: await smtpClass(body?.error ?? "Unknown SMTP error."), ms };
+  } catch {
+    return { ok: false, status: null, cls: controller.signal.aborted ? "harness_wait_ended" : "fetch_failed", ms: Date.now() - started };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The mailbox reader (imapflow, as tests/bot/lifecycle/inbox.ts uses it)
+// ---------------------------------------------------------------------------
+const openReaders = new Set();
+async function openReader() {
+  const mod = await import("imapflow");
+  const ImapFlow = mod.ImapFlow ?? mod.default?.ImapFlow;
+  const client = new ImapFlow({
+    host: env.BOT_IMAP_HOST || "imap.gmail.com",
+    port: Number(env.BOT_IMAP_PORT || 993),
+    secure: true,
+    auth: { user: MAILBOX.raw, pass: READER_PASS },
+    logger: false,
+  });
+  // A socket error is read where the call fails; the event itself is never printed.
+  client.on("error", () => {});
+  openReaders.add(client);
+  try {
+    await client.connect();
+  } catch (e) {
+    await closeReader(client);
+    throw e;
+  }
+  return client;
+}
+async function closeReader(client) {
+  openReaders.delete(client);
+  try {
+    await client.logout();
+  } catch {
+    try {
+      client.close();
+    } catch {
+      // already closed
+    }
+  }
+}
+const closeAllReaders = () => Promise.all([...openReaders].map((c) => closeReader(c)));
+
+/** The inbox, all-mail and spam folders, by their special-use marks. */
+async function findFolders() {
+  const client = await openReader();
+  try {
+    const list = await client.list();
+    const pick = (mark) => list.find((m) => m.specialUse === mark)?.path ?? null;
+    const inbox = pick("\\Inbox") ?? list.find((m) => String(m.path).toUpperCase() === "INBOX")?.path ?? null;
+    return [
+      { role: "inbox", path: inbox },
+      { role: "all-mail", path: pick("\\All") },
+      { role: "spam", path: pick("\\Junk") },
+    ];
+  } finally {
+    await closeReader(client);
+  }
+}
+
+/** Every address a message was delivered to, lower case: envelope recipients and delivery headers. */
+function recipientsOf(msg) {
+  const set = new Set();
+  for (const k of ["to", "cc", "bcc"]) for (const a of msg.envelope?.[k] ?? []) if (a?.address) set.add(a.address.toLowerCase());
+  const raw = msg.headers ? msg.headers.toString("utf8") : "";
+  for (const m of raw.matchAll(/[^\s<>"',;:()]+@[^\s<>"',;:()]+/g)) set.add(m[0].toLowerCase());
+  return set;
+}
+
+/**
+ * One read on a fresh connection: in each folder, one search per alias by
+ * recipient, over mail since `since`. A server hit counts only when the alias
+ * is an exact recipient of the message.
+ * Returns { [alias]: { [role]: { hits, exact: [{ uid, at }] } } }.
+ */
+async function readRound(folders, aliases, since) {
+  const client = await openReader();
+  try {
+    const out = Object.fromEntries(aliases.map((a) => [a, {}]));
+    for (const f of folders) {
+      const lock = await client.getMailboxLock(f.path, { readOnly: true });
+      try {
+        for (const alias of aliases) {
+          const found = await client.search({ to: alias, since }, { uid: true });
+          const uids = Array.isArray(found) ? found : [];
+          const exact = [];
+          if (uids.length) {
+            for await (const msg of client.fetch(uids.join(","), { uid: true, envelope: true, internalDate: true, headers: ["delivered-to", "x-original-to"] }, { uid: true })) {
+              if (recipientsOf(msg).has(alias)) exact.push({ uid: msg.uid, at: msg.internalDate ?? null });
+            }
+          }
+          out[alias][f.role] = { hits: uids.length, exact };
+        }
+      } finally {
+        lock.release();
+      }
+    }
+    return out;
+  } finally {
+    await closeReader(client);
+  }
+}
+const exactCount = (round, alias, folders) => folders.reduce((n, f) => n + (round[alias]?.[f.role]?.exact.length ?? 0), 0);
+const perFolder = (round, alias, folders) => folders.map((f) => `${f.role}=${round[alias]?.[f.role]?.exact.length ?? 0}`).join(" ");
+
+/** Poll until a message to `alias` is found or `deadline` passes. */
+async function waitForAlias(folders, alias, since, deadline, point, label) {
+  let readErrors = 0;
+  for (;;) {
+    try {
+      const r = await readRound(folders, [alias], since);
+      for (const f of folders) {
+        const hit = r[alias][f.role].exact;
+        if (hit.length) return { folder: f, uid: Math.max(...hit.map((h) => h.uid)), at: Date.now(), readErrors };
+      }
+    } catch (e) {
+      readErrors++;
+      if (readErrors <= 3) rec(point, `${label}: a read failed (polling goes on)`, "recorded", imapErr(e));
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) return { folder: null, readErrors };
+    await sleep(Math.min(MAIL_POLL_MS, left));
+  }
+}
+
+async function readStream(stream) {
+  const chunks = [];
+  for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+  return Buffer.concat(chunks);
+}
+/**
+ * The message's text/plain and text/html parts, each read from the stored
+ * message and decoded on its own (transfer encoding, then charset), so a
+ * text made from the HTML is never taken for the text part.
+ */
+async function readParts(folderPath, uid) {
+  const client = await openReader();
+  try {
+    const lock = await client.getMailboxLock(folderPath, { readOnly: true });
+    try {
+      const msg = await client.fetchOne(String(uid), { uid: true, bodyStructure: true }, { uid: true });
+      const leaves = [];
+      const walk = (n) => (n?.childNodes?.length ? n.childNodes.forEach(walk) : n && leaves.push(n));
+      walk(msg?.bodyStructure);
+      const read = async (leaf) => {
+        const { content } = await client.download(String(uid), leaf.part || "1", { uid: true });
+        return content ? (await readStream(content)).toString("utf8") : "";
+      };
+      const inline = (type) => leaves.filter((l) => l.type === type && l.disposition !== "attachment");
+      const texts = [], htmls = [];
+      for (const l of inline("text/plain")) texts.push(await read(l));
+      for (const l of inline("text/html")) htmls.push(await read(l));
+      return { structure: safeCode(msg?.bodyStructure?.type), texts, htmls };
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await closeReader(client);
+  }
+}
+
+function decodeEntities(s) {
+  const named = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+  return String(s).replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (all, e) => {
+    const k = e.toLowerCase();
+    if (k[0] !== "#") return named[k];
+    const cp = k[1] === "x" ? parseInt(k.slice(2), 16) : parseInt(k.slice(1), 10);
+    return Number.isFinite(cp) && cp <= 0x10ffff ? String.fromCodePoint(cp) : all;
+  });
+}
+/** Each <a> of an HTML part: its address and its shown text, as a reader's mail program would take them. */
+function anchorsOf(html) {
+  const out = [];
+  for (const m of String(html).matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
+    const h = /(?:^|\s)href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i.exec(m[1]);
+    out.push({
+      href: h ? decodeEntities(h[1] ?? h[2] ?? h[3]) : null,
+      shown: decodeEntities(m[2].replace(/<[^>]*>/g, "")).trim(),
+    });
+  }
+  return out;
+}
+const lineOf = (text, link) => String(text).split(/\r?\n/).some((l) => l.trim() === link);
+const whole = (ok) => (ok ? "whole" : "changed");
+
+// ---------------------------------------------------------------------------
 // The proofs
 // ---------------------------------------------------------------------------
-const P1 = "Q15.1", P2 = "Q15.2", P3 = "Q15.3", P4 = "Q19.4", P5 = "Q19.5", P6 = "mail";
+const P1 = "Q15.1", P2 = "Q15.2", P3 = "Q15.3", P4 = "Q19.4", P5 = "Q19.5", P6 = "Q19.6";
 const state = {};
 
 async function preamble() {
@@ -215,7 +596,7 @@ async function preamble() {
   try {
     const res = await fetch(`${URL_}/auth/v1/health`, { headers: { apikey: ANON } });
     const body = await res.json().catch(() => ({}));
-    rec("run", "auth server health", "recorded", `status=${res.status} version=${body?.version ?? "unknown"}`);
+    rec("run", "auth server health", "recorded", `status=${res.status} version=${safeCode(body?.version ?? "unknown")}`);
   } catch (e) {
     rec("run", "auth server health", "recorded", harnessText(e));
   }
@@ -244,29 +625,10 @@ async function point1() {
   // The other control (A opens after the admin call) is in point 3.
 }
 
+/** The sent times on lifecycle account A: recorded only (they show a link was made, not that mail went). */
 async function point2Reading(label) {
   const { user, error } = await readUser(state.A.id);
-  const ok = !error && SENT_FIELDS.every((k) => isEmpty(user, k));
-  check(P2, `A ${label}: the four sent times empty`, ok, error ? errInfo(error) : sentStates(user));
-  return { ok, user };
-}
-
-async function point2Control() {
-  // The mailer is asked on purpose, once per run, to a reserved address.
-  const email = addr("i");
-  runAddresses.add(email);
-  const { data, error } = await svc.auth.admin.inviteUserByEmail(email);
-  track("I", data?.user);
-  if (error) {
-    rec(P2, "control: inviteUserByEmail on a new reserved address", "void", `${errInfo(error)}; the mailer refused, point 2 is not proven by this run`);
-    state.control2 = { void: true, code: errCode(error) };
-    return;
-  }
-  rec(P2, "control: inviteUserByEmail on a new reserved address", "recorded", "no error (the mailer accepted)");
-  const { user, error: rErr } = await readUser(data.user.id);
-  const set = sentSet(user);
-  rec(P2, "control: sent times after the invite (read)", set.length ? "recorded" : "fail", rErr ? errInfo(rErr) : sentStates(user));
-  state.control2 = { void: false, set };
+  rec(P2, `A (lifecycle) ${label}: the four sent times`, "recorded", error ? errInfo(error) : sentStates(user));
 }
 
 async function point3() {
@@ -291,7 +653,7 @@ async function point3() {
   state.B.lastBefore = timeState(rb.user, "last_sign_in_at");
 
   // A: no password, unconfirmed.
-  if (A.id) {
+  if (A?.id) {
     const a1 = await signIn(A.email, newPassword());
     check(P3, "A (no password, unconfirmed): a random password is refused", !a1.session && !!a1.error, refusedText(a1));
     const a2 = await signIn(A.email, "");
@@ -309,16 +671,15 @@ async function point3() {
   check(P3, "B (password, confirmed): the right password gives a session", !!b1.session && b1.user?.id === B.id, b1.session ? "session" : errInfo(b1.error));
   const b2 = await signIn(B.email, newPassword());
   check(P3, "B (password, confirmed): a wrong password is refused", !b2.session && !!b2.error, refusedText(b2));
-  state.B.wrongCode = errCode(b2.error);
   const rb2 = await readUser(B.id);
   state.B.lastAfter = timeState(rb2.user, "last_sign_in_at");
   // C: password, unconfirmed (recorded either way).
   const c1 = await signIn(C.email, C.pw);
   rec(P3, "C (password, unconfirmed): the right password", "recorded", c1.session ? "a session came back" : errInfo(c1.error));
-  state.C.rightCode = c1.session ? "session" : errCode(c1.error);
+  state.C.rightCode = c1.session ? "session" : `${c1.error?.status ?? "-"}/${c1.error?.code ?? c1.error?.name ?? "-"}`;
 
   // The step the set-password route will make on A.
-  if (!A.id) return;
+  if (!A?.id) return;
   A.pw = newPassword();
   const up = await svc.auth.admin.updateUserById(A.id, { password: A.pw, email_confirm: true });
   check(P3, "A: updateUserById({ password, email_confirm: true }) has no error", !up.error, errInfo(up.error));
@@ -412,9 +773,11 @@ async function point5Round(H, way) {
   const lifeLeft = Number.isFinite(cx.exp) ? Math.round(cx.exp - Date.now() / 1000) : null;
   rec(P5, `${way}: X's access token life left when tested`, "recorded", lifeLeft === null ? "unknown" : `${lifeLeft} s`);
 
-  // (a) The auth server asked who this is.
-  const ax = await fresh().auth.getUser(X.access);
+  // (a) The auth server asked who this is; the server's own status and code are recorded beside the library's.
+  const ur = answerRecorder("/auth/v1/user");
+  const ax = await fresh(ur.f).auth.getUser(X.access);
   check(P5, `${way} (a): getUser with X's old token is refused`, !ax.data?.user && !!ax.error, ax.data?.user ? "the account came back" : errInfo(ax.error));
+  rec(P5, `${way} (a): the auth server's own answer to X's old token`, "recorded", `status=${ur.box.status ?? "no call"} code=${ur.box.code ?? "-"}`);
   const ay = await fresh().auth.getUser(Y.access);
   check(P5, `${way} (a) control: getUser with Y's token returns the account`, ay.data?.user?.id === H.id, ay.data?.user ? "the account" : errInfo(ay.error));
 
@@ -463,13 +826,213 @@ async function point5() {
   rec(P5, "codes: an unknown address", "recorded", refusedText(uk));
 }
 
+/** Step 1 of point 2: delete any account left at an alias with this harness's prefix. */
+async function sweepMailboxAliases() {
+  const re = new RegExp(`^${escRe(MAILBOX.local)}\\+${escRe(MAIL_TAG_PREFIX)}[a-z0-9-]+@${escRe(MAILBOX.domain)}$`);
+  const ids = [];
+  let scanned = 0, error = null;
+  for (let page = 1; page <= USER_MAX_PAGES; page++) {
+    const { data, error: e } = await svc.auth.admin.listUsers({ page, perPage: USER_PAGE_SIZE });
+    if (e) { error = e; break; }
+    const users = data?.users ?? [];
+    scanned += users.length;
+    for (const u of users) if (u.email && re.test(u.email.toLowerCase())) ids.push(u.id);
+    if (users.length < USER_PAGE_SIZE) break;
+  }
+  let deleted = 0;
+  for (const id of ids) {
+    const { error: d } = await svc.auth.admin.deleteUser(id);
+    if (!d) deleted++;
+  }
+  return { ok: !error && deleted === ids.length, found: ids.length, deleted, scanned, error };
+}
+
+/** Point 2 with the mailbox: A1 and A2 must get no mail, beside the invited control I whose mail arrives. */
+async function point2Mail() {
+  // The reader signs in and finds its three folders before any account or mail is made.
+  let folders;
+  try {
+    folders = await findFolders();
+  } catch (e) {
+    rec(P2, "mailbox: the reader signs in and lists its folders", "void", `${imapErr(e)}; point 2 is not proven by this run`);
+    return;
+  }
+  const missingFolders = folders.filter((f) => !f.path);
+  if (!rec(P2, "mailbox: inbox, all-mail and spam folders found by their special-use marks", missingFolders.length ? "void" : "setup",
+    folders.map((f) => `${f.role}=${f.path ? "found" : "missing"}`).join(" "))) return;
+  state.folders = folders;
+
+  // 1. Leftovers of an earlier run; then the time this run's mail is read from.
+  const sw = await sweepMailboxAliases();
+  rec(P2, "mailbox step 1: accounts left at this harness's aliases deleted", sw.ok ? "setup" : "fail",
+    `found=${sw.found} deleted=${sw.deleted} users scanned=${sw.scanned}${sw.error ? ` scan ${errInfo(sw.error)}` : ""}`);
+  const step1At = Date.now();
+  // IMAP's "since" is a day; a day earlier covers any time zone. The aliases are new, so nothing older can match.
+  const since = new Date(step1At - 24 * 3600_000);
+
+  // 2. A1: the address only, and nothing more.
+  const A1 = { email: mailAlias("a1") };
+  runAddresses.add(A1.email);
+  const c1 = await createAtMailbox(A1.email);
+  track("M-A1", c1.data?.user);
+  if (!check(P2, "mailbox step 2: A1 = createUser({ email }) has no error", !c1.error && !!c1.data?.user?.id, errInfo(c1.error))) return;
+  A1.id = c1.data.user.id;
+
+  // 3. A2: the same create, the administrator's password call, one password sign-in.
+  const A2 = { email: mailAlias("a2"), pw: newPassword() };
+  runAddresses.add(A2.email);
+  const c2 = await createAtMailbox(A2.email);
+  track("M-A2", c2.data?.user);
+  if (!check(P2, "mailbox step 3: A2 = createUser({ email }) has no error", !c2.error && !!c2.data?.user?.id, errInfo(c2.error))) return;
+  A2.id = c2.data.user.id;
+  const up = await svc.auth.admin.updateUserById(A2.id, { password: A2.pw, email_confirm: true });
+  const upOk = check(P2, "mailbox step 3: A2 updateUserById({ password, email_confirm: true }) has no error", !up.error, errInfo(up.error));
+  const s2 = await signIn(A2.email, A2.pw);
+  const s2Ok = check(P2, "mailbox step 3: A2's password sign-in gives a session", !!s2.session && s2.user?.id === A2.id, s2.session ? "session" : errInfo(s2.error));
+  const step3At = Date.now();
+
+  // 4. The control, after A2's last step: one invite, the call spec 36 makes.
+  const I = { email: mailAlias("i") };
+  runAddresses.add(I.email);
+  const inviteAt = Date.now();
+  const inv = await inviteAtMailbox(I.email);
+  track("M-I", inv.data?.user);
+  if (inv.error) {
+    rec(P2, "mailbox step 4: control inviteUserByEmail to I", "void", `${errInfo(inv.error)}; the mailer refused, point 2 is not proven by this run`);
+    return;
+  }
+  rec(P2, "mailbox step 4: control inviteUserByEmail to I", "recorded", "no error");
+
+  // 5. Read until the control's mail is found, for at most five minutes.
+  const got = await waitForAlias(folders, I.email, since, inviteAt + MAIL_WAIT_MS, P2, "mailbox step 5");
+  if (!got.folder) {
+    rec(P2, "mailbox step 5: the control's mail is found within 5 minutes", "void", `not found after ${sec(Date.now() - inviteAt)} s; point 2 is not proven by this run`);
+    return;
+  }
+  rec(P2, "mailbox step 5: the control's mail is found within 5 minutes", "pass", `folder=${got.folder.role} after ${sec(got.at - inviteAt)} s`);
+
+  // 6. The last read: no sooner than five minutes after step 3, one search per alias in every folder.
+  const wait = step3At + MAIL_WAIT_MS - Date.now();
+  if (wait > 0) {
+    console.log(`  waiting ${Math.ceil(wait / 1000)} s before the last read`);
+    await sleep(wait);
+  }
+  let last;
+  try {
+    last = await readRound(folders, [A1.email, A2.email, I.email], since);
+  } catch (e) {
+    rec(P2, "mailbox step 6: the last read", "void", `${imapErr(e)}; point 2 is not proven by this run`);
+    return;
+  }
+  const after = sec(Date.now() - step3At);
+  const nI = exactCount(last, I.email, folders), nA1 = exactCount(last, A1.email, folders), nA2 = exactCount(last, A2.email, folders);
+  rec(P2, "mailbox step 6: the last read finds the control's mail again", nI > 0 ? "pass" : "void", `I ${perFolder(last, I.email, folders)}; ${after} s after step 3`);
+  check(P2, "mailbox step 6: no message to A1 in any folder", nA1 === 0, `A1 ${perFolder(last, A1.email, folders)}`);
+  check(P2, "mailbox step 6: no message to A2 in any folder", nA2 === 0, `A2 ${perFolder(last, A2.email, folders)}`);
+  const loose = [["A1", A1.email], ["A2", A2.email], ["I", I.email]]
+    .map(([k, a]) => [k, folders.reduce((n, f) => n + last[a][f.role].hits, 0) - exactCount(last, a, folders)])
+    .filter(([, n]) => n > 0);
+  if (loose.length) rec(P2, "mailbox step 6: search hits whose recipients are not the alias (not counted)", "recorded", loose.map(([k, n]) => `${k}=${n}`).join(" "));
+
+  // The four sent times, recorded only.
+  for (const [k, x] of [["A1", A1], ["A2", A2], ["I", { id: inv.data?.user?.id }]]) {
+    if (!x.id) continue;
+    const r = await readUser(x.id);
+    rec(P2, `mailbox: ${k}'s four sent times`, "recorded", r.error ? errInfo(r.error) : sentStates(r.user));
+  }
+
+  // The verdict.
+  if (nA1 || nA2) {
+    rec(P2, "mailbox verdict: no mail at create, at the password step or at the first sign-in", "fail",
+      nA1 ? "A1 received mail, so createUser alone mailed it" : "only A2 received mail, so the password call or the first sign-in mailed it");
+  } else if (nI === 0) {
+    rec(P2, "mailbox verdict", "void", "the last read did not find the control's mail; point 2 is not proven by this run");
+  } else {
+    check(P2, "mailbox verdict: no mail at create, at the password step or at the first sign-in", upOk && s2Ok,
+      upOk && s2Ok ? "the control's mail found in the same read" : "A2's steps did not complete");
+  }
+}
+
+/** The one fixed message of point 6, with this run's two links. */
+function transportMessage(link, control) {
+  const intro = "This is an automatic test message from the LMS test harness. It needs no action, and its links lead to no account.";
+  return {
+    subject: "LMS test: link transport check",
+    text: `${intro}\n\nLink 1:\n${link}\n\nLink 2:\n${control}\n`,
+    html: `<!doctype html><html><body><p>${intro}</p><p>Link 1: <a href="${link}">${link}</a></p><p>Link 2: <a href="${control}">${control}</a></p></body></html>`,
+  };
+}
+/** 43 random characters (32 bytes as base64url), the setup token's shape; it belongs to no row. */
+function token43() {
+  const t = randomBytes(32).toString("base64url");
+  if (t.length !== 43) throw new Error("token length");
+  return t;
+}
+
+/** Point 6, the transport leg: the fragment link through send-smtp and back out of the mailbox, whole. */
+async function point6Transport() {
+  const T = mailAlias("t"); // no account: only a recipient
+  const link = `${STAGING_SITE}/auth/set-password#t=${token43()}`;
+  const control = `${STAGING_SITE}/auth/set-password?t=${token43()}`;
+  const message = transportMessage(link, control);
+
+  let folders = state.folders;
+  if (!folders) {
+    try {
+      folders = await findFolders();
+    } catch (e) {
+      rec(P6, "transport: the reader signs in and lists its folders", "void", `${imapErr(e)}; nothing was sent`);
+      return;
+    }
+  }
+  folders = folders.filter((f) => f.path);
+  const since = new Date(Date.now() - 24 * 3600_000);
+
+  const sentAt = Date.now();
+  const ans = await sendThroughSmtpFunction(T, message);
+  if (!ans.ok) {
+    rec(P6, "transport: one message through staging's send-smtp (test organisation's SMTP)", "void", `status=${ans.status ?? "none"} class=${ans.cls} after ${sec(ans.ms)} s; the leg is not proven by this run`);
+    return;
+  }
+  rec(P6, "transport: one message through staging's send-smtp (test organisation's SMTP)", "recorded",
+    `status=${ans.status} ok=true after ${sec(ans.ms)} s (the app waits ${sec(APP_SEND_WAIT_MS)} s)`);
+
+  const got = await waitForAlias(folders, T, since, sentAt + MAIL_WAIT_MS, P6, "transport");
+  if (!got.folder) {
+    rec(P6, "transport: the message is found in the mailbox", "void", `not found after ${sec(Date.now() - sentAt)} s; the leg is not proven by this run`);
+    return;
+  }
+  rec(P6, "transport: the message is found in the mailbox", "recorded", `folder=${got.folder.role} after ${sec(got.at - sentAt)} s`);
+
+  let parts;
+  try {
+    parts = await readParts(got.folder.path, got.uid);
+  } catch (e) {
+    rec(P6, "transport: the message's parts read", "void", `${imapErr(e)}; the leg is not proven by this run`);
+    return;
+  }
+  rec(P6, "transport: the message's parts", "recorded", `structure=${parts.structure} text parts=${parts.texts.length} html parts=${parts.htmls.length}`);
+
+  const anchors = parts.htmls.flatMap(anchorsOf);
+  const rows = [
+    ["text part", parts.texts.some((t) => lineOf(t, link)), parts.texts.some((t) => lineOf(t, control))],
+    ["html part, the link's address", anchors.some((a) => a.href === link), anchors.some((a) => a.href === control)],
+    ["html part, the link's shown text", anchors.some((a) => a.shown === link), anchors.some((a) => a.shown === control)],
+  ];
+  for (const [part, f, c] of rows) rec(P6, `transport: ${part}`, "recorded", `fragment link ${whole(f)}, control ${whole(c)}`);
+  const controlsWhole = rows.every(([, , c]) => c);
+  const fragmentsWhole = rows.every(([, f]) => f);
+  if (!controlsWhole) rec(P6, "transport verdict", "void", "a control did not arrive whole, so the reader's view is not shown; the leg is not proven by this run");
+  else check(P6, "transport verdict: the fragment link arrives whole in every part", fragmentsWhole, fragmentsWhole ? "every part whole" : "a part changed it");
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup: every account of this run, also after a failure
 // ---------------------------------------------------------------------------
-let cleaned = false;
-async function cleanup() {
-  if (cleaned) return true;
-  cleaned = true;
+let cleanupPromise = null;
+/** One cleanup per process: a second caller waits for the first. */
+const cleanup = () => (cleanupPromise ??= doCleanup());
+async function doCleanup() {
   let ok = true;
   const ids = [...new Set(created.values())];
   let deleted = 0;
@@ -482,18 +1045,20 @@ async function cleanup() {
   }
   // Any account of this run's addresses still there (one an error left behind).
   let left = 0, extra = 0, scanned = 0, scanError = null;
-  for (let page = 1; page <= USER_MAX_PAGES; page++) {
-    const { data, error } = await svc.auth.admin.listUsers({ page, perPage: USER_PAGE_SIZE });
-    if (error) { scanError = error; break; }
-    const users = data?.users ?? [];
-    scanned += users.length;
-    for (const u of users) {
-      if (u.email && runAddresses.has(u.email.toLowerCase())) {
-        const { error: dErr } = await svc.auth.admin.deleteUser(u.id);
-        if (dErr) { left++; ok = false; } else extra++;
+  if (runAddresses.size) {
+    for (let page = 1; page <= USER_MAX_PAGES; page++) {
+      const { data, error } = await svc.auth.admin.listUsers({ page, perPage: USER_PAGE_SIZE });
+      if (error) { scanError = error; break; }
+      const users = data?.users ?? [];
+      scanned += users.length;
+      for (const u of users) {
+        if (u.email && runAddresses.has(u.email.toLowerCase())) {
+          const { error: dErr } = await svc.auth.admin.deleteUser(u.id);
+          if (dErr) { left++; ok = false; } else extra++;
+        }
       }
+      if (users.length < USER_PAGE_SIZE) break;
     }
-    if (users.length < USER_PAGE_SIZE) break;
   }
   const { count, error: pErr } = ids.length
     ? await svc.from("profiles").select("id", { count: "exact", head: true }).in("id", ids)
@@ -505,58 +1070,138 @@ async function cleanup() {
   return ok;
 }
 
-process.on("SIGINT", async () => {
-  console.log("interrupted: cleaning up");
-  await cleanup().catch(() => {});
-  process.exit(3);
-});
+// ---------------------------------------------------------------------------
+// Dry run: the plan and the recipient guard, through the same wrappers as
+// the run, with stub transports that count calls. Nothing leaves the process.
+// ---------------------------------------------------------------------------
+function notMailboxFor(box) {
+  const { local, domain, base } = box;
+  const tag = `${MAIL_TAG_PREFIX}x-${RUN}`;
+  return [
+    "", `someone.else@${domain}`, `${local}@other.invalid`, `${local}@${domain}.invalid`,
+    `${local}+${tag}@other.invalid`, `${local}+${tag}@${domain}.invalid`, `${local}+${tag}@sub.${domain}`,
+    `x${local}+${tag}@${domain}`, `${local}x+${tag}@${domain}`, `${local}+${tag}@${domain}@other.invalid`,
+    `"${local}+${tag}@${domain}" <someone@other.invalid>`, `${local}+${tag}@${domain}, someone@other.invalid`,
+    ` ${local}+${tag}@${domain}`, `${local}+${tag}@${domain}\r\nBcc: someone@other.invalid`,
+    `${base}.invalid`, `${local}+${tag}@${domain} `,
+  ];
+}
+async function recipientSelfCheck() {
+  const boxes = [parseMailbox("mailbox@example.invalid"), MAILBOX].filter(Boolean);
+  let calls = 0, refused = 0, tried = 0, accepted = 0, good = 0;
+  const stubFetch = async () => { calls++; throw new Error("stub transport"); };
+  const stubClient = { auth: { admin: { createUser: async () => { calls++; return {}; }, inviteUserByEmail: async () => { calls++; return {}; } } } };
+  const stubMessage = transportMessage(`${STAGING_SITE}/`, `${STAGING_SITE}/`);
+  for (const box of boxes) {
+    for (const bad of notMailboxFor(box)) {
+      for (const send of [
+        () => createAtMailbox(bad, { client: stubClient, box }),
+        () => inviteAtMailbox(bad, { client: stubClient, box }),
+        () => sendThroughSmtpFunction(bad, stubMessage, { fetchImpl: stubFetch, box }),
+      ]) {
+        tried++;
+        try {
+          await send();
+        } catch (e) {
+          if (e instanceof RecipientRefused) refused++;
+        }
+      }
+    }
+    for (const ok of [box.base, ...["a1", "a2", "i", "t"].map((r) => mailAlias(r, box))]) {
+      good++;
+      if (isMailboxRecipient(ok, box)) accepted++;
+    }
+  }
+  const pass = refused === tried && calls === 0 && accepted === good;
+  console.log(`recipient guard: ${refused} of ${tried} calls to addresses that are not the mailbox refused, transport calls made ${calls}; ${accepted} of ${good} mailbox addresses accepted (${boxes.length === 2 ? "a sample mailbox and the set one" : "a sample mailbox only"}) => ${pass ? "pass" : "FAIL"}`);
+  return pass;
+}
+
+if (dryRun) {
+  console.log(`plan: ${mailOnly ? "points 1, 3, 4 and 5 left out (--mail-only)" : "points 1, 3, 4 and 5 run"}; point 2 with the mailbox ${mailReady ? "runs" : `not run (${mailReason})`}; point 6 transport leg ${smtpReady ? "runs" : `not run (${smtpReason})`}; point 6 platform and tenant legs not run (later steps)`);
+  const guardOk = await recipientSelfCheck();
+  console.log("dry run: no call made.");
+  process.exit(guardOk ? 0 : 3);
+}
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+const startedAt = new Date().toISOString();
+const count = (o) => results.filter((r) => r.outcome === o).length;
+function finish() {
+  const summary = `pass=${count("pass")} fail=${count("fail")} void=${count("void")} recorded=${count("recorded")} not_run=${count("not run")} harness=${count("harness")}`;
+  console.log(`\nsummary: ${summary}`);
+  if (reportPath) {
+    writeFileSync(reportPath, JSON.stringify({ startedAt, finishedAt: new Date().toISOString(), project: "staging", mode: mailOnly ? "mail-only" : "all", summary, results }, null, 2) + "\n");
+    console.log("report written");
+  }
+}
+const notRunMail = () => rec(P2, "point 2 with the mailbox", "not run", mailReason);
+const notRunTransport = () => rec(P6, "point 6, transport leg", "not run", smtpReason);
+const notRunLaterLegs = () => {
+  rec(P6, "point 6, platform leg", "not run", "a later step, with staging's platform sender settings");
+  rec(P6, "point 6, tenant leg in the app's own mail", "not run", "pull request C");
+};
+
+// --mail-only with nothing to run: decided before any call, and no call is made.
+if (mailOnly && !mailReady) {
+  notRunMail();
+  notRunTransport();
+  notRunLaterLegs();
+  finish();
+  process.exit(2);
+}
+
+let exiting = false;
+async function emergencyExit(why, e) {
+  if (exiting) return;
+  exiting = true;
+  console.error(`✖ ${why}${e ? `: ${harnessText(e)}` : ""}; cleaning up`);
+  await closeAllReaders().catch(() => {});
+  await cleanup().catch(() => {});
+  finish();
+  process.exit(3);
+}
+process.on("SIGINT", () => emergencyExit("interrupted"));
+process.on("uncaughtException", (e) => emergencyExit("uncaught error", e));
+process.on("unhandledRejection", (e) => emergencyExit("unhandled rejection", e));
+
 let harnessFailed = false;
 async function step(name, fn) {
   try {
     await fn();
   } catch (e) {
     harnessFailed = true;
-    rec(name, "step threw", "harness", harnessText(e));
+    rec(name, "step threw", "harness", e instanceof RecipientRefused ? "a recipient that is not the mailbox was refused" : harnessText(e));
   }
 }
 
-const startedAt = new Date().toISOString();
-await step("run", preamble);
-await step(P1, point1);
-if (state.A?.id) {
-  await step(P2, () => point2Reading("after create").then((r) => (state.A2a = r)));
-  await step(P2, point2Control);
-} else rec(P2, "point 2", "not run", "account A was not created");
-await step(P3, point3);
-if (state.A?.id) await step(P2, () => point2Reading("after point 3's last step").then((r) => (state.A2b = r)));
-await step(P4, point4);
-await step(P5, point5);
-rec(P6, "fragment through mail (SMTP and platform sender)", "not run", "waits for the owner's test mailbox");
-
-// Point 2's verdict: A leaves empty what the control set.
-if (state.control2 && state.A2a && state.A2b) {
-  if (state.control2.void) rec(P2, "verdict", "void", `control refused (${state.control2.code}); not proven by this run`);
-  else {
-    const set = state.control2.set;
-    const aEmpty = set.every((k) => isEmpty(state.A2a.user, k) && isEmpty(state.A2b.user, k));
-    check(P2, "verdict: A leaves empty what the control set", set.length > 0 && aEmpty && state.A2a.ok && state.A2b.ok, `control set: ${set.join(", ") || "nothing"}`);
+let cleanOk = false;
+try {
+  await step("run", preamble);
+  if (!mailOnly) {
+    await step(P1, point1);
+    if (state.A?.id) await step(P2, () => point2Reading("after create"));
+    else rec(P2, "A (lifecycle): the four sent times", "not run", "account A was not created");
+    await step(P3, point3);
+    if (state.A?.id) await step(P2, () => point2Reading("after point 3's last step"));
+    await step(P4, point4);
+    await step(P5, point5);
   }
+  // The transport leg first: point 2 comes last, so that nothing is tried after a void of point 2.
+  if (smtpReady) await step(P6, point6Transport);
+  else notRunTransport();
+  notRunLaterLegs();
+  if (mailReady) await step(P2, point2Mail);
+  else notRunMail();
+} finally {
+  await closeAllReaders().catch(() => {});
+  cleanOk = await cleanup().catch((e) => {
+    rec("cleanup", "cleanup threw", "harness", harnessText(e));
+    return false;
+  });
 }
 
-const cleanOk = await cleanup().catch((e) => {
-  rec("cleanup", "cleanup threw", "harness", harnessText(e));
-  return false;
-});
-
-const count = (o) => results.filter((r) => r.outcome === o).length;
-const summary = `pass=${count("pass")} fail=${count("fail")} void=${count("void")} recorded=${count("recorded")} not_run=${count("not run")} harness=${count("harness")}`;
-console.log(`\nsummary: ${summary}`);
-if (reportPath) {
-  writeFileSync(reportPath, JSON.stringify({ startedAt, finishedAt: new Date().toISOString(), project: "staging", summary, results }, null, 2) + "\n");
-  console.log("report written");
-}
+finish();
 process.exit(harnessFailed || count("harness") || !cleanOk ? 3 : count("fail") || count("void") ? 1 : 0);
