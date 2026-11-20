@@ -548,6 +548,8 @@ async function main() {
       const put = adminPut();
       const sent = (put >= 0 ? JSON.parse(requests[put].body) : {}) as Row;
       eq("forgot-password reset: 200, the owner's password set", [ok.status, ((await ok.json()) as Row).ok, sent.password], [200, true, "Another-Pass-1"]);
+      // ADR 0029 section C: the same call marks the address confirmed (one call, no second update).
+      eq("…the same call marks the address confirmed; it is the reset's one admin update", [sent.email_confirm, requests.filter((r) => r.path.startsWith("/auth/v1/admin/users/") && r.method === "PUT").length], [true, 1]);
       eq("…the impersonation is ended after the password is set and the token spent, and the cookie deleted",
         [put >= 0 && tokenSpent() > put, userCheck() > tokenSpent(), deleted.includes(IMP_COOKIE), browser.has(IMP_COOKIE)], [true, true, true, false]);
       eq("…the owner's sign-in ended with the password set, so the row runs to its expiry", [rows.get(id)?.ended_at, writes().length], [null, 0]);

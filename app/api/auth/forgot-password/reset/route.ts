@@ -112,9 +112,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "User not found" }, { status: 404 });
   }
 
-  // Update password.
+  // Update password. A completed reset also marks the address confirmed, in
+  // the same call (ADR 0029 section C; ADR 0027 point 18, amendment 7): a
+  // person welcomed in invite mode has an unconfirmed address, and a reset
+  // that set only the password could still leave them unable to sign in.
   const { error: pwErr } = await svc.auth.admin.updateUserById(user.id, {
     password: newPw,
+    email_confirm: true,
   });
   if (pwErr) {
     return NextResponse.json({ error: pwErr.message }, { status: 400 });
