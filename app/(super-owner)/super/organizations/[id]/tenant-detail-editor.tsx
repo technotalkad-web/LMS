@@ -38,6 +38,8 @@ const ROLE_LABEL: Record<string, string> = {
 
 /** ADR 0029 rule T2: what "Send setup link again" tells the administrator, word for word. */
 const SEND_AGAIN_NOTE = "The first mail may still arrive. Its link stops working when you send a new one.";
+/** The link on the screen is the link in the mail (rule N8): a new one ends it. */
+const LATER_LINK_NOTE = "If you send a new setup link later, this one stops working.";
 
 /** A row that is not active gives no access; adding the person again sets it active. */
 const STATUS_LABEL: Record<string, string> = {
@@ -287,7 +289,7 @@ export function TenantDetailEditor({
             </p>
             <p>
               Pass this link to the person by another way. It lets them set their own password, works once and
-              expires in 7 days. It is shown only now.
+              expires in 7 days. It is shown only now. {LATER_LINK_NOTE}
             </p>
             {shownLink.mayHaveArrived && <p>{SEND_AGAIN_NOTE}</p>}
             <div className="flex gap-2 items-center">

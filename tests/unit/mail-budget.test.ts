@@ -3,7 +3,9 @@
  * and FP3 of the notes of 2026-11-18; lib/notifications/smtp-state.ts), the
  * run's cases. The routes' sums come with stage 2.
  *   - the rule: at most 40 calls (0.8 of the plan's 50) for a request or a
- *     cron call; an alert's cost and a scheduled call's two sums;
+ *     cron call; a cron call keeps two of them for its end (the carry's read
+ *     and the heartbeat), so its count's limit is 38; an alert's cost and a
+ *     scheduled call's two sums;
  *   - an ESTIMATE, not proof: the sum of an administrator's request adds the
  *     code's call costs to read counts typed by hand. It is labelled so until
  *     gate G3 measures the routes;
@@ -11,10 +13,18 @@
  *     2026-11-21, part 2): the reminders call's calls before its first send,
  *     read by read, for one set of data (the sum gate G3's reminders line
  *     is compared with); the route's own count equals the requests it made,
- *     paged reads included; a whole call never passes 40; a paged read that
+ *     paged reads included; a whole call, its heartbeat included, never
+ *     passes 40, a failed one with its carry read neither; a paged read that
  *     takes one page more than fits stops the run with call_limit, ended by
- *     the count; and a journey-nudges call with no alert due has room for a
- *     full page (500 due learners, 500 managers) and its first group;
+ *     the count; a call that read nobody's people whole for want of room is
+ *     call_limit in members_read, by the clock or by the count, while a
+ *     program left once another's people were read whole is a clean run
+ *     (note of 2026-11-21 (later), point 4); a program with no room for its
+ *     line managers' read is left whole (point 1); each group of escalations
+ *     writes its marks before the next group, and a failed mark is
+ *     state_write (point 2); and a journey-nudges call with no alert due has
+ *     room for a full page (500 due learners, 500 managers) and its first
+ *     group;
  *   - the counted calls are the calls made: the budget's count equals the
  *     requests the run sent, for a run of sends, a stopped run and an alert;
  *   - under a clock the test sets: no send starts after the window (45 s for
@@ -38,6 +48,7 @@ import {
   ADMIN_REQUEST_OWN_CALLS,
   ALERT_CALL_COST,
   CALL_SUM_LIMIT,
+  CRON_END_CALLS,
   CRON_SEND_WINDOW_MS,
   MAIL_CALL_COSTS,
   REQUEST_SEND_WINDOW_MS,
@@ -63,8 +74,10 @@ async function main() {
     eq("N is 4 on the free plan", SENDS_AT_ONCE, 4);
     eq("the windows: 45 s for a request, 240 s for a cron call", [REQUEST_SEND_WINDOW_MS, CRON_SEND_WINDOW_MS], [45_000, 240_000]);
     eq("opening a run costs three calls (the settings, the organisation, the state with its count)", MAIL_CALL_COSTS.open, 3);
-    eq("an alert costs at most 25 calls: within one call's sum, with room left for other work", [ALERT_CALL_COST, ALERT_CALL_COST <= CALL_SUM_LIMIT], [25, true]);
-    eq("a scheduled call's two sums: with an alert, at most 15 calls remain for its own mail", CALL_SUM_LIMIT - ALERT_CALL_COST, 15);
+    eq("a scheduled call keeps two calls for its end (the carry's read and the heartbeat), inside the 40: its count's limit is 38; a request's is 40",
+      [CRON_END_CALLS, cronBudget().callLimit, requestBudget().callLimit], [2, CALL_SUM_LIMIT - 2, CALL_SUM_LIMIT]);
+    eq("an alert costs at most 25 calls: within one call's sum, with room left for other work", [ALERT_CALL_COST, ALERT_CALL_COST <= cronBudget().callLimit], [25, true]);
+    eq("a scheduled call's two sums: with an alert, at most 13 calls remain for its own mail", cronBudget().callLimit - ALERT_CALL_COST, 13);
 
     console.log("\nAN ESTIMATE until gate G3 measures the routes: an administrator's request (rule FP2), from the code's costs and read counts typed by hand");
     {
@@ -77,7 +90,7 @@ async function main() {
       const mailReads = 1 + 2 + 2 + 1;
       const firstGroup = MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark;
       eq("estimate (hand-typed read counts; gate G3 measures the routes): an administrator's request, its own work, its reads and a first mail fit the 40", ADMIN_REQUEST_OWN_CALLS + mailReads + MAIL_CALL_COSTS.open + firstGroup <= CALL_SUM_LIMIT, true);
-      eq("from the code's alert cost (the alert itself is run below): with an alert due, the alert alone fits, and what it leaves is what the call's own mail may use", [ALERT_CALL_COST <= CALL_SUM_LIMIT, CALL_SUM_LIMIT - ALERT_CALL_COST], [true, 15]);
+      eq("from the code's alert cost (the alert itself is run below): with an alert due, the alert alone fits a scheduled call, and what it leaves is what the call's own mail may use", [ALERT_CALL_COST <= cronBudget().callLimit, cronBudget().callLimit - ALERT_CALL_COST], [true, 13]);
     }
 
     await cronRouteCases();
@@ -185,18 +198,34 @@ const assignment = (type: "user" | "team" | "group", ref: string): Row => ({
  * One organisation with `members` active members (every one an address), a
  * course with reminders on, assigned to the first `direct` members by name,
  * and, when asked, to a team and to a static group of two members each, and
- * to a dynamic group whose rule names that team.
+ * to a dynamic group whose rule names that team. With `second`, another
+ * organisation with a course of its own (after the first in the settings'
+ * order) and the same number of members, the first `direct` of them named.
  */
-function reminderWorld(o: { members: number; direct: number; teamAndGroup?: boolean; dynamicGroup?: boolean; state?: Row[] }) {
+function reminderWorld(o: { members: number; direct: number; teamAndGroup?: boolean; dynamicGroup?: boolean; state?: Row[]; second?: boolean }) {
   const ids = Array.from({ length: o.members }, (_, i) => memberId(i));
   const rows = ids.slice(0, o.direct).map((u) => assignment("user", u));
   if (o.teamAndGroup) rows.push(assignment("team", "t-0029"), assignment("group", "g-0029"));
   if (o.dynamicGroup) rows.push(assignment("group", "g-dyn"));
+  const otherIds = o.second ? ids.map((u) => `${u}-b`) : [];
+  const SECOND_COURSE = "c-0030";
+  if (o.second) {
+    rows.push(...otherIds.slice(0, o.direct).map((u) => ({ ...assignment("user", u), id: `a-user-${u}`, course_id: SECOND_COURSE, organization_id: OTHER_ORG })));
+  }
   freshWorld({
-    members: ids.map((u) => ({ organization_id: ORG, user_id: u, role: "user", status: "active" })),
-    profiles: Object.fromEntries(ids.map((u) => [u, `${u}@tenant.stub`])),
+    otherOrgs: o.second ? [{ id: OTHER_ORG, name: "Tenant B", slug: "tenant-b", deleted_at: null }] : [],
+    members: [
+      ...ids.map((u) => ({ organization_id: ORG, user_id: u, role: "user", status: "active" })),
+      ...otherIds.map((u) => ({ organization_id: OTHER_ORG, user_id: u, role: "user", status: "active" })),
+    ],
+    profiles: Object.fromEntries([...ids, ...otherIds].map((u) => [u, `${u}@tenant.stub`])),
     tables: {
-      course_reminder_settings: [{ ...SETTING }],
+      course_reminder_settings: [
+        { ...SETTING },
+        ...(o.second
+          ? [{ ...SETTING, course_id: SECOND_COURSE, courses: { id: SECOND_COURSE, title: "Course B", organization_id: OTHER_ORG, organizations: { name: "Tenant B", slug: "tenant-b", deleted_at: null } } }]
+          : []),
+      ],
       course_assignments: rows,
       team_members: [memberId(o.members - 1), memberId(o.members - 2)].map((u) => ({ team_id: "t-0029", user_id: u })),
       org_groups: [
@@ -232,49 +261,68 @@ const readsOf = (table: string) => requests.filter((r) => r.table === table && r
 
 /**
  * One journey program of the organisation, with `n` learners enrolled and
- * behind, each with a manager of their own; every one an address.
+ * behind, each with a manager of their own; every one an address. With
+ * `second`, a second program of `n` learners of its own, in the same
+ * organisation or in another. With `escalationOnly`, every learner has done
+ * every mission released so far but is past the journey's deadline: no
+ * reminder is due, and each raises an escalation to their manager.
  */
-function nudgeWorld(n: number) {
-  const START = new Date(Date.now() - 8 * 86_400_000).toISOString().slice(0, 10);
+function nudgeWorld(n: number, o: { second?: "same_org" | "other_org"; escalationOnly?: boolean } = {}) {
+  const START = new Date(Date.now() - (o.escalationOnly ? 5 : 8) * 86_400_000).toISOString().slice(0, 10);
   const VERSION = { days: Array.from({ length: 10 }, (_, i) => ({ day: i + 1, course_id: COURSE, mission_title: `Mission ${i + 1}` })), days_total: 10, count_sundays: true, unlock_mode: "calendar" };
-  const learners = Array.from({ length: n }, (_, i) => `l-${String(i).padStart(3, "0")}`);
-  const managers = learners.map((u) => `${u}-mgr`);
+  const programs = [{ id: "p-0029", org: ORG, prefix: "l" }, ...(o.second ? [{ id: "p-0030", org: o.second === "same_org" ? ORG : OTHER_ORG, prefix: "k" }] : [])];
+  const people = programs.map((pr) => {
+    const learners = Array.from({ length: n }, (_, i) => `${pr.prefix}-${String(i).padStart(3, "0")}`);
+    return { ...pr, learners, managers: learners.map((u) => `${u}-mgr`) };
+  });
   freshWorld({
-    members: [
-      ...learners.map((u, i) => ({ organization_id: ORG, user_id: u, role: "user", status: "active", line_manager_id: managers[i] })),
-      ...managers.map((u) => ({ organization_id: ORG, user_id: u, role: "user", status: "active", line_manager_id: null })),
-    ],
-    profiles: Object.fromEntries([...learners, ...managers].map((u) => [u, `${u}@tenant.stub`])),
+    otherOrgs: [{ id: OTHER_ORG, name: "Tenant B", slug: "tenant-b", deleted_at: null }],
+    members: people.flatMap((pr) => [
+      ...pr.learners.map((u, i) => ({ organization_id: pr.org, user_id: u, role: "user", status: "active", line_manager_id: pr.managers[i] })),
+      ...pr.managers.map((u) => ({ organization_id: pr.org, user_id: u, role: "user", status: "active", line_manager_id: null })),
+    ]),
+    profiles: Object.fromEntries(people.flatMap((pr) => [...pr.learners, ...pr.managers]).map((u) => [u, `${u}@tenant.stub`])),
     tables: {
-      journey_programs: [{
-        id: "p-0029", organization_id: ORG, name: "Journey A", is_active: true, nudge_enabled: true, current_version_id: "jv-0029",
-        nudge_cooldown_days: 3, reminder_hour: 0, deadline_days: null, escalation_enabled: true, escalation_after_days: 1,
-        organizations: { name: "Tenant A", slug: "tenant-a", deleted_at: null },
-      }],
-      gamification_settings: [],
-      journey_enrollments: learners.map((u, i) => ({
-        id: `e-${String(i).padStart(3, "0")}`, user_id: u, program_id: "p-0029", status: "active", start_date: START,
-        last_nudged_at: null, last_daily_reminder_on: null, journey_versions: VERSION,
+      journey_programs: people.map((pr) => ({
+        id: pr.id, organization_id: pr.org, name: `Journey ${pr.id}`, is_active: true, nudge_enabled: true, current_version_id: "jv-0029",
+        nudge_cooldown_days: 3, reminder_hour: 0, deadline_days: o.escalationOnly ? 2 : null, escalation_enabled: true, escalation_after_days: 1,
+        organizations: pr.org === ORG ? { name: "Tenant A", slug: "tenant-a", deleted_at: null } : { name: "Tenant B", slug: "tenant-b", deleted_at: null },
       })),
+      gamification_settings: [],
+      journey_enrollments: people.flatMap((pr) => pr.learners.map((u, i) => ({
+        id: `e-${pr.prefix}${String(i).padStart(3, "0")}`, user_id: u, program_id: pr.id, status: "active", start_date: START,
+        last_nudged_at: null, last_daily_reminder_on: null, journey_versions: VERSION,
+      }))),
       courses: [],
     },
     rpc: {
-      // Nothing credited yet: every learner is behind.
-      journey_reminder_counts: (body) => ((body?.p_ids as string[] | undefined) ?? []).map((id) => ({ enrollment_id: id, done: 0, done_today: false, credited: [] })),
+      // Nothing credited yet, so every learner is behind; or, with
+      // escalationOnly, the first seven days credited.
+      journey_reminder_counts: (body) => ((body?.p_ids as string[] | undefined) ?? []).map((id) => ({ enrollment_id: id, done: 0, done_today: false, credited: o.escalationOnly ? [1, 2, 3, 4, 5, 6, 7] : [] })),
     },
   });
 }
+/** The enrolments a request to journey_enrollments names (`id=eq.x` or `id=in.(x,y)`). */
+const idsOf = (q: URLSearchParams) => (q.get("id") ?? "").replace(/^eq\./, "").replace(/^in\.\(|\)$/g, "").split(",").filter(Boolean);
+/** The escalation marks the call wrote: one entry for each write, with its enrolments. */
+const marksWritten = () => requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && "last_nudged_at" in ((q.body as Row) ?? {}));
 
 async function cronRouteCases() {
   process.env.CRON_SECRET = CRON_SECRET;
   const reminders = await import("../../app/api/cron/reminders/route");
   const nudges = await import("../../app/api/cron/journey-nudges/route");
   const realNow = Date.now;
-  /** Run a cron route; with `endClockAt`, the call's 240 seconds end when that table is first read. */
-  const runCron = async (route: { POST: (r: never) => Promise<Response> }, path: string, endClockAt?: string) => {
+  /**
+   * Run a cron route; with `endClockAt`, the call's 240 seconds end when that
+   * table is first read, or at the first request the predicate names. The
+   * stub sees a request once its gate let it through, so the read refused is
+   * the one after it.
+   */
+  const runCron = async (route: { POST: (r: never) => Promise<Response> }, path: string, endClockAt?: string | ((r: (typeof requests)[number]) => boolean)) => {
     let clock = realNow();
     let ended = false;
-    if (endClockAt) world.onRequest = (r) => { if (!ended && r.table === endClockAt) { ended = true; clock += 300_000; } };
+    const at = typeof endClockAt === "string" ? (r: (typeof requests)[number]) => r.table === endClockAt : endClockAt;
+    if (at) world.onRequest = (r) => { if (!ended && at(r)) { ended = true; clock += 300_000; } };
     Date.now = () => clock;
     try {
       const { value, lines } = await captureLogs(async () => {
@@ -282,12 +330,22 @@ async function cronRouteCases() {
         return { status: res.status, body: (await res.json()) as Row };
       });
       const noRoom = lines.map((l) => { try { return JSON.parse(l) as Row; } catch { return null; } }).filter((l): l is Row => l?.event === "cron_no_room");
-      return { ...value, noRoom };
+      const beat = requests.filter((q) => q.table === "ops_heartbeats" && q.method === "POST").map((q) => q.body as Row)[0];
+      return { ...value, noRoom, beat, detail: (beat?.last_detail ?? {}) as Row };
     } finally {
       Date.now = realNow;
     }
   };
-  const remind = (endClockAt?: string) => runCron(reminders as never, "/api/cron/reminders", endClockAt);
+  const remind = (endClockAt?: string | ((r: (typeof requests)[number]) => boolean)) => runCron(reminders as never, "/api/cron/reminders", endClockAt);
+  const nudge = (endClockAt?: string | ((r: (typeof requests)[number]) => boolean)) => runCron(nudges as never, "/api/cron/journey-nudges", endClockAt);
+  /** The n-th request (from 1) to a table, for a clock that ends there. */
+  const nth = (table: string, n: number) => {
+    let seen = 0;
+    return (r: (typeof requests)[number]) => r.table === table && ++seen === n;
+  };
+  /** The keys a run left out because it did not count them ("not known"). */
+  const UNKNOWN_WHEN_STOPPED = ["due", "sent", "failed", "left", "left_complete"];
+  const absent = (body: Row) => UNKNOWN_WHEN_STOPPED.filter((k) => !(k in body));
 
   console.log("\nthe reminders call (note of 2026-11-21, part 2 (b)): its calls before the first send, read by read, for one set of data");
   {
@@ -346,8 +404,24 @@ async function cronRouteCases() {
     // A call with more due than fits: it fills its count and leaves the rest.
     reminderWorld({ members: 4305, direct: 60 });
     const r = await remind();
-    eq("reminders, 4,305 members and 60 due: the call sends some, leaves the rest, and its requests before the heartbeat never pass 40",
-      [r.status, Number(r.body.sent) > 0, Number(r.body.left) > 0, callRequests().length <= CALL_SUM_LIMIT], [200, true, true, true]);
+    eq("reminders, 4,305 members and 60 due: the call sends some, leaves the rest, and its requests, the heartbeat's included, never pass 40",
+      [r.status, Number(r.body.sent) > 0, Number(r.body.left) > 0, requests.length <= CALL_SUM_LIMIT], [200, true, true, true]);
+  }
+
+  console.log("\na scheduled call keeps its two end calls inside the 40 (note of 2026-11-21 (later), point 5)");
+  {
+    // The same full call, with every write of the reminders' state refused:
+    // a failed run that spent its count, then read its own heartbeat row
+    // (the carry) and wrote it.
+    reminderWorld({ members: 4305, direct: 60 });
+    world.writeFails = ["reminder_state"];
+    world.heartbeat = { last_status: "ok", last_run_at: "2026-11-20T06:00:00.000Z", last_detail: { v: 1 } };
+    const r = await remind();
+    const beats = requests.filter((q) => q.table === "ops_heartbeats").map((q) => q.method);
+    eq("a failed run that filled its count (the state writes refused): 500, state_write, the carry read and the heartbeat written",
+      [r.status, (r.detail.errors as Row | undefined)?.state_write !== undefined, beats, r.detail.last_ok_at], [500, true, ["GET", "POST"], "2026-11-20T06:00:00.000Z"]);
+    eq("…every request of the call, the two end calls included, is at most 40, and the call's own are at most 38",
+      [requests.length <= CALL_SUM_LIMIT, callRequests().length <= CALL_SUM_LIMIT - CRON_END_CALLS], [true, true]);
   }
 
   console.log("\nthe reminders call: a paged read that takes one page more than fits stops the run, ended by the count (note of 2026-11-21, part 2 (a) and (b))");
@@ -358,7 +432,7 @@ async function cronRouteCases() {
     // and a first group; the addresses then take one call more.
     const before = 1 + 1 + 1 + 1 + 1;
     const reserve = 1 + MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark + 1;
-    const fit = CALL_SUM_LIMIT - reserve - 1 - before;
+    const fit = cronBudget().callLimit - reserve - 1 - before;
     /** State rows that take exactly `pages` requests to read (the last page short). */
     const rowsFor = (pages: number) => (pages - 1) * SERVER_ROW_CAP + SERVER_ROW_CAP / 2;
     reminderWorld({ members: 10, direct: 2, state: stateRowsOf(rowsFor(fit)) });
@@ -372,22 +446,113 @@ async function cronRouteCases() {
     eq("…the count in the line equals the requests the call made", over.noRoom[0]?.calls, callRequests().length);
   }
 
-  console.log("\nthe members that count with no room left to read them whole: the organisation or the program is left for the next call (the hand-over note of 2026-11-19, point 3)");
+  console.log("\nnobody's people read whole for want of room: the job's own failed step (note of 2026-11-21 (later), point 4)");
   {
-    // The clock ends at the members' organisation read, so the first page is refused.
+    // One organisation; the clock ends at its members' organisation read, so
+    // the first page is refused and no organisation's members are read.
     reminderWorld({ members: 10, direct: 2 });
     const r = await remind("organizations");
-    eq("reminders: a clean run (200, ok), the organisation counted in left_orgs, the count marked incomplete, nobody mailed, no fixed line, no state written",
-      [r.status, r.body.ok, r.body.left_orgs, r.body.left_complete, sends().length, r.noRoom.length, requests.filter((q) => q.table === "reminder_state" && q.method === "POST").length],
-      [200, true, 1, false, 0, 0, 0]);
+    eq("reminders, one organisation, the clock ended at its first read: 500, call_limit, stopped before any send, one fixed line in members_read, ended by the clock",
+      [r.status, r.body.ok, r.body.stopped_before_send, (r.detail.errors as Row | undefined)?.call_limit, r.noRoom.length, r.noRoom[0]?.step, r.noRoom[0]?.ended_by], [500, false, true, 1, 1, "members_read", "clock"]);
+    eq("…left_orgs written, the counts it never made left out (\"not known\"), nobody mailed, no state written",
+      [r.body.left_orgs, absent(r.body), sends().length, requests.filter((q) => q.table === "reminder_state" && q.method === "POST").length], [1, UNKNOWN_WHEN_STOPPED, 0, 0]);
+  }
+  {
+    // The same by the count: one organisation whose members take more pages
+    // than the call has room for (26,000 members, 26 pages).
+    reminderWorld({ members: 26_000, direct: 2 });
+    const r = await remind();
+    eq("reminders, one organisation of 26,000 members: 500, call_limit, one fixed line in members_read, ended by the count, nobody mailed",
+      [r.status, r.body.stopped_before_send, r.noRoom.length, r.noRoom[0]?.step, r.noRoom[0]?.ended_by, r.body.left_orgs, sends().length], [500, true, 1, "members_read", "count", 1, 0]);
+    eq("…the count in the line equals the requests the call made", r.noRoom[0]?.calls, callRequests().length);
+  }
+  {
+    // Two organisations, the first read whole and the second left at its
+    // members' read. Every read before the reminders' sends asks the one gate
+    // of the call, whose count and clock only go on, so the assignments'
+    // read that follows has no room either: the call ends there, in the step
+    // of the note of 2026-11-21, part 2 (a). Recorded as the code reads it.
+    reminderWorld({ members: 10, direct: 2, second: true });
+    const r = await remind(nth("organizations", 2));
+    eq("reminders, two organisations, the second left at its members' read: the next read has no room either: 500, call_limit in assignments_read, left_orgs 1, nobody mailed",
+      [r.status, r.body.stopped_before_send, r.noRoom.map((l) => l.step), r.body.left_orgs, sends().length], [500, true, ["assignments_read"], 1, 0]);
+  }
+  {
+    // Journey nudges, one program; the clock ends at its members'
+    // organisation read, and no alert was due.
+    nudgeWorld(2);
+    const r = await nudge("organizations");
+    eq("journey nudges, one program, the clock ended at its first read: 500, call_limit, stopped before any send, one fixed line in members_read",
+      [r.status, r.body.ok, r.body.stopped_before_send, (r.detail.errors as Row | undefined)?.call_limit, r.noRoom.length, r.noRoom[0]?.job, r.noRoom[0]?.step, r.noRoom[0]?.ended_by],
+      [500, false, true, 1, 1, "journey-nudges", "members_read", "clock"]);
+    eq("…left_orgs written, the counts it never made left out, no claim taken, nothing sent",
+      [r.body.left_orgs, absent(r.body), requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH").length, sends().length], [1, UNKNOWN_WHEN_STOPPED, 0, 0]);
+  }
+  {
+    // Its twin: two programs in two organisations, the first read whole and
+    // mailed; the clock ends at the second's time zone, so its members'
+    // read is refused. Nothing is read after a left program.
+    nudgeWorld(2, { second: "other_org" });
+    const r = await nudge(nth("gamification_settings", 2));
+    const second = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && idsOf(q.query).some((id) => id.startsWith("e-k")));
+    eq("journey nudges, two programs, the second left at its members' read: a clean run (200, ok), left_orgs 1, the count marked incomplete, no fixed line",
+      [r.status, r.body.ok, r.body.left_orgs, r.body.left_complete, r.noRoom.length], [200, true, 1, false, 0]);
+    eq("…the first program mailed, the second neither claimed nor mailed", [sends().some((s) => String(s.to).startsWith("l-")), second.length, sends().some((s) => String(s.to).startsWith("k-"))], [true, 0, false]);
   }
 
+  console.log("\njourney nudges: no room for the line managers' read leaves the program whole (note of 2026-11-21 (later), point 1)");
   {
-    nudgeWorld(2);
-    const r = await runCron(nudges as never, "/api/cron/journey-nudges", "organizations");
-    eq("journey nudges: a clean run (200, ok), the program counted in left_orgs, the count marked incomplete, no claim taken, nothing sent",
-      [r.status, r.body.ok, r.body.left_orgs, r.body.left_complete, requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH").length, sends().length],
-      [200, true, 1, false, 0, 0]);
+    // Two programs of one organisation, escalation on: its members are read
+    // once, for the first program. The clock ends at the second's time zone,
+    // so its line managers' read is refused.
+    nudgeWorld(2, { second: "same_org" });
+    const r = await nudge(nth("gamification_settings", 2));
+    const second = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && idsOf(q.query).some((id) => id.startsWith("e-k")));
+    eq("the second program with no room for its managers' pages: 200, left_orgs 1, the count marked incomplete, no fixed line",
+      [r.status, r.body.ok, r.body.left_orgs, r.body.left_complete, r.noRoom.length], [200, true, 1, false, 0]);
+    eq("…the first program read and mailed; the second neither claimed nor mailed", [sends().some((s) => String(s.to).startsWith("l-")), second.length, sends().some((s) => String(s.to).startsWith("k-"))], [true, 0, false]);
+  }
+
+  console.log("\njourney nudges: each group of escalations writes its marks (note of 2026-11-21 (later), point 2)");
+  {
+    // Thirty learners past the deadline with nothing pending: thirty
+    // escalations and no reminder, more than the call has room for.
+    nudgeWorld(30, { escalationOnly: true });
+    const r = await nudge();
+    const enrolmentOf = (to: string) => `e-l${to.slice(2, 5)}`;
+    const sentTo = sends().map((s) => String(s.to));
+    const marked = marksWritten().flatMap((q) => idsOf(q.query));
+    // Walk the requests: a send that follows a mark (or none) opens a group,
+    // and every escalation sent before it must be marked by then.
+    let pending = new Set<string>();
+    let lastWasMark = true;
+    const openAtGroup: number[] = [];
+    for (const q of requests) {
+      if (q.path === "/functions/v1/send-smtp") {
+        if (lastWasMark) openAtGroup.push(pending.size);
+        lastWasMark = false;
+        pending.add(enrolmentOf(String((q.body as Row).to)));
+      } else if (q.table === "journey_enrollments" && q.method === "PATCH" && "last_nudged_at" in ((q.body as Row) ?? {})) {
+        for (const id of idsOf(q.query)) pending.delete(id);
+        lastWasMark = true;
+      }
+    }
+    eq(`thirty escalations, ${sentTo.length} sent: every one sent to a manager, some left for the next call`, [sentTo.length > 1, sentTo.length < 30, sentTo.every((t) => t.includes("-mgr@"))], [true, true, true]);
+    eq("…each sent escalation has its mark, written before the next group starts; none sent is unmarked at the end",
+      [openAtGroup.length > 1, openAtGroup.every((n) => n === 0), pending.size], [true, true, 0]);
+    eq("…the marks are exactly the escalations sent: one left has no mark", [...marked].sort(), sentTo.map(enrolmentOf).sort());
+    eq("…a clean run: 200, ok, escalated counts the sent, the count marked incomplete, no fixed line",
+      [r.status, r.body.ok, r.body.escalated, r.body.left_complete, r.noRoom.length], [200, true, sentTo.length, false, 0]);
+  }
+  {
+    // The same call with every mark refused by the database.
+    nudgeWorld(30, { escalationOnly: true });
+    world.writeFails = ["journey_enrollments"];
+    world.heartbeat = { last_status: "ok", last_run_at: "2026-11-21T09:00:00.000Z", last_detail: { v: 1 } };
+    const r = await nudge();
+    eq("a mark whose write fails: 500, state_write in the heartbeat, not stopped before a send, the counts written, the last success carried",
+      [r.status, r.body.ok, r.beat?.last_status, Number((r.detail.errors as Row | undefined)?.state_write) > 0, r.body.stopped_before_send, ["due", "sent", "left"].every((k) => k in r.body), r.detail.last_ok_at],
+      [500, false, "error", true, false, true, "2026-11-21T09:00:00.000Z"]);
   }
 
   console.log("\nthe journey-nudges call (note of 2026-11-21, part 2 (c)): with no alert due, room for a full page and its first group");

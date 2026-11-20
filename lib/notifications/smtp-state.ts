@@ -154,9 +154,23 @@ export function requestBudget(opts: { spent?: number; now?: () => number } = {})
   return budget("request", REQUEST_SEND_WINDOW_MS, CALL_SUM_LIMIT, opts);
 }
 
-/** The budgets of one cron call, shared by every organisation's run in it. */
+/**
+ * The calls a scheduled call keeps for its end (ADR 0029, note of 2026-11-21
+ * (later), point 5): the read of its own heartbeat row on a failed run (the
+ * carry of the last successful run) and the heartbeat's write. They are
+ * kept inside CALL_SUM_LIMIT, so every request of a scheduled call, its
+ * heartbeat included, stays within the 40.
+ */
+export const CRON_END_CALLS = 2;
+
+/**
+ * The budgets of one cron call, shared by every organisation's run in it.
+ * The count's limit is CALL_SUM_LIMIT less CRON_END_CALLS: the two end calls
+ * come off the limit, not onto the calls spent, so the count stays the
+ * requests the call made.
+ */
 export function cronBudget(opts: { spent?: number; now?: () => number } = {}): MailBudget {
-  return budget("cron", CRON_SEND_WINDOW_MS, CALL_SUM_LIMIT, opts);
+  return budget("cron", CRON_SEND_WINDOW_MS, CALL_SUM_LIMIT - CRON_END_CALLS, opts);
 }
 
 /**

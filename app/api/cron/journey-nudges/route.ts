@@ -77,10 +77,16 @@ import {
  *     was not attempted. A page the call has no room left to read whole is
  *     left for the next call.
  *   - Every read is whole or not used: the line managers are read in pages
- *     of 1000 rows, and the escalation marks are written in lists of 150.
- *     The members that count are read in pages too, each page asked for and
- *     counted as made (rule FP2); with no room to read them whole, the
- *     program is left for the next call.
+ *     of 1000 rows, and the members that count in pages too, each page asked
+ *     for and counted as made (rule FP2); with no room to read either whole,
+ *     the program is left whole for the next call. A call that had people to
+ *     read and read no program's people whole for want of room, and whose
+ *     alert step did nothing, stops with call_limit and one fixed line
+ *     (cron_no_room); a program left once another's people were read whole
+ *     is a clean run (the note of 2026-11-21 (later), points 1 and 4).
+ *   - The escalation marks are written with each group of escalations, by
+ *     the run's own step after the group; an escalation with no room for its
+ *     mark is left, not sent (point 2).
  *   - A failed run is the job's own failed read or write, or the platform's
  *     call limit: the programs, a time zone, the members that count, the
  *     line managers, a page of enrolments, the progress counts, the
@@ -166,6 +172,17 @@ async function run() {
     spendCalls(budget, 1);
     return true;
   };
+  /**
+   * The call's own stop in a step no later call can finish (ADR 0029, note
+   * of 2026-11-21 (later), point 4): the job's own failed step, call_limit,
+   * with one fixed line: the job, the step's word, the calls spent, and
+   * whether the count or the clock ended it. Numbers and fixed words only.
+   */
+  const noRoom = (step: CronErrorWord) => {
+    const endedBy = budget.now() - budget.startedAt >= budget.windowMs ? "clock" : "count";
+    console.warn(JSON.stringify({ event: "cron_no_room", job: "journey-nudges", step, calls: budget.calls, ended_by: endedBy }));
+    fail("call_limit");
+  };
 
   let reminded = 0;
   let escalated = 0;
@@ -185,6 +202,11 @@ async function run() {
   const failedClasses: string[] = [];
   let no0114 = false;
   let stoppedBeforeSend = false;
+  // Whether the programs were read, so the number left for room is known.
+  let programsRead = false;
+  // Whether any program got past the reads of its people: its members that
+  // count and, where escalation is on, its line managers.
+  let peopleReadWhole = false;
 
   const finish = () =>
     buildMailCronDetail(
@@ -194,7 +216,9 @@ async function run() {
         stoppedBeforeSend,
         no0114,
         ...(stoppedBeforeSend
-          ? {}
+          ? programsRead
+            ? { leftOrgs }
+            : {}
           : {
               due,
               sent: reminded,
@@ -220,6 +244,8 @@ async function run() {
   //    call's own mail: what it costs is not left for the nudges.
   const alert = await sendDueAlert({ baseUrl: base, budget, db: svc });
   if (alert.kind === "failed") fail("alert");
+  // The alert step did work the next call is spared.
+  const alertProgress = alert.kind === "sent" || alert.kind === "dropped" || alert.kind === "taken";
 
   // 2. The programs. A failed read is never "no programs".
   // `*` on the program keeps this deploy-safe across program-column
@@ -236,6 +262,7 @@ async function run() {
     stoppedBeforeSend = true;
     return finish();
   }
+  programsRead = true;
 
   const courseTitle = new Map<string, string>(); // courseId → title (cross-program cache)
   // Rule 10: the members that count, read once per organisation in this run.
@@ -319,8 +346,10 @@ async function run() {
     // membership counts is tested at the send. A failed read means no
     // escalation for this program in this call; the learners' own reminders
     // go on. Read in pages of 1000 rows: a cut list is never used. With no
-    // room left to read it whole, this call makes no escalation for the
-    // program; that is no failure.
+    // room left to read it whole, the program is left whole for the next
+    // call, as a program whose members had no room is (ADR 0029, note of
+    // 2026-11-21 (later), point 1): a learner reminded now would be off the
+    // page for the day, and their escalation with them.
     let managerOf = new Map<string, string>();
     if (escalationOn) {
       const memRows = await readAllStrict<{ user_id: string; line_manager_id: string }>(
@@ -339,11 +368,14 @@ async function run() {
         fail("members_read");
         escalationOn = false;
       } else if (memRows === "no_room") {
-        escalationOn = false;
+        leftOrgs++;
+        leftComplete = false;
+        continue;
       } else {
         managerOf = new Map(memRows.map((m) => [m.user_id, m.line_manager_id]));
       }
     }
+    peopleReadWhole = true;
 
     const tally = perOrg.get(p.organization_id) ?? { reminded: 0, escalated: 0 };
     perOrg.set(p.organization_id, tally);
@@ -676,10 +708,14 @@ async function run() {
             }
           }
 
-          // The escalations, after the page's nudges; then their marks in one
-          // write. Today's order stays: the mail, then the mark.
+          // The escalations, after the page's nudges. Each group's marks are
+          // written with that group, by the run's own step after it (ADR
+          // 0029, note of 2026-11-21 (later), point 2): the run keeps the
+          // mark's call back before the sends, so an escalation with no room
+          // for its mark is not sent but left, and a later call sends it.
           if (escalations.length > 0) {
             const r = await runFor(p.organization_id);
+            const markedAt = new Date().toISOString();
             const results = await sendMany(r, escalations, (x) => ({
               event: "journey_escalation",
               to: { user_id: x.managerId, email: x.email },
@@ -698,24 +734,29 @@ async function run() {
                 direct_link: x.context.direct_link,
                 portal_url: x.context.portal_url,
               },
-            }));
-            const marked = escalations.filter((_, k) => results[k].attempted).map((x) => x.enrolment);
-            // One write for each list of 150 ids (the house rule).
-            const markedAt = new Date().toISOString();
-            for (const ids of chunk(marked, 150)) {
-              if (!hasRoom(budget, 1)) {
-                // No room left for the mark: as for a failed write, the
-                // escalation can go again next hour, and the run says so.
-                fail("state_write");
-                break;
-              }
-              spendCalls(budget, 1);
-              const mark = svc.from("journey_enrollments").update({ last_nudged_at: markedAt });
-              const { error: markErr } = await (ids.length === 1 ? mark.eq("id", ids[0]) : mark.in("id", ids));
-              if (markErr) fail("state_write");
-            }
-            escalated += marked.length;
-            tally.escalated += marked.length;
+            }), {
+              hooks: {
+                // The mark of the group's escalations that were attempted
+                // (sent or failed), in one update. A failed write is the
+                // job's own failed step: that escalation can go again at the
+                // next call that finds the learner on its page.
+                afterCalls: 1,
+                after: async (entries) => {
+                  const ids = entries.filter((e) => e.result.status === "sent" || e.result.status === "failed").map(({ item }) => item.enrolment);
+                  if (ids.length === 0) return { calls: 0 };
+                  const mark = svc.from("journey_enrollments").update({ last_nudged_at: markedAt });
+                  const { error: markErr } = await (ids.length === 1 ? mark.eq("id", ids[0]) : mark.in("id", ids));
+                  if (markErr) fail("state_write");
+                  return { calls: 1 };
+                },
+              },
+            });
+            const attempted = results.filter((res) => res.attempted).length;
+            // An escalation left for want of room has no mark; the count of
+            // what this call owes is no longer whole.
+            if (results.some((res) => res.errorClass === "left")) leftComplete = false;
+            escalated += attempted;
+            tally.escalated += attempted;
           }
         }
       }
@@ -726,6 +767,16 @@ async function run() {
     }
   }
 
+  // A call that had people to read and read nobody's people whole for want
+  // of room, and whose alert step did nothing either, has done nothing the
+  // next call is spared (ADR 0029, note of 2026-11-21 (later), point 4): the
+  // job's own failed step, stopped before any send. A program left once
+  // another's people were read whole, or in a call whose alert went, stays a
+  // clean run.
+  if (leftOrgs > 0 && !peopleReadWhole && !alertProgress) {
+    noRoom("members_read");
+    stoppedBeforeSend = true;
+  }
   for (const r of runs.values()) {
     for (const word of Object.keys(r.errors) as CronErrorWord[]) fail(word, r.errors[word] ?? 0);
   }

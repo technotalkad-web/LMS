@@ -124,21 +124,58 @@ export async function setupLinksReady(svc: SupabaseClient): Promise<"ready" | "m
 }
 
 /**
+ * Why the auth server made no account for a link: one fixed word, read from
+ * the error's code and status (ADR 0029, note of 2026-11-21 (later), point
+ * 8). The server's own message is never read, answered or logged.
+ *   exists           the code email_exists;
+ *   invalid_address  the code email_address_invalid;
+ *   unavailable      a throw, no answer (no status), an answer with neither
+ *                    an error nor an account, or a status of 500 and above;
+ *   refused          anything else, a rate limit among them.
+ */
+export type SetupAccountRefusal = "exists" | "invalid_address" | "unavailable" | "refused";
+
+/** An error code as a log line may print it: one plain word of lower-case letters, digits and underscores, else "unknown". */
+function plainCode(code: unknown): string {
+  return typeof code === "string" && /^[a-z0-9_]+$/.test(code) ? code : "unknown";
+}
+
+/** The fixed word for an error the auth server answered (see SetupAccountRefusal). */
+export function setupAccountRefusalOf(error: { code?: unknown; status?: unknown }): SetupAccountRefusal {
+  if (error.code === "email_exists") return "exists";
+  if (error.code === "email_address_invalid") return "invalid_address";
+  const status = typeof error.status === "number" ? error.status : 0;
+  if (status <= 0 || status >= 500) return "unavailable";
+  return "refused";
+}
+
+/**
  * Create an account for a setup link: the address alone, so the account has
  * no password and an unconfirmed address until the person sets one (rule
- * N9). The only call that creates an account for a link.
+ * N9). The only call that creates an account for a link. Without an account
+ * it answers one fixed word and logs one line with the status and the code.
  */
 export async function createAccountForSetupLink(
   svc: SupabaseClient,
   email: string
-): Promise<{ user: User } | { error: string }> {
+): Promise<{ user: User } | { refused: SetupAccountRefusal }> {
+  let refused: SetupAccountRefusal = "unavailable";
+  let status: number | null = null;
+  let code: unknown = null;
   try {
     const { data, error } = await svc.auth.admin.createUser({ email });
-    if (error || !data?.user) return { error: error?.message ?? "Could not create user" };
-    return { user: data.user };
+    if (!error && data?.user && typeof data.user.id === "string" && data.user.id.length > 0) return { user: data.user };
+    if (error) {
+      const e = error as { code?: unknown; status?: unknown };
+      status = typeof e.status === "number" ? e.status : null;
+      code = e.code ?? null;
+      refused = setupAccountRefusalOf(e);
+    }
   } catch {
-    return { error: "Could not create user" };
+    refused = "unavailable";
   }
+  console.warn(JSON.stringify({ event: "setup_account_not_created", status, code: plainCode(code) }));
+  return { refused };
 }
 
 /**

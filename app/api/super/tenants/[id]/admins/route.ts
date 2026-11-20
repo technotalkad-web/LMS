@@ -14,6 +14,7 @@ import {
   platformSetupLinkOffers,
   platformSetupLinkResendCheck,
   setupLinksReady,
+  type SetupAccountRefusal,
 } from "@/lib/auth/setup-link";
 import {
   expireLaunchTokensForMembers,
@@ -49,6 +50,22 @@ const ADMIN_ROLES = new Set(["super_owner", "admin", "data_analyst"]);
 type AdminRole = "super_owner" | "admin" | "data_analyst";
 
 const TRY_AGAIN = "Could not check this right now. Please try again.";
+
+/**
+ * The console's answer when the sign-in service made no account (ADR 0029,
+ * note of 2026-11-21 (later), point 8): one fixed sentence for each word of
+ * createAccountForSetupLink, never the service's own message.
+ */
+const CREATE_REFUSED: Record<SetupAccountRefusal, { status: number; message: string }> = {
+  exists: { status: 409, message: "This address already has an account, but it could not be looked up here. Nothing was added." },
+  invalid_address: { status: 400, message: "The sign-in service did not accept this address. Nothing was added." },
+  refused: { status: 400, message: "The sign-in service refused to create this account. Nothing was added." },
+  unavailable: {
+    status: 503,
+    message:
+      "The sign-in service did not answer, so the account may or may not have been created. Try again. If the person is then added as an existing account, they set a password with Forgot password.",
+  },
+};
 
 function svc() {
   return createServiceClient(
@@ -189,8 +206,9 @@ export async function POST(
     if (ready === "missing") return NextResponse.json({ error: SETUP_LINKS_NEED_0117 }, { status: 503 });
     if (ready === "unreadable") return NextResponse.json({ error: TRY_AGAIN }, { status: 503 });
     const created = await createAccountForSetupLink(s, email);
-    if ("error" in created) {
-      return NextResponse.json({ error: created.error }, { status: 400 });
+    if ("refused" in created) {
+      const answer = CREATE_REFUSED[created.refused];
+      return NextResponse.json({ error: answer.message }, { status: answer.status });
     }
     user = created.user;
     isBrandNew = true;

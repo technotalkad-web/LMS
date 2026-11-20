@@ -62,10 +62,14 @@ import { chunk, readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
  *     This job reads its sets from the start at every call, so a read it
  *     has no room to finish, or reminders due with no room to open any run,
  *     is the job's own failed step: call_limit, stopped before any send,
- *     with one fixed line (cron_no_room). An organisation whose members the
- *     call has no room left to read, or one left once other mail went, is
- *     left for the next call, a clean run (rule T5; the hand-over note of
- *     2026-11-19, point 3).
+ *     with one fixed line (cron_no_room). So is a call that had members to
+ *     read and read no organisation's members whole for want of room (the
+ *     note of 2026-11-21 (later), point 4). Every read before the sends asks
+ *     the call's one gate, whose count and clock only go on, so an
+ *     organisation whose members had no room is followed by a later read
+ *     with no room either, and that read stops the call. An organisation
+ *     whose run was not opened once other mail went is left for the next
+ *     call, a clean run (rule T5; the hand-over note of 2026-11-19, point 3).
  *   - The finished attempts are asked for by the attempt row's own columns
  *     (completed or passed), the same test the route makes on each row.
  *   - The answer and the heartbeat are built by buildMailCronDetail: counts
@@ -231,6 +235,15 @@ export async function POST(request: Request) {
     }
     countingByOrg.set(oid, counting);
   }
+  // A call that had people to read and read nobody's people whole for want
+  // of room has done nothing a later call is spared: the next call arrives
+  // at the same place (ADR 0029, note of 2026-11-21 (later), point 4). The
+  // job's own failed step, call_limit, stopped before any send. With
+  // another organisation read whole, the reads below meet the same gate.
+  if (leftOrgs > 0 && countingByOrg.size === 0) {
+    noRoom("members_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
   const enabledCourses = allCourses.filter((c) => countingByOrg.has(c.organization_id));
   if (enabledCourses.length === 0) {
     // A successful run with nothing to do must still heartbeat, or the health
@@ -238,11 +251,7 @@ export async function POST(request: Request) {
     // exactly what happened on pre-launch prod: no reminder-enabled courses).
     // A run left with nothing because no organisation could be read is not
     // successful: it records an errored heartbeat and answers 500.
-    return finish(
-      leftOrgs > 0
-        ? { stoppedBeforeSend: false, leftOrgs, leftComplete: false }
-        : { stoppedBeforeSend: false, due: 0, sent: 0, failed: 0, left: 0, leftComplete: unreadableOrgs === 0, leftDailyLimit: 0, leftOrgs: 0 }
-    );
+    return finish({ stoppedBeforeSend: false, due: 0, sent: 0, failed: 0, left: 0, leftComplete: unreadableOrgs === 0, leftDailyLimit: 0, leftOrgs: 0 });
   }
   scanned = enabledCourses.length;
   const courseIds = enabledCourses.map((c) => c.course_id);

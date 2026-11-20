@@ -29,6 +29,8 @@ export type SmtpAnswer = { ok: true } | { ok: false; error: string } | "hang";
 export type World = {
   settings: Row | null | "fail";
   org: Row | null | "fail";
+  /** More organisations, read as the server would beside `org`. */
+  otherOrgs: Row[];
   /** tenant_mail_status: computed from the state row and sent24h; "missing" (no 0114), "fail" (another error), "empty" (no row). */
   status: "computed" | "missing" | "fail" | "empty";
   sent24h: number;
@@ -53,6 +55,10 @@ export type World = {
   rpc: Record<string, (body: Row | null) => unknown>;
   /** Called with each request as it is recorded (a test's clock, for one). */
   onRequest: ((r: Req) => void) | null;
+  /** Tables of world.tables whose writes the server refuses. */
+  writeFails: string[];
+  /** The ops_heartbeats row a failed cron run reads before it writes (the carry), or none. */
+  heartbeat: Row | null;
 };
 
 /** The server answers at most this many rows, whatever a read asks (lib/db/chunked.ts). */
@@ -86,6 +92,7 @@ export function freshWorld(over: Partial<World> = {}): World {
   world = {
     settings: { ...SMTP_SETTINGS },
     org: { id: ORG, name: "Tenant A", slug: "tenant-a", deleted_at: null },
+    otherOrgs: [],
     status: "computed",
     sent24h: 0,
     state: null,
@@ -103,6 +110,8 @@ export function freshWorld(over: Partial<World> = {}): World {
     tables: {},
     rpc: {},
     onRequest: null,
+    writeFails: [],
+    heartbeat: null,
     ...over,
   };
   return world;
@@ -188,6 +197,7 @@ function ordered(rows: Row[], order: string | null): Row[] {
 /** Any table a test put in world.tables, answered as the server would. */
 function genericTable(table: string, method: string, q: URLSearchParams, body: unknown, prefer: string, accept: string): Response {
   const rows = world.tables[table];
+  if (method !== "GET" && world.writeFails.includes(table)) return json({ code: "XX000", message: "stub write failure" }, 500);
   const select = q.get("select") ?? "";
   const whole = select.includes("(") || select.includes("*");
   const shape = (r: Row) => (whole ? r : project(r, select));
@@ -282,7 +292,7 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
   }
   if (table === "organizations") {
     if (world.org === "fail") return json({ code: "XX000", message: "stub read failure" }, 500);
-    const rows = world.org && matches(world.org, q) ? [project(world.org, select)] : [];
+    const rows = [...(world.org ? [world.org] : []), ...world.otherOrgs].filter((o) => matches(o, q)).map((o) => project(o, select));
     return accept.includes("vnd.pgrst.object") ? json(rows[0] ?? null) : json(rows);
   }
   if (table === "rpc/tenant_mail_status") {
@@ -321,8 +331,8 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     return json([]);
   }
   if (table === "ops_heartbeats") {
-    // A failed cron run reads its own row once (no row here), then writes.
-    if (method === "GET") return accept.includes("vnd.pgrst.object") ? json(null) : json([]);
+    // A failed cron run reads its own row once (world.heartbeat, or none), then writes.
+    if (method === "GET") return accept.includes("vnd.pgrst.object") ? json(world.heartbeat) : json(world.heartbeat ? [world.heartbeat] : []);
     return new Response(null, { status: 201 });
   }
   if (table.startsWith("rpc/") && world.rpc[table.slice(4)]) return json(world.rpc[table.slice(4)](body as Row | null));

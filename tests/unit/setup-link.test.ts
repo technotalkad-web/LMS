@@ -12,7 +12,12 @@
  *     whatever its expiry;
  *   - the account for a link is made by one function, with the address
  *     alone; a scan holds auth.admin.createUser to that one function, and
- *     the console's route to calling it;
+ *     the console's route to calling it. Without an account it answers one
+ *     fixed word from the error's code and status (exists, invalid_address,
+ *     refused, unavailable) and logs one line with the status and a plain
+ *     code; the console answers one fixed sentence for each word; a stubbed
+ *     message that holds an address reaches no answer and no log line;
+ *   - the notice that shows a link says that a new setup link ends it;
  *   - the page's read spends nothing for a good link, however often it is
  *     made; an unknown, used, ended, expired or malformed link gets rule
  *     N10's one answer, the same status and body, and is left as it was;
@@ -123,6 +128,8 @@ let requests: Req[] = [];
 const addresses: string[] = [];
 /** What send-smtp answers. */
 let smtpAnswer: { ok: true } | { ok: false; error: string } = { ok: true };
+/** What the auth server answers to a create: the account, an error answer, a body with no account, or no answer at all. */
+let createAnswer: "ok" | "empty" | "throw" | { status: number; body: Row } = "ok";
 let nextLink = 1;
 let created = 0;
 /** Runs just before a claim (a PATCH that sets used_at) is applied: another writer gets there first. */
@@ -174,6 +181,9 @@ function authServer(method: string, p: string, body: Row | null, q: URLSearchPar
   }
   void q;
   if (p === "/auth/v1/admin/users" && method === "POST") {
+    if (createAnswer === "throw") throw new TypeError("fetch failed");
+    if (createAnswer === "empty") return json({});
+    if (createAnswer !== "ok") return json(createAnswer.body, createAnswer.status);
     const a = { id: `0b000000-0000-4000-8000-00000000f${String(++created).padStart(3, "0")}`, email: String(body?.email ?? "") };
     accounts.push(a);
     signIn[a.id] = "omitted";
@@ -317,6 +327,7 @@ function world(o: { links?: Row[]; members?: Row[]; signIn?: SignIn; owners?: st
   beforeClaim = null;
   beforeRelease = null;
   smtpAnswer = { ok: true };
+  createAnswer = "ok";
   jar.clear();
   jar.set("sb-stub-auth-token", SESSION);
 }
@@ -382,6 +393,39 @@ async function main() {
       const creates = requests.filter((q) => q.path === "/auth/v1/admin/users" && q.method === "POST");
       eq("createAccountForSetupLink: one auth.admin.createUser call, whose arguments are the address only", [creates.length, creates.map((c) => c.body)], [1, [{ email: "someone@platform.stub" }]]);
       eq("…it answers the account made", ["user" in r, accounts.length - before], [true, 1]);
+
+      // No account: one fixed word, read from the code and the status, never
+      // the auth server's message (note of 2026-11-21 (later), point 8). The
+      // stubbed message holds an address, which must reach no answer and no
+      // log line.
+      const LEAK = "leaked.person@elsewhere.stub";
+      const refusal = async (answer: typeof createAnswer) => {
+        world();
+        createAnswer = answer;
+        lines.length = 0;
+        const out = await lib.createAccountForSetupLink(svc(), "someone@platform.stub");
+        const logged = lines.filter((l) => l.includes("setup_account_not_created"));
+        return { out, logged, all: lines.join("\n") };
+      };
+      const cases: Array<[string, typeof createAnswer, string, number | null, string]> = [
+        ["code email_exists (422)", { status: 422, body: { code: 422, error_code: "email_exists", msg: `A user with ${LEAK} already exists` } }, "exists", 422, "email_exists"],
+        ["code email_address_invalid (400)", { status: 400, body: { code: 400, error_code: "email_address_invalid", msg: `Email address ${LEAK} is invalid` } }, "invalid_address", 400, "email_address_invalid"],
+        ["a rate limit (429)", { status: 429, body: { code: 429, error_code: "over_email_send_rate_limit", msg: `Too many for ${LEAK}` } }, "refused", 429, "over_email_send_rate_limit"],
+        ["another code (422)", { status: 422, body: { code: 422, error_code: "weak_password", msg: `Something about ${LEAK}` } }, "refused", 422, "weak_password"],
+        ["a code that is not one plain word (400)", { status: 400, body: { code: 400, error_code: `Bad ${LEAK}`, msg: `Bad ${LEAK}` } }, "refused", 400, "unknown"],
+        ["status 500", { status: 500, body: { code: 500, error_code: "unexpected_failure", msg: `Database error saving ${LEAK}` } }, "unavailable", 500, "unexpected_failure"],
+        ["status 503", { status: 503, body: { code: 503, msg: `Upstream down for ${LEAK}` } }, "unavailable", 503, "unknown"],
+      ];
+      for (const [label, answer, word, status, code] of cases) {
+        const r = await refusal(answer);
+        eq(`no account, ${label}: the word ${word}; one log line with the status and the code; no address anywhere`,
+          [r.out, r.logged.length, r.logged.map((l) => JSON.parse(l) as Row)[0], JSON.stringify(r.out).includes(LEAK), r.all.includes(LEAK)],
+          [{ refused: word }, 1, { event: "setup_account_not_created", status, code }, false, false]);
+      }
+      for (const [label, answer] of [["the call throws (no answer)", "throw"], ["an answer with no error and no account", "empty"]] as const) {
+        const r = await refusal(answer);
+        eq(`no account, ${label}: unavailable, one log line, no account made`, [r.out, r.logged.length, accounts.length], [{ refused: "unavailable" }, 1, 2]);
+      }
       // The scan: createUser in setup-link.ts is called in exactly one function,
       // and the console's route reaches it only through that function.
       const callsIn = (file: string, name: string) => {
@@ -698,6 +742,32 @@ async function main() {
         [editor.includes(`const SEND_AGAIN_NOTE = "${T2_NOTE}"`), /sendSetupLinkAgain\(admin: Admin\) \{\s*\/\/[^\n]*\s*if \(!await confirm\(`[^`]*\$\{SEND_AGAIN_NOTE\}`\)\) return;/.test(editor),
           editor.includes("title={`This person has not set a password yet. Email them a new link. ${SEND_AGAIN_NOTE}`}"), editor.includes("{shownLink.mayHaveArrived && <p>{SEND_AGAIN_NOTE}</p>}")],
         [true, true, true, true]);
+
+      // The console's sentence for each word (note of 2026-11-21 (later),
+      // point 8): nothing added, the auth server's message nowhere.
+      const LEAK = "leaked.person@elsewhere.stub";
+      const ROUTE_ANSWERS: Array<[string, typeof createAnswer, number, string]> = [
+        ["exists", { status: 422, body: { code: 422, error_code: "email_exists", msg: `A user with ${LEAK} already exists` } }, 409, "This address already has an account, but it could not be looked up here. Nothing was added."],
+        ["invalid_address", { status: 400, body: { code: 400, error_code: "email_address_invalid", msg: `Email address ${LEAK} is invalid` } }, 400, "The sign-in service did not accept this address. Nothing was added."],
+        ["refused", { status: 429, body: { code: 429, error_code: "over_request_rate_limit", msg: `Too many for ${LEAK}` } }, 400, "The sign-in service refused to create this account. Nothing was added."],
+        ["unavailable", { status: 500, body: { code: 500, error_code: "unexpected_failure", msg: `Database error saving ${LEAK}` } }, 503, "The sign-in service did not answer, so the account may or may not have been created. Try again. If the person is then added as an existing account, they set a password with Forgot password."],
+      ];
+      for (const [word, answer, status, sentence] of ROUTE_ANSWERS) {
+        world({ links: [], members: [] });
+        createAnswer = answer;
+        lines.length = 0;
+        const r = await add("first.admin@platform.stub");
+        eq(`the console's add, ${word}: ${status} with its fixed sentence; nothing written, no link, no mail; the server's message in neither the answer nor a log line`,
+          [r.status, r.body.error, writes("organization_members").length, links.length, smtp().length, JSON.stringify(r.body).includes(LEAK), lines.join("\n").includes(LEAK)],
+          [status, sentence, 0, 0, 0, false, false]);
+      }
+
+      // Rule N8: the link on the screen is the link in the mail, so the
+      // notice that shows it (a welcome not sent, or one that timed out)
+      // says that a new link ends it (note of 2026-11-21 (later), point 7).
+      eq("the notice that shows the link says that a new setup link ends it, for a welcome not sent and for one that timed out",
+        [editor.includes('const LATER_LINK_NOTE = "If you send a new setup link later, this one stops working."'), editor.includes("It is shown only now. {LATER_LINK_NOTE}"), /\{shownLink && \(/.test(editor)],
+        [true, true, true]);
 
       world({ links: [], members: [] });
       const found = await add(P.email);
