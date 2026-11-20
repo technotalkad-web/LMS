@@ -62,6 +62,8 @@ export function BrandedLogin({
     "idle" | "working" | "redirecting" | "sent" | "error"
   >("idle");
   const [error, setError] = useState<string | null>(null);
+  /** The sign-in link route's answer (ADR 0029 section C): its sentence, and whether it was the "could not be sent" one. */
+  const [answer, setAnswer] = useState<{ ready: boolean; message: string } | null>(null);
   usePreloadBrandLoader();
 
   async function startGoogle() {
@@ -122,9 +124,11 @@ export function BrandedLogin({
     setStatus("working");
     setError(null);
     if (mode === "magic") {
-      // White-label: backend mints the link (no Supabase auto-send) and emails
-      // it via this tenant's SMTP (Resend fallback). Always "sent" to the UI so
-      // the form can't enumerate accounts.
+      // The backend mints the link (no Supabase auto-send) and emails it
+      // through the system that serves the account (ADR 0029 section A): this
+      // organisation's own SMTP, or the platform's sender for an
+      // administrator. The page shows the route's answer, which depends on
+      // this organisation's email reading only, the same for every address.
       const res = await fetch("/api/auth/magic-link", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -132,11 +136,12 @@ export function BrandedLogin({
         // headed to (e.g. a QR-scanned course), not just the dashboard.
         body: JSON.stringify({ email, orgSlug, next: safeNext(orgSlug) }),
       });
+      const j = (await res.json().catch(() => ({}))) as { error?: string; ready?: boolean; message?: string };
       if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(j.error ?? "Could not send the sign-in link");
+        setError(res.status === 503 ? "Email could not be sent right now. Please try again in a few minutes." : j.error ?? "Could not send the sign-in link");
         setStatus("error");
       } else {
+        setAnswer({ ready: j.ready === true, message: typeof j.message === "string" ? j.message : "" });
         setStatus("sent");
       }
     } else {
@@ -334,18 +339,23 @@ export function BrandedLogin({
           </div>
 
           {status === "sent" ? (
-            <div className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-2xl p-5 flex items-start gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+            <div
+              className={`border rounded-2xl p-5 flex items-start gap-3 ${
+                answer?.ready === false
+                  ? "border-amber-200 bg-amber-50 text-amber-900"
+                  : "border-emerald-200 bg-emerald-50 text-emerald-900"
+              }`}
+            >
+              <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5" />
               <div>
-                <h3 className="font-semibold mb-1">Check your inbox</h3>
-                <p className="text-sm text-emerald-800/90">
-                  We sent a sign-in link to{" "}
-                  <span className="font-medium">{email}</span>.
-                </p>
+                <h3 className="font-semibold mb-1">
+                  {answer?.ready === false ? "Email could not be sent" : "Check your inbox"}
+                </h3>
+                <p className="text-sm">{answer?.message}</p>
                 <button
                   type="button"
                   onClick={() => switchMode("magic")}
-                  className="mt-3 text-xs underline hover:text-emerald-700"
+                  className="mt-3 text-xs underline"
                 >
                   Use a different email
                 </button>
@@ -382,7 +392,7 @@ export function BrandedLogin({
                       Password
                     </label>
                     <Link
-                      href="/forgot-password"
+                      href={`/forgot-password?org=${encodeURIComponent(orgSlug)}`}
                       className="text-xs text-muted hover:text-ink underline-offset-4 hover:underline"
                     >
                       Forgot password?

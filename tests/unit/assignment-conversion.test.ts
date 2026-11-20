@@ -157,7 +157,6 @@ async function main() {
   process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE;
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = ANON;
   process.env.SUPABASE_SERVICE_ROLE_KEY = SERVICE;
-  delete process.env.RESEND_API_KEY;
   const realFetch = globalThis.fetch;
   globalThis.fetch = stub as typeof fetch;
   const realWarn = console.warn;

@@ -1,157 +1,44 @@
 import { NextResponse } from "next/server";
-import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { notifyBackground } from "@/lib/notifications/send";
-import {
-  OTP_TTL_MINUTES,
-  MAX_REQUESTS_PER_HOUR,
-  generateOtpCode,
-  hashOtp,
-} from "@/lib/auth/password-reset";
+import { prepareCredentialRequest } from "@/lib/auth/credential-mail";
+import { runAfterResponse } from "@/lib/http/after-response";
+import { originFromRequest } from "@/lib/http/origin";
 
 /**
  *   POST /api/auth/forgot-password/request
- *   body: { email }
+ *   body: { email, orgSlug? }
  *
- * Always returns 200 (never reveals whether the email exists).
- * Rate-limited: 5 requests per email per hour. Sends a 6-digit code
- * via the user's home-org SMTP if they're a member of an org, or
- * via the platform default SMTP otherwise.
+ * Asks for a 6-digit reset code (ADR 0029 sections C and D). The page names
+ * its organisation (orgSlug, from /forgot-password?org=<slug>); with none,
+ * or with a slug that names no organisation, it is the page with no
+ * organisation, which serves platform owners and administrators only.
  *
- * If the email doesn't match any auth.user, we still spend a few
- * milliseconds hashing a dummy code so the response time doesn't
- * leak account existence.
+ * The answer is the same for every address that passes the format check:
+ * the same reads in the same order before it (lib/auth/credential-mail.ts),
+ * and a status and body that depend on the organisation's reading only:
+ *   - 200 { ok, ready, message } with section C's sentence for a ready or a
+ *     not-ready organisation, or for the page with no organisation;
+ *   - 503 { error: "account_lookup_unavailable" } when the account lookup
+ *     failed, and 503 { error: "email_unavailable" } when the organisation
+ *     or its settings could not be read.
+ * Everything that depends on the account (rule 2, the limits, the code row,
+ * the send and its records) runs after the response, through
+ * runAfterResponse, and only for an address with an account. The code goes
+ * only by email.
  */
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as { email?: string };
-  const email = body.email?.trim().toLowerCase() ?? "";
-
-  // Reject obviously bad input early but still return 200 below.
-  const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
-  const svc = createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-
-  if (validEmail) {
-    // Rate-limit lookup.
-    const { count } = await svc
-      .from("password_reset_otps")
-      .select("id", { count: "exact", head: true })
-      .eq("email", email)
-      .gte("created_at", new Date(Date.now() - 60 * 60 * 1000).toISOString());
-
-    if ((count ?? 0) < MAX_REQUESTS_PER_HOUR) {
-      // Look up the user. We don't fail if they don't exist — we still
-      // act like we sent a code so attackers can't enumerate accounts.
-      const { data: listed } = await svc.auth.admin.listUsers({
-        page: 1,
-        perPage: 1000,
-      });
-      const user = listed?.users?.find((u) => u.email?.toLowerCase() === email);
-
-      if (!user) {
-        console.warn(
-          `[forgot-password] no auth.user for email=${email} — silently returning 200`
-        );
-      }
-      if (user) {
-        const code = generateOtpCode();
-        const codeHash = hashOtp(code);
-        // The code is never printed: a reset code reaches only the email.
-        const expiresAt = new Date(
-          Date.now() + OTP_TTL_MINUTES * 60_000
-        ).toISOString();
-
-        const ip =
-          request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
-          null;
-        const ua = request.headers.get("user-agent") ?? null;
-
-        // Invalidate any active prior codes for this email.
-        await svc
-          .from("password_reset_otps")
-          .update({ used_at: new Date().toISOString() })
-          .eq("email", email)
-          .is("used_at", null);
-
-        await svc.from("password_reset_otps").insert({
-          email,
-          code_hash: codeHash,
-          expires_at: expiresAt,
-          ip,
-          user_agent: ua,
-        });
-
-        // Pick an org to attribute the email to — the user's first org
-        // membership, or any org if none. We need an organization_id
-        // for notifyBackground() to resolve SMTP + branding.
-        const { data: mem, error: memErr } = await svc
-          .from("organization_members")
-          .select("organization_id, organizations(name)")
-          .eq("user_id", user.id)
-          .limit(1)
-          .maybeSingle();
-        if (memErr) {
-          // Don't mask a transient query failure as "user has no org" — that
-          // silently drops the reset email. Surface it for alerting.
-          console.error(
-            `[forgot-password] org lookup failed for ${user.id} (${email}):`,
-            memErr.message
-          );
-        }
-        type MemOrg = { name: string };
-        const memRow = mem as
-          | {
-              organization_id: string;
-              organizations: MemOrg | MemOrg[] | null;
-            }
-          | null;
-        const orgObj: MemOrg | undefined = memRow
-          ? Array.isArray(memRow.organizations)
-            ? memRow.organizations[0]
-            : memRow.organizations ?? undefined
-          : undefined;
-        const organizationId = memRow?.organization_id;
-        const orgName = orgObj?.name ?? "your workspace";
-
-        if (!organizationId) {
-          console.warn(
-            `[forgot-password] user ${user.id} (${email}) is not in any org — cannot resolve SMTP. Email NOT sent.`
-          );
-        } else {
-          console.log(
-            `[forgot-password] dispatching password_reset email to ${email} via org=${organizationId} (${orgName})`
-          );
-          try {
-            const result = await notifyBackground({
-              organizationId,
-              event: "password_reset",
-              to: { user_id: user.id, email },
-              context: {
-                learner_name: email,
-                learner_email: email,
-                otp_code: code,
-                otp_minutes: String(OTP_TTL_MINUTES),
-                org_name: orgName,
-              },
-            });
-            console.log(
-              `[forgot-password] notifyBackground result:`,
-              result ?? "(no return value)"
-            );
-          } catch (e) {
-            console.error(`[forgot-password] notifyBackground threw:`, e);
-          }
-        }
-      }
-    }
+  const body = (await request.json().catch(() => ({}))) as { email?: unknown; orgSlug?: unknown };
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return NextResponse.json({ error: "A valid email is required" }, { status: 400 });
   }
+  const orgSlug = typeof body.orgSlug === "string" && body.orgSlug.trim() ? body.orgSlug.trim() : null;
 
-  return NextResponse.json({
-    ok: true,
-    message:
-      "If an account exists with that email, we just sent a 6-digit code. It expires in 10 minutes.",
-  });
+  // Read from the request now: the job after the response has no request.
+  const origin = (await originFromRequest()) || "";
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
+  const userAgent = request.headers.get("user-agent") ?? null;
+
+  const prepared = await prepareCredentialRequest({ kind: "reset_code", email, orgSlug, origin, next: null, ip, userAgent });
+  if (prepared.job) runAfterResponse("reset-code", prepared.job);
+  return NextResponse.json(prepared.body, { status: prepared.status });
 }

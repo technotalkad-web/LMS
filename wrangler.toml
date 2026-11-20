@@ -72,14 +72,6 @@ NODE_ENV = "production"
 # only after 0100_alds_core.sql was confirmed on the staging database.
 ALDS_P4 = "on"
 
-# ---- Auth email fallback (global Resend sender) -----------------------------
-# Auth emails (invite / magic-link) are minted via generateLink and sent via the
-# TENANT's SMTP. If a tenant has no SMTP (or it fails), the app falls back to
-# this global Resend sender so users are never locked out. Inert until both are
-# set. RESEND_API_KEY is a SECRET (wrangler secret put RESEND_API_KEY); RESEND_FROM
-# is a plain var. Use a verified domain with SPF/DKIM/DMARC.
-# RESEND_FROM = "Ambak University <no-reply@ambak.com>"
-
 # ---- Platform sender (ADR 0029; lib/email/platform-sender.ts) ---------------
 # The platform's own mailbox, for platform mail only: platform owners' and
 # organisation administrators' codes and links, administrator welcomes and
@@ -191,8 +183,6 @@ OPS_EXPECT_CRONS = "1"
 # here, wrangler's warning that ALDS_P4 exists at the top level but not in
 # env.production.vars no longer appears on production deploys.
 ALDS_P4 = "on"
-# Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
-# RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 # Platform sender (ADR 0029; see the top-level block): every PLATFORM_SMTP_* and
 # PLATFORM_EMAIL_* value is a SECRET, set with
 # `wrangler secret put <NAME> --env production`, never here. Production's

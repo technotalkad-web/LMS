@@ -1,10 +1,12 @@
 /**
  * Sign-in links, reset codes and passwords are never stored in the
  * notification log. The real send path (sendNotification, notifyBackground,
- * sendAuthEmail) and each route that emails a credential run under a stubbed
- * fetch: the password-reset request, the tenant sign-in link, the single and
- * bulk user creation (invite link and typed password). For each one the
- * notification_log insert is captured and checked:
+ * the tenant sign-in link of lib/auth/auth-email.ts) and each route that
+ * emails a credential run under a stubbed fetch: the password-reset request
+ * and the sign-in link on an organisation's page (their job after the
+ * response is run by the test), the single and bulk user creation (invite
+ * link and typed password). For each one the notification_log insert is
+ * captured and checked:
  *
  *   - the route answered as it does today and exactly the expected number of
  *     log rows were written;
@@ -30,6 +32,12 @@
  * mail carries the link; the answer, the platform_email_log row, the
  * account_setup_links row (the token's digest only) and every log line do
  * not, and no notification_log row is written.
+ *
+ * The platform's codes and links (ADR 0029 section F): an administrator's
+ * reset code and sign-in link, asked for on the organisation's page, go to
+ * the platform sender. The mail carries the credential; the
+ * platform_email_log row, the answer and every log line do not, and no
+ * notification_log row is written.
  *
  * Every credential check is a boolean or a count: a failing check never
  * prints a value.
@@ -63,6 +71,11 @@ const CSV_PASSWORD = "Csv-Sentinel-Pass-73";
 // The only cookie- and header-bound import. Everything below it is the real code.
 const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
 (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
+  // after(): the public routes' job is kept and run by the test (ADR 0029 step 12).
+  if (request === "next/server") {
+    const real = load.call(this, request, ...rest) as Record<string, unknown>;
+    return { ...real, after: (task: () => unknown) => { handed.push(task); } };
+  }
   if (request === "next/headers") {
     return {
       cookies: async () => ({ getAll: () => [{ name: "sb-stub-auth-token", value: SESSION }], set() {} }),
@@ -78,6 +91,11 @@ let settings: Row = {};
 let template: Row | null = null;
 let authUsers: Array<{ id: string; email: string }> = [];
 let members = new Set<string>();
+/** Members whose role is admin (an account the platform serves). */
+let admins = new Set<string>();
+/** The tasks the public routes handed to after(). */
+const handed: Array<() => unknown> = [];
+const runHanded = async () => { for (const t of handed.splice(0)) await t(); };
 let created = 0;
 /** tenant_mail_status's one row (ADR 0029, migration 0114): the state and the 24-hour count. */
 let mailStatus: Row = {};
@@ -124,7 +142,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (select === "role,status" && eqOf(url.searchParams, "user_id") === ME.id) return json([{ role: "super_owner", status: "active" }]);
     if (select.includes("organizations(")) return json([{ organization_id: ORG, organizations: { name: "Org" } }]);
     const uid = eqOf(url.searchParams, "user_id");
-    if (uid) return json(members.has(uid) ? [{ user_id: uid, role: "user", status: "active" }] : []);
+    if (uid) return json(members.has(uid) ? [{ organization_id: ORG, user_id: uid, role: admins.has(uid) ? "admin" : "user", status: "active" }] : []);
     return json([]);
   }
   // A platform owner whose row does not require the second factor (as the e2e
@@ -156,11 +174,13 @@ async function checkLog(label: string, opts: { rows: number; secrets: string[]; 
   eq(`${label}: the stored context keys`, Object.keys((rows[0]?.body.context ?? {}) as Row).sort(), [...opts.storedKeys].sort());
 }
 
-function reset(opts: { users?: Array<{ id: string; email: string }>; members?: string[]; settings?: Row; template?: Row | null; status?: Row } = {}) {
+function reset(opts: { users?: Array<{ id: string; email: string }>; members?: string[]; admins?: string[]; settings?: Row; template?: Row | null; status?: Row } = {}) {
   requests = [];
   mailStatus = opts.status ?? {};
   authUsers = [...(opts.users ?? [])];
   members = new Set(opts.members ?? []);
+  admins = new Set(opts.admins ?? []);
+  handed.length = 0;
   settings = opts.settings ?? { smtp_host: "smtp.stub.test", smtp_port: 587, smtp_secure: false, from_email: "noreply@example.test", from_name: "Org", email_paused: false, event_paused: {} };
   template = opts.template ?? null;
 }
@@ -170,8 +190,6 @@ async function main() {
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "stub-anon-key";
   process.env.SUPABASE_SERVICE_ROLE_KEY = "stub-service-role-key";
   delete process.env.SEND_SMTP_FUNCTION_URL;
-  delete process.env.RESEND_API_KEY;
-  delete process.env.RESEND_FROM;
   const realFetch = globalThis.fetch;
   globalThis.fetch = stub as typeof fetch;
   try {
@@ -282,21 +300,24 @@ async function main() {
       await checkLog("template override", { rows: 1, secrets: ["739104", TYPED_PASSWORD, TOKEN_HASH], storedKeys: ["course_name"] });
     }
 
-    console.log("\nsendAuthEmail: a sign-in link");
+    console.log("\nsendTenantSignInLink: a sign-in link through the organisation's run");
     {
-      const { sendAuthEmail } = await import("../../lib/auth/auth-email");
+      const { sendTenantSignInLink, signInLink } = await import("../../lib/auth/auth-email");
+      const { openRun } = await import("../../lib/notifications/smtp-state");
       reset({ users: [{ id: "u-m", email: "member@example.test" }], members: ["u-m"] });
-      const r = await sendAuthEmail({ organizationId: ORG, email: "member@example.test", type: "magiclink", origin: "https://lms.test", next: "/org/dashboard" });
-      eq("sent", r.sent, true);
-      await checkLog("sendAuthEmail magiclink", { rows: 1, secrets: [TOKEN_HASH], storedKeys: [] });
+      const run = await openRun({ organizationId: ORG });
+      const r = await sendTenantSignInLink(run, { userId: "u-m", email: "member@example.test" }, signInLink("https://lms.test", TOKEN_HASH, "/org/dashboard"));
+      eq("sent", r.status === "sent", true);
+      await checkLog("tenant sign-in link", { rows: 1, secrets: [TOKEN_HASH], storedKeys: [] });
     }
 
     console.log("\nPOST /api/auth/forgot-password/request: the reset code");
     {
       const route = await import("../../app/api/auth/forgot-password/request/route");
       reset({ users: [{ id: "u-m", email: "member@example.test" }], members: ["u-m"] });
-      const res = await route.POST(new Request("http://lms.test/api/auth/forgot-password/request", { method: "POST", body: JSON.stringify({ email: "member@example.test" }) }));
-      eq("200", res.status, 200);
+      const res = await route.POST(new Request("http://lms.test/api/auth/forgot-password/request", { method: "POST", body: JSON.stringify({ email: "member@example.test", orgSlug: "org" }) }));
+      eq("200, and nothing sent before the answer", res.status === 200 && smtpPayloads().length === 0, true);
+      await runHanded();
       // The code is random: read it from the email (the template's "# {OTP_Code}" line).
       const code = /^# (\d{6})$/m.exec(smtpPayloads()[0]?.text ?? "")?.[1] ?? "";
       eq("the email carries a 6-digit code", code.length === 6, true);
@@ -309,7 +330,46 @@ async function main() {
       reset({ users: [{ id: "u-m", email: "member@example.test" }], members: ["u-m"] });
       const res = await route.POST(new Request("http://lms.test/api/auth/magic-link", { method: "POST", body: JSON.stringify({ email: "member@example.test", orgSlug: "org" }) }));
       eq("200 { ok: true }", res.status === 200 && (await res.json()).ok === true, true);
+      await runHanded();
       await checkLog("magic_link", { rows: 1, secrets: [TOKEN_HASH], storedKeys: [] });
+    }
+
+    console.log("\nthe platform's reset code and sign-in link for an administrator (ADR 0029 section F)");
+    {
+      const PLATFORM_ENV: Record<string, string> = {
+        PLATFORM_SMTP_HOST: "smtp.platform.stub", PLATFORM_SMTP_PORT: "465", PLATFORM_SMTP_USER: "platform-mailer",
+        PLATFORM_SMTP_PASSWORD: "stub-platform-app-password", PLATFORM_SMTP_FROM: "LMS <noreply@platform.stub>", PLATFORM_EMAIL_ALLOW_DOMAINS: "platform.stub",
+      };
+      for (const [k, v] of Object.entries(PLATFORM_ENV)) process.env[k] = v;
+      const lines: string[] = [];
+      const real = { log: console.log, warn: console.warn, error: console.error };
+      try {
+        for (const [label, path, event] of [
+          ["reset code", "forgot-password/request", "platform_reset_code"],
+          ["sign-in link", "magic-link", "platform_sign_in_link"],
+        ] as const) {
+          const route = path === "magic-link" ? await import("../../app/api/auth/magic-link/route") : await import("../../app/api/auth/forgot-password/request/route");
+          reset({ users: [{ id: "u-a", email: "orgadmin@platform.stub" }], members: ["u-a"], admins: ["u-a"] });
+          const cap = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+          console.log = cap; console.warn = cap; console.error = cap;
+          const res = await route.POST(new Request(`http://lms.test/api/auth/${path}`, { method: "POST", body: JSON.stringify({ email: "orgadmin@platform.stub", orgSlug: "org" }) }));
+          const answer = await res.text();
+          await runHanded();
+          console.log = real.log; console.warn = real.warn; console.error = real.error;
+          const mail = smtpRaw();
+          const secret = event === "platform_reset_code" ? (/(?:^|\\n|\n)(\d{6})(?:\\n|\n)/.exec(mail)?.[1] ?? "(no code)") : TOKEN_HASH;
+          eq(`${label}: 200, and the platform's mail carries the credential`, res.status === 200 && mail.includes(secret), true);
+          const rows = requests.filter((q) => q.path === "/rest/v1/platform_email_log" && q.method === "POST").map((q) => q.raw);
+          eq(`${label}: one platform_email_log row, of the event`, rows.map((r) => String((JSON.parse(r) as Row).event_type)), [event]);
+          eq(`${label}: the row holds neither the credential nor an address`, rows.some((r) => r.includes(secret) || r.includes("@")), false);
+          eq(`${label}: the answer holds no credential`, answer.includes(secret), false);
+          eq(`${label}: no notification_log row`, logRows().length, 0);
+        }
+        eq("no log line holds a code, a link, a token or an address", lines.some((l) => /\b\d{6}\b/.test(l) || l.includes(TOKEN_HASH) || l.includes("token_hash") || l.includes("@")), false);
+      } finally {
+        console.log = real.log; console.warn = real.warn; console.error = real.error;
+        for (const k of Object.keys(PLATFORM_ENV)) delete process.env[k];
+      }
     }
 
     console.log("\nPOST /api/users: invite link and typed password");

@@ -4,7 +4,7 @@ import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
 import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
 import { isTenantEvent } from "./routing";
-import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, noteCallLimit, openRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, markNotSentAlert, noteCallLimit, openRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
 import type { TenantReading } from "@/lib/ops/health-status";
 import type {
   NotificationEvent,
@@ -263,6 +263,70 @@ export async function sendMany<R>(
     : undefined;
   const results = await runMail(run, list, runIO(run, false, hooks));
   return results.map((r, k) => toSendResult(list[k], r));
+}
+
+/** The two events anyone can start without signing in (section C): a reset code and a sign-in link. */
+export type CredentialEvent = "password_reset" | "magic_link";
+
+/** Why a reset code or sign-in link was not attempted: the organisation is not ready, or it is at its daily limit. */
+export type CredentialNotAttempted = "smtp_not_ready" | "daily_limit";
+
+/**
+ * The record of a reset code or sign-in link that was not attempted (ADR
+ * 0029 section C; rule FP4): one failed notification_log row with the fixed
+ * error, written only when that account has no such row for this kind in
+ * this organisation in the last 24 hours, so repeated requests cannot fill
+ * the log. The row is the administrators' view of who was affected; it holds
+ * no credential (nothing was made). The alert is marked as due either way,
+ * under section E's bound. Nothing is sent. A read that fails writes
+ * nothing. Never throws.
+ */
+export async function recordCredentialNotAttempted(
+  run: MailRun,
+  args: { event: CredentialEvent; to: { user_id: string; email: string } },
+  error: CredentialNotAttempted
+): Promise<"written" | "exists" | "unreadable" | "write_failed"> {
+  const db = svc();
+  let answer: "written" | "exists" | "unreadable" | "write_failed";
+  try {
+    spendCalls(run.budget, 1);
+    const since = new Date(run.now() - 24 * 3_600_000).toISOString();
+    const { data, error: readError } = await db
+      .from("notification_log")
+      .select("id")
+      .eq("organization_id", run.organizationId)
+      .eq("to_user_id", args.to.user_id)
+      .eq("event_type", args.event)
+      .eq("error", error)
+      .gte("sent_at", since)
+      .limit(1);
+    if (readError || !Array.isArray(data)) {
+      answer = "unreadable";
+    } else if (data.length > 0) {
+      answer = "exists";
+    } else {
+      spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
+      const row = logRow({
+        organizationId: run.organizationId,
+        orgName: run.orgName,
+        event: args.event,
+        to: args.to,
+        subjectTemplate: DEFAULT_TEMPLATES[args.event]?.subject ?? "",
+        status: "failed",
+        error,
+        context: {},
+      });
+      const { error: writeError } = await db.from("notification_log").insert(row);
+      answer = writeError ? "write_failed" : "written";
+    }
+  } catch {
+    answer = "unreadable";
+  }
+  if (answer === "unreadable" || answer === "write_failed") {
+    console.warn(JSON.stringify({ event: "credential_record_failed", org_id: run.organizationId, kind: args.event, step: answer }));
+  }
+  await markNotSentAlert(run);
+  return answer;
 }
 
 /**

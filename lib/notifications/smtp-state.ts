@@ -744,6 +744,19 @@ async function markAlertDue(run: MailRun, cause: AlertCause): Promise<void> {
 }
 
 /**
+ * A reset code or sign-in link that was not attempted because the
+ * organisation is not ready or at its daily limit (section C; rule FP4):
+ * learner mail that was not sent, so an alert is marked as due under
+ * section E's 24-hour bound. Sends nothing; the same guards as a run's mark
+ * (deleted organisation, no 0114, a state read that failed, a mark already
+ * pending). Never throws. lib/notifications/send.ts calls it with the record
+ * row of such a request.
+ */
+export async function markNotSentAlert(run: MailRun): Promise<void> {
+  await markAlertDue(run, "not_sent");
+}
+
+/**
  * Apply one group's outcomes in order, write the state once if it changed,
  * then mark an alert if a cause arose. A flip stops the run; a failed probe
  * of a run that started failing stops it; a delivered probe clears it.

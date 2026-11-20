@@ -60,16 +60,18 @@ export type RoutingRow = {
 
 /**
  * Section A's table: where each event is sent from. A file that does not
- * exist yet is a sender a later step builds (the two public routes' job in
- * lib/auth/credential-mail.ts; the Users pages' "Send setup link" route of
- * pull request C). The console's welcome is the platform sender's since
- * stage 3. The scan reads the code against this table, never the other way.
+ * exist yet is a sender a later step builds (the Users pages' "Send setup
+ * link" route of pull request C). The two public routes' reset codes and
+ * sign-in links are sent by their job in lib/auth/credential-mail.ts, the
+ * tenant's sign-in link through lib/auth/auth-email.ts; the console's welcome
+ * is the platform sender's. The scan reads the code against this table,
+ * never the other way.
  */
 export const ROUTING_TABLE: readonly RoutingRow[] = [
   {
     system: "tenant",
     events: ["password_reset"],
-    files: ["app/api/auth/forgot-password/request/route.ts", "lib/auth/credential-mail.ts"],
+    files: ["lib/auth/credential-mail.ts"],
   },
   {
     system: "tenant",

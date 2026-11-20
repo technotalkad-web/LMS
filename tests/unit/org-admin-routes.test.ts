@@ -305,7 +305,6 @@ async function main() {
   process.env.CF_API_TOKEN = "stub-cf-token";
   process.env.CF_ZONE_ID = "zone1";
   process.env.CF_SAAS_CNAME_TARGET = "saas.example.test";
-  delete process.env.RESEND_API_KEY;
   delete process.env.SEND_SMTP_URL;
   const realFetch = globalThis.fetch;
   const realWarn = console.warn;

@@ -22,13 +22,13 @@
  * Planted sources prove each scan fires and that a clean source passes.
  *
  * Files still to come (pull request B is built in stages; ADR 0029, note of
- * 2026-11-20, part 3): a file that an early stage cannot yet pass is named
- * in STILL_TO_COME with the stage that changes it. Its findings are set
- * aside, and the test fails as soon as it has none (so the list never goes
- * stale). Stage 3 took the console's admins route off the list: its welcome
- * is platform mail now. lib/auth/auth-email.ts stays on it until the second
- * half of stage 2 is built; the case that the list is empty comes when it
- * leaves.
+ * 2026-11-20, part 3): a file that an early stage could not yet pass was
+ * named in STILL_TO_COME with the stage that changed it, its findings set
+ * aside, and the test failed as soon as it had none (so the list never went
+ * stale). Stage 3 took the console's admins route off the list (its welcome
+ * is platform mail), and the second half of stage 2 took lib/auth/auth-email.ts
+ * off (the tenant link only, with the literal event magic_link). The list is
+ * now empty, and a case holds it so: every file passes every scan.
  *
  * Run:  npx tsx tests/unit/email-routing.test.ts   (or npm run test:unit)
  * (No database, no network.)
@@ -53,10 +53,8 @@ const eq = (n: string, got: unknown, want: unknown) => {
 
 const ROOT = path.resolve(__dirname, "..", "..");
 
-/** The files an early stage cannot pass yet, with the stage that changes them. */
-const STILL_TO_COME: Record<string, string> = {
-  "lib/auth/auth-email.ts": "stage 2: the tenant link only, with the literal event magic_link",
-};
+/** The files an early stage could not pass yet, with the stage that changed them: none since stage 2's second half. */
+const STILL_TO_COME: Record<string, string> = {};
 
 /** The send calls and the system each one carries. */
 const SEND_CALLS: Record<string, "tenant" | "platform"> = {
@@ -241,6 +239,9 @@ async function main() {
       literalCount += literals.length;
     }
     eq(`non-vacuous: the scan reads the send calls (${literalCount} event literals)`, literalCount >= 25, true);
+    eq("no file is still to come: the list is empty (pull request B's stages are all built)", Object.keys(STILL_TO_COME), []);
+    eq("…and the files that left it pass every scan: the tenant link and the console's admins route",
+      all.filter((f) => f.file === "lib/auth/auth-email.ts" || f.file === "app/api/super/tenants/[id]/admins/route.ts").map((f) => `${f.file}:${f.line} ${f.what}`), []);
     const outside = all.filter((f) => !(f.file in STILL_TO_COME));
     eq("no finding outside the files still to come", outside.map((f) => `${f.file}:${f.line} ${f.what}`), []);
     for (const [file, stage] of Object.entries(STILL_TO_COME)) {

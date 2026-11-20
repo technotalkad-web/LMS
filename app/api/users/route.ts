@@ -424,7 +424,7 @@ export async function POST(request: Request) {
 
     if (didInvite && inviteTokenHash) {
       // White-label invite: branded activation link (token_hash → /auth/callback)
-      // sent via the tenant's SMTP, Resend fallback. No Supabase auto-send.
+      // sent via the tenant's SMTP only (no other sender). No Supabase auto-send.
       const base = (origin || "").replace(/\/$/, "");
       const link =
         `${base}/auth/callback?token_hash=${encodeURIComponent(inviteTokenHash)}` +

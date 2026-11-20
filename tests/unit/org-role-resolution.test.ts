@@ -93,7 +93,6 @@ const READS: Record<string, Entry> = {
   "app/(super-owner)/super/organizations/[id]/page.tsx#TenantDetailPage#1": { cls: "subject", reason: "platform console: a tenant's member list" },
   "app/api/assignments/route.ts#POST#1": { cls: "subject", reason: "the named assignees are rows of the org" },
   "app/api/assignments/route.ts#POST#2": { cls: "subject", reason: "the named assignees' vertical and department" },
-  "app/api/auth/forgot-password/request/route.ts#POST#1": { cls: "subject", reason: "the account's first row, to pick the sender of its reset code (ADR 0029 replaces it)", notCaller: "`user` is the account found by the address in the form; the request has no session" },
   "app/api/courses/[courseId]/learners/export/route.ts#GET#1": { cls: "subject", reason: "learners' employee ids for the CSV" },
   "app/api/gamification/avatar/remove/route.ts#POST#1": { cls: "subject", reason: "the target person is a row of the org" },
   "app/api/integrations/employees/route.ts#memQ#1": { cls: "subject", reason: "API key: an employee by employee id" },
