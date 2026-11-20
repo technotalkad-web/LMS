@@ -40,8 +40,8 @@ export const SMTP_SETTINGS: Row = {
 export type World = {
   /** The accounts the auth server lists on its first page. */
   users: Array<{ id: string; email: string }>;
-  /** The lookup's answer: a page, an error, a page with no list, or a call that throws. */
-  lookup: "ok" | "error" | "nolist" | "throw";
+  /** The lookup's answer: a page, an error, a page with no list, a page holding an account with no id, or a call that throws. */
+  lookup: "ok" | "error" | "nolist" | "noid" | "throw";
   orgs: Array<{ id: string; slug: string; name: string; deleted_at: string | null }>;
   orgRead: "ok" | "fail";
   settings: Row | null | "fail";
@@ -146,7 +146,10 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (world.lookup === "throw") throw new TypeError("stub: network down");
     if (world.lookup === "error") return json({ code: 500, error_code: "unexpected_failure", msg: "stub lookup failure" }, 500);
     if (world.lookup === "nolist") return json({});
-    return json({ users: world.users.map((u) => ({ id: u.id, aud: "authenticated", role: "authenticated", email: u.email, app_metadata: {}, user_metadata: {} })), aud: "authenticated" });
+    const listed: Row[] = world.users.map((u) => ({ id: u.id, aud: "authenticated", role: "authenticated", email: u.email, app_metadata: {}, user_metadata: {} }));
+    // One more account on the page, with no id: the page cannot be read whole.
+    if (world.lookup === "noid") listed.push({ aud: "authenticated", role: "authenticated", email: "no-id@tenant.stub", app_metadata: {}, user_metadata: {} });
+    return json({ users: listed, aud: "authenticated" });
   }
   if (p === "/auth/v1/admin/generate_link") {
     const email = String((body as Row).email ?? "");

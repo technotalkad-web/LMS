@@ -17,13 +17,22 @@ import {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = any;
 
+/**
+ * `readFailed`, when given, is called with the error of a read that did not
+ * answer (a missing function before 0073 among them) before the platform
+ * default is used, and may throw: a caller that mails from the answer reads
+ * a failed read as a failure, never as the default (ADR 0029, stage 2's one
+ * rule). Without it the call stays fail-soft.
+ */
 export async function resolvePolicies(
   client: AnyClient,
-  courseIds: string[]
+  courseIds: string[],
+  opts: { readFailed?: (error: unknown) => void } = {}
 ): Promise<Map<string, EffectivePolicy>> {
   const out = new Map<string, EffectivePolicy>();
   const ids = [...new Set(courseIds.filter(Boolean))];
   if (ids.length === 0) return out;
+  let failure: unknown = null;
   try {
     const { data, error } = await client.rpc("effective_attempt_policies", {
       p_course_ids: ids,
@@ -33,10 +42,14 @@ export async function resolvePolicies(
         const cid = row.course_id;
         if (typeof cid === "string") out.set(cid, normalizePolicy(row));
       }
+    } else {
+      failure = error ?? new Error("effective_attempt_policies: no answer");
     }
-  } catch {
-    /* pre-0073 */
+  } catch (e) {
+    /* pre-0073, or the call threw */
+    failure = e;
   }
+  if (failure !== null) opts.readFailed?.(failure);
   for (const id of ids) if (!out.has(id)) out.set(id, DEFAULT_POLICY);
   return out;
 }

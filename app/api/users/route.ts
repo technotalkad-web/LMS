@@ -68,6 +68,8 @@ type CreateUserBody = {
   branch?: string;
 };
 
+/** The existing accounts could not be read: nothing was made (ADR 0029, stage 2's one rule). */
+const ACCOUNTS_UNREADABLE = "Could not read the existing accounts. Nothing was changed; try again.";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_LMS_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
 const VALID_STATUSES = ["active", "inactive", "suspended"] as const;
@@ -257,12 +259,22 @@ export async function POST(request: Request) {
   // email it ourselves through the tenant's branded pipeline below.
   let inviteTokenHash: string | null = null;
 
-  // Look up by email first.
-  const { data: existing } = await svc.auth.admin.listUsers({
-    page: 1,
-    perPage: 1000,
-  });
-  const found = existing?.users?.find(
+  // Look up by email first. Whether the account is new decides whether an
+  // account and a welcome are made, so a failed read is never "no account"
+  // (ADR 0029, stage 2's one rule): nothing is made and the answer is 503.
+  let existing: Awaited<ReturnType<typeof svc.auth.admin.listUsers>> | null;
+  try {
+    existing = await svc.auth.admin.listUsers({
+      page: 1,
+      perPage: 1000,
+    });
+  } catch {
+    existing = null;
+  }
+  if (!existing || existing.error || !Array.isArray(existing.data?.users)) {
+    return NextResponse.json({ error: ACCOUNTS_UNREADABLE }, { status: 503 });
+  }
+  const found = existing.data.users.find(
     (u) => u.email?.toLowerCase() === email
   );
 

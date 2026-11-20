@@ -59,6 +59,7 @@ import { isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-functi
 import { sendPlatformEmail } from "@/lib/email/platform-sender";
 import type { AlertErrorClass, AlertReading } from "@/lib/email/platform-templates";
 import { countingMemberIds } from "@/lib/auth/org-membership";
+import type { CallCounter } from "@/lib/db/chunked";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { MAIL_RECIPIENTS_HEARTBEAT, type CronErrorCounts, type CronErrorWord, type TenantReading } from "@/lib/ops/health-status";
@@ -118,7 +119,8 @@ export const MAIL_CALL_COSTS = {
 /**
  * An alert sent by a scheduled call (rule FP3), at most: the read for the
  * oldest due alert, the state with its count, the settings, the
- * organisation, the members that count (two reads for each of two roles),
+ * organisation, the members that count (the organisation and a page for
+ * each of two roles, counted as read),
  * their addresses, the claim, and five platform mails of three calls each.
  */
 export const ALERT_CALL_COST = 1 + 3 + 4 + 1 + 1 + ALERT_MAX_RECIPIENTS * 3;
@@ -168,6 +170,19 @@ export function unboundedBudget(now: () => number = Date.now): MailBudget {
 
 export function spendCalls(b: MailBudget, n: number): void {
   b.calls += n;
+}
+
+/**
+ * A reader's gate (lib/db/chunked.ts) that counts each call the reader makes
+ * on this budget and never refuses: a request's or an alert's reads of
+ * people cost what they read, every page of a large organisation included
+ * (rule FP2: the sum counts the calls made).
+ */
+export function countCalls(b: MailBudget): CallCounter {
+  return () => {
+    spendCalls(b, 1);
+    return true;
+  };
 }
 
 /** Whether `calls` more fit the count, and the window has not passed. */
@@ -1171,16 +1186,14 @@ export async function sendDueAlert(opts: {
   if (!reading) return clear("cleared");
 
   // 3. The administrators whose membership counts, super owners first, at most five.
-  spendCalls(b, 2);
-  const owners = await countingMemberIds(db, orgId, ["super_owner"]);
+  const owners = await countingMemberIds(db, orgId, ["super_owner"], countCalls(b));
   if (owners === "unreadable") {
     warn("recipients", orgId, "unreadable");
     return { kind: "failed", step: "recipients" };
   }
   let ids = [...owners].sort();
   if (ids.length < ALERT_MAX_RECIPIENTS) {
-    spendCalls(b, 2);
-    const admins = await countingMemberIds(db, orgId, ["admin"]);
+    const admins = await countingMemberIds(db, orgId, ["admin"], countCalls(b));
     if (admins === "unreadable") {
       warn("recipients", orgId, "unreadable");
       return { kind: "failed", step: "recipients" };

@@ -402,6 +402,12 @@ function fakeDb(tables: Record<string, Row[]>, override?: (q: Query) => Answer |
       b.then = (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) => settle().then(res, rej);
       return b;
     },
+    /** A database function, recorded as the table "rpc/<name>": no rows unless `tables` or `override` say otherwise. */
+    rpc(name: string, args: unknown) {
+      const q: Query = { table: `rpc/${name}`, ops: [{ op: "rpc", args: [args] }] };
+      queries.push(q);
+      return Promise.resolve({ data: tables[q.table] ?? [], error: null, ...(override?.(q) ?? {}) });
+    },
   };
   return { client: client as never, queries };
 }
@@ -602,7 +608,9 @@ async function insightsCases() {
       computeLearnerInsights(db.client, { orgId: "org1", orgSlug: "acme", userIds: ["u1", "u2", "u3"], periodDays: 30, now: NOW, strictGroups: true });
     const settled = (p: Promise<unknown>) => p.then(() => "answered", () => "threw");
     const BOOM = { data: null, error: { code: "XX000", message: "stub read failure" } };
-    for (const [what, table] of [["the groups", "org_groups"], ["a static group's rows", "org_group_members"]] as const) {
+    // Stage 2's one rule reaches every read that decides whether the course
+    // reaches a learner: the organisation's courses and paths too.
+    for (const [what, table] of [["the groups", "org_groups"], ["a static group's rows", "org_group_members"], ["the organisation's courses", "courses"], ["the organisation's paths", "learning_paths"], ["the attempt policies", "rpc/effective_attempt_policies"]] as const) {
       const fails = (q: Query) => (q.table === table ? BOOM : undefined);
       eq(`${what} cannot be read: with strictGroups the read throws (the caller answers 503 and sends nothing); without it, the Report Card answers as before`,
         [await settled(strictFor(reportCardDb(fails, withGroup))), await settled(insightsFor(reportCardDb(fails, withGroup)))], ["threw", "answered"]);
@@ -612,6 +620,14 @@ async function insightsCases() {
     const missing = (q: Query) => (q.table === "org_groups" ? { data: null, error: { code: "42P01", message: 'relation "public.org_groups" does not exist' } } : undefined);
     eq("…a database without org_groups (before 0067) is still tolerated with strictGroups",
       await settled(strictFor(reportCardDb(missing, withGroup))), "answered");
+    // "Missing" is read from the error's code: a transient error whose words
+    // name a relation is a failed read, never a database without the table.
+    const wordsOnly = (q: Query) => (q.table === "org_groups" ? { data: null, error: { code: "XX000", message: "could not open relation with OID 16384" } } : undefined);
+    eq("…an error that only names a relation, with no missing-table code, throws with strictGroups",
+      await settled(strictFor(reportCardDb(wordsOnly, withGroup))), "threw");
+    const noPolicies = (q: Query) => (q.table === "rpc/effective_attempt_policies" ? { data: null, error: { code: "PGRST202", message: "Could not find the function public.effective_attempt_policies(p_course_ids) in the schema cache" } } : undefined);
+    eq("…a database without the policies' function (before 0073) is still tolerated with strictGroups: the platform default, as before",
+      await settled(strictFor(reportCardDb(noPolicies, withGroup))), "answered");
   }
 }
 

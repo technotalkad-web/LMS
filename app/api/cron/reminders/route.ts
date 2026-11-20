@@ -54,15 +54,18 @@ import { chunk, readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
  *     migration 0114 are clean runs.
  *   - Every read before the sends follows the house rule (lib/db/chunked.ts):
  *     `.in()` lists of 150 ids and pages of 1000 rows, so no set is cut at
- *     the server's row cap. A set is used whole or not at all. Every read
- *     before the sends asks for room first, keeping back the write that stops
- *     reminders past their cap, one opening and one group of sends (the note
- *     of 2026-11-21, part 2 (a)). This job reads its sets from the start at
- *     every call, so a read it has no room to finish, or reminders due with
- *     no room to open any run, is the job's own failed step: call_limit,
- *     stopped before any send, with one fixed line (cron_no_room). An
- *     organisation left once other mail went is left for the next call, a
- *     clean run (rule T5).
+ *     the server's row cap. A set is used whole or not at all. Every call
+ *     of a read before the sends, each page of the members and of a group
+ *     included, asks for room first and is counted as made (rule FP2),
+ *     keeping back the write that stops reminders past their cap, one
+ *     opening and one group of sends (the note of 2026-11-21, part 2 (a)).
+ *     This job reads its sets from the start at every call, so a read it
+ *     has no room to finish, or reminders due with no room to open any run,
+ *     is the job's own failed step: call_limit, stopped before any send,
+ *     with one fixed line (cron_no_room). An organisation whose members the
+ *     call has no room left to read, or one left once other mail went, is
+ *     left for the next call, a clean run (rule T5; the hand-over note of
+ *     2026-11-19, point 3).
  *   - The finished attempts are asked for by the attempt row's own columns
  *     (completed or passed), the same test the route makes on each row.
  *   - The answer and the heartbeat are built by buildMailCronDetail: counts
@@ -209,17 +212,18 @@ export async function POST(request: Request) {
   // ADR 0030 rule 10: the members that count, read once per organisation for
   // this run. A deleted organisation's courses are dropped before any read;
   // an organisation whose read fails is dropped for this run and logged with
-  // its id. An organisation this call has no room left to read is left for
-  // the next call.
+  // its id. Each call of the read (the organisation, then a call for each
+  // 1,000 members) asks for room first and is counted as made (rule FP2).
+  // An organisation this call has no room left to read whole is left for the
+  // next call (the hand-over note of 2026-11-19, point 3).
   const countingByOrg = new Map<string, ReadonlySet<string>>();
   let leftOrgs = 0;
   for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
-    if (!hasRoom(budget, 2 + SEND_RESERVE)) {
+    const counting = await countingMemberIds(svc, oid, undefined, pageRoom);
+    if (counting === "no_room") {
       leftOrgs++;
       continue;
     }
-    spendCalls(budget, 2);
-    const counting = await countingMemberIds(svc, oid);
     if (counting === "unreadable") {
       console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "cron/reminders", org_id: oid }));
       unreadableOrgs++;
@@ -316,14 +320,15 @@ export async function POST(request: Request) {
       groupRows.push(...(data as Array<{ id: string; organization_id: string }>));
     }
     for (const g of groupRows) {
-      // Each group's members are two calls: asked for first, as every read
-      // before the sends is.
-      if (!hasRoom(budget, 2 + SEND_RESERVE)) {
+      // Each group's members: every call the group reader makes (the group,
+      // a static group's pages, or the members a rule reads and its teams)
+      // asks for room first, as every read before the sends does, and is
+      // counted as made.
+      const ids = await resolveManyGroupsStrict(svc, g.organization_id, [g.id], pageRoom);
+      if (ids === "no_room") {
         noRoom("members_read");
         return finish({ stoppedBeforeSend: true, leftOrgs });
       }
-      spendCalls(budget, 2);
-      const ids = await resolveManyGroupsStrict(svc, g.organization_id, [g.id]);
       if (ids === "unreadable") {
         fail("members_read");
         return finish({ stoppedBeforeSend: true, leftOrgs });

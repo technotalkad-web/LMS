@@ -76,6 +76,8 @@ type ResultRow = {
   team_added?: string;
 };
 
+/** The existing accounts could not be read: nothing was made (ADR 0029, stage 2's one rule). */
+const ACCOUNTS_UNREADABLE = "Could not read the existing accounts. Nothing was changed; try again.";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_LMS_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
 const VALID_STATUSES = ["active", "inactive", "suspended"] as const;
@@ -141,12 +143,23 @@ export async function POST(request: Request) {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
-  const { data: listed } = await svc.auth.admin.listUsers({
-    page: 1,
-    perPage: 1000,
-  });
+  // Whether each row's account is new decides whether an account and a
+  // welcome are made, so a failed read is never "no accounts" (ADR 0029,
+  // stage 2's one rule): no row is written and the answer is 503.
+  let listed: Awaited<ReturnType<typeof svc.auth.admin.listUsers>> | null;
+  try {
+    listed = await svc.auth.admin.listUsers({
+      page: 1,
+      perPage: 1000,
+    });
+  } catch {
+    listed = null;
+  }
+  if (!listed || listed.error || !Array.isArray(listed.data?.users)) {
+    return NextResponse.json({ error: ACCOUNTS_UNREADABLE }, { status: 503 });
+  }
   const userIdByEmail = new Map<string, string>();
-  for (const u of listed?.users ?? []) {
+  for (const u of listed.data.users) {
     if (u.email) userIdByEmail.set(u.email.toLowerCase(), u.id);
   }
 

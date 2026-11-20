@@ -103,7 +103,9 @@ export type AccountLookup = { kind: "found"; userId: string } | { kind: "none" }
  * route's path, one page of up to 1,000 accounts, as before ADR 0027's
  * slice 2 (which changes this one body). The page is searched whole, with no
  * early exit, comparing lower-cased addresses. "error": the answer carries
- * an error, the call throws, or the answer holds no list.
+ * an error, the call throws, the answer holds no list, or an account on the
+ * page has no id. The page's shape is read before any address is compared,
+ * so "error" is the same for every address (section C).
  */
 export async function lookupAccount(db: SupabaseClient, email: string): Promise<AccountLookup> {
   const want = email.trim().toLowerCase();
@@ -116,17 +118,22 @@ export async function lookupAccount(db: SupabaseClient, email: string): Promise<
   if (answer.error) return { kind: "error" };
   const users = (answer.data as { users?: unknown } | null)?.users;
   if (!Array.isArray(users)) return { kind: "error" };
+  const page: Array<{ id: string; email?: unknown }> = [];
+  for (const u of users as Array<{ id?: unknown; email?: unknown } | null>) {
+    if (!u || typeof u.id !== "string" || u.id.length === 0) return { kind: "error" };
+    page.push({ id: u.id, email: u.email });
+  }
   let matches = 0;
   let id: string | null = null;
-  for (const u of users as Array<{ id?: unknown; email?: unknown } | null>) {
-    const address = typeof u?.email === "string" ? u.email.trim().toLowerCase() : null;
+  for (const u of page) {
+    const address = typeof u.email === "string" ? u.email.trim().toLowerCase() : null;
     if (address !== want) continue;
     matches++;
-    if (id === null && typeof u?.id === "string" && u.id.length > 0) id = u.id;
+    id ??= u.id;
   }
-  if (matches === 0) return { kind: "none" };
+  if (matches === 0 || id === null) return { kind: "none" };
   if (matches > 1) return { kind: "ambiguous" };
-  return id ? { kind: "found", userId: id } : { kind: "error" };
+  return { kind: "found", userId: id };
 }
 
 /* ------------------------------------------------- the request, before the answer */

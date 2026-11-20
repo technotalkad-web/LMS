@@ -5,7 +5,7 @@ import { countingMemberIds } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { assigneeRecipientsStrict } from "@/lib/org/groups";
 
 /**
@@ -118,14 +118,12 @@ export async function DELETE(
         // (active, in an organisation that is not deleted). One read of them
         // for this request: it is the org-wide audience and the filter on
         // every other one.
-        spendCalls(budget, 2);
-        const counting = await countingMemberIds(svc, r.organization_id);
+        const counting = await countingMemberIds(svc, r.organization_id, undefined, countCalls(budget));
         if (counting === "unreadable") {
           await recordRecipientsUnreadable("assignments/[id]", r.organization_id);
           return RECIPIENTS_UNREADABLE;
         }
-        spendCalls(budget, 2);
-        const recipients = await assigneeRecipientsStrict(svc, r.organization_id, [r], counting);
+        const recipients = await assigneeRecipientsStrict(svc, r.organization_id, [r], counting, countCalls(budget));
         if (recipients === "unreadable") {
           await recordRecipientsUnreadable("assignments/[id]", r.organization_id);
           return RECIPIENTS_UNREADABLE;

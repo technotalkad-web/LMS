@@ -63,6 +63,16 @@ export async function fetchAll<T>(
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 /**
+ * Asked before each outbound call a reader makes (ADR 0029, rule FP2: the
+ * sum counts the calls made, every paged read included). True: the call is
+ * made, and a caller that counts its calls has counted it. False: the read
+ * stops there and answers "no_room", never part of a set.
+ */
+export type CallGate = () => boolean;
+/** A gate that only counts and never refuses: its reader never answers "no_room". */
+export type CallCounter = () => true;
+
+/**
  * The same house rules for a read that decides who is mailed (ADR 0029):
  * it never throws and never answers part of a set. `page(from, to)` builds
  * one page's query, ordered by a stable key; pages of 1000 rows are read
@@ -74,7 +84,7 @@ export async function fetchAll<T>(
  */
 export async function readAllStrict<T>(
   page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
-  beforePage?: () => boolean
+  beforePage?: CallGate
 ): Promise<T[] | "unreadable" | "no_room"> {
   const out: T[] = [];
   for (let from = 0; ; from += 1000) {
@@ -100,7 +110,7 @@ export async function readAllStrict<T>(
 export async function readByIdsStrict<T>(
   ids: Iterable<string>,
   page: (part: string[], from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
-  beforePage?: () => boolean
+  beforePage?: CallGate
 ): Promise<T[] | "unreadable" | "no_room"> {
   const out: T[] = [];
   for (const part of chunk([...new Set([...ids].filter(Boolean))], 150)) {

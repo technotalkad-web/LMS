@@ -8,7 +8,7 @@ import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membersh
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { assigneeRecipientsStrict } from "@/lib/org/groups";
 import { convertSelfEnrolments } from "@/lib/assignments/direct";
@@ -348,8 +348,7 @@ export async function POST(request: Request) {
         // (active, in an organisation that is not deleted). One read of them
         // for this request: it is the org-wide audience and the filter on
         // every other one.
-        spendCalls(budget, 2);
-        const counting = await countingMemberIds(svc, org.id);
+        const counting = await countingMemberIds(svc, org.id, undefined, countCalls(budget));
         if (counting === "unreadable") {
           await recordRecipientsUnreadable("assignments", org.id);
           return RECIPIENTS_UNREADABLE;
@@ -358,12 +357,12 @@ export async function POST(request: Request) {
         // The recipients: only the rows ACTUALLY inserted, so a
         // re-assignment that hit a 23505 duplicate (already assigned) doesn't
         // re-email that learner. A team or group read that fails mails nobody.
-        spendCalls(budget, 2);
         const recipients = await assigneeRecipientsStrict(
           svc,
           org.id,
           inserted as Array<{ assignee_type: string; user_id: string | null; team_id: string | null; group_id?: string | null }>,
-          counting
+          counting,
+          countCalls(budget)
         );
         if (recipients === "unreadable") {
           await recordRecipientsUnreadable("assignments", org.id);

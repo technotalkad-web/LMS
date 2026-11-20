@@ -1,7 +1,7 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { assignedRecipientsStrict } from "@/lib/org/groups";
@@ -40,18 +40,17 @@ export async function notifyCourseUpdate(args: {
 
     // ADR 0030 rule 10: one read of the org's members that count, for this
     // request: the org-wide audience and the filter on every other one.
-    spendCalls(budget, 2);
-    const counting = await countingMemberIds(svc, org.id);
+    const counting = await countingMemberIds(svc, org.id, undefined, countCalls(budget));
     if (counting === "unreadable") {
       await recordRecipientsUnreadable("course-update", org.id);
       return RECIPIENTS_UNREADABLE;
     }
-    spendCalls(budget, 3);
     const learnerIds = await assignedRecipientsStrict(
       svc,
       org.id,
       { table: "course_assignments", column: "course_id", id: courseId },
-      counting
+      counting,
+      countCalls(budget)
     );
     if (learnerIds === "unreadable") {
       await recordRecipientsUnreadable("course-update", org.id);

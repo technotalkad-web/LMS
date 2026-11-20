@@ -154,6 +154,8 @@ type Account = { id: string; email: string };
 let accounts: Account[] = [];
 let invitations: Row[] = [];
 let authCalls: string[] = [];
+/** The auth server answers the list of accounts with an error. */
+let accountsUnreadable = false;
 // (j): attempts, their launch tokens, the organisations' API keys, and what
 // the code logged with console.error.
 let attempts: Row[] = [];
@@ -282,7 +284,10 @@ const userJson = (a: Account) => ({ id: a.id, aud: "authenticated", role: "authe
 /** The auth server: the admin user list, a new account, and a password sign-in. */
 function authServer(method: string, p: string, body: unknown): Response {
   authCalls.push(`${method} ${p}`);
-  if (p === "/auth/v1/admin/users" && method === "GET") return json({ users: accounts.map(userJson), aud: "authenticated" });
+  if (p === "/auth/v1/admin/users" && method === "GET") {
+    if (accountsUnreadable) return json({ code: 500, error_code: "unexpected_failure", msg: "stub failure" }, 500);
+    return json({ users: accounts.map(userJson), aud: "authenticated" });
+  }
   if (p === "/auth/v1/admin/users" && method === "POST") {
     const a = { id: `u-new-${accounts.length + 1}`, email: (body as { email: string }).email };
     accounts.push(a);
@@ -346,6 +351,7 @@ const world = (o: { members?: Row[]; failing?: string[]; platformOwner?: boolean
   apiKeys = (o.apiKeys ?? []).map((r) => ({ ...r }));
   logged = [];
   authCalls = [];
+  accountsUnreadable = false;
   requests = [];
   smtpSettings = null;
   smtpReply = null;
@@ -1224,6 +1230,30 @@ async function main() {
           eq("bulk, a welcome that timed out: the row reads not_sent, timeout, and the summary counts it as not emailed",
             [res.status, body.results.map((r) => r.email_outcome ?? null), body.summary.emailed, body.summary.not_emailed],
             [200, [{ status: "not_sent", class: "timeout" }], 0, 1]);
+        }
+        {
+          // ADR 0029, stage 2's one rule: whether an account is new decides
+          // whether an account and a welcome are made, so a failed read of
+          // the accounts is never "no account": nothing is made or sent.
+          const BRAND_NEW = "brand.new@example.test";
+          newcomerWorld();
+          smtpWorld();
+          accountsUnreadable = true;
+          const one = await usersRoute.POST(new Request("http://lms.test/api/users", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, first_name: "New", email: BRAND_NEW, employee_id: "E-B", lms_role: "user", node_id: "N1", status: "active" }),
+          }));
+          eq("POST /api/users, the accounts cannot be read: 503, no account made, no member written, nothing sent",
+            [one.status, authCalls.filter((c) => c === "POST /auth/v1/admin/users").length, writes().filter((w) => w.endsWith("organization_members")), smtpSends], [503, 0, [], 0]);
+          newcomerWorld();
+          smtpWorld();
+          accountsUnreadable = true;
+          const file = await bulkRoute.POST(new Request("http://lms.test/api/users/bulk", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, csv: [HEADER, `New,E-B,${BRAND_NEW},user,N1,active`].join("\n") }),
+          }));
+          eq("bulk, the accounts cannot be read: 503 before any row, no account made, no member written, nothing sent",
+            [file.status, authCalls.filter((c) => c === "POST /auth/v1/admin/users").length, writes().filter((w) => w.endsWith("organization_members")), smtpSends], [503, 0, [], 0]);
         }
 
         // ADR 0029 section Q, point 7: whoever the membership resolver turns

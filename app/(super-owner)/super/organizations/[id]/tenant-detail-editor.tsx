@@ -36,6 +36,9 @@ const ROLE_LABEL: Record<string, string> = {
   data_analyst: "Data analyst",
 };
 
+/** ADR 0029 rule T2: what "Send setup link again" tells the administrator, word for word. */
+const SEND_AGAIN_NOTE = "The first mail may still arrive. Its link stops working when you send a new one.";
+
 /** A row that is not active gives no access; adding the person again sets it active. */
 const STATUS_LABEL: Record<string, string> = {
   inactive: "Inactive",
@@ -165,6 +168,8 @@ export function TenantDetailEditor({
   }
 
   async function sendSetupLinkAgain(admin: Admin) {
+    // Rule T2: the action says that the first mail may still arrive.
+    if (!await confirm(`Send ${admin.email} a new setup link? ${SEND_AGAIN_NOTE}`)) return;
     setBusy(true);
     const res = await fetch(`/api/super/tenants/${tenantId}/admins`, {
       method: "PUT",
@@ -284,6 +289,7 @@ export function TenantDetailEditor({
               Pass this link to the person by another way. It lets them set their own password, works once and
               expires in 7 days. It is shown only now.
             </p>
+            {shownLink.mayHaveArrived && <p>{SEND_AGAIN_NOTE}</p>}
             <div className="flex gap-2 items-center">
               <input
                 readOnly
@@ -336,7 +342,7 @@ export function TenantDetailEditor({
                       onClick={() => sendSetupLinkAgain(a)}
                       disabled={busy}
                       className="px-2 py-1 border border-line rounded-md text-xs font-semibold text-ink hover:bg-canvas flex items-center gap-1 disabled:opacity-60"
-                      title="This person has not set a password yet. Email them a new link; the older one stops working."
+                      title={`This person has not set a password yet. Email them a new link. ${SEND_AGAIN_NOTE}`}
                     >
                       <Send className="w-3.5 h-3.5" /> Send setup link again
                     </button>

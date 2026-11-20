@@ -10,6 +10,11 @@
  * tenant_smtp_state (read, upsert, conditional update), the members and
  * profiles an alert reads, and platform_email_log for the alert's platform
  * mail. Every request is recorded. Fixtures use reserved .stub names only.
+ *
+ * The two cron routes run here too (mail-budget.test.ts): any other table a
+ * test puts in `world.tables` is answered from those rows (filters, order,
+ * offset and a page cap of 1000 rows, as the server has), and a function in
+ * `world.rpc` answers its call. A table that is in neither still throws.
  */
 
 export type Row = Record<string, unknown>;
@@ -37,12 +42,21 @@ export type World = {
   templateFails: boolean;
   /** The answer of send-smtp for each call, by recipient address; the default is { ok: true }. */
   smtp: (to: string, n: number) => SmtpAnswer;
-  members: Array<{ organization_id: string; user_id: string; role: string; status: string }>;
+  members: Array<{ organization_id: string; user_id: string; role: string; status: string; line_manager_id?: string | null }>;
   membersFail: boolean;
   profiles: Record<string, string>;
   profilesFail: boolean;
   platformLog: Row[];
+  /** Any other table's rows, by name: read, updated and inserted into as the server would. */
+  tables: Record<string, Row[]>;
+  /** A database function's answer, by name (without "rpc/"), from its body. */
+  rpc: Record<string, (body: Row | null) => unknown>;
+  /** Called with each request as it is recorded (a test's clock, for one). */
+  onRequest: ((r: Req) => void) | null;
 };
+
+/** The server answers at most this many rows, whatever a read asks (lib/db/chunked.ts). */
+export const SERVER_ROW_CAP = 1000;
 
 export const statusColumns = (state: Row | null) => ({
   state: state?.state ?? null,
@@ -86,6 +100,9 @@ export function freshWorld(over: Partial<World> = {}): World {
     profiles: {},
     profilesFail: false,
     platformLog: [],
+    tables: {},
+    rpc: {},
+    onRequest: null,
     ...over,
   };
   return world;
@@ -118,6 +135,11 @@ function evalOp(val: unknown, opv: string): boolean {
     return String(val) === want;
   }
   if (opv.startsWith("lt.")) { const w = unquote(opv.slice(3)); return Number.isFinite(asTime(val)) ? asTime(val) < asTime(w) : String(val) < w; }
+  if (opv.startsWith("gt.")) {
+    if (val === null || val === undefined) return false;
+    const w = unquote(opv.slice(3));
+    return Number.isFinite(asTime(val)) && Number.isFinite(asTime(w)) ? asTime(val) > asTime(w) : String(val) > w;
+  }
   if (opv.startsWith("gte.")) { const w = unquote(opv.slice(4)); return Number.isFinite(asTime(val)) ? asTime(val) >= asTime(w) : String(val) >= w; }
   if (opv.startsWith("in.(")) return opv.slice(4, -1).split(",").map(unquote).includes(String(val));
   throw new Error(`stub: operator not understood: ${opv}`);
@@ -142,6 +164,52 @@ const project = (r: Row, select: string) => {
 };
 
 const MISSING_TABLE = { code: "PGRST205", message: "Could not find the table 'public.tenant_smtp_state' in the schema cache" };
+
+/** A filter on an embedded table ("course_versions.course_id") is the embed's own; the tests' rows already hold only what it lets through. */
+function ownFilters(q: URLSearchParams): URLSearchParams {
+  const out = new URLSearchParams();
+  for (const [k, v] of q) if (!k.includes(".")) out.append(k, v);
+  return out;
+}
+
+/** The order a read asks for ("a.asc,b.desc"), on the row's own columns. */
+function ordered(rows: Row[], order: string | null): Row[] {
+  if (!order) return rows;
+  const keys = order.split(",").map((o) => { const [col, dir] = o.split("."); return { col, desc: dir === "desc" }; });
+  return [...rows].sort((a, b) => {
+    for (const { col, desc } of keys) {
+      const x = String(a[col] ?? ""), y = String(b[col] ?? "");
+      if (x !== y) return (x < y ? -1 : 1) * (desc ? -1 : 1);
+    }
+    return 0;
+  });
+}
+
+/** Any table a test put in world.tables, answered as the server would. */
+function genericTable(table: string, method: string, q: URLSearchParams, body: unknown, prefer: string, accept: string): Response {
+  const rows = world.tables[table];
+  const select = q.get("select") ?? "";
+  const whole = select.includes("(") || select.includes("*");
+  const shape = (r: Row) => (whole ? r : project(r, select));
+  if (method === "GET") {
+    const hit = ordered(rows.filter((r) => matches(r, ownFilters(q))), q.get("order"));
+    const offset = Number(q.get("offset") ?? 0);
+    const limit = Math.min(q.has("limit") ? Number(q.get("limit")) : hit.length, SERVER_ROW_CAP);
+    const out = hit.slice(offset, offset + limit).map(shape);
+    return accept.includes("vnd.pgrst.object") ? json(out[0] ?? null) : json(out);
+  }
+  if (method === "PATCH") {
+    const hit = rows.filter((r) => matches(r, ownFilters(q)));
+    for (const r of hit) Object.assign(r, body as Row);
+    return /return=representation/.test(prefer) ? json(hit.map(shape)) : new Response(null, { status: 204 });
+  }
+  if (method === "POST") {
+    const added = (Array.isArray(body) ? body : [body]) as Row[];
+    rows.push(...added.map((r) => ({ ...r })));
+    return /return=representation/.test(prefer) ? json(added.map(shape), 201) : new Response(null, { status: 201 });
+  }
+  throw new Error(`stub: ${method} ${table}`);
+}
 
 function stateRows(): Row[] {
   return [...(world.state ? [world.state] : []), ...world.otherStates];
@@ -196,7 +264,9 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
   const q = url.searchParams;
   const prefer = h.get("prefer") ?? "";
   const accept = h.get("accept") ?? "";
-  requests.push({ method, path: p, table, query: q, body, prefer, accept, signal: Boolean(init?.signal) });
+  const req: Req = { method, path: p, table, query: q, body, prefer, accept, signal: Boolean(init?.signal) };
+  requests.push(req);
+  world.onRequest?.(req);
   const select = q.get("select") ?? "";
 
   if (p === "/functions/v1/send-smtp") {
@@ -236,7 +306,7 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     if (world.membersFail) return json({ code: "XX000", message: "stub read failure" }, 500);
     let rows = world.members.filter((r) => matches(r as Row, q)).sort((a, b) => a.user_id.localeCompare(b.user_id));
     const offset = Number(q.get("offset") ?? 0);
-    const limit = q.has("limit") ? Number(q.get("limit")) : rows.length;
+    const limit = Math.min(q.has("limit") ? Number(q.get("limit")) : rows.length, SERVER_ROW_CAP);
     rows = rows.slice(offset, offset + limit);
     return json(rows.map((r) => project(r as Row, select)));
   }
@@ -250,7 +320,13 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": `*/${world.platformLog.filter((r) => r.status === "sent").length}` } });
     return json([]);
   }
-  if (table === "ops_heartbeats") return new Response(null, { status: 201 });
+  if (table === "ops_heartbeats") {
+    // A failed cron run reads its own row once (no row here), then writes.
+    if (method === "GET") return accept.includes("vnd.pgrst.object") ? json(null) : json([]);
+    return new Response(null, { status: 201 });
+  }
+  if (table.startsWith("rpc/") && world.rpc[table.slice(4)]) return json(world.rpc[table.slice(4)](body as Row | null));
+  if (p.startsWith("/rest/v1/") && Object.prototype.hasOwnProperty.call(world.tables, table)) return genericTable(table, method, q, body, prefer, accept);
   throw new Error(`stub: unexpected ${method} ${p}`);
 };
 

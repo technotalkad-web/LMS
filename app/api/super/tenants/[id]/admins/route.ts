@@ -166,8 +166,20 @@ export async function POST(
   }
   const org = orgRaw as { id: string; name: string; slug: string; deleted_at: string | null };
 
-  const { data: listed } = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
-  let user = listed?.users?.find((u) => u.email?.toLowerCase() === email);
+  // Whether the account is new decides whether an account, a link and a
+  // welcome are made, so a failed read is never "no account" (ADR 0029,
+  // stage 2's one rule): nothing is made and the console is asked to try
+  // again. One page of up to 1,000 accounts, as before ADR 0027's slice 2.
+  let listed: Awaited<ReturnType<typeof s.auth.admin.listUsers>> | null;
+  try {
+    listed = await s.auth.admin.listUsers({ page: 1, perPage: 1000 });
+  } catch {
+    listed = null;
+  }
+  if (!listed || listed.error || !Array.isArray(listed.data?.users)) {
+    return NextResponse.json({ error: TRY_AGAIN }, { status: 503 });
+  }
+  let user = listed.data.users.find((u) => u.email?.toLowerCase() === email);
   let isBrandNew = false;
 
   if (!user) {

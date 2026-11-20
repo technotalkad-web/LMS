@@ -78,6 +78,9 @@ import {
  *     left for the next call.
  *   - Every read is whole or not used: the line managers are read in pages
  *     of 1000 rows, and the escalation marks are written in lists of 150.
+ *     The members that count are read in pages too, each page asked for and
+ *     counted as made (rule FP2); with no room to read them whole, the
+ *     program is left for the next call.
  *   - A failed run is the job's own failed read or write, or the platform's
  *     call limit: the programs, a time zone, the members that count, the
  *     line managers, a page of enrolments, the progress counts, the
@@ -288,8 +291,16 @@ async function run() {
       continue;
     }
     if (!countingByOrg.has(p.organization_id)) {
-      spendCalls(budget, 2);
-      const read = await countingMemberIds(svc, p.organization_id);
+      // Each call of the read (the organisation, then a call for each 1,000
+      // members) asks for room first and is counted as made (rule FP2). With
+      // no room left to read it whole the program is left for the next call,
+      // as a program with no room is above; nothing is kept of a part read.
+      const read = await countingMemberIds(svc, p.organization_id, undefined, pageRoom);
+      if (read === "no_room") {
+        leftOrgs++;
+        leftComplete = false;
+        continue;
+      }
       if (read === "unreadable") unreadableOrgs++;
       countingByOrg.set(p.organization_id, read);
     }

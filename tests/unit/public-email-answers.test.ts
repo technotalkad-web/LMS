@@ -114,12 +114,13 @@ async function main() {
       const page = (email: string) => asks({ email, orgSlug: SLUG });
 
       console.log(`\n${kind.name}: the account lookup that fails`);
-      for (const mode of ["error", "nolist", "throw"] as const) {
+      for (const mode of ["error", "nolist", "noid", "throw"] as const) {
         base(kind, { lookup: mode });
         // The auth library prints a thrown call itself; those lines are not the route's.
         const known = (await captureLogs(() => page(U.member.email))).value;
         const unknown = (await captureLogs(() => page(UNKNOWN))).value;
-        eq(`a lookup that ${mode === "error" ? "answers an error" : mode === "nolist" ? "answers no list" : "throws"}: 503 account_lookup_unavailable, one body for a known and an unknown address`,
+        const how = { error: "answers an error", nolist: "answers no list", noid: "answers a page holding an account with no id", throw: "throws" }[mode];
+        eq(`a lookup that ${how}: 503 account_lookup_unavailable, one body for a known and an unknown address`,
           [known.status, JSON.parse(known.body), SAME(known, unknown)], [503, { error: "account_lookup_unavailable" }, true]);
         eq("…no job, nothing written, nothing read but the lookup", [known.jobs + unknown.jobs, writes().length, known.calls.length], [0, 0, 1]);
       }

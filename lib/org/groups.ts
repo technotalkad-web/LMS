@@ -2,7 +2,7 @@ import {
   createClient as createServiceClient,
   type SupabaseClient,
 } from "@supabase/supabase-js";
-import { readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
+import { readAllStrict, readByIdsStrict, type CallCounter, type CallGate } from "@/lib/db/chunked";
 
 /**
  * Custom Groups (0067) — the LMS's reusable AUDIENCE object.
@@ -357,27 +357,42 @@ export async function resolveManyGroups(
  * ids and pages of 1000 rows in a stable order, so no set is cut at the
  * server's row cap. The readers above keep their fail-soft answers for
  * pages and audiences that only show people.
+ *
+ * Each takes an optional `beforeCall` (lib/db/chunked.ts, ADR 0029 rule
+ * FP2), asked before every outbound call it makes, the legacy column's
+ * second try included, so a caller that counts its calls counts what the
+ * reader really read. A gate that refuses ends the read with "no_room",
+ * never part of a set; a gate that only counts never does.
  * ---------------------------------------------------------------------- */
 
 type Unreadable = "unreadable";
+type NoRoom = "no_room";
 
 /** The user ids of these teams' members; "unreadable" when the read failed. */
-export async function teamMemberIdsStrict(svc: SupabaseClient, teamIds: Iterable<string>): Promise<Set<string> | Unreadable> {
-  const rows = await readByIdsStrict<{ user_id: string }>(teamIds, (ids, from, to) =>
-    svc.from("team_members").select("user_id").in("team_id", ids).order("team_id").order("user_id").range(from, to)
+export function teamMemberIdsStrict(svc: SupabaseClient, teamIds: Iterable<string>, beforeCall?: CallCounter): Promise<Set<string> | Unreadable>;
+export function teamMemberIdsStrict(svc: SupabaseClient, teamIds: Iterable<string>, beforeCall?: CallGate): Promise<Set<string> | Unreadable | NoRoom>;
+export async function teamMemberIdsStrict(svc: SupabaseClient, teamIds: Iterable<string>, beforeCall?: CallGate): Promise<Set<string> | Unreadable | NoRoom> {
+  const rows = await readByIdsStrict<{ user_id: string }>(
+    teamIds,
+    (ids, from, to) => svc.from("team_members").select("user_id").in("team_id", ids).order("team_id").order("user_id").range(from, to),
+    beforeCall
   );
-  if (rows === "unreadable" || rows === "no_room") return "unreadable";
+  if (rows === "unreadable" || rows === "no_room") return rows;
   return new Set(rows.map((r) => r.user_id));
 }
 
-async function activeMembersStrict(svc: SupabaseClient, orgId: string): Promise<MemberFields[] | Unreadable> {
+async function activeMembersStrict(svc: SupabaseClient, orgId: string, beforeCall?: CallGate): Promise<MemberFields[] | Unreadable | NoRoom> {
   const members: MemberFields[] = [];
   for (let fromIdx = 0; ; fromIdx += 1000) {
     const q = (cols: string) =>
       svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("status", "active").order("user_id").range(fromIdx, fromIdx + 999);
+    if (beforeCall && !beforeCall()) return "no_room";
     let res = await q(MEMBER_FIELD_COLS);
     // 0096 deploy safety, as fetchActiveMembers: the column may not be there yet.
-    if (res.error && /department/.test(res.error.message)) res = await q(MEMBER_FIELD_COLS_LEGACY);
+    if (res.error && /department/.test(res.error.message)) {
+      if (beforeCall && !beforeCall()) return "no_room";
+      res = await q(MEMBER_FIELD_COLS_LEGACY);
+    }
     if (res.error || !Array.isArray(res.data)) return "unreadable";
     const page = (res.data as unknown[]).map((r) => {
       const m = r as Partial<MemberFields>;
@@ -396,33 +411,47 @@ async function activeMembersStrict(svc: SupabaseClient, orgId: string): Promise<
  * static group's rows, the members a rule reads, or a rule's team could not
  * be read.
  */
+export function groupMembersStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  groups: ReadonlyArray<Pick<GroupRow, "id" | "group_type" | "rules">>,
+  beforeCall?: CallCounter
+): Promise<Map<string, Set<string>> | Unreadable>;
+export function groupMembersStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  groups: ReadonlyArray<Pick<GroupRow, "id" | "group_type" | "rules">>,
+  beforeCall?: CallGate
+): Promise<Map<string, Set<string>> | Unreadable | NoRoom>;
 export async function groupMembersStrict(
   svc: SupabaseClient,
   orgId: string,
-  groups: ReadonlyArray<Pick<GroupRow, "id" | "group_type" | "rules">>
-): Promise<Map<string, Set<string>> | Unreadable> {
+  groups: ReadonlyArray<Pick<GroupRow, "id" | "group_type" | "rules">>,
+  beforeCall?: CallGate
+): Promise<Map<string, Set<string>> | Unreadable | NoRoom> {
   const out = new Map<string, Set<string>>();
   try {
     let members: MemberFields[] | null = null;
     for (const g of groups) {
       if (g.group_type === "static") {
-        const rows = await readAllStrict<{ user_id: string }>((from, to) =>
-          svc.from("org_group_members").select("user_id").eq("group_id", g.id).order("user_id").range(from, to)
+        const rows = await readAllStrict<{ user_id: string }>(
+          (from, to) => svc.from("org_group_members").select("user_id").eq("group_id", g.id).order("user_id").range(from, to),
+          beforeCall
         );
-        if (rows === "unreadable" || rows === "no_room") return "unreadable";
+        if (rows === "unreadable" || rows === "no_room") return rows;
         out.set(g.id, new Set(rows.map((r) => r.user_id)));
         continue;
       }
       if (members === null) {
-        const read = await activeMembersStrict(svc, orgId);
-        if (read === "unreadable") return "unreadable";
+        const read = await activeMembersStrict(svc, orgId, beforeCall);
+        if (read === "unreadable" || read === "no_room") return read;
         members = read;
       }
       const rules = parseGroupRules(g.rules);
       let teamSet: Set<string> | null = null;
       if (rules.team_ids && rules.team_ids.length > 0) {
-        const team = await teamMemberIdsStrict(svc, rules.team_ids);
-        if (team === "unreadable") return "unreadable";
+        const team = await teamMemberIdsStrict(svc, rules.team_ids, beforeCall);
+        if (team === "unreadable" || team === "no_room") return team;
         teamSet = team;
       }
       out.set(g.id, new Set(membersByRules(members, rules, teamSet)));
@@ -439,21 +468,27 @@ export async function groupMembersStrict(
  * groups, a static group's rows, the members a rule reads, or a rule's team
  * could not be read.
  */
-export async function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string, groupIds: string[]): Promise<Set<string> | Unreadable> {
+export function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string, groupIds: string[], beforeCall?: CallCounter): Promise<Set<string> | Unreadable>;
+export function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string, groupIds: string[], beforeCall?: CallGate): Promise<Set<string> | Unreadable | NoRoom>;
+export async function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string, groupIds: string[], beforeCall?: CallGate): Promise<Set<string> | Unreadable | NoRoom> {
   const out = new Set<string>();
   if (groupIds.length === 0) return out;
-  const data = await readByIdsStrict<GroupRow>(groupIds, (ids, from, to) =>
-    svc
-      .from("org_groups")
-      .select("id, organization_id, group_type, rules, is_active")
-      .eq("organization_id", orgId)
-      .in("id", ids)
-      .order("id")
-      .range(from, to)
+  const data = await readByIdsStrict<GroupRow>(
+    groupIds,
+    (ids, from, to) =>
+      svc
+        .from("org_groups")
+        .select("id, organization_id, group_type, rules, is_active")
+        .eq("organization_id", orgId)
+        .in("id", ids)
+        .order("id")
+        .range(from, to),
+    beforeCall
   );
-  if (data === "unreadable" || data === "no_room") return "unreadable";
-  const byGroup = await groupMembersStrict(svc, orgId, data.filter((g) => g.is_active !== false));
-  if (byGroup === "unreadable") return "unreadable";
+  if (data === "unreadable" || data === "no_room") return data;
+  const active = data.filter((g) => g.is_active !== false);
+  const byGroup = await groupMembersStrict(svc, orgId, active, beforeCall);
+  if (byGroup === "unreadable" || byGroup === "no_room") return byGroup;
   for (const ids of byGroup.values()) for (const id of ids) out.add(id);
   return out;
 }
@@ -473,12 +508,27 @@ export type AssigneeRow = {
  * read and one group read for all the rows. "unreadable" when any read
  * failed: the caller mails nobody from it.
  */
+export function assigneeRecipientsStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  rows: readonly AssigneeRow[],
+  counting: ReadonlySet<string>,
+  beforeCall?: CallCounter
+): Promise<Set<string> | Unreadable>;
+export function assigneeRecipientsStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  rows: readonly AssigneeRow[],
+  counting: ReadonlySet<string>,
+  beforeCall?: CallGate
+): Promise<Set<string> | Unreadable | NoRoom>;
 export async function assigneeRecipientsStrict(
   svc: SupabaseClient,
   orgId: string,
   rows: readonly AssigneeRow[],
-  counting: ReadonlySet<string>
-): Promise<Set<string> | Unreadable> {
+  counting: ReadonlySet<string>,
+  beforeCall?: CallGate
+): Promise<Set<string> | Unreadable | NoRoom> {
   const out = new Set<string>();
   const teamIds = new Set<string>();
   const groupIds = new Set<string>();
@@ -489,13 +539,13 @@ export async function assigneeRecipientsStrict(
     else if (r.assignee_type === "org") for (const uid of counting) out.add(uid);
   }
   if (teamIds.size > 0) {
-    const team = await teamMemberIdsStrict(svc, teamIds);
-    if (team === "unreadable") return "unreadable";
+    const team = await teamMemberIdsStrict(svc, teamIds, beforeCall);
+    if (team === "unreadable" || team === "no_room") return team;
     for (const uid of team) out.add(uid);
   }
   if (groupIds.size > 0) {
-    const group = await resolveManyGroupsStrict(svc, orgId, [...groupIds]);
-    if (group === "unreadable") return "unreadable";
+    const group = await resolveManyGroupsStrict(svc, orgId, [...groupIds], beforeCall);
+    if (group === "unreadable" || group === "no_room") return group;
     for (const uid of group) out.add(uid);
   }
   // A person named directly, in a team or in a group may hold a row that
@@ -510,18 +560,34 @@ export async function assigneeRecipientsStrict(
  * working), then assigneeRecipientsStrict. "unreadable" when the rows or any
  * team or group read failed.
  */
+export function assignedRecipientsStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  target: { table: "course_assignments" | "learning_path_assignments"; column: "course_id" | "path_id"; id: string },
+  counting: ReadonlySet<string>,
+  beforeCall?: CallCounter
+): Promise<Set<string> | Unreadable>;
+export function assignedRecipientsStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  target: { table: "course_assignments" | "learning_path_assignments"; column: "course_id" | "path_id"; id: string },
+  counting: ReadonlySet<string>,
+  beforeCall?: CallGate
+): Promise<Set<string> | Unreadable | NoRoom>;
 export async function assignedRecipientsStrict(
   svc: SupabaseClient,
   orgId: string,
   target: { table: "course_assignments" | "learning_path_assignments"; column: "course_id" | "path_id"; id: string },
-  counting: ReadonlySet<string>
-): Promise<Set<string> | Unreadable> {
+  counting: ReadonlySet<string>,
+  beforeCall?: CallGate
+): Promise<Set<string> | Unreadable | NoRoom> {
   try {
-    const rows = await readAllStrict<AssigneeRow>((from, to) =>
-      svc.from(target.table).select("*").eq(target.column, target.id).order("id").range(from, to)
+    const rows = await readAllStrict<AssigneeRow>(
+      (from, to) => svc.from(target.table).select("*").eq(target.column, target.id).order("id").range(from, to),
+      beforeCall
     );
-    if (rows === "unreadable" || rows === "no_room") return "unreadable";
-    return await assigneeRecipientsStrict(svc, orgId, rows, counting);
+    if (rows === "unreadable" || rows === "no_room") return rows;
+    return await assigneeRecipientsStrict(svc, orgId, rows, counting, beforeCall);
   } catch {
     return "unreadable";
   }

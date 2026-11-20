@@ -5,7 +5,7 @@ import { CHECK_FAILED } from "@/lib/auth/api-admin";
 import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { mailCounts, sendMany } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { assignedRecipientsStrict, teamMemberIdsStrict } from "@/lib/org/groups";
 
@@ -94,8 +94,7 @@ export async function POST(request: Request) {
   // this request: the audience "all", the org-wide branch of a course or
   // path audience, and the tenant guard below. Unreadable: nothing is sent.
   const budget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
-  spendCalls(budget, 2);
-  const countingRead = await countingMemberIds(svc, org.id);
+  const countingRead = await countingMemberIds(svc, org.id, undefined, countCalls(budget));
   if (countingRead === "unreadable") {
     return NextResponse.json({ error: AUDIENCE_UNREADABLE }, { status: 503 });
   }
@@ -107,14 +106,11 @@ export async function POST(request: Request) {
   if (audience === "users" && body.user_ids) {
     audienceRead = new Set(body.user_ids);
   } else if (audience === "team" && body.team_id) {
-    spendCalls(budget, 1);
-    audienceRead = await teamMemberIdsStrict(svc, [body.team_id]);
+    audienceRead = await teamMemberIdsStrict(svc, [body.team_id], countCalls(budget));
   } else if (audience === "course" && body.course_id) {
-    spendCalls(budget, 3);
-    audienceRead = await assignedRecipientsStrict(svc, org.id, { table: "course_assignments", column: "course_id", id: body.course_id }, counting);
+    audienceRead = await assignedRecipientsStrict(svc, org.id, { table: "course_assignments", column: "course_id", id: body.course_id }, counting, countCalls(budget));
   } else if (audience === "path" && body.path_id) {
-    spendCalls(budget, 3);
-    audienceRead = await assignedRecipientsStrict(svc, org.id, { table: "learning_path_assignments", column: "path_id", id: body.path_id }, counting);
+    audienceRead = await assignedRecipientsStrict(svc, org.id, { table: "learning_path_assignments", column: "path_id", id: body.path_id }, counting, countCalls(budget));
   } else {
     audienceRead = new Set(counting);
   }

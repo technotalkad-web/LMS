@@ -114,6 +114,8 @@ let owners: string[] = [];
 let accounts: Array<{ id: string; email: string }> = [];
 let signIn: Record<string, SignIn> = {};
 let putAnswer: Put = "ok";
+/** What the auth server answers when the accounts are listed. */
+let listAnswer: "ok" | "error" | "throw" = "ok";
 let linksTable: "ok" | "missing" | "fail" = "ok";
 let failing = new Set<string>();
 let requests: Req[] = [];
@@ -165,7 +167,11 @@ const userJson = (id: string, email: string, extra: Row = {}) => ({ id, aud: "au
 function authServer(method: string, p: string, body: Row | null, q: URLSearchParams): Response {
   if (p === "/auth/v1/user" && method === "GET") return json(ME);
   if (p === "/auth/v1/user" && method === "PUT") return json(ME);
-  if (p === "/auth/v1/admin/users" && method === "GET") return json({ users: accounts.map((a) => userJson(a.id, a.email)), aud: "authenticated" });
+  if (p === "/auth/v1/admin/users" && method === "GET") {
+    if (listAnswer === "error") return json({ code: 500, error_code: "unexpected_failure", msg: "stub failure" }, 500);
+    if (listAnswer === "throw") throw new TypeError("fetch failed");
+    return json({ users: accounts.map((a) => userJson(a.id, a.email)), aud: "authenticated" });
+  }
   void q;
   if (p === "/auth/v1/admin/users" && method === "POST") {
     const a = { id: `0b000000-0000-4000-8000-00000000f${String(++created).padStart(3, "0")}`, email: String(body?.email ?? "") };
@@ -305,6 +311,7 @@ function world(o: { links?: Row[]; members?: Row[]; signIn?: SignIn; owners?: st
   accounts = [{ id: P.id, email: P.email }, { id: ME.id, email: ME.email }];
   signIn = { [P.id]: o.signIn ?? "omitted" };
   putAnswer = o.put ?? "ok";
+  listAnswer = "ok";
   linksTable = o.table ?? "ok";
   failing = new Set(o.failing ?? []);
   beforeClaim = null;
@@ -659,6 +666,16 @@ async function main() {
       const profile = requests.find((q) => q.table === "profiles" && q.method === "POST");
       eq("…the forced change is not set for the new account", (profile?.body as Row | undefined)?.must_change_password, false);
 
+      // Whether the account is new decides whether an account, a link and a
+      // welcome are made: a failed read of the accounts is never "no account".
+      for (const how of ["error", "throw"] as const) {
+        world({ links: [], members: [] });
+        listAnswer = how;
+        const unread = await add("first.admin@platform.stub");
+        eq(`the accounts cannot be read (${how === "error" ? "the auth server answers an error" : "the call throws"}): 503, no account made, no link, no mail, no member written`,
+          [unread.status, creates().length, links.length, smtp().length, writes("organization_members").length], [503, 0, 0, 0, 0]);
+      }
+
       world({ links: [], members: [] });
       process.env.PLATFORM_EMAIL_ALLOW_DOMAINS = "elsewhere.stub";
       const notSent = await add("first.admin@platform.stub");
@@ -673,6 +690,14 @@ async function main() {
       const editor = fs.readFileSync(path.join(ROOT, "app", "(super-owner)", "super", "organizations", "[id]", "tenant-detail-editor.tsx"), "utf8");
       eq("…and the console shows it as a welcome that may have been sent, keyed on that class",
         [editor.includes('mayHaveArrived: outcome.class === "timeout"'), editor.includes("The welcome email may have been sent")], [true, true]);
+      // Rule T2: "Send setup link again" says, word for word, that the first
+      // mail may still arrive and that its link stops working; the notice of
+      // a welcome that may have been sent says it too.
+      const T2_NOTE = "The first mail may still arrive. Its link stops working when you send a new one.";
+      eq("…rule T2's sentence, word for word, at the resend action (its confirmation and its title) and in the may-have-been-sent notice",
+        [editor.includes(`const SEND_AGAIN_NOTE = "${T2_NOTE}"`), /sendSetupLinkAgain\(admin: Admin\) \{\s*\/\/[^\n]*\s*if \(!await confirm\(`[^`]*\$\{SEND_AGAIN_NOTE\}`\)\) return;/.test(editor),
+          editor.includes("title={`This person has not set a password yet. Email them a new link. ${SEND_AGAIN_NOTE}`}"), editor.includes("{shownLink.mayHaveArrived && <p>{SEND_AGAIN_NOTE}</p>}")],
+        [true, true, true, true]);
 
       world({ links: [], members: [] });
       const found = await add(P.email);

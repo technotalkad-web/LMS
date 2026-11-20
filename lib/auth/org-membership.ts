@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { fetchAll } from "@/lib/db/chunked";
+import { readAllStrict, type CallCounter, type CallGate } from "@/lib/db/chunked";
 
 /**
  * Who belongs to an organisation (ADR 0030): the one place that answers it.
@@ -154,14 +154,34 @@ export async function listCountingMemberships(
  * The ids of the organisation's members that count (only those holding one
  * of `roles`, when given); an empty set for a deleted or unknown
  * organisation; or "unreadable" when a read failed. One call reads the
- * organisation once and its active rows page by page, for one request or
- * one run.
+ * organisation once and its active rows page by page (1,000 rows a page),
+ * for one request or one run; never part of the set.
+ *
+ * `beforeCall` (ADR 0029, rule FP2), when given, is asked before each of
+ * those calls: the organisation, then every page. A caller that counts its
+ * calls counts them there, so a large organisation costs what it reads. A
+ * gate that refuses ends the read with "no_room"; a gate that only counts
+ * (CallCounter) never does.
  */
+export function countingMemberIds(
+  serviceClient: SupabaseClient,
+  organisationId: string,
+  roles?: readonly string[],
+  beforeCall?: CallCounter
+): Promise<Set<string> | "unreadable">;
+export function countingMemberIds(
+  serviceClient: SupabaseClient,
+  organisationId: string,
+  roles?: readonly string[],
+  beforeCall?: CallGate
+): Promise<Set<string> | "unreadable" | "no_room">;
 export async function countingMemberIds(
   serviceClient: SupabaseClient,
   organisationId: string,
-  roles?: readonly string[]
-): Promise<Set<string> | "unreadable"> {
+  roles?: readonly string[],
+  beforeCall?: CallGate
+): Promise<Set<string> | "unreadable" | "no_room"> {
+  if (beforeCall && !beforeCall()) return "no_room";
   const { data: org, error } = await serviceClient
     .from("organizations")
     .select("id, deleted_at")
@@ -170,21 +190,15 @@ export async function countingMemberIds(
   if (error) return "unreadable";
   const o = org as OrganisationRow | null;
   if (!o || o.deleted_at !== null) return new Set();
-  let rows: Array<MembershipRow & { user_id: string }>;
-  try {
-    rows = await fetchAll<MembershipRow & { user_id: string }>(
-      serviceClient,
-      "organization_members",
-      "user_id, role, status",
-      (q) => {
-        const active = q.eq("organization_id", organisationId).eq("status", "active");
-        return roles ? active.in("role", [...roles]) : active;
-      },
-      "user_id"
-    );
-  } catch {
-    return "unreadable";
-  }
+  const rows = await readAllStrict<MembershipRow & { user_id: string }>((from, to) => {
+    const active = serviceClient
+      .from("organization_members")
+      .select("user_id, role, status")
+      .eq("organization_id", organisationId)
+      .eq("status", "active");
+    return (roles ? active.in("role", [...roles]) : active).order("user_id").range(from, to);
+  }, beforeCall);
+  if (rows === "unreadable" || rows === "no_room") return rows;
   const out = new Set<string>();
   for (const r of rows) {
     if (membershipCounts(r, o) && (!roles || roles.includes(r.role ?? ""))) out.add(r.user_id);
