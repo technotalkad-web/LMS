@@ -20,6 +20,7 @@
  */
 import { ORG, OTHER_ORG, PLATFORM_ENV, eq, finish, freshWorld, installStub, logRows, outbound, removeStub, requests, sends, world } from "./mail-world";
 import {
+  ADMIN_REQUEST_OWN_CALLS,
   ALERT_CALL_COST,
   CALL_SUM_LIMIT,
   CRON_SEND_WINDOW_MS,
@@ -49,6 +50,23 @@ async function main() {
     eq("opening a run costs three calls (the settings, the organisation, the state with its count)", MAIL_CALL_COSTS.open, 3);
     eq("an alert costs at most 25 calls: within one call's sum, with room left for other work", [ALERT_CALL_COST, ALERT_CALL_COST <= CALL_SUM_LIMIT], [25, true]);
     eq("a scheduled call's two sums: with an alert, at most 15 calls remain for its own mail", CALL_SUM_LIMIT - ALERT_CALL_COST, 15);
+
+    console.log("\nthe sums of the kinds of request (rule FP2), from the costs in the code");
+    {
+      // An administrator's request: its own calls, the mail part's reads (a
+      // title, the members that count, a team or group, the addresses), the
+      // opening of its run, and one first send with its group's tail.
+      const mailReads = 1 + 2 + 2 + 1;
+      const firstGroup = MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark;
+      eq("an administrator's request: its own work, its reads and a first mail fit the 40", ADMIN_REQUEST_OWN_CALLS + mailReads + MAIL_CALL_COSTS.open + firstGroup <= CALL_SUM_LIMIT, true);
+      // A scheduled call without an alert: the programs or settings, a time
+      // zone, the members that count, the line managers, a page, its counts,
+      // its profiles and titles, the opening, and a first claimed mail with
+      // its tail and its give-back.
+      const cronReads = 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1;
+      eq("a scheduled call without an alert: its reads and a first claimed mail fit the 40", cronReads + MAIL_CALL_COSTS.open + 1 + firstGroup + SENDS_AT_ONCE <= CALL_SUM_LIMIT, true);
+      eq("…with an alert due, the alert alone fits, and what it leaves is what the call's own mail may use", [ALERT_CALL_COST <= CALL_SUM_LIMIT, CALL_SUM_LIMIT - ALERT_CALL_COST], [true, 15]);
+    }
 
     console.log("\nthe counted calls are the calls made");
     {

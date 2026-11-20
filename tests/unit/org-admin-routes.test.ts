@@ -666,6 +666,9 @@ async function main() {
         const e = (out.body.email ?? {}) as Row;
         eq("…the control: with every read answered, the answer counts everyone it mailed, emailed or not, and records no skip",
           [out.status, e.recipients_unreadable, Number(e.emailed) + Number(e.not_emailed) + Number(e.not_confirmed), skips()], [200, false, ACTIVE.length, []]);
+        const healthy = requests.length;
+        await call(CALLS[4], { role: "admin", failRead: "profiles" });
+        eq("…a skipped request costs fewer calls than the same request's healthy run (one write more, no run)", requests.length < healthy, true);
       }
     }
 

@@ -149,6 +149,12 @@ async function main() {
       freshWorld({ settings: { email_paused: false, event_paused: {} }, state: { organization_id: ORG, state: null, state_changed_at: iso(H), failed_recipients: [], alert_due_at: iso(H) }, members: ADMINS(ORG, [["s1", "super_owner"]]), profiles: { s1: "s1@tenant.stub" } });
       const nc = await dueAlert();
       eq("not configured: the alert says so", [nc.kind === "sent" ? nc.reading : nc.kind, String(platformSends()[0]?.text).includes("no complete SMTP settings")], ["not_configured", true]);
+      // readingOf's order: settings that are not complete read not_configured
+      // before a stored failing state, so the alert says what the console says.
+      freshWorld({ settings: { email_paused: false, event_paused: {} }, state: { organization_id: ORG, state: "failing", state_changed_at: iso(H), failed_recipients: [], last_error_code: "auth", alert_due_at: iso(H) }, members: ADMINS(ORG, [["s1", "super_owner"]]), profiles: { s1: "s1@tenant.stub" } });
+      const cleared = await dueAlert();
+      eq("a failing row whose host has since been cleared: the alert reads not_configured, not the old sign-in class",
+        [cleared.kind === "sent" ? cleared.reading : cleared.kind, String(platformSends()[0]?.text).includes("refused the sign-in")], ["not_configured", false]);
     }
 
     console.log("\nthe reading daily_limit");

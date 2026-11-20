@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { sendMany, type SendResult } from "@/lib/notifications/send";
-import { MAIL_CALL_COSTS, cronBudget, hasRoom, openRun, sendDueAlert, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
+import { MAIL_CALL_COSTS, SENDS_AT_ONCE, cronBudget, hasRoom, openRun, sendDueAlert, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
 import { buildMailCronDetail, owedAfterRun, type CronErrorCounts, type CronErrorWord } from "@/lib/ops/health-status";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import {
@@ -537,6 +537,9 @@ async function run() {
           if (nudgesNow.length > 0) {
             const r = await runFor(p.organization_id);
             const claimed = new Set<string>();
+            // A group whose claim could not be written sends nothing; its
+            // learners stay owed, and the count is no longer complete.
+            const unclaimed = new Set<string>();
             const results: SendResult[] = await sendMany(
               r,
               nudgesNow,
@@ -572,6 +575,8 @@ async function run() {
                       .select("id");
                     if (claimErr || !Array.isArray(won)) {
                       fail("state_write");
+                      leftComplete = false;
+                      for (const n of group) unclaimed.add(n.enrolment);
                       return { keep: group.map(() => false), calls: 1 };
                     }
                     const set = new Set((won as Array<{ id: string }>).map((w) => w.id));
@@ -580,8 +585,9 @@ async function run() {
                   },
                   // A claim is given back after a failure of any class but a
                   // timeout, and after a send that was not attempted, so a
-                  // later run retries it the same day (rule T2).
-                  afterCalls: 2,
+                  // later run retries it the same day (rule T2). One write
+                  // for each earlier date in the group, at most one a mail.
+                  afterCalls: SENDS_AT_ONCE,
                   after: async (entries) => {
                     const giveBack = entries.filter(
                       (x) => claimed.has(x.item.enrolment) && x.result.status !== "sent" && !(x.result.status === "failed" && x.result.cls === "timeout")
@@ -600,6 +606,9 @@ async function run() {
                 },
               }
             );
+            results.forEach((res, k) => {
+              if (res.errorClass === "withdrawn" && unclaimed.has(nudgesNow[k].enrolment)) notStarted++;
+            });
             for (const res of results) {
               if (res.status === "sent") {
                 reminded++;

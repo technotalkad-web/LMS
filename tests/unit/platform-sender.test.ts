@@ -280,7 +280,7 @@ async function main() {
       eq("…and another address at the address's domain does not", await send1("other.person@tenant-a.stub", mixed), [["suppressed", "not_allowed", true], 0, 1]);
       eq("an address entry at a reserved test domain is still suppressed with test_domain", await send1("listed.person@spec.test", "listed.person@spec.test"), [["suppressed", "test_domain", true], 0, 1]);
       eq("…and so is one at example.com", await send1("someone@example.com", "someone@example.com"), [["suppressed", "test_domain", true], 0, 1]);
-      for (const bad of ["a@@tenant-a.stub", "a@b@tenant-a.stub", "listed.person@", "@", "not a domain!", "tenant-a..stub", "@a@tenant-a.stub"]) {
+      for (const bad of ["a@@tenant-a.stub", "a@b@tenant-a.stub", "listed.person@", "@", "not_a_domain!", "tenant-a..stub", "@a@tenant-a.stub"]) {
         eq(`a malformed entry "${bad}" beside a good one matches nothing, and the good one still works`, [await send1("a@tenant-a.stub", `${bad} tenant-b.stub`), (await send1("anyone@tenant-b.stub", `${bad} tenant-b.stub`))[0]], [[["suppressed", "not_allowed", true], 0, 1], ["sent", null, true]]);
       }
       const onlyBad = "a@@tenant-a.stub, listed.person@ ,@";
@@ -291,6 +291,10 @@ async function main() {
       const secretList = `${LISTED} hidden.second@tenant-c.stub tenant-d.stub`;
       await send(welcome(as("other.person@tenant-a.stub"), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList });
       await send(welcome(as(LISTED), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList });
+      // A listed send the mail server refuses writes a log line: the case reads a log that is there.
+      smtpAnswer = async () => json({ ok: false, error: "421 4.7.0 try again later" });
+      await send(welcome(as(LISTED), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList });
+      eq("…the privacy case reads a log that holds lines (a refused send wrote one)", printed.length > 0, true);
       const answer = JSON.stringify(platformSenderReadiness({ ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList })) + JSON.stringify(platformSenderReadiness({ ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: onlyBad }));
       const stored = JSON.stringify(rows) + inserts().map((i) => i.body).join("\n");
       const logText = printed.join("\n");

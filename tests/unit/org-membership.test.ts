@@ -1519,6 +1519,39 @@ async function main() {
             await remindRun();
             eq("…a clean run reads no row and stores no last_ok_at", [requests.filter((r) => r.table === "ops_heartbeats" && r.method === "GET").length, "last_ok_at" in (beat("reminders")?.detail ?? {})], [0, false]);
           }
+          {
+            // Without 0114: the journey nudges are a clean run that says so, and mail as before.
+            mailWorld();
+            statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+            const r = await nudge();
+            eq("journey nudges without 0114: 200, ok, no_0114 true, both learners nudged as before",
+              [r.status, r.body.ok, r.body.no_0114, mailed("journey_nudge")], [200, true, true, ["u-act", "u-act2"]]);
+            // …and an administrator's loop: the broadcast mails as before, with an unchanged answer.
+            mailWorld();
+            statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+            const res = await broadcast.POST(new Request("http://lms.test/api/notifications/broadcast", {
+              method: "POST",
+              body: JSON.stringify({ orgSlug: LIVE.slug, subject: "Hello", body_md: "Body", audience: "all" }),
+            }));
+            const b = (await res.json()) as Row;
+            eq("a broadcast without 0114: every member that counts mailed, no limit applied, the answer as before",
+              [res.status, mailed("custom_broadcast"), b.total, b.sent], [200, COUNTING, COUNTING.length, COUNTING.length]);
+          }
+          {
+            // Rule FP7: the calls before the sends do not grow with the learners due.
+            const before = async (n: number) => {
+              const extra = Array.from({ length: n }, (_, i) => `u-due${String(i).padStart(2, "0")}`);
+              mailWorld({
+                programs: [journeyProgram("p-live", LIVE)],
+                extraMembers: extra.map((u) => M(LIVE, u, "user", "active")),
+                enrolments: extra.map((u, i) => enrol(`e-due${String(i).padStart(2, "0")}`, u, "p-live")),
+              });
+              await nudge();
+              const firstClaim = requests.findIndex((q) => q.table === "journey_enrollments" && q.method === "PATCH");
+              return firstClaim;
+            };
+            eq("journey nudges: 50 learners due cost the same calls before the first claim as 5 do", await before(50), await before(5));
+          }
           // The journey nudges: no slug, no id and no free text in the answer or the heartbeat.
           {
             mailWorld();

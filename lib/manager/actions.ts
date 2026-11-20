@@ -4,7 +4,7 @@ import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { sendMany, type SendResult } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, requestBudget } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, SENDS_AT_ONCE, openRun, requestBudget } from "@/lib/notifications/smtp-state";
 import { type ActionError, type PerLearnerResult } from "@/lib/actions/types";
 import { namesAndEmails } from "@/lib/users/people";
 import {
@@ -417,7 +417,8 @@ export async function sendReminders(
             for (const id of won) claimed.add(id);
             return { keep: group.map((d) => won.has(d.enrolment)), calls: 1 };
           },
-          afterCalls: 2,
+          // One write for each earlier date in the group, at most one a mail.
+          afterCalls: SENDS_AT_ONCE,
           after: async (entries) => {
             const giveBack = entries.filter(
               (e) => claimed.has(e.item.enrolment) && e.result.status !== "sent" && !(e.result.status === "failed" && e.result.cls === "timeout")
