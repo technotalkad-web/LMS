@@ -19,9 +19,11 @@
  * one send, inside the caller's run when it sends several.
  */
 import { resolveEmailsStrict } from "@/lib/users/emails";
-import { sendMany, sendNotification } from "@/lib/notifications/send";
+import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, sendMany, sendNotification, type MailOutcome } from "@/lib/notifications/send";
 import { openRun, recordRecipientsUnreadable, requestBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
+// Type only: the forced restart takes its notifier as an argument.
+import type { ForceRestartNotify } from "./force-restart";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = any;
@@ -105,19 +107,20 @@ export async function notifyAdminsOfRequest(
  * ADR 0030 rule 10: true when the person's membership in the org counts.
  * `counting` is the org's members that count when the caller read them once
  * for several mails (countingMemberIds); else the person's own membership is
- * read here. A failed read is never "counts": no mail.
+ * read here. A failed read is never "counts": no mail, the skip recorded
+ * once, and the answer "unreadable".
  */
 async function recipientCounts(
   svc: AnyClient,
   orgId: string,
   userId: string,
   counting: ReadonlySet<string> | undefined
-): Promise<boolean> {
+): Promise<boolean | "unreadable"> {
   if (counting) return counting.has(userId);
   const m = await resolveOrgMembership(svc, { id: orgId }, userId);
   if (m === "unreadable") {
     await recordRecipientsUnreadable("attempt-decision", orgId);
-    return false;
+    return "unreadable";
   }
   return m !== "none";
 }
@@ -126,6 +129,11 @@ async function recipientCounts(
  * Email a learner that their attempt request was approved or declined (or
  * that an administrator granted them an attempt), when their membership in
  * the org counts. Fail-soft.
+ *
+ * The outcome is for the administrator at the screen (ADR 0029 rule T4):
+ * emailed or not, or nobody emailed because the learner's membership could
+ * not be read. A learner whose membership does not count is not mailed and
+ * not counted (rule 10). Null when the mail part itself failed.
  */
 export async function notifyLearnerOfDecision(
   svc: AnyClient,
@@ -145,10 +153,12 @@ export async function notifyLearnerOfDecision(
     /** The caller's run, when it sends several of these in one request: they share its stop rule and budgets. */
     run?: MailRun;
   }
-): Promise<void> {
+): Promise<MailOutcome | null> {
   try {
-    if (!args.learner.email) return;
-    if (!(await recipientCounts(svc, args.orgId, args.learner.id, args.counting))) return;
+    if (!args.learner.email) return mailCounts([], 1);
+    const counts = await recipientCounts(svc, args.orgId, args.learner.id, args.counting);
+    if (counts === "unreadable") return RECIPIENTS_UNREADABLE;
+    if (!counts) return mailCounts([]);
     const courseLink = args.origin ? `${args.origin}/${args.orgSlug}/courses/${args.courseId}` : "";
     const note = args.note?.trim();
     let body: string;
@@ -168,7 +178,7 @@ export async function notifyLearnerOfDecision(
         `Your request for another attempt at **${args.courseTitle}** was not approved.` +
         (note ? `\n\n_Note from your administrator:_ ${note}` : "");
     }
-    await sendNotification(
+    const sent = await sendNotification(
       {
         organizationId: args.orgId,
         event: "custom_broadcast",
@@ -187,8 +197,35 @@ export async function notifyLearnerOfDecision(
       },
       args.run ? { run: args.run } : {}
     );
+    return mailCounts([sent]);
   } catch (e) {
     console.error(JSON.stringify({ event: "attempt_request_mail_failed", site: "attempt-decision", org_id: args.orgId, error: e instanceof Error ? e.name : "unknown" }));
+    return null;
   }
+}
+
+/**
+ * The notifier a forced restart's re-issue takes (ADR 0014 step 8), built
+ * on notifyLearnerOfDecision, the strict address reader and the skip helper
+ * (ADR 0029), and keeping the mails' outcome for the administrator at the
+ * screen (rule T4): emailed and not, or nobody emailed because the
+ * recipients could not be read. The route answers the outcome beside the
+ * restart's report, never inside it. Undefined when no re-issue was mailed.
+ */
+export function reissueNotifier(): { notify: ForceRestartNotify; outcome: () => MailOutcome | undefined } {
+  let outcome: MailOutcome | undefined;
+  const notify: ForceRestartNotify = {
+    decision: async (svc, args) => {
+      const one = await notifyLearnerOfDecision(svc, args);
+      outcome = addMailOutcome(outcome && !outcome.recipients_unreadable ? outcome : mailCounts([]), one);
+      return one;
+    },
+    emails: resolveEmailsStrict,
+    skipped: async (site, organizationId) => {
+      outcome = RECIPIENTS_UNREADABLE;
+      await recordRecipientsUnreadable(site, organizationId);
+    },
+  };
+  return { notify, outcome: () => outcome };
 }
 

@@ -305,6 +305,21 @@ export function mailCounts(results: readonly SendResult[], noAddress = 0): MailC
   return { recipients_unreadable: false, emailed, not_emailed: notEmailed, not_confirmed: notConfirmed };
 }
 
+/**
+ * One more single mail's outcome added to a request's total, for a request
+ * that sends several one at a time. A mail part that failed (null) or that
+ * could not read its one recipient counts as one not emailed.
+ */
+export function addMailOutcome(total: MailCounts, one: MailOutcome | null): MailCounts {
+  if (!one || one.recipients_unreadable) return { ...total, not_emailed: total.not_emailed + 1 };
+  return {
+    recipients_unreadable: false,
+    emailed: total.emailed + one.emailed,
+    not_emailed: total.not_emailed + one.not_emailed,
+    not_confirmed: total.not_confirmed + one.not_confirmed,
+  };
+}
+
 /** The event a Settings test is logged with. It is no NotificationEvent: no template, no pause, no routing row. */
 export const SETTINGS_TEST_LOG_EVENT = "smtp_test";
 

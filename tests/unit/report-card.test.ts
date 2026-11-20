@@ -588,6 +588,31 @@ async function insightsCases() {
     eq("a degraded batch: no upsert, counted as skipped_unreadable and pending", [bad, failing.db.queries.some((q) => q.table === "report_card_cache" && q.ops.some((o) => o.op === "upsert"))], [{ learners: 0, batches: 0, pending: 1, skipped_unreadable: 1 }, false]);
     eq("the refresh logs once that it skipped", lines.map((x) => JSON.parse(x).event), ["report_card_grants_unreadable", "report_card_cache_skipped_unreadable"]);
   }
+
+  console.log("\nADR 0029 (note of 2026-11-20, part 3) — strictGroups: a group that cannot be read is never \"not assigned\"");
+  {
+    // c1 is also assigned to a static group g1 that holds u1. The manager's
+    // "send reminder now" reads with strictGroups; the Report Card does not.
+    const withGroup = (t: Record<string, Row[]>) => {
+      t.course_assignments.push({ course_id: "c1", assignee_type: "group", user_id: null, team_id: null, group_id: "g1", due_at: null, release_at: null, assigned_at: iso("2026-09-01T00:00:00Z") });
+      t.org_groups = [{ id: "g1", organization_id: "org1", name: "Group one", group_type: "static", rules: {}, is_active: true }];
+      t.org_group_members = [{ group_id: "g1", user_id: "u1" }];
+    };
+    const strictFor = (db: ReturnType<typeof fakeDb>) =>
+      computeLearnerInsights(db.client, { orgId: "org1", orgSlug: "acme", userIds: ["u1", "u2", "u3"], periodDays: 30, now: NOW, strictGroups: true });
+    const settled = (p: Promise<unknown>) => p.then(() => "answered", () => "threw");
+    const BOOM = { data: null, error: { code: "XX000", message: "stub read failure" } };
+    for (const [what, table] of [["the groups", "org_groups"], ["a static group's rows", "org_group_members"]] as const) {
+      const fails = (q: Query) => (q.table === table ? BOOM : undefined);
+      eq(`${what} cannot be read: with strictGroups the read throws (the caller answers 503 and sends nothing); without it, the Report Card answers as before`,
+        [await settled(strictFor(reportCardDb(fails, withGroup))), await settled(insightsFor(reportCardDb(fails, withGroup)))], ["threw", "answered"]);
+    }
+    eq("…the control: with every read answered, strictGroups answers",
+      await settled(strictFor(reportCardDb(undefined, withGroup))), "answered");
+    const missing = (q: Query) => (q.table === "org_groups" ? { data: null, error: { code: "42P01", message: 'relation "public.org_groups" does not exist' } } : undefined);
+    eq("…a database without org_groups (before 0067) is still tolerated with strictGroups",
+      await settled(strictFor(reportCardDb(missing, withGroup))), "answered");
+  }
 }
 
 // ---------------------------------------------------------------------------

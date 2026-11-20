@@ -9,6 +9,7 @@ import { isReleased } from "@/lib/learner/release";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { isMissingRelation } from "@/lib/scoring/attempt-kind";
 import { resolveManyGroupsStrict } from "@/lib/org/groups";
+import { chunk, readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
 
 /**
  *   POST /api/cron/reminders
@@ -51,6 +52,11 @@ import { resolveManyGroupsStrict } from "@/lib/org/groups";
  *     never "no courses", "nobody" or "never reminded"). A tenant's failed
  *     send, a daily limit, a paused organisation and a database without
  *     migration 0114 are clean runs.
+ *   - Every read before the sends follows the house rule (lib/db/chunked.ts):
+ *     `.in()` lists of 150 ids and pages of 1000 rows, so no set is cut at
+ *     the server's row cap. A set is used whole or not at all: a read the
+ *     call has no room left to finish stops the run before any send, as the
+ *     job's own failed step (call_limit).
  *   - The answer and the heartbeat are built by buildMailCronDetail: counts
  *     and fixed words only, never an id, a name, an address or a database
  *     message. A failed run carries its last successful run (last_ok_at).
@@ -107,6 +113,14 @@ export async function POST(request: Request) {
   const fail = (word: CronErrorWord) => {
     errors[word] = (errors[word] ?? 0) + 1;
   };
+  /** One call for a page of a read before the sends, while the call still has room for it, an opening and a send. */
+  const pageRoom = () => {
+    if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.send + 3)) return false;
+    spendCalls(budget, 1);
+    return true;
+  };
+  /** A read that was not finished: its own word, or call_limit when the call had no room to read it whole. */
+  const readFailed = (answer: "unreadable" | "no_room", word: CronErrorWord) => fail(answer === "no_room" ? "call_limit" : word);
   let unreadableOrgs = 0;
   let scanned = 0;
   let skipped = 0;
@@ -123,15 +137,20 @@ export async function POST(request: Request) {
   };
 
   // 1) Courses with reminders enabled. A failed read is never "no courses".
-  spendCalls(budget, 1);
-  const { data: settings, error: settingsErr } = await svc
-    .from("course_reminder_settings")
-    .select(
-      "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug, deleted_at))"
-    )
-    .eq("enabled", true);
-  if (settingsErr || !Array.isArray(settings)) {
-    fail("config_read");
+  const settings = await readAllStrict<ReminderRow>(
+    (from, to) =>
+      svc
+        .from("course_reminder_settings")
+        .select(
+          "course_id, enabled, cadence_days, cap_days, courses(id, title, organization_id, organizations(name, slug, deleted_at))"
+        )
+        .eq("enabled", true)
+        .order("course_id")
+        .range(from, to),
+    pageRoom
+  );
+  if (settings === "unreadable" || settings === "no_room") {
+    readFailed(settings, "config_read");
     return finish({ stoppedBeforeSend: true });
   }
   const allCourses = (settings as unknown[]).map((r) => {
@@ -192,13 +211,13 @@ export async function POST(request: Request) {
 
   // 2) All assignments + memberships + completed user/course pairs.
   // select("*") for 0069 deploy safety (group_id may not be migrated yet).
-  spendCalls(budget, 1);
-  const { data: assignmentRows, error: assignErr } = await svc
-    .from("course_assignments")
-    .select("*")
-    .in("course_id", courseIds);
-  if (assignErr || !Array.isArray(assignmentRows)) {
-    fail("assignments_read");
+  const assignmentRows = await readByIdsStrict<Assignment>(
+    courseIds,
+    (ids, from, to) => svc.from("course_assignments").select("*").in("course_id", ids).order("id").range(from, to),
+    pageRoom
+  );
+  if (assignmentRows === "unreadable" || assignmentRows === "no_room") {
+    readFailed(assignmentRows, "assignments_read");
     return finish({ stoppedBeforeSend: true, leftOrgs });
   }
   // Decision A22 (ADR 0024 step 49's reminders row, P2-6 item 2): a learner's
@@ -219,20 +238,19 @@ export async function POST(request: Request) {
   );
   const teamUserIds = new Map<string, Set<string>>();
   if (teamIds.length > 0) {
-    spendCalls(budget, Math.ceil(teamIds.length / 150));
-    for (let i = 0; i < teamIds.length; i += 150) {
-      const part = teamIds.slice(i, i + 150);
-      const { data: teamMembers, error: teamErr } = await svc.from("team_members").select("team_id, user_id").in("team_id", part);
-      if (teamErr || !Array.isArray(teamMembers)) {
-        fail("members_read");
-        return finish({ stoppedBeforeSend: true, leftOrgs });
-      }
-      for (const m of teamMembers) {
-        const tid = m.team_id as string;
-        const set = teamUserIds.get(tid) ?? new Set<string>();
-        set.add(m.user_id as string);
-        teamUserIds.set(tid, set);
-      }
+    const teamMembers = await readByIdsStrict<{ team_id: string; user_id: string }>(
+      teamIds,
+      (ids, from, to) => svc.from("team_members").select("team_id, user_id").in("team_id", ids).order("team_id").order("user_id").range(from, to),
+      pageRoom
+    );
+    if (teamMembers === "unreadable" || teamMembers === "no_room") {
+      readFailed(teamMembers, "members_read");
+      return finish({ stoppedBeforeSend: true, leftOrgs });
+    }
+    for (const m of teamMembers) {
+      const set = teamUserIds.get(m.team_id) ?? new Set<string>();
+      set.add(m.user_id);
+      teamUserIds.set(m.team_id, set);
     }
   }
 
@@ -248,16 +266,22 @@ export async function POST(request: Request) {
   );
   const groupUserIds = new Map<string, Set<string>>();
   if (groupIds.length > 0) {
-    spendCalls(budget, 1);
-    const { data: groupRows, error: groupErr } = await svc
-      .from("org_groups")
-      .select("id, organization_id")
-      .in("id", groupIds);
-    if (groupErr && !isMissingRelation(groupErr, "org_groups")) {
-      fail("members_read");
-      return finish({ stoppedBeforeSend: true, leftOrgs });
+    // One row for each id, in lists of 150 ids.
+    const groupRows: Array<{ id: string; organization_id: string }> = [];
+    for (const ids of chunk(groupIds, 150)) {
+      if (!pageRoom()) {
+        fail("call_limit");
+        return finish({ stoppedBeforeSend: true, leftOrgs });
+      }
+      const { data, error: groupErr } = await svc.from("org_groups").select("id, organization_id").in("id", ids);
+      if (groupErr && isMissingRelation(groupErr, "org_groups")) break;
+      if (groupErr || !Array.isArray(data)) {
+        fail("members_read");
+        return finish({ stoppedBeforeSend: true, leftOrgs });
+      }
+      groupRows.push(...(data as Array<{ id: string; organization_id: string }>));
     }
-    for (const g of (groupRows ?? []) as Array<{ id: string; organization_id: string }>) {
+    for (const g of groupRows) {
       spendCalls(budget, 2);
       const ids = await resolveManyGroupsStrict(svc, g.organization_id, [g.id]);
       if (ids === "unreadable") {
@@ -275,16 +299,23 @@ export async function POST(request: Request) {
   // Completed pairs. `!inner` makes the embedded-column filter actually
   // restrict parent rows to the courses we care about (without it the filter
   // is a no-op and scans all attempts). A failed read stops the run: an empty
-  // completed-set would re-nudge learners who have already finished.
-  spendCalls(budget, 1);
-  const { data: completedAttempts, error: completedErr } = await svc
-    .from("course_attempts")
-    .select(
-      "user_id, course_versions!inner(course_id), completion_status, success_status"
-    )
-    .in("course_versions.course_id", courseIds);
-  if (completedErr || !Array.isArray(completedAttempts)) {
-    fail("progress_read");
+  // completed-set would re-nudge learners who have already finished. Read
+  // in pages: a set cut at the row cap would remind finished learners too.
+  const completedAttempts = await readByIdsStrict<unknown>(
+    courseIds,
+    (ids, from, to) =>
+      svc
+        .from("course_attempts")
+        .select(
+          "user_id, course_versions!inner(course_id), completion_status, success_status"
+        )
+        .in("course_versions.course_id", ids)
+        .order("id")
+        .range(from, to),
+    pageRoom
+  );
+  if (completedAttempts === "unreadable" || completedAttempts === "no_room") {
+    readFailed(completedAttempts, "progress_read");
     return finish({ stoppedBeforeSend: true, leftOrgs });
   }
   const completedPairs = new Set<string>(); // `user|course`
@@ -312,16 +343,24 @@ export async function POST(request: Request) {
 
   // Existing reminder state. A failed read would make every learner look
   // never reminded, mail them again and write over their state: it stops the
-  // run before any send.
-  spendCalls(budget, 1);
-  const { data: stateRows, error: stateErr } = await svc
-    .from("reminder_state")
-    .select(
-      "user_id, course_id, first_assigned_at, last_nudge_at, nudge_count, stopped"
-    )
-    .in("course_id", courseIds);
-  if (stateErr || !Array.isArray(stateRows)) {
-    fail("state_read");
+  // run before any send. Read in pages for the same reason: a learner past
+  // the row cap would look never reminded too.
+  const stateRows = await readByIdsStrict<Record<string, unknown>>(
+    courseIds,
+    (ids, from, to) =>
+      svc
+        .from("reminder_state")
+        .select(
+          "user_id, course_id, first_assigned_at, last_nudge_at, nudge_count, stopped"
+        )
+        .in("course_id", ids)
+        .order("user_id")
+        .order("course_id")
+        .range(from, to),
+    pageRoom
+  );
+  if (stateRows === "unreadable" || stateRows === "no_room") {
+    readFailed(stateRows, "state_read");
     return finish({ stoppedBeforeSend: true, leftOrgs });
   }
   const stateByKey = new Map<

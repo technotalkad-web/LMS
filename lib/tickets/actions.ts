@@ -27,7 +27,7 @@ export async function actOnTicket(
     dueAt?: string | null;
     expiresInDays?: number | null;
   }
-): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null }> {
+): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null; requester_email: MailOutcome | null }> {
   const { ticket } = args;
   const note = args.note?.trim() || null;
   // The context was verified when the ticket was raised; people may have left
@@ -52,7 +52,8 @@ export async function actOnTicket(
   let outcome: TicketOutcome;
   let summary: string;
   let results: PerLearnerResult[] = [];
-  // The assignment mail's outcome (ADR 0029 rule T4), for the administrator at the screen.
+  // The mail's outcome for the people on the ticket (an assignment's, or a
+  // granted retry's), for the administrator at the screen (ADR 0029 rule T4).
   let email: MailOutcome | null | undefined;
 
   const wordsFor = (rs: PerLearnerResult[], done: PerLearnerResult["status"], verb: string) => {
@@ -70,6 +71,7 @@ export async function actOnTicket(
     });
     if (isActionError(r)) return r;
     results = r.results;
+    email = r.email;
     const w = wordsFor(results, "granted", "Retry granted to");
     if (w.ok === 0) return { error: `Nobody could be granted a retry: ${w.text.replace(/^.*?· /, "")}`, status: 409 };
     outcome = "granted";
@@ -118,10 +120,11 @@ export async function actOnTicket(
   await svc.from("help_ticket_messages").insert({
     organization_id: args.org.id, ticket_id: ticket.id, author_id: args.admin.id, author_role: "admin", body: adminNote,
   });
-  await notifyRequesterOfTicket(svc, {
+  // The requester's mail, and its outcome for the administrator (rule T4).
+  const requesterEmail = await notifyRequesterOfTicket(svc, {
     orgId: args.org.id, orgName: args.org.name, orgSlug: args.org.slug, origin: args.origin,
     requester: { id: ticket.user_id },
     subject: ticket.subject, headline: OUTCOME_LABEL[outcome], message: adminNote,
   });
-  return { outcome, summary, results, ...(email !== undefined ? { email } : {}) };
+  return { outcome, summary, results, ...(email !== undefined ? { email } : {}), requester_email: requesterEmail };
 }

@@ -21,6 +21,7 @@ import { grantSnapshotFor, isMissingColumn, readWithOptionalColumn, type PgError
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { recordRecipientsUnreadable } from "@/lib/notifications/smtp-state";
+import { RECIPIENTS_UNREADABLE } from "@/lib/notifications/send";
 
 /**
  *   PATCH /api/attempt-requests/{id}?orgSlug=acme
@@ -220,7 +221,9 @@ export async function PATCH(
   }
 
   // Email the learner. The decision is saved: a failed read of their
-  // address mails nothing and records the skip (ADR 0029).
+  // address mails nothing and records the skip (ADR 0029). The answer
+  // carries the mail's outcome for the administrator at the screen (rule
+  // T4): emailed or not, or nobody emailed because it could not be read.
   const [{ data: course }, emailMap, origin] = await Promise.all([
     s.from("courses").select("title").eq("id", reqRow.course_id).maybeSingle(),
     resolveEmailsStrict(s, [reqRow.user_id]),
@@ -228,9 +231,9 @@ export async function PATCH(
   ]);
   if (emailMap === "unreadable") {
     await recordRecipientsUnreadable("attempt-decision", org.id as string);
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true, email: RECIPIENTS_UNREADABLE });
   }
-  await notifyLearnerOfDecision(s, {
+  const email = await notifyLearnerOfDecision(s, {
     orgId: org.id as string,
     orgName: (org.name as string) ?? "your org",
     orgSlug,
@@ -243,5 +246,5 @@ export async function PATCH(
     expiresAt,
   });
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, email });
 }

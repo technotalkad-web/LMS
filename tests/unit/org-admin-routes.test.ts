@@ -109,6 +109,8 @@ let orgDeleted = false;
 let zeroRows = false;
 /** A table whose reads fail (the caller's own role read excepted). */
 let failRead: string | null = null;
+/** A table whose reads fail on the service key only (the caller's own session reads it as usual). */
+let failServiceRead: string | null = null;
 /** The caller's own role read fails. */
 let failRole = false;
 /** After a 0-row assignment delete, the row is gone (another delete crossed it) or its read fails. */
@@ -254,6 +256,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   // The caller's own membership read (lib/auth/org-membership.ts): role and status.
   const ownRead = select === "role,status";
   if (failRead && p === `/rest/v1/${failRead}` && !ownRead) return readFailure();
+  if (failServiceRead && !session && p === `/rest/v1/${failServiceRead}`) return readFailure();
   if (failRole && p === "/rest/v1/organization_members" && ownRead) return readFailure();
   if (deletedAway && (p === "/rest/v1/course_assignments" || p === "/rest/v1/learning_path_assignments")) {
     return deletedAway === "fails" ? readFailure() : list([]);
@@ -348,7 +351,7 @@ async function main() {
     const world = (o: {
       role?: string | null; otherRole?: string | null; signedIn?: boolean; zeroRows?: boolean; failRead?: string;
       failRole?: boolean; afterDelete?: "gone" | "fails"; orgUpdate?: "error" | "lost-reply" | "lost-reply-unreadable";
-      status?: string; orgDeleted?: boolean;
+      status?: string; orgDeleted?: boolean; failServiceRead?: string;
     }) => {
       requests = [];
       role = o.role === undefined ? "user" : o.role;
@@ -358,6 +361,7 @@ async function main() {
       signedIn = o.signedIn ?? true;
       zeroRows = o.zeroRows ?? false;
       failRead = o.failRead ?? null;
+      failServiceRead = o.failServiceRead ?? null;
       failRole = o.failRole ?? false;
       afterDelete = o.afterDelete ?? null;
       deletedAway = null;
@@ -660,6 +664,16 @@ async function main() {
         const body = (await res.json()) as Row;
         eq("DELETE /api/assignments/{id}, a team row whose members cannot be read: 200, nobody emailed, the skip recorded, the answer says so",
           [res.status, mailed(), senderEntered(), skips().length, (body.email as Row | null)?.recipients_unreadable], [200, [], false, 1, true]);
+      }
+      {
+        // The path's read in the mail part (on the service key) gives the
+        // organisation whose members and rows decide who is mailed. The
+        // route read the path on the session just before, so a failed read
+        // here is never "nobody to mail" (note of 2026-11-20, part 3).
+        const out = await call(CALLS[7], { role: "admin", failServiceRead: "learning_paths" });
+        eq("POST /api/learning-paths/{id}/courses (notify_update), the path's read for the mail fails: 200, the step added, nobody emailed, no run opened, the skip recorded once, and the answer says so",
+          [out.status, sessionWrites("learning_path_courses", "POST").length, mailed(), senderEntered(), skips(), (out.body.email as Row | null)?.recipients_unreadable],
+          [200, 1, [], false, [["mail-recipients-unreadable", "error", JSON.stringify({ site: "learning-paths/[id]/courses" })]], true]);
       }
       {
         const out = await call(CALLS[4], { role: "admin" });

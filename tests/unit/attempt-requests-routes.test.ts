@@ -332,6 +332,14 @@ async function main() {
         const r = await bulk({ rows: ROWS, mail: { statuses, countingFails: true } });
         eq("that read fails: the grants stand, nothing is mailed, the sender is not entered",
           [r.status, r.body.granted, mailed(), requests.some((q) => q.path === "/rest/v1/notification_settings")], [200, 3, [], false]);
+        // ADR 0029 rule T4 (hand-over note of 2026-11-19, point 1): the answer says so, and the queue page shows it.
+        eq("…and the answer's email says nobody was emailed because the recipients could not be read", r.body.email, { recipients_unreadable: true });
+      }
+      {
+        // The organisation's SMTP is not set up here, so the active learner's mail is not sent: one not emailed.
+        const r = await bulk({ rows: ROWS, mail: { statuses } });
+        eq("the answer's email counts the mails of the learners who count: none emailed, one not emailed",
+          r.body.email, { recipients_unreadable: false, emailed: 0, not_emailed: 1, not_confirmed: 0 });
       }
     }
 

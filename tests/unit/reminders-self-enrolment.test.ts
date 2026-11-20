@@ -12,7 +12,8 @@
  *   - without it (no row carries source): every user row reminds, today's run;
  *   - the read stays select("*") (the missing-column fallback names no 0107
  *     column), and the completed-pairs read of course_attempts is unchanged
- *     (preview-isolation-sites.test.ts pins it; phase 7 moves it).
+ *     (preview-isolation-sites.test.ts pins it; phase 7 moves it) but for
+ *     its pages of 1000 rows (ADR 0029, the house rule of lib/db/chunked.ts).
  *
  * Who is reminded is read from the reminder_state upsert (one entry per
  * learner the run nudged) and the notification_log rows, not from `sent`:
@@ -138,9 +139,11 @@ async function main() {
     console.log("\nthe reads");
     {
       const r = await run([user("u-adm", "admin")]);
-      eq("course_assignments is read with select=* (names no 0107 column), and course_attempts unchanged", r.reads, [
-        `course_assignments ?select=*&course_id=in.(${COURSE})`,
-        `course_attempts ?select=user_id,course_versions!inner(course_id),completion_status,success_status&course_versions.course_id=in.(${COURSE})`,
+      // ADR 0029: both are read in pages of 1000 rows in a stable order (the
+      // house rule, lib/db/chunked.ts), so neither set is cut at the server's cap.
+      eq("course_assignments is read with select=* (names no 0107 column), and course_attempts unchanged but for its pages", r.reads, [
+        `course_assignments ?select=*&course_id=in.(${COURSE})&order=id.asc&offset=0&limit=1000`,
+        `course_attempts ?select=user_id,course_versions!inner(course_id),completion_status,success_status&course_versions.course_id=in.(${COURSE})&order=id.asc&offset=0&limit=1000`,
       ]);
     }
   } finally {

@@ -2,9 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { finalizeAnswer, finalizeDirectUpload } from "@/lib/courses/direct-upload";
 import { originFromRequest } from "@/lib/http/origin";
-import { notifyLearnerOfDecision } from "@/lib/attempts/requests";
-import { resolveEmailsStrict } from "@/lib/users/emails";
-import { recordRecipientsUnreadable } from "@/lib/notifications/smtp-state";
+import { reissueNotifier } from "@/lib/attempts/requests";
 
 /**
  *   POST /api/courses/upload/finalize   { orgSlug, versionId, notify_update?, mode? }
@@ -23,6 +21,10 @@ import { recordRecipientsUnreadable } from "@/lib/notifications/smtp-state";
  *     `retryable: false`. The version IS ready and current; the retry is
  *     "Restart learners on this version" on each older version. A client
  *     must not abort the upload on this answer.
+ *
+ * ADR 0029 rule T4: when the forced restart re-issued grants and mailed
+ * their learners, the answer carries those mails' outcome as `reissueEmail`,
+ * beside `restart` and never inside it.
  */
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as null | {
@@ -35,6 +37,7 @@ export async function POST(request: NextRequest) {
   const auth = await requireOrgAdminApi(body.orgSlug);
   if ("error" in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
+  const reissue = reissueNotifier();
   const result = await finalizeDirectUpload({
     supabase: auth.supabase,
     org: auth.org,
@@ -44,8 +47,9 @@ export async function POST(request: NextRequest) {
     restartMode: body.mode === "force_restart" ? "force_restart" : "grandfather",
     // ADR 0014 step 8: what a forced restart's re-issued grant needs to tell the learner.
     origin: await originFromRequest(),
-    notify: { decision: notifyLearnerOfDecision, emails: resolveEmailsStrict, skipped: recordRecipientsUnreadable },
+    notify: reissue.notify,
   });
   const answer = finalizeAnswer(result);
-  return NextResponse.json(answer.body, { status: answer.status });
+  const reissueEmail = reissue.outcome();
+  return NextResponse.json(result.ok && reissueEmail ? { ...answer.body, reissueEmail } : answer.body, { status: answer.status });
 }

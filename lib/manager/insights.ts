@@ -33,7 +33,7 @@ import {
   todayStr,
 } from "@/lib/journey/journey";
 import { readJourneyCredits } from "@/lib/journey/credits-read";
-import { fetchActiveMembers, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
+import { fetchActiveMembers, groupMembersStrict, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
 import { isReleased } from "@/lib/learner/release";
 import { THRESHOLDS } from "./report-card";
 import { DAY, daysAgo, deriveLearner, fmtDay, maxIso, minIso } from "./derive";
@@ -64,6 +64,14 @@ export type InsightOptions = {
   /** "" | course:<id> | path:<id> | journey:<id> — narrows every number to that content. */
   content?: string;
   now?: Date;
+  /**
+   * For a caller whose answer decides who is mailed (ADR 0029, note of
+   * 2026-11-20, part 3): the groups and their members are read strictly,
+   * and a failed read throws instead of leaving a group's people out. Only
+   * a database without org_groups (before 0067) is still tolerated. The
+   * Report Card pages leave it off.
+   */
+  strictGroups?: boolean;
 };
 
 export type CatalogEntry = { id: string; title: string };
@@ -307,7 +315,29 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   }
   const groupIds = [...new Set([...courseAssigns, ...pathAssigns].filter((a) => a.assignee_type === "group" && a.group_id).map((a) => a.group_id as string))];
   const groupUserIds = new Map<string, Set<string>>();
-  if (groupIds.length) {
+  if (groupIds.length && opts.strictGroups) {
+    // Every read's error is read: a group that could not be read is never
+    // "nobody in it". Lists of 150 ids (the house rule).
+    const groups: GroupRow[] = [];
+    let noGroupsTable = false;
+    for (const ids of chunk(groupIds, 150)) {
+      const { data: groupRows, error: groupErr } = await svc
+        .from("org_groups")
+        .select("id, organization_id, name, group_type, rules, is_active")
+        .in("id", ids);
+      if (groupErr && isMissingRelation(groupErr.message)) {
+        noGroupsTable = true;
+        break;
+      }
+      if (groupErr || !Array.isArray(groupRows)) throw new Error(`org_groups: ${groupErr?.message ?? "no answer"}`);
+      groups.push(...(groupRows as GroupRow[]));
+    }
+    if (!noGroupsTable) {
+      const byGroup = await groupMembersStrict(svc, orgId, groups.filter((g) => g.is_active !== false));
+      if (byGroup === "unreadable") throw new Error("org_groups: a group's members could not be read");
+      for (const [gid, ids] of byGroup) groupUserIds.set(gid, new Set([...ids].filter((u) => userSet.has(u))));
+    }
+  } else if (groupIds.length) {
     try {
       const { data: groupRows } = await svc
         .from("org_groups")

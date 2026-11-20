@@ -507,7 +507,8 @@ export type ForceRestartNotify = {
       /** The organisation's members that count, read once for the run (ADR 0030 rule 10). */
       counting?: ReadonlySet<string>;
     }
-  ) => Promise<void>;
+    // The notifier's answer (a mail outcome) is not part of the forced restart's report.
+  ) => Promise<unknown>;
   /** The strict address reader (ADR 0029): "unreadable" when the read failed, never a partial map. */
   emails: (svc: SupabaseClient, userIds: Iterable<string>) => Promise<Map<string, string> | "unreadable">;
   /** Records a mail skipped because its recipients could not be read (ADR 0029's skip helper, recordRecipientsUnreadable). Never throws. */

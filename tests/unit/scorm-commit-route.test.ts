@@ -23,6 +23,13 @@
  * and the refusal comes before the runtime test (a cmi5 attempt gets 403,
  * not 409).
  *
+ * ADR 0029, point (b) of its pull request B scope: the course's completion
+ * mail is the last outbound work of a finishing commit (after the stored
+ * row, the points and journey RPCs and the CRM webhook), and whatever
+ * becomes of that mail (a refused delivery, the daily cap, an organisation
+ * with no SMTP set up) the response and the saved attempt match those of a
+ * commit whose mail went out.
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/scorm-commit-route.test.ts   (or npm run test:unit)
@@ -76,6 +83,14 @@ let no0107 = false;
 /** ADR 0030: the caller's membership in the attempt's org, and the attempt's runtime. */
 let access: { status?: string; deleted?: boolean; noRow?: boolean; fails?: "org" | "member" } = {};
 let manifestType = "scorm12";
+/**
+ * ADR 0029, point (b) of the note "Pull request B scope": the organisation's
+ * SMTP settings, what send-smtp answers, the daily limit's numbers, and a
+ * configured completion webhook. Empty (the default): no settings (the
+ * completion mail is not attempted), no limit and no webhook, as before.
+ */
+let mailSide: { settings?: boolean; smtp?: () => Response; dailyLimit?: { limit: number; sent: number }; webhook?: boolean } = {};
+const WEBHOOK_HOST = "hooks.example.test";
 const NO_CONTEXT = { code: "42703", message: "column course_attempts.context_kind does not exist" };
 const PATH_READ = "course_version_id,completion_status,success_status,learning_path_id";
 const unmatched: string[] = [];
@@ -91,6 +106,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const key = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get("apikey");
   requests.push({ method, path: p, select, body, query: url.searchParams, key });
   if (p === "/auth/v1/user") return json(USER);
+  // ADR 0029 point (b): the completion webhook's own call, send-smtp, and the settings read, when a case turns them on.
+  if (url.host === WEBHOOK_HOST && mailSide.webhook) return json({ ok: true });
+  if (p === "/functions/v1/send-smtp" && mailSide.smtp) return mailSide.smtp();
+  if (p === "/rest/v1/notification_settings" && mailSide.settings) {
+    return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, smtp_user: null, smtp_password: null, from_email: "noreply@tenant.stub", from_name: null, reply_to: null, email_paused: false, event_paused: {}, logo_url: null, brand_color: null, footer_text: null }]);
+  }
+  if (p === "/rest/v1/org_integration_settings" && mailSide.webhook) return json([{ webhook_url: `https://${WEBHOOK_HOST}/lms-completion`, webhook_secret: null }]);
   // ADR 0030: the learner's membership in the attempt's org (lib/auth/org-membership.ts); counts unless a case says otherwise.
   if (p === "/rest/v1/organizations" && select === "id,deleted_at") {
     if (access.fails === "org") return json({ code: "XX000", message: "stub read failure" }, 500);
@@ -135,7 +157,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   // (migration 0114): one row for the organisation, with no state row yet.
   if (p === "/rest/v1/rpc/tenant_mail_status") {
     const org = (JSON.parse(body || "{}") as Row).p_org ?? null;
-    return json([{ organization_id: org, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
+    return json([{ organization_id: org, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: mailSide.dailyLimit?.limit ?? null, sent_24h: mailSide.dailyLimit?.sent ?? 0 }]);
   }
   if (p.startsWith("/rest/v1/rpc/")) return json(null);
   if (p.startsWith("/rest/v1/")) return json([]);
@@ -385,6 +407,55 @@ async function main() {
         [before.status, before.body.error, control.status, control.body.error], [403, "no_access", 409, "wrong_runtime"]);
       const ok = await run(PASSING, true, failedRow(), { engineVersion: A1 });
       eq("the control: an active member's SCORM commit is written as before (200, one update)", [ok.status, ok.patches.length], [200, 1]);
+    }
+
+    console.log("\n(l) ADR 0029, point (b): the completion mail goes last, and its fate never alters the response or the saved attempt");
+    {
+      const fresh = (): Row => ({
+        id: "a1", user_id: "u1", organization_id: "o1", status: "in_progress", completion_status: "in_progress", success_status: "unknown",
+        score: null, completed_at: null, course_version_id: "v1", cmi_data: {}, progress_pct: null, is_revision: false, context_kind: "individual",
+      });
+      // The milestone block runs (its first read answers); no path completes, so one mail: the course's.
+      pathWorld = true;
+      pathAttempts = [];
+      const SMTP_OK = () => json({ ok: true });
+      /** What a commit leaves: its answer, what it stored (each write's keys and result columns), and its RPCs other than the mail's. */
+      const kept = (r: Awaited<ReturnType<typeof run>>) => [
+        r.status,
+        r.body,
+        r.patches.map((u) => [Object.keys(u).sort(), u.status, u.completion_status, u.success_status, u.score]),
+        r.rpcs.filter(([name]) => name !== "tenant_mail_status"),
+      ];
+      const isMail = (q: Req) =>
+        q.path === "/rest/v1/notification_settings" || q.path === "/rest/v1/rpc/tenant_mail_status" || q.path === "/functions/v1/send-smtp" || q.path === "/rest/v1/notification_log";
+      const smtpCalls = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").length;
+      const at = (pred: (q: Req) => boolean) => requests.findIndex(pred);
+
+      mailSide = { settings: true, smtp: SMTP_OK, webhook: true };
+      const sent = await run(PASSING, true, fresh(), {});
+      const firstMail = at(isMail);
+      const before = [
+        at((q) => q.path === "/rest/v1/course_attempts" && q.method === "PATCH"),
+        at((q) => q.path === "/rest/v1/rpc/gamification_record_activity"),
+        at((q) => q.path === "/rest/v1/rpc/journey_record_completion"),
+        at((q) => q.path === "/lms-completion" && q.method === "POST"),
+      ];
+      eq("a finishing commit whose mail goes out: the stored row, both RPCs and the webhook all precede the first mail request",
+        [sent.status, before.map((i) => i >= 0), before.map((i) => i < firstMail), smtpCalls()], [200, [true, true, true, true], [true, true, true, true], 1]);
+
+      const VARIANTS: Array<[string, typeof mailSide, number]> = [
+        ["a send that fails", { settings: true, smtp: () => json({ ok: false, error: "550 5.1.1 user unknown" }), webhook: true }, 1],
+        ["a send stopped by the daily limit", { settings: true, smtp: SMTP_OK, dailyLimit: { limit: 30, sent: 30 }, webhook: true }, 0],
+        ["a send not attempted (the organisation's SMTP is not set up)", { webhook: true }, 0],
+      ];
+      for (const [what, side, smtp] of VARIANTS) {
+        mailSide = side;
+        const r = await run(PASSING, true, fresh(), {});
+        eq(`${what}: the response and the saved attempt match the commit whose mail went out (send-smtp called ${smtp} time${smtp === 1 ? "" : "s"})`,
+          [kept(r), smtpCalls()], [kept(sent), smtp]);
+      }
+      mailSide = {};
+      pathWorld = false;
     }
 
     eq("no request left the stub", unmatched, []);

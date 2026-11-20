@@ -20,6 +20,7 @@ import {
 } from "../_components/direct-upload";
 import type { ForceRestartOutcome } from "@/lib/attempts/force-restart";
 import { UploadProgressBar } from "../_components/upload-progress";
+import { mailOutcomeWords, type MailOutcomeAnswer } from "@/lib/actions/types";
 
 export type LanguagePackage = {
   id: string;
@@ -368,16 +369,19 @@ export function LanguagesSection({
             // The new version is current either way: the Versions list must show it.
             router.refresh();
             const r = outcome.restart;
+            // ADR 0029 rule T4: what the re-issued grants' emails did, beside the restart's own words.
+            const words = mailOutcomeWords(outcome.reissueEmail);
+            const mail = words ? ` Email to the learners whose grants were re-issued: ${words}` : "";
             if (!r) {
               // Grandfather: no banner, and an earlier replace's banner goes.
               setError(null);
               setNotice(null);
             } else if (r.status === "failed") {
-              setNotice(null);
+              setNotice(mail ? mail.trim() : null);
               setError(r.message);
             } else {
               setError(null);
-              setNotice(`Replaced. ${r.message}`);
+              setNotice(`Replaced. ${r.message}${mail}`);
             }
           }}
         />
@@ -409,7 +413,7 @@ function ReplacePackageDialog({
   courseId: string;
   pkg: LanguagePackage;
   onClose: () => void;
-  onReplaced: (outcome: { restart?: ForceRestartOutcome }) => void;
+  onReplaced: (outcome: { restart?: ForceRestartOutcome; reissueEmail?: MailOutcomeAnswer }) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [mode, setMode] = useState<"grandfather" | "force_restart">("grandfather");
@@ -452,6 +456,7 @@ function ReplacePackageDialog({
     setBusy(true);
     setError(null);
     let restart: ForceRestartOutcome | undefined;
+    let reissueEmail: MailOutcomeAnswer | undefined;
     try {
       const res = await directUpload({
         pkg: unzippedPkg,
@@ -461,19 +466,20 @@ function ReplacePackageDialog({
         onProgress: setProgress,
       });
       restart = res.restart;
+      reissueEmail = res.reissueEmail;
     } catch (err) {
       setBusy(false);
       setProgress(null);
       if (err instanceof PublishedButRestartFailedError) {
         // Published, reset failed: close, refresh, and say so on the page.
-        onReplaced({ restart: err.restart });
+        onReplaced({ restart: err.restart, reissueEmail: err.result.reissueEmail });
         return;
       }
       setError(err instanceof Error ? err.message : "Upload failed");
       return;
     }
     setBusy(false);
-    onReplaced({ restart });
+    onReplaced({ restart, reissueEmail });
   }
 
   async function rejectPackage() {

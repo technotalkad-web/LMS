@@ -14,6 +14,7 @@ import { countingMemberIds } from "@/lib/auth/org-membership";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
 import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
 
 /**
@@ -45,6 +46,11 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * membership counts. The organisation's members that count are read once
  * for the call (countingMemberIds), never once per learner; when that read
  * fails no mail is sent and the grants stand.
+ *
+ * ADR 0029 rule T4: the answer carries the mails' outcome (`email`) for the
+ * administrator at the screen: how many were emailed and not, or nobody
+ * emailed because the recipients could not be read. Absent when nothing
+ * was granted.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -61,7 +67,7 @@ export async function grantExtraAttempts(
     userIds: string[];
     expiresInDays?: number | null;
   }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string }> {
+): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; email?: MailOutcome }> {
   const ids = [...new Set(args.userIds)];
   if (ids.length === 0) return { error: "No learners named", status: 400 };
   const course = await orgCourse(svc, args.orgId, args.courseId);
@@ -148,6 +154,8 @@ export async function grantExtraAttempts(
   const people = await namesAndEmails(svc, ids).catch(() => "unreadable" as const);
   let counting: ReadonlySet<string> | "unreadable" | undefined;
   let run: MailRun | undefined;
+  /** The granted learners' mails, for the answer (rule T4). */
+  let mailed: MailCounts = mailCounts([]);
   for (const uid of ids) {
     const mine = byUser.get(uid) ?? [];
     const retakeIds = retakes.get(`${uid}:${course.id}`)?.retakeIds ?? new Set<string>();
@@ -208,12 +216,16 @@ export async function grantExtraAttempts(
     if (!counting.has(uid)) continue;
     run ??= await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + ids.length }), db: svc });
     const who = people.get(uid);
-    await notifyLearnerOfDecision(svc, {
+    const one = await notifyLearnerOfDecision(svc, {
       orgId: args.orgId, orgName: args.orgName, orgSlug: args.orgSlug, origin: args.origin,
       courseId: course.id, courseTitle: course.title,
       learner: { id: uid, email: who?.email ?? "" }, approved: true, note: null, expiresAt,
       counting, run,
     });
+    mailed = addMailOutcome(mailed, one);
   }
-  return { results, courseTitle: course.title };
+  // Nothing granted: no mail to speak of. A failed read of the recipients:
+  // nobody was emailed, and the answer says why.
+  if (counting === undefined) return { results, courseTitle: course.title };
+  return { results, courseTitle: course.title, email: counting === "unreadable" ? RECIPIENTS_UNREADABLE : mailed };
 }

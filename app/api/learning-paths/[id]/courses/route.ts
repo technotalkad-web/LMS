@@ -137,7 +137,7 @@ export async function POST(
   let email: MailOutcome | null = null;
   if (body.notify_update) {
     email = await (async (): Promise<MailOutcome | null> => {
-      let orgId: string | null = null;
+      const orgId: string = pathOrgId;
       try {
         const svc = createServiceClient(
           process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -146,7 +146,7 @@ export async function POST(
         );
         const budget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
         spendCalls(budget, 1);
-        const { data: pathRow } = await svc
+        const { data: pathRow, error: pathErr } = await svc
           .from("learning_paths")
           .select(
             "name, organization_id, organizations(name, slug)"
@@ -162,8 +162,14 @@ export async function POST(
                 | { name?: string; slug?: string }[];
             }
           | null;
-        if (!p?.organization_id) return null;
-        orgId = p.organization_id;
+        // The path was read earlier in this request, so a failed or empty
+        // read here is a read that failed, never "nobody to mail" (ADR 0029,
+        // note of 2026-11-20, part 3): the step stays added, nobody is
+        // emailed, the skip is recorded and the answer says so.
+        if (pathErr || !p?.organization_id) {
+          await recordRecipientsUnreadable("learning-paths/[id]/courses", orgId);
+          return RECIPIENTS_UNREADABLE;
+        }
         const orgInfo = Array.isArray(p.organizations)
           ? p.organizations[0]
           : p.organizations;

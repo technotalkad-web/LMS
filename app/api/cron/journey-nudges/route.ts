@@ -5,6 +5,7 @@ import { sendMany, type SendResult } from "@/lib/notifications/send";
 import { MAIL_CALL_COSTS, SENDS_AT_ONCE, cronBudget, hasRoom, openRun, sendDueAlert, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
 import { buildMailCronDetail, owedAfterRun, type CronErrorCounts, type CronErrorWord } from "@/lib/ops/health-status";
 import { countingMemberIds } from "@/lib/auth/org-membership";
+import { chunk, readAllStrict } from "@/lib/db/chunked";
 import {
   computeJourneyState,
   courseDaysOf,
@@ -67,12 +68,16 @@ import {
  *   - The call first sends at most one tenant alert that is due (rule FP3),
  *     the oldest, and its cost is in the call's sum.
  *   - The sends are runs: one for each organisation, on this call's one
- *     clock and one count. For each page of due learners: one read of the
- *     learners' and managers' profiles, one read of the course titles, and
- *     the claim taken for each group in one conditional update just before
- *     its sends, so a nudge that is not started holds no claim. A claim is
- *     given back after a failure of any class but a timeout (the mail may
- *     still arrive), and after a send that was not attempted.
+ *     clock and one count. For each page of due learners: the learners' and
+ *     managers' profiles and the course titles, each read in lists of 150
+ *     ids (lib/db/chunked.ts), and the claim taken for each group in one
+ *     conditional update just before its sends, so a nudge that is not
+ *     started holds no claim. A claim is given back after a failure of any
+ *     class but a timeout (the mail may still arrive), and after a send that
+ *     was not attempted. A page the call has no room left to read whole is
+ *     left for the next call.
+ *   - Every read is whole or not used: the line managers are read in pages
+ *     of 1000 rows, and the escalation marks are written in lists of 150.
  *   - A failed run is the job's own failed read or write, or the platform's
  *     call limit: the programs, a time zone, the members that count, the
  *     line managers, a page of enrolments, the progress counts, the
@@ -151,6 +156,12 @@ async function run() {
   const errors: CronErrorCounts = {};
   const fail = (word: CronErrorWord, n = 1) => {
     errors[word] = (errors[word] ?? 0) + n;
+  };
+  /** One call for a page of a read, while the call still has room for it and for a send after it. */
+  const pageRoom = () => {
+    if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.send + 3)) return false;
+    spendCalls(budget, 1);
+    return true;
   };
 
   let reminded = 0;
@@ -295,25 +306,31 @@ async function run() {
     // L1 managers for this org (0011 line_manager_id), fetched once per program:
     // the learners' own rows, active only (rule 10). Whether the manager's own
     // membership counts is tested at the send. A failed read means no
-    // escalation for this program in this call; the learners' own reminders go on.
+    // escalation for this program in this call; the learners' own reminders
+    // go on. Read in pages of 1000 rows: a cut list is never used. With no
+    // room left to read it whole, this call makes no escalation for the
+    // program; that is no failure.
     let managerOf = new Map<string, string>();
     if (escalationOn) {
-      spendCalls(budget, 1);
-      const { data: memRows, error: memErr } = await svc
-        .from("organization_members")
-        .select("user_id, line_manager_id")
-        .eq("organization_id", p.organization_id)
-        .eq("status", "active")
-        .not("line_manager_id", "is", null);
-      if (memErr || !Array.isArray(memRows)) {
+      const memRows = await readAllStrict<{ user_id: string; line_manager_id: string }>(
+        (from, to) =>
+          svc
+            .from("organization_members")
+            .select("user_id, line_manager_id")
+            .eq("organization_id", p.organization_id)
+            .eq("status", "active")
+            .not("line_manager_id", "is", null)
+            .order("user_id")
+            .range(from, to),
+        pageRoom
+      );
+      if (memRows === "unreadable") {
         fail("members_read");
         escalationOn = false;
+      } else if (memRows === "no_room") {
+        escalationOn = false;
       } else {
-        managerOf = new Map(
-          (memRows as Array<{ user_id: string; line_manager_id: string }>).map(
-            (m) => [m.user_id, m.line_manager_id]
-          )
-        );
+        managerOf = new Map(memRows.map((m) => [m.user_id, m.line_manager_id]));
       }
     }
 
@@ -441,36 +458,61 @@ async function run() {
       }
 
       if (candidates.length > 0) {
-        // The learners' and their managers' profiles, in one read. A failed
-        // read is not "no address": nobody on the page takes a claim, and
-        // they are left for the next call.
+        // The learners' and their managers' profiles, in lists of 150 ids
+        // (the house rule, lib/db/chunked.ts: a longer list fails on the
+        // platform). A failed read of any list is not "no address": nobody
+        // on the page takes a claim, and they are left for the next call.
         const managersOnPage = candidates
           .filter((c) => c.escalate)
           .map((c) => managerOf.get(c.e.user_id))
           .filter((m): m is string => !!m && counting.has(m));
         const profileIds = [...new Set([...candidates.map((c) => c.e.user_id), ...managersOnPage])];
-        spendCalls(budget, 1);
-        const { data: profRows, error: profErr } = await svc
-          .from("profiles")
-          .select("id, first_name, last_name, email")
-          .in("id", profileIds);
-        if (profErr || !Array.isArray(profRows)) {
+        const profileLists = chunk(profileIds, 150);
+        // Room for the whole read, the titles and a send after them; with
+        // less, the page is left whole for the next call. That is no failure.
+        if (!hasRoom(budget, profileLists.length + 1 + MAIL_CALL_COSTS.send + 3)) {
+          leftComplete = false;
+          const owed = candidates.filter((c) => c.due).length;
+          due += owed;
+          notStarted += owed;
+          break;
+        }
+        const profRows: Profile[] = [];
+        let profilesRead = true;
+        for (const ids of profileLists) {
+          spendCalls(budget, 1);
+          const { data: rows, error: profErr } = await svc
+            .from("profiles")
+            .select("id, first_name, last_name, email")
+            .in("id", ids);
+          if (profErr || !Array.isArray(rows)) {
+            profilesRead = false;
+            break;
+          }
+          profRows.push(...(rows as Profile[]));
+        }
+        if (!profilesRead) {
           fail("profiles_read");
           leftComplete = false;
           const owed = candidates.filter((c) => c.due).length;
           due += owed;
           notStarted += owed;
         } else {
-          const profileOf = new Map((profRows as Profile[]).map((r) => [r.id, r]));
+          const profileOf = new Map(profRows.map((r) => [r.id, r]));
 
-          // The next missions' course titles, in one read. A failed read
-          // sends the mail with the general words, as before.
+          // The next missions' course titles, in lists of 150 ids. A failed
+          // read, or no room for one, sends the mail with the general words,
+          // as before.
           const titleIds = [...new Set(candidates.filter((c) => !c.missionTitle && c.courseId && !courseTitle.has(c.courseId)).map((c) => c.courseId!))];
-          if (titleIds.length > 0) {
+          for (const ids of chunk(titleIds, 150)) {
+            if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.send + 3)) break;
             spendCalls(budget, 1);
-            const { data: titleRows, error: titleErr } = await svc.from("courses").select("id, title").in("id", titleIds);
-            if (titleErr || !Array.isArray(titleRows)) fail("unknown");
-            else for (const c of titleRows as Array<{ id: string; title?: string | null }>) if (c.title) courseTitle.set(c.id, c.title);
+            const { data: titleRows, error: titleErr } = await svc.from("courses").select("id, title").in("id", ids);
+            if (titleErr || !Array.isArray(titleRows)) {
+              fail("unknown");
+              break;
+            }
+            for (const c of titleRows as Array<{ id: string; title?: string | null }>) if (c.title) courseTitle.set(c.id, c.title);
           }
 
           const nudges: Nudge[] = [];
@@ -647,14 +689,18 @@ async function run() {
               },
             }));
             const marked = escalations.filter((_, k) => results[k].attempted).map((x) => x.enrolment);
-            if (marked.length > 0 && !hasRoom(budget, 1)) {
-              // No room left for the mark: as for a failed write, the
-              // escalation can go again next hour, and the run says so.
-              fail("state_write");
-            } else if (marked.length > 0) {
+            // One write for each list of 150 ids (the house rule).
+            const markedAt = new Date().toISOString();
+            for (const ids of chunk(marked, 150)) {
+              if (!hasRoom(budget, 1)) {
+                // No room left for the mark: as for a failed write, the
+                // escalation can go again next hour, and the run says so.
+                fail("state_write");
+                break;
+              }
               spendCalls(budget, 1);
-              const mark = svc.from("journey_enrollments").update({ last_nudged_at: new Date().toISOString() });
-              const { error: markErr } = await (marked.length === 1 ? mark.eq("id", marked[0]) : mark.in("id", marked));
+              const mark = svc.from("journey_enrollments").update({ last_nudged_at: markedAt });
+              const { error: markErr } = await (ids.length === 1 ? mark.eq("id", ids[0]) : mark.in("id", ids));
               if (markErr) fail("state_write");
             }
             escalated += marked.length;

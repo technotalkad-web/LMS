@@ -164,14 +164,22 @@ export async function sendReminders(
     // Re-derive entitlement and status NOW (dynamic groups change; the page
     // the manager clicked may be stale): the same rules as the Report Card,
     // narrowed to this course. Not assigned/attempted → skip; official result
-    // already in → skip.
-    const { learners } = await computeLearnerInsights(a.svc, {
-      orgId: a.org.id,
-      orgSlug: a.org.slug,
-      userIds: ids,
-      periodDays: null,
-      content: `course:${course.id}`,
-    });
+    // already in → skip. The assignments decide who is mailed, so their reads
+    // are strict (groups included): a failed read answers 503 and sends
+    // nothing (ADR 0029, part 3), never "not assigned this course".
+    let learners: Awaited<ReturnType<typeof computeLearnerInsights>>["learners"];
+    try {
+      ({ learners } = await computeLearnerInsights(a.svc, {
+        orgId: a.org.id,
+        orgSlug: a.org.slug,
+        userIds: ids,
+        periodDays: null,
+        content: `course:${course.id}`,
+        strictGroups: true,
+      }));
+    } catch {
+      return { error: "The learners' assignments could not be read. Nothing was sent; try again.", status: 503 };
+    }
     const lineOf = new Map(learners.map((l) => [l.userId, l.courses.find((c) => c.courseId === course.id) ?? null]));
     const { data: stateRows, error: stateErr } = await a.svc
       .from("reminder_state")

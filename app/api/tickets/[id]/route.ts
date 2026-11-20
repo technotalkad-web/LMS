@@ -45,14 +45,16 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     }).then(({ error: e }) => { if (e && (e as { code?: string }).code !== "42P01") console.warn("[tickets] thread insert:", e.message); });
   }
   const closedNow = update.status === "closed" && ticket.status !== "closed";
-  if (replied || closedNow) {
-    await notifyRequesterOfTicket(svc, {
-      orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: await originFromRequest(),
-      requester: { id: ticket.user_id },
-      subject: ticket.subject,
-      headline: closedNow ? "Ticket closed" : "Reply from your admin",
-      message: replied ? note! : ticket.admin_note,
-    });
-  }
-  return NextResponse.json({ ok: true });
+  // The requester's mail, and its outcome for the administrator at the
+  // screen (ADR 0029 rule T4): emailed or not, or not read.
+  const requesterEmail = replied || closedNow
+    ? await notifyRequesterOfTicket(svc, {
+        orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: await originFromRequest(),
+        requester: { id: ticket.user_id },
+        subject: ticket.subject,
+        headline: closedNow ? "Ticket closed" : "Reply from your admin",
+        message: replied ? note! : ticket.admin_note,
+      })
+    : null;
+  return NextResponse.json({ ok: true, requester_email: requesterEmail });
 }

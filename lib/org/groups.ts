@@ -2,6 +2,7 @@ import {
   createClient as createServiceClient,
   type SupabaseClient,
 } from "@supabase/supabase-js";
+import { readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
 
 /**
  * Custom Groups (0067) — the LMS's reusable AUDIENCE object.
@@ -352,33 +353,28 @@ export async function resolveManyGroups(
  * part 3): a failed read of who is in a team or a group is never "nobody".
  * Each answers "unreadable" when any of its reads failed, and the caller
  * mails nobody from it (a request records the skip; a cron fails its run).
- * The readers above keep their fail-soft answers for pages and audiences
- * that only show people.
+ * Each reads by the house rule (lib/db/chunked.ts): `.in()` lists of 150
+ * ids and pages of 1000 rows in a stable order, so no set is cut at the
+ * server's row cap. The readers above keep their fail-soft answers for
+ * pages and audiences that only show people.
  * ---------------------------------------------------------------------- */
 
 type Unreadable = "unreadable";
 
 /** The user ids of these teams' members; "unreadable" when the read failed. */
 export async function teamMemberIdsStrict(svc: SupabaseClient, teamIds: Iterable<string>): Promise<Set<string> | Unreadable> {
-  const ids = [...new Set([...teamIds].filter(Boolean))];
-  const out = new Set<string>();
-  for (let i = 0; i < ids.length; i += 150) {
-    try {
-      const { data, error } = await svc.from("team_members").select("user_id").in("team_id", ids.slice(i, i + 150));
-      if (error || !Array.isArray(data)) return "unreadable";
-      for (const r of data as Array<{ user_id: string }>) out.add(r.user_id);
-    } catch {
-      return "unreadable";
-    }
-  }
-  return out;
+  const rows = await readByIdsStrict<{ user_id: string }>(teamIds, (ids, from, to) =>
+    svc.from("team_members").select("user_id").in("team_id", ids).order("team_id").order("user_id").range(from, to)
+  );
+  if (rows === "unreadable" || rows === "no_room") return "unreadable";
+  return new Set(rows.map((r) => r.user_id));
 }
 
 async function activeMembersStrict(svc: SupabaseClient, orgId: string): Promise<MemberFields[] | Unreadable> {
   const members: MemberFields[] = [];
   for (let fromIdx = 0; ; fromIdx += 1000) {
     const q = (cols: string) =>
-      svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("status", "active").range(fromIdx, fromIdx + 999);
+      svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("status", "active").order("user_id").range(fromIdx, fromIdx + 999);
     let res = await q(MEMBER_FIELD_COLS);
     // 0096 deploy safety, as fetchActiveMembers: the column may not be there yet.
     if (res.error && /department/.test(res.error.message)) res = await q(MEMBER_FIELD_COLS_LEGACY);
@@ -394,31 +390,27 @@ async function activeMembersStrict(svc: SupabaseClient, orgId: string): Promise<
 }
 
 /**
- * The strict sibling of resolveManyGroups: the active groups among these
- * ids, in this organisation, and their members now. "unreadable" when the
- * groups, a static group's rows, the members a rule reads, or a rule's team
- * could not be read.
+ * Each of these groups' members now, by group: a static group's rows, or the
+ * active members a dynamic group's rules select. The groups are the caller's
+ * own read (their active flag is the caller's to test). "unreadable" when a
+ * static group's rows, the members a rule reads, or a rule's team could not
+ * be read.
  */
-export async function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string, groupIds: string[]): Promise<Set<string> | Unreadable> {
-  const out = new Set<string>();
-  if (groupIds.length === 0) return out;
+export async function groupMembersStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  groups: ReadonlyArray<Pick<GroupRow, "id" | "group_type" | "rules">>
+): Promise<Map<string, Set<string>> | Unreadable> {
+  const out = new Map<string, Set<string>>();
   try {
-    const { data, error } = await svc
-      .from("org_groups")
-      .select("id, organization_id, group_type, rules, is_active")
-      .eq("organization_id", orgId)
-      .in("id", groupIds);
-    if (error || !Array.isArray(data)) return "unreadable";
-    const groups = (data as GroupRow[]).filter((g) => g.is_active !== false);
     let members: MemberFields[] | null = null;
     for (const g of groups) {
       if (g.group_type === "static") {
-        for (let fromIdx = 0; ; fromIdx += 1000) {
-          const page = await svc.from("org_group_members").select("user_id").eq("group_id", g.id).range(fromIdx, fromIdx + 999);
-          if (page.error || !Array.isArray(page.data)) return "unreadable";
-          for (const r of page.data as Array<{ user_id: string }>) out.add(r.user_id);
-          if (page.data.length < 1000) break;
-        }
+        const rows = await readAllStrict<{ user_id: string }>((from, to) =>
+          svc.from("org_group_members").select("user_id").eq("group_id", g.id).order("user_id").range(from, to)
+        );
+        if (rows === "unreadable" || rows === "no_room") return "unreadable";
+        out.set(g.id, new Set(rows.map((r) => r.user_id)));
         continue;
       }
       if (members === null) {
@@ -433,12 +425,37 @@ export async function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string
         if (team === "unreadable") return "unreadable";
         teamSet = team;
       }
-      for (const id of membersByRules(members, rules, teamSet)) out.add(id);
+      out.set(g.id, new Set(membersByRules(members, rules, teamSet)));
     }
     return out;
   } catch {
     return "unreadable";
   }
+}
+
+/**
+ * The strict sibling of resolveManyGroups: the active groups among these
+ * ids, in this organisation, and their members now. "unreadable" when the
+ * groups, a static group's rows, the members a rule reads, or a rule's team
+ * could not be read.
+ */
+export async function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string, groupIds: string[]): Promise<Set<string> | Unreadable> {
+  const out = new Set<string>();
+  if (groupIds.length === 0) return out;
+  const data = await readByIdsStrict<GroupRow>(groupIds, (ids, from, to) =>
+    svc
+      .from("org_groups")
+      .select("id, organization_id, group_type, rules, is_active")
+      .eq("organization_id", orgId)
+      .in("id", ids)
+      .order("id")
+      .range(from, to)
+  );
+  if (data === "unreadable" || data === "no_room") return "unreadable";
+  const byGroup = await groupMembersStrict(svc, orgId, data.filter((g) => g.is_active !== false));
+  if (byGroup === "unreadable") return "unreadable";
+  for (const ids of byGroup.values()) for (const id of ids) out.add(id);
+  return out;
 }
 
 /** An assignment row as the mail paths read it: one person, a team, a group, or the whole organisation. */
@@ -489,7 +506,7 @@ export async function assigneeRecipientsStrict(
 
 /**
  * Everyone a course's or a path's assignment rows reach now, for mail: the
- * rows read in one call (select "*" keeps a database without group_id
+ * rows read in pages of 1000 (select "*" keeps a database without group_id
  * working), then assigneeRecipientsStrict. "unreadable" when the rows or any
  * team or group read failed.
  */
@@ -500,9 +517,11 @@ export async function assignedRecipientsStrict(
   counting: ReadonlySet<string>
 ): Promise<Set<string> | Unreadable> {
   try {
-    const { data, error } = await svc.from(target.table).select("*").eq(target.column, target.id);
-    if (error || !Array.isArray(data)) return "unreadable";
-    return await assigneeRecipientsStrict(svc, orgId, data as AssigneeRow[], counting);
+    const rows = await readAllStrict<AssigneeRow>((from, to) =>
+      svc.from(target.table).select("*").eq(target.column, target.id).order("id").range(from, to)
+    );
+    if (rows === "unreadable" || rows === "no_room") return "unreadable";
+    return await assigneeRecipientsStrict(svc, orgId, rows, counting);
   } catch {
     return "unreadable";
   }

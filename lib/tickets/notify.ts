@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { sendMany, sendNotification } from "@/lib/notifications/send";
+import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, sendNotification, type MailOutcome } from "@/lib/notifications/send";
 import { openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { resolveOrgMembership } from "@/lib/auth/org-membership";
@@ -86,6 +86,12 @@ export async function notifyAdminsOfTicket(
  * The requester's mail about their ticket. Their address is read here, by
  * the strict reader, after the caller's save; a failed read of it, or of
  * their membership, mails nothing and records the skip.
+ *
+ * The outcome is for the administrator at the screen (ADR 0029 rule T4;
+ * the hand-over note of 2026-11-19, point 1): emailed or not, or nobody
+ * emailed because the recipient could not be read. A requester whose
+ * membership does not count is not mailed and not counted (rule 10). Null
+ * when the mail part itself failed.
  */
 export async function notifyRequesterOfTicket(
   svc: SupabaseClient,
@@ -100,28 +106,28 @@ export async function notifyRequesterOfTicket(
     headline: string;
     message: string | null;
   }
-): Promise<void> {
+): Promise<MailOutcome | null> {
   try {
     // Rule 10: a requester whose membership does not count gets no mail.
     const m = await resolveOrgMembership(svc, { id: args.orgId }, args.requester.id);
     if (m === "unreadable") {
       await recordRecipientsUnreadable("ticket-requester", args.orgId);
-      return;
+      return RECIPIENTS_UNREADABLE;
     }
-    if (m === "none") return;
+    if (m === "none") return mailCounts([]);
     const emails = await resolveEmailsStrict(svc, [args.requester.id]);
     if (emails === "unreadable") {
       await recordRecipientsUnreadable("ticket-requester", args.orgId);
-      return;
+      return RECIPIENTS_UNREADABLE;
     }
     const email = emails.get(args.requester.id);
-    if (!email) return;
+    if (!email) return mailCounts([], 1);
     const link = args.origin ? `${args.origin}/${args.orgSlug}/support` : "";
     const body =
       `**${args.headline}** on your ticket **${args.subject}**.` +
       (args.message ? `\n\n> ${args.message}` : "") +
       `\n\nOpen Help & Support to see the full thread.`;
-    await sendNotification({
+    const sent = await sendNotification({
       organizationId: args.orgId,
       event: "custom_broadcast",
       to: { user_id: args.requester.id, email },
@@ -132,7 +138,9 @@ export async function notifyRequesterOfTicket(
         buttons: link ? [{ label: "Open Help & Support", url: link }] : [],
       },
     });
+    return mailCounts([sent]);
   } catch (e) {
     console.error(JSON.stringify({ event: "ticket_mail_failed", site: "ticket-requester", org_id: args.orgId, error: e instanceof Error ? e.name : "unknown" }));
+    return null;
   }
 }

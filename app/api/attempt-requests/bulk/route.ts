@@ -17,6 +17,7 @@ import { readWithContextFilter, withoutPreviews, type ContextFilterState } from 
 import { bulkEligibility } from "@/lib/attempts/request-decision";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
+import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import {
   ADMIN_ROLES,
   expiryFromDays,
@@ -227,7 +228,9 @@ export async function POST(request: Request) {
   // Notify each granted learner. ADR 0030 rule 10: only those whose
   // membership counts, read once for all of them. A failed read of them or
   // of their addresses mails nobody and records the skip (ADR 0029); the
-  // grants stand either way. The mails share one run (rule T4).
+  // grants stand either way. The mails share one run (rule T4), and the
+  // answer says how many were emailed and not, or that nobody was because
+  // the recipients could not be read (`email`; absent when none was granted).
   const [emailMap, origin, counting] = grantedIds.length > 0
     ? await Promise.all([
         resolveEmailsStrict(s, grantedIds),
@@ -235,12 +238,15 @@ export async function POST(request: Request) {
         countingMemberIds(s, org.id as string),
       ])
     : [new Map<string, string>(), "", new Set<string>()] as const;
+  let email: MailOutcome | undefined;
   if (counting === "unreadable" || emailMap === "unreadable") {
     await recordRecipientsUnreadable("attempt-requests/bulk", org.id as string);
+    email = RECIPIENTS_UNREADABLE;
   } else if (grantedIds.some((uid) => counting.has(uid))) {
     const run = await openRun({ organizationId: org.id as string, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS }), db: s });
+    let mailed: MailCounts = mailCounts([]);
     for (const uid of grantedIds) {
-      await notifyLearnerOfDecision(s, {
+      const one = await notifyLearnerOfDecision(s, {
         orgId: org.id as string,
         orgName: (org.name as string) ?? "your org",
         orgSlug,
@@ -254,7 +260,11 @@ export async function POST(request: Request) {
         counting,
         run,
       });
+      mailed = addMailOutcome(mailed, one);
     }
+    email = mailed;
+  } else if (grantedIds.length > 0) {
+    email = mailCounts([]);
   }
 
   return NextResponse.json({
@@ -263,5 +273,6 @@ export async function POST(request: Request) {
     skipped: failedUserIds.length - grantedIds.length,
     skipped_live_retake: skippedLiveRetake,
     failed_total: failedUserIds.length,
+    ...(email ? { email } : {}),
   });
 }

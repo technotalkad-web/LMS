@@ -4,7 +4,9 @@
  * note of 2026-11-20, part 3), and a guard on the pages
  * that show a person's email. Reading one capped page of the whole project's
  * accounts leaves an org's members out once the project has more accounts, and
- * those pages then show the first 8 characters of a user id.
+ * those pages then show the first 8 characters of a user id. Also the house
+ * rule's strict readers for mail (readAllStrict and readByIdsStrict in
+ * lib/db/chunked.ts): whole sets or none, never a part.
  *
  * Run:  npx tsx tests/unit/resolve-emails.test.ts   (or npm run test:unit)
  */
@@ -12,6 +14,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { resolveEmails, resolveEmailsStrict } from "../../lib/users/emails";
+import { readAllStrict, readByIdsStrict } from "../../lib/db/chunked";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -113,6 +116,57 @@ async function main() {
   {
     const svc = { from: () => ({ select: () => ({ in: async () => ({ data: null, error: null }) }) }) } as unknown as SupabaseClient;
     eq("strict: an answer with no rows and no error is \"unreadable\" (no rows is []), never \"no address\"", await resolveEmailsStrict(svc, ["a"]), "unreadable");
+  }
+
+  // The house rule's strict readers (lib/db/chunked.ts; ADR 0029): a read
+  // that decides who is mailed is whole or not used. Pages of 1000 rows
+  // until a short one, `.in()` lists of 150 ids, never a part of a set.
+  {
+    /** A table of `total` rows; records each page asked for; page `failAt` (1-based) fails as `how`. */
+    const table = (total: number, failAt?: number, how: "error" | "throw" | "null" = "error") => {
+      const pages: Array<[number, number]> = [];
+      const page = async (from: number, to: number) => {
+        pages.push([from, to]);
+        if (failAt === pages.length) {
+          if (how === "throw") throw new Error("fetch failed");
+          return how === "null" ? { data: null, error: null } : { data: null, error: { code: "X1" } };
+        }
+        return { data: Array.from({ length: Math.max(0, Math.min(to + 1, total) - from) }, (_, i) => from + i), error: null };
+      };
+      return { pages, page };
+    };
+    {
+      const t = table(2500);
+      const rows = await readAllStrict<number>(t.page);
+      eq("readAllStrict: 2,500 rows read whole, in pages of 1000 until a short one", [Array.isArray(rows) ? rows.length : rows, t.pages], [2500, [[0, 999], [1000, 1999], [2000, 2999]]]);
+    }
+    {
+      const t = table(1000);
+      const rows = await readAllStrict<number>(t.page);
+      eq("…exactly 1000 rows: one more page is asked, and it is empty", [Array.isArray(rows) ? rows.length : rows, t.pages.length], [1000, 2]);
+    }
+    for (const how of ["error", "throw", "null"] as const) {
+      const t = table(2500, 2, how);
+      eq(`…a second page that ${how === "error" ? "fails" : how === "throw" ? "throws" : "answers neither rows nor an error"}: "unreadable", never the first page's rows`, await readAllStrict<number>(t.page), "unreadable");
+    }
+    {
+      const t = table(2500);
+      let room = 1;
+      const rows = await readAllStrict<number>(t.page, () => room-- > 0);
+      eq("…no room for the second page: \"no_room\", and that page is not read", [rows, t.pages.length], ["no_room", 1]);
+    }
+    {
+      const lists: number[] = [];
+      const rows = await readByIdsStrict<string>(["", "a", "a", ...ids], async (part) => {
+        lists.push(part.length);
+        return { data: part, error: null };
+      });
+      eq("readByIdsStrict: blanks and duplicates dropped, lists of at most 150 ids, every id read", [lists, Array.isArray(rows) ? rows.length : rows], [[150, 150, 101], 401]);
+      let asked = 0;
+      eq("…a failed list: \"unreadable\"", await readByIdsStrict<string>(ids, async (part) => (++asked === 2 ? { data: null, error: { code: "X1" } } : { data: part, error: null })), "unreadable");
+      let reads = 0;
+      eq("…no ids: no read, no rows", [await readByIdsStrict<string>([], async () => { reads++; return { data: [], error: null }; }), reads], [[], 0]);
+    }
   }
 
   // Pages that display a person's email must not read a capped list of accounts.
