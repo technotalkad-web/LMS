@@ -34,8 +34,11 @@
  *   - stage 2: the Settings test (a delivery reads healthy, a failure
  *     failing at once, rejected changes nothing, settings that are not
  *     complete attempt nothing, without 0114 it is sent and its state write
- *     skipped); the platform's call limit (call_limit, one fixed line, the
- *     rest left, nothing written); the run's group hooks (a claim taken for
+ *     skipped; a test the platform's call limit refused is no SMTP failure:
+ *     no state settled, no alert marked, no row, the fixed line, and the
+ *     Settings answer says call_limit); the platform's call limit
+ *     (call_limit, one fixed line, the rest left, nothing written); the
+ *     run's group hooks (a claim taken for
  *     each group just before its sends, a withdrawn mail not attempted, the
  *     state written with each group); a learner's request that mails the
  *     administrators, with their read or their addresses unreadable;
@@ -75,7 +78,7 @@ import {
   runReading,
   type SmtpStateSnapshot,
 } from "../../lib/notifications/smtp-state";
-import { sendMany, sendNotification, sendSettingsTest, type SendArgs } from "../../lib/notifications/send";
+import { runSettingsTest, sendMany, sendNotification, sendSettingsTest, type SendArgs } from "../../lib/notifications/send";
 import { CALL_LIMIT_LOG_EVENT, requestBudget } from "../../lib/notifications/smtp-state";
 import { notifyAdminsOfTicket } from "../../lib/tickets/notify";
 import { notifyAdminsOfRequest } from "../../lib/attempts/requests";
@@ -348,6 +351,26 @@ async function main() {
       run = await openRun({ organizationId: ORG });
       r = await sendSettingsTest(run, admin);
       eq("without 0114: the test is sent and shown, and its state write is skipped", [r.status, sends().length, stateWrites().length], ["sent", 1, 0]);
+      // The platform refused the outbound call itself (rule FP8): the test never
+      // reached the mail server, so it says nothing of the SMTP. Read as the
+      // run's attemptOne reads it, from a healthy organisation, so a flip or an
+      // alert mark would show.
+      const healthy = { organization_id: ORG, state: "healthy", state_changed_at: iso(H), failed_recipients: [], last_success_at: iso(H) };
+      freshWorld({ state: { ...healthy }, smtp: () => ({ ok: false, error: "Too many subrequests." }) });
+      run = await openRun({ organizationId: ORG, budget: requestBudget() });
+      const limited = await captureLogs(() => sendSettingsTest(run, admin));
+      eq("a test the platform's call limit refused: left and not attempted, never an SMTP class",
+        [limited.value.status, limited.value.errorClass, limited.value.attempted], ["failed", "left", false]);
+      eq("…no state settled (still healthy, nothing written), no alert marked, no row written",
+        [(world.state as Row | null)?.state, stateWrites().length, (world.state as Row | null)?.alert_due_at ?? null, logInserts().length], ["healthy", 0, null, 0]);
+      eq("…counted once as call_limit, with the one fixed log line",
+        [run.errors.call_limit, limited.lines.filter((l) => l.includes(CALL_LIMIT_LOG_EVENT)).length], [1, 1]);
+      freshWorld({ state: { ...healthy }, smtp: () => ({ ok: false, error: "Too many subrequests." }) });
+      const shown = await captureLogs(() => runSettingsTest({ organizationId: ORG, user: { id: admin.user_id, email: admin.email } }));
+      eq("…the Settings answer says so: not sent, not attempted, call_limit, and the reading is the one before the test",
+        [shown.value.status, shown.value.attempted, shown.value.errorClass, shown.value.reading, stateWrites().length], ["not_sent", false, "call_limit", "healthy", 0]);
+      const page = fs.readFileSync(path.join(__dirname, "..", "..", "app", "[org]", "(admin)", "settings", "settings-client.tsx"), "utf8");
+      eq("…and the Settings page has words for it", /call_limit:\s*"[^"]*limit on outbound calls[^"]*not tested/.test(page), true);
     }
 
     console.log("\nthe platform's call limit (rule FP8)");

@@ -4,7 +4,7 @@ import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
 import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
 import { isTenantEvent } from "./routing";
-import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, openRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, noteCallLimit, openRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
 import type { TenantReading } from "@/lib/ops/health-status";
 import type {
   NotificationEvent,
@@ -325,13 +325,19 @@ export const SETTINGS_TEST_LOG_EVENT = "smtp_test";
 
 const SETTINGS_TEST_SUBJECT = "Test message from your LMS";
 
+/** The text of a mail the platform's call limit left (the run's own words for it). */
+const CALL_LIMIT_LEFT_TEXT = "Left: the request met the platform's limit on outbound calls.";
+
 /**
  * The Settings test (ADR 0029 section C, step 11): one fixed message through
  * the organisation's own SMTP to the administrator who asked for it, waited
  * for at most SMTP_SEND_WAIT_MS, with its notification_log row. Its outcome
  * sets the state (settleSettingsTest): a delivered test reads healthy, a
  * failed one failing at once. Not attempted when the settings are not
- * complete, could not be read, or the daily limit is used up. Never throws.
+ * complete, could not be read, or the daily limit is used up. A send the
+ * platform's call limit refused (rule FP8) is no SMTP failure: it is left,
+ * with the fixed platform_call_limit line, no state settled, no alert marked
+ * and no row written. Never throws.
  */
 export async function sendSettingsTest(run: MailRun, to: { user_id: string; email: string }): Promise<SendResult> {
   const gate = gateSettingsTest(run);
@@ -372,19 +378,30 @@ export async function sendSettingsTest(run: MailRun, to: { user_id: string; emai
         },
         { timeoutMs: SMTP_SEND_WAIT_MS }
       );
-    } catch {
-      answer = { ok: false, error: "The send failed before it reached the mail server." };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e ?? "");
+      answer = { ok: false, error: isCallLimitMessage(message) ? message : "The send failed before it reached the mail server." };
     }
     if (answer.ok) {
       result = { status: "sent", attempted: true, to: to.email };
       await settleSettingsTest(run, { ok: true }, to.user_id);
+    } else if (isCallLimitMessage(answer.error)) {
+      // The platform refused the outbound call itself (rule FP8), as the
+      // run's attemptOne reads it: the test never reached the mail server, so
+      // it says nothing of the SMTP. No state is settled and no alert is
+      // marked; the fixed line is logged once.
+      noteCallLimit(run, "settings_test");
+      result = { status: "failed", error: CALL_LIMIT_LEFT_TEXT, errorClass: "left", attempted: false, to: to.email };
     } else {
       const cls = classifySmtpError(answer.error);
       result = { status: "failed", error: `tenant SMTP failed: ${answer.error ?? "unknown"}`, errorClass: cls, attempted: true, to: to.email };
       await settleSettingsTest(run, { ok: false, cls }, to.user_id);
     }
   }
-  // Its row: counted in the organisation's 24 hours when it was sent (rule FP4).
+  // Its row: counted in the organisation's 24 hours when it was sent (rule
+  // FP4). Not written once the request met the platform's call limit: the
+  // insert would be refused too, as the run writes nothing after it.
+  if (run.callLimited) return result;
   spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
   try {
     const { error } = await svc().from("notification_log").insert({
@@ -429,7 +446,10 @@ export async function runSettingsTest(args: { organizationId: string; user: { id
   if (!args.user.email) return { status: "not_sent", errorClass: "no_address", attempted: false, reading: runReading(run) };
   const r = await sendSettingsTest(run, { user_id: args.user.id, email: args.user.email });
   const status = r.status === "sent" ? "sent" : r.errorClass === "timeout" ? "not_confirmed" : "not_sent";
-  return { status, errorClass: r.status === "sent" ? null : r.errorClass ?? null, attempted: r.attempted === true, reading: runReading(run) };
+  // A test the platform's call limit stopped is named for what it is: the
+  // settings were not tested, and the reading is the one before the test.
+  const errorClass = r.status === "sent" ? null : run.callLimited ? "call_limit" : r.errorClass ?? null;
+  return { status, errorClass, attempted: r.attempted === true, reading: runReading(run) };
 }
 
 /**

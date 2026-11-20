@@ -106,6 +106,8 @@ const CLASS_WORDS: Record<string, string> = {
   daily_limit: "your organisation reached its daily email limit",
   settings_unreadable: "the settings could not be read; try again",
   no_address: "your account has no email address to send the test to",
+  call_limit: "the request reached the platform's limit on outbound calls before the test reached your mail server, so your settings were not tested; try again",
+  left: "the request ran out of room before the test could be sent; try again",
 };
 
 const READING_WORDS: Record<MailState["reading"], string> = {
