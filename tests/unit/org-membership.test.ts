@@ -1717,6 +1717,29 @@ async function main() {
               [[true, true], 163, 0, true]);
           }
           {
+            // ADR 0029, note of 2026-11-21, part 2 (c): a call that sends no
+            // alert has room for one full page, 500 due learners with 500
+            // different managers (1,000 profiles, seven lists of 150), and for
+            // its first group of sends. If it had not, the page would be left
+            // whole (a clean run that says "at least n"), and that comes back
+            // to the architect.
+            const learners = Array.from({ length: 500 }, (_, i) => `u-pg${String(i).padStart(3, "0")}`);
+            const managers = learners.map((u) => `${u}-mgr`);
+            mailWorld({
+              programs: [journeyProgram("p-live", LIVE)],
+              extraMembers: [
+                ...learners.map((u, i) => M(LIVE, u, "user", "active", { line_manager_id: managers[i] })),
+                ...managers.map((u) => M(LIVE, u, "user", "active")),
+              ],
+            });
+            mt.journey_enrollments = learners.map((u, i) => enrol(`e-pg${String(i).padStart(3, "0")}`, u, "p-live"));
+            const r = await nudge();
+            const lists = requests.filter((q) => q.table === "profiles").map((q) => (q.query.get("id") ?? "").replace(/^in\.\(|\)$/g, "").split(","));
+            eq("journey nudges, one full page with no alert due (500 due learners, 500 different managers): every profile read in seven lists, and the first group of nudges sent",
+              [r.status, r.body.ok, lists.length, new Set(lists.flat()).size, mailed("journey_nudge").length > 0, r.body.left_complete === false && Number(r.body.sent) === 0],
+              [200, true, 7, 1000, true, false]);
+          }
+          {
             // The house rule's other half: every read of the reminders is
             // paged at the server's 1000-row cap, so no set is cut there.
             const many = Array.from({ length: 1100 }, (_, i) => `u-st${String(i).padStart(4, "0")}`);
@@ -1744,6 +1767,79 @@ async function main() {
             const r3 = await remindRun();
             eq("reminders, 1,105 finished learners (attempts past the cap): every attempt is read in two pages, so nobody who finished is reminded",
               [r3.status, r3.body.due, mailed(), pages("course_attempts")], [200, 0, [], 2]);
+          }
+          {
+            // ADR 0029, note of 2026-11-21, part 2 (b): only finished rows are
+            // asked for, by the attempt row's own columns, beside the course
+            // filter on the embedded version; the route's own test stays.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            await remindRun();
+            const q = requests.find((x) => x.table === "course_attempts" && x.method === "GET")?.query;
+            eq("reminders: the finished attempts are asked for by completion_status or success_status, with the course filter, the order and the range kept",
+              [q?.get("or"), q?.get("course_versions.course_id")?.startsWith("in."), q?.get("order"), q?.has("offset") || q?.has("limit")],
+              ["(completion_status.eq.completed,success_status.eq.passed)", true, "id.asc", true]);
+          }
+          {
+            // ADR 0029, note of 2026-11-21, part 2 (a): a read before the sends
+            // that has no room to finish, and reminders due with no room to
+            // open any run, are the job's own failed step: 500, call_limit
+            // once, stopped before any send, nobody mailed, no state written,
+            // and one fixed line. The clock is the test's, so the call's 240
+            // seconds can end at a chosen read; the count ends one too.
+            const realNow = Date.now;
+            let clock = realNow();
+            /** Advance the call's clock past its 240 seconds when `table` is first read. */
+            const jumpAt = (table: string) => {
+              let done = false;
+              mFail = (t) => {
+                if (t === table && !done) { done = true; clock += 300_000; }
+                return false;
+              };
+            };
+            const noRoomLines = () => warned.map((l) => { try { return JSON.parse(l) as Row; } catch { return null; } }).filter((l): l is Row => l?.event === "cron_no_room");
+            const stopCase = async (label: string, setup: () => void, step: string, by: "clock" | "count", counts: Row = {}) => {
+              setup();
+              clock = realNow();
+              Date.now = () => clock;
+              let r: { status: number; body: Row };
+              try { r = await remindRun(); } finally { Date.now = realNow; }
+              const b = beat("reminders");
+              const errs = (b?.detail.errors ?? {}) as Row;
+              eq(`reminders, ${label}: 500, call_limit once, stopped before any send, nobody mailed, no state written`,
+                [r.status, r.body.ok, b?.status, errs.call_limit, Object.keys(errs), b?.detail.stopped_before_send, mailed(), stateFor()],
+                [500, false, "error", 1, ["call_limit"], true, [], []]);
+              const line = noRoomLines();
+              eq("…one fixed line: the job, the step's word, the calls spent, what ended it; numbers and fixed words only",
+                [line.length, line[0]?.job, line[0]?.step, typeof line[0]?.calls, line[0]?.ended_by, JSON.stringify(line[0] ?? {}).includes("@")], [1, "reminders", step, "number", by, false]);
+              eq("…the counts it knew are written, the others left out (never 0 for \"not known\")",
+                ["due", "sent", "failed", "left", "left_complete"].map((k) => (k in r.body ? r.body[k] : "absent")),
+                ["due", "sent", "failed", "left", "left_complete"].map((k) => (k in counts ? counts[k] : "absent")));
+            };
+            await stopCase("a paged read with no room left (the call's clock ends at the assignments)",
+              () => { mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] }); jumpAt("course_assignments"); }, "progress_read", "clock");
+            await stopCase("the groups' members with no room left (the clock ends at the groups)",
+              () => { mailWorld({ assignments: [ca("c-live", LIVE, "group", "g-live")] }); jumpAt("org_groups"); }, "members_read", "clock");
+            const many = Array.from({ length: 4300 }, (_, i) => `u-many${String(i).padStart(4, "0")}`);
+            await stopCase("the addresses with no room left (4,305 learners: 29 lists of 150 do not fit the count)",
+              () => mailWorld({ assignments: [ca("c-live", LIVE, "org")], extraMembers: many.map((u) => M(LIVE, u, "user", "active")) }), "profiles_read", "count");
+            await stopCase("reminders due and no room to open any run (the clock ends at the addresses)",
+              () => { mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act"), ca("c-live", LIVE, "user", "u-act2")] }); jumpAt("profiles"); },
+              "mail_status_read", "clock", { due: 2, sent: 0, failed: 0, left: 2, left_complete: false });
+          }
+          {
+            // Rule T5 stays clean: an organisation whose run was not opened
+            // once another organisation's mail had gone.
+            const live = Array.from({ length: 40 }, (_, i) => `u-lv${String(i).padStart(2, "0")}`);
+            const second = ["u-sec1", "u-sec2", "u-sec3"];
+            mailWorld({
+              reminderSettings: [reminderSetting("c-live", LIVE), reminderSetting("c-sec", SECOND)],
+              assignments: [ca("c-live", LIVE, "org"), ca("c-sec", SECOND, "org")],
+              extraMembers: [...live.map((u) => M(LIVE, u, "user", "active")), ...second.map((u) => M(SECOND, u, "user", "active"))],
+            });
+            const r = await remindRun();
+            eq("reminders: an organisation left after another's mail went is a clean run (200, ok, an ok heartbeat), counted in left_orgs",
+              [r.status, r.body.ok, Number(r.body.sent) > 0, Number(r.body.left_orgs) >= 1, mailed().some((u) => second.includes(u)), beat("reminders")?.status],
+              [200, true, true, true, false, "ok"]);
           }
           // The journey nudges: no slug, no id and no free text in the answer or the heartbeat.
           {

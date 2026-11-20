@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendMany } from "@/lib/notifications/send";
-import { CALL_SUM_LIMIT, MAIL_CALL_COSTS, cronBudget, hasRoom, openRun, spendCalls } from "@/lib/notifications/smtp-state";
+import { MAIL_CALL_COSTS, cronBudget, hasRoom, openRun, spendCalls } from "@/lib/notifications/smtp-state";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { buildMailCronDetail, owedAfterRun, type CronErrorCounts, type CronErrorWord } from "@/lib/ops/health-status";
@@ -54,9 +54,17 @@ import { chunk, readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
  *     migration 0114 are clean runs.
  *   - Every read before the sends follows the house rule (lib/db/chunked.ts):
  *     `.in()` lists of 150 ids and pages of 1000 rows, so no set is cut at
- *     the server's row cap. A set is used whole or not at all: a read the
- *     call has no room left to finish stops the run before any send, as the
- *     job's own failed step (call_limit).
+ *     the server's row cap. A set is used whole or not at all. Every read
+ *     before the sends asks for room first, keeping back the write that stops
+ *     reminders past their cap, one opening and one group of sends (the note
+ *     of 2026-11-21, part 2 (a)). This job reads its sets from the start at
+ *     every call, so a read it has no room to finish, or reminders due with
+ *     no room to open any run, is the job's own failed step: call_limit,
+ *     stopped before any send, with one fixed line (cron_no_room). An
+ *     organisation left once other mail went is left for the next call, a
+ *     clean run (rule T5).
+ *   - The finished attempts are asked for by the attempt row's own columns
+ *     (completed or passed), the same test the route makes on each row.
  *   - The answer and the heartbeat are built by buildMailCronDetail: counts
  *     and fixed words only, never an id, a name, an address or a database
  *     message. A failed run carries its last successful run (last_ok_at).
@@ -87,8 +95,21 @@ type Assignment = {
   source?: string | null;
 };
 
-/** A run's own reads before its sends, at most: the organisation's two member reads and the opening of its run. */
-const ORG_OPEN_CALLS = 2 + MAIL_CALL_COSTS.open;
+/**
+ * The first group of a run's sends (rule T4: the first send goes alone): its
+ * template, the send, the group's log insert, a state write, an alert mark,
+ * and the reminders' state written with the group.
+ */
+const FIRST_GROUP_CALLS =
+  MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark + 1;
+/** What a run needs to open and send its first group. */
+const RUN_ROOM = MAIL_CALL_COSTS.open + FIRST_GROUP_CALLS;
+/**
+ * What every read before the sends keeps back (ADR 0029, note of 2026-11-21,
+ * part 2 (a)): the write that stops reminders past their cap, one opening,
+ * and one group of sends.
+ */
+const SEND_RESERVE = 1 + RUN_ROOM;
 
 export async function POST(request: Request) {
   const expected = process.env.CRON_SECRET;
@@ -113,14 +134,27 @@ export async function POST(request: Request) {
   const fail = (word: CronErrorWord) => {
     errors[word] = (errors[word] ?? 0) + 1;
   };
-  /** One call for a page of a read before the sends, while the call still has room for it, an opening and a send. */
+  /** One call for a page of a read before the sends, while the call still keeps its reserve for the sends. */
   const pageRoom = () => {
-    if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.send + 3)) return false;
+    if (!hasRoom(budget, 1 + SEND_RESERVE)) return false;
     spendCalls(budget, 1);
     return true;
   };
-  /** A read that was not finished: its own word, or call_limit when the call had no room to read it whole. */
-  const readFailed = (answer: "unreadable" | "no_room", word: CronErrorWord) => fail(answer === "no_room" ? "call_limit" : word);
+  /**
+   * The call's own stop in a step that no later call can finish (ADR 0029,
+   * note of 2026-11-21, part 2 (a)): this job reads its sets whole, from the
+   * start, at every call, so a read it has no room to finish today it cannot
+   * finish tomorrow. The job's own failed step, call_limit, with one fixed
+   * line: the job, the step's word, the calls spent, and whether the count
+   * or the clock ended it. Numbers and fixed words only.
+   */
+  const noRoom = (step: CronErrorWord) => {
+    const endedBy = budget.now() - budget.startedAt >= budget.windowMs ? "clock" : "count";
+    console.warn(JSON.stringify({ event: "cron_no_room", job: "reminders", step, calls: budget.calls, ended_by: endedBy }));
+    fail("call_limit");
+  };
+  /** A read that was not finished: its own word, or the call's own stop when it had no room to read it whole. */
+  const readFailed = (answer: "unreadable" | "no_room", word: CronErrorWord) => (answer === "no_room" ? noRoom(word) : fail(word));
   let unreadableOrgs = 0;
   let scanned = 0;
   let skipped = 0;
@@ -180,7 +214,7 @@ export async function POST(request: Request) {
   const countingByOrg = new Map<string, ReadonlySet<string>>();
   let leftOrgs = 0;
   for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
-    if (!hasRoom(budget, ORG_OPEN_CALLS + MAIL_CALL_COSTS.send + 3)) {
+    if (!hasRoom(budget, 2 + SEND_RESERVE)) {
       leftOrgs++;
       continue;
     }
@@ -270,7 +304,7 @@ export async function POST(request: Request) {
     const groupRows: Array<{ id: string; organization_id: string }> = [];
     for (const ids of chunk(groupIds, 150)) {
       if (!pageRoom()) {
-        fail("call_limit");
+        noRoom("members_read");
         return finish({ stoppedBeforeSend: true, leftOrgs });
       }
       const { data, error: groupErr } = await svc.from("org_groups").select("id, organization_id").in("id", ids);
@@ -282,6 +316,12 @@ export async function POST(request: Request) {
       groupRows.push(...(data as Array<{ id: string; organization_id: string }>));
     }
     for (const g of groupRows) {
+      // Each group's members are two calls: asked for first, as every read
+      // before the sends is.
+      if (!hasRoom(budget, 2 + SEND_RESERVE)) {
+        noRoom("members_read");
+        return finish({ stoppedBeforeSend: true, leftOrgs });
+      }
       spendCalls(budget, 2);
       const ids = await resolveManyGroupsStrict(svc, g.organization_id, [g.id]);
       if (ids === "unreadable") {
@@ -301,6 +341,9 @@ export async function POST(request: Request) {
   // is a no-op and scans all attempts). A failed read stops the run: an empty
   // completed-set would re-nudge learners who have already finished. Read
   // in pages: a set cut at the row cap would remind finished learners too.
+  // Only finished rows are asked for, by the attempt row's own columns (ADR
+  // 0029, note of 2026-11-21, part 2 (b)): the same test the loop below makes
+  // on each row, which it still makes; fewer pages are read.
   const completedAttempts = await readByIdsStrict<unknown>(
     courseIds,
     (ids, from, to) =>
@@ -310,6 +353,7 @@ export async function POST(request: Request) {
           "user_id, course_versions!inner(course_id), completion_status, success_status"
         )
         .in("course_versions.course_id", ids)
+        .or("completion_status.eq.completed,success_status.eq.passed")
         .order("id")
         .range(from, to),
     pageRoom
@@ -400,7 +444,13 @@ export async function POST(request: Request) {
       for (const uid of orgUserIds.get(a.organization_id) ?? []) add(uid);
     }
   }
-  spendCalls(budget, Math.ceil(allUserIds.size / 150));
+  // One call for each list of 150 addresses, asked for first.
+  const addressCalls = Math.ceil(allUserIds.size / 150);
+  if (!hasRoom(budget, addressCalls + SEND_RESERVE)) {
+    noRoom("profiles_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
+  spendCalls(budget, addressCalls);
   const emailById = await resolveEmailsStrict(svc, allUserIds);
   if (emailById === "unreadable") {
     fail("profiles_read");
@@ -551,14 +601,16 @@ export async function POST(request: Request) {
   let notStarted = 0;
   let leftDailyLimit = 0;
   let no0114 = false;
+  let runsOpened = 0;
   const nowIso = new Date(now).toISOString();
   for (const [orgId, orgJobs] of byOrg) {
-    if (!hasRoom(budget, MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.send + 3) || budget.calls + MAIL_CALL_COSTS.open >= CALL_SUM_LIMIT) {
+    if (!hasRoom(budget, RUN_ROOM)) {
       // No room to open this organisation's run: its reminders are left.
       notStarted += orgJobs.length;
       leftOrgs++;
       continue;
     }
+    runsOpened++;
     const run = await openRun({ organizationId: orgId, budget, db: svc });
     if (run.no0114) no0114 = true;
     const results = await sendMany(
@@ -616,6 +668,25 @@ export async function POST(request: Request) {
     }
   }
   skipped += failedSends + notStarted;
+
+  // Reminders were due and the call had no room to open any organisation's
+  // run: the next call reads the same sets and arrives at the same place, so
+  // this is the job's own failed step (note of 2026-11-21, part 2 (a)), with
+  // its counts. An organisation left once other mail had gone stays clean
+  // (rule T5).
+  if (jobs.length > 0 && runsOpened === 0) {
+    noRoom("mail_status_read");
+    return finish({
+      stoppedBeforeSend: true,
+      due: jobs.length,
+      sent: 0,
+      failed: 0,
+      left: notStarted,
+      leftComplete: false,
+      leftDailyLimit: 0,
+      leftOrgs,
+    });
+  }
 
   return finish({
     stoppedBeforeSend: false,

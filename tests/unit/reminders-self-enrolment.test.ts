@@ -97,7 +97,6 @@ async function main() {
   process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE;
   process.env.SUPABASE_SERVICE_ROLE_KEY = SERVICE;
   process.env.CRON_SECRET = SECRET;
-  delete process.env.RESEND_API_KEY;
   const realFetch = globalThis.fetch;
   globalThis.fetch = stub as typeof fetch;
   try {
@@ -141,9 +140,9 @@ async function main() {
       const r = await run([user("u-adm", "admin")]);
       // ADR 0029: both are read in pages of 1000 rows in a stable order (the
       // house rule, lib/db/chunked.ts), so neither set is cut at the server's cap.
-      eq("course_assignments is read with select=* (names no 0107 column), and course_attempts unchanged but for its pages", r.reads, [
+      eq("course_assignments is read with select=* (names no 0107 column), and course_attempts unchanged but for its pages and its finished-rows filter (ADR 0029, note of 2026-11-21, part 2 (b))", r.reads, [
         `course_assignments ?select=*&course_id=in.(${COURSE})&order=id.asc&offset=0&limit=1000`,
-        `course_attempts ?select=user_id,course_versions!inner(course_id),completion_status,success_status&course_versions.course_id=in.(${COURSE})&order=id.asc&offset=0&limit=1000`,
+        `course_attempts ?select=user_id,course_versions!inner(course_id),completion_status,success_status&course_versions.course_id=in.(${COURSE})&or=(completion_status.eq.completed,success_status.eq.passed)&order=id.asc&offset=0&limit=1000`,
       ]);
     }
   } finally {
