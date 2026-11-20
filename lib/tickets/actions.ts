@@ -3,6 +3,7 @@ import { grantExtraAttempts } from "@/lib/attempts/grant";
 import { assignCourseDirect } from "@/lib/assignments/direct";
 import { isActionError, type ActionError, type PerLearnerResult } from "@/lib/actions/types";
 import { notifyRequesterOfTicket } from "./notify";
+import type { MailOutcome } from "@/lib/notifications/send";
 import { OUTCOME_LABEL, type TicketOutcome } from "./types";
 import type { TicketRow } from "./auth";
 
@@ -26,7 +27,7 @@ export async function actOnTicket(
     dueAt?: string | null;
     expiresInDays?: number | null;
   }
-): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[] }> {
+): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null }> {
   const { ticket } = args;
   const note = args.note?.trim() || null;
   // The context was verified when the ticket was raised; people may have left
@@ -51,6 +52,8 @@ export async function actOnTicket(
   let outcome: TicketOutcome;
   let summary: string;
   let results: PerLearnerResult[] = [];
+  // The assignment mail's outcome (ADR 0029 rule T4), for the administrator at the screen.
+  let email: MailOutcome | null | undefined;
 
   const wordsFor = (rs: PerLearnerResult[], done: PerLearnerResult["status"], verb: string) => {
     const ok = rs.filter((r) => r.status === done || (done === "assigned" && r.status === "already" && /updated/.test(r.reason ?? ""))).length;
@@ -82,6 +85,7 @@ export async function actOnTicket(
     });
     if (isActionError(r)) return r;
     results = r.results;
+    email = r.email;
     if (args.action === "extend_due") {
       const n = results.filter((x) => x.status === "assigned" || (x.status === "already" && /updated/.test(x.reason ?? ""))).length;
       if (n === 0) return { error: "The due date could not be updated for anyone", status: 409 };
@@ -119,5 +123,5 @@ export async function actOnTicket(
     requester: { id: ticket.user_id },
     subject: ticket.subject, headline: OUTCOME_LABEL[outcome], message: adminNote,
   });
-  return { outcome, summary, results };
+  return { outcome, summary, results, ...(email !== undefined ? { email } : {}) };
 }

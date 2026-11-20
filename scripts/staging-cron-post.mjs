@@ -6,9 +6,9 @@
 //
 // RUN BY HAND, STAGING ONLY. .github/workflows/cron.yml posts only to
 // production, with production's secret, so nothing in it can be run against
-// staging. This script posts one cron route of the staging app again and
-// again until the answer says nothing is left, a call sends nothing more, or
-// 4 minutes have passed.
+// staging. This script repeats a POST to one cron route of the staging app
+// and stops at the first of: an answer with nothing left, a call that sent
+// nothing more, or a 4-minute limit.
 //
 // It refuses every address but staging's two apps: the staging Worker
 // (my-lms.mentora.workers.dev) and the Cloud Run staging service

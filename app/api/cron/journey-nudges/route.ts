@@ -647,7 +647,11 @@ async function run() {
               },
             }));
             const marked = escalations.filter((_, k) => results[k].attempted).map((x) => x.enrolment);
-            if (marked.length > 0 && hasRoom(budget, 1)) {
+            if (marked.length > 0 && !hasRoom(budget, 1)) {
+              // No room left for the mark: as for a failed write, the
+              // escalation can go again next hour, and the run says so.
+              fail("state_write");
+            } else if (marked.length > 0) {
               spendCalls(budget, 1);
               const mark = svc.from("journey_enrollments").update({ last_nudged_at: new Date().toISOString() });
               const { error: markErr } = await (marked.length === 1 ? mark.eq("id", marked[0]) : mark.in("id", marked));
