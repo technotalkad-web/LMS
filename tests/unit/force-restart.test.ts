@@ -223,6 +223,8 @@ const runArgs = () => ({
       notifyCalls.push({ userId: a.learner.id, approved: a.approved, note: a.note, expiresAt: a.expiresAt, email: a.learner.email });
     },
     emails: async (_svc: unknown, uids: Iterable<string>) => new Map([...uids].map((u) => [u, `${u}@example.test`] as [string, string])),
+    // ADR 0029: the skip helper, injected; it writes today's log line.
+    skipped: async (site: string, orgId: string | null) => { console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site, org_id: orgId })); },
   },
 });
 const ZERO_REGRANT = { reissued: 0, reissue_failed: 0, reissue_pending: 0, revision_closed: 0 };
@@ -941,7 +943,9 @@ function library() {
   const at = src.indexOf("if (err instanceof PublishedButRestartFailedError) {");
   const own = at === -1 ? -1 : src.indexOf("setError(err instanceof Error", at);
   const block = own === -1 ? "" : src.slice(at, own);
-  eq("doUpload: the published-but-failed catch hands err.restart to onReplaced and returns before the dialog's own setError", /onReplaced\(\{ restart: err\.restart \}\);\s*return;\s*\}\s*$/.test(block), true);
+  // ADR 0029 rule T4: the re-issue mails' outcome travels beside the restart.
+  eq("doUpload: the published-but-failed catch hands err.restart (and the re-issue mails' outcome) to onReplaced and returns before the dialog's own setError",
+    /onReplaced\(\{ restart: err\.restart, reissueEmail: err\.result\.reissueEmail \}\);\s*return;\s*\}\s*$/.test(block), true);
   const h = src.indexOf("onReplaced={(outcome) => {");
   const handler = h === -1 ? "" : src.slice(h, src.indexOf("/>", h));
   const refresh = handler.indexOf("router.refresh();");
@@ -951,7 +955,8 @@ function library() {
   eq("onReplaced: refreshes before choosing a banner", refresh !== -1 && refresh < grand, true);
   eq("onReplaced: grandfather clears both banners", /setError\(null\);[\s\S]*setNotice\(null\);/.test(handler.slice(grand, failed)), true);
   eq("onReplaced: failed → the red error banner with the restart message", handler.slice(failed, okBranch).includes("setError(r.message);"), true);
-  eq("onReplaced: ok → the replace-result notice", handler.slice(okBranch).includes("setNotice(`Replaced. ${r.message}`);"), true);
+  eq("onReplaced: ok → the replace-result notice (with the re-issue mails' words after it)", handler.slice(okBranch).includes("setNotice(`Replaced. ${r.message}${mail}`);"), true);
+  eq("onReplaced: the mail's words come from the shared mailOutcomeWords", handler.includes("const words = mailOutcomeWords(outcome.reissueEmail);"), true);
   eq("the notice renders as data-testid=replace-result", src.includes('data-testid="replace-result"'), true);
 }
 
@@ -1375,12 +1380,20 @@ async function regrant() {
     eq("…and no runtime Supabase import (types only)", /^import \{[^}]*\} from "@supabase\/supabase-js";$/m.test(src) && /^import type \{ SupabaseClient \} from "@supabase\/supabase-js";$/m.test(src), false);
     eq("…the expiry is DEFAULT_GRANT_EXPIRY_DAYS from lib/attempts/constants", /import \{ DEFAULT_GRANT_EXPIRY_DAYS \} from "@\/lib\/attempts\/constants";/.test(src), true);
     const mp = fs.readFileSync(path.join(root, "app/api/courses/[courseId]/packages/[packageId]/versions/route.ts"), "utf8");
-    eq("multipart route: org id/name/slug, course id/title, the admin, the origin, the version number, the notifier",
+    eq("multipart route: org id/name/slug, course id/title, the admin, the origin, the version number, the notifier (the strict address reader and the skip helper, ADR 0029)",
       /resolveOrgMembership<\{ id: string; name: string; slug: string \}>\([^)]*"id, name, slug"\s*\)/.test(mp) && /\.select\("id, title"\)/.test(mp) &&
         /forceRestartOlderVersions\(svc, \{\s*packageId,\s*newVersionId: result\.versionId,\s*versionNumber: result\.versionNumber,\s*admin: \{ id: caller\.id \},/.test(mp) &&
-        /origin: await originFromRequest\(\),/.test(mp) && /notify: \{ decision: notifyLearnerOfDecision, emails: resolveEmails \},/.test(mp), true);
+        /origin: await originFromRequest\(\),/.test(mp) && /const reissue = reissueNotifier\(\);/.test(mp) && /notify: reissue\.notify,/.test(mp), true);
     const fin = fs.readFileSync(path.join(root, "app/api/courses/upload/finalize/route.ts"), "utf8");
-    eq("finalize route: passes the origin and the notifier", /origin: await originFromRequest\(\),/.test(fin) && /notify: \{ decision: notifyLearnerOfDecision, emails: resolveEmails \},/.test(fin), true);
+    eq("finalize route: passes the origin and the notifier (the strict address reader and the skip helper, ADR 0029)",
+      /origin: await originFromRequest\(\),/.test(fin) && /const reissue = reissueNotifier\(\);/.test(fin) && /notify: reissue\.notify,/.test(fin), true);
+    // ADR 0029 rule T4: the routes' notifier is reissueNotifier, which keeps
+    // the re-issue mails' outcome for the answer; it is built on the learner
+    // notifier, the strict address reader and the skip helper.
+    const rq = fs.readFileSync(path.join(root, "lib/attempts/requests.ts"), "utf8").replace(/\r\n/g, "\n");
+    const notifier = rq.slice(rq.indexOf("export function reissueNotifier("));
+    eq("reissueNotifier: the decision is notifyLearnerOfDecision, the addresses resolveEmailsStrict, a skip recordRecipientsUnreadable",
+      [/await notifyLearnerOfDecision\(svc, args\)/.test(notifier), /emails: resolveEmailsStrict,/.test(notifier), /await recordRecipientsUnreadable\(site, organizationId\)/.test(notifier)], [true, true, true]);
     const du = fs.readFileSync(path.join(root, "lib/courses/direct-upload.ts"), "utf8");
     eq("finalizeDirectUpload: the version number, the admin, the org, the course title",
       /versionNumber: version\.version_number,\s*admin: \{ id: args\.userId \},\s*org,\s*origin: args\.origin,\s*course: \{ id: course\.id, title: course\.title \?\? "this course" \},\s*notify: args\.notify,/.test(du) &&

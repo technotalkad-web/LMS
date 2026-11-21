@@ -109,6 +109,8 @@ let orgDeleted = false;
 let zeroRows = false;
 /** A table whose reads fail (the caller's own role read excepted). */
 let failRead: string | null = null;
+/** A table whose reads fail on the service key only (the caller's own session reads it as usual). */
+let failServiceRead: string | null = null;
 /** The caller's own role read fails. */
 let failRole = false;
 /** After a 0-row assignment delete, the row is gone (another delete crossed it) or its read fails. */
@@ -254,6 +256,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   // The caller's own membership read (lib/auth/org-membership.ts): role and status.
   const ownRead = select === "role,status";
   if (failRead && p === `/rest/v1/${failRead}` && !ownRead) return readFailure();
+  if (failServiceRead && !session && p === `/rest/v1/${failServiceRead}`) return readFailure();
   if (failRole && p === "/rest/v1/organization_members" && ownRead) return readFailure();
   if (deletedAway && (p === "/rest/v1/course_assignments" || p === "/rest/v1/learning_path_assignments")) {
     return deletedAway === "fails" ? readFailure() : list([]);
@@ -302,7 +305,6 @@ async function main() {
   process.env.CF_API_TOKEN = "stub-cf-token";
   process.env.CF_ZONE_ID = "zone1";
   process.env.CF_SAAS_CNAME_TARGET = "saas.example.test";
-  delete process.env.RESEND_API_KEY;
   delete process.env.SEND_SMTP_URL;
   const realFetch = globalThis.fetch;
   const realWarn = console.warn;
@@ -348,7 +350,7 @@ async function main() {
     const world = (o: {
       role?: string | null; otherRole?: string | null; signedIn?: boolean; zeroRows?: boolean; failRead?: string;
       failRole?: boolean; afterDelete?: "gone" | "fails"; orgUpdate?: "error" | "lost-reply" | "lost-reply-unreadable";
-      status?: string; orgDeleted?: boolean;
+      status?: string; orgDeleted?: boolean; failServiceRead?: string;
     }) => {
       requests = [];
       role = o.role === undefined ? "user" : o.role;
@@ -358,6 +360,7 @@ async function main() {
       signedIn = o.signedIn ?? true;
       zeroRows = o.zeroRows ?? false;
       failRead = o.failRead ?? null;
+      failServiceRead = o.failServiceRead ?? null;
       failRole = o.failRole ?? false;
       afterDelete = o.afterDelete ?? null;
       deletedAway = null;
@@ -582,9 +585,9 @@ async function main() {
 
     console.log("\n(l) ADR 0030 rule 10: the notification pass mails only members that count");
     {
-      /** Who the sender logged a mail for (each send writes one notification_log row). */
+      /** Who the sender logged a mail for (one insert holds one row, or a group's rows: ADR 0029). */
       const mailed = () => requests.filter((r) => r.path === "/rest/v1/notification_log" && r.method === "POST")
-        .map((r) => String((r.body as Row).to_user_id)).sort();
+        .flatMap((r) => (Array.isArray(r.body) ? (r.body as Row[]) : [r.body as Row])).map((b) => String(b.to_user_id)).sort();
       /** The sender's first read: zero means it was never entered. */
       const senderEntered = () => requests.some((r) => r.path === "/rest/v1/notification_settings");
       /** The one read of the members that count (countingMemberIds). */
@@ -638,6 +641,47 @@ async function main() {
         const out = await call(c, { role: "admin", failRead: "organization_members" });
         eq(`${c.name}, the members that count cannot be read: the change stands (200), nothing is sent, the sender is not entered`,
           [out.status, mailed(), senderEntered()], [200, [], false]);
+      }
+      // ADR 0029 (note of 2026-11-19, point 7; part 3 of the note of
+      // 2026-11-20): a failed read of the recipients, or of their addresses,
+      // is never "nobody" and never "no address". The save stands, no run
+      // opens, the skip is recorded once, and the answer says so.
+      const skips = () => requests.filter((r) => r.path === "/rest/v1/ops_heartbeats" && r.method === "POST")
+        .map((r) => [(r.body as Row).name, (r.body as Row).last_status, JSON.stringify((r.body as Row).last_detail)]);
+      for (const c of [CALLS[4], CALLS[5], CALLS[7]]) {
+        for (const table of ["organization_members", "profiles"]) {
+          const out = await call(c, { role: "admin", failRead: table });
+          const site = c === CALLS[4] ? "assignments/[id]" : c === CALLS[5] ? "learning-path-assignments/[id]" : "learning-paths/[id]/courses";
+          eq(`${c.name}, ${table === "profiles" ? "the addresses" : "the members that count"} cannot be read: 200, nobody emailed, no run opened, the skip recorded once with its fixed word, and the answer says the recipients were unreadable`,
+            [out.status, mailed(), senderEntered(), requests.some((r) => r.path === "/rest/v1/rpc/tenant_mail_status"), skips(), (out.body.email as Row | null)?.recipients_unreadable],
+            [200, [], false, false, [["mail-recipients-unreadable", "error", JSON.stringify({ site })]], true]);
+        }
+      }
+      {
+        world({ role: "admin", failRead: "team_members" });
+        const res = await assignment.DELETE(del("/api/assignments/a2"), params("a2"));
+        const body = (await res.json()) as Row;
+        eq("DELETE /api/assignments/{id}, a team row whose members cannot be read: 200, nobody emailed, the skip recorded, the answer says so",
+          [res.status, mailed(), senderEntered(), skips().length, (body.email as Row | null)?.recipients_unreadable], [200, [], false, 1, true]);
+      }
+      {
+        // The path's read in the mail part (on the service key) gives the
+        // organisation whose members and rows decide who is mailed. The
+        // route read the path on the session just before, so a failed read
+        // here is never "nobody to mail" (note of 2026-11-20, part 3).
+        const out = await call(CALLS[7], { role: "admin", failServiceRead: "learning_paths" });
+        eq("POST /api/learning-paths/{id}/courses (notify_update), the path's read for the mail fails: 200, the step added, nobody emailed, no run opened, the skip recorded once, and the answer says so",
+          [out.status, sessionWrites("learning_path_courses", "POST").length, mailed(), senderEntered(), skips(), (out.body.email as Row | null)?.recipients_unreadable],
+          [200, 1, [], false, [["mail-recipients-unreadable", "error", JSON.stringify({ site: "learning-paths/[id]/courses" })]], true]);
+      }
+      {
+        const out = await call(CALLS[4], { role: "admin" });
+        const e = (out.body.email ?? {}) as Row;
+        eq("…the control: with every read answered, the answer counts everyone it mailed, emailed or not, and records no skip",
+          [out.status, e.recipients_unreadable, Number(e.emailed) + Number(e.not_emailed) + Number(e.not_confirmed), skips()], [200, false, ACTIVE.length, []]);
+        const healthy = requests.length;
+        await call(CALLS[4], { role: "admin", failRead: "profiles" });
+        eq("…a skipped request costs fewer calls than the same request's healthy run (one write more, no run)", requests.length < healthy, true);
       }
     }
 

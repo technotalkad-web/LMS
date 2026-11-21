@@ -8,6 +8,8 @@ import { SettingsClient } from "./settings-client";
 import { serviceProviderDetails } from "@/lib/supabase/sso-admin";
 import { maskedConfig } from "@/lib/lrs/config";
 import { normalizeBackground, type DashboardBackground } from "@/lib/theme/dashboard-background";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { readTenantMailStatus, readingOf, tenantDailyLimit } from "@/lib/notifications/smtp-state";
 
 export const dynamic = "force-dynamic";
 
@@ -167,6 +169,31 @@ export default async function SettingsPage({
       (smtpRow?.event_paused as Record<string, boolean> | null) ?? {},
   };
 
+  // The SMTP tab's reading (ADR 0029 section C): the state row and the
+  // 24-hour count in one call (tenant_mail_status). Without migration 0114,
+  // or when the call fails, the tab says the state is not known.
+  const status = await readTenantMailStatus(
+    createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } }),
+    org.id
+  );
+  const settingsComplete = !!(settings.smtp_host && smtpRow?.smtp_port && settings.from_email);
+  const mailState =
+    status.kind === "ok"
+      ? (() => {
+          const limit = tenantDailyLimit(status.row.daily_limit);
+          return {
+            known: true as const,
+            reading: readingOf({ settingsComplete, deleted: false, state: status.row.state }),
+            since: status.row.state_changed_at,
+            lastErrorClass: status.row.last_error_code,
+            lastSuccessAt: status.row.last_success_at,
+            sent24h: status.row.sent_24h,
+            limit: limit.limit,
+            routineStop: limit.routineStop,
+          };
+        })()
+      : { known: false as const, reading: readingOf({ settingsComplete, deleted: false, state: null }) };
+
   return (
     <div className="max-w-5xl">
       <header className="mb-6 sm:mb-8">
@@ -181,6 +208,7 @@ export default async function SettingsPage({
       <SettingsClient
         orgSlug={orgSlug}
         settings={settings}
+        mailState={mailState}
         templates={templates}
         orgName={org.name}
         workspace={workspace}

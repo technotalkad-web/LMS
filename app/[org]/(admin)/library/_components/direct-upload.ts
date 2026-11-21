@@ -4,6 +4,7 @@ import JSZip from "jszip";
 import type { ValidationResult } from "./validation-gate";
 // Type only: the force-restart module never enters the client bundle.
 import type { ForceRestartOutcome } from "@/lib/attempts/force-restart";
+import type { MailOutcomeAnswer } from "@/lib/actions/types";
 
 /**
  * Browser side of the direct-to-storage upload:
@@ -185,6 +186,10 @@ export type DirectUploadResult = {
   fileCount: number;
   /** Replace with mode force_restart only: the reset, reported apart from the publish (ADR 0011). */
   restart?: ForceRestartOutcome;
+  /** The "new version" email to assigned learners, when it was asked for and the course had a version before (ADR 0029 rule T4). */
+  updateEmail?: MailOutcomeAnswer;
+  /** Force restart only: the emails of the re-issued grants, beside `restart` (ADR 0029 rule T4). */
+  reissueEmail?: MailOutcomeAnswer;
 };
 
 /**

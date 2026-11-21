@@ -14,11 +14,17 @@
  *     another still sends, and alerts and welcomes are outside it; the
  *     ceiling (default 375, a deployment setting) refuses everything except
  *     a platform owner's own code, link and test;
- *   - the welcome goes to each of the add-admin route's three roles;
+ *   - the welcome goes to each of the add-admin route's three roles, with
+ *     its setup link and never a password (ADR 0029, rules N4 and N5);
  *   - a trailing line break in the stored password is not sent;
  *   - the error classes, read from send-smtp's free text, with a recipient's
- *     refusal and a sender's failure kept apart; the 8 s wait and
- *     its fixed message; without a timeout the request is today's;
+ *     refusal and a sender's failure kept apart; the 15 s wait (rule T1, the
+ *     one value of both systems) and its fixed message; without a timeout
+ *     the request is today's;
+ *   - the allow-list's exact addresses (ADR 0029, note of 2026-11-20, part
+ *     1): an address entry allows that address only, a domain entry its
+ *     domain, "*" everything; a malformed entry matches nothing, and a list
+ *     of only malformed entries reads as unset;
  *   - no secret value and no address in any log line or row.
  *
  * Under a stubbed fetch: PostgREST's platform_email_log (reads, counts,
@@ -38,7 +44,8 @@ import {
   type PlatformSendRequest,
   type PlatformEvent,
 } from "../../lib/email/platform-sender";
-import { classifySmtpError, dispatchSmtp, dispatchTimeoutMessage } from "../../lib/email/smtp-function";
+import { PLATFORM_SEND_TIMEOUT_MS } from "../../lib/email/platform-sender";
+import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, dispatchTimeoutMessage } from "../../lib/email/smtp-function";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -74,8 +81,10 @@ const code = (to: typeof OWNER, organizationId: string | null): PlatformSendRequ
 const link = (to: typeof OWNER, organizationId: string | null): PlatformSendRequest<"platform_sign_in_link"> =>
   ({ event: "platform_sign_in_link", to, organizationId, content: { link: LINK, minutes: 60 } });
 const test = (): PlatformSendRequest<"platform_test"> => ({ event: "platform_test", to: OWNER, organizationId: null, content: {} });
+/** A setup link in the form the server issues: the token alone in the fragment. */
+const SETUP_LINK = `https://lms.stub/auth/set-password#t=${"S".repeat(43)}`;
 const welcome = (to: typeof OWNER, organizationId: string, role: "super_owner" | "admin" | "data_analyst" = "admin"): PlatformSendRequest<"platform_admin_welcome"> =>
-  ({ event: "platform_admin_welcome", to, organizationId, content: { organizationName: "Tenant A", signInUrl: "https://lms.stub/tenant-a/login", role } });
+  ({ event: "platform_admin_welcome", to, organizationId, content: { organizationName: "Tenant A", signInUrl: "https://lms.stub/tenant-a/login", role, setupLink: SETUP_LINK, days: 7 } });
 const alert = (to: typeof OWNER, organizationId: string): PlatformSendRequest<"tenant_smtp_alert"> =>
   ({ event: "tenant_smtp_alert", to, organizationId, content: { organizationName: "Tenant A", settingsUrl: "https://lms.stub/tenant-a/settings", reading: "failing", errorClass: "auth" } });
 
@@ -198,7 +207,7 @@ async function main() {
       const p = JSON.parse(sends()[0].body) as Record<string, unknown>;
       eq("the payload carries the platform's settings and the fixed text", [p.host, p.port, p.secure, p.user, p.from, p.to, p.subject], ["smtp.platform.stub", 465, true, SMTP_USER, FROM, ADMIN_A.email, "Your LMS password reset code"]);
       eq("…no Reply-To unless set", "replyTo" in p && p.replyTo !== undefined, false);
-      eq("…the request is bounded by a signal (the 8 s wait)", sends()[0].init?.signal instanceof AbortSignal, true);
+      eq("…the request is bounded by a signal (the 15 s wait)", sends()[0].init?.signal instanceof AbortSignal, true);
       eq("the row: the event, the organisation, the user id, sent; no address, no content", rows.map((x) => [x.event_type, x.organization_id, x.to_user_id, x.status, x.error_code, x.error_detail]), [["platform_reset_code", ORG_A, ADMIN_A.userId, "sent", null, null]]);
       eq("the insert names only the log's columns", Object.keys(JSON.parse(inserts()[0].body)).sort(), ["error_code", "error_detail", "event_type", "organization_id", "status", "to_user_id"]);
       fresh();
@@ -245,6 +254,54 @@ async function main() {
       eq("…an unlisted one is suppressed", (await send(welcome({ ...ADMIN_A, email: "a@elsewhere.stub" }, ORG_A), list)).errorCode, "not_allowed");
       eq("…an address that is not one plain address is suppressed", (await send(welcome({ ...ADMIN_A, email: "a@b.stub, c@d.stub" }, ORG_A), list)).errorCode, "not_allowed");
       eq("only the two listed sends were dispatched", sends().length, 2);
+    }
+
+    console.log("\nthe allow-list takes exact addresses (note of 2026-11-20, part 1)");
+    {
+      const LISTED = "listed.person@tenant-a.stub";
+      const as = (email: string) => ({ ...ADMIN_A, email });
+      const send1 = async (email: string, list: string) => {
+        fresh();
+        const r = await send(welcome(as(email), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: list });
+        return [short(r), sends().length, rows.length];
+      };
+      eq("an address entry lets that address through", await send1(LISTED, LISTED), [["sent", null, true], 1, 1]);
+      eq("…whatever the letter case of the recipient", await send1("Listed.Person@TENANT-A.stub", LISTED), [["sent", null, true], 1, 1]);
+      eq("…whatever the letter case of the entry, with spaces and commas around it", await send1(LISTED, "  , LISTED.Person@Tenant-A.STUB ,  "), [["sent", null, true], 1, 1]);
+      eq("…and with spaces around the recipient's address", await send1(`  ${LISTED} `, LISTED), [["sent", null, true], 1, 1]);
+      eq("another address at the same domain: suppressed, not_allowed, one row, no dispatch", await send1("other.person@tenant-a.stub", LISTED), [["suppressed", "not_allowed", true], 0, 1]);
+      eq("a dot variant is another address", await send1("listedperson@tenant-a.stub", LISTED), [["suppressed", "not_allowed", true], 0, 1]);
+      eq("a \"+tag\" variant is another address", await send1("listed.person+spec@tenant-a.stub", LISTED), [["suppressed", "not_allowed", true], 0, 1]);
+      eq("…unless it is listed by itself", await send1("listed.person+spec@tenant-a.stub", `${LISTED} listed.person+spec@tenant-a.stub`), [["sent", null, true], 1, 1]);
+      eq("a domain entry still allows the whole domain", await send1("anyone@tenant-a.stub", "tenant-a.stub"), [["sent", null, true], 1, 1]);
+      eq("…and an \"@domain\" entry", await send1("anyone@tenant-a.stub", "@tenant-a.stub"), [["sent", null, true], 1, 1]);
+      eq("\"*\" alone allows every domain that is not reserved", await send1("anyone@elsewhere.stub", "*"), [["sent", null, true], 1, 1]);
+      eq("\"*\" beside addresses allows everything too", await send1("anyone@elsewhere.stub", `${LISTED}, *`), [["sent", null, true], 1, 1]);
+      const mixed = `${LISTED} tenant-b.stub`;
+      eq("an address and a domain in one list: the address works", await send1(LISTED, mixed), [["sent", null, true], 1, 1]);
+      eq("…the domain works", await send1("anyone@tenant-b.stub", mixed), [["sent", null, true], 1, 1]);
+      eq("…and another address at the address's domain does not", await send1("other.person@tenant-a.stub", mixed), [["suppressed", "not_allowed", true], 0, 1]);
+      eq("an address entry at a reserved test domain is still suppressed with test_domain", await send1("listed.person@spec.test", "listed.person@spec.test"), [["suppressed", "test_domain", true], 0, 1]);
+      eq("…and so is one at example.com", await send1("someone@example.com", "someone@example.com"), [["suppressed", "test_domain", true], 0, 1]);
+      for (const bad of ["a@@tenant-a.stub", "a@b@tenant-a.stub", "listed.person@", "@", "not_a_domain!", "tenant-a..stub", "@a@tenant-a.stub"]) {
+        eq(`a malformed entry "${bad}" beside a good one matches nothing, and the good one still works`, [await send1("a@tenant-a.stub", `${bad} tenant-b.stub`), (await send1("anyone@tenant-b.stub", `${bad} tenant-b.stub`))[0]], [[["suppressed", "not_allowed", true], 0, 1], ["sent", null, true]]);
+      }
+      const onlyBad = "a@@tenant-a.stub, listed.person@ ,@";
+      eq("a list of only malformed entries names the variable as missing, as a list of only separators does", platformSenderReadiness({ ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: onlyBad }), { configured: false, missing: ["PLATFORM_EMAIL_ALLOW_DOMAINS"] });
+      eq("…and nothing is dispatched (not_allowed, as for an unset list)", await send1("a@tenant-a.stub", onlyBad), [["suppressed", "not_allowed", true], 0, 1]);
+      eq("a list of exact addresses is configured", platformSenderReadiness({ ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: `${LISTED} second.person@tenant-a.stub` }), { configured: true, missing: [] });
+      fresh(); printed = [];
+      const secretList = `${LISTED} hidden.second@tenant-c.stub tenant-d.stub`;
+      await send(welcome(as("other.person@tenant-a.stub"), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList });
+      await send(welcome(as(LISTED), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList });
+      // A listed send the mail server refuses writes a log line: the case reads a log that is there.
+      smtpAnswer = async () => json({ ok: false, error: "421 4.7.0 try again later" });
+      await send(welcome(as(LISTED), ORG_A), { ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList });
+      eq("…the privacy case reads a log that holds lines (a refused send wrote one)", printed.length > 0, true);
+      const answer = JSON.stringify(platformSenderReadiness({ ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: secretList })) + JSON.stringify(platformSenderReadiness({ ...ENV, PLATFORM_EMAIL_ALLOW_DOMAINS: onlyBad }));
+      const stored = JSON.stringify(rows) + inserts().map((i) => i.body).join("\n");
+      const logText = printed.join("\n");
+      eq("no row, log line or readiness answer holds the list or an address", ["listed.person", "hidden.second", "tenant-c.stub", "tenant-d.stub", "@"].filter((x) => stored.includes(x) || logText.includes(x) || answer.includes(x)), []);
     }
 
     console.log("\na limit that cannot be read sends nothing and writes nothing");
@@ -349,7 +406,8 @@ async function main() {
     }
 
     console.log("\nthe welcome goes to each of the add-admin route's three roles");
-    const PASSWORD_LINE = "The person who created your account gives you your first password; this email never contains one. If you do not have it, choose \"Forgot password?\" on that page.";
+    // The welcome's fixed lines that name a password: the setup link's lead-in and the way after it.
+    const PASSWORD_LINES = ["Set your own password with this link:", "After that, choose \"Forgot password?\" on the sign-in page."];
     for (const role of ["super_owner", "admin", "data_analyst"] as const) {
       fresh();
       // A caller that slips a password into the content (not a field of the type): it is never sent.
@@ -357,8 +415,10 @@ async function main() {
       const sentinel = "Sentinel-Pass-0029!";
       const r = await send({ ...req, content: { ...req.content, password: sentinel } as typeof req.content });
       const p = JSON.parse(sends()[0]?.body ?? "{}") as { text?: string; html?: string; subject?: string };
-      const passwordLines = (p.text ?? "").split("\n").filter((l) => /password/i.test(l));
-      eq(`${role}: sent, with the role in the text; the only line about a password is the fixed one, and the slipped-in value is in no part of the mail`, [r.status, (p.text ?? "").includes("Your role:"), passwordLines, [p.subject, p.text, p.html].some((x) => (x ?? "").includes(sentinel))], ["sent", true, [PASSWORD_LINE], false]);
+      // The link's own line names its path (/auth/set-password), not a password.
+      const passwordLines = (p.text ?? "").split("\n").filter((l) => /password/i.test(l) && l !== SETUP_LINK);
+      eq(`${role}: sent, with the role and the setup link in the text; the only lines about a password are the fixed ones, and the slipped-in value is in no part of the mail`, [r.status, (p.text ?? "").includes("Your role:"), (p.text ?? "").includes(SETUP_LINK), passwordLines, [p.subject, p.text, p.html].some((x) => (x ?? "").includes(sentinel))], ["sent", true, true, PASSWORD_LINES, false]);
+      eq(`${role}: no log row holds the setup link or its token`, inserts().some((i) => i.body.includes(SETUP_LINK.split("#t=")[1])), false);
     }
 
     console.log("\nthe password setting: a trailing line break is not part of it");
@@ -394,7 +454,7 @@ async function main() {
       // lib/email/smtp-function.ts) and the runbook's lived case (ops/RUNBOOK.md §6.3).
       const recorded: Array<[string, string]> = [
         ["Timed out after 25000ms: SMTP send to smtp.platform.stub:465", "timeout"],
-        [dispatchTimeoutMessage(8000), "timeout"],
+        [dispatchTimeoutMessage(15000), "timeout"],
         ["SMTP 535 BadCredentials", "auth"],
         ["Authentication failed", "auth"],
         ["Connection refused", "unreachable"],
@@ -458,8 +518,9 @@ async function main() {
       eq("send-smtp answers 503: failed, unreachable", short(await send(code(ADMIN_A, ORG_A))), ["failed", "unreachable", true]);
     }
 
-    console.log("\nthe wait: 8 s for a send, a fixed message, and today's request without a timeout");
+    console.log("\nthe wait: 15 s for a send, a fixed message, and today's request without a timeout");
     {
+      eq("rule T1: one wait for both systems, 15 s, kept in smtp-function.ts and read by the platform sender", [SMTP_SEND_WAIT_MS, PLATFORM_SEND_TIMEOUT_MS], [15000, 15000]);
       fresh();
       smtpAnswer = () => new Promise<Response>(() => {});
       const hang = (_i: RequestInfo | URL, init?: RequestInit) =>

@@ -9,7 +9,7 @@
  *
  * (The 3 magic-link users are covered in 11-magic-link.spec.ts.)
  *
- * Uses Gmail plus-addressing: technotalkad+<tag>@gmail.com all land in the one
+ * Uses plus-addressing on the test mailbox (BOT_MAIL_ADDRESS): every alias lands in the one
  * inbox; a unique per-run TAG keeps aliases (and inbox matches) collision-free.
  */
 import { test, expect } from "@playwright/test";

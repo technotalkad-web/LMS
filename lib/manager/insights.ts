@@ -14,6 +14,8 @@ import {
   GrantReadError,
   fetchPassRequired,
   grantSnapshotForUsers,
+  isMissingRelation as relationMissing,
+  isSchemaMissing,
   readPagedWithOptionalColumn,
   type GrantSnapshot,
   type OptionalColumnState,
@@ -33,7 +35,7 @@ import {
   todayStr,
 } from "@/lib/journey/journey";
 import { readJourneyCredits } from "@/lib/journey/credits-read";
-import { fetchActiveMembers, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
+import { fetchActiveMembers, groupMembersStrict, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
 import { isReleased } from "@/lib/learner/release";
 import { THRESHOLDS } from "./report-card";
 import { DAY, daysAgo, deriveLearner, fmtDay, maxIso, minIso } from "./derive";
@@ -64,6 +66,18 @@ export type InsightOptions = {
   /** "" | course:<id> | path:<id> | journey:<id> — narrows every number to that content. */
   content?: string;
   now?: Date;
+  /**
+   * For a caller whose answer decides who is mailed (ADR 0029, note of
+   * 2026-11-20, part 3, and stage 2's one rule): every read that decides
+   * whether a course reaches a learner throws when it fails, instead of
+   * leaving the learner "not assigned": the organisation's courses and
+   * paths, the groups and their members, and the courses' attempt policies
+   * (a default policy can read a learner as finished). Only a database
+   * without org_groups (before 0067) or without the policies' function
+   * (before 0073), read from the error's code, is still tolerated. The
+   * Report Card pages leave it off.
+   */
+  strictGroups?: boolean;
 };
 
 export type CatalogEntry = { id: string; title: string };
@@ -215,18 +229,23 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const today = opts.now ? new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(now) : todayStr(tz);
 
   /* ---- catalog (titles for everything we may show; the picker lists active only) ---- */
-  const { data: courseRows } = await svc
+  // The active courses and paths decide which assignments reach a learner:
+  // for a caller that mails from the answer, a failed read throws (the
+  // caller answers 503), never "not assigned".
+  const { data: courseRows, error: courseErr } = await svc
     .from("courses")
     .select("id, title, is_active")
     .eq("organization_id", orgId)
     .order("title");
+  if (opts.strictGroups && (courseErr || !Array.isArray(courseRows))) throw new Error(`courses: ${courseErr?.message ?? "no answer"}`);
   const allCourses = (courseRows ?? []) as Array<{ id: string; title: string; is_active: boolean }>;
   const courseTitle = new Map(allCourses.map((c) => [c.id, c.title]));
-  const { data: pathRows } = await svc
+  const { data: pathRows, error: pathErr } = await svc
     .from("learning_paths")
     .select("id, name, is_active")
     .eq("organization_id", orgId)
     .order("name");
+  if (opts.strictGroups && (pathErr || !Array.isArray(pathRows))) throw new Error(`learning_paths: ${pathErr?.message ?? "no answer"}`);
   const allPaths = (pathRows ?? []) as Array<{ id: string; name: string; is_active: boolean }>;
   const pathName = new Map(allPaths.map((p) => [p.id, p.name]));
   const pathCourseRows = allPaths.length
@@ -307,7 +326,31 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   }
   const groupIds = [...new Set([...courseAssigns, ...pathAssigns].filter((a) => a.assignee_type === "group" && a.group_id).map((a) => a.group_id as string))];
   const groupUserIds = new Map<string, Set<string>>();
-  if (groupIds.length) {
+  if (groupIds.length && opts.strictGroups) {
+    // Every read's error is read: a group that could not be read is never
+    // "nobody in it". Lists of 150 ids (the house rule).
+    const groups: GroupRow[] = [];
+    let noGroupsTable = false;
+    for (const ids of chunk(groupIds, 150)) {
+      const { data: groupRows, error: groupErr } = await svc
+        .from("org_groups")
+        .select("id, organization_id, name, group_type, rules, is_active")
+        .in("id", ids);
+      // "Missing" is read from the error's code, never from its words: a
+      // transient error that names a relation is a failed read.
+      if (groupErr && relationMissing(groupErr, "org_groups")) {
+        noGroupsTable = true;
+        break;
+      }
+      if (groupErr || !Array.isArray(groupRows)) throw new Error(`org_groups: ${groupErr?.message ?? "no answer"}`);
+      groups.push(...(groupRows as GroupRow[]));
+    }
+    if (!noGroupsTable) {
+      const byGroup = await groupMembersStrict(svc, orgId, groups.filter((g) => g.is_active !== false));
+      if (byGroup === "unreadable") throw new Error("org_groups: a group's members could not be read");
+      for (const [gid, ids] of byGroup) groupUserIds.set(gid, new Set([...ids].filter((u) => userSet.has(u))));
+    }
+  } else if (groupIds.length) {
     try {
       const { data: groupRows } = await svc
         .from("org_groups")
@@ -467,8 +510,13 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       return null;
     }
   };
+  // For a caller that mails from the answer, a failed read of the policies
+  // throws: the platform default could read a learner as finished.
+  const policiesUnreadable = (e: unknown) => {
+    if (!isSchemaMissing(e as PgError)) throw new Error("effective_attempt_policies: the read failed");
+  };
   const [policies, snapshots, passRequired, visits] = await Promise.all([
-    resolvePolicies(svc, courseIdList),
+    resolvePolicies(svc, courseIdList, opts.strictGroups ? { readFailed: policiesUnreadable } : {}),
     readGrants(),
     fetchPassRequired(svc, courseIdList),
     // "Last revisit" beside the inactive flag (ADR 0014:199), fail-soft.

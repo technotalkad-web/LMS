@@ -9,9 +9,11 @@
 # Two surfaces this file controls beyond the build artifact:
 #   1. compatibility_flags = ["nodejs_compat"] — required for
 #      crypto.createHmac (impersonation cookie) and @aws-sdk/* (R2).
-#   2. [triggers.crons] — scheduled triggers for the 4 cron routes.
-#      Cloudflare's built-in cron is free and gives us reliable wakeup
-#      without provisioning anything external.
+#   2. [triggers.crons] — kept EMPTY on purpose. The Worker OpenNext builds
+#      exports only `fetch`, so a Cloudflare cron trigger would fire an event
+#      nothing receives. The jobs are driven from GitHub Actions instead:
+#      .github/workflows/cron.yml POSTs /api/cron/* on production
+#      (ops/RUNBOOK.md §2; staging has no schedule).
 #
 # Secrets (SUPABASE_SERVICE_ROLE_KEY, IMPERSONATION_SECRET, CRON_SECRET,
 # R2 keys) are set with `wrangler secret put <NAME>` — never in this file.
@@ -38,11 +40,11 @@ binding = "ASSETS"
 enabled = true
 
 # ---- Scheduled triggers (cron) ---------------------------------------------
-# Each entry is a cron expression in UTC. Cloudflare invokes the Worker's
-# scheduled handler (which OpenNext synthesizes from your /api/cron/*
-# route handlers) at these times.
-#
-# Schedules match what pre-launch-checklist.docx § 7 expects.
+# Empty, and it stays empty: OpenNext synthesizes no `scheduled` handler, so
+# Cloudflare would invoke nothing at these times. The schedules live in
+# .github/workflows/cron.yml, which POSTs each /api/cron/* route of the
+# production Worker with its cron secret. Each such call is one ordinary
+# request, under the free plan's limits like any other.
 [triggers]
 crons = [
   
@@ -72,14 +74,6 @@ NODE_ENV = "production"
 # only after 0100_alds_core.sql was confirmed on the staging database.
 ALDS_P4 = "on"
 
-# ---- Auth email fallback (global Resend sender) -----------------------------
-# Auth emails (invite / magic-link) are minted via generateLink and sent via the
-# TENANT's SMTP. If a tenant has no SMTP (or it fails), the app falls back to
-# this global Resend sender so users are never locked out. Inert until both are
-# set. RESEND_API_KEY is a SECRET (wrangler secret put RESEND_API_KEY); RESEND_FROM
-# is a plain var. Use a verified domain with SPF/DKIM/DMARC.
-# RESEND_FROM = "Ambak University <no-reply@ambak.com>"
-
 # ---- Platform sender (ADR 0029; lib/email/platform-sender.ts) ---------------
 # The platform's own mailbox, for platform mail only: platform owners' and
 # organisation administrators' codes and links, administrator welcomes and
@@ -92,11 +86,17 @@ ALDS_P4 = "on"
 #   wrangler secret put PLATFORM_SMTP_USER
 #   wrangler secret put PLATFORM_SMTP_PASSWORD          # the mailbox's app password
 #   wrangler secret put PLATFORM_SMTP_FROM              # Name <address>
-#   wrangler secret put PLATFORM_EMAIL_ALLOW_DOMAINS    # staging: only a domain the owner controls
-#     (never a public mail provider's domain: every staging account there
-#     could then be mailed; reserved test domains are never mailed anyway)
+#   wrangler secret put PLATFORM_EMAIL_ALLOW_DOMAINS    # staging: exact addresses only
+#     The value is a list cut at commas: on staging only exact addresses,
+#       <local>@<domain>,<local>+<fixed-alias>@<domain>,...
+#     each allowing that address alone ("+tag" and dot variants are other
+#     addresses); no domain entry and no "*". The four entries and their uses
+#     are in ops/RUNBOOK.md §6.3a, "The allow-list". The real addresses go
+#     only into this secret, never into a file. Reserved test domains are
+#     never mailed anyway. A list with no usable entry sends nothing.
 # Optional: PLATFORM_EMAIL_REPLY_TO, PLATFORM_EMAIL_DAILY_CEILING (default 375;
-# set it to three quarters of the mailbox's confirmed daily cap) and
+# 25 where staging shares production's mailbox; otherwise three quarters of
+# the mailbox's daily cap) and
 # PLATFORM_EMAIL_ORG_DAILY_LIMIT (default 50). Staging never uses production's
 # credential. Unset, the sender sends nothing and /api/ops/health reads
 # degraded to a caller with the secret. Setup, rotation, limits: ops/RUNBOOK.md §6.3.
@@ -191,8 +191,6 @@ OPS_EXPECT_CRONS = "1"
 # here, wrangler's warning that ALDS_P4 exists at the top level but not in
 # env.production.vars no longer appears on production deploys.
 ALDS_P4 = "on"
-# Auth-email fallback: RESEND_API_KEY via `wrangler secret put`; RESEND_FROM here.
-# RESEND_FROM = "Ambak University <no-reply@ambak.com>"
 # Platform sender (ADR 0029; see the top-level block): every PLATFORM_SMTP_* and
 # PLATFORM_EMAIL_* value is a SECRET, set with
 # `wrangler secret put <NAME> --env production`, never here. Production's

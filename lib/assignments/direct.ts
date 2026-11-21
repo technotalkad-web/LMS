@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { notifyBackground } from "@/lib/notifications/send";
+import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
 import { DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
@@ -96,7 +97,7 @@ export async function assignCourseDirect(
     /** false = a due-date change on people who already hold the course: no "you have been assigned" email. */
     notify?: boolean;
   }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; dueAt: string | null }> {
+): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; dueAt: string | null; email: MailOutcome | null }> {
   const ids = [...new Set(args.userIds)];
   if (ids.length === 0) return { error: "No learners named", status: 400 };
   const course = await orgCourse(svc, args.orgId, args.courseId);
@@ -154,27 +155,45 @@ export async function assignCourseDirect(
       else if (conversion.error) results[i] = { userId: r.userId, status: "failed", reason: `self-enrolment not converted: ${conversion.error.message ?? "update failed"}` };
     }
   }
+  // The assignment mail (ADR 0029 rule T4): one run within the request's
+  // budgets. The rows are saved; a failed read of the learners' addresses
+  // mails nobody, records the skip, and the outcome says so.
+  let email: MailOutcome | null = null;
   if (inserted.length && args.notify !== false) {
-    const people = await namesAndEmails(svc, inserted);
-    const link = args.origin ? `${args.origin}/${args.orgSlug}/courses/${course.id}/launch` : `/${args.orgSlug}/courses/${course.id}/launch`;
-    for (const uid of inserted) {
-      const who = people.get(uid);
-      if (!who?.email) continue;
-      await notifyBackground({
-        organizationId: args.orgId,
-        event: "asset_assignment",
-        to: { user_id: uid, email: who.email },
-        context: {
-          learner_name: who.name,
-          learner_email: who.email,
-          course_name: course.title,
-          course_id: course.id,
-          org_name: args.orgName,
-          direct_link: link,
-          due_date: dueAt ? `Due ${dueAt.slice(0, 10)}.` : "No due date.",
-        },
-      });
-    }
+    email = await (async (): Promise<MailOutcome | null> => {
+      let people: Awaited<ReturnType<typeof namesAndEmails>>;
+      try {
+        people = await namesAndEmails(svc, inserted);
+      } catch {
+        await recordRecipientsUnreadable("assign-direct", args.orgId);
+        return RECIPIENTS_UNREADABLE;
+      }
+      try {
+        const link = args.origin ? `${args.origin}/${args.orgSlug}/courses/${course.id}/launch` : `/${args.orgSlug}/courses/${course.id}/launch`;
+        const learners = inserted.flatMap((uid) => {
+          const who = people.get(uid);
+          return who?.email ? [{ uid, name: who.name, email: who.email }] : [];
+        });
+        const run = await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + inserted.length }), db: svc });
+        const sent = await sendMany(run, learners, (l) => ({
+          event: "asset_assignment",
+          to: { user_id: l.uid, email: l.email },
+          context: {
+            learner_name: l.name,
+            learner_email: l.email,
+            course_name: course.title,
+            course_id: course.id,
+            org_name: args.orgName,
+            direct_link: link,
+            due_date: dueAt ? `Due ${dueAt.slice(0, 10)}.` : "No due date.",
+          },
+        }));
+        return mailCounts(sent, inserted.length - learners.length);
+      } catch (e) {
+        console.warn(JSON.stringify({ event: "assignment_mail_failed", site: "assign-direct", org_id: args.orgId, error: e instanceof Error ? e.name : "unknown" }));
+        return null;
+      }
+    })();
   }
-  return { results, courseTitle: course.title, dueAt };
+  return { results, courseTitle: course.title, dueAt, email };
 }

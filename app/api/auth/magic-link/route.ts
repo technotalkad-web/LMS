@@ -1,70 +1,45 @@
 import { NextResponse } from "next/server";
-import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { safeNextPath } from "@/lib/auth/safe-next";
-import { sendAuthEmail, sendPlatformMagicLink } from "@/lib/auth/auth-email";
+import { prepareCredentialRequest } from "@/lib/auth/credential-mail";
+import { runAfterResponse } from "@/lib/http/after-response";
 
 /**
  *   POST /api/auth/magic-link   body: { email, orgSlug?, next? }
  *
- * White-label magic-link sign-in. Mints the link via the Admin API (no Supabase
- * auto-send) and emails it:
- *   - tenant context (orgSlug) → the tenant's branded SMTP (Resend fallback),
- *     only when the address belongs to a member of that organisation
- *     (lib/auth/auth-email.ts states the rule); anyone else gets the generic
- *     platform email
- *   - platform login (no orgSlug, or an unknown one) → global Resend sender
+ * Asks for an emailed sign-in link (ADR 0029 sections C and D), the same
+ * shape as the reset-code request: the page's organisation from orgSlug;
+ * with none, or a slug that names no organisation, the page with no
+ * organisation, which serves platform owners and administrators only.
  *
- * `next` (optional) is a same-app path to land on after sign-in — used by
- * deep links (e.g. QR-code scans of a course) so the emailed link returns the
- * learner to the exact page they scanned, not the dashboard. It keeps its
- * query (a launch's Preview mode, path, journey day and language) and goes
- * through lib/auth/safe-next.ts's open-redirect guard: one leading "/", no
- * scheme or host, no backslash or control character.
+ * The answer is the same for every address that passes the format check
+ * (lib/auth/credential-mail.ts): the same reads in the same order before
+ * it, and 200 { ok, ready, message } by the organisation's reading, or 503
+ * for every address when the account lookup, the organisation or its
+ * settings could not be read. The link is minted and mailed after the
+ * response, only for an address with an account, through the system rule 2
+ * of section A gives it: the organisation's own SMTP or the platform sender.
  *
- * Always returns { ok: true } so the form can't be used to enumerate accounts.
+ * `next` (optional) is a same-app path to land on after sign-in, used by
+ * deep links (a QR-code scan of a course) so the emailed link returns the
+ * learner to the page they scanned. It keeps its query (a launch's Preview
+ * mode, path, journey day and language) and goes through
+ * lib/auth/safe-next.ts's open-redirect guard: one leading "/", no scheme
+ * or host, no backslash or control character.
  */
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as {
-    email?: string;
-    orgSlug?: string;
-    next?: string;
-  };
-  const email = (body.email ?? "").trim().toLowerCase();
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  const body = (await request.json().catch(() => ({}))) as { email?: unknown; orgSlug?: unknown; next?: unknown };
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return NextResponse.json({ error: "A valid email is required" }, { status: 400 });
   }
-  const safeNext = safeNextPath(body.next);
+  const orgSlug = typeof body.orgSlug === "string" && body.orgSlug.trim() ? body.orgSlug.trim() : null;
+  const safeNext = safeNextPath(typeof body.next === "string" ? body.next : null);
 
+  // Read from the request now: the job after the response has no request.
   const origin = (await originFromRequest()) || "";
 
-  // Tenant path: branded login carries orgSlug → white-label via tenant SMTP.
-  if (body.orgSlug) {
-    const svc = createServiceClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
-      { auth: { persistSession: false } }
-    );
-    const { data: org } = await svc
-      .from("organizations")
-      .select("id, slug")
-      .eq("slug", body.orgSlug)
-      .maybeSingle();
-    if (org) {
-      await sendAuthEmail({
-        organizationId: org.id as string,
-        email,
-        type: "magiclink",
-        origin,
-        next: safeNext ?? `/${org.slug}/dashboard`,
-      });
-      // Enumeration-safe regardless of whether the user exists.
-      return NextResponse.json({ ok: true });
-    }
-    // Unknown org → fall through to generic (still don't leak anything).
-  }
-
-  // Platform path (no org context): generic link via global Resend.
-  await sendPlatformMagicLink({ email, origin });
-  return NextResponse.json({ ok: true });
+  const prepared = await prepareCredentialRequest({ kind: "sign_in_link", email, orgSlug, origin, next: safeNext, ip: null, userAgent: null });
+  if (prepared.job) runAfterResponse("sign-in-link", prepared.job);
+  return NextResponse.json(prepared.body, { status: prepared.status });
 }

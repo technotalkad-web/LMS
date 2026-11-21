@@ -9,8 +9,7 @@ import {
   forceRestartReplaceAnswer,
   forceRestartReport,
 } from "@/lib/attempts/force-restart";
-import { notifyLearnerOfDecision } from "@/lib/attempts/requests";
-import { resolveEmails } from "@/lib/users/emails";
+import { reissueNotifier } from "@/lib/attempts/requests";
 import { originFromRequest } from "@/lib/http/origin";
 import { runPackageGuardian } from "@/lib/alds/guardian";
 import {
@@ -208,7 +207,10 @@ export async function POST(
     // is a value (never a throw): the version above stays published whatever
     // it says, and a failed reset answers 500 with published: true.
     // ADR 0014 step 8: the reset retakes' grants are re-issued in the same
-    // operation, by this admin, and the learners told.
+    // operation, by this admin, and the learners told. ADR 0029 rule T4: the
+    // re-issue mails' outcome is answered as `reissue_email`, beside the
+    // restart's report and never inside it.
+    const reissue = reissueNotifier();
     const run = await forceRestartOlderVersions(svc, {
       packageId,
       newVersionId: result.versionId,
@@ -217,7 +219,7 @@ export async function POST(
       org: { id: org.id, name: (org as { name?: string }).name ?? "", slug: (org as { slug?: string }).slug ?? orgSlug },
       origin: await originFromRequest(),
       course: { id: course.id, title: (course as { title?: string }).title ?? "this course" },
-      notify: { decision: notifyLearnerOfDecision, emails: resolveEmails },
+      notify: reissue.notify,
     });
     answer = forceRestartReplaceAnswer({
       courseId,
@@ -226,6 +228,8 @@ export async function POST(
       versionNumber: result.versionNumber,
       report: forceRestartReport(run),
     });
+    const reissueEmail = reissue.outcome();
+    if (reissueEmail) answer = { ...answer, body: { ...answer.body, reissue_email: reissueEmail } };
   }
 
   // ADR 0005 note (e), additions of 2026-10-19: the Package Guardian static

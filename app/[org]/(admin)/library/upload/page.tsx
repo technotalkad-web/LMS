@@ -23,6 +23,7 @@ import {
   type UploadProgress,
 } from "../_components/direct-upload";
 import { UploadProgressBar } from "../_components/upload-progress";
+import { mailOutcomeWords, type MailOutcomeAnswer } from "@/lib/actions/types";
 
 type UploadState =
   | { kind: "idle" }
@@ -35,6 +36,8 @@ type UploadState =
       title: string;
       manifestType: string;
       language: string | null;
+      /** The update email's outcome, as the publish answered it (absent when none was sent). */
+      updateEmail: MailOutcomeAnswer | null;
     }
   | { kind: "error"; message: string };
 
@@ -213,6 +216,7 @@ export default function CourseUploadPage() {
         language: targetCourseId && targetPackageId
           ? ((packages ?? []).find((p) => p.id === targetPackageId)?.language ?? null)
           : language,
+        updateEmail: json.updateEmail ?? null,
       });
     } catch (err) {
       clearOwnSuggestion();
@@ -337,13 +341,13 @@ export default function CourseUploadPage() {
               </>
             ) : null}
             .
-            {isNewVersion && notifyUpdate && (
-              <>
-                {" "}
-                Update notifications have been queued for assigned learners.
-              </>
-            )}
           </p>
+          {mailOutcomeWords(state.updateEmail) && (
+            // ADR 0029 rule T4: what the update email did, as the publish answered it.
+            <p role="status" className="text-sm mb-6">
+              Update email to assigned learners: {mailOutcomeWords(state.updateEmail)}
+            </p>
+          )}
           <div className="flex gap-3">
             <button
               type="button"

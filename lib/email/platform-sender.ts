@@ -1,5 +1,5 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { classifySmtpError, dispatchSmtp, type SmtpErrorClass } from "./smtp-function";
+import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, type SmtpErrorClass } from "./smtp-function";
 import {
   PLATFORM_EVENTS,
   isPlatformEvent,
@@ -31,11 +31,11 @@ export { PLATFORM_EVENTS, isPlatformEvent, type PlatformContent, type PlatformEv
  *   2. the reserved test domains and the allow-list (suppressed,
  *      test_domain or not_allowed): nothing is ever dispatched to a reserved
  *      test domain, on any environment, and nothing at all while the
- *      allow-list is unset;
+ *      allow-list is unset or holds no usable entry;
  *   3. the organisation limit, then the daily ceiling (refused, org_limit or
  *      ceiling);
  *   4. "not configured" (failed, not_configured);
- *   5. the send, at most 8 s (sent, or failed with the error class).
+ *   5. the send, at most 15 s (sent, or failed with the error class).
  * The limits are read from the log before every send. A limit that cannot
  * be read sends nothing and writes nothing: the answer is "log_unreadable"
  * and the platform_email health check reads fail. The platform mailbox is
@@ -78,8 +78,12 @@ export const PLATFORM_OPTIONAL_SETTINGS = [
 export const DEFAULT_DAILY_CEILING = 375;
 /** Codes and links for one organisation's administrators in 24 hours (default D4). */
 export const DEFAULT_ORG_DAILY_LIMIT = 50;
-/** One send waits at most this long (default D4); send-smtp may still deliver later. */
-export const PLATFORM_SEND_TIMEOUT_MS = 8_000;
+/**
+ * One send waits at most this long: the one wait of both systems (rule T1,
+ * SMTP_SEND_WAIT_MS in lib/email/smtp-function.ts). send-smtp may still
+ * deliver later.
+ */
+export const PLATFORM_SEND_TIMEOUT_MS = SMTP_SEND_WAIT_MS;
 
 /** Per account and kind (section G). Events with null have no account limit. */
 export const ACCOUNT_LIMITS: Record<PlatformEvent, { hour: number; day: number } | null> = {
@@ -156,15 +160,47 @@ function parsePositiveInt(v: string | undefined, fallback: number): number {
   return n >= 1 ? n : fallback;
 }
 
-/** The allow-list: "*" allows every domain; otherwise exact domains, comma or space separated. Null when unset. */
-function parseAllowList(v: string | undefined): { all: boolean; domains: Set<string> } | null {
+/** A domain as the sender reads one: labels of letters, digits and hyphens, joined by dots. */
+const DOMAIN_SHAPE = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/;
+
+type AllowList = { all: boolean; domains: Set<string>; addresses: Set<string> };
+
+/**
+ * Parses PLATFORM_EMAIL_ALLOW_DOMAINS (ADR 0029). Entries are separated by
+ * commas or white space and come in three forms:
+ *   - "*" admits everyone;
+ *   - a full address (a single "@" with a local part and a valid domain)
+ *     admits that one address only; the comparison ignores case and
+ *     surrounding blanks but nothing else, so "+tag" or dotted variants
+ *     need entries of their own;
+ *   - anything else is read as a domain (an optional leading "@" or
+ *     trailing "." is stripped) and admits that exact domain.
+ * Entries that fit none of the forms are ignored. If no entry survives, the
+ * result is null, which the sender treats exactly like a missing variable,
+ * so a malformed value fails closed instead of admitting more.
+ * The parsed list is never echoed in logs, rows or answers.
+ */
+function parseAllowList(v: string | undefined): AllowList | null {
   if (!present(v)) return null;
-  const items = v!
-    .split(/[\s,]+/)
-    .map((d) => d.trim().toLowerCase().replace(/^@/, "").replace(/\.$/, ""))
-    .filter(Boolean);
-  if (items.length === 0) return null;
-  return { all: items.includes("*"), domains: new Set(items.filter((d) => d !== "*")) };
+  const list: AllowList = { all: false, domains: new Set(), addresses: new Set() };
+  for (const raw of v!.split(/[\s,]+/)) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    if (entry === "*") {
+      list.all = true;
+    } else if (entry.includes("@") && !entry.startsWith("@")) {
+      if (entry.indexOf("@") === entry.lastIndexOf("@") && addressDomain(entry) !== null) list.addresses.add(entry.toLowerCase());
+    } else {
+      const domain = entry.toLowerCase().replace(/^@/, "").replace(/\.$/, "");
+      if (DOMAIN_SHAPE.test(domain)) list.domains.add(domain);
+    }
+  }
+  return list.all || list.domains.size > 0 || list.addresses.size > 0 ? list : null;
+}
+
+/** Whether the list lets this recipient through: "*", the exact address, or its domain. */
+function allowListAdmits(list: AllowList, email: string, domain: string): boolean {
+  return list.all || list.addresses.has(String(email ?? "").trim().toLowerCase()) || list.domains.has(domain);
 }
 
 /**
@@ -223,7 +259,7 @@ export function addressDomain(email: string): string | null {
   const e = String(email ?? "").trim();
   if (!/^[^\s@<>"',;]+@[^\s@<>"',;]+$/.test(e)) return null;
   const domain = e.slice(e.lastIndexOf("@") + 1).toLowerCase().replace(/\.$/, "");
-  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(domain)) return null;
+  if (!DOMAIN_SHAPE.test(domain)) return null;
   return domain;
 }
 
@@ -337,7 +373,7 @@ export async function sendPlatformEmail<E extends PlatformEvent>(
   if (!domain) return log("suppressed", "not_allowed");
   if (isReservedTestDomain(domain)) return log("suppressed", "test_domain");
   const allow = parseAllowList(env.PLATFORM_EMAIL_ALLOW_DOMAINS);
-  if (!allow || !(allow.all || allow.domains.has(domain))) return log("suppressed", "not_allowed");
+  if (!allow || !allowListAdmits(allow, to.email, domain)) return log("suppressed", "not_allowed");
 
   // 3. The organisation limit, then the ceiling.
   const limits = platformEmailLimits(env);

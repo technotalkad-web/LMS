@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   ArrowRight,
@@ -18,6 +17,29 @@ import { InlineSpinner } from "@/components/ui/brand-loader";
 
 type Step = "request" | "verify" | "reset" | "signing_in";
 
+/** The one line every visitor of the form with no organisation reads (ADR 0029 section D). */
+const LEARNERS_LINE = "Learners: sign in at your organisation's own address.";
+
+/** What the request route's answer says, for the page: the same for every address. */
+type RequestAnswer = { ok: true; ready: boolean; message: string } | { ok: false; error: string };
+
+/** The page's words for an answer that is not 200: a 503 is "try again", whatever its cause. */
+function requestError(status: number, j: { error?: unknown }): string {
+  if (status === 503) return "Email could not be sent right now. Please try again in a few minutes.";
+  return typeof j.error === "string" && j.error ? j.error : "Could not send code";
+}
+
+async function askForCode(email: string, orgSlug: string | null): Promise<RequestAnswer> {
+  const res = await fetch("/api/auth/forgot-password/request", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(orgSlug ? { email, orgSlug } : { email }),
+  });
+  const j = (await res.json().catch(() => ({}))) as { ready?: unknown; message?: unknown; error?: unknown };
+  if (!res.ok) return { ok: false, error: requestError(res.status, j) };
+  return { ok: true, ready: j.ready === true, message: typeof j.message === "string" ? j.message : "" };
+}
+
 /**
  * Single-page password-recovery flow:
  *
@@ -27,9 +49,14 @@ type Step = "request" | "verify" | "reset" | "signing_in";
  *               → redirect to /select-org (which routes to dashboard)
  *
  * No full-page reloads between steps. Errors render inline.
+ *
+ * ADR 0029 section D: `org` is the organisation the page was opened for
+ * (/forgot-password?org=<slug>), or null for the form with no organisation.
+ * The request route's answer is shown as it comes, the same for every
+ * address: section C's sentence for a ready or a not-ready organisation, or
+ * for the form with no organisation. The code step follows either answer.
  */
-export function ForgotPasswordClient() {
-  const router = useRouter();
+export function ForgotPasswordClient({ org = null }: { org?: { slug: string; name: string } | null }) {
   const supabase = createClient();
 
   const [step, setStep] = useState<Step>("request");
@@ -43,6 +70,10 @@ export function ForgotPasswordClient() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  /** The organisation's answer was the not-ready one: shown as a warning, the code step still open. */
+  const [notReady, setNotReady] = useState(false);
+
+  const signInHref = org ? `/${org.slug}/login` : "/login";
 
   /* ---------- step 1: request code ---------- */
   async function submitRequest(e: React.FormEvent) {
@@ -51,19 +82,17 @@ export function ForgotPasswordClient() {
     setErr(null);
     setInfo(null);
     try {
-      const res = await fetch("/api/auth/forgot-password/request", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email: email.trim() }),
-      });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setErr(j.error ?? "Could not send code");
+      const answer = await askForCode(email.trim(), org?.slug ?? null);
+      if (!answer.ok) {
+        setErr(answer.error);
         setBusy(false);
         return;
       }
       setStep("verify");
-      setInfo(`We sent a 6-digit code to ${email.trim()}.`);
+      setNotReady(!answer.ready);
+      setInfo(answer.message);
+    } catch {
+      setErr("Network error");
     } finally {
       setBusy(false);
     }
@@ -166,18 +195,16 @@ export function ForgotPasswordClient() {
     setBusy(true);
     setErr(null);
     try {
-      const res = await fetch("/api/auth/forgot-password/request", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email: email.trim() }),
-      });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setErr(j.error ?? "Could not send code");
+      const answer = await askForCode(email.trim(), org?.slug ?? null);
+      if (!answer.ok) {
+        setErr(answer.error);
       } else {
-        setInfo(`We sent a new code to ${email.trim()}.`);
+        setNotReady(!answer.ready);
+        setInfo(answer.message);
         setCode("");
       }
+    } catch {
+      setErr("Network error");
     } finally {
       setBusy(false);
     }
@@ -198,11 +225,19 @@ export function ForgotPasswordClient() {
           {(step === "reset" || step === "signing_in") && "Set a new password"}
         </h1>
         <p className="text-muted text-sm mt-1">
-          {step === "request" && "We'll email you a single-use code."}
-          {step === "verify" && info}
+          {step === "request" && (org ? `For ${org.name}. We'll email you a single-use code.` : "For platform owners and organisation administrators. We'll email you a single-use code.")}
+          {step === "verify" && !notReady && info}
           {step === "reset" && info}
           {step === "signing_in" && "Signing you in…"}
         </p>
+        {step === "request" && !org && (
+          <p className="text-muted text-xs mt-2">{LEARNERS_LINE}</p>
+        )}
+        {step === "verify" && notReady && info && (
+          <div className="mt-3 bg-amber-50 border border-amber-200 text-amber-900 text-sm rounded-md p-3 text-left">
+            {info}
+          </div>
+        )}
       </header>
 
       {/* Step 1: email */}
@@ -238,7 +273,7 @@ export function ForgotPasswordClient() {
           </button>
 
           <p className="text-center text-sm text-muted pt-2">
-            <Link href="/login" className="hover:text-ink inline-flex items-center gap-1">
+            <Link href={signInHref} className="hover:text-ink inline-flex items-center gap-1">
               <ArrowLeft className="w-3 h-3" /> Back to sign in
             </Link>
           </p>

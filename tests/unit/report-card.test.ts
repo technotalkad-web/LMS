@@ -402,6 +402,12 @@ function fakeDb(tables: Record<string, Row[]>, override?: (q: Query) => Answer |
       b.then = (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) => settle().then(res, rej);
       return b;
     },
+    /** A database function, recorded as the table "rpc/<name>": no rows unless `tables` or `override` say otherwise. */
+    rpc(name: string, args: unknown) {
+      const q: Query = { table: `rpc/${name}`, ops: [{ op: "rpc", args: [args] }] };
+      queries.push(q);
+      return Promise.resolve({ data: tables[q.table] ?? [], error: null, ...(override?.(q) ?? {}) });
+    },
   };
   return { client: client as never, queries };
 }
@@ -588,6 +594,41 @@ async function insightsCases() {
     eq("a degraded batch: no upsert, counted as skipped_unreadable and pending", [bad, failing.db.queries.some((q) => q.table === "report_card_cache" && q.ops.some((o) => o.op === "upsert"))], [{ learners: 0, batches: 0, pending: 1, skipped_unreadable: 1 }, false]);
     eq("the refresh logs once that it skipped", lines.map((x) => JSON.parse(x).event), ["report_card_grants_unreadable", "report_card_cache_skipped_unreadable"]);
   }
+
+  console.log("\nADR 0029 (note of 2026-11-20, part 3) — strictGroups: a group that cannot be read is never \"not assigned\"");
+  {
+    // c1 is also assigned to a static group g1 that holds u1. The manager's
+    // "send reminder now" reads with strictGroups; the Report Card does not.
+    const withGroup = (t: Record<string, Row[]>) => {
+      t.course_assignments.push({ course_id: "c1", assignee_type: "group", user_id: null, team_id: null, group_id: "g1", due_at: null, release_at: null, assigned_at: iso("2026-09-01T00:00:00Z") });
+      t.org_groups = [{ id: "g1", organization_id: "org1", name: "Group one", group_type: "static", rules: {}, is_active: true }];
+      t.org_group_members = [{ group_id: "g1", user_id: "u1" }];
+    };
+    const strictFor = (db: ReturnType<typeof fakeDb>) =>
+      computeLearnerInsights(db.client, { orgId: "org1", orgSlug: "acme", userIds: ["u1", "u2", "u3"], periodDays: 30, now: NOW, strictGroups: true });
+    const settled = (p: Promise<unknown>) => p.then(() => "answered", () => "threw");
+    const BOOM = { data: null, error: { code: "XX000", message: "stub read failure" } };
+    // Stage 2's one rule reaches every read that decides whether the course
+    // reaches a learner: the organisation's courses and paths too.
+    for (const [what, table] of [["the groups", "org_groups"], ["a static group's rows", "org_group_members"], ["the organisation's courses", "courses"], ["the organisation's paths", "learning_paths"], ["the attempt policies", "rpc/effective_attempt_policies"]] as const) {
+      const fails = (q: Query) => (q.table === table ? BOOM : undefined);
+      eq(`${what} cannot be read: with strictGroups the read throws (the caller answers 503 and sends nothing); without it, the Report Card answers as before`,
+        [await settled(strictFor(reportCardDb(fails, withGroup))), await settled(insightsFor(reportCardDb(fails, withGroup)))], ["threw", "answered"]);
+    }
+    eq("…the control: with every read answered, strictGroups answers",
+      await settled(strictFor(reportCardDb(undefined, withGroup))), "answered");
+    const missing = (q: Query) => (q.table === "org_groups" ? { data: null, error: { code: "42P01", message: 'relation "public.org_groups" does not exist' } } : undefined);
+    eq("…a database without org_groups (before 0067) is still tolerated with strictGroups",
+      await settled(strictFor(reportCardDb(missing, withGroup))), "answered");
+    // "Missing" is read from the error's code: a transient error whose words
+    // name a relation is a failed read, never a database without the table.
+    const wordsOnly = (q: Query) => (q.table === "org_groups" ? { data: null, error: { code: "XX000", message: "could not open relation with OID 16384" } } : undefined);
+    eq("…an error that only names a relation, with no missing-table code, throws with strictGroups",
+      await settled(strictFor(reportCardDb(wordsOnly, withGroup))), "threw");
+    const noPolicies = (q: Query) => (q.table === "rpc/effective_attempt_policies" ? { data: null, error: { code: "PGRST202", message: "Could not find the function public.effective_attempt_policies(p_course_ids) in the schema cache" } } : undefined);
+    eq("…a database without the policies' function (before 0073) is still tolerated with strictGroups: the platform default, as before",
+      await settled(strictFor(reportCardDb(noPolicies, withGroup))), "answered");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,12 +648,13 @@ function sourceCases() {
     const branch = src.slice(src.indexOf('if (target === "course") {'), src.indexOf("// Journey: the learner's ACTIVE enrollment"));
     const at = branch.indexOf('reason: "records could not be read; try again"');
     eq("the course branch skips on line.historyUnavailable / status 'unavailable' with its reason", [
-      /if \(line\.historyUnavailable \|\| line\.status === "unavailable"\) \{\s*results\.push\(\{ userId: uid, status: "skipped", reason: "records could not be read; try again" \}\);\s*continue;\s*\}/.test(branch),
+      /if \(line\.historyUnavailable \|\| line\.status === "unavailable"\) \{\s*byUser\.set\(uid, \{ userId: uid, status: "skipped", reason: "records could not be read; try again" \}\);\s*continue;\s*\}/.test(branch),
     ], [true]);
-    eq("…after the !line check and before the completed skip, notifyBackground( and the reminder_state upsert", [
+    // ADR 0029: the sends are one run (sendMany), and the state is written with each group.
+    eq("…after the !line check and before the completed skip, the run's sends (sendMany) and the reminder_state upsert", [
       at > branch.indexOf("if (!line)"),
       at < branch.indexOf('line.status === "completed"'),
-      at < branch.indexOf("notifyBackground("),
+      at < branch.indexOf("sendMany("),
       at < branch.indexOf('.from("reminder_state").upsert('),
       branch.indexOf('.from("reminder_state").upsert(') > 0,
     ], [true, true, true, true, true]);

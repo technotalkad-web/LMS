@@ -10,7 +10,8 @@
 -- the paste of 0110 (ADR 0026) whichever of the two came second, and
 -- whenever the owner wants to know that the rule still holds.
 --
--- ANSWER: success ("DO" and "ROLLBACK") means every check held. A failure
+-- ANSWER: success ("Success. No rows returned" in the SQL editor; "DO" and
+-- "ROLLBACK" in psql) means every check held. A failure
 -- raises "0115 after-check failed:" and names each object that breaks the
 -- rule; nothing was changed either way. A helper or one of the seven
 -- policies without the rule means an older file was pasted again: paste

@@ -10,6 +10,11 @@
  * call under app/ and lib/, resolves its `context` (an object literal, a
  * same-file `const x = {...}`, or a spread of one) and fails on a context it
  * cannot resolve. The number of call sites is pinned so a missed one shows.
+ * It reads the run's loop helper too (ADR 0029, step 10): every
+ * sendMany(run, recipients, (r) => ({ ... })) call's builder must return an
+ * object literal whose context resolves the same way. Its sites are pinned
+ * on their own (none until the loops become runs in stage 2); a planted
+ * source proves the scan reads a builder.
  * It also checks the named keys of NotificationContext and the key list of
  * ops/notification-log-credential-purge.sql against the same allow-list, and
  * the script's credential-key lists against CREDENTIAL_KEYS.
@@ -65,8 +70,17 @@ const CLASSIFIED: Record<string, "stored" | "dropped"> = {
   reminder_line: "dropped",
 };
 const CREDENTIAL_KEYS = ["password", "otp_code", "direct_link", "portal_url"];
-/** notifyBackground / sendNotification calls with an object literal, under app/ and lib/. */
-const EXPECTED_CALL_SITES = 26;
+/**
+ * notifyBackground / sendNotification calls with an object literal, under
+ * app/ and lib/: the single sends left once ADR 0029's stage 2 made the
+ * loops runs (the welcomes, the public code and link, the commit route's
+ * two, a ticket requester's and a decision's mail). The console's welcome
+ * left this list in stage 3: it is platform mail now, with a setup link and
+ * no password (lib/email/platform-templates.ts).
+ */
+const EXPECTED_CALL_SITES = 10;
+/** sendMany calls (the run's loop helper), under app/ and lib/: every loop of tenant mail since stage 2. */
+const EXPECTED_RUN_HELPER_SITES = 15;
 
 /* ---------------- a small scanner: skips strings, templates and comments ---------------- */
 
@@ -174,6 +188,49 @@ function keysOfIdentifier(src: string, name: string, file: string): string[] {
 
 type Site = { file: string; line: number; keys: string[] };
 
+/** The context keys of the call whose object literal opens at `open`; throws when it cannot resolve them. */
+function contextKeysAt(src: string, open: number, file: string, line: number): string[] {
+  const ctxEntry = entries(src, open).find((e) => /^context\s*(:|$)/.test(e.text));
+  if (!ctxEntry) throw new Error(`${file}:${line} call has no context`);
+  const value = ctxEntry.text.replace(/^context\s*:?\s*/, "");
+  if (value === "") return keysOfIdentifier(src, "context", file);
+  if (/^[A-Za-z_$][\w$]*$/.test(value)) return keysOfIdentifier(src, value, file);
+  if (value.startsWith("{")) return keysOfObject(src, ctxEntry.start + ctxEntry.text.indexOf("{"), file);
+  throw new Error(`${file}:${line} context is not resolvable: ${value.slice(0, 40)}`);
+}
+
+/**
+ * The run helper's calls in one source: sendMany(run, recipients, (r) => ({ ... })).
+ * The builder must be an arrow function that returns an object literal.
+ */
+function scanRunHelper(src: string, file: string): { sites: Site[]; errors: string[] } {
+  const sites: Site[] = [];
+  const errors: string[] = [];
+  const re = /\bsendMany\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src))) {
+    const paren = m.index + m[0].length - 1;
+    const before = src.slice(Math.max(0, m.index - 20), m.index);
+    if (/function\s+$/.test(before) || isInsideNonCode(src, m.index)) continue;
+    const line = lineOf(src, m.index);
+    try {
+      // The builder is the call's third argument; a fourth (the run's group
+      // hooks) may hold arrows of its own.
+      const builder = entries(src, paren)[2];
+      const arrowAt = builder ? builder.text.indexOf("=>") : -1;
+      if (!builder || arrowAt < 0) throw new Error(`${file}:${line} sendMany's mail is not an arrow function`);
+      const arrow = builder.start + arrowAt;
+      const body = builder.text.slice(arrowAt + 2).trimStart();
+      if (!body.startsWith("(")) throw new Error(`${file}:${line} sendMany's builder does not return an object literal`);
+      const open = src.indexOf("{", arrow);
+      sites.push({ file, line, keys: contextKeysAt(src, open, file, line) });
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e));
+    }
+  }
+  return { sites, errors };
+}
+
 function walk(dir: string, out: string[]) {
   for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, d.name);
@@ -205,22 +262,22 @@ function scan(): { sites: Site[]; errors: string[] } {
       try {
         if (!after.startsWith("{")) throw new Error(`${file}:${lineOf(src, m.index)} call does not pass an object literal`);
         const open = src.indexOf("{", paren);
-        const ctxEntry = entries(src, open).find((e) => /^context\s*(:|$)/.test(e.text));
-        if (!ctxEntry) throw new Error(`${file}:${lineOf(src, m.index)} call has no context`);
-        const value = ctxEntry.text.replace(/^context\s*:?\s*/, "");
-        let keys: string[];
-        if (value === "") keys = keysOfIdentifier(src, "context", file);
-        else if (/^[A-Za-z_$][\w$]*$/.test(value)) keys = keysOfIdentifier(src, value, file);
-        else if (value.startsWith("{")) keys = keysOfObject(src, ctxEntry.start + ctxEntry.text.indexOf("{"), file);
-        else throw new Error(`${file}:${lineOf(src, m.index)} context is not resolvable: ${value.slice(0, 40)}`);
-        sites.push({ file, line: lineOf(src, m.index), keys });
+        sites.push({ file, line: lineOf(src, m.index), keys: contextKeysAt(src, open, file, lineOf(src, m.index)) });
       } catch (e) {
         errors.push(e instanceof Error ? e.message : String(e));
       }
     }
+    // The run's loop helper: its builder's context, in its own count.
+    if (file !== "lib/notifications/send.ts") {
+      const helper = scanRunHelper(src, file);
+      helperSites.push(...helper.sites);
+      errors.push(...helper.errors);
+    }
   }
   return { sites, errors };
 }
+
+const helperSites: Site[] = [];
 
 /** True when index i sits inside a comment or a string (a quick forward scan of the file). */
 function isInsideNonCode(src: string, i: number): boolean {
@@ -248,6 +305,20 @@ function main() {
   eq("no unclassified key at any call site", unclassified, []);
   const seen = new Set(sites.flatMap((s) => s.keys));
   eq("the scan sees the credential keys (it reads the real call sites)", CREDENTIAL_KEYS.filter((k) => !seen.has(k)), []);
+
+  console.log("\nthe run's loop helper (sendMany) is read the same way");
+  {
+    eq(`${EXPECTED_RUN_HELPER_SITES} sendMany call sites under app/ and lib/`, helperSites.length, EXPECTED_RUN_HELPER_SITES);
+    eq("…every key at them classified", helperSites.flatMap((s) => s.keys.filter((k) => !(k in CLASSIFIED)).map((k) => `${s.file}:${s.line} ${k}`)), []);
+    const planted = `const shared = { course_name: c.title };
+      await sendMany(run, people, (p) => ({ event: "asset_assignment", to: { user_id: p.id, email: p.email }, context: { ...shared, learner_name: p.name, direct_link: link } }));
+      await sendMany(run, people, mailFor);
+      await sendMany(run, people, (p) => { return { event: "asset_assignment", to: p, context: {} }; });
+      // sendMany(run, people, (p) => ({ context: { nope: 1 } }))`;
+    const r = scanRunHelper(planted, "app/planted/route.ts");
+    eq("a planted builder's context keys are read, through a spread", r.sites.map((x) => x.keys.sort()), [["course_name", "direct_link", "learner_name"]]);
+    eq("…a builder that is not an arrow returning an object literal fails, and a comment is not a call", r.errors.map((e) => e.replace(/^app\/planted\/route\.ts:\d+ /, "")), ["sendMany's mail is not an arrow function", "sendMany's builder does not return an object literal"]);
+  }
 
   console.log("\nNotificationContext's named keys are classified");
   {

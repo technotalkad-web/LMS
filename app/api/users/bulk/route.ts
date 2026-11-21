@@ -3,7 +3,8 @@ import { createClient } from "@/lib/supabase/server";
 import { CHECK_FAILED } from "@/lib/auth/api-admin";
 import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { notifyBackground } from "@/lib/notifications/send";
+import { sendNotification, welcomeOutcome, type WelcomeOutcome } from "@/lib/notifications/send";
+import { openRun, unboundedBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import {
@@ -67,12 +68,16 @@ type ResultRow = {
   email: string;
   status: "created" | "updated" | "invited" | "skipped" | "error";
   message?: string;
+  /** The welcome's outcome (ADR 0029 step 16); absent when no welcome was due. */
+  email_outcome?: WelcomeOutcome;
   // #162: if the row had a team_name and we successfully added them
   // to that team, the team name is surfaced here so admins see
   // "added to Marketing" in the result UI.
   team_added?: string;
 };
 
+/** The existing accounts could not be read: nothing was made (ADR 0029, stage 2's one rule). */
+const ACCOUNTS_UNREADABLE = "Could not read the existing accounts. Nothing was changed; try again.";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_LMS_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
 const VALID_STATUSES = ["active", "inactive", "suspended"] as const;
@@ -138,12 +143,23 @@ export async function POST(request: Request) {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
-  const { data: listed } = await svc.auth.admin.listUsers({
-    page: 1,
-    perPage: 1000,
-  });
+  // Whether each row's account is new decides whether an account and a
+  // welcome are made, so a failed read is never "no accounts" (ADR 0029,
+  // stage 2's one rule): no row is written and the answer is 503.
+  let listed: Awaited<ReturnType<typeof svc.auth.admin.listUsers>> | null;
+  try {
+    listed = await svc.auth.admin.listUsers({
+      page: 1,
+      perPage: 1000,
+    });
+  } catch {
+    listed = null;
+  }
+  if (!listed || listed.error || !Array.isArray(listed.data?.users)) {
+    return NextResponse.json({ error: ACCOUNTS_UNREADABLE }, { status: 503 });
+  }
   const userIdByEmail = new Map<string, string>();
-  for (const u of listed?.users ?? []) {
+  for (const u of listed.data.users) {
     if (u.email) userIdByEmail.set(u.email.toLowerCase(), u.id);
   }
 
@@ -261,6 +277,8 @@ export async function POST(request: Request) {
   const lastWritten = new Map<string, { status: string; row: number }>();
 
   const results: ResultRow[] = [];
+  /** One run for the file's welcomes, opened at the first one. */
+  let welcomeRun: MailRun | undefined;
 
   for (const i of order) {
     const r = rows[i];
@@ -603,11 +621,17 @@ export async function POST(request: Request) {
       }
     }
 
-    // Fire welcome email for new accounts (skip when we just updated metadata).
+    // The welcome email for new accounts (none when we just updated
+    // metadata), with its outcome on the row (ADR 0029 step 16). The file's
+    // welcomes share one run: the 15-second wait and the stop rule, and
+    // neither budget until pull request C cuts the file (rule T4).
     // ADR 0030 rule 10: only when the row just written is active (the org
     // counted for the caller above), so a row written inactive or suspended
-    // gets no welcome.
+    // gets no welcome, and its outcome says not_sent, inactive.
+    let welcome: WelcomeOutcome | undefined;
+    if (!priorMem && status !== "active") welcome = { status: "not_sent", class: "inactive" };
     if (!priorMem && status === "active") {
+      welcomeRun ??= await openRun({ organizationId: org.id as string, budget: unboundedBudget(), db: svc });
       const origin = await originFromRequest();
       const learnerName =
         r.first_name!.trim() + (r.last_name ? " " + r.last_name.trim() : "");
@@ -616,7 +640,7 @@ export async function POST(request: Request) {
         const link =
           `${base}/auth/callback?token_hash=${encodeURIComponent(inviteTokenHash)}` +
           `&type=invite&next=${encodeURIComponent(`/${orgSlug}/dashboard`)}`;
-        await notifyBackground({
+        welcome = welcomeOutcome(await sendNotification({
           organizationId: org.id,
           event: "account_invite",
           to: { user_id: authUserId, email },
@@ -627,9 +651,9 @@ export async function POST(request: Request) {
             portal_url: link,
             org_name: (org as { name: string }).name,
           },
-        });
+        }, { run: welcomeRun }));
       } else {
-        await notifyBackground({
+        welcome = welcomeOutcome(await sendNotification({
           organizationId: org.id,
           event: "account_creation",
           to: { user_id: authUserId, email },
@@ -644,7 +668,7 @@ export async function POST(request: Request) {
               ? `${origin}/${orgSlug}/dashboard`
               : "your learning portal",
           },
-        });
+        }, { run: welcomeRun }));
       }
     }
 
@@ -652,6 +676,7 @@ export async function POST(request: Request) {
       row: rowNum,
       email,
       status: outcome,
+      ...(welcome ? { email_outcome: welcome } : {}),
       ...(managerNote ? { message: managerNote } : {}),
       ...(teamAdded ? { team_added: teamAdded } : {}),
     });
@@ -711,6 +736,9 @@ export async function POST(request: Request) {
     total: rows.length,
     created: results.filter((r) => r.status === "created").length,
     invited: results.filter((r) => r.status === "invited").length,
+    // ADR 0029 step 16: the welcomes, as their rows report them.
+    emailed: results.filter((r) => r.email_outcome?.status === "sent").length,
+    not_emailed: results.filter((r) => r.email_outcome && r.email_outcome.status !== "sent").length,
     updated: results.filter((r) => r.status === "updated").length,
     skipped: results.filter((r) => r.status === "skipped").length,
     errored: results.filter((r) => r.status === "error").length,

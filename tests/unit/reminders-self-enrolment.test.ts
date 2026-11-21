@@ -12,7 +12,8 @@
  *   - without it (no row carries source): every user row reminds, today's run;
  *   - the read stays select("*") (the missing-column fallback names no 0107
  *     column), and the completed-pairs read of course_attempts is unchanged
- *     (preview-isolation-sites.test.ts pins it; phase 7 moves it).
+ *     (preview-isolation-sites.test.ts pins it; phase 7 moves it) but for
+ *     its pages of 1000 rows (ADR 0029, the house rule of lib/db/chunked.ts).
  *
  * Who is reminded is read from the reminder_state upsert (one entry per
  * learner the run nudged) and the notification_log rows, not from `sent`:
@@ -71,7 +72,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     const inList = /id=in\.\(([^)]*)\)/.exec(query)?.[1] ?? "";
     return json(inList.split(",").filter(Boolean).map((id) => ({ id, email: `${id}@example.test` })));
   }
-  if (table === "notification_settings") return json([{ email_paused: true, event_paused: {} }]);
+  // ADR 0029: the reminders are one run for the organisation, and a reminder
+  // that is not attempted is not a nudge (step 10), so the organisation's
+  // SMTP is complete here and the send goes.
+  if (url.pathname === "/functions/v1/send-smtp") return json({ ok: true });
+  if (table === "notification_settings") return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, from_email: "noreply@tenant.stub", email_paused: false, event_paused: {} }]);
+  // ADR 0029: each send opens its run with tenant_mail_status (migration 0114): one row, no state yet.
+  if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? ORG, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
   if (table === "organizations") return json([{ id: ORG, name: "Org", deleted_at: null }]);
   if (table === "notification_log") return json([], 201);
   return json([]);
@@ -90,7 +97,6 @@ async function main() {
   process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE;
   process.env.SUPABASE_SERVICE_ROLE_KEY = SERVICE;
   process.env.CRON_SECRET = SECRET;
-  delete process.env.RESEND_API_KEY;
   const realFetch = globalThis.fetch;
   globalThis.fetch = stub as typeof fetch;
   try {
@@ -99,11 +105,13 @@ async function main() {
       assignmentRows = rows;
       requests = [];
       const res = await route.POST(new Request("http://lms.test/api/cron/reminders", { method: "POST", headers: { "x-cron-secret": SECRET } }));
-      const upsert = requests.find((q) => q.table === "reminder_state" && q.method === "POST");
+      // The state is written with each group of sends (ADR 0029 rule FP7), and
+      // a group's log rows are one insert: both are read across every write.
+      const upserts = requests.filter((q) => q.table === "reminder_state" && q.method === "POST");
       return {
         status: res.status,
-        reminded: ((upsert?.body ?? []) as Row[]).map((r) => r.user_id as string).sort(),
-        logged: requests.filter((q) => q.table === "notification_log").map((q) => (q.body as Row).to_user_id as string).sort(),
+        reminded: upserts.flatMap((q) => (q.body ?? []) as Row[]).map((r) => r.user_id as string).sort(),
+        logged: requests.filter((q) => q.table === "notification_log").flatMap((q) => (Array.isArray(q.body) ? (q.body as Row[]) : [q.body as Row])).map((r) => r.to_user_id as string).sort(),
         resolved: requests.filter((q) => q.table === "profiles").flatMap((q) => (/id=in\.\(([^)]*)\)/.exec(q.query)?.[1] ?? "").split(",")).sort(),
         reads: requests.filter((q) => q.method === "GET" && (q.table === "course_assignments" || q.table === "course_attempts")).map((q) => `${q.table} ${q.query}`),
       };
@@ -130,9 +138,11 @@ async function main() {
     console.log("\nthe reads");
     {
       const r = await run([user("u-adm", "admin")]);
-      eq("course_assignments is read with select=* (names no 0107 column), and course_attempts unchanged", r.reads, [
-        `course_assignments ?select=*&course_id=in.(${COURSE})`,
-        `course_attempts ?select=user_id,course_versions!inner(course_id),completion_status,success_status&course_versions.course_id=in.(${COURSE})`,
+      // ADR 0029: both are read in pages of 1000 rows in a stable order (the
+      // house rule, lib/db/chunked.ts), so neither set is cut at the server's cap.
+      eq("course_assignments is read with select=* (names no 0107 column), and course_attempts unchanged but for its pages and its finished-rows filter (ADR 0029, note of 2026-11-21, part 2 (b))", r.reads, [
+        `course_assignments ?select=*&course_id=in.(${COURSE})&order=id.asc&offset=0&limit=1000`,
+        `course_attempts ?select=user_id,course_versions!inner(course_id),completion_status,success_status&course_versions.course_id=in.(${COURSE})&or=(completion_status.eq.completed,success_status.eq.passed)&order=id.asc&offset=0&limit=1000`,
       ]);
     }
   } finally {

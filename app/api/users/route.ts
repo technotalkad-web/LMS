@@ -4,7 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { CHECK_FAILED } from "@/lib/auth/api-admin";
 import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { notifyBackground } from "@/lib/notifications/send";
+import { sendNotification, welcomeOutcome, type WelcomeOutcome } from "@/lib/notifications/send";
 import { checkQuota } from "@/lib/billing/enforce-quota";
 import {
   GOVERNED_FIELDS,
@@ -68,6 +68,8 @@ type CreateUserBody = {
   branch?: string;
 };
 
+/** The existing accounts could not be read: nothing was made (ADR 0029, stage 2's one rule). */
+const ACCOUNTS_UNREADABLE = "Could not read the existing accounts. Nothing was changed; try again.";
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_LMS_ROLES = ["user", "data_analyst", "admin", "super_owner"] as const;
 const VALID_STATUSES = ["active", "inactive", "suspended"] as const;
@@ -257,12 +259,22 @@ export async function POST(request: Request) {
   // email it ourselves through the tenant's branded pipeline below.
   let inviteTokenHash: string | null = null;
 
-  // Look up by email first.
-  const { data: existing } = await svc.auth.admin.listUsers({
-    page: 1,
-    perPage: 1000,
-  });
-  const found = existing?.users?.find(
+  // Look up by email first. Whether the account is new decides whether an
+  // account and a welcome are made, so a failed read is never "no account"
+  // (ADR 0029, stage 2's one rule): nothing is made and the answer is 503.
+  let existing: Awaited<ReturnType<typeof svc.auth.admin.listUsers>> | null;
+  try {
+    existing = await svc.auth.admin.listUsers({
+      page: 1,
+      perPage: 1000,
+    });
+  } catch {
+    existing = null;
+  }
+  if (!existing || existing.error || !Array.isArray(existing.data?.users)) {
+    return NextResponse.json({ error: ACCOUNTS_UNREADABLE }, { status: 503 });
+  }
+  const found = existing.data.users.find(
     (u) => u.email?.toLowerCase() === email
   );
 
@@ -407,10 +419,14 @@ export async function POST(request: Request) {
     }
   }
 
-  // Fire welcome / account-creation email (background, non-blocking).
+  // The welcome / account-creation email. ADR 0029 (section C, step 16):
+  // the request waits for the send and the answer carries its outcome.
   // ADR 0030 rule 10: only when the row just written is active (the org
   // counted for the caller above), so a person added as inactive or
-  // suspended gets no welcome.
+  // suspended gets no welcome, and the outcome says not_sent, inactive
+  // (no row is written and the SMTP state does not move).
+  let welcome: WelcomeOutcome | null = null;
+  if (!priorMem && status !== "active") welcome = { status: "not_sent", class: "inactive" };
   if (!priorMem && status === "active") {
     // Use the request-origin helper (see #146 for the full sweep).
     const origin = await originFromRequest();
@@ -420,12 +436,12 @@ export async function POST(request: Request) {
 
     if (didInvite && inviteTokenHash) {
       // White-label invite: branded activation link (token_hash → /auth/callback)
-      // sent via the tenant's SMTP, Resend fallback. No Supabase auto-send.
+      // sent via the tenant's SMTP only (no other sender). No Supabase auto-send.
       const base = (origin || "").replace(/\/$/, "");
       const link =
         `${base}/auth/callback?token_hash=${encodeURIComponent(inviteTokenHash)}` +
         `&type=invite&next=${encodeURIComponent(`/${org.slug}/dashboard`)}`;
-      await notifyBackground({
+      welcome = welcomeOutcome(await sendNotification({
         organizationId: org.id,
         event: "account_invite",
         to: { user_id: authUserId, email },
@@ -436,9 +452,9 @@ export async function POST(request: Request) {
           portal_url: link,
           org_name: org.name,
         },
-      });
+      }));
     } else {
-      await notifyBackground({
+      welcome = welcomeOutcome(await sendNotification({
         organizationId: org.id,
         event: "account_creation",
         to: { user_id: authUserId, email },
@@ -455,13 +471,14 @@ export async function POST(request: Request) {
             : `/${org.slug}/dashboard`,
           org_name: org.name,
         },
-      });
+      }));
     }
   }
 
   return NextResponse.json({
     user_id: authUserId,
     invited: didInvite,
+    email_outcome: welcome,
     warnings: managerWarnings,
     ...(tokensExpired ? {} : { tokens_expired: false }),
   });

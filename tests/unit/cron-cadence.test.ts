@@ -15,7 +15,14 @@
  *   - every schedule line has exactly one case arm and every arm a schedule;
  *   - SUBDAILY_STALE_WARN is exactly the cadence entries whose schedule fires
  *     more than once a day, and its ceiling is at least a day;
- *   - ERRORED_WARN names lrs-forward alone, and only cadence entries.
+ *   - ERRORED_WARN is declared once and names exactly lrs-forward, reminders
+ *     and journey-nudges (ADR 0029, the owner's answer of 2026-11-20), each
+ *     a cadence entry;
+ *   - the row a request writes when it skipped its mail
+ *     (mail-recipients-unreadable, ADR 0029 note of 2026-11-19) is in none of
+ *     the three lists and in no arm of cron.yml: it is no job;
+ *   - the console's copy of the two mail crons' rules (MAIL_CRON_SCHEDULE in
+ *     lib/ops/health-status.ts) equals the route's entries for them.
  *
  * A job scheduled outside cron.yml (pg_cron, ADR 0007 step 11) would need its
  * own list here.
@@ -221,8 +228,10 @@ eq(
     wiring.map((w) => [w.cadenceMin, w.staleWarnOnly, w.staleDegradedAfterMin]),
     [["CRON_CADENCE_MIN", "SUBDAILY_STALE_WARN", "SUBDAILY_STALE_DEGRADED_MIN"]]
   );
-  // The owner's decision of 2026-11-15 (ADR 0024, the note of that date): an
-  // errored last run of lrs-forward reads "warn"; any other job's still "ok".
+  // The owner's decision of 2026-11-15 (ADR 0024, the note of that date),
+  // widened by the owner's answer of 2026-11-20 (ADR 0029, note of that
+  // date, part 2): an errored last run of lrs-forward, reminders or
+  // journey-nudges reads "warn"; any other job's still "ok".
   eq("…and ERRORED_WARN as erroredWarn", wiring.map((w) => w.erroredWarn), ["ERRORED_WARN"]);
   const errored: string[][] = [];
   const visitList = (node: ts.Node) => {
@@ -238,8 +247,58 @@ eq(
     ts.forEachChild(node, visitList);
   };
   visitList(sf);
-  eq("ERRORED_WARN is declared once and names lrs-forward alone", errored, [["lrs-forward"]]);
+  eq("ERRORED_WARN is declared once and names exactly lrs-forward, reminders and journey-nudges", errored.map((l) => [...l].sort()), [["journey-nudges", "lrs-forward", "reminders"]]);
   eq("…every entry is a cadence entry", (errored[0] ?? []).filter((j) => !cadence.has(j)), []);
+
+  // ADR 0029, note of 2026-11-19: the row a request writes when it skipped its
+  // mail is no job. A cadence entry for it would read never-seen and page.
+  const SKIP_ROW = "mail-recipients-unreadable";
+  eq(`${SKIP_ROW} is in none of CRON_CADENCE_MIN, SUBDAILY_STALE_WARN and ERRORED_WARN`,
+    [cadence.has(SKIP_ROW), subdaily.warnOnly.includes(SKIP_ROW), (errored[0] ?? []).includes(SKIP_ROW)], [false, false, false]);
+  eq(`…and in no arm or schedule of cron.yml`, [scheduledJobs.includes(SKIP_ROW), yml.includes(SKIP_ROW)], [false, false]);
+
+  // The console reads the two mail crons by the same rule as this route
+  // (ADR 0029, note of 2026-11-20, part 2, point 8): its copy of their
+  // entries is held equal to the route's.
+  const hs = fs.readFileSync(path.join(root, "lib/ops/health-status.ts"), "utf8");
+  const hsf = ts.createSourceFile("health-status.ts", hs, ts.ScriptTarget.Latest, true);
+  let schedule: { cadence: Record<string, number>; warnOnly: string[]; ceiling: number; errored: string[] } | null = null;
+  const strings = (e: ts.Expression): string[] => {
+    let x = e;
+    while (ts.isAsExpression(x) || ts.isParenthesizedExpression(x)) x = x.expression;
+    if (!ts.isArrayLiteralExpression(x)) throw new Error("MAIL_CRON_SCHEDULE: a list that is not an array literal");
+    return x.elements.map((el) => (ts.isStringLiteral(el) ? el.text : el.getText()));
+  };
+  const visitSchedule = (node: ts.Node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === "MAIL_CRON_SCHEDULE" && node.initializer && ts.isObjectLiteralExpression(node.initializer)) {
+      const out = { cadence: {} as Record<string, number>, warnOnly: [] as string[], ceiling: NaN, errored: [] as string[] };
+      for (const p of node.initializer.properties) {
+        if (!ts.isPropertyAssignment(p) || !ts.isIdentifier(p.name)) continue;
+        let init = p.initializer;
+        while (ts.isAsExpression(init) || ts.isParenthesizedExpression(init)) init = init.expression;
+        if (p.name.text === "cadenceMin" && ts.isObjectLiteralExpression(init)) {
+          for (const q of init.properties) {
+            if (!ts.isPropertyAssignment(q)) continue;
+            const key = ts.isIdentifier(q.name) || ts.isStringLiteral(q.name) ? q.name.text : q.name.getText();
+            out.cadence[key] = numeric(q.initializer);
+          }
+        }
+        if (p.name.text === "staleWarnOnly") out.warnOnly = strings(p.initializer);
+        if (p.name.text === "staleDegradedAfterMin") out.ceiling = numeric(init);
+        if (p.name.text === "erroredWarn") out.errored = strings(p.initializer);
+      }
+      schedule = out;
+    }
+    ts.forEachChild(node, visitSchedule);
+  };
+  visitSchedule(hsf);
+  const s = schedule as { cadence: Record<string, number>; warnOnly: string[]; ceiling: number; errored: string[] } | null;
+  const MAIL_JOBS = ["reminders", "journey-nudges"];
+  eq("MAIL_CRON_SCHEDULE is found in lib/ops/health-status.ts", s !== null, true);
+  eq("…its cadence is the route's for the two mail crons", s?.cadence, Object.fromEntries(MAIL_JOBS.map((j) => [j, cadence.get(j)])));
+  eq("…its sub-daily list is the route's, for the two", [...(s?.warnOnly ?? [])].sort(), MAIL_JOBS.filter((j) => subdaily.warnOnly.includes(j)).sort());
+  eq("…its ceiling is the route's", s?.ceiling, subdaily.ceilingMin);
+  eq("…its errored list is the route's, for the two", [...(s?.errored ?? [])].sort(), MAIL_JOBS.filter((j) => (errored[0] ?? []).includes(j)).sort());
 }
 
 console.log("\neach cadence entry's route records its heartbeat under that name");

@@ -274,9 +274,9 @@ export async function POST(request: NextRequest) {
 
   // Update notification: only meaningful when this was a new version of an
   // existing course (i.e., learners already had the old version assigned).
-  if (wantsNotify && courseId) {
-    await notifyCourseUpdate({ org: org as { id: string; slug: string; name: string }, courseId });
-  }
+  const updateEmail = wantsNotify && courseId
+    ? await notifyCourseUpdate({ org: org as { id: string; slug: string; name: string }, courseId })
+    : null;
 
   // ADR 0005 note (e), additions of 2026-10-19: the Package Guardian static
   // gate, warn-only (flag ALDS_P4, default off), LAST, after the update
@@ -288,5 +288,5 @@ export async function POST(request: NextRequest) {
     console.warn("[alds] guardian failed", e instanceof Error ? e.message : e);
   }
 
-  return NextResponse.json(result);
+  return NextResponse.json(updateEmail ? { ...result, updateEmail } : result);
 }

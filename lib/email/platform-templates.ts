@@ -12,7 +12,12 @@
  *     cleanOrganizationName (cut to 60 characters, anything shaped like a
  *     link or an address removed);
  *   - the role a person was given on the console's add-admin route;
- *   - a fixed reading and error class of a tenant's SMTP.
+ *   - in the welcome only, the setup link of an account the console has
+ *     just created (ADR 0029, rules N4 and N5): the LMS's own address
+ *     /auth/set-password with its token in the fragment and nothing else,
+ *     and its life in days. The person sets their own password there;
+ *   - a fixed reading and error class of a tenant's SMTP, and for the
+ *     reading daily_limit the organisation's daily limit as a whole number.
  * A content value that fails its check throws PlatformTemplateError: it is
  * a programming error, and nothing is sent.
  *
@@ -36,19 +41,33 @@ export function isPlatformEvent(value: unknown): value is PlatformEvent {
 /** The role the console's add-admin route gives (app/api/super/tenants/[id]/admins/route.ts). */
 export type WelcomeRole = "super_owner" | "admin" | "data_analyst";
 
-/** A tenant SMTP reading that is not ready, and the class of its last failure. */
-export type AlertReading = "failing" | "not_configured";
+/**
+ * Why the alert is sent: the tenant's SMTP is failing or not configured, or
+ * its routine mail stopped at its daily limit less the reserve (ADR 0029,
+ * rule FP4), and the class of its last failure.
+ */
+export type AlertReading = "failing" | "not_configured" | "daily_limit";
 export type AlertErrorClass = "auth" | "quota" | "timeout" | "unreachable" | "unknown";
 
 export type PlatformContent = {
   platform_reset_code: { code: string; minutes: number };
   platform_sign_in_link: { link: string; minutes: number };
-  platform_admin_welcome: { organizationName: string; signInUrl: string; role: WelcomeRole };
+  platform_admin_welcome: {
+    organizationName: string;
+    signInUrl: string;
+    role: WelcomeRole;
+    /** The setup link the server issued for this new account: /auth/set-password#t=<token>. */
+    setupLink: string;
+    /** The link's life in days, a whole number from 1 to 7 (the table refuses a longer one). */
+    days: number;
+  };
   tenant_smtp_alert: {
     organizationName: string;
     settingsUrl: string;
     reading: AlertReading;
     errorClass: AlertErrorClass | null;
+    /** The organisation's daily limit: given with the reading daily_limit only, a whole number from 1 to 100,000. */
+    dailyLimit?: number;
   };
   platform_test: Record<string, never>;
 };
@@ -98,6 +117,27 @@ function checkUrl(field: string, value: unknown): string {
   }
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) {
     throw new PlatformTemplateError(`${field}: only an http or https address without credentials`);
+  }
+  return value;
+}
+
+/**
+ * The welcome's setup link (ADR 0029, rule N5): an absolute address the
+ * server built, on the path /auth/set-password, with no query and with the
+ * token alone in the fragment (#t= and 43 characters of base64url).
+ */
+function checkSetupLink(value: unknown): string {
+  const link = checkUrl("setupLink", value);
+  const url = new URL(link);
+  if (url.pathname !== "/auth/set-password" || url.search !== "" || !/^#t=[A-Za-z0-9_-]{43}$/.test(url.hash)) {
+    throw new PlatformTemplateError("setupLink: only the LMS's own set-password address with its token in the fragment");
+  }
+  return link;
+}
+
+function checkDays(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 7) {
+    throw new PlatformTemplateError("days: a whole number from 1 to 7");
   }
   return value;
 }
@@ -171,18 +211,20 @@ function blocksFor<E extends PlatformEvent>(event: E, content: PlatformContent[E
       if (typeof role !== "string" || !WELCOME_ROLES.includes(role)) {
         throw new PlatformTemplateError("role: super_owner, admin or data_analyst");
       }
+      const setupLink = checkSetupLink(c.setupLink);
+      const days = checkDays(c.days);
       const org = cleanOrganizationName(c.organizationName);
       return {
         subject: "Your LMS account",
         blocks: [
           { kind: "p", text: `An account was created for you on the LMS for ${org}.` },
           { kind: "p", text: `Your role: ${ROLE_LABEL[role]}.` },
-          { kind: "p", text: "Sign in at:" },
+          { kind: "p", text: "Set your own password with this link:" },
+          { kind: "link", href: setupLink },
+          { kind: "p", text: `It works once and expires in ${days} days.` },
+          { kind: "p", text: "After that, choose \"Forgot password?\" on the sign-in page." },
+          { kind: "p", text: "Then sign in at:" },
           { kind: "link", href: signInUrl },
-          {
-            kind: "p",
-            text: "The person who created your account gives you your first password; this email never contains one. If you do not have it, choose \"Forgot password?\" on that page.",
-          },
           { kind: "p", text: SIGN_OFF },
         ],
       };
@@ -190,13 +232,32 @@ function blocksFor<E extends PlatformEvent>(event: E, content: PlatformContent[E
     case "tenant_smtp_alert": {
       const c = content as PlatformContent["tenant_smtp_alert"];
       const settingsUrl = checkUrl("settingsUrl", c?.settingsUrl);
-      if (c.reading !== "failing" && c.reading !== "not_configured") {
-        throw new PlatformTemplateError("reading: failing or not_configured");
+      if (c.reading !== "failing" && c.reading !== "not_configured" && c.reading !== "daily_limit") {
+        throw new PlatformTemplateError("reading: failing, not_configured or daily_limit");
       }
       if (c.errorClass !== null && (typeof c.errorClass !== "string" || !ALERT_ERROR_CLASSES.includes(c.errorClass))) {
         throw new PlatformTemplateError("errorClass: a fixed class or null");
       }
       const org = cleanOrganizationName(c.organizationName);
+      if (c.reading === "daily_limit") {
+        const limit = c.dailyLimit;
+        if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100_000) {
+          throw new PlatformTemplateError("dailyLimit: a whole number from 1 to 100000 with the reading daily_limit");
+        }
+        return {
+          subject: "Notice: the organisation's routine email has stopped for today",
+          blocks: [
+            { kind: "p", text: `Routine email from the LMS for ${org} has stopped: the organisation is close to its daily email limit of ${limit} emails in 24 hours.` },
+            { kind: "p", text: "Reminders, announcements, and assignment and completion emails are not being sent." },
+            { kind: "p", text: "Password reset codes, sign-in links and welcome emails still go out until the full limit is reached. At the limit no email is sent, and learners who ask for a code see \"Email could not be sent. Please contact your LMS Administrator.\"" },
+            { kind: "p", text: "Routine email starts again by itself as the emails of the last 24 hours become more than a day old. Nothing is sent through any other mail server." },
+            { kind: "p", text: "The limit is set by the platform owner. The organisation's settings show the count:" },
+            { kind: "link", href: settingsUrl },
+            { kind: "p", text: `You receive this as an administrator of ${org}. ${SIGN_OFF}` },
+          ],
+        };
+      }
+      if (c.dailyLimit !== undefined) throw new PlatformTemplateError("dailyLimit: only with the reading daily_limit");
       const reason =
         c.reading === "not_configured"
           ? "The organisation has no complete SMTP settings."

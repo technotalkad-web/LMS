@@ -29,6 +29,7 @@ import {
 } from "@/components/admin";
 import { CATEGORY_LABEL, OUTCOME_LABEL, type TicketCategory, type TicketOutcome } from "@/lib/tickets/types";
 import { GRANT_EXPIRY_CHOICES } from "@/lib/attempts/constants";
+import { mailOutcomeWords, type MailOutcomeAnswer } from "@/lib/actions/types";
 
 export type TicketView = {
   id: string;
@@ -60,6 +61,9 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
   const [filter, setFilter] = useState<Filter>(managerOpen > 0 ? "manager" : "open");
   const [busy, setBusy] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, string>>({});
+  // What the last action's emails did (ADR 0029 rule T4). Shown at the top of
+  // the page: a ticket closed by the action may leave the current view.
+  const [mailNotice, setMailNotice] = useState<string | null>(null);
 
   const filtered =
     filter === "all" ? tickets
@@ -68,10 +72,15 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
 
   const call = async (key: string, path: string, method: string, body: unknown): Promise<string | null> => {
     setBusy(key);
+    setMailNotice(null);
     try {
       const res = await fetch(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      const j = (await res.json().catch(() => ({}))) as { error?: string; summary?: string };
+      const j = (await res.json().catch(() => ({}))) as { error?: string; summary?: string; email?: MailOutcomeAnswer | null; requester_email?: MailOutcomeAnswer | null };
       if (!res.ok) return j.error ?? "Something went wrong";
+      const people = mailOutcomeWords(j.email);
+      const requester = mailOutcomeWords(j.requester_email);
+      const lines = [people && `Email to the people on the ticket: ${people}`, requester && `Email to the requester: ${requester}`].filter(Boolean);
+      setMailNotice(lines.length > 0 ? lines.join(" ") : null);
       router.refresh();
       return null;
     } catch {
@@ -116,6 +125,12 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
       </KpiStrip>
 
       <TabStrip tabs={tabs} active={filter} onChange={setFilter} />
+
+      {mailNotice && (
+        <div role="status" className="mb-3 border border-line bg-paper text-ink rounded-xl px-3 py-2 text-sm">
+          {mailNotice}
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <Card className="p-0">

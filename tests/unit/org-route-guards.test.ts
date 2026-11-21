@@ -139,9 +139,10 @@ const ALLOW: Allow[] = [
       "app/api/auth/forgot-password/reset/route.ts POST",
       "app/api/auth/forgot-password/verify/route.ts POST",
       "app/api/auth/magic-link/route.ts POST",
+      "app/api/auth/set-password/route.ts POST",
     ],
     authority: "public-sign-in",
-    reason: "public sign-in and password-reset flows: no session yet, so no org role applies" },
+    reason: "public sign-in, password-reset and setup-link flows: no session yet, so no org role applies (the setup link's token is the authority, checked in lib/auth/setup-link.ts)" },
   { handlers: [
       "app/api/auth/change-password/route.ts POST",
       "app/auth/callback/route.ts GET",
@@ -163,6 +164,8 @@ const ALLOW: Allow[] = [
     reason: "a learner with a membership that counts asks for another attempt on their own record" },
   { handlers: ["app/api/courses/[courseId]/language-preference/route.ts PUT"], authority: "membership",
     reason: "self-service: the caller's own language preference row, while their membership counts" },
+  { handlers: ["app/api/ops/health/route.ts GET"], authority: "cron-secret",
+    reason: "the health check: its one rpc, tenant_mail_status, only reads (ADR 0029 step 17) and runs only for a caller that sent the cron secret" },
   { handlers: ["app/api/broadcasts/route.ts POST"], authority: "own-account",
     reason: "self-service: the caller marks a platform broadcast read on their own row" },
 ];

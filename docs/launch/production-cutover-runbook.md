@@ -131,13 +131,11 @@ binding = "ASSETS"
 [env.production.observability]
 enabled = true
 
+# Empty on purpose (corrected 2026-11-21, ADR 0029): the Worker has no
+# scheduled handler, so a cron trigger here would fire nothing. The jobs are
+# driven by .github/workflows/cron.yml (step 10).
 [env.production.triggers]
-crons = [
-  "0 2 * * *",   # /api/cron/billing
-  "0 3 * * *",   # /api/cron/reaper
-  "0 6 * * *",   # /api/cron/reminders
-  "0 7 * * 1",   # /api/cron/rls-audit
-]
+crons = []
 
 [env.production.vars]
 NEXT_PUBLIC_SUPABASE_URL = "https://alkfrcglmseksweqhwzq.supabase.co"
@@ -172,7 +170,7 @@ Paste: a freshly generated 32+ char random string (do **not** reuse staging's �
 ```
 npx wrangler secret put CRON_SECRET --env production
 ```
-Paste: another fresh random 32+ char string. This is the bearer the cron handlers check before doing work.
+Paste: another fresh random 32+ char string. This is the secret the cron handlers check (the `x-cron-secret` header) before doing work; the repository secret `PROD_CRON_SECRET` that `.github/workflows/cron.yml` sends must equal it (corrected 2026-11-21, ADR 0029; this read "the bearer").
 
 - [ ] All three secrets set without errors.
 - [ ] Verify they're all listed: `npx wrangler secret list --env production` — expect 3 entries: `SUPABASE_SERVICE_ROLE_KEY`, `IMPERSONATION_SECRET`, `CRON_SECRET`.
@@ -213,7 +211,7 @@ Expected output: `Deployed my-lms-prod triggers: ...` and a URL `https://my-lms-
 
 - [ ] Deploy succeeded.
 - [ ] `https://my-lms-prod.mentora.workers.dev` returns a page (not a 1101 / not a 503).
-- [ ] Dashboard → Workers & Pages → `my-lms-prod` → **Triggers** shows the 4 cron schedules.
+- [ ] The Worker has no cron triggers, and none are expected under **Triggers** (corrected 2026-11-21, ADR 0029; this read "shows the 4 cron schedules"). The schedules are checked in step 10.
 
 ---
 
@@ -257,7 +255,7 @@ These are the minimum pre-launch confidence checks. Detailed steps for each are 
 
 **Mission 16 — Admin SMTP + branding**
 - [ ] Tenant admin updates org branding (logo, brand color, login hero text) → `/{slug}/login` reflects the change immediately.
-- [ ] Tenant admin sends a forgot-password from the org's branded login page → email arrives **From** the org's configured From address (not platform default).
+- [ ] A learner of the org asks for a reset code on the org's branded login page → email arrives **From** the org's configured From address (a tenant's mail has no other sender). Since ADR 0029 an administrator's own code comes from the platform mailbox instead (`ops/RUNBOOK.md` §6.3, item 5).
 
 If any of the three fails, do not invite real users. Diagnose and re-test.
 
@@ -265,15 +263,12 @@ If any of the three fails, do not invite real users. Diagnose and re-test.
 
 ## 10. Cron verification
 
-Cloudflare crons run on UTC. The earliest one (`/api/cron/billing` at 02:00 UTC) will fire that night. To verify all four are healthy without waiting:
+Corrected 2026-11-21 (ADR 0029): this step read "Cloudflare crons", with a check of the Worker's Triggers tab. The Worker has no cron triggers. GitHub Actions drives every job: `.github/workflows/cron.yml` ("Scheduled crons (prod)") POSTs each `/api/cron/*` route of the production Worker with the `x-cron-secret` header, on UTC schedules, and only from the default branch. The earliest daily one (`/api/cron/billing` at 02:00 UTC) runs that night. To verify without waiting:
 
-- [ ] Dashboard → Workers & Pages → `my-lms-prod` → **Triggers** → confirm all 4 schedules show with their next-fire time.
-- [ ] Optionally trigger one manually right now:
-  ```
-  curl -X POST -H "Authorization: Bearer PROD_CRON_SECRET" https://my-lms-prod.mentora.workers.dev/api/cron/rls-audit
-  ```
-  Expect a JSON response describing the audit result.
-- [ ] Tomorrow morning: check the Worker's **Logs** tab for the 02:00 / 03:00 / 06:00 entries. All four should have run and exited 200.
+- [ ] Repository → Settings → Secrets and variables → Actions: `PROD_CRON_SECRET` (equal to the Worker's `CRON_SECRET`) and `PROD_BASE_URL` are set.
+- [ ] Actions → **Scheduled crons (prod)** is enabled.
+- [ ] Optionally run one now: Actions → **Scheduled crons (prod)** → **Run workflow**, endpoint `/api/cron/rls-audit`. The run prints `HTTP 200` and the answer's numbers, and fails on any other status.
+- [ ] Tomorrow morning: the workflow's runs at 02:00 / 03:00 / 06:00 UTC are green.
 
 ---
 
@@ -296,14 +291,14 @@ Cloudflare crons run on UTC. The earliest one (`/api/cron/billing` at 02:00 UTC)
 ## 12. Post-cutover — first 7 days
 
 - [ ] **Day 1:** Watch Worker logs hourly. Confirm forgot-password emails are flowing. Check `notification_log` table for any `ok=false` rows.
-- [ ] **Day 2:** Confirm all 4 crons ran overnight (Logs tab).
+- [ ] **Day 2:** Confirm the scheduled jobs ran overnight: the **Scheduled crons (prod)** runs in the Actions tab are green (corrected 2026-11-21, ADR 0029; this read "all 4 crons ... (Logs tab)").
 - [ ] **Day 3–7:** Once daily, check:
   - Supabase Dashboard → Database → **Logs** for any policy denials or errors
   - Supabase Dashboard → **Usage** — track DB size, egress, auth requests; you have 500MB / 5GB / 50k respectively on free tier
   - Cloudflare Dashboard → Worker **Analytics** — request count, error rate, CPU time
 - [ ] **End of week 1:** Schedule the deferred work:
   - Ticket #119 — nightly DB backup (no longer optional once you have paying customers)
-  - Ticket #120 — Resend or platform SMTP for Supabase auth emails (currently only your custom org SMTP works; Supabase's built-in auth emails like email-confirm use the project's SMTP setting — verify it's configured or learners signing up will silently miss confirmation mail)
+  - Ticket #120 — closed by ADR 0029 (pull request B): the LMS sends every email itself, a tenant's through its own SMTP and the platform's through the platform mailbox, with no fallback; Supabase Auth's own mailer sends none of the app's mail and is turned down on production (`docs/ops/supabase-auth-smtp.md`)
   - Ticket #124 — custom domain (optional but improves trust; deferred)
 
 ---

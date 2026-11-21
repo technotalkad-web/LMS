@@ -67,6 +67,17 @@ export type AttentionProviderMeta = {
 /** The registry. Add a provider here (+ a fetcher in collect.ts) to add a type. */
 export const ATTENTION_PROVIDERS: AttentionProviderMeta[] = [
   {
+    // ADR 0029 section E and rule FP4: the organisation's own email cannot
+    // be sent, or its daily email count is near or past its limit. Its item
+    // cannot be marked as read: it goes when the cause is gone.
+    type: "tenant-smtp",
+    label: "Email (SMTP)",
+    description: "This organisation's email cannot be sent (SMTP not set up, or failing), or its daily email limit is near or reached.",
+    defaultEnabled: true,
+    defaultPriority: "critical",
+    configurablePriority: true,
+  },
+  {
     type: "attempt-request",
     label: "Attempt requests",
     description: "Learners waiting on an extra-attempt decision.",

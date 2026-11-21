@@ -13,6 +13,8 @@ import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from ".
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
 
 /**
@@ -44,6 +46,11 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * membership counts. The organisation's members that count are read once
  * for the call (countingMemberIds), never once per learner; when that read
  * fails no mail is sent and the grants stand.
+ *
+ * ADR 0029 rule T4: the answer carries the mails' outcome (`email`) for the
+ * administrator at the screen: how many were emailed and not, or nobody
+ * emailed because the recipients could not be read. Absent when nothing
+ * was granted.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -60,7 +67,7 @@ export async function grantExtraAttempts(
     userIds: string[];
     expiresInDays?: number | null;
   }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string }> {
+): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; email?: MailOutcome }> {
   const ids = [...new Set(args.userIds)];
   if (ids.length === 0) return { error: "No learners named", status: 400 };
   const course = await orgCourse(svc, args.orgId, args.courseId);
@@ -142,8 +149,13 @@ export async function grantExtraAttempts(
   const nowIso = new Date().toISOString();
   const days = args.expiresInDays;
   const expiresAt = expiryFromDays(days === null || (typeof days === "number" && GRANT_EXPIRY_CHOICES.includes(days)) ? days : undefined);
-  const people = await namesAndEmails(svc, ids);
+  // The addresses are read for the mail only: a failed read is never "no
+  // address" and never stops a grant. It mails nobody (ADR 0029).
+  const people = await namesAndEmails(svc, ids).catch(() => "unreadable" as const);
   let counting: ReadonlySet<string> | "unreadable" | undefined;
+  let run: MailRun | undefined;
+  /** The granted learners' mails, for the answer (rule T4). */
+  let mailed: MailCounts = mailCounts([]);
   for (const uid of ids) {
     const mine = byUser.get(uid) ?? [];
     const retakeIds = retakes.get(`${uid}:${course.id}`)?.retakeIds ?? new Set<string>();
@@ -189,21 +201,31 @@ export async function grantExtraAttempts(
     }
     results.push({ userId: uid, status: "granted" });
     // ADR 0030 rule 10: the organisation's members that count, read once for
-    // this call at its first grant. Unreadable: no mail; the grants stand.
+    // this call at its first grant. A failed read of them or of the
+    // addresses mails nobody and records the skip once; the grants stand.
     if (counting === undefined) {
       counting = await countingMemberIds(svc, args.orgId);
-      if (counting === "unreadable") {
-        console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "attempt-grant", org_id: args.orgId }));
+      if (counting === "unreadable" || people === "unreadable") {
+        counting = "unreadable";
+        await recordRecipientsUnreadable("attempt-grant", args.orgId);
       }
     }
-    if (counting === "unreadable") continue;
+    if (counting === "unreadable" || people === "unreadable") continue;
+    // Rule 10: a learner whose membership does not count gets no mail, and
+    // no run is opened for nobody.
+    if (!counting.has(uid)) continue;
+    run ??= await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + ids.length }), db: svc });
     const who = people.get(uid);
-    await notifyLearnerOfDecision(svc, {
+    const one = await notifyLearnerOfDecision(svc, {
       orgId: args.orgId, orgName: args.orgName, orgSlug: args.orgSlug, origin: args.origin,
       courseId: course.id, courseTitle: course.title,
       learner: { id: uid, email: who?.email ?? "" }, approved: true, note: null, expiresAt,
-      counting,
+      counting, run,
     });
+    mailed = addMailOutcome(mailed, one);
   }
-  return { results, courseTitle: course.title };
+  // Nothing granted: no mail to speak of. A failed read of the recipients:
+  // nobody was emailed, and the answer says why.
+  if (counting === undefined) return { results, courseTitle: course.title };
+  return { results, courseTitle: course.title, email: counting === "unreadable" ? RECIPIENTS_UNREADABLE : mailed };
 }

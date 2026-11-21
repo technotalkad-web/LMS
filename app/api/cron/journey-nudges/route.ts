@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
-import { notifyBackground } from "@/lib/notifications/send";
+import { sendMany, type SendResult } from "@/lib/notifications/send";
+import { MAIL_CALL_COSTS, SENDS_AT_ONCE, cronBudget, hasRoom, openRun, sendDueAlert, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
+import { buildMailCronDetail, owedAfterRun, type CronErrorCounts, type CronErrorWord } from "@/lib/ops/health-status";
 import { countingMemberIds } from "@/lib/auth/org-membership";
+import { chunk, readAllStrict } from "@/lib/db/chunked";
 import {
   computeJourneyState,
   courseDaysOf,
@@ -60,6 +63,42 @@ import {
  * mail_recipients_unreadable log line, not in a count. The next scheduled
  * run is the retry.
  *
+ * ADR 0029 (rules T2, T5, FP2, FP3, FP7 and FP8; the note of 2026-11-20,
+ * part 2):
+ *   - The call first sends at most one tenant alert that is due (rule FP3),
+ *     the oldest, and its cost is in the call's sum.
+ *   - The sends are runs: one for each organisation, on this call's one
+ *     clock and one count. For each page of due learners: the learners' and
+ *     managers' profiles and the course titles, each read in lists of 150
+ *     ids (lib/db/chunked.ts), and the claim taken for each group in one
+ *     conditional update just before its sends, so a nudge that is not
+ *     started holds no claim. A claim is given back after a failure of any
+ *     class but a timeout (the mail may still arrive), and after a send that
+ *     was not attempted. A page the call has no room left to read whole is
+ *     left for the next call.
+ *   - Every read is whole or not used: the line managers are read in pages
+ *     of 1000 rows, and the members that count in pages too, each page asked
+ *     for and counted as made (rule FP2); with no room to read either whole,
+ *     the program is left whole for the next call. A call that had people to
+ *     read and read no program's people whole for want of room, and whose
+ *     alert step did nothing, stops with call_limit and one fixed line
+ *     (cron_no_room); a program left once another's people were read whole
+ *     is a clean run (the note of 2026-11-21 (later), points 1 and 4).
+ *   - The escalation marks are written with each group of escalations, by
+ *     the run's own step after the group; an escalation with no room for its
+ *     mark is left, not sent (point 2).
+ *   - A failed run is the job's own failed read or write, or the platform's
+ *     call limit: the programs, a time zone, the members that count, the
+ *     line managers, a page of enrolments, the progress counts, the
+ *     profiles, a course title, a claim or its giving back, the escalation
+ *     marks, the alert step. A failed read is never a default: a program
+ *     whose time zone could not be read is left for the next call, and a
+ *     learner whose profile could not be read takes no claim and is left.
+ *   - The answer and the heartbeat are built by buildMailCronDetail: counts
+ *     and fixed words only. No organisation's slug or id, and no database
+ *     message, is answered or stored; the numbers for one organisation go to
+ *     a Worker log line with its id.
+ *
  * Scheduled hourly from .github/workflows/cron.yml.
  */
 
@@ -82,6 +121,36 @@ function hourInTz(tz: string): number {
   );
 }
 
+type Program = {
+  id: string;
+  organization_id: string;
+  name: string;
+  nudge_cooldown_days: number;
+  reminder_hour?: number | null; // 0088 — undefined before the migration → 11
+  deadline_days?: number | null; // 0065
+  escalation_enabled?: boolean;
+  escalation_after_days?: number;
+  organizations:
+    | { name: string; slug: string; deleted_at?: string | null }
+    | Array<{ name: string; slug: string; deleted_at?: string | null }>;
+};
+
+type Enrolment = {
+  id: string;
+  user_id: string;
+  start_date: string;
+  last_nudged_at: string | null;
+  last_daily_reminder_on: string | null;
+  journey_versions:
+    | { days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }
+    | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
+};
+
+type Profile = { id: string; first_name: string | null; last_name: string | null; email: string | null };
+
+/** A learner's nudge of one page: the mail's context, and the claim's previous value to give back. */
+type Nudge = { enrolment: string; userId: string; email: string; previous: string | null; context: Record<string, string> };
+
 async function run() {
   const svc = createServiceClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -92,44 +161,125 @@ async function run() {
   // LEGITIMATE NEXT_PUBLIC_SITE_URL use: crons have no inbound request to
   // derive an origin from (same pattern as api/cron/reminders).
   const base = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ?? "";
-
-  // `*` on the program keeps this deploy-safe across program-column
-  // migrations — 0065/0088 fields arrive as undefined before they run.
-  const { data: progRows, error: progErr } = await svc
-    .from("journey_programs")
-    .select("*, organizations!inner(name, slug, deleted_at)")
-    .eq("is_active", true)
-    .eq("nudge_enabled", true)
-    .not("current_version_id", "is", null);
-  if (progErr) return { ok: false, error: progErr.message, total_ms: Date.now() - t0 };
+  const budget = cronBudget();
+  const errors: CronErrorCounts = {};
+  const fail = (word: CronErrorWord, n = 1) => {
+    errors[word] = (errors[word] ?? 0) + n;
+  };
+  /** One call for a page of a read, while the call still has room for it and for a send after it. */
+  const pageRoom = () => {
+    if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.send + 3)) return false;
+    spendCalls(budget, 1);
+    return true;
+  };
+  /**
+   * The call's own stop in a step no later call can finish (ADR 0029, note
+   * of 2026-11-21 (later), point 4): the job's own failed step, call_limit,
+   * with one fixed line: the job, the step's word, the calls spent, and
+   * whether the count or the clock ended it. Numbers and fixed words only.
+   */
+  const noRoom = (step: CronErrorWord) => {
+    const endedBy = budget.now() - budget.startedAt >= budget.windowMs ? "clock" : "count";
+    console.warn(JSON.stringify({ event: "cron_no_room", job: "journey-nudges", step, calls: budget.calls, ended_by: endedBy }));
+    fail("call_limit");
+  };
 
   let reminded = 0;
   let escalated = 0;
   let scanned = 0;
   let skippedEarly = 0;
   let capped = false;
-  const details: Array<{ org: string; reminded: number; escalated: number }> = [];
-  const courseTitle = new Map<string, string>(); // courseId → title (cross-program cache)
-  // Rule 10: the members that count, read once per organisation in this run.
-  const countingByOrg = new Map<string, ReadonlySet<string> | "unreadable">();
   let skippedOrg = 0;
   // Organisations (not programs) whose members could not be read: the run
   // fails when there is one.
   let unreadableOrgs = 0;
+  let leftOrgs = 0;
+  let leftComplete = true;
+  let due = 0;
+  let failedNudges = 0;
+  let notStarted = 0;
+  let leftDailyLimit = 0;
+  const failedClasses: string[] = [];
+  let no0114 = false;
+  let stoppedBeforeSend = false;
+  // Whether the programs were read, so the number left for room is known.
+  let programsRead = false;
+  // Whether any program got past the reads of its people: its members that
+  // count and, where escalation is on, its line managers.
+  let peopleReadWhole = false;
 
-  for (const p of (progRows ?? []) as Array<{
-    id: string;
-    organization_id: string;
-    name: string;
-    nudge_cooldown_days: number;
-    reminder_hour?: number | null; // 0088 — undefined before the migration → 11
-    deadline_days?: number | null; // 0065
-    escalation_enabled?: boolean;
-    escalation_after_days?: number;
-    organizations:
-      | { name: string; slug: string; deleted_at?: string | null }
-      | Array<{ name: string; slug: string; deleted_at?: string | null }>;
-  }>) {
+  const finish = () =>
+    buildMailCronDetail(
+      {
+        errors,
+        unreadableOrgs,
+        stoppedBeforeSend,
+        no0114,
+        ...(stoppedBeforeSend
+          ? programsRead
+            ? { leftOrgs }
+            : {}
+          : {
+              due,
+              sent: reminded,
+              failed: failedNudges,
+              left: owedAfterRun("journey-nudges", { notStarted, failedClasses }),
+              leftComplete,
+              leftDailyLimit,
+              leftOrgs,
+            }),
+      },
+      {
+        total_ms: Date.now() - t0,
+        scanned,
+        reminded,
+        escalated,
+        skipped_early: skippedEarly,
+        skipped_org_programs: skippedOrg,
+        capped,
+      }
+    );
+
+  // 1. At most one alert that is due, the oldest (rule FP3), before the
+  //    call's own mail: what it costs is not left for the nudges.
+  const alert = await sendDueAlert({ baseUrl: base, budget, db: svc });
+  if (alert.kind === "failed") fail("alert");
+  // The alert step did work the next call is spared.
+  const alertProgress = alert.kind === "sent" || alert.kind === "dropped" || alert.kind === "taken";
+
+  // 2. The programs. A failed read is never "no programs".
+  // `*` on the program keeps this deploy-safe across program-column
+  // migrations — 0065/0088 fields arrive as undefined before they run.
+  spendCalls(budget, 1);
+  const { data: progRows, error: progErr } = await svc
+    .from("journey_programs")
+    .select("*, organizations!inner(name, slug, deleted_at)")
+    .eq("is_active", true)
+    .eq("nudge_enabled", true)
+    .not("current_version_id", "is", null);
+  if (progErr || !Array.isArray(progRows)) {
+    fail("config_read");
+    stoppedBeforeSend = true;
+    return finish();
+  }
+  programsRead = true;
+
+  const courseTitle = new Map<string, string>(); // courseId → title (cross-program cache)
+  // Rule 10: the members that count, read once per organisation in this run.
+  const countingByOrg = new Map<string, ReadonlySet<string> | "unreadable">();
+  // One run for each organisation, opened when its first mail is due.
+  const runs = new Map<string, MailRun>();
+  const runFor = async (orgId: string): Promise<MailRun> => {
+    const open = runs.get(orgId);
+    if (open) return open;
+    const r = await openRun({ organizationId: orgId, budget, db: svc });
+    if (r.no0114) no0114 = true;
+    runs.set(orgId, r);
+    return r;
+  };
+  const perOrg = new Map<string, { reminded: number; escalated: number }>();
+
+  for (const p of progRows as Program[]) {
     if (reminded >= MAX_REMINDERS_PER_RUN) {
       capped = true;
       break;
@@ -140,11 +290,24 @@ async function run() {
       skippedOrg++;
       continue;
     }
-    const { data: gsRow } = await svc
+    // A program this call has no room left for is left for the next call.
+    if (!hasRoom(budget, 4 + MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.send + 3)) {
+      leftOrgs++;
+      leftComplete = false;
+      continue;
+    }
+    spendCalls(budget, 1);
+    const { data: gsRow, error: tzErr } = await svc
       .from("gamification_settings")
       .select("timezone")
       .eq("organization_id", p.organization_id)
       .maybeSingle();
+    if (tzErr) {
+      // A failed read is not the default time zone: the program is left.
+      fail("config_read");
+      leftComplete = false;
+      continue;
+    }
     const tz = (gsRow as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
     const today = todayStr(tz);
     const reminderHour = Math.min(23, Math.max(0, p.reminder_hour ?? 11));
@@ -155,7 +318,16 @@ async function run() {
       continue;
     }
     if (!countingByOrg.has(p.organization_id)) {
-      const read = await countingMemberIds(svc, p.organization_id);
+      // Each call of the read (the organisation, then a call for each 1,000
+      // members) asks for room first and is counted as made (rule FP2). With
+      // no room left to read it whole the program is left for the next call,
+      // as a program with no room is above; nothing is kept of a part read.
+      const read = await countingMemberIds(svc, p.organization_id, undefined, pageRoom);
+      if (read === "no_room") {
+        leftOrgs++;
+        leftComplete = false;
+        continue;
+      }
       if (read === "unreadable") unreadableOrgs++;
       countingByOrg.set(p.organization_id, read);
     }
@@ -166,35 +338,58 @@ async function run() {
       continue;
     }
     const cooldownCutoff = new Date(Date.now() - (p.nudge_cooldown_days ?? 3) * 86400000);
-    const escalationOn = p.escalation_enabled === true;
+    let escalationOn = p.escalation_enabled === true;
     const escalateAfter = p.escalation_after_days ?? 3;
 
     // L1 managers for this org (0011 line_manager_id), fetched once per program:
     // the learners' own rows, active only (rule 10). Whether the manager's own
-    // membership counts is tested at the send.
+    // membership counts is tested at the send. A failed read means no
+    // escalation for this program in this call; the learners' own reminders
+    // go on. Read in pages of 1000 rows: a cut list is never used. With no
+    // room left to read it whole, the program is left whole for the next
+    // call, as a program whose members had no room is (ADR 0029, note of
+    // 2026-11-21 (later), point 1): a learner reminded now would be off the
+    // page for the day, and their escalation with them.
     let managerOf = new Map<string, string>();
     if (escalationOn) {
-      const { data: memRows } = await svc
-        .from("organization_members")
-        .select("user_id, line_manager_id")
-        .eq("organization_id", p.organization_id)
-        .eq("status", "active")
-        .not("line_manager_id", "is", null);
-      managerOf = new Map(
-        ((memRows ?? []) as Array<{ user_id: string; line_manager_id: string }>).map(
-          (m) => [m.user_id, m.line_manager_id]
-        )
+      const memRows = await readAllStrict<{ user_id: string; line_manager_id: string }>(
+        (from, to) =>
+          svc
+            .from("organization_members")
+            .select("user_id, line_manager_id")
+            .eq("organization_id", p.organization_id)
+            .eq("status", "active")
+            .not("line_manager_id", "is", null)
+            .order("user_id")
+            .range(from, to),
+        pageRoom
       );
+      if (memRows === "unreadable") {
+        fail("members_read");
+        escalationOn = false;
+      } else if (memRows === "no_room") {
+        leftOrgs++;
+        leftComplete = false;
+        continue;
+      } else {
+        managerOf = new Map(memRows.map((m) => [m.user_id, m.line_manager_id]));
+      }
     }
+    peopleReadWhole = true;
 
-    let orgReminded = 0;
-    let orgEscalated = 0;
+    const tally = perOrg.get(p.organization_id) ?? { reminded: 0, escalated: 0 };
+    perOrg.set(p.organization_id, tally);
     // Keyset pagination by id (stable while we stamp non-id columns); the daily
     // guard filter drops learners already reminded today.
     let lastId = "";
     for (;;) {
       if (reminded >= MAX_REMINDERS_PER_RUN) {
         capped = true;
+        break;
+      }
+      if (!hasRoom(budget, 4 + MAIL_CALL_COSTS.send + 3)) {
+        // No room for another page: the rest of this program is left.
+        leftComplete = false;
         break;
       }
       let q = svc
@@ -208,17 +403,15 @@ async function run() {
         .order("id", { ascending: true })
         .limit(PAGE);
       if (lastId) q = q.gt("id", lastId);
-      const { data: enrRows } = await q;
-      const batch = (enrRows ?? []) as Array<{
-        id: string;
-        user_id: string;
-        start_date: string;
-        last_nudged_at: string | null;
-        last_daily_reminder_on: string | null;
-        journey_versions:
-          | { days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }
-          | Array<{ days: unknown; days_total: number; count_sundays: boolean; unlock_mode?: string | null }>;
-      }>;
+      spendCalls(budget, 1);
+      const { data: enrRows, error: enrErr } = await q;
+      if (enrErr || !Array.isArray(enrRows)) {
+        // A failed read is not "no learners": the program's other pages are left.
+        fail("assignments_read");
+        leftComplete = false;
+        break;
+      }
+      const batch = enrRows as Enrolment[];
       if (batch.length === 0) break;
 
       // One batched round-trip for the page: the credited days + whether a
@@ -228,20 +421,31 @@ async function run() {
       // database without it (ADR 0024 step 45). A failed read reminds
       // nobody on the page: it is never "nothing done", which would email
       // every learner that they are behind (reminderCountsFrom).
+      spendCalls(budget, 1);
       const { data: cntRows, error: cntErr } = await svc.rpc("journey_reminder_counts", {
         p_ids: batch.map((e) => e.id),
       });
       const counts = reminderCountsFrom(cntRows, cntErr);
       if (cntErr) {
+        fail("progress_read");
+        leftComplete = false;
         console.warn(JSON.stringify({ event: "journey_reminder_counts_failed", program_id: p.id, code: cntErr.code ?? null }));
       }
 
+      // Who on the page is due, and who needs an escalation.
+      type Candidate = {
+        e: Enrolment;
+        due: boolean;
+        escalate: boolean;
+        state: ReturnType<typeof computeJourneyState>;
+        unlockMode: "calendar" | "progress";
+        deadlineDate: string | null;
+        courseId: string | null;
+        missionTitle: string | null;
+      };
+      const candidates: Candidate[] = [];
       for (const e of batch) {
         scanned++;
-        if (reminded >= MAX_REMINDERS_PER_RUN) {
-          capped = true;
-          break;
-        }
         // Rule 10: a learner whose membership does not count gets no reminder,
         // is not stamped, and raises no escalation.
         if (!counting.has(e.user_id)) continue;
@@ -252,7 +456,6 @@ async function run() {
         const unlockMode = v.unlock_mode === "progress" ? "progress" : "calendar";
         const cnt = counts.ok ? counts.countOf(e.id) : null;
         if (!cnt) continue;
-        const doneToday = cnt.done_today;
         const courseDays = courseDaysOf(v.days, v.days_total);
         const state = computeJourneyState({
           startDate: e.start_date,
@@ -266,9 +469,9 @@ async function run() {
         if (state.finished) continue;
 
         // Pending work worth a reminder today?
-        const due =
+        const isDue =
           unlockMode === "progress"
-            ? state.todayUnlocked && !doneToday // has an open mission, none done today
+            ? state.todayUnlocked && !cnt.done_today // has an open mission, none done today
             : state.pendingDays >= 1; // one or more released missions pending
 
         // Deadline (0065) → manager escalation (calendar-only).
@@ -283,140 +486,277 @@ async function run() {
           (state.behindDays >= escalateAfter || overdue) &&
           (e.last_nudged_at === null || new Date(e.last_nudged_at) < cooldownCutoff);
 
-        if (!due && !needsEscalation) continue;
-
-        // ATOMIC CLAIM for the daily reminder: only the invocation whose
-        // conditional UPDATE matches (not yet reminded today) wins the send.
-        let claimed = false;
-        if (due) {
-          const { data: claim } = await svc
-            .from("journey_enrollments")
-            .update({ last_daily_reminder_on: today })
-            .eq("id", e.id)
-            .or(`last_daily_reminder_on.is.null,last_daily_reminder_on.lt.${today}`)
-            .select("id");
-          claimed = (claim?.length ?? 0) > 0;
-        }
-        if (!claimed && !needsEscalation) continue;
-
-        const { data: prof } = await svc
-          .from("profiles")
-          .select("first_name, last_name, email")
-          .eq("id", e.user_id)
-          .maybeSingle();
-        const profile = prof as {
-          first_name?: string | null;
-          last_name?: string | null;
-          email?: string | null;
-        } | null;
-        if (!profile?.email) {
-          // Can't email → release the claim so a later run can retry.
-          if (claimed) {
-            await svc
-              .from("journey_enrollments")
-              .update({ last_daily_reminder_on: e.last_daily_reminder_on })
-              .eq("id", e.id);
-          }
-          continue;
-        }
-        const learnerName =
-          [profile.first_name, profile.last_name].filter(Boolean).join(" ").trim() ||
-          profile.email.split("@")[0];
-
-        // Next mission's name (the learner's current incomplete day).
+        if (!isDue && !needsEscalation) continue;
         const entry = parseVersionDays(v.days).get(state.currentDay);
-        let nextModule = entry?.mission_title ?? null;
-        if (!nextModule && entry?.course_id) {
-          if (!courseTitle.has(entry.course_id)) {
-            const { data: cRow } = await svc
-              .from("courses")
-              .select("title")
-              .eq("id", entry.course_id)
-              .maybeSingle();
-            courseTitle.set(entry.course_id, (cRow as { title?: string } | null)?.title ?? "your next module");
-          }
-          nextModule = courseTitle.get(entry.course_id) ?? "your next module";
+        candidates.push({
+          e,
+          due: isDue,
+          escalate: needsEscalation,
+          state,
+          unlockMode,
+          deadlineDate,
+          courseId: entry?.course_id ?? null,
+          missionTitle: entry?.mission_title ?? null,
+        });
+      }
+
+      if (candidates.length > 0) {
+        // The learners' and their managers' profiles, in lists of 150 ids
+        // (the house rule, lib/db/chunked.ts: a longer list fails on the
+        // platform). A failed read of any list is not "no address": nobody
+        // on the page takes a claim, and they are left for the next call.
+        const managersOnPage = candidates
+          .filter((c) => c.escalate)
+          .map((c) => managerOf.get(c.e.user_id))
+          .filter((m): m is string => !!m && counting.has(m));
+        const profileIds = [...new Set([...candidates.map((c) => c.e.user_id), ...managersOnPage])];
+        const profileLists = chunk(profileIds, 150);
+        // Room for the whole read, the titles and a send after them; with
+        // less, the page is left whole for the next call. That is no failure.
+        if (!hasRoom(budget, profileLists.length + 1 + MAIL_CALL_COSTS.send + 3)) {
+          leftComplete = false;
+          const owed = candidates.filter((c) => c.due).length;
+          due += owed;
+          notStarted += owed;
+          break;
         }
-        nextModule = nextModule ?? "your next module";
-
-        // Mode-appropriate reason line (keeps "days behind" only where it means
-        // something; progress journeys never say "behind").
-        const reminderLine =
-          unlockMode === "calendar" && state.behindDays >= 1
-            ? `You're **${state.behindDays} day${state.behindDays === 1 ? "" : "s"} behind** — missed missions can be caught up one after another.`
-            : "Pick up where you left off — it only takes a few minutes.";
-
-        const journeyCtx = {
-          learner_name: learnerName,
-          learner_email: profile.email,
-          org_name: org?.name ?? "",
-          journey_name: p.name,
-          day: String(state.currentDay),
-          days_total: String(state.daysTotal),
-          behind_days: String(state.behindDays),
-          next_module: nextModule,
-          reminder_line: reminderLine,
-          deadline_date: deadlineDate ?? "",
-          direct_link: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
-          portal_url: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
-        };
-
-        if (claimed) {
-          const res = await notifyBackground({
-            organizationId: p.organization_id,
-            event: "journey_nudge",
-            to: { user_id: e.user_id, email: profile.email },
-            context: journeyCtx,
-          });
-          if (res?.status === "sent") {
-            reminded++;
-            orgReminded++;
-          } else {
-            // Send failed/queued → release the claim so a later run retries
-            // rather than burning the learner's one reminder for the day.
-            await svc
-              .from("journey_enrollments")
-              .update({ last_daily_reminder_on: e.last_daily_reminder_on })
-              .eq("id", e.id);
+        const profRows: Profile[] = [];
+        let profilesRead = true;
+        for (const ids of profileLists) {
+          spendCalls(budget, 1);
+          const { data: rows, error: profErr } = await svc
+            .from("profiles")
+            .select("id, first_name, last_name, email")
+            .in("id", ids);
+          if (profErr || !Array.isArray(rows)) {
+            profilesRead = false;
+            break;
           }
+          profRows.push(...(rows as Profile[]));
         }
+        if (!profilesRead) {
+          fail("profiles_read");
+          leftComplete = false;
+          const owed = candidates.filter((c) => c.due).length;
+          due += owed;
+          notStarted += owed;
+        } else {
+          const profileOf = new Map(profRows.map((r) => [r.id, r]));
 
-        if (needsEscalation) {
-          const managerId = managerOf.get(e.user_id);
-          // Rule 10: only a manager whose membership counts is mailed.
-          if (managerId && counting.has(managerId)) {
-            const { data: mgr } = await svc
-              .from("profiles")
-              .select("first_name, last_name, email")
-              .eq("id", managerId)
-              .maybeSingle();
-            const manager = mgr as {
-              first_name?: string | null;
-              last_name?: string | null;
-              email?: string | null;
-            } | null;
-            if (manager?.email) {
-              await notifyBackground({
-                organizationId: p.organization_id,
-                event: "journey_escalation",
-                to: { user_id: managerId, email: manager.email },
-                context: {
-                  ...journeyCtx,
-                  manager_name:
-                    [manager.first_name, manager.last_name].filter(Boolean).join(" ").trim() ||
-                    manager.email.split("@")[0],
-                  direct_link: base
-                    ? `${base}/${org?.slug}/team-performance`
-                    : `/${org?.slug}/team-performance`,
-                },
-              });
-              await svc
-                .from("journey_enrollments")
-                .update({ last_nudged_at: new Date().toISOString() })
-                .eq("id", e.id);
-              escalated++;
-              orgEscalated++;
+          // The next missions' course titles, in lists of 150 ids. A failed
+          // read, or no room for one, sends the mail with the general words,
+          // as before.
+          const titleIds = [...new Set(candidates.filter((c) => !c.missionTitle && c.courseId && !courseTitle.has(c.courseId)).map((c) => c.courseId!))];
+          for (const ids of chunk(titleIds, 150)) {
+            if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.send + 3)) break;
+            spendCalls(budget, 1);
+            const { data: titleRows, error: titleErr } = await svc.from("courses").select("id, title").in("id", ids);
+            if (titleErr || !Array.isArray(titleRows)) {
+              fail("unknown");
+              break;
             }
+            for (const c of titleRows as Array<{ id: string; title?: string | null }>) if (c.title) courseTitle.set(c.id, c.title);
+          }
+
+          const nudges: Nudge[] = [];
+          const escalations: Array<{ enrolment: string; managerId: string; email: string; context: Record<string, string> }> = [];
+          for (const c of candidates) {
+            const profile = profileOf.get(c.e.user_id);
+            if (!profile?.email) continue;
+            const learnerName =
+              [profile.first_name, profile.last_name].filter(Boolean).join(" ").trim() ||
+              profile.email.split("@")[0];
+            const nextModule = c.missionTitle ?? (c.courseId ? courseTitle.get(c.courseId) : undefined) ?? "your next module";
+            // Mode-appropriate reason line (keeps "days behind" only where it means
+            // something; progress journeys never say "behind").
+            const reminderLine =
+              c.unlockMode === "calendar" && c.state.behindDays >= 1
+                ? `You're **${c.state.behindDays} day${c.state.behindDays === 1 ? "" : "s"} behind** — missed missions can be caught up one after another.`
+                : "Pick up where you left off — it only takes a few minutes.";
+            const journeyCtx = {
+              learner_name: learnerName,
+              learner_email: profile.email,
+              org_name: org?.name ?? "",
+              journey_name: p.name,
+              day: String(c.state.currentDay),
+              days_total: String(c.state.daysTotal),
+              behind_days: String(c.state.behindDays),
+              next_module: nextModule,
+              reminder_line: reminderLine,
+              deadline_date: c.deadlineDate ?? "",
+              direct_link: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
+              portal_url: base ? `${base}/${org?.slug}/journey` : `/${org?.slug}/journey`,
+            };
+            if (c.due) nudges.push({ enrolment: c.e.id, userId: c.e.user_id, email: profile.email, previous: c.e.last_daily_reminder_on, context: journeyCtx });
+            if (c.escalate) {
+              const managerId = managerOf.get(c.e.user_id);
+              // Rule 10: only a manager whose membership counts is mailed.
+              const manager = managerId && counting.has(managerId) ? profileOf.get(managerId) : undefined;
+              if (managerId && manager?.email) {
+                escalations.push({
+                  enrolment: c.e.id,
+                  managerId,
+                  email: manager.email,
+                  context: {
+                    ...journeyCtx,
+                    manager_name:
+                      [manager.first_name, manager.last_name].filter(Boolean).join(" ").trim() ||
+                      manager.email.split("@")[0],
+                    direct_link: base
+                      ? `${base}/${org?.slug}/team-performance`
+                      : `/${org?.slug}/team-performance`,
+                  },
+                });
+              }
+            }
+          }
+          due += nudges.length;
+
+          // The nudges: one group at a time, each claimed just before its sends.
+          const room = Math.max(0, MAX_REMINDERS_PER_RUN - reminded);
+          const nudgesNow = nudges.slice(0, room);
+          if (nudges.length > nudgesNow.length) {
+            capped = true;
+            notStarted += nudges.length - nudgesNow.length;
+          }
+          if (nudgesNow.length > 0) {
+            const r = await runFor(p.organization_id);
+            const claimed = new Set<string>();
+            // A group whose claim could not be written sends nothing; its
+            // learners stay owed, and the count is no longer complete.
+            const unclaimed = new Set<string>();
+            const results: SendResult[] = await sendMany(
+              r,
+              nudgesNow,
+              (n) => ({
+                event: "journey_nudge",
+                to: { user_id: n.userId, email: n.email },
+                context: {
+                  learner_name: n.context.learner_name,
+                  learner_email: n.context.learner_email,
+                  org_name: n.context.org_name,
+                  journey_name: n.context.journey_name,
+                  day: n.context.day,
+                  days_total: n.context.days_total,
+                  behind_days: n.context.behind_days,
+                  next_module: n.context.next_module,
+                  reminder_line: n.context.reminder_line,
+                  deadline_date: n.context.deadline_date,
+                  direct_link: n.context.direct_link,
+                  portal_url: n.context.portal_url,
+                },
+              }),
+              {
+                hooks: {
+                  // ATOMIC CLAIM for the daily reminder, for the group: only
+                  // the invocation whose conditional UPDATE matches (not yet
+                  // reminded today) wins a learner's send.
+                  beforeCalls: 1,
+                  before: async (group) => {
+                    const ids = group.map((n) => n.enrolment);
+                    const upd = svc.from("journey_enrollments").update({ last_daily_reminder_on: today });
+                    const { data: won, error: claimErr } = await (ids.length === 1 ? upd.eq("id", ids[0]) : upd.in("id", ids))
+                      .or(`last_daily_reminder_on.is.null,last_daily_reminder_on.lt.${today}`)
+                      .select("id");
+                    if (claimErr || !Array.isArray(won)) {
+                      fail("state_write");
+                      leftComplete = false;
+                      for (const n of group) unclaimed.add(n.enrolment);
+                      return { keep: group.map(() => false), calls: 1 };
+                    }
+                    const set = new Set((won as Array<{ id: string }>).map((w) => w.id));
+                    for (const id of set) claimed.add(id);
+                    return { keep: group.map((n) => set.has(n.enrolment)), calls: 1 };
+                  },
+                  // A claim is given back after a failure of any class but a
+                  // timeout, and after a send that was not attempted, so a
+                  // later run retries it the same day (rule T2). One write
+                  // for each earlier date in the group, at most one a mail.
+                  afterCalls: SENDS_AT_ONCE,
+                  after: async (entries) => {
+                    const giveBack = entries.filter(
+                      (x) => claimed.has(x.item.enrolment) && x.result.status !== "sent" && !(x.result.status === "failed" && x.result.cls === "timeout")
+                    );
+                    const byPrevious = new Map<string | null, string[]>();
+                    for (const { item } of giveBack) byPrevious.set(item.previous, [...(byPrevious.get(item.previous) ?? []), item.enrolment]);
+                    let calls = 0;
+                    for (const [previous, ids] of byPrevious) {
+                      calls++;
+                      const rel = svc.from("journey_enrollments").update({ last_daily_reminder_on: previous });
+                      const { error: relErr } = await (ids.length === 1 ? rel.eq("id", ids[0]) : rel.in("id", ids));
+                      if (relErr) fail("state_write");
+                    }
+                    return { calls };
+                  },
+                },
+              }
+            );
+            results.forEach((res, k) => {
+              if (res.errorClass === "withdrawn" && unclaimed.has(nudgesNow[k].enrolment)) notStarted++;
+            });
+            for (const res of results) {
+              if (res.status === "sent") {
+                reminded++;
+                tally.reminded++;
+              } else if (res.attempted) {
+                failedNudges++;
+                failedClasses.push(String(res.errorClass ?? "unknown"));
+              } else if (res.errorClass !== "withdrawn") {
+                notStarted++;
+                if (res.errorClass === "daily_limit") leftDailyLimit++;
+              }
+            }
+          }
+
+          // The escalations, after the page's nudges. Each group's marks are
+          // written with that group, by the run's own step after it (ADR
+          // 0029, note of 2026-11-21 (later), point 2): the run keeps the
+          // mark's call back before the sends, so an escalation with no room
+          // for its mark is not sent but left, and a later call sends it.
+          if (escalations.length > 0) {
+            const r = await runFor(p.organization_id);
+            const markedAt = new Date().toISOString();
+            const results = await sendMany(r, escalations, (x) => ({
+              event: "journey_escalation",
+              to: { user_id: x.managerId, email: x.email },
+              context: {
+                learner_name: x.context.learner_name,
+                learner_email: x.context.learner_email,
+                org_name: x.context.org_name,
+                journey_name: x.context.journey_name,
+                day: x.context.day,
+                days_total: x.context.days_total,
+                behind_days: x.context.behind_days,
+                next_module: x.context.next_module,
+                reminder_line: x.context.reminder_line,
+                deadline_date: x.context.deadline_date,
+                manager_name: x.context.manager_name,
+                direct_link: x.context.direct_link,
+                portal_url: x.context.portal_url,
+              },
+            }), {
+              hooks: {
+                // The mark of the group's escalations that were attempted
+                // (sent or failed), in one update. A failed write is the
+                // job's own failed step: that escalation can go again at the
+                // next call that finds the learner on its page.
+                afterCalls: 1,
+                after: async (entries) => {
+                  const ids = entries.filter((e) => e.result.status === "sent" || e.result.status === "failed").map(({ item }) => item.enrolment);
+                  if (ids.length === 0) return { calls: 0 };
+                  const mark = svc.from("journey_enrollments").update({ last_nudged_at: markedAt });
+                  const { error: markErr } = await (ids.length === 1 ? mark.eq("id", ids[0]) : mark.in("id", ids));
+                  if (markErr) fail("state_write");
+                  return { calls: 1 };
+                },
+              },
+            });
+            const attempted = results.filter((res) => res.attempted).length;
+            // An escalation left for want of room has no mark; the count of
+            // what this call owes is no longer whole.
+            if (results.some((res) => res.errorClass === "left")) leftComplete = false;
+            escalated += attempted;
+            tally.escalated += attempted;
           }
         }
       }
@@ -425,27 +765,29 @@ async function run() {
       if (batch.length < PAGE) break;
       lastId = batch[batch.length - 1].id;
     }
-    if (orgReminded > 0 || orgEscalated > 0) {
-      details.push({
-        org: org?.slug ?? p.organization_id,
-        reminded: orgReminded,
-        escalated: orgEscalated,
-      });
-    }
   }
 
-  return {
-    ok: unreadableOrgs === 0,
-    total_ms: Date.now() - t0,
-    scanned,
-    reminded,
-    escalated,
-    skipped_early: skippedEarly,
-    skipped_org_programs: skippedOrg,
-    unreadable_orgs: unreadableOrgs,
-    capped,
-    details,
-  };
+  // A call that had people to read and read nobody's people whole for want
+  // of room, and whose alert step did nothing either, has done nothing the
+  // next call is spared (ADR 0029, note of 2026-11-21 (later), point 4): the
+  // job's own failed step, stopped before any send. A program left once
+  // another's people were read whole, or in a call whose alert went, stays a
+  // clean run.
+  if (leftOrgs > 0 && !peopleReadWhole && !alertProgress) {
+    noRoom("members_read");
+    stoppedBeforeSend = true;
+  }
+  for (const r of runs.values()) {
+    for (const word of Object.keys(r.errors) as CronErrorWord[]) fail(word, r.errors[word] ?? 0);
+  }
+  // One organisation's numbers go to the Worker's log with its id, never to
+  // the answer or the heartbeat.
+  for (const [orgId, t] of perOrg) {
+    if (t.reminded > 0 || t.escalated > 0) {
+      console.log(JSON.stringify({ event: "journey_nudges_org", org_id: orgId, reminded: t.reminded, escalated: t.escalated }));
+    }
+  }
+  return finish();
 }
 
 export async function POST(request: NextRequest) {
@@ -453,9 +795,9 @@ export async function POST(request: NextRequest) {
   if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
     return unauthorized();
   }
-  const result = await run();
-  await recordHeartbeat("journey-nudges", result, result.ok);
-  return NextResponse.json(result, { status: result.ok ? 200 : 500 });
+  const detail = await run();
+  await recordHeartbeat("journey-nudges", detail.heartbeat, detail.ok, { carryLastOk: true });
+  return NextResponse.json(detail.answer, { status: detail.ok ? 200 : 500 });
 }
 
 export const GET = POST;

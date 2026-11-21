@@ -255,7 +255,8 @@ console.log("\nPOST /api/attempt-requests/bulk: fail closed, skip a live retake 
     inOrder(src, ['return unreadable("versions")', 'return unreadable("attempts")', 'return unreadable("grants")', 'return unreadable("open requests")', ".insert(rows)"]), true);
   eq("unreadable answers 503 records_unreadable", /const unreadable = \(read: string\) => \{[\s\S]*?\{ error: "records_unreadable" \}, \{ status: 503 \}/.test(src), true);
   eq("no .insert( before the last 503", src.indexOf(".insert(") > src.lastIndexOf('return unreadable("'), true);
-  eq("the answer carries skipped_live_retake", /skipped_live_retake: skippedLiveRetake,\s*failed_total: failedUserIds\.length,\s*\}\);\s*\}\s*$/.test(src), true);
+  // ADR 0029 rule T4: the answer also carries the grants' mail outcome, when a grant was made.
+  eq("the answer carries skipped_live_retake (and the mail's outcome after it)", /skipped_live_retake: skippedLiveRetake,\s*failed_total: failedUserIds\.length,\s*\.\.\.\(email \? \{ email \} : \{\}\),\s*\}\);\s*\}\s*$/.test(src), true);
 }
 
 console.log("\nThe Attempt Requests page: the strict chain read, the request-time result (ADR 0014 steps 7, 11)");
@@ -579,6 +580,9 @@ async function ticketCases() {
       [byUid(out).u1, byUid(out).u5, f.queries.filter((q) => q.table === "organizations").length, memberReads.length,
         memberReads[0]?.ops.some((o) => o.op === "eq" && o.args[0] === "status" && o.args[1] === "active")],
       ["granted", "granted", 1, 1, true]);
+    // ADR 0029 rule T4: the answer carries the mails' outcome for the administrator at the screen.
+    eq("…the answer's mail outcome: neither granted learner counts, so nobody is counted as emailed or not",
+      (out as { email?: unknown }).email, { recipients_unreadable: false, emailed: 0, not_emailed: 0, not_confirmed: 0 });
   }
   {
     // The members that count cannot be read: the grants stand, no mail, one log line with the organisation's id.
@@ -597,6 +601,14 @@ async function ticketCases() {
       [byUid(out).u1, byUid(out).u5, f.inserts.length, f.queries.filter((q) => q.table === "organizations").length,
         f.queries.filter((q) => q.table === "organization_members").length, lines.length, lines.every((l) => l.includes(ORG) && !l.includes("@"))],
       ["granted", "granted", 2, 1, 0, 1, true]);
+    eq("…and the answer says nobody was emailed because the recipients could not be read (the inbox shows it)",
+      (out as { email?: unknown }).email, { recipients_unreadable: true });
+  }
+  {
+    // Nothing granted: no mail to speak of, and no outcome in the answer.
+    const f = fakeDb(TABLES(), (q) => (q.table === "course_versions" ? BOOM : null));
+    const out = await ticket(f.db);
+    eq("nothing granted (a failed read): the answer carries no mail outcome", "email" in (out as object), false);
   }
   {
     // A database without 0107: the filter answers 42703 naming context_kind.
