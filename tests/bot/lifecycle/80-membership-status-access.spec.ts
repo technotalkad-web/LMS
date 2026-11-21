@@ -826,12 +826,12 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     expect(await broadcast("adminB", b, [ap("x").id]), "B's broadcast to X: as to the person not in B").toEqual(toOutsider);
     expect(await mailRows(b.id, ap("x").id, "custom_broadcast"), "no broadcast logged for X in B").toBe(0);
     // In A, X counts and the inactive learner does not: one recipient. Email
-    // is paused in A, so the broadcast answers 409 that nothing was sent,
+    // is paused in A, so the broadcast answers 200 that nothing was sent,
     // with that one recipient, and logs no row.
     const xBefore = await mailRows(a.id, ap("x").id, "custom_broadcast");
     const inA = await broadcast("admin", a, [ap("x").id, ap("inactiveLearner").id]);
-    const inABody = JSON.parse(inA.body || "{}") as { total?: number; paused?: boolean };
-    expect([inA.status, inABody.paused, inABody.total], "A's broadcast to X and the inactive learner: paused, X only").toEqual([409, true, 1]);
+    const inABody = JSON.parse(inA.body || "{}") as { total?: number; paused?: boolean; sent?: number };
+    expect([inA.status, inABody.paused, inABody.total, inABody.sent], "A's broadcast to X and the inactive learner: paused, X only, nobody emailed").toEqual([200, true, 1, 0]);
     expect(await mailRows(a.id, ap("x").id, "custom_broadcast"), "a paused broadcast logs no row for X").toBe(xBefore);
     // The assignment mails polled above are the positive control, logged
     // after the earlier ticket reply: none at all for the inactive learner,

@@ -83,7 +83,8 @@ export function BroadcastClient({
   const [body, setBody] = useState("");
   const [buttons, setButtons] = useState<ButtonRow[]>([]);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ sent: number; failed: number; total: number; notConfirmed: number } | null>(null);
+  /** The last broadcast's counts; `paused`: the organisation's email is paused, and the sentence says nothing was sent. */
+  const [result, setResult] = useState<{ sent: number; failed: number; total: number; notConfirmed: number; paused?: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   function toggleUser(id: string) {
@@ -138,8 +139,13 @@ export function BroadcastClient({
       body: JSON.stringify(payload),
     });
     setBusy(false);
-    const j = (await res.json().catch(() => ({}))) as { sent?: number; failed?: number; total?: number; error?: string; email?: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null };
+    const j = (await res.json().catch(() => ({}))) as { sent?: number; failed?: number; total?: number; error?: string; paused?: boolean; message?: string; email?: { recipients_unreadable: true } | { recipients_unreadable: false; emailed: number; not_emailed: number; not_confirmed: number } | null };
     if (!res.ok) { setError(j.error ?? "Send failed"); return; }
+    // ADR 0029: under the organisation's pause nothing is sent; the draft is kept.
+    if (j.paused) {
+      setResult({ sent: 0, failed: j.total ?? 0, total: j.total ?? 0, notConfirmed: 0, paused: j.message ?? "Email is paused for this organisation. Nothing was sent." });
+      return;
+    }
     // ADR 0029 rule T4: emailed and not emailed; a timeout is "not confirmed" (rule T2).
     const notConfirmed = j.email && !j.email.recipients_unreadable ? j.email.not_confirmed : 0;
     setResult({ sent: j.sent ?? 0, failed: Math.max(0, (j.failed ?? 0) - notConfirmed), total: j.total ?? 0, notConfirmed });
@@ -168,8 +174,9 @@ export function BroadcastClient({
         <Card className="p-5">
           <div className="flex items-center gap-2 mb-3">
             {result.failed === 0 ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <AlertTriangle className="w-4 h-4 text-amber-600" />}
-            <h2 className="serif text-xl text-ink">Broadcast sent</h2>
+            <h2 className="serif text-xl text-ink">{result.paused ? "Broadcast not sent" : "Broadcast sent"}</h2>
           </div>
+          {result.paused && <p className="mb-3 text-sm text-ink">{result.paused}</p>}
           <KpiStrip>
             <KpiCard label="Recipients" value={result.total} />
             <KpiCard label="Sent" value={result.sent} accent="text-emerald-600" icon={<CheckCircle2 className="w-4 h-4" />} />

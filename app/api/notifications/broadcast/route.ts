@@ -39,12 +39,14 @@ const MAX_BUTTONS = 3;
  * sends nothing. The mail is one run within the request's budgets; the
  * answer says how many were emailed and how many were not.
  *
- * The organisation's pause, master or the broadcast event's own, stops a
- * broadcast (ADR 0029, the owner's decision of 2026-11-21). The route asks
- * the run once, before its loop: when paused it answers 409 with
- * BROADCAST_PAUSED, `paused: true` and the number of recipients it would
- * have mailed, and writes no row for any of them (a loop's refusal is one
- * answer, as a loop stopped by the daily limit writes none).
+ * A pause stops every event but reset codes and sign-in links (ADR 0029,
+ * the owner's decision of 2026-11-21): the organisation's master pause, or
+ * the pause of custom_broadcast, stops a broadcast. The route asks the run
+ * once, after it opens and before its loop: when paused it sends nothing,
+ * writes no row for any recipient (a loop's refusal is one answer, as a
+ * loop stopped by the daily limit writes none), and answers 200 with
+ * `paused: true`, the sentence BROADCAST_PAUSED as `message`, and the
+ * counts of a broadcast that emailed nobody.
  */
 const AUDIENCE_UNREADABLE = "Could not read who can receive this. Nothing was sent; try again.";
 const BROADCAST_PAUSED = "Email is paused for this organisation. Nothing was sent.";
@@ -245,7 +247,14 @@ export async function POST(request: Request) {
   // for each recipient.
   const gate = gateSend(run, "custom_broadcast");
   if (!gate.attempt && gate.cls === "paused") {
-    return NextResponse.json({ error: BROADCAST_PAUSED, paused: true, total: recipientIds.size }, { status: 409 });
+    return NextResponse.json({
+      paused: true,
+      message: BROADCAST_PAUSED,
+      sent: 0,
+      failed: recipientIds.size,
+      total: recipientIds.size,
+      email: mailCounts([], recipientIds.size),
+    });
   }
   const results = await sendMany(run, people, (p) => ({
     event: "custom_broadcast",

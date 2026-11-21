@@ -79,7 +79,7 @@
  *       request; a deleted organisation's course or program is skipped
  *       before any read of it, and a broadcast there is refused as for a
  *       non-member; a broadcast in a paused organisation (the master pause,
- *       or the custom_broadcast pause) answers 409 that nothing was sent,
+ *       or the custom_broadcast pause) answers 200 that nothing was sent,
  *       with no row for any recipient (ADR 0029, the owner's decision of
  *       2026-11-21); a learner whose row does not count is not claimed,
  *       gets no reminder state (not even a stopped one past the cap) and
@@ -1968,8 +1968,16 @@ async function main() {
           let smtp = 0;
           smtpAnswer = () => { smtp++; return json({ ok: true }); };
           const r = await cast({ audience: "all" });
-          eq(`broadcast under ${label}: 409 with the paused sentence and the number it would have mailed, no row written, nothing sent`,
-            [r.status, r.body.error, r.body.paused, r.body.total, mailed(), smtp], [409, "Email is paused for this organisation. Nothing was sent.", true, COUNTING.length, [], 0]);
+          eq(`broadcast under ${label}: 200 with paused, the sentence and the counts of nobody emailed, no row written, nothing sent`,
+            [r.status, r.body.message, r.body.paused, r.body.sent, r.body.failed, r.body.total, r.body.email, mailed(), smtp],
+            [200, "Email is paused for this organisation. Nothing was sent.", true, 0, COUNTING.length, COUNTING.length, { recipients_unreadable: false, emailed: 0, not_emailed: COUNTING.length, not_confirmed: 0 }, [], 0]);
+        }
+        {
+          // The broadcast page shows that sentence for a paused answer, and keeps the draft.
+          const page = fs.readFileSync(path.resolve(__dirname, "../..", "app/[org]/(admin)/notifications/broadcast-client.tsx"), "utf8");
+          const pausedBranch = page.slice(page.indexOf("if (j.paused)"), page.indexOf("return;", page.indexOf("if (j.paused)")));
+          eq("…the broadcast page reads paused, shows the answer's sentence, and keeps the draft",
+            [pausedBranch.includes("paused: j.message"), /\{result\.paused && <p[^>]*>\{result\.paused\}<\/p>\}/.test(page), pausedBranch.includes("setSubject")], [true, true, false]);
         }
         {
           mailWorld({ settings: { event_paused: { asset_reminder: true } } });
