@@ -53,6 +53,52 @@ export type SmtpDispatchPayload = {
  */
 export const SMTP_SEND_WAIT_MS = 15_000;
 
+/**
+ * Each limit on a public code or link is claimed before the send (ADR 0029,
+ * the note of 2026-11-22): the job writes its claim, then counts the rows
+ * with its own among them, and goes on only within the limit. The same
+ * three numbers hold in both systems (the platform's `pending` row, the
+ * tenant's `queued` row).
+ *
+ * CLAIM_SEND_WITHIN_MS: a job starts its send no later than this after it
+ * wrote its claim; later, it sends nothing.
+ */
+export const CLAIM_SEND_WITHIN_MS = 30_000;
+/**
+ * A claim counts as a send in flight for this long from its row's time,
+ * against an organisation's share, the platform's ceiling and a tenant's
+ * daily limit. It is at least the time to start the send, the send's own
+ * wait, and a minute for the outcome's row and for two clocks that differ,
+ * so a mail that went has its sent row before its claim stops counting.
+ */
+export const CLAIM_IN_FLIGHT_MS = 120_000;
+/** At most this many claims of one account and kind count as in flight: no more of them can go in an hour. */
+export const CLAIMS_IN_FLIGHT_PER_ACCOUNT = 5;
+/** A read of the claims in flight asks for this many rows; a full page cannot be counted, and nothing is sent. */
+export const CLAIMS_IN_FLIGHT_PAGE = 1000;
+
+/**
+ * The sends in flight that a list of claims stands for: for each account and
+ * kind at most CLAIMS_IN_FLIGHT_PER_ACCOUNT, and a claim with no account
+ * counts by itself. So the claims of one address hold back no more of a
+ * share than that address may use.
+ */
+export function claimsInFlight(rows: ReadonlyArray<{ to_user_id?: unknown; event_type?: unknown }>): number {
+  const byAccount = new Map<string, number>();
+  let alone = 0;
+  for (const r of rows) {
+    if (typeof r.to_user_id !== "string" || r.to_user_id.length === 0) {
+      alone++;
+      continue;
+    }
+    const key = `${r.to_user_id} ${String(r.event_type ?? "")}`;
+    byAccount.set(key, Math.min(CLAIMS_IN_FLIGHT_PER_ACCOUNT, (byAccount.get(key) ?? 0) + 1));
+  }
+  let n = alone;
+  for (const c of byAccount.values()) n += c;
+  return n;
+}
+
 export type SmtpDispatchOptions = {
   /**
    * Stop waiting after this many milliseconds and answer a timeout. The

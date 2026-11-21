@@ -9,6 +9,22 @@
  * runs the job when it chooses: everything recorded before POST resolves is
  * "the calls before the answer") and next/headers (the request's host).
  * Fixtures use reserved .stub names only.
+ *
+ * The tables answer as the server would, so that jobs run together prove
+ * something (ADR 0029, the note of 2026-11-22):
+ *   - every filter of a read, a count and an update is honoured (eq, neq,
+ *     is, lt, lte, gt, gte, in, or and and, and array literals), and eq
+ *     compares the exact text, as a value read and passed back is;
+ *   - a row gets its time when it is written, from Date.now(), so a test's
+ *     clock moves it, and times only rise within one world;
+ *   - a count and tenant_mail_status's sent_24h are counted from the rows
+ *     (`sent24h` adds the organisation's mail sent before the test, which
+ *     is not in `log`);
+ *   - an insert-or-ignore that finds its row answers no row;
+ *   - every database call is answered from the rows as they are when it
+ *     arrives, and the answer is handed back after a wait (`readDelayMs`,
+ *     else one turn of the event loop), so that jobs started together
+ *     interleave.
  */
 import Module from "node:module";
 
@@ -66,6 +82,16 @@ export type World = {
   failing: Set<string>;
   /** Called with each request as it is recorded (a test's clock, for one). */
   onRequest: ((r: Req) => void) | null;
+  /** A database call's answer is handed back after this many milliseconds; 0: after one turn of the event loop. */
+  readDelayMs: number;
+  /** An insert into these tables fails. */
+  writeFailing: Set<string>;
+  /** send-smtp answers after this many milliseconds (a send takes time). */
+  smtpDelayMs: number;
+  /** A read for which this answers true fails (a read that fails after an earlier one did not). */
+  failRead: ((r: Req) => boolean) | null;
+  /** notification_log's status check: "no_queued" refuses the word queued, as a database whose check lacks it would. */
+  logCheck: "ok" | "no_queued";
 };
 
 export let world: World;
@@ -97,10 +123,26 @@ export function freshWorld(over: Partial<World> = {}): World {
     smtp: () => ({ ok: true }),
     failing: new Set(),
     onRequest: null,
+    readDelayMs: 0,
+    writeFailing: new Set(),
+    smtpDelayMs: 0,
+    failRead: null,
+    logCheck: "ok",
     ...over,
   };
+  lastStamp = 0;
+  nextId = 1;
   return world;
 }
+
+let lastStamp = 0;
+let nextId = 1;
+/** A row's time when it is written: the clock's, and never earlier than the world's last one. */
+export function stamp(): string {
+  lastStamp = Math.max(Date.now(), lastStamp + 1);
+  return new Date(lastStamp).toISOString();
+}
+const newId = (prefix: string) => `${prefix}-${String(nextId++).padStart(6, "0")}`;
 
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -108,31 +150,99 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
 const unquote = (v: string) => (v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v);
 const t = (v: unknown) => (typeof v === "string" ? Date.parse(v) : NaN);
 
-function op(val: unknown, opv: string): boolean {
+/** Split a PostgREST list on its top-level commas (inside no parentheses or quotes). */
+function splitTop(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0, cur = "", quoted = false;
+  for (const ch of s) {
+    if (ch === '"') quoted = !quoted;
+    if (!quoted && ch === "(") depth++;
+    if (!quoted && ch === ")") depth--;
+    if (!quoted && ch === "," && depth === 0) { out.push(cur); cur = ""; } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+/** The text a value is compared as: an array as its literal ("{a,b}"), anything else as itself. */
+const asText = (val: unknown) => (Array.isArray(val) ? `{${val.join(",")}}` : String(val));
+/** An order between two values: by time when both read as times, else by their text. */
+function cmp(val: unknown, want: string): number {
+  if (Number.isFinite(t(val)) && Number.isFinite(t(want))) return t(val) - t(want);
+  const a = asText(val);
+  return a < want ? -1 : a > want ? 1 : 0;
+}
+export function op(val: unknown, opv: string): boolean {
   if (opv === "is.null") return val === null || val === undefined;
-  if (opv.startsWith("eq.")) return String(val) === unquote(opv.slice(3));
-  if (opv.startsWith("gt.")) return t(val) > t(unquote(opv.slice(3)));
-  if (opv.startsWith("gte.")) return t(val) >= t(unquote(opv.slice(4)));
-  if (opv.startsWith("in.(")) return opv.slice(4, -1).split(",").map(unquote).includes(String(val));
+  if (opv === "not.is.null") return !(val === null || val === undefined);
+  if (opv.startsWith("eq.")) return val !== null && val !== undefined && asText(val) === unquote(opv.slice(3));
+  if (opv.startsWith("neq.")) return val !== null && val !== undefined && asText(val) !== unquote(opv.slice(4));
+  const ord = /^(lt|lte|gt|gte)\.(.*)$/.exec(opv);
+  if (ord) {
+    if (val === null || val === undefined) return false;
+    const c = cmp(val, unquote(ord[2]));
+    return ord[1] === "lt" ? c < 0 : ord[1] === "lte" ? c <= 0 : ord[1] === "gt" ? c > 0 : c >= 0;
+  }
+  if (opv.startsWith("in.(")) return opv.slice(4, -1).split(",").map(unquote).includes(asText(val));
   throw new Error(`stub: operator not understood: ${opv}`);
 }
-function matches(r: Row, q: URLSearchParams): boolean {
+/** One condition of an or/and list: "col.op.value", or a nested "and(...)" or "or(...)". */
+function cond(r: Row, c: string): boolean {
+  if (c.startsWith("and(")) return splitTop(c.slice(4, -1)).every((x) => cond(r, x));
+  if (c.startsWith("or(")) return splitTop(c.slice(3, -1)).some((x) => cond(r, x));
+  const i = c.indexOf(".");
+  return op(r[c.slice(0, i)], c.slice(i + 1));
+}
+export function matches(r: Row, q: URLSearchParams): boolean {
   for (const [k, v] of q) {
     if (["select", "order", "limit", "offset", "on_conflict", "columns"].includes(k)) continue;
+    if (k === "or") { if (!splitTop(v.slice(1, -1)).some((c) => cond(r, c))) return false; continue; }
+    if (k === "and") { if (!splitTop(v.slice(1, -1)).every((c) => cond(r, c))) return false; continue; }
     if (!op(r[k], v)) return false;
   }
   return true;
 }
 function rowsOf(rows: Row[], q: URLSearchParams): Row[] {
   let out = rows.filter((r) => matches(r, q));
-  if ((q.get("order") ?? "").endsWith(".desc")) {
-    const col = (q.get("order") ?? "").split(".")[0];
-    out = [...out].sort((a, b) => t(b[col]) - t(a[col]));
+  const order = q.get("order");
+  if (order) {
+    const keys = order.split(",").map((o) => { const [col, dir] = o.split("."); return { col, desc: dir === "desc" }; });
+    out = [...out].sort((a, b) => {
+      for (const { col, desc } of keys) {
+        const c = cmp(a[col], asText(b[col]));
+        if (c !== 0) return desc ? -c : c;
+      }
+      return 0;
+    });
   }
   return q.has("limit") ? out.slice(0, Number(q.get("limit"))) : out;
 }
+const project = (r: Row, select: string) => {
+  if (!select || select === "*") return r;
+  const out: Row = {};
+  for (const k of select.split(",").map((x) => x.trim())) out[k] = r[k];
+  return out;
+};
+/** The answer to a write: the rows written when representation was asked for, else none. */
+const written = (prefer: string, rows: Row[], select: string, status = 201) =>
+  /return=representation/.test(prefer) ? json(rows.map((r) => project(r, select)), status) : new Response(null, { status: status === 201 ? 201 : 204 });
+/** A count of the rows a HEAD read's filters let through. */
+const counted = (rows: Row[], q: URLSearchParams) => new Response(null, { status: 200, headers: { "content-range": `*/${rows.filter((r) => matches(r, q)).length}` } });
+/** One turn of the event loop, or the world's wait: an answer is handed back after other jobs have run. */
+const pause = () => new Promise<void>((res) => (world.readDelayMs > 0 ? setTimeout(res, world.readDelayMs) : setImmediate(res)));
 
+/**
+ * Each database call is answered from the rows as they are when it arrives,
+ * and the answer is handed back after the world's wait: so other jobs' calls
+ * arrive in between, as they do against a server.
+ */
 const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  const answer = await serve(input, init);
+  if (url.pathname.startsWith("/rest/v1/")) await pause();
+  return answer;
+};
+
+const serve = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const h = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
@@ -163,6 +273,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json({ id, aud: "authenticated", role: "authenticated", email, app_metadata: {}, user_metadata: {}, action_link: "https://stub/verify", email_otp: "000000", hashed_token: TOKEN_HASH, redirect_to: "", verification_type: "magiclink" });
   }
   if (p === "/functions/v1/send-smtp") {
+    if (world.smtpDelayMs > 0) await new Promise((res) => setTimeout(res, world.smtpDelayMs));
     const answer = world.smtp(String((body as Row).to));
     if (answer === "hang") {
       // No answer: the caller's own wait ends it (a send with no wait would hang here).
@@ -171,7 +282,13 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json(answer);
   }
   if (!p.startsWith("/rest/v1/")) throw new Error(`stub: unexpected ${method} ${url.host}${p}`);
-  if (method === "GET" && world.failing.has(table)) return json({ code: "XX000", message: "stub read failure" }, 500);
+  const select = q.get("select") ?? "";
+  const me = requests[requests.length - 1];
+  const isRead = method === "GET" || method === "HEAD" || table === "rpc/tenant_mail_status";
+  if (isRead && (((method === "GET" || method === "HEAD") && world.failing.has(table)) || world.failRead?.(me))) {
+    return json({ code: "XX000", message: "stub read failure" }, 500);
+  }
+  if (method === "POST" && world.writeFailing.has(table)) return json({ code: "XX000", message: "stub write failure" }, 500);
 
   switch (table) {
     case "organizations": {
@@ -185,11 +302,14 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       if (world.status === "missing") return json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
       if (world.status === "fail") return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
       const s = world.state ?? {};
+      const orgId = (body as Row | null)?.p_org ?? null;
+      const dayAgo = Date.now() - 24 * 3_600_000;
+      const sentHere = world.log.filter((r) => r.organization_id === orgId && r.status === "sent" && t(r.sent_at) >= dayAgo).length;
       return json([{
-        organization_id: (body as Row | null)?.p_org ?? null, state: s.state ?? null, state_changed_at: s.state_changed_at ?? null,
+        organization_id: orgId, state: s.state ?? null, state_changed_at: s.state_changed_at ?? null,
         last_success_at: s.last_success_at ?? null, last_failure_at: s.last_failure_at ?? null, last_error_code: s.last_error_code ?? null,
         failed_recipients: s.failed_recipients ?? [], last_alert_at: s.last_alert_at ?? null, alert_due_at: s.alert_due_at ?? null,
-        daily_limit: world.dailyLimit, sent_24h: world.sent24h,
+        daily_limit: world.dailyLimit, sent_24h: world.sent24h + sentHere,
       }]);
     }
     case "rpc/mail_job_mark": {
@@ -204,32 +324,68 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       return json(rowsOf(world.invitations, q));
     case "platform_owners":
       return json(rowsOf(world.owners.map((user_id) => ({ user_id })), q));
-    case "password_reset_otps":
-      if (method === "GET") return json(rowsOf(world.otps, q));
-      if (method === "POST") { world.otps.push({ ...(body as Row), created_at: new Date().toISOString(), used_at: null }); return new Response(null, { status: 201 }); }
-      return new Response(null, { status: 204 });
-    case "notification_log":
-      if (method === "GET") return json(rowsOf(world.log, q));
-      for (const r of Array.isArray(body) ? (body as Row[]) : [body as Row]) world.log.push({ sent_at: new Date().toISOString(), ...r });
-      return new Response(null, { status: 201 });
+    case "password_reset_otps": {
+      if (method === "GET") return json(rowsOf(world.otps, q).map((r) => project(r, select)));
+      if (method === "HEAD") return counted(world.otps, q);
+      if (method === "POST") {
+        const added = (Array.isArray(body) ? body : [body]) as Row[];
+        const rows = added.map((r) => ({ id: newId("otp"), used_at: null, attempts: 0, ...r, created_at: stamp() }));
+        world.otps.push(...rows);
+        return written(prefer, rows, select);
+      }
+      if (method === "PATCH") {
+        const hit = world.otps.filter((r) => matches(r, q));
+        for (const r of hit) Object.assign(r, body as Row);
+        return written(prefer, hit, select, 200);
+      }
+      break;
+    }
+    case "notification_log": {
+      if (method === "GET") return json(rowsOf(world.log, q).map((r) => project(r, select)));
+      if (method === "HEAD") return counted(world.log, q);
+      if (method === "POST") {
+        const given = Array.isArray(body) ? (body as Row[]) : [body as Row];
+        if (world.logCheck === "no_queued" && given.some((r) => r.status === "queued")) {
+          return json({ code: "23514", message: "new row for relation \"notification_log\" violates check constraint" }, 400);
+        }
+        const rows = given.map((r) => ({ id: newId("log"), sent_at: stamp(), ...r }));
+        world.log.push(...rows);
+        return written(prefer, rows, select);
+      }
+      break;
+    }
     case "notification_templates":
       return json([]);
     case "tenant_smtp_state": {
       if (method === "POST") {
         const rec = body as Row;
-        if (!world.state) world.state = { state: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, ...rec };
-        return /return=representation/.test(prefer) ? json([{ organization_id: rec.organization_id }], 201) : new Response(null, { status: 201 });
+        const ignore = /resolution=ignore-duplicates/.test(prefer);
+        let rows: Row[] = [];
+        if (!world.state) {
+          world.state = { state: null, state_changed_at: stamp(), last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, ...rec };
+          rows = [world.state];
+        } else if (!ignore) {
+          Object.assign(world.state, rec);
+          rows = [world.state];
+        }
+        return written(prefer, rows, select);
       }
       if (method === "PATCH") {
-        if (world.state) Object.assign(world.state, body as Row);
-        return /return=representation/.test(prefer) ? json(world.state ? [{ organization_id: ORG }] : []) : new Response(null, { status: 204 });
+        const hit = world.state && matches({ organization_id: ORG, ...world.state }, q) ? [world.state] : [];
+        for (const r of hit) Object.assign(r, body as Row);
+        return written(prefer, hit.map((r) => ({ organization_id: ORG, ...r })), select, 200);
       }
-      return json(world.state ? [world.state] : []);
+      return json(world.state ? rowsOf([{ organization_id: ORG, ...world.state }], q).map((r) => project(r, select)) : []);
     }
-    case "platform_email_log":
-      if (method === "POST") { world.platformLog.push({ sent_at: new Date().toISOString(), ...(body as Row) }); return new Response(null, { status: 201 }); }
-      if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": `*/${world.platformLog.filter((r) => r.status === "sent").length}` } });
-      return json(rowsOf(world.platformLog, q));
+    case "platform_email_log": {
+      if (method === "POST") {
+        const rows = (Array.isArray(body) ? (body as Row[]) : [body as Row]).map((r) => ({ id: newId("pel"), sent_at: stamp(), ...r }));
+        world.platformLog.push(...rows);
+        return written(prefer, rows, select);
+      }
+      if (method === "HEAD") return counted(world.platformLog, q);
+      return json(rowsOf(world.platformLog, q).map((r) => project(r, select)));
+    }
     case "ops_heartbeats":
       return new Response(null, { status: 201 });
   }

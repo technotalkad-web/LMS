@@ -17,7 +17,8 @@
  *   - an owner whose row requires the second factor, at AAL1: 403
  *     mfa_required, and nothing is read, sent or written; at AAL2: sent;
  *   - the answer and the audit row say whether the sender's log row was
- *     written (logged).
+ *     written (logged);
+ *   - /super/email's last send is never a claim (pending).
  *
  * ADR 0029 pull request B, stage 4 (step 17; rule FP4):
  *   - POST /api/super/email/limit: a platform owner sets an organisation's
@@ -45,6 +46,7 @@
 import Module from "node:module";
 import React, { type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { matches } from "./mail-world";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -122,9 +124,9 @@ let stateWrites: Array<{ method: string; body: Record<string, unknown>; query: s
  */
 const DB_MESSAGE = "stub database message 0029";
 type Read = "ok" | "missing" | "fail";
-let page: { status: Read; statusRows: Array<Record<string, unknown>>; settings: Array<Record<string, unknown>>; jobs: Read; jobRows: Array<Record<string, unknown>>; beats: Array<Record<string, unknown>> | "fail"; orgs: Array<{ id: string; name: string }> };
+let page: { status: Read; statusRows: Array<Record<string, unknown>>; settings: Array<Record<string, unknown>>; jobs: Read; jobRows: Array<Record<string, unknown>>; beats: Array<Record<string, unknown>> | "fail"; orgs: Array<{ id: string; name: string }>; log: Array<Record<string, unknown>> };
 const freshPage = () => {
-  page = { status: "ok", statusRows: [], settings: [], jobs: "ok", jobRows: [], beats: [], orgs: [] };
+  page = { status: "ok", statusRows: [], settings: [], jobs: "ok", jobRows: [], beats: [], orgs: [], log: [] };
 };
 freshPage();
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
@@ -156,7 +158,9 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (logMissing) return json({ code: "PGRST205", message: "Could not find the table" }, 404);
     if (method === "POST") { logRows.push(JSON.parse(body)); return new Response(null, { status: 201 }); }
     if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": "*/0" } });
-    return json([]);
+    // The page's reads of the log, with their filters, newest first.
+    const rows = page.log.filter((r) => matches(r, url.searchParams)).sort((a, b) => String(b.sent_at).localeCompare(String(a.sent_at)));
+    return json(url.searchParams.has("limit") ? rows.slice(0, Number(url.searchParams.get("limit"))) : rows);
   }
   if (p === "/rest/v1/platform_audit_log" && method === "POST") { auditRows.push(JSON.parse(body)); return new Response(null, { status: 201 }); }
   if (p === "/rest/v1/organizations") {
@@ -390,6 +394,19 @@ async function main() {
         [ORGS(failed).includes(UNREADABLE_ORGS), ORGS(failed).includes("<table"), JOBS(failed).includes("could not be read just now"), failed.includes("The jobs' heartbeats could not be read just now."), failed.includes(TENANT_MAIL_NEEDS_0114), failed.startsWith("ERROR PAGE")],
         [true, false, true, true, false, false]);
       eq("…and no database message anywhere on the page", failed.includes(DB_MESSAGE), false);
+
+      fresh();
+      page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      page.log = [
+        { sent_at: "2026-11-21T10:05:00.000Z", event_type: "platform_sign_in_link", status: "suppressed", error_code: "pending" },
+        { sent_at: "2026-11-21T10:00:00.000Z", event_type: "platform_reset_code", status: "sent", error_code: null },
+      ];
+      const lastSend = between(await render(), "Last send", "Sent in 24 hours");
+      eq("the last send is never a claim: a pending row after a sent one shows the sent one",
+        [lastSend.includes("platform_reset_code"), lastSend.includes("pending"), lastSend.includes("platform_sign_in_link")], [true, false, false]);
+      fresh();
+      page.log = [{ sent_at: "2026-11-21T10:05:00.000Z", event_type: "platform_reset_code", status: "suppressed", error_code: "test_domain" }];
+      eq("…a row the reserved domains stopped is still shown", between(await render(), "Last send", "Sent in 24 hours").includes("test_domain"), true);
 
       console.log("\n/super/email, rendered: the reminder jobs through the fixed sentences");
       const at = (minAgo: number) => new Date(Date.now() - minAgo * 60_000).toISOString();

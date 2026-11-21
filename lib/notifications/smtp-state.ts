@@ -30,7 +30,12 @@
  *     no send starts past its window, and the call sum stays within
  *     CALL_SUM_LIMIT. What a budget leaves is reported as left, never
  *     dropped in silence.
- * nextState() decides when the state row is written (see there). An alert
+ * nextState() decides when the state row is written (see there). The row is
+ * written only while it still reads as the run read it (settleState, ADR
+ * 0029, the note of 2026-11-22): a write that misses reads the row again
+ * and applies the outcomes to it, and a flip, the stop and the alert follow
+ * the write the database took. The public job reads the run again once,
+ * after its claim (refreshRun). An alert
  * is never sent from here during a run: markAlertDue sets alert_due_at with
  * one conditional update that respects section E's spacing, and
  * sendDueAlert, called only by a scheduled job (rule FP3), mails at most
@@ -119,6 +124,8 @@ export const MAIL_CALL_COSTS = {
   logInsert: 1,
   /** One tenant_smtp_state write. */
   stateWrite: 1,
+  /** One tenant_mail_status read again: after a state write that missed, and the public job's after its claim. */
+  reRead: 1,
   /** Marking an alert: one conditional update, two when the state row is not there yet. */
   alertMark: 2,
 } as const;
@@ -508,9 +515,10 @@ export type MailRun = {
   rowExists: boolean;
   lastAlertAt: string | null;
   alertDueAt: string | null;
-  /** Null: no daily limit applied (no 0114, or the count could not be read). */
-  readonly limit: DailyLimit | null;
-  readonly sent24h: number;
+  /** Null: no daily limit applied (no 0114, or the count could not be read). refreshRun may replace it. */
+  limit: DailyLimit | null;
+  /** The 24-hour count as read; refreshRun may replace it before any send of the run. */
+  sent24h: number;
   sentInRun: number;
   readonly startedFailing: boolean;
   /** A run that started failing and has not yet delivered: its next send goes alone, as the probe. */
@@ -711,37 +719,207 @@ export function gateSend(
   return { attempt: true };
 }
 
-/** Write the run's state row (an upsert of the state columns only). A missing table stops further writes in this run. */
-async function writeState(run: MailRun, next: SmtpStateSnapshot): Promise<void> {
-  if (!run.stateWritable || run.callLimited) return;
+/** The fixed log line of a state write that did not land after its re-reads, or had no room for one. */
+export const STATE_WRITE_MISSED_EVENT = "tenant_smtp_state_write_missed";
+/** A state write that misses is read again and written again at most this often (part 4 of the note of 2026-11-22). */
+export const MAX_STATE_REREADS = FLIP_AFTER_PEOPLE - 1;
+
+/** One step of the stored state: what to write, whether there is anything to write, and whether it turns the organisation failing. */
+type StateStep = { next: SmtpStateSnapshot; write: boolean; flipped: boolean };
+
+const laterThan = (iso: string | null, atMs: number) => iso !== null && Date.parse(iso) > atMs;
+
+/**
+ * A row read again after a miss (fresh): an outcome the row already shows to
+ * be older is not applied. A delivery is not applied when the row holds a
+ * later failure, and a failure is not applied when it holds a later
+ * delivery; equal times are applied.
+ */
+function olderThanRow(row: SmtpStateSnapshot, outcome: SendOutcome, atMs: number): boolean {
+  return outcome.ok ? laterThan(row.last_failure_at, atMs) : laterThan(row.last_success_at, atMs);
+}
+
+/** A group's outcomes, all at the group's one time, applied in order to `prev`. */
+function groupStep(prev: SmtpStateSnapshot, outcomes: ReadonlyArray<{ recipientId: string | null; outcome: SendOutcome }>, atMs: number, fresh: boolean): StateStep {
+  let next = prev;
+  let write = false;
+  let flipped = false;
+  for (const { recipientId, outcome } of outcomes) {
+    if (fresh && olderThanRow(prev, outcome, atMs)) continue;
+    const s = nextState(next, outcome, recipientId, atMs);
+    next = s.next;
+    write = write || s.write;
+    if (s.flipped) flipped = true;
+  }
+  return { next, write, flipped };
+}
+
+/** The Settings test's outcome (section C): a delivery as nextState has it; a failure but rejected turns the organisation failing at once. */
+function settingsTestStep(prev: SmtpStateSnapshot, outcome: SendOutcome, recipientId: string | null, atMs: number, fresh: boolean): StateStep {
+  if (fresh && olderThanRow(prev, outcome, atMs)) return { next: prev, write: false, flipped: false };
+  if (outcome.ok) {
+    const s = nextState(prev, outcome, recipientId, atMs);
+    return { next: s.next, write: s.write, flipped: false };
+  }
+  const atIso = new Date(atMs).toISOString();
+  const wasFailing = prev.state === "failing";
+  return {
+    next: { ...prev, state: "failing", state_changed_at: wasFailing ? prev.state_changed_at : atIso, last_failure_at: atIso, last_error_code: outcome.cls },
+    write: true,
+    flipped: !wasFailing,
+  };
+}
+
+/** A row read again: its state columns, whether it exists, and the alert's two times. Never the count or the limit. */
+function takeRow(run: MailRun, row: TenantMailStatusRow): void {
+  run.stored = {
+    state: row.state,
+    state_changed_at: row.state_changed_at,
+    last_success_at: row.last_success_at,
+    last_failure_at: row.last_failure_at,
+    last_error_code: row.last_error_code,
+    failed_recipients: row.failed_recipients,
+  };
+  run.rowExists = row.state_changed_at !== null;
+  run.lastAlertAt = row.last_alert_at;
+  run.alertDueAt = row.alert_due_at;
+}
+
+/**
+ * The public job reads the organisation again, once, after its claim (ADR
+ * 0029, the note of 2026-11-22, part 5): one tenant_mail_status call,
+ * charged to the run's budget. On "ok" the run takes the state, whether the
+ * row exists, the alert's two times, the daily limit and the count: no send
+ * of the run has gone yet, so the count is replaced. Otherwise the run keeps
+ * what it read when it opened. A read that fails is the run's own failed
+ * read (mail_status_read).
+ */
+export async function refreshRun(run: MailRun): Promise<StatusRead["kind"]> {
+  spendCalls(run.budget, MAIL_CALL_COSTS.reRead);
+  const status = await readTenantMailStatus(run.db, run.organizationId);
+  if (status.kind !== "ok") {
+    if (status.kind === "unreadable") countError(run.errors, "mail_status_read");
+    return status.kind;
+  }
+  takeRow(run, status.row);
+  run.limit = tenantDailyLimit(status.row.daily_limit, run.env);
+  run.sent24h = status.row.sent_24h;
+  return "ok";
+}
+
+/**
+ * One write of the run's state columns (never the alert's two times or the
+ * daily limit), only while the row still reads as the run read it. A row
+ * that was read is one update matched on its state, its three times and its
+ * failed recipients, each as read (an empty value as empty); no row read is
+ * an insert that does nothing when the row is there. Either way the row is
+ * asked back: none back is a miss, not an error. After a write the run keeps
+ * exactly what it wrote. A missing table stops further writes in this run.
+ */
+async function writeStateRow(run: MailRun, next: SmtpStateSnapshot): Promise<"written" | "miss" | "error"> {
   spendCalls(run.budget, MAIL_CALL_COSTS.stateWrite);
   run.report.stateWrites++;
+  const nowIso = new Date(run.now()).toISOString();
+  const changedAt = next.state_changed_at ?? nowIso;
+  const columns = {
+    state: next.state,
+    state_changed_at: changedAt,
+    last_success_at: next.last_success_at,
+    last_failure_at: next.last_failure_at,
+    last_error_code: next.last_error_code,
+    failed_recipients: next.failed_recipients,
+    updated_at: nowIso,
+  };
+  const read = run.stored;
   try {
-    const { error } = await run.db.from("tenant_smtp_state").upsert(
-      {
-        organization_id: run.organizationId,
-        state: next.state,
-        state_changed_at: next.state_changed_at ?? new Date(run.now()).toISOString(),
-        last_success_at: next.last_success_at,
-        last_failure_at: next.last_failure_at,
-        last_error_code: next.last_error_code,
-        failed_recipients: next.failed_recipients,
-        updated_at: new Date(run.now()).toISOString(),
-      },
-      { onConflict: "organization_id" }
-    );
+    let answer: { data: unknown; error: { code?: string | null; message?: string | null } | null };
+    if (run.rowExists) {
+      let q = run.db.from("tenant_smtp_state").update(columns).eq("organization_id", run.organizationId);
+      for (const col of ["state", "state_changed_at", "last_success_at", "last_failure_at"] as const) {
+        const value = read[col];
+        q = value === null ? q.is(col, null) : q.eq(col, value);
+      }
+      answer = await q.eq("failed_recipients", `{${read.failed_recipients.join(",")}}`).select("organization_id");
+    } else {
+      answer = await run.db
+        .from("tenant_smtp_state")
+        .upsert({ organization_id: run.organizationId, ...columns }, { onConflict: "organization_id", ignoreDuplicates: true })
+        .select("organization_id");
+    }
+    const error = answer.error;
     if (error) {
-      if (isCallLimitMessage(errorText(error))) return noteCallLimit(run, "state_write");
+      if (isCallLimitMessage(errorText(error))) {
+        noteCallLimit(run, "state_write");
+        return "error";
+      }
       if (isMissingRelation(error, "tenant_smtp_state")) run.stateWritable = false;
       else countError(run.errors, "state_write");
       console.warn(JSON.stringify({ event: "tenant_smtp_state_write_failed", org_id: run.organizationId, code: String(error.code ?? "unknown") }));
-      return;
+      return "error";
     }
+    if (!Array.isArray(answer.data) || answer.data.length === 0) return "miss";
+    run.stored = { ...next, state_changed_at: changedAt };
     run.rowExists = true;
+    return "written";
   } catch (e) {
-    if (isCallLimitMessage(errorText(e))) return noteCallLimit(run, "state_write");
-    countError(run.errors, "state_write");
-    console.warn(JSON.stringify({ event: "tenant_smtp_state_write_failed", org_id: run.organizationId, code: "thrown" }));
+    if (isCallLimitMessage(errorText(e))) noteCallLimit(run, "state_write");
+    else {
+      countError(run.errors, "state_write");
+      console.warn(JSON.stringify({ event: "tenant_smtp_state_write_failed", org_id: run.organizationId, code: "thrown" }));
+    }
+    return "error";
+  }
+}
+
+/**
+ * Record outcomes on the state row (ADR 0029, the note of 2026-11-22, part
+ * 4). `compute` gives the step from a reading; `fresh` is true for a row
+ * read again after a miss.
+ *
+ * The step is written only while the row still reads as the run read it. A
+ * miss reads the row again (tenant_mail_status), applies the outcomes to it
+ * and writes again, at most MAX_STATE_REREADS times, and each time only
+ * while the budget has room for the read and the write. After the last miss,
+ * or with no room, the outcome is not recorded: one fixed line, no flip, no
+ * alert, no failed step; the run goes on from the row it read last. A
+ * re-read that fails is the run's failed read (mail_status_read). A re-read
+ * that finds the organisation failing with nothing to write stops the run,
+ * with no flip of its own.
+ *
+ * Answers the step the database took; the run's own step when the run
+ * cannot write (no 0114, a status that could not be read, a missing table,
+ * the platform's call limit, a failed write), as before; or null when the
+ * outcome was not recorded.
+ */
+async function settleState(run: MailRun, compute: (prev: SmtpStateSnapshot, fresh: boolean) => StateStep): Promise<StateStep | null> {
+  let step = compute(run.stored, false);
+  if (!step.write || !run.stateWritable || run.callLimited) {
+    run.stored = step.next;
+    return step;
+  }
+  for (let reReads = 0; ; reReads++) {
+    const answer = await writeStateRow(run, step.next);
+    if (answer === "written") return step;
+    if (answer === "error") {
+      run.stored = step.next;
+      return step;
+    }
+    if (reReads >= MAX_STATE_REREADS || !hasRoom(run.budget, MAIL_CALL_COSTS.reRead + MAIL_CALL_COSTS.stateWrite)) {
+      console.warn(JSON.stringify({ event: STATE_WRITE_MISSED_EVENT, org_id: run.organizationId }));
+      return null;
+    }
+    spendCalls(run.budget, MAIL_CALL_COSTS.reRead);
+    const fresh = await readTenantMailStatus(run.db, run.organizationId);
+    if (fresh.kind !== "ok") {
+      if (fresh.kind === "unreadable") countError(run.errors, "mail_status_read");
+      return null;
+    }
+    takeRow(run, fresh.row);
+    step = compute(run.stored, true);
+    if (!step.write) {
+      if (run.stored.state === "failing") run.stopped = true;
+      return { next: run.stored, write: false, flipped: false };
+    }
   }
 }
 
@@ -772,10 +950,14 @@ async function markAlertDue(run: MailRun, cause: AlertCause): Promise<void> {
       const ins = await run.db
         .from("tenant_smtp_state")
         .upsert({ organization_id: run.organizationId, alert_due_at: nowIso, updated_at: nowIso }, { onConflict: "organization_id", ignoreDuplicates: true })
-        .select("organization_id");
+        .select("organization_id, state_changed_at");
       if (ins.error) return fail(String(ins.error.code ?? "unknown"), isMissingRelation(ins.error, "tenant_smtp_state"), ins.error);
       run.rowExists = true;
       if (Array.isArray(ins.data) && ins.data.length > 0) {
+        // The row this insert made: the run keeps its time, so that its next
+        // state write matches the row as it is.
+        const made = str((ins.data[0] as { state_changed_at?: unknown }).state_changed_at);
+        if (made) run.stored = { ...run.stored, state_changed_at: made };
         run.alertMarked = true;
         run.alertDueAt = nowIso;
         run.report.alertMarked = true;
@@ -815,28 +997,28 @@ export async function markNotSentAlert(run: MailRun): Promise<void> {
 }
 
 /**
- * Apply one group's outcomes in order, write the state once if it changed,
- * then mark an alert if a cause arose. A flip stops the run; a failed probe
- * of a run that started failing stops it; a delivered probe clears it.
+ * Apply one group's outcomes in order, at the group's one time, and record
+ * them on the state row (settleState), then mark an alert if a cause arose.
+ * A flip stops the run and marks its alert only when the database took the
+ * write that flips; a failed probe of a run that started failing stops it; a
+ * delivered probe clears it.
  */
-async function settleGroup(run: MailRun, outcomes: Array<{ recipientId: string | null; outcome: SendOutcome }>, causes: Set<AlertCause>): Promise<void> {
-  let write = false;
-  let flipped = false;
-  for (const { recipientId, outcome } of outcomes) {
-    const step = nextState(run.stored, outcome, recipientId, run.now());
-    run.stored = step.next;
-    write = write || step.write;
-    if (step.flipped) flipped = true;
-    if (run.probeOpen) {
-      if (outcome.ok) run.probeOpen = false;
-      else if (outcome.cls !== "rejected") run.stopped = true;
-    }
+async function settleGroup(
+  run: MailRun,
+  outcomes: Array<{ recipientId: string | null; outcome: SendOutcome }>,
+  causes: Set<AlertCause>,
+  atMs: number
+): Promise<void> {
+  for (const { outcome } of outcomes) {
+    if (!run.probeOpen) break;
+    if (outcome.ok) run.probeOpen = false;
+    else if (outcome.cls !== "rejected") run.stopped = true;
   }
-  if (flipped) {
+  const taken = await settleState(run, (prev, fresh) => groupStep(prev, outcomes, atMs, fresh));
+  if (taken?.flipped) {
     run.stopped = true;
     causes.add("flip");
   }
-  if (write) await writeState(run, run.stored);
   if (causes.has("flip")) await markAlertDue(run, "flip");
   else if (causes.has("daily_limit")) await markAlertDue(run, "daily_limit");
   else if (causes.has("not_sent")) await markAlertDue(run, "not_sent");
@@ -989,6 +1171,8 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
     first = first && group.length === 0;
     const outcomes: Array<{ recipientId: string | null; outcome: SendOutcome }> = [];
     const countBefore = run.sent24h + run.sentInRun;
+    // The group's one time: taken when its sends have answered (part 4 of the note of 2026-11-22).
+    let groupAt = 0;
     if (group.length > 0) {
       spendCalls(run.budget, group.length * MAIL_CALL_COSTS.send + templatesNeeded * MAIL_CALL_COSTS.template);
       const answers = await Promise.all(
@@ -1001,6 +1185,7 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
           }
         })
       );
+      groupAt = run.now();
       group.forEach((idx, k) => {
         const a = answers[k];
         decided.push(idx);
@@ -1056,7 +1241,7 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         spendCalls(run.budget, Math.max(0, hooks.afterCalls ?? 0));
       }
     }
-    if (!run.callLimited) await settleGroup(run, outcomes, causes);
+    if (!run.callLimited) await settleGroup(run, outcomes, causes, groupAt || run.now());
     if (run.callLimited) {
       for (; i < items.length; i++) {
         results[i] = notAttempted("left", "Left: the request met the platform's limit on outbound calls.");
@@ -1091,33 +1276,25 @@ export function gateSettingsTest(run: MailRun): { attempt: true } | { attempt: f
  * The state after a Settings test (section C): a delivered test reads
  * healthy; a failed test turns the organisation failing at once, whatever
  * the class but rejected (one recipient's refusal says nothing about the
- * sender). A flip marks an alert as due under section E's bounds. Without
- * migration 0114 the run cannot write, and nothing is written.
+ * sender), unless the row read again after a missed write holds a later
+ * delivery. The write goes through settleState, so it lands only while the
+ * row reads as the run read it; the stop and a flip's alert (section E's
+ * bounds) follow the write the database took. `atMs`: when the test's send
+ * answered. Without migration 0114 the run cannot write, and nothing is
+ * written.
  */
-export async function settleSettingsTest(run: MailRun, outcome: SendOutcome, recipientId: string | null): Promise<void> {
+export async function settleSettingsTest(run: MailRun, outcome: SendOutcome, recipientId: string | null, atMs: number = run.now()): Promise<void> {
   run.report.attempted++;
   if (outcome.ok) {
     run.report.sent++;
     run.sentInRun++;
-    const step = nextState(run.stored, outcome, recipientId, run.now());
-    run.stored = step.next;
-    if (step.write) await writeState(run, run.stored);
-    return;
+  } else {
+    run.report.failed++;
+    if (outcome.cls === "rejected") return;
   }
-  run.report.failed++;
-  if (outcome.cls === "rejected") return;
-  const nowIso = new Date(run.now()).toISOString();
-  const wasFailing = run.stored.state === "failing";
-  run.stored = {
-    ...run.stored,
-    state: "failing",
-    state_changed_at: wasFailing ? run.stored.state_changed_at : nowIso,
-    last_failure_at: nowIso,
-    last_error_code: outcome.cls,
-  };
-  run.stopped = true;
-  await writeState(run, run.stored);
-  if (!wasFailing) await markAlertDue(run, "flip");
+  const taken = await settleState(run, (prev, fresh) => settingsTestStep(prev, outcome, recipientId, atMs, fresh));
+  if (!outcome.ok && taken && run.stored.state === "failing") run.stopped = true;
+  if (taken?.flipped) await markAlertDue(run, "flip");
 }
 
 /**

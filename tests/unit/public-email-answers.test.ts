@@ -17,7 +17,9 @@
  *     (the ready answer); settings that cannot be read are 503 for all;
  *   - only an account that was found starts the job;
  *   - the job: a member on a ready organisation gets the organisation's own
- *     mail; a member of another organisation gets nothing; an administrator
+ *     mail, its claim written first (a queued row with no context; the
+ *     platform's, a pending row: the note of 2026-11-22); a member of
+ *     another organisation gets nothing; an administrator
  *     and an administrator a platform owner invited get the platform's mail,
  *     also on a not-ready page; a not-ready organisation attempts nothing,
  *     writes its record once in 24 hours and marks the alert as due; the
@@ -87,10 +89,10 @@ function base(kind: Kind, over: Parameters<typeof freshWorld>[0] = {}) {
     owners: [U.owner.id],
     ...over,
   });
-  // The address past its limit: five codes, or five links, in the last hour.
+  // The address past its limit: five codes, or five claimed links, in the last hour.
   for (let i = 0; i < 5; i++) {
     if (kind.tenantEvent === "password_reset") world.otps.push({ email: U.limited.email, created_at: HOUR_AGO(), used_at: null });
-    else world.log.push({ organization_id: ORG, to_user_id: U.limited.id, event_type: "magic_link", status: "sent", error: null, sent_at: HOUR_AGO() });
+    else world.log.push({ organization_id: ORG, to_user_id: U.limited.id, event_type: "magic_link", status: "queued", error: "claim", sent_at: HOUR_AGO() });
   }
 }
 
@@ -197,8 +199,9 @@ async function main() {
       const platformSent = () => tenantSends().filter((r) => (r.body as Row).host === "smtp.platform.stub").length;
 
       await job(U.member.email, { orgSlug: SLUG });
-      eq("a member on a ready organisation: one mail through its own SMTP, one row of the event, no platform mail",
-        [tenantSent(), logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), platformSent(), platformRows().length], [1, [[kind.tenantEvent, "sent", U.member.id]], 0, 0]);
+      eq("a member on a ready organisation: one mail through its own SMTP, its claim and then its row, no platform mail",
+        [tenantSent(), logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), platformSent(), platformRows().length], [1, [[kind.tenantEvent, "queued", U.member.id], [kind.tenantEvent, "sent", U.member.id]], 0, 0]);
+      eq("…the claim is the error word claim with no context", logInserts().filter((r) => r.status === "queued").map((r) => [r.error, JSON.stringify(r.context)]), [["claim", "{}"]]);
       eq("…a sign-in link is minted once, for the account looked up", linksMinted().length, kind.tenantEvent === "magic_link" ? 1 : 0);
 
       await job(UNKNOWN, { orgSlug: SLUG });
@@ -213,13 +216,13 @@ async function main() {
       for (const [label, over] of [["a ready", {}], ["a not-ready", { settings: null }]] as Array<[string, Parameters<typeof freshWorld>[0]]>) {
         await job(U.admin.email, { orgSlug: SLUG }, over, PLATFORM_ENV);
         eq(`an administrator on ${label} page: the platform's mail (Q1 before Q3), no tenant attempt`,
-          [platformRows().map((r) => [r.event_type, r.status, r.organization_id, r.to_user_id]), tenantSent()], [[[kind.platformEvent, "sent", ORG, U.admin.id]], 0]);
+          [platformRows().map((r) => [r.event_type, r.status, r.organization_id, r.to_user_id]), tenantSent()], [[[kind.platformEvent, "suppressed", ORG, U.admin.id], [kind.platformEvent, "sent", ORG, U.admin.id]], 0]);
         await job(U.ownerInvited.email, { orgSlug: SLUG }, over, PLATFORM_ENV);
         eq(`…an administrator a platform owner invited, with no account row yet, on ${label} page: the platform's mail`,
-          [platformRows().map((r) => [r.event_type, r.status, r.organization_id]), tenantSent()], [[[kind.platformEvent, "sent", ORG]], 0]);
+          [platformRows().map((r) => [r.event_type, r.status, r.organization_id]), tenantSent()], [[[kind.platformEvent, "suppressed", ORG], [kind.platformEvent, "sent", ORG]], 0]);
       }
       await job(U.owner.email, {}, {}, PLATFORM_ENV);
-      eq("a platform owner on the page with no organisation: the platform's mail, with no organisation", platformRows().map((r) => [r.event_type, r.status, r.organization_id]), [[kind.platformEvent, "sent", null]]);
+      eq("a platform owner on the page with no organisation: the platform's mail, with no organisation (its claim, then its row)", platformRows().map((r) => [r.event_type, r.status, r.error_code, r.organization_id]), [[kind.platformEvent, "suppressed", "pending", null], [kind.platformEvent, "sent", null, null]]);
       await job(U.member.email, {}, {}, PLATFORM_ENV);
       eq("a learner on the page with no organisation: nothing minted, sent or marked", [linksMinted().length, tenantSends().length, platformRows().length, marks().length], [0, 0, 0, 0]);
 
@@ -245,7 +248,7 @@ async function main() {
       eq("a limit that cannot be read: nothing made, nothing sent", [tenantSends().length, linksMinted().length], [0, 0]);
 
       await job(U.invited.email, { orgSlug: SLUG });
-      eq("the invitation rule: an invited account with no membership gets the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), [[kind.tenantEvent, "sent", U.invited.id]]);
+      eq("the invitation rule: an invited account with no membership gets the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), [[kind.tenantEvent, "queued", U.invited.id], [kind.tenantEvent, "sent", U.invited.id]]);
       base(kind);
       world.members.push({ organization_id: OTHER_ORG, user_id: U.invited.id, role: "user", status: "active" });
       await job(U.invited.email, { orgSlug: SLUG }, {}, {}, true);
@@ -254,7 +257,7 @@ async function main() {
       world.orgs.find((o) => o.id === OTHER_ORG)!.deleted_at = "2026-11-01T00:00:00Z";
       world.members.push({ organization_id: OTHER_ORG, user_id: U.invited.id, role: "user", status: "active" });
       await job(U.invited.email, { orgSlug: SLUG }, {}, {}, true);
-      eq("…whose only membership is in a deleted organisation: the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status]), [[kind.tenantEvent, "sent"]]);
+      eq("…whose only membership is in a deleted organisation: the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status]), [[kind.tenantEvent, "queued"], [kind.tenantEvent, "sent"]]);
 
       for (const [label, over] of [["memberships", { failing: new Set(["organization_members"]) }], ["invitations", { failing: new Set(["invitations"]) }], ["platform owners", { failing: new Set(["platform_owners"]) }]] as Array<[string, Parameters<typeof freshWorld>[0]]>) {
         await job(U.member.email, { orgSlug: SLUG }, over, PLATFORM_ENV);
@@ -263,10 +266,10 @@ async function main() {
 
       if (kind.tenantEvent === "magic_link") {
         const { lines } = await job(U.member.email, { orgSlug: SLUG }, { linkUserId: () => U.outsider.id });
-        eq("a link whose account differs from the one looked up: nothing sent", [linksMinted().length, tenantSends().length, logInserts().length], [1, 0, 0]);
+        eq("a link whose account differs from the one looked up: nothing sent, and only its claim written", [linksMinted().length, tenantSends().length, logInserts().map((r) => r.status)], [1, 0, ["queued"]]);
         eq("…and an error class is logged", lines.some((l) => l.includes("account_mismatch")), true);
         await job(U.admin.email, { orgSlug: SLUG }, { linkUserId: () => U.outsider.id }, PLATFORM_ENV);
-        eq("…the same for a platform-served account", [tenantSends().length, platformRows().length], [0, 0]);
+        eq("…the same for a platform-served account", [tenantSends().length, platformRows().map((r) => r.error_code)], [0, ["pending"]]);
         await job(U.member.email, { orgSlug: SLUG, next: "/tenant-a/courses/c1/launch?mode=preview" });
         const sent = String((tenantSends()[0]?.body as Row | undefined)?.html ?? "");
         eq("a member's link carries the page they asked for, through safeNextPath", sent.includes(encodeURIComponent("/tenant-a/courses/c1/launch?mode=preview")), true);

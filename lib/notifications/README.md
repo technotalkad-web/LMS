@@ -76,8 +76,11 @@ call site to it.
   answer, never dropped in silence.
 - **The organisation's state** (`tenant_smtp_state`, migration 0114):
   `not_configured`, `configured`, `healthy` or `failing`, written only when a
-  send changes it. In a run, a `failing` organisation gets one probe; once the
-  state flips to `failing` the rest are not attempted. The administrators get
+  send changes it, and only while the row still reads as the run read it: a
+  write that misses reads the row again and applies the run's outcomes to it
+  by time (at most twice), and a flip, the stop and the alert follow the
+  write the database took. In a run, a `failing` organisation gets one probe;
+  once the state flips to `failing` the rest are not attempted. The administrators get
   an Attention Center item, a banner and one platform alert (marked as due,
   mailed by the hourly `journey-nudges` call).
 - **The daily limit** (rule FP4): each organisation's `sent` rows of the last
@@ -87,6 +90,14 @@ call site to it.
   and at the limit itself nothing more is attempted. A limit of 25 or less
   is all reserve, so routine mail never goes at it; the pages call that
   "routine mail off at this limit" (the notice `routine_off`).
+- **A public reset code or sign-in link claims its limits before the send**
+  (`claimCredentialMail` in `send.ts`; the platform's is `claimPlatformSend`):
+  the job writes a `queued` row with the error word `claim` and no context,
+  then counts with that row among the rows, so the account's limit and the
+  organisation's daily limit hold under concurrent requests. The row queues
+  nothing, holds no credential and is never counted as sent. A reset code's
+  own row is written closed and opened only after every limit, and only then
+  are the address's older codes closed.
 - **Without migration 0114** (production until its sitting): no state is
   stored, every organisation with complete settings is treated as ready, and
   no daily limit applies; the send is attempted as before.

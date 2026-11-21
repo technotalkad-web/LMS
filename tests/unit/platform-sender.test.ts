@@ -4,9 +4,12 @@
  *   - configured or not, and each half-set case (names only, never a value);
  *   - the order of section F: the account limit; the reserved test domains
  *     and the allow-list (suppressed); the organisation limit and the
- *     ceiling (refused); not configured (failed); the send;
+ *     ceiling (refused); not configured (failed); the send. A code or a
+ *     link writes its claim (suppressed, pending) before it counts, and the
+ *     outcome's row after it (the note of 2026-11-22; the claims under
+ *     concurrent requests are in tests/unit/mail-claims.test.ts);
  *   - a limit that cannot be read, or a missing table, sends nothing and
- *     writes nothing;
+ *     writes nothing but a claim already there;
  *   - the limits of section G: 5 an hour and 10 a day per account and kind,
  *     one refused row an hour; a platform owner's own code and link have the
  *     hourly limit only; the test counts only sends that reached the mail
@@ -147,6 +150,10 @@ const sends = () => requests.filter((r) => r.path === "/functions/v1/send-smtp")
 const inserts = () => requests.filter((r) => r.path === "/rest/v1/platform_email_log" && r.method === "POST");
 const reads = () => requests.filter((r) => r.path === "/rest/v1/platform_email_log" && (r.method === "GET" || r.method === "HEAD"));
 const ago = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+/** A claim of a code or link (the note of 2026-11-22): the account's requests are counted on these. */
+const CLAIM: Partial<Row> = { status: "suppressed", error_code: "pending" };
+/** The rows of what came of the sends, without their claims. */
+const outcomes = () => rows.filter((r) => !(r.status === "suppressed" && r.error_code === "pending"));
 const seed = (n: number, base: Partial<Row>, minutesAgo: (i: number) => number) => {
   for (let i = 0; i < n; i++) rows.push({ id: `s${nextId++}`, sent_at: ago(minutesAgo(i)), event_type: "platform_reset_code", organization_id: null, to_user_id: null, status: "sent", error_code: null, error_detail: null, ...base });
 };
@@ -193,7 +200,9 @@ async function main() {
 
       fresh();
       const half = { ...ENV }; delete half.PLATFORM_SMTP_PASSWORD;
-      eq("a send while not configured: failed, not_configured, one row, nothing dispatched", [short(await send(code(ADMIN_A, ORG_A), half)), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "not_configured", true], 0, [["failed", "not_configured"]]]);
+      eq("a code while not configured: failed, not_configured, its claim and one row, nothing dispatched", [short(await send(code(ADMIN_A, ORG_A), half)), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "not_configured", true], 0, [["suppressed", "pending"], ["failed", "not_configured"]]]);
+      fresh();
+      eq("…a welcome while not configured: one row, no claim", [short(await send(welcome(ADMIN_A, ORG_A), half)), rows.map((r) => [r.status, r.error_code])], [["failed", "not_configured", true], [["failed", "not_configured"]]]);
       fresh();
       const noAllow = { ...ENV }; delete noAllow.PLATFORM_EMAIL_ALLOW_DOMAINS;
       eq("the allow-list unset: suppressed, not_allowed, nothing dispatched", [short(await send(code(ADMIN_A, ORG_A), noAllow)), sends().length], [["suppressed", "not_allowed", true], 0]);
@@ -208,8 +217,8 @@ async function main() {
       eq("the payload carries the platform's settings and the fixed text", [p.host, p.port, p.secure, p.user, p.from, p.to, p.subject], ["smtp.platform.stub", 465, true, SMTP_USER, FROM, ADMIN_A.email, "Your LMS password reset code"]);
       eq("…no Reply-To unless set", "replyTo" in p && p.replyTo !== undefined, false);
       eq("…the request is bounded by a signal (the 15 s wait)", sends()[0].init?.signal instanceof AbortSignal, true);
-      eq("the row: the event, the organisation, the user id, sent; no address, no content", rows.map((x) => [x.event_type, x.organization_id, x.to_user_id, x.status, x.error_code, x.error_detail]), [["platform_reset_code", ORG_A, ADMIN_A.userId, "sent", null, null]]);
-      eq("the insert names only the log's columns", Object.keys(JSON.parse(inserts()[0].body)).sort(), ["error_code", "error_detail", "event_type", "organization_id", "status", "to_user_id"]);
+      eq("the rows: the claim, then the outcome; each with the event, the organisation and the user id, no address, no content", rows.map((x) => [x.event_type, x.organization_id, x.to_user_id, x.status, x.error_code, x.error_detail]), [["platform_reset_code", ORG_A, ADMIN_A.userId, "suppressed", "pending", null], ["platform_reset_code", ORG_A, ADMIN_A.userId, "sent", null, null]]);
+      eq("each insert names only the log's columns", inserts().map((i) => Object.keys(JSON.parse(i.body)).sort()), [0, 1].map(() => ["error_code", "error_detail", "event_type", "organization_id", "status", "to_user_id"]));
       fresh();
       await send(code(ADMIN_A, ORG_A), { ...ENV, PLATFORM_EMAIL_REPLY_TO: "help@platform-owner.stub", PLATFORM_SMTP_SECURE: "" , PLATFORM_SMTP_PORT: "587" });
       const p2 = JSON.parse(sends()[0].body) as Record<string, unknown>;
@@ -222,7 +231,7 @@ async function main() {
     console.log("\nthe order of section F");
     {
       fresh();
-      seed(5, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, (i) => 5 + i);
+      seed(5, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, (i) => 5 + i);
       eq("1. the account limit comes first: an account at its limit with a reserved-domain address is refused, not suppressed", short(await send(code({ ...ADMIN_A, email: "admin@tenant-a.test" }, ORG_A))), ["refused", "account_limit", true]);
       fresh();
       seed(DEFAULT_DAILY_CEILING, { status: "sent" }, () => 30);
@@ -309,7 +318,7 @@ async function main() {
       fresh(); failRead = "rows";
       eq("the account read fails: nothing sent, no row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
       fresh(); failRead = "count";
-      eq("the organisation count fails: the same", [short(await send(code(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
+      eq("the organisation count after the claim fails: nothing sent, the claim the only row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "log_unreadable", false], 0, [["suppressed", "pending"]]]);
       fresh(); failRead = "count";
       eq("the ceiling count fails (a welcome): the same", [short(await send(welcome(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
       fresh(); tableMissing = true;
@@ -321,24 +330,24 @@ async function main() {
     console.log("\nthe account limits (section G)");
     {
       fresh();
-      seed(4, { to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 10 + i);
+      seed(4, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 10 + i);
       eq("four links in the hour: the fifth is sent", (await send(link(ADMIN_A, ORG_A))).status, "sent");
       eq("…the sixth is refused, with one refused row", [short(await send(link(ADMIN_A, ORG_A))), rows.filter((r) => r.status === "refused").length], [["refused", "account_limit", true], 1]);
       eq("…the seventh in that hour writes no further row", [short(await send(link(ADMIN_A, ORG_A))), rows.filter((r) => r.status === "refused").length, sends().length], [["refused", "account_limit", false], 1, 1]);
       eq("…another kind for the same account is counted on its own", (await send(code(ADMIN_A, ORG_A))).status, "sent");
       eq("…another account is not touched", (await send(link(ADMIN_B, ORG_B))).status, "sent");
       fresh();
-      seed(5, { to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 61 + i);
+      seed(5, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 61 + i);
       seed(1, { to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link", status: "refused", error_code: "account_limit" }, () => 70);
       eq("an hour later the hourly limit has passed (its refused row is not an attempt)", (await send(link(ADMIN_A, ORG_A))).status, "sent");
       fresh();
-      seed(10, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
+      seed(10, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
       eq("ten codes in the day, none in the hour: an administrator is refused (the daily limit)", short(await send(code(ADMIN_A, ORG_A))), ["refused", "account_limit", true]);
-      seed(10, { to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
+      seed(10, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
       eq("…a platform owner's own code is sent (hourly limit only)", (await send(code(OWNER, null))).status, "sent");
-      seed(10, { to_user_id: OWNER.userId, event_type: "platform_sign_in_link" }, (i) => 90 + i * 60);
+      seed(10, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_sign_in_link" }, (i) => 90 + i * 60);
       eq("…and the owner's own link", (await send(link(OWNER, null))).status, "sent");
-      seed(5, { to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 1 + i);
+      seed(5, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 1 + i);
       eq("…but five owner codes in the hour refuse the next one", short(await send(code(OWNER, null))), ["refused", "account_limit", true]);
       fresh();
       seed(10, { to_user_id: OWNER.userId, event_type: "platform_test" }, (i) => 90 + i * 60);
@@ -361,8 +370,15 @@ async function main() {
       eq("welcomes and alerts have no account limit", [(await send(welcome(ADMIN_A, ORG_A))).status, (await send(alert(ADMIN_A, ORG_A))).status], ["sent", "sent"]);
       fresh();
       seed(4, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code", status: "suppressed", error_code: "test_domain" }, (i) => 1 + i);
+      seed(1, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, () => 2);
       seed(1, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code", status: "refused", error_code: "ceiling" }, () => 2);
-      eq("every request counts, whatever its outcome (four suppressed and one refused by the ceiling: the sixth is refused)", short(await send(code(ADMIN_A, ORG_A))), ["refused", "account_limit", true]);
+      eq("every request counts once, whatever its outcome (four the reserved domains stopped, and one claim the ceiling refused: the sixth is refused)", short(await send(code(ADMIN_A, ORG_A))), ["refused", "account_limit", true]);
+      fresh();
+      seed(4, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, (i) => 1 + i);
+      seed(4, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code", status: "sent" }, (i) => 1 + i);
+      seed(4, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code", status: "refused", error_code: "org_limit" }, (i) => 1 + i);
+      eq("…a row that follows a claim is not a request (four claims, each with its outcome: the fifth is sent)", (await send(code(ADMIN_A, ORG_A))).status, "sent");
+      eq("…and the sixth is refused before it claims: its refused row, and no claim", [short(await send(code(ADMIN_A, ORG_A))), rows.filter((r) => r.error_code === "pending").length], [["refused", "account_limit", true], 5]);
     }
 
     console.log("\nthe organisation limit (section G)");
@@ -511,7 +527,8 @@ async function main() {
         fresh();
         smtpAnswer = async () => json({ ok: false, error: m });
         const r = await send(code(ADMIN_A, ORG_A));
-        eq(`a send answered "${m.slice(0, 40)}": failed, ${c}, its detail kept`, [short(r), rows[0]?.error_code, typeof rows[0]?.error_detail], [["failed", c, true], c, "string"]);
+        const row = outcomes()[0];
+        eq(`a send answered "${m.slice(0, 40)}": failed, ${c}, its detail kept`, [short(r), row?.error_code, typeof row?.error_detail], [["failed", c, true], c, "string"]);
       }
       fresh();
       smtpAnswer = async () => new Response("", { status: 503 });
@@ -551,7 +568,8 @@ async function main() {
       const secrets = [PASSWORD, SMTP_USER, SERVICE_KEY, FROM, ADMIN_A.email, ADMIN_B.email, "x@tenant-a.test", "platform-owner.stub"];
       const rowText = JSON.stringify(rows) + inserts().map((i) => i.body).join("\n");
       eq("the rows hold no secret, no address, no '@'", [secrets.filter((s) => rowText.includes(s)), rowText.includes("@")], [[], false]);
-      eq("the detail is kept, scrubbed and short", [rows[0].error_code, rows[0].error_detail!.length <= 200, rows[0].error_detail!.includes("[redacted]")], ["auth", true, true]);
+      const failedRow = outcomes()[0];
+      eq("the detail is kept, scrubbed and short", [failedRow.error_code, failedRow.error_detail!.length <= 200, failedRow.error_detail!.includes("[redacted]")], ["auth", true, true]);
       const logText = printed.join("\n");
       eq(`the log lines (${printed.length}) hold no secret and no address`, [printed.length > 0, secrets.filter((s) => logText.includes(s)), logText.includes("@")], [true, [], false]);
       eq("scrubErrorDetail cuts to 200 characters after scrubbing", scrubErrorDetail("word ".repeat(100) + "a@b.stub", []).length, 200);

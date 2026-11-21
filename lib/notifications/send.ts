@@ -1,10 +1,11 @@
-import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { loadTemplate, mdToHtml, DEFAULT_CTAS, DEFAULT_TEMPLATES } from "./templates";
 import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
-import { SMTP_SEND_WAIT_MS, classifySmtpError, dispatchSmtp, isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
+import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, SMTP_SEND_WAIT_MS, claimsInFlight, classifySmtpError, dispatchSmtp, isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
+import { MAX_REQUESTS_PER_DAY, MAX_REQUESTS_PER_HOUR } from "@/lib/auth/password-reset";
 import { isTenantEvent } from "./routing";
-import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, markNotSentAlert, noteCallLimit, openRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, markNotSentAlert, noteCallLimit, openRun, refreshRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
 import type { TenantReading } from "@/lib/ops/health-status";
 import type {
   NotificationEvent,
@@ -348,6 +349,134 @@ export async function recordCredentialNotAttempted(
   return answer;
 }
 
+/** The error word of a tenant's claim: a `queued` row of notification_log that queues nothing and holds no credential. */
+export const CREDENTIAL_CLAIM_ERROR = "claim";
+
+const DAY_MS = 24 * 3_600_000;
+
+/**
+ * The account's claimed sign-in links through its organisation's SMTP in
+ * the last 24 hours, newest first: the `queued` rows of magic_link. It asks
+ * for one row more than the daily limit, so a row past the limit is never
+ * hidden by the size of the page. A record row of a link that was not
+ * attempted is not a request, and is not read here.
+ */
+export function readLinkClaims(db: SupabaseClient, userId: string, nowMs: number) {
+  return db
+    .from("notification_log")
+    .select("sent_at")
+    .eq("to_user_id", userId)
+    .eq("event_type", "magic_link")
+    .eq("status", "queued")
+    .gte("sent_at", new Date(nowMs - DAY_MS).toISOString())
+    .order("sent_at", { ascending: false })
+    .limit(MAX_REQUESTS_PER_DAY + 1);
+}
+
+/** A tenant claim's answer: its time, or why nothing is sent (its record row, if one is owed, is already written). */
+export type CredentialClaim =
+  | { ok: true; at: number }
+  | { ok: false; why: "claim_failed" | "limit_read_failed" | "account_limit" | CredentialNotAttempted };
+
+/**
+ * Claim a public reset code or sign-in link on the organisation's own SMTP
+ * before it is made (ADR 0029, the note of 2026-11-22). Each limit is
+ * claimed before the send: the job writes its claim, a `queued` row with
+ * the error word `claim` and no context, and only then reads, with its own
+ * claim among the rows:
+ *   - for a link, the account's claims again (readLinkClaims): past 5 in the
+ *     hour or 10 in the day nothing is sent;
+ *   - the run again (refreshRun): an organisation that now reads failing or
+ *     not configured is not attempted (smtp_not_ready, with its record row
+ *     and the alert mark);
+ *   - the organisation's claims in flight (CLAIM_IN_FLIGHT_MS, at most five
+ *     for one account and kind): with the fresh 24-hour count, past the
+ *     daily limit is not attempted (daily_limit, with its record row and the
+ *     alert mark), and so is a full page of claims, which cannot be counted.
+ * A claim that cannot be written, or an account count that cannot be read,
+ * sends nothing. A fresh status or a count of claims that cannot be read
+ * applies no daily limit to this request (rule FP4): the run keeps what it
+ * read first, and one fixed line names the read. The account limits have no
+ * such fallback. Every call is charged to the run. Never throws.
+ */
+export async function claimCredentialMail(
+  run: MailRun,
+  args: { event: CredentialEvent; to: { user_id: string; email: string } },
+  opts: { link: boolean }
+): Promise<CredentialClaim> {
+  const db = svc();
+  const warn = (step: string, code?: string) =>
+    console.warn(JSON.stringify({ event: "credential_claim", org_id: run.organizationId, kind: args.event, step, ...(code ? { code } : {}) }));
+  const at = run.now();
+  spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
+  try {
+    const { error } = await db.from("notification_log").insert(
+      logRow({
+        organizationId: run.organizationId,
+        orgName: run.orgName,
+        event: args.event,
+        to: args.to,
+        subjectTemplate: DEFAULT_TEMPLATES[args.event]?.subject ?? "",
+        status: "queued",
+        error: CREDENTIAL_CLAIM_ERROR,
+        context: {},
+      })
+    );
+    if (error) {
+      warn("claim_failed", String(error.code ?? "unknown"));
+      return { ok: false, why: "claim_failed" };
+    }
+  } catch {
+    warn("claim_failed", "thrown");
+    return { ok: false, why: "claim_failed" };
+  }
+
+  const nowMs = run.now();
+  spendCalls(run.budget, (opts.link ? 1 : 0) + 1);
+  const settle = <T,>(p: PromiseLike<T>): Promise<T | "thrown"> => Promise.resolve(p).catch(() => "thrown" as const);
+  const [account, status, flight] = await Promise.all([
+    opts.link ? settle(readLinkClaims(db, args.to.user_id, nowMs)) : Promise.resolve(null),
+    refreshRun(run),
+    settle(
+      db
+        .from("notification_log")
+        .select("to_user_id, event_type")
+        .eq("organization_id", run.organizationId)
+        .eq("status", "queued")
+        .gte("sent_at", new Date(nowMs - CLAIM_IN_FLIGHT_MS).toISOString())
+        .order("sent_at", { ascending: false })
+        .limit(CLAIMS_IN_FLIGHT_PAGE)
+    ),
+  ]);
+
+  if (account !== null) {
+    if (account === "thrown" || account.error || !Array.isArray(account.data)) {
+      warn("limit_read_failed");
+      return { ok: false, why: "limit_read_failed" };
+    }
+    const rows = account.data as Array<{ sent_at?: unknown }>;
+    const inHour = rows.filter((r) => typeof r.sent_at === "string" && Date.parse(r.sent_at) >= nowMs - 3_600_000).length;
+    if (inHour > MAX_REQUESTS_PER_HOUR || rows.length > MAX_REQUESTS_PER_DAY) return { ok: false, why: "account_limit" };
+  }
+
+  const reading = runReading(run);
+  if (reading === "failing" || reading === "not_configured") {
+    await recordCredentialNotAttempted(run, args, "smtp_not_ready");
+    return { ok: false, why: "smtp_not_ready" };
+  }
+  const flightRead = flight !== "thrown" && !flight.error && Array.isArray(flight.data);
+  if (status === "unreadable") warn("status_unread");
+  if (!flightRead) warn("claims_unread");
+  if (run.limit && status === "ok" && flightRead) {
+    const claims = flight.data as Array<{ to_user_id: string | null; event_type: string }>;
+    if (claims.length >= CLAIMS_IN_FLIGHT_PAGE || run.sent24h + claimsInFlight(claims) > run.limit.limit) {
+      await recordCredentialNotAttempted(run, args, "daily_limit");
+      return { ok: false, why: "daily_limit" };
+    }
+  }
+  return { ok: true, at };
+}
+
 /**
  * A welcome's outcome on the Users answers and rows (ADR 0029 section C, step
  * 16): sent, or not sent with its class. A timeout is "not_sent" with the
@@ -465,9 +594,11 @@ export async function sendSettingsTest(run: MailRun, to: { user_id: string; emai
       const message = e instanceof Error ? e.message : String(e ?? "");
       answer = { ok: false, error: isCallLimitMessage(message) ? message : "The send failed before it reached the mail server." };
     }
+    // The test's time on the state row: when its send answered.
+    const answeredAt = run.now();
     if (answer.ok) {
       result = { status: "sent", attempted: true, to: to.email };
-      await settleSettingsTest(run, { ok: true }, to.user_id);
+      await settleSettingsTest(run, { ok: true }, to.user_id, answeredAt);
     } else if (isCallLimitMessage(answer.error)) {
       // The platform refused the outbound call itself (rule FP8), as the
       // run's attemptOne reads it: the test never reached the mail server, so
@@ -478,7 +609,7 @@ export async function sendSettingsTest(run: MailRun, to: { user_id: string; emai
     } else {
       const cls = classifySmtpError(answer.error);
       result = { status: "failed", error: `tenant SMTP failed: ${answer.error ?? "unknown"}`, errorClass: cls, attempted: true, to: to.email };
-      await settleSettingsTest(run, { ok: false, cls }, to.user_id);
+      await settleSettingsTest(run, { ok: false, cls }, to.user_id, answeredAt);
     }
   }
   // Its row: counted in the organisation's 24 hours when it was sent (rule

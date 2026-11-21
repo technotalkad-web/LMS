@@ -201,7 +201,10 @@ administrator welcomes, SMTP alerts); never a learner's mail, and it is never
 a fallback for a tenant's SMTP, nor a tenant's SMTP for it. It posts to the
 `send-smtp` function like a tenant send; every send is one row of
 `public.platform_email_log` (migration 0113: user ids, statuses and error
-classes; never an address or message content).
+classes; never an address or message content). A code or a link claims its
+limits before the send: its first row is the claim (`suppressed` with the
+error code `pending`), its second what came of it. A `pending` row is never a
+send: the health check and "Last send" on `/super/email` do not read it.
 
 **Setup** (staging first; production in the sitting before the tag that
 carries the sender, ADR 0029 section M):
@@ -361,7 +364,9 @@ Center. The platform owner sees every organisation on `/super/email` →
   attempted, and its sign-in page answers "Email could not be sent. Please
   contact your LMS Administrator." For each account and kind, only the first
   such request in a 24-hour window leaves a `failed` row (error `smtp_not_ready`,
-  or `daily_limit`). What happens to its other mail depends on why it is not
+  or `daily_limit`). A code or link that is attempted first writes its claim, a
+  `queued` row with the error `claim`: it queues nothing, holds no credential
+  and never counts as sent. What happens to its other mail depends on why it is not
   ready:
   - `failing`: the other mail is still tried, and the first send acts as the
     probe. In one request or cron run the organisation gets one probe; once a

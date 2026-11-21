@@ -39,6 +39,11 @@
  * platform_email_log row, the answer and every log line do not, and no
  * notification_log row is written.
  *
+ * The claim each public code or link writes before it is made (the note of
+ * 2026-11-22): the tenant's is a queued notification_log row with the error
+ * word claim and no context, the platform's a pending platform_email_log
+ * row. Neither holds a credential.
+ *
  * Every credential check is a boolean or a count: a failing check never
  * prints a value.
  *
@@ -97,6 +102,7 @@ let admins = new Set<string>();
 const handed: Array<() => unknown> = [];
 const runHanded = async () => { for (const t of handed.splice(0)) await t(); };
 let created = 0;
+let codeRows = 0;
 /** tenant_mail_status's one row (ADR 0029, migration 0114): the state and the 24-hour count. */
 let mailStatus: Row = {};
 const statusRow = (over: Row = {}): Row => ({ state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0, ...over });
@@ -130,6 +136,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json({ ...userJson(u.id, u.email), action_link: "https://stub/verify", email_otp: "000000", hashed_token: TOKEN_HASH, redirect_to: "", verification_type: "magiclink" });
   }
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
+  // A reset code's row is written and asked back (its id and its time), then opened.
+  if (p === "/rest/v1/password_reset_otps" && method === "POST") return json([{ id: `otp-${++codeRows}`, created_at: new Date(Date.now() + codeRows).toISOString() }], 201);
   // The platform sender's limit reads: no row in 24 hours (a count of 0).
   if (p === "/rest/v1/platform_email_log" && method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": "*/0" } });
   if (p === "/rest/v1/notification_settings") return json([settings]);
@@ -160,7 +168,7 @@ const logRows = () => requests.filter((q) => q.path === "/rest/v1/notification_l
 const smtpRaw = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").map((q) => q.raw).join("\n");
 const smtpPayloads = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").map((q) => q.body as { subject: string; text: string });
 
-async function checkLog(label: string, opts: { rows: number; secrets: string[]; storedKeys: string[]; mailed?: boolean }) {
+async function checkLog(label: string, opts: { rows: number; secrets: string[]; storedKeys: string[]; mailed?: boolean; claims?: number }) {
   const { STORED_CONTEXT_KEYS } = await import("../../lib/notifications/send");
   const allowed = new Set<string>(STORED_CONTEXT_KEYS);
   const rows = logRows();
@@ -171,7 +179,11 @@ async function checkLog(label: string, opts: { rows: number; secrets: string[]; 
   eq(`${label}: no log row holds the credential (any column)`, rows.some((r) => opts.secrets.some((s) => r.raw.includes(s))), false);
   eq(`${label}: no log row holds a token_hash`, rows.some((r) => /token_hash/i.test(r.raw)), false);
   eq(`${label}: every stored context key is allow-listed`, rows.every((r) => Object.keys((r.body.context ?? {}) as Row).every((k) => allowed.has(k))), true);
-  eq(`${label}: the stored context keys`, Object.keys((rows[0]?.body.context ?? {}) as Row).sort(), [...opts.storedKeys].sort());
+  // The outcome's row: a claim written before it (queued) has no context.
+  const outcome = rows.find((r) => r.body.status !== "queued") ?? rows[0];
+  eq(`${label}: the stored context keys`, Object.keys((outcome?.body.context ?? {}) as Row).sort(), [...opts.storedKeys].sort());
+  const claims = rows.filter((r) => r.body.status === "queued");
+  eq(`${label}: ${opts.claims ?? 0} claim row(s), each with the error word claim and no context`, claims.length === (opts.claims ?? 0) && claims.every((r) => r.body.error === "claim" && Object.keys((r.body.context ?? {}) as Row).length === 0), true);
 }
 
 function reset(opts: { users?: Array<{ id: string; email: string }>; members?: string[]; admins?: string[]; settings?: Row; template?: Row | null; status?: Row } = {}) {
@@ -321,7 +333,7 @@ async function main() {
       // The code is random: read it from the email (the template's "# {OTP_Code}" line).
       const code = /^# (\d{6})$/m.exec(smtpPayloads()[0]?.text ?? "")?.[1] ?? "";
       eq("the email carries a 6-digit code", code.length === 6, true);
-      await checkLog("password_reset", { rows: 1, secrets: code ? [code] : ["(no code)"], storedKeys: ["org_name", "otp_minutes"] });
+      await checkLog("password_reset", { rows: 2, claims: 1, secrets: code ? [code] : ["(no code)"], storedKeys: ["org_name", "otp_minutes"] });
     }
 
     console.log("\nPOST /api/auth/magic-link: the tenant sign-in link");
@@ -331,7 +343,7 @@ async function main() {
       const res = await route.POST(new Request("http://lms.test/api/auth/magic-link", { method: "POST", body: JSON.stringify({ email: "member@example.test", orgSlug: "org" }) }));
       eq("200 { ok: true }", res.status === 200 && (await res.json()).ok === true, true);
       await runHanded();
-      await checkLog("magic_link", { rows: 1, secrets: [TOKEN_HASH], storedKeys: [] });
+      await checkLog("magic_link", { rows: 2, claims: 1, secrets: [TOKEN_HASH], storedKeys: [] });
     }
 
     console.log("\nthe platform's reset code and sign-in link for an administrator (ADR 0029 section F)");
@@ -360,7 +372,7 @@ async function main() {
           const secret = event === "platform_reset_code" ? (/(?:^|\\n|\n)(\d{6})(?:\\n|\n)/.exec(mail)?.[1] ?? "(no code)") : TOKEN_HASH;
           eq(`${label}: 200, and the platform's mail carries the credential`, res.status === 200 && mail.includes(secret), true);
           const rows = requests.filter((q) => q.path === "/rest/v1/platform_email_log" && q.method === "POST").map((q) => q.raw);
-          eq(`${label}: one platform_email_log row, of the event`, rows.map((r) => String((JSON.parse(r) as Row).event_type)), [event]);
+          eq(`${label}: two platform_email_log rows, the claim and the outcome, of the event`, rows.map((r) => [String((JSON.parse(r) as Row).event_type), String((JSON.parse(r) as Row).error_code)]).flat(), [event, "pending", event, "null"]);
           eq(`${label}: the row holds neither the credential nor an address`, rows.some((r) => r.includes(secret) || r.includes("@")), false);
           eq(`${label}: the answer holds no credential`, answer.includes(secret), false);
           eq(`${label}: no notification_log row`, logRows().length, 0);

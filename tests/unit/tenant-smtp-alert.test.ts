@@ -131,7 +131,7 @@ async function main() {
       eq("three due: one call sends one alert, the oldest", [first.kind, platformSends().map((s) => s.to), world.otherStates[0].alert_due_at, typeof world.state?.alert_due_at, typeof world.otherStates[1].alert_due_at], ["sent", ["b-admin@tenant.stub"], null, "string", "string"]);
 
       freshWorld({ state: due(), members: admins, profiles });
-      world.platformLog.push(...Array.from({ length: 60 }, () => ({ event_type: "platform_reset_code", organization_id: ORG, status: "sent" })));
+      world.platformLog.push(...Array.from({ length: 60 }, () => ({ event_type: "platform_reset_code", organization_id: ORG, status: "sent", sent_at: iso(H) })));
       eq("the organisation's platform allowance for codes and links used up: the alert still goes", [(await dueAlert()).kind, platformSends().length], ["sent", 5]);
     }
 

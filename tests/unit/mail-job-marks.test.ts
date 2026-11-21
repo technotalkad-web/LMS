@@ -86,7 +86,7 @@ async function main() {
       base();
       await job(ADMIN.email, { orgSlug: SLUG }, PLATFORM_ENV);
       eq("a platform-served administrator: the marks are the platform's", marks().map((m) => [m.p_kind, m.p_mark]), [["platform", "started"], ["platform", "finished"]]);
-      eq("…around the platform's mail", platformRows().map((r) => r.status), ["sent"]);
+      eq("…around the platform's mail (its claim, then its row)", platformRows().map((r) => r.status), ["suppressed", "sent"]);
 
       base();
       const none = await job("nobody@tenant.stub");
@@ -147,28 +147,31 @@ async function main() {
 
       base();
       await slowJob(MEMBER.email, 22_500);
-      const tenantRow = logInserts().find((r) => r.event_type === "password_reset");
+      // The outcome's row, not the claim written before it.
+      const outcomeRows = () => logInserts().filter((r) => r.event_type === "password_reset" && r.status !== "queued");
+      const platformOutcomes = () => platformRows().filter((r) => r.error_code !== "pending");
+      const tenantRow = outcomeRows()[0];
       eq(`tenant: 22.5 s of the job spent before the send: the send is given what is left less the row's time (${left(22_500)} ms), not the whole wait`,
         [tenantSends().length, String(tenantRow?.error ?? "").includes(`Timed out after ${left(22_500)}ms`)], [1, true]);
       eq("…the row is written and the job finished", [tenantRow?.status, marks().map((m) => m.p_mark)], ["failed", ["started", "finished"]]);
 
       base();
       const tenantLate = await slowJob(MEMBER.email, 24_000);
-      eq("tenant: 24 s spent, no time left for the send: it is not started, no row is written for it, one fixed line, and the job is finished",
-        [tenantSends().length, logInserts().filter((r) => r.event_type === "password_reset").length, line(tenantLate.lines, "no_time"), marks().map((m) => m.p_mark)],
+      eq("tenant: 24 s spent, no time left for the send: it is not started, no outcome row is written for it, one fixed line, and the job is finished",
+        [tenantSends().length, outcomeRows().length, line(tenantLate.lines, "no_time"), marks().map((m) => m.p_mark)],
         [0, 0, 1, ["started", "finished"]]);
 
       base();
       await slowJob(ADMIN.email, 22_500, PLATFORM_ENV);
-      const platformRow = platformRows()[0];
+      const platformRow = platformOutcomes()[0];
       eq(`platform: 22.5 s spent: the send is given ${left(22_500)} ms, and its row says it timed out`,
         [platformRow?.event_type, platformRow?.status, platformRow?.error_code, String(platformRow?.error_detail ?? "").includes(`Timed out after ${left(22_500)}ms`)],
         ["platform_reset_code", "failed", "timeout", true]);
 
       base();
       const platformLate = await slowJob(ADMIN.email, 24_000, PLATFORM_ENV);
-      eq("platform: no time left: nothing dispatched, no row, one fixed line, and the job is finished",
-        [platformRows().length, requests.filter((r) => r.path === "/functions/v1/send-smtp").length, line(platformLate.lines, "no_time"), marks().map((m) => m.p_mark)],
+      eq("platform: no time left: nothing dispatched, no outcome row, one fixed line, and the job is finished",
+        [platformOutcomes().length, requests.filter((r) => r.path === "/functions/v1/send-smtp").length, line(platformLate.lines, "no_time"), marks().map((m) => m.p_mark)],
         [0, 0, 1, ["started", "finished"]]);
     }
   } finally {

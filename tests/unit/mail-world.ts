@@ -15,6 +15,18 @@
  * test puts in `world.tables` is answered from those rows (filters, order,
  * offset and a page cap of 1000 rows, as the server has), and a function in
  * `world.rpc` answers its call. A table that is in neither still throws.
+ *
+ * As the server would (ADR 0029, the note of 2026-11-22): every filter of a
+ * read, a count and a conditional update is honoured (eq, neq, is, lt, lte,
+ * gt, gte, in, or and and, and array literals), and eq compares the exact
+ * text, as a value read and passed back is; a row gets its time when it is
+ * written, from Date.now(); notification_log and platform_email_log keep
+ * their rows, and counts and tenant_mail_status's sent_24h are counted from
+ * them (`sent24h` adds the mail sent before the test); an insert-or-ignore
+ * that finds its row answers no row; and every database call is answered
+ * from the rows as they are when it arrives and handed back after a wait
+ * (`readDelayMs`, else one turn of the event loop), so that runs started
+ * together interleave.
  */
 
 export type Row = Record<string, unknown>;
@@ -65,6 +77,10 @@ export type World = {
   allSettings: Row[] | null;
   /** Tables that answer as not on this database (PGRST205). */
   missingTables: string[];
+  /** notification_log's rows: every insert lands here with its time. */
+  log: Row[];
+  /** A database call's answer is handed back after this many milliseconds; 0: after one turn of the event loop. */
+  readDelayMs: number;
 };
 
 /** The server answers at most this many rows, whatever a read asks (lib/db/chunked.ts). */
@@ -121,10 +137,25 @@ export function freshWorld(over: Partial<World> = {}): World {
     otherSent: {},
     allSettings: null,
     missingTables: [],
+    log: [],
+    readDelayMs: 0,
     ...over,
   };
+  lastStamp = 0;
+  nextId = 1;
   return world;
 }
+
+let lastStamp = 0;
+let nextId = 1;
+/** A row's time when it is written: the clock's, and never earlier than the world's last one. */
+export function stamp(): string {
+  lastStamp = Math.max(Date.now(), lastStamp + 1);
+  return new Date(lastStamp).toISOString();
+}
+const newId = (prefix: string) => `${prefix}-${String(nextId++).padStart(6, "0")}`;
+/** One turn of the event loop, or the world's wait: an answer is handed back after other runs have gone on. */
+const pause = () => new Promise<void>((res) => (world.readDelayMs > 0 ? setTimeout(res, world.readDelayMs) : setImmediate(res)));
 
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -144,25 +175,33 @@ function splitTop(s: string): string[] {
 const unquote = (v: string) => (v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v);
 const asTime = (v: unknown) => (typeof v === "string" ? Date.parse(v) : NaN);
 
+/** The text a value is compared as: an array as its literal ("{a,b}"), anything else as itself. */
+const asText = (val: unknown) => (Array.isArray(val) ? `{${val.join(",")}}` : String(val));
+/** An order between two values: by time when both read as times, else by their text. */
+function cmp(val: unknown, want: string): number {
+  if (Number.isFinite(asTime(val)) && Number.isFinite(asTime(want))) return asTime(val) - asTime(want);
+  const a = asText(val);
+  return a < want ? -1 : a > want ? 1 : 0;
+}
 function evalOp(val: unknown, opv: string): boolean {
   if (opv === "is.null") return val === null || val === undefined;
   if (opv === "not.is.null") return !(val === null || val === undefined);
-  if (opv.startsWith("eq.")) {
-    const want = unquote(opv.slice(3));
-    if (typeof val === "string" && Number.isFinite(asTime(val)) && Number.isFinite(asTime(want)) && /\dT\d/.test(want)) return asTime(val) === asTime(want);
-    return String(val) === want;
-  }
-  if (opv.startsWith("lt.")) { const w = unquote(opv.slice(3)); return Number.isFinite(asTime(val)) ? asTime(val) < asTime(w) : String(val) < w; }
-  if (opv.startsWith("gt.")) {
+  // The exact text: a time passed back as it was read matches, a reformatted one does not.
+  if (opv.startsWith("eq.")) return val !== null && val !== undefined && asText(val) === unquote(opv.slice(3));
+  if (opv.startsWith("neq.")) return val !== null && val !== undefined && asText(val) !== unquote(opv.slice(4));
+  const ord = /^(lt|lte|gt|gte)\.(.*)$/.exec(opv);
+  if (ord) {
     if (val === null || val === undefined) return false;
-    const w = unquote(opv.slice(3));
-    return Number.isFinite(asTime(val)) && Number.isFinite(asTime(w)) ? asTime(val) > asTime(w) : String(val) > w;
+    const c = cmp(val, unquote(ord[2]));
+    return ord[1] === "lt" ? c < 0 : ord[1] === "lte" ? c <= 0 : ord[1] === "gt" ? c > 0 : c >= 0;
   }
-  if (opv.startsWith("gte.")) { const w = unquote(opv.slice(4)); return Number.isFinite(asTime(val)) ? asTime(val) >= asTime(w) : String(val) >= w; }
-  if (opv.startsWith("in.(")) return opv.slice(4, -1).split(",").map(unquote).includes(String(val));
+  if (opv.startsWith("in.(")) return opv.slice(4, -1).split(",").map(unquote).includes(asText(val));
   throw new Error(`stub: operator not understood: ${opv}`);
 }
+/** One condition of an or/and list: "col.op.value", or a nested "and(...)" or "or(...)". */
 function evalCond(r: Row, c: string): boolean {
+  if (c.startsWith("and(")) return splitTop(c.slice(4, -1)).every((x) => evalCond(r, x));
+  if (c.startsWith("or(")) return splitTop(c.slice(3, -1)).some((x) => evalCond(r, x));
   const i = c.indexOf(".");
   return evalOp(r[c.slice(0, i)], c.slice(i + 1));
 }
@@ -170,6 +209,7 @@ export function matches(r: Row, q: URLSearchParams): boolean {
   for (const [k, v] of q) {
     if (["select", "order", "limit", "offset", "on_conflict", "columns"].includes(k)) continue;
     if (k === "or") { if (!splitTop(v.slice(1, -1)).some((c) => evalCond(r, c))) return false; continue; }
+    if (k === "and") { if (!splitTop(v.slice(1, -1)).every((c) => evalCond(r, c))) return false; continue; }
     if (!evalOp(r[k], v)) return false;
   }
   return true;
@@ -255,7 +295,7 @@ function stateTable(method: string, q: URLSearchParams, body: unknown, prefer: s
     if (existing) {
       if (!ignore) { Object.assign(existing, rec); written = existing; }
     } else {
-      written = { state: null, state_changed_at: new Date().toISOString(), failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, ...rec };
+      written = { state: null, state_changed_at: stamp(), last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, ...rec };
       if (rec.organization_id === ORG) world.state = written;
       else world.otherStates.push(written);
     }
@@ -271,7 +311,19 @@ function stateTable(method: string, q: URLSearchParams, body: unknown, prefer: s
   throw new Error(`stub: ${method} tenant_smtp_state`);
 }
 
+/**
+ * Each database call is answered from the rows as they are when it arrives,
+ * and the answer is handed back after the world's wait: so other runs'
+ * calls arrive in between, as they do against a server.
+ */
 export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  const answer = await serve(input, init);
+  if (url.pathname.startsWith("/rest/v1/")) await pause();
+  return answer;
+};
+
+const serve = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const h = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
@@ -315,6 +367,9 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     if (world.status === "fail") return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
     if (world.status === "empty") return json([]);
     const orgId = (body as Row | null)?.p_org;
+    // The organisation's sent mail of 24 hours: what was sent before the test, and its sent rows here.
+    const dayAgo = Date.now() - 24 * 3_600_000;
+    const sentHere = (id: unknown) => world.log.filter((r) => r.organization_id === id && r.status === "sent" && asTime(r.sent_at) >= dayAgo).length;
     if (orgId === null || orgId === undefined) {
       // Every organisation that is not deleted, one row each.
       const orgs = [...(world.org && world.org !== "fail" ? [world.org] : []), ...world.otherOrgs].filter((o) => o.deleted_at === null || o.deleted_at === undefined);
@@ -322,12 +377,12 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
         orgs.map((o) => {
           const id = String(o.id);
           const state = id === ORG ? world.state : world.otherStates.find((r) => r.organization_id === id) ?? null;
-          return { organization_id: id, ...statusColumns(state), sent_24h: id === ORG ? world.sent24h : world.otherSent[id] ?? 0 };
+          return { organization_id: id, ...statusColumns(state), sent_24h: (id === ORG ? world.sent24h : world.otherSent[id] ?? 0) + sentHere(id) };
         })
       );
     }
     const state = orgId === ORG ? world.state : world.otherStates.find((r) => r.organization_id === orgId) ?? null;
-    return json([{ organization_id: orgId, ...statusColumns(state), sent_24h: world.sent24h }]);
+    return json([{ organization_id: orgId, ...statusColumns(state), sent_24h: world.sent24h + sentHere(orgId) }]);
   }
   if (table === "notification_templates") {
     if (world.templateFails) return json({ code: "XX000", message: "stub read failure" }, 500);
@@ -335,7 +390,11 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
   }
   if (table === "notification_log") {
     if (world.logFails) return json({ code: "XX000", message: "stub write failure" }, 500);
-    return new Response(null, { status: 201 });
+    if (method === "GET") return json(ordered(world.log.filter((r) => matches(r, q)), q.get("order")).slice(0, q.has("limit") ? Number(q.get("limit")) : undefined).map((r) => project(r, select)));
+    if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": `*/${world.log.filter((r) => matches(r, q)).length}` } });
+    const added = (Array.isArray(body) ? (body as Row[]) : [body as Row]).map((r) => ({ id: newId("log"), sent_at: stamp(), ...r }));
+    world.log.push(...added);
+    return /return=representation/.test(prefer) ? json(added.map((r) => project(r, select)), 201) : new Response(null, { status: 201 });
   }
   if (table === "tenant_smtp_state") return stateTable(method, q, body, prefer, accept);
   if (table === "organization_members") {
@@ -352,9 +411,13 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     return json(ids.filter((id) => world.profiles[id]).map((id) => ({ id, email: world.profiles[id] })));
   }
   if (table === "platform_email_log") {
-    if (method === "POST") { world.platformLog.push(body as Row); return new Response(null, { status: 201 }); }
-    if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": `*/${world.platformLog.filter((r) => r.status === "sent").length}` } });
-    return json([]);
+    if (method === "POST") {
+      const added = (Array.isArray(body) ? (body as Row[]) : [body as Row]).map((r) => ({ id: newId("pel"), sent_at: stamp(), ...r }));
+      world.platformLog.push(...added);
+      return /return=representation/.test(prefer) ? json(added.map((r) => project(r, select)), 201) : new Response(null, { status: 201 });
+    }
+    if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": `*/${world.platformLog.filter((r) => matches(r, q)).length}` } });
+    return json(ordered(world.platformLog.filter((r) => matches(r, q)), q.get("order")).slice(0, q.has("limit") ? Number(q.get("limit")) : undefined).map((r) => project(r, select)));
   }
   if (table === "ops_heartbeats") {
     // A failed cron run reads its own row once (world.heartbeat, or none), then writes.

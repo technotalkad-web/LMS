@@ -47,7 +47,15 @@
  *     each group just before its sends, a withdrawn mail not attempted, the
  *     state written with each group); a learner's request that mails the
  *     administrators, with their read or their addresses unreadable;
- *     an organisation read that fails attempts nothing.
+ *     an organisation read that fails attempts nothing;
+ *   - the state row is written only while it still reads as the run read
+ *     it (the note of 2026-11-22, part 4): failures at once from several
+ *     runs all reach the row and flip it once; a delivery and a failure from
+ *     two runs are applied by time; a missed write reads again at most
+ *     twice, takes the state and never the count; a last miss, or one with
+ *     no room, records nothing and logs one line; an alert mark and a new
+ *     limit between read and write are kept; a re-read that finds failing
+ *     stops the run with no second alert.
  *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
@@ -84,7 +92,7 @@ import {
   type SmtpStateSnapshot,
 } from "../../lib/notifications/smtp-state";
 import { runSettingsTest, sendMany, sendNotification, sendSettingsTest, type SendArgs } from "../../lib/notifications/send";
-import { CALL_LIMIT_LOG_EVENT, requestBudget } from "../../lib/notifications/smtp-state";
+import { CALL_LIMIT_LOG_EVENT, MAX_STATE_REREADS, STATE_WRITE_MISSED_EVENT, requestBudget } from "../../lib/notifications/smtp-state";
 import { notifyAdminsOfTicket } from "../../lib/tickets/notify";
 import { notifyAdminsOfRequest, notifyLearnerOfDecision, reissueNotifier } from "../../lib/attempts/requests";
 import { createClient } from "@supabase/supabase-js";
@@ -505,6 +513,116 @@ async function main() {
       const full = reissueNotifier({ budget: spent });
       await reissue(full.notify);
       eq("…a request whose budget is spent sends none: the run draws on the request's count", [sends().length, (full.outcome() as { not_emailed?: number } | undefined)?.not_emailed], [0, 5]);
+    }
+
+    console.log("\nthe state row is written only while it still reads as the run read it (note of 2026-11-22, part 4)");
+    {
+      const [p1, p2, p3, p4] = people(4);
+      const OK = () => ({ ok: true as const });
+      const AUTH = { ok: false as const, error: "535 5.7.8 Authentication failed" };
+      const patches = () => requests.filter((r) => r.table === "tenant_smtp_state" && r.method === "PATCH");
+      const alertMarks = () => requests.filter((r) => r.table === "tenant_smtp_state" && r.method !== "GET" && (r.body as Row | null)?.alert_due_at);
+      const missedLines = (lines: string[]) => lines.filter((l) => l.includes(`"event":"${STATE_WRITE_MISSED_EVENT}"`)).length;
+
+      // (a) three runs on an empty state, three failures for three people at once.
+      freshWorld({ smtp: () => DEAD });
+      const runs = await Promise.all([0, 1, 2].map(() => openRun({ organizationId: ORG })));
+      await Promise.all(runs.map((run, k) => sendMany(run, [[p1, p2, p3][k]], mailTo())));
+      eq("(a) three runs opened on no row, three people failing at once: the row reads failing with the three, and one alert is due",
+        [world.state?.state, [...((world.state?.failed_recipients as string[]) ?? [])].sort(), typeof world.state?.alert_due_at, runs.filter((r) => r.alertMarked).length], ["failing", [p1.id, p2.id, p3.id].sort(), "string", 1]);
+      eq("…the flip stopped only the run whose write turned the row failing, and no other run read it as its own flip", runs.filter((r) => r.report.alertMarked).length, 1);
+
+      // (b) a delivery by one run, then a failure by another that opened before it.
+      const t0 = Date.now();
+      const counted = { organization_id: ORG, state: "healthy", state_changed_at: iso(48 * H), last_success_at: iso(2 * H), last_failure_at: iso(H), last_error_code: "timeout", failed_recipients: [p1.id, p2.id] };
+      freshWorld({ state: { ...counted } });
+      const a = await openRun({ organizationId: ORG, now: () => t0 });
+      const b = await openRun({ organizationId: ORG, now: () => t0 + 1_000 });
+      world.smtp = OK;
+      await sendMany(a, [p4], mailTo());
+      world.smtp = () => DEAD;
+      await sendMany(b, [p3], mailTo());
+      eq("(b) two runs on a healthy row with two people counted; one delivers, the other then fails for a third: healthy with that one person, no alert",
+        [world.state?.state, world.state?.failed_recipients, world.state?.alert_due_at ?? null], ["healthy", [p3.id], null]);
+
+      // (c) a delivery and a failed Settings test, in both orders of writing and both orders by time.
+      const testAdmin = { user_id: p2.id, email: p2.email };
+      const both = async (deliveryAt: number, testAt: number, deliveryFirst: boolean) => {
+        freshWorld({ state: { ...counted, failed_recipients: [p1.id] } });
+        const deliveryRun = await openRun({ organizationId: ORG, now: () => deliveryAt });
+        const testRun = await openRun({ organizationId: ORG, now: () => testAt });
+        const deliver = async () => { world.smtp = OK; await sendMany(deliveryRun, [p4], mailTo()); };
+        const test = async () => { world.smtp = () => DEAD; await sendSettingsTest(testRun, testAdmin); };
+        if (deliveryFirst) { await deliver(); await test(); } else { await test(); await deliver(); }
+        return world.state?.state;
+      };
+      eq("(c) a delivery that ended just before a failed Settings test does not undo it, whichever was written first",
+        [await both(t0, t0 + 5_000, true), await both(t0, t0 + 5_000, false)], ["failing", "failing"]);
+      eq("…a delivery later than the failed test clears it, whichever was written first", [await both(t0 + 5_000, t0, true), await both(t0 + 5_000, t0, false)], ["healthy", "healthy"]);
+
+      // Two runs on no row: one insert, and the other reads again and updates.
+      freshWorld({ smtp: () => DEAD });
+      const n1 = await openRun({ organizationId: ORG });
+      const n2 = await openRun({ organizationId: ORG });
+      await sendMany(n1, [p1], mailTo());
+      await sendMany(n2, [p2], mailTo());
+      eq("two runs on no row: the first inserts, the second's insert does nothing, it reads again and updates",
+        [world.state?.failed_recipients, requests.filter((r) => r.table === "tenant_smtp_state" && r.method === "POST").length, patches().length, statusCalls().length], [[p1.id, p2.id], 2, 1, 3]);
+
+      // An alert mark and a new daily limit between a run's read and its write.
+      freshWorld({ smtp: () => DEAD, state: { organization_id: ORG, state: "healthy", state_changed_at: iso(48 * H), last_success_at: iso(2 * H), last_failure_at: null, failed_recipients: [] } });
+      const between = await openRun({ organizationId: ORG });
+      const due = iso(60_000);
+      Object.assign(world.state!, { alert_due_at: due, daily_limit: 900 });
+      await sendMany(between, [p1], mailTo());
+      eq("an alert mark and a new daily limit that land between the read and the write: not a miss, and not written over",
+        [world.state?.failed_recipients, world.state?.alert_due_at, world.state?.daily_limit, statusCalls().length, patches().length], [[p1.id], due, 900, 1, 1]);
+
+      // Every write misses: the third miss, and a miss with no room.
+      const fresh = { organization_id: ORG, state: "healthy", state_changed_at: iso(48 * H), last_success_at: iso(2 * H), last_failure_at: null, failed_recipients: [] };
+      freshWorld({ smtp: () => AUTH, state: { ...fresh } });
+      let bump = 0;
+      world.onRequest = (r) => { if (r.table === "tenant_smtp_state" && r.method === "PATCH" && world.state) world.state.last_success_at = iso(H - ++bump * 1_000); };
+      const missing = await openRun({ organizationId: ORG });
+      const third = await captureLogs(() => sendMany(missing, [p1], mailTo()));
+      world.onRequest = null;
+      eq("a third miss records nothing, logs one line, flips nothing and does not fail the job",
+        [patches().length, statusCalls().length, missedLines(third.lines), world.state?.state, world.state?.failed_recipients, world.state?.alert_due_at ?? null, missing.stopped, missing.errors.state_write ?? 0, third.value[0].status],
+        [1 + MAX_STATE_REREADS, 1 + MAX_STATE_REREADS, 1, "healthy", [], null, false, 0, "failed"]);
+      freshWorld({ smtp: () => AUTH, state: { ...fresh } });
+      let clk = Date.now();
+      const tight = requestBudget({ now: () => clk });
+      world.onRequest = (r) => { if (r.table === "tenant_smtp_state" && r.method === "PATCH" && world.state) { world.state.last_success_at = iso(H - 1_000); clk += 50_000; } };
+      const noRoom = await openRun({ organizationId: ORG, budget: tight });
+      const roomless = await captureLogs(() => sendMany(noRoom, [p1], mailTo()));
+      world.onRequest = null;
+      eq("…a miss with no room for the read and the write: no re-read, the same one line, nothing recorded",
+        [patches().length, statusCalls().length, missedLines(roomless.lines), world.state?.state, noRoom.errors.state_write ?? 0], [1, 1, 1, "healthy", 0]);
+      freshWorld({ smtp: () => AUTH, state: { ...fresh } });
+      world.onRequest = (r) => { if (r.table === "tenant_smtp_state" && r.method === "PATCH" && world.state) { world.state.last_success_at = iso(H - 1_000); world.status = "fail"; } };
+      const failedRead = await openRun({ organizationId: ORG });
+      await captureLogs(() => sendMany(failedRead, [p1], mailTo()));
+      world.onRequest = null;
+      eq("…a re-read that fails is the run's failed read, and the outcome is not recorded", [failedRead.errors.mail_status_read ?? 0, world.state?.state], [1, "healthy"]);
+
+      // A re-read leaves the run's count alone.
+      freshWorld({ smtp: () => DEAD, sent24h: 10, state: { ...fresh } });
+      let once = false;
+      world.onRequest = (r) => { if (!once && r.table === "tenant_smtp_state" && r.method === "PATCH" && world.state) { once = true; world.state.last_success_at = iso(H); world.sent24h = 300; } };
+      const counting = await openRun({ organizationId: ORG });
+      const limitBefore = counting.limit;
+      await sendMany(counting, [p1], mailTo());
+      world.onRequest = null;
+      eq("a re-read after a miss takes the state, never the count or the limit", [counting.sent24h, counting.limit, statusCalls().length, world.state?.failed_recipients], [10, limitBefore, 2, [p1.id]]);
+
+      // A re-read that finds the organisation failing.
+      freshWorld({ smtp: () => DEAD, state: { ...counted } });
+      const flipper = await openRun({ organizationId: ORG });
+      const late = await openRun({ organizationId: ORG });
+      await sendMany(flipper, [p3], mailTo());
+      const marksAfterFlip = alertMarks().length;
+      await sendMany(late, [p4], mailTo());
+      eq("a re-read that finds failing stops the run, with no second alert", [world.state?.state, flipper.stopped, late.stopped, late.alertMarked, alertMarks().length - marksAfterFlip], ["failing", true, true, false, 0]);
     }
   } finally {
     removeStub();

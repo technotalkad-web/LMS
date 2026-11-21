@@ -44,7 +44,12 @@
  *   - the runs of one cron call share one clock and one count;
  *   - the first send of a run goes alone; opening a run costs the same for 50
  *     recipients as for 5;
- *   - pull request B's bulk file carries neither budget.
+ *   - pull request B's bulk file carries neither budget;
+ *   - the state write that misses (the note of 2026-11-22, part 4): its read
+ *     again and its write again are counted as made, and a healthy run's sum
+ *     does not move; the public routes' job, each limit claimed before the
+ *     send, makes at most 40 calls with the calls before its answer, on the
+ *     four paths (over tests/unit/public-mail-world.ts).
  *
  * Part (k) of tests/unit/org-membership.test.ts keeps its own cron cases
  * (each named read with no room, the finished attempts' filter); the sums
@@ -132,6 +137,20 @@ async function main() {
       const b3 = cronBudget();
       const alert = await sendDueAlert({ baseUrl: "https://lms.stub", env: PLATFORM_ENV, budget: b3 });
       eq("an alert to two administrators: sent, and its count covers its requests and stays within its cost", [alert.kind, b3.calls >= outbound(), b3.calls <= ALERT_CALL_COST], ["sent", true, true]);
+      // A state write that misses: its read again and its write again are counted as made.
+      freshWorld({ smtp: () => ({ ok: false, error: "Connection refused" }), state: { organization_id: ORG, state: "healthy", state_changed_at: new Date(Date.now() - 72 * 3_600_000).toISOString(), last_success_at: new Date(Date.now() - 3_600_000).toISOString(), last_failure_at: null, failed_recipients: [] } });
+      let moved = false;
+      world.onRequest = (q) => { if (!moved && q.table === "tenant_smtp_state" && q.method === "PATCH" && world.state) { moved = true; world.state.last_failure_at = new Date(Date.now() - 600_000).toISOString(); } };
+      const b6 = requestBudget();
+      const missed = await openRun({ organizationId: ORG, budget: b6 });
+      await sendMany(missed, people(1), mailTo);
+      world.onRequest = null;
+      eq("a run whose state write missed once: the count equals the requests (open 3, template 1, send 1, log insert 1, write 1, read again 1, write 1)", [b6.calls, outbound()], [outbound(), 3 + 1 + 1 + 1 + 1 + 1 + 1]);
+      freshWorld();
+      const b7 = requestBudget();
+      const healthy = await openRun({ organizationId: ORG, budget: b7 });
+      await sendMany(healthy, people(1), mailTo);
+      eq("…a healthy run's sum does not move (open 3, template 1, send 1, log insert 1, one state write)", [b7.calls, outbound()], [3 + 1 + 1 + 1 + 1, 3 + 1 + 1 + 1 + 1]);
       freshWorld();
       const b4 = cronBudget();
       await sendDueAlert({ baseUrl: "https://lms.stub", env: PLATFORM_ENV, budget: b4 });
@@ -198,7 +217,53 @@ async function main() {
   } finally {
     removeStub();
   }
+  await publicJobSums();
   finish();
+}
+
+/* ------------------------- the public job, its calls before the answer and after it */
+
+/**
+ * The public routes' job (the note of 2026-11-22: each limit claimed before
+ * the send) on the four paths, over tests/unit/public-mail-world.ts: the
+ * calls before the answer and the job's own calls, counted as made, are at
+ * most 40 together.
+ */
+async function publicJobSums() {
+  const PW = await import("./public-mail-world");
+  PW.install(PW.PLATFORM_ENV);
+  try {
+    const request = await import("../../app/api/auth/forgot-password/request/route");
+    const magic = await import("../../app/api/auth/magic-link/route");
+    const LEARNER = { id: "0f100000-0000-4000-8000-000000000001", email: "learner@tenant.stub" };
+    const ADMIN = { id: "0f100000-0000-4000-8000-000000000002", email: "admin@tenant.stub" };
+    console.log("\nthe public job: its calls before the answer and after it, together at most 40 (note of 2026-11-22)");
+    for (const [label, route, path, who, payload] of [
+      ["a tenant reset code", request, "/api/auth/forgot-password/request", LEARNER, { orgSlug: PW.SLUG }],
+      ["a tenant sign-in link", magic, "/api/auth/magic-link", LEARNER, { orgSlug: PW.SLUG }],
+      ["a platform reset code on the organisation's page", request, "/api/auth/forgot-password/request", ADMIN, { orgSlug: PW.SLUG }],
+      ["a platform sign-in link on the organisation's page", magic, "/api/auth/magic-link", ADMIN, { orgSlug: PW.SLUG }],
+    ] as const) {
+      PW.freshWorld({
+        users: [LEARNER, ADMIN],
+        members: [
+          { organization_id: PW.ORG, user_id: LEARNER.id, role: "user", status: "active" },
+          { organization_id: PW.ORG, user_id: ADMIN.id, role: "admin", status: "active" },
+        ],
+        // A state row whose last delivery is old, so the tenant's send writes it.
+        state: { state: "healthy", state_changed_at: new Date(Date.now() - 72 * 3_600_000).toISOString(), last_success_at: new Date(Date.now() - 48 * 3_600_000).toISOString(), last_failure_at: null, failed_recipients: [] },
+      });
+      const { value } = await PW.captureLogs(async () => {
+        const asked = await PW.ask(route, path, { email: who.email, ...payload });
+        await PW.runJobs();
+        return { before: asked.calls.length, after: PW.requests.length };
+      });
+      eq(`${label}: ${value.before} calls before the answer and ${value.after} in the job, at most ${CALL_SUM_LIMIT} together, and the mail went`,
+        [value.before + value.after <= CALL_SUM_LIMIT, PW.requests.filter((r) => r.path === "/functions/v1/send-smtp").length], [true, 1]);
+    }
+  } finally {
+    PW.uninstall();
+  }
 }
 
 /* -------------------------------------------- the two cron routes, run here */

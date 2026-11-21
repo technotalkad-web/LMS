@@ -19,6 +19,9 @@
  *   - one alert, due from the moment routine mail stops;
  *   - when tenant_mail_status cannot be read, or 0114 is not pasted, no limit
  *     is applied and the send is attempted;
+ *   - the public job's run read again after its claim (refreshRun): the
+ *     count, the limit and the state replaced, one call charged; a read that
+ *     fails keeps the first reading;
  *   - the readers (stage 4): every organisation's reading, count and limit
  *     from one call of tenant_mail_status for all of them, whether an
  *     organisation that would warn has an active member, "missing" without
@@ -50,6 +53,7 @@ import {
   readTenantMailNotice,
   readTenantSmtpOverview,
   readingSince,
+  refreshRun,
   runReady,
   tenantDailyLimit,
   tenantMailNoticeOf,
@@ -128,6 +132,24 @@ async function main() {
       const failed = await openRun({ organizationId: ORG });
       const f = await sendMany(failed, people(3), routine);
       eq("the call fails: no limit, every send attempted, the failed read counted", [failed.limit, f.map((x) => x.status).join(","), failed.errors], [null, "sent,sent,sent", { mail_status_read: 1 }]);
+    }
+
+    console.log("\nthe public job reads the run again after its claim (refreshRun; note of 2026-11-22, part 5)");
+    {
+      freshWorld({ sent24h: 100, state: { organization_id: ORG, state: "healthy", state_changed_at: new Date().toISOString(), failed_recipients: [], daily_limit: 300 } });
+      const run = await openRun({ organizationId: ORG });
+      world.sent24h = 290;
+      world.state!.daily_limit = 400;
+      world.state!.state = "failing";
+      const before = run.budget.calls;
+      const kind = await refreshRun(run);
+      eq("read again: the count, the limit and the state replaced, one call charged", [kind, run.sent24h, run.limit?.limit, run.stored.state, run.budget.calls - before, statusCalls().length], ["ok", 290, 400, "failing", 1, 2]);
+      world.status = "fail";
+      const failedAgain = await refreshRun(run);
+      eq("…a read again that fails keeps what the run read, and is the run's failed read", [failedAgain, run.sent24h, run.limit?.limit, run.errors.mail_status_read], ["unreadable", 290, 400, 1]);
+      freshWorld({ status: "missing" });
+      const no0114 = await openRun({ organizationId: ORG });
+      eq("…without 0114: no limit before and after, and no failed read", [await refreshRun(no0114), no0114.limit, no0114.errors.mail_status_read ?? 0], ["missing", null, 0]);
     }
 
     await readerCases();

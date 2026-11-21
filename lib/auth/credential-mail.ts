@@ -1,10 +1,11 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { NO_TIME_LEFT_TEXT, recordCredentialNotAttempted, sendNotification, type SendResult } from "@/lib/notifications/send";
+import { NO_TIME_LEFT_TEXT, claimCredentialMail, readLinkClaims, recordCredentialNotAttempted, sendNotification, type SendResult } from "@/lib/notifications/send";
 import { openRun, requestBudget, runReading, runReady, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
-import { platformSenderReadiness, sendPlatformEmail } from "@/lib/email/platform-sender";
+import { claimPlatformSend, platformSenderReadiness, sendPlatformEmail } from "@/lib/email/platform-sender";
+import { CLAIM_SEND_WITHIN_MS } from "@/lib/email/smtp-function";
 import { ADMIN_ROLES, grantsAdminRights, listCountingMemberships, type CountingOrganisation } from "@/lib/auth/org-membership";
 import { isSchemaMissing } from "@/lib/scoring/attempt-kind";
-import { MAX_REQUESTS_PER_HOUR, OTP_TTL_MINUTES, generateOtpCode, hashOtp } from "@/lib/auth/password-reset";
+import { MAX_REQUESTS_PER_DAY, MAX_REQUESTS_PER_HOUR, OTP_TTL_MINUTES, generateOtpCode, hashOtp } from "@/lib/auth/password-reset";
 import { sendTenantSignInLink, signInLink } from "@/lib/auth/auth-email";
 
 /**
@@ -43,11 +44,21 @@ import { sendTenantSignInLink, signInLink } from "@/lib/auth/auth-email";
  *   - a tenant-served account on an organisation that is not ready (or at
  *     its daily limit) gets nothing: no code, no link, one record row in 24
  *     hours and an alert marked as due (recordCredentialNotAttempted);
- *   - the limits of section G, read before anything is made: 5 an hour and
- *     10 a day for one account (a platform owner's own: the hourly limit
- *     only). A limit that cannot be read makes nothing;
+ *   - the limits of section G: 5 an hour and 10 a day for one account (a
+ *     platform owner's own: the hourly limit only), the organisation's
+ *     daily limit or platform share, and the platform's ceiling. Each limit
+ *     is claimed before the send (the note of 2026-11-22): the job reads
+ *     the count, writes its claim, counts again with its claim among the
+ *     rows, and goes on only within the limit, so the limits hold under
+ *     concurrent requests. A reset code's claim is its own row, written
+ *     closed and opened only after every limit, and only then are the
+ *     address's older codes closed; a sign-in link's is a claim row of its
+ *     system (claimCredentialMail, claimPlatformSend). A count or a claim
+ *     that cannot be read or written makes nothing usable and sends
+ *     nothing. A send starts no later than CLAIM_SEND_WITHIN_MS after its
+ *     claim;
  *   - a sign-in link is minted only for the account the lookup found, and
- *     only once the limits and rule 2 allow it: generateLink is never the
+ *     only once its claim and rule 2 allow it: generateLink is never the
  *     lookup, and an id it returns that differs sends nothing;
  *   - a single deadline (rule T3): CREDENTIAL_JOB_MS from the job's own
  *     start. A send's wait is capped by what remains of it, after SEND_ROW_MS
@@ -65,7 +76,7 @@ type Env = Record<string, string | undefined>;
 export type CredentialKind = "reset_code" | "sign_in_link";
 
 /** Section G: one account's codes or links in 24 hours, in both systems. A platform owner's own has the hourly limit only. */
-export const MAX_CREDENTIALS_PER_DAY = 10;
+export const MAX_CREDENTIALS_PER_DAY = MAX_REQUESTS_PER_DAY;
 /** Section G: one account's codes or links in an hour (today's MAX_REQUESTS_PER_HOUR). */
 export const MAX_CREDENTIALS_PER_HOUR = MAX_REQUESTS_PER_HOUR;
 /**
@@ -418,16 +429,19 @@ async function markJob(ctx: JobContext, kind: "tenant" | "platform", mark: "star
 }
 
 /**
- * Whether the account is under its limit (section G), from the newest rows
- * of the last 24 hours, newest first, that `read` answers. null when the
- * read failed: nothing is made.
+ * Whether the account is within its limit (section G), from the newest rows
+ * of the last 24 hours, newest first, that `read` answers. Before the job's
+ * own row is among them (`ownIncluded` false) the limit is reached at 5 in
+ * the hour or 10 in the day; with its own row among them, it is passed only
+ * past those numbers. Each read asks for one row more than the daily limit.
+ * null when the read failed: nothing is made.
  */
 async function underLimit(
   ctx: JobContext,
   read: () => PromiseLike<{ data: unknown; error: unknown }>,
   timeOf: (row: Record<string, unknown>) => unknown,
   hourlyOnly: boolean,
-  counts: (row: Record<string, unknown>) => boolean = () => true
+  ownIncluded = false
 ): Promise<boolean | null> {
   spend(ctx, 1);
   let answer: { data: unknown; error: unknown };
@@ -438,19 +452,20 @@ async function underLimit(
   }
   if (answer.error || !Array.isArray(answer.data)) return null;
   const hourAgo = ctx.now() - 3_600_000;
-  const rows = (answer.data as Array<Record<string, unknown>>).filter(counts);
+  const rows = answer.data as Array<Record<string, unknown>>;
   const inHour = rows.filter((r) => {
     const t = timeOf(r);
     return typeof t === "string" && Date.parse(t) >= hourAgo;
   }).length;
-  if (inHour >= MAX_CREDENTIALS_PER_HOUR) return false;
-  return hourlyOnly || rows.length < MAX_CREDENTIALS_PER_DAY;
+  const past = (n: number, limit: number) => (ownIncluded ? n > limit : n >= limit);
+  if (past(inHour, MAX_CREDENTIALS_PER_HOUR)) return false;
+  return hourlyOnly || !past(rows.length, MAX_CREDENTIALS_PER_DAY);
 }
 
 const dayAgoIso = (ctx: JobContext) => new Date(ctx.now() - 24 * 3_600_000).toISOString();
 
-/** Reset codes: the account's code rows of the last 24 hours (password_reset_otps), in both systems. */
-function resetCodesUnderLimit(ctx: JobContext, hourlyOnly: boolean): Promise<boolean | null> {
+/** Reset codes: the address's code rows of the last 24 hours (password_reset_otps), in both systems. */
+function resetCodesUnderLimit(ctx: JobContext, hourlyOnly: boolean, ownIncluded = false): Promise<boolean | null> {
   return underLimit(
     ctx,
     () =>
@@ -460,36 +475,99 @@ function resetCodesUnderLimit(ctx: JobContext, hourlyOnly: boolean): Promise<boo
         .eq("email", ctx.email)
         .gte("created_at", dayAgoIso(ctx))
         .order("created_at", { ascending: false })
-        .limit(MAX_CREDENTIALS_PER_DAY),
+        .limit(MAX_CREDENTIALS_PER_DAY + 1),
     (r) => r.created_at,
-    hourlyOnly
+    hourlyOnly,
+    ownIncluded
   );
 }
 
-/** A new reset code: older open codes of the address are closed, then the new code's row is written. null when the row was not written. */
-async function newResetCode(ctx: JobContext): Promise<string | null> {
-  const code = generateOtpCode();
-  const nowIso = new Date(ctx.now()).toISOString();
-  spend(ctx, 2);
-  try {
-    const closed = await ctx.db.from("password_reset_otps").update({ used_at: nowIso }).eq("email", ctx.email).is("used_at", null);
-    if (closed.error) console.warn(JSON.stringify({ event: "credential_mail", kind: ctx.kind, outcome: "close_codes_failed", code: codeOf(closed.error) }));
-    const written = await ctx.db.from("password_reset_otps").insert({
-      email: ctx.email,
-      code_hash: hashOtp(code),
-      expires_at: new Date(ctx.now() + OTP_TTL_MINUTES * 60_000).toISOString(),
-      ip: ctx.ip,
-      user_agent: ctx.userAgent,
-    });
-    if (written.error) {
-      console.warn(JSON.stringify({ event: "credential_mail", kind: ctx.kind, outcome: "code_row_failed", code: codeOf(written.error) }));
-      return null;
-    }
-    return code;
-  } catch (e) {
-    console.warn(JSON.stringify({ event: "credential_mail", kind: ctx.kind, outcome: "code_row_failed", code: codeOf(e) }));
+/** A code's row as the database wrote it: its id and its time, passed back as read. */
+type CodeRow = { id: string; created_at: string };
+
+/**
+ * A reset code's first three steps (the note of 2026-11-22, part 3): the
+ * address's count; the code's row, written closed (used_at set), so no code
+ * works from it until the job opens it; and the count again, with that row
+ * among them. Past the limit the row stays closed and counts as a request.
+ * null: nothing more is done (the fixed line is written here).
+ */
+async function writeClosedCode(ctx: JobContext, hourlyOnly: boolean, system: "tenant" | "platform"): Promise<{ code: string; row: CodeRow } | null> {
+  const before = await resetCodesUnderLimit(ctx, hourlyOnly);
+  if (before !== true) {
+    note(ctx, system, before === null ? "limit_read_failed" : "account_limit");
     return null;
   }
+  const code = generateOtpCode();
+  spend(ctx, 1);
+  let row: CodeRow;
+  try {
+    const written = await ctx.db
+      .from("password_reset_otps")
+      .insert({
+        email: ctx.email,
+        code_hash: hashOtp(code),
+        expires_at: new Date(ctx.now() + OTP_TTL_MINUTES * 60_000).toISOString(),
+        ip: ctx.ip,
+        user_agent: ctx.userAgent,
+        used_at: new Date(ctx.now()).toISOString(),
+      })
+      .select("id, created_at");
+    const made = Array.isArray(written.data) ? (written.data[0] as { id?: unknown; created_at?: unknown } | undefined) : undefined;
+    if (written.error || !made || typeof made.id !== "string" || typeof made.created_at !== "string") {
+      note(ctx, system, "code_row_failed", written.error ? codeOf(written.error) : "no_row");
+      return null;
+    }
+    row = { id: made.id, created_at: made.created_at };
+  } catch (e) {
+    note(ctx, system, "code_row_failed", codeOf(e));
+    return null;
+  }
+  const after = await resetCodesUnderLimit(ctx, hourlyOnly, true);
+  if (after !== true) {
+    note(ctx, system, after === null ? "limit_read_failed" : "account_limit");
+    return null;
+  }
+  return { code, row };
+}
+
+/**
+ * A reset code's opening, after every limit and claim: the code's own row
+ * is opened, then the address's open codes older than it are closed. So a
+ * request that was refused never closes a person's valid code, and of two
+ * codes that pass at the same moment the newer stays open. false: the row
+ * could not be opened, and nothing is sent.
+ */
+async function openResetCode(ctx: JobContext, row: CodeRow, system: "tenant" | "platform"): Promise<boolean> {
+  spend(ctx, 2);
+  try {
+    const opened = await ctx.db.from("password_reset_otps").update({ used_at: null }).eq("id", row.id);
+    if (opened.error) {
+      note(ctx, system, "code_open_failed", codeOf(opened.error));
+      return false;
+    }
+    const closed = await ctx.db
+      .from("password_reset_otps")
+      .update({ used_at: new Date(ctx.now()).toISOString() })
+      .eq("email", ctx.email)
+      .is("used_at", null)
+      .lt("created_at", row.created_at);
+    if (closed.error) note(ctx, system, "close_codes_failed", codeOf(closed.error));
+    return true;
+  } catch (e) {
+    note(ctx, system, "code_open_failed", codeOf(e));
+    return false;
+  }
+}
+
+/**
+ * A claim older than CLAIM_SEND_WITHIN_MS sends nothing. The tenant's check
+ * is made just before the send is handed to the run (the platform sender
+ * makes its own); in both systems it is also made before a code is opened,
+ * so a job too late to send never closes a person's older code.
+ */
+function claimStale(ctx: JobContext, at: number): boolean {
+  return ctx.now() - at > CLAIM_SEND_WITHIN_MS;
 }
 
 /**
@@ -528,29 +606,33 @@ async function tenantMail(ctx: JobContext): Promise<void> {
   const run = ctx.run!;
   const org = ctx.org!;
   const event = ctx.kind === "reset_code" ? "password_reset" : "magic_link";
+  const to = { user_id: ctx.userId, email: ctx.email };
   if (!runReady(run)) {
     // Not attempted: no code, no link, the record row once in 24 hours and the alert marked as due.
     const reading = runReading(run);
     const atLimit = reading !== "not_configured" && reading !== "failing" && run.limit !== null;
     const why = atLimit ? "daily_limit" : "smtp_not_ready";
-    await recordCredentialNotAttempted(run, { event, to: { user_id: ctx.userId, email: ctx.email } }, why);
+    await recordCredentialNotAttempted(run, { event, to }, why);
     note(ctx, "tenant", why);
     return;
   }
   if (ctx.kind === "reset_code") {
-    const under = await resetCodesUnderLimit(ctx, false);
-    if (under !== true) return note(ctx, "tenant", under === null ? "limit_read_failed" : "account_limit");
-    const code = await newResetCode(ctx);
-    if (!code) return;
+    const made = await writeClosedCode(ctx, false, "tenant");
+    if (!made) return;
+    const claim = await claimCredentialMail(run, { event: "password_reset", to }, { link: false });
+    if (!claim.ok) return note(ctx, "tenant", claim.why);
+    if (claimStale(ctx, claim.at)) return note(ctx, "tenant", "claim_stale");
+    if (!(await openResetCode(ctx, made.row, "tenant"))) return;
+    if (claimStale(ctx, claim.at)) return note(ctx, "tenant", "claim_stale");
     const r = await sendNotification(
       {
         organizationId: run.organizationId,
         event: "password_reset",
-        to: { user_id: ctx.userId, email: ctx.email },
+        to,
         context: {
           learner_name: ctx.email,
           learner_email: ctx.email,
-          otp_code: code,
+          otp_code: made.code,
           otp_minutes: String(OTP_TTL_MINUTES),
           org_name: run.orgName,
         },
@@ -559,23 +641,13 @@ async function tenantMail(ctx: JobContext): Promise<void> {
     );
     return noteTenantSend(ctx, r);
   }
-  const under = await underLimit(
-    ctx,
-    () =>
-      ctx.db
-        .from("notification_log")
-        .select("sent_at")
-        .eq("to_user_id", ctx.userId)
-        .eq("event_type", "magic_link")
-        .gte("sent_at", dayAgoIso(ctx))
-        .order("sent_at", { ascending: false })
-        .limit(MAX_CREDENTIALS_PER_DAY),
-    (r) => r.sent_at,
-    false
-  );
+  const under = await underLimit(ctx, () => readLinkClaims(ctx.db, ctx.userId, ctx.now()), (r) => r.sent_at, false);
   if (under !== true) return note(ctx, "tenant", under === null ? "limit_read_failed" : "account_limit");
+  const claim = await claimCredentialMail(run, { event: "magic_link", to }, { link: true });
+  if (!claim.ok) return note(ctx, "tenant", claim.why);
   const link = await mintSignInLink(ctx, ctx.next ?? `/${org.slug}/dashboard`, "tenant");
   if (!link) return;
+  if (claimStale(ctx, claim.at)) return note(ctx, "tenant", "claim_stale");
   const r = await sendTenantSignInLink(run, { userId: ctx.userId, email: ctx.email }, link, { timeLeftMs: () => timeLeftForSend(ctx) });
   noteTenantSend(ctx, r);
 }
@@ -592,40 +664,28 @@ async function platformMail(ctx: JobContext, choice: { organizationId: string | 
   const to = { userId: ctx.userId, email: ctx.email, platformOwner: choice.owner };
   const deps = { db: ctx.db, env: ctx.env, now: ctx.now, timeLeftMs: () => timeLeftForSend(ctx) };
   if (ctx.kind === "reset_code") {
-    const under = await resetCodesUnderLimit(ctx, choice.owner);
-    if (under !== true) return note(ctx, "platform", under === null ? "limit_read_failed" : "account_limit");
-    const code = await newResetCode(ctx);
-    if (!code) return;
+    const made = await writeClosedCode(ctx, choice.owner, "platform");
+    if (!made) return;
+    const claimed = await claimPlatformSend({ event: "platform_reset_code", to, organizationId: choice.organizationId }, deps);
+    if (!claimed.claimed) return notePlatformSend(ctx, claimed.result);
+    if (claimStale(ctx, claimed.claim.at)) return note(ctx, "platform", "claim_stale");
+    // A sender that is not configured opens no code and closes none: the
+    // send below writes its not_configured row and nothing goes.
+    if (platformSenderReadiness(ctx.env).configured && !(await openResetCode(ctx, made.row, "platform"))) return;
     const r = await sendPlatformEmail(
-      { event: "platform_reset_code", to, organizationId: choice.organizationId, content: { code, minutes: OTP_TTL_MINUTES } },
-      deps
+      { event: "platform_reset_code", to, organizationId: choice.organizationId, content: { code: made.code, minutes: OTP_TTL_MINUTES } },
+      { ...deps, claim: claimed.claim }
     );
     return notePlatformSend(ctx, r);
   }
-  // The platform sender reads this same limit before it sends; it is read
-  // here first so that no link is minted for an account past it.
-  const under = await underLimit(
-    ctx,
-    () =>
-      ctx.db
-        .from("platform_email_log")
-        .select("sent_at, status, error_code")
-        .eq("to_user_id", ctx.userId)
-        .eq("event_type", "platform_sign_in_link")
-        .gte("sent_at", dayAgoIso(ctx))
-        .order("sent_at", { ascending: false })
-        .limit(100),
-    (r) => r.sent_at,
-    choice.owner,
-    // The sender's own refusal rows are not requests.
-    (r) => !(r.status === "refused" && r.error_code === "account_limit")
-  );
-  if (under !== true) return note(ctx, "platform", under === null ? "limit_read_failed" : "account_limit");
+  // The sender's claim holds the account's limit before the link is minted.
+  const claimed = await claimPlatformSend({ event: "platform_sign_in_link", to, organizationId: choice.organizationId }, deps);
+  if (!claimed.claimed) return notePlatformSend(ctx, claimed.result);
   const link = await mintSignInLink(ctx, ctx.next ?? "/select-org", "platform");
   if (!link) return;
   const r = await sendPlatformEmail(
     { event: "platform_sign_in_link", to, organizationId: choice.organizationId, content: { link, minutes: SIGN_IN_LINK_MINUTES } },
-    deps
+    { ...deps, claim: claimed.claim }
   );
   notePlatformSend(ctx, r);
 }
@@ -633,5 +693,6 @@ async function platformMail(ctx: JobContext, choice: { organizationId: string | 
 /** The fixed line of a platform send: its status and code, or no_time when the job's deadline left no time to start it. */
 function notePlatformSend(ctx: JobContext, r: { status: string; errorCode: string | null }): void {
   if (r.errorCode === "no_time") return note(ctx, "platform", "no_time");
+  if (r.errorCode === "claim_stale") return note(ctx, "platform", "claim_stale");
   note(ctx, "platform", r.status, r.errorCode ?? undefined);
 }

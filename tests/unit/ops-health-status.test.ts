@@ -12,7 +12,9 @@
  *     row an auth or quota failure, the two newest both failures, the daily
  *     ceiling) makes the authenticated status "degraded"; one timeout,
  *     unreachable or unknown row, or half the ceiling, is "warn";
- *     suppressed, refused, rejected and not_configured rows never move it;
+ *     suppressed, refused, rejected and not_configured rows never move it,
+ *     and neither does a claim (suppressed, pending), which hides no
+ *     failure under it;
  *   - the route, under a stubbed fetch: the `email` check ignores
  *     password_reset and magic_link rows and counts the rest; the
  *     unauthenticated answer is { status, ts } computed without the new
@@ -596,6 +598,9 @@ async function routeTests() {
         ["configured, an auth failure", () => { configure(true); platformRows = [{ sent_at: minutesAgo(1), status: "failed", error_code: "auth" }]; }, "fail", "degraded"],
         ["configured, two failures", () => { configure(true); platformRows = [{ sent_at: minutesAgo(1), status: "failed", error_code: "unknown" }, { sent_at: minutesAgo(2), status: "failed", error_code: "unreachable" }]; }, "fail", "degraded"],
         ["configured, suppressed and rejected rows only above a sent one", () => { configure(true); platformRows = [{ sent_at: minutesAgo(1), status: "suppressed", error_code: "test_domain" }, { sent_at: minutesAgo(2), status: "failed", error_code: "rejected" }, { sent_at: minutesAgo(3), status: "refused", error_code: "ceiling" }, { sent_at: minutesAgo(9), status: "sent", error_code: null }]; }, "ok", "ok"],
+        // A claim (suppressed, pending: the note of 2026-11-22) is no send and no failure: it neither moves the check nor hides a row under it.
+        ["configured, claims of codes and links above a sent row", () => { configure(true); platformRows = [...Array.from({ length: 30 }, (_, i) => ({ sent_at: minutesAgo(1 + i / 100), status: "suppressed", error_code: "pending" })), { sent_at: minutesAgo(9), status: "sent", error_code: null }]; }, "ok", "ok"],
+        ["configured, claims above an auth failure", () => { configure(true); platformRows = [{ sent_at: minutesAgo(1), status: "suppressed", error_code: "pending" }, { sent_at: minutesAgo(2), status: "suppressed", error_code: "pending" }, { sent_at: minutesAgo(3), status: "failed", error_code: "auth" }]; }, "fail", "degraded"],
         ["configured, the log not there (0113 not pasted)", () => { configure(true); platformTableMissing = true; }, "fail", "degraded"],
         ["not configured", () => { configure(false); }, "fail", "degraded"],
       ];
