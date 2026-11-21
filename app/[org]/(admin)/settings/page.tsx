@@ -9,7 +9,7 @@ import { serviceProviderDetails } from "@/lib/supabase/sso-admin";
 import { maskedConfig } from "@/lib/lrs/config";
 import { normalizeBackground, type DashboardBackground } from "@/lib/theme/dashboard-background";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { readTenantMailStatus, readingOf, tenantDailyLimit } from "@/lib/notifications/smtp-state";
+import { readTenantMailStatus, readingOf, readingSince, tenantDailyLimit } from "@/lib/notifications/smtp-state";
 
 export const dynamic = "force-dynamic";
 
@@ -186,10 +186,12 @@ export default async function SettingsPage({
     status.kind === "ok"
       ? (() => {
           const limit = tenantDailyLimit(status.row.daily_limit);
+          const reading = readingOf({ settingsComplete, deleted: false, state: status.row.state });
           return {
             known: true as const,
-            reading: readingOf({ settingsComplete, deleted: false, state: status.row.state }),
-            since: status.row.state_changed_at,
+            reading,
+            // Only a healthy or failing reading has a time (readingSince).
+            since: readingSince(reading, status.row.state_changed_at),
             lastErrorClass: status.row.last_error_code,
             lastSuccessAt: status.row.last_success_at,
             sent24h: status.row.sent_24h,

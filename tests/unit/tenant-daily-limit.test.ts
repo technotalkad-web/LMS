@@ -49,6 +49,7 @@ import {
   readMailJobCounts,
   readTenantMailNotice,
   readTenantSmtpOverview,
+  readingSince,
   runReady,
   tenantDailyLimit,
   tenantMailNoticeOf,
@@ -164,6 +165,15 @@ async function readerCases() {
       const r = await readTenantSmtpOverview(db());
       eq(`${label}`, r.kind === "ok" ? [r.rows[0].routineStopped, r.rows[0].atLimit] : r, [stopped, atLimit]);
     }
+    // A state row made by the limit's edit alone: a time, no state.
+    freshWorld({ state: { organization_id: ORG, state: null, state_changed_at: "2026-11-21T09:00:00.000Z", failed_recipients: [], daily_limit: 1500 }, allSettings: [{ organization_id: ORG, ...SMTP_SETTINGS }] });
+    const editOnly = await readTenantSmtpOverview(db());
+    eq("configured, nothing sent yet, on a row the limit's edit made: no \"since\" (that time is the edit's, not a reading's)",
+      editOnly.kind === "ok" ? [editOnly.rows[0].reading, editOnly.rows[0].since] : editOnly, ["configured", null]);
+    freshWorld({ state: { ...healthy, state: "failing", state_changed_at: "2026-11-21T07:00:00.000Z" }, allSettings: [{ organization_id: ORG, ...SMTP_SETTINGS }], members: [member(ORG, "u1")] });
+    const failingSince = await readTenantSmtpOverview(db());
+    eq("…a healthy or failing reading keeps its time", [failingSince.kind === "ok" ? failingSince.rows[0].since : failingSince, readingSince("healthy", "2026-11-20T08:00:00.000Z"), readingSince("not_configured", "2026-11-20T08:00:00.000Z")],
+      ["2026-11-21T07:00:00.000Z", "2026-11-20T08:00:00.000Z", null]);
     freshWorld({ state: { ...healthy, daily_limit: 10 }, sent24h: 0 });
     const low = await readTenantSmtpOverview(db());
     eq("a stored limit of 10: routine mail is off at this limit (the line is 0), which the list says apart from a stop", low.kind === "ok" ? [low.rows[0].routineOff, low.rows[0].limit.routineStop, low.rows[0].atLimit] : low, [true, 0, false]);
@@ -262,6 +272,8 @@ function bannerAndTabText(): void {
   eq("…and Settings opens on the tab the page names: the page passes ?tab= and the client starts on it",
     [/initialTab=\{initialTab\}/.test(fs.readFileSync(path.join(root, "app", "[org]", "(admin)", "settings", "page.tsx"), "utf8")), /useState<SettingsTab>\(\(\) => settingsTabOf\(initialTab\)\)/.test(tab)], [true, true]);
   eq("the SMTP tab says so when the line where routine mail stops is 0", /mailState\.routineStop === 0\s*\?\s*" At this limit reminders, announcements and assignment email are never sent/.test(tab), true);
+  const settingsPage = fs.readFileSync(path.join(root, "app", "[org]", "(admin)", "settings", "page.tsx"), "utf8");
+  eq("the SMTP tab's \"since\" is the reading's (readingSince), never the row's time alone", [/since: readingSince\(reading, status\.row\.state_changed_at\)/.test(settingsPage), /since: status\.row\.state_changed_at/.test(settingsPage)], [true, false]);
 }
 
 main().catch((e) => {

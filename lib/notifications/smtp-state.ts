@@ -255,6 +255,17 @@ export function readingOf(input: { settingsComplete: boolean; deleted: boolean; 
   return "configured";
 }
 
+/**
+ * Since when the organisation has had its reading, as the stored state says
+ * it: a healthy or failing reading began at the state's last change. Neither
+ * "configured" nor "not configured" comes from a recorded change, so it has
+ * no time: a state row the limit's edit made carries a time and no state,
+ * and that time is no reading's.
+ */
+export function readingSince(reading: TenantReading, stateChangedAt: string | null): string | null {
+  return reading === "healthy" || reading === "failing" ? stateChangedAt : null;
+}
+
 export type DailyLimit = { limit: number; reserve: number; routineStop: number };
 
 function positiveInt(v: unknown, max: number): number | null {
@@ -1334,6 +1345,7 @@ export const TENANT_MAIL_NEEDS_0114 =
 export type TenantSmtpOverviewRow = {
   organization_id: string;
   reading: TenantReading;
+  /** Since when it has had that reading (readingSince): null for configured and not configured. */
   since: string | null;
   lastErrorClass: string | null;
   lastSuccessAt: string | null;
@@ -1409,10 +1421,11 @@ export async function readTenantSmtpOverview(db: SupabaseClient, env: Env = proc
     const rows: TenantSmtpOverviewRow[] = status.map((raw) => {
       const r = statusRow(raw);
       const limit = tenantDailyLimit(r.daily_limit, env);
+      const reading = readingOf({ settingsComplete: complete.has(r.organization_id), deleted: false, state: r.state });
       return {
         organization_id: r.organization_id,
-        reading: readingOf({ settingsComplete: complete.has(r.organization_id), deleted: false, state: r.state }),
-        since: r.state_changed_at,
+        reading,
+        since: readingSince(reading, r.state_changed_at),
         lastErrorClass: r.last_error_code,
         lastSuccessAt: r.last_success_at,
         sent24h: r.sent_24h,

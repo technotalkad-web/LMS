@@ -369,6 +369,14 @@ async function main() {
       eq("…the lost-job numbers, and no sentence that names the migration", [JOBS(withIt).includes("1 lost of 4 started"), withIt.includes(TENANT_MAIL_NEEDS_0114)], [true, false]);
 
       fresh();
+      page.statusRows = [{ organization_id: ORG_ID, state: null, state_changed_at: "2026-11-21T09:00:00.000Z", last_success_at: null, last_error_code: null, daily_limit: 1500, sent_24h: 0 }];
+      page.settings = [{ organization_id: ORG_ID, smtp_host: "smtp.tenant.stub", smtp_port: 465, from_email: "from-0029" }];
+      page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      const limitOnly = await render();
+      eq("configured, nothing sent yet, with only the limit set: the row shows no \"since\" time, the edit's time nowhere",
+        [ORGS(limitOnly).includes("Configured, nothing sent yet"), ORGS(limitOnly).includes("2026-11-21 09:00 UTC")], [true, false]);
+
+      fresh();
       page.statusRows = [{ organization_id: ORG_ID, state: "healthy", state_changed_at: "2026-11-20T08:00:00.000Z", last_success_at: "2026-11-21T07:30:00.000Z", last_error_code: null, daily_limit: 10, sent_24h: 0 }];
       page.settings = [{ organization_id: ORG_ID, smtp_host: "smtp.tenant.stub", smtp_port: 465, from_email: "from-0029" }];
       page.orgs = [{ id: ORG_ID, name: "Tenant A" }];

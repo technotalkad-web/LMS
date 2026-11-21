@@ -261,7 +261,7 @@ export default async function PlatformEmailPage() {
                       {READING_TEXT[t.reading]}
                       {t.atLimit ? " · at its daily limit: all mail stopped" : t.routineOff ? " · routine mail off at this limit" : t.routineStopped ? " · routine mail stopped for today" : ""}
                     </td>
-                    <td className="py-2 pr-4 text-ink">{t.reading === "not_configured" ? "" : fmt(t.since)}</td>
+                    <td className="py-2 pr-4 text-ink">{t.since ? fmt(t.since) : ""}</td>
                     <td className="py-2 pr-4 font-mono text-xs text-ink">{t.lastErrorClass ?? ""}</td>
                     <td className="py-2 pr-4 text-ink">{fmt(t.lastSuccessAt)}</td>
                     <td className="py-2 pr-4 text-ink">
