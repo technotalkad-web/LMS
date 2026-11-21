@@ -101,7 +101,8 @@
  *   - mail: an organisation-wide assignment logs a mail for each active
  *     member and none for the inactive and suspended ones (email paused, so
  *     nothing leaves); a broadcast in A to X and the inactive learner
- *     reaches X only, and one in B to X reaches nobody;
+ *     counts X only (email is paused there, so it answers that nothing was
+ *     sent and writes no row), and one in B to X reaches nobody;
  *   - a cmi5 launch open while the learner is deactivated on the Users
  *     page: the next statement is refused, the attempt stays in progress,
  *     and after reactivation a new launch resumes it; removing the learner
@@ -622,8 +623,9 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     app.e = await createOrg({ name: "Lifecycle membership app E" });
     const { a, b, d, e } = app as Required<Pick<typeof app, "a" | "b" | "d" | "e">>;
     // Email paused in every organisation of the group: a mail is logged and
-    // never leaves. A broadcast is paused too and still logged; the one sent
-    // below has one recipient.
+    // never leaves. A broadcast is paused too: the route answers that nothing
+    // was sent, with the number of recipients it would have mailed, and logs
+    // no row (ADR 0029, the owner's decision of 2026-11-21).
     for (const org of [a, b, d, e]) {
       const { error } = await svc().from("notification_settings").upsert({ organization_id: org.id, email_paused: true }, { onConflict: "organization_id" });
       expect(error, `pause email in ${org.slug}: ${error?.message}`).toBeNull();
@@ -745,7 +747,7 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     expect(ok.status, `the control (A's active administrator) replies: ${ok.body}`).toBe(200);
     // The reply's mail is sent in the background, after the answer: this
     // first read can come before it would be logged. The mail test below
-    // reads it again after a positive control has been logged.
+    // reads it again after its assignment mails, logged later, have landed.
     expect(await mailRows(app.a!.id, ap("inactiveLearner").id, "custom_broadcast"), "the reply's mail does not reach its requester, whose row does not count").toBe(0);
   });
 
@@ -823,13 +825,17 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     expect(toOutsider.status, "B's broadcast to a person not in B is refused").toBe(400);
     expect(await broadcast("adminB", b, [ap("x").id]), "B's broadcast to X: as to the person not in B").toEqual(toOutsider);
     expect(await mailRows(b.id, ap("x").id, "custom_broadcast"), "no broadcast logged for X in B").toBe(0);
-    // In A, X counts and the inactive learner does not: one recipient.
+    // In A, X counts and the inactive learner does not: one recipient. Email
+    // is paused in A, so the broadcast answers 409 that nothing was sent,
+    // with that one recipient, and logs no row.
     const xBefore = await mailRows(a.id, ap("x").id, "custom_broadcast");
     const inA = await broadcast("admin", a, [ap("x").id, ap("inactiveLearner").id]);
-    expect([inA.status, (JSON.parse(inA.body || "{}") as { total?: number }).total], "A's broadcast to X and the inactive learner: X only").toEqual([200, 1]);
-    await expect.poll(() => mailRows(a.id, ap("x").id, "custom_broadcast"), { message: "X's broadcast in A logged", timeout: 60_000 }).toBe(xBefore + 1);
-    // After that positive control, none at all for the inactive learner: not
-    // this broadcast, and not the earlier ticket reply's background mail.
+    const inABody = JSON.parse(inA.body || "{}") as { total?: number; paused?: boolean };
+    expect([inA.status, inABody.paused, inABody.total], "A's broadcast to X and the inactive learner: paused, X only").toEqual([409, true, 1]);
+    expect(await mailRows(a.id, ap("x").id, "custom_broadcast"), "a paused broadcast logs no row for X").toBe(xBefore);
+    // The assignment mails polled above are the positive control, logged
+    // after the earlier ticket reply: none at all for the inactive learner,
+    // not this broadcast and not that reply's background mail.
     expect(await mailRows(a.id, ap("inactiveLearner").id, "custom_broadcast"), "none for the inactive learner (this broadcast, and the ticket reply before it)").toBe(0);
   });
 

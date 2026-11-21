@@ -78,7 +78,10 @@
  *       the whole organisation, from one read of them for the run or the
  *       request; a deleted organisation's course or program is skipped
  *       before any read of it, and a broadcast there is refused as for a
- *       non-member; a learner whose row does not count is not claimed,
+ *       non-member; a broadcast in a paused organisation (the master pause,
+ *       or the custom_broadcast pause) answers 409 that nothing was sent,
+ *       with no row for any recipient (ADR 0029, the owner's decision of
+ *       2026-11-21); a learner whose row does not count is not claimed,
  *       gets no reminder state (not even a stopped one past the cap) and
  *       raises no escalation, and an escalation goes only to a manager
  *       whose row counts; an attempt request reaches the active
@@ -1378,6 +1381,8 @@ async function main() {
       let smtpAnswer: () => Response = () => json({ ok: true });
       let statusAnswer: ((org: unknown) => Response) | null = null;
       let mFail: (table: string, select: string, query: URLSearchParams) => boolean = () => false;
+      /** The pause fields of the organisation's settings answer (email_paused, event_paused). */
+      let mSettings: Row = {};
       let warned: string[] = [];
       const mailStub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
         const url = new URL(input instanceof Request ? input.url : String(input));
@@ -1397,7 +1402,7 @@ async function main() {
         if (p === "/functions/v1/send-smtp") return smtpAnswer();
         if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
         if (table === "notification_settings" && method === "GET") {
-          return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, smtp_user: null, smtp_password: null, from_email: "noreply@tenant.stub", from_name: null, reply_to: null, email_paused: false, event_paused: {}, logo_url: null, brand_color: null, footer_text: null }]);
+          return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, smtp_user: null, smtp_password: null, from_email: "noreply@tenant.stub", from_name: null, reply_to: null, email_paused: false, event_paused: {}, logo_url: null, brand_color: null, footer_text: null, ...mSettings }]);
         }
         if (table === "rpc/journey_reminder_counts") {
           // Nothing credited yet: every enrolment is behind.
@@ -1436,6 +1441,7 @@ async function main() {
         assignments?: Row[]; pathAssignments?: Row[]; reminderState?: Row[]; extraMembers?: Row[];
         reminderSettings?: Row[]; programs?: Row[]; enrolments?: Row[];
         fail?: (table: string, select: string, query: URLSearchParams) => boolean;
+        settings?: Row;
       } = {}) => {
         mt = {
           organizations: [LIVE, SECOND, GONE].map((x) => ({ ...x })),
@@ -1455,6 +1461,7 @@ async function main() {
           ],
         };
         mFail = o.fail ?? (() => false);
+        mSettings = { ...(o.settings ?? {}) };
         requests = [];
         warned = [];
         smtpAnswer = () => json({ ok: true });
@@ -1952,6 +1959,22 @@ async function main() {
         {
           const r = await cast({ audience: "all" });
           eq("…the control: the same session in the live organisation still reaches every member that counts", [r.status, mailed("custom_broadcast")], [200, COUNTING]);
+        }
+        // ADR 0029, the owner's decision of 2026-11-21: the pause stops a
+        // broadcast. The route asks the run once, before its loop, and
+        // answers that nothing was sent, with no row for any recipient.
+        for (const [label, settings] of [["the master pause", { email_paused: true }], ["the custom_broadcast pause", { event_paused: { custom_broadcast: true } }]] as const) {
+          mailWorld({ settings });
+          let smtp = 0;
+          smtpAnswer = () => { smtp++; return json({ ok: true }); };
+          const r = await cast({ audience: "all" });
+          eq(`broadcast under ${label}: 409 with the paused sentence and the number it would have mailed, no row written, nothing sent`,
+            [r.status, r.body.error, r.body.paused, r.body.total, mailed(), smtp], [409, "Email is paused for this organisation. Nothing was sent.", true, COUNTING.length, [], 0]);
+        }
+        {
+          mailWorld({ settings: { event_paused: { asset_reminder: true } } });
+          const r = await cast({ audience: "all" });
+          eq("…the control: another event's pause leaves a broadcast alone", [r.status, mailed("custom_broadcast")], [200, COUNTING]);
         }
 
         // ---- the course update mail ----

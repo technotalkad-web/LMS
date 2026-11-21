@@ -16,7 +16,10 @@
  *   - pausing: password_reset and magic_link (D1) ignore it, every other
  *     event obeys it, custom_broadcast (broadcasts, ticket and
  *     attempt-request mail) included, under the master pause and its own
- *     event pause (the owner's decision of 2026-11-21);
+ *     event pause (the owner's decision of 2026-11-21): a ticket's and an
+ *     attempt request's mail to the administrators and a learner's decision
+ *     mail write their paused rows, and a reset code, a sign-in link and the
+ *     Settings test still go;
  *   - deleted organisations read not_configured, send nothing and get no
  *     alert mark; one only scheduled for deletion (deleted_at still empty)
  *     sends as before;
@@ -83,7 +86,7 @@ import {
 import { runSettingsTest, sendMany, sendNotification, sendSettingsTest, type SendArgs } from "../../lib/notifications/send";
 import { CALL_LIMIT_LOG_EVENT, requestBudget } from "../../lib/notifications/smtp-state";
 import { notifyAdminsOfTicket } from "../../lib/tickets/notify";
-import { notifyAdminsOfRequest, reissueNotifier } from "../../lib/attempts/requests";
+import { notifyAdminsOfRequest, notifyLearnerOfDecision, reissueNotifier } from "../../lib/attempts/requests";
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
 import path from "node:path";
@@ -224,14 +227,32 @@ async function main() {
         const b = await sendNotification({ ...one("custom_broadcast"), override: { subject: "Notice", body_md: "Hello" } });
         eq(`custom_broadcast under ${label}: paused, not attempted, nothing sent, its row written as paused`,
           [b.status, b.errorClass, b.attempted, sends().length, logRows().map((r) => [r.event_type, r.status, r.subject])], ["paused", "paused", false, 0, [["custom_broadcast", "failed", "(paused)"]]]);
+        const code = await sendNotification(one("password_reset"));
+        const link = await sendNotification(one("magic_link"));
+        eq(`…under ${label} a reset code and a sign-in link still go`, [code.status, link.status, sends().length], ["sent", "sent", 2]);
       }
-      {
+      for (const [label, settings] of [["the master pause", { ...SMTP_SETTINGS, email_paused: true }], ["the custom_broadcast pause", { ...SMTP_SETTINGS, event_paused: { custom_broadcast: true } }]] as const) {
         const admins = [{ organization_id: ORG, user_id: "0d000000-0000-4000-8000-000000000001", role: "admin", status: "active" }];
-        freshWorld({ settings: { ...SMTP_SETTINGS, email_paused: true }, members: admins, profiles: { [admins[0].user_id]: "admin1@tenant.stub" } });
-        const db = createClient("http://stub.supabase.test", "stub-service-key-0029", { auth: { persistSession: false } });
-        await notifyAdminsOfTicket(db, { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", subject: "Help", requester: { name: "A manager", email: null }, categoryLabel: "Retry", lines: ["one"], note: null });
-        eq("a ticket's mail to the administrators on a paused organisation: paused, nothing sent", [sends().length, logRows().map((r) => [r.to_user_id, r.status, r.subject])], [0, [[admins[0].user_id, "failed", "(paused)"]]]);
+        const learner = { organization_id: ORG, user_id: "0e000000-0000-4000-8000-000000000001", role: "user", status: "active" };
+        const db = () => createClient("http://stub.supabase.test", "stub-service-key-0029", { auth: { persistSession: false } });
+        const world = () => freshWorld({ settings, members: [...admins, learner], profiles: { [admins[0].user_id]: "admin1@tenant.stub", [learner.user_id]: "learner@tenant.stub" } });
+        world();
+        await notifyAdminsOfTicket(db(), { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", subject: "Help", requester: { name: "A manager", email: null }, categoryLabel: "Retry", lines: ["one"], note: null });
+        eq(`a ticket's mail to the administrators under ${label}: paused, nothing sent, its row written as paused`, [sends().length, logRows().map((r) => [r.to_user_id, r.status, r.subject])], [0, [[admins[0].user_id, "failed", "(paused)"]]]);
+        world();
+        await notifyAdminsOfRequest(db(), { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", courseTitle: "Home loans", learnerEmail: "learner@tenant.stub", reason: null });
+        eq(`an attempt request's mail to the administrators under ${label}: paused, nothing sent, its row written as paused`, [sends().length, logRows().map((r) => [r.to_user_id, r.status, r.subject])], [0, [[admins[0].user_id, "failed", "(paused)"]]]);
+        world();
+        const decision = await notifyLearnerOfDecision(db(), { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", courseId: "c-0029", courseTitle: "Home loans", learner: { id: learner.user_id, email: "learner@tenant.stub" }, approved: true });
+        eq(`the learner's decision mail under ${label}: not emailed, nothing sent, its row written as paused`,
+          [sends().length, logRows().map((r) => [r.to_user_id, r.status, r.subject]), (decision as { emailed?: number } | null)?.emailed], [0, [[learner.user_id, "failed", "(paused)"]], 0]);
       }
+      // The switch: the Settings page's list of event pauses holds
+      // custom_broadcast, and its words name the three kinds of mail it stops.
+      const settingsPage = fs.readFileSync(path.join(__dirname, "..", "..", "app", "[org]", "(admin)", "settings", "settings-client.tsx"), "utf8").replace(/\r\n/g, "\n");
+      const pauseList = settingsPage.slice(settingsPage.indexOf("const PAUSE_EVENTS"), settingsPage.indexOf("];", settingsPage.indexOf("const PAUSE_EVENTS")));
+      eq("the Settings page has a pause switch for custom_broadcast, labelled with broadcasts, ticket and attempt-request email",
+        [/"custom_broadcast",/.test(pauseList), /custom_broadcast: "Custom broadcast, ticket and attempt-request email"/.test(settingsPage), /PAUSE_LABELS\[ev\] \?\? EVENT_LABELS\[ev\]/.test(settingsPage)], [true, true, true]);
     }
 
     console.log("\na deleted organisation; one scheduled for deletion");
@@ -358,6 +379,9 @@ async function main() {
       freshWorld({ settings: { ...SMTP_SETTINGS, email_paused: true } });
       run = await openRun({ organizationId: ORG });
       eq("a pause does not stop the test: the administrator asked for it", (await sendSettingsTest(run, admin)).status, "sent");
+      freshWorld({ settings: { ...SMTP_SETTINGS, event_paused: { custom_broadcast: true } } });
+      run = await openRun({ organizationId: ORG });
+      eq("…nor does the custom_broadcast pause: the test is no event of the organisation's mail", (await sendSettingsTest(run, admin)).status, "sent");
       freshWorld({ status: "missing" });
       run = await openRun({ organizationId: ORG });
       r = await sendSettingsTest(run, admin);

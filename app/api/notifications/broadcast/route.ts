@@ -5,7 +5,7 @@ import { CHECK_FAILED } from "@/lib/auth/api-admin";
 import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { mailCounts, sendMany } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, gateSend, openRun, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { assignedRecipientsStrict, teamMemberIdsStrict } from "@/lib/org/groups";
 
@@ -38,8 +38,16 @@ const MAX_BUTTONS = 3;
  * a team, of an assignment's people or of the addresses answers 503 and
  * sends nothing. The mail is one run within the request's budgets; the
  * answer says how many were emailed and how many were not.
+ *
+ * The organisation's pause, master or the broadcast event's own, stops a
+ * broadcast (ADR 0029, the owner's decision of 2026-11-21). The route asks
+ * the run once, before its loop: when paused it answers 409 with
+ * BROADCAST_PAUSED, `paused: true` and the number of recipients it would
+ * have mailed, and writes no row for any of them (a loop's refusal is one
+ * answer, as a loop stopped by the daily limit writes none).
  */
 const AUDIENCE_UNREADABLE = "Could not read who can receive this. Nothing was sent; try again.";
+const BROADCAST_PAUSED = "Email is paused for this organisation. Nothing was sent.";
 export async function POST(request: Request) {
   const body = (await request.json().catch(() => ({}))) as {
     orgSlug?: string;
@@ -233,6 +241,12 @@ export async function POST(request: Request) {
     return address ? [{ uid, email: address }] : [];
   });
   const run = await openRun({ organizationId: org.id, budget, db: svc });
+  // The pause, asked once of the run before its loop: one answer, no row
+  // for each recipient.
+  const gate = gateSend(run, "custom_broadcast");
+  if (!gate.attempt && gate.cls === "paused") {
+    return NextResponse.json({ error: BROADCAST_PAUSED, paused: true, total: recipientIds.size }, { status: 409 });
+  }
   const results = await sendMany(run, people, (p) => ({
     event: "custom_broadcast",
     to: { user_id: p.uid, email: p.email },

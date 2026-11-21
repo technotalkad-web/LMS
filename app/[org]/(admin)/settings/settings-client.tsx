@@ -510,7 +510,19 @@ const PAUSE_EVENTS: NotificationEvent[] = [
   "path_assignment",
   "path_unassignment",
   "path_completion",
+  // ADR 0029, the owner's decision of 2026-11-21: broadcasts, ticket mail
+  // and attempt-request mail all go as custom_broadcast, and its pause
+  // stops all three.
+  "custom_broadcast",
 ];
+
+/**
+ * The pause list's own words for an event whose name alone says too little.
+ * The Templates tab keeps EVENT_LABELS.
+ */
+const PAUSE_LABELS: Partial<Record<NotificationEvent, string>> = {
+  custom_broadcast: "Custom broadcast, ticket and attempt-request email",
+};
 
 function BrandingPauseForm({
   orgSlug,
@@ -598,7 +610,7 @@ function BrandingPauseForm({
               key={ev}
               className="flex items-center justify-between gap-2 px-3 py-2 border border-line rounded-lg"
             >
-              <span>{EVENT_LABELS[ev]}</span>
+              <span>{PAUSE_LABELS[ev] ?? EVENT_LABELS[ev]}</span>
               <input
                 type="checkbox"
                 checked={!form.event_paused[ev]}
