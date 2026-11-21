@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { sendMany } from "@/lib/notifications/send";
-import { MAIL_CALL_COSTS, cronBudget, hasRoom, openRun, spendCalls } from "@/lib/notifications/smtp-state";
+import { MAIL_CALL_COSTS, REMINDER_LATER_READS, cronBudget, hasRoom, openRun, spendCalls } from "@/lib/notifications/smtp-state";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { buildMailCronDetail, owedAfterRun, type CronErrorCounts, type CronErrorWord } from "@/lib/ops/health-status";
@@ -123,15 +123,16 @@ const RUN_ROOM = MAIL_CALL_COSTS.open + FIRST_GROUP_CALLS;
 const SEND_RESERVE = 1 + RUN_ROOM;
 /**
  * What the members' read of an organisation keeps back besides that: one
- * call for each read that every run makes after it (the assignments, the
- * finished attempts, the state and a first list of addresses). So when an
- * organisation is left for room once another's members were read whole,
- * the call still has room to read on and remind the first one's learners: a
- * clean run that counts it in left_orgs (ADR 0029, note of 2026-11-21
- * (later), point 4, "what stays clean"). A read after it that needs more
- * pages than this still stops the run in its own step (part 2 (a)).
+ * call for each read that every run makes after it when anybody is to be
+ * reminded (REMINDER_LATER_READS: the assignments, the finished attempts,
+ * the state and a first list of addresses). So when an organisation is left
+ * for room once another's members were read whole, the call still has room
+ * to read on and remind the first one's learners: a clean run that counts it
+ * in left_orgs (ADR 0029, note of 2026-11-21 (later), point 4, "what stays
+ * clean"; the note of 2026-11-21 (evening), part 1). A read after it that
+ * needs more pages than this still stops the run in its own step (part 2 (a)).
  */
-const LATER_READS = 4;
+const LATER_READS = REMINDER_LATER_READS.length;
 
 export async function POST(request: Request) {
   const expected = process.env.CRON_SECRET;

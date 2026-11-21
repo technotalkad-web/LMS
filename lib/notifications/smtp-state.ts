@@ -171,6 +171,19 @@ export function requestBudget(opts: { spent?: number; now?: () => number } = {})
 export const CRON_END_CALLS = 2;
 
 /**
+ * The reads every reminders call makes after its members' read whenever
+ * anybody is to be reminded, each at its least, which is one call (ADR 0029,
+ * note of 2026-11-21 (evening), part 1), in the route's own words for those
+ * steps: the assignments, the finished attempts, the reminders' state and
+ * one list of addresses. Declared once: the reminders route keeps back one
+ * call for each in its members' read (its LATER_READS is this list's
+ * length), and tests/unit/mail-budget.test.ts checks the list against the
+ * reads the call makes. A floor, not scaled: a read that needs more than its
+ * one call stops the run in its own step.
+ */
+export const REMINDER_LATER_READS = ["assignments_read", "progress_read", "state_read", "profiles_read"] as const satisfies readonly CronErrorWord[];
+
+/**
  * The budgets of one cron call, shared by every organisation's run in it.
  * The count's limit is CALL_SUM_LIMIT less CRON_END_CALLS: the two end calls
  * come off the limit, not onto the calls spent, so the count stays the

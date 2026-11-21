@@ -26,6 +26,12 @@
  *     mark is state_write (point 2); and a journey-nudges call with no alert
  *     due has room for a full page (500 due learners, 500 managers) and its
  *     first group;
+ *   - the reminders' later reads (note of 2026-11-21 (evening), part 1): the
+ *     list is the reads the smallest reminding call makes between its
+ *     members and its run, each once; at the most pages of members the gate
+ *     allows, from the constants, the call sends, and one page more stops
+ *     it in members_read; ended by the clock at the second organisation's
+ *     own row, it stops in assignments_read with nothing read after it;
  *   - the counted calls are the calls made: the budget's count equals the
  *     requests the run sent, for a run of sends, a stopped run, a run of
  *     mail whose text the caller gives (no template is read, none counted)
@@ -54,6 +60,7 @@ import {
   CRON_END_CALLS,
   CRON_SEND_WINDOW_MS,
   MAIL_CALL_COSTS,
+  REMINDER_LATER_READS,
   REQUEST_SEND_WINDOW_MS,
   SENDS_AT_ONCE,
   cronBudget,
@@ -270,6 +277,8 @@ function perTable(beforeFirstSend: boolean): Record<string, number> {
 const sorted = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => a.localeCompare(b)));
 /** The reads of one table (its writes left out). */
 const readsOf = (table: string) => requests.filter((r) => r.table === table && r.method === "GET").length;
+/** The table each of the reminders' later reads asks (REMINDER_LATER_READS), by the route's word for its step. */
+const TABLE_OF_LATER_READ: Record<string, string> = { assignments_read: "course_assignments", progress_read: "course_attempts", state_read: "reminder_state", profiles_read: "profiles" };
 
 /**
  * One journey program of the organisation, with `n` learners enrolled and
@@ -384,6 +393,53 @@ async function cronRouteCases() {
     const SUM = Object.values(READ_BY_READ).reduce((a, b) => a + b, 0);
     eq("reminders, 2,500 members, three people, a team and a group: 200, and the call reminds them", [r.status, r.body.ok, Number(r.body.sent) > 0], [200, true, true]);
     eq(`…the calls before the first send, read by read (${SUM} in all)`, sorted(perTable(true)), sorted(READ_BY_READ));
+    eq("…the reminders' later reads are lines of this sum", REMINDER_LATER_READS.map((w) => TABLE_OF_LATER_READ[w]).filter((t) => t in READ_BY_READ).length, REMINDER_LATER_READS.length);
+  }
+
+  console.log("\nthe reminders' later reads (note of 2026-11-21 (evening), part 1): one list, the reads the call makes after its members");
+  {
+    // The smallest set of data that reminds somebody: one organisation, one
+    // page of members, two people named directly, no team and no group.
+    reminderWorld({ members: 10, direct: 2 });
+    const r = await remind();
+    const lastMembers = requests.map((q) => q.table).lastIndexOf("organization_members");
+    const opening = requests.findIndex((q, k) => k > lastMembers && ["notification_settings", "organizations", "rpc/tenant_mail_status"].includes(q.table));
+    const wordOf = Object.fromEntries(Object.entries(TABLE_OF_LATER_READ).map(([w, t]) => [t, w]));
+    const between = requests.slice(lastMembers + 1, opening).map((q) => wordOf[q.table] ?? `a read the list does not hold: ${q.table}`);
+    eq("the smallest call that reminds somebody: 200, and it reminds them", [r.status, r.body.ok, Number(r.body.sent) > 0], [200, true, true]);
+    eq("…between its last page of members and its run's opening: one request for each read of the list, and nothing else", [...between].sort(), [...REMINDER_LATER_READS].sort());
+  }
+  {
+    // The boundary, from the constants: the call's count, less the settings'
+    // one call, the members' organisation read, the list, and what every
+    // read keeps back for the sends (the write that stops reminders past
+    // their cap, an opening and a first group).
+    const reserve = 1 + MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark + 1;
+    const most = cronBudget().callLimit - 1 - 1 - REMINDER_LATER_READS.length - reserve;
+    /** Members that take exactly `pages` requests to read (the last page short). */
+    const membersFor = (pages: number) => (pages - 1) * SERVER_ROW_CAP + SERVER_ROW_CAP / 2;
+    reminderWorld({ members: membersFor(most), direct: 2 });
+    const fits = await remind();
+    eq(`one organisation whose members take ${most} pages, the most the gate allows: 200, its first reminder sent, every page read, at most 40 requests`,
+      [fits.status, fits.body.ok, Number(fits.body.sent) >= 1, readsOf("organization_members"), requests.length <= CALL_SUM_LIMIT], [200, true, true, most, true]);
+    reminderWorld({ members: membersFor(most + 1), direct: 2 });
+    const over = await remind();
+    eq(`…with one page more: 500 in members_read, ended by the count, left_orgs 1, nobody mailed`,
+      [over.status, over.noRoom.length, over.noRoom[0]?.step, over.noRoom[0]?.ended_by, over.body.left_orgs, sends().length], [500, 1, "members_read", "count", 1, 0]);
+  }
+  {
+    // The clock form: two organisations, the first read whole; the call's
+    // 240 seconds end at the second organisation's own row, so its members'
+    // first page is refused and so is the read after it.
+    reminderWorld({ members: 10, direct: 2, second: true });
+    const r = await remind(nth("organizations", 2));
+    const line = r.noRoom[0];
+    eq("ended by the clock at the second organisation's own row: 500, not ok, stopped before any send, call_limit once, one line in assignments_read ended by the clock",
+      [r.status, r.body.ok, r.body.stopped_before_send, (r.detail.errors as Row | undefined)?.call_limit, r.noRoom.length, line?.step, line?.ended_by], [500, false, true, 1, 1, "assignments_read", "clock"]);
+    eq("…left_orgs 1, the five counts left out, no request for the assignments, nobody mailed, no state written",
+      [r.body.left_orgs, absent(r.body), readsOf("course_assignments"), sends().length, requests.filter((q) => (q.table === "reminder_state" || q.table === "tenant_smtp_state") && q.method !== "GET").length],
+      [1, UNKNOWN_WHEN_STOPPED, 0, 0, 0]);
+    eq("…the count in the line equals the requests the call made", line?.calls, callRequests().length);
   }
 
   console.log("\nthe reminders call: the route's own count is the requests it made, paged reads included (rule FP2)");
