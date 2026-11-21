@@ -34,6 +34,13 @@
  *     without the platform sender's settings.
  *   - A limit under requests made at once is read as "at most", and the
  *     requests as claimed by at least one claim row of each kind.
+ *   - A scheduled call (a POST to /api/cron/*) goes only to a local app or a
+ *     staging app (isStagingAppUrl of scripts/staging-cron-post.mjs); any
+ *     other address fails the case before the call.
+ *   - A navigation to a setup link never prints its fragment: a failed one
+ *     is reported with the fragment as #t=<redacted>.
+ *   - A clean-up step that fails fails the run, with the count of failed
+ *     steps and no address.
  *
  * Settings: the lifecycle suite's (NEXT_PUBLIC_SUPABASE_URL and the two
  * keys, E2E_BASE_URL), and the app's cron secret as spec 78 reads it
@@ -43,7 +50,7 @@
  *
  * Nothing printed holds an address, a link, a token or a code.
  */
-import { test, expect, type Browser } from "@playwright/test";
+import { test, expect, type Browser, type Page } from "@playwright/test";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@supabase/supabase-js";
 import { addMember, createAuthUser, createOrg, markPlatformOwner, rand, svc, testEmail } from "./data";
@@ -51,6 +58,8 @@ import { authedContext } from "../lib/session";
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { aliasFor, configureOrgSmtp } from "./inbox";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const CRON_SECRET = process.env.LIFECYCLE_CRON_SECRET || process.env.KIVO_CLOUD_RUN_CRON_SECRET || "";
 const MAIL_READY = !!(process.env.BOT_MAIL_ADDRESS && process.env.BOT_SMTP_USER && process.env.BOT_SMTP_PASS);
@@ -254,6 +263,55 @@ async function health(withSecret: boolean): Promise<{ status: number; body: Reco
   return { status: res.status, body };
 }
 
+/**
+ * isStagingAppUrl of scripts/staging-cron-post.mjs. It is loaded by a
+ * dynamic import, as the ES module it is: a static import here is compiled
+ * to require, which cannot load that file.
+ */
+async function stagingAppTest(): Promise<(raw: string) => boolean> {
+  const href = pathToFileURL(path.resolve(__dirname, "../../../scripts/staging-cron-post.mjs")).href;
+  const mod = (await import(href)) as { isStagingAppUrl?: unknown };
+  if (typeof mod.isStagingAppUrl !== "function") throw new Error("scripts/staging-cron-post.mjs exports no isStagingAppUrl");
+  return mod.isStagingAppUrl as (raw: string) => boolean;
+}
+
+/**
+ * Whether a scheduled call may go to this app: a local app (localhost,
+ * 127.0.0.1 or [::1], over http or https, with nothing after the port), or a
+ * staging app as scripts/staging-cron-post.mjs reads one.
+ */
+async function cronTargetAllowed(base: string): Promise<boolean> {
+  let u: URL;
+  try {
+    u = new URL(base);
+  } catch {
+    return false;
+  }
+  if (u.username || u.password || u.pathname !== "/" || u.search || u.hash) return false;
+  const local = (u.protocol === "http:" || u.protocol === "https:") && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  return local || (await stagingAppTest())(`${base.replace(/\/+$/, "")}/`);
+}
+
+/** Every POST to /api/cron/* of this file: refused before the call unless the app is local or staging's. */
+async function cronPost(route: string): Promise<Response> {
+  expect(await cronTargetAllowed(`${BASE}/`), "a scheduled call goes only to a local app or a staging app (E2E_BASE_URL)").toBe(true);
+  return fetch(`${BASE}/api/cron/${route}`, { method: "POST", headers: { "x-cron-secret": CRON_SECRET } });
+}
+
+/**
+ * Open an address that holds a setup link. A failed navigation is reported
+ * with the fragment as #t=<redacted>: a new error, so neither its message
+ * nor its stack carries the token.
+ */
+async function gotoSetupLink(page: Page, address: string): Promise<void> {
+  try {
+    await page.goto(address);
+  } catch (e) {
+    const redact = (s: string) => s.replace(/#t=[^\s"'`<>)\]]*/g, "#t=<redacted>");
+    throw new Error(redact(e instanceof Error ? e.message : String(e)));
+  }
+}
+
 /** Rule (a) of the file: send this organisation's due alert by the scheduled call, past any older mark. */
 async function sendOwnAlert(orgId: string): Promise<void> {
   const own = await stateRow(orgId);
@@ -267,7 +325,7 @@ async function sendOwnAlert(orgId: string): Promise<void> {
   const older = count ?? 0;
   expect(older, `${older} older alert marks are due on staging; more than twenty is worth a look before this runs`).toBeLessThanOrEqual(20);
   for (let i = 0; i <= older; i++) {
-    const res = await fetch(`${BASE}/api/cron/journey-nudges`, { method: "POST", headers: { "x-cron-secret": CRON_SECRET } });
+    const res = await cronPost("journey-nudges");
     await res.text().catch(() => "");
     expect(res.status === 401 || res.status === 403, "the cron secret is accepted").toBe(false);
     if (!(await stateRow(orgId))?.alert_due_at) return;
@@ -351,30 +409,40 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
   test.afterAll(async () => {
     const d = db();
     let failed = 0;
-    for (const id of made.owners) if ((await d.from("platform_owners").delete().eq("user_id", id)).error) failed++;
-    for (const id of made.orgs) if ((await d.from("organizations").delete().eq("id", id)).error) failed++;
+    /** One clean-up step: an error it answers, or one it throws, counts as failed; every step runs. */
+    const step = async (run: () => PromiseLike<{ error: unknown }>, tolerate: (error: unknown) => boolean = () => false): Promise<void> => {
+      try {
+        const { error } = await run();
+        if (error && !tolerate(error)) failed++;
+      } catch {
+        failed++;
+      }
+    };
+    for (const id of made.owners) await step(() => d.from("platform_owners").delete().eq("user_id", id));
+    for (const id of made.orgs) await step(() => d.from("organizations").delete().eq("id", id));
     // Accounts the app made for this file (the bulk file's rows, the console's
     // administrator) are found by their address.
     const byAddress: string[] = [];
-    for (let page = 1; page <= 20; page++) {
-      const { data, error } = await d.auth.admin.listUsers({ page, perPage: LOOKUP_PAGE });
-      if (error) {
-        failed++;
-        break;
+    try {
+      for (let page = 1; page <= 20; page++) {
+        const { data, error } = await d.auth.admin.listUsers({ page, perPage: LOOKUP_PAGE });
+        if (error) {
+          failed++;
+          break;
+        }
+        const users = data?.users ?? [];
+        for (const u of users) if (u.email && made.emails.has(u.email.toLowerCase())) byAddress.push(u.id);
+        if (users.length < LOOKUP_PAGE) break;
       }
-      const users = data?.users ?? [];
-      for (const u of users) if (u.email && made.emails.has(u.email.toLowerCase())) byAddress.push(u.id);
-      if (users.length < LOOKUP_PAGE) break;
+    } catch {
+      failed++;
     }
-    for (const id of new Set([...made.users, ...byAddress])) {
-      const { error } = await d.auth.admin.deleteUser(id);
-      if (error && error.status !== 404) failed++;
-    }
-    if (made.emails.size) {
-      const { error } = await d.from("password_reset_otps").delete().in("email", [...made.emails]);
-      if (error) failed++;
-    }
-    console.log(`[spec 79 cleanup] organisations=${made.orgs.length} accounts=${new Set([...made.users, ...byAddress]).size} failed=${failed}`);
+    const accounts = new Set([...made.users, ...byAddress]);
+    for (const id of accounts) await step(() => d.auth.admin.deleteUser(id), (error) => (error as { status?: number }).status === 404);
+    if (made.emails.size) await step(() => d.from("password_reset_otps").delete().in("email", [...made.emails]));
+    console.log(`[spec 79 cleanup] organisations=${made.orgs.length} accounts=${accounts.size} failed=${failed}`);
+    // A step that failed fails the run: the count only, never an address.
+    if (failed > 0) throw new Error(`spec 79 clean-up: ${failed} step(s) failed; see the [spec 79 cleanup] line`);
   });
 
   test("staging holds 0114 and 0117, takes no fallback, and leaves the account lookup room", async () => {
@@ -762,12 +830,19 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
       const res = await ctx.request.post("/api/notifications/broadcast", {
         data: { orgSlug: org.slug, subject: "Spec 79", body_md: "Spec 79 routine mail.", audience: "users", user_ids: [learner.id] },
       });
-      expect(res.status(), "the broadcast answers").toBeLessThan(500);
+      // Accepted: a refusal (a 4xx) is not a broadcast that routine mail stopped.
+      expect(res.status(), "the broadcast is accepted (200)").toBe(200);
       await until(() => stateRow(org.id), (s) => !!s?.alert_due_at, "one alert is due once routine mail stops");
       expect(ofEvent(await tenantRows(org.id, learner.id), "custom_broadcast").filter(attempted).length, "the routine mail is not attempted").toBe(0);
       const page = await ctx.newPage();
       await page.goto(`/${org.slug}/attention`);
-      await expect(page.getByText(ROUTINE_STOPPED_TITLE).first(), "the Attention Center item").toBeVisible({ timeout: 30_000 });
+      // The item in the Attention Center's list, not the admin banner that
+      // carries the same words; section K: it is critical.
+      const item = page.locator("article").filter({ hasText: ROUTINE_STOPPED_TITLE });
+      await expect(item, "the Attention Center item").toBeVisible({ timeout: 30_000 });
+      const group = page.locator("section").filter({ has: item });
+      await expect(group, "one group holds the item").toHaveCount(1);
+      await expect(group.getByRole("heading", { level: 2 }), "the item is in the Critical group").toContainText("Critical");
       await page.close();
     } finally {
       await ctx.close();
@@ -831,13 +906,13 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
       // token out of the address bar), it spends nothing.
       for (let i = 0; i < 2; i++) {
         const p = await visitor.newPage();
-        await p.goto(open);
+        await gotoSetupLink(p, open);
         await expect(p.getByRole("heading", { name: "Set your password" }), `the form, opening ${i + 1}`).toBeVisible({ timeout: 30_000 });
         await expect(p.getByText(org.name).first()).toBeVisible();
         await p.close();
       }
       const page = await visitor.newPage();
-      await page.goto(open);
+      await gotoSetupLink(page, open);
       await expect(page.getByRole("heading", { name: "Set your password" })).toBeVisible({ timeout: 30_000 });
       const { data: linkRows, error: linkError } = await db().from("account_setup_links").select("used_at, ended_at").eq("user_id", userId);
       expect(linkError, "read the link's row").toBeNull();
@@ -853,7 +928,7 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
       await signedIn.close();
 
       const again = await visitor.newPage();
-      await again.goto(open);
+      await gotoSetupLink(again, open);
       await expect(again.getByText(LINK_UNUSABLE), "the same link then gets rule N10's answer").toBeVisible({ timeout: 30_000 });
     } finally {
       await visitor.close();
