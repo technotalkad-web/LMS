@@ -21,10 +21,11 @@
  *
  * ADR 0029 pull request B, stage 4 (step 17; rule FP4):
  *   - POST /api/super/email/limit: a platform owner sets an organisation's
- *     daily limit, or empties it for the default; the number it replaces is
- *     read first, one write holds the organisation's id, the number and the
- *     time, and one audit row holds the number before and after; a number
- *     outside 1 to 100,000 is 400, an organisation not found or deleted is
+ *     daily limit, or asks by name for the default (use_default); the number
+ *     it replaces is read first, one write holds the organisation's id, the
+ *     number and the time, and one audit row holds the number before and
+ *     after; a number outside 1 to 100,000, and a null that was not asked
+ *     for as the default, is 400, an organisation not found or deleted is
  *     404, and nothing is written; without migration 0114 it is refused
  *     with the console's sentence that names the migration; a signed-in
  *     user with no owner row gets 403 and nothing is read or written;
@@ -277,14 +278,29 @@ async function main() {
         [stateWrites.length, Object.keys(stateWrites[0]?.body ?? {}).sort(), stateWrites[0]?.body.daily_limit, stateWrites[0]?.query.includes("on_conflict=organization_id")], [1, ["daily_limit", "organization_id", "updated_at"], 1500, true]);
       eq("…one audit row with the number before and after, on the organisation",
         auditRows.map((r) => [r.action, r.actor_user_id, r.target_type, r.target_id, JSON.stringify(r.metadata)]), [["tenant_email.daily_limit", OWNER.id, "organization", ORG_ID, JSON.stringify({ previous: null, daily_limit: 1500 })]]);
-      const back = await set({ organization_id: ORG_ID, daily_limit: null });
-      eq("emptied for the default: 200, null, and the number it replaced is read first", [back.status, back.body.daily_limit, back.body.previous, JSON.stringify(auditRows[1]?.metadata)], [200, null, 1500, JSON.stringify({ previous: 1500, daily_limit: null })]);
+      const writesBefore = stateWrites.length;
+      const nullOnly = await set({ organization_id: ORG_ID, daily_limit: null });
+      eq("a null limit that was not asked for as the default (a box the form could not read): 400, nothing written, no audit row, the limit kept",
+        [nullOnly.status, stateWrites.length - writesBefore, auditRows.length], [400, 0, 1]);
+      const back = await set({ organization_id: ORG_ID, use_default: true });
+      eq("the default asked for by name: 200, null, and the number it replaced is read first", [back.status, back.body.daily_limit, back.body.previous, JSON.stringify(auditRows[1]?.metadata)], [200, null, 1500, JSON.stringify({ previous: 1500, daily_limit: null })]);
 
-      for (const bad of [0, 1.5, "1500", 100_001, -3]) {
+      for (const bad of [0, 1.5, "1500", 100_001, -3, null, undefined]) {
         fresh(); signIn(OWNER);
         const r = await set({ organization_id: ORG_ID, daily_limit: bad });
-        eq(`a number outside 1 to 100,000 (${JSON.stringify(bad)}): 400, nothing written, no audit row`, [r.status, stateWrites.length, auditRows.length], [400, 0, 0]);
+        eq(`a number outside 1 to 100,000, or none (${JSON.stringify(bad) ?? "absent"}): 400, nothing written, no audit row`, [r.status, stateWrites.length, auditRows.length], [400, 0, 0]);
       }
+      fresh(); signIn(OWNER);
+      const both = await set({ organization_id: ORG_ID, daily_limit: 50, use_default: true });
+      eq("a number and the default together: 400, nothing written", [both.status, stateWrites.length, auditRows.length], [400, 0, 0]);
+
+      console.log("\nthe daily limit's form reads the box itself (step 17)");
+      const { parseDailyLimitText } = await import("../../app/(super-owner)/super/email/daily-limit-form");
+      eq("a plain number, and one written in groups of three, are read as that number",
+        ["1500", "1,500", "1 500", " 375 ", "100000"].map((t) => parseDailyLimitText(t)), [1500, 1500, 1500, 375, 100000].map((value) => ({ ok: true, value })));
+      eq("an empty box, and text that is no whole number from 1 to 100,000, are refused: never the default",
+        ["", "   ", "-", "1e", "1e3", "15,00", "1.5", "0", "100001", "abc"].map((t) => parseDailyLimitText(t).ok), Array(10).fill(false));
+      eq("…the refusal says what to type and names the default's own button", (parseDailyLimitText("1,5,00") as { message?: string }).message, "Type a whole number from 1 to 100,000, or choose Use the default.");
       for (const [label, id] of [["an organisation that does not exist", "0a000000-0000-4000-8000-0000000000ff"], ["a deleted organisation", GONE_ID], ["an id that is not one", "acme"]] as const) {
         fresh(); signIn(OWNER);
         const r = await set({ organization_id: id, daily_limit: 100 });

@@ -6,12 +6,16 @@ import { isMissingRelation } from "@/lib/scoring/attempt-kind";
 
 /**
  *   POST /api/super/email/limit     { organization_id, daily_limit }
+ *   POST /api/super/email/limit     { organization_id, use_default: true }
  *
  * Sets one organisation's daily email limit (ADR 0029 step 17; rule FP4 of
  * the note of 2026-11-18): tenant_smtp_state.daily_limit, a whole number
- * from 1 to 100,000, or null to go back to the default. A platform owner
- * only (requirePlatformOwnerApi "full"); a tenant's administrators see the
- * number and cannot change it.
+ * from 1 to 100,000. Going back to the default is its own request,
+ * `use_default: true`, which stores null; a daily_limit of null, or of
+ * anything that is not such a number, is refused with 400 and nothing is
+ * written, so a value the form could not read never resets the limit. A
+ * platform owner only (requirePlatformOwnerApi "full"); a tenant's
+ * administrators see the number and cannot change it.
  *
  * Reads the number it replaces first, writes the organisation's id, the
  * number and the time and nothing else, then writes one platform_audit_log
@@ -26,14 +30,15 @@ import { isMissingRelation } from "@/lib/scoring/attempt-kind";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STATE_TABLE = "tenant_smtp_state";
-const LIMIT_RULE = "The daily limit is a whole number from 1 to 100,000, or empty for the default.";
+const LIMIT_RULE = "The daily limit is a whole number from 1 to 100,000. To go back to the default, choose Use the default.";
+const ONE_OF_THEM = "Send a daily limit or use_default, not both.";
 const TRY_AGAIN = "Could not change the limit right now. Please try again.";
 
 export async function POST(request: Request) {
   const guard = await requirePlatformOwnerApi("full");
   if ("error" in guard) return NextResponse.json({ error: guard.error }, { status: guard.status });
 
-  let body: { organization_id?: unknown; daily_limit?: unknown };
+  let body: { organization_id?: unknown; daily_limit?: unknown; use_default?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -41,8 +46,13 @@ export async function POST(request: Request) {
   }
   const orgId = typeof body?.organization_id === "string" ? body.organization_id : "";
   if (!UUID.test(orgId)) return NextResponse.json({ error: "Organisation not found" }, { status: 404 });
-  const next = body?.daily_limit;
-  if (next !== null && !(typeof next === "number" && Number.isInteger(next) && next >= 1 && next <= 100_000)) {
+  // The default is asked for by name; a null limit is never read as it.
+  const useDefault = body?.use_default === true;
+  if (useDefault && body?.daily_limit !== undefined && body?.daily_limit !== null) {
+    return NextResponse.json({ error: ONE_OF_THEM }, { status: 400 });
+  }
+  const next: number | null = useDefault ? null : typeof body?.daily_limit === "number" ? body.daily_limit : NaN;
+  if (next !== null && !(Number.isInteger(next) && next >= 1 && next <= 100_000)) {
     return NextResponse.json({ error: LIMIT_RULE }, { status: 400 });
   }
 

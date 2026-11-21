@@ -384,7 +384,9 @@ Center. The platform owner sees every organisation on `/super/email` →
 **The daily limit.** Counted over the last 24 hours (no midnight) from the
 organisation's `sent` rows in `notification_log`, test sends included.
 - **Where it is set:** by a platform owner on `/super/email`, column "Daily
-  limit"; each change writes a `platform_audit_log` row. Tenant administrators
+  limit": type the number and press Save, or press "Use the default" to go
+  back to the default; an empty or unreadable box is refused, never saved as
+  the default. Each change writes a `platform_audit_log` row. Tenant administrators
   see it and cannot change it. Where none is set: `TENANT_EMAIL_DEFAULT_DAILY_LIMIT`
   if the environment sets it, else **375**. The production tenant's is
   **1,500**: the owner enters it on `/super/email` after the release that
