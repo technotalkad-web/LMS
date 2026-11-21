@@ -3,11 +3,17 @@ import { createClient as createServiceClient } from "@supabase/supabase-js";
 import {
   EMAIL_CHECK_IGNORED_EVENTS,
   classifyCrons,
+  classifyMailCrons,
+  classifyMailJobs,
+  classifyMailRecipients,
+  classifyTenantSmtp,
   overallStatus,
   type CheckStatus,
+  type CronJobState,
   type HeartbeatRow,
 } from "@/lib/ops/health-status";
 import { readPlatformEmailHealth } from "@/lib/email/platform-health";
+import { readMailJobCounts, readTenantSmtpOverview } from "@/lib/notifications/smtp-state";
 
 export const dynamic = "force-dynamic";
 
@@ -26,15 +32,29 @@ export const dynamic = "force-dynamic";
  *   crons       ops_heartbeats freshness vs expected cadence  stale → DEGRADED*
  *   lrs_outbox  pending/failed backlog + dead letters         breach → WARN
  *   email       notification_log failures in last 24h,        breach → WARN
- *               password_reset and magic_link not counted
+ *               password_reset and magic_link not counted, nor
+ *               rows with the error daily_limit
  *
  * Under email_checks, not checks (ADR 0029 section H), with the secret only:
- *   platform_email  the platform sender (lib/email/platform-health.ts)
- *                   fail → DEGRADED, warn → WARN
- * The watchdog's public summary prints checks only, so it never names it.
- * The unauthenticated { status } is computed without it, and the check is
- * not run for a caller without the secret: no unauthenticated request moves
- * the unauthenticated status.
+ *   platform_email   the platform sender (lib/email/platform-health.ts)
+ *                    fail → DEGRADED, warn → WARN
+ *   tenant_smtp      organisations by reading: warn while one with an
+ *                    active member is failing, not configured, or past
+ *                    the line where its routine mail stops; never fail
+ *   mail_jobs        code and link jobs the platform ended (today and
+ *                    yesterday, UTC); warn, never fail
+ *   mail_recipients  warn for 24 hours after a request skipped its mail
+ *                    because its recipients could not be read; never fail
+ *   mail_crons       the two mail crons: state, last run, last successful
+ *                    run, failure details and pending reminders. Its
+ *                    status repeats what crons reads for them; it is no
+ *                    input of the overall status
+ * tenant_smtp and mail_jobs read unknown without migration 0114, and
+ * unknown moves nothing. The watchdog's public summary prints checks only,
+ * so it never names them. The unauthenticated { status } is computed
+ * without them, they are not run for a caller without the secret, and the
+ * heartbeats' last_detail is read only for a caller with it: no
+ * unauthenticated request moves the unauthenticated status.
  *
  * *Cron staleness only affects overall status when OPS_EXPECT_CRONS=1 is set on
  * the worker (true on PROD, where cron.yml fires; staging has no schedule, so
@@ -89,12 +109,16 @@ const SUBDAILY_STALE_DEGRADED_MIN = 26 * 60;
 
 /**
  * The jobs whose errored last run reads "warn" while their heartbeat is fresh
- * (the owner's decision of 2026-11-15; ADR 0024, the note of that date).
- * lrs-forward reports not-OK when its preview check or its park write fails
- * (app/api/cron/lrs-forward/route.ts). Any other job's errored run still
- * reads "ok", as before. tests/unit/cron-cadence.test.ts checks the list.
+ * (the owner's decision of 2026-11-15; ADR 0024, the note of that date;
+ * widened by the owner's answer of 2026-11-20, ADR 0029, note of that date,
+ * part 2). lrs-forward reports not-OK when its preview check or its park
+ * write fails (app/api/cron/lrs-forward/route.ts); reminders and
+ * journey-nudges when one of their own database reads or writes failed or
+ * they met the platform's call limit, never for a tenant's failed send. Any
+ * other job's errored run still reads "ok". Production only, as every
+ * heartbeat rule. tests/unit/cron-cadence.test.ts checks the list.
  */
-const ERRORED_WARN = ["lrs-forward"];
+const ERRORED_WARN = ["lrs-forward", "reminders", "journey-nudges"];
 
 const OUTBOX_BACKLOG_WARN = 50; // overdue-but-undelivered statements
 const EMAIL_FAILURES_WARN = 5; // failed sends in the last 24h
@@ -105,6 +129,20 @@ function svc() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+}
+
+/**
+ * For the checks of email_checks that never read fail: a throw reads
+ * "unknown", with no message.
+ */
+async function timedUnknown(fn: () => Promise<Omit<Check, "latency_ms">>): Promise<Check> {
+  const t0 = Date.now();
+  try {
+    const r = await fn();
+    return { ...r, latency_ms: Date.now() - t0 };
+  } catch {
+    return { status: "unknown", latency_ms: Date.now() - t0 };
+  }
 }
 
 async function timed(fn: () => Promise<Omit<Check, "latency_ms">>): Promise<Check> {
@@ -138,26 +176,42 @@ async function checkStorage(): Promise<Check> {
   });
 }
 
-async function checkCrons(expectCrons: boolean): Promise<Check> {
-  return timed(async () => {
+type HeartbeatRows = Array<HeartbeatRow & { last_detail?: unknown }> | "unreadable";
+
+/**
+ * The crons check, from one read of ops_heartbeats. last_detail is selected
+ * only for a caller with the secret (the mail crons' details); the same
+ * rows serve mail_recipients and mail_crons. `levels` is the one call's
+ * answer for each job, kept out of checks.crons.
+ */
+async function checkCrons(
+  expectCrons: boolean,
+  withDetail: boolean
+): Promise<{ check: Check; rows: HeartbeatRows; crons: { jobs: Record<string, CronJobState>; levels: Record<string, "ok" | "warn" | "fail"> } | null }> {
+  let rows: HeartbeatRows = "unreadable";
+  let crons: { jobs: Record<string, CronJobState>; levels: Record<string, "ok" | "warn" | "fail"> } | null = null;
+  const check = await timed(async () => {
     const { data, error } = await svc()
       .from("ops_heartbeats")
-      .select("name, last_run_at, last_status");
+      .select(withDetail ? "name, last_run_at, last_status, last_detail" : "name, last_run_at, last_status");
     if (error) {
       // Table missing (migration 0050 not applied) — visible, but not a page.
       return { status: "unknown", detail: error.message };
     }
-    const { status, jobs } = classifyCrons({
+    rows = (data ?? []) as unknown as Array<HeartbeatRow & { last_detail?: unknown }>;
+    const { status, jobs, levels } = classifyCrons({
       cadenceMin: CRON_CADENCE_MIN,
       staleWarnOnly: SUBDAILY_STALE_WARN,
       staleDegradedAfterMin: SUBDAILY_STALE_DEGRADED_MIN,
       erroredWarn: ERRORED_WARN,
-      rows: (data ?? []) as HeartbeatRow[],
+      rows: rows.map((r) => ({ name: r.name, last_run_at: r.last_run_at, last_status: r.last_status })),
       nowMs: Date.now(),
       expectCrons,
     });
+    crons = { jobs, levels };
     return { status, detail: { expect_crons: expectCrons, jobs } };
   });
+  return { check, rows, crons };
 }
 
 async function checkLrsOutbox(): Promise<Check> {
@@ -187,6 +241,10 @@ async function checkLrsOutbox(): Promise<Check> {
 // without a session starts, are not counted, so the public status depends on
 // no unauthenticated request. Every other event is counted as before.
 const EMAIL_CHECK_EVENTS_FILTER = `(${EMAIL_CHECK_IGNORED_EVENTS.join(",")})`;
+// A failed row whose error is daily_limit is a stop at an organisation's
+// daily limit, not a failed send: tenant_smtp carries it (rule FP8). A row
+// with no error is counted, as before.
+const EMAIL_CHECK_NOT_DAILY_LIMIT = "error.is.null,error.neq.daily_limit";
 
 async function checkEmail(): Promise<Check> {
   return timed(async () => {
@@ -197,6 +255,7 @@ async function checkEmail(): Promise<Check> {
       .select("id", { count: "exact", head: true })
       .eq("status", "failed")
       .not("event_type", "in", EMAIL_CHECK_EVENTS_FILTER)
+      .or(EMAIL_CHECK_NOT_DAILY_LIMIT)
       .gte("sent_at", sinceIso);
     if (error) return { status: "unknown", detail: error.message };
     const { count: sent } = await db
@@ -232,20 +291,48 @@ async function checkPlatformEmail(): Promise<Check> {
   });
 }
 
+/** `tenant_smtp` (ADR 0029 section H; rule FP8): counts by reading, from one call for every organisation. */
+async function checkTenantSmtp(): Promise<Check> {
+  return timedUnknown(async () => {
+    const overview = await readTenantSmtpOverview(svc());
+    if (overview.kind !== "ok") {
+      const r = classifyTenantSmtp(overview.kind);
+      return { status: r.status, detail: { no_0114: overview.kind === "missing" } };
+    }
+    const r = classifyTenantSmtp(
+      overview.rows.map((o) => ({ reading: o.reading, hasMembers: o.hasMembers === true, routineStopped: o.routineStopped }))
+    );
+    return { status: r.status, detail: { organisations: overview.rows.length, ...r.counts, no_0114: false } };
+  });
+}
+
+/** `mail_jobs` (rule FP3): code and link jobs started and lost, today and yesterday (UTC). */
+async function checkMailJobs(): Promise<Check> {
+  return timedUnknown(async () => {
+    const days = await readMailJobCounts(svc());
+    const r = classifyMailJobs(days);
+    if (r.started === null || r.lost === null) return { status: r.status, detail: { no_0114: days === "missing" } };
+    return { status: r.status, detail: { started: r.started, lost: r.lost, no_0114: false } };
+  });
+}
+
 export async function GET(request: Request) {
   const expectCrons = process.env.OPS_EXPECT_CRONS === "1";
   const authed =
     !!process.env.CRON_SECRET &&
     request.headers.get("x-cron-secret") === process.env.CRON_SECRET;
 
-  const [db, storage, crons, lrsOutbox, email, platformEmail] = await Promise.all([
+  const [db, storage, cronRead, lrsOutbox, email, platformEmail, tenantSmtp, mailJobs] = await Promise.all([
     checkDb(),
     checkStorage(),
-    checkCrons(expectCrons),
+    checkCrons(expectCrons, authed),
     checkLrsOutbox(),
     checkEmail(),
     authed ? checkPlatformEmail() : Promise.resolve(null),
+    authed ? checkTenantSmtp() : Promise.resolve(null),
+    authed ? checkMailJobs() : Promise.resolve(null),
   ]);
+  const crons = cronRead.check;
 
   const base = {
     db: db.status,
@@ -255,7 +342,7 @@ export async function GET(request: Request) {
     email: email.status,
   };
 
-  if (!authed || !platformEmail) {
+  if (!authed || !platformEmail || !tenantSmtp || !mailJobs) {
     // Without the email_checks: no unauthenticated request moves this status.
     const status = overallStatus(base);
     return NextResponse.json(
@@ -263,14 +350,31 @@ export async function GET(request: Request) {
       { status: status === "down" ? 503 : 200 }
     );
   }
-  const status = overallStatus({ ...base, platformEmail: platformEmail.status });
+  // From the one heartbeats read: the last skip, and the two mail crons.
+  const recipients = classifyMailRecipients({ rows: cronRead.rows, nowMs: Date.now() });
+  const mailRecipients: Check = { status: recipients.status, detail: { last_skip_at: recipients.last_skip_at } };
+  const mc = classifyMailCrons({ rows: cronRead.rows, crons: cronRead.crons, expectCrons });
+  const mailCrons: Check = { status: mc.status, detail: { expect_crons: mc.expect_crons, jobs: mc.jobs } };
+  const status = overallStatus({
+    ...base,
+    platformEmail: platformEmail.status,
+    tenantSmtp: tenantSmtp.status,
+    mailJobs: mailJobs.status,
+    mailRecipients: mailRecipients.status,
+  });
   return NextResponse.json(
     {
       status,
       ts: new Date().toISOString(),
       expect_crons: expectCrons,
       checks: { db, storage, crons, lrs_outbox: lrsOutbox, email },
-      email_checks: { platform_email: platformEmail },
+      email_checks: {
+        platform_email: platformEmail,
+        tenant_smtp: tenantSmtp,
+        mail_jobs: mailJobs,
+        mail_recipients: mailRecipients,
+        mail_crons: mailCrons,
+      },
     },
     { status: status === "down" ? 503 : 200 }
   );

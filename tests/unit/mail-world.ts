@@ -59,6 +59,12 @@ export type World = {
   writeFails: string[];
   /** The ops_heartbeats row a failed cron run reads before it writes (the carry), or none. */
   heartbeat: Row | null;
+  /** Each other organisation's 24-hour count, for tenant_mail_status of every organisation (the others' default to 0). */
+  otherSent: Record<string, number>;
+  /** notification_settings of every organisation, for a read with no organisation filter; null: the one row of `settings`, for ORG. */
+  allSettings: Row[] | null;
+  /** Tables that answer as not on this database (PGRST205). */
+  missingTables: string[];
 };
 
 /** The server answers at most this many rows, whatever a read asks (lib/db/chunked.ts). */
@@ -112,6 +118,9 @@ export function freshWorld(over: Partial<World> = {}): World {
     onRequest: null,
     writeFails: [],
     heartbeat: null,
+    otherSent: {},
+    allSettings: null,
+    missingTables: [],
     ...over,
   };
   return world;
@@ -286,8 +295,14 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     }
     return json(answer);
   }
+  if (world.missingTables.includes(table)) return json({ code: "PGRST205", message: `Could not find the table 'public.${table}' in the schema cache` }, 404);
   if (table === "notification_settings") {
     if (world.settings === "fail") return json({ code: "XX000", message: "stub read failure" }, 500);
+    if (!q.has("organization_id")) {
+      // Every organisation's settings (the health check and the console).
+      const all = world.allSettings ?? (world.settings ? [{ organization_id: ORG, ...world.settings }] : []);
+      return json(all.map((r) => project(r, select)));
+    }
     return json(world.settings ? [world.settings] : []);
   }
   if (table === "organizations") {
@@ -300,6 +315,17 @@ export const stub = async (input: RequestInfo | URL, init?: RequestInit): Promis
     if (world.status === "fail") return json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
     if (world.status === "empty") return json([]);
     const orgId = (body as Row | null)?.p_org;
+    if (orgId === null || orgId === undefined) {
+      // Every organisation that is not deleted, one row each.
+      const orgs = [...(world.org && world.org !== "fail" ? [world.org] : []), ...world.otherOrgs].filter((o) => o.deleted_at === null || o.deleted_at === undefined);
+      return json(
+        orgs.map((o) => {
+          const id = String(o.id);
+          const state = id === ORG ? world.state : world.otherStates.find((r) => r.organization_id === id) ?? null;
+          return { organization_id: id, ...statusColumns(state), sent_24h: id === ORG ? world.sent24h : world.otherSent[id] ?? 0 };
+        })
+      );
+    }
     const state = orgId === ORG ? world.state : world.otherStates.find((r) => r.organization_id === orgId) ?? null;
     return json([{ organization_id: orgId, ...statusColumns(state), sent_24h: world.sent24h }]);
   }

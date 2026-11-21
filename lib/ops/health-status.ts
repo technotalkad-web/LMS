@@ -14,10 +14,11 @@
  *   - any other stale job reads "fail".
  *
  * An errored last run (the owner's decision of 2026-11-15; ADR 0024, the note
- * of that date): a job in `erroredWarn` whose heartbeat is not stale and whose
- * last_status is not "ok" reads "warn", on production only. Staleness is read
- * first and keeps its rules. Any other job's errored last run still reads
- * "ok"; its state says last-run-errored.
+ * of that date; widened by ADR 0029, the owner's answer of 2026-11-20): a job
+ * in `erroredWarn` (lrs-forward, reminders and journey-nudges) whose
+ * heartbeat is not stale and whose last_status is not "ok" reads "warn", on
+ * production only. Staleness is read first and keeps its rules. Any other
+ * job's errored last run still reads "ok"; its state says last-run-errored.
  *
  * Email (ADR 0029 section H, decision 5):
  *   - the `email` check counts failed notification_log rows of every event
@@ -110,6 +111,11 @@ export type CronJobState = {
   age_min?: number;
 };
 
+/**
+ * `levels` holds what each job adds to the status (ok, warn or fail); the
+ * route keeps it out of checks.crons, whose shape does not change, and reads
+ * the two mail crons' levels for `mail_crons` from the same call.
+ */
 export function classifyCrons(input: {
   cadenceMin: Record<string, number>;
   staleWarnOnly: readonly string[];
@@ -118,18 +124,18 @@ export function classifyCrons(input: {
   rows: HeartbeatRow[];
   nowMs: number;
   expectCrons: boolean;
-}): { status: "ok" | "warn" | "fail"; jobs: Record<string, CronJobState> } {
+}): { status: "ok" | "warn" | "fail"; jobs: Record<string, CronJobState>; levels: Record<string, "ok" | "warn" | "fail"> } {
   const byName = new Map(input.rows.map((r) => [r.name, r]));
   const warnOnly = new Set(input.staleWarnOnly);
   const erroredWarn = new Set(input.erroredWarn);
   const jobs: Record<string, CronJobState> = {};
-  let failing = 0;
-  let warning = 0;
+  const levels: Record<string, "ok" | "warn" | "fail"> = {};
   for (const [name, cadence] of Object.entries(input.cadenceMin)) {
+    levels[name] = "ok";
     const row = byName.get(name);
     if (!row) {
       jobs[name] = { status: "never-seen" };
-      if (input.expectCrons) failing++;
+      if (input.expectCrons) levels[name] = "fail";
       continue;
     }
     const ageMin = Math.round((input.nowMs - new Date(row.last_run_at).getTime()) / 60_000);
@@ -141,13 +147,13 @@ export function classifyCrons(input: {
     };
     if (!input.expectCrons) continue;
     if (!isStale) {
-      if (erroredWarn.has(name) && row.last_status !== "ok") warning++;
+      if (erroredWarn.has(name) && row.last_status !== "ok") levels[name] = "warn";
       continue;
     }
-    if (warnOnly.has(name) && ageMin <= input.staleDegradedAfterMin) warning++;
-    else failing++;
+    levels[name] = warnOnly.has(name) && ageMin <= input.staleDegradedAfterMin ? "warn" : "fail";
   }
-  return { status: failing > 0 ? "fail" : warning > 0 ? "warn" : "ok", jobs };
+  const all = Object.values(levels);
+  return { status: all.includes("fail") ? "fail" : all.includes("warn") ? "warn" : "ok", jobs, levels };
 }
 
 /* ------------------------------------------------------------------------
@@ -444,8 +450,11 @@ export function classifyMailJobs(
 
 /**
  * db fail → down; storage, crons or platformEmail fail → degraded; any warn →
- * warn. platformEmail is given only for a caller that holds the secret: the
- * unauthenticated status is computed without it (ADR 0029 section H).
+ * warn. platformEmail, tenantSmtp, mailJobs and mailRecipients are given only
+ * for a caller that holds the secret: the unauthenticated status is computed
+ * without them (ADR 0029 section H). The last three never read above warn,
+ * so they never make the status degraded, and "unknown" moves nothing. The
+ * mail_crons check is no input: its reading is the crons check's own.
  */
 export function overallStatus(c: {
   db: CheckStatus;
@@ -454,9 +463,178 @@ export function overallStatus(c: {
   lrsOutbox: CheckStatus;
   email: CheckStatus;
   platformEmail?: CheckStatus;
+  tenantSmtp?: CheckStatus;
+  mailJobs?: CheckStatus;
+  mailRecipients?: CheckStatus;
 }): OverallStatus {
   if (c.db === "fail") return "down";
   if (c.storage === "fail" || c.crons === "fail" || c.platformEmail === "fail") return "degraded";
-  if ([c.crons, c.lrsOutbox, c.email, c.platformEmail].includes("warn")) return "warn";
+  if ([c.crons, c.lrsOutbox, c.email, c.platformEmail, c.tenantSmtp, c.mailJobs, c.mailRecipients].includes("warn")) return "warn";
   return "ok";
+}
+
+/* ------------------------------------------------------------------------
+ * ADR 0029 pull request B, stage 4: the two mail crons as the health check
+ * (mail_crons, with the secret) and the console's "Reminder jobs" block show
+ * them. Counts and fixed words only: everything comes through
+ * readMailCronDetail, and every sentence below is fixed text.
+ * ---------------------------------------------------------------------- */
+
+/** The two mail crons. */
+export const MAIL_CRON_JOBS = ["reminders", "journey-nudges"] as const;
+export type MailCronJob = (typeof MAIL_CRON_JOBS)[number];
+
+/**
+ * The two mail crons' schedule rules, for a reader that is not the health
+ * route (the console's page). The health route's lists are the source;
+ * tests/unit/cron-cadence.test.ts holds these equal to their entries there.
+ */
+export const MAIL_CRON_SCHEDULE = {
+  cadenceMin: { reminders: 26 * 60, "journey-nudges": 6 * 60 } as Record<MailCronJob, number>,
+  staleWarnOnly: ["journey-nudges"] as readonly string[],
+  staleDegradedAfterMin: 26 * 60,
+  erroredWarn: ["reminders", "journey-nudges"] as readonly string[],
+};
+
+/** One mail cron as mail_crons answers it and the console shows it. */
+export type MailCronJobReading = {
+  state: CronJobState["status"];
+  /** What the job adds to the crons check: ok when crons are not expected here. */
+  level: "ok" | "warn" | "fail";
+  last_run_at: string | null;
+  /** The last successful run; null is "not known". */
+  last_ok_at: string | null;
+  /** The last run's failure details, as the reader lets them through; null when the row has none it can read. */
+  failure: Omit<MailCronDetail, "known" | "last_ok_at"> | null;
+  pending: PendingReading;
+};
+
+/**
+ * `mail_crons` (returned under email_checks with the secret; ADR 0029, note
+ * of 2026-11-20, part 2, point 8). Its status repeats what the crons check
+ * reads for the two jobs, from the same classifyCrons call; it is not an
+ * input of the overall status. "unknown" when the heartbeats cannot be read.
+ */
+export function classifyMailCrons(input: {
+  rows: Array<{ name: string; last_run_at: string; last_status: string; last_detail?: unknown }> | "unreadable";
+  crons: { jobs: Record<string, CronJobState>; levels: Record<string, "ok" | "warn" | "fail"> } | null;
+  expectCrons: boolean;
+}): { status: CheckStatus; expect_crons: boolean; jobs: Partial<Record<MailCronJob, MailCronJobReading>> } {
+  if (input.rows === "unreadable" || !input.crons) return { status: "unknown", expect_crons: input.expectCrons, jobs: {} };
+  const rows = input.rows;
+  const jobs: Partial<Record<MailCronJob, MailCronJobReading>> = {};
+  let worst: "ok" | "warn" | "fail" = "ok";
+  for (const job of MAIL_CRON_JOBS) {
+    const state = input.crons.jobs[job];
+    if (!state) continue;
+    const level = input.crons.levels[job] ?? "ok";
+    if (level === "fail" || (level === "warn" && worst === "ok")) worst = level;
+    const row = rows.find((r) => r.name === job) ?? null;
+    const items = mailCronItems(row);
+    let failure: MailCronJobReading["failure"] = null;
+    if (items.details) {
+      failure = {};
+      for (const [k, v] of Object.entries(items.details)) {
+        if (k !== "known" && k !== "last_ok_at") (failure as Record<string, unknown>)[k] = v;
+      }
+    }
+    jobs[job] = {
+      state: state.status,
+      level,
+      last_run_at: row ? parsableTime(row.last_run_at) : null,
+      last_ok_at: items.lastOk,
+      failure,
+      pending: items.pending,
+    };
+  }
+  return { status: worst, expect_crons: input.expectCrons, jobs };
+}
+
+/**
+ * One fixed sentence for each word of a failed step (ADR 0029, note of
+ * 2026-11-20, part 2, point 5, and the note of 2026-11-21 (later)). The
+ * console shows these, with a count, and never a word it does not know.
+ * call_limit has two sentences: see callLimitSentence.
+ */
+export const CRON_ERROR_SENTENCES: Record<Exclude<CronErrorWord, "call_limit">, string> = {
+  config_read: "The job could not read its own settings (what has reminders on, or an organisation's time zone).",
+  members_read: "The job could not read who belongs to an organisation, a team or a group, or who their line managers are.",
+  assignments_read: "The job could not read the assignments or the journey enrolments.",
+  progress_read: "The job could not read the learners' progress.",
+  state_read: "The job could not read the record of earlier reminders.",
+  state_write: "A record of mail that went could not be written, so that mail can go again.",
+  profiles_read: "The job could not read the learners' or managers' email addresses.",
+  mail_status_read: "The job could not read an organisation's email state and daily count; its mail was still tried, with no daily limit.",
+  log_write: "The job could not write the log of the mail it tried.",
+  alert: "The job could not send an organisation's SMTP alert that was due.",
+  unknown: "Another step of the job failed.",
+};
+
+/**
+ * call_limit, by whether the run stopped before it sent anything: the job's
+ * own stop (it could not read who is due within one call), or the platform's
+ * own refusal part-way through a run (rule FP8).
+ */
+export function callLimitSentence(stoppedBeforeSend: boolean): string {
+  return stoppedBeforeSend
+    ? "The job could not read who is due within one call, so nothing was sent. Waiting does not clear this."
+    : "The job met the platform's limit on calls part-way through: what was sent is counted, and the rest waits for the next run.";
+}
+
+/** "n time(s)" after a sentence whose step failed more than once. */
+const times = (n: number) => (n > 1 ? ` (${n} times)` : "");
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * The failure details of a mail cron's last run as fixed sentences: each
+ * failed step's sentence with its count, the unreadable organisations, a
+ * stop before any send, and what was left for the next run. Counts and
+ * fixed words only; an empty list when there is nothing to say.
+ */
+export function mailCronFailureSentences(failure: MailCronJobReading["failure"]): string[] {
+  if (!failure) return [];
+  const out: string[] = [];
+  const errors = failure.errors ?? {};
+  for (const word of CRON_ERROR_WORDS) {
+    const n = errors[word];
+    if (!isCount(n) || n === 0) continue;
+    const sentence = word === "call_limit" ? callLimitSentence(failure.stopped_before_send === true) : CRON_ERROR_SENTENCES[word];
+    out.push(sentence + times(n));
+  }
+  if (isCount(failure.unreadable_orgs) && failure.unreadable_orgs > 0) {
+    out.push(`${plural(failure.unreadable_orgs, "organisation", "organisations")} could not be read, so nobody there was reminded in that run.`);
+  }
+  if (failure.stopped_before_send === true && !(isCount(errors.call_limit) && errors.call_limit > 0)) {
+    out.push("The run stopped before it sent anything.");
+  }
+  if (isCount(failure.left_orgs) && failure.left_orgs > 0) {
+    out.push(`${plural(failure.left_orgs, "organisation or program", "organisations or programs")} waited for the next run.`);
+  }
+  if (isCount(failure.left_daily_limit) && failure.left_daily_limit > 0) {
+    out.push(`${plural(failure.left_daily_limit, "reminder was", "reminders were")} held by an organisation's daily email limit.`);
+  }
+  if (failure.no_0114 === true) {
+    out.push("This database has no migration 0114 yet: no daily limit was applied and no email state was recorded.");
+  }
+  return out;
+}
+
+/** The pending reminders as shown: a number, "at least n", or "not known" with its reason. */
+export function pendingSentence(pending: PendingReading, failure: MailCronJobReading["failure"]): string {
+  if (pending.kind === "exact") return String(pending.n);
+  if (pending.kind === "at_least") return `at least ${pending.n}`;
+  return failure ? "not known: the run failed before it counted" : "not known";
+}
+
+/** The state of a mail cron as shown, and whether it counts here. */
+export function cronStateSentence(state: CronJobState["status"], expectCrons: boolean): string {
+  const base =
+    state === "ok"
+      ? "The last run ended cleanly."
+      : state === "last-run-errored"
+        ? "The last run failed."
+        : state === "stale"
+          ? "No run within its expected time."
+          : "No run has been recorded.";
+  return expectCrons ? base : `${base} Not scheduled here: shown, not counted.`;
 }

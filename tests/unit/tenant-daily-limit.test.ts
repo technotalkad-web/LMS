@@ -1,7 +1,9 @@
 /**
  * A daily limit for each tenant (ADR 0029, rule FP4 of the note of
- * 2026-11-18; lib/notifications/smtp-state.ts), the run's cases. The
- * readers' and the limit route's cases come with stage 4.
+ * 2026-11-18; lib/notifications/smtp-state.ts), the run's cases and the
+ * readers' cases (stage 4). The limit route's cases are in
+ * tests/unit/platform-email-console.test.ts, which signs in a platform
+ * owner.
  *   - the numbers: 375 where none is set, or the environment's default; the
  *     reserve a tenth, rounded up, at least 25; routine mail stops at 337 of
  *     375, 1,350 of 1,500, 5 of 30, and never below 0 for a limit under 25;
@@ -16,24 +18,41 @@
  *     count;
  *   - one alert, due from the moment routine mail stops;
  *   - when tenant_mail_status cannot be read, or 0114 is not pasted, no limit
- *     is applied and the send is attempted.
+ *     is applied and the send is attempted;
+ *   - the readers (stage 4): every organisation's reading, count and limit
+ *     from one call of tenant_mail_status for all of them, whether an
+ *     organisation that would warn has an active member, "missing" without
+ *     0114 and "unreadable" for any other failure; the code and link jobs'
+ *     counts; one organisation's notice for its banner and its Attention
+ *     Center item, in two calls (one for the count), with its four causes;
+ *     the provider gives no item for a state it cannot read and does not
+ *     throw, while settings that are incomplete still give not_configured
+ *     from the settings alone, and its item cannot be marked as read.
  *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
  * Run:  npx tsx tests/unit/tenant-daily-limit.test.ts   (or npm run test:unit)
  */
-import { ORG, eq, finish, freshWorld, installStub, logRows, removeStub, sends, stateWrites, statusCalls, world } from "./mail-world";
+import { ORG, OTHER_ORG, SMTP_SETTINGS, SUPABASE, eq, finish, freshWorld, installStub, logRows, removeStub, requests, sends, stateWrites, statusCalls, world } from "./mail-world";
 import {
   DAILY_LIMIT_RESERVE_MIN,
   DEFAULT_TENANT_DAILY_LIMIT,
+  NEAR_LIMIT_SHARE,
   RESERVE_EVENTS,
   dailyLimitAllows,
   drawsOnReserve,
   openRun,
+  readMailJobCounts,
+  readTenantMailNotice,
+  readTenantSmtpOverview,
   runReady,
   tenantDailyLimit,
+  tenantMailNoticeOf,
 } from "../../lib/notifications/smtp-state";
 import { sendMany, sendNotification, type SendArgs } from "../../lib/notifications/send";
+import { collectAttention } from "../../lib/attention/collect";
+import { ATTENTION_PROVIDERS } from "../../lib/attention/types";
+import { createClient } from "@supabase/supabase-js";
 
 const people = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `0b000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`, email: `person${i + 1}@tenant.stub` }));
 const routine = (p: { id: string; email: string }) => ({ event: "asset_reminder" as const, to: { user_id: p.id, email: p.email }, context: {} });
@@ -103,10 +122,108 @@ async function main() {
       const f = await sendMany(failed, people(3), routine);
       eq("the call fails: no limit, every send attempted, the failed read counted", [failed.limit, f.map((x) => x.status).join(","), failed.errors], [null, "sent,sent,sent", { mail_status_read: 1 }]);
     }
+
+    await readerCases();
   } finally {
     removeStub();
   }
   finish();
+}
+
+/* ------------------------------------------------ the readers (stage 4) */
+
+async function readerCases() {
+  const db = () => createClient(SUPABASE, "stub-service-key", { auth: { persistSession: false } });
+  const B = { id: OTHER_ORG, name: "Tenant B", slug: "tenant-b", deleted_at: null };
+  const member = (org: string, user: string, status = "active") => ({ organization_id: org, user_id: user, role: "user", status });
+  const healthy = { organization_id: ORG, state: "healthy", state_changed_at: "2026-11-20T08:00:00.000Z", failed_recipients: [], last_success_at: "2026-11-21T08:00:00.000Z", daily_limit: null };
+
+  console.log("\nthe readers: every organisation in one call (step 17)");
+  {
+    freshWorld({ otherOrgs: [B], state: { ...healthy }, sent24h: 12, allSettings: [{ organization_id: ORG, ...SMTP_SETTINGS }], members: [member(ORG, "u1"), member(OTHER_ORG, "u2")] });
+    const o = await readTenantSmtpOverview(db());
+    const calls = statusCalls();
+    eq("one call of tenant_mail_status for every organisation, with no organisation named", [calls.length, (calls[0]?.body as Record<string, unknown> | null)?.p_org], [1, null]);
+    eq("…each organisation's reading from its settings and its state", o.kind === "ok" ? o.rows.map((r) => [r.organization_id, r.reading, r.sent24h, r.limit.limit]) : o, [[ORG, "healthy", 12, DEFAULT_TENANT_DAILY_LIMIT], [OTHER_ORG, "not_configured", 0, DEFAULT_TENANT_DAILY_LIMIT]]);
+    eq("…whether it has an active member is read only for the one that would warn, in one read", [o.kind === "ok" ? o.rows.map((r) => r.hasMembers) : o, requests.filter((r) => r.table === "organization_members").length], [[null, true], 1]);
+    eq("…the settings read asks for the three fields that decide complete, never the password", requests.filter((r) => r.table === "notification_settings").map((r) => r.query.get("select")), ["organization_id,smtp_host,smtp_port,from_email"]);
+
+    freshWorld({ otherOrgs: [B], allSettings: [{ organization_id: ORG, ...SMTP_SETTINGS }], members: [member(OTHER_ORG, "u2", "inactive")] });
+    const quiet = await readTenantSmtpOverview(db());
+    eq("an organisation not configured with no active member: its member read says so", quiet.kind === "ok" ? quiet.rows.find((r) => r.organization_id === OTHER_ORG)?.hasMembers : quiet, false);
+
+    for (const [label, sent, stopped, atLimit] of [["336 of 375", 336, false, false], ["337 of 375: routine mail has stopped", 337, true, false], ["375 of 375: the limit", 375, true, true]] as const) {
+      freshWorld({ state: { ...healthy }, sent24h: sent, members: [member(ORG, "u1")] });
+      const r = await readTenantSmtpOverview(db());
+      eq(`${label}`, r.kind === "ok" ? [r.rows[0].routineStopped, r.rows[0].atLimit] : r, [stopped, atLimit]);
+    }
+    freshWorld({ state: { ...healthy, daily_limit: 1500 }, sent24h: 1349 });
+    const big = await readTenantSmtpOverview(db());
+    eq("a stored limit of 1,500: the number and the line where routine mail stops are the organisation's own", big.kind === "ok" ? [big.rows[0].storedLimit, big.rows[0].limit.routineStop, big.rows[0].routineStopped] : big, [1500, 1350, false]);
+
+    freshWorld({ status: "missing" });
+    eq("without 0114 (no such function): missing, and nothing else is read", [await readTenantSmtpOverview(db()), requests.filter((r) => r.table !== "rpc/tenant_mail_status").length], [{ kind: "missing" }, 0]);
+    freshWorld({ status: "fail" });
+    eq("any other failure of the call: unreadable, which is not missing", await readTenantSmtpOverview(db()), { kind: "unreadable" });
+    freshWorld({ settings: "fail" });
+    eq("the settings cannot be read: unreadable", await readTenantSmtpOverview(db()), { kind: "unreadable" });
+    freshWorld({ allSettings: [], membersFail: true });
+    eq("the member read fails for one that would warn: unreadable, never \"no members\"", await readTenantSmtpOverview(db()), { kind: "unreadable" });
+  }
+
+  console.log("\nthe readers: the code and link jobs (today and yesterday, UTC)");
+  {
+    const now = Date.parse("2026-11-21T10:00:00Z");
+    freshWorld({ tables: { mail_job_counts: [
+      { day: "2026-11-21", kind: "tenant", started: 4, finished: 3 },
+      { day: "2026-11-20", kind: "platform", started: 2, finished: 2 },
+      { day: "2026-11-19", kind: "tenant", started: 9, finished: 0 },
+    ] } });
+    eq("the two days' rows only, in one read", [await readMailJobCounts(db(), now), requests.length], [[
+      { day: "2026-11-21", kind: "tenant", started: 4, finished: 3 },
+      { day: "2026-11-20", kind: "platform", started: 2, finished: 2 },
+    ], 1]);
+    freshWorld({ missingTables: ["mail_job_counts"] });
+    eq("without 0114 (no such table): missing", await readMailJobCounts(db(), now), "missing");
+  }
+
+  console.log("\none organisation's notice: its banner and its Attention Center item (section E; rule FP4)");
+  {
+    const ok = (row: Record<string, unknown>) => ({ kind: "ok" as const, row: { organization_id: ORG, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0, ...row } as never });
+    const N = (settings: "complete" | "incomplete" | "unreadable", status: Parameters<typeof tenantMailNoticeOf>[0]["status"]) => tenantMailNoticeOf({ settings, status }, {});
+    eq("settings incomplete: not configured, from the settings alone, whatever the state read", [N("incomplete", { kind: "missing" }), N("incomplete", { kind: "unreadable", code: "x" })], [{ kind: "not_configured" }, { kind: "not_configured" }]);
+    eq("settings that cannot be read, or a state that cannot be read (0114 not pasted included): no notice", [N("unreadable", ok({})), N("complete", { kind: "missing" }), N("complete", { kind: "unreadable", code: "x" })], [null, null, null]);
+    eq("failing: since when, and the last error class", N("complete", ok({ state: "failing", state_changed_at: "2026-11-21T07:00:00.000Z", last_error_code: "auth" })), { kind: "failing", since: "2026-11-21T07:00:00.000Z", lastErrorClass: "auth" });
+    eq(`the count: a warning from ${NEAR_LIMIT_SHARE * 10} tenths (300 of 375), routine mail stopped (337), the limit (375); nothing below (299)`,
+      [299, 300, 337, 375].map((n) => N("complete", ok({ state: "healthy", sent_24h: n }))?.kind ?? null), [null, "near_limit", "routine_stopped", "limit_reached"]);
+
+    freshWorld({ state: { ...healthy }, sent24h: 340 });
+    const notice = await readTenantMailNotice(db(), ORG);
+    eq("read: two calls, one of them for the count", [notice, requests.length, statusCalls().length], [{ kind: "routine_stopped", sent24h: 340, limit: 375 }, 2, 1]);
+    eq("…the settings read asks for the three fields that decide complete, never the password", requests.filter((r) => r.table === "notification_settings").map((r) => r.query.get("select")), ["smtp_host,smtp_port,from_email"]);
+    freshWorld({ status: "fail" });
+    eq("read, the state cannot be read: no notice, no throw", await readTenantMailNotice(db(), ORG), null);
+
+    // The provider, through collectAttention with it alone enabled.
+    const onlyThis = { enabled: true, config: Object.fromEntries(ATTENTION_PROVIDERS.filter((p) => p.type !== "tenant-smtp").map((p) => [p.type, { enabled: false }])) };
+    const collect = async (dismissals = new Map<string, string>()) => (await collectAttention({ svc: db(), orgId: ORG, orgSlug: "tenant-a", settings: onlyThis, dismissals })).items;
+    eq("the provider is in the registry, critical by default, and first", [ATTENTION_PROVIDERS[0]?.type, ATTENTION_PROVIDERS[0]?.defaultPriority], ["tenant-smtp", "critical"]);
+    freshWorld({ settings: null, status: "missing" });
+    const nc = await collect(new Map([["tenant-smtp:not_configured", "2999-01-01T00:00:00.000Z"]]));
+    eq("settings incomplete, 0114 not pasted: one critical item, not configured, linking to Settings, that cannot be marked as read",
+      nc.map((i) => [i.key, i.priority, i.href, i.dismissible]), [["tenant-smtp:not_configured", "critical", "/tenant-a/settings", false]]);
+    freshWorld({ status: "missing" });
+    eq("settings complete, 0114 not pasted: no item", (await collect()).length, 0);
+    freshWorld({ status: "fail" });
+    eq("settings complete, the state cannot be read: no item, and no throw", (await collect()).length, 0);
+    freshWorld({ settings: "fail" });
+    eq("the settings cannot be read: no item", (await collect()).length, 0);
+    freshWorld({ state: { ...healthy }, sent24h: 310 });
+    eq("near the limit: one item, a warning (high), with the count and the limit", (await collect()).map((i) => [i.key, i.priority, i.context]), [["tenant-smtp:near_limit", "high", "310 of 375 sent in the last 24 hours. Routine email stops before the limit."]]);
+    freshWorld({ state: { ...healthy, state: "failing", last_error_code: "unreachable" } });
+    const f = await collect();
+    eq("failing: critical, with its last error class and no address", [f.map((i) => [i.key, i.priority]), /@/.test(JSON.stringify(f))], [[["tenant-smtp:failing", "critical"]], false]);
+  }
 }
 
 main().catch((e) => {

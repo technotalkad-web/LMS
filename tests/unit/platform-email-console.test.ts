@@ -19,6 +19,20 @@
  *   - the answer and the audit row say whether the sender's log row was
  *     written (logged).
  *
+ * ADR 0029 pull request B, stage 4 (step 17; rule FP4):
+ *   - POST /api/super/email/limit: a platform owner sets an organisation's
+ *     daily limit, or empties it for the default; the number it replaces is
+ *     read first, one write holds the organisation's id, the number and the
+ *     time, and one audit row holds the number before and after; a number
+ *     outside 1 to 100,000 is 400, an organisation not found or deleted is
+ *     404, and nothing is written; without migration 0114 it is refused
+ *     with the console's sentence that names the migration; a signed-in
+ *     user with no owner row gets 403 and nothing is read or written;
+ *   - /super/email: the page shows the reminder jobs through the fixed
+ *     sentences (the three forms of pending and "not known"), the line that
+ *     names migration 0114 in place of the list and the numbers, and no
+ *     database message.
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/platform-email-console.test.ts   (or npm run test:unit)
@@ -76,6 +90,12 @@ let auditRows: Array<Record<string, unknown>> = [];
 let logMissing = false;
 let adminEmail: string | null = OWNER.email;
 let ownerMfaRequired = false;
+/** The organisations the limit route reads, and tenant_smtp_state: its rows, or no 0114, or another failure. */
+const ORG_ID = "0a000000-0000-4000-8000-0000000000a1";
+const GONE_ID = "0a000000-0000-4000-8000-0000000000d1";
+let stateRows: Array<Record<string, unknown>> = [];
+let stateTable: "ok" | "missing" | "fail" = "ok";
+let stateWrites: Array<{ method: string; body: Record<string, unknown>; query: string }> = [];
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 
@@ -108,10 +128,32 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return json([]);
   }
   if (p === "/rest/v1/platform_audit_log" && method === "POST") { auditRows.push(JSON.parse(body)); return new Response(null, { status: 201 }); }
+  if (p === "/rest/v1/organizations") {
+    const id = (url.searchParams.get("id") ?? "").replace(/^eq\./, "");
+    const r = id === ORG_ID ? { id, deleted_at: null } : id === GONE_ID ? { id, deleted_at: "2026-11-01T00:00:00Z" } : null;
+    return json(object ? r : r ? [r] : []);
+  }
+  if (p === "/rest/v1/tenant_smtp_state") {
+    if (stateTable === "missing") return json({ code: "PGRST205", message: "Could not find the table 'public.tenant_smtp_state' in the schema cache" }, 404);
+    if (stateTable === "fail") return json({ code: "XX000", message: "stub failure" }, 500);
+    if (method === "GET") {
+      const id = (url.searchParams.get("organization_id") ?? "").replace(/^eq\./, "");
+      const r = stateRows.find((s) => s.organization_id === id) ?? null;
+      return json(object ? r : r ? [r] : []);
+    }
+    const rec = JSON.parse(body) as Record<string, unknown>;
+    stateWrites.push({ method, body: rec, query: url.search });
+    const existing = stateRows.find((s) => s.organization_id === rec.organization_id);
+    if (existing) Object.assign(existing, rec); else stateRows.push({ ...rec });
+    return new Response(null, { status: 201 });
+  }
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
   throw new Error(`stub: unexpected ${method} ${p}`);
 };
-const fresh = () => { requests = []; logRows = []; auditRows = []; logMissing = false; adminEmail = OWNER.email; ownerMfaRequired = false; browser.clear(); };
+const fresh = () => {
+  requests = []; logRows = []; auditRows = []; logMissing = false; adminEmail = OWNER.email; ownerMfaRequired = false; browser.clear();
+  stateRows = []; stateTable = "ok"; stateWrites = [];
+};
 const smtp = () => requests.filter((r) => r.path === "/functions/v1/send-smtp").map((r) => JSON.parse(r.body) as Record<string, unknown>);
 
 async function main() {
@@ -172,6 +214,63 @@ async function main() {
       fresh(); ownerMfaRequired = true; signIn(OWNER, "aal2");
       const ok = await post();
       eq("…the same owner at AAL2: sent", [ok.status, ((await ok.json()) as Record<string, unknown>).status, smtp().length], [200, "sent", 1]);
+    }
+
+    console.log("\nthe daily limit: POST /api/super/email/limit (step 17; rule FP4)");
+    {
+      const { TENANT_MAIL_NEEDS_0114 } = await import("../../lib/notifications/smtp-state");
+      const limit = await import("../../app/api/super/email/limit/route");
+      const set = async (b: unknown) => {
+        const res = await (limit.POST as unknown as (r: Request) => Promise<Response>)(new Request("http://lms.test/api/super/email/limit", { method: "POST", body: JSON.stringify(b) }));
+        return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+      };
+      fresh(); signIn(OWNER);
+      const first = await set({ organization_id: ORG_ID, daily_limit: 1500 });
+      eq("a platform owner sets 1,500: 200, the number, none before it, audited", [first.status, first.body], [200, { ok: true, daily_limit: 1500, previous: null, audited: true }]);
+      eq("…one write: the organisation's id, the number and the time, nothing else, on the organisation's row",
+        [stateWrites.length, Object.keys(stateWrites[0]?.body ?? {}).sort(), stateWrites[0]?.body.daily_limit, stateWrites[0]?.query.includes("on_conflict=organization_id")], [1, ["daily_limit", "organization_id", "updated_at"], 1500, true]);
+      eq("…one audit row with the number before and after, on the organisation",
+        auditRows.map((r) => [r.action, r.actor_user_id, r.target_type, r.target_id, JSON.stringify(r.metadata)]), [["tenant_email.daily_limit", OWNER.id, "organization", ORG_ID, JSON.stringify({ previous: null, daily_limit: 1500 })]]);
+      const back = await set({ organization_id: ORG_ID, daily_limit: null });
+      eq("emptied for the default: 200, null, and the number it replaced is read first", [back.status, back.body.daily_limit, back.body.previous, JSON.stringify(auditRows[1]?.metadata)], [200, null, 1500, JSON.stringify({ previous: 1500, daily_limit: null })]);
+
+      for (const bad of [0, 1.5, "1500", 100_001, -3]) {
+        fresh(); signIn(OWNER);
+        const r = await set({ organization_id: ORG_ID, daily_limit: bad });
+        eq(`a number outside 1 to 100,000 (${JSON.stringify(bad)}): 400, nothing written, no audit row`, [r.status, stateWrites.length, auditRows.length], [400, 0, 0]);
+      }
+      for (const [label, id] of [["an organisation that does not exist", "0a000000-0000-4000-8000-0000000000ff"], ["a deleted organisation", GONE_ID], ["an id that is not one", "acme"]] as const) {
+        fresh(); signIn(OWNER);
+        const r = await set({ organization_id: id, daily_limit: 100 });
+        eq(`${label}: 404, nothing written`, [r.status, stateWrites.length, auditRows.length], [404, 0, 0]);
+      }
+      fresh(); signIn(OWNER); stateTable = "missing";
+      const no0114 = await set({ organization_id: ORG_ID, daily_limit: 100 });
+      eq("without 0114: refused with the console's sentence that names the migration, nothing written, no audit row", [no0114.status, no0114.body.error, stateWrites.length, auditRows.length], [503, TENANT_MAIL_NEEDS_0114, 0, 0]);
+      eq("…the sentence names the migration", TENANT_MAIL_NEEDS_0114.includes("0114"), true);
+      fresh(); signIn(OWNER); stateTable = "fail";
+      const failed = await set({ organization_id: ORG_ID, daily_limit: 100 });
+      eq("another failure: 503 with the route's own words, nothing written, no audit row", [failed.status, String(failed.body.error).includes("stub"), stateWrites.length, auditRows.length], [503, false, 0, 0]);
+      fresh(); signIn(MEMBER);
+      const member = await set({ organization_id: ORG_ID, daily_limit: 100 });
+      eq("a signed-in user with no owner row: 403, and nothing is read beyond the guard or written", [member.status, requests.some((r) => r.path === "/rest/v1/tenant_smtp_state" || r.path === "/rest/v1/organizations"), auditRows.length], [403, false, 0]);
+    }
+
+    console.log("\n/super/email: the reminder jobs, and the line without 0114");
+    {
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const page = fs.readFileSync(path.resolve(__dirname, "../../app/(super-owner)/super/email/page.tsx"), "utf8");
+      const hs = await import("../../lib/ops/health-status");
+      eq("the page shows the jobs through the fixed sentences and the pending reminders' three forms",
+        ["cronStateSentence(", "mailCronFailureSentences(", "pendingSentence(", "classifyMailCrons(", "MAIL_CRON_SCHEDULE"].map((s) => page.includes(s)), [true, true, true, true, true]);
+      eq("…which read a number, at least n, and not known",
+        [hs.pendingSentence({ kind: "exact", n: 3 }, {}), hs.pendingSentence({ kind: "at_least", n: 3 }, {}), hs.pendingSentence({ kind: "not_known" }, null), hs.pendingSentence({ kind: "not_known" }, { stopped_before_send: true })],
+        ["3", "at least 3", "not known", "not known: the run failed before it counted"]);
+      eq("…the last successful run reads not known when none is known, and the page says so", page.includes('j.last_ok_at ? fmt(j.last_ok_at) : "not known"'), true);
+      eq("…without 0114 the sentence that names it stands in place of the list and the job numbers", (page.match(/TENANT_MAIL_NEEDS_0114/g) ?? []).length >= 3, true);
+      eq("…and where crons are not scheduled the page says so", page.includes("Not scheduled here: shown, not counted."), true);
+      eq("…no database message is shown: the page reads no error's message", /\.message\b/.test(page), false);
     }
   } finally {
     globalThis.fetch = realFetch;

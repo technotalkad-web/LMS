@@ -43,9 +43,14 @@
  * mail_status_read step. If a state write reports the table itself as
  * absent, writes are switched off for the rest of the run.
  *
- * recordRecipientsUnreadable (at the end of this file, ADR 0029 note of
- * 2026-11-19) is called once by a request whose recipient read failed and
- * which therefore sends nothing.
+ * recordRecipientsUnreadable (ADR 0029 note of 2026-11-19) is called once
+ * by a request whose recipient read failed and which therefore sends
+ * nothing.
+ *
+ * The readers at the end of this file (step 17) only read: every
+ * organisation's reading with its count and limit for the health check and
+ * the console, the code and link jobs' counts, and one organisation's
+ * notice for its banner and its Attention Center item.
  *
  * This module never sends tenant mail itself: lib/notifications/send.ts
  * renders and dispatches through the run (runMail), so the two files do not
@@ -59,7 +64,7 @@ import { isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-functi
 import { sendPlatformEmail } from "@/lib/email/platform-sender";
 import type { AlertErrorClass, AlertReading } from "@/lib/email/platform-templates";
 import { countingMemberIds } from "@/lib/auth/org-membership";
-import type { CallCounter } from "@/lib/db/chunked";
+import { chunk, readAllStrict, type CallCounter } from "@/lib/db/chunked";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { recordHeartbeat } from "@/lib/ops/heartbeat";
 import { MAIL_RECIPIENTS_HEARTBEAT, type CronErrorCounts, type CronErrorWord, type TenantReading } from "@/lib/ops/health-status";
@@ -1273,6 +1278,193 @@ export async function sendDueAlert(opts: {
   );
   const sent = outcomes.filter(Boolean).length;
   return { kind: "sent", reading, recipients: recipients.length, sent, failed: recipients.length - sent };
+}
+
+/* ------------------------------------- readers for health and the console */
+
+/**
+ * The console's line where the organisations' email state, counts and
+ * limits would be, and the limit route's refusal, on a database without
+ * migration 0114: one sentence for both (ADR 0029 step 17).
+ */
+export const TENANT_MAIL_NEEDS_0114 =
+  "Migration 0114 is not on this database yet, so the organisations' email state, daily counts and daily limits are not kept here: they cannot be shown or set.";
+
+/** One organisation's email as the health check and the console read it (ADR 0029 step 17). */
+export type TenantSmtpOverviewRow = {
+  organization_id: string;
+  reading: TenantReading;
+  since: string | null;
+  lastErrorClass: string | null;
+  lastSuccessAt: string | null;
+  sent24h: number;
+  /** The number a platform owner set; null: the default applies. */
+  storedLimit: number | null;
+  limit: DailyLimit;
+  /** Routine mail has stopped: the count is at the limit less its reserve. */
+  routineStopped: boolean;
+  /** The full limit is reached: nothing more is attempted. */
+  atLimit: boolean;
+  /** Whether it has an active member: read only for one that would warn, null otherwise. */
+  hasMembers: boolean | null;
+};
+
+export type TenantSmtpOverview = { kind: "ok"; rows: TenantSmtpOverviewRow[] } | { kind: "missing" } | { kind: "unreadable" };
+
+/**
+ * The organisations among `ids` that have an active member, by keyset over
+ * the organisation id: a full page moves past its last organisation, so no
+ * answer is cut at the row cap and a large organisation costs one page. Ids
+ * in lists of 150. "unreadable" when any read failed: never "no members".
+ */
+async function organisationsWithActiveMembers(db: SupabaseClient, ids: readonly string[]): Promise<Set<string> | "unreadable"> {
+  const found = new Set<string>();
+  for (const part of chunk([...new Set(ids)], 150)) {
+    let after: string | null = null;
+    for (;;) {
+      let q = db.from("organization_members").select("organization_id").in("organization_id", part).eq("status", "active").order("organization_id").limit(1000);
+      if (after) q = q.gt("organization_id", after);
+      const { data, error } = await q;
+      if (error || !Array.isArray(data)) return "unreadable";
+      const rows = data as Array<{ organization_id: string }>;
+      for (const r of rows) found.add(r.organization_id);
+      if (rows.length < 1000) break;
+      after = rows[rows.length - 1].organization_id;
+    }
+  }
+  return found;
+}
+
+/**
+ * Every organisation that is not deleted, with its reading, its 24-hour
+ * count and its daily limit (ADR 0029 step 17; rule FP4): tenant_mail_status
+ * once for all of them, the settings' three fields that decide "complete",
+ * and, for those that would warn, whether they have an active member. Pages
+ * of 1000 rows. "missing" when the function is not on this database (0114
+ * not pasted, read by the error's code); any other failure is "unreadable".
+ * Never throws. Holds no address and no password.
+ */
+export async function readTenantSmtpOverview(db: SupabaseClient, env: Env = process.env): Promise<TenantSmtpOverview> {
+  try {
+    let statusError: unknown = null;
+    const status = await readAllStrict<Record<string, unknown>>(async (from, to) => {
+      const answer = await db.rpc("tenant_mail_status", { p_org: null }).order("organization_id").range(from, to);
+      if (answer.error) statusError = answer.error;
+      return answer;
+    });
+    if (status === "unreadable" || status === "no_room") {
+      return isSchemaMissing(statusError as { code?: string | null; message?: string | null } | null) ? { kind: "missing" } : { kind: "unreadable" };
+    }
+    const settings = await readAllStrict<{ organization_id: string; smtp_host: string | null; smtp_port: number | null; from_email: string | null }>((from, to) =>
+      db.from("notification_settings").select("organization_id, smtp_host, smtp_port, from_email").order("organization_id").range(from, to)
+    );
+    if (settings === "unreadable" || settings === "no_room") return { kind: "unreadable" };
+    const complete = new Set(settings.filter((s) => s.smtp_host && s.smtp_port && s.from_email).map((s) => s.organization_id));
+    const rows: TenantSmtpOverviewRow[] = status.map((raw) => {
+      const r = statusRow(raw);
+      const limit = tenantDailyLimit(r.daily_limit, env);
+      return {
+        organization_id: r.organization_id,
+        reading: readingOf({ settingsComplete: complete.has(r.organization_id), deleted: false, state: r.state }),
+        since: r.state_changed_at,
+        lastErrorClass: r.last_error_code,
+        lastSuccessAt: r.last_success_at,
+        sent24h: r.sent_24h,
+        storedLimit: r.daily_limit,
+        limit,
+        routineStopped: r.sent_24h >= limit.routineStop,
+        atLimit: r.sent_24h >= limit.limit,
+        hasMembers: null,
+      };
+    });
+    const wouldWarn = rows.filter((r) => r.reading === "failing" || r.reading === "not_configured" || r.routineStopped);
+    if (wouldWarn.length > 0) {
+      const withMembers = await organisationsWithActiveMembers(db, wouldWarn.map((r) => r.organization_id));
+      if (withMembers === "unreadable") return { kind: "unreadable" };
+      for (const r of wouldWarn) r.hasMembers = withMembers.has(r.organization_id);
+    }
+    return { kind: "ok", rows };
+  } catch {
+    return { kind: "unreadable" };
+  }
+}
+
+/** One UTC day's code and link jobs (mail_job_counts, 0114). */
+export type MailJobDay = { day: string; kind: string; started: number; finished: number };
+
+/**
+ * The code and link jobs of today and yesterday (UTC), as `mail_jobs` and
+ * the console read them. "missing" when the table is not on this database
+ * (0114 not pasted, read by the error's code); any other failure is
+ * "unreadable". At most four rows. Never throws.
+ */
+export async function readMailJobCounts(db: SupabaseClient, nowMs: number = Date.now()): Promise<MailJobDay[] | "missing" | "unreadable"> {
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const yesterday = new Date(nowMs - 86_400_000).toISOString().slice(0, 10);
+  try {
+    const { data, error } = await db.from("mail_job_counts").select("day, kind, started, finished").in("day", [yesterday, today]);
+    if (error) return isMissingRelation(error, "mail_job_counts") ? "missing" : "unreadable";
+    if (!Array.isArray(data)) return "unreadable";
+    return (data as Array<Record<string, unknown>>).map((r) => ({
+      day: String(r.day ?? ""),
+      kind: String(r.kind ?? ""),
+      started: typeof r.started === "number" ? r.started : 0,
+      finished: typeof r.finished === "number" ? r.finished : 0,
+    }));
+  } catch {
+    return "unreadable";
+  }
+}
+
+/** From this share of the daily limit the banner and the Attention Center warn (rule FP4: eight tenths). */
+export const NEAR_LIMIT_SHARE = 0.8;
+
+/**
+ * What an organisation's administrators are told on its pages (section E;
+ * rule FP4): its email is not set up, it is failing, or its daily count is
+ * near the limit, past the line where routine mail stops, or at the limit.
+ */
+export type TenantMailNotice =
+  | { kind: "not_configured" }
+  | { kind: "failing"; since: string | null; lastErrorClass: string | null }
+  | { kind: "limit_reached" | "routine_stopped" | "near_limit"; sent24h: number; limit: number };
+
+/**
+ * The notice from the settings and the status read. Settings that could not
+ * be read, and a status that could not be read (0114 not pasted included),
+ * give no notice; settings that are incomplete give not_configured from the
+ * settings alone.
+ */
+export function tenantMailNoticeOf(input: { settings: "complete" | "incomplete" | "unreadable"; status: StatusRead }, env: Env = process.env): TenantMailNotice | null {
+  if (input.settings === "unreadable") return null;
+  if (input.settings === "incomplete") return { kind: "not_configured" };
+  if (input.status.kind !== "ok") return null;
+  const row = input.status.row;
+  if (row.state === "failing") return { kind: "failing", since: row.state_changed_at, lastErrorClass: row.last_error_code };
+  const limit = tenantDailyLimit(row.daily_limit, env);
+  if (row.sent_24h >= limit.limit) return { kind: "limit_reached", sent24h: row.sent_24h, limit: limit.limit };
+  if (row.sent_24h >= limit.routineStop) return { kind: "routine_stopped", sent24h: row.sent_24h, limit: limit.limit };
+  if (row.sent_24h >= NEAR_LIMIT_SHARE * limit.limit) return { kind: "near_limit", sent24h: row.sent_24h, limit: limit.limit };
+  return null;
+}
+
+/**
+ * One organisation's notice, for its banner and its Attention Center item:
+ * two calls, the settings' three fields and tenant_mail_status. Never
+ * throws; a read that fails gives no notice.
+ */
+export async function readTenantMailNotice(db: SupabaseClient, organizationId: string): Promise<TenantMailNotice | null> {
+  try {
+    const [settingsRead, status] = await Promise.all([
+      db.from("notification_settings").select("smtp_host, smtp_port, from_email").eq("organization_id", organizationId).maybeSingle(),
+      readTenantMailStatus(db, organizationId),
+    ]);
+    const s = settingsRead.data as { smtp_host?: string | null; smtp_port?: number | null; from_email?: string | null } | null;
+    const settings = settingsRead.error ? "unreadable" : s && s.smtp_host && s.smtp_port && s.from_email ? "complete" : "incomplete";
+    return tenantMailNoticeOf({ settings, status });
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------- the skip helper */

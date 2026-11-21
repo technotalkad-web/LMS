@@ -6,8 +6,9 @@ import { carriedLastOk } from "./health-status";
  * recordHeartbeat(<job name>) at the end of a run (including runs that found
  * no work — a quiet period must still read as "alive"). /api/ops/health then
  * flags any job whose last_run_at is older than its expected cadence, and a
- * job of its ERRORED_WARN list whose last run passed ok = false
- * (lib/ops/health-status.ts).
+ * job of its ERRORED_WARN list (lrs-forward, reminders, journey-nudges)
+ * whose last run passed ok = false (lib/ops/health-status.ts). The health
+ * route reads last_detail only for a caller with the secret.
  *
  * Not every row is a job: MAIL_RECIPIENTS_HEARTBEAT (lib/ops/health-status.ts)
  * marks the latest request that skipped its mail because the recipient read

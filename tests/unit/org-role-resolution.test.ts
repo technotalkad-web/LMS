@@ -147,6 +147,7 @@ const READS: Record<string, Entry> = {
   "lib/manager/coverage.ts#q#1": { cls: "subject", reason: "manager list" },
   "lib/manager/insights.ts#computeLearnerInsights#1": { cls: "subject", reason: "learner dimensions (fetchByIds)" },
   "lib/manager/insights.ts#computeLearnerInsights#2": { cls: "subject", reason: "learner dimensions, pre-0096 columns (fetchByIds)" },
+  "lib/notifications/smtp-state.ts#organisationsWithActiveMembers#1": { cls: "subject", reason: "health check and console (ADR 0029 step 17): which organisations that would warn have an active member, by organisation id only" },
   "lib/org/groups.ts#q#1": { cls: "subject", reason: "dynamic group members (active rows)" },
   "lib/org/groups.ts#q#2": { cls: "subject", reason: "dynamic group members (active rows), the strict reader for mail (ADR 0029): a failed read is never nobody" },
   "lib/org/reporting-line.ts#q#1": { cls: "subject", reason: "the whole hierarchy, every status by design" },

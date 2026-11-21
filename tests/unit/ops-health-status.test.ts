@@ -23,8 +23,7 @@
  *     the status, the time and checks.<name>.status, so it never prints the
  *     new check.
  *
- * ADR 0029 pull request B, the pure rules (stage 1; the route's wiring and
- * the ERRORED_WARN list come with stage 4):
+ * ADR 0029 pull request B, the pure rules (stage 1):
  *   - `mail_recipients` (note of 2026-11-19): warn for 24 hours after a
  *     skipped request's row, ok with none or an older one, unknown when the
  *     heartbeats cannot be read, never fail, and no schedule rule;
@@ -41,28 +40,60 @@
  *     and carries the time; a clean run makes no read and writes no time;
  *   - `tenant_smtp` and `mail_jobs`: warn, unknown, never fail.
  *
+ * ADR 0029 pull request B, stage 4 (step 17; the note of 2026-11-20, part 2;
+ * the note of 2026-11-21 (later)):
+ *   - classifyCrons answers each job's level beside its state; the overall
+ *     status takes tenant_smtp, mail_jobs and mail_recipients (warn at most,
+ *     unknown moves nothing) and not mail_crons;
+ *   - mail_crons: its status repeats the two jobs' levels, its jobs hold the
+ *     state, the last run, the last successful run, the failure details as
+ *     the reader lets them through and the pending reminders; "unknown" when
+ *     the heartbeats cannot be read;
+ *   - the console's fixed sentences: one for each word, call_limit split by
+ *     whether the run stopped before it sent, state_write, the organisations
+ *     left, the three forms of pending and "not known", and "not scheduled
+ *     here: shown, not counted";
+ *   - the route: ERRORED_WARN names the three jobs, so a fresh failed run of
+ *     reminders or journey-nudges reads warn on production, with and
+ *     without the secret, and not on staging; tenant_smtp, mail_jobs,
+ *     mail_recipients and mail_crons are under email_checks with the secret
+ *     and none of them is read for a caller without it; last_detail is read
+ *     only for a caller with the secret; checks.crons keeps its shape; the
+ *     email check does not count rows with the error daily_limit; without
+ *     0114 tenant_smtp and mail_jobs read unknown and the status does not
+ *     move; a stored detail with a slug or a message reaches no answer;
+ *     what ops-watch.yml prints for a failed reminders run is crons: warn
+ *     and nothing new.
+ *
  * Run:  npx tsx tests/unit/ops-health-status.test.ts   (or npm run test:unit)
  * (No DB, no network.)
  */
 import fs from "node:fs";
 import path from "node:path";
 import {
+  CRON_ERROR_SENTENCES,
   CRON_ERROR_WORDS,
   EMAIL_CHECK_IGNORED_EVENTS,
+  MAIL_CRON_JOBS,
   MAIL_RECIPIENTS_HEARTBEAT,
   MAIL_RECIPIENTS_WARN_HOURS,
   buildMailCronDetail,
+  callLimitSentence,
   carriedLastOk,
   classifyCrons,
+  classifyMailCrons,
   classifyMailJobs,
   classifyMailRecipients,
   classifyPlatformEmail,
   classifyTenantSmtp,
+  cronStateSentence,
   lastSuccessfulRun,
+  mailCronFailureSentences,
   mailCronItems,
   overallStatus,
   owedAfterRun,
   pendingOf,
+  pendingSentence,
   readMailCronDetail,
   type CheckStatus,
 } from "../../lib/ops/health-status";
@@ -295,6 +326,73 @@ console.log("\ntenant_smtp and mail_jobs (never fail)");
   eq("mail_jobs: cannot be read, or no 0114 → unknown", [classifyMailJobs("unreadable").status, classifyMailJobs("missing").status], ["unknown", "unknown"]);
 }
 
+console.log("\nstage 4: each job's level, and the overall status with the secret's checks");
+{
+  const c = crons(with_("lrs-forward", 31));
+  eq("classifyCrons answers each job's level beside its state", [c.levels["lrs-forward"], c.levels.reaper, c.jobs["lrs-forward"].status], ["warn", "ok", "stale"]);
+  eq("…a daily job stale is fail; on staging every level is ok", [crons(with_("reaper", 26 * 60 + 1)).levels.reaper, Object.values(crons([], false).levels).every((l) => l === "ok")], ["fail", true]);
+  for (const k of ["tenantSmtp", "mailJobs", "mailRecipients"] as const) {
+    eq(`${k}: warn → warn, unknown → ok, never degraded`, [op({ [k]: "warn" }), op({ [k]: "unknown" }), op({ [k]: "ok" })], ["warn", "ok", "ok"]);
+  }
+  eq("without them (the unauthenticated status) the rules of before", [op({ crons: "warn" }), op({})], ["warn", "ok"]);
+}
+
+console.log("\nstage 4: mail_crons");
+{
+  const CAD = { "lrs-forward": 30, reminders: 26 * 60, "journey-nudges": 360 };
+  const LIST = ["lrs-forward", "reminders", "journey-nudges"];
+  type R = { name: string; last_run_at: string; last_status: string; last_detail?: unknown };
+  const run = (rows: R[], expectCrons = true) => {
+    const cl = classifyCrons({ cadenceMin: CAD, staleWarnOnly: ["lrs-forward", "journey-nudges"], staleDegradedAfterMin: CEILING, erroredWarn: LIST, rows, nowMs: NOW, expectCrons });
+    return { cl, mc: classifyMailCrons({ rows, crons: cl, expectCrons }) };
+  };
+  const callLimitStop = { v: 1, failed_steps: 1, unreadable_orgs: 0, stopped_before_send: true, left_orgs: 1, no_0114: false, errors: { call_limit: 1 }, last_ok_at: ago(26 * 60) };
+  const rows: R[] = [
+    { name: "lrs-forward", last_run_at: ago(3), last_status: "ok" },
+    { name: "reminders", last_run_at: ago(60), last_status: "error", last_detail: { ...callLimitStop, orgs: ["acme"], error: "permission denied for person@tenant.stub" } },
+    { name: "journey-nudges", last_run_at: ago(30), last_status: "ok", last_detail: { v: 1, failed_steps: 0, unreadable_orgs: 0, stopped_before_send: false, due: 9, sent: 4, failed: 0, left: 5, left_complete: false, left_orgs: 1, no_0114: false } },
+  ];
+  const { cl, mc } = run(rows);
+  eq("its status repeats the two jobs' levels from the same call (reminders failed: warn)", [mc.status, cl.levels.reminders, cl.status], ["warn", "warn", "warn"]);
+  eq("…the jobs are exactly the two mail crons", Object.keys(mc.jobs).sort(), [...MAIL_CRON_JOBS].sort());
+  const rem = mc.jobs.reminders!;
+  eq("reminders: its state, its last run, its carried last success, pending not known", [rem.state, rem.level, rem.last_run_at, rem.last_ok_at, rem.pending], ["last-run-errored", "warn", ago(60), ago(26 * 60), { kind: "not_known" }]);
+  eq("…its failure details hold the counts and words the reader lets through, and no slug or message", [rem.failure?.errors, rem.failure?.stopped_before_send, rem.failure?.left_orgs, JSON.stringify(mc).match(/acme|person@|permission/g)], [{ call_limit: 1 }, true, 1, null]);
+  const jn = mc.jobs["journey-nudges"]!;
+  eq("journey-nudges: ok, its own time is its last success, pending at least 5", [jn.state, jn.level, jn.last_ok_at, jn.pending], ["ok", "ok", ago(30), { kind: "at_least", n: 5 }]);
+  const staging = run(rows, false);
+  eq("crons not expected (staging): every level ok, the status ok, the failed run still says so", [staging.mc.status, staging.mc.jobs.reminders?.state, staging.mc.jobs.reminders?.level, staging.mc.expect_crons], ["ok", "last-run-errored", "ok", false]);
+  eq("the heartbeats cannot be read → unknown, no jobs", classifyMailCrons({ rows: "unreadable", crons: null, expectCrons: true }), { status: "unknown", expect_crons: true, jobs: {} });
+  const stale = run([{ name: "reminders", last_run_at: ago(26 * 60 + 1), last_status: "ok", last_detail: { v: 1 } }]);
+  eq("a stale reminders reads fail, as crons does; a job never seen reads its state", [stale.mc.status, stale.mc.jobs.reminders?.state, stale.mc.jobs["journey-nudges"]?.state, stale.mc.jobs["journey-nudges"]?.last_run_at], ["fail", "stale", "never-seen", null]);
+}
+
+console.log("\nstage 4: the console's fixed sentences");
+{
+  eq("one fixed sentence for every word but call_limit", Object.keys(CRON_ERROR_SENTENCES).sort(), CRON_ERROR_WORDS.filter((w) => w !== "call_limit").sort());
+  eq("call_limit, stopped before any send: the job could not read who is due within one call, nothing was sent, waiting does not clear it",
+    callLimitSentence(true), "The job could not read who is due within one call, so nothing was sent. Waiting does not clear this.");
+  eq("call_limit part-way: the platform's limit met part-way, what was sent is counted, the rest waits",
+    callLimitSentence(false), "The job met the platform's limit on calls part-way through: what was sent is counted, and the rest waits for the next run.");
+  eq("state_write: a record of mail that went could not be written, so it can go again", CRON_ERROR_SENTENCES.state_write, "A record of mail that went could not be written, so that mail can go again.");
+  const stop = mailCronFailureSentences({ failed_steps: 1, unreadable_orgs: 0, stopped_before_send: true, left_orgs: 1, errors: { call_limit: 1 } });
+  eq("the job's own stop: its sentence, and the organisations or programs that waited", stop, [callLimitSentence(true), "1 organisation or program waited for the next run."]);
+  const partWay = mailCronFailureSentences({ failed_steps: 3, unreadable_orgs: 2, stopped_before_send: false, errors: { call_limit: 1, state_write: 2 } });
+  eq("the platform part-way, two failed writes and two organisations unread", partWay, [
+    `${CRON_ERROR_SENTENCES.state_write} (2 times)`,
+    callLimitSentence(false),
+    "2 organisations could not be read, so nobody there was reminded in that run.",
+  ]);
+  eq("a run that stopped before any send for another step says so", mailCronFailureSentences({ stopped_before_send: true, errors: { config_read: 1 } }), [CRON_ERROR_SENTENCES.config_read, "The run stopped before it sent anything."]);
+  eq("a clean run with organisations left: they wait for the next run", mailCronFailureSentences({ failed_steps: 0, left_orgs: 3, stopped_before_send: false }), ["3 organisations or programs waited for the next run."]);
+  eq("nothing to say: no sentence; no detail: none", [mailCronFailureSentences({ failed_steps: 0, stopped_before_send: false }), mailCronFailureSentences(null)], [[], []]);
+  eq("pending, three forms: a number, at least n, not known", [pendingSentence({ kind: "exact", n: 0 }, null), pendingSentence({ kind: "at_least", n: 4 }, {}), pendingSentence({ kind: "not_known" }, null)], ["0", "at least 4", "not known"]);
+  eq("…not known after a run that failed before it counted says so", pendingSentence({ kind: "not_known" }, { stopped_before_send: true }), "not known: the run failed before it counted");
+  eq("the state, scheduled and not", [cronStateSentence("last-run-errored", true), cronStateSentence("ok", false)], ["The last run failed.", "The last run ended cleanly. Not scheduled here: shown, not counted."]);
+  const all = [...Object.values(CRON_ERROR_SENTENCES), callLimitSentence(true), callLimitSentence(false)].join(" ");
+  eq("no sentence holds an address, an id or a database word", /@|[0-9a-f]{8}-|duplicate key|violates/i.test(all), false);
+}
+
 /* ---------------- recordHeartbeat's fourth argument ---------------- */
 
 async function heartbeatCarryTests() {
@@ -348,6 +446,16 @@ let notificationRows: LogRow[] = [];
 let platformRows: LogRow[] = [];
 let platformTableMissing = false;
 let requests: Array<{ method: string; path: string; query: URLSearchParams }> = [];
+/** ops_heartbeats rows, answered with the columns a read selects. */
+let heartbeatRows: LogRow[] = [];
+/** The authenticated answer for a failed reminders run on production, for what the watchdog prints. */
+let failedRemindersBody: Record<string, unknown> | null = null;
+/** tenant_mail_status for every organisation: its rows, or no 0114, or another failure. */
+let tenantStatus: "missing" | "fail" | Array<Record<string, unknown>> = [];
+let settingsRows: Array<Record<string, unknown>> = [];
+let memberRows: LogRow[] = [];
+/** mail_job_counts: its rows, or no 0114, or another failure. */
+let jobCounts: "missing" | "fail" | Array<Record<string, unknown>> = [];
 
 function splitTop(s: string): string[] {
   const out: string[] = [];
@@ -361,6 +469,9 @@ function splitTop(s: string): string[] {
   return out;
 }
 function evalOp(val: string | null | undefined, opv: string): boolean {
+  if (opv === "is.null") return val === null || val === undefined;
+  if (opv.startsWith("neq.")) return val !== null && val !== undefined && String(val) !== opv.slice(4);
+  if (opv.startsWith("gt.")) return val !== null && val !== undefined && String(val) > opv.slice(3);
   if (opv.startsWith("eq.")) return String(val) === opv.slice(3);
   if (opv.startsWith("gte.")) return String(val) >= opv.slice(4);
   if (opv.startsWith("lte.")) return String(val) <= opv.slice(4);
@@ -393,7 +504,25 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const p = url.pathname;
   if (p === "/storage/v1/bucket") return jsonRes([]);
   if (p === "/rest/v1/organizations") return countRes(1);
-  if (p === "/rest/v1/ops_heartbeats") return jsonRes([]);
+  if (p === "/rest/v1/ops_heartbeats") {
+    const cols = (url.searchParams.get("select") ?? "").split(",").map((c) => c.trim());
+    return jsonRes(heartbeatRows.map((r) => Object.fromEntries(cols.map((c) => [c, r[c] ?? null]))));
+  }
+  if (p === "/rest/v1/rpc/tenant_mail_status") {
+    if (tenantStatus === "missing") return jsonRes({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+    if (tenantStatus === "fail") return jsonRes({ code: "57014", message: "canceling statement due to statement timeout for org acme" }, 500);
+    return jsonRes(tenantStatus);
+  }
+  if (p === "/rest/v1/notification_settings") return jsonRes(settingsRows);
+  if (p === "/rest/v1/organization_members") {
+    const found = memberRows.filter((r) => matches(r, url.searchParams)).sort((a, b) => String(a.organization_id).localeCompare(String(b.organization_id)));
+    return jsonRes(found.slice(0, Number(url.searchParams.get("limit") ?? "1000")));
+  }
+  if (p === "/rest/v1/mail_job_counts") {
+    if (jobCounts === "missing") return jsonRes({ code: "PGRST205", message: "Could not find the table 'public.mail_job_counts' in the schema cache" }, 404);
+    if (jobCounts === "fail") return jsonRes({ code: "XX000", message: "stub read failure" }, 500);
+    return jsonRes(jobCounts.filter((r) => matches(r as LogRow, url.searchParams)));
+  }
   if (p === "/rest/v1/lrs_forward_outbox") return countRes(0);
   if (p === "/rest/v1/notification_log" && method === "HEAD") return countRes(notificationRows.filter((r) => matches(r, url.searchParams)).length);
   if (p === "/rest/v1/platform_email_log") {
@@ -432,7 +561,11 @@ async function routeTests() {
       return { http: res.status, body: (await res.json()) as Record<string, unknown> };
     };
     const configure = (on: boolean) => { for (const [k, v] of Object.entries(PLATFORM_ENV)) { if (on) process.env[k] = v; else delete process.env[k]; } };
-    const fresh = () => { notificationRows = []; platformRows = []; platformTableMissing = false; };
+    const fresh = () => {
+      notificationRows = []; platformRows = []; platformTableMissing = false;
+      heartbeatRows = []; tenantStatus = []; settingsRows = []; memberRows = []; jobCounts = [];
+      delete process.env.OPS_EXPECT_CRONS;
+    };
     const platformStatus = (b: Record<string, unknown>) => ((b.email_checks as Record<string, { status: string }>)?.platform_email?.status);
 
     console.log("\nthe route: the unauthenticated answer and email_checks");
@@ -445,7 +578,9 @@ async function routeTests() {
       const full = await call(true);
       eq("with the secret: degraded while the sender is not configured", full.body.status, "degraded");
       eq("…checks holds exactly the five checks of before", Object.keys(full.body.checks as object).sort(), ["crons", "db", "email", "lrs_outbox", "storage"]);
-      eq("…email_checks holds platform_email, and nothing of it is under checks", [Object.keys(full.body.email_checks as object), JSON.stringify(full.body.checks).includes("platform")], [["platform_email"], false]);
+      eq("…email_checks holds platform_email and the four checks of pull request B, and nothing of them is under checks",
+        [Object.keys(full.body.email_checks as object).sort(), /platform|tenant_smtp|mail_jobs|mail_recipients|mail_crons/.test(JSON.stringify(full.body.checks))],
+        [["mail_crons", "mail_jobs", "mail_recipients", "platform_email", "tenant_smtp"], false]);
       const pe = (full.body.email_checks as Record<string, { status: string; detail: { missing: string[]; configured: boolean } }>).platform_email;
       eq("…platform_email reads fail, names the missing variables and holds no value", [pe.status, pe.detail.configured, pe.detail.missing.length], ["fail", false, 6]);
       configure(true);
@@ -494,9 +629,130 @@ async function routeTests() {
       notificationRows = notificationRows.map((r) => (r.event_type === "asset_assignment" ? { ...r, sent_at: minutesAgo(25 * 60) } : r));
       eq("…older than 24 hours: ok", (await call(false)).body.status, "ok");
     }
+
+    // ---- stage 4 (step 17; the note of 2026-11-20, part 2) ----
+    const checkOf = (b: Record<string, unknown>, k: string) => (b.email_checks as Record<string, { status: string; detail?: Record<string, unknown> }>)[k];
+    /** Every cadence entry fresh and ok, with one job's row set as given. */
+    const ALL_JOBS = ["lrs-forward", "gamification-refresh", "journey-nudges", "billing", "reaper", "refresh-report-views", "reminders", "rls-audit", "gamification-monthly"];
+    const beats = (over: Record<string, LogRow> = {}) => ALL_JOBS.map((name) => ({ name, last_run_at: minutesAgo(1), last_status: "ok", last_detail: { v: 1 } as unknown as string, ...(over[name] ?? {}) }));
+    const STOP = { v: 1, failed_steps: 1, unreadable_orgs: 0, stopped_before_send: true, left_orgs: 1, no_0114: false, errors: { call_limit: 1 }, last_ok_at: minutesAgo(26 * 60), orgs: ["acme"], error: "permission denied for person@tenant.stub" };
+
+    console.log("\nthe route, stage 4: the new checks are read only with the secret");
+    {
+      fresh(); configure(true);
+      platformRows = [{ sent_at: minutesAgo(5), status: "sent", error_code: null }];
+      heartbeatRows = beats();
+      const pub = await call(false);
+      const NEW_READS = ["/rest/v1/rpc/tenant_mail_status", "/rest/v1/mail_job_counts", "/rest/v1/notification_settings", "/rest/v1/organization_members"];
+      eq("without the secret: none of the new checks' reads is made", requests.filter((r) => NEW_READS.includes(r.path)).map((r) => r.path), []);
+      eq("…and the heartbeats are read without last_detail", requests.filter((r) => r.path === "/rest/v1/ops_heartbeats").map((r) => r.query.get("select")), ["name,last_run_at,last_status"]);
+      eq("…the answer is the status and the time only", Object.keys(pub.body).sort(), ["status", "ts"]);
+      const full = await call(true);
+      eq("with the secret: last_detail is read, in the one heartbeats read", requests.filter((r) => r.path === "/rest/v1/ops_heartbeats").map((r) => r.query.get("select")), ["name,last_run_at,last_status,last_detail"]);
+      const cronsCheck = (full.body.checks as Record<string, { detail: { expect_crons: boolean; jobs: Record<string, Record<string, unknown>> } }>).crons;
+      eq("checks.crons keeps its shape: expect_crons and jobs, each job its state, last run and age only",
+        [Object.keys(cronsCheck.detail).sort(), [...new Set(Object.values(cronsCheck.detail.jobs).flatMap((j) => Object.keys(j)))].sort()], [["expect_crons", "jobs"], ["age_min", "last_run_at", "status"]]);
+      eq("…and no last_detail reaches it", JSON.stringify(cronsCheck).includes("last_detail") || JSON.stringify(cronsCheck).includes("failed_steps"), false);
+    }
+
+    console.log("\nthe route, stage 4: a failed run of a mail cron reads warn on production (ERRORED_WARN)");
+    {
+      for (const job of ["reminders", "journey-nudges"]) {
+        fresh(); configure(true); process.env.OPS_EXPECT_CRONS = "1";
+        platformRows = [{ sent_at: minutesAgo(5), status: "sent", error_code: null }];
+        heartbeatRows = beats({ [job]: { last_status: "error", last_detail: STOP as unknown as string } });
+        const full = await call(true);
+        if (job === "reminders") failedRemindersBody = full.body;
+        const pub = await call(false);
+        const mc = checkOf(full.body, "mail_crons");
+        eq(`${job}'s fresh failed run: crons warn, the status warn with and without the secret, never degraded`,
+          [(full.body.checks as Record<string, { status: string }>).crons.status, full.body.status, pub.body.status], ["warn", "warn", "warn"]);
+        const jobReading = (mc.detail?.jobs as Record<string, Record<string, unknown>>)[job];
+        eq(`…mail_crons repeats it, with the state, the carried last success, the failure's words and pending not known`,
+          [mc.status, jobReading.state, jobReading.level, jobReading.last_ok_at, (jobReading.failure as Record<string, unknown>).errors, jobReading.pending],
+          ["warn", "last-run-errored", "warn", new Date(Date.parse(String(STOP.last_ok_at))).toISOString(), { call_limit: 1 }, { kind: "not_known" }]);
+        eq("…the stored slug and message reach no answer", /acme|person@|permission denied/.test(JSON.stringify(full.body)), false);
+      }
+      fresh(); configure(true);
+      platformRows = [{ sent_at: minutesAgo(5), status: "sent", error_code: null }];
+      heartbeatRows = beats({ reminders: { last_status: "error", last_detail: STOP as unknown as string } });
+      const staging = await call(true);
+      const mc = checkOf(staging.body, "mail_crons");
+      eq("crons not expected (staging): crons ok, the status ok, and mail_crons says the run failed, not counted",
+        [(staging.body.checks as Record<string, { status: string }>).crons.status, staging.body.status, mc.status, mc.detail?.expect_crons, (mc.detail?.jobs as Record<string, Record<string, unknown>>).reminders.state],
+        ["ok", "ok", "ok", false, "last-run-errored"]);
+    }
+
+    console.log("\nthe route, stage 4: tenant_smtp and mail_jobs");
+    {
+      const ORG_A = "0a000000-0000-4000-8000-0000000000a1";
+      const ORG_B = "0a000000-0000-4000-8000-0000000000b1";
+      const statusRow = (org: string, over: Record<string, unknown> = {}) => ({ organization_id: org, state: "healthy", state_changed_at: minutesAgo(60), last_success_at: minutesAgo(5), last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 10, ...over });
+      const ready = (org: string) => ({ organization_id: org, smtp_host: "smtp.tenant.stub", smtp_port: 465, from_email: "noreply@tenant.stub" });
+      const arrange = () => { fresh(); configure(true); platformRows = [{ sent_at: minutesAgo(5), status: "sent", error_code: null }]; heartbeatRows = beats(); };
+
+      arrange(); tenantStatus = "missing"; jobCounts = "missing";
+      const no0114 = await call(true);
+      eq("without 0114: tenant_smtp and mail_jobs read unknown and say so, and the status does not move",
+        [checkOf(no0114.body, "tenant_smtp").status, checkOf(no0114.body, "tenant_smtp").detail, checkOf(no0114.body, "mail_jobs").status, checkOf(no0114.body, "mail_jobs").detail, no0114.body.status],
+        ["unknown", { no_0114: true }, "unknown", { no_0114: true }, "ok"]);
+      arrange(); tenantStatus = "fail"; jobCounts = "fail";
+      const failed = await call(true);
+      eq("another failure: unknown, with no message, and the status does not move",
+        [checkOf(failed.body, "tenant_smtp").status, checkOf(failed.body, "mail_jobs").status, failed.body.status, /acme|statement|stub read/.test(JSON.stringify(failed.body.email_checks))], ["unknown", "unknown", "ok", false]);
+
+      arrange(); tenantStatus = [statusRow(ORG_A), statusRow(ORG_B)]; settingsRows = [ready(ORG_A), ready(ORG_B)];
+      jobCounts = [{ day: new Date().toISOString().slice(0, 10), kind: "tenant", started: 5, finished: 5 }];
+      const allOk = await call(true);
+      eq("every organisation ready, no job lost: ok, ok, and the members are not read", [checkOf(allOk.body, "tenant_smtp").status, checkOf(allOk.body, "mail_jobs").status, allOk.body.status, requests.some((r) => r.path === "/rest/v1/organization_members")], ["ok", "ok", "ok", false]);
+
+      arrange(); tenantStatus = [statusRow(ORG_A, { state: "failing", last_error_code: "auth" }), statusRow(ORG_B)]; settingsRows = [ready(ORG_A)];
+      memberRows = [{ organization_id: ORG_A, status: "active" }];
+      const warn = await call(true);
+      const memberReads = requests.filter((r) => r.path === "/rest/v1/organization_members");
+      eq("one failing with an active member: tenant_smtp warn, the status warn; the other, not configured with no member, does not count",
+        [checkOf(warn.body, "tenant_smtp").status, warn.body.status, (await call(false)).body.status], ["warn", "warn", "ok"]);
+      eq("…the detail holds counts only", checkOf(warn.body, "tenant_smtp").detail, { organisations: 2, not_configured: 1, configured: 0, healthy: 0, failing: 1, routine_stopped: 0, no_0114: false });
+      eq("…one members read, for the two that would warn, active only", [memberReads.length, memberReads[0]?.query.get("status")], [1, "eq.active"]);
+
+      arrange(); tenantStatus = [statusRow(ORG_A, { sent_24h: 340 })]; settingsRows = [ready(ORG_A)]; memberRows = [{ organization_id: ORG_A, status: "active" }];
+      eq("routine mail stopped by the daily limit (340 of 375): warn", checkOf((await call(true)).body, "tenant_smtp").status, "warn");
+
+      arrange(); tenantStatus = [statusRow(ORG_A)]; settingsRows = [ready(ORG_A)];
+      jobCounts = [{ day: new Date().toISOString().slice(0, 10), kind: "tenant", started: 10, finished: 7 }];
+      const lost = await call(true);
+      eq("three code or link jobs lost today: mail_jobs warn with its counts, the status warn", [checkOf(lost.body, "mail_jobs").status, checkOf(lost.body, "mail_jobs").detail, lost.body.status], ["warn", { started: 10, lost: 3, no_0114: false }, "warn"]);
+    }
+
+    console.log("\nthe route, stage 4: mail_recipients");
+    {
+      fresh(); configure(true);
+      platformRows = [{ sent_at: minutesAgo(5), status: "sent", error_code: null }];
+      const skipAt = minutesAgo(60);
+      heartbeatRows = [...beats(), { name: "mail-recipients-unreadable", last_run_at: skipAt, last_status: "error", last_detail: { site: "assignments" } as unknown as string }];
+      const full = await call(true);
+      eq("a request's skip an hour ago: mail_recipients warn with its time, the status warn; the unauthenticated status does not move",
+        [checkOf(full.body, "mail_recipients").status, checkOf(full.body, "mail_recipients").detail?.last_skip_at, full.body.status, (await call(false)).body.status],
+        ["warn", skipAt, "warn", "ok"]);
+    }
+
+    console.log("\nthe route, stage 4: the email check does not count rows with the error daily_limit");
+    {
+      fresh(); configure(true);
+      platformRows = [{ sent_at: minutesAgo(5), status: "sent", error_code: null }];
+      for (let i = 0; i < 8; i++) notificationRows.push({ event_type: "asset_reminder", status: "failed", error: "daily_limit", sent_at: minutesAgo(10 + i) });
+      const full = await call(true);
+      const email = (full.body.checks as Record<string, { status: string; detail: { failed_24h: number } }>).email;
+      eq("eight reminders stopped at a daily limit: the email check ok, failed_24h 0", [email.status, email.detail.failed_24h], ["ok", 0]);
+      eq("…the failed count carries the filter", requests.filter((r) => r.path === "/rest/v1/notification_log").map((r) => r.query.get("or")), ["(error.is.null,error.neq.daily_limit)", null]);
+      for (let i = 0; i < 6; i++) notificationRows.push({ event_type: "asset_reminder", status: "failed", error: "tenant SMTP failed: timeout", sent_at: minutesAgo(20 + i) });
+      const after = await call(true);
+      eq("…six failed sends beside them: warn, as before", (after.body.checks as Record<string, { status: string }>).email.status, "warn");
+    }
   } finally {
     globalThis.fetch = realFetch;
     for (const k of Object.keys(PLATFORM_ENV)) delete process.env[k];
+    delete process.env.OPS_EXPECT_CRONS;
   }
 }
 
@@ -523,6 +779,14 @@ function opsWatchTests() {
   };
   const printed = { status: body.status, ts: body.ts, checks: Object.fromEntries(Object.entries(body.checks).map(([k, v]) => [k, { status: v.status }])) };
   eq("…so a body with email_checks prints no word of them", [JSON.stringify(printed).includes("platform"), Object.keys(printed)], [false, ["status", "ts", "checks"]]);
+  // The route's own answer for a failed reminders run on production, through the same filter.
+  const real = failedRemindersBody as { status: string; ts: string; checks: Record<string, { status: string }> } | null;
+  eq("non-vacuous: the route answered a failed reminders run", real !== null && "email_checks" in (real as object), true);
+  if (real) {
+    const out = { status: real.status, ts: real.ts, checks: Object.fromEntries(Object.entries(real.checks).map(([k, v]) => [k, { status: v.status }])) };
+    eq("a failed reminders run prints crons: warn and the status warn, and nothing new", [out.status, out.checks.crons, Object.keys(out.checks).sort()], ["warn", { status: "warn" }, ["crons", "db", "email", "lrs_outbox", "storage"]]);
+    eq("…no word of the job, its failure or the new checks", /reminders|call_limit|mail_crons|tenant_smtp|mail_jobs|mail_recipients/.test(JSON.stringify(out)), false);
+  }
 }
 
 routeTests()
