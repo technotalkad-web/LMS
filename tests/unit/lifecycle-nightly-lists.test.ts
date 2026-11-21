@@ -70,10 +70,6 @@ eq("PRODUCT_SPECS holds spec 69 (ADR 0024 P2-8's gate, 2026-11-16)", PRODUCTS.in
 // The step-16 note's S6: spec 78 joins after one green hand run with 0112 on
 // staging (2026-11-17), in PRODUCT_SPECS and not DEFAULT_SPECS.
 eq("PRODUCT_SPECS holds spec 78 (the 0112 gate, 2026-11-17)", PRODUCTS.includes("78"), true);
-// ADR 0029, stage 7: spec 79 joins after its green hand runs on staging with
-// 0114 and 0117 (2026-11-21), with the bot inbox settings and without them,
-// in PRODUCT_SPECS and not DEFAULT_SPECS.
-eq("PRODUCT_SPECS holds spec 79 (ADR 0029 stage 7, 2026-11-21)", PRODUCTS.includes("79"), true);
 
 // ── the workflow ─────────────────────────────────────────────────────────────
 console.log("\n.github/workflows/lifecycle-nightly.yml: two jobs, one after the other");

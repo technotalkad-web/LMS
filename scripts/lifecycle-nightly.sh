@@ -63,12 +63,9 @@ DEFAULT_SPECS="00 32 33 34 43 47 48 49 50 51 52 53 54 55 63 64 65 66"
 # spec 78 joined after its green hand run of 2026-11-17 on staging with 0112
 # pasted (the ADR 0024 step-16 note of 2026-11-16, S6); spec 80 (ADR 0030,
 # the database group of migration 0115) joined after its green hand run of
-# 2026-11-18 on staging with 0115 pasted (ADR 0030 gate G5); spec 79 (ADR
-# 0029, the two mail systems) joined after its green hand runs of
-# 2026-11-21 on staging with 0114 and 0117 pasted, once with the bot inbox
-# settings and once without them. The nightly has no inbox settings, so its
-# mail cases are skipped there and shown, and the cases that read rows run.
-PRODUCT_SPECS="68 69 78 79 80"
+# 2026-11-18 on staging with 0115 pasted (ADR 0030 gate G5).
+# Spec 79 is run by hand before a release until its cron posts cannot reach other organisations.
+PRODUCT_SPECS="68 69 78 80"
 PORT="${LIFECYCLE_PORT:-3100}"
 STAGING_REF="zeaclbapadosqqttexxh"
 
