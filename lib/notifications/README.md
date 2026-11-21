@@ -107,4 +107,7 @@ Two flags on `notification_settings`:
 
 Both are checked before each send (`gateSend` in `smtp-state.ts`) and give a
 `paused` outcome that's logged for audit. A paused welcome is not sent, and
-the administrator is told.
+the administrator is told. A broadcast asks once, before its loop: under
+either pause it answers 409 "Email is paused for this organisation. Nothing
+was sent." and logs no row for any recipient. On Settings, the event pause
+"Custom broadcast, ticket and attempt-request email" stops all three.
