@@ -11,8 +11,8 @@
 #      crypto.createHmac (impersonation cookie) and @aws-sdk/* (R2).
 #   2. [triggers.crons] — kept EMPTY on purpose. The Worker OpenNext builds
 #      exports only `fetch`, so a Cloudflare cron trigger would fire an event
-#      nothing receives. Every scheduled job is a GitHub Actions run of
-#      .github/workflows/cron.yml that POSTs /api/cron/* on production
+#      nothing receives. The jobs are driven from GitHub Actions instead:
+#      .github/workflows/cron.yml POSTs /api/cron/* on production
 #      (ops/RUNBOOK.md §2; staging has no schedule).
 #
 # Secrets (SUPABASE_SERVICE_ROLE_KEY, IMPERSONATION_SECRET, CRON_SECRET,

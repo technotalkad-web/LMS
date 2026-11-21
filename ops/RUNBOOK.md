@@ -81,8 +81,8 @@ drift-safe (`if exists`, `to_regclass()` guards) and probe before releases (§6.
 |---|---|---|
 | **Deep health** | `GET /api/ops/health` (`x-cron-secret` header for detail) | `ok` / `warn` (advisory: LRS backlog, email failures, or a job scheduled more than once a day — `lrs-forward`, `gamification-refresh`, `journey-nudges` — stale with its last run less than 26 h ago, which GitHub's cron starvation causes; or the last run of `lrs-forward` (its preview check or its park write failed, §6.5), `reminders` or `journey-nudges` (one of the job's own steps failed, §6.2) ended in an error while its heartbeat is fresh) / `degraded` (storage; a stale daily, weekly or monthly job; a job never seen; a frequent job whose last run is more than 26 h ago) / `down` (DB unreachable, HTTP 503). Heartbeats count on prod only (`OPS_EXPECT_CRONS=1`); ADR 0007, note of 2026-11-14 on decision 4; ADR 0024, note of 2026-11-15 |
 | **Platform sender** | `GET /api/ops/health` with the secret: `email_checks.platform_email` (never under `checks`, so the watchdog's summary never prints it); `/super/email` and the console banner | `fail` (not configured; the log unreadable; the newest send an `auth` or `quota` failure; two failed sends in a row; the daily ceiling) makes the authenticated status `degraded`; one `timeout`, `unreachable` or `unknown` send, or half the ceiling, `warn`. The unauthenticated status never includes it. **`degraded` with every printed check `ok` is the platform sender**: read `email_checks` with the secret, then §6.3. ADR 0029 section H |
-| **Tenant mail** | `GET /api/ops/health` with the secret: `email_checks.tenant_smtp`, `mail_jobs`, `mail_recipients` and `mail_crons` (never under `checks`); `/super/email` | `tenant_smtp`: the organisations by reading (§6.3b); `warn` while one with members is `failing` or `not_configured`, or has had its routine mail stopped by its daily limit. `mail_jobs`: reset-code and sign-in-link jobs the platform ended after their start mark, over today and yesterday (UTC); `warn` at 3 lost, or above 2 in 100 once 50 have started. `mail_recipients`: `warn` for 24 h after a request skipped its mail because its recipients could not be read (§6.2). `mail_crons`: the two reminder jobs' state, last run, last successful run, failure details and pending reminders (§6.2); its status repeats what `crons` reads for them and is no input of the overall status. None of them reads `fail`, and `unknown` moves nothing. Without migration 0114 `tenant_smtp` and `mail_jobs` read `unknown`; `mail_recipients` and `mail_crons` need no migration. The unauthenticated status is computed without them. ADR 0029 section H and its notes of 2026-11-19 and 2026-11-20 |
-| **Cron heartbeats** | `ops_heartbeats` table (migration 0050); each cron upserts on every run | staleness vs cadence map in the health route; `last_status` `error` reads `warn` for `lrs-forward`, `reminders` and `journey-nudges` (`ERRORED_WARN`) until that job's next clean run, on prod only, and is shown, not counted, for every other job. The health route reads `last_detail` only for a caller with the secret. One row is not a job: `mail-recipients-unreadable` (the `mail_recipients` check reads its age; no cadence list names it, so it never shows under `crons`) |
+| **Tenant mail** | `GET /api/ops/health` with the secret: `email_checks.tenant_smtp`, `mail_jobs`, `mail_recipients` and `mail_crons` (never under `checks`); `/super/email` | `tenant_smtp`: the organisations by reading (§6.3b); `warn` while an organisation with members is `failing`, is `not_configured`, or is past the point where its daily limit holds back routine mail. `mail_jobs`: reset-code and sign-in-link jobs the platform ended after their start mark, counted for today and yesterday (UTC); `warn` from 3 lost, or from a lost share over 2% once 50 jobs have started. `mail_recipients`: `warn` for 24 h after a request skipped its mail because its recipients could not be read (§6.2). `mail_crons`: the two reminder jobs' state, last run, last successful run, failure details and pending reminders (§6.2); its status repeats what `crons` reads for them and is no input of the overall status. None of them reads `fail`, and `unknown` moves nothing. Without migration 0114 `tenant_smtp` and `mail_jobs` read `unknown`; `mail_recipients` and `mail_crons` need no migration. The unauthenticated status is computed without them. ADR 0029 section H and its notes of 2026-11-19 and 2026-11-20 |
+| **Cron heartbeats** | `ops_heartbeats` table (migration 0050); each cron upserts on every run | staleness vs cadence map in the health route; `last_status` `error` reads `warn` for `lrs-forward`, `reminders` and `journey-nudges` (`ERRORED_WARN`) until that job's next clean run, on prod only, and is shown, not counted, for every other job. Without the secret the health route does not read `last_detail` at all. One row is not a job: `mail-recipients-unreadable` (the `mail_recipients` check reads its age; no cadence list names it, so it never shows under `crons`) |
 | **Watchdog + digest** | GitHub issues labelled `ops-incident` / `ops-digest` | incident lifecycle + daily history |
 | **RLS cross-tenant audit** | `rls-audit.yml` on migration PRs + weekly cron | FAILs policy-less org-scoped tables & runtime leaks |
 | **Supabase Security Advisor** | Dashboard → Advisors (both projects) | accepted floor: 6 WARNs on `is_org_member`/`is_org_admin`/`is_platform_owner` (RLS helpers — **never** revoke their EXECUTE) |
@@ -121,29 +121,26 @@ blast radius (which tenants/flows) → recommended action → what approval is n
    (requests, CPU-time p99, errors), storage growth. Trend, don't just snapshot.
    For the first two weeks of the pilot this is read **every day**, as the
    block below says.
-9. Cost: the **Workers paid plan is on hold** by the owner's decision of
-   2026-11-18. Production and staging stay on the free plan (50 outbound calls
-   and 10 ms of CPU for one request), and nothing may depend on an upgrade.
+9. Cost: the owner decided on 2026-11-18 to **hold the Workers paid plan**.
+   Production and staging stay on the free plan (50 outbound calls and 10 ms
+   of CPU for one request); no step may count on an upgrade.
    Supabase plan headroom, including Edge Function calls (each mail is one
-   call of `send-smtp`). The paid plan is looked at again when any one of
-   these holds (ADR 0029, rule FP9):
-   - codes and links lost (`mail_jobs`): more than 2 in 100 jobs in a week, or 5 in one day;
-   - requests ended by the platform (error 1102 for CPU, or too many outbound
-     calls): more than 1 in 100 requests on any day, or more than 20 in a week
-     on the routes that store a learner's result (SCORM commit, xAPI statements);
-   - the group has to shrink: fewer than 4 mails fit one request;
-   - volume: more than 750 tenant mails a day (half the production tenant's
-     limit) on 5 days of any 14, or, once the mail queue is live, one action
-     that queues more than 400;
-   - requests: more than half the plan's daily request allowance on any day;
-   - people wait: a bulk file of 100 rows takes more than 10 minutes;
-   - mail waits: until the mail queue (ADR 0032) is live, an administrator's
-     action reported people "not emailed" on 3 days of any 7; once it is live,
-     the oldest waiting mail older than 2 hours on 3 days of any 7, or 10 or
-     more mails in a week that expired untried while the SMTP worked and the
-     limit had room;
-   - the schedule stops being free: the repository is made private, or
-     GitHub changes what a public repository's scheduled runs cost.
+   call of `send-smtp`). Any one of these signs reopens the paid-plan
+   question (ADR 0029, rule FP9):
+   - `mail_jobs`: over 2% of code and link jobs lost in a week, or 5 lost in a day;
+   - error 1102 (CPU) or a refused outbound call: over 1% of a day's requests,
+     or over 20 a week on the SCORM commit and xAPI statements routes;
+   - fewer than 4 mails fit in one request;
+   - tenant mail above 750 a day (half the production tenant's limit) on 5 of
+     any 14 days, or, once the mail queue is live, one action queuing over 400;
+   - a day above half the plan's daily request allowance;
+   - a 100-row bulk file needing over 10 minutes;
+   - before the mail queue (ADR 0032): "not emailed" counts in an
+     administrator's answer on 3 of any 7 days; after it: mail waiting over
+     2 hours on 3 of any 7 days, or 10 or more mails a week expiring untried
+     while the SMTP and the limit both had room;
+   - the repository turns private, or GitHub starts charging a public
+     repository for scheduled runs.
 10. Post a weekly summary comment (status, incidents, trends, top 3 recommendations).
 
 **The free plan's daily read** (the first two weeks of the pilot; ADR 0029,
@@ -179,7 +176,7 @@ rule FP8). Write the numbers into that day's digest comment:
 - **`Cron /api/cron/reminders returned 500`** with `ok: false` → one of the job's own steps failed: a database read or write, an organisation whose members could not be read (`unreadable_orgs` above zero in the run log), or the call limit (`stopped_before_send` true when it stopped before any mail). Nobody in an unreadable organisation was reminded and no reminder state was written for them; the other organisations finished unless the run stopped before sending. The heartbeat reads `error`, and the organisation's id is only in the `mail_recipients_unreadable` log line. With ADR 0029 pull request B's code, `reminders` is in `ERRORED_WARN`, so on prod the overall status reads `warn` until the job's next clean run: read it as "A yellow page from a reminder job" below. (Code from before that pull request leaves the overall status where it was and shows the job as `last-run-errored` in the crons detail, read with the secret.) The next daily run is the retry; a repeat is a database fault or the call limit. A run the platform itself ended writes no heartbeat: it shows as this red run, then as a stale heartbeat. (ADR 0030, note "Pull request B build decisions", change 2; ADR 0029, notes of 2026-11-20 and 2026-11-21.)
 - **`Cron /api/cron/journey-nudges returned 500`** with `ok: false` → the same for the journey reminders: an unreadable organisation's programs were skipped (also counted in `skipped_org_programs`) and none of their learners was claimed or mailed. Read it as the line above; the next hourly run is the retry.
 - **A yellow page from a reminder job** (`reminders` or `journey-nudges`; ADR 0029, note of 2026-11-20, part 2):
-  - *What it means.* On prod (`OPS_EXPECT_CRONS=1`) the job ran recently and its last run failed: one of its own database reads or writes failed, an organisation could not be read, or it met the call limit. These are **not** failures and read clean: a tenant's failed send or a tenant that is not ready (`tenant_smtp` carries those), a stop at a daily limit, organisations or programs left for the next run for want of room, a paused or deleted organisation, and a database without 0114. The word `warn` on `crons` is public (the watchdog's summary prints it); the details never are.
+  - *What it means.* On prod (`OPS_EXPECT_CRONS=1`) the job ran recently and its last run failed: a database read or write of the job itself went wrong, an organisation could not be read, or it met the call limit. A run still reads clean when the trouble was not the job's own: mail a tenant's server refused, or a tenant not ready (both show under `tenant_smtp`); a daily limit reached; organisations or programs held over to the next run for lack of room; an organisation that is paused or deleted; a database that lacks 0114. The word `warn` on `crons` is public (the watchdog's summary prints it); the details never are.
   - *Where its three items are read.* `/super/email` → "Reminder jobs": for each job its state, last run, **last successful run**, **pending reminders** and **failure details**, in fixed sentences. With the secret, the same under `email_checks.mail_crons.jobs.<job>` of `GET /api/ops/health`. Without the secret only the status word is answered. The heartbeat's `last_detail` holds counts and fixed words only (`errors` counted by step word, `failed_steps`, `unreadable_orgs`, `stopped_before_send`, `due`, `sent`, `failed`, `left`, `left_complete`, `left_daily_limit`, `left_orgs`, `no_0114`, and `last_ok_at` on a failed run); ids and the database's message are only in the Worker's log line. "Last successful run: not known" means the row predates this code or the run could not read its previous row; the next clean run sets it. Pending reminders read as a number, "at least n" (the run could not count everyone), or "not known: the run failed before it counted"; a number left out is never shown as 0.
   - *How it clears.* By the job's next clean run, and only that: the next day's run for `reminders` (or by hand: Actions → "Scheduled crons (prod)" → Run workflow → `/api/cron/reminders`), the next hour for `journey-nudges`. Nobody clears it in the database. A job with no run at all reads by the staleness rules instead (`reminders` past 26 h reads `degraded`). Staging has no schedule, so there the status never turns yellow and the block says "Not scheduled here: shown, not counted."; a run by hand on staging is `node scripts/staging-cron-post.mjs <reminders | journey-nudges>`.
   - *By sentence.* "The job could not read who is due within one call, so nothing was sent. Waiting does not clear this." (`call_limit` with a stop before sending): an organisation too large for one call; it fails every day until the code changes, so send it to the architect with the run's counts. "The job met the platform's limit on calls part-way through …": the next run continues; a repeat is a capacity question (§5 item 9). "A record of mail that went could not be written, so that mail can go again." (`state_write`): check the database; one reminder or escalation may go twice. "n organisations could not be read …": a database fault or the call limit; the ids are in the `mail_recipients_unreadable` log lines. "n organisations or programs waited for the next run." on a clean run: room ran out; not yellow, and pending reads "at least n". "This database has no migration 0114 yet …": normal on prod until its sitting for 0114; the run is clean, with no daily limit and no email state recorded.
@@ -189,7 +186,7 @@ rule FP8). Write the numbers into that day's digest comment:
 ### 6.3 Email delivery broken (P2)
 1. Triage source: `notification_log` — group recent `failed` rows by `error`.
 2. **SMTP 535 BadCredentials** → tenant's Gmail app password revoked/rotated (Google silently kills them on password change). Fix: regenerate 16-char app password, update tenant SMTP settings, send test (Settings → SMTP → "Send test"; a delivered test clears the organisation's reading, §6.3b). *(Lived: ALL Ambak mail dead for weeks.)*
-3. **No fallback** (ADR 0029 section B). A tenant's mail goes only through that tenant's own SMTP, and platform mail only through the platform mailbox (§6.3a). A send that cannot go is `failed`, with a message that names the organisation's SMTP; no other sender is tried, and none is configured.
+3. **No fallback** (ADR 0029 section B). A tenant's mail goes only through that tenant's own SMTP, and platform mail only through the platform mailbox (§6.3a). When that sender cannot deliver, the row reads `failed` and its message points at the organisation's SMTP settings; nothing else is tried, and nothing else is configured.
 4. Junk-foldering (delivered but unseen) → SPF/DKIM/DMARC missing on the From domain; align display name; long-term: a verified sending domain on the tenant's own mailbox.
 5. Reset codes and sign-in links follow the account (ADR 0029 section A, rule 2). Platform owners and organisation administrators (`super_owner`, `admin`) get theirs from the platform sender on every page. Everyone else gets theirs through the SMTP of the organisation whose sign-in page they used, as its member. So a tenant SMTP failure stops its learners' codes and links, not its administrators'.
 6. The `email` health check counts only events that a signed-in person or the system starts, so it leaves out `password_reset` and `magic_link` rows (ADR 0029 section H), and rows with the error `daily_limit`. Read those in `notification_log` directly; the organisation's reading (§6.3b) covers them.
@@ -227,8 +224,8 @@ carries the sender, ADR 0029 section M):
    mailbox (about 500 a day), so production's ceiling is **375**, the owner's
    figure; unset, the sender uses 375 too. Each environment has its own app
    password, but where staging's and production's both belong to the same
-   mailbox the provider counts their mail together: then staging's ceiling is
-   **25**, so the mailbox sends at most 400 a day. A staging mailbox of its own
+   mailbox the provider adds both environments' mail up: staging's ceiling is
+   then **25**, keeping the mailbox's total to 400 a day. A staging mailbox of its own
    takes three quarters of its own cap. Mail the mailbox sends outside the LMS
    counts against the same cap.
 4. `/super/email` → "Send test to my address": the message arrives and the
@@ -243,13 +240,14 @@ carries the sender, ADR 0029 section M):
 2026-11-20 and 2026-11-21). A list cut at commas and white space. Each entry is
 one of three things:
 - `*`: every address. Production's value, and it is not changed.
-- An exact address, `<local>@<domain>`: that address and no other, compared
-  whole with letter case ignored. Nothing else is folded: a "+tag" or a dot
-  more or less is another address, and is listed by itself if it is wanted.
+- An exact address, `<local>@<domain>`: only that address, matched in full
+  and without regard to letter case. No other folding happens, so a "+tag"
+  form or a dotted spelling counts as a different address and needs its own
+  entry.
 - A domain, `<domain>` or `@<domain>`: every address at it. Staging lists none.
 
-An entry that is none of these is dropped and matches nothing. A list with no
-usable entry reads as unset: nothing is sent, `/super/email` names the variable
+Any other entry is ignored and allows nobody. If no entry is usable the list
+counts as unset: nothing is sent, `/super/email` names the variable
 under "Missing or invalid", and `platform_email` reads `fail`. `*` beside other entries allows
 everything. Reserved test domains are never mailed, whatever the list holds,
 and tenant mail is never read against the list.
@@ -262,19 +260,19 @@ a commit or a chat:
 ```
 | Entry | Whom it serves |
 |---|---|
-| `<send-test-local>@<send-test-domain>` | "Send test" on `/super/email`, which mails the signed-in platform owner's own sign-in address: the staging account the owner presses it with. Left out when that address is the test mailbox's own |
-| `<test-mailbox-local>@<test-mailbox-domain>` | the test mailbox itself, for a check by hand with an account at that address |
-| `<test-mailbox-local>+p0029h-welcome@<test-mailbox-domain>` | the setup-link proof harness (`scripts/check-auth-setup-link-proofs.mjs`): the console adds an administrator at this alias and the welcome is read from the mailbox. The harness deletes an account left at its prefix before it starts |
-| `<test-mailbox-local>+g1-alert@<test-mailbox-domain>` | gate G1 (b): the one administrator of the gate's organisation whose SMTP alert is a real send. Whoever runs the gate deletes that account when it ends; the lifecycle cleanup never covers the mailbox's domain |
+| `<send-test-local>@<send-test-domain>` | "Send test" on `/super/email`: the test goes to the address of the platform-owner account that presses the button on staging. Not needed when that account uses the test mailbox's address |
+| `<test-mailbox-local>@<test-mailbox-domain>` | the test mailbox's own address; nothing automated mails it, it is there for manual checks |
+| `<test-mailbox-local>+p0029h-welcome@<test-mailbox-domain>` | the platform leg of the setup-link proof (point 6): an administrator added on the console at this alias, whose welcome and link are then checked in the mailbox. It carries the prefix of `scripts/check-auth-setup-link-proofs.mjs`, whose first step removes any account left at that prefix; that script does not run this leg yet |
+| `<test-mailbox-local>+g1-alert@<test-mailbox-domain>` | gate G1 (b): the single administrator, in the gate's test organisation, who receives a real SMTP alert. The person running the gate removes that account afterwards, since no automatic cleanup touches the mailbox's domain |
 
-Anyone else on staging gets no platform mail there (no code, no link, no
-alert): each such send is one `suppressed` row with `not_allowed`, and they
-sign in by password. Adding a person is the owner's step, one exact address at
-a time. Setting it: the staging Worker, `wrangler secret put
-PLATFORM_EMAIL_ALLOW_DOMAINS`, which holds at once; Cloud Run staging, a new
-version of the secret `lms-platform-email-allow-domains`, which every instance
-that starts afterwards and the next deploy read (the deploy script mounts the
-newest version). Then "Send test". Code from before ADR 0029 pull request B
+Nobody else on staging receives platform mail: their codes, links and alerts
+are logged as `suppressed` with `not_allowed`, and they use their password to
+sign in. Only the owner adds a name to the list, one address per entry.
+Setting it: on the staging Worker, `wrangler secret put
+PLATFORM_EMAIL_ALLOW_DOMAINS` takes effect immediately; on Cloud Run staging,
+add a version to the secret `lms-platform-email-allow-domains`, and each
+instance started after that, like the next deploy, picks it up (the deploy
+script mounts the newest version). Then "Send test". Code from before ADR 0029 pull request B
 reads an address entry as a domain that matches nobody: with only address
 entries it sends no platform mail at all, and "Send test" reads not sent there
 until that pull request's code is deployed.
@@ -361,18 +359,18 @@ Center. The platform owner sees every organisation on `/super/email` →
 - **While an organisation is not ready** (`failing`, `not_configured`, or at
   its daily limit): its learners' reset codes and sign-in links are not
   attempted, and its sign-in page answers "Email could not be sent. Please
-  contact your LMS Administrator." The first such request for an account and
-  kind in 24 hours writes one `failed` row with the error `smtp_not_ready` (or
-  `daily_limit`). Other mail is still attempted when the settings are
-  complete; the first send is the probe. In one request or cron run a
+  contact your LMS Administrator." For each account and kind, only the first
+  such request in a 24-hour window leaves a `failed` row (error `smtp_not_ready`,
+  or `daily_limit`). Everything else is still tried as long as the settings are
+  complete, and the first send acts as the probe. In one request or cron run a
   `failing` organisation gets one probe; once a run's sends flip it, the rest
   are not attempted and are recorded as not sent.
 - **The alert.** `tenant_smtp_alert` goes by the platform sender to at most
-  five of the organisation's active administrators: when it becomes `failing`
-  (at most once in 6 hours), when a learner's mail was not sent because it was
-  not ready (at most once in 24 hours), and when its routine mail stops at the
-  daily limit. A request only marks the alert as due; the hourly
-  `journey-nudges` call sends it, at most one alert in a call. Staging has no
+  five of the organisation's active administrators. Three things raise it: the
+  reading turning `failing` (no more than once per 6 hours); a learner's mail
+  held back while the organisation was not ready (no more than once per 24
+  hours); and routine mail halting at the daily limit. Requests only flag the alert as due; it is
+  the hourly `journey-nudges` call that mails it, one alert per call at most. Staging has no
   schedule: there it goes only with `node scripts/staging-cron-post.mjs
   journey-nudges`. A deleted organisation is never alerted.
 
@@ -382,13 +380,13 @@ organisation's `sent` rows in `notification_log`, test sends included.
   limit"; each change writes a `platform_audit_log` row. Tenant administrators
   see it and cannot change it. Where none is set: `TENANT_EMAIL_DEFAULT_DAILY_LIMIT`
   if the environment sets it, else **375**. The production tenant's is
-  **1,500**: the owner sets it on `/super/email` once the release that carries
-  it is live, and reads it back on that organisation's SMTP tab.
-- **The reserve:** a tenth of the limit, rounded up, and at least 25, is kept
-  for mail a person is waiting for (reset codes, sign-in links, welcome mail,
-  setup links and the Settings test). Routine mail (reminders, nudges,
-  broadcasts, assignment, update, completion, ticket and attempt-request mail)
-  stops at the limit less the reserve: 1,350 of 1,500, 337 of 375. From eight
+  **1,500**: the owner enters it on `/super/email` after the release that
+  carries this code is live, then checks the organisation's SMTP tab shows it.
+- **The reserve:** one tenth of the limit (rounded up, never under 25) stays
+  free for mail someone is actively expecting: reset codes, sign-in links,
+  welcome mail, setup links and the Settings test. Everything routine (reminders,
+  nudges, broadcasts, and the assignment, update, completion, ticket and
+  attempt-request messages) halts once the limit minus that reserve is reached: 1,350 of 1,500, 337 of 375. From eight
   tenths the Attention Center item warns; when routine mail stops it is
   critical and one alert is due. At the limit nothing more is attempted
   through that SMTP until earlier mail is 24 hours old, and the organisation
@@ -396,13 +394,14 @@ organisation's `sent` rows in `notification_log`, test sends included.
 - An administrator's own send reports `not_sent` with the class `daily_limit`;
   it is not an SMTP failure and does not move the reading. A reminder job that
   stops for it says how many it left (`left_daily_limit`) and sends them later.
-- If the tenant's provider refuses for `quota` first, the mailbox's real cap is
-  lower than the limit assumed: set the limit to three quarters of the real cap.
-- **One mailbox, one environment.** A production mailbox is never configured on
-  a staging organisation.
+- A `quota` refusal from the tenant's own provider before the limit is reached
+  means the mailbox allows less than assumed: lower the limit to 75% of what it
+  really allows.
+- **One mailbox, one environment.** No staging organisation is ever given a
+  production mailbox.
 
 **Before and after the 0114 and 0117 sitting.** Staging has both files;
-production gets them in a sitting of its own, before the tag that carries pull
+production is to receive them in its own dedicated sitting, ahead of the tag that carries pull
 request B's code (`docs/MIGRATIONS.md`). The code also runs on a database
 without them (a deploy ahead of the sitting, or after a reverse):
 - *Without 0114:* no reading is stored and no alert is marked; every
@@ -501,8 +500,8 @@ go-live:
 | Item | Why | Target |
 |---|---|---|
 | Supabase → Pro + compute upgrade | nano's conns/CPU die under classroom-start spikes; free tier pauses + no PITR | Pro, ≥ small/medium compute, PITR on, **pooled connections (Supavisor port 6543)** |
-| Workers paid plan + custom domain | workers.dev is rate-limited/unbranded; move to owned domain + CF proxy. The free plan gives one request 50 outbound calls and 10 ms of CPU, on staging and production alike | Paid plan **on hold** by the owner's decision of 2026-11-18: the pilot runs on the free plan and nothing depends on an upgrade; it is looked at again on any sign of §5 item 9. The custom domain: ADR 0031 |
-| Email: each tenant's own SMTP, with its daily limit | a mailbox's provider caps its daily sends (a Google Workspace mailbox about 2,000, a personal one about 500); one large tenant's reminders could pass that | each tenant sends through its own SMTP only, under its daily limit (production tenant 1,500; §6.3b); platform mail through the platform mailbox, 375 a day (§6.3a); no fallback. Watch `email.sent_24h` and, with the secret, `email_checks.tenant_smtp` |
+| Workers paid plan + custom domain | workers.dev is rate-limited/unbranded; move to owned domain + CF proxy. The free plan gives one request 50 outbound calls and 10 ms of CPU, on staging and production alike | Paid plan **on hold** (owner, 2026-11-18): the pilot is run on the free plan, with no dependency on an upgrade; it is looked at again on any sign of §5 item 9. The custom domain: ADR 0031 |
+| Email: every tenant on its own SMTP, under a daily limit | a mailbox's provider caps its daily sends (a Google Workspace mailbox about 2,000, a personal one about 500); one large tenant's reminders could pass that | each tenant sends through its own SMTP only, under its daily limit (production tenant 1,500; §6.3b); platform mail through the platform mailbox, 375 a day (§6.3a); no fallback. Watch `email.sent_24h` and, with the secret, `email_checks.tenant_smtp` |
 | Load test the hot paths | login burst, SCORM commit storms (every learner every few seconds), report pages | k6/artillery vs staging at 2× expected peak before launch |
 | Observability upgrades | 10-min probe is MTTR-bounded; JS errors invisible | Cloudflare Workers analytics review, Supabase log drain, Sentry (optional but recommended) |
 | Storage growth | packages × versions accumulate (size_bytes tracked per version) | monitor via tenant_usage; prune superseded versions policy |

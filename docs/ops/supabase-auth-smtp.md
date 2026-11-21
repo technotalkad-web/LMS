@@ -1,7 +1,7 @@
 # Supabase Auth's own mailer — kept apart
 
-Rewritten for ADR 0029 (section F, "Supabase Auth's own mailer stays apart
-and is off on production"). Until then this page set the hosted auth server's
+Rewritten for ADR 0029, section F (the hosted auth server's mailer is kept
+separate from the LMS's mail, and switched down on production). Until then this page set the hosted auth server's
 mailer up as the platform's email system, with a Workspace mailbox and branded
 templates. That design is gone: the LMS now sends every email itself, and the
 auth server's mailer is not one of its senders. What stays here is how that
@@ -12,12 +12,12 @@ end-to-end run still points at.
 
 ## The two email systems the LMS uses
 
-Both post to the `send-smtp` Edge Function. Neither is ever a fallback for the
-other, and neither goes through the auth server's mailer.
+Both post to the `send-smtp` Edge Function. One never stands in for the
+other, and the auth server's mailer carries neither.
 
 | System | What it sends | Through |
 |---|---|---|
-| **Tenant mail** | welcome and invitation mail from the Users pages, assignment, unassignment, update and completion mail, reminders, journey nudges and escalations, broadcasts, ticket and attempt-request mail, and the reset codes and sign-in links of learners and data analysts | that organisation's own SMTP (Settings → SMTP), under its daily limit (`ops/RUNBOOK.md` §6.3b). Nothing else: if it is not ready, the mail is not sent and the administrators are told |
+| **Tenant mail** | welcome and invitation mail from the Users pages, assignment, unassignment, update and completion mail, reminders, journey nudges and escalations, broadcasts, ticket and attempt-request mail, and the reset codes and sign-in links of learners and data analysts | that organisation's own SMTP (Settings → SMTP), under its daily limit (`ops/RUNBOOK.md` §6.3b). No other route: while the settings are incomplete nothing is sent; while the organisation reads `failing`, learners' codes and links are not sent and other mail gets one probe per run; at the daily limit nothing is sent. Its administrators see the reading and are alerted |
 | **Platform mail** | reset codes and sign-in links of platform owners and organisation administrators, the welcome (with its setup link) for a person a platform owner adds on the console, SMTP alerts to a tenant's administrators, the console's test | the platform's own mailbox, set only in deployment secrets (`ops/RUNBOOK.md` §6.3a) |
 
 The app makes its links itself: `auth.admin.generateLink` mints a sign-in or
@@ -39,7 +39,7 @@ verified yet**: write down what it offers when the settings are tried.
 2. **No custom SMTP.** Neither the platform mailbox nor any tenant's mailbox
    is entered in the auth settings. If an earlier setup put a mailbox there,
    take it out.
-3. **The email rate limit at its lowest.**
+3. **The auth server's email rate limit set as low as it goes.**
 
 The one session call that can still reach the mailer is a password change
 (`updateUser`), whose notice the settings above keep down.
@@ -49,8 +49,8 @@ The one session call that can still reach the mailer is a password change
 Staging may keep the mailer on for lifecycle spec 36
 (`tests/bot/lifecycle/36-email-template-real.spec.ts`), which asks it on
 purpose for one invitation to a test inbox, and as the control of the
-setup-link proof harness. It sends from a mailbox that is neither production's
-nor the platform sender's. When the production settings above are tried on
+setup-link proof harness. Its mailbox is a third one: not production's, and not
+the platform sender's. When the production settings above are tried on
 staging, that spec's mail stops; note it and set staging back after the trial.
 
 ---

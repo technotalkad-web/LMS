@@ -113,7 +113,7 @@ its **own** mailbox credential, never production's, and an allow-list of
 allowing that one address (a "+tag" or a dot variant is another address and
 is listed by itself), with no domain entry and no `*`. Staging's four entries
 and what each serves are in `ops/RUNBOOK.md` §6.3a, "The allow-list"; the
-addresses themselves are typed only into the secret. Reserved test domains
+real addresses are entered in the secret and nowhere else. Reserved test domains
 (`.test`, `example.com` and the like) are never mailed, whatever the list
 holds. A list with no usable entry sends nothing and reads as not configured.
 

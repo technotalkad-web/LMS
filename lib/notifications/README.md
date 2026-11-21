@@ -82,9 +82,9 @@ call site to it.
   mailed by the hourly `journey-nudges` call).
 - **The daily limit** (rule FP4): each organisation's `sent` rows of the last
   24 hours against its limit (375 unless a platform owner sets another on
-  `/super/email`). A tenth of it, at least 25, is kept for mail a person waits
-  for; routine mail stops before it, and at the limit nothing more is
-  attempted.
+  `/super/email`). One tenth (at least 25) is held back for mail someone is
+  expecting, such as reset codes; routine mail halts short of that reserve,
+  and at the limit itself nothing more is attempted.
 - **Without migration 0114** (production until its sitting): no state is
   stored, every organisation with complete settings is treated as ready, and
   no daily limit applies; the send is attempted as before.
@@ -97,7 +97,8 @@ Two flags on `notification_settings`:
 - `email_paused boolean` — master kill switch. Stops ALL automatic
   events. Exempt: `custom_broadcast` (explicit admin action), and
   `password_reset` and `magic_link`, which the person asked for (ADR 0029
-  section C); those still go only through the tenant's own SMTP.
+  section C); the exemption adds no sender, so those still use the tenant's
+  SMTP and nothing else.
 - `event_paused jsonb` — `{"asset_reminder": true, …}`. Pauses individual
   event types while letting others through; the same three are exempt.
 
