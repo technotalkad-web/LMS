@@ -55,7 +55,8 @@ export { PLATFORM_EVENTS, isPlatformEvent, type PlatformContent, type PlatformEv
  * share and the ceiling count the sent rows and the in-flight rows. So the
  * limits hold under concurrent requests, and the shares count only the rows
  * of requests that passed their account's count. The welcome, the alert and
- * the test read their limits from the log as before and write no claim.
+ * the test read their limits from the log and write no claim; the test's
+ * account limit is an exact count of the tests that reached the mail server.
  * A limit that cannot be read sends nothing: the answer is "log_unreadable",
  * no row is written for it beyond a claim or an in-flight row already there,
  * and the platform_email health check reads fail. The platform mailbox is
@@ -332,8 +333,6 @@ function svc(): SupabaseClient {
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 
-type LogRow = { sent_at: string; status: string; error_code: string | null };
-
 /** Who a row of the log is about: the event, the organisation and the user id (never an address). */
 type RowOf = { event: PlatformEvent; organizationId: string | null; userId: string };
 
@@ -356,8 +355,6 @@ function unreadable(event: PlatformEvent, step: string): PlatformSendResult {
   console.warn(`[platform-email] ${event}: log_unreadable (${step}); nothing sent`);
   return { status: "failed", errorCode: "log_unreadable", logged: false };
 }
-
-const isLimitRow = (r: LogRow) => r.status === "refused" && r.error_code === "account_limit";
 
 /** The reserved test domains, then the allow-list (section F): the row of a mail that is not sent, or null to go on. */
 function suppression(to: PlatformRecipient, env: Env): "not_allowed" | "test_domain" | null {
@@ -559,7 +556,10 @@ export type PlatformSendDeps = {
  * the credential was made, or one this call takes itself when none is
  * handed to it. A claim older than CLAIM_SEND_WITHIN_MS sends nothing and
  * writes no row (claim_stale). The welcome, the alert and the test read
- * their limits as before and write no claim. Then, for every event: "not
+ * their limits from the log and write no claim: the test's account limit is
+ * two exact counts of its sends that reached the mail server (its sent
+ * tests, and its failed tests whose class is a send's), for the hour and the
+ * day; one that cannot be read sends nothing. Then, for every event: "not
  * configured", the send within the time left, and the outcome's row.
  */
 export async function sendPlatformEmail<E extends PlatformEvent>(req: PlatformSendRequest<E>, deps: PlatformSendDeps = {}): Promise<PlatformSendResult> {
@@ -594,31 +594,35 @@ export async function sendPlatformEmail<E extends PlatformEvent>(req: PlatformSe
   // The welcome, the alert and the test: their limits as read before the send.
   const now = clock();
   const dayAgo = new Date(now - DAY_MS).toISOString();
-  const hourAgoMs = now - HOUR_MS;
   // 1. The account limit: the test's only (the welcome and the alert have none).
   const accountLimit = ACCOUNT_LIMITS[event];
   if (accountLimit) {
-    const { data, error } = await db
-      .from("platform_email_log")
-      .select("sent_at, status, error_code")
-      .eq("to_user_id", to.userId)
-      .eq("event_type", event)
-      .gte("sent_at", dayAgo)
-      .order("sent_at", { ascending: false })
-      .limit(100);
-    if (error || !Array.isArray(data)) return unreadable(event, "account");
-    const rows = data as LogRow[];
     // The test counts only the sends that reached the mail server: a test
     // that was suppressed or found the sender not configured used nothing of
     // the mailbox, so an owner fixing the setup is not locked out of testing.
-    // The read is the newest 100 rows of 24 hours; the limits are read on them.
-    const reachedServer = (r: LogRow) =>
-      r.status === "sent" || (r.status === "failed" && DISPATCHED_FAILURE_CLASSES.has(r.error_code ?? ""));
-    const attempts = rows.filter((r) => !isLimitRow(r) && reachedServer(r));
-    const inHour = attempts.filter((r) => Date.parse(r.sent_at) >= hourAgoMs).length;
-    if (inHour >= accountLimit.hour || attempts.length >= accountLimit.day) {
-      const recorded = rows.some((r) => isLimitRow(r) && Date.parse(r.sent_at) >= hourAgoMs);
-      if (recorded) return { status: "refused", errorCode: "account_limit", logged: false };
+    // Two exact counts (accountRequests), read together: the account's sent
+    // tests, and its failed tests whose class is a send's.
+    const ofAccount = () =>
+      db.from("platform_email_log").select("id", { count: "exact", head: true }).eq("to_user_id", to.userId).eq("event_type", event);
+    const sentSince: CountSince = (sinceIso) => ofAccount().eq("status", "sent").gte("sent_at", sinceIso);
+    const failedSince: CountSince = (sinceIso) =>
+      ofAccount().eq("status", "failed").in("error_code", [...DISPATCHED_FAILURE_CLASSES]).gte("sent_at", sinceIso);
+    const [sent, failed] = await Promise.all([accountRequests(sentSince, now), accountRequests(failedSince, now)]);
+    if (!sent || !failed) return unreadable(event, "account");
+    if (sent.hour + failed.hour >= accountLimit.hour || sent.day + failed.day >= accountLimit.day) {
+      // One refused row an hour for the account and kind, read by a query of
+      // its own, as claimPlatformSend's step 1 reads it. If that cannot be
+      // read, nothing more is written.
+      const recorded = await db
+        .from("platform_email_log")
+        .select("id")
+        .eq("to_user_id", to.userId)
+        .eq("event_type", event)
+        .eq("status", "refused")
+        .eq("error_code", "account_limit")
+        .gte("sent_at", new Date(now - HOUR_MS).toISOString())
+        .limit(1);
+      if (recorded.error || !Array.isArray(recorded.data) || recorded.data.length > 0) return { status: "refused", errorCode: "account_limit", logged: false };
       return writeRow(db, of, "refused", "account_limit");
     }
   }

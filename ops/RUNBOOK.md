@@ -301,8 +301,10 @@ organisation's administrators (`PLATFORM_EMAIL_ORG_DAILY_LIMIT`; alerts and
 welcomes are outside it); the daily ceiling for all platform mail. A platform
 owner's own code, link and test are exempt from the organisation's share and
 the ceiling. Each platform owner account can send up to 30 messages a day past
-the ceiling (ten codes, ten links, ten tests). Keep the ceilings of the
-environments that share the mailbox, plus 30 for each platform owner account,
+the ceiling (ten codes, ten links, ten tests). The ten tests are counted one
+at a time: send one test and wait for its answer before the next. Keep the
+ceilings of the environments that share the mailbox, plus 30 for each
+platform owner account,
 under the mailbox's daily cap. Nothing is ever sent to a reserved test domain
 (`.test`, `.example`, `.invalid`, `.localhost`, `example.com/.net/.org`), and
 nothing at all while the allow-list is unset.

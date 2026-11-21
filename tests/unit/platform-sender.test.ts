@@ -15,7 +15,7 @@
  *   - the limits of section G: 5 an hour and 10 a day per account and kind,
  *     the same for every account, a platform owner's own included, with one
  *     refused row an hour; the test counts only sends that reached the mail
- *     server; one organisation at its limit is refused while another still
+ *     server, by an exact count; one organisation at its limit is refused while another still
  *     sends, and alerts, welcomes and a platform owner's own mail are
  *     outside it; the ceiling (default 375, a deployment setting) refuses
  *     everything except a platform owner's own code, link and test;
@@ -388,6 +388,23 @@ async function main() {
       seed(1, { to_user_id: OWNER.userId, event_type: "platform_test", status: "failed", error_code: "rejected" }, () => 6);
       seed(3, { to_user_id: OWNER.userId, event_type: "platform_test", status: "failed", error_code: "not_configured" }, (i) => 7 + i);
       eq("…a failed send that reached it counts (two sent, two auth, one rejected: the sixth is refused)", short(await send(test())), ["refused", "account_limit", true]);
+      fresh();
+      seed(10, { to_user_id: OWNER.userId, event_type: "platform_test" }, (i) => 90 + i * 60);
+      seed(50, { to_user_id: OWNER.userId, event_type: "platform_test", status: "refused", error_code: "account_limit" }, (i) => 61 + (i % 28));
+      seed(50, { to_user_id: OWNER.userId, event_type: "platform_test", status: "suppressed", error_code: "not_allowed" }, (i) => 61 + (i % 28));
+      seed(50, { to_user_id: OWNER.userId, event_type: "platform_test", status: "failed", error_code: "not_configured" }, (i) => 61 + (i % 28));
+      eq("the test's count is exact: ten sent tests in the day and none in the hour, with 150 newer rows that do not count (refused, suppressed, not configured), the next is refused",
+        [short(await send(test())), sends().length], [["refused", "account_limit", true], 0]);
+      fresh(); failRead = "account";
+      eq("…a count of the test's sends that cannot be read: nothing sent, no row", [short(await send(test())), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
+      fresh();
+      seed(5, { to_user_id: OWNER.userId, event_type: "platform_test" }, (i) => 1 + i);
+      failRead = "rows";
+      eq("…at the limit, the read of the hour's refused row fails: refused, nothing sent, no row written", [short(await send(test())), sends().length, inserts().length], [["refused", "account_limit", false], 0, 0]);
+      fresh();
+      seed(5, { to_user_id: OWNER.userId, event_type: "platform_test" }, (i) => 1 + i);
+      seed(1, { to_user_id: OWNER.userId, event_type: "platform_test", status: "refused", error_code: "account_limit" }, () => 30);
+      eq("…at the limit with a refused row in the hour: refused, no further row", [short(await send(test())), inserts().length], [["refused", "account_limit", false], 0]);
       fresh();
       seed(30, { to_user_id: ADMIN_A.userId, event_type: "platform_admin_welcome", organization_id: ORG_A }, () => 5);
       eq("welcomes and alerts have no account limit", [(await send(welcome(ADMIN_A, ORG_A))).status, (await send(alert(ADMIN_A, ORG_A))).status], ["sent", "sent"]);
