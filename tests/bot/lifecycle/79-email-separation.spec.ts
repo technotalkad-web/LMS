@@ -32,7 +32,8 @@
  *     before its allow-list and before its own settings, so every platform
  *     row here is `suppressed` with `test_domain` on any build, with or
  *     without the platform sender's settings.
- *   - A limit under requests made at once is read as "at most".
+ *   - A limit under requests made at once is read as "at most", and the
+ *     requests as claimed by at least one claim row of each kind.
  *
  * Settings: the lifecycle suite's (NEXT_PUBLIC_SUPABASE_URL and the two
  * keys, E2E_BASE_URL), and the app's cron secret as spec 78 reads it
@@ -215,6 +216,8 @@ async function stateRow(orgId: string): Promise<StateRow | null> {
 /** A send that reached the mail server: a sent row, or a failed row the send itself wrote. */
 const attempted = (r: LogRow) => r.status === "sent" || (r.status === "failed" && String(r.error ?? "").startsWith("tenant SMTP failed:"));
 const inFlight = (r: LogRow) => r.status === "queued" && r.error === "in_flight";
+/** A sign-in link's claim on the organisation's SMTP (CREDENTIAL_CLAIM_ERROR in lib/notifications/send.ts). */
+const linkClaim = (r: LogRow) => r.status === "queued" && r.error === "claim";
 const ofEvent = (rows: LogRow[], event: string) => rows.filter((r) => r.event_type === event);
 const suppressedOnTestDomain = (r: PlatformRow) => r.status === "suppressed" && r.error_code === "test_domain";
 
@@ -615,7 +618,7 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
     expect((await stateRow(gone.id))?.alert_due_at ?? null, "no alert is marked").toBeNull();
   });
 
-  const bulk: { org?: Org; person?: string } = {};
+  const bulk: { org?: Org; person?: string; personStatus?: string } = {};
 
   test("a bulk file with a broken SMTP: three attempts, the state failing, one alert, every row not sent", async ({ browser }) => {
     const org = await newOrg("bulk");
@@ -630,7 +633,7 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
     const csv = ["first_name,last_name,unique_id,email,lms_role,node_id,status", ...people.map((p, i) => `Bulk,P${i + 1},S79-${rand(6)},${p},user,root,active`)].join("\n");
 
     const ctx = await authedContext(browser, BASE, admin.email, admin.password);
-    let results: Array<{ status?: string; email_outcome?: { status?: string } }> = [];
+    let results: Array<{ email?: string; status?: string; email_outcome?: { status?: string } }> = [];
     try {
       const res = await ctx.request.post("/api/users/bulk", { data: { orgSlug: org.slug, csv } });
       expect(res.status(), "the bulk file answers 200").toBe(200);
@@ -640,6 +643,8 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
     }
     expect(results.length, "a result for each row").toBe(people.length);
     expect(results.every((r) => r.status === "invited" || r.status === "created"), "every row's account is made").toBe(true);
+    // The next case's premise: how the person's account was made, read there.
+    if (bulk.person) bulk.personStatus = results.find((r) => String(r.email ?? "").toLowerCase() === bulk.person!.toLowerCase())?.status;
     expect(results.every((r) => r.email_outcome?.status === "not_sent"), "every row's welcome is not sent").toBe(true);
     const invites = ofEvent(await tenantRows(org.id), "account_invite");
     expect(invites.filter(attempted).length, "three attempts, then the run stops").toBe(3);
@@ -655,6 +660,17 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
     const org = bulk.org!;
     const person = bulk.person!;
     expect(org && person, "the bulk case before").toBeTruthy();
+    // The premise: a new account the bulk file made in invite mode, whose address is not confirmed before the reset.
+    expect(bulk.personStatus, "the bulk file made the person's account in invite mode").toBe("invited");
+    const { data: profiles, error: profileError } = await db().from("profiles").select("id").eq("email", person.toLowerCase());
+    expect(profileError, "read the person's profile").toBeNull();
+    expect((profiles ?? []).length, "one profile at the person's address").toBe(1);
+    const personId = String((profiles ?? [])[0]?.id);
+    const confirmedAt = async (): Promise<string | null> => {
+      const { data, error } = await db().auth.admin.getUserById(personId);
+      expect(error, "read the person's account").toBeNull();
+      return data?.user?.email_confirmed_at ?? null;
+    };
     await configureOrgSmtp(org.id);
     const tester = await member(org, "bulk-tester", "admin", { alias: true });
     const t = await settingsTest(browser, org, tester);
@@ -671,8 +687,10 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
     expect(verify.status, "the code is accepted").toBe(200);
     const { reset_token } = (await verify.json()) as { reset_token?: string };
     const password = `S79-${rand(10)}Aa1!`;
+    expect(await confirmedAt(), "the person's address is still unconfirmed before the reset").toBeNull();
     const reset = await fetch(`${BASE}/api/auth/forgot-password/reset`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: person, reset_token, new_password: password }) });
     expect(reset.status, "the password is set").toBe(200);
+    expect(await confirmedAt(), "the reset confirms the address").toBeTruthy();
     const c = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { auth: { persistSession: false, autoRefreshToken: false } });
     const { data, error } = await c.auth.signInWithPassword({ email: person, password });
     expect(error, "the person signs in").toBeNull();
@@ -858,11 +876,22 @@ test.describe.serial("ADR 0029 spec 79: tenant mail and platform mail kept apart
     const rows = await tenantRows(org.id, a.id);
     const linkTries = ofEvent(rows, "magic_link").filter(attempted).length;
     const codeTries = ofEvent(rows, "password_reset").filter(attempted).length;
+    const linkClaims = ofEvent(rows, "magic_link").filter(linkClaim).length;
+    const { count: codeRows, error: codeRowsError } = await db()
+      .from("password_reset_otps")
+      .select("id", { count: "exact", head: true })
+      .eq("email", a.email.toLowerCase());
+    expect(codeRowsError, "read the code rows").toBeNull();
     // Requests that meet at a limit may all be refused: each is claimed and
     // counted before its send, so the bound is "at most", never an exact number.
     // The counts are recorded on the run; the second learner below shows that
     // the organisation still sends.
-    test.info().annotations.push({ type: "attempts", description: `links ${linkTries}, codes ${codeTries}` });
+    test.info().annotations.push({ type: "attempts", description: `links ${linkTries}, codes ${codeTries}, link claims ${linkClaims}, code rows ${codeRows ?? 0}` });
+    // The floor, which holds even when every send is refused: a new learner's
+    // first request of each kind reads no earlier one, so it writes its claim
+    // (a link's claim row, a code's own closed row) before any limit refuses it.
+    expect(linkClaims, "the link requests were claimed: at least one claim row").toBeGreaterThanOrEqual(1);
+    expect(codeRows ?? 0, "the code requests were claimed: at least one code row").toBeGreaterThanOrEqual(1);
     expect(linkTries, "at most five links are attempted").toBeLessThanOrEqual(5);
     expect(codeTries, "at most five codes are attempted").toBeLessThanOrEqual(5);
     expect(ofEvent(rows, "magic_link").filter(inFlight).length, "at most five link rows in flight").toBeLessThanOrEqual(5);

@@ -89,7 +89,10 @@
 //   6. the row: one platform_email_log row for the new account,
 //      platform_admin_welcome, sent;
 //   7. the mail: found within five minutes in the inbox, all-mail or spam
-//      folder; the folder and the seconds are recorded;
+//      folder. The alias is fixed and step 11 mails it too, so only a
+//      message the mail server received from the add on (less a minute for
+//      the two clocks) counts. The folder, and the seconds from the add to
+//      that message's received time, are recorded;
 //   8. the control: the sign-in address (the build's address, the
 //      organisation's slug, /login) whole in the text part, and in the HTML
 //      part as a link's address and as its shown text;
@@ -102,8 +105,8 @@
 //  10. the use: the token with a password sets it once; that password signs
 //      in at the auth server; the same token then gets rule N10's answer;
 //  11. twenty sign-in-link requests at once for the administrator at the
-//      alias: at most five sent rows and at most five in-flight rows, so at
-//      most five mails;
+//      alias: at least one claim row, at most five sent rows and at most
+//      five in-flight rows, so at most five mails;
 //  12. clean-up, also after a failure, in this order: the alias's account
 //      (its link's row, membership and profile go with it), the platform
 //      owner's row and account, the organisation; a last read finds no
@@ -115,10 +118,11 @@
 // not found in five minutes, or the control is not whole in a part. Fail:
 // invited false (the alias was still taken), a link that is cut, changed,
 // percent-encoded or wrapped in another address, a token the build refuses,
-// any part of step 10, or more than five of step 11. Each run mails the
-// alias once for the welcome and at most five times in step 11, from
-// staging's platform mailbox, inside staging's ceiling. The console's audit
-// row of the add names the alias and outlives the account.
+// any part of step 10, or in step 11 no claim row or more than five sent or
+// in-flight rows. Each run mails the alias once for the welcome and at most
+// five times in step 11, from staging's platform mailbox, inside staging's
+// ceiling. The console's audit row of the add names the alias and outlives
+// the account.
 //
 // Output: step names, pass / fail / recorded / void / not run, HTTP statuses,
 // error codes, "set" / "empty" for a time, "set" / "unset" for a setting,
@@ -191,6 +195,12 @@ const LINK_UNUSABLE = "This link can no longer be used. Ask your LMS Administrat
 const SETUP_PATH = "/auth/set-password";
 /** The job after a public request has 25 s (CREDENTIAL_JOB_MS in lib/auth/credential-mail.ts). */
 const APP_JOB_MS = 25_000;
+/**
+ * Step 7 of the platform leg: the alias is fixed, so only a message the mail
+ * server received at or after the add, less this much for the two clocks,
+ * is this run's welcome (spec 79's mail reader keeps the same minute).
+ */
+const MAIL_CLOCK_SKEW_MS = 60_000;
 /** Step 11 of the platform leg: requests made at once, and the most that may be sent (5 in the hour for one account). */
 const LEG_BURST = 20;
 const LEG_BURST_MAX = 5;
@@ -596,15 +606,30 @@ async function readRound(folders, aliases, since) {
 const exactCount = (round, alias, folders) => folders.reduce((n, f) => n + (round[alias]?.[f.role]?.exact.length ?? 0), 0);
 const perFolder = (round, alias, folders) => folders.map((f) => `${f.role}=${round[alias]?.[f.role]?.exact.length ?? 0}`).join(" ");
 
-/** Poll until a message to `alias` is found or `deadline` passes. */
-async function waitForAlias(folders, alias, since, deadline, point, label) {
+/** A message's received time (the mail server's internal date) in ms, or null when it is absent or unreadable. */
+function receivedMs(at) {
+  if (at === null || at === undefined) return null;
+  const ms = new Date(at).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Poll until a message to `alias` is found or `deadline` passes. With
+ * `floor` (ms), only a message the mail server received at or after it
+ * counts, and `receivedAt` is that message's received time.
+ */
+async function waitForAlias(folders, alias, since, deadline, point, label, floor = null) {
   let readErrors = 0;
   for (;;) {
     try {
       const r = await readRound(folders, [alias], since);
       for (const f of folders) {
-        const hit = r[alias][f.role].exact;
-        if (hit.length) return { folder: f, uid: Math.max(...hit.map((h) => h.uid)), at: Date.now(), readErrors };
+        const all = r[alias][f.role].exact;
+        const hit = floor === null ? all : all.filter((h) => (receivedMs(h.at) ?? -Infinity) >= floor);
+        if (hit.length) {
+          const best = hit.reduce((a, b) => (b.uid > a.uid ? b : a));
+          return { folder: f, uid: best.uid, at: Date.now(), receivedAt: receivedMs(best.at), readErrors };
+        }
       }
     } catch (e) {
       readErrors++;
@@ -1258,12 +1283,14 @@ async function platformLegRun() {
     rec(P6P, "step 7: the reader signs in and lists its folders", "void", `${imapErr(e)}; the leg is not proven by this run`);
     return;
   }
-  const got = await waitForAlias(folders, alias, since, addAt + MAIL_WAIT_MS, P6P, "step 7");
+  // The alias is fixed and step 11 mails it too: only a message received from the add on is this run's welcome.
+  const got = await waitForAlias(folders, alias, since, addAt + MAIL_WAIT_MS, P6P, "step 7", addAt - MAIL_CLOCK_SKEW_MS);
   if (!got.folder) {
-    rec(P6P, "step 7: the welcome is found within 5 minutes", "void", `not found after ${sec(Date.now() - addAt)} s; the leg is not proven by this run`);
+    rec(P6P, "step 7: the welcome is found within 5 minutes", "void", `no message received since the add, after ${sec(Date.now() - addAt)} s; the leg is not proven by this run`);
     return;
   }
-  rec(P6P, "step 7: the welcome is found within 5 minutes", "recorded", `folder=${got.folder.role} after ${sec(got.at - addAt)} s from the add`);
+  // Seconds from the add to the mail server's received time; a clock a little behind reads as 0.
+  rec(P6P, "step 7: the welcome is found within 5 minutes", "recorded", `folder=${got.folder.role} received ${sec(Math.max(0, got.receivedAt - addAt))} s after the add`);
   let parts;
   try {
     parts = await readParts(got.folder.path, got.uid);
@@ -1326,9 +1353,12 @@ async function platformLegRun() {
   const links = r11.rows.filter((r) => r.event_type === "platform_sign_in_link");
   const sentLinks = links.filter((r) => r.status === "sent").length;
   const flight = links.filter((r) => r.status === "suppressed" && r.error_code === "in_flight").length;
+  const claims = links.filter((r) => r.status === "suppressed" && r.error_code === "pending").length;
+  // A fresh account's first request reads no earlier request, so it writes its claim even when every send is then refused.
+  check(P6P, "step 11: at least one claim row (the requests reached the sender)", !r11.error && claims >= 1, `claims=${claims}`);
   check(P6P, `step 11: at most ${LEG_BURST_MAX} sent rows`, !r11.error && sentLinks <= LEG_BURST_MAX, `sent=${sentLinks}`);
   check(P6P, `step 11: at most ${LEG_BURST_MAX} in-flight rows`, !r11.error && flight <= LEG_BURST_MAX, `in_flight=${flight}`);
-  rec(P6P, "step 11: the burst's other rows", "recorded", `refused=${links.filter((r) => r.status === "refused").length} failed=${links.filter((r) => r.status === "failed").length} claims=${links.filter((r) => r.status === "suppressed" && r.error_code === "pending").length}`);
+  rec(P6P, "step 11: the burst's other rows", "recorded", `refused=${links.filter((r) => r.status === "refused").length} failed=${links.filter((r) => r.status === "failed").length}`);
 }
 /** A password sign-in at the auth server on a fresh client (the name signIn is the run's own helper above). */
 const signIn_ = (email, password) => signIn(email, password);
