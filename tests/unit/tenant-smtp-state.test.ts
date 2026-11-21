@@ -14,7 +14,9 @@
  *     three times; one send, then groups of four, each group logged by one
  *     insert;
  *   - pausing: password_reset and magic_link (D1) ignore it, every other
- *     event obeys it, custom_broadcast keeps its existing exemption;
+ *     event obeys it, custom_broadcast (broadcasts, ticket and
+ *     attempt-request mail) included, under the master pause and its own
+ *     event pause (the owner's decision of 2026-11-21);
  *   - deleted organisations read not_configured, send nothing and get no
  *     alert mark; one only scheduled for deletion (deleted_at still empty)
  *     sends as before;
@@ -214,13 +216,22 @@ async function main() {
         eq(`${label}: a reset code and a sign-in link still go, through the tenant's SMTP only`, [code.status, link.status, sends().length, sends().every((s) => s.host === "smtp.tenant.stub")], ["sent", "sent", 2, true]);
         eq(`${label}: any other event is paused, not attempted, with its row`, [other.status, other.errorClass, other.attempted, logRows()[2]?.status, logRows()[2]?.subject], ["paused", "paused", false, "failed", "(paused)"]);
       }
-      freshWorld({ settings: { ...SMTP_SETTINGS, email_paused: true } });
-      const b = await sendNotification({ ...one("custom_broadcast"), override: { subject: "Notice", body_md: "Hello" } });
-      // Section C keeps every event but the two public ones under the pause;
-      // this old pass of custom_broadcast (ticket and attempt-request mail)
-      // is kept as it was and is raised in pull request B's text for the
-      // owner, as the free-plan note's "Found on main" asks.
-      eq("custom_broadcast still passes the master pause, as before (kept; raised in the pull request's text, not changed by this record's code)", b.status, "sent");
+      // The owner's decision of 2026-11-21: custom_broadcast (broadcasts,
+      // ticket and attempt-request mail) is under the pause like every event
+      // but the two a person asks for on the public pages.
+      for (const [label, settings] of [["the master pause", { ...SMTP_SETTINGS, email_paused: true }], ["its own event pause", { ...SMTP_SETTINGS, event_paused: { custom_broadcast: true } }]] as const) {
+        freshWorld({ settings });
+        const b = await sendNotification({ ...one("custom_broadcast"), override: { subject: "Notice", body_md: "Hello" } });
+        eq(`custom_broadcast under ${label}: paused, not attempted, nothing sent, its row written as paused`,
+          [b.status, b.errorClass, b.attempted, sends().length, logRows().map((r) => [r.event_type, r.status, r.subject])], ["paused", "paused", false, 0, [["custom_broadcast", "failed", "(paused)"]]]);
+      }
+      {
+        const admins = [{ organization_id: ORG, user_id: "0d000000-0000-4000-8000-000000000001", role: "admin", status: "active" }];
+        freshWorld({ settings: { ...SMTP_SETTINGS, email_paused: true }, members: admins, profiles: { [admins[0].user_id]: "admin1@tenant.stub" } });
+        const db = createClient("http://stub.supabase.test", "stub-service-key-0029", { auth: { persistSession: false } });
+        await notifyAdminsOfTicket(db, { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", subject: "Help", requester: { name: "A manager", email: null }, categoryLabel: "Retry", lines: ["one"], note: null });
+        eq("a ticket's mail to the administrators on a paused organisation: paused, nothing sent", [sends().length, logRows().map((r) => [r.to_user_id, r.status, r.subject])], [0, [[admins[0].user_id, "failed", "(paused)"]]]);
+      }
     }
 
     console.log("\na deleted organisation; one scheduled for deletion");

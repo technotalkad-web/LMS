@@ -547,8 +547,9 @@ function BrandingPauseForm({
           <div>
             <h2 className="serif text-2xl">Master pause</h2>
             <p className="text-xs text-muted">
-              When on, all automatic emails are skipped. Admin-triggered
-              broadcasts still send.
+              When on, every email is skipped, broadcasts, ticket and
+              attempt-request emails included. Only password reset codes and
+              sign-in links still send: the person asked for them.
             </p>
           </div>
           <label className="flex items-center gap-2 text-sm">

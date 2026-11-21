@@ -11,8 +11,10 @@
  * read then, and the run carries its own count:
  *   - the reading (section C): not_configured (host, port or From missing,
  *     or the organisation deleted), configured, healthy, failing;
- *   - the pause, which never stops password_reset and magic_link (D1); the
- *     old pass of custom_broadcast is kept as it was;
+ *   - the pause, master or per event, which stops every event but
+ *     password_reset and magic_link (D1; the owner's decision of 2026-11-21
+ *     put custom_broadcast, so ticket, attempt-request and broadcast mail,
+ *     under it too);
  *   - the stop rule: on an organisation already failing, the run's first
  *     send is a probe and a failed probe ends the run; otherwise the run
  *     ends when nextState() turns the organisation failing (auth and quota
@@ -656,9 +658,9 @@ const NOT_CONFIGURED_TEXT = "The organisation's SMTP is not configured (Settings
  * Whether one mail of this event is attempted now, and if not, why. In this
  * order: the settings or the organisation could not be read; the
  * platform's call limit was met in this run; the organisation is deleted; the
- * pause (never for password_reset and magic_link, nor, as before, for
- * custom_broadcast); the settings are incomplete; the run has stopped; the
- * daily limit, counting the sends already started (`inFlight`).
+ * pause (every event but password_reset and magic_link, custom_broadcast
+ * included); the settings are incomplete; the run has stopped; the daily
+ * limit, counting the sends already started (`inFlight`).
  */
 export function gateSend(
   run: MailRun,
@@ -674,7 +676,7 @@ export function gateSend(
   if (run.callLimited) return { attempt: false, cls: "left", error: "Left: the request met the platform's limit on outbound calls." };
   if (run.deleted) return { attempt: false, cls: "not_configured", error: "The organisation is deleted; its SMTP is not used. Nothing was sent." };
   const cfg = run.settings;
-  const pauseApplies = !PAUSE_EXEMPT_EVENTS.includes(event) && event !== "custom_broadcast";
+  const pauseApplies = !PAUSE_EXEMPT_EVENTS.includes(event);
   if (pauseApplies && cfg?.email_paused) return { attempt: false, cls: "paused", error: "Email sending is paused at the org level." };
   if (pauseApplies && cfg?.event_paused?.[event]) return { attempt: false, cls: "paused", error: `Event "${event}" is paused.` };
   if (!settingsComplete(cfg)) return { attempt: false, cls: "not_configured", error: NOT_CONFIGURED_TEXT };

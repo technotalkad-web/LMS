@@ -6,9 +6,10 @@ import { resolveOrgMembership } from "@/lib/auth/org-membership";
 
 /**
  * Ticket emails (Phase 4a). Like the attempt-request mails these go out as
- * `custom_broadcast` with an override subject/body: no new template, not
- * silenced by the org pause toggles, and a mail hiccup never fails the
- * ticket. Admin roles as in lib/attempts/requests.ts.
+ * `custom_broadcast` with an override subject/body: no new template, stopped
+ * by the organisation's pause like every event but a reset code and a
+ * sign-in link (ADR 0029, the owner's decision of 2026-11-21), and a mail
+ * hiccup never fails the ticket. Admin roles as in lib/attempts/requests.ts.
  *
  * ADR 0030 rule 10: both go only to people whose membership in the org counts
  * (active, in an organisation that is not deleted). The admins' read filters

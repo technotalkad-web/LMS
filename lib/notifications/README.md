@@ -94,13 +94,14 @@ call site to it.
 
 Two flags on `notification_settings`:
 
-- `email_paused boolean` — master kill switch. Stops ALL automatic
-  events. Exempt: `custom_broadcast` (explicit admin action), and
-  `password_reset` and `magic_link`, which the person asked for (ADR 0029
-  section C); the exemption adds no sender, so those still use the tenant's
-  SMTP and nothing else.
+- `email_paused boolean` — master kill switch. Stops every event,
+  `custom_broadcast` included (broadcasts, ticket mail and attempt-request
+  mail; the owner's decision of 2026-11-21). Exempt: `password_reset` and
+  `magic_link`, which the person asked for (ADR 0029 section C); the
+  exemption adds no sender, so those still use the tenant's SMTP and nothing
+  else.
 - `event_paused jsonb` — `{"asset_reminder": true, …}`. Pauses individual
-  event types while letting others through; the same three are exempt.
+  event types while letting others through; the same two are exempt.
 
 Both are checked before each send (`gateSend` in `smtp-state.ts`) and give a
 `paused` outcome that's logged for audit. A paused welcome is not sent, and

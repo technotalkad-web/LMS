@@ -622,8 +622,8 @@ test.describe.serial("ADR 0030 spec 80: membership status, the app group", () =>
     app.e = await createOrg({ name: "Lifecycle membership app E" });
     const { a, b, d, e } = app as Required<Pick<typeof app, "a" | "b" | "d" | "e">>;
     // Email paused in every organisation of the group: a mail is logged and
-    // never leaves. A broadcast ignores the pause; the one sent below has one
-    // recipient.
+    // never leaves. A broadcast is paused too and still logged; the one sent
+    // below has one recipient.
     for (const org of [a, b, d, e]) {
       const { error } = await svc().from("notification_settings").upsert({ organization_id: org.id, email_paused: true }, { onConflict: "organization_id" });
       expect(error, `pause email in ${org.slug}: ${error?.message}`).toBeNull();

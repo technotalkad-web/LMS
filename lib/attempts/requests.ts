@@ -4,10 +4,10 @@
  * route and the bulk-grant route.
  *
  * Emails go out as `custom_broadcast` with an override subject/body: that path
- * needs no new template, no widening of the notification_templates CHECK, and
- * is not silenced by the org pause toggles (these are explicit, low-volume
- * transactional messages a learner or admin is waiting on). A mail hiccup
- * never fails the action.
+ * needs no new template and no widening of the notification_templates CHECK.
+ * The organisation's pause, master or per event, stops them as it stops every
+ * event but a reset code and a sign-in link (ADR 0029, the owner's decision
+ * of 2026-11-21). A mail hiccup never fails the action.
  *
  * ADR 0030 rule 10: both go only to people whose membership in the org counts
  * (active, in an organisation that is not deleted).
