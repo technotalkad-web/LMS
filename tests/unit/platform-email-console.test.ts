@@ -28,16 +28,22 @@
  *     404, and nothing is written; without migration 0114 it is refused
  *     with the console's sentence that names the migration; a signed-in
  *     user with no owner row gets 403 and nothing is read or written;
- *   - /super/email: the page shows the reminder jobs through the fixed
- *     sentences (the three forms of pending and "not known"), the line that
- *     names migration 0114 in place of the list and the numbers, and no
- *     database message.
+ *   - /super/email, the real server component rendered to markup over the
+ *     same stubs: without migration 0114 the sentence that names it stands
+ *     in place of the organisations' list and of the lost-job numbers, and
+ *     the page still renders; with it, the list; a state that cannot be read
+ *     reads its own sentence, with no database message; the reminder jobs
+ *     through the fixed sentences: pending as a number, "at least n" and
+ *     "not known" with its reason, the last successful run "not known", and
+ *     whether crons are scheduled here.
  *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/platform-email-console.test.ts   (or npm run test:unit)
  */
 import Module from "node:module";
+import React, { type ReactElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 let pass = 0, fail = 0;
 const eq = (n: string, got: unknown, want: unknown) => {
@@ -77,9 +83,19 @@ const signIn = (u: User, aal: "aal1" | "aal2" = "aal2") => {
   browser.set(AUTH_COOKIE, JSON.stringify({ access_token: t, refresh_token: "r", token_type: "bearer", expires_in: 3600, expires_at: 4102444800, user: u }));
 };
 
+// tsx compiles the page's JSX to React.createElement.
+(globalThis as { React?: unknown }).React = React;
+
+// The page's client components call useRouter, which needs the app router
+// mounted; outside it they get a router that does nothing. The rest of
+// next/navigation (redirect among it) is the real module.
 const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
 (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
   if (request === "next/headers") return { cookies: async () => jar, headers: async () => new Headers({ host: "lms.test" }) };
+  if (request === "next/navigation") {
+    const real = load.call(this, request, ...rest) as Record<string, unknown>;
+    return { ...real, useRouter: () => ({ refresh() {}, push() {}, replace() {}, back() {}, forward() {}, prefetch() {} }) };
+  }
   return load.call(this, request, ...rest);
 };
 
@@ -96,6 +112,20 @@ const GONE_ID = "0a000000-0000-4000-8000-0000000000d1";
 let stateRows: Array<Record<string, unknown>> = [];
 let stateTable: "ok" | "missing" | "fail" = "ok";
 let stateWrites: Array<{ method: string; body: Record<string, unknown>; query: string }> = [];
+/**
+ * What /super/email reads besides the platform log: tenant_mail_status for
+ * every organisation (its rows, the function not there, or another
+ * failure), the settings, the code and link jobs' counts, the heartbeat
+ * rows and the organisations' names. A failure answers DB_MESSAGE, which the
+ * page must never show.
+ */
+const DB_MESSAGE = "stub database message 0029";
+type Read = "ok" | "missing" | "fail";
+let page: { status: Read; statusRows: Array<Record<string, unknown>>; settings: Array<Record<string, unknown>>; jobs: Read; jobRows: Array<Record<string, unknown>>; beats: Array<Record<string, unknown>> | "fail"; orgs: Array<{ id: string; name: string }> };
+const freshPage = () => {
+  page = { status: "ok", statusRows: [], settings: [], jobs: "ok", jobRows: [], beats: [], orgs: [] };
+};
+freshPage();
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 
@@ -129,6 +159,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   }
   if (p === "/rest/v1/platform_audit_log" && method === "POST") { auditRows.push(JSON.parse(body)); return new Response(null, { status: 201 }); }
   if (p === "/rest/v1/organizations") {
+    // The page's list of names: every organisation not deleted.
+    if (!url.searchParams.has("id")) return json(page.orgs);
     const id = (url.searchParams.get("id") ?? "").replace(/^eq\./, "");
     const r = id === ORG_ID ? { id, deleted_at: null } : id === GONE_ID ? { id, deleted_at: "2026-11-01T00:00:00Z" } : null;
     return json(object ? r : r ? [r] : []);
@@ -148,11 +180,25 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     return new Response(null, { status: 201 });
   }
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
+  if (p === "/rest/v1/rpc/tenant_mail_status") {
+    if (page.status === "missing") return json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+    if (page.status === "fail") return json({ code: "XX000", message: DB_MESSAGE }, 500);
+    return json(page.statusRows);
+  }
+  if (p === "/rest/v1/notification_settings") return json(page.settings);
+  if (p === "/rest/v1/organization_members") return json([]);
+  if (p === "/rest/v1/mail_job_counts") {
+    if (page.jobs === "missing") return json({ code: "PGRST205", message: "Could not find the table 'public.mail_job_counts' in the schema cache" }, 404);
+    if (page.jobs === "fail") return json({ code: "XX000", message: DB_MESSAGE }, 500);
+    return json(page.jobRows);
+  }
+  if (p === "/rest/v1/ops_heartbeats") return page.beats === "fail" ? json({ code: "XX000", message: DB_MESSAGE }, 500) : json(page.beats);
   throw new Error(`stub: unexpected ${method} ${p}`);
 };
 const fresh = () => {
   requests = []; logRows = []; auditRows = []; logMissing = false; adminEmail = OWNER.email; ownerMfaRequired = false; browser.clear();
   stateRows = []; stateTable = "ok"; stateWrites = [];
+  freshPage();
 };
 const smtp = () => requests.filter((r) => r.path === "/functions/v1/send-smtp").map((r) => JSON.parse(r.body) as Record<string, unknown>);
 
@@ -256,21 +302,91 @@ async function main() {
       eq("a signed-in user with no owner row: 403, and nothing is read beyond the guard or written", [member.status, requests.some((r) => r.path === "/rest/v1/tenant_smtp_state" || r.path === "/rest/v1/organizations"), auditRows.length], [403, false, 0]);
     }
 
-    console.log("\n/super/email: the reminder jobs, and the line without 0114");
+    console.log("\n/super/email, rendered: the organisations, the lost jobs and the line without 0114");
     {
-      const fs = await import("node:fs");
-      const path = await import("node:path");
-      const page = fs.readFileSync(path.resolve(__dirname, "../../app/(super-owner)/super/email/page.tsx"), "utf8");
+      const { TENANT_MAIL_NEEDS_0114 } = await import("../../lib/notifications/smtp-state");
       const hs = await import("../../lib/ops/health-status");
-      eq("the page shows the jobs through the fixed sentences and the pending reminders' three forms",
-        ["cronStateSentence(", "mailCronFailureSentences(", "pendingSentence(", "classifyMailCrons(", "MAIL_CRON_SCHEDULE"].map((s) => page.includes(s)), [true, true, true, true, true]);
-      eq("…which read a number, at least n, and not known",
-        [hs.pendingSentence({ kind: "exact", n: 3 }, {}), hs.pendingSentence({ kind: "at_least", n: 3 }, {}), hs.pendingSentence({ kind: "not_known" }, null), hs.pendingSentence({ kind: "not_known" }, { stopped_before_send: true })],
-        ["3", "at least 3", "not known", "not known: the run failed before it counted"]);
-      eq("…the last successful run reads not known when none is known, and the page says so", page.includes('j.last_ok_at ? fmt(j.last_ok_at) : "not known"'), true);
-      eq("…without 0114 the sentence that names it stands in place of the list and the job numbers", (page.match(/TENANT_MAIL_NEEDS_0114/g) ?? []).length >= 3, true);
-      eq("…and where crons are not scheduled the page says so", page.includes("Not scheduled here: shown, not counted."), true);
-      eq("…no database message is shown: the page reads no error's message", /\.message\b/.test(page), false);
+      const emailPage = (await import("../../app/(super-owner)/super/email/page")).default;
+      const decode = (html: string) => html.replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+      /** The page as a signed-in platform owner sees it; a throw is an error page. */
+      const render = async () => {
+        signIn(OWNER);
+        try {
+          return decode(renderToStaticMarkup((await emailPage()) as ReactElement));
+        } catch (e) {
+          return `ERROR PAGE: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      };
+      /** The markup between two headings or labels of the page. */
+      const between = (html: string, from: string, to: string) => {
+        const a = html.indexOf(from);
+        const b = html.indexOf(to, a + from.length);
+        return a < 0 || b < 0 ? "" : html.slice(a, b);
+      };
+      const ORGS = (html: string) => between(html, "Organisations' email", "Lost mail and skipped mail");
+      const JOBS = (html: string) => between(html, "Code and link jobs the platform ended", "Last request that skipped its mail");
+      const count = (html: string, s: string) => html.split(s).length - 1;
+      const UNREADABLE_ORGS = "The organisations' email state could not be read just now. Reload the page to try again.";
+
+      fresh(); page.status = "missing"; page.jobs = "missing"; page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      const no0114 = await render();
+      eq("without 0114: the page renders (its heading and its other sections), no error page",
+        [no0114.startsWith("ERROR PAGE"), no0114.includes("Platform Email"), no0114.includes("Reminder jobs"), no0114.includes("Send test")], [false, true, true, true]);
+      eq("…the sentence that names the migration, twice: in place of the organisations' list, and in place of the lost-job numbers",
+        [count(no0114, TENANT_MAIL_NEEDS_0114), ORGS(no0114).includes(TENANT_MAIL_NEEDS_0114), JOBS(no0114).includes(TENANT_MAIL_NEEDS_0114)], [2, true, true]);
+      eq("…and neither the list nor the numbers: no table, no organisation's name, no \"lost of\", and no \"could not be read just now\"",
+        [no0114.includes("<table"), ORGS(no0114).includes("Tenant A"), JOBS(no0114).includes(" lost of "), no0114.includes("could not be read just now")], [false, false, false, false]);
+
+      fresh();
+      page.statusRows = [{ organization_id: ORG_ID, state: "healthy", state_changed_at: "2026-11-20T08:00:00.000Z", last_success_at: "2026-11-21T07:30:00.000Z", last_error_code: null, daily_limit: 1500, sent_24h: 12 }];
+      page.settings = [{ organization_id: ORG_ID, smtp_host: "smtp.tenant.stub", smtp_port: 465, from_email: "from-0029" }];
+      page.jobRows = [{ day: new Date().toISOString().slice(0, 10), kind: "reset_code", started: 4, finished: 3 }];
+      page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      const withIt = await render();
+      eq("with 0114: the organisations' list, a row with the name, the reading, the count of the limit and the limit's form holding the stored number",
+        [withIt.includes("<table"), ORGS(withIt).includes("Tenant A"), ORGS(withIt).includes("Healthy"), ORGS(withIt).includes("12 of 1500"), ORGS(withIt).includes('aria-label="Daily email limit"'), ORGS(withIt).includes('value="1500"')],
+        [true, true, true, true, true, true]);
+      eq("…the lost-job numbers, and no sentence that names the migration", [JOBS(withIt).includes("1 lost of 4 started"), withIt.includes(TENANT_MAIL_NEEDS_0114)], [true, false]);
+
+      fresh(); page.status = "fail"; page.jobs = "fail"; page.beats = "fail"; page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      const failed = await render();
+      eq("a state that cannot be read: its own sentences, in place of the list, the numbers and the jobs; no sentence that names the migration; no error page",
+        [ORGS(failed).includes(UNREADABLE_ORGS), ORGS(failed).includes("<table"), JOBS(failed).includes("could not be read just now"), failed.includes("The jobs' heartbeats could not be read just now."), failed.includes(TENANT_MAIL_NEEDS_0114), failed.startsWith("ERROR PAGE")],
+        [true, false, true, true, false, false]);
+      eq("…and no database message anywhere on the page", failed.includes(DB_MESSAGE), false);
+
+      console.log("\n/super/email, rendered: the reminder jobs through the fixed sentences");
+      const at = (minAgo: number) => new Date(Date.now() - minAgo * 60_000).toISOString();
+      const beat = (name: string, status: "ok" | "error", minAgo: number, run: Parameters<typeof hs.buildMailCronDetail>[0]) =>
+        ({ name, last_run_at: at(minAgo), last_status: status, last_detail: hs.buildMailCronDetail(run).heartbeat });
+      /** The text of each job's row, in the page's order: reminders, then journey-nudges. */
+      const cell = (html: string, label: string) =>
+        [...html.matchAll(new RegExp(`<dt[^>]*>${label}</dt><dd[^>]*>(.*?)</dd>`, "g"))].map((m) => m[1].replace(/<[^>]+>/g, ""));
+      const NO_ERRORS = { errors: {}, unreadableOrgs: 0, no0114: false };
+
+      fresh(); page.status = "missing"; page.jobs = "missing";
+      page.beats = [
+        beat("reminders", "ok", 60, { ...NO_ERRORS, stoppedBeforeSend: false, due: 5, sent: 2, failed: 0, left: 3, leftComplete: true, leftDailyLimit: 0, leftOrgs: 0 }),
+        beat("journey-nudges", "ok", 30, { ...NO_ERRORS, stoppedBeforeSend: false, due: 6, sent: 2, failed: 0, left: 4, leftComplete: false, leftDailyLimit: 0, leftOrgs: 1 }),
+      ];
+      delete process.env.OPS_EXPECT_CRONS;
+      const clean = await render();
+      eq("two clean runs: pending as a number, and as \"at least n\" when the count is not whole", cell(clean, "Pending reminders"), ["3", "at least 4"]);
+      eq("…each last successful run is its own time, the state the clean sentence, and the program that waited said once",
+        [cell(clean, "Last successful run").every((t) => t.endsWith(" UTC")), cell(clean, "State").map((t) => t.startsWith(hs.cronStateSentence("ok", true))), count(clean, "1 organisation or program waited for the next run.")], [true, [true, true], 1]);
+      eq("…where crons are not scheduled the page says so, and counts neither job",
+        [clean.includes("Not scheduled here: shown, not counted."), count(clean, "not counted</span>"), clean.includes("Scheduled here:")], [true, 2, false]);
+
+      fresh(); page.status = "missing"; page.jobs = "missing";
+      page.beats = [beat("reminders", "error", 60, { errors: { call_limit: 1 }, unreadableOrgs: 0, no0114: false, stoppedBeforeSend: true, leftOrgs: 1 })];
+      process.env.OPS_EXPECT_CRONS = "1";
+      const stopped = await render();
+      delete process.env.OPS_EXPECT_CRONS;
+      eq("a run that stopped before it counted: \"not known\" with its reason; a job with no run: \"not known\"", cell(stopped, "Pending reminders"), ["not known: the run failed before it counted", "not known"]);
+      eq("…the last successful run reads \"not known\" when none is known, for both", cell(stopped, "Last successful run"), ["not known", "not known"]);
+      eq("…the failure details are the job's own stop's sentence alone, and the job with no run reads none recorded",
+        [cell(stopped, "Failure details")[0], cell(stopped, "Failure details")[1], cell(stopped, "State")[1]], [hs.callLimitSentence(true), "not known", hs.cronStateSentence("never-seen", true)]);
+      eq("…where crons are scheduled the page says so, and counts them", [stopped.includes("Scheduled here: a failed run reads warn on the health check until the job's next clean run."), stopped.includes("not counted</span>")], [true, false]);
     }
   } finally {
     globalThis.fetch = realFetch;

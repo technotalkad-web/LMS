@@ -361,10 +361,17 @@ Center. The platform owner sees every organisation on `/super/email` →
   attempted, and its sign-in page answers "Email could not be sent. Please
   contact your LMS Administrator." For each account and kind, only the first
   such request in a 24-hour window leaves a `failed` row (error `smtp_not_ready`,
-  or `daily_limit`). Everything else is still tried as long as the settings are
-  complete, and the first send acts as the probe. In one request or cron run a
-  `failing` organisation gets one probe; once a run's sends flip it, the rest
-  are not attempted and are recorded as not sent.
+  or `daily_limit`). What happens to its other mail depends on why it is not
+  ready:
+  - `failing`: the other mail is still tried, and the first send acts as the
+    probe. In one request or cron run the organisation gets one probe; once a
+    run's sends flip it, the rest are not attempted and are recorded as not
+    sent.
+  - `not_configured`: nothing can be tried, because the settings are not
+    complete.
+  - at its daily limit: nothing at all is attempted through its SMTP and there
+    is no probe, whatever its reading; routine mail had already stopped short
+    of the limit (see "The daily limit" below).
 - **The alert.** `tenant_smtp_alert` goes by the platform sender to at most
   five of the organisation's active administrators. Three things raise it: the
   reading turning `failing` (no more than once per 6 hours); a learner's mail

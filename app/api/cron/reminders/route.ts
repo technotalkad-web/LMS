@@ -64,12 +64,16 @@ import { chunk, readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
  *     is the job's own failed step: call_limit, stopped before any send,
  *     with one fixed line (cron_no_room). So is a call that had members to
  *     read and read no organisation's members whole for want of room (the
- *     note of 2026-11-21 (later), point 4). Every read before the sends asks
- *     the call's one gate, whose count and clock only go on, so an
- *     organisation whose members had no room is followed by a later read
- *     with no room either, and that read stops the call. An organisation
- *     whose run was not opened once other mail went is left for the next
- *     call, a clean run (rule T5; the hand-over note of 2026-11-19, point 3).
+ *     note of 2026-11-21 (later), point 4). A page of an organisation's
+ *     members also keeps back one call for each read that every run makes
+ *     after it, so an organisation left for room once another's members were
+ *     read whole leaves the call room to read on: a clean run, counted in
+ *     left_orgs (point 4, "what stays clean"). A later read that needs more
+ *     than that still stops the call in its own step. The count and the
+ *     clock only go on, so an organisation left by the clock is followed by
+ *     a later read with no room either. An organisation whose run was not
+ *     opened once other mail went is left for the next call, a clean run
+ *     (rule T5; the hand-over note of 2026-11-19, point 3).
  *   - The finished attempts are asked for by the attempt row's own columns
  *     (completed or passed), the same test the route makes on each row.
  *   - The answer and the heartbeat are built by buildMailCronDetail: counts
@@ -117,6 +121,17 @@ const RUN_ROOM = MAIL_CALL_COSTS.open + FIRST_GROUP_CALLS;
  * and one group of sends.
  */
 const SEND_RESERVE = 1 + RUN_ROOM;
+/**
+ * What the members' read of an organisation keeps back besides that: one
+ * call for each read that every run makes after it (the assignments, the
+ * finished attempts, the state and a first list of addresses). So when an
+ * organisation is left for room once another's members were read whole,
+ * the call still has room to read on and remind the first one's learners: a
+ * clean run that counts it in left_orgs (ADR 0029, note of 2026-11-21
+ * (later), point 4, "what stays clean"). A read after it that needs more
+ * pages than this still stops the run in its own step (part 2 (a)).
+ */
+const LATER_READS = 4;
 
 export async function POST(request: Request) {
   const expected = process.env.CRON_SECRET;
@@ -144,6 +159,12 @@ export async function POST(request: Request) {
   /** One call for a page of a read before the sends, while the call still keeps its reserve for the sends. */
   const pageRoom = () => {
     if (!hasRoom(budget, 1 + SEND_RESERVE)) return false;
+    spendCalls(budget, 1);
+    return true;
+  };
+  /** The same for a page of an organisation's members, which also keeps back the reads after it. */
+  const membersPageRoom = () => {
+    if (!hasRoom(budget, 1 + LATER_READS + SEND_RESERVE)) return false;
     spendCalls(budget, 1);
     return true;
   };
@@ -217,13 +238,14 @@ export async function POST(request: Request) {
   // this run. A deleted organisation's courses are dropped before any read;
   // an organisation whose read fails is dropped for this run and logged with
   // its id. Each call of the read (the organisation, then a call for each
-  // 1,000 members) asks for room first and is counted as made (rule FP2).
-  // An organisation this call has no room left to read whole is left for the
-  // next call (the hand-over note of 2026-11-19, point 3).
+  // 1,000 members) asks for room first and is counted as made (rule FP2),
+  // keeping back the reads after it (LATER_READS). An organisation this call
+  // has no room left to read whole is left for the next call (the hand-over
+  // note of 2026-11-19, point 3).
   const countingByOrg = new Map<string, ReadonlySet<string>>();
   let leftOrgs = 0;
   for (const oid of new Set(allCourses.filter((c) => c.org_live).map((c) => c.organization_id))) {
-    const counting = await countingMemberIds(svc, oid, undefined, pageRoom);
+    const counting = await countingMemberIds(svc, oid, undefined, membersPageRoom);
     if (counting === "no_room") {
       leftOrgs++;
       continue;
@@ -239,7 +261,9 @@ export async function POST(request: Request) {
   // of room has done nothing a later call is spared: the next call arrives
   // at the same place (ADR 0029, note of 2026-11-21 (later), point 4). The
   // job's own failed step, call_limit, stopped before any send. With
-  // another organisation read whole, the reads below meet the same gate.
+  // another organisation read whole, the reads below have the room the
+  // members' read kept back, and the run goes on: the organisation left is
+  // counted in left_orgs, on a clean run.
   if (leftOrgs > 0 && countingByOrg.size === 0) {
     noRoom("members_read");
     return finish({ stoppedBeforeSend: true, leftOrgs });

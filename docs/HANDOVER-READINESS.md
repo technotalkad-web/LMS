@@ -45,7 +45,7 @@ These are **not bugs** — they are features that don't exist. If Ambak expects 
 | Email (transactional) | **Per-org SMTP** via a Supabase Edge Function (`send-smtp`) | Validated working end-to-end (Gmail) |
 | Email (auth: invite/magic-link/reset) | **The app itself** (corrected 2026-11-21, ADR 0029): learners' codes and links through their organisation's SMTP, administrators' and platform owners' through the platform mailbox; the Supabase Auth mailer sends none of the app's mail | Site URL still matters for the auth server's own redirects (see `docs/ops/supabase-auth-smtp.md` Step 0) |
 | Object storage | Supabase Storage or **Cloudflare R2** (`STORAGE_DRIVER`) | Course packages under `course-content` bucket |
-| Scheduled jobs | **Cloudflare cron triggers** → `/api/cron/*` | reminders, billing, reaper, refresh-report-views, rls-audit |
+| Scheduled jobs | **GitHub Actions** (`.github/workflows/cron.yml`) POSTs `/api/cron/*` on production with the cron secret (corrected 2026-11-21, ADR 0029; this read "Cloudflare cron triggers": the Worker has no scheduled handler, so `wrangler.toml` keeps its trigger list empty) | reminders, journey-nudges, billing, reaper, refresh-report-views, rls-audit, lrs-forward, gamification-refresh, gamification-monthly, report-card-refresh; staging has no schedule |
 | Errors | **Sentry** (`@sentry/nextjs`) | Already wired |
 | CI/CD | **GitHub Actions** | PR checks (typecheck/lint/e2e); deploy-staging on `main`; deploy-prod on `v*.*.*` tag (gated `production` env); nightly e2e; nightly Supabase backup; RLS cross-tenant audit |
 
@@ -178,7 +178,7 @@ Maps to [AUDIT-FINDINGS.md](../tests/bot/lifecycle/AUDIT-FINDINGS.md). **P0 = bl
 
 - **Verified:** assign to user/team/org, dashboard surfacing, assignment/unassignment/reminder/completion emails, learning-path sequencing (with the L1 `org_public` gating gap to fix).
 - Validate the **bulk/org-wide assignment** path at Ambak scale (5,000 rows + email fan-out → needs C2/C3 fixes).
-- Reminder cadence/cap configurable per course — verify Ambak's desired cadence and that the cron is scheduled (Cloudflare cron is set for 06:00 UTC).
+- Reminder cadence/cap configurable per course — verify Ambak's desired cadence and that the cron is scheduled (`.github/workflows/cron.yml` posts `/api/cron/reminders` daily at 06:00 UTC; corrected 2026-11-21, ADR 0029: this read "Cloudflare cron").
 
 ---
 
@@ -236,7 +236,7 @@ Deliverables to produce before handover:
 - [ ] Prod Auth: **Site URL + Redirect URLs** = prod app; the Auth mailer turned down as `docs/ops/supabase-auth-smtp.md` says (corrected 2026-11-21, ADR 0029; this read "SMTP configured"); the platform sender's secrets set and its test delivered (`ops/RUNBOOK.md` §6.3a); SPF/DKIM/DMARC set.
 - [ ] Prod secrets set as Worker secrets (CRON_SECRET, service-role, IMPERSONATION_SECRET); **test creds rotated**.
 - [ ] Sentry alerts + uptime + cron-failure + notification_log-failure alerts live.
-- [ ] Cloudflare cron triggers confirmed on prod worker.
+- [ ] The scheduled jobs confirmed on prod: the `Scheduled crons (prod)` workflow (`.github/workflows/cron.yml`) is enabled, its repository secrets are set, and one manual run answers 200 (corrected 2026-11-21, ADR 0029; this read "Cloudflare cron triggers confirmed on prod worker", but the Worker has no cron triggers).
 - [ ] Backups verified; DR runbook written.
 - [ ] Ambak content validated on staging (formats = 1.2/cmi5), incl. mobile.
 - [ ] Capability gaps (§1) signed off by Ambak.
