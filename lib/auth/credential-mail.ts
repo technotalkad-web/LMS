@@ -49,12 +49,12 @@ import { sendTenantSignInLink, signInLink } from "@/lib/auth/auth-email";
  *   - a sign-in link is minted only for the account the lookup found, and
  *     only once the limits and rule 2 allow it: generateLink is never the
  *     lookup, and an id it returns that differs sends nothing;
- *   - one deadline for the whole job (rule T3): it takes its start time, and
- *     every send waits the smaller of its own wait and the time the job has
- *     left less SEND_ROW_MS kept for that send's row, so every row is
- *     written within CREDENTIAL_JOB_MS. A send with no time left is not
- *     started, and a fixed line says so. Every step reads the same deadline
- *     from the job's context (JobContext.endsAt).
+ *   - a single deadline (rule T3): CREDENTIAL_JOB_MS from the job's own
+ *     start. A send's wait is capped by what remains of it, after SEND_ROW_MS
+ *     is set aside for the send's log row, and never exceeds the sender's
+ *     usual wait. When nothing remains the send is skipped with a fixed log
+ *     line. The deadline sits on the job's context (JobContext.endsAt) for
+ *     every step to read.
  *
  * No log line holds an address, a user id, a code, a link or a database
  * message: fixed words and error codes only.
@@ -303,7 +303,10 @@ function spend(ctx: JobContext, n: number): void {
  *   4. the mail: tenantMail or platformMail, each with its limits, the code
  *      or link, and the send within the time left;
  *   5. the finish mark, also after a failure.
- * A step added later goes between 3 and 4 and reads the same deadline.
+ * Every step takes the job's context, and any step, wherever it sits (here
+ * or inside the mail step), reads the one deadline from ctx.endsAt; a send
+ * takes its time left from timeLeftForSend(ctx). No step keeps a clock of
+ * its own.
  */
 async function credentialJob(input: JobInput): Promise<void> {
   const ctx: JobContext = { ...input, endsAt: input.now() + CREDENTIAL_JOB_MS };

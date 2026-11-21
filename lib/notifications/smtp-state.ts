@@ -171,15 +171,13 @@ export function requestBudget(opts: { spent?: number; now?: () => number } = {})
 export const CRON_END_CALLS = 2;
 
 /**
- * The reads every reminders call makes after its members' read whenever
- * anybody is to be reminded, each at its least, which is one call (ADR 0029,
- * note of 2026-11-21 (evening), part 1), in the route's own words for those
- * steps: the assignments, the finished attempts, the reminders' state and
- * one list of addresses. Declared once: the reminders route keeps back one
- * call for each in its members' read (its LATER_READS is this list's
- * length), and tests/unit/mail-budget.test.ts checks the list against the
- * reads the call makes. A floor, not scaled: a read that needs more than its
- * one call stops the run in its own step.
+ * The reminders job's steps that come after its members' read on any call
+ * with someone due (ADR 0029, note of 2026-11-21 (evening), part 1), named
+ * with the job's step words: assignments, finished attempts, reminder state,
+ * addresses. The route's members' read holds back one call per entry (its
+ * LATER_READS is the length here); tests/unit/mail-budget.test.ts compares
+ * this list with the requests a call really makes. One call per step is the
+ * least each needs; a step that needs more still stops the job in that step.
  */
 export const REMINDER_LATER_READS = ["assignments_read", "progress_read", "state_read", "profiles_read"] as const satisfies readonly CronErrorWord[];
 
