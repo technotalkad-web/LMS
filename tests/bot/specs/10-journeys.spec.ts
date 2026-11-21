@@ -35,12 +35,44 @@ test("auth — bad credentials are rejected without crashing", async ({ browser,
   await ctx.close();
 });
 
+/** The one line of the form with no organisation (ADR 0029 section D; LEARNERS_LINE in lib/auth/credential-mail.ts). */
+const LEARNERS_LINE = "Learners: sign in at your organisation's own address.";
+
 test("auth — forgot-password page renders and accepts an email", async ({ browser, baseURL }) => {
   const ctx = await browser.newContext({ baseURL: baseURL! });
   const page = await ctx.newPage();
   const sc: StepCtx = { page, role: "anonymous", area: "auth/forgot-password", repro: ["Open /forgot-password"] };
   await page.goto("/forgot-password");
   await expectVisible(sc, page.getByRole("button", { name: /send|reset|continue|code/i }).first(), "submit button");
+  // The form with no organisation serves platform owners and administrators,
+  // and tells learners where to sign in instead.
+  await expectVisible(sc, page.getByText(LEARNERS_LINE), "the learners' line on the form with no organisation");
+  await ctx.close();
+});
+
+test("auth — the organisation's forgot-password form names the organisation", async ({ browser, baseURL }) => {
+  const seed = readSeed();
+  const ctx = await browser.newContext({ baseURL: baseURL! });
+  const page = await ctx.newPage();
+  const target = `/forgot-password?org=${encodeURIComponent(seed.org.slug)}`;
+  const sc: StepCtx = { page, role: "anonymous", area: "auth/forgot-password", repro: [`Open ${target}`] };
+  await page.goto(target);
+  await expectVisible(sc, page.getByRole("button", { name: /send|reset|continue|code/i }).first(), "submit button");
+  await expectVisible(sc, page.getByText(`For ${seed.org.name}.`, { exact: false }), "the organisation's name on its own form");
+  await expectThat(sc, (await page.getByText(LEARNERS_LINE).count()) === 0, "no learners' line on the organisation's own form", "medium");
+  await ctx.close();
+});
+
+/** Rule N10's one answer for a link that cannot be used (LINK_UNUSABLE_MESSAGE in lib/auth/setup-link.ts). */
+const LINK_UNUSABLE = "This link can no longer be used. Ask your LMS Administrator for a new one, or use Forgot password.";
+
+test("auth — the set-password page with no link gives the one answer for a link that cannot be used", async ({ browser, baseURL }) => {
+  const ctx = await browser.newContext({ baseURL: baseURL! });
+  const page = await ctx.newPage();
+  const sc: StepCtx = { page, role: "anonymous", area: "auth/set-password", repro: ["Open /auth/set-password"] };
+  await page.goto("/auth/set-password");
+  await expectVisible(sc, page.getByText(LINK_UNUSABLE), "rule N10's answer", "high");
+  await expectThat(sc, (await page.getByLabel(/new password/i).count()) === 0, "no password form without a link", "high");
   await ctx.close();
 });
 

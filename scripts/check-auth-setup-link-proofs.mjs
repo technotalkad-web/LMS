@@ -6,13 +6,22 @@
 // =============================================================================
 //
 // RUN BY HAND, STAGING ONLY. It refuses any Supabase project but staging
-// (the rule of tests/bot/lifecycle/cleanup.ts, isStagingSupabaseUrl). It
-// touches no app code and no app table: it calls the auth server the way the
-// set-password code will (auth.admin.createUser, auth.admin.updateUserById,
-// auth.admin.generateLink with verifyOtp as app/auth/callback/route.ts uses
-// it, auth.admin.getUserById, and signInWithPassword on a fresh client that
-// keeps no session), and, for point 6, staging's send-smtp Edge Function with
-// the request lib/email/smtp-function.ts (dispatchSmtp) makes.
+// (the rule of tests/bot/lifecycle/cleanup.ts, isStagingSupabaseUrl). Points
+// 1 to 6's first leg touch no app code and no app table: they call the auth
+// server the way the set-password code does (auth.admin.createUser,
+// auth.admin.updateUserById, auth.admin.generateLink with verifyOtp as
+// app/auth/callback/route.ts uses it, auth.admin.getUserById, and
+// signInWithPassword on a fresh client that keeps no session), and, for point
+// 6, staging's send-smtp Edge Function with the request
+// lib/email/smtp-function.ts (dispatchSmtp) makes.
+//
+// The platform leg of point 6 (--platform-leg) is the one part that widens
+// this: it calls the app, a build of this branch that holds staging's
+// platform sender settings, at STAGING_BASE_URL; it makes one organisation in
+// the lifecycle namespace and one platform owner at the lifecycle domain; and
+// it reads one app table, platform_email_log, by user id, for a row's event,
+// status and code only. The platform settings stay in that deployment: none
+// is given to this script. See "The platform leg" below.
 //
 // Accounts of points 1 and 3 to 5: new per run, in the lifecycle namespace
 // (`lifecycle+p0029-<role>-<run>@lifecycle.test`, tests/e2e/helpers/
@@ -55,9 +64,61 @@
 // from the mailbox and decoded one by one. Pass: the setup-style link is
 // there character for character in the text part, as the HTML link's
 // address and as its shown text. A control that is not there whole makes
-// the leg void. The platform and tenant legs are later steps; they print
-// "not run". In a run, point 6 goes before point 2, so a void of point 2 is
-// the last thing tried.
+// the leg void. The tenant leg is pull request C's; it prints "not run".
+// In a run, point 6 goes before point 2, so a void of point 2 is the last
+// thing tried.
+//
+// Point 6, platform leg (--platform-leg, run alone). The build's own
+// console adds an administrator at one fixed, listed alias of the test
+// mailbox (`<its local part>+p0029h-welcome@<its domain>`), and the welcome
+// the platform sender mails is read back from the mailbox:
+//   1. the build: 43 random characters posted to /api/auth/set-password with
+//      no password get rule N10's answer, so the address serves this branch
+//      (any other answer: the leg is "not run"); it is step 9's control;
+//   2. the sweep: any account left at an alias with this harness's prefix is
+//      deleted; the time is noted;
+//   3. the fixtures, with the service role: one organisation in the
+//      lifecycle namespace and one platform owner at the lifecycle domain
+//      (a password, a confirmed address, no forced change, mfa_required
+//      false, as markPlatformOwner writes it);
+//   4. the session: that owner signs in through the build's own /login form,
+//      in a browser this script drives (no cookie is made by hand);
+//   5. the add: POST /api/super/tenants/<organisation>/admins with the alias
+//      (through the recipient guard) and the role admin: 200, invited true,
+//      email_outcome.status "sent", and no setup_link in the answer;
+//   6. the row: one platform_email_log row for the new account,
+//      platform_admin_welcome, sent;
+//   7. the mail: found within five minutes in the inbox, all-mail or spam
+//      folder; the folder and the seconds are recorded;
+//   8. the control: the sign-in address (the build's address, the
+//      organisation's slug, /login) whole in the text part, and in the HTML
+//      part as a link's address and as its shown text;
+//   9. the link: the text part holds one address on the build's own host,
+//      path /auth/set-password, no query, a fragment of #t= and 43
+//      characters; the HTML part holds the same address as a link's address
+//      and as its shown text. The token posted with no password gets the
+//      good answer naming step 3's organisation, and again the same; any
+//      other 43 characters get step 1's answer;
+//  10. the use: the token with a password sets it once; that password signs
+//      in at the auth server; the same token then gets rule N10's answer;
+//  11. twenty sign-in-link requests at once for the administrator at the
+//      alias: at most five sent rows and at most five in-flight rows, so at
+//      most five mails;
+//  12. clean-up, also after a failure, in this order: the alias's account
+//      (its link's row, membership and profile go with it), the platform
+//      owner's row and account, the organisation; a last read finds no
+//      account at the prefix. The platform_email_log rows and the console's
+//      audit row stay, with the user id emptied (on delete set null).
+// Pass: steps 5 to 11. Void, and not proven by that run: the welcome is not
+// sent (its class is recorded: not_allowed is the list, not_configured the
+// deployment's settings, timeout a mail that may still arrive), the mail is
+// not found in five minutes, or the control is not whole in a part. Fail:
+// invited false (the alias was still taken), a link that is cut, changed,
+// percent-encoded or wrapped in another address, a token the build refuses,
+// any part of step 10, or more than five of step 11. Each run mails the
+// alias once for the welcome and at most five times in step 11, from
+// staging's platform mailbox, inside staging's ceiling. The console's audit
+// row of the add names the alias and outlives the account.
 //
 // Output: step names, pass / fail / recorded / void / not run, HTTP statuses,
 // error codes, "set" / "empty" for a time, "set" / "unset" for a setting,
@@ -73,6 +134,9 @@
 //   needs BOT_SMTP_USER and BOT_SMTP_PASS, with BOT_SMTP_HOST, BOT_SMTP_PORT,
 //   BOT_SMTP_SECURE and BOT_SMTP_FROM_NAME optional (configureOrgSmtp's
 //   defaults). Without them those points print "not run" and the rest runs.
+//   The platform leg also reads STAGING_BASE_URL, the address of the build
+//   under test, under the name scripts/staging-cron-post.mjs reads, and it
+//   must pass that script's own test (isStagingAppUrl, imported).
 //   Loaded the way the Playwright configs load them, e.g.
 //     node -r dotenv/config scripts/check-auth-setup-link-proofs.mjs \
 //       dotenv_config_path=<checkout>/.env.test.local --report <file>.json
@@ -81,18 +145,22 @@
 //   --dry-run        check the settings, the project guard and the recipient
 //                    guard; call nothing
 //   --mail-only      run only points 2 and 6 (the mailbox points)
+//   --platform-leg   run only point 6's platform leg (it needs the mailbox
+//                    settings and STAGING_BASE_URL); without this flag the
+//                    leg prints "not run"
 //   --report <file>  also write the results as JSON (no secrets, no ids)
 //
 // EXIT: 0 every proof passed; 1 a proof failed or its control was void;
-// 2 refused (not staging, a setting missing; also --mail-only when the
-// mailbox settings are unset, after its "not run" lines); 3 harness error or
-// a failed cleanup.
+// 2 refused (not staging, a setting missing; also --mail-only or
+// --platform-leg when their settings are unset, after the "not run" lines);
+// 3 harness error or a failed cleanup.
 // =============================================================================
 
 import { createClient } from "@supabase/supabase-js";
 import { randomBytes } from "node:crypto";
 import { writeFileSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { isStagingAppUrl } from "./staging-cron-post.mjs";
 
 const STAGING_REF = "zeaclbapadosqqttexxh";
 const PRODUCTION_REF = "alkfrcglmseksweqhwzq";
@@ -114,6 +182,17 @@ const MAIL_POLL_MS = 15_000;
 const SEND_WAIT_MS = 30_000;
 /** lib/email/smtp-function.ts SMTP_SEND_WAIT_MS: how long the app waits for one send. */
 const APP_SEND_WAIT_MS = 15_000;
+/** The platform leg's one alias role: `<local>+p0029h-welcome@<domain>`, the address on the staging allow-list. */
+const LEG_ALIAS_ROLE = "welcome";
+/** Rule N10's one answer for a link that cannot be used (LINK_UNUSABLE_MESSAGE in lib/auth/setup-link.ts). */
+const LINK_UNUSABLE = "This link can no longer be used. Ask your LMS Administrator for a new one, or use Forgot password.";
+/** The setup link's path and token shape (SETUP_LINK_PATH, SETUP_TOKEN_SHAPE in lib/auth/setup-link.ts). */
+const SETUP_PATH = "/auth/set-password";
+/** The job after a public request has 25 s (CREDENTIAL_JOB_MS in lib/auth/credential-mail.ts). */
+const APP_JOB_MS = 25_000;
+/** Step 11 of the platform leg: requests made at once, and the most that may be sent (5 in the hour for one account). */
+const LEG_BURST = 20;
+const LEG_BURST_MAX = 5;
 
 // ---------------------------------------------------------------------------
 // Flags and settings
@@ -121,11 +200,13 @@ const APP_SEND_WAIT_MS = 15_000;
 const argv = process.argv.slice(2).filter((a) => !a.startsWith("dotenv_config_"));
 let dryRun = false;
 let mailOnly = false;
+let platformLeg = false;
 let reportPath = null;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--dry-run") dryRun = true;
   else if (a === "--mail-only") mailOnly = true;
+  else if (a === "--platform-leg") platformLeg = true;
   else if (a === "--report" && argv[i + 1]) reportPath = argv[++i];
   else {
     console.error(`✖ unknown flag (${a.slice(0, 20)})`);
@@ -187,6 +268,17 @@ const mailReason = !isSet("BOT_MAIL_ADDRESS")
 const mailReady = mailReason === null;
 const smtpReason = mailReason ?? (!isSet("BOT_SMTP_USER") || !isSet("BOT_SMTP_PASS") ? "BOT_SMTP_USER or BOT_SMTP_PASS unset" : null);
 const smtpReady = smtpReason === null;
+
+/** The build under test for the platform leg: STAGING_BASE_URL, through the cron poster's own test of a staging app address. */
+const LEG_BASE = (env.STAGING_BASE_URL ?? "").trim().replace(/\/+$/, "");
+const legBaseReason = !LEG_BASE
+  ? "STAGING_BASE_URL unset"
+  : !isStagingAppUrl(`${LEG_BASE}/`)
+    ? "STAGING_BASE_URL set but not a staging app address"
+    : null;
+const legReason = mailReason ?? legBaseReason;
+const legReady = legReason === null;
+console.log(`platform leg settings: STAGING_BASE_URL ${LEG_BASE ? "set" : "unset"}${LEG_BASE ? `, a staging app address ${legBaseReason ? "no" : "yes"}` : ""}`);
 
 // ---------------------------------------------------------------------------
 // Results
@@ -1027,6 +1119,245 @@ async function point6Transport() {
 }
 
 // ---------------------------------------------------------------------------
+// Point 6, the platform leg: the console's welcome, read back from the mailbox
+// ---------------------------------------------------------------------------
+const P6P = "Q19.6p";
+/** The leg's fixed alias of the mailbox; the staging allow-list names it. */
+const legAlias = (box = MAILBOX) => `${box.local}+${MAIL_TAG_PREFIX}${LEG_ALIAS_ROLE}@${box.domain}`;
+/** The only way the leg names the alias to the app: through the recipient guard. */
+function legRecipient(address, box = MAILBOX) {
+  return mailboxRecipient(address, box);
+}
+/** What the leg made, for its own clean-up in its own order. */
+const leg = { orgId: null, ownerId: null, adminId: null, browser: null };
+
+/** POST a JSON body to the build; the answer's status and parsed body (never printed). */
+async function postBuild(path, body, { fetchImpl = fetch } = {}) {
+  const res = await fetchImpl(`${LEG_BASE}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => null);
+  return { status: res.status, json };
+}
+const isUnusable = (a) => a.status === 400 && a.json?.error === LINK_UNUSABLE && a.json?.code === "unusable";
+
+/** The leg's platform_email_log rows for one account: event, status and code only. */
+async function legRows(userId) {
+  const { data, error } = await svc.from("platform_email_log").select("event_type, status, error_code").eq("to_user_id", userId);
+  return { rows: Array.isArray(data) ? data : [], error };
+}
+
+/** Lines of a text part that name the set-password page on the build's host, in any form. */
+function setupLines(text, host) {
+  return String(text)
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.includes(SETUP_PATH) || l.includes(encodeURIComponent(SETUP_PATH)) || (l.includes(host) && /set-password/i.test(l)));
+}
+
+async function platformLegRun() {
+  const host = new URL(LEG_BASE).host;
+  const setupRe = new RegExp(`^${escRe(`${new URL(LEG_BASE).origin}${SETUP_PATH}`)}#t=([A-Za-z0-9_-]{43})$`);
+
+  // 1. The build.
+  let first;
+  try {
+    first = await postBuild("/api/auth/set-password", { token: token43() });
+  } catch (e) {
+    rec(P6P, "step 1: the build answers", "not run", `the request failed (${safeCode(e?.name)}); the address does not serve this branch`);
+    return;
+  }
+  if (!isUnusable(first)) {
+    rec(P6P, "step 1: 43 random characters get rule N10's answer", "not run", `status=${first.status}; the address does not serve this branch`);
+    return;
+  }
+  rec(P6P, "step 1: 43 random characters get rule N10's answer (the build is this branch)", "setup", `status=${first.status}`);
+
+  // 2. The sweep.
+  const sw = await sweepMailboxAliases();
+  if (!rec(P6P, "step 2: accounts left at this harness's aliases deleted", sw.ok ? "setup" : "fail",
+    `found=${sw.found} deleted=${sw.deleted} users scanned=${sw.scanned}${sw.error ? ` scan ${errInfo(sw.error)}` : ""}`)) return;
+  const sweptAt = Date.now();
+  const since = new Date(sweptAt - 24 * 3600_000);
+
+  // 3. The fixtures.
+  const slug = `${NS_PREFIX}-p0029h-${randomBytes(3).toString("hex")}`;
+  const orgName = `Lifecycle platform leg ${RUN}`;
+  const { data: org, error: orgError } = await svc.from("organizations").insert({ name: orgName, slug }).select("id").single();
+  if (!rec(P6P, "step 3: the organisation (lifecycle namespace)", orgError || !org?.id ? "fail" : "setup", orgError ? `code=${safeCode(orgError.code)}` : "made")) return;
+  leg.orgId = org.id;
+  const O = { email: addr("owner"), pw: newPassword() };
+  runAddresses.add(O.email);
+  const o = await svc.auth.admin.createUser({ email: O.email, password: O.pw, email_confirm: true });
+  track("leg-owner", o.data?.user);
+  if (!rec(P6P, "step 3: the platform owner's account (password, confirmed)", o.error || !o.data?.user?.id ? "fail" : "setup", errInfo(o.error))) return;
+  leg.ownerId = o.data.user.id;
+  const prof = await svc.from("profiles").upsert({ id: leg.ownerId, email: O.email, first_name: "Platform", last_name: "Leg", must_change_password: false }, { onConflict: "id" });
+  const po = await svc.from("platform_owners").upsert({ user_id: leg.ownerId, mfa_required: false }, { onConflict: "user_id" });
+  if (!rec(P6P, "step 3: the owner's profile (no forced change) and platform owner row (mfa_required false)", prof.error || po.error ? "fail" : "setup",
+    `profile ${prof.error ? `code=${safeCode(prof.error.code)}` : "ok"}; platform_owners ${po.error ? `code=${safeCode(po.error.code)}` : "ok"}`)) return;
+
+  // 4. The session, through the build's own /login form.
+  const { chromium } = await import("playwright");
+  leg.browser = await chromium.launch();
+  const ctx = await leg.browser.newContext({ baseURL: LEG_BASE });
+  const page = await ctx.newPage();
+  let signedIn = false;
+  try {
+    await page.goto("/login");
+    await page.getByLabel(/work email/i).waitFor({ timeout: 30_000 });
+    await page.getByLabel(/work email/i).fill(O.email);
+    await page.getByLabel(/^password$/i).fill(O.pw);
+    await page.getByRole("button", { name: /sign in/i }).click();
+    await page.waitForURL(/\/super(\/|$)/, { timeout: 30_000 });
+    signedIn = true;
+  } catch (e) {
+    rec(P6P, "step 4: the owner signs in through /login", "fail", `${safeCode(e?.name)}`);
+  }
+  await page.close().catch(() => {});
+  if (!signedIn) return;
+  rec(P6P, "step 4: the owner signs in through /login", "setup", "a session in the driven browser");
+
+  // 5. The add, through the recipient guard.
+  const alias = legRecipient(legAlias());
+  const added = await ctx.request.post(`/api/super/tenants/${leg.orgId}/admins`, { data: { email: alias, role: "admin" } });
+  const ans = await added.json().catch(() => null);
+  if (typeof ans?.user_id === "string") leg.adminId = ans.user_id;
+  if (added.status() !== 200) {
+    rec(P6P, "step 5: the console's add answers 200", "fail", `status=${added.status()}`);
+    return;
+  }
+  if (ans?.invited !== true) {
+    rec(P6P, "step 5: invited true (a new account at the alias)", "fail", "invited false: the alias was still taken");
+    return;
+  }
+  if (ans?.email_outcome?.status !== "sent") {
+    rec(P6P, "step 5: the welcome is sent", "void", `email_outcome=${safeCode(ans?.email_outcome?.status)} class=${safeCode(ans?.email_outcome?.class)}; the leg is not proven by this run`);
+    return;
+  }
+  check(P6P, "step 5: 200, invited true, email_outcome sent, no setup_link in the answer (rule N8)", !("setup_link" in ans), "setup_link absent");
+  await ctx.close().catch(() => {});
+
+  // 6. The row.
+  const r6 = await legRows(leg.adminId);
+  const welcomes = r6.rows.filter((r) => r.event_type === "platform_admin_welcome");
+  check(P6P, "step 6: one platform_email_log row, platform_admin_welcome, sent", !r6.error && welcomes.length === 1 && welcomes[0].status === "sent",
+    r6.error ? `read code=${safeCode(r6.error.code)}` : `rows=${welcomes.length} status=${welcomes.map((r) => safeCode(r.status)).join(",") || "-"}`);
+
+  // 7. The mail.
+  let folders;
+  try {
+    folders = (await findFolders()).filter((f) => f.path);
+  } catch (e) {
+    rec(P6P, "step 7: the reader signs in and lists its folders", "void", `${imapErr(e)}; the leg is not proven by this run`);
+    return;
+  }
+  const got = await waitForAlias(folders, alias, since, sweptAt + MAIL_WAIT_MS, P6P, "step 7");
+  if (!got.folder) {
+    rec(P6P, "step 7: the welcome is found within 5 minutes", "void", `not found after ${sec(Date.now() - sweptAt)} s; the leg is not proven by this run`);
+    return;
+  }
+  rec(P6P, "step 7: the welcome is found within 5 minutes", "recorded", `folder=${got.folder.role} after ${sec(got.at - sweptAt)} s`);
+  let parts;
+  try {
+    parts = await readParts(got.folder.path, got.uid);
+  } catch (e) {
+    rec(P6P, "step 7: the welcome's parts read", "void", `${imapErr(e)}; the leg is not proven by this run`);
+    return;
+  }
+  rec(P6P, "step 7: the welcome's parts", "recorded", `structure=${parts.structure} text parts=${parts.texts.length} html parts=${parts.htmls.length}`);
+  const anchors = parts.htmls.flatMap(anchorsOf);
+
+  // 8. The control: the sign-in address, which this script knows exactly.
+  const signIn = `${new URL(LEG_BASE).origin}/${slug}/login`;
+  const control = [
+    ["text part", parts.texts.some((t) => lineOf(t, signIn))],
+    ["html part, the link's address", anchors.some((a) => a.href === signIn)],
+    ["html part, the link's shown text", anchors.some((a) => a.shown === signIn)],
+  ];
+  for (const [part, ok] of control) rec(P6P, `step 8: the sign-in address, ${part}`, "recorded", whole(ok));
+  if (!control.every(([, ok]) => ok)) {
+    rec(P6P, "step 8: the control is whole in every part", "void", "the reader's view is not shown; the leg is not proven by this run");
+    return;
+  }
+
+  // 9. The link.
+  const lines = parts.texts.flatMap((t) => setupLines(t, host));
+  const exact = lines.filter((l) => setupRe.test(l));
+  const link = exact.length === 1 && lines.length === 1 ? exact[0] : null;
+  if (!check(P6P, "step 9: the text part holds one setup address on the build's host, no query, #t= and 43 characters", !!link,
+    `lines naming the page=${lines.length}, of the exact form=${exact.length}`)) return;
+  const htmlWhole = anchors.some((a) => a.href === link) && anchors.some((a) => a.shown === link);
+  check(P6P, "step 9: the HTML part holds the same address as a link's address and as its shown text", htmlWhole, whole(htmlWhole));
+  const token = setupRe.exec(link)[1];
+  const read1 = await postBuild("/api/auth/set-password", { token });
+  check(P6P, "step 9: the token with no password gets the good answer naming the organisation", read1.status === 200 && read1.json?.organization === orgName, `status=${read1.status} organisation ${read1.json?.organization === orgName ? "named" : "not named"}`);
+  const read2 = await postBuild("/api/auth/set-password", { token });
+  check(P6P, "step 9: posted again, it is still good (a read spends nothing)", read2.status === 200 && read2.json?.organization === orgName, `status=${read2.status}`);
+  const other = await postBuild("/api/auth/set-password", { token: token43() });
+  check(P6P, "step 9: any other 43 characters get step 1's answer", isUnusable(other), `status=${other.status}`);
+
+  // 10. The use.
+  const pw = newPassword();
+  const set = await postBuild("/api/auth/set-password", { token, password: pw });
+  check(P6P, "step 10: the token with a password sets it", set.status === 200 && set.json?.ok === true, `status=${set.status} code=${safeCode(set.json?.code)}`);
+  const s10 = await signIn_(alias, pw);
+  check(P6P, "step 10: that password signs in at the auth server", !!s10.session, s10.session ? "session" : errInfo(s10.error));
+  const after = await postBuild("/api/auth/set-password", { token });
+  check(P6P, "step 10: the same token then gets rule N10's answer", isUnusable(after), `status=${after.status}`);
+
+  // 11. Twenty sign-in-link requests at once for the administrator at the alias.
+  const burst = await Promise.all(Array.from({ length: LEG_BURST }, () => postBuild("/api/auth/magic-link", { email: alias }).catch(() => ({ status: null }))));
+  rec(P6P, `step 11: ${LEG_BURST} sign-in-link requests at once`, "recorded", `answered 200: ${burst.filter((b) => b.status === 200).length}`);
+  await sleep(APP_JOB_MS + 5_000);
+  let r11 = await legRows(leg.adminId);
+  for (let i = 0; i < 10; i++) {
+    await sleep(3_000);
+    const next = await legRows(leg.adminId);
+    if (next.rows.length === r11.rows.length) break;
+    r11 = next;
+  }
+  const links = r11.rows.filter((r) => r.event_type === "platform_sign_in_link");
+  const sentLinks = links.filter((r) => r.status === "sent").length;
+  const flight = links.filter((r) => r.status === "suppressed" && r.error_code === "in_flight").length;
+  check(P6P, `step 11: at most ${LEG_BURST_MAX} sent rows`, !r11.error && sentLinks <= LEG_BURST_MAX, `sent=${sentLinks}`);
+  check(P6P, `step 11: at most ${LEG_BURST_MAX} in-flight rows`, !r11.error && flight <= LEG_BURST_MAX, `in_flight=${flight}`);
+  rec(P6P, "step 11: the burst's other rows", "recorded", `refused=${links.filter((r) => r.status === "refused").length} failed=${links.filter((r) => r.status === "failed").length} claims=${links.filter((r) => r.status === "suppressed" && r.error_code === "pending").length}`);
+}
+/** A password sign-in at the auth server on a fresh client (the name signIn is the run's own helper above). */
+const signIn_ = (email, password) => signIn(email, password);
+
+/** Step 12: the leg's clean-up, in its order, also after a failure. */
+async function platformLegCleanup() {
+  let ok = true;
+  const notes = [];
+  if (leg.browser) await leg.browser.close().catch(() => {});
+  if (leg.adminId) {
+    const { error } = await svc.auth.admin.deleteUser(leg.adminId);
+    if (error) { ok = false; notes.push(`alias account ${errInfo(error)}`); }
+  }
+  if (leg.ownerId) {
+    const row = await svc.from("platform_owners").delete().eq("user_id", leg.ownerId);
+    if (row.error) { ok = false; notes.push(`owner row code=${safeCode(row.error.code)}`); }
+    const { error } = await svc.auth.admin.deleteUser(leg.ownerId);
+    if (error) { ok = false; notes.push(`owner account ${errInfo(error)}`); }
+    created.delete("leg-owner");
+  }
+  if (leg.orgId) {
+    const { error } = await svc.from("organizations").delete().eq("id", leg.orgId);
+    if (error) { ok = false; notes.push(`organisation code=${safeCode(error.code)}`); }
+  }
+  // A last read: no account left at the harness's prefix.
+  const last = await sweepMailboxAliases();
+  if (!last.ok || last.found > 0) ok = false;
+  rec(P6P, "step 12: clean-up (alias account, owner row and account, organisation; none left at the prefix)", ok ? "pass" : "fail",
+    `${notes.join("; ") || "all deleted"}; left at the prefix=${last.found}${last.found ? `, deleted now=${last.deleted}` : ""}`);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup: every account of this run, also after a failure
 // ---------------------------------------------------------------------------
 let cleanupPromise = null;
@@ -1088,6 +1419,8 @@ function notMailboxFor(box) {
 }
 async function recipientSelfCheck() {
   const boxes = [parseMailbox("mailbox@example.invalid"), MAILBOX].filter(Boolean);
+  // The platform leg's one way to name an address to the app.
+  let legRefused = 0, legTried = 0, legAccepted = 0;
   let calls = 0, refused = 0, tried = 0, accepted = 0, good = 0;
   const stubFetch = async () => { calls++; throw new Error("stub transport"); };
   const stubClient = { auth: { admin: { createUser: async () => { calls++; return {}; }, inviteUserByEmail: async () => { calls++; return {}; } } } };
@@ -1098,6 +1431,7 @@ async function recipientSelfCheck() {
         () => createAtMailbox(bad, { client: stubClient, box }),
         () => inviteAtMailbox(bad, { client: stubClient, box }),
         () => sendThroughSmtpFunction(bad, stubMessage, { fetchImpl: stubFetch, box }),
+        async () => legRecipient(bad, box),
       ]) {
         tried++;
         try {
@@ -1111,14 +1445,43 @@ async function recipientSelfCheck() {
       good++;
       if (isMailboxRecipient(ok, box)) accepted++;
     }
+    for (const bad of notMailboxFor(box)) {
+      legTried++;
+      try {
+        legRecipient(bad, box);
+      } catch (e) {
+        if (e instanceof RecipientRefused) legRefused++;
+      }
+    }
+    try {
+      if (legRecipient(legAlias(box), box) === legAlias(box)) legAccepted++;
+    } catch {
+      // refused: counted below as not accepted
+    }
   }
   const pass = refused === tried && calls === 0 && accepted === good;
   console.log(`recipient guard: ${refused} of ${tried} calls to addresses that are not the mailbox refused, transport calls made ${calls}; ${accepted} of ${good} mailbox addresses accepted (${boxes.length === 2 ? "a sample mailbox and the set one" : "a sample mailbox only"}) => ${pass ? "pass" : "FAIL"}`);
-  return pass;
+  const legPass = legRefused === legTried && legAccepted === boxes.length;
+  console.log(`platform leg guard: the fixed alias accepted for ${legAccepted} of ${boxes.length} mailbox(es); ${legRefused} of ${legTried} other addresses refused => ${legPass ? "pass" : "FAIL"}`);
+  const baseChecks = [
+    ["https://my-lms.mentora.workers.dev", true],
+    ["https://my-lms-staging-123456789.asia-south1.run.app", true],
+    ["https://my-lms-prod.mentora.workers.dev", false],
+    ["http://localhost:3100", false],
+    ["https://my-lms.mentora.workers.dev:8443", false],
+    ["https://example.invalid", false],
+  ];
+  const baseOk = baseChecks.every(([u, want]) => isStagingAppUrl(`${u}/`) === want);
+  console.log(`platform leg address test: the cron poster's isStagingAppUrl admits the two staging apps and refuses ${baseChecks.length - 2} other addresses => ${baseOk ? "pass" : "FAIL"}`);
+  return pass && legPass && baseOk;
 }
 
 if (dryRun) {
-  console.log(`plan: ${mailOnly ? "points 1, 3, 4 and 5 left out (--mail-only)" : "points 1, 3, 4 and 5 run"}; point 2 with the mailbox ${mailReady ? "runs" : `not run (${mailReason})`}; point 6 transport leg ${smtpReady ? "runs" : `not run (${smtpReason})`}; point 6 platform and tenant legs not run (later steps)`);
+  if (platformLeg) {
+    console.log(`plan: point 6 platform leg alone (--platform-leg): ${legReady ? "runs" : `not run (${legReason})`}: the build's console adds an administrator at the fixed alias, the welcome is read from the mailbox, its link is used once, then ${LEG_BURST} sign-in-link requests at once; points 1 to 5 and the transport leg left out; the tenant leg not run (pull request C)`);
+  } else {
+    console.log(`plan: ${mailOnly ? "points 1, 3, 4 and 5 left out (--mail-only)" : "points 1, 3, 4 and 5 run"}; point 2 with the mailbox ${mailReady ? "runs" : `not run (${mailReason})`}; point 6 transport leg ${smtpReady ? "runs" : `not run (${smtpReason})`}; point 6 platform leg not run (it runs alone, with --platform-leg); point 6 tenant leg not run (pull request C)`);
+  }
   const guardOk = await recipientSelfCheck();
   console.log("dry run: no call made.");
   process.exit(guardOk ? 0 : 3);
@@ -1140,9 +1503,16 @@ function finish() {
 const notRunMail = () => rec(P2, "point 2 with the mailbox", "not run", mailReason);
 const notRunTransport = () => rec(P6, "point 6, transport leg", "not run", smtpReason);
 const notRunLaterLegs = () => {
-  rec(P6, "point 6, platform leg", "not run", "a later step, with staging's platform sender settings");
+  rec(P6, "point 6, platform leg", "not run", "it runs alone, with --platform-leg, against a build that holds staging's platform sender settings");
   rec(P6, "point 6, tenant leg in the app's own mail", "not run", "pull request C");
 };
+
+// --platform-leg with its settings unset: decided before any call, and no call is made.
+if (platformLeg && !legReady) {
+  rec(P6P, "point 6, platform leg", "not run", legReason);
+  finish();
+  process.exit(2);
+}
 
 // --mail-only with nothing to run: decided before any call, and no call is made.
 if (mailOnly && !mailReady) {
@@ -1178,6 +1548,22 @@ async function step(name, fn) {
 }
 
 let cleanOk = false;
+if (platformLeg) {
+  let legClean = false;
+  try {
+    await step("run", preamble);
+    await step(P6P, platformLegRun);
+  } finally {
+    legClean = await platformLegCleanup().catch((e) => {
+      rec(P6P, "step 12: clean-up threw", "harness", harnessText(e));
+      return false;
+    });
+    await closeAllReaders().catch(() => {});
+    cleanOk = (await cleanup().catch(() => false)) && legClean;
+  }
+  finish();
+  process.exit(harnessFailed || count("harness") || !cleanOk ? 3 : count("fail") || count("void") ? 1 : 0);
+}
 try {
   await step("run", preamble);
   if (!mailOnly) {
