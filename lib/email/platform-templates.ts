@@ -17,7 +17,8 @@
  *     /auth/set-password with its token in the fragment and nothing else,
  *     and its life in days. The person sets their own password there;
  *   - a fixed reading and error class of a tenant's SMTP, and for the
- *     reading daily_limit the organisation's daily limit as a whole number.
+ *     readings daily_limit and limit_reached the organisation's daily limit
+ *     as a whole number.
  * A content value that fails its check throws PlatformTemplateError: it is
  * a programming error, and nothing is sent.
  *
@@ -42,11 +43,13 @@ export function isPlatformEvent(value: unknown): value is PlatformEvent {
 export type WelcomeRole = "super_owner" | "admin" | "data_analyst";
 
 /**
- * Why the alert is sent: the tenant's SMTP is failing or not configured, or
- * its routine mail stopped at its daily limit less the reserve (ADR 0029,
- * rule FP4), and the class of its last failure.
+ * Why the alert is sent: the tenant's SMTP is failing or not configured, its
+ * routine mail stopped at its daily limit less the reserve (ADR 0029, rule
+ * FP4), or, at a limit no larger than the reserve (routine mail off by the
+ * setting), the full limit is reached (limit_reached); and the class of its
+ * last failure.
  */
-export type AlertReading = "failing" | "not_configured" | "daily_limit";
+export type AlertReading = "failing" | "not_configured" | "daily_limit" | "limit_reached";
 export type AlertErrorClass = "auth" | "quota" | "timeout" | "unreachable" | "unknown";
 
 export type PlatformContent = {
@@ -66,7 +69,7 @@ export type PlatformContent = {
     settingsUrl: string;
     reading: AlertReading;
     errorClass: AlertErrorClass | null;
-    /** The organisation's daily limit: given with the reading daily_limit only, a whole number from 1 to 100,000. */
+    /** The organisation's daily limit: given with the readings daily_limit and limit_reached only, a whole number from 1 to 100,000. */
     dailyLimit?: number;
   };
   platform_test: Record<string, never>;
@@ -232,17 +235,31 @@ function blocksFor<E extends PlatformEvent>(event: E, content: PlatformContent[E
     case "tenant_smtp_alert": {
       const c = content as PlatformContent["tenant_smtp_alert"];
       const settingsUrl = checkUrl("settingsUrl", c?.settingsUrl);
-      if (c.reading !== "failing" && c.reading !== "not_configured" && c.reading !== "daily_limit") {
-        throw new PlatformTemplateError("reading: failing, not_configured or daily_limit");
+      if (c.reading !== "failing" && c.reading !== "not_configured" && c.reading !== "daily_limit" && c.reading !== "limit_reached") {
+        throw new PlatformTemplateError("reading: failing, not_configured, daily_limit or limit_reached");
       }
       if (c.errorClass !== null && (typeof c.errorClass !== "string" || !ALERT_ERROR_CLASSES.includes(c.errorClass))) {
         throw new PlatformTemplateError("errorClass: a fixed class or null");
       }
       const org = cleanOrganizationName(c.organizationName);
-      if (c.reading === "daily_limit") {
+      if (c.reading === "daily_limit" || c.reading === "limit_reached") {
         const limit = c.dailyLimit;
         if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 100_000) {
-          throw new PlatformTemplateError("dailyLimit: a whole number from 1 to 100000 with the reading daily_limit");
+          throw new PlatformTemplateError("dailyLimit: a whole number from 1 to 100000 with the readings daily_limit and limit_reached");
+        }
+        if (c.reading === "limit_reached") {
+          return {
+            subject: "Notice: the organisation's email has stopped for today",
+            blocks: [
+              { kind: "p", text: `Email from the LMS for ${org} has stopped: the organisation has reached its daily email limit of ${limit} emails in 24 hours.` },
+              { kind: "p", text: "No email is being sent. Learners who ask for a password reset code or a sign-in link see \"Email could not be sent. Please contact your LMS Administrator.\"" },
+              { kind: "p", text: "At this limit, reminders, announcements and assignment emails are never sent: the whole limit is kept for password reset codes, sign-in links and welcome emails." },
+              { kind: "p", text: "Password reset codes, sign-in links and welcome emails start again by themselves as the emails of the last 24 hours become more than a day old. Nothing is sent through any other mail server." },
+              { kind: "p", text: "The limit is set by the platform owner. The organisation's settings show the count:" },
+              { kind: "link", href: settingsUrl },
+              { kind: "p", text: `You receive this as an administrator of ${org}. ${SIGN_OFF}` },
+            ],
+          };
         }
         return {
           subject: "Notice: the organisation's routine email has stopped for today",
@@ -257,7 +274,7 @@ function blocksFor<E extends PlatformEvent>(event: E, content: PlatformContent[E
           ],
         };
       }
-      if (c.dailyLimit !== undefined) throw new PlatformTemplateError("dailyLimit: only with the reading daily_limit");
+      if (c.dailyLimit !== undefined) throw new PlatformTemplateError("dailyLimit: only with the readings daily_limit and limit_reached");
       const reason =
         c.reading === "not_configured"
           ? "The organisation has no complete SMTP settings."

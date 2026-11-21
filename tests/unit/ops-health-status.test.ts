@@ -40,7 +40,10 @@
  *     reminders ("not known", "at least", a timed-out nudge not owed);
  *   - recordHeartbeat's fourth argument: a failed run reads its own row once
  *     and carries the time; a clean run makes no read and writes no time;
- *   - `tenant_smtp` and `mail_jobs`: warn, unknown, never fail.
+ *   - `tenant_smtp` and `mail_jobs`: warn, unknown, never fail; a limit no
+ *     larger than its reserve is a setting (the later note of 2026-11-22,
+ *     part 5): below it an organisation reads ok and is counted under
+ *     routine_off, at its full limit it warns.
  *
  * ADR 0029 pull request B, stage 4 (step 17; the note of 2026-11-20, part 2;
  * the note of 2026-11-21 (later)):
@@ -312,14 +315,18 @@ console.log("\nthe mail crons' detail: words, builder, reader, carry, pending");
 
 console.log("\ntenant_smtp and mail_jobs (never fail)");
 {
-  const o = (reading: "not_configured" | "configured" | "healthy" | "failing", hasMembers = true, routineStopped = false) => ({ reading, hasMembers, routineStopped });
+  const o = (reading: "not_configured" | "configured" | "healthy" | "failing", hasMembers = true, routineStopped = false, routineOff = false, atLimit = false) => ({ reading, hasMembers, routineStopped, routineOff, atLimit });
   eq("every organisation ready → ok", classifyTenantSmtp([o("healthy"), o("configured")]).status, "ok");
   eq("one failing with members → warn", classifyTenantSmtp([o("healthy"), o("failing")]).status, "warn");
   eq("one not configured with members → warn", classifyTenantSmtp([o("not_configured")]).status, "warn");
   eq("…without members it does not count", classifyTenantSmtp([o("not_configured", false), o("failing", false)]).status, "ok");
   eq("routine mail stopped by the daily limit → warn", classifyTenantSmtp([o("healthy", true, true)]).status, "warn");
+  eq("routine mail off by a small limit, below the limit, with members → ok, counted under routine_off",
+    [classifyTenantSmtp([o("healthy", true, false, true)]).status, classifyTenantSmtp([o("healthy", true, false, true)]).counts?.routine_off], ["ok", 1]);
+  eq("…at its full limit, with members → warn, and not counted as routine_off", [classifyTenantSmtp([o("healthy", true, false, true, true)]).status, classifyTenantSmtp([o("healthy", true, false, true, true)]).counts?.routine_off], ["warn", 0]);
+  eq("…at its full limit without members it does not count", classifyTenantSmtp([o("healthy", false, false, true, true)]).status, "ok");
   eq("cannot be read, or no 0114 → unknown", [classifyTenantSmtp("unreadable").status, classifyTenantSmtp("missing").status], ["unknown", "unknown"]);
-  eq("…the counts by reading", classifyTenantSmtp([o("healthy"), o("failing"), o("failing", true, true)]).counts, { not_configured: 0, configured: 0, healthy: 1, failing: 2, routine_stopped: 1 });
+  eq("…the counts by reading", classifyTenantSmtp([o("healthy"), o("failing"), o("failing", true, true), o("configured", true, false, true)]).counts, { not_configured: 0, configured: 1, healthy: 1, failing: 2, routine_stopped: 1, routine_off: 1 });
   eq("mail_jobs: none lost → ok", classifyMailJobs([{ started: 20, finished: 20 }, { started: 10, finished: 10 }]).status, "ok");
   eq("mail_jobs: 3 lost over the two days → warn", classifyMailJobs([{ started: 20, finished: 18 }, { started: 10, finished: 9 }]), { status: "warn", started: 30, lost: 3 });
   eq("mail_jobs: 2 lost of 49 → ok (fewer than 50 started, fewer than 3 lost)", classifyMailJobs([{ started: 49, finished: 47 }]).status, "ok");
@@ -720,11 +727,22 @@ async function routeTests() {
       const memberReads = requests.filter((r) => r.path === "/rest/v1/organization_members");
       eq("one failing with an active member: tenant_smtp warn, the status warn; the other, not configured with no member, does not count",
         [checkOf(warn.body, "tenant_smtp").status, warn.body.status, (await call(false)).body.status], ["warn", "warn", "ok"]);
-      eq("…the detail holds counts only", checkOf(warn.body, "tenant_smtp").detail, { organisations: 2, not_configured: 1, configured: 0, healthy: 0, failing: 1, routine_stopped: 0, no_0114: false });
+      eq("…the detail holds counts only", checkOf(warn.body, "tenant_smtp").detail, { organisations: 2, not_configured: 1, configured: 0, healthy: 0, failing: 1, routine_stopped: 0, routine_off: 0, no_0114: false });
       eq("…one members read, for the two that would warn, active only", [memberReads.length, memberReads[0]?.query.get("status")], [1, "eq.active"]);
 
       arrange(); tenantStatus = [statusRow(ORG_A, { sent_24h: 340 })]; settingsRows = [ready(ORG_A)]; memberRows = [{ organization_id: ORG_A, status: "active" }];
       eq("routine mail stopped by the daily limit (340 of 375): warn", checkOf((await call(true)).body, "tenant_smtp").status, "warn");
+
+      // A limit no larger than its reserve is a setting (the later note of 2026-11-22, part 5).
+      arrange(); tenantStatus = [statusRow(ORG_A, { daily_limit: 10, sent_24h: 0 })]; settingsRows = [ready(ORG_A)]; memberRows = [{ organization_id: ORG_A, status: "active" }];
+      const off = await call(true);
+      eq("a limit of 10 with nothing sent and active members: ok, with routine_off 1, and the status does not move",
+        [checkOf(off.body, "tenant_smtp").status, (checkOf(off.body, "tenant_smtp").detail as Record<string, unknown>).routine_off, (checkOf(off.body, "tenant_smtp").detail as Record<string, unknown>).routine_stopped, off.body.status], ["ok", 1, 0, "ok"]);
+      arrange(); tenantStatus = [statusRow(ORG_A, { daily_limit: 10, sent_24h: 10 })]; settingsRows = [ready(ORG_A)]; memberRows = [{ organization_id: ORG_A, status: "active" }];
+      const full = await call(true);
+      eq("…the same at 10 of 10: warn, the status warn", [checkOf(full.body, "tenant_smtp").status, full.body.status], ["warn", "warn"]);
+      arrange(); tenantStatus = [statusRow(ORG_A, { daily_limit: 26, sent_24h: 1 })]; settingsRows = [ready(ORG_A)]; memberRows = [{ organization_id: ORG_A, status: "active" }];
+      eq("a limit of 26 with one sent (its routine line is 1): warn, as before", checkOf((await call(true)).body, "tenant_smtp").status, "warn");
 
       arrange(); tenantStatus = [statusRow(ORG_A)]; settingsRows = [ready(ORG_A)];
       jobCounts = [{ day: new Date().toISOString().slice(0, 10), kind: "tenant", started: 10, finished: 7 }];

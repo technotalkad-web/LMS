@@ -39,8 +39,10 @@ export const dynamic = "force-dynamic";
  *   platform_email   the platform sender (lib/email/platform-health.ts)
  *                    fail → DEGRADED, warn → WARN
  *   tenant_smtp      organisations by reading: warn while one with an
- *                    active member is failing, not configured, or past
- *                    the line where its routine mail stops; never fail
+ *                    active member is failing, not configured, past the
+ *                    line where its routine mail stops (a line above 0),
+ *                    or at its full limit; a limit with routine mail off
+ *                    below it is a setting (routine_off); never fail
  *   mail_jobs        code and link jobs the platform ended (today and
  *                    yesterday, UTC); warn, never fail
  *   mail_recipients  warn for 24 hours after a request skipped its mail
@@ -300,7 +302,7 @@ async function checkTenantSmtp(): Promise<Check> {
       return { status: r.status, detail: { no_0114: overview.kind === "missing" } };
     }
     const r = classifyTenantSmtp(
-      overview.rows.map((o) => ({ reading: o.reading, hasMembers: o.hasMembers === true, routineStopped: o.routineStopped }))
+      overview.rows.map((o) => ({ reading: o.reading, hasMembers: o.hasMembers === true, routineStopped: o.routineStopped, routineOff: o.routineOff, atLimit: o.atLimit }))
     );
     return { status: r.status, detail: { organisations: overview.rows.length, ...r.counts, no_0114: false } };
   });

@@ -20,6 +20,11 @@
  *     when the run's own deliveries reach the line with nothing refused),
  *     mailed with the limit; a refusal once routine mail has stopped, or at
  *     the full limit, is spaced 24 hours from the last alert, not 6;
+ *   - a limit no larger than its reserve (10 and 25) is a setting: a routine
+ *     mail it holds back marks no alert, a mark found below the full limit
+ *     is cleared without a mail, and at the full limit one alert goes with
+ *     the reading limit_reached and none again inside 24 hours; at 26 the
+ *     routine line is 1 and the daily_limit alert is as before;
  *   - a failed read before the claim leaves the alert due for the next call;
  *   - without migration 0114: no mark, and the read for the oldest due alert
  *     answers "none" without an error.
@@ -198,6 +203,41 @@ async function main() {
       const byCode = await openRun({ organizationId: ORG });
       const bc = await sendNotification(one("password_reset"), { run: byCode });
       eq("…and when a reset code reaches it: one is due", [bc.status, byCode.report.alertMarked, typeof world.state?.alert_due_at], ["sent", true, "string"]);
+    }
+
+    console.log("\na limit no larger than its reserve is a setting: routine mail off, and the reading limit_reached (the later note of 2026-11-22, part 5)");
+    {
+      const admins = { members: ADMINS(ORG, [["s1", "super_owner"]]), profiles: { s1: "s1@tenant.stub" } };
+      const atLimitWorld = (limit: number, sent24h: number, over: Row = {}) =>
+        freshWorld({ sent24h, ...admins, state: { organization_id: ORG, state: "healthy", state_changed_at: iso(48 * H), failed_recipients: [], last_success_at: iso(H), daily_limit: limit, ...over } });
+      for (const limit of [10, 25]) {
+        atLimitWorld(limit, 0);
+        const run = await openRun({ organizationId: ORG });
+        const r = await sendMany(run, people(3), mailTo);
+        eq(`a limit of ${limit}: a routine mail is not attempted (daily_limit) and marks no alert`, [r.map((x) => x.errorClass).join(","), run.report.alertMarked, world.state?.alert_due_at ?? null, tenantSends().length], ["daily_limit,daily_limit,daily_limit", false, null, 0]);
+        atLimitWorld(limit, 3, { alert_due_at: iso(H) });
+        const cleared = await dueAlert();
+        eq(`…a mark found on it below its limit is cleared without a mail`, [cleared, platformSends().length, world.state?.alert_due_at ?? null], [{ kind: "dropped", reason: "cleared" }, 0, null]);
+        atLimitWorld(limit, limit);
+        const full = await openRun({ organizationId: ORG });
+        const code = await sendNotification(one("password_reset"), { run: full });
+        eq(`…at its full limit (${limit} of ${limit}) a reset code is not attempted and marks the alert`, [code.errorClass, full.report.alertMarked, typeof world.state?.alert_due_at], ["daily_limit", true, "string"]);
+        const sent = await dueAlert();
+        const text = String(platformSends()[0]?.text ?? "");
+        eq("…the scheduled call mails one alert with the reading limit_reached, its subject and the limit",
+          [sent.kind === "sent" ? sent.reading : sent.kind, platformSends().length, String(platformSends()[0]?.subject ?? ""), text.includes(`daily email limit of ${limit} emails in 24 hours`), /routine email starts again/i.test(text)],
+          ["limit_reached", 1, "Notice: the organisation's email has stopped for today", true, false]);
+        const again = await openRun({ organizationId: ORG });
+        await sendNotification(one("password_reset"), { run: again });
+        eq("…and none is marked again inside 24 hours", [again.report.alertMarked, world.state?.alert_due_at ?? null, (await dueAlert()).kind, platformSends().length], [false, null, "none", 1]);
+      }
+      atLimitWorld(26, 0);
+      const run = await openRun({ organizationId: ORG });
+      const r = await sendMany(run, people(2), mailTo);
+      eq("a limit of 26: the routine line is 1, the first routine mail goes and the next stops, with the daily_limit alert as before",
+        [run.limit?.routineStop, r.map((x) => (x.status === "sent" ? "sent" : x.errorClass)).join(","), run.report.alertMarked], [1, "sent,daily_limit", true]);
+      const d = await dueAlert();
+      eq("…mailed with the reading daily_limit and the limit", [d.kind === "sent" ? d.reading : d.kind, String(platformSends()[0]?.text).includes("26 emails in 24 hours")], ["daily_limit", true]);
     }
 
     console.log("\na failed read before the claim leaves the alert due");

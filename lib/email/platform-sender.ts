@@ -125,6 +125,16 @@ export const ORG_LIMITED_EVENTS: readonly PlatformEvent[] = ["platform_reset_cod
  */
 const DISPATCHED_FAILURE_CLASSES: ReadonlySet<string> = new Set<SmtpErrorClass>(["auth", "quota", "timeout", "unreachable", "rejected", "unknown"]);
 
+/**
+ * Whether the send behind a result was attempted (send-smtp was called for
+ * it): a sent row, or a failed row with a send's class. Any other answer (a
+ * refusal, a suppression, not configured, no time, a stale claim, a limit
+ * that could not be read) attempted nothing.
+ */
+export function platformSendAttempted(r: { status: string; errorCode: string | null }): boolean {
+  return r.status === "sent" || (r.status === "failed" && DISPATCHED_FAILURE_CLASSES.has(r.errorCode ?? ""));
+}
+
 /** Reserved for testing and documentation (RFC 2606 and RFC 6761). */
 export const RESERVED_TEST_TLDS = ["test", "example", "invalid", "localhost"] as const;
 export const RESERVED_TEST_DOMAINS = ["example.com", "example.net", "example.org"] as const;

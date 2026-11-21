@@ -462,9 +462,14 @@ export function alertMayBeMarked(input: { cause: AlertCause; lastAlertAt: string
  * run that opened with routine mail already stopped, whose stop was alerted
  * by the run that reached the line. So a day at the limit draws one alert,
  * not one every 6 hours. `count` includes the sends already started.
+ *
+ * null: no cause. A limit no larger than its reserve (routine line 0) is a
+ * setting: routine mail never goes at it, so a routine mail it holds back
+ * below the full limit owes no alert (the later note of 2026-11-22, part 5).
  */
-export function dailyLimitCause(input: { event: NotificationEvent; sentAtOpen: number; count: number; limit: DailyLimit }): AlertCause {
+export function dailyLimitCause(input: { event: NotificationEvent; sentAtOpen: number; count: number; limit: DailyLimit }): AlertCause | null {
   if (drawsOnReserve(input.event)) return "not_sent";
+  if (input.limit.routineStop === 0 && input.count < input.limit.limit) return null;
   return input.sentAtOpen < input.limit.routineStop && input.count < input.limit.limit ? "daily_limit" : "not_sent";
 }
 
@@ -526,6 +531,13 @@ export type MailRun = {
   stopped: boolean;
   stateWritable: boolean;
   alertMarked: boolean;
+  /**
+   * The run stopped on a flip the database did not take (its state write
+   * answered an error): it marks no alert for the rest of the run, since an
+   * alert follows the write the database took. The next run whose failure
+   * is written marks it.
+   */
+  stoppedOnUnrecordedFlip: boolean;
   /** Templates read in this run, by event (send.ts fills it): one read for each event. */
   readonly templates: Map<string, unknown>;
   /** The run's own failed reads and writes, by fixed word (a cron's failed steps). */
@@ -651,6 +663,7 @@ export async function openRun(opts: {
     // The state is written over only when it was read: never on "missing" or "unreadable".
     stateWritable: status.kind === "ok",
     alertMarked: false,
+    stoppedOnUnrecordedFlip: false,
     templates: new Map(),
     errors,
     report: {
@@ -889,7 +902,11 @@ async function writeStateRow(run: MailRun, next: SmtpStateSnapshot): Promise<"wr
  * Answers the step the database took; the run's own step when the run
  * cannot write (no 0114, a status that could not be read, a missing table,
  * the platform's call limit, a failed write), as before; or null when the
- * outcome was not recorded.
+ * outcome was not recorded. A write that answers an error is the run's
+ * failed step, and the run still goes on by its own step, so a flip still
+ * stops it; when that step is a flip the run is marked
+ * (stoppedOnUnrecordedFlip) and marks no alert for the rest of the run: the
+ * run's stop follows the run, the alert follows the database.
  */
 async function settleState(run: MailRun, compute: (prev: SmtpStateSnapshot, fresh: boolean) => StateStep): Promise<StateStep | null> {
   let step = compute(run.stored, false);
@@ -901,6 +918,7 @@ async function settleState(run: MailRun, compute: (prev: SmtpStateSnapshot, fres
     const answer = await writeStateRow(run, step.next);
     if (answer === "written") return step;
     if (answer === "error") {
+      if (step.flipped) run.stoppedOnUnrecordedFlip = true;
       run.stored = step.next;
       return step;
     }
@@ -929,10 +947,12 @@ async function settleState(run: MailRun, compute: (prev: SmtpStateSnapshot, fres
  * so concurrent requests cannot mark twice. If no state row exists yet, an
  * insert-or-ignore creates it already marked; when another writer created
  * the row first, the guarded update runs instead. Sends nothing. A run marks
- * at most once, and not at all for a deleted organisation, without 0114, or
- * when its state read failed.
+ * at most once, and not at all for a deleted organisation, without 0114,
+ * when its state read failed, or once it stopped on a flip the database did
+ * not take.
  */
 async function markAlertDue(run: MailRun, cause: AlertCause): Promise<void> {
+  if (run.stoppedOnUnrecordedFlip) return;
   if (run.alertMarked || run.deleted || !run.stateWritable || run.callLimited) return;
   const nowMs = run.now();
   if (!alertMayBeMarked({ cause, lastAlertAt: run.lastAlertAt, alertDueAt: run.alertDueAt, nowMs })) return;
@@ -1115,7 +1135,8 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         if (gate.cls === "daily_limit") {
           if (!drawsOnReserve(event)) run.report.routineStopped = true;
           // gateSend refuses for the daily limit only when run.limit is set.
-          if (run.limit) causes.add(dailyLimitCause({ event, sentAtOpen: run.sent24h, count: run.sent24h + run.sentInRun + group.length, limit: run.limit }));
+          const cause = run.limit ? dailyLimitCause({ event, sentAtOpen: run.sent24h, count: run.sent24h + run.sentInRun + group.length, limit: run.limit }) : null;
+          if (cause) causes.add(cause);
           if (io.rowForDailyLimit) rows.push({ item: items[i], result: results[i] });
         } else if (gate.cls !== "left") {
           if (gate.cls === "not_ready" || (gate.cls === "not_configured" && !run.deleted)) causes.add("not_sent");
@@ -1199,9 +1220,12 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         }
         if (!a.ok && a.notStarted) {
           // No time was left for it (rule T3): not an attempt, so no row and
-          // nothing learnt of the tenant's SMTP. It is left.
+          // nothing learnt of the tenant's SMTP. It is left, and the send's
+          // call, charged with the group, is given back: the count is the
+          // calls made (a template it read stays counted).
           results[idx] = notAttempted("left", a.error);
           run.report.notAttempted.left++;
+          spendCalls(run.budget, -MAIL_CALL_COSTS.send);
           return;
         }
         run.report.attempted++;
@@ -1325,7 +1349,12 @@ const ALERT_CLASSES: readonly string[] = ["auth", "quota", "timeout", "unreachab
  * conditional update on the alert time that was read, so two calls never
  * both send; then the mails start together, at most five, super owners
  * first. The reading is taken now: an organisation that is ready again, or
- * deleted, gets no alert and its mark is cleared. Never throws.
+ * deleted, gets no alert and its mark is cleared. After failing and not
+ * configured: an organisation whose routine line is 0 (a limit no larger
+ * than its reserve, a setting) reads limit_reached at its full limit and
+ * nothing below it, where a mark is cleared without a mail; any other reads
+ * daily_limit from its routine line on. Both readings carry the limit's
+ * number. Never throws.
  */
 export async function sendDueAlert(opts: {
   baseUrl: string;
@@ -1425,6 +1454,9 @@ export async function sendDueAlert(opts: {
   } else if (row.state === "failing") {
     reading = "failing";
     errorClass = row.last_error_code && ALERT_CLASSES.includes(row.last_error_code) ? (row.last_error_code as AlertErrorClass) : null;
+  } else if (limit.routineStop === 0) {
+    // Routine mail is off at this limit (a setting): only the full limit is a reading.
+    if (row.sent_24h >= limit.limit) reading = "limit_reached";
   } else if (row.sent_24h >= limit.routineStop) {
     reading = "daily_limit";
   }
@@ -1491,7 +1523,7 @@ export async function sendDueAlert(opts: {
               settingsUrl,
               reading: reading!,
               errorClass: reading === "failing" ? errorClass : null,
-              ...(reading === "daily_limit" ? { dailyLimit: limit.limit } : {}),
+              ...(reading === "daily_limit" || reading === "limit_reached" ? { dailyLimit: limit.limit } : {}),
             },
           },
           { db, env, now }
@@ -1528,7 +1560,7 @@ export type TenantSmtpOverviewRow = {
   /** The number a platform owner set; null: the default applies. */
   storedLimit: number | null;
   limit: DailyLimit;
-  /** Routine mail has stopped: the count is at the limit less its reserve. */
+  /** Routine mail has stopped for today: the count is at the limit less its reserve, a line above 0. */
   routineStopped: boolean;
   /**
    * Routine mail never goes at this limit: it is no more than the reserve
@@ -1606,13 +1638,14 @@ export async function readTenantSmtpOverview(db: SupabaseClient, env: Env = proc
         sent24h: r.sent_24h,
         storedLimit: r.daily_limit,
         limit,
-        routineStopped: r.sent_24h >= limit.routineStop,
+        // Routine mail stops for today only where its line is above 0: at a lower limit it is off by the setting.
+        routineStopped: limit.routineStop > 0 && r.sent_24h >= limit.routineStop,
         routineOff: limit.routineStop === 0,
         atLimit: r.sent_24h >= limit.limit,
         hasMembers: null,
       };
     });
-    const wouldWarn = rows.filter((r) => r.reading === "failing" || r.reading === "not_configured" || r.routineStopped);
+    const wouldWarn = rows.filter((r) => r.reading === "failing" || r.reading === "not_configured" || r.routineStopped || r.atLimit);
     if (wouldWarn.length > 0) {
       const withMembers = await organisationsWithActiveMembers(db, wouldWarn.map((r) => r.organization_id));
       if (withMembers === "unreadable") return { kind: "unreadable" };

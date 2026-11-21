@@ -261,6 +261,27 @@ async function publicJobSums() {
       eq(`${label}: ${value.before} calls before the answer and ${value.after} in the job, at most ${CALL_SUM_LIMIT} together, and the mail went`,
         [value.before + value.after <= CALL_SUM_LIMIT, PW.requests.filter((r) => r.path === "/functions/v1/send-smtp").length], [true, 1]);
     }
+
+    // The tenant half of the public job, on its run: the claim, then a send the
+    // job's deadline left no time to start (rule T3). The run's count is the
+    // requests it made: the send that was not started is not one of them.
+    console.log("\na public job whose deadline passed before its send counts exactly the requests it made (the later note of 2026-11-22, part 6)");
+    const { claimCredentialMail, sendNotification } = await import("../../lib/notifications/send");
+    const { sendTenantSignInLink } = await import("../../lib/auth/auth-email");
+    for (const kind of ["password_reset", "magic_link"] as const) {
+      PW.freshWorld({ users: [LEARNER], members: [{ organization_id: PW.ORG, user_id: LEARNER.id, role: "user", status: "active" }] });
+      const { value } = await PW.captureLogs(async () => {
+        const run = await openRun({ organizationId: PW.ORG, budget: requestBudget() });
+        const to = { user_id: LEARNER.id, email: LEARNER.email };
+        const claim = await claimCredentialMail(run, { event: kind, to }, { link: kind === "magic_link" });
+        const noTime = () => 0;
+        const r = kind === "magic_link"
+          ? await sendTenantSignInLink(run, { userId: LEARNER.id, email: LEARNER.email }, "https://lms.stub/auth/finish?token_hash=t&type=magiclink", { timeLeftMs: noTime })
+          : await sendNotification({ organizationId: PW.ORG, event: kind, to, context: { otp_code: "123456", otp_minutes: "10" } }, { run, timeLeftMs: noTime });
+        return { claimed: claim.ok, attempted: r.attempted, counted: run.budget.calls, made: PW.requests.length };
+      });
+      eq(`${kind}: claimed, the send not started, and the run's count equals the requests made (${value.made})`, [value.claimed, value.attempted, value.counted], [true, false, value.made]);
+    }
   } finally {
     PW.uninstall();
   }

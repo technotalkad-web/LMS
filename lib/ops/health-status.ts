@@ -400,21 +400,27 @@ export type TenantReading = "not_configured" | "configured" | "healthy" | "faili
 
 /**
  * `tenant_smtp` (returned under email_checks; ADR 0029). Gives "warn" when
- * some organisation with members cannot send (failing or not configured) or
- * has reached the point where its routine mail stops for the day. Gives
- * "unknown" without readable status (including a database without 0114).
- * It never escalates to "fail": each tenant repairs its own server.
+ * some organisation with members cannot send (failing or not configured),
+ * has reached the point where its routine mail stops for the day (a routine
+ * line above 0: `routineStopped`), or is at its full limit. A limit no
+ * larger than its reserve is a setting: routine mail is off at it, and such
+ * an organisation below its limit does not warn; the detail counts the
+ * organisations whose routine mail is off and that are below their limit
+ * under routine_off. Gives "unknown" without readable status (including a
+ * database without 0114). It never escalates to "fail": each tenant repairs
+ * its own server.
  */
 export function classifyTenantSmtp(
-  input: Array<{ reading: TenantReading; hasMembers: boolean; routineStopped: boolean }> | "unreadable" | "missing"
-): { status: "ok" | "warn" | "unknown"; counts: Record<TenantReading | "routine_stopped", number> | null } {
+  input: Array<{ reading: TenantReading; hasMembers: boolean; routineStopped: boolean; routineOff: boolean; atLimit: boolean }> | "unreadable" | "missing"
+): { status: "ok" | "warn" | "unknown"; counts: Record<TenantReading | "routine_stopped" | "routine_off", number> | null } {
   if (input === "unreadable" || input === "missing") return { status: "unknown", counts: null };
-  const counts: Record<TenantReading | "routine_stopped", number> = { not_configured: 0, configured: 0, healthy: 0, failing: 0, routine_stopped: 0 };
+  const counts: Record<TenantReading | "routine_stopped" | "routine_off", number> = { not_configured: 0, configured: 0, healthy: 0, failing: 0, routine_stopped: 0, routine_off: 0 };
   let warn = false;
   for (const o of input) {
     counts[o.reading]++;
     if (o.routineStopped) counts.routine_stopped++;
-    if (o.hasMembers && (o.reading === "failing" || o.reading === "not_configured" || o.routineStopped)) warn = true;
+    if (o.routineOff && !o.atLimit) counts.routine_off++;
+    if (o.hasMembers && (o.reading === "failing" || o.reading === "not_configured" || o.routineStopped || o.atLimit)) warn = true;
   }
   return { status: warn ? "warn" : "ok", counts };
 }

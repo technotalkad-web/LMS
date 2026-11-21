@@ -25,7 +25,8 @@
  * another account's code or link: its claims count against nobody else.
  *
  * Also: the shared times and the word; each path's rows in order; a reset
- * code's row written closed and opened only after every limit; a claim older
+ * code's row written closed and opened only after every limit, and only a
+ * send that was attempted closes the address's older codes; a claim older
  * than the send window sends nothing; a claim, an in-flight row or a count
  * that cannot be written or read sends nothing on the platform, and on a
  * tenant in-flight rows that cannot be counted are no reading of the daily
@@ -697,8 +698,8 @@ async function main() {
       const opened = idx((r) => r.table === "password_reset_otps" && r.method === "PATCH" && (r.body as Row).used_at === null);
       const closedOlder = idx((r) => r.table === "password_reset_otps" && r.method === "PATCH" && r.query.has("created_at"));
       const sent = idx((r) => r.path === "/functions/v1/send-smtp");
-      eq("the row is written closed, then the in-flight row, then it is opened, then the older codes are closed, then the send",
-        [typeof (requests[written]?.body as Row | undefined)?.used_at, written < flight, flight < opened, opened < closedOlder, closedOlder < sent], ["string", true, true, true, true]);
+      eq("the row is written closed, then the in-flight row, then it is opened, then the send, and only then are the older codes closed",
+        [typeof (requests[written]?.body as Row | undefined)?.used_at, written < flight, flight < opened, opened < sent, sent < closedOlder], ["string", true, true, true, true]);
       eq("…the new code is the one open; the older one is closed", openCodes(LEARNER.email).map((r) => r.id === "otp-older"), [false]);
       base({ dailyLimit: 30, sent24h: 29 });
       seedTenant(5, { event_type: "password_reset", to_user_id: LEARNER_X.id, status: "queued", error: IN_FLIGHT_WORD }, () => 20_000);
@@ -710,6 +711,44 @@ async function main() {
       await withEnv({ PLATFORM_SMTP_HOST: undefined }, () => one(CODE, { email: ADMIN.email }));
       eq("the platform sender not configured: no code opened, none closed; the claim, the in-flight row and the not_configured row",
         [openCodes(ADMIN.email).map((r) => r.id), world.platformLog.map((r) => [r.status, r.error_code])], [["otp-older"], [["suppressed", "pending"], ["suppressed", IN_FLIGHT_WORD], ["failed", "not_configured"]]]);
+    }
+
+    console.log("\nonly a send that was attempted closes an older code (the later note of 2026-11-22, part 4)");
+    {
+      const opening = (r: Req) => r.table === "password_reset_otps" && r.method === "PATCH" && (r.body as Row).used_at === null;
+      /** A code's job whose clock moves on by `ms` while its own row is opened. */
+      const movedAtOpen = async (payload: Row, ms: number) => {
+        const clock = fakeClock();
+        world.onRequest = (r) => { if (opening(r)) clock.move(ms); };
+        try {
+          return jobLines(await one(CODE, payload));
+        } finally {
+          world.onRequest = null;
+          clock.restore();
+        }
+      };
+      const older = (email: string) => ({ id: "otp-older", email, code_hash: hashOtp("121212"), created_at: ago(5 * MIN), used_at: null, attempts: 0, expires_at: new Date(Date.now() + 5 * MIN).toISOString() });
+      const own = (email: string) => world.otps.find((r) => r.email === email && r.id !== "otp-older");
+      const newestOpen = (email: string) => [...openCodes(email)].sort((a, b) => Date.parse(String(b.created_at)) - Date.parse(String(a.created_at)))[0]?.id ?? null;
+      for (const [system, payload, email] of [["tenant", { email: LEARNER.email, orgSlug: SLUG }, LEARNER.email], ["platform", { email: ADMIN.email }, ADMIN.email]] as const) {
+        const host = system === "tenant" ? "tenant" : "platform";
+        base();
+        world.otps.push(older(email));
+        let lines = await movedAtOpen(payload, CLAIM_SEND_WITHIN_MS + 1_000);
+        eq(`${system} code: the clock passes the claim's 30 s while the code is opened: nothing sent, its own row closed again, the older code still open and the newest open row`,
+          [dispatched(host).length, typeof own(email)?.used_at, openCodes(email).map((r) => r.id), newestOpen(email), lines.map((l) => l.outcome)], [0, "string", ["otp-older"], "otp-older", ["claim_stale"]]);
+        base();
+        world.otps.push(older(email));
+        // Past the job's deadline less the time kept for the send's row, inside the claim's 30 s.
+        lines = await movedAtOpen(payload, 24_000);
+        eq(`${system} code: the job's deadline passes while the code is opened: nothing sent, its own row closed again, the older code still open and the newest open row`,
+          [dispatched(host).length, typeof own(email)?.used_at, openCodes(email).map((r) => r.id), newestOpen(email), lines.map((l) => l.outcome)], [0, "string", ["otp-older"], "otp-older", ["no_time"]]);
+        base({ smtp: () => ({ ok: false, error: "Connection refused" }) });
+        world.otps.push(older(email));
+        lines = jobLines(await one(CODE, payload));
+        eq(`${system} code: a send that is attempted and fails closes the older code and leaves the new one open`,
+          [dispatched(host).length, world.otps.find((r) => r.id === "otp-older")?.used_at !== null, own(email)?.used_at ?? null, lines.map((l) => l.code ?? l.outcome)], [1, true, null, ["unreachable"]]);
+      }
     }
 
     console.log("\nthe sender's two halves");

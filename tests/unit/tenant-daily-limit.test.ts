@@ -34,7 +34,10 @@
  *   - a limit of 25 or less, where routine mail never goes: its own notice
  *     (routine_off), a warning that names the limit as the cause and never
  *     "for today", on the console's list and in the Attention Center item,
- *     the banner and the SMTP tab.
+ *     the banner and the SMTP tab; it is a setting (the later note of
+ *     2026-11-22, part 5): a routine mail it holds back below the full limit
+ *     owes no alert, routine mail is never "stopped for today" at it, and an
+ *     organisation at its full limit is among those whose members are read.
  *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
@@ -47,6 +50,7 @@ import {
   NEAR_LIMIT_SHARE,
   RESERVE_EVENTS,
   dailyLimitAllows,
+  dailyLimitCause,
   drawsOnReserve,
   openRun,
   readMailJobCounts,
@@ -86,6 +90,14 @@ async function main() {
     eq("…routine mail does not draw on it", ["asset_reminder", "custom_broadcast", "asset_completion", "journey_nudge"].map((e) => drawsOnReserve(e as SendArgs["event"])), [false, false, false, false]);
     const L = tenantDailyLimit(375, {});
     eq("at 336 a routine mail fits, at 337 it does not; a code fits to 374", [dailyLimitAllows(336, L, "asset_reminder"), dailyLimitAllows(337, L, "asset_reminder"), dailyLimitAllows(374, L, "password_reset"), dailyLimitAllows(375, L, "password_reset")], [true, false, true, false]);
+    for (const limit of [10, DAILY_LIMIT_RESERVE_MIN]) {
+      const small = tenantDailyLimit(limit, {});
+      eq(`a limit of ${limit} is a setting: a routine mail it holds back below the full limit owes no alert; at the full limit, and for a code, the 24-hour cause`,
+        [dailyLimitCause({ event: "asset_reminder", sentAtOpen: 0, count: 0, limit: small }), dailyLimitCause({ event: "asset_reminder", sentAtOpen: 3, count: limit - 1, limit: small }), dailyLimitCause({ event: "asset_reminder", sentAtOpen: limit, count: limit, limit: small }), dailyLimitCause({ event: "password_reset", sentAtOpen: limit, count: limit, limit: small })],
+        [null, null, "not_sent", "not_sent"]);
+    }
+    const L26 = tenantDailyLimit(26, {});
+    eq("a limit of 26: the routine line is 1, and routine mail that stops in the run owes daily_limit, as before", [L26.routineStop, dailyLimitCause({ event: "asset_reminder", sentAtOpen: 0, count: 1, limit: L26 })], [1, "daily_limit"]);
 
     console.log("\nthe run reads the count once and carries it");
     {
@@ -196,9 +208,18 @@ async function readerCases() {
     const failingSince = await readTenantSmtpOverview(db());
     eq("…a healthy or failing reading keeps its time", [failingSince.kind === "ok" ? failingSince.rows[0].since : failingSince, readingSince("healthy", "2026-11-20T08:00:00.000Z"), readingSince("not_configured", "2026-11-20T08:00:00.000Z")],
       ["2026-11-21T07:00:00.000Z", "2026-11-20T08:00:00.000Z", null]);
-    freshWorld({ state: { ...healthy, daily_limit: 10 }, sent24h: 0 });
+    freshWorld({ state: { ...healthy, daily_limit: 10 }, sent24h: 0, members: [member(ORG, "u1")] });
     const low = await readTenantSmtpOverview(db());
-    eq("a stored limit of 10: routine mail is off at this limit (the line is 0), which the list says apart from a stop", low.kind === "ok" ? [low.rows[0].routineOff, low.rows[0].limit.routineStop, low.rows[0].atLimit] : low, [true, 0, false]);
+    eq("a stored limit of 10: routine mail is off at this limit (the line is 0), which the list says apart from a stop, and its members are not read",
+      low.kind === "ok" ? [low.rows[0].routineOff, low.rows[0].limit.routineStop, low.rows[0].routineStopped, low.rows[0].atLimit, low.rows[0].hasMembers] : low, [true, 0, false, false, null]);
+    for (const limit of [10, DAILY_LIMIT_RESERVE_MIN]) {
+      freshWorld({ state: { ...healthy, daily_limit: limit }, sent24h: limit - 1, members: [member(ORG, "u1")] });
+      const below = await readTenantSmtpOverview(db());
+      eq(`…a limit of ${limit} one short of it: routine mail off, not stopped for today, and its members are not read`, below.kind === "ok" ? [below.rows[0].routineOff, below.rows[0].routineStopped, below.rows[0].atLimit, below.rows[0].hasMembers] : below, [true, false, false, null]);
+      freshWorld({ state: { ...healthy, daily_limit: limit }, sent24h: limit, members: [member(ORG, "u1")] });
+      const at = await readTenantSmtpOverview(db());
+      eq(`…at its full limit (${limit} of ${limit}): at the limit, and among those whose members are read`, at.kind === "ok" ? [at.rows[0].routineStopped, at.rows[0].atLimit, at.rows[0].hasMembers] : at, [false, true, true]);
+    }
     freshWorld({ state: { ...healthy, daily_limit: DAILY_LIMIT_RESERVE_MIN + 1 }, sent24h: 0 });
     const above = await readTenantSmtpOverview(db());
     eq(`…at ${DAILY_LIMIT_RESERVE_MIN + 1} routine mail goes, so it is not off`, above.kind === "ok" ? [above.rows[0].routineOff, above.rows[0].routineStopped] : above, [false, false]);

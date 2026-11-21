@@ -55,7 +55,12 @@
  *     twice, takes the state and never the count; a last miss, or one with
  *     no room, records nothing and logs one line; an alert mark and a new
  *     limit between read and write are kept; a re-read that finds failing
- *     stops the run with no second alert.
+ *     stops the run with no second alert;
+ *   - an alert follows the write the database took (the later note of
+ *     2026-11-22, part 4): a run whose flipping write answers an error still
+ *     stops, and marks no alert, for the flip or for the mail its stop left;
+ *     a failed Settings test whose write answers an error marks none; the
+ *     next run or test whose write lands marks one.
  *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
@@ -623,6 +628,35 @@ async function main() {
       const marksAfterFlip = alertMarks().length;
       await sendMany(late, [p4], mailTo());
       eq("a re-read that finds failing stops the run, with no second alert", [world.state?.state, flipper.stopped, late.stopped, late.alertMarked, alertMarks().length - marksAfterFlip], ["failing", true, true, false, 0]);
+    }
+
+    console.log("\nan alert follows the write the database took; the run's stop follows the run (the later note of 2026-11-22, part 4)");
+    {
+      const five = people(5);
+      const flipWrite = (r: { table: string; method: string; body: unknown }) => r.table === "tenant_smtp_state" && r.method !== "GET" && (r.body as Row | null)?.state === "failing";
+      freshWorld({ smtp: () => DEAD, failWrite: flipWrite });
+      const run = await openRun({ organizationId: ORG });
+      const { value: r } = await captureLogs(() => sendMany(run, five, mailTo()));
+      eq("three different people fail, the write before the flip lands and the write that flips answers an error: the run stops, the two mails behind it not attempted",
+        [sends().length, r.slice(3).map((x) => [x.errorClass, x.attempted]), run.stopped], [3, [["not_ready", false], ["not_ready", false]], true]);
+      eq("…state_write counted once, and the row reads as the write that landed left it, not failing",
+        [run.errors.state_write ?? 0, world.state?.state ?? null, world.state?.failed_recipients], [1, null, [five[0].id]]);
+      eq("…no alert is due: not for the flip, and not for the mail its stop left unsent", [run.report.alertMarked, world.state?.alert_due_at ?? null], [false, null]);
+      world.failWrite = null;
+      const next = await openRun({ organizationId: ORG });
+      await sendMany(next, five, mailTo());
+      eq("the next run, whose write lands, flips the row and marks one alert", [world.state?.state, next.report.alertMarked, typeof world.state?.alert_due_at], ["failing", true, "string"]);
+
+      const admin = { user_id: "0c000000-0000-4000-8000-000000000001", email: "admin@tenant.stub" };
+      freshWorld({ state: { organization_id: ORG, state: "healthy", state_changed_at: iso(H), failed_recipients: [], last_success_at: iso(H) }, smtp: () => ({ ok: false, error: "535 5.7.8 Username and Password not accepted" }), failWrite: flipWrite });
+      const testRun = await openRun({ organizationId: ORG });
+      const { value: test } = await captureLogs(() => sendSettingsTest(testRun, admin));
+      eq("a failed Settings test whose write answers an error: the answer still shows the test's result, and no alert is due",
+        [test.status, test.errorClass, world.state?.state, world.state?.alert_due_at ?? null, testRun.report.alertMarked], ["failed", "auth", "healthy", null, false]);
+      world.failWrite = null;
+      const retest = await openRun({ organizationId: ORG });
+      await sendSettingsTest(retest, admin);
+      eq("…the next test, whose write lands, flips the row and marks one alert", [world.state?.state, typeof world.state?.alert_due_at, retest.report.alertMarked], ["failing", "string", true]);
     }
   } finally {
     removeStub();

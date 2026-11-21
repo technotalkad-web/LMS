@@ -23,7 +23,9 @@
  * written, from Date.now(); notification_log and platform_email_log keep
  * their rows, and counts and tenant_mail_status's sent_24h are counted from
  * them (`sent24h` adds the mail sent before the test); an insert-or-ignore
- * that finds its row answers no row; and every database call is answered
+ * that finds its row answers no row; one chosen write can fail on its own
+ * (`failWrite`), beside the switches that fail every state write or log
+ * insert; and every database call is answered
  * from the rows as they are when it arrives and handed back after a wait
  * (`readDelayMs`, else one turn of the event loop), so that runs started
  * together interleave.
@@ -81,6 +83,8 @@ export type World = {
   log: Row[];
   /** A database call's answer is handed back after this many milliseconds; 0: after one turn of the event loop. */
   readDelayMs: number;
+  /** A write (an insert, an upsert or an update) for which this answers true fails: one chosen write, such as the state write that flips. */
+  failWrite: ((r: Req) => boolean) | null;
 };
 
 /** The server answers at most this many rows, whatever a read asks (lib/db/chunked.ts). */
@@ -139,6 +143,7 @@ export function freshWorld(over: Partial<World> = {}): World {
     missingTables: [],
     log: [],
     readDelayMs: 0,
+    failWrite: null,
     ...over,
   };
   lastStamp = 0;
@@ -348,6 +353,7 @@ const serve = async (input: RequestInfo | URL, init?: RequestInit): Promise<Resp
     return json(answer);
   }
   if (world.missingTables.includes(table)) return json({ code: "PGRST205", message: `Could not find the table 'public.${table}' in the schema cache` }, 404);
+  if (method !== "GET" && method !== "HEAD" && !table.startsWith("rpc/") && world.failWrite?.(req)) return json({ code: "XX000", message: "stub write failure" }, 500);
   if (table === "notification_settings") {
     if (world.settings === "fail") return json({ code: "XX000", message: "stub read failure" }, 500);
     if (!q.has("organization_id")) {

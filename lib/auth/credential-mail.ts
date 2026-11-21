@@ -1,7 +1,7 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { NO_TIME_LEFT_TEXT, claimCredentialMail, countLinkClaims, recordCredentialNotAttempted, sendNotification, type SendResult } from "@/lib/notifications/send";
 import { openRun, requestBudget, runReading, runReady, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
-import { claimPlatformSend, platformSenderReadiness, sendPlatformEmail } from "@/lib/email/platform-sender";
+import { claimPlatformSend, platformSendAttempted, platformSenderReadiness, sendPlatformEmail } from "@/lib/email/platform-sender";
 import { CLAIM_SEND_WITHIN_MS, accountRequests, type CountSince } from "@/lib/email/smtp-function";
 import { ADMIN_ROLES, grantsAdminRights, listCountingMemberships, type CountingOrganisation } from "@/lib/auth/org-membership";
 import { isSchemaMissing } from "@/lib/scoring/attempt-kind";
@@ -51,12 +51,16 @@ import { sendTenantSignInLink, signInLink } from "@/lib/auth/auth-email";
  *     the count, writes its claim, counts again with its claim among the
  *     rows, and goes on only within the limit, so the limits hold under
  *     concurrent requests. A reset code's claim is its own row, written
- *     closed and opened only after every limit, and only then are the
- *     address's older codes closed; a sign-in link's is a claim row of its
- *     system (claimCredentialMail, claimPlatformSend). A count or a claim
- *     that cannot be read or written makes nothing usable and sends
+ *     closed and opened only after every limit; a sign-in link's is a claim
+ *     row of its system (claimCredentialMail, claimPlatformSend). Only a
+ *     request that passed its account's count writes its in-flight row,
+ *     which the shares count (the later note of 2026-11-22). A count or a
+ *     claim that cannot be read or written makes nothing usable and sends
  *     nothing. A send starts no later than CLAIM_SEND_WITHIN_MS after its
  *     claim;
+ *   - only a send that was attempted closes the address's older codes: a
+ *     code that was opened and whose send was not attempted is closed again,
+ *     and the older code works as before (closeOlder, closeOwn);
  *   - a sign-in link is minted only for the account the lookup found, and
  *     only once its claim and rule 2 allow it: generateLink is never the
  *     lookup, and an id it returns that differs sends nothing;
@@ -506,26 +510,21 @@ async function writeClosedCode(ctx: JobContext, hourlyOnly: boolean, system: "te
 
 /**
  * A reset code's opening, after every limit and claim: the code's own row
- * is opened, then the address's open codes older than it are closed. So a
- * request that was refused never closes a person's valid code, and of two
- * codes that pass at the same moment the newer stays open. false: the row
- * could not be opened, and nothing is sent.
+ * only, and nothing else (ADR 0029, the later note of 2026-11-22, part 4).
+ * After the send one of two steps follows: closeOlder when the send was
+ * attempted, closeOwn when it was not. So a request that was refused, or
+ * whose send was not attempted, never closes a person's valid code, and of
+ * two codes that pass at the same moment the newer stays open. false: the
+ * row could not be opened, and nothing is sent.
  */
 async function openResetCode(ctx: JobContext, row: CodeRow, system: "tenant" | "platform"): Promise<boolean> {
-  spend(ctx, 2);
+  spend(ctx, 1);
   try {
     const opened = await ctx.db.from("password_reset_otps").update({ used_at: null }).eq("id", row.id);
     if (opened.error) {
       note(ctx, system, "code_open_failed", codeOf(opened.error));
       return false;
     }
-    const closed = await ctx.db
-      .from("password_reset_otps")
-      .update({ used_at: new Date(ctx.now()).toISOString() })
-      .eq("email", ctx.email)
-      .is("used_at", null)
-      .lt("created_at", row.created_at);
-    if (closed.error) note(ctx, system, "close_codes_failed", codeOf(closed.error));
     return true;
   } catch (e) {
     note(ctx, system, "code_open_failed", codeOf(e));
@@ -534,10 +533,47 @@ async function openResetCode(ctx: JobContext, row: CodeRow, system: "tenant" | "
 }
 
 /**
+ * After a send that was attempted: the address's open codes older than this
+ * job's own are closed. The verify and reset steps read only the newest open
+ * row of an address, so until then an older row behind the new one opens
+ * nothing. One call; never throws, and a failure is one fixed line.
+ */
+async function closeOlder(ctx: JobContext, row: CodeRow, system: "tenant" | "platform"): Promise<void> {
+  spend(ctx, 1);
+  try {
+    const closed = await ctx.db
+      .from("password_reset_otps")
+      .update({ used_at: new Date(ctx.now()).toISOString() })
+      .eq("email", ctx.email)
+      .is("used_at", null)
+      .lt("created_at", row.created_at);
+    if (closed.error) note(ctx, system, "close_codes_failed", codeOf(closed.error));
+  } catch (e) {
+    note(ctx, system, "close_codes_failed", codeOf(e));
+  }
+}
+
+/**
+ * After an opened code whose send was not attempted (a stale claim, no time
+ * left, the run's own refusal): this job's own row is closed again, by its
+ * id, while it is still open, and the address's older code works as before.
+ * One call; never throws, and a failure is one fixed line.
+ */
+async function closeOwn(ctx: JobContext, row: CodeRow, system: "tenant" | "platform"): Promise<void> {
+  spend(ctx, 1);
+  try {
+    const closed = await ctx.db.from("password_reset_otps").update({ used_at: new Date(ctx.now()).toISOString() }).eq("id", row.id).is("used_at", null);
+    if (closed.error) note(ctx, system, "close_own_failed", codeOf(closed.error));
+  } catch (e) {
+    note(ctx, system, "close_own_failed", codeOf(e));
+  }
+}
+
+/**
  * A claim older than CLAIM_SEND_WITHIN_MS sends nothing. The tenant's check
  * is made just before the send is handed to the run (the platform sender
  * makes its own); in both systems it is also made before a code is opened,
- * so a job too late to send never closes a person's older code.
+ * so a job too late to send never opens its code.
  */
 function claimStale(ctx: JobContext, at: number): boolean {
   return ctx.now() - at > CLAIM_SEND_WITHIN_MS;
@@ -596,7 +632,10 @@ async function tenantMail(ctx: JobContext): Promise<void> {
     if (!claim.ok) return note(ctx, "tenant", claim.why);
     if (claimStale(ctx, claim.at)) return note(ctx, "tenant", "claim_stale");
     if (!(await openResetCode(ctx, made.row, "tenant"))) return;
-    if (claimStale(ctx, claim.at)) return note(ctx, "tenant", "claim_stale");
+    if (claimStale(ctx, claim.at)) {
+      await closeOwn(ctx, made.row, "tenant");
+      return note(ctx, "tenant", "claim_stale");
+    }
     const r = await sendNotification(
       {
         organizationId: run.organizationId,
@@ -612,6 +651,9 @@ async function tenantMail(ctx: JobContext): Promise<void> {
       },
       { run, timeLeftMs: () => timeLeftForSend(ctx) }
     );
+    // Only a send that was attempted closes the address's older codes.
+    if (r.attempted === true) await closeOlder(ctx, made.row, "tenant");
+    else await closeOwn(ctx, made.row, "tenant");
     return noteTenantSend(ctx, r);
   }
   const under = await underLimit(ctx, countLinkClaims(ctx.db, ctx.userId), false);
@@ -644,11 +686,17 @@ async function platformMail(ctx: JobContext, choice: { organizationId: string | 
     if (claimStale(ctx, claimed.claim.at)) return note(ctx, "platform", "claim_stale");
     // A sender that is not configured opens no code and closes none: the
     // send below writes its not_configured row and nothing goes.
-    if (platformSenderReadiness(ctx.env).configured && !(await openResetCode(ctx, made.row, "platform"))) return;
+    const opened = platformSenderReadiness(ctx.env).configured;
+    if (opened && !(await openResetCode(ctx, made.row, "platform"))) return;
     const r = await sendPlatformEmail(
       { event: "platform_reset_code", to, organizationId: choice.organizationId, content: { code: made.code, minutes: OTP_TTL_MINUTES } },
       { ...deps, claim: claimed.claim }
     );
+    // Only a send that was attempted closes the address's older codes; any other answer closes this one again.
+    if (opened) {
+      if (platformSendAttempted(r)) await closeOlder(ctx, made.row, "platform");
+      else await closeOwn(ctx, made.row, "platform");
+    }
     return notePlatformSend(ctx, r);
   }
   // The sender's claim holds the account's limit before the link is minted.
