@@ -31,6 +31,7 @@ import { chunk, readAllStrict, readByIdsStrict } from "@/lib/db/chunked";
  *   - Skip learners who have already completed/passed the course.
  *   - Skip learners whose first_assigned_at is older than cap_days.
  *   - Skip learners whose last_nudge_at is newer than cadence_days ago.
+ *   - Read the addresses of the learners still due, and only theirs.
  *   - For survivors, send asset_reminder + update reminder_state.
  *
  * ADR 0029 (rules T5, FP2, FP4, FP7 and FP8; the hand-over note of
@@ -464,38 +465,6 @@ export async function POST(request: Request) {
     });
   }
 
-  // The addresses, for members that count only, in one strict read: a
-  // failed read is never "no address".
-  const allUserIds = new Set<string>();
-  for (const a of assignments) {
-    const counting = countingByOrg.get(a.organization_id);
-    const add = (uid: string) => {
-      if (counting?.has(uid)) allUserIds.add(uid);
-    };
-    if (a.assignee_type === "user" && a.user_id) add(a.user_id);
-    if (a.assignee_type === "team" && a.team_id) {
-      for (const uid of teamUserIds.get(a.team_id) ?? []) add(uid);
-    }
-    if (a.assignee_type === "group" && a.group_id) {
-      for (const uid of groupUserIds.get(a.group_id) ?? []) add(uid);
-    }
-    if (a.assignee_type === "org") {
-      for (const uid of orgUserIds.get(a.organization_id) ?? []) add(uid);
-    }
-  }
-  // One call for each list of 150 addresses, asked for first.
-  const addressCalls = Math.ceil(allUserIds.size / 150);
-  if (!hasRoom(budget, addressCalls + SEND_RESERVE)) {
-    noRoom("profiles_read");
-    return finish({ stoppedBeforeSend: true, leftOrgs });
-  }
-  spendCalls(budget, addressCalls);
-  const emailById = await resolveEmailsStrict(svc, allUserIds);
-  if (emailById === "unreadable") {
-    fail("profiles_read");
-    return finish({ stoppedBeforeSend: true, leftOrgs });
-  }
-
   const now = Date.now();
   // LEGITIMATE NEXT_PUBLIC_SITE_URL use: cron triggers have no inbound
   // request, so there are no headers to read. The build-time value is
@@ -515,7 +484,9 @@ export async function POST(request: Request) {
   };
   const stopUpserts: StateUpsert[] = [];
 
-  // Phase 1: apply all skip rules and build the list of due reminders.
+  // Phase 1: apply all skip rules and build the list of due reminders. The
+  // addresses are read after it, for the learners still due only, so the
+  // read is sized on who is due, not on everyone the assignments reach.
   type Job = {
     uid: string;
     email: string;
@@ -525,7 +496,7 @@ export async function POST(request: Request) {
     lastNudgeMs: number;
     directLink: string;
   };
-  const jobs: Job[] = [];
+  const due: Array<Omit<Job, "email">> = [];
 
   for (const course of enabledCourses) {
     const cadenceMs = course.cadence_days * 24 * 60 * 60 * 1000;
@@ -594,15 +565,9 @@ export async function POST(request: Request) {
         skipped++;
         continue;
       }
-      const email = emailById.get(uid);
-      if (!email) {
-        skipped++;
-        continue;
-      }
 
-      jobs.push({
+      due.push({
         uid,
-        email,
         course,
         firstAssignedIso: st
           ? st.first_assigned_at
@@ -614,6 +579,31 @@ export async function POST(request: Request) {
           : `/${course.org_slug}/courses/${course.course_id}/launch`,
       });
     }
+  }
+
+  // The addresses, for the learners still due only, in one strict read: a
+  // failed read is never "no address". One call for each list of 150
+  // addresses, asked for first, keeping back what the sends need.
+  const dueIds = new Set(due.map((d) => d.uid));
+  const addressCalls = Math.ceil(dueIds.size / 150);
+  if (!hasRoom(budget, addressCalls + SEND_RESERVE)) {
+    noRoom("profiles_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
+  spendCalls(budget, addressCalls);
+  const emailById = await resolveEmailsStrict(svc, dueIds);
+  if (emailById === "unreadable") {
+    fail("profiles_read");
+    return finish({ stoppedBeforeSend: true, leftOrgs });
+  }
+  const jobs: Job[] = [];
+  for (const d of due) {
+    const email = emailById.get(d.uid);
+    if (!email) {
+      skipped++;
+      continue;
+    }
+    jobs.push({ ...d, email });
   }
 
   // Reminders past their cap are stopped in one write, before any send.

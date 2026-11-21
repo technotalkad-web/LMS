@@ -32,6 +32,8 @@
  *     allows, from the constants, the call sends, and one page more stops
  *     it in members_read; ended by the clock at the second organisation's
  *     own row, it stops in assignments_read with nothing read after it;
+ *   - the addresses are read only for the learners the skip rules leave due:
+ *     3,000 members that count with five due, and the call sends;
  *   - the counted calls are the calls made: the budget's count equals the
  *     requests the run sent, for a run of sends, a stopped run, a run of
  *     mail whose text the caller gives (no template is read, none counted)
@@ -208,7 +210,7 @@ const SETTING: Row = {
   courses: { id: COURSE, title: "Course A", organization_id: ORG, organizations: { name: "Tenant A", slug: "tenant-a", deleted_at: null } },
 };
 const memberId = (i: number) => `m-${String(i).padStart(5, "0")}`;
-const assignment = (type: "user" | "team" | "group", ref: string): Row => ({
+const assignment = (type: "user" | "team" | "group" | "org", ref: string): Row => ({
   id: `a-${type}-${ref}`, course_id: COURSE, organization_id: ORG, assignee_type: type,
   user_id: type === "user" ? ref : null, team_id: type === "team" ? ref : null, group_id: type === "group" ? ref : null, release_at: null, source: "admin",
 });
@@ -221,9 +223,10 @@ const assignment = (type: "user" | "team" | "group", ref: string): Row => ({
  * order) and the same number of members, or `secondMembers` when given, the
  * first `direct` of them named.
  */
-function reminderWorld(o: { members: number; direct: number; teamAndGroup?: boolean; dynamicGroup?: boolean; state?: Row[]; second?: boolean; secondMembers?: number }) {
+function reminderWorld(o: { members: number; direct: number; teamAndGroup?: boolean; dynamicGroup?: boolean; orgWide?: boolean; state?: Row[]; second?: boolean; secondMembers?: number }) {
   const ids = Array.from({ length: o.members }, (_, i) => memberId(i));
   const rows = ids.slice(0, o.direct).map((u) => assignment("user", u));
+  if (o.orgWide) rows.push(assignment("org", ORG));
   if (o.teamAndGroup) rows.push(assignment("team", "t-0029"), assignment("group", "g-0029"));
   if (o.dynamicGroup) rows.push(assignment("group", "g-dyn"));
   const otherIds = o.second ? Array.from({ length: o.secondMembers ?? o.members }, (_, i) => `${memberId(i)}-b`) : [];
@@ -277,6 +280,11 @@ function perTable(beforeFirstSend: boolean): Record<string, number> {
 const sorted = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => a.localeCompare(b)));
 /** The reads of one table (its writes left out). */
 const readsOf = (table: string) => requests.filter((r) => r.table === table && r.method === "GET").length;
+/** `ids`, each reminded an hour ago (inside a cadence of one day, within the cap): no reminder is due for them. */
+const remindedAnHourAgo = (ids: readonly string[]): Row[] => {
+  const at = new Date(Date.now() - 3_600_000).toISOString();
+  return ids.map((u) => ({ user_id: u, course_id: COURSE, first_assigned_at: at, last_nudge_at: at, nudge_count: 1, stopped: false }));
+};
 /** The table each of the reminders' later reads asks (REMINDER_LATER_READS), by the route's word for its step. */
 const TABLE_OF_LATER_READ: Record<string, string> = { assignments_read: "course_assignments", progress_read: "course_attempts", state_read: "reminder_state", profiles_read: "profiles" };
 
@@ -440,6 +448,19 @@ async function cronRouteCases() {
       [r.body.left_orgs, absent(r.body), readsOf("course_assignments"), sends().length, requests.filter((q) => (q.table === "reminder_state" || q.table === "tenant_smtp_state") && q.method !== "GET").length],
       [1, UNKNOWN_WHEN_STOPPED, 0, 0, 0]);
     eq("…the count in the line equals the requests the call made", line?.calls, callRequests().length);
+  }
+
+  console.log("\nthe reminders call reads addresses only for the learners still due");
+  {
+    // An organisation-wide assignment over 3,000 members that count; all but
+    // five were reminded an hour ago, inside the cadence, so five are due.
+    const ids = Array.from({ length: 3000 }, (_, i) => memberId(i));
+    reminderWorld({ members: 3000, direct: 0, orgWide: true, state: remindedAnHourAgo(ids.slice(5)) });
+    const r = await remind();
+    const lists = requests.filter((q) => q.table === "profiles").map((q) => (q.query.get("id") ?? "").replace(/^in\.\(|\)$/g, "").split(",").sort());
+    eq("3,000 members that count, five due: 200, the five reminded, and only their addresses read, in one list",
+      [r.status, r.body.ok, Number(r.body.due), Number(r.body.sent), lists], [200, true, 5, 5, [ids.slice(0, 5).sort()]]);
+    eq("…its requests, the heartbeat's included, never pass 40", requests.length <= CALL_SUM_LIMIT, true);
   }
 
   console.log("\nthe reminders call: the route's own count is the requests it made, paged reads included (rule FP2)");
