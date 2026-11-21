@@ -1,8 +1,8 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { NO_TIME_LEFT_TEXT, claimCredentialMail, readLinkClaims, recordCredentialNotAttempted, sendNotification, type SendResult } from "@/lib/notifications/send";
+import { NO_TIME_LEFT_TEXT, claimCredentialMail, countLinkClaims, recordCredentialNotAttempted, sendNotification, type SendResult } from "@/lib/notifications/send";
 import { openRun, requestBudget, runReading, runReady, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
 import { claimPlatformSend, platformSenderReadiness, sendPlatformEmail } from "@/lib/email/platform-sender";
-import { CLAIM_SEND_WITHIN_MS } from "@/lib/email/smtp-function";
+import { CLAIM_SEND_WITHIN_MS, accountRequests, type CountSince } from "@/lib/email/smtp-function";
 import { ADMIN_ROLES, grantsAdminRights, listCountingMemberships, type CountingOrganisation } from "@/lib/auth/org-membership";
 import { isSchemaMissing } from "@/lib/scoring/attempt-kind";
 import { MAX_REQUESTS_PER_DAY, MAX_REQUESTS_PER_HOUR, OTP_TTL_MINUTES, generateOtpCode, hashOtp } from "@/lib/auth/password-reset";
@@ -429,54 +429,27 @@ async function markJob(ctx: JobContext, kind: "tenant" | "platform", mark: "star
 }
 
 /**
- * Whether the account is within its limit (section G), from the newest rows
- * of the last 24 hours, newest first, that `read` answers. Before the job's
- * own row is among them (`ownIncluded` false) the limit is reached at 5 in
- * the hour or 10 in the day; with its own row among them, it is passed only
- * past those numbers. Each read asks for one row more than the daily limit.
- * null when the read failed: nothing is made.
+ * Whether the account is within its limit (section G), from two exact
+ * counts of its rows (accountRequests): in the last hour and, unless only
+ * the hourly limit applies, in the last 24 hours. Before the job's own row
+ * is among them (`ownIncluded` false) the limit is reached at 5 in the hour
+ * or 10 in the day; with its own row among them, it is passed only past
+ * those numbers. null when a count failed: nothing is made.
  */
-async function underLimit(
-  ctx: JobContext,
-  read: () => PromiseLike<{ data: unknown; error: unknown }>,
-  timeOf: (row: Record<string, unknown>) => unknown,
-  hourlyOnly: boolean,
-  ownIncluded = false
-): Promise<boolean | null> {
-  spend(ctx, 1);
-  let answer: { data: unknown; error: unknown };
-  try {
-    answer = await read();
-  } catch {
-    return null;
-  }
-  if (answer.error || !Array.isArray(answer.data)) return null;
-  const hourAgo = ctx.now() - 3_600_000;
-  const rows = answer.data as Array<Record<string, unknown>>;
-  const inHour = rows.filter((r) => {
-    const t = timeOf(r);
-    return typeof t === "string" && Date.parse(t) >= hourAgo;
-  }).length;
-  const past = (n: number, limit: number) => (ownIncluded ? n > limit : n >= limit);
-  if (past(inHour, MAX_CREDENTIALS_PER_HOUR)) return false;
-  return hourlyOnly || !past(rows.length, MAX_CREDENTIALS_PER_DAY);
+async function underLimit(ctx: JobContext, countSince: CountSince, hourlyOnly: boolean, ownIncluded = false): Promise<boolean | null> {
+  spend(ctx, hourlyOnly ? 1 : 2);
+  const n = await accountRequests(countSince, ctx.now(), !hourlyOnly);
+  if (!n) return null;
+  const past = (count: number, limit: number) => (ownIncluded ? count > limit : count >= limit);
+  if (past(n.hour, MAX_CREDENTIALS_PER_HOUR)) return false;
+  return n.day === null || !past(n.day, MAX_CREDENTIALS_PER_DAY);
 }
 
-const dayAgoIso = (ctx: JobContext) => new Date(ctx.now() - 24 * 3_600_000).toISOString();
-
-/** Reset codes: the address's code rows of the last 24 hours (password_reset_otps), in both systems. */
+/** Reset codes: the address's code rows (password_reset_otps), in both systems; each is a request. */
 function resetCodesUnderLimit(ctx: JobContext, hourlyOnly: boolean, ownIncluded = false): Promise<boolean | null> {
   return underLimit(
     ctx,
-    () =>
-      ctx.db
-        .from("password_reset_otps")
-        .select("created_at")
-        .eq("email", ctx.email)
-        .gte("created_at", dayAgoIso(ctx))
-        .order("created_at", { ascending: false })
-        .limit(MAX_CREDENTIALS_PER_DAY + 1),
-    (r) => r.created_at,
+    (sinceIso) => ctx.db.from("password_reset_otps").select("id", { count: "exact", head: true }).eq("email", ctx.email).gte("created_at", sinceIso),
     hourlyOnly,
     ownIncluded
   );
@@ -641,7 +614,7 @@ async function tenantMail(ctx: JobContext): Promise<void> {
     );
     return noteTenantSend(ctx, r);
   }
-  const under = await underLimit(ctx, () => readLinkClaims(ctx.db, ctx.userId, ctx.now()), (r) => r.sent_at, false);
+  const under = await underLimit(ctx, countLinkClaims(ctx.db, ctx.userId), false);
   if (under !== true) return note(ctx, "tenant", under === null ? "limit_read_failed" : "account_limit");
   const claim = await claimCredentialMail(run, { event: "magic_link", to }, { link: true });
   if (!claim.ok) return note(ctx, "tenant", claim.why);

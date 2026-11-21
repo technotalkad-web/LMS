@@ -78,6 +78,32 @@ export const CLAIMS_IN_FLIGHT_PER_ACCOUNT = 5;
 export const CLAIMS_IN_FLIGHT_PAGE = 1000;
 
 /**
+ * One exact count of an account's rows at or after a time: a read with
+ * `count: "exact", head: true` and the limit's own filters, which returns
+ * the number of rows and no page.
+ */
+export type CountSince = (sinceIso: string) => PromiseLike<{ count: number | null; error: unknown }>;
+
+/**
+ * An account's requests in the last hour and, when its daily limit applies,
+ * in the last 24 hours (ADR 0029 section G; the note of 2026-11-22), in both
+ * systems: two exact counts of the rows that limit names, read together. A
+ * count covers every such row, whatever else the log holds, so the same rows
+ * always give the same answer. null when a count cannot be read: nothing is
+ * sent on it.
+ */
+export async function accountRequests(countSince: CountSince, nowMs: number, daily: boolean): Promise<{ hour: number; day: number | null } | null> {
+  // A count that throws, fails or answers no number is one that cannot be read.
+  const read = (sinceMs: number): Promise<number | null> =>
+    new Promise<{ count: number | null; error: unknown } | null>((resolve) => resolve(countSince(new Date(sinceMs).toISOString())))
+      .then((r) => (!r || r.error || typeof r.count !== "number" ? null : r.count))
+      .catch(() => null);
+  const [hour, day] = await Promise.all([read(nowMs - 3_600_000), daily ? read(nowMs - 24 * 3_600_000) : Promise.resolve(null)]);
+  if (hour === null || (daily && day === null)) return null;
+  return { hour, day: daily ? day : null };
+}
+
+/**
  * The sends in flight that a list of claims stands for: for each account and
  * kind at most CLAIMS_IN_FLIGHT_PER_ACCOUNT, and a claim with no account
  * counts by itself. So the claims of one address hold back no more of a

@@ -14,6 +14,10 @@
  * together is asserted as "at most the limit", never as an exact number:
  * a claim may refuse more than it must, never less.
  *
+ * Each account count is exact (a count of the rows its limit names, with no
+ * page), and the account limits hold hour after hour on a moved clock: at
+ * the limit, a burst of requests at once, then requests one by one.
+ *
  * Also: the shared times and the count of claims in flight; a reset code's
  * row written closed and opened only after every limit; a claim older than
  * the send window sends nothing; a claim or a count that cannot be written
@@ -30,7 +34,7 @@ import {
   ORG, OTHER_ORG, PLATFORM_ENV, SLUG, SUPABASE, ask, captureLogs, eq, finish, freshWorld, handed, install, requests, uninstall, world,
   type Asked, type Req, type Row,
 } from "./public-mail-world";
-import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, CLAIM_SEND_WITHIN_MS, SMTP_SEND_WAIT_MS, claimsInFlight } from "../../lib/email/smtp-function";
+import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, CLAIM_SEND_WITHIN_MS, SMTP_SEND_WAIT_MS, accountRequests, claimsInFlight } from "../../lib/email/smtp-function";
 import { claimPlatformSend, sendPlatformEmail, type PlatformSendRequest } from "../../lib/email/platform-sender";
 import { hashOtp } from "../../lib/auth/password-reset";
 
@@ -128,6 +132,53 @@ function fakeClock(start = Date.now()) {
   return { move: (ms: number) => { t += ms; }, now: () => t, restore: () => { Date.now = real; } };
 }
 
+/** One request: its answer, then the jobs it hands over (run by the caller). */
+type Ask = () => Promise<Array<() => unknown>>;
+/** A burst at the limit: this many requests at once for one account. */
+const BURST = 150;
+const HOURS = 3;
+
+/**
+ * Hour after hour on a moved clock (61 minutes apart, so all of them lie
+ * inside one day): five requests one after another (the hour's limit), then
+ * BURST requests at once, then ten more one after another. Answers what was
+ * sent in each hour, what the first five sent, and, for the first burst,
+ * how many jobs ran and what they sent.
+ */
+async function hourAfterHour(asked: Ask, sent: () => number): Promise<{ perHour: number[]; firstFive: number; burstJobs: number; burstSent: number }> {
+  const clock = fakeClock();
+  const perHour: number[] = [];
+  let firstFive = 0;
+  let burstJobs = 0;
+  let burstSent = 0;
+  const oneByOne = async (n: number) => {
+    for (let i = 0; i < n; i++) for (const job of await asked()) await job();
+  };
+  try {
+    await captureLogs(async () => {
+      for (let h = 0; h < HOURS; h++) {
+        if (h > 0) clock.move(61 * 60_000);
+        const before = sent();
+        await oneByOne(5);
+        if (h === 0) firstFive = sent() - before;
+        const jobs: Array<() => unknown> = [];
+        for (let i = 0; i < BURST; i++) jobs.push(...(await asked()));
+        const beforeBurst = sent();
+        await Promise.all(jobs.map((j) => j()));
+        if (h === 0) {
+          burstJobs = jobs.length;
+          burstSent = sent() - beforeBurst;
+        }
+        await oneByOne(10);
+        perHour.push(sent() - before);
+      }
+    });
+  } finally {
+    clock.restore();
+  }
+  return { perHour, firstFive, burstJobs, burstSent };
+}
+
 /** Set environment values for one block. */
 async function withEnv<T>(env: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const saved: Record<string, string | undefined> = {};
@@ -173,6 +224,17 @@ async function main() {
       eq("…another kind of that account counts apart, and so does another account", claimsInFlight([...of("u1", "magic_link", 7), ...of("u1", "password_reset", 2), ...of("u2", "magic_link", 3)]), 5 + 2 + 3);
       eq("…a claim with no account counts by itself", claimsInFlight([...of(null, "magic_link", 7), ...of("u1", "magic_link", 9)]), 7 + 5);
       eq("…no claims, none", claimsInFlight([]), 0);
+      const at = Date.now();
+      const byWindow = (sinceIso: string) => Promise.resolve({ count: at - Date.parse(sinceIso) > 2 * 3_600_000 ? 9 : 4, error: null });
+      eq("an account's requests: two exact counts, the hour's and the day's", await accountRequests(byWindow, at, true), { hour: 4, day: 9 });
+      eq("…with the hourly limit alone, the day is not read", await accountRequests(byWindow, at, false), { hour: 4, day: null });
+      const unread = [
+        await accountRequests(() => Promise.resolve({ count: null, error: { code: "XX000" } }), at, true),
+        await accountRequests(() => { throw new Error("stub"); }, at, true),
+        await accountRequests(() => Promise.reject(new Error("stub")), at, true),
+        await accountRequests((s) => Promise.resolve({ count: at - Date.parse(s) > 2 * 3_600_000 ? null : 4, error: null }), at, true),
+      ];
+      eq("…a count that fails, throws or answers no number cannot be read: null", unread, [null, null, null, null]);
     }
 
     console.log("\nthe world answers each read as the table was when it arrived");
@@ -303,6 +365,74 @@ async function main() {
       }
     }
 
+    console.log(`\nthe account limits hold hour after hour: at the limit, ${BURST} requests at once, then requests one by one`);
+    {
+      const asks = (kind: Kind, payload: Row): Ask => async () => {
+        await ask(kind.route, kind.path, payload);
+        return handed.splice(0);
+      };
+      const platformSentOf = (event: string, userId: string) => () => platformRowsOf((r) => r.event_type === event && r.to_user_id === userId && r.status === "sent").length;
+      const tenantSentOf = (event: string, userId: string) => () => world.log.filter((r) => r.event_type === event && r.to_user_id === userId && r.status === "sent").length;
+      const cases: Array<{ label: string; asked: Ask; sent: () => number }> = [
+        { label: "platform sign-in link, one administrator, through the route", asked: asks(LINK_KIND, { email: ADMIN.email }), sent: platformSentOf("platform_sign_in_link", ADMIN.id) },
+        { label: "platform reset code, one administrator, through the route", asked: asks(CODE, { email: ADMIN.email }), sent: platformSentOf("platform_reset_code", ADMIN.id) },
+        { label: "tenant sign-in link, one learner", asked: asks(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }), sent: tenantSentOf("magic_link", LEARNER.id) },
+        { label: "tenant reset code, one learner", asked: asks(CODE, { email: LEARNER.email, orgSlug: SLUG }), sent: tenantSentOf("password_reset", LEARNER.id) },
+      ];
+      for (const kind of ["platform_sign_in_link", "platform_reset_code"] as const) {
+        const req = kind === "platform_sign_in_link"
+          ? ({ event: kind, to: { userId: ADMIN.id, email: ADMIN.email, platformOwner: false }, organizationId: ORG, content: { link: LINK, minutes: 60 } } as PlatformSendRequest<typeof kind>)
+          : ({ event: kind, to: { userId: ADMIN.id, email: ADMIN.email, platformOwner: false }, organizationId: ORG, content: { code: "123456", minutes: 10 } } as PlatformSendRequest<typeof kind>);
+        cases.push({
+          label: `the platform sender alone, ${kind === "platform_sign_in_link" ? "a link" : "a code"}, one administrator`,
+          asked: async () => [() => sendPlatformEmail(req, { db, env: PLATFORM_ENV })],
+          sent: platformSentOf(kind, ADMIN.id),
+        });
+      }
+      for (const c of cases) {
+        base();
+        const run = await hourAfterHour(c.asked, c.sent);
+        const total = run.perHour.reduce((a, b) => a + b, 0);
+        eq(`${c.label}: no hour sends more than 5, and the ${HOURS} hours together no more than 10 (${run.perHour.join(", ")})`, [run.perHour.every((n) => n <= 5), total <= 10], [true, true]);
+        eq("…non-vacuous: the first hour's five went one after another, and the second hour's sent within the day's room", [run.firstFive, run.perHour[1]], [5, 5]);
+        eq(`…the first hour's burst at the limit ran (${BURST} jobs) and sent nothing`, [run.burstJobs, run.burstSent], [BURST, 0]);
+      }
+    }
+
+    console.log("\neach account count is an exact count of the note's rows: a count of the rows, with no page");
+    {
+      /** The reads of one account's rows: by its user id, or by its address for code rows. */
+      const accountReads = (table: string) => requests.filter((r) => r.table === table && (r.method === "GET" || r.method === "HEAD") && (r.query.has("to_user_id") || r.query.has("email")));
+      const shape = (r: Req) => ({
+        exact: r.method === "HEAD" && /(^|,)\s*count=exact/.test(r.prefer),
+        keys: [...new Set(r.query.keys())].sort(),
+        filters: Object.fromEntries([...r.query.entries()].filter(([k]) => k !== "select" && k !== "to_user_id" && k !== "email" && k !== "sent_at" && k !== "created_at")),
+        since: r.query.get("sent_at") ?? r.query.get("created_at") ?? "",
+      });
+      const check = (label: string, reads: Req[], keys: string[], filters: Record<string, string>) => {
+        const shapes = reads.map(shape);
+        eq(`${label}: four counts (the hour and the day, before the claim and after it), each exact, with no page or order`,
+          [shapes.length, shapes.every((s) => s.exact && JSON.stringify(s.keys) === JSON.stringify(keys) && JSON.stringify(s.filters) === JSON.stringify(filters)), shapes.every((s) => s.since.startsWith("gte."))],
+          [4, true, true]);
+        const spans = reads.map((r) => Date.parse((r.query.get("sent_at") ?? r.query.get("created_at") ?? "").slice(4)));
+        eq(`${label}: …two of them read the hour and two the day`, [spans.filter((t) => Date.now() - t <= 3_600_000 + 60_000).length, spans.filter((t) => Date.now() - t >= 24 * 3_600_000 - 60_000).length], [2, 2]);
+      };
+      base();
+      await one(LINK_KIND, { email: ADMIN.email });
+      check("platform link", accountReads("platform_email_log"), ["event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.platform_sign_in_link", status: "eq.suppressed" });
+      base();
+      await one(CODE, { email: ADMIN.email });
+      check("platform code, the sender's account", accountReads("platform_email_log"), ["event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.platform_reset_code", status: "eq.suppressed" });
+      check("platform code, the address's code rows", accountReads("password_reset_otps"), ["created_at", "email", "select"], {});
+      base();
+      await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG });
+      check("tenant link", accountReads("notification_log"), ["event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.magic_link", status: "eq.queued" });
+      base();
+      await one(CODE, { email: LEARNER.email, orgSlug: SLUG });
+      check("tenant code, the address's code rows", accountReads("password_reset_otps"), ["created_at", "email", "select"], {});
+      eq("…a tenant code reads no account count of links", accountReads("notification_log").length, 0);
+    }
+
     console.log("\nan organisation's share and the ceiling, many accounts at once");
     {
       base();
@@ -430,6 +560,10 @@ async function main() {
       base({ failRead: (r) => r.table === "platform_email_log" && r.query.get("error_code") === "eq.pending" });
       lines = jobLines(await one(kind, { email: ADMIN.email }));
       eq(`platform ${kind.name}: the claims in flight cannot be read: nothing sent, the claim the only row`, [dispatched("platform").length, world.platformLog.map((r) => r.error_code), lines.map((l) => l.code)], [0, ["pending"], ["log_unreadable"]]);
+      // The account's count read once its claim is written.
+      base({ failRead: (r) => r.table === "platform_email_log" && r.method === "HEAD" && r.query.has("to_user_id") && world.platformLog.some((row) => row.error_code === "pending") });
+      lines = jobLines(await one(kind, { email: ADMIN.email }));
+      eq(`platform ${kind.name}: the account's count after the claim cannot be read: nothing sent, the claim the only row`, [dispatched("platform").length, world.platformLog.map((r) => r.error_code), lines.map((l) => l.code)], [0, ["pending"], ["log_unreadable"]]);
       base({ writeFailing: new Set(["notification_log"]) });
       const all = await one(kind, { email: LEARNER.email, orgSlug: SLUG });
       lines = jobLines(all);
@@ -437,8 +571,8 @@ async function main() {
         [dispatched("tenant").length, lines.map((l) => l.outcome), all.some((l) => l.includes('"step":"claim_failed"') && l.includes('"code":"XX000"'))], [0, ["claim_failed"], true]);
     }
     {
-      let reads = 0;
-      base({ failRead: (r) => r.table === "notification_log" && r.query.get("status") === "eq.queued" && r.query.has("to_user_id") && ++reads === 2 });
+      // The account's count read once its claim is written.
+      base({ failRead: (r) => r.table === "notification_log" && r.query.get("status") === "eq.queued" && r.query.has("to_user_id") && world.log.some((row) => row.status === "queued") });
       const lines = jobLines(await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }));
       eq("tenant link: the account's count after the claim cannot be read: nothing minted or sent", [dispatched("tenant").length, requests.filter((r) => r.path === "/auth/v1/admin/generate_link").length, lines.map((l) => l.outcome)], [0, 0, ["limit_read_failed"]]);
       for (const kind of KINDS) {

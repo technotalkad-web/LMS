@@ -4,9 +4,11 @@ import {
   CLAIM_IN_FLIGHT_MS,
   CLAIM_SEND_WITHIN_MS,
   SMTP_SEND_WAIT_MS,
+  accountRequests,
   claimsInFlight,
   classifySmtpError,
   dispatchSmtp,
+  type CountSince,
   type SmtpErrorClass,
 } from "./smtp-function";
 import {
@@ -378,15 +380,17 @@ export type PlatformClaimAnswer = { claimed: true; claim: PlatformClaim } | { cl
  * Claim one code or link before it is made (ADR 0029, the note of
  * 2026-11-22). Each limit is claimed before the send: the request writes its
  * claim, a row with the status `suppressed` and the word `pending`, and only
- * then counts, its own claim among the rows. In this order:
- *   1. the account's rows of this kind whose status is `suppressed` or
- *      `refused`, read before anything is written: at the limit (5 in the
- *      hour, 10 in the day; a platform owner's own, the hourly limit only)
- *      it is refused, with one such row an hour, and no claim is written;
+ * then counts, its own claim among the rows. Each count of the account is
+ * exact (accountRequests): the number of the account's rows of this kind
+ * whose status is `suppressed`, in the hour and in the day. In this order:
+ *   1. the account's counts, read before anything is written: at the limit
+ *      (5 in the hour, 10 in the day; a platform owner's own, the hourly
+ *      limit only) it is refused, with one such row an hour, and no claim is
+ *      written;
  *   2. the reserved test domains and the allow-list: a `suppressed` row, as
  *      before, and no claim;
  *   3. the claim;
- *   4. four reads together: the account's rows again; the organisation's
+ *   4. four reads together: the account's counts again; the organisation's
  *      sent codes and links of 24 hours; all sent mail of 24 hours; and the
  *      claims in flight (CLAIM_IN_FLIGHT_MS, at most five for one account
  *      and kind, claimsInFlight). A read that fails, or a full page of
@@ -413,30 +417,36 @@ export async function claimPlatformSend(
   const dailyApplies = !(to.platformOwner && OWNER_HOURLY_ONLY.has(event));
   const of: RowOf = { event, organizationId, userId: to.userId };
   const not = (result: PlatformSendResult): PlatformClaimAnswer => ({ claimed: false, result });
-  const accountRows = (nowMs: number) =>
+  // A request of the account: a claim, or one the reserved domains or the list stopped.
+  const requestsSince: CountSince = (sinceIso) =>
     db
       .from("platform_email_log")
-      .select("sent_at, status, error_code")
+      .select("id", { count: "exact", head: true })
       .eq("to_user_id", to.userId)
       .eq("event_type", event)
-      .in("status", ["suppressed", "refused"])
-      .gte("sent_at", new Date(nowMs - DAY_MS).toISOString())
-      .order("sent_at", { ascending: false })
-      .limit(100);
-  // A request of the account: a claim, or one the reserved domains or the list stopped.
-  const requestsIn = (rows: LogRow[], nowMs: number) => {
-    const asked = rows.filter((r) => r.status === "suppressed");
-    return { hour: asked.filter((r) => Date.parse(r.sent_at) >= nowMs - HOUR_MS).length, day: asked.length };
-  };
+      .eq("status", "suppressed")
+      .gte("sent_at", sinceIso);
+  const past = (n: { hour: number; day: number | null }, ownIncluded: boolean) =>
+    ownIncluded
+      ? n.hour > limit.hour || (n.day !== null && n.day > limit.day)
+      : n.hour >= limit.hour || (n.day !== null && n.day >= limit.day);
 
   // 1. The account limit, before anything is written.
   const firstMs = clock();
-  const first = await accountRows(firstMs);
-  if (first.error || !Array.isArray(first.data)) return not(unreadable(event, "account"));
-  const before = requestsIn(first.data as LogRow[], firstMs);
-  if (before.hour >= limit.hour || (dailyApplies && before.day >= limit.day)) {
-    const recorded = (first.data as LogRow[]).some((r) => isLimitRow(r) && Date.parse(r.sent_at) >= firstMs - HOUR_MS);
-    if (recorded) return not({ status: "refused", errorCode: "account_limit", logged: false });
+  const before = await accountRequests(requestsSince, firstMs, dailyApplies);
+  if (!before) return not(unreadable(event, "account"));
+  if (past(before, false)) {
+    // One refused row an hour for the account and kind. If that cannot be read, nothing more is written.
+    const recorded = await db
+      .from("platform_email_log")
+      .select("id")
+      .eq("to_user_id", to.userId)
+      .eq("event_type", event)
+      .eq("status", "refused")
+      .eq("error_code", "account_limit")
+      .gte("sent_at", new Date(firstMs - HOUR_MS).toISOString())
+      .limit(1);
+    if (recorded.error || !Array.isArray(recorded.data) || recorded.data.length > 0) return not({ status: "refused", errorCode: "account_limit", logged: false });
     return not(await writeRow(db, of, "refused", "account_limit"));
   }
 
@@ -463,7 +473,7 @@ export async function claimPlatformSend(
   const orgApplies = organizationId !== null && !to.platformOwner;
   const ceilingApplies = !(to.platformOwner && OWNER_CEILING_EXEMPT.has(event));
   const [again, orgSent, allSent, flight] = await Promise.all([
-    accountRows(nowMs),
+    accountRequests(requestsSince, nowMs, dailyApplies),
     orgApplies
       ? db
           .from("platform_email_log")
@@ -485,16 +495,13 @@ export async function claimPlatformSend(
           .limit(CLAIMS_IN_FLIGHT_PAGE)
       : null,
   ]);
-  if (again.error || !Array.isArray(again.data)) return not(unreadable(event, "account"));
+  if (!again) return not(unreadable(event, "account"));
   if (orgSent && (orgSent.error || typeof orgSent.count !== "number")) return not(unreadable(event, "organisation"));
   if (allSent && (allSent.error || typeof allSent.count !== "number")) return not(unreadable(event, "ceiling"));
   if (flight && (flight.error || !Array.isArray(flight.data) || flight.data.length >= CLAIMS_IN_FLIGHT_PAGE)) return not(unreadable(event, "claims"));
 
   // 5. In section F's order: the account, the organisation's share, the ceiling.
-  const after = requestsIn(again.data as LogRow[], nowMs);
-  if (after.hour > limit.hour || (dailyApplies && after.day > limit.day)) {
-    return not({ status: "refused", errorCode: "account_limit", logged: false });
-  }
+  if (past(again, true)) return not({ status: "refused", errorCode: "account_limit", logged: false });
   const claims = (flight?.data ?? []) as Array<{ to_user_id: string | null; event_type: string; organization_id: string | null }>;
   if (orgApplies && (orgSent!.count as number) + claimsInFlight(claims.filter((c) => c.organization_id === organizationId)) > limits.orgDailyLimit) {
     return not(await writeRow(db, of, "refused", "org_limit"));

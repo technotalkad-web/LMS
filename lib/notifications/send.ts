@@ -2,7 +2,7 @@ import { createClient as createServiceClient, type SupabaseClient } from "@supab
 import { loadTemplate, mdToHtml, DEFAULT_CTAS, DEFAULT_TEMPLATES } from "./templates";
 import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
-import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, SMTP_SEND_WAIT_MS, claimsInFlight, classifySmtpError, dispatchSmtp, isCallLimitMessage, type SmtpErrorClass } from "@/lib/email/smtp-function";
+import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, SMTP_SEND_WAIT_MS, accountRequests, claimsInFlight, classifySmtpError, dispatchSmtp, isCallLimitMessage, type CountSince, type SmtpErrorClass } from "@/lib/email/smtp-function";
 import { MAX_REQUESTS_PER_DAY, MAX_REQUESTS_PER_HOUR } from "@/lib/auth/password-reset";
 import { isTenantEvent } from "./routing";
 import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, markNotSentAlert, noteCallLimit, openRun, refreshRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
@@ -352,25 +352,21 @@ export async function recordCredentialNotAttempted(
 /** The error word of a tenant's claim: a `queued` row of notification_log that queues nothing and holds no credential. */
 export const CREDENTIAL_CLAIM_ERROR = "claim";
 
-const DAY_MS = 24 * 3_600_000;
-
 /**
- * The account's claimed sign-in links through its organisation's SMTP in
- * the last 24 hours, newest first: the `queued` rows of magic_link. It asks
- * for one row more than the daily limit, so a row past the limit is never
- * hidden by the size of the page. A record row of a link that was not
- * attempted is not a request, and is not read here.
+ * The account's claimed sign-in links through its organisation's SMTP, as
+ * an exact count from a time on (accountRequests): the `queued` rows of
+ * magic_link. A record row of a link that was not attempted is not a
+ * request, and is not counted here.
  */
-export function readLinkClaims(db: SupabaseClient, userId: string, nowMs: number) {
-  return db
-    .from("notification_log")
-    .select("sent_at")
-    .eq("to_user_id", userId)
-    .eq("event_type", "magic_link")
-    .eq("status", "queued")
-    .gte("sent_at", new Date(nowMs - DAY_MS).toISOString())
-    .order("sent_at", { ascending: false })
-    .limit(MAX_REQUESTS_PER_DAY + 1);
+export function countLinkClaims(db: SupabaseClient, userId: string): CountSince {
+  return (sinceIso) =>
+    db
+      .from("notification_log")
+      .select("id", { count: "exact", head: true })
+      .eq("to_user_id", userId)
+      .eq("event_type", "magic_link")
+      .eq("status", "queued")
+      .gte("sent_at", sinceIso);
 }
 
 /** A tenant claim's answer: its time, or why nothing is sent (its record row, if one is owed, is already written). */
@@ -384,8 +380,8 @@ export type CredentialClaim =
  * claimed before the send: the job writes its claim, a `queued` row with
  * the error word `claim` and no context, and only then reads, with its own
  * claim among the rows:
- *   - for a link, the account's claims again (readLinkClaims): past 5 in the
- *     hour or 10 in the day nothing is sent;
+ *   - for a link, the account's claims again, two exact counts
+ *     (countLinkClaims): past 5 in the hour or 10 in the day nothing is sent;
  *   - the run again (refreshRun): an organisation that now reads failing or
  *     not configured is not attempted (smtp_not_ready, with its record row
  *     and the alert mark);
@@ -432,10 +428,10 @@ export async function claimCredentialMail(
   }
 
   const nowMs = run.now();
-  spendCalls(run.budget, (opts.link ? 1 : 0) + 1);
+  spendCalls(run.budget, (opts.link ? 2 : 0) + 1);
   const settle = <T,>(p: PromiseLike<T>): Promise<T | "thrown"> => Promise.resolve(p).catch(() => "thrown" as const);
   const [account, status, flight] = await Promise.all([
-    opts.link ? settle(readLinkClaims(db, args.to.user_id, nowMs)) : Promise.resolve(null),
+    opts.link ? accountRequests(countLinkClaims(db, args.to.user_id), nowMs, true) : Promise.resolve("none" as const),
     refreshRun(run),
     settle(
       db
@@ -449,14 +445,12 @@ export async function claimCredentialMail(
     ),
   ]);
 
-  if (account !== null) {
-    if (account === "thrown" || account.error || !Array.isArray(account.data)) {
+  if (account !== "none") {
+    if (!account) {
       warn("limit_read_failed");
       return { ok: false, why: "limit_read_failed" };
     }
-    const rows = account.data as Array<{ sent_at?: unknown }>;
-    const inHour = rows.filter((r) => typeof r.sent_at === "string" && Date.parse(r.sent_at) >= nowMs - 3_600_000).length;
-    if (inHour > MAX_REQUESTS_PER_HOUR || rows.length > MAX_REQUESTS_PER_DAY) return { ok: false, why: "account_limit" };
+    if (account.hour > MAX_REQUESTS_PER_HOUR || (account.day ?? 0) > MAX_REQUESTS_PER_DAY) return { ok: false, why: "account_limit" };
   }
 
   const reading = runReading(run);

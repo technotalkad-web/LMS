@@ -29,7 +29,8 @@
 import Module from "node:module";
 
 export type Row = Record<string, unknown>;
-export type Req = { method: string; host: string; path: string; table: string; query: URLSearchParams; body: unknown; raw: string; key: string };
+/** One recorded call; `prefer` is its Prefer header (an exact count asks for count=exact there). */
+export type Req = { method: string; host: string; path: string; table: string; query: URLSearchParams; body: unknown; raw: string; key: string; prefer: string };
 
 export const SUPABASE = "http://stub.supabase.test";
 export const ORG = "0c000000-0000-4000-8000-0000000000a1";
@@ -253,9 +254,9 @@ const serve = async (input: RequestInfo | URL, init?: RequestInit): Promise<Resp
   const table = p.replace("/rest/v1/", "");
   const q = url.searchParams;
   const keyParts = [...q.entries()].map(([k, v]) => `${k}=${v}`).sort().join("&");
-  requests.push({ method, host: url.host, path: p, table, query: q, body, raw, key: `${method} ${p}?${keyParts} ${raw}` });
-  world.onRequest?.(requests[requests.length - 1]);
   const prefer = h.get("prefer") ?? "";
+  requests.push({ method, host: url.host, path: p, table, query: q, body, raw, key: `${method} ${p}?${keyParts} ${raw}`, prefer });
+  world.onRequest?.(requests[requests.length - 1]);
 
   if (p === "/auth/v1/admin/users" && method === "GET") {
     if (world.lookup === "throw") throw new TypeError("stub: network down");

@@ -98,7 +98,8 @@ type Req = { method: string; path: string; query: URLSearchParams; body: string;
 let rows: Row[] = [];
 let requests: Req[] = [];
 let tableMissing = false;
-let failRead: null | "rows" | "count" = null;
+/** A read that fails: "rows" a read of rows; "account" a count of one account's rows; "count" any other count (an organisation's, the ceiling's). */
+let failRead: null | "rows" | "account" | "count" = null;
 let smtpAnswer: () => Promise<Response> = async () => json({ ok: true });
 let nextId = 1;
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
@@ -130,7 +131,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
       return new Response(null, { status: 201 });
     }
     if (method === "HEAD") {
-      if (failRead === "count") return new Response(null, { status: 500 });
+      if (failRead === (url.searchParams.has("to_user_id") ? "account" : "count")) return new Response(null, { status: 500 });
       const n = rows.filter((r) => matches(r, url.searchParams)).length;
       return new Response(null, { status: 200, headers: { "content-range": `*/${n}` } });
     }
@@ -315,8 +316,8 @@ async function main() {
 
     console.log("\na limit that cannot be read sends nothing and writes nothing");
     {
-      fresh(); failRead = "rows";
-      eq("the account read fails: nothing sent, no row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
+      fresh(); failRead = "account";
+      eq("the account count fails: nothing sent, no row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
       fresh(); failRead = "count";
       eq("the organisation count after the claim fails: nothing sent, the claim the only row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "log_unreadable", false], 0, [["suppressed", "pending"]]]);
       fresh(); failRead = "count";
@@ -379,6 +380,20 @@ async function main() {
       seed(4, { to_user_id: ADMIN_A.userId, event_type: "platform_reset_code", status: "refused", error_code: "org_limit" }, (i) => 1 + i);
       eq("…a row that follows a claim is not a request (four claims, each with its outcome: the fifth is sent)", (await send(code(ADMIN_A, ORG_A))).status, "sent");
       eq("…and the sixth is refused before it claims: its refused row, and no claim", [short(await send(code(ADMIN_A, ORG_A))), rows.filter((r) => r.error_code === "pending").length], [["refused", "account_limit", true], 5]);
+      fresh();
+      seed(4, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 20 + i);
+      seed(200, { to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link", status: "refused", error_code: "account_limit" }, (i) => 1 + (i % 10));
+      eq("the account's count reads its requests only: four claims and 200 refused rows in the hour, the fifth is sent", (await send(link(ADMIN_A, ORG_A))).status, "sent");
+      eq("…and the sixth is refused, with no further row", [short(await send(link(ADMIN_A, ORG_A))), rows.filter((r) => r.error_code === "pending").length, sends().length], [["refused", "account_limit", false], 5, 1]);
+      fresh();
+      seed(9, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 120 + i * 60);
+      seed(300, { to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link", status: "refused", error_code: "account_limit" }, (i) => 61 + (i % 50));
+      eq("…the same for the day: nine claims and 300 refused rows in the day, the tenth is sent", (await send(link(ADMIN_A, ORG_A))).status, "sent");
+      eq("…and the eleventh is refused for the day", [short(await send(link(ADMIN_A, ORG_A))), sends().length], [["refused", "account_limit", true], 1]);
+      fresh();
+      seed(5, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_sign_in_link" }, (i) => 1 + i);
+      failRead = "rows";
+      eq("at the limit, the read of the hour's refused row fails: refused, nothing sent, no row written", [short(await send(link(ADMIN_A, ORG_A))), sends().length, inserts().length], [["refused", "account_limit", false], 0, 0]);
     }
 
     console.log("\nthe organisation limit (section G)");

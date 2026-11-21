@@ -138,8 +138,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/functions/v1/send-smtp") return json({ ok: true });
   // A reset code's row is written and asked back (its id and its time), then opened.
   if (p === "/rest/v1/password_reset_otps" && method === "POST") return json([{ id: `otp-${++codeRows}`, created_at: new Date(Date.now() + codeRows).toISOString() }], 201);
-  // The platform sender's limit reads: no row in 24 hours (a count of 0).
-  if (p === "/rest/v1/platform_email_log" && method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": "*/0" } });
+  // Every count (the limits' reads, in both systems): no row in 24 hours (a count of 0).
+  if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-range": "*/0" } });
   if (p === "/rest/v1/notification_settings") return json([settings]);
   if (p === "/rest/v1/notification_templates") return json(template ? [template] : []);
   if (p === "/rest/v1/notification_log") return json([], 201);
