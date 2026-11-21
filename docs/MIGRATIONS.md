@@ -96,8 +96,9 @@ Each file's header is the full rule; this is the cross-file summary.
 - **0113** (`platform_email_log`, the platform sender's log; one table,
   deny-all, service role select and insert only): written and rehearsed
   (`scripts/migration-rehearsal`, scenarios `0113-defaults` and
-  `0113-no-defaults`); **not yet pasted on staging or production**
-  (2026-11-17). Independent of 0107 to 0112: it needs only
+  `0113-no-defaults`). **On staging**: present (a read-only check on
+  2026-11-21 found the table; the paste date was not recorded here).
+  **Production**: not recorded; checked at the start of its own sitting. Independent of 0107 to 0112: it needs only
   `public.organizations` and `auth.users`. Pasted **before** the code of
   ADR 0029 pull request A on each environment (decision 7); code that
   arrives first sends no platform mail and its health check reads `fail`
