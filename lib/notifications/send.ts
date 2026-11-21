@@ -209,6 +209,8 @@ function runIO(run: MailRun, rowForDailyLimit: boolean, hooks?: GroupHooks<SendA
     attempt: (a: SendArgs) => attemptOne(run, a),
     writeLog: (entries: Array<{ item: SendArgs; result: RunItemResult }>) => writeLogRows(run, entries),
     rowForDailyLimit,
+    // attemptOne reads no template for a mail whose text is given.
+    needsTemplate: (a: SendArgs) => !a.override,
     hooks,
   };
 }

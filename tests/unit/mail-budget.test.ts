@@ -27,7 +27,9 @@
  *     due has room for a full page (500 due learners, 500 managers) and its
  *     first group;
  *   - the counted calls are the calls made: the budget's count equals the
- *     requests the run sent, for a run of sends, a stopped run and an alert;
+ *     requests the run sent, for a run of sends, a stopped run, a run of
+ *     mail whose text the caller gives (no template is read, none counted)
+ *     and an alert;
  *   - under a clock the test sets: no send starts after the window (45 s for
  *     a request, 240 s for a cron call) and none beyond the count; what is
  *     left is reported, with no row;
@@ -108,6 +110,14 @@ async function main() {
       const stopped = await openRun({ organizationId: ORG, budget: b2 });
       await sendMany(stopped, people(9), mailTo);
       eq("a run stopped on a dead SMTP (three sends, their writes and the alert's mark): the count equals the requests", b2.calls, outbound());
+      // Mail whose text the caller gives (broadcasts, ticket and
+      // attempt-request mail) reads no template, so none is counted.
+      freshWorld();
+      const b5 = requestBudget();
+      const given = await openRun({ organizationId: ORG, budget: b5 });
+      await sendMany(given, people(7), (p) => ({ event: "custom_broadcast" as const, to: { user_id: p.id, email: p.email }, context: {}, override: { subject: "Notice", body_md: "Hello" } }));
+      eq("a run of seven mails with their own text: no template read, and the count equals the requests (open 3, sends 7, log inserts 3, one state write)",
+        [requests.filter((q) => q.table === "notification_templates").length, b5.calls, outbound()], [0, outbound(), 3 + 7 + 3 + 1]);
       const members = [{ organization_id: ORG, user_id: "s1", role: "super_owner", status: "active" }, { organization_id: ORG, user_id: "a1", role: "admin", status: "active" }];
       freshWorld({ state: { organization_id: ORG, state: "failing", state_changed_at: new Date().toISOString(), failed_recipients: [], last_error_code: "auth", alert_due_at: new Date(Date.now() - 60_000).toISOString() }, members, profiles: { s1: "s1@tenant.stub", a1: "a1@tenant.stub" } });
       const b3 = cronBudget();

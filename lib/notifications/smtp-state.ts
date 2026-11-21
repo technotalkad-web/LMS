@@ -854,6 +854,12 @@ export type RunMailIO<T> = {
   writeLog: (entries: Array<{ item: T; result: RunItemResult }>) => Promise<boolean | "call_limit">;
   /** A mail refused by the daily limit writes its row (one mail on its own); a loop writes none and reports the count. */
   rowForDailyLimit: boolean;
+  /**
+   * Whether this mail reads its event's template: false for one whose text
+   * the caller gives (an override), which no read is made for, so none is
+   * counted (the counted calls are the calls made). Unset: every mail does.
+   */
+  needsTemplate?: (item: T) => boolean;
   hooks?: GroupHooks<T>;
 };
 
@@ -873,6 +879,7 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
   const notAttempted = (cls: NotAttemptedClass, error: string): RunItemResult => ({ status: "not_attempted", cls, error });
   const hooks = io.hooks ?? {};
   const hookCalls = (hooks.before ? Math.max(0, hooks.beforeCalls ?? 0) : 0) + (hooks.after ? Math.max(0, hooks.afterCalls ?? 0) : 0);
+  const readsTemplate = (item: T) => (io.needsTemplate ? io.needsTemplate(item) : true);
   let i = 0;
   let first = true;
   while (i < items.length) {
@@ -911,7 +918,7 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
         i++;
         continue;
       }
-      const needsTemplate = !run.templates.has(event) && !eventsInGroup.has(event);
+      const needsTemplate = readsTemplate(items[i]) && !run.templates.has(event) && !eventsInGroup.has(event);
       if (group.length + templatesNeeded + (needsTemplate ? 1 : 0) + 1 > fit) break;
       if (needsTemplate) {
         templatesNeeded++;
@@ -950,7 +957,7 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
       });
       if (kept.length < group.length) {
         // Templates for events no longer sent are not read.
-        const events = new Set(kept.map((idx) => io.eventOf(items[idx])));
+        const events = new Set(kept.filter((idx) => readsTemplate(items[idx])).map((idx) => io.eventOf(items[idx])));
         templatesNeeded = [...eventsInGroup].filter((e) => events.has(e as NotificationEvent)).length;
       }
       group = kept;
