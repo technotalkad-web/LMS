@@ -1,4 +1,4 @@
-import { sendNotification, type SendResult } from "@/lib/notifications/send";
+import { sendNotification, type SendResult, type TimeLeftMs } from "@/lib/notifications/send";
 import type { MailRun } from "@/lib/notifications/smtp-state";
 
 /**
@@ -31,7 +31,8 @@ export function signInLink(origin: string, tokenHash: string, next: string): str
 export async function sendTenantSignInLink(
   run: MailRun,
   to: { userId: string; email: string },
-  link: string
+  link: string,
+  opts: { timeLeftMs?: TimeLeftMs } = {}
 ): Promise<SendResult> {
   return sendNotification(
     {
@@ -45,6 +46,6 @@ export async function sendTenantSignInLink(
         portal_url: link,
       },
     },
-    { run }
+    { run, timeLeftMs: opts.timeLeftMs }
   );
 }

@@ -1,5 +1,5 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { recordCredentialNotAttempted, sendNotification } from "@/lib/notifications/send";
+import { NO_TIME_LEFT_TEXT, recordCredentialNotAttempted, sendNotification, type SendResult } from "@/lib/notifications/send";
 import { openRun, requestBudget, runReading, runReady, spendCalls, type MailRun } from "@/lib/notifications/smtp-state";
 import { platformSenderReadiness, sendPlatformEmail } from "@/lib/email/platform-sender";
 import { ADMIN_ROLES, grantsAdminRights, listCountingMemberships, type CountingOrganisation } from "@/lib/auth/org-membership";
@@ -48,7 +48,13 @@ import { sendTenantSignInLink, signInLink } from "@/lib/auth/auth-email";
  *     only). A limit that cannot be read makes nothing;
  *   - a sign-in link is minted only for the account the lookup found, and
  *     only once the limits and rule 2 allow it: generateLink is never the
- *     lookup, and an id it returns that differs sends nothing.
+ *     lookup, and an id it returns that differs sends nothing;
+ *   - one deadline for the whole job (rule T3): it takes its start time, and
+ *     every send waits the smaller of its own wait and the time the job has
+ *     left less SEND_ROW_MS kept for that send's row, so every row is
+ *     written within CREDENTIAL_JOB_MS. A send with no time left is not
+ *     started, and a fixed line says so. Every step reads the same deadline
+ *     from the job's context (JobContext.endsAt).
  *
  * No log line holds an address, a user id, a code, a link or a database
  * message: fixed words and error codes only.
@@ -172,6 +178,15 @@ function serviceClient(): SupabaseClient {
 const CALLS_BEFORE_THE_RUN = 2;
 
 /**
+ * Rule T3: the job after the response has this long for everything, from
+ * its own start (section G's "Time" point; SMTP_SEND_WAIT_MS is this less
+ * the room for the job's reads and rows).
+ */
+export const CREDENTIAL_JOB_MS = 25_000;
+/** Rule T3: the time kept after a send for that send's row. */
+export const SEND_ROW_MS = 2_000;
+
+/**
  * The reads before the answer, the answer, and the job to run after it.
  * Never throws for a database outcome.
  */
@@ -219,13 +234,14 @@ export async function prepareCredentialRequest(req: CredentialRequest, deps: Dep
   }
 
   if (lookup.kind !== "found") return { status: 200, body, job: null };
-  const ctx: JobContext = { ...req, userId: lookup.userId, org, run, db, env, now };
-  return { status: 200, body, job: () => credentialJob(ctx) };
+  const input: JobInput = { ...req, userId: lookup.userId, org, run, db, env, now };
+  return { status: 200, body, job: () => credentialJob(input) };
 }
 
 /* ---------------------------------------------------------- the job */
 
-type JobContext = CredentialRequest & {
+/** What the request hands to its job, read before the answer. */
+type JobInput = CredentialRequest & {
   userId: string;
   org: { id: string; slug: string } | null;
   run: MailRun | null;
@@ -233,6 +249,22 @@ type JobContext = CredentialRequest & {
   env: Env;
   now: () => number;
 };
+
+/** The job's context: its input and its one deadline (rule T3), which every step reads. */
+type JobContext = JobInput & {
+  /** The time the job's work must end by: its start plus CREDENTIAL_JOB_MS. */
+  endsAt: number;
+};
+
+/**
+ * The time the job has left for a send (rule T3): to its deadline, less
+ * SEND_ROW_MS kept for that send's row. Read just before the send starts;
+ * the sender waits the smaller of its own wait and this, and starts nothing
+ * when it is zero or less.
+ */
+function timeLeftForSend(ctx: JobContext): number {
+  return ctx.endsAt - ctx.now() - SEND_ROW_MS;
+}
 
 type Choice =
   | { system: "platform"; organizationId: string | null; owner: boolean }
@@ -263,8 +295,18 @@ function spend(ctx: JobContext, n: number): void {
  * The work after the response for one found account. Every outcome is a
  * fixed log line; it never throws for a database or send outcome
  * (runAfterResponse catches anything else).
+ *
+ * Its steps, in order, all on one context with one deadline (rule T3):
+ *   1. the start of the job, which sets the deadline;
+ *   2. rule 2's choice of system (chooseSystem);
+ *   3. the start mark (markJob);
+ *   4. the mail: tenantMail or platformMail, each with its limits, the code
+ *      or link, and the send within the time left;
+ *   5. the finish mark, also after a failure.
+ * A step added later goes between 3 and 4 and reads the same deadline.
  */
-async function credentialJob(ctx: JobContext): Promise<void> {
+async function credentialJob(input: JobInput): Promise<void> {
+  const ctx: JobContext = { ...input, endsAt: input.now() + CREDENTIAL_JOB_MS };
   const choice = await chooseSystem(ctx);
   if (choice.system === "none") return;
   if (choice.system === "unreadable") {
@@ -510,9 +552,9 @@ async function tenantMail(ctx: JobContext): Promise<void> {
           org_name: run.orgName,
         },
       },
-      { run }
+      { run, timeLeftMs: () => timeLeftForSend(ctx) }
     );
-    return note(ctx, "tenant", r.status === "sent" ? "sent" : "not_sent", r.errorClass);
+    return noteTenantSend(ctx, r);
   }
   const under = await underLimit(
     ctx,
@@ -531,14 +573,21 @@ async function tenantMail(ctx: JobContext): Promise<void> {
   if (under !== true) return note(ctx, "tenant", under === null ? "limit_read_failed" : "account_limit");
   const link = await mintSignInLink(ctx, ctx.next ?? `/${org.slug}/dashboard`, "tenant");
   if (!link) return;
-  const r = await sendTenantSignInLink(run, { userId: ctx.userId, email: ctx.email }, link);
-  note(ctx, "tenant", r.status === "sent" ? "sent" : "not_sent", r.errorClass);
+  const r = await sendTenantSignInLink(run, { userId: ctx.userId, email: ctx.email }, link, { timeLeftMs: () => timeLeftForSend(ctx) });
+  noteTenantSend(ctx, r);
+}
+
+/** The fixed line of a tenant send: sent, not sent with its class, or no_time when the job's deadline left no time to start it. */
+function noteTenantSend(ctx: JobContext, r: SendResult): void {
+  if (r.status === "sent") return note(ctx, "tenant", "sent");
+  if (r.error === NO_TIME_LEFT_TEXT) return note(ctx, "tenant", "no_time");
+  note(ctx, "tenant", "not_sent", r.errorClass);
 }
 
 /** Through the platform sender (a platform-served account, on any page). */
 async function platformMail(ctx: JobContext, choice: { organizationId: string | null; owner: boolean }): Promise<void> {
   const to = { userId: ctx.userId, email: ctx.email, platformOwner: choice.owner };
-  const deps = { db: ctx.db, env: ctx.env, now: ctx.now };
+  const deps = { db: ctx.db, env: ctx.env, now: ctx.now, timeLeftMs: () => timeLeftForSend(ctx) };
   if (ctx.kind === "reset_code") {
     const under = await resetCodesUnderLimit(ctx, choice.owner);
     if (under !== true) return note(ctx, "platform", under === null ? "limit_read_failed" : "account_limit");
@@ -548,7 +597,7 @@ async function platformMail(ctx: JobContext, choice: { organizationId: string | 
       { event: "platform_reset_code", to, organizationId: choice.organizationId, content: { code, minutes: OTP_TTL_MINUTES } },
       deps
     );
-    return note(ctx, "platform", r.status, r.errorCode ?? undefined);
+    return notePlatformSend(ctx, r);
   }
   // The platform sender reads this same limit before it sends; it is read
   // here first so that no link is minted for an account past it.
@@ -575,5 +624,11 @@ async function platformMail(ctx: JobContext, choice: { organizationId: string | 
     { event: "platform_sign_in_link", to, organizationId: choice.organizationId, content: { link, minutes: SIGN_IN_LINK_MINUTES } },
     deps
   );
+  notePlatformSend(ctx, r);
+}
+
+/** The fixed line of a platform send: its status and code, or no_time when the job's deadline left no time to start it. */
+function notePlatformSend(ctx: JobContext, r: { status: string; errorCode: string | null }): void {
+  if (r.errorCode === "no_time") return note(ctx, "platform", "no_time");
   note(ctx, "platform", r.status, r.errorCode ?? undefined);
 }

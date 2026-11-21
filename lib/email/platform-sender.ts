@@ -123,7 +123,9 @@ export type PlatformLogStatus = "sent" | "failed" | "suppressed" | "refused";
 export type PlatformSendResult =
   | { status: PlatformLogStatus; errorCode: PlatformErrorCode | null; logged: boolean }
   /** The limits could not be read: nothing was sent and no row was written. */
-  | { status: "failed"; errorCode: "log_unreadable"; logged: false };
+  | { status: "failed"; errorCode: "log_unreadable"; logged: false }
+  /** The caller's job had no time left to start the send (rule T3): nothing was sent and no row was written. */
+  | { status: "failed"; errorCode: "no_time"; logged: false };
 
 export type PlatformRecipient = {
   userId: string;
@@ -303,10 +305,14 @@ type LogRow = { sent_at: string; status: string; error_code: string | null };
  * throws only on a programming error (an event that is not a platform
  * event, content that fails its template's check, a test to anyone but a
  * platform owner), before anything is read or sent.
+ *
+ * `timeLeftMs`: a caller's job with one deadline (rule T3), read just before
+ * the send starts. The send waits the smaller of PLATFORM_SEND_TIMEOUT_MS and
+ * that; with no time left nothing is dispatched and no row is written.
  */
 export async function sendPlatformEmail<E extends PlatformEvent>(
   req: PlatformSendRequest<E>,
-  deps: { db?: SupabaseClient; env?: Env; now?: () => number } = {}
+  deps: { db?: SupabaseClient; env?: Env; now?: () => number; timeLeftMs?: () => number } = {}
 ): Promise<PlatformSendResult> {
   const { event, to, organizationId } = req;
   if (!isPlatformEvent(event)) throw new TypeError("sendPlatformEmail: not a platform event");
@@ -402,7 +408,12 @@ export async function sendPlatformEmail<E extends PlatformEvent>(
   const smtp = readSmtpSettings(env);
   if (!smtp) return log("failed", "not_configured");
 
-  // 5. The send.
+  // 5. The send, within the time the caller's job has left (rule T3).
+  const waitMs = Math.floor(Math.min(PLATFORM_SEND_TIMEOUT_MS, deps.timeLeftMs ? deps.timeLeftMs() : Number.POSITIVE_INFINITY));
+  if (!(waitMs > 0)) {
+    console.warn(`[platform-email] ${event}: no_time; nothing sent`);
+    return { status: "failed", errorCode: "no_time", logged: false };
+  }
   const result = await dispatchSmtp(
     {
       host: smtp.host,
@@ -417,7 +428,7 @@ export async function sendPlatformEmail<E extends PlatformEvent>(
       text: rendered.text,
       html: rendered.html,
     },
-    { timeoutMs: PLATFORM_SEND_TIMEOUT_MS }
+    { timeoutMs: waitMs }
   );
   if (result.ok) return log("sent", null);
   const cls = classifySmtpError(result.error);

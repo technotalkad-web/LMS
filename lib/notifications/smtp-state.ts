@@ -848,8 +848,10 @@ export type RunMailIO<T> = {
   /**
    * Render and dispatch one mail. A throw reads as an unknown failure.
    * `callLimit`: the platform refused the outbound call itself (rule FP8).
+   * `notStarted`: the caller's deadline left no time to start the send
+   * (rule T3): it never reached the mail server.
    */
-  attempt: (item: T) => Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass; callLimit?: boolean }>;
+  attempt: (item: T) => Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass; callLimit?: boolean; notStarted?: boolean }>;
   /** One notification_log insert for these rows; false when the write failed, "call_limit" when the platform refused it. */
   writeLog: (entries: Array<{ item: T; result: RunItemResult }>) => Promise<boolean | "call_limit">;
   /** A mail refused by the daily limit writes its row (one mail on its own); a loop writes none and reports the count. */
@@ -986,6 +988,13 @@ export async function runMail<T>(run: MailRun, items: readonly T[], io: RunMailI
           results[idx] = notAttempted("left", "Left: the request met the platform's limit on outbound calls.");
           run.report.notAttempted.left++;
           noteCallLimit(run, "send");
+          return;
+        }
+        if (!a.ok && a.notStarted) {
+          // No time was left for it (rule T3): not an attempt, so no row and
+          // nothing learnt of the tenant's SMTP. It is left.
+          results[idx] = notAttempted("left", a.error);
+          run.report.notAttempted.left++;
           return;
         }
         run.report.attempted++;

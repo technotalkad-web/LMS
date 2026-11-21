@@ -12,16 +12,21 @@
  *   - the job marks an alert as due and sends none (the scheduled call
  *     sends it);
  *   - without 0114 (mail_job_mark missing) the job makes no mark, logs a
- *     fixed line, and still sends; a mark that fails otherwise does the same.
+ *     fixed line, and still sends; a mark that fails otherwise does the same;
+ *   - the job's one deadline (rule T3): a send waits the smaller of its own
+ *     wait and the time the job has left, less the time kept for its row;
+ *     with no time left the send does not start, no row is written for it,
+ *     a fixed line says so and the job is still finished. Both systems.
  *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/mail-job-marks.test.ts   (or npm run test:unit)
  */
 import {
-  ORG, PLATFORM_ENV, SLUG, TODAY, ask, captureLogs, eq, finish, freshWorld, install, marks, platformRows, requests,
+  ORG, PLATFORM_ENV, SLUG, TODAY, ask, captureLogs, eq, finish, freshWorld, install, logInserts, marks, platformRows, requests,
   runJobs, tenantSends, uninstall, world, type Row,
 } from "./public-mail-world";
+import { CREDENTIAL_JOB_MS, SEND_ROW_MS } from "../../lib/auth/credential-mail";
 
 const MEMBER = { id: "0e000000-0000-4000-8000-000000000001", email: "member@tenant.stub" };
 const ADMIN = { id: "0e000000-0000-4000-8000-000000000002", email: "admin@tenant.stub" };
@@ -108,6 +113,63 @@ async function main() {
       base({ jobMark: "fail" });
       const failed = await job(MEMBER.email);
       eq("a mark that fails otherwise: no finish, the mail still goes, and its own line", [marks().map((m) => m.p_mark), tenantSends().length, failed.lines.some((l) => l.includes("mail_job_mark_failed"))], [["started"], 1, true]);
+    }
+
+    console.log("\nthe job's one deadline (rule T3)");
+    {
+      eq("the job has 25 s for everything, and keeps 2 s for a send's row", [CREDENTIAL_JOB_MS, SEND_ROW_MS], [25_000, 2_000]);
+      const realNow = Date.now;
+      /**
+       * A reset code's job on the organisation's page whose own work before
+       * the send takes `spentMs` of the job's time: the clock moves on when
+       * the code's row is written. The send never answers, so its row says
+       * how long it was given.
+       */
+      const slowJob = async (email: string, spentMs: number, env: Record<string, string> = {}) => {
+        let clock = realNow();
+        Date.now = () => clock;
+        world.smtp = () => "hang";
+        world.onRequest = (r) => { if (r.table === "password_reset_otps" && r.method === "POST") clock += spentMs; };
+        for (const [k, v] of Object.entries(env)) process.env[k] = v;
+        try {
+          return await captureLogs(async () => {
+            await ask(request, "/api/auth/forgot-password/request", { email, orgSlug: SLUG });
+            requests.length = 0;
+            await runJobs();
+          });
+        } finally {
+          Date.now = realNow;
+          for (const k of Object.keys(env)) delete process.env[k];
+        }
+      };
+      const left = (spentMs: number) => CREDENTIAL_JOB_MS - spentMs - SEND_ROW_MS;
+      const line = (lines: string[], outcome: string) => lines.filter((l) => l.includes('"event":"credential_mail"') && l.includes(`"outcome":"${outcome}"`)).length;
+
+      base();
+      await slowJob(MEMBER.email, 22_500);
+      const tenantRow = logInserts().find((r) => r.event_type === "password_reset");
+      eq(`tenant: 22.5 s of the job spent before the send: the send is given what is left less the row's time (${left(22_500)} ms), not the whole wait`,
+        [tenantSends().length, String(tenantRow?.error ?? "").includes(`Timed out after ${left(22_500)}ms`)], [1, true]);
+      eq("…the row is written and the job finished", [tenantRow?.status, marks().map((m) => m.p_mark)], ["failed", ["started", "finished"]]);
+
+      base();
+      const tenantLate = await slowJob(MEMBER.email, 24_000);
+      eq("tenant: 24 s spent, no time left for the send: it is not started, no row is written for it, one fixed line, and the job is finished",
+        [tenantSends().length, logInserts().filter((r) => r.event_type === "password_reset").length, line(tenantLate.lines, "no_time"), marks().map((m) => m.p_mark)],
+        [0, 0, 1, ["started", "finished"]]);
+
+      base();
+      await slowJob(ADMIN.email, 22_500, PLATFORM_ENV);
+      const platformRow = platformRows()[0];
+      eq(`platform: 22.5 s spent: the send is given ${left(22_500)} ms, and its row says it timed out`,
+        [platformRow?.event_type, platformRow?.status, platformRow?.error_code, String(platformRow?.error_detail ?? "").includes(`Timed out after ${left(22_500)}ms`)],
+        ["platform_reset_code", "failed", "timeout", true]);
+
+      base();
+      const platformLate = await slowJob(ADMIN.email, 24_000, PLATFORM_ENV);
+      eq("platform: no time left: nothing dispatched, no row, one fixed line, and the job is finished",
+        [platformRows().length, requests.filter((r) => r.path === "/functions/v1/send-smtp").length, line(platformLate.lines, "no_time"), marks().map((m) => m.p_mark)],
+        [0, 0, 1, ["started", "finished"]]);
     }
   } finally {
     uninstall();

@@ -91,11 +91,22 @@ function templateFor(run: MailRun, event: NotificationEvent): Promise<Template> 
   return read;
 }
 
-/** Render and dispatch one mail through the run's settings, waiting at most SMTP_SEND_WAIT_MS. */
+/** The text of a mail whose send did not start because the caller's job had no time left (rule T3). */
+export const NO_TIME_LEFT_TEXT = "Left: the job had no time left to send this mail.";
+
+/**
+ * The time a caller's job has left for a send, read just before the send
+ * starts (rule T3): the send waits the smaller of SMTP_SEND_WAIT_MS and this;
+ * zero or less starts no send.
+ */
+export type TimeLeftMs = () => number;
+
+/** Render and dispatch one mail through the run's settings, waiting at most SMTP_SEND_WAIT_MS, or the caller's time left when that is less. */
 async function attemptOne(
   run: MailRun,
-  args: SendArgs
-): Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass; callLimit?: boolean }> {
+  args: SendArgs,
+  timeLeftMs?: TimeLeftMs
+): Promise<{ ok: true } | { ok: false; error: string; cls: SmtpErrorClass; callLimit?: boolean; notStarted?: boolean }> {
   const { event, to, context, override } = args;
   const cfg = run.settings as NotificationSettings;
   const tpl: Template = override
@@ -131,6 +142,9 @@ async function attemptOne(
     ctaButtons: ctaButtons.length > 0 ? ctaButtons : undefined,
   });
 
+  // Rule T3: read last, just before the send starts.
+  const waitMs = Math.floor(Math.min(SMTP_SEND_WAIT_MS, timeLeftMs ? timeLeftMs() : Number.POSITIVE_INFINITY));
+  if (!(waitMs > 0)) return { ok: false, cls: "unknown", error: NO_TIME_LEFT_TEXT, notStarted: true };
   const result = await dispatchSmtp(
     {
       host: cfg.smtp_host!,
@@ -145,7 +159,7 @@ async function attemptOne(
       text: body_md,
       html,
     },
-    { timeoutMs: SMTP_SEND_WAIT_MS }
+    { timeoutMs: waitMs }
   );
   if (result.ok) return { ok: true };
   if (isCallLimitMessage(result.error)) return { ok: false, cls: "unknown", error: "call_limit", callLimit: true };
@@ -202,11 +216,11 @@ function toSendResult(args: SendArgs, r: RunItemResult): SendResult {
   return { status: r.cls === "paused" ? "paused" : "failed", error: r.error, errorClass: r.cls, attempted: false, to: args.to.email };
 }
 
-function runIO(run: MailRun, rowForDailyLimit: boolean, hooks?: GroupHooks<SendArgs>) {
+function runIO(run: MailRun, rowForDailyLimit: boolean, hooks?: GroupHooks<SendArgs>, timeLeftMs?: TimeLeftMs) {
   return {
     eventOf: (a: SendArgs) => a.event,
     recipientOf: (a: SendArgs) => a.to.user_id ?? null,
-    attempt: (a: SendArgs) => attemptOne(run, a),
+    attempt: (a: SendArgs) => attemptOne(run, a, timeLeftMs),
     writeLog: (entries: Array<{ item: SendArgs; result: RunItemResult }>) => writeLogRows(run, entries),
     rowForDailyLimit,
     // attemptOne reads no template for a mail whose text is given.
@@ -225,14 +239,17 @@ function refuseNonTenant(event: unknown, where: string): void {
  * this mail alone (one read more than before: the state and the 24-hour
  * count). Throws only for an event that is not a tenant event, before
  * anything is read; every send or database outcome is in the result.
+ * `timeLeftMs`: a job with one deadline (rule T3); the send waits no longer
+ * than the time it has left, and with none left it is not started (left,
+ * NO_TIME_LEFT_TEXT, no row).
  */
-export async function sendNotification(args: SendArgs, opts: { run?: MailRun } = {}): Promise<SendResult> {
+export async function sendNotification(args: SendArgs, opts: { run?: MailRun; timeLeftMs?: TimeLeftMs } = {}): Promise<SendResult> {
   refuseNonTenant(args.event, "sendNotification");
   if (opts.run && opts.run.organizationId !== args.organizationId) {
     throw new TypeError("sendNotification: the run is another organisation's");
   }
   const run = opts.run ?? (await openRun({ organizationId: args.organizationId }));
-  const [r] = await runMail(run, [args], runIO(run, true));
+  const [r] = await runMail(run, [args], runIO(run, true, undefined, opts.timeLeftMs));
   return toSendResult(args, r);
 }
 

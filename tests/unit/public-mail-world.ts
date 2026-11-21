@@ -60,9 +60,12 @@ export type World = {
   /** notification_log rows (reads and inserts). */
   log: Row[];
   platformLog: Row[];
-  smtp: (to: string) => { ok: true } | { ok: false; error: string };
+  /** send-smtp's answer; "hang": no answer until the caller stops waiting. */
+  smtp: (to: string) => { ok: true } | { ok: false; error: string } | "hang";
   /** A read of these tables fails. */
   failing: Set<string>;
+  /** Called with each request as it is recorded (a test's clock, for one). */
+  onRequest: ((r: Req) => void) | null;
 };
 
 export let world: World;
@@ -93,6 +96,7 @@ export function freshWorld(over: Partial<World> = {}): World {
     platformLog: [],
     smtp: () => ({ ok: true }),
     failing: new Set(),
+    onRequest: null,
     ...over,
   };
   return world;
@@ -140,6 +144,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   const q = url.searchParams;
   const keyParts = [...q.entries()].map(([k, v]) => `${k}=${v}`).sort().join("&");
   requests.push({ method, host: url.host, path: p, table, query: q, body, raw, key: `${method} ${p}?${keyParts} ${raw}` });
+  world.onRequest?.(requests[requests.length - 1]);
   const prefer = h.get("prefer") ?? "";
 
   if (p === "/auth/v1/admin/users" && method === "GET") {
@@ -157,7 +162,14 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     if (!id) return json({ code: 404, error_code: "user_not_found", msg: "User not found" }, 404);
     return json({ id, aud: "authenticated", role: "authenticated", email, app_metadata: {}, user_metadata: {}, action_link: "https://stub/verify", email_otp: "000000", hashed_token: TOKEN_HASH, redirect_to: "", verification_type: "magiclink" });
   }
-  if (p === "/functions/v1/send-smtp") return json(world.smtp(String((body as Row).to)));
+  if (p === "/functions/v1/send-smtp") {
+    const answer = world.smtp(String((body as Row).to));
+    if (answer === "hang") {
+      // No answer: the caller's own wait ends it (a send with no wait would hang here).
+      return new Promise<Response>((_res, rej) => init?.signal?.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" }))));
+    }
+    return json(answer);
+  }
   if (!p.startsWith("/rest/v1/")) throw new Error(`stub: unexpected ${method} ${url.host}${p}`);
   if (method === "GET" && world.failing.has(table)) return json({ code: "XX000", message: "stub read failure" }, 500);
 
