@@ -49,7 +49,8 @@
  *     again and its write again are counted as made, and a healthy run's sum
  *     does not move; the public routes' job, each limit claimed before the
  *     send, makes at most 40 calls with the calls before its answer, on the
- *     four paths (over tests/unit/public-mail-world.ts).
+ *     four paths and on a platform owner's own code and link (over
+ *     tests/unit/public-mail-world.ts).
  *
  * Part (k) of tests/unit/org-membership.test.ts keeps its own cron cases
  * (each named read with no room, the finished attempts' filter); the sums
@@ -225,9 +226,10 @@ async function main() {
 
 /**
  * The public routes' job (the note of 2026-11-22: each limit claimed before
- * the send) on the four paths, over tests/unit/public-mail-world.ts: the
- * calls before the answer and the job's own calls, counted as made, are at
- * most 40 together.
+ * the send) on the four paths, and on a platform owner's own code and link
+ * on the page with no organisation, over tests/unit/public-mail-world.ts:
+ * the calls before the answer and the job's own calls, counted as made, are
+ * at most 40 together.
  */
 async function publicJobSums() {
   const PW = await import("./public-mail-world");
@@ -237,15 +239,20 @@ async function publicJobSums() {
     const magic = await import("../../app/api/auth/magic-link/route");
     const LEARNER = { id: "0f100000-0000-4000-8000-000000000001", email: "learner@tenant.stub" };
     const ADMIN = { id: "0f100000-0000-4000-8000-000000000002", email: "admin@tenant.stub" };
+    /** A platform owner: in the world's owners, with no membership. */
+    const OWNER = { id: "0f100000-0000-4000-8000-000000000003", email: "owner@platform.stub" };
     console.log("\nthe public job: its calls before the answer and after it, together at most 40 (note of 2026-11-22)");
     for (const [label, route, path, who, payload] of [
       ["a tenant reset code", request, "/api/auth/forgot-password/request", LEARNER, { orgSlug: PW.SLUG }],
       ["a tenant sign-in link", magic, "/api/auth/magic-link", LEARNER, { orgSlug: PW.SLUG }],
       ["a platform reset code on the organisation's page", request, "/api/auth/forgot-password/request", ADMIN, { orgSlug: PW.SLUG }],
       ["a platform sign-in link on the organisation's page", magic, "/api/auth/magic-link", ADMIN, { orgSlug: PW.SLUG }],
+      ["a platform owner's own reset code on the page with no organisation", request, "/api/auth/forgot-password/request", OWNER, {}],
+      ["a platform owner's own sign-in link on the page with no organisation", magic, "/api/auth/magic-link", OWNER, {}],
     ] as const) {
       PW.freshWorld({
-        users: [LEARNER, ADMIN],
+        users: [LEARNER, ADMIN, OWNER],
+        owners: [OWNER.id],
         members: [
           { organization_id: PW.ORG, user_id: LEARNER.id, role: "user", status: "active" },
           { organization_id: PW.ORG, user_id: ADMIN.id, role: "admin", status: "active" },

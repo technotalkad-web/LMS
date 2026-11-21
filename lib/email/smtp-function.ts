@@ -95,18 +95,18 @@ export const IN_FLIGHT_WORD = "in_flight";
 export type CountSince = (sinceIso: string) => PromiseLike<{ count: number | null; error: unknown }>;
 
 /**
- * An account's requests in the last hour and, when its daily limit applies,
- * in the last 24 hours (ADR 0029 section G; the note of 2026-11-22), in both
- * systems: two exact counts of the rows that limit names, read together. A
- * count covers every such row, whatever else the log holds, so the same rows
- * always give the same answer. null when a count cannot be read: nothing is
- * sent on it.
+ * An account's requests in the last hour and in the last 24 hours (ADR 0029
+ * section G; the note of 2026-11-22), in both systems and for every account,
+ * a platform owner's own included: two exact counts of the rows that limit
+ * names, read together. A count covers every such row, whatever else the log
+ * holds, so the same rows always give the same answer. null when either
+ * count cannot be read: nothing is sent on it.
  */
-export async function accountRequests(countSince: CountSince, nowMs: number, daily: boolean): Promise<{ hour: number; day: number | null } | null> {
+export async function accountRequests(countSince: CountSince, nowMs: number): Promise<{ hour: number; day: number } | null> {
   const read = (sinceMs: number): Promise<number | null> => exactCount(() => countSince(new Date(sinceMs).toISOString()));
-  const [hour, day] = await Promise.all([read(nowMs - 3_600_000), daily ? read(nowMs - 24 * 3_600_000) : Promise.resolve(null)]);
-  if (hour === null || (daily && day === null)) return null;
-  return { hour, day: daily ? day : null };
+  const [hour, day] = await Promise.all([read(nowMs - 3_600_000), read(nowMs - 24 * 3_600_000)]);
+  if (hour === null || day === null) return null;
+  return { hour, day };
 }
 
 /**

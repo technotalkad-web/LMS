@@ -44,9 +44,10 @@ import { sendTenantSignInLink, signInLink } from "@/lib/auth/auth-email";
  *   - a tenant-served account on an organisation that is not ready (or at
  *     its daily limit) gets nothing: no code, no link, one record row in 24
  *     hours and an alert marked as due (recordCredentialNotAttempted);
- *   - the limits of section G: 5 an hour and 10 a day for one account (a
- *     platform owner's own: the hourly limit only), the organisation's
- *     daily limit or platform share, and the platform's ceiling. Each limit
+ *   - the limits of section G: 5 an hour and 10 a day for one account, a
+ *     platform owner's own included; the organisation's daily limit or
+ *     platform share, and the platform's ceiling (a platform owner's own
+ *     code and link are exempt from the share and the ceiling). Each limit
  *     is claimed before the send (the note of 2026-11-22): the job reads
  *     the count, writes its claim, counts again with its claim among the
  *     rows, and goes on only within the limit, so the limits hold under
@@ -79,7 +80,7 @@ type Env = Record<string, string | undefined>;
 
 export type CredentialKind = "reset_code" | "sign_in_link";
 
-/** Section G: one account's codes or links in 24 hours, in both systems. A platform owner's own has the hourly limit only. */
+/** Section G: one account's codes or links in 24 hours, in both systems, for every account (a platform owner's own included). */
 export const MAX_CREDENTIALS_PER_DAY = MAX_REQUESTS_PER_DAY;
 /** Section G: one account's codes or links in an hour (today's MAX_REQUESTS_PER_HOUR). */
 export const MAX_CREDENTIALS_PER_HOUR = MAX_REQUESTS_PER_HOUR;
@@ -434,27 +435,26 @@ async function markJob(ctx: JobContext, kind: "tenant" | "platform", mark: "star
 
 /**
  * Whether the account is within its limit (section G), from two exact
- * counts of its rows (accountRequests): in the last hour and, unless only
- * the hourly limit applies, in the last 24 hours. Before the job's own row
- * is among them (`ownIncluded` false) the limit is reached at 5 in the hour
- * or 10 in the day; with its own row among them, it is passed only past
- * those numbers. null when a count failed: nothing is made.
+ * counts of its rows (accountRequests): in the last hour and in the last 24
+ * hours, for every account. Before the job's own row is among them
+ * (`ownIncluded` false) the limit is reached at 5 in the hour or 10 in the
+ * day; with its own row among them, it is passed only past those numbers.
+ * null when a count failed: nothing is made.
  */
-async function underLimit(ctx: JobContext, countSince: CountSince, hourlyOnly: boolean, ownIncluded = false): Promise<boolean | null> {
-  spend(ctx, hourlyOnly ? 1 : 2);
-  const n = await accountRequests(countSince, ctx.now(), !hourlyOnly);
+async function underLimit(ctx: JobContext, countSince: CountSince, ownIncluded = false): Promise<boolean | null> {
+  spend(ctx, 2);
+  const n = await accountRequests(countSince, ctx.now());
   if (!n) return null;
   const past = (count: number, limit: number) => (ownIncluded ? count > limit : count >= limit);
   if (past(n.hour, MAX_CREDENTIALS_PER_HOUR)) return false;
-  return n.day === null || !past(n.day, MAX_CREDENTIALS_PER_DAY);
+  return !past(n.day, MAX_CREDENTIALS_PER_DAY);
 }
 
 /** Reset codes: the address's code rows (password_reset_otps), in both systems; each is a request. */
-function resetCodesUnderLimit(ctx: JobContext, hourlyOnly: boolean, ownIncluded = false): Promise<boolean | null> {
+function resetCodesUnderLimit(ctx: JobContext, ownIncluded = false): Promise<boolean | null> {
   return underLimit(
     ctx,
     (sinceIso) => ctx.db.from("password_reset_otps").select("id", { count: "exact", head: true }).eq("email", ctx.email).gte("created_at", sinceIso),
-    hourlyOnly,
     ownIncluded
   );
 }
@@ -469,8 +469,8 @@ type CodeRow = { id: string; created_at: string };
  * among them. Past the limit the row stays closed and counts as a request.
  * null: nothing more is done (the fixed line is written here).
  */
-async function writeClosedCode(ctx: JobContext, hourlyOnly: boolean, system: "tenant" | "platform"): Promise<{ code: string; row: CodeRow } | null> {
-  const before = await resetCodesUnderLimit(ctx, hourlyOnly);
+async function writeClosedCode(ctx: JobContext, system: "tenant" | "platform"): Promise<{ code: string; row: CodeRow } | null> {
+  const before = await resetCodesUnderLimit(ctx);
   if (before !== true) {
     note(ctx, system, before === null ? "limit_read_failed" : "account_limit");
     return null;
@@ -500,7 +500,7 @@ async function writeClosedCode(ctx: JobContext, hourlyOnly: boolean, system: "te
     note(ctx, system, "code_row_failed", codeOf(e));
     return null;
   }
-  const after = await resetCodesUnderLimit(ctx, hourlyOnly, true);
+  const after = await resetCodesUnderLimit(ctx, true);
   if (after !== true) {
     note(ctx, system, after === null ? "limit_read_failed" : "account_limit");
     return null;
@@ -626,7 +626,7 @@ async function tenantMail(ctx: JobContext): Promise<void> {
     return;
   }
   if (ctx.kind === "reset_code") {
-    const made = await writeClosedCode(ctx, false, "tenant");
+    const made = await writeClosedCode(ctx, "tenant");
     if (!made) return;
     const claim = await claimCredentialMail(run, { event: "password_reset", to }, { link: false });
     if (!claim.ok) return note(ctx, "tenant", claim.why);
@@ -656,7 +656,7 @@ async function tenantMail(ctx: JobContext): Promise<void> {
     else await closeOwn(ctx, made.row, "tenant");
     return noteTenantSend(ctx, r);
   }
-  const under = await underLimit(ctx, countLinkClaims(ctx.db, ctx.userId), false);
+  const under = await underLimit(ctx, countLinkClaims(ctx.db, ctx.userId));
   if (under !== true) return note(ctx, "tenant", under === null ? "limit_read_failed" : "account_limit");
   const claim = await claimCredentialMail(run, { event: "magic_link", to }, { link: true });
   if (!claim.ok) return note(ctx, "tenant", claim.why);
@@ -679,7 +679,7 @@ async function platformMail(ctx: JobContext, choice: { organizationId: string | 
   const to = { userId: ctx.userId, email: ctx.email, platformOwner: choice.owner };
   const deps = { db: ctx.db, env: ctx.env, now: ctx.now, timeLeftMs: () => timeLeftForSend(ctx) };
   if (ctx.kind === "reset_code") {
-    const made = await writeClosedCode(ctx, choice.owner, "platform");
+    const made = await writeClosedCode(ctx, "platform");
     if (!made) return;
     const claimed = await claimPlatformSend({ event: "platform_reset_code", to, organizationId: choice.organizationId }, deps);
     if (!claimed.claimed) return notePlatformSend(ctx, claimed.result);

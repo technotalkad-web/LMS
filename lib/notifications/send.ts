@@ -444,12 +444,12 @@ export async function claimCredentialMail(
       return { ok: false, why: "claim_failed" };
     }
     spendCalls(run.budget, 2);
-    const account = await accountRequests(countLinkClaims(db, args.to.user_id), run.now(), true);
+    const account = await accountRequests(countLinkClaims(db, args.to.user_id), run.now());
     if (!account) {
       warn("limit_read_failed");
       return { ok: false, why: "limit_read_failed" };
     }
-    if (account.hour > MAX_REQUESTS_PER_HOUR || (account.day ?? 0) > MAX_REQUESTS_PER_DAY) return { ok: false, why: "account_limit" };
+    if (account.hour > MAX_REQUESTS_PER_HOUR || account.day > MAX_REQUESTS_PER_DAY) return { ok: false, why: "account_limit" };
   }
   const flight = await writeQueuedRow(db, run, args, IN_FLIGHT_WORD);
   if (!flight.ok) {

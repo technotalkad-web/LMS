@@ -6,7 +6,10 @@
  * account's count writes its in-flight row, and the shares count the rows
  * sent and the in-flight rows, never a claim. So the limits hold under
  * concurrent requests:
- *   - the account limit (5 in the hour, 10 in the day), in both systems;
+ *   - the account limit (5 in the hour, 10 in the day), in both systems, the
+ *     same for every account, a platform owner's own included; a platform
+ *     owner's own code and link are outside the organisation's share and the
+ *     ceiling;
  *   - the organisation's platform share and the platform's ceiling;
  *   - the organisation's own daily limit for its codes and links.
  *
@@ -56,6 +59,9 @@ const LEARNER_X = { id: id(5), email: "learner-x@tenant.stub" };
 const LEARNER_Y = { id: id(6), email: "learner-y@tenant.stub" };
 /** An administrator of the other organisation. */
 const ADMIN_B = { id: id(7), email: "admin-b@tenant-b.stub" };
+/** Platform owners: in the world's owners, with no membership; addresses the allow-list ("*") admits. */
+const OWNER = { id: id(8), email: "owner@platform.stub" };
+const OWNER_2 = { id: id(9), email: "owner-2@platform.stub" };
 const many = (n: number, from: number, role: "admin" | "user") =>
   Array.from({ length: n }, (_, i) => ({ id: id(from + i), email: `${role}-${from + i}@tenant.stub`, role }));
 const ADMINS = many(40, 100, "admin");
@@ -80,6 +86,18 @@ function base(over: Parameters<typeof freshWorld>[0] = {}) {
       { organization_id: OTHER_ORG, user_id: ADMIN_B.id, role: "admin", status: "active" },
     ],
     ...over,
+  });
+}
+
+/**
+ * Platform owners (in `owners`, with no membership) and one administrator of
+ * the other organisation, at the default ceiling and share.
+ */
+function ownerWorld(owners: Array<{ id: string; email: string }>) {
+  freshWorld({
+    users: [...owners, ADMIN_B].map((p) => ({ id: p.id, email: p.email })),
+    owners: owners.map((o) => o.id),
+    members: [{ organization_id: OTHER_ORG, user_id: ADMIN_B.id, role: "admin", status: "active" }],
   });
 }
 
@@ -252,13 +270,12 @@ async function main() {
       eq("one word for an in-flight row, in both systems", IN_FLIGHT_WORD, "in_flight");
       const at = Date.now();
       const byWindow = (sinceIso: string) => Promise.resolve({ count: at - Date.parse(sinceIso) > 2 * 3_600_000 ? 9 : 4, error: null });
-      eq("an account's requests: two exact counts, the hour's and the day's", await accountRequests(byWindow, at, true), { hour: 4, day: 9 });
-      eq("…with the hourly limit alone, the day is not read", await accountRequests(byWindow, at, false), { hour: 4, day: null });
+      eq("an account's requests: two exact counts, the hour's and the day's, for every account", await accountRequests(byWindow, at), { hour: 4, day: 9 });
       const unread = [
-        await accountRequests(() => Promise.resolve({ count: null, error: { code: "XX000" } }), at, true),
-        await accountRequests(() => { throw new Error("stub"); }, at, true),
-        await accountRequests(() => Promise.reject(new Error("stub")), at, true),
-        await accountRequests((s) => Promise.resolve({ count: at - Date.parse(s) > 2 * 3_600_000 ? null : 4, error: null }), at, true),
+        await accountRequests(() => Promise.resolve({ count: null, error: { code: "XX000" } }), at),
+        await accountRequests(() => { throw new Error("stub"); }, at),
+        await accountRequests(() => Promise.reject(new Error("stub")), at),
+        await accountRequests((s) => Promise.resolve({ count: at - Date.parse(s) > 2 * 3_600_000 ? null : 4, error: null }), at),
       ];
       eq("…a count that fails, throws or answers no number cannot be read: null", unread, [null, null, null, null]);
     }
@@ -407,9 +424,12 @@ async function main() {
       };
       const platformSentOf = (event: string, userId: string) => () => platformRowsOf((r) => r.event_type === event && r.to_user_id === userId && r.status === "sent").length;
       const tenantSentOf = (event: string, userId: string) => () => world.log.filter((r) => r.event_type === event && r.to_user_id === userId && r.status === "sent").length;
-      const cases: Array<{ label: string; asked: Ask; sent: () => number }> = [
+      const owners = () => ownerWorld([OWNER]);
+      const cases: Array<{ label: string; asked: Ask; sent: () => number; world?: () => void }> = [
         { label: "platform sign-in link, one administrator, through the route", asked: asks(LINK_KIND, { email: ADMIN.email }), sent: platformSentOf("platform_sign_in_link", ADMIN.id) },
         { label: "platform reset code, one administrator, through the route", asked: asks(CODE, { email: ADMIN.email }), sent: platformSentOf("platform_reset_code", ADMIN.id) },
+        { label: "platform sign-in link, a platform owner's own, through the route", asked: asks(LINK_KIND, { email: OWNER.email }), sent: platformSentOf("platform_sign_in_link", OWNER.id), world: owners },
+        { label: "platform reset code, a platform owner's own, through the route", asked: asks(CODE, { email: OWNER.email }), sent: platformSentOf("platform_reset_code", OWNER.id), world: owners },
         { label: "tenant sign-in link, one learner", asked: asks(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }), sent: tenantSentOf("magic_link", LEARNER.id) },
         { label: "tenant reset code, one learner", asked: asks(CODE, { email: LEARNER.email, orgSlug: SLUG }), sent: tenantSentOf("password_reset", LEARNER.id) },
       ];
@@ -424,13 +444,111 @@ async function main() {
         });
       }
       for (const c of cases) {
-        base();
+        if (c.world) c.world();
+        else base();
         const run = await hourAfterHour(c.asked, c.sent);
         const total = run.perHour.reduce((a, b) => a + b, 0);
         eq(`${c.label}: no hour sends more than 5, and the ${HOURS} hours together no more than 10 (${run.perHour.join(", ")})`, [run.perHour.every((n) => n <= 5), total <= 10], [true, true]);
         eq("…non-vacuous: the first hour's five went one after another, and the second hour's sent within the day's room", [run.firstFive, run.perHour[1]], [5, 5]);
         eq(`…the first hour's burst at the limit ran (${BURST} jobs) and sent nothing`, [run.burstJobs, run.burstSent], [BURST, 0]);
       }
+    }
+
+    console.log("\na platform owner's own codes and links: 5 an hour and 10 a day, outside the share and the ceiling");
+    {
+      const DAY = 24 * 3_600_000;
+      const ROUND_MS = 61 * MIN;
+      const ROUNDS = 24;
+      /** One account's sent rows of one kind. */
+      const sentOf = (who: { id: string }, event: string) => platformRowsOf((r) => r.to_user_id === who.id && r.event_type === event && r.status === "sent");
+      /** The most of these rows inside any 24 hours. */
+      const mostInADay = (rows: Row[]) => {
+        const ts = rows.map((r) => Date.parse(String(r.sent_at))).sort((a, b) => a - b);
+        let most = 0;
+        for (let i = 0, j = 0; i < ts.length; i++) {
+          while (ts[i] - ts[j] >= DAY) j++;
+          most = Math.max(most, i - j + 1);
+        }
+        return most;
+      };
+      const sentInLastDay = () => platformRowsOf((r) => r.status === "sent" && Date.parse(String(r.sent_at)) >= Date.now() - DAY).length;
+      /** `n` requests on the page with no organisation, each job run to its end before the next: each job's line (its code, else its outcome). */
+      const oneByOne = async (kind: Kind, email: string, n: number) => {
+        const out: string[] = [];
+        for (let i = 0; i < n; i++) out.push(...jobLines(await one(kind, { email })).map((l) => l.code ?? l.outcome));
+        return out;
+      };
+      /**
+       * ROUNDS rounds 61 minutes apart, from the clock's time: in each, six
+       * code requests and then six link requests for each owner's address.
+       * Each round's lines, and the sent rows of the last 24 hours at the end
+       * of each round.
+       */
+      const rounds = async (clock: ReturnType<typeof fakeClock>, owners: Array<{ email: string }>) => {
+        const lines: string[][] = [];
+        const lastDay: number[] = [];
+        for (let h = 0; h < ROUNDS; h++) {
+          if (h > 0) clock.move(ROUND_MS);
+          const round: string[] = [];
+          for (const o of owners) round.push(...(await oneByOne(CODE, o.email, 6)), ...(await oneByOne(LINK_KIND, o.email, 6)));
+          lines.push(round);
+          lastDay.push(sentInLastDay());
+        }
+        return { lines, lastDay };
+      };
+      /** Other accounts' sent mail, stamped at the start. */
+      const otherMail = (n: number) => seedPlatform(n, { event_type: "platform_admin_welcome", organization_id: ORG, to_user_id: id(1000), status: "sent" }, () => 0);
+      const FIVE_THEN_LIMIT = [...Array(5).fill("sent"), "account_limit"];
+
+      for (const [n, admin] of [[134, "sent"], [354, "sent"], [355, "ceiling"]] as const) {
+        ownerWorld([OWNER]);
+        const clock = fakeClock();
+        try {
+          otherMail(n);
+          const run = await rounds(clock, [OWNER]);
+          eq(`${n} other mails sent at the start: the owner's first code and first link are sent`, [run.lines[0][0], run.lines[0][6]], ["sent", "sent"]);
+          eq("…24 rounds an hour and a minute apart, six codes and six links in each: ten codes and ten links in all, five of each in each of the first two rounds",
+            [sentOf(OWNER, "platform_reset_code").length, sentOf(OWNER, "platform_sign_in_link").length, run.lines.slice(0, 2)], [10, 10, [[...FIVE_THEN_LIMIT, ...FIVE_THEN_LIMIT], [...FIVE_THEN_LIMIT, ...FIVE_THEN_LIMIT]]]);
+          eq("…rounds 3 to 24 send nothing, and each of their jobs' lines reads account_limit", run.lines.slice(2).every((r) => r.length === 12 && r.every((x) => x === "account_limit")), true);
+          const adminLines = jobLines(await one(LINK_KIND, { email: ADMIN_B.email })).map((l) => l.code ?? l.outcome);
+          const adminRefused = platformRowsOf((r) => r.to_user_id === ADMIN_B.id && r.status === "refused").map((r) => r.error_code);
+          eq(admin === "sent" ? "…an administrator's link at the last round's time is sent, and no refused row names the administrator" : "…an administrator's link at the last round's time is refused by the ceiling",
+            [adminLines, sentOf(ADMIN_B, "platform_sign_in_link").length, adminRefused], admin === "sent" ? [["sent"], 1, []] : [["ceiling"], 0, ["ceiling"]]);
+          if (n === 134) {
+            clock.move(ROUND_MS);
+            eq("…one more round 61 minutes after the 24th, of five links for the owner: all five are sent, the first round's being more than a day old", await oneByOne(LINK_KIND, OWNER.email, 5), Array(5).fill("sent"));
+            eq("…and no 24 hours of the whole run hold more than ten of the owner's codes or ten of the owner's links", [mostInADay(sentOf(OWNER, "platform_reset_code")), mostInADay(sentOf(OWNER, "platform_sign_in_link"))], [10, 10]);
+          }
+        } finally {
+          clock.restore();
+        }
+      }
+
+      ownerWorld([OWNER, OWNER_2]);
+      const clock = fakeClock();
+      try {
+        otherMail(375);
+        const run = await rounds(clock, [OWNER, OWNER_2]);
+        eq("two platform owners, the ceiling's number of other mails sent at the start, the same 24 rounds for both addresses: each first code and link sent, and ten codes and ten links for each",
+          [[run.lines[0][0], run.lines[0][6], run.lines[0][12], run.lines[0][18]], [OWNER, OWNER_2].map((o) => [sentOf(o, "platform_reset_code").length, sentOf(o, "platform_sign_in_link").length])], [Array(4).fill("sent"), [[10, 10], [10, 10]]]);
+        eq("…so the sent rows of the last 24 hours, at the end of every round, are at most the ceiling and 40", Math.max(...run.lastDay) <= 375 + 40, true);
+      } finally {
+        clock.restore();
+      }
+
+      // Both counts of a code take the daily limit: the address's code rows and the platform's claims.
+      ownerWorld([OWNER]);
+      for (let i = 0; i < 10; i++) world.otps.push({ id: `otp-day-${i}`, email: OWNER.email, code_hash: hashOtp("131313"), created_at: ago(90 * MIN + i * 60 * MIN), used_at: ago(80 * MIN), attempts: 0, expires_at: ago(80 * MIN) });
+      const byRows = jobLines(await one(CODE, { email: OWNER.email }));
+      eq("ten code rows of the owner's address in the day, none in the hour, an empty platform log: account_limit, no code row written, no row on the platform's log, nothing sent",
+        [byRows.map((l) => l.code ?? l.outcome), world.otps.length, world.platformLog.length, dispatched("platform").length], [["account_limit"], 10, 0, 0]);
+      ownerWorld([OWNER]);
+      seedPlatform(10, { event_type: "platform_reset_code", organization_id: null, to_user_id: OWNER.id, status: "suppressed", error_code: "pending" }, (i) => 90 * MIN + i * 60 * MIN);
+      const byClaims = jobLines(await one(CODE, { email: OWNER.email }));
+      const ownRows = world.otps.filter((r) => r.email === OWNER.email);
+      eq("ten claims of the owner's own code in the day on the platform's log and no code row: its code row written closed and still closed, one refused row and no claim, nothing sent",
+        [byClaims.map((l) => l.code ?? l.outcome), ownRows.length, ownRows.every((r) => typeof r.used_at === "string"), platformRowsOf((r) => r.status === "refused").map((r) => r.error_code), claimsOfPlatform().length, inFlightOfPlatform().length, dispatched("platform").length],
+        [["account_limit"], 1, true, ["account_limit"], 10, 0, 0]);
     }
 
     console.log("\neach account count is an exact count of the account's claims: a count of the rows, with no page");

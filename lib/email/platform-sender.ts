@@ -113,8 +113,6 @@ export const ACCOUNT_LIMITS: Record<PlatformEvent, { hour: number; day: number }
   platform_admin_welcome: null,
   tenant_smtp_alert: null,
 };
-/** A platform owner's own code and link keep the hourly limit only. */
-const OWNER_HOURLY_ONLY: ReadonlySet<PlatformEvent> = new Set(["platform_reset_code", "platform_sign_in_link"]);
 /** A platform owner's own code, link and test are never refused by the ceiling. */
 const OWNER_CEILING_EXEMPT: ReadonlySet<PlatformEvent> = new Set(["platform_reset_code", "platform_sign_in_link", "platform_test"]);
 /** The events the organisation limit counts and refuses: administrators' codes and links. */
@@ -403,9 +401,8 @@ export const ACCOUNT_REQUEST_WORDS = ["pending", "test_domain", "not_allowed"] a
  * of this kind whose status is `suppressed` and whose word is one of
  * ACCOUNT_REQUEST_WORDS, in the hour and in the day. In this order:
  *   1. the account's counts, read before anything is written: at the limit
- *      (5 in the hour, 10 in the day; a platform owner's own, the hourly
- *      limit only) it is refused, with one such row an hour, and no claim is
- *      written;
+ *      (5 in the hour, 10 in the day, for every account) it is refused, with
+ *      one such row an hour, and no claim is written;
  *   2. the reserved test domains and the allow-list: a `suppressed` row, as
  *      before, and no claim;
  *   3. the claim;
@@ -437,7 +434,6 @@ export async function claimPlatformSend(
   const clock = deps.now ?? Date.now;
   const db = deps.db ?? svc();
   const limit = ACCOUNT_LIMITS[event]!;
-  const dailyApplies = !(to.platformOwner && OWNER_HOURLY_ONLY.has(event));
   const of: RowOf = { event, organizationId, userId: to.userId };
   const not = (result: PlatformSendResult): PlatformClaimAnswer => ({ claimed: false, result });
   // A request of the account: a claim, or one the reserved domains or the list stopped. Never an in-flight row.
@@ -450,14 +446,12 @@ export async function claimPlatformSend(
       .eq("status", "suppressed")
       .in("error_code", [...ACCOUNT_REQUEST_WORDS])
       .gte("sent_at", sinceIso);
-  const past = (n: { hour: number; day: number | null }, ownIncluded: boolean) =>
-    ownIncluded
-      ? n.hour > limit.hour || (n.day !== null && n.day > limit.day)
-      : n.hour >= limit.hour || (n.day !== null && n.day >= limit.day);
+  const past = (n: { hour: number; day: number }, ownIncluded: boolean) =>
+    ownIncluded ? n.hour > limit.hour || n.day > limit.day : n.hour >= limit.hour || n.day >= limit.day;
 
   // 1. The account limit, before anything is written.
   const firstMs = clock();
-  const before = await accountRequests(requestsSince, firstMs, dailyApplies);
+  const before = await accountRequests(requestsSince, firstMs);
   if (!before) return not(unreadable(event, "account"));
   if (past(before, false)) {
     // One refused row an hour for the account and kind. If that cannot be read, nothing more is written.
@@ -491,7 +485,7 @@ export async function claimPlatformSend(
   if (claim.error) return not(unreadable(event, "claim"));
 
   // 4. The account's counts again, the claim among the rows.
-  const again = await accountRequests(requestsSince, clock(), dailyApplies);
+  const again = await accountRequests(requestsSince, clock());
   if (!again) return not(unreadable(event, "account"));
   if (past(again, true)) return not({ status: "refused", errorCode: "account_limit", logged: false });
 

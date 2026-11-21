@@ -13,12 +13,12 @@
  *   - a limit that cannot be read, or a missing table, sends nothing and
  *     writes nothing but a claim or an in-flight row already there;
  *   - the limits of section G: 5 an hour and 10 a day per account and kind,
- *     one refused row an hour; a platform owner's own code and link have the
- *     hourly limit only; the test counts only sends that reached the mail
- *     server; one organisation at its limit is refused while
- *     another still sends, and alerts and welcomes are outside it; the
- *     ceiling (default 375, a deployment setting) refuses everything except
- *     a platform owner's own code, link and test;
+ *     the same for every account, a platform owner's own included, with one
+ *     refused row an hour; the test counts only sends that reached the mail
+ *     server; one organisation at its limit is refused while another still
+ *     sends, and alerts, welcomes and a platform owner's own mail are
+ *     outside it; the ceiling (default 375, a deployment setting) refuses
+ *     everything except a platform owner's own code, link and test;
  *   - the welcome goes to each of the add-admin route's three roles, with
  *     its setup link and never a password (ADR 0029, rules N4 and N5);
  *   - a trailing line break in the stored password is not sent;
@@ -347,12 +347,31 @@ async function main() {
       fresh();
       seed(10, { ...CLAIM, to_user_id: ADMIN_A.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
       eq("ten codes in the day, none in the hour: an administrator is refused (the daily limit)", short(await send(code(ADMIN_A, ORG_A))), ["refused", "account_limit", true]);
+      // Each case on a fresh log: a refused row of the same hour changes the next answer's `logged`.
+      fresh();
       seed(10, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
-      eq("…a platform owner's own code is sent (hourly limit only)", (await send(code(OWNER, null))).status, "sent");
+      eq("…ten of a platform owner's own codes in the day, none in the hour: refused the same (the daily limit), with its row", short(await send(code(OWNER, null))), ["refused", "account_limit", true]);
+      fresh();
       seed(10, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_sign_in_link" }, (i) => 90 + i * 60);
-      eq("…and the owner's own link", (await send(link(OWNER, null))).status, "sent");
+      eq("…and ten of the owner's own links", short(await send(link(OWNER, null))), ["refused", "account_limit", true]);
+      fresh();
+      seed(9, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
+      eq("…nine of the owner's own codes in the day, none in the hour: the tenth is sent, the eleventh is refused", [short(await send(code(OWNER, null))), short(await send(code(OWNER, null)))], [["sent", null, true], ["refused", "account_limit", true]]);
+      fresh();
+      seed(9, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_sign_in_link" }, (i) => 90 + i * 60);
+      eq("…and the same for the owner's own links", [short(await send(link(OWNER, null))), short(await send(link(OWNER, null)))], [["sent", null, true], ["refused", "account_limit", true]]);
+      fresh();
       seed(5, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 1 + i);
-      eq("…but five owner codes in the hour refuse the next one", short(await send(code(OWNER, null))), ["refused", "account_limit", true]);
+      eq("…and five owner codes in the hour refuse the next one", short(await send(code(OWNER, null))), ["refused", "account_limit", true]);
+      fresh();
+      const ownLink = await send(link(OWNER, null));
+      const counts = reads();
+      const span = (r: Req) => Date.now() - Date.parse((r.query.get("sent_at") ?? "").slice(4));
+      eq("a platform owner's own link makes four reads of the log, each a count of its account's requests (the hour and the day, before its claim and after it), and none of an organisation, of sent rows or of in-flight rows",
+        [ownLink.status, counts.length, counts.every((r) => r.method === "HEAD" && r.query.get("to_user_id") === `eq.${OWNER.userId}` && r.query.get("event_type") === "eq.platform_sign_in_link" && r.query.get("status") === "eq.suppressed"),
+          counts.filter((r) => r.query.has("organization_id") || r.query.get("status") === "eq.sent" || r.query.get("error_code") === "eq.in_flight").length,
+          counts.filter((r) => span(r) <= 3_600_000 + 60_000).length, counts.filter((r) => span(r) >= 24 * 3_600_000 - 60_000).length],
+        ["sent", 4, true, 0, 2, 2]);
       fresh();
       seed(10, { to_user_id: OWNER.userId, event_type: "platform_test" }, (i) => 90 + i * 60);
       eq("the test keeps its daily limit for the owner (10 a day)", short(await send(test())), ["refused", "account_limit", true]);
@@ -429,6 +448,14 @@ async function main() {
       eq("…a welcome is refused", (await send(welcome(ADMIN_A, ORG_A))).errorCode, "ceiling");
       eq("…an alert is refused", (await send(alert(ADMIN_A, ORG_A))).errorCode, "ceiling");
       eq("…a platform owner's own code, link and test are sent", [(await send(code(OWNER, null))).status, (await send(link(OWNER, null))).status, (await send(test())).status], ["sent", "sent", "sent"]);
+      fresh();
+      seed(DEFAULT_DAILY_CEILING, { status: "sent", event_type: "platform_admin_welcome" }, () => 60);
+      seed(9, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
+      eq(`${DEFAULT_DAILY_CEILING} sent and nine of a platform owner's own codes in the day: its code is sent`, short(await send(code(OWNER, null))), ["sent", null, true]);
+      fresh();
+      seed(DEFAULT_DAILY_CEILING, { status: "sent", event_type: "platform_admin_welcome" }, () => 60);
+      seed(10, { ...CLAIM, to_user_id: OWNER.userId, event_type: "platform_reset_code" }, (i) => 90 + i * 60);
+      eq("…with ten of them it is refused for the account, not by the ceiling", short(await send(code(OWNER, null))), ["refused", "account_limit", true]);
       fresh();
       seed(DEFAULT_DAILY_CEILING - 1, { status: "sent" }, () => 60);
       seed(50, { status: "failed", error_code: "auth" }, () => 60);

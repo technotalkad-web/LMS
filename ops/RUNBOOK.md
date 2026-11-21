@@ -294,14 +294,18 @@ arrived (the app waits 15 s for one send, in both systems; `send-smtp` keeps
 trying for up to 25 s).
 
 **Limits** (ADR 0029 section G; checked before every send, and a limit that
-cannot be read sends nothing): 5 an hour and 10 a day per account and kind (a
-platform owner's own code and link: the hourly limit only; the test counts only
-the sends that reached the mail server); 50 codes and links
-a day for one organisation's administrators (`PLATFORM_EMAIL_ORG_DAILY_LIMIT`;
-alerts and welcomes are outside it); the daily ceiling for all platform mail
-(a platform owner's own code, link and test are exempt). Nothing is ever sent
-to a reserved test domain (`.test`, `.example`, `.invalid`, `.localhost`,
-`example.com/.net/.org`), and nothing at all while the allow-list is unset.
+cannot be read sends nothing): 5 an hour and 10 a day for every account and
+kind, a platform owner's own included (the test counts only the sends that
+reached the mail server); 50 codes and links a day for one
+organisation's administrators (`PLATFORM_EMAIL_ORG_DAILY_LIMIT`; alerts and
+welcomes are outside it); the daily ceiling for all platform mail. A platform
+owner's own code, link and test are exempt from the organisation's share and
+the ceiling. Each platform owner account can send up to 30 messages a day past
+the ceiling (ten codes, ten links, ten tests). Keep the ceilings of the
+environments that share the mailbox, plus 30 for each platform owner account,
+under the mailbox's daily cap. Nothing is ever sent to a reserved test domain
+(`.test`, `.example`, `.invalid`, `.localhost`, `example.com/.net/.org`), and
+nothing at all while the allow-list is unset.
 
 **Retention:** rows are kept 90 days. Monthly, in the SQL editor with the role
 selector on postgres:
