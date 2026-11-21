@@ -15,7 +15,8 @@ import { readTenantMailNotice, type TenantMailNotice } from "@/lib/notifications
  * The banner of section E (ADR 0029; rule FP4) for the organisation's
  * super owners and admins: its email is not set up or failing, or its
  * daily count is near the limit, past the line where routine mail stops,
- * or at the limit. Fixed words, the count and the limit; no address.
+ * or at the limit; or its limit is so low that routine mail never goes.
+ * Fixed words, the count and the limit; no address.
  */
 function tenantMailBanner(notice: TenantMailNotice | null): { tone: "critical" | "warning"; text: string } | null {
   if (!notice) return null;
@@ -28,6 +29,8 @@ function tenantMailBanner(notice: TenantMailNotice | null): { tone: "critical" |
       return { tone: "critical", text: `All email has stopped: ${notice.sent24h} of the daily limit of ${notice.limit} were sent in the last 24 hours. Email starts again as the 24 hours move on.` };
     case "routine_stopped":
       return { tone: "critical", text: `Routine email has stopped for today: ${notice.sent24h} of the daily limit of ${notice.limit} were sent in the last 24 hours. Reset codes, sign-in links and welcome mail still go until the limit.` };
+    case "routine_off":
+      return { tone: "warning", text: `Routine email is off for this organisation: its daily limit of ${notice.limit} is no more than the part kept for reset codes, sign-in links and welcome mail, so reminders, announcements and assignment email are never sent. A platform owner sets the limit.` };
     case "near_limit":
       return { tone: "warning", text: `Email is near today's limit: ${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Routine email stops before the limit.` };
   }

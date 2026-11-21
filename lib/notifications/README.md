@@ -84,7 +84,9 @@ call site to it.
   24 hours against its limit (375 unless a platform owner sets another on
   `/super/email`). One tenth (at least 25) is held back for mail someone is
   expecting, such as reset codes; routine mail halts short of that reserve,
-  and at the limit itself nothing more is attempted.
+  and at the limit itself nothing more is attempted. A limit of 25 or less
+  is all reserve, so routine mail never goes at it; the pages call that
+  "routine mail off at this limit" (the notice `routine_off`).
 - **Without migration 0114** (production until its sitting): no state is
   stored, every organisation with complete settings is treated as ready, and
   no daily limit applies; the send is attempted as before.

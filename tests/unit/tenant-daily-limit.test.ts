@@ -27,7 +27,11 @@
  *     Center item, in two calls (one for the count), with its four causes;
  *     the provider gives no item for a state it cannot read and does not
  *     throw, while settings that are incomplete still give not_configured
- *     from the settings alone, and its item cannot be marked as read.
+ *     from the settings alone, and its item cannot be marked as read;
+ *   - a limit of 25 or less, where routine mail never goes: its own notice
+ *     (routine_off), a warning that names the limit as the cause and never
+ *     "for today", on the console's list and in the Attention Center item,
+ *     the banner and the SMTP tab.
  *
  * Under the stubbed fetch of tests/unit/mail-world.ts. No database, no network.
  *
@@ -53,6 +57,8 @@ import { sendMany, sendNotification, type SendArgs } from "../../lib/notificatio
 import { collectAttention } from "../../lib/attention/collect";
 import { ATTENTION_PROVIDERS } from "../../lib/attention/types";
 import { createClient } from "@supabase/supabase-js";
+import fs from "node:fs";
+import path from "node:path";
 
 const people = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `0b000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`, email: `person${i + 1}@tenant.stub` }));
 const routine = (p: { id: string; email: string }) => ({ event: "asset_reminder" as const, to: { user_id: p.id, email: p.email }, context: {} });
@@ -124,6 +130,7 @@ async function main() {
     }
 
     await readerCases();
+    bannerAndTabText();
   } finally {
     removeStub();
   }
@@ -157,6 +164,12 @@ async function readerCases() {
       const r = await readTenantSmtpOverview(db());
       eq(`${label}`, r.kind === "ok" ? [r.rows[0].routineStopped, r.rows[0].atLimit] : r, [stopped, atLimit]);
     }
+    freshWorld({ state: { ...healthy, daily_limit: 10 }, sent24h: 0 });
+    const low = await readTenantSmtpOverview(db());
+    eq("a stored limit of 10: routine mail is off at this limit (the line is 0), which the list says apart from a stop", low.kind === "ok" ? [low.rows[0].routineOff, low.rows[0].limit.routineStop, low.rows[0].atLimit] : low, [true, 0, false]);
+    freshWorld({ state: { ...healthy, daily_limit: DAILY_LIMIT_RESERVE_MIN + 1 }, sent24h: 0 });
+    const above = await readTenantSmtpOverview(db());
+    eq(`…at ${DAILY_LIMIT_RESERVE_MIN + 1} routine mail goes, so it is not off`, above.kind === "ok" ? [above.rows[0].routineOff, above.rows[0].routineStopped] : above, [false, false]);
     freshWorld({ state: { ...healthy, daily_limit: 1500 }, sent24h: 1349 });
     const big = await readTenantSmtpOverview(db());
     eq("a stored limit of 1,500: the number and the line where routine mail stops are the organisation's own", big.kind === "ok" ? [big.rows[0].storedLimit, big.rows[0].limit.routineStop, big.rows[0].routineStopped] : big, [1500, 1350, false]);
@@ -197,6 +210,12 @@ async function readerCases() {
     eq(`the count: a warning from ${NEAR_LIMIT_SHARE * 10} tenths (300 of 375), routine mail stopped (337), the limit (375); nothing below (299)`,
       [299, 300, 337, 375].map((n) => N("complete", ok({ state: "healthy", sent_24h: n }))?.kind ?? null), [null, "near_limit", "routine_stopped", "limit_reached"]);
 
+    eq(`a limit of ${DAILY_LIMIT_RESERVE_MIN} or less: routine mail never goes, its own notice (not a stop for today), whatever the count below the limit`,
+      [[10, 0], [10, 5], [DAILY_LIMIT_RESERVE_MIN, 0]].map(([limit, sent]) => N("complete", ok({ state: "healthy", daily_limit: limit, sent_24h: sent }))),
+      [{ kind: "routine_off", sent24h: 0, limit: 10 }, { kind: "routine_off", sent24h: 5, limit: 10 }, { kind: "routine_off", sent24h: 0, limit: DAILY_LIMIT_RESERVE_MIN }]);
+    eq("…at the limit itself all mail has stopped, which still says so", N("complete", ok({ state: "healthy", daily_limit: 10, sent_24h: 10 }))?.kind, "limit_reached");
+    eq(`…at ${DAILY_LIMIT_RESERVE_MIN + 1} routine mail goes: no notice at 0`, N("complete", ok({ state: "healthy", daily_limit: DAILY_LIMIT_RESERVE_MIN + 1, sent_24h: 0 })), null);
+
     freshWorld({ state: { ...healthy }, sent24h: 340 });
     const notice = await readTenantMailNotice(db(), ORG);
     eq("read: two calls, one of them for the count", [notice, requests.length, statusCalls().length], [{ kind: "routine_stopped", sent24h: 340, limit: 375 }, 2, 1]);
@@ -220,10 +239,26 @@ async function readerCases() {
     eq("the settings cannot be read: no item", (await collect()).length, 0);
     freshWorld({ state: { ...healthy }, sent24h: 310 });
     eq("near the limit: one item, a warning (high), with the count and the limit", (await collect()).map((i) => [i.key, i.priority, i.context]), [["tenant-smtp:near_limit", "high", "310 of 375 sent in the last 24 hours. Routine email stops before the limit."]]);
+    freshWorld({ state: { ...healthy, daily_limit: 10 } });
+    const off = await collect();
+    eq("a limit of 10: one item that says routine email is off at this limit, a warning (high), never \"for today\"",
+      [off.map((i) => [i.key, i.priority]), off.some((i) => /for today/i.test(`${i.title} ${i.context}`)), off[0]?.context?.includes("The daily limit of 10")], [[["tenant-smtp:routine_off", "high"]], false, true]);
     freshWorld({ state: { ...healthy, state: "failing", last_error_code: "unreachable" } });
     const f = await collect();
     eq("failing: critical, with its last error class and no address", [f.map((i) => [i.key, i.priority]), /@/.test(JSON.stringify(f))], [[["tenant-smtp:failing", "critical"]], false]);
   }
+}
+
+/** The banner and the SMTP tab, by their text (a layout's and a client page's functions cannot be imported here). */
+function bannerAndTabText(): void {
+  console.log("\nthe banner and the SMTP tab for a limit where routine mail never goes");
+  const root = path.join(__dirname, "..", "..");
+  const layout = fs.readFileSync(path.join(root, "app", "[org]", "(admin)", "layout.tsx"), "utf8");
+  const off = layout.slice(layout.indexOf('case "routine_off":'), layout.indexOf('case "near_limit":'));
+  eq("the banner has a case for it: a warning that names the limit and says routine email is never sent, not \"for today\"",
+    [off.length > 0, /tone: "warning"/.test(off), /never sent/.test(off), /for today/.test(off)], [true, true, true, false]);
+  const tab = fs.readFileSync(path.join(root, "app", "[org]", "(admin)", "settings", "settings-client.tsx"), "utf8");
+  eq("the SMTP tab says so when the line where routine mail stops is 0", /mailState\.routineStop === 0\s*\?\s*" At this limit reminders, announcements and assignment email are never sent/.test(tab), true);
 }
 
 main().catch((e) => {

@@ -397,7 +397,11 @@ organisation's `sent` rows in `notification_log`, test sends included.
   nudges, broadcasts, and the assignment, update, completion, ticket and
   attempt-request messages) halts once the limit minus that reserve is reached: 1,350 of 1,500, 337 of 375. From eight
   tenths the Attention Center item warns; when routine mail stops it is
-  critical and one alert is due. At the limit nothing more is attempted
+  critical and one alert is due. A limit of 25 or less is all reserve:
+  routine mail never goes at it. The route accepts it (1 to 100,000), the
+  form says so when it is saved, and the console, the banner, the Attention
+  Center item and the SMTP tab read "routine mail off at this limit", a
+  warning, not a stop for today. At the limit nothing more is attempted
   through that SMTP until earlier mail is 24 hours old, and the organisation
   reads not ready. The platform mailbox is never used instead.
 - An administrator's own send reports `not_sent` with the class `daily_limit`;

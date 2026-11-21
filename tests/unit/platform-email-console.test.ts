@@ -301,6 +301,10 @@ async function main() {
       eq("an empty box, and text that is no whole number from 1 to 100,000, are refused: never the default",
         ["", "   ", "-", "1e", "1e3", "15,00", "1.5", "0", "100001", "abc"].map((t) => parseDailyLimitText(t).ok), Array(10).fill(false));
       eq("…the refusal says what to type and names the default's own button", (parseDailyLimitText("1,5,00") as { message?: string }).message, "Type a whole number from 1 to 100,000, or choose Use the default.");
+      const { routineOffNote } = await import("../../app/(super-owner)/super/email/daily-limit-form");
+      const { DAILY_LIMIT_RESERVE_MIN } = await import("../../lib/notifications/smtp-state");
+      eq(`a limit of ${DAILY_LIMIT_RESERVE_MIN} or less is accepted, and the form says when it is saved that routine mail never goes at it; above, nothing more`,
+        [routineOffNote(10, DAILY_LIMIT_RESERVE_MIN)?.includes("routine mail never goes"), routineOffNote(DAILY_LIMIT_RESERVE_MIN, DAILY_LIMIT_RESERVE_MIN) !== null, routineOffNote(DAILY_LIMIT_RESERVE_MIN + 1, DAILY_LIMIT_RESERVE_MIN)], [true, true, null]);
       for (const [label, id] of [["an organisation that does not exist", "0a000000-0000-4000-8000-0000000000ff"], ["a deleted organisation", GONE_ID], ["an id that is not one", "acme"]] as const) {
         fresh(); signIn(OWNER);
         const r = await set({ organization_id: id, daily_limit: 100 });
@@ -363,6 +367,14 @@ async function main() {
         [withIt.includes("<table"), ORGS(withIt).includes("Tenant A"), ORGS(withIt).includes("Healthy"), ORGS(withIt).includes("12 of 1500"), ORGS(withIt).includes('aria-label="Daily email limit"'), ORGS(withIt).includes('value="1500"')],
         [true, true, true, true, true, true]);
       eq("…the lost-job numbers, and no sentence that names the migration", [JOBS(withIt).includes("1 lost of 4 started"), withIt.includes(TENANT_MAIL_NEEDS_0114)], [true, false]);
+
+      fresh();
+      page.statusRows = [{ organization_id: ORG_ID, state: "healthy", state_changed_at: "2026-11-20T08:00:00.000Z", last_success_at: "2026-11-21T07:30:00.000Z", last_error_code: null, daily_limit: 10, sent_24h: 0 }];
+      page.settings = [{ organization_id: ORG_ID, smtp_host: "smtp.tenant.stub", smtp_port: 465, from_email: "from-0029" }];
+      page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      const lowLimit = await render();
+      eq("a limit of 10: the reading says routine mail is off at this limit, not that it stopped for today",
+        [ORGS(lowLimit).includes("routine mail off at this limit"), ORGS(lowLimit).includes("stopped for today"), ORGS(lowLimit).includes("0 of 10")], [true, false, true]);
 
       fresh(); page.status = "fail"; page.jobs = "fail"; page.beats = "fail"; page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
       const failed = await render();

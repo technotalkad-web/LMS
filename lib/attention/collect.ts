@@ -517,6 +517,9 @@ export function tenantSmtpItem(notice: TenantMailNotice | null, orgSlug: string,
       return { ...base, key: "tenant-smtp:daily_limit", priority, title: "All email has stopped: the daily email limit is reached", context: `${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Email starts again as the 24 hours move on.`, occurredAt: nowIso, actionLabel: "Review today's email" };
     case "routine_stopped":
       return { ...base, key: "tenant-smtp:daily_limit", priority, title: "Routine email has stopped for today", context: `${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Reset codes, sign-in links and welcome mail still go until the limit.`, occurredAt: nowIso, actionLabel: "Review today's email" };
+    case "routine_off":
+      // The limit's setting, not a stop for today: a warning, as near_limit.
+      return { ...base, key: "tenant-smtp:routine_off", priority: priority === "critical" ? "high" : priority, title: "Routine email is off at this daily limit", context: `The daily limit of ${notice.limit} is no more than the part kept for reset codes, sign-in links and welcome mail, so reminders, announcements and assignment email are never sent. ${notice.sent24h} sent in the last 24 hours. A platform owner sets the limit.`, occurredAt: nowIso, actionLabel: "Review today's email" };
     case "near_limit":
       return { ...base, key: "tenant-smtp:near_limit", priority: priority === "critical" ? "high" : priority, title: "Email is near today's limit", context: `${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Routine email stops before the limit.`, occurredAt: nowIso, actionLabel: "Review today's email" };
   }

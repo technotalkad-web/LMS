@@ -332,7 +332,9 @@ function SmtpForm({
               Sent in the last 24 hours: {mailState.sent24h} of the limit of {mailState.limit}.
               {mailState.sent24h >= mailState.limit
                 ? " All email has stopped until earlier email is more than 24 hours old."
-                : mailState.sent24h >= mailState.routineStop
+                : mailState.routineStop === 0
+                  ? " At this limit reminders, announcements and assignment email are never sent: the whole limit is kept for reset codes, sign-in links and welcome email. A platform owner sets the limit."
+                  : mailState.sent24h >= mailState.routineStop
                   ? " Reminders, announcements and assignment email have stopped; reset codes and welcome email go on until the limit."
                   : ""}
             </div>

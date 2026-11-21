@@ -1321,6 +1321,12 @@ export type TenantSmtpOverviewRow = {
   limit: DailyLimit;
   /** Routine mail has stopped: the count is at the limit less its reserve. */
   routineStopped: boolean;
+  /**
+   * Routine mail never goes at this limit: it is no more than the reserve
+   * (DAILY_LIMIT_RESERVE_MIN or less), so the line where routine mail stops
+   * is 0. A setting, not a stop for today.
+   */
+  routineOff: boolean;
   /** The full limit is reached: nothing more is attempted. */
   atLimit: boolean;
   /** Whether it has an active member: read only for one that would warn, null otherwise. */
@@ -1391,6 +1397,7 @@ export async function readTenantSmtpOverview(db: SupabaseClient, env: Env = proc
         storedLimit: r.daily_limit,
         limit,
         routineStopped: r.sent_24h >= limit.routineStop,
+        routineOff: limit.routineStop === 0,
         atLimit: r.sent_24h >= limit.limit,
         hasMembers: null,
       };
@@ -1441,11 +1448,13 @@ export const NEAR_LIMIT_SHARE = 0.8;
  * What an organisation's administrators are told on its pages (section E;
  * rule FP4): its email is not set up, it is failing, or its daily count is
  * near the limit, past the line where routine mail stops, or at the limit.
+ * routine_off: the limit is no more than the reserve, so routine mail never
+ * goes at it; that is the limit's setting, not a stop for today.
  */
 export type TenantMailNotice =
   | { kind: "not_configured" }
   | { kind: "failing"; since: string | null; lastErrorClass: string | null }
-  | { kind: "limit_reached" | "routine_stopped" | "near_limit"; sent24h: number; limit: number };
+  | { kind: "limit_reached" | "routine_stopped" | "routine_off" | "near_limit"; sent24h: number; limit: number };
 
 /**
  * The notice from the settings and the status read. Settings that could not
@@ -1461,6 +1470,7 @@ export function tenantMailNoticeOf(input: { settings: "complete" | "incomplete" 
   if (row.state === "failing") return { kind: "failing", since: row.state_changed_at, lastErrorClass: row.last_error_code };
   const limit = tenantDailyLimit(row.daily_limit, env);
   if (row.sent_24h >= limit.limit) return { kind: "limit_reached", sent24h: row.sent_24h, limit: limit.limit };
+  if (limit.routineStop === 0) return { kind: "routine_off", sent24h: row.sent_24h, limit: limit.limit };
   if (row.sent_24h >= limit.routineStop) return { kind: "routine_stopped", sent24h: row.sent_24h, limit: limit.limit };
   if (row.sent_24h >= NEAR_LIMIT_SHARE * limit.limit) return { kind: "near_limit", sent24h: row.sent_24h, limit: limit.limit };
   return null;

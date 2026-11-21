@@ -35,7 +35,17 @@ export function parseDailyLimitText(text: string): { ok: true; value: number } |
   return { ok: true, value };
 }
 
-export function DailyLimitForm({ organizationId, storedLimit, defaultLimit }: { organizationId: string; storedLimit: number | null; defaultLimit: number }) {
+/**
+ * What a limit means for routine mail, said when it is saved (rule FP4): at
+ * `reserveMin` or less the whole limit is the reserve kept for reset codes,
+ * sign-in links and welcome mail, so routine mail never goes. null above it.
+ */
+export function routineOffNote(limit: number, reserveMin: number): string | null {
+  if (limit > reserveMin) return null;
+  return `At ${reserveMin} or less, routine mail never goes: reminders, announcements and assignment email are not sent, and the whole limit is kept for reset codes, sign-in links and welcome mail.`;
+}
+
+export function DailyLimitForm({ organizationId, storedLimit, defaultLimit, reserveMin }: { organizationId: string; storedLimit: number | null; defaultLimit: number; reserveMin: number }) {
   const router = useRouter();
   const [value, setValue] = useState(storedLimit === null ? "" : String(storedLimit));
   const [busy, setBusy] = useState(false);
@@ -70,7 +80,8 @@ export function DailyLimitForm({ organizationId, storedLimit, defaultLimit }: { 
       setMessage(parsed.message);
       return;
     }
-    void post({ daily_limit: parsed.value }, "Saved.");
+    const note = routineOffNote(parsed.value, reserveMin);
+    void post({ daily_limit: parsed.value }, note ? `Saved. ${note}` : "Saved.");
   }
 
   function resetToDefault() {

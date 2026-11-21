@@ -17,7 +17,7 @@ import {
   type PlatformEmailReason,
   type TenantReading,
 } from "@/lib/ops/health-status";
-import { TENANT_MAIL_NEEDS_0114, readMailJobCounts, readTenantSmtpOverview, tenantDailyLimit } from "@/lib/notifications/smtp-state";
+import { DAILY_LIMIT_RESERVE_MIN, TENANT_MAIL_NEEDS_0114, readMailJobCounts, readTenantSmtpOverview, tenantDailyLimit } from "@/lib/notifications/smtp-state";
 import { readAllStrict } from "@/lib/db/chunked";
 import { SendTestButton } from "./send-test-button";
 import { DailyLimitForm } from "./daily-limit-form";
@@ -259,7 +259,7 @@ export default async function PlatformEmailPage() {
                     <td className="py-2 pr-4 text-ink">{nameOf.get(t.organization_id) ?? "(name not read)"}</td>
                     <td className="py-2 pr-4 text-ink">
                       {READING_TEXT[t.reading]}
-                      {t.atLimit ? " · at its daily limit: all mail stopped" : t.routineStopped ? " · routine mail stopped for today" : ""}
+                      {t.atLimit ? " · at its daily limit: all mail stopped" : t.routineOff ? " · routine mail off at this limit" : t.routineStopped ? " · routine mail stopped for today" : ""}
                     </td>
                     <td className="py-2 pr-4 text-ink">{t.reading === "not_configured" ? "" : fmt(t.since)}</td>
                     <td className="py-2 pr-4 font-mono text-xs text-ink">{t.lastErrorClass ?? ""}</td>
@@ -268,7 +268,7 @@ export default async function PlatformEmailPage() {
                       {t.sent24h} of {t.limit.limit}
                     </td>
                     <td className="py-2">
-                      <DailyLimitForm organizationId={t.organization_id} storedLimit={t.storedLimit} defaultLimit={defaultLimit} />
+                      <DailyLimitForm organizationId={t.organization_id} storedLimit={t.storedLimit} defaultLimit={defaultLimit} reserveMin={DAILY_LIMIT_RESERVE_MIN} />
                     </td>
                   </tr>
                 ))}
