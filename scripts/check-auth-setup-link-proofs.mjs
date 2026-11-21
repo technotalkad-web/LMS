@@ -152,7 +152,8 @@
 //
 // EXIT: 0 every proof passed; 1 a proof failed or its control was void;
 // 2 refused (not staging, a setting missing; also --mail-only or
-// --platform-leg when their settings are unset, after the "not run" lines);
+// --platform-leg when their settings are unset, after the "not run" lines,
+// and --platform-leg when STAGING_BASE_URL does not serve this branch);
 // 3 harness error or a failed cleanup.
 // =============================================================================
 
@@ -1129,7 +1130,7 @@ function legRecipient(address, box = MAILBOX) {
   return mailboxRecipient(address, box);
 }
 /** What the leg made, for its own clean-up in its own order. */
-const leg = { orgId: null, ownerId: null, adminId: null, browser: null };
+const leg = { orgId: null, ownerId: null, adminId: null, browser: null, notRun: false };
 
 /** POST a JSON body to the build; the answer's status and parsed body (never printed). */
 async function postBuild(path, body, { fetchImpl = fetch } = {}) {
@@ -1166,10 +1167,12 @@ async function platformLegRun() {
   try {
     first = await postBuild("/api/auth/set-password", { token: token43() });
   } catch (e) {
+    leg.notRun = true;
     rec(P6P, "step 1: the build answers", "not run", `the request failed (${safeCode(e?.name)}); the address does not serve this branch`);
     return;
   }
   if (!isUnusable(first)) {
+    leg.notRun = true;
     rec(P6P, "step 1: 43 random characters get rule N10's answer", "not run", `status=${first.status}; the address does not serve this branch`);
     return;
   }
@@ -1220,8 +1223,9 @@ async function platformLegRun() {
   if (!signedIn) return;
   rec(P6P, "step 4: the owner signs in through /login", "setup", "a session in the driven browser");
 
-  // 5. The add, through the recipient guard.
+  // 5. The add, through the recipient guard. Step 7's five minutes count from here.
   const alias = legRecipient(legAlias());
+  const addAt = Date.now();
   const added = await ctx.request.post(`/api/super/tenants/${leg.orgId}/admins`, { data: { email: alias, role: "admin" } });
   const ans = await added.json().catch(() => null);
   if (typeof ans?.user_id === "string") leg.adminId = ans.user_id;
@@ -1254,12 +1258,12 @@ async function platformLegRun() {
     rec(P6P, "step 7: the reader signs in and lists its folders", "void", `${imapErr(e)}; the leg is not proven by this run`);
     return;
   }
-  const got = await waitForAlias(folders, alias, since, sweptAt + MAIL_WAIT_MS, P6P, "step 7");
+  const got = await waitForAlias(folders, alias, since, addAt + MAIL_WAIT_MS, P6P, "step 7");
   if (!got.folder) {
-    rec(P6P, "step 7: the welcome is found within 5 minutes", "void", `not found after ${sec(Date.now() - sweptAt)} s; the leg is not proven by this run`);
+    rec(P6P, "step 7: the welcome is found within 5 minutes", "void", `not found after ${sec(Date.now() - addAt)} s; the leg is not proven by this run`);
     return;
   }
-  rec(P6P, "step 7: the welcome is found within 5 minutes", "recorded", `folder=${got.folder.role} after ${sec(got.at - sweptAt)} s`);
+  rec(P6P, "step 7: the welcome is found within 5 minutes", "recorded", `folder=${got.folder.role} after ${sec(got.at - addAt)} s from the add`);
   let parts;
   try {
     parts = await readParts(got.folder.path, got.uid);
@@ -1562,7 +1566,8 @@ if (platformLeg) {
     cleanOk = (await cleanup().catch(() => false)) && legClean;
   }
   finish();
-  process.exit(harnessFailed || count("harness") || !cleanOk ? 3 : count("fail") || count("void") ? 1 : 0);
+  // An address that does not serve this branch: the leg is "not run", exit 2 as the settings refusals.
+  process.exit(harnessFailed || count("harness") || !cleanOk ? 3 : count("fail") || count("void") ? 1 : leg.notRun ? 2 : 0);
 }
 try {
   await step("run", preamble);
