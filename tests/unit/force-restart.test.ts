@@ -1386,15 +1386,20 @@ async function regrant() {
         /origin: await originFromRequest\(\),/.test(mp) && /const reissue = reissueNotifier\(\);/.test(mp) && /notify: reissue\.notify,/.test(mp), true);
     const fin = fs.readFileSync(path.join(root, "app/api/courses/upload/finalize/route.ts"), "utf8");
     eq("finalize route: passes the origin and the notifier (the strict address reader and the skip helper, ADR 0029)",
-      /origin: await originFromRequest\(\),/.test(fin) && /const reissue = reissueNotifier\(\);/.test(fin) && /notify: reissue\.notify,/.test(fin), true);
+      /origin: await originFromRequest\(\),/.test(fin) && /const reissue = reissueNotifier\(\{ budget: mailBudget \}\);/.test(fin) && /notify: reissue\.notify,/.test(fin), true);
+    // ADR 0029 rule T4: the request's two budgets are one, shared by the
+    // re-issue mails and the update mail, never a second fresh budget.
+    eq("finalize route: one request budget, given to the notifier and to the update mail",
+      [/const mailBudget = requestBudget\(\{ spent: ADMIN_REQUEST_OWN_CALLS \}\);/.test(fin), /notify: reissue\.notify,\s*mailBudget,/.test(fin)], [true, true]);
     // ADR 0029 rule T4: the routes' notifier is reissueNotifier, which keeps
     // the re-issue mails' outcome for the answer; it is built on the learner
     // notifier, the strict address reader and the skip helper.
     const rq = fs.readFileSync(path.join(root, "lib/attempts/requests.ts"), "utf8").replace(/\r\n/g, "\n");
     const notifier = rq.slice(rq.indexOf("export function reissueNotifier("));
-    eq("reissueNotifier: the decision is notifyLearnerOfDecision, the addresses resolveEmailsStrict, a skip recordRecipientsUnreadable",
-      [/await notifyLearnerOfDecision\(svc, args\)/.test(notifier), /emails: resolveEmailsStrict,/.test(notifier), /await recordRecipientsUnreadable\(site, organizationId\)/.test(notifier)], [true, true, true]);
+    eq("reissueNotifier: the decision is notifyLearnerOfDecision inside the request's one run, the addresses resolveEmailsStrict, a skip recordRecipientsUnreadable",
+      [/run \?\?= await openRun\(\{ organizationId: args\.orgId, budget, db: svc \}\);/.test(notifier), /await notifyLearnerOfDecision\(svc, \{ \.\.\.args, run \}\)/.test(notifier), /emails: resolveEmailsStrict,/.test(notifier), /await recordRecipientsUnreadable\(site, organizationId\)/.test(notifier)], [true, true, true, true]);
     const du = fs.readFileSync(path.join(root, "lib/courses/direct-upload.ts"), "utf8");
+    eq("finalizeDirectUpload: the update mail draws on the request's budget", /notifyCourseUpdate\(\{ org, courseId: course\.id, budget: args\.mailBudget \}\)/.test(du), true);
     eq("finalizeDirectUpload: the version number, the admin, the org, the course title",
       /versionNumber: version\.version_number,\s*admin: \{ id: args\.userId \},\s*org,\s*origin: args\.origin,\s*course: \{ id: course\.id, title: course\.title \?\? "this course" \},\s*notify: args\.notify,/.test(du) &&
         /\.select\("id, organization_id, current_version_id, title"\)/.test(du), true);

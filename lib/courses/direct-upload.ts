@@ -32,6 +32,7 @@ import {
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
 import type { MailOutcome } from "@/lib/notifications/send";
+import type { MailBudget } from "@/lib/notifications/smtp-state";
 import {
   forceRestartOlderVersions,
   forceRestartReport,
@@ -400,6 +401,8 @@ export async function finalizeDirectUpload(args: {
   origin: string;
   /** ADR 0014 step 8: the learner notifier and email resolver the forced restart's re-issue uses (passed in by the route). */
   notify: ForceRestartNotify;
+  /** ADR 0029 rule T4: the request's mail budgets, shared by the re-issue mails and the update mail. */
+  mailBudget?: MailBudget;
 }): Promise<FinalizeResult> {
   const { supabase, org, versionId } = args;
   const loaded = await loadUploadingVersion(supabase, org.id, versionId);
@@ -498,7 +501,7 @@ export async function finalizeDirectUpload(args: {
   }
   let updateEmail: MailOutcome | null = null;
   if (args.notifyUpdate && hadCurrent) {
-    updateEmail = await notifyCourseUpdate({ org, courseId: course.id });
+    updateEmail = await notifyCourseUpdate({ org, courseId: course.id, budget: args.mailBudget });
   }
 
   // ADR 0005 note (e) of 2026-10-19 (position: its addition of that date):

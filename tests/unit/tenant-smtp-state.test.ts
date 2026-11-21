@@ -83,7 +83,7 @@ import {
 import { runSettingsTest, sendMany, sendNotification, sendSettingsTest, type SendArgs } from "../../lib/notifications/send";
 import { CALL_LIMIT_LOG_EVENT, requestBudget } from "../../lib/notifications/smtp-state";
 import { notifyAdminsOfTicket } from "../../lib/tickets/notify";
-import { notifyAdminsOfRequest } from "../../lib/attempts/requests";
+import { notifyAdminsOfRequest, reissueNotifier } from "../../lib/attempts/requests";
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
 import path from "node:path";
@@ -455,6 +455,32 @@ async function main() {
         await send();
         eq(`${label}, a read that finds no administrator: nothing is sent and nothing is recorded`, [sends().length, skipRows()], [0, []]);
       }
+    }
+
+    console.log("\na forced restart's re-issue mails: one run for the request (rule T4)");
+    {
+      const db = () => createClient("http://stub.supabase.test", "stub-service-key-0029", { auth: { persistSession: false } });
+      const learners = people(5);
+      const counting = new Set(learners.map((p) => p.id));
+      const reissue = async (notify: ReturnType<typeof reissueNotifier>["notify"]) => {
+        for (const p of learners) {
+          await notify.decision(db(), { orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "", courseId: "c-0029", courseTitle: "Home loans", learner: { id: p.id, email: p.email }, approved: true, note: null, expiresAt: null, counting });
+        }
+      };
+      freshWorld({ smtp: () => DEAD, state: { organization_id: ORG, state: "failing", state_changed_at: iso(H), failed_recipients: ["x1", "x2", "x3"], last_error_code: "unreachable", last_alert_at: iso(H) } });
+      const failing = reissueNotifier();
+      await reissue(failing.notify);
+      eq("five re-issued learners on a failing organisation: one read of its state and one send, the probe; the other four not attempted",
+        [statusCalls().length, sends().length, failing.outcome()], [1, 1, { recipients_unreadable: false, emailed: 0, not_emailed: 5, not_confirmed: 0 }]);
+      freshWorld();
+      const healthy = reissueNotifier();
+      await reissue(healthy.notify);
+      eq("…on a ready organisation the five go in that one run", [statusCalls().length, sends().length, healthy.outcome()], [1, 5, { recipients_unreadable: false, emailed: 5, not_emailed: 0, not_confirmed: 0 }]);
+      freshWorld();
+      const spent = requestBudget({ spent: 40 });
+      const full = reissueNotifier({ budget: spent });
+      await reissue(full.notify);
+      eq("…a request whose budget is spent sends none: the run draws on the request's count", [sends().length, (full.outcome() as { not_emailed?: number } | undefined)?.not_emailed], [0, 5]);
     }
   } finally {
     removeStub();

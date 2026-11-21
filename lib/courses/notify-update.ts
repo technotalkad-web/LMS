@@ -1,7 +1,7 @@
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls, type MailBudget } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { assignedRecipientsStrict } from "@/lib/org/groups";
@@ -17,10 +17,15 @@ import { assignedRecipientsStrict } from "@/lib/org/groups";
  * how many learners were emailed and how many were not; null when the mail
  * part itself failed. A failed read of the recipients is never "nobody":
  * nobody is emailed, the skip is recorded, and the outcome says so.
+ *
+ * `budget`: the request's, when the same request has sent other mail (a
+ * forced restart's re-issue mails in the direct-upload finalise step), so
+ * both runs draw on one count and one clock; else one for this request.
  */
 export async function notifyCourseUpdate(args: {
   org: { id: string; slug: string; name: string };
   courseId: string;
+  budget?: MailBudget;
 }): Promise<MailOutcome | null> {
   const { org, courseId } = args;
   try {
@@ -29,7 +34,7 @@ export async function notifyCourseUpdate(args: {
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     );
-    const budget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+    const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
     spendCalls(budget, 1);
     const { data: courseRow } = await svc
       .from("courses")

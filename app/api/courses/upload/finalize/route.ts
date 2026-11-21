@@ -3,6 +3,7 @@ import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { finalizeAnswer, finalizeDirectUpload } from "@/lib/courses/direct-upload";
 import { originFromRequest } from "@/lib/http/origin";
 import { reissueNotifier } from "@/lib/attempts/requests";
+import { ADMIN_REQUEST_OWN_CALLS, requestBudget } from "@/lib/notifications/smtp-state";
 
 /**
  *   POST /api/courses/upload/finalize   { orgSlug, versionId, notify_update?, mode? }
@@ -37,7 +38,10 @@ export async function POST(request: NextRequest) {
   const auth = await requireOrgAdminApi(body.orgSlug);
   if ("error" in auth) return NextResponse.json({ error: auth.error }, { status: auth.status });
 
-  const reissue = reissueNotifier();
+  // ADR 0029 rule T4: the request's two budgets, shared by the forced
+  // restart's re-issue mails and the update mail.
+  const mailBudget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+  const reissue = reissueNotifier({ budget: mailBudget });
   const result = await finalizeDirectUpload({
     supabase: auth.supabase,
     org: auth.org,
@@ -48,6 +52,7 @@ export async function POST(request: NextRequest) {
     // ADR 0014 step 8: what a forced restart's re-issued grant needs to tell the learner.
     origin: await originFromRequest(),
     notify: reissue.notify,
+    mailBudget,
   });
   const answer = finalizeAnswer(result);
   const reissueEmail = reissue.outcome();

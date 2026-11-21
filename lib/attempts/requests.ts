@@ -20,7 +20,7 @@
  */
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, sendMany, sendNotification, type MailOutcome } from "@/lib/notifications/send";
-import { openRun, recordRecipientsUnreadable, requestBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 // Type only: the forced restart takes its notifier as an argument.
 import type { ForceRestartNotify } from "./force-restart";
@@ -211,12 +211,25 @@ export async function notifyLearnerOfDecision(
  * screen (rule T4): emailed and not, or nobody emailed because the
  * recipients could not be read. The route answers the outcome beside the
  * restart's report, never inside it. Undefined when no re-issue was mailed.
+ *
+ * The re-issue mails of one request are one run (rule T4), as every other
+ * loop of mail an administrator starts: one read of the organisation's
+ * state, its stop rule (an organisation already failing is tried once, by
+ * the probe) and the request's budgets. The run opens at the first mail
+ * that has someone to reach, never for nobody. `budget`: the request's,
+ * when the request sends other mail too, so all of it draws on one count
+ * and one clock; else one for this request.
  */
-export function reissueNotifier(): { notify: ForceRestartNotify; outcome: () => MailOutcome | undefined } {
+export function reissueNotifier(opts: { budget?: MailBudget } = {}): { notify: ForceRestartNotify; outcome: () => MailOutcome | undefined } {
   let outcome: MailOutcome | undefined;
+  const budget = opts.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+  let run: MailRun | undefined;
   const notify: ForceRestartNotify = {
     decision: async (svc, args) => {
-      const one = await notifyLearnerOfDecision(svc, args);
+      if (args.learner.email && (!args.counting || args.counting.has(args.learner.id))) {
+        run ??= await openRun({ organizationId: args.orgId, budget, db: svc });
+      }
+      const one = await notifyLearnerOfDecision(svc, { ...args, run });
       outcome = addMailOutcome(outcome && !outcome.recipients_unreadable ? outcome : mailCounts([]), one);
       return one;
     },
