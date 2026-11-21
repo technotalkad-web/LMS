@@ -47,7 +47,9 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@supabase/supabase-js";
 import { addMember, createAuthUser, createOrg, markPlatformOwner, rand, svc, testEmail } from "./data";
 import { authedContext } from "../lib/session";
-import { aliasFor, configureOrgSmtp, waitForEmail } from "./inbox";
+import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
+import { aliasFor, configureOrgSmtp } from "./inbox";
 
 const CRON_SECRET = process.env.LIFECYCLE_CRON_SECRET || process.env.KIVO_CLOUD_RUN_CRON_SECRET || "";
 const MAIL_READY = !!(process.env.BOT_MAIL_ADDRESS && process.env.BOT_SMTP_USER && process.env.BOT_SMTP_PASS);
@@ -270,13 +272,55 @@ async function sendOwnAlert(orgId: string): Promise<void> {
   expect((await stateRow(orgId))?.alert_due_at ?? null, `this case's alert is sent after ${older + 1} scheduled calls`).toBeNull();
 }
 
-/** A delivered mail in the bot inbox; a timeout says so without naming the recipient. */
-async function mailArrives(recipient: string, since: Date, subjectIncludes?: string) {
-  try {
-    return await waitForEmail({ recipient, since, subjectIncludes, timeoutMs: 180_000 });
-  } catch {
-    throw new Error("the mail did not arrive in the bot inbox within 180 s");
+/**
+ * A delivered mail in the bot inbox, by its exact recipient. Each poll opens
+ * a fresh connection and reads the inbox's newest messages itself, comparing
+ * each envelope's recipients, so it does not wait on the mail server's own
+ * search index. A timeout says so without naming the recipient.
+ */
+async function mailArrives(recipient: string, since: Date): Promise<{ text: string; html: string }> {
+  const want = recipient.toLowerCase();
+  const floor = since.getTime() - 60_000;
+  const end = Date.now() + 180_000;
+  while (Date.now() < end) {
+    const client = new ImapFlow({
+      host: process.env.BOT_IMAP_HOST || "imap.gmail.com",
+      port: Number(process.env.BOT_IMAP_PORT || 993),
+      secure: true,
+      auth: { user: process.env.BOT_MAIL_ADDRESS!, pass: (process.env.BOT_IMAP_PASS || process.env.BOT_SMTP_PASS || "").replace(/\s+/g, "") },
+      logger: false,
+    });
+    client.on("error", () => {});
+    try {
+      await client.connect();
+      const lock = await client.getMailboxLock("INBOX", { readOnly: true });
+      try {
+        const found = await client.search({ since: new Date(floor - 86_400_000) }, { uid: true });
+        const recent = (Array.isArray(found) ? found : []).slice(-200);
+        let best = 0;
+        if (recent.length) {
+          for await (const m of client.fetch(recent.join(","), { uid: true, envelope: true, internalDate: true }, { uid: true })) {
+            const to = (m.envelope?.to ?? []).map((a) => String(a.address ?? "").toLowerCase());
+            const at = m.internalDate ? new Date(m.internalDate).getTime() : 0;
+            if (to.includes(want) && at >= floor && m.uid > best) best = m.uid;
+          }
+        }
+        if (best) {
+          const msg = await client.fetchOne(String(best), { source: true }, { uid: true });
+          const parsed = await simpleParser((msg as { source: Buffer }).source);
+          return { text: parsed.text ?? "", html: typeof parsed.html === "string" ? parsed.html : "" };
+        }
+      } finally {
+        lock.release();
+      }
+    } catch {
+      // A failed read: the next poll tries again on a new connection.
+    } finally {
+      await client.logout().catch(() => {});
+    }
+    await sleep(5_000);
   }
+  throw new Error("the mail did not arrive in the bot inbox within 180 s");
 }
 
 /** The Settings test, run by an administrator of the organisation from the bot inbox, as the SMTP tab's "Send test" does. */
