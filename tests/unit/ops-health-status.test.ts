@@ -376,7 +376,7 @@ console.log("\nstage 4: the console's fixed sentences");
     callLimitSentence(false), "The job met the platform's limit on calls part-way through: what was sent is counted, and the rest waits for the next run.");
   eq("state_write: a record of mail that went could not be written, so it can go again", CRON_ERROR_SENTENCES.state_write, "A record of mail that went could not be written, so that mail can go again.");
   const stop = mailCronFailureSentences({ failed_steps: 1, unreadable_orgs: 0, stopped_before_send: true, left_orgs: 1, errors: { call_limit: 1 } });
-  eq("the job's own stop: its sentence, and the organisations or programs that waited", stop, [callLimitSentence(true), "1 organisation or program waited for the next run."]);
+  eq("the job's own stop: its sentence alone (the organisations left are said only on a clean run)", stop, [callLimitSentence(true)]);
   const partWay = mailCronFailureSentences({ failed_steps: 3, unreadable_orgs: 2, stopped_before_send: false, errors: { call_limit: 1, state_write: 2 } });
   eq("the platform part-way, two failed writes and two organisations unread", partWay, [
     `${CRON_ERROR_SENTENCES.state_write} (2 times)`,

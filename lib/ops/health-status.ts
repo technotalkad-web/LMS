@@ -588,13 +588,16 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 /**
  * The failure details of a mail cron's last run as fixed sentences: each
  * failed step's sentence with its count, the unreadable organisations, a
- * stop before any send, and what was left for the next run. Counts and
- * fixed words only; an empty list when there is nothing to say.
+ * stop before any send, and, on a clean run only, the organisations or
+ * programs that wait for the next run (on a failed run the step's own
+ * sentence says what happens next). Counts and fixed words only; an empty
+ * list when there is nothing to say.
  */
 export function mailCronFailureSentences(failure: MailCronJobReading["failure"]): string[] {
   if (!failure) return [];
   const out: string[] = [];
   const errors = failure.errors ?? {};
+  const clean = !CRON_ERROR_WORDS.some((w) => isCount(errors[w]) && (errors[w] as number) > 0) && !(isCount(failure.unreadable_orgs) && failure.unreadable_orgs > 0);
   for (const word of CRON_ERROR_WORDS) {
     const n = errors[word];
     if (!isCount(n) || n === 0) continue;
@@ -607,7 +610,7 @@ export function mailCronFailureSentences(failure: MailCronJobReading["failure"])
   if (failure.stopped_before_send === true && !(isCount(errors.call_limit) && errors.call_limit > 0)) {
     out.push("The run stopped before it sent anything.");
   }
-  if (isCount(failure.left_orgs) && failure.left_orgs > 0) {
+  if (clean && isCount(failure.left_orgs) && failure.left_orgs > 0) {
     out.push(`${plural(failure.left_orgs, "organisation or program", "organisations or programs")} waited for the next run.`);
   }
   if (isCount(failure.left_daily_limit) && failure.left_daily_limit > 0) {
