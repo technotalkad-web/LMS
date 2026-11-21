@@ -43,7 +43,7 @@ These are **not bugs** — they are features that don't exist. If Ambak expects 
 | Data | **Supabase** (Postgres + Auth + Storage) with **RLS** | Multi-tenant isolation via row-level security + org-scoped queries |
 | Privileged ops | Supabase **service-role** client | **Bypasses RLS** — every service-role query must self-enforce org scoping (root of the Tier-1 findings) |
 | Email (transactional) | **Per-org SMTP** via a Supabase Edge Function (`send-smtp`) | Validated working end-to-end (Gmail) |
-| Email (auth: invite/magic-link/reset) | **Supabase Auth mailer** (separate from org SMTP) | Needs Auth SMTP + correct Site URL (see §7) |
+| Email (auth: invite/magic-link/reset) | **The app itself** (corrected 2026-11-21, ADR 0029): learners' codes and links through their organisation's SMTP, administrators' and platform owners' through the platform mailbox; the Supabase Auth mailer sends none of the app's mail | Site URL still matters for the auth server's own redirects (see `docs/ops/supabase-auth-smtp.md` Step 0) |
 | Object storage | Supabase Storage or **Cloudflare R2** (`STORAGE_DRIVER`) | Course packages under `course-content` bucket |
 | Scheduled jobs | **Cloudflare cron triggers** → `/api/cron/*` | reminders, billing, reaper, refresh-report-views, rls-audit |
 | Errors | **Sentry** (`@sentry/nextjs`) | Already wired |
@@ -69,7 +69,7 @@ Maps to [AUDIT-FINDINGS.md](../tests/bot/lifecycle/AUDIT-FINDINGS.md). **P0 = bl
 ### P1 — before go-live
 - **B2** quota fails open on error → fail closed. **L1** sequential-gating bypass for `org_public` paths. **L3/L4/R1** report-consistency + sticky-completion on the path-reports page. **N2/N3** duplicate/placeholder-leaking emails. **S8** dedicated `IMPERSONATION_SECRET`. **N5** org-less password reset.
 - **Load test** to 1,000 (then 5,000) — see §4.
-- **Auth config**: Supabase **Site URL + Redirect URLs** set to the prod app (fixes the invite/magic-link → localhost issue we found); Auth SMTP confirmed on prod project.
+- **Auth config**: Supabase **Site URL + Redirect URLs** set to the prod app (fixes the invite/magic-link → localhost issue we found); Auth SMTP confirmed on prod project. *(Corrected 2026-11-21, ADR 0029: no Auth SMTP; the Auth mailer is turned down on production, `docs/ops/supabase-auth-smtp.md`.)*
 
 ### P2 — fast-follow (post-launch ok)
 - **D2/D3** score normalization (score.min/max; cmi5 masteryScore), **D4/D5** concurrency/token hardening, **B1** quota TOCTOU (DB-side enforcement), **B3/B4/B5** billing semantics (decisions — §16), **N7/N8** cmi5 completion email + real learner names.
@@ -142,8 +142,8 @@ Maps to [AUDIT-FINDINGS.md](../tests/bot/lifecycle/AUDIT-FINDINGS.md). **P0 = bl
 
 ## 10. Email delivery reliability
 
-- Transactional (org SMTP) is **validated end-to-end** (send + IMAP receipt). For 5,000-recipient blasts, **batch + rate-limit** (C2/C3) and consider a reputable provider (SendGrid/SES/Postmark) over a personal Gmail — Gmail has daily send caps that a 5,000-user org will hit.
-- **Auth emails** (invite/magic-link/reset) go via **Supabase Auth** — confirm Auth SMTP on the **prod** project and set **Site URL + Redirect URLs** to the prod app (we found it pointing at `localhost`, which silently breaks invite onboarding).
+- Transactional (org SMTP) is **validated end-to-end** (send + IMAP receipt). For 5,000-recipient blasts, **batch + rate-limit** (C2/C3) and consider a reputable provider (SendGrid/SES/Postmark) over a personal Gmail — Gmail has daily send caps that a 5,000-user org will hit. *(2026-11-21, ADR 0029: each tenant sends only through its own SMTP, under a daily limit the platform owner sets; `ops/RUNBOOK.md` §6.3b.)*
+- **Auth emails** (invite/magic-link/reset) go via **Supabase Auth** — confirm Auth SMTP on the **prod** project and set **Site URL + Redirect URLs** to the prod app (we found it pointing at `localhost`, which silently breaks invite onboarding). *(Corrected 2026-11-21, ADR 0029: the app mails these itself, a learner's through the organisation's SMTP and an administrator's through the platform mailbox; no Auth SMTP is set; Site URL + Redirect URLs still matter, `docs/ops/supabase-auth-smtp.md` Step 0.)*
 - Configure **SPF/DKIM/DMARC** for Ambak's sending domain to stay out of spam — essential for a university rollout.
 - Monitor bounces; surface `notification_log` failures to admins.
 
@@ -168,7 +168,7 @@ Maps to [AUDIT-FINDINGS.md](../tests/bot/lifecycle/AUDIT-FINDINGS.md). **P0 = bl
 ## 13. User onboarding & authentication workflows
 
 - **Verified:** password onboarding (welcome email w/ temp password → login button + manual login), forced password change, password reset (app OTP via org SMTP).
-- **Magic-link/invite:** works once Supabase Auth SMTP + Site URL are set (§7/§10). Finish the magic-link verification after that config.
+- **Magic-link/invite:** works once Supabase Auth SMTP + Site URL are set (§7/§10). Finish the magic-link verification after that config. *(Corrected 2026-11-21, ADR 0029: the app sends sign-in links and invitations itself; they do not depend on Auth SMTP.)*
 - Decide Ambak's default: **temp-password** vs **magic-link** onboarding for 1,000 users (magic-link avoids password handling but depends on Auth email reliability + Site URL config).
 - Consider **bulk CSV import** path testing for the initial 1,000-user load (quota TOCTOU B1 matters here under concurrency).
 
@@ -233,7 +233,7 @@ Deliverables to produce before handover:
 - [ ] All **P0** items (§3) fixed, code-reviewed (`/security-review`), and **re-tested** (lifecycle + bot suites green; add cross-tenant regression tests).
 - [ ] Load test to 1,000 (then 5,000) passes targets (§5).
 - [ ] Prod Supabase: migrations applied (incl. new indexes), compute tier + pooling sized, **PITR on**, **test restore done**.
-- [ ] Prod Auth: SMTP configured, **Site URL + Redirect URLs** = prod app; SPF/DKIM/DMARC set.
+- [ ] Prod Auth: **Site URL + Redirect URLs** = prod app; the Auth mailer turned down as `docs/ops/supabase-auth-smtp.md` says (corrected 2026-11-21, ADR 0029; this read "SMTP configured"); the platform sender's secrets set and its test delivered (`ops/RUNBOOK.md` §6.3a); SPF/DKIM/DMARC set.
 - [ ] Prod secrets set as Worker secrets (CRON_SECRET, service-role, IMPERSONATION_SECRET); **test creds rotated**.
 - [ ] Sentry alerts + uptime + cron-failure + notification_log-failure alerts live.
 - [ ] Cloudflare cron triggers confirmed on prod worker.
@@ -262,7 +262,7 @@ Deliverables to produce before handover:
 4. **SCORM 2004 content mismatch** — silent non-tracking; the most likely user complaint. *Confirm formats now.*
 5. **Auth email/Site-URL misconfig** — broken invite onboarding for 1,000 users. *P1, easy.*
 6. **Unvalidated backups / no DR drill.** *P1.*
-7. **Gmail send caps** for 5,000-user blasts. *Move to a real ESP.*
+7. **Gmail send caps** for 5,000-user blasts. *Move to a real ESP.* *(2026-11-21, ADR 0029: each tenant's own SMTP, with a daily limit in the app; the mailbox's cap is the tenant's to size.)*
 
 ---
 

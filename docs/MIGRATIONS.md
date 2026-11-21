@@ -136,7 +136,8 @@ Each file's header is the full rule; this is the cross-file summary.
   `public.organizations` and `auth.users`. It **must** be pasted ahead of
   pull request B's code (code that comes first turns away an add with no
   password before creating any account). Rows older than 90 days are
-  cleared by hand with the statement in the file's header, which always
+  cleared by hand with the statement in the file's header (given word for
+  word in `ops/RUNBOOK.md` §6.3a, and held equal by a unit case), which always
   keeps the newest row of each account in each organisation, because the
   "Send setup link" action (rule N12) is offered only where such a row
   exists; never use a plain delete of every old row. Reverse with

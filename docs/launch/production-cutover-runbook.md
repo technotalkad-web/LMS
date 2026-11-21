@@ -257,7 +257,7 @@ These are the minimum pre-launch confidence checks. Detailed steps for each are 
 
 **Mission 16 — Admin SMTP + branding**
 - [ ] Tenant admin updates org branding (logo, brand color, login hero text) → `/{slug}/login` reflects the change immediately.
-- [ ] Tenant admin sends a forgot-password from the org's branded login page → email arrives **From** the org's configured From address (not platform default).
+- [ ] A learner of the org asks for a reset code on the org's branded login page → email arrives **From** the org's configured From address (a tenant's mail has no other sender). Since ADR 0029 an administrator's own code comes from the platform mailbox instead (`ops/RUNBOOK.md` §6.3, item 5).
 
 If any of the three fails, do not invite real users. Diagnose and re-test.
 
@@ -303,7 +303,7 @@ Cloudflare crons run on UTC. The earliest one (`/api/cron/billing` at 02:00 UTC)
   - Cloudflare Dashboard → Worker **Analytics** — request count, error rate, CPU time
 - [ ] **End of week 1:** Schedule the deferred work:
   - Ticket #119 — nightly DB backup (no longer optional once you have paying customers)
-  - Ticket #120 — Resend or platform SMTP for Supabase auth emails (currently only your custom org SMTP works; Supabase's built-in auth emails like email-confirm use the project's SMTP setting — verify it's configured or learners signing up will silently miss confirmation mail)
+  - Ticket #120 — closed by ADR 0029 (pull request B): the LMS sends every email itself, a tenant's through its own SMTP and the platform's through the platform mailbox, with no fallback; Supabase Auth's own mailer sends none of the app's mail and is turned down on production (`docs/ops/supabase-auth-smtp.md`)
   - Ticket #124 — custom domain (optional but improves trust; deferred)
 
 ---

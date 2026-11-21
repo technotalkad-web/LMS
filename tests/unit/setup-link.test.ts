@@ -54,7 +54,12 @@
  *     route, and the page sends no referrer;
  *   - the auth server's sent times are read nowhere in app/ and lib/;
  *   - no request address holds the token, and no log line holds a token, a
- *     link or a password.
+ *     link or a password;
+ *   - the clean-up of the table: ops/RUNBOOK.md gives the statement of
+ *     0117's header word for word (white space and comment marks aside),
+ *     says which row it keeps and warns against the short form, and holds
+ *     no other delete on the table (ADR 0029, note of 2026-11-19, point 2;
+ *     note of 2026-11-20, part 3). Planted texts prove each check fires.
  *
  * No database, no network.
  *
@@ -331,6 +336,43 @@ function world(o: { links?: Row[]; members?: Row[]; signIn?: SignIn; owners?: st
   jar.clear();
   jar.set("sb-stub-auth-token", SESSION);
 }
+/* ---------------- the clean-up statement: the runbook against 0117's header ---------------- */
+/** A text with each line's leading SQL comment mark taken off. */
+const withoutMarks = (text: string) => text.split(/\r?\n/).map((l) => l.replace(/^\s*--/, "")).join("\n");
+/** A statement with no white space, so that only its words are compared. */
+const squashed = (sql: string) => sql.replace(/\s+/g, "");
+/** Prose with its emphasis marks and line breaks taken out. */
+const prose = (text: string) => text.replace(/\*\*/g, "").replace(/\s+/g, " ");
+const linksDelete = () => /\bdelete\s+from\s+(?:only\s+)?(?:"?public"?\s*\.\s*)?"?account_setup_links\b/gi;
+const linksTruncate = () => /\btruncate\s+(?:table\s+)?(?:only\s+)?(?:"?public"?\s*\.\s*)?"?account_setup_links\b/gi;
+/** Every delete on the table in a text, comment marks taken off: from "delete" to the first ";" after it. */
+function deletesOnLinks(text: string): string[] {
+  const plain = withoutMarks(text);
+  return [...plain.matchAll(linksDelete())].map((m) => {
+    const end = plain.indexOf(";", m.index ?? 0);
+    return plain.slice(m.index ?? 0, end < 0 ? undefined : end + 1);
+  });
+}
+/** 0117's own statement: the delete its header gives after "Use this statement and no other:". */
+function headerStatement(migration: string): string | null {
+  const plain = withoutMarks(migration);
+  const at = plain.search(/Use\s+this\s+statement\s+and\s+no\s+other:/);
+  return at < 0 ? null : deletesOnLinks(plain.slice(at))[0] ?? null;
+}
+/** What is wrong with a runbook's clean-up against 0117's header; an empty list when it is right. */
+function cleanupFindings(runbook: string, migration: string): string[] {
+  const want = headerStatement(migration);
+  if (!want) return ["0117's header gives no statement"];
+  const out: string[] = [];
+  const deletes = deletesOnLinks(runbook);
+  if (deletes.length !== 1) out.push(`the runbook gives ${deletes.length} deletes on account_setup_links`);
+  else if (squashed(deletes[0]) !== squashed(want)) out.push("the runbook's statement differs from 0117's");
+  if ([...runbook.matchAll(linksTruncate())].length > 0) out.push("the runbook truncates account_setup_links");
+  if (!/newest row of each account in each organisation is kept/i.test(prose(runbook))) out.push("the runbook does not say which row is kept");
+  if (!/never use the short form/i.test(prose(runbook))) out.push("the runbook does not warn against the short form");
+  return out;
+}
+
 const writes = (table = "account_setup_links") => requests.filter((r) => r.table === table && r.method !== "GET" && r.method !== "HEAD");
 const linkPatches = () => writes().filter((r) => r.method === "PATCH").map((r) => r.body as Row);
 const adminPuts = () => requests.filter((r) => r.path.startsWith("/auth/v1/admin/users/") && r.method === "PUT");
@@ -362,6 +404,30 @@ async function main() {
     const N10 = { status: lib.LINK_UNUSABLE_STATUS, body: { error: lib.LINK_UNUSABLE_MESSAGE, code: "unusable" } };
     const asN10 = (r: { status: number; body: Row }) => ({ status: r.status, body: r.body });
     const TRY = { status: 503, body: { error: lib.LINK_TRY_AGAIN_MESSAGE, code: "unreadable" } };
+
+    console.log("\nthe clean-up of account_setup_links: the runbook gives 0117's statement word for word, and no other delete");
+    {
+      const runbook = fs.readFileSync(path.join(ROOT, "ops", "RUNBOOK.md"), "utf8").replace(/\r\n/g, "\n");
+      const migration = fs.readFileSync(path.join(ROOT, "supabase", "migrations", "0117_account_setup_links.sql"), "utf8");
+      const want = squashed(headerStatement(migration) ?? "");
+      eq("non-vacuous: 0117's header gives one delete, on the table, that keeps the newer row of a pair (exists; time, then id)",
+        [want.startsWith("deletefrompublic.account_setup_linksl"), want.includes("andexists("), want.includes("(n.created_at,n.id)>(l.created_at,l.id)"), deletesOnLinks(migration).length],
+        [true, true, true, 1]);
+      eq("ops/RUNBOOK.md gives that statement word for word, says which row is kept, warns against the short form, and holds no other delete on the table",
+        cleanupFindings(runbook, migration), []);
+      const [given] = deletesOnLinks(runbook);
+      const SHORT = "delete from public.account_setup_links where created_at < now() - interval '90 days';";
+      eq("planted: the short form in place of the statement fails", cleanupFindings(runbook.replace(given, SHORT), migration), ["the runbook's statement differs from 0117's"]);
+      eq("planted: a second delete on the table beside the statement fails", cleanupFindings(`${runbook}\n\`\`\`sql\n${SHORT}\n\`\`\`\n`, migration), ["the runbook gives 2 deletes on account_setup_links"]);
+      eq("planted: a truncate of the table fails", cleanupFindings(`${runbook}\ntruncate table public.account_setup_links;\n`, migration), ["the runbook truncates account_setup_links"]);
+      eq("planted: one comparison changed (>= for >) fails", cleanupFindings(runbook.replace(given, given.replace(") > (l.created_at", ") >= (l.created_at")), migration), ["the runbook's statement differs from 0117's"]);
+      eq("planted: no statement at all fails", cleanupFindings(runbook.replace(given, ""), migration), ["the runbook gives 0 deletes on account_setup_links"]);
+      eq("planted: the same statement on one line behind a comment mark passes (white space and comment marks aside)",
+        cleanupFindings(runbook.replace(given, `-- ${given.replace(/\s+/g, " ")}`), migration), []);
+      eq("planted: a runbook that drops the kept-row sentence and the warning fails on both",
+        cleanupFindings(runbook.replace(/newest row of each account in each\s+organisation is kept/, "row is kept").replace(/Never use\s+the short form/, "Avoid other forms"), migration),
+        ["the runbook does not say which row is kept", "the runbook does not warn against the short form"]);
+    }
 
     console.log("\nissuing a link");
     {

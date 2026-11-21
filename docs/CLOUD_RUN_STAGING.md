@@ -109,10 +109,13 @@ administrator welcomes and SMTP alerts. It never sends a learner's mail and
 is never a fallback for a tenant's SMTP. Every setting is a secret, the
 non-secret ones too, so no address sits in the repository. Staging uses
 its **own** mailbox credential, never production's, and an allow-list of
-only domains whose every mailbox the owner controls. Never list a public
-mail provider's domain: every staging account at that provider could then
-be mailed. Reserved test domains (`.test`, `example.com` and the like) are
-never mailed, so listing one sends nothing.
+**exact addresses only**: `<local>@<domain>` entries cut at commas, each
+allowing that one address (a "+tag" or a dot variant is another address and
+is listed by itself), with no domain entry and no `*`. Staging's four entries
+and what each serves are in `ops/RUNBOOK.md` §6.3a, "The allow-list"; the
+addresses themselves are typed only into the secret. Reserved test domains
+(`.test`, `example.com` and the like) are never mailed, whatever the list
+holds. A list with no usable entry sends nothing and reads as not configured.
 
 ```bash
 printf '%s' "<smtp host>"                    | gcloud secrets create lms-platform-smtp-host --data-file=-
@@ -122,9 +125,12 @@ printf '%s' "<mailbox sign-in name>"         | gcloud secrets create lms-platfor
 # the app password at a hidden prompt, so it is in no shell history
 read -rs PW && printf '%s' "$PW" | gcloud secrets create lms-platform-smtp-password --data-file=-; unset PW
 printf '%s' "<Name <address>>"               | gcloud secrets create lms-platform-smtp-from --data-file=-
-printf '%s' "<a domain you control>[,<another>]" | gcloud secrets create lms-platform-email-allow-domains --data-file=-
+# the allow-list at a hidden prompt too, so no file or shell history holds
+# the addresses; its form: <local>@<domain>,<local>+<fixed-alias>@<domain>,...
+read -rs AL && printf '%s' "$AL" | gcloud secrets create lms-platform-email-allow-domains --data-file=-; unset AL
 # optional: lms-platform-email-reply-to, lms-platform-email-daily-ceiling
-# (default 375), lms-platform-email-org-daily-limit (default 50)
+# (default 375; 25 where staging shares production's mailbox),
+# lms-platform-email-org-daily-limit (default 50)
 
 PN=$(gcloud projects describe "$(gcloud config get-value project)" --format='value(projectNumber)')
 # every one the deploy script may mount; an optional one not created is skipped
@@ -151,9 +157,15 @@ reads `degraded` to a caller with the secret (`platform_email` under
 mounts none of them. Rotation: add a new version of
 `lms-platform-smtp-password` (`read -rs PW && printf '%s' "$PW" | gcloud
 secrets versions add lms-platform-smtp-password --data-file=-; unset PW`),
-redeploy, then press "Send test" on `/super/email`. The ceiling: set `lms-platform-email-daily-ceiling` to three
-quarters of the mailbox's confirmed daily cap; without it the sender uses
-375, three quarters of the smaller cap (about 500 a day) the owner may choose.
+redeploy, then press "Send test" on `/super/email`. A new allow-list: add
+a version the same way (`read -rs AL && printf '%s' "$AL" | gcloud secrets
+versions add lms-platform-email-allow-domains --data-file=-; unset AL`). The
+script mounts the newest version, so every instance that starts afterwards
+and the next deploy read it; then press "Send test". The ceiling: set
+`lms-platform-email-daily-ceiling` to three quarters of the mailbox's daily
+cap; without it the sender uses 375, three quarters of a personal Google
+mailbox's cap (about 500 a day). Where staging's credential belongs to the
+same mailbox as production's, staging's ceiling is 25.
 Migration `0113_platform_email_log.sql` goes on the staging database before
 the code (ADR 0029 decision 7). Details: `ops/RUNBOOK.md` §6.3.
 
